@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+results/
+*.parquet
+*.png
+*.glb
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.claude/settings.local.json

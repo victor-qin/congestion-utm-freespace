@@ -60,6 +60,29 @@ def test_total_delay_decomposes_into_levers():
     assert math.isclose(held["total_delay_s"], held["ground_delay_s"], rel_tol=1e-9)
 
 
+def test_delay_pct_is_bounded_and_consistent():
+    res = run(SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1200.0, seed=2))
+    df = metrics.flight_frame(res)
+    acc = df[df["accepted"]]
+    assert "delay_pct" in df.columns
+    assert (acc["delay_pct"] >= 0).all() and (acc["delay_pct"] < 100).all()   # fraction of trip time
+    # a zero-delay flight is 0%, and pct moves with total_delay (monotone within a run)
+    assert acc.loc[acc["total_delay_s"] == 0.0, "delay_pct"].fillna(0).eq(0.0).all()
+    # explicit check against the definition for one flight
+    r = acc.iloc[acc["total_delay_s"].argmax()]
+    nominal = metrics.nominal_flight_time_s(r["straight_line_m"], res.config)
+    assert math.isclose(r["delay_pct"], 100 * r["total_delay_s"] / (nominal + r["total_delay_s"]),
+                        rel_tol=1e-9)
+
+
+def test_delay_sources_sum_to_total_delay():
+    # the breakdown is exact: ground_delay + air_hold + detour_time == total_delay (no residual)
+    res = run(SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1200.0, seed=2))
+    acc = metrics.flight_frame(res).query("accepted")
+    recombined = acc["ground_delay_s"] + acc["air_hold_s"] + acc["detour_time_s"]
+    assert ((recombined - acc["total_delay_s"]).abs() < 1e-9).all()
+
+
 def test_total_delay_is_nan_for_denied():
     # a fully-blocked straight flight is denied → no arrival → NaN delay (not a misleading 0)
     from freespace_sim.ledger import ReservationLedger

@@ -88,11 +88,20 @@ def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:
     )
 
 
+def nominal_flight_time_s(straight_m: float, cfg: SimConfig) -> float:
+    """Unimpeded door-to-door air time (s): straight cruise + the mandatory climb and descent."""
+    return straight_m / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s
+
+
 def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
     """One tidy record for a single operational intent (accepted or denied)."""
     straight = _straight_horizontal_m(intent)
     flown = _flown_horizontal_m(intent)
     stretch = (flown / straight) if (intent.accepted and straight > 1e-9) else float("nan")
+    td = total_delay_s(intent, cfg)
+    # delay as a fraction of the actual trip time — bounded [0, 100), comparable across trip lengths
+    nominal = nominal_flight_time_s(straight, cfg)
+    delay_pct = (100.0 * td / (nominal + td)) if (intent.accepted and nominal + td > 0) else float("nan")
     return {
         "flight_id": intent.request.flight_id,
         "uss_id": intent.request.uss_id,
@@ -105,8 +114,11 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
         "ground_delay_s": intent.ground_delay_s,
         "air_hold_s": intent.air_hold_s,
         "air_detour_m": intent.air_detour_m,
+        # detour expressed as lateness-seconds; ground_delay + air_hold + detour_time == total_delay
+        "detour_time_s": (intent.air_detour_m / cfg.nominal_speed_mps) if intent.accepted else float("nan"),
         "altitude_change_m": intent.altitude_change_m,
-        "total_delay_s": total_delay_s(intent, cfg),  # unified congestion lateness
+        "total_delay_s": td,                      # unified congestion lateness (s)
+        "delay_pct": delay_pct,                    # ... as % of the flight's total trip time
         "cost": intent.cost,
         "solve_time_s": intent.solve_time_s,   # planner wall time for this flight
         "straight_line_m": straight,
@@ -156,6 +168,8 @@ def aggregate(result: SimResult) -> dict:
         "mean_total_delay_s": float(acc["total_delay_s"].mean()) if len(acc) else 0.0,
         "p50_total_delay_s": _q(acc["total_delay_s"], 0.50),
         "p95_total_delay_s": _q(acc["total_delay_s"], 0.95),
+        "mean_delay_pct": float(acc["delay_pct"].mean()) if len(acc) else 0.0,
+        "p95_delay_pct": _q(acc["delay_pct"], 0.95),
         "mean_air_detour_m": float(acc["air_detour_m"].mean()) if len(acc) else 0.0,
         "p95_air_detour_m": _q(acc["air_detour_m"], 0.95),
         "mean_stretch": float(acc["stretch"].mean()) if len(acc) else 1.0,

@@ -112,8 +112,12 @@ def run_one(region, lam, horizon, seed, planner, tag) -> None:
     plot_outcomes_by_hour(outcomes_by_hour(res), folder / "outcomes_by_hour.png")
     df = metrics.flight_frame(res)
     if df["accepted"].any():
-        viz.delay_histogram(df.loc[df["accepted"], "total_delay_s"],
+        acc_df = df.loc[df["accepted"]]
+        viz.delay_histogram(acc_df["total_delay_s"],
                             out=folder / "delay_hist.png", title=f"Total delay — λ={lam:g}/h")
+        viz.delay_pct_histogram(acc_df["delay_pct"],
+                                out=folder / "delay_pct_hist.png", title=f"Delay % — λ={lam:g}/h")
+        viz.delay_sources(acc_df, out=folder / "delay_sources.png", by=None)   # single-run breakdown
     viz.congestion_heatmap(res, out=folder / "heatmap.png")
     print(f"  captured → {folder}")
 

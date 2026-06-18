@@ -113,17 +113,22 @@ def congestion_heatmap(result: SimResult, out=None, bins: int = 60):
     return ax
 
 
-def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distribution"):
-    """Histogram of total-delay seconds — how many flights suffered how much congestion lateness."""
+def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distribution",
+                    xlabel="total delay (s)", unit=" s"):
+    """Histogram of delay — how many flights suffered how much congestion lateness.
+
+    ``xlabel``/``unit`` let the same plotter serve both absolute seconds and the percent-of-trip
+    flavour (see :func:`delay_pct_histogram`). NaN (denied) flights are dropped.
+    """
     vals = np.asarray([v for v in values if v == v], float)  # drop NaN (denied) flights
     own = ax is None
     if own:
         _, ax = plt.subplots(figsize=(7, 4.5))
     ax.hist(vals, bins=bins, color="#2563eb", edgecolor="white", linewidth=0.5)
     mean = float(vals.mean()) if len(vals) else 0.0
-    ax.axvline(mean, color="#dc2626", linestyle="--", lw=1.2, label=f"mean = {mean:.0f} s")
+    ax.axvline(mean, color="#dc2626", linestyle="--", lw=1.2, label=f"mean = {mean:.0f}{unit}")
     ax.set_title(f"{title}   (n={len(vals)})")
-    ax.set_xlabel("total delay (s)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("flights")
     ax.legend()
     ax.grid(True, alpha=0.3, axis="y")
@@ -133,18 +138,20 @@ def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distributio
     return ax
 
 
-def delay_histograms_by_lambda(per_flight_df, out=None, col="total_delay_s"):
+def delay_histograms_by_lambda(per_flight_df, out=None, col="total_delay_s", xlabel="total delay (s)",
+                               unit="s", bins=None, suptitle="Total-delay distribution by offered demand"):
     """One delay histogram per λ (shared x-axis) — the congestion distribution shifting with demand.
 
     ``per_flight_df`` is a concat of `metrics.flight_frame` results, each tagged with its
     ``lam_per_hour``. Denied flights (NaN delay) are dropped; the surviving count is in each title.
+    ``col``/``xlabel``/``unit``/``bins`` select the absolute-seconds or percent-of-trip flavour.
     """
     df = per_flight_df.dropna(subset=[col])
     lams = sorted(df["lam_per_hour"].unique())
     if not lams:
         raise ValueError("no accepted flights to plot")
-    hi = float(df[col].max()) or 1.0
-    bins = np.linspace(0, hi, 25)
+    if bins is None:
+        bins = np.linspace(0, float(df[col].max()) or 1.0, 25)
     cols = min(3, len(lams))
     rows = (len(lams) + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.0 * rows),
@@ -154,15 +161,87 @@ def delay_histograms_by_lambda(per_flight_df, out=None, col="total_delay_s"):
         vals = df.loc[df["lam_per_hour"] == lam, col].to_numpy()
         ax.hist(vals, bins=bins, color="#2563eb", edgecolor="white", linewidth=0.5)
         ax.axvline(vals.mean(), color="#dc2626", linestyle="--", lw=1.0,
-                   label=f"mean={vals.mean():.0f}s")
+                   label=f"mean={vals.mean():.0f}{unit}")
         ax.set_title(f"λ={lam:g}/h  (n={len(vals)})", fontsize=11)
-        ax.set_xlabel("total delay (s)")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("flights")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3, axis="y")
     for ax in flat[len(lams):]:
         ax.set_visible(False)
-    fig.suptitle("Total-delay distribution by offered demand", fontsize=13)
+    fig.suptitle(suptitle, fontsize=13)
+    fig.tight_layout()
+    if out:
+        fig.savefig(out, dpi=120)
+        plt.close(fig)
+    return fig
+
+
+def delay_pct_histogram(values, out=None, title="Delay as % of flight time"):
+    """Histogram of delay as a percentage of total trip time (bounded [0, 100))."""
+    return delay_histogram(values, out=out, title=title, bins=np.linspace(0, 100, 21),
+                           xlabel="delay (% of flight time)", unit="%")
+
+
+def delay_pct_histograms_by_lambda(per_flight_df, out=None):
+    """Per-λ histograms of delay as % of trip time — comparable across runs with different trip lengths."""
+    return delay_histograms_by_lambda(
+        per_flight_df, out=out, col="delay_pct", xlabel="delay (% of flight time)", unit="%",
+        bins=np.linspace(0, 100, 21), suptitle="Delay-as-%-of-flight-time distribution by offered demand")
+
+
+_DELAY_SOURCES = [
+    ("ground_delay_s", "ground delay", "#2563eb"),   # waited on the pad (FCFS queueing)
+    ("air_hold_s", "air hold", "#f59e0b"),            # loitered/hovered mid-route
+    ("detour_time_s", "detour time", "#10b981"),      # extra path length, as lateness-seconds
+]
+
+
+def delay_sources(per_flight_df, out=None, by="lam_per_hour"):
+    """Where delay comes from: stacked mean delay by source (ground / air-hold / detour-time).
+
+    Left panel = absolute seconds (how the total grows); right panel = % share (how the *mix*
+    shifts — e.g. detour-dominated when sparse, ground-delay-dominated once the airspace saturates).
+    Groups by ``by`` (λ) if that column is present, else shows a single aggregate bar. The three
+    sources sum exactly to ``total_delay_s``.
+    """
+    df = per_flight_df
+    if "accepted" in df.columns:
+        df = df[df["accepted"]]
+    df = df.dropna(subset=["total_delay_s"])
+    if by and by in df.columns:
+        groups = sorted(df[by].unique())
+        labels = [f"{g:g}" for g in groups]
+        means = {k: np.array([df.loc[df[by] == g, k].mean() for g in groups]) for k, _, _ in _DELAY_SOURCES}
+        xlabel = "offered load λ (req/h)"
+    else:
+        labels = ["all flights"]
+        means = {k: np.array([df[k].mean()]) for k, _, _ in _DELAY_SOURCES}
+        xlabel = ""
+
+    fig, (a_abs, a_pct) = plt.subplots(1, 2, figsize=(12, 4.5))
+    x = np.arange(len(labels))
+    total = sum(means[k] for k, _, _ in _DELAY_SOURCES)
+    total_safe = np.where(total == 0, 1.0, total)
+
+    for ax, normalize in ((a_abs, False), (a_pct, True)):
+        bottom = np.zeros(len(labels))
+        for k, name, color in _DELAY_SOURCES:
+            v = means[k] / total_safe * 100 if normalize else means[k]
+            ax.bar(x, v, bottom=bottom, label=name, color=color, edgecolor="white", linewidth=0.5)
+            bottom += v
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_xlabel(xlabel)
+        ax.grid(True, alpha=0.3, axis="y")
+    a_abs.set_title("Mean delay by source")
+    a_abs.set_ylabel("seconds")
+    a_abs.legend()
+    a_pct.set_title("Delay composition (share)")
+    a_pct.set_ylabel("% of total delay")
+    a_pct.set_ylim(0, 100)
+
+    fig.suptitle("Where delay comes from", fontsize=13)
     fig.tight_layout()
     if out:
         fig.savefig(out, dpi=120)

@@ -134,7 +134,9 @@ def main() -> None:
     per_flight.to_parquet(folder / "per_flight.parquet", index=False)
     plot_sweep(rows, folder / "lambda_sweep.png")
     viz.delay_histograms_by_lambda(per_flight, out=folder / "delay_histograms.png")
-    print(f"sweep saved → {folder}  (summary + delay_histograms + per_flight.parquet)")
+    viz.delay_pct_histograms_by_lambda(per_flight, out=folder / "delay_pct_histograms.png")
+    viz.delay_sources(per_flight, out=folder / "delay_sources.png")   # where delay comes from, vs λ
+    print(f"sweep saved → {folder}  (summary + delay_histograms + delay_pct_histograms + per_flight)")
 
 
 if __name__ == "__main__":

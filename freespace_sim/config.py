@@ -46,16 +46,16 @@ class SimConfig:
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
     # --- denial budgets ---
-    max_ground_delay_s: float = 600.0
-    max_detour_factor: float = 2.0     # deny if flown/straight-line exceeds this
+    max_ground_delay_s: float = 100000.0
+    max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this
 
     # --- demand / horizon ---
     horizon_s: float = 14_400.0        # 4 h
     lam_per_hour: float = 200.0
     seed: int = 0
 
-    # --- planner selection (pluggable; DEFAULT astar_milp = A* homotopy + MILP geometry refine) ---
-    planner: str = "astar_milp"        # "straight"|"rrt"|"decoupled"|"lazy"|"opt"|"astar"|"milp"|...
+    # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
+    planner: str = "astar_milp_shortcut"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
 
     # ----- DERIVED (kept inside SimConfig) -----
     @property

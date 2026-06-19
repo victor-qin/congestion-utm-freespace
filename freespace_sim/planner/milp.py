@@ -66,9 +66,11 @@ class MILPOptPlanner:
         lock_margin_m: float = 80.0,  # only pin a knot's side when the warm path is this clearly outside
         max_steps: int = 60,
         max_obstacles: int = 40,
-        time_limit_s: float = 20.0,
+        time_limit_s: float = 5.0,     # hard cap (backstop for genuinely hard MILPs the gap can't close)
+        gap_rel: float | None = 0.01,  # stop CBC once the incumbent is within 1% of optimal
     ):
         self.warm_planner = warm_planner or SpaceTimeRRTStar()
+        self.gap_rel = gap_rel
         self.optimize_delay = optimize_delay
         self.lock_homotopy = lock_homotopy
         self.n_dirs = n_dirs
@@ -228,7 +230,10 @@ class MILPOptPlanner:
         prob += (cfg.cost_air_lateral_per_m * pulp.lpSum(L)
                  + cfg.cost_altitude_change_per_m * pulp.lpSum(V)
                  + cfg.cost_ground_delay_per_s * d)             # trade detour against delay globally
-        prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=self.time_limit_s))
+        solver_kw = {"msg": 0, "timeLimit": self.time_limit_s}
+        if self.gap_rel is not None:
+            solver_kw["gapRel"] = self.gap_rel   # quit proving optimality past a 2% gap (big-M tail)
+        prob.solve(pulp.PULP_CBC_CMD(**solver_kw))
         if pulp.LpStatus[prob.status] not in ("Optimal",) or px[1].value() is None:
             return None
 

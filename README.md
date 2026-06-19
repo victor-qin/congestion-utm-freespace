@@ -43,8 +43,9 @@ uv run python -m experiments.lambda_sweep --quick --planner lazy
 uv run python -m experiments.replay results/<folder> --open
 ```
 
-> **Planner speed:** the default planner is `astar_milp` (A\* homotopy + MILP geometry refine) —
-> high fidelity but ~3–4 s/flight at high density. Pass `--planner lazy` for fast statistical sweeps.
+> **Planner speed:** the default planner is `astar_milp_shortcut` (A\* → shortcut → MILP → shortcut) —
+> high fidelity, ~1–5 s/flight (a 1% MIP gap + 5 s cap keep the MILP from churning). Pass
+> `--planner lazy` for fast statistical sweeps.
 
 ## Architecture
 
@@ -83,7 +84,9 @@ delay vs air detour vs air hold vs altitude change), so they are directly compar
 | `astar` | A\* on a fixed hex lattice (pitch = speed·dt); ground delay + reroute + hover |
 | `milp` | MILP trajectory optimization (Richards & How big-M) |
 | `opt` / `opt_astar` | NLP (CasADi/IPOPT) continuous polish; `opt_astar` warm-starts from A\* |
-| **`astar_milp`** (default) | A\* picks the homotopy + delay; a homotopy-locked MILP refines the geometry as a fast LP |
+| `astar_milp` | A\* picks the homotopy + delay; a homotopy-locked MILP refines the geometry as a fast LP |
+| `astar_shortcut` | A\* + a deterministic greedy shortcut pass — solver-free berth tightening |
+| **`astar_milp_shortcut`** (default) | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |
 
 ## Experiments
 

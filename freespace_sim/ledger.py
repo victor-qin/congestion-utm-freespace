@@ -27,6 +27,13 @@ class ReservationLedger:
         self._fids: list[int] = []
         self._aabb: list[tuple[np.ndarray, np.ndarray]] = []
         self._buckets: dict[int, list[int]] = {}
+        self._observers: list = []   # commit subscribers (publish hook); see subscribe()
+
+    def subscribe(self, callback) -> None:
+        """Register ``callback(flight_id, volumes)``, fired after each successful commit — the
+        publish hook (ASTM F3548-21 Subscription/notification analogue). Used by the A* planner's
+        incremental hex-occupancy service to absorb new volumes without rebuilding from scratch."""
+        self._observers.append(callback)
 
     # ----- internals -----
     def _steps(self, vol: Volume4D) -> range:
@@ -56,6 +63,8 @@ class ReservationLedger:
             self._aabb.append(v.aabb())
             for s in self._steps(v):
                 self._buckets.setdefault(s, []).append(idx)
+        for cb in self._observers:           # publish hook: notify subscribers of the new volumes
+            cb(flight_id, volumes)
 
     def release(self, flight_id: int) -> None:
         """Remove a flight (operator-initiated replanning). Rare in v0; rebuilds the index."""

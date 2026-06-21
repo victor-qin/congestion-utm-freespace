@@ -56,6 +56,7 @@ class DenialReason(Enum):
     BUDGET_EXCEEDED = "budget_exceeded"      # no plan within max_ground_delay_s / max_detour_factor
     SEARCH_EXHAUSTED = "search_exhausted"    # hit the RRT* sample cap (compute-bounded)
     CONFLICT_AT_COMMIT = "conflict_at_commit"  # lost a commit-time race (multi-USS, future)
+    CONFLICT_FILED = "conflict_filed"  # filing has a conflict (multi-USS, future)
 
 
 @dataclass

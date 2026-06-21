@@ -61,10 +61,27 @@ class AStarPlanner:
         goal_c = hg.hex_center(gq, grr, R)
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
 
-        # build the blocked-set from committed volumes (conservatively inflated)
+        # Build the blocked-set AND the wider pad-occupancy set in a single vectorized sweep over
+        # committed volumes. `blocked` uses the corridor footprint (corridor half-width + one hex);
+        # `pad_blocked` uses the wider hover-cylinder footprint so the takeoff/landing dwell check
+        # matches the actual reservation. The hover reservation occupies the pad for
+        # hover_time_s + climb_time_s; without `pad_blocked` the search lands on a pad that a
+        # later-crossing corridor sweeps through mid-descent → post-build CONFLICT_FILED. One
+        # rasterize_volume_dual call computes each volume's geometry once (was two passes).
+        infl_blocked = cfg.corridor_width_m / 2.0 + R
+        infl_pad = cfg.effective_hover_radius_m + R
         blocked: set[tuple[int, int, int]] = set()
+        pad_blocked: set[tuple[int, int, int]] = set()
         for _fid, vol in ledger.iter_committed():
-            blocked.update(hg.rasterize_volume(vol, cfg, R))
+            for q, r, s, in_blocked in hg.rasterize_volume_dual(vol, cfg, R, infl_blocked, infl_pad):
+                pad_blocked.add((q, r, s))
+                if in_blocked:
+                    blocked.add((q, r, s))
+        dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
+
+        def pad_clear(q, r, s0):
+            """Is the pad at hex (q, r) free for the full dwell window starting at step s0?"""
+            return all((q, r, k) not in pad_blocked for k in range(s0, s0 + dwell_steps + 1))
 
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come
         def h_air(q, r):
@@ -92,14 +109,18 @@ class AStarPlanner:
             if st in closed:
                 continue
             closed.add(st)
-            if st[0] == "a" and st[1] == gq and st[2] == grr:
+            if st[0] == "a" and st[1] == gq and st[2] == grr and pad_clear(gq, grr, st[3]):
                 goal_state = st
                 break
+            # reaching the dest hex whose landing dwell is blocked is NOT a goal — fall through and
+            # keep expanding (the ground-wait/hover levers find an arrival whose dwell is clear).
             expansions += 1
             if expansions > self.max_expansions:
                 break
             base_g = g[st]
-            for nst, cost in self._edges(st, cfg, pitch, climb_steps, climb_cost, blocked, max_step):
+            for nst, cost in self._edges(
+                st, cfg, pitch, climb_steps, climb_cost, blocked, max_step, pad_blocked, dwell_steps
+            ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
                     g[nst] = ng
@@ -129,7 +150,7 @@ class AStarPlanner:
         if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
         if ledger.any_conflict(volumes):
-            return _deny(req, DenialReason.BUDGET_EXCEEDED)   # raster slack / hover contention
+            return _deny(req, DenialReason.CONFLICT_FILED)   # raster slack / hover contention
 
         intent = OperationalIntent(
             request=req,
@@ -145,7 +166,7 @@ class AStarPlanner:
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, blocked, max_step):
+    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, blocked, max_step, pad_blocked, dwell_steps):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -153,7 +174,10 @@ class AStarPlanner:
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             ts = s + climb_steps
-            if ts <= max_step and (q, r, ts) not in blocked:
+            # takeoff: the climb-completion air cell must be clear AND the origin pad must stay clear
+            # for the whole takeoff dwell (which starts at this ground step s) — symmetric to landing.
+            pad_ok = all((q, r, k) not in pad_blocked for k in range(s, s + dwell_steps + 1))
+            if ts <= max_step and (q, r, ts) not in blocked and pad_ok:
                 out.append((("a", q, r, ts), climb_cost))                            # takeoff
             return out
         _, q, r, s = st

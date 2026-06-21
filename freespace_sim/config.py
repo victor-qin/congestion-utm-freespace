@@ -55,7 +55,7 @@ class SimConfig:
     seed: int = 0
 
     # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
-    planner: str = "astar_milp_shortcut"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
+    planner: str = "astar"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
 
     # ----- DERIVED (kept inside SimConfig) -----
     @property

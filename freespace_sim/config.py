@@ -39,6 +39,9 @@ class SimConfig:
     corridor_height_m: float = 30.0    # full vertical extent, centered on the segment
     time_buffer_s: float = 4.0         # ASTM time buffer (§4.3.11); ≈ one dt
 
+    # --- multi-pad vertiport terminal (shared hub airspace; see volumes/conflict) ---
+    terminal_radius_m: float = 60.0    # radius of a hub's shared terminal column; corridors start here
+
     # --- hover cylinder (own radius knob; defaults to corridor width) ---
     hover_radius_m: float | None = None   # None ⇒ effective_hover_radius_m = corridor_width_m
     hover_time_s: float = 30.0         # dwell at takeoff/landing (climb time added on top)

@@ -34,9 +34,9 @@ class DemandSpec:
     hubs: tuple[int, ...] = ()            # per-USS hub counts (hub patterns; defaults if empty)
     direction: str = "delivery"            # hub pattern: "delivery" (hub→customer) | "pickup"
     # --- hub_radius extras (multi-pad hubs, radius service areas, return flights) ---
-    radius_m: float = 3000.0               # customers drawn within this radius of a hub
-    pads_per_hub: int = 1                  # parallel launch pads per hub
-    return_flights: bool = True            # each delivery → a return to its origin pad
+    radius_m: "float | dict[str, float]" = 3000.0   # customer radius (scalar, or per-USS dict)
+    pads_per_hub: int = 1                  # terminal capacity N per hub
+    return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 120.0            # delay before the return is filed
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -126,7 +126,9 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         "dallas_hub_2uss_large", region_m=(60000.0, 45000.0), lam_per_hour=34500.0, horizon_s=1800.0,
         demand=DemandSpec(
             pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(192, 383),
-            radius_m=5000.0, pads_per_hub=2, return_flights=True,
+            # fewer Walmarts ⇒ each reaches farther; many strip malls ⇒ tighter local delivery
+            radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0}, pads_per_hub=2,
+            return_flights=True,
         ),
     ),
 }

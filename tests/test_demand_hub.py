@@ -12,7 +12,6 @@ from freespace_sim.demand import (
     HubRadiusDemand,
     HubVoronoiDemand,
     UniformPoissonDemand,
-    _pad_offsets,
     nearest_hub,
 )
 from freespace_sim.sim import run
@@ -125,66 +124,70 @@ def test_hub_demand_run_verified_astar():
     assert s["n_accepted"] + s["n_denied"] == s["n_requests"]
 
 
-# --- HubRadiusDemand: multi-pad hubs + radius service areas + return flights -------------------
+# --- HubRadiusDemand: single-point hubs + terminals + radius areas + returns ------------------
 
 def _radius_cfg():
     return SimConfig(region_size_m=(20000.0, 20000.0), lam_per_hour=600.0, horizon_s=3600.0)
 
 
-def test_pad_offsets_spaced_and_centered():
-    offs = _pad_offsets(4, 150.0)
-    assert offs.shape == (4, 2)
-    assert np.allclose(offs.mean(axis=0), 0.0)                    # centered on the hub
-    d = np.linalg.norm(offs[:, None, :] - offs[None, :, :], axis=2)
-    np.fill_diagonal(d, np.inf)
-    assert d.min() >= 150.0 - 1e-6                                # adjacent pads a full spacing apart
-    assert _pad_offsets(1, 150.0).shape == (1, 2) and np.allclose(_pad_offsets(1, 150.0), 0.0)
-
-
-def test_pads_per_hub_makes_spaced_independent_pads():
+def test_hubs_are_single_points():
     cfg = _radius_cfg()
-    m = HubRadiusDemand(n_hubs_per_uss={"a": 3}, pads_per_hub=4)
-    pads = m.place_pads(cfg, np.random.default_rng(m.hub_seed))["a"]
-    assert pads.shape == (3, 4, 2)
-    spacing = 2.5 * cfg.effective_hover_radius_m
-    for hub_pads in pads:                                         # within each hub, pads ≥ a spacing apart
-        d = np.linalg.norm(hub_pads[:, None] - hub_pads[None, :], axis=2)
-        np.fill_diagonal(d, np.inf)
-        assert d.min() >= spacing - 1e-6
+    hubs = HubRadiusDemand(n_hubs_per_uss={"a": 3, "b": 5}).place_hubs(
+        cfg, np.random.default_rng(0))
+    assert hubs["a"].shape == (3, 2) and hubs["b"].shape == (5, 2)
 
 
-def test_pads_per_hub_multiplies_distinct_launch_points():
+def test_delivery_sets_origin_terminal_with_capacity():
     cfg = _radius_cfg()
-    base = HubRadiusDemand(n_hubs_per_uss={"a": 5}, pads_per_hub=1, return_flights=False)
-    multi = HubRadiusDemand(n_hubs_per_uss={"a": 5}, pads_per_hub=4, return_flights=False)
-    o1 = {tuple(np.round(_xy(r.origin), 3)) for r in base.generate(cfg, np.random.default_rng(0))}
-    o4 = {tuple(np.round(_xy(r.origin), 3)) for r in multi.generate(cfg, np.random.default_rng(0))}
-    assert len(o1) <= 5                                           # ≤ one launch point per hub
-    assert len(o4) > len(o1)                                      # pads add parallel launch points
+    m = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 4}, pads_per_hub=3, return_flights=False)
+    reqs = m.generate(cfg, np.random.default_rng(0))
+    assert reqs
+    for r in reqs:                                   # delivery: origin is a hub terminal of capacity 3
+        assert r.origin_terminal is not None and r.dest_terminal is None
+        hub_id, cap = r.origin_terminal
+        assert cap == 3 and str(hub_id).startswith("walmart_uss#")
 
 
-def test_customer_within_radius_of_a_hub():
+def test_pads_per_hub_is_capacity_not_geometry():
+    # pads_per_hub changes the capacity tag, NOT the hub locations (single points, stable across N)
+    cfg = _radius_cfg()
+    a = HubRadiusDemand(n_hubs_per_uss={"a": 5}, pads_per_hub=1, return_flights=False)
+    b = HubRadiusDemand(n_hubs_per_uss={"a": 5}, pads_per_hub=8, return_flights=False)
+    ha = a.place_hubs(cfg, np.random.default_rng(a.hub_seed))["a"]
+    hb = b.place_hubs(cfg, np.random.default_rng(b.hub_seed))["a"]
+    assert np.array_equal(ha, hb)                                 # same infrastructure
+    assert {r.origin_terminal[1] for r in b.generate(cfg, np.random.default_rng(0))} == {8}
+
+
+def test_customer_within_per_uss_radius():
     cfg = _radius_cfg()
     m = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 4, "stripmall_uss": 8},
-                        radius_m=2500.0, return_flights=False)
-    centers = {uid: pads.mean(axis=1) for uid, pads in
-               m.place_pads(cfg, np.random.default_rng(m.hub_seed)).items()}
-    for r in m.generate(cfg, np.random.default_rng(7)):           # deliveries: dest is the customer
-        c = _xy(r.dest)
-        dmin = np.linalg.norm(centers[r.uss_id] - c, axis=1).min()
-        assert dmin <= 2500.0 + 1e-6                              # customer in some hub's disk
+                        radius_m={"walmart_uss": 6000.0, "stripmall_uss": 2000.0},
+                        return_flights=False)
+    hubs = m.place_hubs(cfg, np.random.default_rng(m.hub_seed))
+    for r in m.generate(cfg, np.random.default_rng(7)):           # delivery: dest is the customer
+        cust = _xy(r.dest)
+        radius = 6000.0 if r.uss_id == "walmart_uss" else 2000.0
+        dmin = np.linalg.norm(hubs[r.uss_id] - cust, axis=1).min()
+        assert dmin <= radius + 1e-6
 
 
-def test_return_flights_double_count_and_roundtrip():
+def test_return_flights_roundtrip_and_terminals():
     cfg = _radius_cfg()
-    deliv = HubRadiusDemand(n_hubs_per_uss={"a": 4}, pads_per_hub=2, return_flights=False)
-    both = HubRadiusDemand(n_hubs_per_uss={"a": 4}, pads_per_hub=2, return_flights=True)
-    nd = len(deliv.generate(cfg, np.random.default_rng(0)))
-    rs = both.generate(cfg, np.random.default_rng(0))
+    nd = len(HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=False).generate(
+        cfg, np.random.default_rng(0)))
+    rs = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=True).generate(
+        cfg, np.random.default_rng(0))
     assert len(rs) == 2 * nd                                      # one return per delivery
-    # the round trip exists: for every (origin→dest) there is a matching (dest→origin)
+    deliveries = [r for r in rs if r.origin_terminal is not None]
+    returns = [r for r in rs if r.dest_terminal is not None]
+    assert len(deliveries) == len(returns) == nd
+    # a return lands at a hub that some delivery launched from (same hub_id)
+    deliv_hubs = {r.origin_terminal[0] for r in deliveries}
+    assert all(r.dest_terminal[0] in deliv_hubs for r in returns)
+    # round trip: every (origin→dest) leg has its reverse among the flights
     legs = {(tuple(np.round(_xy(r.origin), 2)), tuple(np.round(_xy(r.dest), 2))) for r in rs}
-    assert all((d, o) in legs for (o, d) in legs)                 # every leg has its reverse
+    assert all((d, o) in legs for (o, d) in legs)
 
 
 def test_radius_demand_run_verified_astar():

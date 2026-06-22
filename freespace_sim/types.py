@@ -73,6 +73,11 @@ class FlightRequest:
     t_request: float                 # filing time → FCFS order
     t_departure: float | None = None  # desired departure (None = depart at t_request)
     uss_id: str = "default"
+    # multi-pad vertiport endpoints: (hub_id, capacity) when origin/dest is a shared-terminal hub.
+    # None (default) → ordinary single pad. The hub *centre* is ``origin``/``dest``; the id drives the
+    # shared-terminal exemption + pad capacity. A delivery sets origin_terminal; a return sets dest.
+    origin_terminal: "tuple | None" = None
+    dest_terminal: "tuple | None" = None
 
     def sort_key(self) -> tuple[float, int]:
         return (self.t_request, self.flight_id)

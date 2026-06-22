@@ -116,7 +116,8 @@ def reservation_frame(result: SimResult) -> pd.DataFrame:
     for i in result.accepted:
         for v in i.volumes or []:
             s = v.shape
-            row = {"flight_id": i.request.flight_id, "t_start": v.t_start, "t_end": v.t_end}
+            row = {"flight_id": i.request.flight_id, "t_start": v.t_start, "t_end": v.t_end,
+                   "terminal_id": None if v.terminal_id is None else str(v.terminal_id)}
             if isinstance(s, BoxSpec):
                 row.update({"kind": "box", "cx": s.center[0], "cy": s.center[1], "cz": s.center[2],
                             "rot": json.dumps(list(s.rot)), "ext": json.dumps(list(s.extents)),
@@ -126,7 +127,7 @@ def reservation_frame(result: SimResult) -> pd.DataFrame:
                             "rot": "", "ext": "", "radius": s.radius, "z_lo": s.z_lo, "z_hi": s.z_hi})
             rows.append(row)
     cols = ["flight_id", "kind", "t_start", "t_end", "cx", "cy", "cz",
-            "rot", "ext", "radius", "z_lo", "z_hi"]
+            "rot", "ext", "radius", "z_lo", "z_hi", "terminal_id"]
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -314,7 +315,10 @@ def _volume_from_row(r) -> Volume4D:
                             rot=tuple(json.loads(r.rot)), extents=tuple(json.loads(r.ext)))
     else:
         spec = CylinderSpec(cx=r.cx, cy=r.cy, radius=r.radius, z_lo=r.z_lo, z_hi=r.z_hi)
-    return Volume4D(spec, float(r.t_start), float(r.t_end))
+    tid = getattr(r, "terminal_id", None)
+    if tid is not None and (tid != tid or tid == ""):   # NaN / empty → no terminal
+        tid = None
+    return Volume4D(spec, float(r.t_start), float(r.t_end), terminal_id=tid)
 
 
 def save_sweep(rows: list[dict], *, root: Path | str = DEFAULT_ROOT, label: str = "sweep",

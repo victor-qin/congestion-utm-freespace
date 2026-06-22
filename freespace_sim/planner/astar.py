@@ -41,6 +41,15 @@ def _deny(req, reason):
     )
 
 
+def _perimeter(center_xy, toward, radius, z):
+    """A point ``radius`` m from ``center_xy`` toward ``toward`` (xy), at altitude ``z`` — where a
+    hub's corridor starts/ends so same-hub flights diverge from the shared terminal edge."""
+    d = np.asarray(toward, float)[:2] - center_xy
+    n = float(np.linalg.norm(d))
+    p = center_xy + (radius * d / n if n > 1e-9 else np.array([radius, 0.0]))
+    return np.array([float(p[0]), float(p[1]), float(z)], float)
+
+
 class AStarPlanner:
     def __init__(self, max_expansions: int = 600_000):
         self.max_expansions = max_expansions
@@ -164,7 +173,8 @@ class AStarPlanner:
             for (_, q, r, s) in air
         ]
         volumes, centerline, cum_horiz, n_hover = self._build(
-            cruise_wps, origin, dest, base, ground_steps, cfg
+            cruise_wps, origin, dest, base, ground_steps, cfg,
+            origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
         if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
@@ -210,23 +220,41 @@ class AStarPlanner:
             out.append((("a", q, r, ns), cfg.cost_air_hold_per_s * dt))
         return out
 
-    def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg):
+    def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
+        # Shared-terminal hubs: the column at the hub is a tagged hover; the corridor *starts/ends at
+        # the terminal perimeter* so same-hub flights diverge, and the one box that still dips into the
+        # terminal (its contiguity overlap) is tagged so it's transparent to the shared column.
+        R_t = cfg.terminal_radius_m
+        wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
+        o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
+        if origin_term is not None and len(wps) >= 2:
+            wps[0][0] = _perimeter(o_xy, wps[1][0], R_t, wps[0][0][2])
+        if dest_term is not None and len(wps) >= 2:
+            wps[-1][0] = _perimeter(d_xy, wps[-2][0], R_t, wps[-1][0][2])
+
         edges = []
-        centerline: list[TimedPoint] = [(cruise_wps[0][0].copy(), cruise_wps[0][1])]
+        centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]
         cum_horiz = 0.0
         n_hover = 0
-        for (a, ta), (b, tb) in zip(cruise_wps, cruise_wps[1:]):
-            edges.append(corridor_segment_volume(a, ta, b, tb, cfg))
+        reach = R_t + cfg.corridor_segment_len_m   # a box this close to a hub overlaps its terminal
+        for (a, ta), (b, tb) in zip(wps, wps[1:]):
+            mid = (a[:2] + b[:2]) / 2.0
+            tid = None
+            if origin_term is not None and float(np.linalg.norm(mid - o_xy)) <= reach:
+                tid = origin_term[0]
+            elif dest_term is not None and float(np.linalg.norm(mid - d_xy)) <= reach:
+                tid = dest_term[0]
+            edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))
             cum_horiz += horiz
             if horiz < _EPS:
                 n_hover += 1
         t_takeoff = (base + ground_steps) * cfg.dt_s
-        t_arrive = cruise_wps[-1][1]
+        t_arrive = wps[-1][1]
         volumes = [
-            hover_reservation(origin, t_takeoff, cfg),
+            hover_reservation(origin, t_takeoff, cfg, terminal_id=origin_term[0] if origin_term else None),
             *edges,
-            hover_reservation(dest, t_arrive, cfg),
+            hover_reservation(dest, t_arrive, cfg, terminal_id=dest_term[0] if dest_term else None),
         ]
         return volumes, centerline, cum_horiz, n_hover

@@ -16,8 +16,12 @@ class SimConfig:
     dims: int = 3
     ground_level_m: float = 0.0
     cruise_level_m: float = 150.0      # PREFERRED cruise height (not a hard level)
-    z_min_m: float = 0.0               # altitude deconfliction band
-    z_max_m: float = 200.0
+    # Altitude deconfliction band. Currently COLLAPSED to the single cruise level: the airspace has
+    # one flight level, so altitude is not yet a deconfliction lever (planners that sample z — RRT*,
+    # MILP, NLP — stay on the cruise plane, matching the cruise-plane A* search and keeping the
+    # top-down replay faithful). Widen this band (e.g. 0–200) to re-enable multi-altitude routing.
+    z_min_m: float = 150.0
+    z_max_m: float = 150.0
 
     # --- region (continuous horizontal free space), local ENU metres ---
     region_size_m: tuple[float, float] = (10_000.0, 10_000.0)

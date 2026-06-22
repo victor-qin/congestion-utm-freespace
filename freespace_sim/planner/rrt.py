@@ -65,7 +65,7 @@ def _deny(req, reason):
 class SpaceTimeRRTStar:
     def __init__(
         self,
-        max_samples: int = 6000,
+        max_samples: int = 20000,
         goal_bias: float = 0.15,
         tube_frac: float = 0.55,      # of non-goal samples, fraction drawn in the straight-line tube
         tube_radius_m: float = 600.0,

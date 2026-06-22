@@ -27,25 +27,30 @@ re-checks it after every run, and `sim.run()` asserts it, so every experiment se
 
 ## Quickstart
 
+Experiments are a three-stage pipeline joined through saved run folders on disk — **define** a scenario,
+**execute** it, **read out** artifacts — composed with plain shell (see [Experiments](#experiments)).
+
 ```bash
 uv sync
 uv run pytest -q -m "not slow"          # full test suite, ASTM invariant included
 
-# Run a named scenario and capture a complete, replayable run folder:
-uv run python -m experiments.metro_scenario --region 5000 5000 --lam 600 --planner lazy
-#   → results/<timestamp>_metro_lam600_<hash>/  (config, scenario, trajectories, reservations,
-#     metrics, replay.html, figures). Open replay.html to scrub the timeline.
+# EXECUTE one named scenario → a complete, reloadable run folder (the folder path is the last stdout line):
+FOLDER=$(uv run python -m experiments.run --scenario dallas_hub_2uss --planner astar_shortcut | tail -1)
 
-# The headline congestion curve (denial / delay / detour / throughput vs demand λ):
-uv run python -m experiments.lambda_sweep --quick --planner lazy
+# READ OUT artifacts from that saved run (no re-simulation):
+uv run python -m experiments.readouts.replay        "$FOLDER" --open   # scrub the timeline, colored by USS
+uv run python -m experiments.readouts.figures       "$FOLDER"          # snapshot / heatmap / 3D-GLB
+uv run python -m experiments.readouts.uss_breakdown "$FOLDER"          # per-operator table + bars
 
-# (Re)generate the replay viewer for any saved run folder:
-uv run python -m experiments.replay results/<folder> --open
+# Compose sweeps / comparisons as pure shell (loop the run box, then a cross-run readout):
+bash experiments/batch/lambda_sweep.sh demo            # λ×seed sweep → congestion curve
+bash experiments/batch/compare_planners.sh demo        # several planners → comparison table
 ```
 
-> **Planner speed:** the default planner is `astar_milp_shortcut` (A\* → shortcut → MILP → shortcut) —
-> high fidelity, ~1–5 s/flight (a 1% MIP gap + 5 s cap keep the MILP from churning). Pass
-> `--planner lazy` for fast statistical sweeps.
+> **Planner speed:** the default planner is `astar` (A\* on the hex lattice) — fast and 0-denial on the
+> metro scenarios. Pass `--planner astar_shortcut` for tighter berths (solver-free), or
+> `astar_milp_shortcut` for headline-quality MILP refinement (~1–5 s/flight); `lazy` is fastest for
+> rough sweeps.
 
 ## Architecture
 
@@ -53,6 +58,8 @@ uv run python -m experiments.replay results/<folder> --open
 freespace_sim/
   types.py        FlightRequest, OperationalIntent, IntentStatus, DenialReason
   config.py       SimConfig — every knob (geometry, kinematics, cost weights, budgets) as defaults
+  scenarios.py    ScenarioSpec + DemandSpec + SCENARIOS registry — named worlds → (SimConfig, demand)
+  demand.py       DemandModel: UniformPoissonDemand (1+ USS) · HubVoronoiDemand (geographic hubs)
   geometry.py     FCL-backed BoxSpec / CylinderSpec (oriented 3D box, vertical cylinder)
   volumes.py      Volume4D + the corridor / hover builders (the build-then-check contract)
   conflict.py     volumes_conflict() — temporal prune then exact FCL 3D collision
@@ -81,26 +88,57 @@ delay vs air detour vs air hold vs altitude change), so they are directly compar
 | `straight` | direct path + departure time-shift into a free slot (deny if space is blocked) |
 | `rrt` | space-time RRT\* — reroute / delay / hover / altitude in one search |
 | `lazy` | straight first, escalate to RRT\* only for blocked flights |
-| `astar` | A\* on a fixed hex lattice (pitch = speed·dt); ground delay + reroute + hover |
+| **`astar`** (default) | A\* on a fixed hex lattice (pitch = speed·dt); ground delay + reroute + hover |
 | `milp` | MILP trajectory optimization (Richards & How big-M) |
 | `opt` / `opt_astar` | NLP (CasADi/IPOPT) continuous polish; `opt_astar` warm-starts from A\* |
 | `astar_milp` | A\* picks the homotopy + delay; a homotopy-locked MILP refines the geometry as a fast LP |
 | `astar_shortcut` | A\* + a deterministic greedy shortcut pass — solver-free berth tightening |
-| **`astar_milp_shortcut`** (default) | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |
+| `astar_milp_shortcut` | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |
 
 ## Experiments
 
-| command | what it does |
-|---|---|
-| `metro_scenario` | named stress scenario — you choose region + λ list; each λ → a full captured run folder + replay |
-| `lambda_sweep` | the FCFS congestion curve (2×2 panel + total-delay histograms) across demand λ |
-| `make_replay` | a single ad-hoc run → full capture + replay + snapshot/heatmap/3D-GLB |
-| `replay` | (re)generate/open the HTML replay of any saved run folder, entirely from disk |
-| `compare_planners` / `compare_optimizers` | acceptance / cost / runtime across planners on one scenario |
+Three composable stages, joined through saved run folders on disk — so analysis never re-runs the sim,
+and the demand pattern / USS count is a property of the **scenario** (reused by every stage for free):
+
+**1. DEFINE** — a `ScenarioSpec` is a named *world* (region, horizon, λ, planner, demand pattern). The
+registry in [`scenarios.py`](freespace_sim/scenarios.py) ships `metro_uniform` (1 USS), `metro_2uss`
+(2 USS, uniform), and `dallas_hub_2uss` (2 USS, geographic hub-and-spoke). Any field is overridable.
+
+**2. EXECUTE** — `experiments.run` runs **one** scenario and persists it (no plots). Sweeps and
+comparisons are pure-shell loops over it, joined by a shared `--tag`:
+
+```bash
+uv run python -m experiments.run --scenario dallas_hub_2uss --planner astar_shortcut --tag demo
+uv run python -m experiments.run --scenario metro_2uss --demand hub --uss a b --hubs 5 15 --lam 240
+```
+
+**3. READ OUT** — standalone consumers that load saved data (never re-simulate):
+
+| readout | scope | from | produces |
+|---|---|---|---|
+| `readouts.replay` | per-run | a run folder | `replay.html` (scrub, colored by USS) |
+| `readouts.figures` | per-run | a run folder | snapshot / heatmap / 3D-GLB (`--uss` slices) |
+| `readouts.uss_breakdown` | per-run | `per_uss.parquet` | per-operator table + bar chart |
+| `readouts.histograms` | per-run | `flights.parquet` | delay / delay-% / delay-source distributions |
+| `readouts.curve` | cross-run | `index.parquet` | congestion curve vs λ (filter by `--tag`/`--scenario`) |
+| `readouts.compare` | cross-run | `index.parquet` | comparison table (group by `--by`, default planner) |
+
+Distributions are a *single-run* property, so `histograms` is per-run; the **shell** owns multiplicity
+— `lambda_sweep.sh` loops `run`, feeds each folder to `histograms`, and collects them under the sweep
+folder. The only genuinely cross-run readout is `curve` (a *trend* needs many points), which reads the
+index the loop populated.
+
+**Orchestration** lives in [`experiments/batch/`](experiments/batch) (`lambda_sweep.sh`,
+`compare_planners.sh`, `replay_demo.sh`) — plain shell composing the run box + readouts.
+(`compare_optimizers.py` stays standalone: it's a planner micro-benchmark on hand-built obstacles, not
+the demand pipeline.)
 
 Every run folder is self-contained (`config.json`, `experiment.json`, `scenario.parquet`,
-`trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `replay.html`) and a row is
-appended to `results/index.parquet` for cross-run queries.
+`trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `per_uss.parquet`) and a row is
+appended to `results/index.parquet` (with `scenario`/`tag`/`demand`/`n_uss` columns) for cross-run
+readouts. **Per-run** readouts (`replay`/`figures`/`uss_breakdown`/`histograms`) write *into* the run
+folder (or a collecting `--out-dir`); the **cross-run** `curve`/`compare` describe a run *set*, so they
+write into `results/sweeps/<tag-or-scenario>/` (stable per label — re-running refreshes in place).
 
 ## The replay viewer (`replay.html`)
 

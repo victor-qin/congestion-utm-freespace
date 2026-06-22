@@ -5,7 +5,19 @@ import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.demand import HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
-from freespace_sim.scenarios import SCENARIOS, DemandSpec, ScenarioSpec, with_overrides
+from freespace_sim.scenarios import (
+    SCENARIOS,
+    DemandSpec,
+    ScenarioSpec,
+    get_scenario,
+    with_overrides,
+)
+
+
+def test_get_scenario_resolves_and_rejects():
+    assert get_scenario("metro_2uss") is SCENARIOS["metro_2uss"]
+    with pytest.raises(ValueError):
+        get_scenario("no_such_scenario")
 
 
 def test_config_applies_overrides_over_defaults():

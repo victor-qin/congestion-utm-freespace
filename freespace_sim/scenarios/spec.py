@@ -1,26 +1,19 @@
-"""ScenarioSpec — the *world* an experiment runs on, separate from the experiment itself.
+"""ScenarioSpec / DemandSpec — the frozen recipes a named world is built from.
 
-A ``ScenarioSpec`` is a small, frozen recipe that knows how to build the two things the simulator
-needs: a :class:`SimConfig` (geometry / kinematics / horizon / planner) and a
-:class:`~freespace_sim.demand.DemandModel` (who flies, from where, in what pattern). The
-``SCENARIOS`` registry names a few canonical worlds so they can be invoked by name instead of a pile
-of flags.
-
-This is deliberately the *only* new abstraction in the experiment restructure: the execute step
-(``experiments/run.py``) turns one ``ScenarioSpec`` into one persisted run folder, and the readout
-scripts consume those folders — neither re-derives the world. ``ScenarioSpec`` is the config recipe;
-:class:`freespace_sim.scenario.Scenario` (the time-ordered event list) is a different, lower-level
-thing the sim builds internally.
+A ``ScenarioSpec`` knows how to build the two things the simulator needs: a :class:`SimConfig`
+(geometry / kinematics / horizon / planner) and a :class:`~freespace_sim.demand.DemandModel` (who
+flies, from where, in what pattern). It is the config recipe; :class:`freespace_sim.scenario.Scenario`
+(the time-ordered event list) is a different, lower-level thing the sim builds internally.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from .config import SimConfig
-from .demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
+from ..config import SimConfig
+from ..demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
 
-# default Walmart/strip-mall split for the hub pattern when counts aren't given explicitly
+# default Walmart/strip-mall split for the hub patterns when counts aren't given explicitly
 _DEFAULT_HUB_LABELS = ("walmart_uss", "stripmall_uss")
 _DEFAULT_HUB_COUNTS = (6, 20)
 
@@ -71,7 +64,7 @@ class DemandSpec:
 
 @dataclass(frozen=True)
 class ScenarioSpec:
-    """A named world: region + kinematics horizon + demand rate + planner + demand pattern.
+    """A named world: region + horizon + demand rate + planner + demand pattern.
 
     ``config()`` and ``demand_model()`` are the two builders the execute step calls. Override any
     field with :func:`with_overrides` (a thin ``dataclasses.replace``) — that's how CLI flags layer
@@ -105,30 +98,3 @@ def with_overrides(spec: ScenarioSpec, *, demand_overrides: dict | None = None, 
     if demand_overrides:
         overrides["demand"] = replace(spec.demand, **demand_overrides)
     return replace(spec, **overrides)
-
-
-SCENARIOS: dict[str, ScenarioSpec] = {
-    # single-operator uniform baseline
-    "metro_uniform": ScenarioSpec("metro_uniform", region_m=(5000.0, 5000.0)),
-    # two operators, uniform O/D — exercises cross-USS deconfliction without geographic structure
-    "metro_2uss": ScenarioSpec(
-        "metro_2uss", region_m=(5000.0, 5000.0),
-        demand=DemandSpec(pattern="uniform", uss=("uss_a", "uss_b")),
-    ),
-    # the headline: two operators, geographic hub-and-spoke demand (few Walmarts, many strip malls)
-    "dallas_hub_2uss": ScenarioSpec(
-        "dallas_hub_2uss", region_m=(10000.0, 10000.0),
-        demand=DemandSpec(pattern="hub", uss=("walmart_uss", "stripmall_uss"), hubs=(6, 20)),
-    ),
-    # metro-scale Dallas: real hub counts (192 Walmarts, 383 strip malls) over a 60×45 km region,
-    # multi-pad hubs + radius service areas + return flights. λ counts deliveries (returns ~double it).
-    "dallas_hub_2uss_large": ScenarioSpec(
-        "dallas_hub_2uss_large", region_m=(60000.0, 45000.0), lam_per_hour=34500.0, horizon_s=1800.0,
-        demand=DemandSpec(
-            pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(192, 383),
-            # fewer Walmarts ⇒ each reaches farther; many strip malls ⇒ tighter local delivery
-            radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0}, pads_per_hub=2,
-            return_flights=True,
-        ),
-    ),
-}

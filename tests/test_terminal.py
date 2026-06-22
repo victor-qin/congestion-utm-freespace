@@ -5,7 +5,10 @@ byte today's behavior; a hub flight tags its column with the hub id (shared amon
 opaque to cruise). Capacity (N concurrent) is Phase B.
 """
 
+import warnings
+
 import numpy as np
+import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.sim import run
@@ -14,6 +17,10 @@ from freespace_sim.types import FlightRequest, vec
 
 def _astar(**over):
     return SimConfig(planner="astar", region_size_m=(5000.0, 5000.0), **over)
+
+
+def _terminal_req():
+    return FlightRequest(0, vec(1000, 1000, 0), vec(3400, 1000, 0), 0.0, origin_terminal=("H", 4))
 
 
 def test_non_terminal_flight_emits_untagged_volumes():
@@ -68,3 +75,17 @@ def test_corridor_starts_away_from_the_hub_centre():
     cl = res.accepted[0].centerline
     first_air = np.array(cl[0][0])[:2]
     assert np.linalg.norm(first_air - np.array([1000.0, 1000.0])) >= cfg.terminal_radius_m - 1e-6
+
+
+def test_non_astar_planner_warns_on_terminal_flight():
+    # a non-A* planner rebuilds corridors and drops the tag → loud RuntimeWarning, not silent wrongness
+    with pytest.warns(RuntimeWarning, match="terminal airspace"):
+        run(SimConfig(planner="straight", region_size_m=(5000.0, 5000.0)), requests=[_terminal_req()])
+
+
+def test_astar_planner_does_not_warn_on_terminal_flight():
+    # A* tags the column → no warning (turn RuntimeWarning into an error to prove silence)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        res = run(_astar(), requests=[_terminal_req()])
+    assert res.verified and res.accepted

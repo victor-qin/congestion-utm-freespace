@@ -23,13 +23,13 @@ import sys
 import time
 
 from freespace_sim import runs
-from freespace_sim.scenarios import SCENARIOS, with_overrides
+from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
 from freespace_sim.sim import run
 
 
 def spec_from_args(args):
     """Layer CLI overrides on top of the chosen registry scenario (frozen → copies, never mutates)."""
-    spec = SCENARIOS[args.scenario]
+    spec = get_scenario(args.scenario)
     top: dict = {}
     if args.region is not None:
         top["region_m"] = (float(args.region[0]), float(args.region[1]))

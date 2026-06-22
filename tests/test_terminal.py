@@ -120,13 +120,14 @@ def test_corridor_overlap_controls_perimeter_start():
 # --- Phase B: pad capacity — N concurrent same-hub launches, then ground delay ----------------
 
 
-def _radial_delivery(hub_xy, angle_deg, dist, capacity, fid, t=0.0):
-    """A delivery from ``hub_xy`` (capacity N) to a customer ``dist`` m away at ``angle_deg`` — so a
-    batch of them diverge from the shared column and contend ONLY for pads, not airspace."""
+def _radial_delivery(hub_xy, angle_deg, dist, capacity, fid, t=0.0, radius=None):
+    """A delivery from ``hub_xy`` (capacity N, optional column ``radius``) to a customer ``dist`` m away
+    at ``angle_deg`` — so a batch of them diverge from the shared column and contend ONLY for pads, not
+    airspace. This is the ``rad(...)`` diagnostic from the Phase B build, promoted into the suite."""
     a = np.radians(angle_deg)
     dest = vec(hub_xy[0] + dist * np.cos(a), hub_xy[1] + dist * np.sin(a), 0)
     return FlightRequest(fid, vec(hub_xy[0], hub_xy[1], 0), dest, t,
-                         origin_terminal=Terminal("H", capacity))
+                         origin_terminal=Terminal("H", capacity, radius=radius))
 
 
 @pytest.mark.parametrize("cap", [1, 2, 4])
@@ -160,6 +161,71 @@ def test_capacity_one_serializes_like_a_single_pad():
     res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
     assert res.verified and len(res.accepted) == 2
     assert sum(a.ground_delay_s == 0.0 for a in res.accepted) == 1    # one now, one delayed
+
+
+# --- the `fid` diagnostics promoted to the suite: terminal-radius × fan-out sweeps ------------
+#
+# Each test below pins a concrete problem hit while building Phase B. The driving config is the same
+# `rad(...)` fan-out used during debugging: N deliveries leaving one hub in evenly-spaced directions.
+
+_REGION = (8000.0, 8000.0)
+_HUB = (4000.0, 4000.0)
+
+
+@pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
+def test_no_strict_corridor_box_enters_the_shared_column(radius):
+    # FOLD-BACK + CLEARANCE regression. The first _build only repositioned waypoint[0] while the
+    # search's next cell sat ~one hex from the centre, folding the first corridor box back through the
+    # column (centerline 210→62→…). And overlap=0 put the back-edge exactly on the boundary, so an
+    # off-radial box tipped inside and a sibling's column conflicted with it. Both are fixed by folding
+    # away in-column waypoints and starting the exit lane a clear corridor_width out: every STRICT box
+    # must stay outside the column disk.
+    res = run(SimConfig(planner="astar", region_size_m=_REGION),
+              requests=[_radial_delivery(_HUB, 0.0, 2500.0, 4, 0, radius=radius)])
+    C = np.array(_HUB)
+    boxes = [v for v in res.accepted[0].volumes if isinstance(v.shape, BoxSpec)]
+
+    def d2hub(v):
+        lo, hi = v.aabb()
+        return float(np.linalg.norm(np.clip(C, lo[:2], hi[:2]) - C))
+
+    assert boxes and min(d2hub(v) for v in boxes) > radius
+
+
+@pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
+@pytest.mark.parametrize("n", [3, 4, 5])
+def test_divergent_same_hub_launches_are_concurrent(radius, n):
+    # THE headline fid sweep + the column-vs-sibling-corridor and knife-edge fixes in one: n flights
+    # fanning out from a single hub (capacity n) all launch at the same instant and verify — across
+    # terminal radii and including n=4's opposite-direction (0/90/180/270) pairs that the tangent
+    # clearance bug used to deny. Pre-Phase-B these serialized ~one per dwell; now zero ground delay.
+    reqs = [_radial_delivery(_HUB, i * 360.0 / n, 2500.0, n, i, radius=radius) for i in range(n)]
+    res = run(SimConfig(planner="astar", region_size_m=_REGION), requests=reqs)
+    assert res.verified and len(res.accepted) == n
+    assert all(a.ground_delay_s == 0.0 for a in res.accepted)
+
+
+@pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
+def test_pad_capacity_gate_holds_across_radii(radius):
+    # The fid capacity sweep: capacity 3 with 4 fanned-out flights → exactly 3 launch concurrently and
+    # the 4th is ground-delayed (admitted, not denied), at every terminal radius. Pins that the dwell
+    # counter — not the geometry — is what bounds concurrency.
+    reqs = [_radial_delivery(_HUB, i * 90.0, 2500.0, 3, i, radius=radius) for i in range(4)]
+    res = run(SimConfig(planner="astar", region_size_m=_REGION), requests=reqs)
+    assert res.verified and len(res.accepted) == 4
+    assert sum(a.ground_delay_s == 0.0 for a in res.accepted) == 3
+    assert any(a.ground_delay_s > 0.0 for a in res.accepted)
+
+
+def test_astar_shortcut_preserves_same_hub_concurrency():
+    # The shortcut refiner rebuilds the corridor from the path corners (a DIFFERENT route than
+    # astar._build), so it must inherit the exit-lane fold — not merely keep tags + verify, but keep
+    # same-hub launches concurrent. A regression here would silently re-serialize refined runs.
+    reqs = [_radial_delivery(_HUB, 0.0, 2500.0, 2, 0, radius=150.0),
+            _radial_delivery(_HUB, 180.0, 2500.0, 2, 1, radius=150.0)]
+    res = run(SimConfig(planner="astar_shortcut", region_size_m=_REGION), requests=reqs)
+    assert res.verified and len(res.accepted) == 2
+    assert all(a.ground_delay_s == 0.0 for a in res.accepted)
 
 
 def test_foreign_corridor_through_a_hub_column_is_never_double_booked():

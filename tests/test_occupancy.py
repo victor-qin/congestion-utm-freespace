@@ -110,6 +110,20 @@ def test_capacity_one_terminal_matches_binary_pad():
     assert not svc.pad_clear(q, r, s, 0, terminal_id="H", capacity=1)
 
 
+def test_evict_drops_terminal_counter_in_lockstep():
+    # the per-hub dwell counter must be time-evicted like blocked/pad, or stale dwells would wrongly
+    # gate future launches (and leak memory) — eviction loops over term_cells too
+    svc = HexOccupancyService(CFG)
+    svc.add_volume(hover_reservation((1500.0, 1500.0, 0.0), 80.0, CFG, terminal_id="H"))
+    steps = sorted(svc.term_cells)
+    assert steps                                              # the dwell occupies a band of steps
+    watermark = steps[len(steps) // 2]
+    svc.evict_before(watermark)
+    assert svc.term_cells and min(svc.term_cells) >= watermark
+    svc.reset()
+    assert svc.term_cells == {}                               # reset clears the counter too
+
+
 def test_publish_hook_feeds_service_on_commit():
     """Subscribing to the ledger keeps the service in lockstep with commits (the Option-A wiring)."""
     led = ReservationLedger(CFG)

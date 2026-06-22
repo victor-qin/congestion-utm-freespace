@@ -197,3 +197,19 @@ def test_radius_demand_run_verified_astar():
     assert res.verified
     s = res.summary()
     assert s["n_accepted"] + s["n_denied"] == s["n_requests"]
+
+
+def test_more_pads_per_hub_cut_ground_delay():
+    # the Phase B payoff end-to-end: on a hub-funnelled scenario (few hubs, returns), giving each hub
+    # more pads slashes pad-contention ground delay — same demand, only pads_per_hub changes.
+    cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0),
+                    lam_per_hour=600.0, horizon_s=300.0, seed=1)
+
+    def mean_delay(pads):
+        dem = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 2, "stripmall_uss": 3}, radius_m=2500.0,
+                              pads_per_hub=pads, terminal_radius_m=150.0, return_flights=True)
+        res = run(cfg, demand=dem)
+        assert res.verified
+        return float(np.mean([a.ground_delay_s for a in res.accepted]))
+
+    assert mean_delay(4) < 0.5 * mean_delay(1)   # 1→4 pads cuts mean delay by far more than half

@@ -15,8 +15,10 @@ import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import BoxSpec, CylinderSpec
+from freespace_sim.ledger import ReservationLedger
+from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, Terminal, vec
+from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
 
 
 def _astar(**over):
@@ -158,6 +160,29 @@ def test_capacity_one_serializes_like_a_single_pad():
     res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
     assert res.verified and len(res.accepted) == 2
     assert sum(a.ground_delay_s == 0.0 for a in res.accepted) == 1    # one now, one delayed
+
+
+def test_foreign_corridor_through_a_hub_column_is_never_double_booked():
+    # A foreign cruise corridor (planned earlier, FCFS) transits a hub's location; a later launch from
+    # that hub whose large shared column (r150) overlaps that corridor must NOT be silently accepted
+    # into a conflict. The ledger (exact, full-column) catches the overlap where A*'s cell-local search
+    # cannot, so today the launch is conservatively DENIED rather than ground-delayed — a known
+    # search/ledger fidelity edge at large terminal radius (the tagless hex raster can't tell a foreign
+    # transit clipping the column's outer ring from a same-hub exit lane whose inflation also clips it).
+    cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0))
+    led = ReservationLedger(cfg)
+    pl = AStarPlanner()
+    foreign = FlightRequest(99, vec(1200, 4000, 0), vec(6800, 4000, 0), 0.0)   # cruises across the hub
+    led.commit(99, pl.plan(foreign, led, cfg).volumes)
+    launch = FlightRequest(0, vec(4000, 4000, 0), vec(4000, 7000, 0), 80.0,
+                           origin_terminal=Terminal("H", 4, radius=150.0))
+    intent = pl.plan(launch, led, cfg)
+    # load-bearing invariant: never a silent double-booking — it yields, or (if accepted) is truly clear
+    assert intent.status is IntentStatus.REJECTED or not led.any_conflict(intent.volumes)
+    # pins today's conservative behavior; flip to an accepted-with-ground-delay assertion if we ever add
+    # a conflict-retry that degrades this denial into a delay
+    assert intent.status is IntentStatus.REJECTED
+    assert intent.denial_reason is DenialReason.CONFLICT_FILED
 
 
 def test_non_astar_planner_warns_on_terminal_flight():

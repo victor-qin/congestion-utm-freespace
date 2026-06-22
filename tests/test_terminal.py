@@ -1,8 +1,11 @@
 """Shared terminal volumes — multi-pad vertiport airspace.
 
-Phase A: the exemption + perimeter geometry + backward-compat. A flight with no terminal is byte-for-
-byte today's behavior; a hub flight tags its column with the hub id (shared among that hub's flights,
-opaque to cruise). Capacity (N concurrent) is Phase B.
+Phase A: the exemption + geometry + backward-compat. A flight with no terminal is byte-for-byte
+today's behavior; a hub flight tags its column with the hub id (shared among that hub's flights,
+opaque to cruise). Phase B: pad capacity. The drone climbs in the shared column and the strict
+corridor (its "exit lane") begins a clear margin beyond the column edge — the centre→edge leg is
+flown but unreserved (vertiport-tactical), so up to ``capacity`` same-hub flights launch concurrently
+and the (N+1)th takes ground delay. Divergent launches go at once; same-lane launches contend.
 """
 
 import warnings
@@ -69,12 +72,13 @@ def test_delivery_then_return_roundtrip_verifies():
 
 
 def test_corridor_starts_away_from_the_hub_centre():
-    # perimeter-start: the first cruise waypoint sits ~terminal radius from the hub, not on top of it
+    # the reserved corridor (exit lane) starts at the column edge, not on top of the hub: waypoints
+    # inside the column are folded away and the centre→edge leg is left unreserved (vertiport-tactical)
     cfg = _astar()
     req = FlightRequest(0, vec(1000, 1000, 0), vec(4000, 1000, 0), 0.0, origin_terminal=("H", 4))
     res = run(cfg, requests=[req])
     first_air = np.array(res.accepted[0].centerline[0][0])[:2]
-    # default terminal radius = hover footprint; default overlap = corridor_width/2 ⇒ start at R
+    # exit lane starts a clear corridor_width beyond the column edge (default terminal radius = hover)
     assert np.linalg.norm(first_air - np.array([1000.0, 1000.0])) >= cfg.effective_hover_radius_m - 1e-6
 
 
@@ -109,6 +113,51 @@ def test_corridor_overlap_controls_perimeter_start():
         return float(np.linalg.norm(first - np.array([1500.0, 1500.0])))
 
     assert start_dist(40.0) < start_dist(0.0)   # more overlap → starts closer to the hub centre
+
+
+# --- Phase B: pad capacity — N concurrent same-hub launches, then ground delay ----------------
+
+
+def _radial_delivery(hub_xy, angle_deg, dist, capacity, fid, t=0.0):
+    """A delivery from ``hub_xy`` (capacity N) to a customer ``dist`` m away at ``angle_deg`` — so a
+    batch of them diverge from the shared column and contend ONLY for pads, not airspace."""
+    a = np.radians(angle_deg)
+    dest = vec(hub_xy[0] + dist * np.cos(a), hub_xy[1] + dist * np.sin(a), 0)
+    return FlightRequest(fid, vec(hub_xy[0], hub_xy[1], 0), dest, t,
+                         origin_terminal=Terminal("H", capacity))
+
+
+@pytest.mark.parametrize("cap", [1, 2, 4])
+def test_pad_capacity_admits_n_concurrent_then_delays(cap):
+    # N+1 deliveries leave one hub at the same instant: exactly N launch now (capacity), the extra
+    # takes ground delay — admitted, not denied. This is the whole point of Phase B.
+    hub = (3000.0, 3000.0)
+    n = cap + 1
+    reqs = [_radial_delivery(hub, i * 360.0 / n, 2000.0, cap, i) for i in range(n)]
+    res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
+    assert res.verified and len(res.accepted) == n                    # all admitted, none denied
+    concurrent = [a for a in res.accepted if a.ground_delay_s == 0.0]
+    assert len(concurrent) == cap                                     # exactly N share the column now
+    assert any(a.ground_delay_s > 0.0 for a in res.accepted)          # the (N+1)th waits for a pad
+
+
+def test_two_same_hub_flights_launch_concurrently_under_capacity():
+    # the sharp before/after: with capacity 2, two same-hub launches BOTH go at t0 (pre-Phase-B the
+    # first flight's column blocked the second into a ground delay)
+    hub = (3000.0, 3000.0)
+    reqs = [_radial_delivery(hub, 0.0, 2000.0, 2, 0), _radial_delivery(hub, 180.0, 2000.0, 2, 1)]
+    res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
+    assert res.verified and len(res.accepted) == 2
+    assert all(a.ground_delay_s == 0.0 for a in res.accepted)         # concurrent, zero ground delay
+
+
+def test_capacity_one_serializes_like_a_single_pad():
+    # capacity 1 ⟺ the legacy single pad: the second same-hub launch must wait
+    hub = (3000.0, 3000.0)
+    reqs = [_radial_delivery(hub, 0.0, 2000.0, 1, 0), _radial_delivery(hub, 180.0, 2000.0, 1, 1)]
+    res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
+    assert res.verified and len(res.accepted) == 2
+    assert sum(a.ground_delay_s == 0.0 for a in res.accepted) == 1    # one now, one delayed
 
 
 def test_non_astar_planner_warns_on_terminal_flight():

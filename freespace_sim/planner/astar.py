@@ -57,6 +57,33 @@ def _perimeter(center_xy, toward, radius, z):
     return np.array([float(p[0]), float(p[1]), float(z)], float)
 
 
+def _fold_head_into_column(wps, center, exit_r, speed):
+    """Drop the leading waypoints that lie inside ``exit_r`` of ``center`` and re-root the corridor at
+    the column edge (the flight's "exit lane"). The folded centre→edge leg is flown but left
+    UNRESERVED — inside the terminal the vertiport deconflicts its own traffic tactically, so same-hub
+    flights may share that space; only the exit lane reaches the ledger. ``wps`` is a list of
+    ``[xyz, t]`` (mutable). Returns the trimmed list; a no-op if the whole cruise stays inside."""
+    k = next((i for i in range(1, len(wps))
+              if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
+    if k is None:
+        return wps
+    edge = _perimeter(center, wps[k][0], exit_r, wps[0][0][2])
+    leg = float(np.linalg.norm(wps[k][0][:2] - edge[:2])) / speed   # unreserved edge→first-cell leg
+    return [[edge, wps[k][1] - leg], *wps[k:]]
+
+
+def _fold_tail_into_column(wps, center, exit_r, speed):
+    """Landing-end mirror of :func:`_fold_head_into_column`: drop trailing waypoints inside the
+    destination column and end the corridor at that column's edge (descent inside is unreserved)."""
+    k = next((i for i in range(len(wps) - 2, -1, -1)
+              if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
+    if k is None:
+        return wps
+    edge = _perimeter(center, wps[k][0], exit_r, wps[-1][0][2])
+    leg = float(np.linalg.norm(wps[k][0][:2] - edge[:2])) / speed
+    return [*wps[:k + 1], [edge, wps[k][1] + leg]]
+
+
 class AStarPlanner:
     def __init__(self, max_expansions: int = 600_000):
         self.max_expansions = max_expansions
@@ -116,6 +143,14 @@ class AStarPlanner:
         svc = self._occupancy(req, ledger, cfg)
         dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
 
+        # Shared-terminal context (Phase B). A flight owns its origin/dest vertiports: their columns
+        # are transparent to its search (``own``), and its takeoff/landing dwell is gated by the hub's
+        # pad capacity rather than a binary pad check. No terminal ⇒ own=∅, capacity 1 ⇒ old behavior.
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        own = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        o_tid, o_cap = (o_term.id, o_term.capacity) if o_term else (None, 1)
+        d_tid, d_cap = (d_term.id, d_term.capacity) if d_term else (None, 1)
+
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come
         def h_air(q, r):
             d = float(np.linalg.norm(hg.hex_center(q, r, R) - goal_c))
@@ -143,7 +178,7 @@ class AStarPlanner:
                 continue
             closed.add(st)
             if st[0] == "a" and st[1] == gq and st[2] == grr and svc.pad_clear(
-                gq, grr, st[3], dwell_steps
+                gq, grr, st[3], dwell_steps, d_tid, d_cap
             ):
                 goal_state = st
                 break
@@ -154,7 +189,8 @@ class AStarPlanner:
                 break
             base_g = g[st]
             for nst, cost in self._edges(
-                st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps
+                st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
+                own, o_tid, o_cap,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -202,7 +238,8 @@ class AStarPlanner:
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps):
+    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
+               own=(), o_tid=None, o_cap=1):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -210,9 +247,11 @@ class AStarPlanner:
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             ts = s + climb_steps
-            # takeoff: the climb-completion air cell must be clear AND the origin pad must stay clear
-            # for the whole takeoff dwell (which starts at this ground step s) — symmetric to landing.
-            if ts <= max_step and not svc.is_blocked(q, r, ts) and svc.pad_clear(q, r, s, dwell_steps):
+            # takeoff: the climb-completion air cell must be clear AND the origin pad must have a free
+            # slot for the whole takeoff dwell (starting at ground step s) — symmetric to landing. The
+            # pad gate is capacity-aware: up to o_cap same-hub dwells share the column (Phase B).
+            if (ts <= max_step and not svc.is_blocked(q, r, ts, own)
+                    and svc.pad_clear(q, r, s, dwell_steps, o_tid, o_cap)):
                 out.append((("a", q, r, ts), climb_cost))                            # takeoff
             return out
         _, q, r, s = st
@@ -221,30 +260,37 @@ class AStarPlanner:
             return out
         for dq, dr in hg.AXIAL_NEIGHBORS:                                            # reroute
             nq, nr = q + dq, r + dr
-            if not svc.is_blocked(nq, nr, ns):
+            if not svc.is_blocked(nq, nr, ns, own):
                 out.append((("a", nq, nr, ns), cfg.cost_air_lateral_per_m * pitch))
-        if not svc.is_blocked(q, r, ns):                                            # hover
+        if not svc.is_blocked(q, r, ns, own):                                       # hover
             out.append((("a", q, r, ns), cfg.cost_air_hold_per_s * dt))
         return out
 
     def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
-        # Shared-terminal hubs: ONLY the hub hover column is tagged shared (sized to the terminal's
-        # radius). The corridor starts/ends at the column edge pulled in by ``corridor_overlap`` so its
-        # first box dips into the column by that much — but corridor boxes stay strict, so they
-        # deconflict against everything (same-hub flights included). Only the column is shared.
+        # Shared-terminal hubs: the drone climbs in the tagged hover column, then its strategic corridor
+        # (the "exit lane") begins at the column EDGE. Waypoints inside the column are folded away — the
+        # centre→edge leg is flown but NOT reserved, because inside the terminal the vertiport handles
+        # its own traffic tactically (same-hub flights may share that space concurrently). Only the exit
+        # lane + cruise reach the ledger, where corridor boxes stay strict (untagged): two flights can't
+        # occupy the same exit lane at once, while divergent same-hub launches go concurrently.
         origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
         half = cfg.corridor_width_m / 2.0
         wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
         o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
+        speed = cfg.nominal_speed_mps
 
-        def _start_offset(term):   # perimeter-start distance: first box penetrates the column by `ov`
-            ov = term.corridor_overlap if term.corridor_overlap is not None else half
-            return terminal_radius(term, cfg) + half - ov
+        def _exit_radius(term):
+            # The reserved exit lane starts a clear ``corridor_width`` beyond the column edge so its
+            # back-extended first box stays OUTSIDE any sibling's column (a strict corridor touching a
+            # shared column would conflict). The column-edge→lane gap is the unreserved tactical zone;
+            # ``corridor_overlap`` pulls the lane back in toward the column if a scenario wants it.
+            ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
+            return terminal_radius(term, cfg) + cfg.corridor_width_m - ov
 
         if origin_term is not None and len(wps) >= 2:
-            wps[0][0] = _perimeter(o_xy, wps[1][0], _start_offset(origin_term), wps[0][0][2])
+            wps = _fold_head_into_column(wps, o_xy, _exit_radius(origin_term), speed)
         if dest_term is not None and len(wps) >= 2:
-            wps[-1][0] = _perimeter(d_xy, wps[-2][0], _start_offset(dest_term), wps[-1][0][2])
+            wps = _fold_tail_into_column(wps, d_xy, _exit_radius(dest_term), speed)
 
         edges = []
         centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]

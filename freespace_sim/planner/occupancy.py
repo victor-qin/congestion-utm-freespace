@@ -42,6 +42,7 @@ from collections.abc import Collection, Hashable
 
 from . import hexgrid as hg
 from ..config import SimConfig
+from ..geometry import CylinderSpec
 from ..volumes import Volume4D
 
 _EMPTY: dict = {}
@@ -61,9 +62,15 @@ class HexOccupancyService:
         self.evicted_before: int | None = None   # lowest retained step
 
     # ----- maintenance -----
-    def add_volume(self, vol: Volume4D) -> None:
-        """Rasterize one committed volume (once). Ordinary volumes feed the binary blocked/pad
-        step-buckets; a shared terminal column instead increments its per-hub dwell counter."""
+    def add_volume(self, vol: Volume4D, own_cols: tuple = ()) -> None:
+        """Rasterize one committed volume (once). Ordinary corridor cells feed the binary blocked/pad
+        step-buckets; a shared terminal column instead increments its per-hub dwell counter.
+
+        ``own_cols`` is the committing flight's own terminal columns ``(cx, cy, radius)``. A corridor
+        cell falling INSIDE one of them is the vertiport's unreserved tactical interior (the flight's
+        exit lane proper lies outside the column and is still recorded), so it's skipped — leaving only
+        *foreign* corridors inside any hub's column for a launch to detect and wait out (see pad_clear).
+        """
         tid = vol.terminal_id
         for q, r, s, in_blk in hg.rasterize_volume_dual(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
@@ -71,6 +78,8 @@ class HexOccupancyService:
             if self.evicted_before is not None and s < self.evicted_before:
                 continue                 # guard: never resurrect an already-evicted past step
             if tid is None:
+                if own_cols and self._inside_a_column(q, r, own_cols):
+                    continue             # the committing flight's own terminal interior — unreserved
                 self.pad.setdefault(s, set()).add((q, r))
                 if in_blk:
                     self.blocked.setdefault(s, set()).add((q, r))
@@ -81,10 +90,17 @@ class HexOccupancyService:
                 cell[tid] = cell.get(tid, 0) + 1
         self.n_added += 1
 
+    def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
+        c = hg.hex_center(q, r, self.R)
+        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
+
     def on_commit(self, _flight_id, volumes) -> None:
-        """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes."""
+        """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes,
+        dropping the corridor cells inside its own terminal columns (the unreserved tactical interior)."""
+        own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
+                         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         for v in volumes:
-            self.add_volume(v)
+            self.add_volume(v, own_cols=own_cols)
 
     def evict_before(self, step: int) -> None:
         """Drop all cells at steps < ``step`` (cells the sim clock has passed; no future plan can
@@ -120,21 +136,26 @@ class HexOccupancyService:
         return (q, r) in self.blocked.get(s, ())
 
     def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int,
-                  terminal_id: Hashable = None, capacity: int = 1) -> bool:
+                  terminal_id: Hashable = None, capacity: int = 1, footprint: tuple = None) -> bool:
         """Is the pad at hex (q, r) free for the whole dwell window [s0, s0 + dwell_steps]?
 
-        An ordinary pad (``terminal_id is None``) is exclusive: clear iff no committed footprint
-        touches it (capacity 1). A shared vertiport pad is gated purely by **capacity** — clear iff
-        every step in the window has fewer than ``capacity`` ``terminal_id`` dwells and no foreign
-        column overlaps it. The non-terminal ``pad`` map is deliberately *not* consulted for a shared
-        pad: same-hub corridor onsets sweep their own column and must not block it, and foreign cruise
-        never reaches a hub (it's walled off in :meth:`is_blocked`). The ledger is the final arbiter.
+        An ordinary pad (``terminal_id is None``) is exclusive: clear iff no committed footprint touches
+        it (capacity 1). A shared vertiport pad is gated by (a) **capacity** at the hub-centre cell and
+        (b) the rule that *no foreign corridor occupies the column*: ``footprint`` (the column's hex
+        cells) is scanned against the binary ``pad`` map — which inside a hub's column holds only foreign
+        corridors, since a flight's own exit-lane interior is dropped on commit. So a launch ground-delays
+        while a corridor transits its vertiport, instead of taking off and being denied by the ledger.
         """
+        cells = footprint if footprint is not None else ((q, r),)
         for k in range(s0, s0 + dwell_steps + 1):
+            padk = self.pad.get(k, ())
+            for cell in cells:
+                if cell in padk:
+                    return False                 # a foreign corridor (or ordinary pad) sweeps the column
             here = self.term_cells.get(k, _EMPTY).get((q, r)) if self.term_cells else None
             if terminal_id is None:
-                if (q, r) in self.pad.get(k, ()) or here is not None:
-                    return False                 # exclusive pad: any footprint (incl. a hub column)
+                if here is not None:
+                    return False                 # an ordinary pad sitting under some hub's column
             elif here is not None:
                 if here.get(terminal_id, 0) >= capacity:
                     return False                 # all N pads busy this step → take ground delay

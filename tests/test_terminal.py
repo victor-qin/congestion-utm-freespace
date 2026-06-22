@@ -18,7 +18,7 @@ from freespace_sim.geometry import BoxSpec, CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.sim import run
-from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
+from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 
 
 def _astar(**over):
@@ -228,13 +228,13 @@ def test_astar_shortcut_preserves_same_hub_concurrency():
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)
 
 
-def test_foreign_corridor_through_a_hub_column_is_never_double_booked():
+def test_launch_waits_for_a_foreign_corridor_to_clear_the_column():
     # A foreign cruise corridor (planned earlier, FCFS) transits a hub's location; a later launch from
-    # that hub whose large shared column (r150) overlaps that corridor must NOT be silently accepted
-    # into a conflict. The ledger (exact, full-column) catches the overlap where A*'s cell-local search
-    # cannot, so today the launch is conservatively DENIED rather than ground-delayed — a known
-    # search/ledger fidelity edge at large terminal radius (the tagless hex raster can't tell a foreign
-    # transit clipping the column's outer ring from a same-hub exit lane whose inflation also clips it).
+    # that hub can only ACTIVATE its column once that airspace is free. A* scans the whole column
+    # footprint at takeoff, sees the foreign corridor, and GROUND-DELAYS the launch until it clears —
+    # instead of taking off into it and being denied by the ledger. The footprint scan is faithful
+    # because a flight's own exit-lane raster inflation is dropped inside its column, leaving only
+    # foreign corridors there (see occupancy.add_volume / pad_clear).
     cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0))
     led = ReservationLedger(cfg)
     pl = AStarPlanner()
@@ -243,12 +243,27 @@ def test_foreign_corridor_through_a_hub_column_is_never_double_booked():
     launch = FlightRequest(0, vec(4000, 4000, 0), vec(4000, 7000, 0), 80.0,
                            origin_terminal=Terminal("H", 4, radius=150.0))
     intent = pl.plan(launch, led, cfg)
-    # load-bearing invariant: never a silent double-booking — it yields, or (if accepted) is truly clear
-    assert intent.status is IntentStatus.REJECTED or not led.any_conflict(intent.volumes)
-    # pins today's conservative behavior; flip to an accepted-with-ground-delay assertion if we ever add
-    # a conflict-retry that degrades this denial into a delay
-    assert intent.status is IntentStatus.REJECTED
-    assert intent.denial_reason is DenialReason.CONFLICT_FILED
+    assert intent.status is IntentStatus.ACCEPTED          # admitted, not denied
+    assert intent.ground_delay_s > 0.0                     # it waited for the airspace to free
+    assert not led.any_conflict(intent.volumes)            # and the activated column is genuinely clear
+
+
+def test_launch_detects_a_corridor_clipping_only_the_column_outer_ring():
+    # the strong case the footprint scan exists for: a foreign corridor that crosses the column's OUTER
+    # ring (offset ~120m in y) but NEVER the hub-centre cell — a cell-local takeoff check would miss it,
+    # so the full-footprint scan is what forces the launch to wait. With a wide r300 column the corridor
+    # passes well inside it.
+    cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0))
+    led = ReservationLedger(cfg)
+    pl = AStarPlanner()
+    foreign = FlightRequest(99, vec(1200, 4120, 0), vec(6800, 4120, 0), 0.0)   # 120 m north of the hub
+    led.commit(99, pl.plan(foreign, led, cfg).volumes)
+    launch = FlightRequest(0, vec(4000, 4000, 0), vec(4000, 1000, 0), 80.0,    # depart SOUTH, away from it
+                           origin_terminal=Terminal("H", 4, radius=300.0))
+    intent = pl.plan(launch, led, cfg)
+    assert intent.status is IntentStatus.ACCEPTED
+    assert intent.ground_delay_s > 0.0                     # the ring clip alone is enough to delay
+    assert not led.any_conflict(intent.volumes)
 
 
 def test_non_astar_planner_warns_on_terminal_flight():

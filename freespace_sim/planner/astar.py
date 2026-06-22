@@ -48,6 +48,29 @@ def _deny(req, reason):
     )
 
 
+def _absorb(svc, ledger):
+    """Feed already-committed reservations into the occupancy service grouped BY FLIGHT (volumes of one
+    flight are committed contiguously), so the per-flight own-column drop in ``on_commit`` applies to
+    pre-existing flights exactly as it does to live commits — not volume-by-volume."""
+    for _fid, grp in itertools.groupby(ledger.iter_committed(), key=lambda fv: fv[0]):
+        svc.on_commit(_fid, [v for _, v in grp])
+
+
+def _column_cells(center, radius, R):
+    """Hex cells whose centre lies within ``radius`` of ``center`` (xy) — a terminal column's footprint.
+    Scanned at takeoff/landing so A* won't activate a column a foreign corridor has already reserved."""
+    cx, cy = float(center[0]), float(center[1])
+    cq, cr = hg.enu_to_axial(cx, cy, R)
+    span = int(math.ceil(radius / R)) + 3
+    out = []
+    for dq in range(-span, span + 1):
+        for dr in range(-span, span + 1):
+            c = hg.hex_center(cq + dq, cr + dr, R)
+            if (c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= radius * radius:
+                out.append((cq + dq, cr + dr))
+    return tuple(out)
+
+
 def _perimeter(center_xy, toward, radius, z):
     """A point ``radius`` m from ``center_xy`` toward ``toward`` (xy), at altitude ``z`` — where a
     hub's corridor starts/ends so same-hub flights diverge from the shared terminal edge."""
@@ -99,8 +122,7 @@ class AStarPlanner:
             svc = self._svc = HexOccupancyService(cfg)
             self._svc_ledger = ledger
             ledger.subscribe(svc.on_commit)                 # publish hook: future commits auto-feed
-            for _fid, vol in ledger.iter_committed():        # absorb anything already committed
-                svc.add_volume(vol)
+            _absorb(svc, ledger)                             # absorb anything already committed
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
@@ -108,8 +130,7 @@ class AStarPlanner:
                 stacklevel=2,
             )
             svc.reset()
-            for _fid, vol in ledger.iter_committed():
-                svc.add_volume(vol)
+            _absorb(svc, ledger)
         # Evict cells older than the request clock (extra step of buffer); requests arrive in
         # non-decreasing time, so no future plan can query an evicted step.
         svc.evict_before(int(req.t_request // cfg.dt_s) - 2)
@@ -150,6 +171,10 @@ class AStarPlanner:
         own = frozenset(t.id for t in (o_term, d_term) if t is not None)
         o_tid, o_cap = (o_term.id, o_term.capacity) if o_term else (None, 1)
         d_tid, d_cap = (d_term.id, d_term.capacity) if d_term else (None, 1)
+        # the hub column's full footprint — a launch may only activate it if no foreign corridor already
+        # occupies any of these cells for the dwell window (else ground-delay until the airspace frees)
+        o_fp = _column_cells(origin, terminal_radius(o_term, cfg), R) if o_term else None
+        d_fp = _column_cells(dest, terminal_radius(d_term, cfg), R) if d_term else None
 
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come
         def h_air(q, r):
@@ -178,7 +203,7 @@ class AStarPlanner:
                 continue
             closed.add(st)
             if st[0] == "a" and st[1] == gq and st[2] == grr and svc.pad_clear(
-                gq, grr, st[3], dwell_steps, d_tid, d_cap
+                gq, grr, st[3], dwell_steps, d_tid, d_cap, d_fp
             ):
                 goal_state = st
                 break
@@ -190,7 +215,7 @@ class AStarPlanner:
             base_g = g[st]
             for nst, cost in self._edges(
                 st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-                own, o_tid, o_cap,
+                own, o_tid, o_cap, o_fp,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -239,7 +264,7 @@ class AStarPlanner:
         return intent
 
     def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-               own=(), o_tid=None, o_cap=1):
+               own=(), o_tid=None, o_cap=1, o_fp=None):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -247,11 +272,11 @@ class AStarPlanner:
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             ts = s + climb_steps
-            # takeoff: the climb-completion air cell must be clear AND the origin pad must have a free
-            # slot for the whole takeoff dwell (starting at ground step s) — symmetric to landing. The
-            # pad gate is capacity-aware: up to o_cap same-hub dwells share the column (Phase B).
+            # takeoff: the climb-completion air cell must be clear AND the origin column must activate —
+            # have a free pad slot (capacity) AND no foreign corridor occupying its footprint — for the
+            # whole takeoff dwell (starting at ground step s). Symmetric to the landing check.
             if (ts <= max_step and not svc.is_blocked(q, r, ts, own)
-                    and svc.pad_clear(q, r, s, dwell_steps, o_tid, o_cap)):
+                    and svc.pad_clear(q, r, s, dwell_steps, o_tid, o_cap, o_fp)):
                 out.append((("a", q, r, ts), climb_cost))                            # takeoff
             return out
         _, q, r, s = st

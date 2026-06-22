@@ -140,6 +140,8 @@ def save_run(
     experiment: str | None = None,
     experiment_args: dict | None = None,
     wall_seconds: float | None = None,
+    scenario: str | None = None,
+    demand: str | None = None,
     write_replay: bool = True,
     index: bool = True,
 ) -> Path:
@@ -158,6 +160,9 @@ def save_run(
     (folder / "git.json").write_text(json.dumps(_git_info(), indent=2))
     (folder / "experiment.json").write_text(json.dumps({
         "experiment": experiment or label,
+        "scenario": scenario,
+        "demand": demand,
+        "tag": label,
         "args": experiment_args or {},
         "wall_seconds": wall_seconds,
         "timestamp": stamp,
@@ -171,31 +176,66 @@ def save_run(
     trajectory_frame(result).to_parquet(folder / "trajectories.parquet", index=False)
     reservation_frame(result).to_parquet(folder / "reservations.parquet", index=False)
     metrics.flight_frame(result).to_parquet(folder / "flights.parquet", index=False)
+    metrics.per_uss_frame(result).to_parquet(folder / "per_uss.parquet", index=False)   # per-operator slice
 
     if write_replay:
         from . import viz_html
         viz_html.write_html(result, folder / "replay.html")
 
     if index:
-        _append_index(result, folder, Path(root), wall_seconds)
+        _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
+                      tag=label, demand=demand)
     return folder
 
 
-def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: float | None) -> None:
-    """Append one queryable row per run to ``results/index.parquet``."""
+def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: float | None,
+                  *, scenario: str | None = None, tag: str | None = None,
+                  demand: str | None = None) -> None:
+    """Append one queryable row per run to ``results/index.parquet``.
+
+    The ``scenario`` / ``tag`` / ``demand`` columns are the join keys cross-run readouts filter on:
+    a batch sweep stamps every run with the same ``tag`` so a readout can select exactly its runs.
+    """
+    cfg = result.config
     agg = metrics.aggregate(result)
-    row = {"path": str(folder), "planner": result.config.planner,
-           "lam_per_hour": result.config.lam_per_hour, "seed": result.config.seed,
+    row = {"path": str(folder), "scenario": scenario, "tag": tag, "demand": demand,
+           "planner": cfg.planner, "lam_per_hour": cfg.lam_per_hour, "seed": cfg.seed,
+           "horizon_s": cfg.horizon_s,
+           "region_w": cfg.region_size_m[0], "region_h": cfg.region_size_m[1],
            "wall_seconds": wall_seconds,
-           **{k: agg[k] for k in ("n_requests", "n_accepted", "n_denied", "denial_rate",
+           **{k: agg[k] for k in ("n_uss", "n_requests", "n_accepted", "n_denied", "denial_rate",
+                                  "congestion_denial_rate", "offered_load_per_h", "throughput_per_h",
                                   "mean_total_delay_s", "p95_total_delay_s", "mean_air_detour_m",
-                                  "airspace_utilization", "mean_solve_time_s", "p95_solve_time_s",
+                                  "mean_stretch", "mean_cost",
+                                  "airspace_utilization", "denial_rate_spread", "mean_delay_spread",
+                                  "mean_solve_time_s", "p95_solve_time_s",
                                   "max_solve_time_s", "total_solve_time_s", "verified")}}
     path = root / INDEX_FILENAME
     df = pd.DataFrame([row])
     if path.exists():
         df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
     df.to_parquet(path, index=False)
+
+
+def load_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
+    """Load the cross-run index (one row per saved run), or an empty frame if none exists yet.
+
+    This is the interface for cross-run readouts (curve, compare): read it, filter by
+    ``scenario`` / ``tag`` / ``planner``, and plot — no re-simulation."""
+    path = Path(root) / INDEX_FILENAME
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+
+
+def sweep_dir(label: str, root: Path | str = DEFAULT_ROOT) -> Path:
+    """Folder that groups a *run set's* cross-run readout artifacts (curve / histograms / compare).
+
+    A cross-run readout describes a *set* of runs (the ``--tag``/``--scenario`` it filtered on), not a
+    single run, so its artifacts don't belong in any one run folder nor loose in the results root —
+    they live here, under ``<root>/sweeps/<label>/``. Stable per label, so re-running a readout
+    refreshes its artifacts in place instead of scattering timestamped copies."""
+    d = Path(root) / "sweeps" / label
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 @dataclasses.dataclass

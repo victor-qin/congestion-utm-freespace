@@ -50,7 +50,7 @@ class SimConfig:
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
     # --- denial budgets ---
-    max_ground_delay_s: float = 100000.0
+    max_ground_delay_s: float = 3600.0
     max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this
 
     # --- demand / horizon ---

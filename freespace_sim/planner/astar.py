@@ -42,7 +42,7 @@ def _deny(req, reason):
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 300_000):
+    def __init__(self, max_expansions: int = 600_000):
         self.max_expansions = max_expansions
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None

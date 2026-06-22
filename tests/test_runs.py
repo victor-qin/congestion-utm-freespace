@@ -85,6 +85,21 @@ def test_index_parquet_appends(tmp_path):
     assert {"path", "planner", "verified", "mean_total_delay_s"} <= set(idx.columns)
 
 
+def test_index_records_scenario_tag_demand_for_cross_run_filter(tmp_path):
+    runs.save_run(_small(), root=tmp_path, label="sweepX", scenario="metro_2uss", demand="uniform")
+    runs.save_run(_small(), root=tmp_path, label="sweepX", scenario="metro_2uss", demand="uniform")
+    runs.save_run(_small(), root=tmp_path, label="other", scenario="metro_uniform", demand="uniform")
+    idx = runs.load_index(tmp_path)
+    assert {"scenario", "tag", "demand", "n_uss", "horizon_s", "region_w", "region_h"} <= set(idx.columns)
+    # the tag is the join key a cross-run readout filters on
+    assert len(idx[idx["tag"] == "sweepX"]) == 2
+    assert set(idx[idx["tag"] == "sweepX"]["scenario"]) == {"metro_2uss"}
+
+
+def test_load_index_empty_when_missing(tmp_path):
+    assert runs.load_index(tmp_path).empty
+
+
 def test_denied_flight_captured_without_volumes(tmp_path):
     # a fully-walled straight flight is denied; the capture must record it (no volumes) and reload it
     led = ReservationLedger(SimConfig())

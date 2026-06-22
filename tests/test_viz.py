@@ -18,9 +18,51 @@ def _small_run():
                requests=reqs)
 
 
+def _two_uss_run():
+    reqs = [
+        FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, uss_id="walmart"),
+        FlightRequest(2, vec(1000, -800, 0), vec(1000, 1200, 0), 0.0, uss_id="stripmall"),
+    ]
+    return run(SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0)),
+               requests=reqs)
+
+
 def test_flight_color_is_deterministic_and_distinct():
     assert viz.flight_color(1) == viz.flight_color(1)
     assert viz.flight_color(1) != viz.flight_color(2)
+
+
+def test_uss_hues_distinct_and_deterministic():
+    h1 = viz.uss_hues(["walmart", "stripmall"])
+    h2 = viz.uss_hues(["stripmall", "walmart"])      # order-independent (sorted internally)
+    assert h1 == h2
+    assert h1["walmart"] != h1["stripmall"]
+
+
+def test_flight_color_by_uss_groups_by_hue():
+    import colorsys
+    hues = viz.uss_hues(["walmart", "stripmall"])
+    # same USS, different flight → same hue (only sat/value jitter)
+    a = colorsys.rgb_to_hsv(*viz.flight_color_by_uss("walmart", 1, hues))
+    b = colorsys.rgb_to_hsv(*viz.flight_color_by_uss("walmart", 7, hues))
+    assert abs(a[0] - b[0]) < 1e-9
+    # different USS → different hue family
+    c = colorsys.rgb_to_hsv(*viz.flight_color_by_uss("stripmall", 1, hues))
+    assert abs(a[0] - c[0]) > 1e-9
+
+
+def test_snapshot_uss_filter_writes_file(tmp_path):
+    res = _two_uss_run()
+    viz.snapshot(res, t=20.0, out=tmp_path / "walmart.png", uss="walmart")
+    assert (tmp_path / "walmart.png").stat().st_size > 0
+
+
+def test_payload_carries_uss_and_colors():
+    res = _two_uss_run()
+    payload = viz_html._payload(res)
+    assert all("uss" in f for f in payload["flights"])
+    assert set(payload["uss_colors"]) == {"walmart", "stripmall"}
+    assert all(c.startswith("#") and len(c) == 7 for c in payload["uss_colors"].values())
 
 
 def test_box_footprint_is_four_xy_corners_of_right_size():

@@ -24,9 +24,38 @@ _GOLDEN = 0.618033988749895
 
 
 def flight_color(flight_id: int) -> tuple[float, float, float]:
-    """Visually-distinct RGB for a flight, hue stepped by the golden ratio."""
+    """Visually-distinct RGB for a flight, hue stepped by the golden ratio (legacy / single-USS)."""
     h = (flight_id * _GOLDEN) % 1.0
     return colorsys.hsv_to_rgb(h, 0.62, 0.95)
+
+
+def uss_hues(uss_ids) -> dict[str, float]:
+    """Assign each USS an evenly-spaced base hue (deterministic by sorted id). With two operators
+    these land on opposite sides of the wheel → maximally distinct families."""
+    ids = sorted(set(uss_ids))
+    n = max(1, len(ids))
+    return {uid: i / n for i, uid in enumerate(ids)}
+
+
+def flight_color_by_uss(uss_id: str, flight_id: int, hues: dict[str, float]) -> tuple[float, float, float]:
+    """RGB for a flight: hue identifies the owning USS, while saturation/value jitter by ``flight_id``
+    so same-operator flights read as a distinguishable family rather than one flat blob."""
+    h = hues.get(uss_id, 0.0)
+    s = 0.45 + 0.30 * ((flight_id * _GOLDEN) % 1.0)
+    v = 0.78 + 0.20 * ((flight_id * 0.387) % 1.0)
+    return colorsys.hsv_to_rgb(h, s, v)
+
+
+def result_uss_hues(result: SimResult) -> dict[str, float]:
+    """Stable hue map over every USS present in the run (accepted *or* denied) so colors don't shift
+    between snapshots when a given operator has no active flight at some ``t``."""
+    return uss_hues({i.request.uss_id for i in result.intents})
+
+
+def uss_swatch_hex(uss_id: str, hues: dict[str, float]) -> str:
+    """Canonical legend swatch (the USS's base hue at fixed sat/value) as a #rrggbb string."""
+    r, g, b = colorsys.hsv_to_rgb(hues.get(uss_id, 0.0), 0.6, 0.9)
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
 
 def box_footprint(spec: BoxSpec) -> np.ndarray:
@@ -54,13 +83,18 @@ def _position_at(centerline, t: float):
     return centerline[-1][0][:2]
 
 
-def snapshot(result: SimResult, t: float, ax=None, out=None):
-    """Top-down view of every reservation active at time ``t`` + drone dots."""
+def snapshot(result: SimResult, t: float, ax=None, out=None, uss: str | None = None):
+    """Top-down view of every reservation active at time ``t`` + drone dots, colored by owning USS.
+
+    Pass ``uss`` to slice the view to a single operator's flights.
+    """
     own = ax is None
     if own:
         _, ax = plt.subplots(figsize=(8, 8))
-    for intent in result.accepted:
-        col = flight_color(intent.request.flight_id)
+    hues = result_uss_hues(result)
+    shown = [i for i in result.accepted if uss is None or i.request.uss_id == uss]
+    for intent in shown:
+        col = flight_color_by_uss(intent.request.uss_id, intent.request.flight_id, hues)
         for v in _active(intent.volumes, t):
             if isinstance(v.shape, BoxSpec):
                 ax.add_patch(Polygon(box_footprint(v.shape), closed=True,
@@ -76,8 +110,9 @@ def snapshot(result: SimResult, t: float, ax=None, out=None):
     ax.set_xlim(-0.05 * w, w)
     ax.set_ylim(-0.05 * h, h)
     ax.set_aspect("equal")
-    ax.set_title(f"t = {t:.0f} s   ·   active flights: "
-                 f"{sum(bool(_active(i.volumes, t)) for i in result.accepted)}")
+    scope = "" if uss is None else f"   ·   USS={uss}"
+    ax.set_title(f"t = {t:.0f} s{scope}   ·   active flights: "
+                 f"{sum(bool(_active(i.volumes, t)) for i in shown)}")
     ax.set_xlabel("east (m)")
     ax.set_ylabel("north (m)")
     if out:
@@ -257,8 +292,9 @@ def scene_3d(result: SimResult, t: float | None = None):
     import trimesh
 
     scene = trimesh.Scene()
+    hues = result_uss_hues(result)
     for intent in result.accepted:
-        r, g, b = flight_color(intent.request.flight_id)
+        r, g, b = flight_color_by_uss(intent.request.uss_id, intent.request.flight_id, hues)
         color = [int(r * 255), int(g * 255), int(b * 255), 110]
         vols = intent.volumes if t is None else _active(intent.volumes, t)
         for v in vols:

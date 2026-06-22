@@ -12,14 +12,15 @@ import json
 
 from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
-from .viz import box_footprint, flight_color
+from .viz import box_footprint, flight_color_by_uss, result_uss_hues, uss_swatch_hex
 
 
 def _payload(result: SimResult) -> dict:
     """Flatten the accepted intents into a compact, JSON-serialisable scene description."""
+    hues = result_uss_hues(result)
     flights = []
     for intent in result.accepted:
-        r, g, b = flight_color(intent.request.flight_id)
+        r, g, b = flight_color_by_uss(intent.request.uss_id, intent.request.flight_id, hues)
         boxes, cyls = [], []
         for v in intent.volumes or []:
             if isinstance(v.shape, BoxSpec):
@@ -32,6 +33,7 @@ def _payload(result: SimResult) -> dict:
         o, d = intent.request.origin, intent.request.dest
         flights.append({
             "id": intent.request.flight_id,
+            "uss": intent.request.uss_id,
             "color": f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}",
             "boxes": boxes, "cyls": cyls, "path": path,
             "o": [float(o[0]), float(o[1])], "d": [float(d[0]), float(d[1])],
@@ -41,11 +43,13 @@ def _payload(result: SimResult) -> dict:
     # it did, expose its circumradius so the replay can overlay the exact grid A* searched on.
     hex_available = "astar" in cfg.planner
     from .planner.hexgrid import circumradius
+    uss_colors = {uid: uss_swatch_hex(uid, hues) for uid in sorted(hues)}
     return {
         "horizon": cfg.horizon_s,
         "dt": cfg.dt_s,
         "region": list(cfg.region_size_m),
         "flights": flights,
+        "uss_colors": uss_colors,           # {uss_id: #rrggbb} for the legend / per-USS slice
         "hex_available": hex_available,
         "hex_R": circumradius(cfg) if hex_available else 0.0,
         "planner": cfg.planner,
@@ -74,9 +78,11 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
   <input id="slider" type="range" min="0" max="{horizon}" value="0" step="1">
   <span id="t">t = 0 s</span>
   <label class="tog" id="hexWrap"><input type="checkbox" id="hexToggle"> hex grid (A*)</label>
+  <span id="legend" style="display:flex;gap:10px;flex-wrap:wrap"></span>
  </div>
 </div><script>
 const DATA = {data};
+const hidden = new Set();                              // USS ids toggled off via the legend
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const [W, H] = DATA.region, PAD = 20, S = (cv.width - 2*PAD) / Math.max(W, H);
 const sx = x => PAD + x*S, sy = y => cv.height - PAD - y*S;   // flip y: north is up
@@ -111,6 +117,7 @@ function draw(t){{
   if(document.getElementById('hexToggle').checked) drawHexGrid();
   let nActive=0;
   for(const fl of DATA.flights){{
+    if(hidden.has(fl.uss)) continue;                 // per-USS slice (legend toggles)
     let on=false;
     ctx.lineWidth=0.6;
     for(const bx of fl.boxes){{ if(!active(bx,t)) continue; on=true;
@@ -150,6 +157,21 @@ document.addEventListener('keydown', e=>{{
   else if(e.key==='ArrowRight') step(+DATA.dt);
   else if(e.key===' '){{ e.preventDefault(); document.getElementById('play').click(); }}
 }});
+// legend + per-USS show/hide (only when more than one operator flew)
+(function buildLegend(){{
+  const usses = Object.keys(DATA.uss_colors || {{}});
+  if(usses.length < 2) return;
+  const legend = document.getElementById('legend');
+  for(const u of usses){{
+    const lab = document.createElement('label'); lab.className = 'tog';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true;
+    cb.onchange = ()=>{{ cb.checked ? hidden.delete(u) : hidden.add(u); draw(+slider.value); }};
+    const sw = document.createElement('span');
+    sw.style.cssText = 'display:inline-block;width:11px;height:11px;border-radius:2px;background:'+DATA.uss_colors[u];
+    lab.appendChild(cb); lab.appendChild(sw); lab.appendChild(document.createTextNode(u));
+    legend.appendChild(lab);
+  }}
+}})();
 draw(0);
 </script></body></html>"""
 

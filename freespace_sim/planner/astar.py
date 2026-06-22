@@ -27,8 +27,15 @@ import numpy as np
 from ..config import SimConfig
 from ..cost import trajectory_cost
 from ..ledger import ReservationLedger
-from ..types import DenialReason, FlightRequest, IntentStatus, OperationalIntent, TimedPoint
-from ..volumes import corridor_segment_volume, hover_reservation
+from ..types import (
+    DenialReason,
+    FlightRequest,
+    IntentStatus,
+    OperationalIntent,
+    TimedPoint,
+    as_terminal,
+)
+from ..volumes import corridor_segment_volume, hover_reservation, terminal_for_box, terminal_radius
 from . import hexgrid as hg
 from .occupancy import HexOccupancyService
 
@@ -221,29 +228,30 @@ class AStarPlanner:
         return out
 
     def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
-        # Shared-terminal hubs: the column at the hub is a tagged hover; the corridor *starts/ends at
-        # the terminal perimeter* so same-hub flights diverge, and the one box that still dips into the
-        # terminal (its contiguity overlap) is tagged so it's transparent to the shared column.
-        R_t = cfg.terminal_radius_m
+        # Shared-terminal hubs: the hub column is a tagged hover of the terminal's own radius; the
+        # corridor starts/ends at the column edge offset by ``corridor_overlap`` so the first box
+        # penetrates the column by that much (and is tagged transparent to it). Same-hub flights diverge
+        # from the perimeter; outside the column they deconflict strictly.
+        origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
+        half = cfg.corridor_width_m / 2.0
         wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
         o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
+
+        def _start_offset(term):   # perimeter-start distance: first box penetrates the column by `ov`
+            ov = term.corridor_overlap if term.corridor_overlap is not None else half
+            return terminal_radius(term, cfg) + half - ov
+
         if origin_term is not None and len(wps) >= 2:
-            wps[0][0] = _perimeter(o_xy, wps[1][0], R_t, wps[0][0][2])
+            wps[0][0] = _perimeter(o_xy, wps[1][0], _start_offset(origin_term), wps[0][0][2])
         if dest_term is not None and len(wps) >= 2:
-            wps[-1][0] = _perimeter(d_xy, wps[-2][0], R_t, wps[-1][0][2])
+            wps[-1][0] = _perimeter(d_xy, wps[-2][0], _start_offset(dest_term), wps[-1][0][2])
 
         edges = []
         centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]
         cum_horiz = 0.0
         n_hover = 0
-        reach = R_t + cfg.corridor_segment_len_m   # a box this close to a hub overlaps its terminal
         for (a, ta), (b, tb) in zip(wps, wps[1:]):
-            mid = (a[:2] + b[:2]) / 2.0
-            tid = None
-            if origin_term is not None and float(np.linalg.norm(mid - o_xy)) <= reach:
-                tid = origin_term[0]
-            elif dest_term is not None and float(np.linalg.norm(mid - d_xy)) <= reach:
-                tid = dest_term[0]
+            tid = terminal_for_box(a[:2], b[:2], o_xy, d_xy, origin_term, dest_term, cfg)
             edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))
@@ -253,8 +261,12 @@ class AStarPlanner:
         t_takeoff = (base + ground_steps) * cfg.dt_s
         t_arrive = wps[-1][1]
         volumes = [
-            hover_reservation(origin, t_takeoff, cfg, terminal_id=origin_term[0] if origin_term else None),
+            hover_reservation(origin, t_takeoff, cfg,
+                              terminal_id=origin_term.id if origin_term else None,
+                              radius=origin_term.radius if origin_term else None),
             *edges,
-            hover_reservation(dest, t_arrive, cfg, terminal_id=dest_term[0] if dest_term else None),
+            hover_reservation(dest, t_arrive, cfg,
+                              terminal_id=dest_term.id if dest_term else None,
+                              radius=dest_term.radius if dest_term else None),
         ]
         return volumes, centerline, cum_horiz, n_hover

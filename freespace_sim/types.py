@@ -8,9 +8,10 @@ vectors instead of H3 cells.)
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 
@@ -59,6 +60,34 @@ class DenialReason(Enum):
     CONFLICT_FILED = "conflict_filed"  # filing has a conflict (multi-USS, future)
 
 
+class Terminal(NamedTuple):
+    """A multi-pad vertiport endpoint a flight uses (origin for a takeoff, dest for a landing).
+
+    Vertiport infrastructure travels with the terminal, not in global config:
+    - ``radius`` — the shared terminal column size; ``None`` ⇒ the hover footprint
+      (``cfg.effective_hover_radius_m``) is used when the geometry is built.
+    - ``corridor_overlap`` — how far the first corridor box penetrates the column (and is shared with
+      same-hub flights); ``None`` ⇒ ``cfg.corridor_width_m / 2``, the natural contiguity overlap. 0 ⇒
+      corridors stay strictly outside the terminal.
+
+    Both are set when hubs are created (the demand model), so a big-box hub and a small pad can differ
+    and a non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).
+    """
+
+    id: Hashable
+    capacity: int = 1
+    radius: float | None = None
+    corridor_overlap: float | None = None
+
+
+def as_terminal(t) -> "Terminal | None":
+    """Normalize a terminal descriptor: ``None``, a :class:`Terminal`, or a plain
+    ``(id, capacity[, radius[, corridor_overlap]])`` tuple → a :class:`Terminal` (or ``None``)."""
+    if t is None or isinstance(t, Terminal):
+        return t
+    return Terminal(*t)
+
+
 @dataclass
 class FlightRequest:
     """Pure demand: who wants to fly from where to where, and when they filed.
@@ -73,11 +102,12 @@ class FlightRequest:
     t_request: float                 # filing time → FCFS order
     t_departure: float | None = None  # desired departure (None = depart at t_request)
     uss_id: str = "default"
-    # multi-pad vertiport endpoints: (hub_id, capacity) when origin/dest is a shared-terminal hub.
-    # None (default) → ordinary single pad. The hub *centre* is ``origin``/``dest``; the id drives the
-    # shared-terminal exemption + pad capacity. A delivery sets origin_terminal; a return sets dest.
-    origin_terminal: "tuple | None" = None
-    dest_terminal: "tuple | None" = None
+    # multi-pad vertiport endpoints (:class:`Terminal`) when origin/dest is a shared-terminal hub.
+    # None (default) → ordinary single pad. The hub *centre* is ``origin``/``dest``; the Terminal drives
+    # the shared-terminal exemption + pad capacity + column size. A delivery sets origin_terminal; a
+    # return sets dest_terminal. Plain ``(id, capacity)`` tuples are accepted (normalized by builders).
+    origin_terminal: "Terminal | None" = None
+    dest_terminal: "Terminal | None" = None
 
     def sort_key(self) -> tuple[float, int]:
         return (self.t_request, self.flight_id)

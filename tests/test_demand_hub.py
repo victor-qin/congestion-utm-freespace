@@ -144,8 +144,7 @@ def test_delivery_sets_origin_terminal_with_capacity():
     assert reqs
     for r in reqs:                                   # delivery: origin is a hub terminal of capacity 3
         assert r.origin_terminal is not None and r.dest_terminal is None
-        hub_id, cap = r.origin_terminal
-        assert cap == 3 and str(hub_id).startswith("walmart_uss#")
+        assert r.origin_terminal.capacity == 3 and str(r.origin_terminal.id).startswith("walmart_uss#")
 
 
 def test_pads_per_hub_is_capacity_not_geometry():

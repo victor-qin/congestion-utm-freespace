@@ -27,8 +27,10 @@ class DemandSpec:
     hubs: tuple[int, ...] = ()            # per-USS hub counts (hub patterns; defaults if empty)
     direction: str = "delivery"            # hub pattern: "delivery" (hub→customer) | "pickup"
     # --- hub_radius extras (multi-pad hubs, radius service areas, return flights) ---
-    radius_m: "float | dict[str, float]" = 3000.0   # customer radius (scalar, or per-USS dict)
+    radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS dict)
     pads_per_hub: int = 1                  # terminal capacity N per hub
+    terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
+    corridor_overlap_m: "float | None" = None        # first-box penetration into the column; None → cw/2
     return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 120.0            # delay before the return is filed
 
@@ -52,6 +54,7 @@ class DemandSpec:
             return HubRadiusDemand(
                 n_hubs_per_uss=dict(zip(labels, counts)),
                 radius_m=self.radius_m, pads_per_hub=self.pads_per_hub,
+                terminal_radius_m=self.terminal_radius_m, corridor_overlap_m=self.corridor_overlap_m,
                 return_flights=self.return_flights, turnaround_s=self.turnaround_s,
             )
         if self.pattern != "uniform":

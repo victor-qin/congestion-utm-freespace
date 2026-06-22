@@ -18,7 +18,7 @@ from typing import Protocol
 import numpy as np
 
 from .config import SimConfig
-from .types import FlightRequest, vec
+from .types import FlightRequest, Terminal, vec
 
 
 class DemandModel(Protocol):
@@ -166,8 +166,10 @@ class HubRadiusDemand:
     n_hubs_per_uss: dict[str, int] = field(
         default_factory=lambda: {"walmart_uss": 6, "stripmall_uss": 20}
     )
-    radius_m: "float | dict[str, float]" = 3000.0   # customer radius (scalar, or per-USS)
+    radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS)
     pads_per_hub: int = 1                            # terminal capacity N per hub
+    terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
+    corridor_overlap_m: "float | None" = None        # first-box penetration into the column; None → cw/2
     return_flights: bool = True                      # each delivery → a return to its origin hub
     turnaround_s: float = 120.0                      # delay before the return is filed (after est. arrival)
     uss_share: dict[str, float] | None = None
@@ -183,6 +185,12 @@ class HubRadiusDemand:
 
     def _radius_for(self, uss_id: str) -> float:
         return float(self.radius_m[uss_id] if isinstance(self.radius_m, dict) else self.radius_m)
+
+    def _terminal_radius_for(self, uss_id: str) -> float | None:
+        tr = self.terminal_radius_m
+        if tr is None:
+            return None                              # builder defaults to the hover footprint
+        return float(tr[uss_id] if isinstance(tr, dict) else tr)
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
         ids = list(self.n_hubs_per_uss)
@@ -208,7 +216,8 @@ class HubRadiusDemand:
             uss_id = ids[int(rng.choice(len(ids), p=probs))]
             hi = int(rng.integers(hubs[uss_id].shape[0]))
             hub = hubs[uss_id][hi]
-            terminal = (f"{uss_id}#{hi}", int(self.pads_per_hub))     # (hub_id, capacity)
+            terminal = Terminal(f"{uss_id}#{hi}", int(self.pads_per_hub),
+                                self._terminal_radius_for(uss_id), self.corridor_overlap_m)
             radius = self._radius_for(uss_id)
             customer = None
             for _ in range(20):  # redraw until in-region and a non-trivial hop from the hub

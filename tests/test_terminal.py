@@ -11,8 +11,9 @@ import numpy as np
 import pytest
 
 from freespace_sim.config import SimConfig
+from freespace_sim.geometry import BoxSpec, CylinderSpec
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, vec
+from freespace_sim.types import FlightRequest, Terminal, vec
 
 
 def _astar(**over):
@@ -68,13 +69,37 @@ def test_delivery_then_return_roundtrip_verifies():
 
 
 def test_corridor_starts_away_from_the_hub_centre():
-    # perimeter-start: the first cruise waypoint sits ~terminal_radius from the hub, not on top of it
+    # perimeter-start: the first cruise waypoint sits ~terminal radius from the hub, not on top of it
     cfg = _astar()
     req = FlightRequest(0, vec(1000, 1000, 0), vec(4000, 1000, 0), 0.0, origin_terminal=("H", 4))
     res = run(cfg, requests=[req])
-    cl = res.accepted[0].centerline
-    first_air = np.array(cl[0][0])[:2]
-    assert np.linalg.norm(first_air - np.array([1000.0, 1000.0])) >= cfg.terminal_radius_m - 1e-6
+    first_air = np.array(res.accepted[0].centerline[0][0])[:2]
+    # default terminal radius = hover footprint; default overlap = corridor_width/2 ⇒ start at R
+    assert np.linalg.norm(first_air - np.array([1000.0, 1000.0])) >= cfg.effective_hover_radius_m - 1e-6
+
+
+def test_terminal_radius_sizes_the_column():
+    # a custom terminal radius makes the shared column that big (default is the hover footprint)
+    req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
+                        origin_terminal=Terminal("H", 4, radius=200.0))
+    res = run(_astar(), requests=[req])
+    cyl = [v for v in res.accepted[0].volumes
+           if v.terminal_id == "H" and isinstance(v.shape, CylinderSpec)][0]
+    assert abs(cyl.shape.radius - 200.0) < 1e-6
+
+
+def test_corridor_overlap_controls_first_box_sharing():
+    # overlap=0 ⇒ corridor starts outside the column ⇒ NO box tagged (strict outside the terminal);
+    # overlap>0 ⇒ the penetrating first box is tagged (shared with same-hub flights)
+    def tagged_boxes(overlap):
+        req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
+                            origin_terminal=Terminal("H", 4, corridor_overlap=overlap))
+        res = run(_astar(), requests=[req])
+        return [v for v in res.accepted[0].volumes
+                if v.terminal_id == "H" and isinstance(v.shape, BoxSpec)]
+
+    assert tagged_boxes(0.0) == []          # only the column carries the tag
+    assert len(tagged_boxes(40.0)) >= 1     # first box penetrates → shared
 
 
 def test_non_astar_planner_warns_on_terminal_flight():
@@ -89,3 +114,13 @@ def test_astar_planner_does_not_warn_on_terminal_flight():
         warnings.simplefilter("error", RuntimeWarning)
         res = run(_astar(), requests=[_terminal_req()])
     assert res.verified and res.accepted
+
+
+def test_astar_shortcut_preserves_terminal_tags_no_warning():
+    # the refiner rebuilds the corridor but now keeps the inner A*'s terminal tags → no warning
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        res = run(SimConfig(planner="astar_shortcut", region_size_m=(5000.0, 5000.0)),
+                  requests=[_terminal_req()])
+    assert res.verified
+    assert any(v.terminal_id == "H" for v in res.accepted[0].volumes)   # column tag survived the rebuild

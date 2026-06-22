@@ -88,18 +88,27 @@ def test_terminal_radius_sizes_the_column():
     assert abs(cyl.shape.radius - 200.0) < 1e-6
 
 
-def test_corridor_overlap_controls_first_box_sharing():
-    # overlap=0 ⇒ corridor starts outside the column ⇒ NO box tagged (strict outside the terminal);
-    # overlap>0 ⇒ the penetrating first box is tagged (shared with same-hub flights)
-    def tagged_boxes(overlap):
+def test_only_the_column_is_shared_corridors_strict():
+    # ONLY the hover column is tagged shared; every corridor box stays strict (conflicts with all,
+    # including same-hub flights), even the bit that dips into the terminal by corridor_overlap
+    req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
+                        origin_terminal=Terminal("H", 4, corridor_overlap=40.0))
+    res = run(_astar(), requests=[req])
+    vols = res.accepted[0].volumes
+    tagged = [v for v in vols if v.terminal_id == "H"]
+    assert tagged and all(isinstance(v.shape, CylinderSpec) for v in tagged)         # only column(s)
+    assert all(v.terminal_id is None for v in vols if isinstance(v.shape, BoxSpec))  # boxes strict
+
+
+def test_corridor_overlap_controls_perimeter_start():
+    # the overlap is a *geometry* knob now: bigger overlap → corridor starts deeper inside the terminal
+    def start_dist(overlap):
         req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
                             origin_terminal=Terminal("H", 4, corridor_overlap=overlap))
-        res = run(_astar(), requests=[req])
-        return [v for v in res.accepted[0].volumes
-                if v.terminal_id == "H" and isinstance(v.shape, BoxSpec)]
+        first = np.array(run(_astar(), requests=[req]).accepted[0].centerline[0][0])[:2]
+        return float(np.linalg.norm(first - np.array([1500.0, 1500.0])))
 
-    assert tagged_boxes(0.0) == []          # only the column carries the tag
-    assert len(tagged_boxes(40.0)) >= 1     # first box penetrates → shared
+    assert start_dist(40.0) < start_dist(0.0)   # more overlap → starts closer to the hub centre
 
 
 def test_non_astar_planner_warns_on_terminal_flight():

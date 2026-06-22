@@ -35,7 +35,7 @@ from ..types import (
     TimedPoint,
     as_terminal,
 )
-from ..volumes import corridor_segment_volume, hover_reservation, terminal_for_box, terminal_radius
+from ..volumes import corridor_segment_volume, hover_reservation, terminal_radius
 from . import hexgrid as hg
 from .occupancy import HexOccupancyService
 
@@ -228,10 +228,10 @@ class AStarPlanner:
         return out
 
     def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
-        # Shared-terminal hubs: the hub column is a tagged hover of the terminal's own radius; the
-        # corridor starts/ends at the column edge offset by ``corridor_overlap`` so the first box
-        # penetrates the column by that much (and is tagged transparent to it). Same-hub flights diverge
-        # from the perimeter; outside the column they deconflict strictly.
+        # Shared-terminal hubs: ONLY the hub hover column is tagged shared (sized to the terminal's
+        # radius). The corridor starts/ends at the column edge pulled in by ``corridor_overlap`` so its
+        # first box dips into the column by that much — but corridor boxes stay strict, so they
+        # deconflict against everything (same-hub flights included). Only the column is shared.
         origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
         half = cfg.corridor_width_m / 2.0
         wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
@@ -251,8 +251,7 @@ class AStarPlanner:
         cum_horiz = 0.0
         n_hover = 0
         for (a, ta), (b, tb) in zip(wps, wps[1:]):
-            tid = terminal_for_box(a[:2], b[:2], o_xy, d_xy, origin_term, dest_term, cfg)
-            edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
+            edges.append(corridor_segment_volume(a, ta, b, tb, cfg))   # corridor boxes stay strict
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))
             cum_horiz += horiz

@@ -95,25 +95,6 @@ def terminal_radius(term, cfg: SimConfig) -> float:
     return term.radius if term.radius is not None else cfg.effective_hover_radius_m
 
 
-def terminal_for_box(a_xy, b_xy, origin_xy, dest_xy, origin_term, dest_term, cfg: SimConfig):
-    """The ``terminal_id`` a corridor box inherits if it penetrates a hub's shared column, else None.
-
-    A box is shared (tagged transparent among same-hub flights) iff its centreline comes within
-    ``R + corridor_width/2`` of the hub centre — i.e. the box overlaps the column of radius ``R`` (the
-    terminal's own radius). Whether the *first* box reaches that far is set by the corridor's
-    perimeter-start placement, which encodes ``corridor_overlap``. Terms must be normalized Terminals.
-    """
-    half = cfg.corridor_width_m / 2.0
-    a, b = np.asarray(a_xy, float), np.asarray(b_xy, float)
-    for term, hub in ((origin_term, origin_xy), (dest_term, dest_xy)):
-        if term is None:
-            continue
-        R = terminal_radius(term, cfg)
-        if min(float(np.linalg.norm(a - hub)), float(np.linalg.norm(b - hub))) < R + half:
-            return term.id
-    return None
-
-
 def build_reservation_from_corners(
     corners: list[Vec], origin: Vec, dest: Vec, t_depart: float, g_delay: float, cfg: SimConfig,
     *, origin_term=None, dest_term=None,
@@ -121,10 +102,10 @@ def build_reservation_from_corners(
     """Resample a corner polyline to ≤segment-length boxes, time at nominal speed, assemble.
 
     Shared by the RRT* smoother, the NLP/MILP planners, and the shortcut refiner so they all emit the
-    *same* contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` =
-    ``(hub_id, capacity)`` are given, the hub hover column and the boxes that touch the terminal are
-    tagged so the shared-terminal exemption applies — i.e. an A*-refined plan (astar_shortcut, …)
-    keeps the terminal airspace its inner A* established. Returns (volumes, centerline, horiz, dz).
+    *same* contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are
+    given, only the hub **hover column** is tagged shared (and sized to the terminal's radius) — every
+    corridor box stays strict, so it deconflicts against everything, same-hub flights included, even the
+    bit that dips into the terminal by ``corridor_overlap``. Returns (volumes, centerline, horiz, dz).
     """
     origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
     t = t_depart + g_delay + cfg.climb_time_s
@@ -132,7 +113,6 @@ def build_reservation_from_corners(
     edges: list[Volume4D] = []
     cum_horiz = cum_dz = 0.0
     seg = cfg.corridor_segment_len_m
-    o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
     for a, b in zip(corners, corners[1:]):
         a = np.asarray(a, float)
         b = np.asarray(b, float)
@@ -145,8 +125,7 @@ def build_reservation_from_corners(
             horiz = float(np.linalg.norm((sb - sa)[:2]))
             dz = abs(float(sb[2] - sa[2]))
             t_next = t + max(horiz / cfg.nominal_speed_mps, dz / cfg.climb_rate_mps, 1e-3)
-            tid = terminal_for_box(sa[:2], sb[:2], o_xy, d_xy, origin_term, dest_term, cfg)
-            edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg, terminal_id=tid))
+            edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg))   # corridor boxes stay strict
             centerline.append((sb.copy(), t_next))
             t = t_next
             cum_horiz += horiz

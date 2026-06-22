@@ -144,7 +144,11 @@ def aggregate(result: SimResult) -> dict:
     acc = df[df["accepted"]]
     den = df[df["denied"]]
     horizon_h = cfg.horizon_s / 3600.0
-    region_vol_m3 = cfg.region_size_m[0] * cfg.region_size_m[1] * (cfg.z_max_m - cfg.z_min_m)
+    # Vertical extent of the usable airspace. When the altitude band is collapsed to a single flight
+    # level (z_max == z_min), fall back to the corridor slab height — the vertical footprint a flight
+    # actually occupies at that level — so utilization stays meaningful instead of dividing by zero.
+    vert_extent_m = max(cfg.z_max_m - cfg.z_min_m, cfg.corridor_height_m)
+    region_vol_m3 = cfg.region_size_m[0] * cfg.region_size_m[1] * vert_extent_m
     airspace_capacity_m3_s = region_vol_m3 * cfg.horizon_s
 
     # split real congestion (budget) from the planner's search artifact

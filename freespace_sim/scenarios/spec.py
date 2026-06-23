@@ -32,7 +32,7 @@ class DemandSpec:
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub
-    turnaround_s: float = 120.0            # delay before the return is filed
+    turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
         labels = self.uss or _DEFAULT_HUB_LABELS

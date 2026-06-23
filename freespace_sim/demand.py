@@ -171,7 +171,7 @@ class HubRadiusDemand:
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # first-box penetration into the column; None → cw/2
     return_flights: bool = True                      # each delivery → a return to its origin hub
-    turnaround_s: float = 120.0                      # delay before the return is filed (after est. arrival)
+    turnaround_s: float = 0.0                      # delay before the return is filed (after est. arrival)
     uss_share: dict[str, float] | None = None
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F

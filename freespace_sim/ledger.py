@@ -25,7 +25,7 @@ class ReservationLedger:
         self.cfg = cfg
         self._vols: list[Volume4D] = []
         self._fids: list[int] = []
-        self._aabb: list[tuple[np.ndarray, np.ndarray]] = []
+        self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
         self._buckets: dict[int, list[int]] = {}
         self._observers: list = []   # commit subscribers (publish hook); see subscribe()
 
@@ -48,10 +48,24 @@ class ReservationLedger:
         return seen
 
     @staticmethod
-    def _aabb_miss(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> bool:
-        amin, amax = a
-        bmin, bmax = b
-        return bool(np.any(amax < bmin) or np.any(bmax < amin))
+    def _flat_aabb(vol: Volume4D) -> tuple[float, float, float, float, float, float]:
+        """A volume's world AABB as six plain floats ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
+
+        Flattening once (here, at commit/query time) lets the per-pair overlap prune below run as
+        scalar comparisons. ``np.any`` on the 3-vector form costs ~34x more PER CALL — the arrays are
+        length 3, so the work is dwarfed by numpy's dispatch/alloc/box overhead — and ``_aabb_miss``
+        is the ledger's single hottest line (tens of millions of calls per run)."""
+        lo, hi = vol.aabb()
+        return (float(lo[0]), float(lo[1]), float(lo[2]),
+                float(hi[0]), float(hi[1]), float(hi[2]))
+
+    @staticmethod
+    def _aabb_miss(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
+        """True iff the two flat AABBs are separated on some axis (so they cannot intersect). Scalar
+        equivalent of ``np.any(amax < bmin) or np.any(bmax < amin)`` — see :meth:`_flat_aabb`."""
+        return (a[3] < b[0] or b[3] < a[0]      # x: amax < bmin or bmax < amin
+                or a[4] < b[1] or b[4] < a[1]   # y
+                or a[5] < b[2] or b[5] < a[2])  # z
 
     # ----- writes -----
     def commit(self, flight_id: int, volumes: list[Volume4D]) -> None:
@@ -60,7 +74,7 @@ class ReservationLedger:
             idx = len(self._vols)
             self._vols.append(v)
             self._fids.append(flight_id)
-            self._aabb.append(v.aabb())
+            self._aabb.append(self._flat_aabb(v))
             for s in self._steps(v):
                 self._buckets.setdefault(s, []).append(idx)
         for cb in self._observers:           # publish hook: notify subscribers of the new volumes
@@ -78,7 +92,7 @@ class ReservationLedger:
         """Every committed (flight_id, volume) that conflicts with any of ``volumes``."""
         out: list[tuple[int, Volume4D]] = []
         for v in volumes:
-            vbb = v.aabb()
+            vbb = self._flat_aabb(v)
             for idx in self._candidate_indices(v):
                 if self._aabb_miss(vbb, self._aabb[idx]):
                     continue
@@ -90,7 +104,7 @@ class ReservationLedger:
     def any_conflict(self, volumes: list[Volume4D]) -> bool:
         """Fast feasibility check: True as soon as one committed volume conflicts (planner hot path)."""
         for v in volumes:
-            vbb = v.aabb()
+            vbb = self._flat_aabb(v)
             for idx in self._candidate_indices(v):
                 if self._aabb_miss(vbb, self._aabb[idx]):
                     continue

@@ -101,11 +101,11 @@ def test_demand_hub_radius_builds_with_params():
 
 def test_dallas_large_scenario_uses_radius_pads_returns():
     spec = SCENARIOS["dallas_hub_2uss_large"]
-    assert spec.region_m == (60000.0, 45000.0)
+    assert spec.region_m == (10000.0, 10000.0)
     d = spec.demand_model()
     assert isinstance(d, HubRadiusDemand)
-    assert d.n_hubs_per_uss == {"walmart_uss": 192, "stripmall_uss": 383}
-    assert d.pads_per_hub == 2 and d.return_flights is True
+    assert d.n_hubs_per_uss == {"walmart_uss": 6, "stripmall_uss": 20}
+    assert d.pads_per_hub == 4 and d.return_flights is True
     # generates a two-USS round-trip demand (run at a small λ/horizon so the test stays fast)
     small = with_overrides(spec, lam_per_hour=120.0, horizon_s=300.0)
     reqs = small.demand_model().generate(small.config(), np.random.default_rng(0))

@@ -44,8 +44,17 @@ def _payload(result: SimResult) -> dict:
     hex_available = "astar" in cfg.planner
     from .planner.hexgrid import circumradius
     uss_colors = {uid: uss_swatch_hex(uid, hues) for uid in sorted(hues)}
+    # The replay clock must span the LAST volume to clear, not just the demand horizon: return flights
+    # are scheduled after their delivery + turnaround, so they fly well past cfg.horizon_s and would be
+    # clipped off the right edge of the slider otherwise. For return-free runs this stays == horizon_s.
+    play_end = cfg.horizon_s
+    for f in flights:
+        for seg in f["boxes"]:
+            play_end = max(play_end, seg["t1"])
+        for seg in f["cyls"]:
+            play_end = max(play_end, seg["t1"])
     return {
-        "horizon": cfg.horizon_s,
+        "horizon": play_end,
         "dt": cfg.dt_s,
         "region": list(cfg.region_size_m),
         "flights": flights,
@@ -63,7 +72,7 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
  canvas{{background:#161b22;border:1px solid #30363d;border-radius:6px}}
  #bar{{display:flex;align-items:center;gap:8px;width:760px;flex-wrap:wrap}}
  #bar input[type=range]{{flex:1;min-width:240px}}
- button{{background:#21262d;color:#d7dde3;border:1px solid #30363d;border-radius:5px;
+ button,select{{background:#21262d;color:#d7dde3;border:1px solid #30363d;border-radius:5px;
         padding:5px 10px;cursor:pointer}}
  #t{{font-variant-numeric:tabular-nums;min-width:120px}}
  label.tog{{display:flex;align-items:center;gap:5px;font-size:13px;color:#8b949e;cursor:pointer}}
@@ -77,6 +86,15 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
   <button id="fwd" title="step forward one timestep">⏭</button>
   <input id="slider" type="range" min="0" max="{horizon}" value="0" step="1">
   <span id="t">t = 0 s</span>
+  <label class="tog" for="speed">speed
+   <select id="speed" title="playback speed">
+    <option value="0.25">0.25&times;</option>
+    <option value="0.5">0.5&times;</option>
+    <option value="1" selected>1&times;</option>
+    <option value="2">2&times;</option>
+    <option value="4">4&times;</option>
+    <option value="8">8&times;</option>
+   </select></label>
   <label class="tog" id="hexWrap"><input type="checkbox" id="hexToggle"> hex grid (A*)</label>
   <span id="legend" style="display:flex;gap:10px;flex-wrap:wrap"></span>
  </div>
@@ -138,19 +156,24 @@ function draw(t){{
   }}
   document.getElementById('t').textContent = 't = '+Math.round(t)+' s  ('+nActive+' active)';
 }}
-const slider=document.getElementById('slider'); slider.oninput=()=>draw(+slider.value);
+const slider=document.getElementById('slider');
+slider.oninput=()=>{{ clock=+slider.value; draw(clock); }};   // scrubbing re-seats the play clock
 function step(d){{ playing=false; document.getElementById('play').textContent='▶ play';
   let t=Math.max(0, Math.min(DATA.horizon, +slider.value + d));
-  slider.value=t; draw(t); }}
+  clock=t; slider.value=t; draw(t); }}
 document.getElementById('back').onclick=()=>step(-DATA.dt);   // one timestep back
 document.getElementById('fwd').onclick=()=>step(+DATA.dt);    // one timestep forward
 document.getElementById('hexToggle').onchange=()=>draw(+slider.value);
 if(!DATA.hex_available) document.getElementById('hexWrap').style.display='none';
-let playing=false, raf=null;
-function tick(){{ if(!playing) return; let t=+slider.value + DATA.horizon/600;
-  if(t>DATA.horizon) t=0; slider.value=t; draw(t); raf=requestAnimationFrame(tick); }}
+let playing=false, raf=null, speed=1, clock=0;
+document.getElementById('speed').onchange=function(){{ speed=+this.value; }};
+// the play position is a FLOAT clock, not the slider value — the range input snaps to step=1, so it
+// cannot hold sub-unit advances and speeds < 1 would round away. At 1x the full horizon plays in ~10s
+// (60fps · horizon/600 per frame); speed scales that per-frame step (0.25x ⇒ 40s, 8x ⇒ ~1.25s).
+function tick(){{ if(!playing) return; clock += speed*DATA.horizon/600;
+  if(clock>DATA.horizon) clock=0; slider.value=clock; draw(clock); raf=requestAnimationFrame(tick); }}
 document.getElementById('play').onclick=function(){{ playing=!playing;
-  this.textContent = playing?'⏸ pause':'▶ play'; if(playing) tick(); }};
+  this.textContent = playing?'⏸ pause':'▶ play'; if(playing){{ clock=+slider.value; tick(); }} }};
 // keyboard: ← / → step one timestep, space toggles play
 document.addEventListener('keydown', e=>{{
   if(e.key==='ArrowLeft') step(-DATA.dt);

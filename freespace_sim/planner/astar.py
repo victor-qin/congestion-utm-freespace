@@ -151,7 +151,7 @@ class AStarPlanner:
 
         oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
-        goal_c = hg.hex_center(gq, grr, R)
+        gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr   # goal hex centre, as scalars
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
 
         # Incremental hex-occupancy service: holds the blocked (corridor footprint) and pad (wider
@@ -176,14 +176,18 @@ class AStarPlanner:
         o_fp = _column_cells(origin, terminal_radius(o_term, cfg), R) if o_term else None
         d_fp = _column_cells(dest, terminal_radius(d_term, cfg), R) if d_term else None
 
-        # admissible heuristic: straight dash at c_lat + the mandatory descent still to come
-        def h_air(q, r):
-            d = float(np.linalg.norm(hg.hex_center(q, r, R) - goal_c))
-            return cfg.cost_air_lateral_per_m * d + climb_cost
+        # admissible heuristic: straight dash at c_lat + the mandatory descent still to come.
+        # h_air is evaluated for EVERY generated neighbour (the search hot path), so the hex centre is
+        # computed inline as scalars and the distance via math.sqrt(dx*dx+dy*dy) — bit-for-bit the same
+        # value np.linalg.norm returns for a length-2 vector, but ~19x cheaper (no array alloc / ufunc).
+        sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
 
-        h_ground = cfg.cost_air_lateral_per_m * float(
-            np.linalg.norm(hg.hex_center(oq, orr, R) - goal_c)
-        ) + 2.0 * climb_cost
+        def h_air(q, r):
+            dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
+            return c_lat * math.sqrt(dx * dx + dy * dy) + climb_cost
+
+        dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
+        h_ground = c_lat * math.sqrt(dx0 * dx0 + dy0 * dy0) + 2.0 * climb_cost
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6

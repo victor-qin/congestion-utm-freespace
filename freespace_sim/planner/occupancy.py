@@ -72,12 +72,16 @@ class HexOccupancyService:
         *foreign* corridors inside any hub's column for a launch to detect and wait out (see pad_clear).
         """
         tid = vol.terminal_id
+        # Only a tagged *column* (hover cylinder) feeds the per-hub dwell counter; a tagged *corridor*
+        # box (an in-terminal exit lane) is still a corridor — it goes to blocked/pad like any other,
+        # so it is never miscounted as a pad dwell. ("column ⟺ cylinder"; stored kind is issue #11.)
+        is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         for q, r, s, in_blk in hg.rasterize_volume_dual(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if self.evicted_before is not None and s < self.evicted_before:
                 continue                 # guard: never resurrect an already-evicted past step
-            if tid is None:
+            if not is_column:
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue             # the committing flight's own terminal interior — unreserved
                 self.pad.setdefault(s, set()).add((q, r))

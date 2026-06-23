@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcl
 
+from .geometry import CylinderSpec
 from .volumes import Volume4D
 
 
@@ -17,13 +18,16 @@ def volumes_conflict(a: Volume4D, b: Volume4D, *, security_margin: float = 0.0) 
     ``security_margin`` (metres) optionally requires the shapes to be that far *apart* rather than
     merely non-overlapping — a clean place to encode safety beyond the corridor buffer.
 
-    **Shared-terminal exemption:** two volumes carrying the same non-None ``terminal_id`` belong to
-    the same vertiport terminal and are *mutually transparent* — a multi-pad hub's own flights share
-    its airspace column (pad capacity is bounded tactically, not here). Everything else, including a
-    cruise corridor (``terminal_id=None``) versus a terminal, conflicts as usual, so the column still
-    blocks overflight. This is the one documented exception to the strict no-overlap invariant.
+    **Shared-terminal exemption (column-involved).** Two volumes at the same vertiport (same non-None
+    ``terminal_id``) are mutually transparent *only when a column is involved* — i.e. at least one is a
+    hover cylinder (``CylinderSpec``). So a flight's exit-lane corridor passing through its own hub's
+    shared column does not conflict, but two same-hub *corridor* boxes (``BoxSpec`` vs ``BoxSpec``)
+    still conflict — same-direction launches contend. A cruise corridor (``terminal_id=None``) or a
+    different hub conflicts as usual, so a busy column still blocks overflight. Here "column ⟺ cylinder,
+    corridor ⟺ box" is derived from shape; a stored ``kind`` is the full version (see GitHub issue #11).
     """
-    if a.terminal_id is not None and a.terminal_id == b.terminal_id:
+    if (a.terminal_id is not None and a.terminal_id == b.terminal_id
+            and (isinstance(a.shape, CylinderSpec) or isinstance(b.shape, CylinderSpec))):
         return False
     if not (a.t_start < b.t_end and b.t_start < a.t_end):   # 1) time-window overlap
         return False

@@ -333,8 +333,14 @@ class AStarPlanner:
         centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]
         cum_horiz = 0.0
         n_hover = 0
-        for (a, ta), (b, tb) in zip(wps, wps[1:]):
-            edges.append(corridor_segment_volume(a, ta, b, tb, cfg))   # corridor boxes stay strict
+        n_seg = len(wps) - 1
+        for i, ((a, ta), (b, tb)) in enumerate(zip(wps, wps[1:])):
+            # Tag the FIRST/LAST (in-terminal exit-lane / approach) box with its hub, so the
+            # column-involved exemption lets it pass through that hub's own shared column. Cruise
+            # boxes stay untagged; box↔box at the same hub still conflicts (same-dir launches contend).
+            tid = (origin_term.id if (i == 0 and origin_term is not None)
+                   else dest_term.id if (i == n_seg - 1 and dest_term is not None) else None)
+            edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))
             cum_horiz += horiz

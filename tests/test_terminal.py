@@ -94,16 +94,19 @@ def test_terminal_radius_sizes_the_column():
     assert abs(cyl.shape.radius - 200.0) < 1e-6
 
 
-def test_only_the_column_is_shared_corridors_strict():
-    # ONLY the hover column is tagged shared; every corridor box stays strict (conflicts with all,
-    # including same-hub flights), even the bit that dips into the terminal by corridor_overlap
+def test_column_and_exit_lane_box_are_tagged_cruise_is_not():
+    # the hub column (cylinder) AND the in-terminal exit-lane box (first corridor box) carry the hub
+    # tag; cruise boxes stay untagged. The column-involved exemption (conflict.py) then lets the
+    # exit-lane box pass through its own column while two same-hub boxes still conflict.
     req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
                         origin_terminal=Terminal("H", 4, corridor_overlap=40.0))
     res = run(_astar(), requests=[req])
     vols = res.accepted[0].volumes
-    tagged = [v for v in vols if v.terminal_id == "H"]
-    assert tagged and all(isinstance(v.shape, CylinderSpec) for v in tagged)         # only column(s)
-    assert all(v.terminal_id is None for v in vols if isinstance(v.shape, BoxSpec))  # boxes strict
+    tagged_cyl = [v for v in vols if v.terminal_id == "H" and isinstance(v.shape, CylinderSpec)]
+    tagged_box = [v for v in vols if v.terminal_id == "H" and isinstance(v.shape, BoxSpec)]
+    assert tagged_cyl                                       # the shared column is tagged
+    assert tagged_box                                       # the exit-lane box is now tagged too
+    assert any(v.terminal_id is None for v in vols if isinstance(v.shape, BoxSpec))   # cruise boxes are not
 
 
 def test_corridor_overlap_controls_perimeter_start():

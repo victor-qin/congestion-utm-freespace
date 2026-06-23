@@ -64,13 +64,13 @@ class Terminal(NamedTuple):
     """A multi-pad vertiport endpoint a flight uses (origin for a takeoff, dest for a landing).
 
     Vertiport infrastructure travels with the terminal, not in global config:
-    - ``radius`` — the shared terminal column size; ``None`` ⇒ the hover footprint
-      (``cfg.effective_hover_radius_m``) is used when the geometry is built.
-    - ``corridor_overlap`` — how far the reserved exit lane is pulled back IN toward the column.
-      ``None``/``0`` (default) ⇒ the lane keeps a ``cfg.corridor_width_m / 2`` clearance OUTSIDE the
-      column edge, which is what lets same-hub launches stay concurrent. Raising it shrinks the gap;
-      at ``w/2`` the gap is 0 but the strict corridor then touches siblings' (shared) columns and
-      CONFLICTS — collapsing same-hub concurrency. So 0 is the default, not ``w/2``. See ``_exit_radius``.
+    - ``radius`` — the shared terminal column size; ``None`` ⇒ ``cfg.terminal_radius_m`` (90 m default),
+      wide enough that divergent same-hub exit lanes don't crowd at the edge when flush.
+    - ``corridor_overlap`` — how far the reserved exit lane overlaps INTO the column (inner edge =
+      ``R − overlap``). ``None``/``0`` (default) ⇒ the lane starts FLUSH with the column edge; the
+      column-involved exemption (``conflict.volumes_conflict``) keeps the tagged exit-lane box
+      conflict-free with same-hub columns, while two same-hub corridors still contend. ``> 0`` penetrates
+      the column; ``< 0`` leaves a clearance gap outside it. See ``planner.astar._exit_radius``.
 
     Both are set when hubs are created (the demand model), so a big-box hub and a small pad can differ
     and a non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).

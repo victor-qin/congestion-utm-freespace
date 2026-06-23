@@ -30,7 +30,7 @@ class DemandSpec:
     radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS dict)
     pads_per_hub: int = 1                  # terminal capacity N per hub
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
-    corridor_overlap_m: "float | None" = None        # pulls exit lane toward column; None/0 → keep w/2 gap
+    corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 120.0            # delay before the return is filed
 

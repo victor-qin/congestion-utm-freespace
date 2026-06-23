@@ -91,8 +91,8 @@ def build_corridor(centerline: list[TimedPoint], cfg: SimConfig) -> list[Volume4
 
 
 def terminal_radius(term, cfg: SimConfig) -> float:
-    """A terminal's column radius — its own ``radius`` if set, else the hover footprint."""
-    return term.radius if term.radius is not None else cfg.effective_hover_radius_m
+    """A terminal's column radius — its own ``radius`` if set, else ``cfg.terminal_radius_m`` (90 m)."""
+    return term.radius if term.radius is not None else cfg.terminal_radius_m
 
 
 def build_reservation_from_corners(
@@ -103,9 +103,10 @@ def build_reservation_from_corners(
 
     Shared by the RRT* smoother, the NLP/MILP planners, and the shortcut refiner so they all emit the
     *same* contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are
-    given, only the hub **hover column** is tagged shared (and sized to the terminal's radius) — every
-    corridor box stays strict, so it deconflicts against everything, same-hub flights included, even the
-    bit that dips into the terminal by ``corridor_overlap``. Returns (volumes, centerline, horiz, dz).
+    given, the hub **hover column** is tagged shared (sized to the terminal's radius) AND the in-terminal
+    **exit-lane** box (first/last) is tagged with the hub, so the column-involved exemption lets it pass
+    through that column at zero gap; all other corridor boxes stay strict (untagged). Returns
+    (volumes, centerline, horiz, dz).
     """
     origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
     t = t_depart + g_delay + cfg.climb_time_s
@@ -125,21 +126,32 @@ def build_reservation_from_corners(
             horiz = float(np.linalg.norm((sb - sa)[:2]))
             dz = abs(float(sb[2] - sa[2]))
             t_next = t + max(horiz / cfg.nominal_speed_mps, dz / cfg.climb_rate_mps, 1e-3)
-            edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg))   # corridor boxes stay strict
+            edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg))
             centerline.append((sb.copy(), t_next))
             t = t_next
             cum_horiz += horiz
             cum_dz += dz
+    # Tag the exit-lane / approach box (first/last) with its hub so the column-involved exemption applies
+    # (the refiner rebuilds from already-folded corners, so corners[0]/[-1] sit at the column edge).
+    if edges and origin_term is not None:
+        edges[0] = _retag(edges[0], origin_term.id)
+    if edges and dest_term is not None:
+        edges[-1] = _retag(edges[-1], dest_term.id)
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,
-                          radius=origin_term.radius if origin_term else None),
+                          radius=terminal_radius(origin_term, cfg) if origin_term else None),
         *edges,
         hover_reservation(dest, t, cfg,
                           terminal_id=dest_term.id if dest_term else None,
-                          radius=dest_term.radius if dest_term else None),
+                          radius=terminal_radius(dest_term, cfg) if dest_term else None),
     ]
     return volumes, centerline, cum_horiz, cum_dz
+
+
+def _retag(vol: Volume4D, terminal_id) -> Volume4D:
+    """Return a copy of ``vol`` with its ``terminal_id`` set (Volume4D is frozen)."""
+    return Volume4D(vol.shape, vol.t_start, vol.t_end, terminal_id=terminal_id)
 
 
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,

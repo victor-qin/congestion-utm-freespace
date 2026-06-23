@@ -305,24 +305,14 @@ class AStarPlanner:
         speed = cfg.nominal_speed_mps
 
         def _exit_radius(term):
-            # The reserved exit lane starts a clear ``corridor_width`` beyond the column edge so its
-            # back-extended first box stays OUTSIDE any sibling's column. The column-edge→lane gap
-            # (default ``w/2`` = 30 m) is the unreserved tactical zone; ``corridor_overlap`` pulls the
-            # lane back in toward the column.
-            #
-            # WARNING — the gap is a DECONFLICTION REQUIREMENT, not cosmetic. The exit lane is a *strict*
-            # (untagged) corridor; a sibling's column is *shared* (tagged). Different tags ⇒ they conflict
-            # if they touch. Inner edge = R + w/2 − overlap, so:
-            #   overlap = 0    (default) → inner edge at R + w/2  → 30 m clearance, same-hub launches CONCURRENT.
-            #   overlap = w/2           → inner edge at R          → ZERO gap, but the strict corridor now
-            #                                                        touches siblings' columns → CONFLICTS →
-            #                                                        same-hub concurrency collapses (measured a
-            #                                                        divergent fan drop 4/4 → 2/4 accepted).
-            # So the default is 0 (keep the clearance), NOT w/2. Zero separation + N-concurrent launches are
-            # mutually exclusive under the strict-corridor model — to get both you must make the in-terminal
-            # corridor segment shared (tag it + a column-only exemption). See GitHub issue #10.
+            # Inner edge = R − overlap, so the exit lane starts FLUSH with the column edge by default
+            # (corridor_overlap = 0). The exit-lane box is tagged with the hub, and the column-involved
+            # exemption (conflict.volumes_conflict) makes it transparent to same-hub COLUMNS — so flush is
+            # conflict-free vs columns. Two same-hub *corridor* boxes still contend (box↔box stays strict),
+            # so divergent lanes need the column wide enough not to crowd: cfg.terminal_radius_m defaults
+            # to 90 m for exactly this. overlap>0 penetrates the column; overlap<0 leaves a gap. (Issue #10.)
             ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
-            return terminal_radius(term, cfg) + cfg.corridor_width_m - ov
+            return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
 
         if origin_term is not None and len(wps) >= 2:
             wps = _fold_head_into_column(wps, o_xy, _exit_radius(origin_term), speed)
@@ -351,10 +341,10 @@ class AStarPlanner:
         volumes = [
             hover_reservation(origin, t_takeoff, cfg,
                               terminal_id=origin_term.id if origin_term else None,
-                              radius=origin_term.radius if origin_term else None),
+                              radius=terminal_radius(origin_term, cfg) if origin_term else None),
             *edges,
             hover_reservation(dest, t_arrive, cfg,
                               terminal_id=dest_term.id if dest_term else None,
-                              radius=dest_term.radius if dest_term else None),
+                              radius=terminal_radius(dest_term, cfg) if dest_term else None),
         ]
         return volumes, centerline, cum_horiz, n_hover

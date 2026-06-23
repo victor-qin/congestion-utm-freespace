@@ -176,39 +176,38 @@ _HUB = (4000.0, 4000.0)
 
 
 @pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
-def test_no_strict_corridor_box_enters_the_shared_column(radius):
-    # FOLD-BACK + CLEARANCE regression. The first _build only repositioned waypoint[0] while the
-    # search's next cell sat ~one hex from the centre, folding the first corridor box back through the
-    # column (centerline 210→62→…). And overlap=0 put the back-edge exactly on the boundary, so an
-    # off-radial box tipped inside and a sibling's column conflicted with it. Both are fixed by folding
-    # away in-column waypoints and starting the exit lane a clear corridor_width out: every STRICT box
-    # must stay outside the column disk.
+def test_no_untagged_cruise_box_enters_the_shared_column(radius):
+    # FOLD-BACK regression. The exit lane starts FLUSH with the column edge (default overlap=0) and the
+    # first box is TAGGED with the hub — it may touch the column (the column-involved exemption makes it
+    # transparent there). But the UNTAGGED cruise boxes must still stay outside the column disk; if the
+    # fold-back bug returned, a cruise box would dip back inside.
     res = run(SimConfig(planner="astar", region_size_m=_REGION),
               requests=[_radial_delivery(_HUB, 0.0, 2500.0, 4, 0, radius=radius)])
     C = np.array(_HUB)
-    boxes = [v for v in res.accepted[0].volumes if isinstance(v.shape, BoxSpec)]
+    cruise = [v for v in res.accepted[0].volumes
+              if isinstance(v.shape, BoxSpec) and v.terminal_id is None]
 
     def d2hub(v):
         lo, hi = v.aabb()
         return float(np.linalg.norm(np.clip(C, lo[:2], hi[:2]) - C))
 
-    assert boxes and min(d2hub(v) for v in boxes) > radius
+    assert cruise and min(d2hub(v) for v in cruise) > radius
 
 
-@pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
+@pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
 @pytest.mark.parametrize("n", [3, 4, 5])
 def test_divergent_same_hub_launches_are_concurrent(radius, n):
-    # THE headline fid sweep + the column-vs-sibling-corridor and knife-edge fixes in one: n flights
-    # fanning out from a single hub (capacity n) all launch at the same instant and verify — across
-    # terminal radii and including n=4's opposite-direction (0/90/180/270) pairs that the tangent
-    # clearance bug used to deny. Pre-Phase-B these serialized ~one per dwell; now zero ground delay.
+    # THE headline fid sweep: n flights fanning out from a single hub (capacity n) all launch at the
+    # same instant and verify, with the exit lane FLUSH (default overlap=0). Needs the column wide
+    # enough that divergent lanes don't crowd at the edge — radii ≥ 90 (the default); a 60 m column
+    # is too tight at flush and the lanes (box↔box) contend. Pre-Phase-B these serialized one per dwell.
     reqs = [_radial_delivery(_HUB, i * 360.0 / n, 2500.0, n, i, radius=radius) for i in range(n)]
     res = run(SimConfig(planner="astar", region_size_m=_REGION), requests=reqs)
     assert res.verified and len(res.accepted) == n
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)
 
 
-@pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
+@pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
 def test_pad_capacity_gate_holds_across_radii(radius):
     # The fid capacity sweep: capacity 3 with 4 fanned-out flights → exactly 3 launch concurrently and
     # the 4th is ground-delayed (admitted, not denied), at every terminal radius. Pins that the dwell

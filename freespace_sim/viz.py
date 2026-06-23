@@ -149,11 +149,12 @@ def congestion_heatmap(result: SimResult, out=None, bins: int = 60):
 
 
 def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distribution",
-                    xlabel="total delay (s)", unit=" s"):
+                    xlabel="total delay (s)", unit=" s", meanfmt=".0f"):
     """Histogram of delay — how many flights suffered how much congestion lateness.
 
-    ``xlabel``/``unit`` let the same plotter serve both absolute seconds and the percent-of-trip
-    flavour (see :func:`delay_pct_histogram`). NaN (denied) flights are dropped.
+    ``xlabel``/``unit``/``meanfmt`` let the same plotter serve absolute seconds, the percent-of-trip
+    flavour (see :func:`delay_pct_histogram`), and the unbounded trip-time-inflation ratio (see
+    :func:`trip_ratio_histogram`). NaN (denied) flights are dropped.
     """
     vals = np.asarray([v for v in values if v == v], float)  # drop NaN (denied) flights
     own = ax is None
@@ -161,7 +162,7 @@ def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distributio
         _, ax = plt.subplots(figsize=(7, 4.5))
     ax.hist(vals, bins=bins, color="#2563eb", edgecolor="white", linewidth=0.5)
     mean = float(vals.mean()) if len(vals) else 0.0
-    ax.axvline(mean, color="#dc2626", linestyle="--", lw=1.2, label=f"mean = {mean:.0f}{unit}")
+    ax.axvline(mean, color="#dc2626", linestyle="--", lw=1.2, label=f"mean = {mean:{meanfmt}}{unit}")
     ax.set_title(f"{title}   (n={len(vals)})")
     ax.set_xlabel(xlabel)
     ax.set_ylabel("flights")
@@ -216,6 +217,15 @@ def delay_pct_histogram(values, out=None, title="Delay as % of flight time"):
     """Histogram of delay as a percentage of total trip time (bounded [0, 100))."""
     return delay_histogram(values, out=out, title=title, bins=np.linspace(0, 100, 21),
                            xlabel="delay (% of flight time)", unit="%")
+
+
+def trip_ratio_histogram(values, out=None, title="Trip-time inflation"):
+    """Histogram of (straight-line flight time + delay) / straight-line flight time — the trip-time
+    inflation factor. Unbounded (≥ 1): 1.0 = flew the ideal with no wait, 2.0 = took twice as long.
+    The unbounded complement of :func:`delay_pct_histogram` (auto-ranged so the tail is visible)."""
+    return delay_histogram(values, out=out, title=title, bins=25,
+                           xlabel="trip time ÷ straight-line time  (≥ 1, unbounded)", unit="×",
+                           meanfmt=".2f")
 
 
 def delay_pct_histograms_by_lambda(per_flight_df, out=None):

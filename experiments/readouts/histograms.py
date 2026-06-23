@@ -54,9 +54,15 @@ def main() -> None:
                         title=f"Total delay{lam_title}")
     viz.delay_pct_histogram(acc["delay_pct"].dropna(), out=out / f"{prefix}delay_pct_hist.png",
                             title=f"Delay % of trip{lam_title}")
+    # trip-time inflation = (straight-line time + delay) / straight-line time (≥ 1, unbounded). Newer
+    # runs store it directly; for older flights.parquet derive it from delay_pct (== 100/(100-pct)).
+    ratio = (acc["trip_time_ratio"] if "trip_time_ratio" in acc.columns
+             else 100.0 / (100.0 - acc["delay_pct"])).dropna()
+    viz.trip_ratio_histogram(ratio, out=out / f"{prefix}trip_ratio_hist.png",
+                             title=f"Trip-time inflation{lam_title}")
     viz.delay_sources(acc, out=out / f"{prefix}delay_sources.png", by=None)
-    print(f"wrote {prefix}delay_hist.png + {prefix}delay_pct_hist.png + {prefix}delay_sources.png "
-          f"to {out}/  ({len(acc)} accepted flights)")
+    print(f"wrote {prefix}delay_hist.png + {prefix}delay_pct_hist.png + {prefix}trip_ratio_hist.png "
+          f"+ {prefix}delay_sources.png to {out}/  ({len(acc)} accepted flights)")
 
 
 if __name__ == "__main__":

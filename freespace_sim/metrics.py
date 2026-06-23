@@ -102,6 +102,10 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
     # delay as a fraction of the actual trip time — bounded [0, 100), comparable across trip lengths
     nominal = nominal_flight_time_s(straight, cfg)
     delay_pct = (100.0 * td / (nominal + td)) if (intent.accepted and nominal + td > 0) else float("nan")
+    # trip-time inflation: actual trip time (straight-line flight time + all delay) ÷ the ideal
+    # straight-line time. ≥ 1, UNBOUNDED — 1.0 = flew the ideal with no wait, 2.0 = took twice as long.
+    # The unbounded complement of delay_pct: trip_time_ratio == 100 / (100 - delay_pct).
+    trip_time_ratio = ((nominal + td) / nominal) if (intent.accepted and nominal > 1e-9) else float("nan")
     return {
         "flight_id": intent.request.flight_id,
         "uss_id": intent.request.uss_id,
@@ -119,6 +123,7 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
         "altitude_change_m": intent.altitude_change_m,
         "total_delay_s": td,                      # unified congestion lateness (s)
         "delay_pct": delay_pct,                    # ... as % of the flight's total trip time
+        "trip_time_ratio": trip_time_ratio,        # (straight-line time + delay) / straight-line time
         "cost": intent.cost,
         "solve_time_s": intent.solve_time_s,   # planner wall time for this flight
         "straight_line_m": straight,

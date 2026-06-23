@@ -66,9 +66,11 @@ class Terminal(NamedTuple):
     Vertiport infrastructure travels with the terminal, not in global config:
     - ``radius`` — the shared terminal column size; ``None`` ⇒ the hover footprint
       (``cfg.effective_hover_radius_m``) is used when the geometry is built.
-    - ``corridor_overlap`` — how far the first corridor box penetrates the column (and is shared with
-      same-hub flights); ``None`` ⇒ ``cfg.corridor_width_m / 2``, the natural contiguity overlap. 0 ⇒
-      corridors stay strictly outside the terminal.
+    - ``corridor_overlap`` — how far the reserved exit lane is pulled back IN toward the column.
+      ``None``/``0`` (default) ⇒ the lane keeps a ``cfg.corridor_width_m / 2`` clearance OUTSIDE the
+      column edge, which is what lets same-hub launches stay concurrent. Raising it shrinks the gap;
+      at ``w/2`` the gap is 0 but the strict corridor then touches siblings' (shared) columns and
+      CONFLICTS — collapsing same-hub concurrency. So 0 is the default, not ``w/2``. See ``_exit_radius``.
 
     Both are set when hubs are created (the demand model), so a big-box hub and a small pad can differ
     and a non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).

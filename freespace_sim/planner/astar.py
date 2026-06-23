@@ -306,9 +306,21 @@ class AStarPlanner:
 
         def _exit_radius(term):
             # The reserved exit lane starts a clear ``corridor_width`` beyond the column edge so its
-            # back-extended first box stays OUTSIDE any sibling's column (a strict corridor touching a
-            # shared column would conflict). The column-edge→lane gap is the unreserved tactical zone;
-            # ``corridor_overlap`` pulls the lane back in toward the column if a scenario wants it.
+            # back-extended first box stays OUTSIDE any sibling's column. The column-edge→lane gap
+            # (default ``w/2`` = 30 m) is the unreserved tactical zone; ``corridor_overlap`` pulls the
+            # lane back in toward the column.
+            #
+            # WARNING — the gap is a DECONFLICTION REQUIREMENT, not cosmetic. The exit lane is a *strict*
+            # (untagged) corridor; a sibling's column is *shared* (tagged). Different tags ⇒ they conflict
+            # if they touch. Inner edge = R + w/2 − overlap, so:
+            #   overlap = 0    (default) → inner edge at R + w/2  → 30 m clearance, same-hub launches CONCURRENT.
+            #   overlap = w/2           → inner edge at R          → ZERO gap, but the strict corridor now
+            #                                                        touches siblings' columns → CONFLICTS →
+            #                                                        same-hub concurrency collapses (measured a
+            #                                                        divergent fan drop 4/4 → 2/4 accepted).
+            # So the default is 0 (keep the clearance), NOT w/2. Zero separation + N-concurrent launches are
+            # mutually exclusive under the strict-corridor model — to get both you must make the in-terminal
+            # corridor segment shared (tag it + a column-only exemption). See GitHub issue on this trade-off.
             ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
             return terminal_radius(term, cfg) + cfg.corridor_width_m - ov
 

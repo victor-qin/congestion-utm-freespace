@@ -5,6 +5,10 @@ boxes are allowed to overlap — ASTM contiguity). We re-derive this independent
 by replaying accepted intents in FCFS order into a fresh ledger and asserting each one is clear
 against everything committed before it. That checks every inter-flight pair exactly once and will
 catch any bug in a planner's build-then-check discipline.
+
+One documented exception: volumes sharing a ``terminal_id`` (a multi-pad vertiport's shared terminal
+airspace) are mutually transparent — this is enforced uniformly inside ``conflict.volumes_conflict``,
+which both the live ledger and this replay route through, so no special-casing is needed here.
 """
 
 from __future__ import annotations

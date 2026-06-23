@@ -102,6 +102,10 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
     # delay as a fraction of the actual trip time — bounded [0, 100), comparable across trip lengths
     nominal = nominal_flight_time_s(straight, cfg)
     delay_pct = (100.0 * td / (nominal + td)) if (intent.accepted and nominal + td > 0) else float("nan")
+    # trip-time inflation: actual trip time (straight-line flight time + all delay) ÷ the ideal
+    # straight-line time. ≥ 1, UNBOUNDED — 1.0 = flew the ideal with no wait, 2.0 = took twice as long.
+    # The unbounded complement of delay_pct: trip_time_ratio == 100 / (100 - delay_pct).
+    trip_time_ratio = ((nominal + td) / nominal) if (intent.accepted and nominal > 1e-9) else float("nan")
     return {
         "flight_id": intent.request.flight_id,
         "uss_id": intent.request.uss_id,
@@ -119,6 +123,7 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
         "altitude_change_m": intent.altitude_change_m,
         "total_delay_s": td,                      # unified congestion lateness (s)
         "delay_pct": delay_pct,                    # ... as % of the flight's total trip time
+        "trip_time_ratio": trip_time_ratio,        # (straight-line time + delay) / straight-line time
         "cost": intent.cost,
         "solve_time_s": intent.solve_time_s,   # planner wall time for this flight
         "straight_line_m": straight,
@@ -137,10 +142,11 @@ def _q(series: pd.Series, q: float) -> float:
     return float(series.quantile(q)) if len(series) else 0.0
 
 
-def aggregate(result: SimResult) -> dict:
-    """Flat headline rollup for one run — the row a λ-sweep collects."""
-    cfg = result.config
-    df = flight_frame(result)
+def _rollup(df: pd.DataFrame, cfg: SimConfig) -> dict:
+    """Group-level rollup of a (sub)frame of flight rows — shared by ``aggregate`` (the whole run)
+    and ``per_uss_frame`` (one operator's slice). Denominators (horizon, region capacity) are the
+    *run's*, so a per-USS ``airspace_utilization`` reads as that operator's share of the whole sky.
+    """
     acc = df[df["accepted"]]
     den = df[df["denied"]]
     horizon_h = cfg.horizon_s / 3600.0
@@ -150,21 +156,14 @@ def aggregate(result: SimResult) -> dict:
     vert_extent_m = max(cfg.z_max_m - cfg.z_min_m, cfg.corridor_height_m)
     region_vol_m3 = cfg.region_size_m[0] * cfg.region_size_m[1] * vert_extent_m
     airspace_capacity_m3_s = region_vol_m3 * cfg.horizon_s
-
     # split real congestion (budget) from the planner's search artifact
-    by_reason = den["denial_reason"].value_counts().to_dict() if len(den) else {}
-    n_budget = int(by_reason.get(DenialReason.BUDGET_EXCEEDED.value, 0))
-
+    n_budget = int((den["denial_reason"] == DenialReason.BUDGET_EXCEEDED.value).sum()) if len(den) else 0
     return {
-        "lam_per_hour": cfg.lam_per_hour,
-        "seed": cfg.seed,
-        "planner": cfg.planner,
         "n_requests": len(df),
         "n_accepted": int(len(acc)),
         "n_denied": int(len(den)),
         "denial_rate": len(den) / max(1, len(df)),
         "congestion_denial_rate": n_budget / max(1, len(df)),  # budget-only (real congestion)
-        "denials_by_reason": by_reason,
         "offered_load_per_h": len(df) / max(horizon_h, 1e-9),
         "throughput_per_h": len(acc) / max(horizon_h, 1e-9),
         "mean_ground_delay_s": float(acc["ground_delay_s"].mean()) if len(acc) else 0.0,
@@ -185,5 +184,54 @@ def aggregate(result: SimResult) -> dict:
         "total_solve_time_s": float(df["solve_time_s"].sum()),
         "reserved_vol_m3_s": float(df["reserved_vol_m3_s"].sum()),
         "airspace_utilization": float(df["reserved_vol_m3_s"].sum()) / max(airspace_capacity_m3_s, 1e-9),
+    }
+
+
+def _per_uss_table(df: pd.DataFrame, cfg: SimConfig) -> pd.DataFrame:
+    total_acc = int(df["accepted"].sum()) if len(df) else 0
+    rows = []
+    for uss_id, g in df.groupby("uss_id", sort=True):
+        acc = g[g["accepted"]]
+        rows.append({
+            "uss_id": uss_id,
+            **_rollup(g, cfg),
+            # per-USS-only: flight length (confirms hub-demand shortening) + share of the throughput
+            "mean_straight_line_m": float(acc["straight_line_m"].mean()) if len(acc) else 0.0,
+            "share_of_accepted": (len(acc) / total_acc) if total_acc else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def per_uss_frame(result: SimResult) -> pd.DataFrame:
+    """One metrics row per USS — the per-operator slice of a (multi-)USS run. Each row's counts and
+    reserved volume sum to the overall ``aggregate`` totals (see tests)."""
+    return _per_uss_table(flight_frame(result), result.config)
+
+
+def aggregate(result: SimResult) -> dict:
+    """Flat headline rollup for one run — the row a λ-sweep collects."""
+    cfg = result.config
+    df = flight_frame(result)
+    den = df[df["denied"]]
+    by_reason = den["denial_reason"].value_counts().to_dict() if len(den) else {}
+
+    # cross-USS fairness: does one operator systematically lose under FCFS? (0 when single-USS)
+    per_uss = _per_uss_table(df, cfg)
+    n_uss = int(len(per_uss))
+    if n_uss > 1:
+        denial_rate_spread = float(per_uss["denial_rate"].max() - per_uss["denial_rate"].min())
+        mean_delay_spread = float(per_uss["mean_total_delay_s"].max() - per_uss["mean_total_delay_s"].min())
+    else:
+        denial_rate_spread = mean_delay_spread = 0.0
+
+    return {
+        "lam_per_hour": cfg.lam_per_hour,
+        "seed": cfg.seed,
+        "planner": cfg.planner,
+        **_rollup(df, cfg),
+        "denials_by_reason": by_reason,
+        "n_uss": n_uss,
+        "denial_rate_spread": denial_rate_spread,
+        "mean_delay_spread": mean_delay_spread,
         "verified": result.verified,
     }

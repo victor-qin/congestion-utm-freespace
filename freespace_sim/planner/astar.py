@@ -27,8 +27,15 @@ import numpy as np
 from ..config import SimConfig
 from ..cost import trajectory_cost
 from ..ledger import ReservationLedger
-from ..types import DenialReason, FlightRequest, IntentStatus, OperationalIntent, TimedPoint
-from ..volumes import corridor_segment_volume, hover_reservation
+from ..types import (
+    DenialReason,
+    FlightRequest,
+    IntentStatus,
+    OperationalIntent,
+    TimedPoint,
+    as_terminal,
+)
+from ..volumes import corridor_segment_volume, hover_reservation, terminal_radius
 from . import hexgrid as hg
 from .occupancy import HexOccupancyService
 
@@ -41,8 +48,67 @@ def _deny(req, reason):
     )
 
 
+def _absorb(svc, ledger):
+    """Feed already-committed reservations into the occupancy service grouped BY FLIGHT (volumes of one
+    flight are committed contiguously), so the per-flight own-column drop in ``on_commit`` applies to
+    pre-existing flights exactly as it does to live commits — not volume-by-volume."""
+    for _fid, grp in itertools.groupby(ledger.iter_committed(), key=lambda fv: fv[0]):
+        svc.on_commit(_fid, [v for _, v in grp])
+
+
+def _column_cells(center, radius, R):
+    """Hex cells whose centre lies within ``radius`` of ``center`` (xy) — a terminal column's footprint.
+    Scanned at takeoff/landing so A* won't activate a column a foreign corridor has already reserved."""
+    cx, cy = float(center[0]), float(center[1])
+    cq, cr = hg.enu_to_axial(cx, cy, R)
+    span = int(math.ceil(radius / R)) + 3
+    out = []
+    for dq in range(-span, span + 1):
+        for dr in range(-span, span + 1):
+            c = hg.hex_center(cq + dq, cr + dr, R)
+            if (c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= radius * radius:
+                out.append((cq + dq, cr + dr))
+    return tuple(out)
+
+
+def _perimeter(center_xy, toward, radius, z):
+    """A point ``radius`` m from ``center_xy`` toward ``toward`` (xy), at altitude ``z`` — where a
+    hub's corridor starts/ends so same-hub flights diverge from the shared terminal edge."""
+    d = np.asarray(toward, float)[:2] - center_xy
+    n = float(np.linalg.norm(d))
+    p = center_xy + (radius * d / n if n > 1e-9 else np.array([radius, 0.0]))
+    return np.array([float(p[0]), float(p[1]), float(z)], float)
+
+
+def _fold_head_into_column(wps, center, exit_r, speed):
+    """Drop the leading waypoints that lie inside ``exit_r`` of ``center`` and re-root the corridor at
+    the column edge (the flight's "exit lane"). The folded centre→edge leg is flown but left
+    UNRESERVED — inside the terminal the vertiport deconflicts its own traffic tactically, so same-hub
+    flights may share that space; only the exit lane reaches the ledger. ``wps`` is a list of
+    ``[xyz, t]`` (mutable). Returns the trimmed list; a no-op if the whole cruise stays inside."""
+    k = next((i for i in range(1, len(wps))
+              if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
+    if k is None:
+        return wps
+    edge = _perimeter(center, wps[k][0], exit_r, wps[0][0][2])
+    leg = float(np.linalg.norm(wps[k][0][:2] - edge[:2])) / speed   # unreserved edge→first-cell leg
+    return [[edge, wps[k][1] - leg], *wps[k:]]
+
+
+def _fold_tail_into_column(wps, center, exit_r, speed):
+    """Landing-end mirror of :func:`_fold_head_into_column`: drop trailing waypoints inside the
+    destination column and end the corridor at that column's edge (descent inside is unreserved)."""
+    k = next((i for i in range(len(wps) - 2, -1, -1)
+              if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
+    if k is None:
+        return wps
+    edge = _perimeter(center, wps[k][0], exit_r, wps[-1][0][2])
+    leg = float(np.linalg.norm(wps[k][0][:2] - edge[:2])) / speed
+    return [*wps[:k + 1], [edge, wps[k][1] + leg]]
+
+
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 300_000):
+    def __init__(self, max_expansions: int = 600_000):
         self.max_expansions = max_expansions
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
@@ -56,8 +122,7 @@ class AStarPlanner:
             svc = self._svc = HexOccupancyService(cfg)
             self._svc_ledger = ledger
             ledger.subscribe(svc.on_commit)                 # publish hook: future commits auto-feed
-            for _fid, vol in ledger.iter_committed():        # absorb anything already committed
-                svc.add_volume(vol)
+            _absorb(svc, ledger)                             # absorb anything already committed
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
@@ -65,8 +130,7 @@ class AStarPlanner:
                 stacklevel=2,
             )
             svc.reset()
-            for _fid, vol in ledger.iter_committed():
-                svc.add_volume(vol)
+            _absorb(svc, ledger)
         # Evict cells older than the request clock (extra step of buffer); requests arrive in
         # non-decreasing time, so no future plan can query an evicted step.
         svc.evict_before(int(req.t_request // cfg.dt_s) - 2)
@@ -100,6 +164,18 @@ class AStarPlanner:
         svc = self._occupancy(req, ledger, cfg)
         dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
 
+        # Shared-terminal context (Phase B). A flight owns its origin/dest vertiports: their columns
+        # are transparent to its search (``own``), and its takeoff/landing dwell is gated by the hub's
+        # pad capacity rather than a binary pad check. No terminal ⇒ own=∅, capacity 1 ⇒ old behavior.
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        own = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        o_tid, o_cap = (o_term.id, o_term.capacity) if o_term else (None, 1)
+        d_tid, d_cap = (d_term.id, d_term.capacity) if d_term else (None, 1)
+        # the hub column's full footprint — a launch may only activate it if no foreign corridor already
+        # occupies any of these cells for the dwell window (else ground-delay until the airspace frees)
+        o_fp = _column_cells(origin, terminal_radius(o_term, cfg), R) if o_term else None
+        d_fp = _column_cells(dest, terminal_radius(d_term, cfg), R) if d_term else None
+
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come
         def h_air(q, r):
             d = float(np.linalg.norm(hg.hex_center(q, r, R) - goal_c))
@@ -127,7 +203,7 @@ class AStarPlanner:
                 continue
             closed.add(st)
             if st[0] == "a" and st[1] == gq and st[2] == grr and svc.pad_clear(
-                gq, grr, st[3], dwell_steps
+                gq, grr, st[3], dwell_steps, d_tid, d_cap, d_fp
             ):
                 goal_state = st
                 break
@@ -138,7 +214,8 @@ class AStarPlanner:
                 break
             base_g = g[st]
             for nst, cost in self._edges(
-                st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps
+                st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
+                own, o_tid, o_cap, o_fp,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -164,7 +241,8 @@ class AStarPlanner:
             for (_, q, r, s) in air
         ]
         volumes, centerline, cum_horiz, n_hover = self._build(
-            cruise_wps, origin, dest, base, ground_steps, cfg
+            cruise_wps, origin, dest, base, ground_steps, cfg,
+            origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
         if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
@@ -185,7 +263,8 @@ class AStarPlanner:
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps):
+    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
+               own=(), o_tid=None, o_cap=1, o_fp=None):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -193,9 +272,11 @@ class AStarPlanner:
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             ts = s + climb_steps
-            # takeoff: the climb-completion air cell must be clear AND the origin pad must stay clear
-            # for the whole takeoff dwell (which starts at this ground step s) — symmetric to landing.
-            if ts <= max_step and not svc.is_blocked(q, r, ts) and svc.pad_clear(q, r, s, dwell_steps):
+            # takeoff: the climb-completion air cell must be clear AND the origin column must activate —
+            # have a free pad slot (capacity) AND no foreign corridor occupying its footprint — for the
+            # whole takeoff dwell (starting at ground step s). Symmetric to the landing check.
+            if (ts <= max_step and not svc.is_blocked(q, r, ts, own)
+                    and svc.pad_clear(q, r, s, dwell_steps, o_tid, o_cap, o_fp)):
                 out.append((("a", q, r, ts), climb_cost))                            # takeoff
             return out
         _, q, r, s = st
@@ -204,29 +285,66 @@ class AStarPlanner:
             return out
         for dq, dr in hg.AXIAL_NEIGHBORS:                                            # reroute
             nq, nr = q + dq, r + dr
-            if not svc.is_blocked(nq, nr, ns):
+            if not svc.is_blocked(nq, nr, ns, own):
                 out.append((("a", nq, nr, ns), cfg.cost_air_lateral_per_m * pitch))
-        if not svc.is_blocked(q, r, ns):                                            # hover
+        if not svc.is_blocked(q, r, ns, own):                                       # hover
             out.append((("a", q, r, ns), cfg.cost_air_hold_per_s * dt))
         return out
 
-    def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg):
+    def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
+        # Shared-terminal hubs: the drone climbs in the tagged hover column, then its strategic corridor
+        # (the "exit lane") begins at the column EDGE. Waypoints inside the column are folded away — the
+        # centre→edge leg is flown but NOT reserved, because inside the terminal the vertiport handles
+        # its own traffic tactically (same-hub flights may share that space concurrently). Only the exit
+        # lane + cruise reach the ledger, where corridor boxes stay strict (untagged): two flights can't
+        # occupy the same exit lane at once, while divergent same-hub launches go concurrently.
+        origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
+        half = cfg.corridor_width_m / 2.0
+        wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
+        o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
+        speed = cfg.nominal_speed_mps
+
+        def _exit_radius(term):
+            # Inner edge = R − overlap, so the exit lane starts FLUSH with the column edge by default
+            # (corridor_overlap = 0). The exit-lane box is tagged with the hub, and the column-involved
+            # exemption (conflict.volumes_conflict) makes it transparent to same-hub COLUMNS — so flush is
+            # conflict-free vs columns. Two same-hub *corridor* boxes still contend (box↔box stays strict),
+            # so divergent lanes need the column wide enough not to crowd: cfg.terminal_radius_m defaults
+            # to 90 m for exactly this. overlap>0 penetrates the column; overlap<0 leaves a gap. (Issue #10.)
+            ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
+            return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
+
+        if origin_term is not None and len(wps) >= 2:
+            wps = _fold_head_into_column(wps, o_xy, _exit_radius(origin_term), speed)
+        if dest_term is not None and len(wps) >= 2:
+            wps = _fold_tail_into_column(wps, d_xy, _exit_radius(dest_term), speed)
+
         edges = []
-        centerline: list[TimedPoint] = [(cruise_wps[0][0].copy(), cruise_wps[0][1])]
+        centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]
         cum_horiz = 0.0
         n_hover = 0
-        for (a, ta), (b, tb) in zip(cruise_wps, cruise_wps[1:]):
-            edges.append(corridor_segment_volume(a, ta, b, tb, cfg))
+        n_seg = len(wps) - 1
+        for i, ((a, ta), (b, tb)) in enumerate(zip(wps, wps[1:])):
+            # Tag the FIRST/LAST (in-terminal exit-lane / approach) box with its hub, so the
+            # column-involved exemption lets it pass through that hub's own shared column. Cruise
+            # boxes stay untagged; box↔box at the same hub still conflicts (same-dir launches contend).
+            tid = (origin_term.id if (i == 0 and origin_term is not None)
+                   else dest_term.id if (i == n_seg - 1 and dest_term is not None) else None)
+            edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))
             cum_horiz += horiz
             if horiz < _EPS:
                 n_hover += 1
         t_takeoff = (base + ground_steps) * cfg.dt_s
-        t_arrive = cruise_wps[-1][1]
+        t_arrive = wps[-1][1]
         volumes = [
-            hover_reservation(origin, t_takeoff, cfg),
+            hover_reservation(origin, t_takeoff, cfg,
+                              terminal_id=origin_term.id if origin_term else None,
+                              radius=terminal_radius(origin_term, cfg) if origin_term else None),
             *edges,
-            hover_reservation(dest, t_arrive, cfg),
+            hover_reservation(dest, t_arrive, cfg,
+                              terminal_id=dest_term.id if dest_term else None,
+                              radius=terminal_radius(dest_term, cfg) if dest_term else None),
         ]
         return volumes, centerline, cum_horiz, n_hover

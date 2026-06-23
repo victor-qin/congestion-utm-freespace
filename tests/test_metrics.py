@@ -117,3 +117,55 @@ def test_congestion_rises_with_demand():
                                          horizon_s=1800.0, seed=1)))
     assert hi["reserved_vol_m3_s"] > lo["reserved_vol_m3_s"]
     assert hi["mean_ground_delay_s"] >= lo["mean_ground_delay_s"]
+
+
+# --- per-USS slicing -------------------------------------------------------------------------
+
+from freespace_sim.demand import UniformPoissonDemand   # noqa: E402
+
+
+def _two_uss_run():
+    cfg = SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1800.0, seed=4,
+                    region_size_m=(5000.0, 5000.0))
+    return run(cfg, demand=UniformPoissonDemand(uss_ids=("walmart", "stripmall")))
+
+
+def test_per_uss_frame_one_row_per_uss():
+    res = _two_uss_run()
+    pu = metrics.per_uss_frame(res)
+    assert set(pu["uss_id"]) == {"walmart", "stripmall"}
+    assert len(pu) == 2
+
+
+def test_per_uss_counts_sum_to_overall():
+    res = _two_uss_run()
+    pu = metrics.per_uss_frame(res)
+    agg = metrics.aggregate(res)
+    assert int(pu["n_requests"].sum()) == agg["n_requests"]
+    assert int(pu["n_accepted"].sum()) == agg["n_accepted"]
+    assert int(pu["n_denied"].sum()) == agg["n_denied"]
+    assert math.isclose(float(pu["share_of_accepted"].sum()), 1.0, rel_tol=1e-9)
+
+
+def test_per_uss_reserved_volume_sums_to_overall():
+    res = _two_uss_run()
+    pu = metrics.per_uss_frame(res)
+    agg = metrics.aggregate(res)
+    assert math.isclose(float(pu["reserved_vol_m3_s"].sum()), agg["reserved_vol_m3_s"], rel_tol=1e-9)
+    # each operator's utilization is its share of the whole sky → they sum to the overall
+    assert math.isclose(float(pu["airspace_utilization"].sum()), agg["airspace_utilization"], rel_tol=1e-9)
+
+
+def test_aggregate_reports_n_uss_and_spreads():
+    res = _two_uss_run()
+    agg = metrics.aggregate(res)
+    assert agg["n_uss"] == 2
+    assert agg["denial_rate_spread"] >= 0.0
+    assert agg["mean_delay_spread"] >= 0.0
+
+
+def test_cross_uss_spread_zero_for_single_uss():
+    agg = metrics.aggregate(run(SimConfig(planner="straight", lam_per_hour=60.0, horizon_s=1200.0, seed=1)))
+    assert agg["n_uss"] == 1
+    assert agg["denial_rate_spread"] == 0.0
+    assert agg["mean_delay_spread"] == 0.0

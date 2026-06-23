@@ -26,14 +26,16 @@ from ..volumes import build_reservation_from_corners
 _EPS = 1e-9
 
 
-def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz):
+def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
+             origin_term=None, dest_term=None):
     """Resample corners → ≤120 m corridor boxes, then budget + ledger conflict check.
 
     Returns (volumes, centerline, cum_horiz, cum_dz) or None if it busts the detour budget or
     overlaps a committed reservation. This is the feasibility oracle the greedy sweep consults.
+    ``origin_term``/``dest_term`` preserve the inner A*'s terminal tags through the rebuild.
     """
     volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
-        corners, origin, dest, t_depart, g_delay, cfg
+        corners, origin, dest, t_depart, g_delay, cfg, origin_term=origin_term, dest_term=dest_term
     )
     if straight_horiz > _EPS and cum_horiz / straight_horiz > cfg.max_detour_factor:
         return None
@@ -43,7 +45,7 @@ def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_hor
 
 
 def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
-                     ledger: ReservationLedger):
+                     ledger: ReservationLedger, origin_term=None, dest_term=None):
     """Greedily drop interior knots whose removal stays conflict-free; return simplified corners.
 
     Deterministic single-knot fixpoint: sweep interior knots front-to-back, remove any whose removal
@@ -55,7 +57,8 @@ def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
     if len(corners) <= 2:
         return corners
     straight_horiz = float(np.linalg.norm((np.asarray(dest, float) - np.asarray(origin, float))[:2]))
-    if _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz) is None:
+    if _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
+                origin_term, dest_term) is None:
         return corners
     changed = True
     while changed and len(corners) > 2:
@@ -63,7 +66,8 @@ def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
         i = 1
         while i < len(corners) - 1:
             cand = corners[:i] + corners[i + 1:]
-            if _rebuild(cand, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz) is not None:
+            if _rebuild(cand, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
+                        origin_term, dest_term) is not None:
                 corners = cand           # removed knot i; re-test the same index (list shifted)
                 changed = True
             else:
@@ -99,12 +103,13 @@ class ShortcutRefiner:
 
         g_delay = intent.ground_delay_s
         t_depart = intent.centerline[0][1] - g_delay - cfg.climb_time_s   # exact inverse of the build
-        simplified = shortcut_corners(corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger)
+        ot, dt = req.origin_terminal, req.dest_terminal
+        simplified = shortcut_corners(corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger, ot, dt)
         if len(simplified) >= len(corners):
             return intent                              # nothing removed
 
         straight = float(np.linalg.norm((np.asarray(req.dest, float) - np.asarray(req.origin, float))[:2]))
-        built = _rebuild(simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight)
+        built = _rebuild(simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight, ot, dt)
         if built is None:
             return intent
         volumes, centerline, cum_horiz, cum_dz = built

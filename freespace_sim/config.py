@@ -42,6 +42,10 @@ class SimConfig:
     # --- hover cylinder (own radius knob; defaults to corridor width) ---
     hover_radius_m: float | None = None   # None ⇒ effective_hover_radius_m = corridor_width_m
     hover_time_s: float = 30.0         # dwell at takeoff/landing (climb time added on top)
+    # default shared-terminal COLUMN radius when a Terminal doesn't set its own (per-hub Terminal.radius
+    # overrides). 90 m (> corridor_width) gives divergent same-hub exit lanes enough angular spread to
+    # start flush with the column edge (corridor_overlap=0) and still launch concurrently. See astar._exit_radius.
+    terminal_radius_m: float = 90.0
 
     # --- COST MODEL (shared by every planner; the FCFS trade-off knobs) ---
     cost_ground_delay_per_s: float = 1.0      # wait on the pad
@@ -50,7 +54,7 @@ class SimConfig:
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
     # --- denial budgets ---
-    max_ground_delay_s: float = 100000.0
+    max_ground_delay_s: float = 3600.0
     max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this
 
     # --- demand / horizon ---

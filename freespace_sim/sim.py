@@ -17,7 +17,7 @@ import numpy as np
 
 from . import verify
 from .config import SimConfig
-from .demand import UniformPoissonDemand
+from .demand import DemandModel, UniformPoissonDemand
 from .dss import DSS
 from .ledger import ReservationLedger
 from .mechanism import FCFSMechanism, Mechanism
@@ -115,12 +115,13 @@ def run(
     *,
     scenario: Scenario | None = None,
     requests: list[FlightRequest] | None = None,
+    demand: DemandModel | None = None,
     planner_name: str | None = None,
     mechanism: Mechanism | None = None,
     progress: bool | ProgressCallback | None = None,
 ) -> SimResult:
-    """Run one strategic-layer simulation. Provide a scenario, an explicit request list, or neither
-    (demand is then generated from `cfg`).
+    """Run one strategic-layer simulation. Provide a scenario, an explicit request list, a `demand`
+    model, or none (a default `UniformPoissonDemand` is then generated from `cfg`).
 
     ``progress`` gives live feedback through long runs: ``True`` prints a throttled status line
     (done/total, accepted/denied, elapsed, ETA); a callable is invoked as ``progress(done, total,
@@ -128,7 +129,8 @@ def run(
     """
     if scenario is None:
         if requests is None:
-            requests = UniformPoissonDemand().generate(cfg, np.random.default_rng(cfg.seed))
+            model = demand if demand is not None else UniformPoissonDemand()
+            requests = model.generate(cfg, np.random.default_rng(cfg.seed))
         scenario = scenario_from_requests(requests)
 
     ledger = ReservationLedger(cfg)

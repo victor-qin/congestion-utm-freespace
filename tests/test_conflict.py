@@ -7,10 +7,10 @@ from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.volumes import Volume4D
 
 
-def box_vol(cx, cy, cz, t0, t1, *, length=40, width=40, height=30):
+def box_vol(cx, cy, cz, t0, t1, *, length=40, width=40, height=30, terminal_id=None):
     p0 = np.array([cx - length / 2, cy, cz], float)
     p1 = np.array([cx + length / 2, cy, cz], float)
-    return Volume4D(box_from_segment(p0, p1, width, height), t0, t1)
+    return Volume4D(box_from_segment(p0, p1, width, height), t0, t1, terminal_id=terminal_id)
 
 
 def test_space_and_time_overlap_conflicts():
@@ -55,3 +55,49 @@ def test_security_margin_enforces_separation():
     b = box_vol(60, 0, 150, 0, 10, length=40, width=40)  # x ∈ [40, 80] → 20 m gap
     assert not volumes_conflict(a, b)
     assert volumes_conflict(a, b, security_margin=25.0)  # require 25 m apart → now a conflict
+
+
+# --- shared-terminal exemption (multi-pad vertiport airspace) --------------------------------
+
+def _terminal(cx, cy, t0, t1, hub):
+    return Volume4D(CylinderSpec(cx, cy, 60, 0, 150), t0, t1, terminal_id=hub)
+
+
+def test_same_terminal_volumes_are_transparent():
+    # two flights sharing one hub's terminal occupy the same column at the same time — NOT a conflict
+    a = _terminal(0, 0, 0, 60, hub="walmart#3")
+    b = _terminal(0, 0, 0, 60, hub="walmart#3")
+    assert not volumes_conflict(a, b)
+
+
+def test_different_terminals_still_conflict():
+    a = _terminal(0, 0, 0, 60, hub="walmart#3")
+    b = _terminal(0, 0, 0, 60, hub="walmart#7")   # different vertiport, same spot/time → conflict
+    assert volumes_conflict(a, b)
+
+
+def test_cruise_corridor_blocked_by_terminal():
+    # a corridor (terminal_id=None) over a busy hub still conflicts → cruise must route around it
+    terminal = _terminal(0, 0, 0, 60, hub="walmart#3")
+    corridor = box_vol(0, 0, 150, 10, 20)
+    assert corridor.terminal_id is None
+    assert volumes_conflict(terminal, corridor)
+
+
+def test_exemption_is_column_involved_box_vs_box_still_conflicts():
+    # the column-involved rule: at the same hub a column (cylinder) is transparent to a corridor box
+    # (the exit lane passes through its own column), but two same-hub corridor BOXES still conflict
+    # (same-direction launches contend). cyl↔cyl and cross-hub are covered by the tests above.
+    col   = _terminal(0, 0, 0, 60, hub="H")                      # hover column (cylinder), hub H
+    lane  = box_vol(0, 0, 150, 0, 60, terminal_id="H")           # exit-lane box, same hub, same spot
+    other = box_vol(0, 0, 150, 0, 60, terminal_id="H")           # another same-hub box, overlapping
+    assert not volumes_conflict(col, lane)                       # cylinder ↔ box (same hub) → exempt
+    assert volumes_conflict(lane, other)                         # box ↔ box (same hub) → still conflict
+    assert volumes_conflict(lane, box_vol(0, 0, 150, 0, 60, terminal_id="G"))   # different hub → conflict
+
+
+def test_terminal_exemption_ignores_time_and_space_when_shared():
+    # the exemption short-circuits before the time/space tests — same id ⇒ never a conflict
+    a = _terminal(0, 0, 0, 10, hub="h")
+    b = _terminal(0, 0, 0, 10, hub="h")
+    assert not volumes_conflict(a, b, security_margin=100.0)

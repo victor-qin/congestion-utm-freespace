@@ -320,7 +320,7 @@ class AStarPlanner:
             #                                                        divergent fan drop 4/4 → 2/4 accepted).
             # So the default is 0 (keep the clearance), NOT w/2. Zero separation + N-concurrent launches are
             # mutually exclusive under the strict-corridor model — to get both you must make the in-terminal
-            # corridor segment shared (tag it + a column-only exemption). See GitHub issue on this trade-off.
+            # corridor segment shared (tag it + a column-only exemption). See GitHub issue #10.
             ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
             return terminal_radius(term, cfg) + cfg.corridor_width_m - ov
 

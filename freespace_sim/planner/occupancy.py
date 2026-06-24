@@ -9,18 +9,17 @@ maintains them incrementally: each committed volume is rasterized **exactly once
 in :func:`hexgrid.rasterize_volume_dual`) when the ledger publishes its commit, and cells older than
 the request clock are evicted so memory stays bounded to the active time window.
 
-**Shared terminal columns (Phase B).** A committed *terminal column* (``vol.terminal_id is not
-None``) is NOT an ordinary obstacle — it's a multi-pad vertiport that admits up to ``capacity``
-concurrent dwells of *its own* flights while still walling off everyone else. Such volumes are kept
-out of the binary ``blocked``/``pad`` sets and instead counted in ``term_cells`` (``step -> cell ->
-{terminal_id: dwell_count}``). The A* queries then:
-  * **own-hub exemption** — :meth:`is_blocked` ignores a cell occupied *only* by the flight's own
-    terminal(s), so a hub's flights fly through their shared column; a *foreign* hub's column still
-    blocks (cruise reroutes around busy vertiports);
-  * **capacity gate** — :meth:`pad_clear` admits a takeoff/landing dwell iff fewer than ``capacity``
-    same-hub dwells already cover the window. **Capacity 1 ⟺ the old binary check** (count 0).
-A run with no terminals never touches ``term_cells`` (it stays empty → zero overhead), so the maps
-are byte-identical to before — the property the occupancy tests pin.
+**Shared terminal columns.** A committed *terminal column* (``vol.terminal_id is not None``) is NOT
+an ordinary obstacle — it's a multi-pad vertiport shared by its own hub's flights and walled off from
+everyone else. Such volumes are kept out of the binary ``blocked``/``pad`` sets and instead recorded
+in ``term_cells`` (``step -> cell -> {terminal_id}``) — a per-cell SET of the hubs whose columns cover
+that cell. :meth:`is_blocked` uses it for the **own-hub cruise exemption**: a cell occupied *only* by
+the flight's own terminal(s) is transparent (a hub's flights fly through their shared column), while a
+*foreign* hub's column is a wall (cruise reroutes around busy vertiports). **Pad capacity is NOT
+counted here** — up-to-``capacity`` concurrent same-hub dwells are gated temporally by
+:class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, which the A* planner consults at
+the takeoff/landing gate. A run with no terminals never touches ``term_cells`` (it stays empty → zero
+overhead), so the binary maps are byte-identical to before — the property the occupancy tests pin.
 
 ASTM framing: the planner's USS holds this as the local picture fed by DSS commit notifications
 (F3548-21 Subscriptions) — see ``ReservationLedger.subscribe`` (the publish hook).
@@ -56,15 +55,15 @@ class HexOccupancyService:
         self.infl_pad = cfg.effective_hover_radius_m + self.R     # wider hover-cylinder footprint
         self.blocked: dict[int, set[tuple[int, int]]] = {}        # step -> {(q, r)}  (non-terminal)
         self.pad: dict[int, set[tuple[int, int]]] = {}            # step -> {(q, r)}  (non-terminal)
-        # shared terminal columns: step -> cell -> {terminal_id: concurrent-dwell count}
-        self.term_cells: dict[int, dict[tuple[int, int], dict[Hashable, int]]] = {}
+        # shared terminal columns: step -> cell -> {terminal_id}  (which hubs' columns cover the cell)
+        self.term_cells: dict[int, dict[tuple[int, int], set[Hashable]]] = {}
         self.n_added = 0                  # committed volumes absorbed (shrink tripwire)
         self.evicted_before: int | None = None   # lowest retained step
 
     # ----- maintenance -----
     def add_volume(self, vol: Volume4D, own_cols: tuple = ()) -> None:
         """Rasterize one committed volume (once). Ordinary corridor cells feed the binary blocked/pad
-        step-buckets; a shared terminal column instead increments its per-hub dwell counter.
+        step-buckets; a shared terminal column instead records its hub id in the per-cell set.
 
         ``own_cols`` is the committing flight's own terminal columns ``(cx, cy, radius)``. A corridor
         cell falling INSIDE one of them is the vertiport's unreserved tactical interior (the flight's
@@ -72,9 +71,9 @@ class HexOccupancyService:
         *foreign* corridors inside any hub's column for a launch to detect and wait out (see pad_clear).
         """
         tid = vol.terminal_id
-        # Only a tagged *column* (hover cylinder) feeds the per-hub dwell counter; a tagged *corridor*
+        # Only a tagged *column* (hover cylinder) feeds the per-cell hub set; a tagged *corridor*
         # box (an in-terminal exit lane) is still a corridor — it goes to blocked/pad like any other,
-        # so it is never miscounted as a pad dwell. ("column ⟺ cylinder"; stored kind is issue #11.)
+        # so it is never mistaken for a column cell. ("column ⟺ cylinder"; stored kind is issue #11.)
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         for q, r, s, in_blk in hg.rasterize_volume_dual(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
@@ -88,10 +87,9 @@ class HexOccupancyService:
                 if in_blk:
                     self.blocked.setdefault(s, set()).add((q, r))
             elif in_blk:
-                # shared terminal column: count one dwell of `tid` over its inner (blocked-strength)
-                # footprint — the cells A* queries for takeoff/landing and own-hub exemption.
-                cell = self.term_cells.setdefault(s, {}).setdefault((q, r), {})
-                cell[tid] = cell.get(tid, 0) + 1
+                # shared terminal column: record `tid` over its inner (blocked-strength) footprint —
+                # the cells A* queries for the own-hub cruise exemption (capacity lives in TerminalCapacity).
+                self.term_cells.setdefault(s, {}).setdefault((q, r), set()).add(tid)
         self.n_added += 1
 
     def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
@@ -139,30 +137,14 @@ class HexOccupancyService:
                 return any(tid not in own for tid in here)
         return (q, r) in self.blocked.get(s, ())
 
-    def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int,
-                  terminal_id: Hashable = None, capacity: int = 1, footprint: tuple = None) -> bool:
-        """Is the pad at hex (q, r) free for the whole dwell window [s0, s0 + dwell_steps]?
-
-        An ordinary pad (``terminal_id is None``) is exclusive: clear iff no committed footprint touches
-        it (capacity 1). A shared vertiport pad is gated by (a) **capacity** at the hub-centre cell and
-        (b) the rule that *no foreign corridor occupies the column*: ``footprint`` (the column's hex
-        cells) is scanned against the binary ``pad`` map — which inside a hub's column holds only foreign
-        corridors, since a flight's own exit-lane interior is dropped on commit. So a launch ground-delays
-        while a corridor transits its vertiport, instead of taking off and being denied by the ledger.
-        """
-        cells = footprint if footprint is not None else ((q, r),)
+    def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int) -> bool:
+        """Is the ordinary (non-terminal) pad at hex (q, r) free for the whole dwell window
+        [s0, s0 + dwell_steps]? Clear iff no committed corridor footprint sweeps it AND it does not sit
+        under any hub's shared column. Shared-terminal takeoff/landing dwells are gated *temporally* by
+        :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, not here."""
         for k in range(s0, s0 + dwell_steps + 1):
-            padk = self.pad.get(k, ())
-            for cell in cells:
-                if cell in padk:
-                    return False                 # a foreign corridor (or ordinary pad) sweeps the column
-            here = self.term_cells.get(k, _EMPTY).get((q, r)) if self.term_cells else None
-            if terminal_id is None:
-                if here is not None:
-                    return False                 # an ordinary pad sitting under some hub's column
-            elif here is not None:
-                if here.get(terminal_id, 0) >= capacity:
-                    return False                 # all N pads busy this step → take ground delay
-                if any(tid != terminal_id for tid in here):
-                    return False                 # another hub's column overlaps this pad
+            if (q, r) in self.pad.get(k, ()):
+                return False                     # a committed corridor sweeps the pad
+            if self.term_cells and (q, r) in self.term_cells.get(k, _EMPTY):
+                return False                     # an ordinary pad sitting under some hub's column
         return True

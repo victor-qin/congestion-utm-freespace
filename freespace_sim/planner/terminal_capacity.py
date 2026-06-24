@@ -31,7 +31,7 @@ from ..config import SimConfig
 from ..geometry import CylinderSpec
 from ..ledger import ReservationLedger
 from ..types import as_terminal
-from ..volumes import corridor_segment_volume, hover_reservation, terminal_radius
+from ..volumes import corridor_segment_volume, exit_radius, hover_reservation, terminal_radius
 
 
 class TerminalCapacity:
@@ -113,16 +113,16 @@ class TerminalCapacity:
         serialize concurrent launches too. Gating the real box geometry here keeps both behaviors.
 
         The lane box is built EXACTLY as ``astar._build`` builds the exit lane — rooted flush at the
-        column edge (``exit_r = radius + corridor_half − overlap``), one segment long toward ``toward``,
-        over the column's lifetime — so this gate and the commit-time ``any_conflict`` agree."""
+        column edge (:func:`volumes.exit_radius`, the one fold radius the commit also uses), one segment
+        long toward ``toward``, over the column's lifetime — so this gate and the commit-time
+        ``any_conflict`` agree."""
         cx, cy = float(center[0]), float(center[1])
         dx, dy = float(toward[0]) - cx, float(toward[1]) - cy
         n = math.hypot(dx, dy)
         if n < 1e-9:
             return True                                   # degenerate (origin == dest): nothing to fly
         ux, uy = dx / n, dy / n
-        ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
-        exit_r = terminal_radius(term, self.cfg) + self.cfg.corridor_width_m / 2.0 - ov
+        exit_r = exit_radius(term, self.cfg)
         z = self.cfg.cruise_level_m
         seg = self.cfg.corridor_segment_len_m
         edge = [cx + exit_r * ux, cy + exit_r * uy, z]

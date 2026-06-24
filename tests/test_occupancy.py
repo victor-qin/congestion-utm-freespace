@@ -62,7 +62,8 @@ def test_evict_drops_past_keeps_future():
     assert _flatten(svc.blocked) == before
 
 
-# --- Phase B: shared terminal columns — per-hub dwell counter + capacity gate -----------------
+# --- shared terminal columns — per-cell hub-id set for the cruise own-hub exemption ------------
+# (pad capacity is NOT here anymore — it's gated temporally by TerminalCapacity; see test_terminal_capacity)
 
 from freespace_sim.volumes import hover_reservation   # noqa: E402
 
@@ -75,11 +76,11 @@ def _hub_cell_and_step(svc):
 
 
 def test_terminal_column_stays_out_of_binary_maps():
-    # a tagged column is counted, not walled: blocked/pad (the binary obstacle maps) stay empty
+    # a tagged column is recorded, not walled: blocked/pad (the binary obstacle maps) stay empty
     svc = HexOccupancyService(CFG)
     svc.add_volume(hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H"))
     assert svc.blocked == {} and svc.pad == {}
-    assert svc.term_cells                                   # it landed in the per-hub counter instead
+    assert svc.term_cells                                   # it landed in the per-cell hub set instead
 
 
 def test_own_hub_column_transparent_foreign_blocks():
@@ -91,28 +92,9 @@ def test_own_hub_column_transparent_foreign_blocks():
     assert svc.is_blocked(q, r, s, own={"other"})          # a different hub still sees a wall
 
 
-def test_capacity_gate_counts_both_takeoff_and_landing_dwells():
-    # a departure dwell AND an arrival dwell at the SAME hub both occupy a pad (Phase B counts both)
-    svc = HexOccupancyService(CFG)
-    svc.add_volume(hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H"))   # takeoff
-    svc.add_volume(hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H"))   # landing
-    (q, r), s = _hub_cell_and_step(svc)
-    assert svc.term_cells[s][(q, r)]["H"] == 2             # two concurrent dwells counted
-    assert not svc.pad_clear(q, r, s, 0, terminal_id="H", capacity=2)   # both pads busy → no slot
-    assert svc.pad_clear(q, r, s, 0, terminal_id="H", capacity=3)       # room for a third
-
-
-def test_capacity_one_terminal_matches_binary_pad():
-    # capacity 1 ⟺ the old exclusive pad: one dwell already there ⇒ no slot
-    svc = HexOccupancyService(CFG)
-    svc.add_volume(hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H"))
-    (q, r), s = _hub_cell_and_step(svc)
-    assert not svc.pad_clear(q, r, s, 0, terminal_id="H", capacity=1)
-
-
-def test_evict_drops_terminal_counter_in_lockstep():
-    # the per-hub dwell counter must be time-evicted like blocked/pad, or stale dwells would wrongly
-    # gate future launches (and leak memory) — eviction loops over term_cells too
+def test_evict_drops_terminal_cells_in_lockstep():
+    # the per-cell hub set must be time-evicted like blocked/pad, or stale cells would wrongly mark
+    # cruise obstacles (and leak memory) — eviction loops over term_cells too
     svc = HexOccupancyService(CFG)
     svc.add_volume(hover_reservation((1500.0, 1500.0, 0.0), 80.0, CFG, terminal_id="H"))
     steps = sorted(svc.term_cells)
@@ -121,7 +103,7 @@ def test_evict_drops_terminal_counter_in_lockstep():
     svc.evict_before(watermark)
     assert svc.term_cells and min(svc.term_cells) >= watermark
     svc.reset()
-    assert svc.term_cells == {}                               # reset clears the counter too
+    assert svc.term_cells == {}                               # reset clears term_cells too
 
 
 def test_publish_hook_feeds_service_on_commit():

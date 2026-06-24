@@ -35,9 +35,15 @@ from ..types import (
     TimedPoint,
     as_terminal,
 )
-from ..volumes import corridor_segment_volume, hover_reservation, terminal_radius
+from ..volumes import (
+    corridor_segment_volume,
+    hover_reservation,
+    segment_overlaps_column,
+    terminal_radius,
+)
 from . import hexgrid as hg
 from .occupancy import HexOccupancyService
+from .terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
 
@@ -54,21 +60,6 @@ def _absorb(svc, ledger):
     pre-existing flights exactly as it does to live commits — not volume-by-volume."""
     for _fid, grp in itertools.groupby(ledger.iter_committed(), key=lambda fv: fv[0]):
         svc.on_commit(_fid, [v for _, v in grp])
-
-
-def _column_cells(center, radius, R):
-    """Hex cells whose centre lies within ``radius`` of ``center`` (xy) — a terminal column's footprint.
-    Scanned at takeoff/landing so A* won't activate a column a foreign corridor has already reserved."""
-    cx, cy = float(center[0]), float(center[1])
-    cq, cr = hg.enu_to_axial(cx, cy, R)
-    span = int(math.ceil(radius / R)) + 3
-    out = []
-    for dq in range(-span, span + 1):
-        for dr in range(-span, span + 1):
-            c = hg.hex_center(cq + dq, cr + dr, R)
-            if (c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= radius * radius:
-                out.append((cq + dq, cr + dr))
-    return tuple(out)
 
 
 def _perimeter(center_xy, toward, radius, z):
@@ -112,6 +103,7 @@ class AStarPlanner:
         self.max_expansions = max_expansions
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
+        self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
 
     def _occupancy(self, req, ledger, cfg) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
@@ -120,9 +112,12 @@ class AStarPlanner:
         svc = self._svc
         if svc is None or self._svc_ledger is not ledger:
             svc = self._svc = HexOccupancyService(cfg)
+            self._tcap = TerminalCapacity(cfg, ledger)       # temporal pad capacity, same ledger
             self._svc_ledger = ledger
             ledger.subscribe(svc.on_commit)                 # publish hook: future commits auto-feed
+            ledger.subscribe(self._tcap.on_commit)
             _absorb(svc, ledger)                             # absorb anything already committed
+            _absorb(self._tcap, ledger)
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
@@ -130,10 +125,16 @@ class AStarPlanner:
                 stacklevel=2,
             )
             svc.reset()
+            self._tcap.reset()
             _absorb(svc, ledger)
-        # Evict cells older than the request clock (extra step of buffer); requests arrive in
-        # non-decreasing time, so no future plan can query an evicted step.
-        svc.evict_before(int(req.t_request // cfg.dt_s) - 2)
+            _absorb(self._tcap, ledger)
+        # Evict state older than the request clock. Requests arrive in non-decreasing time, and with
+        # ``t_departure >= t_request`` enforced (types) + ``base = ceil(t_depart/dt)``, the earliest
+        # step/time any plan reads is ``base >= floor(t_request/dt)`` — so the bare request-clock
+        # watermark (no buffer) drops only un-readable state. EXACTLY TIGHT: it relies on that
+        # ``base >= floor(t_request/dt)`` invariant, so don't loosen base/t_departure without re-checking.
+        svc.evict_before(int(req.t_request // cfg.dt_s))
+        self._tcap.evict_before(req.t_request)
         return svc
 
     def plan(
@@ -144,8 +145,8 @@ class AStarPlanner:
         R = hg.circumradius(cfg)
         origin = np.asarray(req.origin, float)
         dest = np.asarray(req.dest, float)
-        t_depart = req.t_departure if req.t_departure is not None else req.t_request
-        base = int(round(t_depart / dt))
+        t_depart = req.t_departure                       # types enforces it is set and >= t_request
+        base = int(math.ceil(t_depart / dt))             # ceil ⇒ base*dt >= t_depart: never depart before filing
         climb_steps = max(1, int(math.ceil(cfg.climb_time_s / dt)))
         climb_cost = cfg.cost_altitude_change_per_m * (cfg.cruise_level_m - cfg.ground_level_m)
 
@@ -162,19 +163,17 @@ class AStarPlanner:
         # hover_time_s + climb_time_s, so the search must not land where a later corridor sweeps
         # through mid-descent (else post-build CONFLICT_FILED). See occupancy.py.
         svc = self._occupancy(req, ledger, cfg)
+        tcap = self._tcap
         dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
 
-        # Shared-terminal context (Phase B). A flight owns its origin/dest vertiports: their columns
-        # are transparent to its search (``own``), and its takeoff/landing dwell is gated by the hub's
-        # pad capacity rather than a binary pad check. No terminal ⇒ own=∅, capacity 1 ⇒ old behavior.
+        # Shared-terminal context (Phase B). A flight owns its origin/dest vertiports: their columns are
+        # transparent to its search (``own``). A shared-hub takeoff/landing dwell is gated by
+        # ``TerminalCapacity`` (the temporal authority: pad capacity + column activation); an ordinary
+        # (no-terminal) pad still uses the binary ``svc.pad_clear``. No terminal ⇒ own=∅, old behavior.
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         own = frozenset(t.id for t in (o_term, d_term) if t is not None)
-        o_tid, o_cap = (o_term.id, o_term.capacity) if o_term else (None, 1)
-        d_tid, d_cap = (d_term.id, d_term.capacity) if d_term else (None, 1)
-        # the hub column's full footprint — a launch may only activate it if no foreign corridor already
-        # occupies any of these cells for the dwell window (else ground-delay until the airspace frees)
-        o_fp = _column_cells(origin, terminal_radius(o_term, cfg), R) if o_term else None
-        d_fp = _column_cells(dest, terminal_radius(d_term, cfg), R) if d_term else None
+        o_cap = o_term.capacity if o_term else 1
+        d_cap = d_term.capacity if d_term else 1
 
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come.
         # h_air is evaluated for EVERY generated neighbour (the search hot path), so the hex centre is
@@ -206,8 +205,9 @@ class AStarPlanner:
             if st in closed:
                 continue
             closed.add(st)
-            if st[0] == "a" and st[1] == gq and st[2] == grr and svc.pad_clear(
-                gq, grr, st[3], dwell_steps, d_tid, d_cap, d_fp
+            if st[0] == "a" and st[1] == gq and st[2] == grr and (
+                tcap.dwell_ok(d_term, dest, st[3] * dt, d_cap, origin) if d_term is not None
+                else svc.pad_clear(gq, grr, st[3], dwell_steps)
             ):
                 goal_state = st
                 break
@@ -219,7 +219,7 @@ class AStarPlanner:
             base_g = g[st]
             for nst, cost in self._edges(
                 st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-                own, o_tid, o_cap, o_fp,
+                own, o_cap, o_term, origin, tcap, dest,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -268,7 +268,7 @@ class AStarPlanner:
         return intent
 
     def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-               own=(), o_tid=None, o_cap=1, o_fp=None):
+               own=(), o_cap=1, o_term=None, origin=None, tcap=None, dest=None):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -276,11 +276,13 @@ class AStarPlanner:
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             ts = s + climb_steps
-            # takeoff: the climb-completion air cell must be clear AND the origin column must activate —
-            # have a free pad slot (capacity) AND no foreign corridor occupying its footprint — for the
-            # whole takeoff dwell (starting at ground step s). Symmetric to the landing check.
-            if (ts <= max_step and not svc.is_blocked(q, r, ts, own)
-                    and svc.pad_clear(q, r, s, dwell_steps, o_tid, o_cap, o_fp)):
+            # takeoff: the climb-completion air cell must be clear AND the origin pad must admit the whole
+            # takeoff dwell starting at ground step s — a shared hub via TerminalCapacity (capacity +
+            # column activation + exit-lane toward dest, gated at the exact takeoff time s*dt), an
+            # ordinary pad via svc.pad_clear.
+            pad_ok = (tcap.dwell_ok(o_term, origin, s * dt, o_cap, dest) if o_term is not None
+                      else svc.pad_clear(q, r, s, dwell_steps))
+            if ts <= max_step and not svc.is_blocked(q, r, ts, own) and pad_ok:
                 out.append((("a", q, r, ts), climb_cost))                            # takeoff
             return out
         _, q, r, s = st
@@ -327,13 +329,18 @@ class AStarPlanner:
         centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]
         cum_horiz = 0.0
         n_hover = 0
-        n_seg = len(wps) - 1
-        for i, ((a, ta), (b, tb)) in enumerate(zip(wps, wps[1:])):
-            # Tag the FIRST/LAST (in-terminal exit-lane / approach) box with its hub, so the
-            # column-involved exemption lets it pass through that hub's own shared column. Cruise
-            # boxes stay untagged; box↔box at the same hub still conflicts (same-dir launches contend).
-            tid = (origin_term.id if (i == 0 and origin_term is not None)
-                   else dest_term.id if (i == n_seg - 1 and dest_term is not None) else None)
+        o_r = terminal_radius(origin_term, cfg) if origin_term is not None else 0.0
+        d_r = terminal_radius(dest_term, cfg) if dest_term is not None else 0.0
+        for (a, ta), (b, tb) in zip(wps, wps[1:]):
+            # Tag EVERY box that reaches into its hub's OWN column (not just the first/last exit lane),
+            # so the column-involved exemption covers the whole in-column reach. An untagged cruise box
+            # grazing the shared column would otherwise conflict (different tid) at commit — the
+            # cruise-box-clip bug. The number of such boxes is geometry-dependent (radius × exit angle),
+            # so we test each box, not a fixed index. Far cruise boxes stay untagged; two same-hub boxes
+            # still conflict (box↔box), so same-direction launches contend → gated by exit_clear.
+            tid = (origin_term.id if origin_term is not None and segment_overlaps_column(a, b, o_xy, o_r, cfg)
+                   else dest_term.id if dest_term is not None and segment_overlaps_column(a, b, d_xy, d_r, cfg)
+                   else None)
             edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))

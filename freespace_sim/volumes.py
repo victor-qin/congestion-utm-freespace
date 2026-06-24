@@ -95,6 +95,23 @@ def terminal_radius(term, cfg: SimConfig) -> float:
     return term.radius if term.radius is not None else cfg.terminal_radius_m
 
 
+def exit_radius(term, cfg: SimConfig) -> float:
+    """A hub's exit-lane inner edge — flush with the column edge by default (``corridor_overlap = 0``).
+
+    Inner edge = R − overlap, so the reserved lane/fold starts FLUSH with the column edge; the exit-lane box
+    is tagged with the hub and the column-involved exemption (:func:`conflict.volumes_conflict`) makes it
+    transparent to same-hub COLUMNS, while two same-hub *corridor* boxes still contend (box↔box stays
+    strict), so divergent lanes need the column wide enough not to crowd (``cfg.terminal_radius_m`` 90 m
+    default). ``overlap > 0`` penetrates the column; ``< 0`` leaves a clearance gap. (Issue #10.)
+
+    The single source of truth for the fold/lane radius — used by the A* head/tail fold
+    (:func:`planner.astar._fold_path`, which drives both the commit and the landing gate) and
+    :meth:`planner.terminal_capacity.TerminalCapacity.exit_clear` — so the gate, the commit, and the
+    exit-lane check all root the lane at the same edge and cannot drift."""
+    ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
+    return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
+
+
 def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool:
     """Does the corridor box for segment ``a→b`` reach into the disk of ``radius`` at ``center`` (xy)?
 

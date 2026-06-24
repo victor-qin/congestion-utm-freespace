@@ -25,13 +25,15 @@ unit-level guard on mechanism 1.
 """
 
 import numpy as np
+import pytest
 
 from freespace_sim.dss import DSS
+from freespace_sim.geometry import CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
 from freespace_sim.scenarios import get_scenario, with_overrides
-from freespace_sim.sim import scenario_from_requests
+from freespace_sim.sim import run, scenario_from_requests
 from freespace_sim.uss import USS
 
 # Flights extracted from dallas_hub_2uss_large @ seed 0, pads_per_hub=4. Replaying just these in FCFS
@@ -84,3 +86,46 @@ def test_same_hub_exit_lanes_do_not_collide():
     intents = _replay(EXIT_COLLISION)
     assert intents[44].accepted                                  # the first lane commits
     assert intents[92].accepted                                  # ground-delays past fid 44's lane; admitted
+
+
+def _max_concurrent(intervals):
+    """Max number of half-open [t0, t1) windows overlapping at any instant."""
+    evts = sorted([(a, 1) for a, _ in intervals] + [(b, -1) for _, b in intervals])
+    cur = mx = 0
+    for _, d in evts:
+        cur += d
+        mx = max(mx, cur)
+    return mx
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("seed,pads", [(s, 2) for s in range(8)] + [(4, 4)])
+def test_landing_capacity_accurate_to_arrival_and_not_oversubscribed(seed, pads):
+    # Issue #15 regression (the landing-side capacity gate, across seeds, with returns). Two properties:
+    #  (1) ACCURATE TO ARRIVAL — every return's committed LANDING column opens EXACTLY at the flown arrival
+    #      (dest hover t_start == centerline[-1] time). The committed arrival is the tail-folded column
+    #      edge, and the gate counts capacity there (``astar._committed_arrival``), so the window it counts
+    #      IS the window the drone occupies the hub — not the goal-hex step time ``st[3]*dt``, ~2-7 s later.
+    #  (2) NO OVER-SUBSCRIPTION — peak concurrent same-hub dwells (delivery-takeoffs + return-landings)
+    #      never exceeds the pad count. Pre-fix, gating at the goal-hex step over-subscribed pads=2 on 7/8
+    #      seeds (capacity-2 hubs reaching 3 concurrent dwells); capacity has no commit-time backstop
+    #      (same-hub columns are conflict-exempt in volumes_conflict / verify), so ONLY this gate prevents
+    #      it. (`slow`: one full ~100-flight hub run per case.)
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), demand_overrides={"pads_per_hub": pads},
+                          planner="astar", lam_per_hour=600.0, horizon_s=300.0, seed=seed)
+    res = run(spec.config(), demand=spec.demand_model())
+    assert res.verified
+    dwells: dict = {}
+    for it in res.accepted:
+        for v in it.volumes or []:
+            if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
+                dwells.setdefault(v.terminal_id, []).append((v.t_start, v.t_end))
+        if it.request.dest_terminal is not None:                   # a return → lands at the hub
+            # the committed LANDING column (_build emits it last) opens EXACTLY at the flown arrival —
+            # so the capacity window the gate counted is the window the drone is actually in the hub
+            landing_col = it.volumes[-1]
+            assert landing_col.t_start == it.centerline[-1][1], (
+                f"fid {it.request.flight_id}: landing column opens at {landing_col.t_start}, "
+                f"flown arrival {it.centerline[-1][1]}")
+    over = {h: _max_concurrent(iv) for h, iv in dwells.items() if _max_concurrent(iv) > pads}
+    assert not over, f"pads over-subscribed (capacity {pads}): {over}"

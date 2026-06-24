@@ -37,6 +37,7 @@ from ..types import (
 )
 from ..volumes import (
     corridor_segment_volume,
+    exit_radius,
     hover_reservation,
     segment_overlaps_column,
     terminal_radius,
@@ -96,6 +97,43 @@ def _fold_tail_into_column(wps, center, exit_r, speed):
     edge = _perimeter(center, wps[k][0], exit_r, wps[-1][0][2])
     leg = float(np.linalg.norm(wps[k][0][:2] - edge[:2])) / speed
     return [*wps[:k + 1], [edge, wps[k][1] + leg]]
+
+
+def _fold_path(wps, origin, dest, origin_term, dest_term, cfg):
+    """Apply the head + tail column folds exactly as :meth:`AStarPlanner._build` commits them, returning
+    the folded ``[[xyz, t], ...]`` list. Extracted so the landing gate computes the SAME arrival time the
+    commit stamps — gate and commit fold through one function and cannot drift. The fold edge is
+    :func:`volumes.exit_radius` (the one radius ``_build``, this gate, and ``TerminalCapacity.exit_clear``
+    all share). ``origin_term``/``dest_term`` must be normalized (:class:`Terminal` or ``None``)."""
+    speed = cfg.nominal_speed_mps
+    if origin_term is not None and len(wps) >= 2:
+        wps = _fold_head_into_column(wps, np.asarray(origin, float)[:2], exit_radius(origin_term, cfg), speed)
+    if dest_term is not None and len(wps) >= 2:
+        wps = _fold_tail_into_column(wps, np.asarray(dest, float)[:2], exit_radius(dest_term, cfg), speed)
+    return wps
+
+
+def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, dest_term):
+    """The exact time ``_build`` will stamp on the destination hover column for a goal candidate.
+
+    The landing capacity gate must count siblings in the coordinate they were COMMITTED in. ``_build``
+    re-times the dest column to the tail-folded column EDGE (:func:`_fold_tail_into_column`) — ~2–7 s before
+    the goal-hex (centre) step time the search arrives at — so gating at ``goal_st[3]*dt`` counts the wrong
+    window and can silently over-subscribe a pad (capacity has no commit-time backstop: same-hub columns are
+    conflict-exempt). Instead, reconstruct this candidate's air path from ``came``, rebuild the same cruise
+    waypoints, run the SAME folds (:func:`_fold_path`), and return the folded edge-arrival time. Gate window
+    ≡ commit window → the FCFS capacity count is exact, no margin needed. The goal hex is gated only when
+    popped (≤ once per distinct arrival step — A* closes each state), each an O(path) reconstruction:
+    negligible against the search even at a saturated hub where it fires once per candidate arrival time."""
+    air = []
+    s = goal_st
+    while s is not None and s[0] == "a":
+        air.append(s)
+        s = came.get(s)
+    air.reverse()
+    wps = [[np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), step * dt]
+           for (_, q, r, step) in air]
+    return _fold_path(wps, origin, dest, origin_term, dest_term, cfg)[-1][1]
 
 
 class AStarPlanner:
@@ -206,7 +244,15 @@ class AStarPlanner:
                 continue
             closed.add(st)
             if st[0] == "a" and st[1] == gq and st[2] == grr and (
-                tcap.dwell_ok(d_term, dest, st[3] * dt, d_cap, origin) if d_term is not None
+                # Gate landing capacity at the time _build will COMMIT the dest column (the tail-folded
+                # edge arrival), not the goal-hex step time st[3]*dt — they differ by the centre→edge
+                # fold (~2–7 s), and counting the wrong window silently over-subscribes a pad. See
+                # _committed_arrival. Takeoff (_edges) is exact: the origin column sits at the ground step.
+                tcap.dwell_ok(
+                    d_term, dest,
+                    _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term),
+                    d_cap, origin,
+                ) if d_term is not None
                 else svc.pad_clear(gq, grr, st[3], dwell_steps)
             ):
                 goal_state = st
@@ -305,25 +351,11 @@ class AStarPlanner:
         # lane + cruise reach the ledger, where corridor boxes stay strict (untagged): two flights can't
         # occupy the same exit lane at once, while divergent same-hub launches go concurrently.
         origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
-        half = cfg.corridor_width_m / 2.0
-        wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
+        # Fold the head/tail into the hub columns exactly as the landing gate predicted (shared
+        # _fold_path → gate arrival time == committed dest-column time, bit-for-bit).
+        wps = _fold_path([[np.asarray(p, float).copy(), t] for p, t in cruise_wps],
+                         origin, dest, origin_term, dest_term, cfg)
         o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
-        speed = cfg.nominal_speed_mps
-
-        def _exit_radius(term):
-            # Inner edge = R − overlap, so the exit lane starts FLUSH with the column edge by default
-            # (corridor_overlap = 0). The exit-lane box is tagged with the hub, and the column-involved
-            # exemption (conflict.volumes_conflict) makes it transparent to same-hub COLUMNS — so flush is
-            # conflict-free vs columns. Two same-hub *corridor* boxes still contend (box↔box stays strict),
-            # so divergent lanes need the column wide enough not to crowd: cfg.terminal_radius_m defaults
-            # to 90 m for exactly this. overlap>0 penetrates the column; overlap<0 leaves a gap. (Issue #10.)
-            ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
-            return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
-
-        if origin_term is not None and len(wps) >= 2:
-            wps = _fold_head_into_column(wps, o_xy, _exit_radius(origin_term), speed)
-        if dest_term is not None and len(wps) >= 2:
-            wps = _fold_tail_into_column(wps, d_xy, _exit_radius(dest_term), speed)
 
         edges = []
         centerline: list[TimedPoint] = [(wps[0][0].copy(), wps[0][1])]

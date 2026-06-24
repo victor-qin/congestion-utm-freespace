@@ -70,7 +70,7 @@ class Terminal(NamedTuple):
       ``R − overlap``). ``None``/``0`` (default) ⇒ the lane starts FLUSH with the column edge; the
       column-involved exemption (``conflict.volumes_conflict``) keeps the tagged exit-lane box
       conflict-free with same-hub columns, while two same-hub corridors still contend. ``> 0`` penetrates
-      the column; ``< 0`` leaves a clearance gap outside it. See ``planner.astar._exit_radius``.
+      the column; ``< 0`` leaves a clearance gap outside it. See ``volumes.exit_radius``.
 
     Both are set when hubs are created (the demand model), so a big-box hub and a small pad can differ
     and a non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).

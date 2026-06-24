@@ -111,6 +111,19 @@ class FlightRequest:
     origin_terminal: "Terminal | None" = None
     dest_terminal: "Terminal | None" = None
 
+    def __post_init__(self):
+        # Single source of truth for the file/departure relationship: a flight departs no earlier than
+        # it is filed. ``None`` means "depart as soon as filed". Enforced here, not per-planner, so every
+        # consumer can rely on ``t_departure`` being set and ``>= t_request`` — A*'s ``ceil(t_depart/dt)``
+        # discretization and the request-clock eviction watermark both depend on it.
+        if self.t_departure is None:
+            self.t_departure = self.t_request
+        elif self.t_departure < self.t_request:
+            raise ValueError(
+                f"t_departure ({self.t_departure}) < t_request ({self.t_request}): "
+                "a flight cannot depart before it is filed"
+            )
+
     def sort_key(self) -> tuple[float, int]:
         return (self.t_request, self.flight_id)
 

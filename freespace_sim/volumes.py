@@ -95,6 +95,32 @@ def terminal_radius(term, cfg: SimConfig) -> float:
     return term.radius if term.radius is not None else cfg.terminal_radius_m
 
 
+def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool:
+    """Does the corridor box for segment ``a→b`` reach into the disk of ``radius`` at ``center`` (xy)?
+
+    Accounts for the box geometry corridor_segment_volume builds: the centerline is extended by half
+    the corridor width at each end, and the box has a half-width of ``corridor_width/2``. So the box
+    overlaps the column iff the distance from ``center`` to the *extended* centerline is below
+    ``radius + corridor_width/2``.
+
+    Used to tag EVERY near-hub box that reaches into a flight's own column — not just box[0]/box[-1].
+    The count of such boxes is geometry-dependent (radius × exit angle), so a fixed "tag the first N"
+    rule is unsound (e.g. a 500 m column can need boxes [1] and [2] tagged); this geometric test scales.
+    Far cruise boxes stay untagged, so foreign/same-hub overflight still deconflicts."""
+    a2 = np.asarray(a, float)[:2]
+    b2 = np.asarray(b, float)[:2]
+    c2 = np.asarray(center, float)[:2]
+    seg = b2 - a2
+    L = float(np.linalg.norm(seg))
+    u = seg / L if L > 1e-9 else np.array([1.0, 0.0])
+    ext = cfg.corridor_width_m / 2.0
+    p0, p1 = a2 - u * ext, b2 + u * ext              # box centerline incl. longitudinal extension
+    ab = p1 - p0
+    t = float(np.clip((c2 - p0).dot(ab) / max(ab.dot(ab), 1e-12), 0.0, 1.0))
+    d = float(np.linalg.norm(c2 - (p0 + t * ab)))    # distance center → extended centerline
+    return d < radius + cfg.corridor_width_m / 2.0   # + box half-width
+
+
 def build_reservation_from_corners(
     corners: list[Vec], origin: Vec, dest: Vec, t_depart: float, g_delay: float, cfg: SimConfig,
     *, origin_term=None, dest_term=None,
@@ -114,6 +140,10 @@ def build_reservation_from_corners(
     edges: list[Volume4D] = []
     cum_horiz = cum_dz = 0.0
     seg = cfg.corridor_segment_len_m
+    o_xy = np.asarray(origin, float)[:2] if origin_term is not None else None
+    d_xy = np.asarray(dest, float)[:2] if dest_term is not None else None
+    o_r = terminal_radius(origin_term, cfg) if origin_term is not None else 0.0
+    d_r = terminal_radius(dest_term, cfg) if dest_term is not None else 0.0
     for a, b in zip(corners, corners[1:]):
         a = np.asarray(a, float)
         b = np.asarray(b, float)
@@ -126,17 +156,17 @@ def build_reservation_from_corners(
             horiz = float(np.linalg.norm((sb - sa)[:2]))
             dz = abs(float(sb[2] - sa[2]))
             t_next = t + max(horiz / cfg.nominal_speed_mps, dz / cfg.climb_rate_mps, 1e-3)
-            edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg))
+            # Tag EVERY box reaching into its hub's own column (not just first/last), so a near-hub
+            # cruise box grazing the shared column is column-exempt rather than a CONFLICT_FILED. See
+            # segment_overlaps_column; mirrors astar._build's per-box tagging.
+            tid = (origin_term.id if o_xy is not None and segment_overlaps_column(sa, sb, o_xy, o_r, cfg)
+                   else dest_term.id if d_xy is not None and segment_overlaps_column(sa, sb, d_xy, d_r, cfg)
+                   else None)
+            edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg, terminal_id=tid))
             centerline.append((sb.copy(), t_next))
             t = t_next
             cum_horiz += horiz
             cum_dz += dz
-    # Tag the exit-lane / approach box (first/last) with its hub so the column-involved exemption applies
-    # (the refiner rebuilds from already-folded corners, so corners[0]/[-1] sit at the column edge).
-    if edges and origin_term is not None:
-        edges[0] = _retag(edges[0], origin_term.id)
-    if edges and dest_term is not None:
-        edges[-1] = _retag(edges[-1], dest_term.id)
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,
@@ -147,11 +177,6 @@ def build_reservation_from_corners(
                           radius=terminal_radius(dest_term, cfg) if dest_term else None),
     ]
     return volumes, centerline, cum_horiz, cum_dz
-
-
-def _retag(vol: Volume4D, terminal_id) -> Volume4D:
-    """Return a copy of ``vol`` with its ``terminal_id`` set (Volume4D is frozen)."""
-    return Volume4D(vol.shape, vol.t_start, vol.t_end, terminal_id=terminal_id)
 
 
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,

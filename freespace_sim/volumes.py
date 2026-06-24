@@ -129,10 +129,10 @@ def build_reservation_from_corners(
 
     Shared by the RRT* smoother, the NLP/MILP planners, and the shortcut refiner so they all emit the
     *same* contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are
-    given, the hub **hover column** is tagged shared (sized to the terminal's radius) AND the in-terminal
-    **exit-lane** box (first/last) is tagged with the hub, so the column-involved exemption lets it pass
-    through that column at zero gap; all other corridor boxes stay strict (untagged). Returns
-    (volumes, centerline, horiz, dz).
+    given, the hub **hover column** is tagged shared (sized to the terminal's radius) AND **every corridor
+    box that reaches into that column** (``segment_overlaps_column`` — not just the first/last) is tagged
+    with the hub, so the column-involved exemption lets the near-hub corridor pass through the shared
+    column; every box clear of the column stays strict (untagged). Returns (volumes, centerline, horiz, dz).
     """
     origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
     t = t_depart + g_delay + cfg.climb_time_s

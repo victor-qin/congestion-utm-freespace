@@ -8,19 +8,20 @@ test is <1 s and needs no full ~100-flight run).
      shortcut admitted a takeoff into it. **FIXED**: ``TerminalCapacity.column_clear`` always queries.
      Regression below: the {46,4,58,8} subset (which the pre-fix code denied) now fully admits.
 
-  2. **cruise box vs sibling column** — the first UNTAGGED cruise box just past the tagged exit lane
-     reaches back into a same-hub sibling's column. Only box[0]/box[-1] are tagged
-     (``astar._build`` ~L346, ``volumes.build_reservation_from_corners`` ~L137), and A* is blind to its
-     own hub's columns (``occupancy.is_blocked`` own-hub exemption ~L139), so it files a clipping plan.
-     **OPEN** (xfail).
+  2. **cruise box vs sibling column** — a near-hub cruise box just past the exit lane reaches back into
+     a same-hub sibling's column. **FIXED**: every box overlapping the flight's own column is now tagged
+     (``volumes.segment_overlaps_column``, applied in ``astar._build`` + ``build_reservation_from_corners``),
+     not just box[0]/box[-1], so the near-hub corridor is column-exempt instead of CONFLICT_FILED.
 
-  3. **same-hub exit lanes collide** — two tagged exit boxes overlap *inside* the shared column; box↔box
-     is not exempt (``conflict.volumes_conflict`` L29-31), and A* can't see the sibling's in-column
-     corridor (dropped by ``occupancy.add_volume`` own_cols ~L85) so it can't ground-delay around it.
-     **OPEN** (xfail).
+  3. **same-hub exit lanes collide** — two exit boxes overlap at the shared-column edge; box↔box is not
+     exempt (``conflict.volumes_conflict`` L29-31). **FIXED**: the takeoff/landing edge is gated by
+     ``TerminalCapacity.exit_clear`` — a precise FCL check of the exit lane vs committed sibling lanes —
+     so the colliding flight ground-delays (the hex grid can't do this: its inflation would also
+     serialize DIVERGENT launches).
 
-(See ``tests/test_terminal_capacity.py::test_column_clear_always_queries_even_when_siblings_cover`` for
-the unit-level guard on mechanism 1.)
+All three are now FIXED; the tests below are **regressions** (they assert ``.accepted`` and pass). See
+``tests/test_terminal_capacity.py::test_column_clear_always_queries_even_when_siblings_cover`` for the
+unit-level guard on mechanism 1.
 """
 
 import numpy as np

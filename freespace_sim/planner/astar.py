@@ -62,21 +62,6 @@ def _absorb(svc, ledger):
         svc.on_commit(_fid, [v for _, v in grp])
 
 
-def _column_cells(center, radius, R):
-    """Hex cells whose centre lies within ``radius`` of ``center`` (xy) — a terminal column's footprint.
-    Scanned at takeoff/landing so A* won't activate a column a foreign corridor has already reserved."""
-    cx, cy = float(center[0]), float(center[1])
-    cq, cr = hg.enu_to_axial(cx, cy, R)
-    span = int(math.ceil(radius / R)) + 3
-    out = []
-    for dq in range(-span, span + 1):
-        for dr in range(-span, span + 1):
-            c = hg.hex_center(cq + dq, cr + dr, R)
-            if (c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= radius * radius:
-                out.append((cq + dq, cr + dr))
-    return tuple(out)
-
-
 def _perimeter(center_xy, toward, radius, z):
     """A point ``radius`` m from ``center_xy`` toward ``toward`` (xy), at altitude ``z`` — where a
     hub's corridor starts/ends so same-hub flights diverge from the shared terminal edge."""

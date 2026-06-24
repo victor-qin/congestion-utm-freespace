@@ -1,13 +1,14 @@
+import numpy as np
 import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.planner import get_planner
-from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner import get_planner, hexgrid as hg
+from freespace_sim.planner.astar import AStarPlanner, _committed_arrival
 from freespace_sim.planner.opt import NLPOptPlanner
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, IntentStatus, vec
+from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
@@ -104,3 +105,30 @@ def test_astar_demand_run_is_verified():
     )
     res = run(cfg)
     assert res.verified
+
+
+def test_committed_arrival_gates_at_the_folded_dest_column_time_not_the_goal_step():
+    # Issue #15 tripwire: the landing gate must count capacity at the time _build COMMITS the dest column
+    # — the tail-folded column-edge arrival — not the goal-hex step time st[3]*dt. _committed_arrival
+    # rebuilds the candidate path and folds it through the SAME _fold_path _build uses, so the gate time
+    # and the committed dest-column t_start agree bit-for-bit; and that time is strictly earlier than the
+    # goal-hex step (proving we no longer gate at st[3]*dt, which over-subscribed pads on 7/8 dallas seeds).
+    cfg = SimConfig()
+    dt, R = cfg.dt_s, hg.circumradius(cfg)
+    dest = vec(0, 0, 0)
+    dest_term = Terminal("H", 2, radius=300.0)            # wide column → the straight-in tail clearly folds
+    # a straight-in air path along the q-axis toward the dest hub, one hex per step (q=5→0, steps 10→15)
+    air = [("a", q, 0, 10 + (5 - q)) for q in (5, 4, 3, 2, 1, 0)]
+    goal = air[-1]
+    came = {air[i]: air[i - 1] for i in range(1, len(air))}
+    came[air[0]] = ("g", 5, 0, 9)                          # the takeoff ground state ends the air walk
+    origin = vec(*hg.hex_center(5, 0, R), 0.0)
+
+    arr = _committed_arrival(goal, came, R, dt, cfg, origin, dest, None, dest_term)
+
+    # gate == commit: equals the dest-column t_start _build stamps (both fold via _fold_path)
+    cruise_wps = [(np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), s * dt) for (_, q, r, s) in air]
+    volumes, *_ = AStarPlanner()._build(cruise_wps, origin, dest, 0, 0, cfg, dest_term=dest_term)
+    assert arr == volumes[-1].t_start
+    # and strictly earlier than the goal-hex step time — the fold moved it (not gating at st[3]*dt)
+    assert arr < goal[3] * dt

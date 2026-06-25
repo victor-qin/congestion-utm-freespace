@@ -33,6 +33,7 @@ class DemandSpec:
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
+    uss_share: "dict[str, float] | None" = None      # demand split across USSs (None ⇒ equal weight)
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -57,6 +58,7 @@ class DemandSpec:
                 radius_m=self.radius_m, pads_per_hub=self.pads_per_hub,
                 terminal_radius_m=self.terminal_radius_m, corridor_overlap_m=self.corridor_overlap_m,
                 return_flights=self.return_flights, turnaround_s=self.turnaround_s,
+                uss_share=self.uss_share,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":

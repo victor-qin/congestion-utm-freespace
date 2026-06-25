@@ -256,6 +256,10 @@ class HubRadiusDemand:
             return None                              # builder defaults to the hover footprint
         return float(tr[uss_id] if isinstance(tr, dict) else tr)
 
+    def _pads_for(self, uss_id: str) -> int:
+        p = self.pads_per_hub
+        return int(p[uss_id] if isinstance(p, dict) else p)
+
     def _shares(self) -> tuple[list[str], np.ndarray]:
         ids = list(self.n_hubs_per_uss)
         p = (np.ones(len(ids)) if self.uss_share is None

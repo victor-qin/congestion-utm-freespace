@@ -11,8 +11,10 @@ ground state on the origin pad. The four cost levers are literally four edge typ
 So a single shortest-path search finds the globally-optimal mix of wait/detour/hover — resolution-
 optimal, deterministically, in polynomial time, with time-windowed obstacles handled natively
 (the step is in the state). The admissible straight-dash heuristic keeps the time axis from
-exploding. Output hex-centre corners are smoothed and rebuilt into the usual continuous corridor;
-`verify` is the backstop. Pairs with the NLP as `opt ← astar` for continuous polish.
+exploding; ``cfg.heuristic_weight`` (weighted A*, f = g + w·h) optionally trades bounded
+suboptimality (cost ≤ w·optimal) for fewer expansions — safe because separation is enforced by the
+search/ledger gates, not the cost. Output hex-centre corners are smoothed and rebuilt into the usual
+continuous corridor; `verify` is the backstop. Pairs with the NLP as `opt ← astar` for continuous polish.
 """
 
 from __future__ import annotations
@@ -145,6 +147,7 @@ class AStarPlanner:
         # capacity gain comes from per-level TAKEOFF, which is independent. Disable on huge scenarios to
         # recover most of the single-plane speed and keep the gain.
         self.vertical_edges = vertical_edges
+        self.last_expansions = 0                        # nodes expanded by the most recent plan()
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
@@ -264,11 +267,12 @@ class AStarPlanner:
         max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
                     + 3 * n_hops + 2 * climb_span + 6)
 
+        w = cfg.heuristic_weight                          # weighted A*: f = g + w*h (w=1 ⇒ optimal)
         start = ("g", oq, orr, base)
         g = {start: 0.0}
         came: dict = {}
         counter = itertools.count()
-        pq = [(h_ground, next(counter), start)]
+        pq = [(w * h_ground, next(counter), start)]
         closed: set = set()
         goal_state = None
         expansions = 0
@@ -319,8 +323,9 @@ class AStarPlanner:
                     g[nst] = ng
                     came[nst] = st
                     hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
-                    heapq.heappush(pq, (ng + hh, next(counter), nst))
+                    heapq.heappush(pq, (ng + w * hh, next(counter), nst))
 
+        self.last_expansions = expansions     # search-effort telemetry (analysis/benchmarks)
         if goal_state is None:
             # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
             # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /

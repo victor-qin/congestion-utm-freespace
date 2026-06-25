@@ -53,6 +53,13 @@ class SimConfig:
     cost_air_hold_per_s: float = 3.0          # loiter/hover mid-route (expensive)
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
+    # --- search (A*) ---
+    # Weighted A*: priority is g + heuristic_weight * h. 1.0 = optimal (admissible). >1.0 trades
+    # bounded suboptimality (path cost <= w * optimal) for far fewer expansions — safe here because
+    # path cost is a soft FCFS proxy; separation is enforced independently by the hex-occupancy search
+    # gate and the exact ledger conflict check at commit, neither of which the heuristic touches.
+    heuristic_weight: float = 1.0
+
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
     max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this

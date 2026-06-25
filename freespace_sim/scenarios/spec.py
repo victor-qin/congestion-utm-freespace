@@ -83,6 +83,7 @@ class ScenarioSpec:
     seed: int = 0
     planner: str | None = None             # None → SimConfig's default planner
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
+    heuristic_weight: float | None = None  # None → SimConfig default (1.0, optimal); >1 ⇒ weighted A*
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -94,6 +95,7 @@ class ScenarioSpec:
             seed=self.seed,
             **({"planner": self.planner} if self.planner else {}),
             **({"fixed_exit_lanes": self.fixed_exit_lanes} if self.fixed_exit_lanes is not None else {}),
+            **({"heuristic_weight": self.heuristic_weight} if self.heuristic_weight is not None else {}),
         )
 
     def demand_model(self) -> DemandModel | None:

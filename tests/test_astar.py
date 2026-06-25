@@ -47,6 +47,37 @@ def test_astar_reroutes_around_a_wall_that_straight_cannot_pass():
     assert intent.air_detour_m > 0.0                 # deterministically routed around
 
 
+def test_weighted_astar_w1_is_the_optimal_baseline():
+    """heuristic_weight=1.0 must be bit-identical to the default (1.0*h == h in IEEE-754)."""
+    from dataclasses import replace
+
+    led = ReservationLedger(CFG)
+    led.commit(99, [_wall()])
+    opt = AStarPlanner().plan(_req(), led, CFG)
+    w1 = AStarPlanner().plan(_req(), led, replace(CFG, heuristic_weight=1.0))
+    assert w1.cost == opt.cost
+    assert len(w1.volumes) == len(opt.volumes)
+    assert [c for _, c in w1.centerline] == [c for _, c in opt.centerline]   # same path, same times
+
+
+def test_weighted_astar_trades_optimality_for_fewer_expansions():
+    """w>1: still accepted + separation-safe, cost <= w*optimal, and never more expansions."""
+    from dataclasses import replace
+
+    led = ReservationLedger(CFG)
+    led.commit(99, [_wall()])
+    p_opt = AStarPlanner()
+    opt = p_opt.plan(_req(), led, CFG)
+
+    for w in (1.5, 2.0, 3.0):
+        p = AStarPlanner()
+        intent = p.plan(_req(), led, replace(CFG, heuristic_weight=w))
+        assert intent.status is IntentStatus.ACCEPTED            # weighting changes cost, not feasibility
+        assert not led.any_conflict(intent.volumes)              # safety is gate-enforced, not cost-enforced
+        assert intent.cost <= w * opt.cost + 1e-6                # bounded suboptimality
+        assert p.last_expansions <= p_opt.last_expansions        # a consistent h scaled never explores more
+
+
 def test_astar_uses_ground_delay_for_a_busy_destination_pad():
     led = ReservationLedger(CFG)
     led.commit(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])

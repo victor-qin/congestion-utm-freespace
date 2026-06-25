@@ -167,7 +167,7 @@ class HubRadiusDemand:
         default_factory=lambda: {"walmart_uss": 6, "stripmall_uss": 20}
     )
     radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS)
-    pads_per_hub: int = 1                            # terminal capacity N per hub
+    pads_per_hub: "int | dict[str, int]" = 1         # terminal capacity N per hub (scalar, or per-USS)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True                      # each delivery → a return to its origin hub
@@ -191,6 +191,10 @@ class HubRadiusDemand:
         if tr is None:
             return None                              # builder defaults to the hover footprint
         return float(tr[uss_id] if isinstance(tr, dict) else tr)
+
+    def _pads_for(self, uss_id: str) -> int:
+        p = self.pads_per_hub
+        return int(p[uss_id] if isinstance(p, dict) else p)
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
         ids = list(self.n_hubs_per_uss)
@@ -216,7 +220,7 @@ class HubRadiusDemand:
             uss_id = ids[int(rng.choice(len(ids), p=probs))]
             hi = int(rng.integers(hubs[uss_id].shape[0]))
             hub = hubs[uss_id][hi]
-            terminal = Terminal(f"{uss_id}#{hi}", int(self.pads_per_hub),
+            terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id),
                                 self._terminal_radius_for(uss_id), self.corridor_overlap_m)
             radius = self._radius_for(uss_id)
             customer = None

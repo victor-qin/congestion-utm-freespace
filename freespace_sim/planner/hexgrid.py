@@ -16,15 +16,22 @@ the true continuous gap, and FCL verify is the backstop.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
 from ..config import SimConfig
 from ..geometry import BoxSpec
-from ..volumes import Volume4D
+from ..types import as_terminal
+from ..volumes import Volume4D, exit_radius, graze_angle, terminal_radius
 
 SQRT3 = math.sqrt(3.0)
 AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
+
+
+def hex_neighbors(q: int, r: int) -> list[tuple[int, int]]:
+    """The 6 axial neighbours of hex (q, r)."""
+    return [(q + dq, r + dr) for dq, dr in AXIAL_NEIGHBORS]
 
 
 def circumradius(cfg: SimConfig) -> float:
@@ -56,6 +63,82 @@ def _axial_round(qf: float, rf: float) -> tuple[int, int]:
     else:
         rz = -rx - ry
     return int(rx), int(rz)
+
+
+@dataclass(frozen=True)
+class Lane:
+    """A hub's canonical exit/approach lane: a boundary hex just outside the column.
+
+    Each lane is a capacity-1 conflict-graph resource (issue #18). ``graze`` holds the indices (into the
+    hub's lane list) of the other lanes whose corridors would overlap this one at the column edge —
+    reserving this lane locks those too, so same-direction launches serialise while divergent ones stay
+    concurrent."""
+
+    cell: tuple[int, int]
+    bearing: float            # degrees, from the hub centre
+    dist: float               # metres, hub centre → cell centre
+    graze: tuple[int, ...]
+
+
+_LANE_CACHE: dict = {}
+
+
+def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
+    bx, by = hex_center(*cell, R)
+    return math.degrees(math.atan2(by - cy, bx - cx))
+
+
+def _ang_gap(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
+    """A hub's fixed exit-lane set: the **boundary hexes** of its column.
+
+    Classify hexes by centre distance to the hub: *covered* if within ``exit_radius`` (flood-filled out
+    from the home hex), *boundary* if not covered but hex-adjacent to a covered cell. The boundary ring
+    is the canonical exit-lane set — fully determined by the hub position and the fixed grid (no
+    snapping). Each lane records which other lanes it would graze (bearings within
+    :func:`volumes.graze_angle`). Deterministic in ``(center, term, cfg)`` and memoised — hubs don't
+    move during a run. See issue #18."""
+    term = as_terminal(term)
+    cx, cy = float(center[0]), float(center[1])
+    key = (round(cx, 3), round(cy, 3), term, cfg)
+    cached = _LANE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    R = circumradius(cfg)
+    er = exit_radius(term, cfg)
+    covered: set = set()
+    stack = [enu_to_axial(cx, cy, R)]                    # the home hex is always covered (er > R)
+    while stack:
+        h = stack.pop()
+        if h in covered:
+            continue
+        hx, hy = hex_center(*h, R)
+        if math.hypot(hx - cx, hy - cy) < er - 1e-9:
+            covered.add(h)
+            stack.extend(hex_neighbors(*h))
+    boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
+    cells = sorted(boundary, key=lambda c: _bearing_deg(c, cx, cy, R))
+    bearings = [_bearing_deg(c, cx, cy, R) for c in cells]
+    hub = np.array([cx, cy])
+    # Graze set: two lanes lock each other when their bearings differ by less than θ_min
+    # (:func:`volumes.graze_angle`) — i.e. their exit corridors would overlap at the column edge. This is
+    # an approximation (the committed first cruise box can bend toward the destination), so a small
+    # near-threshold residual remains; the ledger stays the backstop. See issue #18.
+    th = graze_angle(term, cfg)
+    lanes = [
+        Lane(
+            cell=c,
+            bearing=bearings[i],
+            dist=float(np.linalg.norm(hex_center(*c, R) - hub)),
+            graze=tuple(j for j in range(len(cells)) if j != i and _ang_gap(bearings[i], bearings[j]) < th),
+        )
+        for i, c in enumerate(cells)
+    ]
+    _LANE_CACHE[key] = lanes
+    return lanes
 
 
 def _cruise_overlap(vol: Volume4D, cfg: SimConfig) -> bool:

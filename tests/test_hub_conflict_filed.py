@@ -43,11 +43,11 @@ CRUISE_CLIP = (4, 8, 86)      # walmart#4 deliveries; fid 86's first cruise box 
 EXIT_COLLISION = (44, 92)     # stripmall#5 deliveries; their exit lanes collide inside the shared column
 
 
-def _replay(fids):
+def _replay(fids, fixed=False):
     """Plan just ``fids`` (FCFS-ordered) from the seed-0 dallas demand; return {flight_id: intent}."""
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
                           demand_overrides={"pads_per_hub": 4}, planner="astar",
-                          lam_per_hour=600.0, horizon_s=300.0, seed=0)
+                          lam_per_hour=600.0, horizon_s=300.0, seed=0, fixed_exit_lanes=fixed)
     cfg = spec.config()
     byid = {r.flight_id: r for r in spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))}
     sub = sorted((byid[i] for i in fids), key=lambda r: (r.t_request, r.flight_id))
@@ -86,6 +86,17 @@ def test_same_hub_exit_lanes_do_not_collide():
     intents = _replay(EXIT_COLLISION)
     assert intents[44].accepted                                  # the first lane commits
     assert intents[92].accepted                                  # ground-delays past fid 44's lane; admitted
+
+
+@pytest.mark.parametrize("fids", [LAZY_SKIP, CRUISE_CLIP, EXIT_COLLISION])
+def test_fixed_exit_lanes_admit_all_three_mechanisms(fids):
+    # fixed_exit_lanes (issue #18): the structural fix. Each mechanism subset is admitted conflict-free
+    # under fixed boundary-hex lanes — same-hub exit-lane contention serialises on the per-cell
+    # conflict-graph schedule instead of filing a CONFLICT_FILED. All-accepted ⇒ all committed clean
+    # (the FCFS mechanism re-checks the ledger at commit), so the run is conflict-free by construction.
+    intents = _replay(fids, fixed=True)
+    assert all(intents[f].accepted for f in fids), \
+        {f: intents[f].denial_reason.value for f in fids if not intents[f].accepted}
 
 
 def _max_concurrent(intervals):

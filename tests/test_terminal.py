@@ -290,3 +290,57 @@ def test_astar_shortcut_preserves_terminal_tags_no_warning():
                   requests=[_terminal_req()])
     assert res.verified
     assert any(v.terminal_id == "H" for v in res.accepted[0].volumes)   # column tag survived the rebuild
+
+
+# --- fixed_exit_lanes (issue #18): flag-on variants -------------------------------------------------
+#
+# With the flag on a shared-terminal flight routes through one of the hub's fixed boundary-hex lanes,
+# each a capacity-1 conflict-graph resource. Divergent launches take different cells (concurrent);
+# same-direction launches contend for one cell (the second serialises or diverts), never deny.
+
+
+def _astar_fl(**over):
+    return SimConfig(planner="astar", region_size_m=_REGION, fixed_exit_lanes=True, **over)
+
+
+@pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
+@pytest.mark.parametrize("n", [3, 4, 5])
+def test_divergent_same_hub_launches_concurrent_fixed_lanes(radius, n):
+    # flag-on headline: fanned-out flights take DIFFERENT boundary-hex lanes → all launch at once, verify.
+    reqs = [_radial_delivery(_HUB, i * 360.0 / n, 2500.0, n, i, radius=radius) for i in range(n)]
+    res = run(_astar_fl(), requests=reqs)
+    assert res.verified and len(res.accepted) == n
+    assert all(a.ground_delay_s == 0.0 for a in res.accepted)
+
+
+def test_same_direction_same_hub_launches_do_not_deny_fixed_lanes():
+    # two deliveries to the SAME destination from one hub (capacity 2) want the SAME exit cell. Pre-fix
+    # this was a same-hub exit-lane CONFLICT_FILED; now the second serialises (ground delay) or diverts
+    # to a neighbour lane (detour) — either way both ACCEPT and the run verifies.
+    dest = vec(_HUB[0] + 2500.0, _HUB[1], 0)
+    reqs = [FlightRequest(i, vec(_HUB[0], _HUB[1], 0), dest, 0.0,
+                          origin_terminal=Terminal("H", 2, radius=150.0)) for i in range(2)]
+    res = run(_astar_fl(), requests=reqs)
+    assert res.verified and len(res.accepted) == 2
+    assert any(a.ground_delay_s > 0.0 or a.air_detour_m > 0.0 for a in res.accepted)
+
+
+def test_fixed_lane_first_box_carries_terminal_and_lane_cell():
+    # flag-on: the first cruise box (the exit lane) is tagged with the hub AND its boundary cell, so
+    # TerminalCapacity records the per-cell dwell; cruise boxes stay untagged.
+    req = FlightRequest(0, vec(_HUB[0], _HUB[1], 0), vec(_HUB[0] + 2500.0, _HUB[1], 0), 0.0,
+                        origin_terminal=Terminal("H", 4, radius=150.0))
+    vols = run(_astar_fl(), requests=[req]).accepted[0].volumes
+    lane_boxes = [v for v in vols if isinstance(v.shape, BoxSpec) and v.lane_cell is not None]
+    assert lane_boxes and all(v.terminal_id == "H" for v in lane_boxes)
+    assert any(v.terminal_id is None for v in vols if isinstance(v.shape, BoxSpec))   # cruise untagged
+
+
+def test_astar_shortcut_concurrency_fixed_lanes():
+    # the refiner rebuilds via build_reservation_from_corners; with the flag on it must keep the boundary
+    # endpoints so divergent same-hub launches stay concurrent and verify.
+    reqs = [_radial_delivery(_HUB, 0.0, 2500.0, 2, 0, radius=150.0),
+            _radial_delivery(_HUB, 180.0, 2500.0, 2, 1, radius=150.0)]
+    res = run(SimConfig(planner="astar_shortcut", region_size_m=_REGION, fixed_exit_lanes=True), requests=reqs)
+    assert res.verified and len(res.accepted) == 2
+    assert all(a.ground_delay_s == 0.0 for a in res.accepted)

@@ -21,6 +21,7 @@ import heapq
 import itertools
 import math
 import warnings
+from dataclasses import replace
 
 import numpy as np
 
@@ -213,6 +214,18 @@ class AStarPlanner:
         o_cap = o_term.capacity if o_term else 1
         d_cap = d_term.capacity if d_term else 1
 
+        # Fixed exit lanes (issue #18). A shared-terminal takeoff/landing routes through one of the hub's
+        # canonical boundary-hex lanes, each a capacity-1 conflict-graph resource. ``o_lanes``/``d_lanes``
+        # are the boundary cells + graze sets (memoised); empty when the flag is off or the end isn't a
+        # terminal, in which case the legacy fold/exit_clear path runs.
+        fixed_lanes = cfg.fixed_exit_lanes
+        o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
+        d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
+        d_lane_by_cell = {L.cell: L for L in d_lanes}
+        # When the dest is a terminal the goal is a boundary cell, ~``d_max`` before the hub centre the
+        # heuristic targets — subtract it to stay admissible.
+        h_off = max((L.dist for L in d_lanes), default=0.0)
+
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come.
         # h_air is evaluated for EVERY generated neighbour (the search hot path), so the hex centre is
         # computed inline as scalars and the distance via math.sqrt(dx*dx+dy*dy) — bit-for-bit the same
@@ -221,10 +234,10 @@ class AStarPlanner:
 
         def h_air(q, r):
             dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
-            return c_lat * math.sqrt(dx * dx + dy * dy) + climb_cost
+            return c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off) + climb_cost
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
-        h_ground = c_lat * math.sqrt(dx0 * dx0 + dy0 * dy0) + 2.0 * climb_cost
+        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * climb_cost
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6
@@ -243,20 +256,35 @@ class AStarPlanner:
             if st in closed:
                 continue
             closed.add(st)
-            if st[0] == "a" and st[1] == gq and st[2] == grr and (
-                # Gate landing capacity at the time _build will COMMIT the dest column (the tail-folded
-                # edge arrival), not the goal-hex step time st[3]*dt — they differ by the centre→edge
-                # fold (~2–7 s), and counting the wrong window silently over-subscribes a pad. See
-                # _committed_arrival. Takeoff (_edges) is exact: the origin column sits at the ground step.
-                tcap.dwell_ok(
-                    d_term, dest,
-                    _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term),
-                    d_cap, origin,
-                ) if d_term is not None
-                else svc.pad_clear(gq, grr, st[3], dwell_steps)
-            ):
-                goal_state = st
-                break
+            if st[0] == "a":
+                goal_ok = False
+                if fixed_lanes and d_term is not None:
+                    # Fixed exit lanes: the goal is reaching one of the dest's boundary-hex lanes, gated
+                    # by the per-cell conflict-graph reservation (+ pad capacity + column). The corridor
+                    # ends at the boundary cell; the descent into the column is the hover reservation, so
+                    # the dest column opens at the cell-arrival time (window matches the committed lane box).
+                    L = d_lane_by_cell.get((st[1], st[2]))
+                    if L is not None:
+                        t_arr = st[3] * dt
+                        gz = tuple(d_lanes[j].cell for j in L.graze)
+                        goal_ok = (tcap.dwell_ok(d_term, dest, t_arr, d_cap)
+                                   and tcap.cell_admits(d_term.id, L.cell, gz,
+                                                        (st[3] - 1) * dt - cfg.time_buffer_s,
+                                                        t_arr + cfg.time_buffer_s))
+                elif st[1] == gq and st[2] == grr:
+                    # Legacy: gate landing capacity at the COMMITTED (tail-folded edge) arrival, not the
+                    # goal-hex step time — they differ by the centre→edge fold; see _committed_arrival.
+                    goal_ok = (
+                        tcap.dwell_ok(
+                            d_term, dest,
+                            _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term),
+                            d_cap, origin,
+                        ) if d_term is not None
+                        else svc.pad_clear(gq, grr, st[3], dwell_steps)
+                    )
+                if goal_ok:
+                    goal_state = st
+                    break
             # reaching the dest hex whose landing dwell is blocked is NOT a goal — fall through and
             # keep expanding (the ground-wait/hover levers find an arrival whose dwell is clear).
             expansions += 1
@@ -265,7 +293,7 @@ class AStarPlanner:
             base_g = g[st]
             for nst, cost in self._edges(
                 st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-                own, o_cap, o_term, origin, tcap, dest,
+                own, o_cap, o_term, origin, tcap, dest, o_lanes,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -314,7 +342,7 @@ class AStarPlanner:
         return intent
 
     def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-               own=(), o_cap=1, o_term=None, origin=None, tcap=None, dest=None):
+               own=(), o_cap=1, o_term=None, origin=None, tcap=None, dest=None, o_lanes=()):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -322,6 +350,25 @@ class AStarPlanner:
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             ts = s + climb_steps
+            if cfg.fixed_exit_lanes and o_term is not None:
+                # Fixed exit lanes: emit one takeoff edge per boundary-hex lane. The climb happens in the
+                # column; the lateral traverse out to the lane cell is folded into the edge COST (and the
+                # cell is reached at the climb-completion step, so ground_steps + the gate/commit windows
+                # stay exact). Gated by capacity+column AND the per-cell conflict-graph reservation.
+                if ts > max_step:
+                    return out
+                cap_col_ok = tcap.dwell_ok(o_term, origin, s * dt, o_cap)
+                o_r = terminal_radius(o_term, cfg)
+                w0, w1 = ts * dt - cfg.time_buffer_s, (ts + 1) * dt + cfg.time_buffer_s
+                for L in o_lanes:
+                    lq, lr = L.cell
+                    if svc.is_blocked(lq, lr, ts, own):
+                        continue
+                    gz = tuple(o_lanes[j].cell for j in L.graze)
+                    if cap_col_ok and tcap.cell_admits(o_term.id, L.cell, gz, w0, w1):
+                        out.append((("a", lq, lr, ts),
+                                    climb_cost + cfg.cost_air_lateral_per_m * (L.dist - o_r)))
+                return out
             # takeoff: the climb-completion air cell must be clear AND the origin pad must admit the whole
             # takeoff dwell starting at ground step s — a shared hub via TerminalCapacity (capacity +
             # column activation + exit-lane toward dest, gated at the exact takeoff time s*dt), an
@@ -351,10 +398,12 @@ class AStarPlanner:
         # lane + cruise reach the ledger, where corridor boxes stay strict (untagged): two flights can't
         # occupy the same exit lane at once, while divergent same-hub launches go concurrently.
         origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
-        # Fold the head/tail into the hub columns exactly as the landing gate predicted (shared
-        # _fold_path → gate arrival time == committed dest-column time, bit-for-bit).
-        wps = _fold_path([[np.asarray(p, float).copy(), t] for p, t in cruise_wps],
-                         origin, dest, origin_term, dest_term, cfg)
+        wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
+        if not cfg.fixed_exit_lanes:
+            # Legacy: fold the head/tail into the hub columns exactly as the landing gate predicted
+            # (shared _fold_path → gate arrival == committed dest-column time, bit-for-bit). With
+            # fixed_exit_lanes the air path already starts/ends on boundary cells — nothing to fold.
+            wps = _fold_path(wps, origin, dest, origin_term, dest_term, cfg)
         o_xy, d_xy = np.asarray(origin, float)[:2], np.asarray(dest, float)[:2]
 
         edges = []
@@ -379,6 +428,18 @@ class AStarPlanner:
             cum_horiz += horiz
             if horiz < _EPS:
                 n_hover += 1
+        if cfg.fixed_exit_lanes and edges:
+            # Tag the exit/approach lane boxes with their boundary cell so TerminalCapacity records the
+            # per-cell dwell. Force terminal_id too: a far boundary cell's box may not graze the column
+            # (so segment_overlaps_column left it untagged), yet on_commit keys cell_dwells on
+            # (terminal_id, lane_cell). The conflict-graph gate (_edges / landing) reserved this cell.
+            Rh = hg.circumradius(cfg)
+            if origin_term is not None:
+                c0 = hg.enu_to_axial(float(wps[0][0][0]), float(wps[0][0][1]), Rh)
+                edges[0] = replace(edges[0], terminal_id=origin_term.id, lane_cell=c0)
+            if dest_term is not None:
+                cN = hg.enu_to_axial(float(wps[-1][0][0]), float(wps[-1][0][1]), Rh)
+                edges[-1] = replace(edges[-1], terminal_id=dest_term.id, lane_cell=cN)
         t_takeoff = (base + ground_steps) * cfg.dt_s
         t_arrive = wps[-1][1]
         volumes = [

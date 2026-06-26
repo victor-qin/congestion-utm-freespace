@@ -80,6 +80,7 @@ class ScenarioSpec:
     lam_per_hour: float = 600.0
     seed: int = 0
     planner: str | None = None             # None → SimConfig's default planner
+    fixed_exit_lanes: bool = False         # issue #18: route shared-terminal flights through fixed lanes
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -89,6 +90,7 @@ class ScenarioSpec:
             lam_per_hour=self.lam_per_hour,
             horizon_s=self.horizon_s,
             seed=self.seed,
+            fixed_exit_lanes=self.fixed_exit_lanes,
             **({"planner": self.planner} if self.planner else {}),
         )
 

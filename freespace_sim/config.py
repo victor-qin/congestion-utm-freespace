@@ -65,6 +65,14 @@ class SimConfig:
     # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
     planner: str = "astar"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
 
+    # --- fixed terminal exit lanes (issue #18) ---
+    # When True, a shared-terminal takeoff/landing routes through one of the hub's canonical *boundary
+    # hexes* (the cells just outside the column), each a capacity-1 resource that locks only the cells
+    # whose corridors would graze it (conflict-graph reservation). Replaces the per-flight fold +
+    # exit_clear gate, eliminating same-hub exit-lane CONFLICT_FILED structurally. False ⇒ the legacy
+    # fold/exit_clear path (unchanged). Default off until A/B-validated.
+    fixed_exit_lanes: bool = False
+
     # ----- DERIVED (kept inside SimConfig) -----
     @property
     def corridor_segment_len_m(self) -> float:

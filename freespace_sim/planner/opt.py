@@ -136,8 +136,13 @@ class NLPOptPlanner:
 
         x = ca.vertcat(d, pint)
         w, h = cfg.region_size_m
-        lbx = [0.0] + [0.0, 0.0, cfg.z_min_m] * nint
-        ubx = [cfg.max_ground_delay_s] + [w, h, cfg.z_max_m] * nint
+        # bound interior z to the continuous band, WIDENED to include the warm seed's altitudes — so a
+        # multi-level A* seed (e.g. a low flight level) is polished in place instead of being forced to
+        # the single cruise plane (which would violate the per-segment climb limit and be rejected).
+        seed_zs = [float(k[2]) for k in knots]
+        z_lo, z_hi = min(cfg.z_min_m, min(seed_zs)), max(cfg.z_max_m, max(seed_zs))
+        lbx = [0.0] + [0.0, 0.0, z_lo] * nint
+        ubx = [cfg.max_ground_delay_s] + [w, h, z_hi] * nint
         x0 = [seed_delay] + np.array(knots[1:-1]).flatten().tolist()
 
         solver = ca.nlpsol(
@@ -166,7 +171,8 @@ class NLPOptPlanner:
             centerline=centerline,
             ground_delay_s=d_opt,
             air_detour_m=max(0.0, cum_horiz - straight_horiz),
-            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m) + cum_dz,
+            altitude_change_m=(float(corners[0][2]) - cfg.ground_level_m)
+            + (float(corners[-1][2]) - cfg.ground_level_m) + cum_dz,
             planner="opt",
         )
         intent.cost = trajectory_cost(intent, cfg)

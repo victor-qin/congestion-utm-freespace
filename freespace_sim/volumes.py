@@ -152,7 +152,11 @@ def build_reservation_from_corners(
     column; every box clear of the column stays strict (untagged). Returns (volumes, centerline, horiz, dz).
     """
     origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
-    t = t_depart + g_delay + cfg.climb_time_s
+    # the corner z is the source of truth for climb timing: cruise starts after the climb to the
+    # FIRST corner's altitude (its flight level), not a fixed preferred-level climb.
+    z_takeoff = float(np.asarray(corners[0], float)[2])
+    z_land = float(np.asarray(corners[-1], float)[2])
+    t = t_depart + g_delay + cfg.climb_time_to(z_takeoff)
     centerline: list[TimedPoint] = [(np.asarray(corners[0], float).copy(), t)]
     edges: list[Volume4D] = []
     cum_horiz = cum_dz = 0.0
@@ -198,31 +202,39 @@ def build_reservation_from_corners(
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,
-                          radius=terminal_radius(origin_term, cfg) if origin_term else None),
+                          radius=terminal_radius(origin_term, cfg) if origin_term else None,
+                          climb_time_s=cfg.climb_time_to(z_takeoff)),
         *edges,
         hover_reservation(dest, t, cfg,
                           terminal_id=dest_term.id if dest_term else None,
-                          radius=terminal_radius(dest_term, cfg) if dest_term else None),
+                          radius=terminal_radius(dest_term, cfg) if dest_term else None,
+                          climb_time_s=cfg.climb_time_to(z_land)),
     ]
     return volumes, centerline, cum_horiz, cum_dz
 
 
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,
-                      radius: float | None = None) -> Volume4D:
+                      radius: float | None = None, z_hi: float | None = None,
+                      climb_time_s: float | None = None) -> Volume4D:
     """A vertical hover cylinder at ``center`` (ASTM area-based intent, §4.3.5).
 
     ``radius`` (default ``effective_hover_radius_m``) lets a multi-pad vertiport size its shared column
-    bigger than a single pad. Altitude band [ground, cruise] so it covers the climb or descent; active
-    for ``hover_time_s + climb_time_s`` from ``t0``. When ``terminal_id`` is set this cylinder is a
-    shared terminal column — transparent to its own hub's flights, opaque to everyone else (see
-    :func:`conflict.volumes_conflict`).
+    bigger than a single pad. Altitude band [ground, ``z_hi``] — ``z_hi`` defaults to
+    ``airspace_ceiling_m`` so the column spans the full regulated tube (a vertiport owns its vertical
+    column of regulated airspace). Active for ``hover_time_s + climb_time_s`` from ``t0``; pass
+    ``climb_time_s`` (e.g. :meth:`SimConfig.climb_time_to` of the flight's cruise level) to size the
+    window to the actual climb instead of the preferred-level default. When ``terminal_id`` is set this
+    cylinder is a shared terminal column — transparent to its own hub's flights, opaque to everyone else
+    (see :func:`conflict.volumes_conflict`).
     """
     center = np.asarray(center, float)
+    z_hi = cfg.airspace_ceiling_m if z_hi is None else float(z_hi)
+    ct = cfg.climb_time_s if climb_time_s is None else float(climb_time_s)
     spec = CylinderSpec(
         cx=float(center[0]),
         cy=float(center[1]),
         radius=cfg.effective_hover_radius_m if radius is None else float(radius),
         z_lo=cfg.ground_level_m,
-        z_hi=cfg.cruise_level_m,
+        z_hi=z_hi,
     )
-    return Volume4D(spec, t0, t0 + cfg.hover_time_s + cfg.climb_time_s, terminal_id=terminal_id)
+    return Volume4D(spec, t0, t0 + cfg.hover_time_s + ct, terminal_id=terminal_id)

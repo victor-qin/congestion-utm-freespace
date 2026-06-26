@@ -356,3 +356,13 @@ def test_astar_shortcut_concurrency_fixed_lanes():
     res = run(SimConfig(planner="astar_shortcut", region_size_m=_REGION, fixed_exit_lanes=True), requests=reqs)
     assert res.verified and len(res.accepted) == 2
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)
+
+
+def test_terminal_column_spans_the_regulated_tube():
+    # a hub's shared hover column now spans [ground, airspace_ceiling] (the full regulated tube)
+    cfg = _astar()
+    res = run(cfg, requests=[_terminal_req()])
+    assert res.verified and res.accepted
+    cols = [v for v in res.accepted[0].volumes
+            if v.terminal_id == "H" and isinstance(v.shape, CylinderSpec)]
+    assert cols and all(abs(c.shape.z_hi - cfg.airspace_ceiling_m) < 1e-6 for c in cols)

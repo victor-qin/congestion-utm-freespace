@@ -70,3 +70,39 @@ def test_milp_shortcut_never_worsens_the_milp_solution():
     assert sc.accepted
     assert not led.any_conflict(sc.volumes)
     assert sc.cost <= base.cost + 1e-6                 # post-MILP shortcut is monotone
+
+
+# --- multi-altitude: the refiner polishes A*'s multi-level output -----------------------------------
+
+def _climb_walls_led():
+    """A ledger forcing a mid-route climb: level 1 walled early, level 0 walled late (both mid-route)."""
+    led = ReservationLedger(CFG)
+    led.commit(98, [Volume4D(box_from_segment(vec(900, -400, CFG.level_z(1)),
+                                              vec(900, 400, CFG.level_z(1)), 40, CFG.corridor_height_m),
+                             0.0, 1e6)])
+    led.commit(97, [Volume4D(box_from_segment(vec(1500, -400, CFG.level_z(0)),
+                                              vec(1500, 400, CFG.level_z(0)), 40, CFG.corridor_height_m),
+                             0.0, 1e6)])
+    return led
+
+
+def test_astar_shortcut_preserves_multilevel_climb():
+    led = _climb_walls_led()
+    s = get_planner("astar_shortcut").plan(_req(), led, CFG)
+    assert s.accepted
+    assert not led.any_conflict(s.volumes)                              # build-then-check holds
+    levels = sorted({round(float(p[2]), 1) for p, _ in s.centerline})
+    assert CFG.level_z(0) in levels and CFG.level_z(1) in levels        # the climb knot survived
+
+
+def test_astar_shortcut_slants_the_climb_staircase():
+    a = AStarPlanner().plan(_req(), _climb_walls_led(), CFG)
+    led = _climb_walls_led()
+    s = get_planner("astar_shortcut").plan(_req(), led, CFG)
+    assert s.accepted and not led.any_conflict(s.volumes)
+    assert s.cost <= a.cost + 1e-6                                      # a post-pass never worsens
+    cl = s.centerline
+    slanted = any(abs(float(cl[i + 1][0][0]) - float(cl[i][0][0])) > 1.0
+                  and abs(float(cl[i + 1][0][2]) - float(cl[i][0][2])) > 1.0
+                  for i in range(len(cl) - 1))
+    assert slanted   # A*'s orthogonal cruise→climb→cruise staircase fused into a DIAGONAL climb

@@ -99,7 +99,7 @@ class TerminalCapacity:
                                 radius=terminal_radius(term, self.cfg))
         return not self.ledger.any_conflict([col])
 
-    def exit_clear(self, term, center, toward, t0: float) -> bool:
+    def exit_clear(self, term, center, toward, t0: float, z: float | None = None) -> bool:
         """Step 1b — exit/approach lane, LEGACY path only (``fixed_exit_lanes=False``): the corridor the
         flight flies from the column EDGE toward ``toward`` (origin→dest on takeoff; dest←origin on
         landing) is free of committed conflict over the dwell window ``[t0, t0 + hover + climb)``. Only
@@ -126,7 +126,9 @@ class TerminalCapacity:
             return True                                   # degenerate (origin == dest): nothing to fly
         ux, uy = dx / n, dy / n
         exit_r = exit_radius(term, self.cfg)
-        z = self.cfg.cruise_level_m
+        # the lane sits at the flight's CHOSEN cruise level (multi-altitude); same-hub siblings at a
+        # different level are vertically disjoint, so the lane check must use that level's z.
+        z = self.cfg.cruise_level_m if z is None else float(z)
         seg = self.cfg.corridor_segment_len_m
         edge = [cx + exit_r * ux, cy + exit_r * uy, z]
         far = [cx + (exit_r + seg) * ux, cy + (exit_r + seg) * uy, z]
@@ -134,13 +136,24 @@ class TerminalCapacity:
         lane = corridor_segment_volume(edge, t0, far, t1, self.cfg, terminal_id=term.id)
         return not self.ledger.any_conflict([lane])
 
-    def dwell_ok(self, term, center, t0: float, capacity: int, toward=None) -> bool:
+    def dwell_ok(self, term, center, t0: float, capacity: int, toward=None, z: float | None = None) -> bool:
         """The takeoff/landing edge exists at ``t0`` iff capacity admits AND the column is deployable
         over the dwell window ``[t0, t0 + hover + climb)`` AND — when ``toward`` (the other endpoint) is
-        given — the exit/approach lane toward it is clear of committed sibling lanes (:meth:`exit_clear`).
-        ``toward=None`` skips the lane check (capacity/column only)."""
+        given — the exit/approach lane toward it (at cruise level ``z``) is clear of committed sibling
+        lanes (:meth:`exit_clear`). ``toward=None`` skips the lane check (capacity/column only)."""
         term = as_terminal(term)
         t1 = t0 + self.cfg.hover_time_s + self.cfg.climb_time_s
         return (self.admits(term.id, t0, t1, capacity)
                 and self.column_clear(term, center, t0)
-                and (toward is None or self.exit_clear(term, center, toward, t0)))
+                and (toward is None or self.exit_clear(term, center, toward, t0, z)))
+
+    def dwell_ok_levels(self, term, center, t0: float, capacity: int, toward, zs) -> list[bool]:
+        """Multi-altitude fast path: capacity + column activation are level-AGNOSTIC (the column spans
+        the whole [ground, ceiling] tube), so compute them ONCE; only the exit lane varies per cruise
+        level. Returns a bool per ``z`` in ``zs``. (Used by the legacy fold/exit_clear takeoff path; the
+        fixed-lane path deconflicts siblings by cell occupancy instead and doesn't need it.)"""
+        term = as_terminal(term)
+        t1 = t0 + self.cfg.hover_time_s + self.cfg.climb_time_s
+        if not (self.admits(term.id, t0, t1, capacity) and self.column_clear(term, center, t0)):
+            return [False] * len(zs)
+        return [self.exit_clear(term, center, toward, t0, z) for z in zs]

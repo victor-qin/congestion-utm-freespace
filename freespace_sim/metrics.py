@@ -150,10 +150,12 @@ def _rollup(df: pd.DataFrame, cfg: SimConfig) -> dict:
     acc = df[df["accepted"]]
     den = df[df["denied"]]
     horizon_h = cfg.horizon_s / 3600.0
-    # Vertical extent of the usable airspace. When the altitude band is collapsed to a single flight
-    # level (z_max == z_min), fall back to the corridor slab height — the vertical footprint a flight
-    # actually occupies at that level — so utilization stays meaningful instead of dividing by zero.
-    vert_extent_m = max(cfg.z_max_m - cfg.z_min_m, cfg.corridor_height_m)
+    # Vertical extent of the usable airspace. With discrete flight levels (n_levels > 1) the usable
+    # tube is the regulated band [ground, airspace_ceiling]. Otherwise the continuous band is collapsed
+    # to a single plane (z_max == z_min), so fall back to the corridor slab height — the vertical
+    # footprint a flight occupies at that level — so utilization stays meaningful (not a divide-by-zero).
+    vert_extent_m = ((cfg.airspace_ceiling_m - cfg.ground_level_m) if cfg.n_levels > 1
+                     else max(cfg.z_max_m - cfg.z_min_m, cfg.corridor_height_m))
     region_vol_m3 = cfg.region_size_m[0] * cfg.region_size_m[1] * vert_extent_m
     airspace_capacity_m3_s = region_vol_m3 * cfg.horizon_s
     # split real congestion (budget) from the planner's search artifact

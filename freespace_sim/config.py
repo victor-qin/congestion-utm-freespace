@@ -7,21 +7,28 @@ is it cheaper to wait on the pad, fly a detour, hover, or change altitude?
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class SimConfig:
-    # --- dimensionality & altitude (full continuous 3D) ---
+    # --- dimensionality & altitude (full 3D, regulated band [ground_level_m, airspace_ceiling_m]) ---
     dims: int = 3
     ground_level_m: float = 0.0
-    cruise_level_m: float = 150.0      # PREFERRED cruise height (not a hard level)
-    # Altitude deconfliction band. Currently COLLAPSED to the single cruise level: the airspace has
-    # one flight level, so altitude is not yet a deconfliction lever (planners that sample z — RRT*,
-    # MILP, NLP — stay on the cruise plane, matching the cruise-plane A* search and keeping the
-    # top-down replay faithful). Widen this band (e.g. 0–200) to re-enable multi-altitude routing.
-    z_min_m: float = 150.0
-    z_max_m: float = 150.0
+    cruise_level_m: float = 75.0       # single-plane planners' cruise altitude (RRT*/MILP/NLP/straight)
+    # Continuous-sampler band (RRT*/MILP/NLP). Collapsed to the single cruise level so those planners stay
+    # on one plane. A* instead deconflicts by altitude on the DISCRETE ``flight_levels_m`` ladder below;
+    # widening this band (z_min_m < z_max_m) to give the samplers multi-altitude too is a follow-up.
+    z_min_m: float = 75.0
+    z_max_m: float = 75.0
+    # Regulated airspace ceiling: every hover/terminal column spans [ground_level_m, airspace_ceiling_m].
+    airspace_ceiling_m: float = 125.0
+    # A*'s discrete cruise levels. Strictly ascending; adjacent gaps must EXCEED corridor_height_m (so
+    # neighbouring level boxes don't touch in z and stay FCL-disjoint), and the top/bottom boxes
+    # (level ± corridor_height_m/2) must fit within [ground_level_m, airspace_ceiling_m]. Set
+    # ``flight_levels_m=(cruise_level_m,)`` (and matching ceiling) for legacy single-level behaviour.
+    flight_levels_m: tuple[float, ...] = (30.0, 70.0, 110.0)
 
     # --- region (continuous horizontal free space), local ENU metres ---
     region_size_m: tuple[float, float] = (10_000.0, 10_000.0)
@@ -32,7 +39,7 @@ class SimConfig:
 
     # --- kinematics ---
     nominal_speed_mps: float = 30.0    # horizontal cruise
-    climb_rate_mps: float = 6.0        # vertical climb/descent (0↔150 m ⇒ 25 s)
+    climb_rate_mps: float = 6.0        # vertical climb/descent (0↔75 m ⇒ 12.5 s)
 
     # --- corridor geometry (WIDTH & HEIGHT are knobs; LENGTH is derived from speed×dt) ---
     corridor_width_m: float = 60.0     # full lateral width of each corridor box
@@ -85,10 +92,68 @@ class SimConfig:
 
     @property
     def climb_time_s(self) -> float:
-        """Seconds to climb ground → cruise (150 / 6 = 25 s)."""
+        """Seconds to climb ground → the preferred cruise level (75 / 6 = 12.5 s).
+
+        This is the single-plane planners' climb time; A* uses :meth:`climb_time_to` per flight level.
+        """
         return (self.cruise_level_m - self.ground_level_m) / self.climb_rate_mps
 
     @property
     def n_steps(self) -> int:
         """Number of discrete timesteps in the horizon."""
         return int(self.horizon_s / self.dt_s)
+
+    # ----- discrete flight levels (A*'s altitude ladder) -----
+    @property
+    def n_levels(self) -> int:
+        """Number of discrete cruise levels A* can route on."""
+        return len(self.flight_levels_m)
+
+    def level_z(self, L: int) -> float:
+        """Altitude (m) of flight-level index ``L``."""
+        return self.flight_levels_m[L]
+
+    def nearest_level(self, z: float) -> int:
+        """Index of the flight level closest to altitude ``z``."""
+        return min(range(self.n_levels), key=lambda i: abs(self.flight_levels_m[i] - z))
+
+    def climb_time_to(self, z: float) -> float:
+        """Seconds to climb ground → ``z`` (or descend ``z`` → ground) at the climb rate."""
+        return (z - self.ground_level_m) / self.climb_rate_mps
+
+    def climb_steps_to(self, z: float, dt: float | None = None) -> int:
+        """Discrete timesteps to climb ground → ``z`` (≥ 1)."""
+        dt = self.dt_s if dt is None else dt
+        return max(1, int(math.ceil(self.climb_time_to(z) / dt)))
+
+    @staticmethod
+    def equidistant_levels(z_lo: float, z_hi: float, n: int) -> tuple[float, ...]:
+        """``n`` evenly spaced levels in [``z_lo``, ``z_hi``] inclusive (n ≥ 1)."""
+        if n <= 1:
+            return (z_lo,)
+        step = (z_hi - z_lo) / (n - 1)
+        return tuple(z_lo + step * i for i in range(n))
+
+    def __post_init__(self) -> None:
+        """Validate the flight-level ladder (frozen dataclass — raise only, never mutate)."""
+        lv = self.flight_levels_m
+        if not lv:
+            raise ValueError("flight_levels_m must be non-empty")
+        if list(lv) != sorted(lv) or len(set(lv)) != len(lv):
+            raise ValueError(f"flight_levels_m must be strictly ascending: {lv}")
+        half = self.corridor_height_m / 2.0
+        if lv[0] - half < self.ground_level_m - 1e-9:
+            raise ValueError(
+                f"lowest level {lv[0]} box dips below ground_level_m {self.ground_level_m}")
+        if lv[-1] + half > self.airspace_ceiling_m + 1e-9:
+            raise ValueError(
+                f"top level {lv[-1]} box exceeds airspace_ceiling_m {self.airspace_ceiling_m}")
+        for a, b in zip(lv, lv[1:]):
+            if (b - a) <= self.corridor_height_m + 1e-9:
+                raise ValueError(
+                    f"levels {a},{b} gap {b - a} <= corridor_height_m {self.corridor_height_m}; "
+                    "adjacent level boxes would overlap in z")
+        if not (self.ground_level_m <= self.cruise_level_m <= self.airspace_ceiling_m):
+            raise ValueError(
+                f"cruise_level_m {self.cruise_level_m} outside "
+                f"[{self.ground_level_m}, {self.airspace_ceiling_m}]")

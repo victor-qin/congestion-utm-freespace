@@ -53,10 +53,10 @@ class HexOccupancyService:
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R   # corridor footprint
         self.infl_pad = cfg.effective_hover_radius_m + self.R     # wider hover-cylinder footprint
-        self.blocked: dict[int, set[tuple[int, int]]] = {}        # step -> {(q, r)}  (non-terminal)
-        self.pad: dict[int, set[tuple[int, int]]] = {}            # step -> {(q, r)}  (non-terminal)
-        # shared terminal columns: step -> cell -> {terminal_id}  (which hubs' columns cover the cell)
-        self.term_cells: dict[int, dict[tuple[int, int], set[Hashable]]] = {}
+        self.blocked: dict[int, set[tuple[int, int, int]]] = {}   # step -> {(q, r, L)}  (non-terminal)
+        self.pad: dict[int, set[tuple[int, int, int]]] = {}       # step -> {(q, r, L)}  (non-terminal)
+        # shared terminal columns: step -> (q, r, L) -> {terminal_id}  (which hubs' columns cover the cell)
+        self.term_cells: dict[int, dict[tuple[int, int, int], set[Hashable]]] = {}
         self.n_added = 0                  # committed volumes absorbed (shrink tripwire)
         self.evicted_before: int | None = None   # lowest retained step
 
@@ -75,7 +75,7 @@ class HexOccupancyService:
         # box (an in-terminal exit lane) is still a corridor — it goes to blocked/pad like any other,
         # so it is never mistaken for a column cell. ("column ⟺ cylinder"; stored kind is issue #11.)
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, s, in_blk in hg.rasterize_volume_dual(
+        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if self.evicted_before is not None and s < self.evicted_before:
@@ -83,13 +83,14 @@ class HexOccupancyService:
             if not is_column:
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue             # the committing flight's own terminal interior — unreserved
-                self.pad.setdefault(s, set()).add((q, r))
+                self.pad.setdefault(s, set()).add((q, r, L))
                 if in_blk:
-                    self.blocked.setdefault(s, set()).add((q, r))
+                    self.blocked.setdefault(s, set()).add((q, r, L))
             elif in_blk:
-                # shared terminal column: record `tid` over its inner (blocked-strength) footprint —
-                # the cells A* queries for the own-hub cruise exemption (capacity lives in TerminalCapacity).
-                self.term_cells.setdefault(s, {}).setdefault((q, r), set()).add(tid)
+                # shared terminal column: record `tid` over its inner (blocked-strength) footprint at
+                # level L — the cells A* queries for the own-hub cruise exemption (capacity lives in
+                # TerminalCapacity).
+                self.term_cells.setdefault(s, {}).setdefault((q, r, L), set()).add(tid)
         self.n_added += 1
 
     def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
@@ -122,8 +123,8 @@ class HexOccupancyService:
         self.evicted_before = None
 
     # ----- queries (the A* search hot path) -----
-    def is_blocked(self, q: int, r: int, s: int, own: Collection[Hashable] = ()) -> bool:
-        """Is hex (q, r) an obstacle at step ``s``?
+    def is_blocked(self, q: int, r: int, L: int, s: int, own: Collection[Hashable] = ()) -> bool:
+        """Is hex (q, r) at flight level ``L`` an obstacle at step ``s``?
 
         A flight owns its vertiports: a cell inside its **own** terminal column is passable — the flight
         climbs/descends through its shared column. A cell under a *foreign* terminal column is a hard
@@ -142,23 +143,28 @@ class HexOccupancyService:
         plan, so this never self-blocks; the 90 m interior is skipped from ``blocked`` (``add_volume``
         ``own_cols``), so the climb stays clear. Flag off ⇒ ``False`` here, i.e. unchanged."""
         if self.term_cells:                      # zero-overhead when no terminals exist
-            here = self.term_cells.get(s, _EMPTY).get((q, r))
+            here = self.term_cells.get(s, _EMPTY).get((q, r, L))
             if here is not None:
                 if any(tid not in own for tid in here):
                     return True                  # foreign column → wall
                 # own-only column: transparent for the climb, unless (fixed lanes) a committed sibling
-                # corridor occupies this footprint cell — the same-hub serialisation A* must see.
-                return self.cfg.fixed_exit_lanes and (q, r) in self.blocked.get(s, ())
-        return (q, r) in self.blocked.get(s, ())
+                # corridor occupies this footprint cell at this level — the same-hub serialisation A* sees.
+                return self.cfg.fixed_exit_lanes and (q, r, L) in self.blocked.get(s, ())
+        return (q, r, L) in self.blocked.get(s, ())
 
     def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int) -> bool:
         """Is the ordinary (non-terminal) pad at hex (q, r) free for the whole dwell window
-        [s0, s0 + dwell_steps]? Clear iff no committed corridor footprint sweeps it AND it does not sit
-        under any hub's shared column. Shared-terminal takeoff/landing dwells are gated *temporally* by
-        :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, not here."""
+        [s0, s0 + dwell_steps]? The takeoff/landing hover column spans the full tube [ground, ceiling],
+        so the pad is clear iff NO committed corridor sweeps its cell at ANY flight level AND it does not
+        sit under any hub's shared column. Shared-terminal dwells are gated *temporally* by
+        :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, not here. (One level ⇒ the
+        legacy single-cell check.)"""
         for k in range(s0, s0 + dwell_steps + 1):
-            if (q, r) in self.pad.get(k, ()):
-                return False                     # a committed corridor sweeps the pad
-            if self.term_cells and (q, r) in self.term_cells.get(k, _EMPTY):
-                return False                     # an ordinary pad sitting under some hub's column
+            padk = self.pad.get(k, ())
+            tck = self.term_cells.get(k, _EMPTY) if self.term_cells else _EMPTY
+            for L in range(self.cfg.n_levels):
+                if (q, r, L) in padk:
+                    return False                 # a committed corridor sweeps the pad at level L
+                if (q, r, L) in tck:
+                    return False                 # an ordinary pad sitting under some hub's column
         return True

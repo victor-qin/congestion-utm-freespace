@@ -78,12 +78,18 @@ def get_planner(name: str) -> Planner:
 
         # Safe Interval Path Planning: same cost model + terminal gating + output as A*, but the air
         # search collapses the per-step axis into safe intervals (cost-aware Pareto). Drop-in for astar.
-        return SIPPPlanner()
+        # Compiled by default: a numba air-cruise kernel for non-terminal flights, auto-falling back to
+        # the pure-Python reference (terminals, out-of-box strays, or when numba is unavailable).
+        return SIPPPlanner(compiled=True)
+    if name == "sipp_ref":
+        from .sipp import SIPPPlanner
+
+        return SIPPPlanner(compiled=False)   # pure-Python reference oracle (A/B + the fallback path)
     if name == "sipp_shortcut":
         from .shortcut import ShortcutRefiner
         from .sipp import SIPPPlanner
 
-        return ShortcutRefiner(SIPPPlanner(), label="sipp_sc")
+        return ShortcutRefiner(SIPPPlanner(compiled=True), label="sipp_sc")
     if name == "opt_astar":
         from .astar import AStarPlanner
         from .opt import NLPOptPlanner

@@ -37,6 +37,7 @@ from ..geometry import CylinderSpec
 from ..volumes import terminal_radius
 from . import hexgrid as hg
 from .astar import AStarPlanner, _absorb, _committed_arrival
+from .compiled_occupancy import CompiledOccupancy
 
 _EPS = 1e-6
 
@@ -45,6 +46,18 @@ def _deny(req, reason):
     return OperationalIntent(
         request=req, status=IntentStatus.REJECTED, denial_reason=reason, planner="sipp"
     )
+
+
+def _iv_index_global(cocc, cell, step):
+    """Pool slot id of ``cell``'s interval containing ``step`` (the kernel's frontier node id); ``-1`` if
+    the step is blocked (no interval contains it). Walks the cell's interval chain from slot ``cell``."""
+    lo, hi, nxt = cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt
+    slot = cell
+    while slot != -1:
+        if lo[slot] <= step <= hi[slot]:
+            return slot
+        slot = int(nxt[slot])
+    return -1
 
 
 class SafeIntervalIndex:
@@ -192,10 +205,27 @@ def _nondominated(frontier, key, t, g, w):
 class SIPPPlanner(AStarPlanner):
     """Safe-interval cost-aware planner; inherits occupancy/terminal sync and corridor build from A*."""
 
-    def __init__(self, max_expansions: int = 600_000):
+    def __init__(self, max_expansions: int = 600_000, compiled: bool = True):
         super().__init__(max_expansions)
         self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
         self._sidx_ledger = None
+        # --- compiled (numba) air-cruise kernel; falls back to the pure-Python reference ---
+        self.compiled = compiled
+        self._kernel = None
+        if compiled:
+            try:
+                from .sipp_kernel import _search
+                self._kernel = _search
+            except ImportError:
+                self.compiled = False                  # numba absent → pure-Python everywhere
+        self._cocc: CompiledOccupancy | None = None    # interval pool (per ledger)
+        self._cocc_ledger = None
+        self._gen = 0                                  # version stamp for reused kernel state
+        self._k_cap = -1                               # frontier size the kernel arrays are sized to
+        self._k_lab_cell = None                        # kernel work arrays (allocated lazily)
+        self._k_out_q = None
+        self._fb = 0                                   # kernel→reference fallbacks (diagnostics/tests)
+        self._n_expansions = 0                         # kernel expansions on the last compiled plan
 
     def _sipp_index(self, req, ledger, cfg) -> "SafeIntervalIndex":
         """Maintain the SafeIntervalIndex in lockstep with the ledger (mirrors ``_occupancy``): first use
@@ -214,6 +244,17 @@ class SIPPPlanner(AStarPlanner):
         return sidx
 
     def plan(self, req, ledger, cfg):
+        """Dispatch: the compiled air-cruise kernel for non-terminal flights (Phase 1); the pure-Python
+        reference for terminal flights (Phase 2, not yet compiled) and as the universal fallback when
+        numba is absent, a flight strays out of the kernel box, or a capacity valve trips."""
+        if not self.compiled:
+            return self._plan_reference(req, ledger, cfg)
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        if o_term is not None or d_term is not None:
+            return self._plan_reference(req, ledger, cfg)
+        return self._plan_compiled(req, ledger, cfg)
+
+    def _plan_reference(self, req, ledger, cfg):
         # ---- setup: identical to AStarPlanner.plan (so cost/terminals/output match exactly) ----
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
@@ -361,6 +402,157 @@ class SIPPPlanner(AStarPlanner):
             air_detour_m=max(0.0, cum_horiz - straight),
             altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m),
             planner="sipp",
+        )
+        intent.cost = trajectory_cost(intent, cfg)
+        return intent
+
+    # ================= compiled (numba) air-cruise path (Phase 1: non-terminal) =================
+    def _compiled_occ(self, req, ledger, cfg) -> CompiledOccupancy:
+        """Maintain the dense interval table in lockstep with the ledger (mirrors ``_sipp_index``)."""
+        cocc = self._cocc
+        if cocc is None or self._cocc_ledger is not ledger:
+            cocc = self._cocc = CompiledOccupancy(cfg)
+            self._cocc_ledger = ledger
+            ledger.subscribe(cocc.on_commit)
+            _absorb(cocc, ledger)
+        elif ledger.n_volumes < cocc.n_added:
+            cocc.reset()
+            _absorb(cocc, ledger)
+        cocc.evict_before(int(req.t_request // cfg.dt_s))
+        return cocc
+
+    def _kernel_state(self, cocc) -> None:
+        """(Re)allocate version-stamped kernel work arrays. The frontier is sized to the interval pool
+        (grows with the ledger); labels/heap are fixed-cap (overflow → fallback); both are reused across
+        plans — reset is a ``self._gen`` bump, not an O(N) clear."""
+        if self._k_cap < cocc.cap:                       # frontier: one slot per pool interval
+            self._k_cap = cocc.cap
+            self._k_front_head = np.full(cocc.cap, -1, np.int64)
+            self._k_front_gen = np.zeros(cocc.cap, np.int64)
+        if self._k_lab_cell is None:                     # labels + heap: allocate once
+            ml = 1 << 21
+            self._k_max = ml
+            self._k_lab_cell = np.empty(ml, np.int64)
+            self._k_lab_slot = np.empty(ml, np.int64)
+            self._k_lab_arr = np.empty(ml, np.int64)
+            self._k_lab_g = np.empty(ml, np.float64)
+            self._k_lab_par = np.empty(ml, np.int64)
+            self._k_lab_next = np.empty(ml, np.int64)
+            self._k_lab_dead = np.full(ml, -1, np.int64)   # version-stamped: == gen ⇒ evicted, skip at pop
+            self._k_heap_f = np.empty(ml, np.float64)
+            self._k_heap_c = np.empty(ml, np.int64)
+            self._k_heap_n = np.empty(ml, np.int64)
+        if self._k_out_q is None or self._k_out_q.shape[0] < cocc.MAXS + 8:
+            self._k_out_q = np.empty(cocc.MAXS + 8, np.int64)
+            self._k_out_r = np.empty(cocc.MAXS + 8, np.int64)
+            self._k_out_s = np.empty(cocc.MAXS + 8, np.int64)
+
+    def _plan_compiled(self, req, ledger, cfg):
+        from .sipp_kernel import FALLBACK, NO_PATH
+        dt = cfg.dt_s
+        pitch = cfg.nominal_speed_mps * dt
+        R = hg.circumradius(cfg)
+        origin = np.asarray(req.origin, float)
+        dest = np.asarray(req.dest, float)
+        base = int(math.ceil(req.t_departure / dt))
+        climb_steps = max(1, int(math.ceil(cfg.climb_time_s / dt)))
+        climb_cost = cfg.cost_altitude_change_per_m * (cfg.cruise_level_m - cfg.ground_level_m)
+        oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
+        gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
+        gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr
+        straight = float(np.linalg.norm(dest[:2] - origin[:2]))
+
+        svc = self._occupancy(req, ledger, cfg)
+        cocc = self._compiled_occ(req, ledger, cfg)
+        dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
+        own = frozenset()
+        c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
+                               cfg.cost_air_lateral_per_m)
+        n_hops = int(math.ceil(max(straight, pitch) / pitch))
+        max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6
+
+        ocell, gcell = cocc.cell_id(oq, orr), cocc.cell_id(gq, grr)
+        if ocell < 0 or gcell < 0:
+            return self._plan_reference(req, ledger, cfg)          # out of kernel box → reference
+
+        # ---- start labels: ground-delayed climb-in-place takeoffs at the origin cell ----
+        smax = base + int(math.ceil(cfg.max_ground_delay_s / dt))
+        s_cell, s_slot, s_arr, s_g = [], [], [], []
+        for s in range(base, smax + 1):
+            ts = s + climb_steps
+            if ts > max_step:
+                break
+            if svc.is_blocked(oq, orr, ts, own) or not svc.pad_clear(oq, orr, s, dwell_steps):
+                continue
+            slot = _iv_index_global(cocc, ocell, ts)
+            if slot < 0:
+                continue                                      # ts blocked (unreachable post is_blocked)
+            s_cell.append(ocell); s_slot.append(slot); s_arr.append(ts)
+            s_g.append((s - base) * c_gd * dt + climb_cost)   # ground delay billed per-second (×dt)
+        if not s_cell:
+            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+
+        # ---- landing-feasible step intervals at the dest cell (folds the per-step pad gate) ----
+        lf_lo, lf_hi, lo = [], [], -1
+        for s in range(base, max_step + 1):
+            if svc.pad_clear(gq, grr, s, dwell_steps):
+                if lo < 0:
+                    lo = s
+            elif lo >= 0:
+                lf_lo.append(lo); lf_hi.append(s - 1); lo = -1
+        if lo >= 0:
+            lf_lo.append(lo); lf_hi.append(max_step)
+        if not lf_lo:
+            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+
+        # ---- call the kernel ----
+        self._kernel_state(cocc)
+        self._gen += 1
+        n, _cost, _n_exp, flag = self._kernel(
+            cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt, cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan,
+            base, max_step,
+            np.asarray(s_cell, np.int64), np.asarray(s_slot, np.int64), np.asarray(s_arr, np.int64),
+            np.asarray(s_g, np.float64), len(s_cell),
+            gq, grr, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64), len(lf_lo),
+            c_hold, c_lat, pitch, dt, gx, gy, R, 0.0, climb_cost,
+            self._gen, self._k_front_head, self._k_front_gen,
+            self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
+            self._k_lab_next, self._k_lab_dead, self._k_max,
+            self._k_heap_f, self._k_heap_c, self._k_heap_n, self._k_max,
+            self._k_out_q, self._k_out_r, self._k_out_s,
+        )
+        self._n_expansions = int(_n_exp)
+        if flag == FALLBACK:
+            self._fb += 1
+            return self._plan_reference(req, ledger, cfg)
+        if flag == NO_PATH:
+            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+
+        # ---- reconstruct: out_* is goal→start; reverse + re-expand folded hover waits ----
+        labels = [(int(self._k_out_q[i]), int(self._k_out_r[i]), int(self._k_out_s[i]))
+                  for i in range(n - 1, -1, -1)]
+        air = []
+        for i, (q, r, a) in enumerate(labels):
+            air.append((q, r, a))
+            if i + 1 < len(labels):
+                for k in range(a + 1, labels[i + 1][2]):
+                    air.append((q, r, k))
+        ground_steps = air[0][2] - climb_steps - base
+        delay = ground_steps * dt
+        cruise_wps: list[TimedPoint] = [
+            (np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), a * dt) for (q, r, a) in air]
+        volumes, centerline, cum_horiz, n_hover = self._build(
+            cruise_wps, origin, dest, base, ground_steps, cfg,
+            origin_term=req.origin_terminal, dest_term=req.dest_terminal,
+        )
+        if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
+        if ledger.any_conflict(volumes):
+            return _deny(req, DenialReason.CONFLICT_FILED)
+        intent = OperationalIntent(
+            request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
+            ground_delay_s=delay, air_hold_s=n_hover * dt, air_detour_m=max(0.0, cum_horiz - straight),
+            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m), planner="sipp",
         )
         intent.cost = trajectory_cost(intent, cfg)
         return intent

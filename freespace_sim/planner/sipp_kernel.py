@@ -1,0 +1,229 @@
+"""Compiled (numba) air-cruise kernel for cost-aware SIPP (issue #8, Track B).
+
+This is the hot path of :class:`~freespace_sim.planner.sipp.SIPPPlanner` — the safe-interval A* over the
+air lattice — lifted into a ``@njit`` function over flat arrays. The pure-Python ``SIPPPlanner`` stays
+the reference oracle (and the fallback); this kernel must reproduce its exact optimal weighted cost.
+Everything terminal/geometry/commit stays in the Python host.
+
+**Occupancy** is the linked-list interval pool of :class:`CompiledOccupancy`: a cell's free intervals
+are slots walked from slot ``cell`` along ``iv_nxt``; each slot is a unique frontier node id.
+
+**Multi-label, not single-best.** Because the objective is weighted cost (``c_hold != c_gd``), a
+``(cell, interval)`` is reached at several non-dominating ``(arrival, cost)`` labels (e.g. the origin via
+many cheap ground-delay amounts — none dominates, since reproducing a later arrival by air-hover costs
+``c_hold > c_gd``). Each search node is a *label*; the Pareto frontier per slot is a **version-stamped
+linked list** of labels (unbounded — a fixed cap would overflow at the origin / hot hubs), walked for
+dominance on insert. No eviction (a since-dominated label only adds a cheap compare); no per-(cell,step)
+dedup and no stale-skip (pure speedups — omitting them costs extra expansions, never optimality).
+
+Dominance (matches ``sipp._nondominated``): stored ``(t2,g2)`` dominates new ``(t,g)`` iff
+``t2 <= t and g2 + (t - t2)*c_hold <= g``. Goal cells are frontier-EXEMPT (their per-step landing gate
+is not interval-captured). Ground delay (the cheap ``c_gd`` lever) is folded into the *start labels* by
+the host, so every in-air wait here is air-hover at ``c_hold``.
+"""
+from __future__ import annotations
+
+import numpy as np
+from numba import njit
+
+_SQRT3 = 1.7320508075688772
+
+OK = 0
+NO_PATH = 1
+FALLBACK = 2          # out-of-box stray or label/heap capacity → host falls back to the reference
+
+
+@njit(cache=True)
+def _search(
+    iv_lo, iv_hi, iv_nxt, qmin, rmin, rspan, qspan, base, max_step,   # interval pool + box
+    start_cell, start_slot, start_arr, start_g, n_start,              # takeoff start labels
+    gq, grr, lf_lo, lf_hi, lf_n,                                      # goal cell + landing-feasible ivals
+    c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,         # cost + heuristic params
+    gen, front_head, front_gen,                                      # frontier (linked-list heads/slot)
+    lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_dead, max_lab,  # labels
+    heap_f, heap_c, heap_n, max_heap,                                # binary heap
+    out_q, out_r, out_s,                                             # output path buffers
+):
+    nlab = 0
+    size = 0
+    ctr = 0
+    n_exp = 0
+
+    for i in range(n_start):                            # seed takeoff start labels into the heap
+        if nlab >= max_lab or size >= max_heap:
+            return -1, 0.0, n_exp, FALLBACK
+        L = nlab; nlab += 1
+        cell = start_cell[i]
+        lab_cell[L] = cell; lab_slot[L] = start_slot[i]; lab_arr[L] = start_arr[i]
+        lab_g[L] = start_g[i]; lab_par[L] = -1; lab_next[L] = -1
+        iq = cell // rspan
+        q = iq + qmin; r = cell - iq * rspan + rmin
+        dxx = R * _SQRT3 * (q + r / 2.0) - gx
+        dyy = R * 1.5 * r - gy
+        f = start_g[i] + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost
+        heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L; ctr += 1
+        ii = size; size += 1
+        while ii > 0:
+            par = (ii - 1) // 2
+            if heap_f[ii] < heap_f[par] or (heap_f[ii] == heap_f[par] and heap_c[ii] < heap_c[par]):
+                tf = heap_f[ii]; heap_f[ii] = heap_f[par]; heap_f[par] = tf
+                tc = heap_c[ii]; heap_c[ii] = heap_c[par]; heap_c[par] = tc
+                tn = heap_n[ii]; heap_n[ii] = heap_n[par]; heap_n[par] = tn
+                ii = par
+            else:
+                break
+
+    while size > 0:
+        L = heap_n[0]
+        size -= 1                                       # pop min → sift down
+        heap_f[0] = heap_f[size]; heap_c[0] = heap_c[size]; heap_n[0] = heap_n[size]
+        i = 0
+        while True:
+            lft = 2 * i + 1; rgt = 2 * i + 2; sm = i
+            if lft < size and (heap_f[lft] < heap_f[sm] or (heap_f[lft] == heap_f[sm] and heap_c[lft] < heap_c[sm])):
+                sm = lft
+            if rgt < size and (heap_f[rgt] < heap_f[sm] or (heap_f[rgt] == heap_f[sm] and heap_c[rgt] < heap_c[sm])):
+                sm = rgt
+            if sm == i:
+                break
+            tf = heap_f[i]; heap_f[i] = heap_f[sm]; heap_f[sm] = tf
+            tc = heap_c[i]; heap_c[i] = heap_c[sm]; heap_c[sm] = tc
+            tn = heap_n[i]; heap_n[i] = heap_n[sm]; heap_n[sm] = tn
+            i = sm
+
+        if lab_dead[L] == gen:                          # evicted since pushed (a dominator was inserted)
+            continue
+        cell = lab_cell[L]; slot = lab_slot[L]; arr = lab_arr[L]; g = lab_g[L]
+        iq = cell // rspan
+        q = iq + qmin; r = cell - iq * rspan + rmin
+        is_goal = (q == gq and r == grr)
+
+        if is_goal:                                     # goal acceptance within a landing-feasible run
+            feasible = False
+            for k in range(lf_n):
+                if lf_lo[k] <= arr <= lf_hi[k]:
+                    feasible = True
+                    break
+            if feasible:
+                m = 0                                   # reconstruct: walk parents into out_* (goal→start)
+                cur = L
+                while cur != -1:
+                    cc = lab_cell[cur]; ci = cc // rspan
+                    out_q[m] = ci + qmin
+                    out_r[m] = cc - ci * rspan + rmin
+                    out_s[m] = lab_arr[cur]
+                    cur = lab_par[cur]
+                    m += 1
+                return m, g, n_exp, OK
+
+        n_exp += 1
+        hh = iv_hi[slot]
+        hi_c = hh if hh < max_step else max_step        # current cell free-until (how long we may hover)
+
+        for d in range(6):                              # reroute: one successor per neighbour interval
+            if d == 0:
+                nq = q + 1; nr = r
+            elif d == 1:
+                nq = q - 1; nr = r
+            elif d == 2:
+                nq = q; nr = r + 1
+            elif d == 3:
+                nq = q; nr = r - 1
+            elif d == 4:
+                nq = q + 1; nr = r - 1
+            else:
+                nq = q - 1; nr = r + 1
+            niq = nq - qmin; nir = nr - rmin
+            if niq < 0 or niq >= qspan or nir < 0 or nir >= rspan:
+                return -1, 0.0, n_exp, FALLBACK         # out-of-box stray → host reference
+            ncell = niq * rspan + nir
+            ngoal = (nq == gq and nr == grr)
+            sj = ncell                                  # walk the neighbour cell's interval chain
+            while sj != -1:
+                lo = iv_lo[sj]
+                if lo < base:
+                    lo = base
+                hi = iv_hi[sj]
+                if hi > max_step:
+                    hi = max_step
+                if lo <= hi:
+                    a = arr + 1
+                    if a < lo:
+                        a = lo
+                    if a > hi:
+                        sj = iv_nxt[sj]
+                        continue
+                    if a - 1 > hi_c:                     # cannot hover here long enough (chain ascends)
+                        break
+                    wait = a - (arr + 1)
+                    ng = g + c_hold * dt * wait + c_lat * pitch
+                    dominated = False
+                    if not ngoal and front_gen[sj] == gen:  # walk slot frontier: dominated? + evict dominees
+                        t = a * dt
+                        prevm = -1
+                        mlab = front_head[sj]
+                        while mlab != -1:
+                            t2 = lab_arr[mlab] * dt; g2 = lab_g[mlab]
+                            nxtm = lab_next[mlab]
+                            if t2 <= t and g2 + (t - t2) * c_hold <= ng + 1e-9:
+                                dominated = True
+                                break
+                            if t <= t2 and ng + (t2 - t) * c_hold <= g2 + 1e-9:
+                                lab_dead[mlab] = gen        # new dominates stored → evict (unlink + skip)
+                                if prevm == -1:
+                                    front_head[sj] = nxtm
+                                else:
+                                    lab_next[prevm] = nxtm
+                            else:
+                                prevm = mlab
+                            mlab = nxtm
+                    if not dominated:
+                        if nlab >= max_lab or size >= max_heap:
+                            return -1, 0.0, n_exp, FALLBACK
+                        L2 = nlab; nlab += 1
+                        lab_cell[L2] = ncell; lab_slot[L2] = sj; lab_arr[L2] = a
+                        lab_g[L2] = ng; lab_par[L2] = L
+                        if ngoal:
+                            lab_next[L2] = -1
+                        elif front_gen[sj] != gen:
+                            front_gen[sj] = gen; lab_next[L2] = -1; front_head[sj] = L2
+                        else:
+                            lab_next[L2] = front_head[sj]; front_head[sj] = L2
+                        dxx = R * _SQRT3 * (nq + nr / 2.0) - gx
+                        dyy = R * 1.5 * nr - gy
+                        f = ng + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost
+                        heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L2; ctr += 1
+                        ii = size; size += 1
+                        while ii > 0:
+                            par = (ii - 1) // 2
+                            if heap_f[ii] < heap_f[par] or (heap_f[ii] == heap_f[par] and heap_c[ii] < heap_c[par]):
+                                tf = heap_f[ii]; heap_f[ii] = heap_f[par]; heap_f[par] = tf
+                                tc = heap_c[ii]; heap_c[ii] = heap_c[par]; heap_c[par] = tc
+                                tn = heap_n[ii]; heap_n[ii] = heap_n[par]; heap_n[par] = tn
+                                ii = par
+                            else:
+                                break
+                sj = iv_nxt[sj]
+
+        if is_goal and arr + 1 <= hi_c:                 # goal-cell hover: retry the per-step landing gate
+            if nlab >= max_lab or size >= max_heap:
+                return -1, 0.0, n_exp, FALLBACK
+            L2 = nlab; nlab += 1
+            lab_cell[L2] = cell; lab_slot[L2] = slot; lab_arr[L2] = arr + 1
+            lab_g[L2] = g + c_hold * dt; lab_par[L2] = L; lab_next[L2] = -1
+            dxx = R * _SQRT3 * (q + r / 2.0) - gx
+            dyy = R * 1.5 * r - gy
+            f = (g + c_hold * dt) + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost
+            heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L2; ctr += 1
+            ii = size; size += 1
+            while ii > 0:
+                par = (ii - 1) // 2
+                if heap_f[ii] < heap_f[par] or (heap_f[ii] == heap_f[par] and heap_c[ii] < heap_c[par]):
+                    tf = heap_f[ii]; heap_f[ii] = heap_f[par]; heap_f[par] = tf
+                    tc = heap_c[ii]; heap_c[ii] = heap_c[par]; heap_c[par] = tc
+                    tn = heap_n[ii]; heap_n[ii] = heap_n[par]; heap_n[par] = tn
+                    ii = par
+                else:
+                    break
+
+    return -1, 0.0, n_exp, NO_PATH

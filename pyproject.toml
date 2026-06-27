@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 cloud = ["huggingface_hub>=0.20"]   # optional: push/pull run folders to a HF Hub dataset repo
+compiled = ["numba>=0.59"]          # optional: numba JIT for the compiled SIPP air-cruise kernel (#8)
 
 [build-system]
 requires = ["hatchling"]

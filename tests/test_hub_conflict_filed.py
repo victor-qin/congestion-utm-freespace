@@ -78,11 +78,12 @@ def test_cruise_box_does_not_clip_a_sibling_column():
 
 
 def test_same_hub_exit_lanes_do_not_collide():
-    # Mechanism 3, FIXED. The takeoff edge is now gated by ``TerminalCapacity.exit_clear`` — a precise
-    # (FCL) check of the exit lane toward the dest against committed sibling lanes (box↔box, not
-    # column-exempt). fid 92's lane overlaps fid 44's, so it ground-delays past it instead of being
-    # denied. (The hex grid is too coarse for this: its inflation would also serialize DIVERGENT
-    # launches; see ``exit_clear`` and ``test_terminal.test_divergent_same_hub_launches_are_concurrent``.)
+    # Mechanism 3, LEGACY path (fixed_exit_lanes off — _replay's default). The takeoff edge is gated by
+    # ``TerminalCapacity.exit_clear`` — a precise (FCL) check of the exit lane toward the dest against
+    # committed sibling lanes (box↔box, not column-exempt). fid 92's lane overlaps fid 44's, so it
+    # ground-delays past it instead of being denied. (The default fixed-lane path instead serialises this
+    # via exact cell occupancy in ``occupancy.is_blocked`` — see
+    # ``test_fixed_exit_lanes_admit_all_three_mechanisms``.)
     intents = _replay(EXIT_COLLISION)
     assert intents[44].accepted                                  # the first lane commits
     assert intents[92].accepted                                  # ground-delays past fid 44's lane; admitted
@@ -90,10 +91,11 @@ def test_same_hub_exit_lanes_do_not_collide():
 
 @pytest.mark.parametrize("fids", [LAZY_SKIP, CRUISE_CLIP, EXIT_COLLISION])
 def test_fixed_exit_lanes_admit_all_three_mechanisms(fids):
-    # fixed_exit_lanes (issue #18): the structural fix. Each mechanism subset is admitted conflict-free
-    # under fixed boundary-hex lanes — same-hub exit-lane contention serialises on the per-cell
-    # conflict-graph schedule instead of filing a CONFLICT_FILED. All-accepted ⇒ all committed clean
-    # (the FCFS mechanism re-checks the ledger at commit), so the run is conflict-free by construction.
+    # fixed_exit_lanes (issue #18): the structural fix, now the default. Each mechanism subset is admitted
+    # conflict-free under fixed boundary-hex lanes — same-hub exit-lane contention serialises on exact
+    # CELL occupancy (``occupancy.is_blocked`` sees a committed sibling exit corridor in the column
+    # footprint) instead of filing a CONFLICT_FILED. All-accepted ⇒ all committed clean (the FCFS
+    # mechanism re-checks the ledger at commit), so the run is conflict-free by construction.
     intents = _replay(fids, fixed=True)
     assert all(intents[f].accepted for f in fids), \
         {f: intents[f].denial_reason.value for f in fids if not intents[f].accepted}

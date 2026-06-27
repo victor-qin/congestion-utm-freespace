@@ -46,9 +46,6 @@ class TerminalCapacity:
         self.ledger = ledger
         self.dwells: dict[Hashable, list[tuple[float, float]]] = {}   # tid -> [(t_start, t_end), ...]
         self.radius: dict[Hashable, float] = {}                       # tid -> the hub's one column radius
-        # (tid, (q,r)) -> [(t_start, t_end), ...] : per exit-lane-cell dwells for the conflict-graph
-        # reservation (issue #18, fixed_exit_lanes). Empty unless lane-tagged boxes are committed.
-        self.cell_dwells: dict[tuple, list[tuple[float, float]]] = {}
         self.evicted_before: float | None = None
 
     # ----- maintenance (push, via ledger.subscribe) -----
@@ -65,10 +62,6 @@ class TerminalCapacity:
                         f"({r} vs {v.shape.radius})"
                     )
                 self.dwells.setdefault(v.terminal_id, []).append((v.t_start, v.t_end))
-            # Exit/approach lane box (fixed_exit_lanes): record its window under (hub, cell) for the
-            # conflict-graph gate. A lane box is the tagged corridor segment, not the column cylinder.
-            if v.terminal_id is not None and v.lane_cell is not None:
-                self.cell_dwells.setdefault((v.terminal_id, v.lane_cell), []).append((v.t_start, v.t_end))
 
     def evict_before(self, t: float) -> None:
         """Drop dwells ending at or before ``t`` (monotonic). The caller passes the request clock: with
@@ -82,18 +75,11 @@ class TerminalCapacity:
                 self.dwells[tid] = kept
             else:
                 del self.dwells[tid]
-        for k in list(self.cell_dwells):
-            kept = [iv for iv in self.cell_dwells[k] if iv[1] > t]
-            if kept:
-                self.cell_dwells[k] = kept
-            else:
-                del self.cell_dwells[k]
         self.evicted_before = t
 
     def reset(self) -> None:
         self.dwells.clear()
         self.radius.clear()
-        self.cell_dwells.clear()
         self.evicted_before = None
 
     # ----- queries (plan time) -----
@@ -103,18 +89,6 @@ class TerminalCapacity:
         for me" (capacity 1 ⟺ the old exclusive pad)."""
         n = sum(1 for (a, b) in self.dwells.get(terminal_id, ()) if a < t1 and t0 < b)
         return n < capacity
-
-    def cell_admits(self, hub_id: Hashable, cell, graze_cells, t0: float, t1: float) -> bool:
-        """Conflict-graph exit-lane gate (issue #18, fixed_exit_lanes): boundary ``cell`` is free over
-        ``[t0, t1)`` iff neither it nor any of its graze-neighbour cells has a committed lane dwell
-        overlapping the window. Capacity-1 per cell; locking the (precomputed) graze set serialises two
-        same-direction launches while divergent ones stay concurrent. ``graze_cells`` is the cell's
-        neighbour set from :func:`planner.hexgrid.terminal_lanes`."""
-        for c in (cell, *graze_cells):
-            for (a, b) in self.cell_dwells.get((hub_id, c), ()):
-                if a < t1 and t0 < b:
-                    return False
-        return True
 
     def column_clear(self, term, center, t0: float) -> bool:
         """Step 1 — column activation: can the column deploy at ``t0`` with no FOREIGN transit? Build the
@@ -126,17 +100,20 @@ class TerminalCapacity:
         return not self.ledger.any_conflict([col])
 
     def exit_clear(self, term, center, toward, t0: float) -> bool:
-        """Step 1b — exit/approach lane: the corridor lane the flight flies from the column EDGE toward
-        ``toward`` (origin→dest on takeoff; dest←origin on landing) is free of committed conflict over
-        the dwell window ``[t0, t0 + hover + climb)``.
+        """Step 1b — exit/approach lane, LEGACY path only (``fixed_exit_lanes=False``): the corridor the
+        flight flies from the column EDGE toward ``toward`` (origin→dest on takeoff; dest←origin on
+        landing) is free of committed conflict over the dwell window ``[t0, t0 + hover + climb)``. Only
+        reached via ``dwell_ok(..., toward=...)``; the default fixed-lane path does the same job with
+        exact cell occupancy in :meth:`planner.occupancy.HexOccupancyService.is_blocked` (issue #18) and
+        never calls this.
 
-        This is the PRECISE (FCL) check the hex grid is too coarse to make at the shared edge. Same-hub
-        SIBLING exit lanes are box↔box — NOT column-exempt (``conflict.volumes_conflict`` needs a
-        cylinder) — so two flights launching the SAME direction at once collide, while DIVERGENT lanes
-        (spatially disjoint) do not. A*'s ``is_blocked`` cannot draw that line: at the edge the
-        corridor's hex inflation (~corridor_half + R ≈ 129 m at R=69) exceeds the spacing between
-        divergent lanes (~127 m for 90°-apart launches off a 90 m column), so a grid check would
-        serialize concurrent launches too. Gating the real box geometry here keeps both behaviors.
+        It is the PRECISE (FCL) check: same-hub SIBLING exit lanes are box↔box — NOT column-exempt
+        (``conflict.volumes_conflict`` needs a cylinder) — so two flights launching the SAME direction at
+        once collide, while DIVERGENT lanes (spatially disjoint) do not. The *legacy* ``is_blocked``
+        could not draw that line (its ~corridor_half + R ≈ 129 m inflation exceeded the ~127 m spacing
+        between 90°-apart lanes off a 90 m column, so a grid check serialized concurrent launches too);
+        issue #18 fixed that for the default path by recording the sibling corridor as exact cell
+        occupancy, so a fixed-lane launch sees it without this box check.
 
         The lane box is built EXACTLY as ``astar._build`` builds the exit lane — rooted flush at the
         column edge (:func:`volumes.exit_radius`, the one fold radius the commit also uses), one segment

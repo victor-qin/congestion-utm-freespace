@@ -35,10 +35,6 @@ class Volume4D:
     t_start: float
     t_end: float
     terminal_id: Hashable = None
-    # When this box is a shared-terminal *exit/approach lane* (issue #18), ``lane_cell`` is the axial
-    # ``(q, r)`` of the boundary hex it runs to/from. ``TerminalCapacity`` keys its per-cell capacity-1
-    # schedule on ``(terminal_id, lane_cell)``; ``None`` for every other volume (the default).
-    lane_cell: "tuple[int, int] | None" = None
 
     def to_fcl(self):
         return self.shape.to_fcl()
@@ -57,7 +53,6 @@ class Volume4D:
 
 def corridor_segment_volume(
     p0: Vec, t0: float, p1: Vec, t1: float, cfg: SimConfig, *, terminal_id: Hashable = None,
-    lane_cell: "tuple[int, int] | None" = None,
 ) -> Volume4D:
     """Build the single corridor box for one segment (p0,t0)→(p1,t1).
 
@@ -80,8 +75,7 @@ def corridor_segment_volume(
     a = p0 - u * ext        # extend behind the start
     b = p1 + u * ext        # and beyond the end → overlap with neighbours
     spec = box_from_segment(a, b, cfg.corridor_width_m, cfg.corridor_height_m)
-    return Volume4D(spec, t0 - cfg.time_buffer_s, t1 + cfg.time_buffer_s, terminal_id=terminal_id,
-                    lane_cell=lane_cell)
+    return Volume4D(spec, t0 - cfg.time_buffer_s, t1 + cfg.time_buffer_s, terminal_id=terminal_id)
 
 
 def build_corridor(centerline: list[TimedPoint], cfg: SimConfig) -> list[Volume4D]:
@@ -116,18 +110,6 @@ def exit_radius(term, cfg: SimConfig) -> float:
     exit-lane check all root the lane at the same edge and cannot drift."""
     ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
     return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
-
-
-def graze_angle(term, cfg: SimConfig) -> float:
-    """Bearing separation (degrees) below which two same-hub exit corridors overlap at the column edge.
-
-    Two ``corridor_width``-wide lanes leaving a radius-``r`` column graze when their centrelines are
-    closer than the corridor width there: ``2·r·sin(Δθ/2) < corridor_width`` ⇒
-    ``Δθ < 2·asin(corridor_width / 2r)``. This ``θ_min`` is the conflict-graph threshold — two exit
-    cells whose bearings differ by less than it lock each other (issue #18). Shrinks as ``r`` grows, so
-    bigger columns graze less. (Clamped for ``r < corridor_width/2``, where every lane would graze.)"""
-    r = terminal_radius(as_terminal(term), cfg)
-    return float(2.0 * np.degrees(np.arcsin(min(1.0, cfg.corridor_width_m / (2.0 * r)))))
 
 
 def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool:
@@ -203,17 +185,14 @@ def build_reservation_from_corners(
             cum_horiz += horiz
             cum_dz += dz
     if cfg.fixed_exit_lanes and edges and (origin_term is not None or dest_term is not None):
-        # Fixed exit lanes: the first/last corner is a boundary cell (the shortcut/refiner never drops
-        # endpoints), so tag the first/last box with it — mirrors astar._build so a rebuilt corridor
-        # records the same per-cell dwell. Lazy import avoids the volumes↔hexgrid cycle.
-        from .planner.hexgrid import circumradius, enu_to_axial
-        Rh = circumradius(cfg)
+        # Fixed exit lanes: force the hub tag on the first/last (boundary-cell) box. It leaves from /
+        # arrives at the column edge and can graze the shared column; an untagged box grazing it would
+        # conflict at commit (different tid) — the cruise-box-clip. ``segment_overlaps_column`` tags
+        # interior boxes; this guarantees the boundary box too (mirrors ``astar._build``).
         if origin_term is not None:
-            c0 = enu_to_axial(float(corners[0][0]), float(corners[0][1]), Rh)
-            edges[0] = replace(edges[0], terminal_id=origin_term.id, lane_cell=c0)
+            edges[0] = replace(edges[0], terminal_id=origin_term.id)
         if dest_term is not None:
-            cN = enu_to_axial(float(corners[-1][0]), float(corners[-1][1]), Rh)
-            edges[-1] = replace(edges[-1], terminal_id=dest_term.id, lane_cell=cN)
+            edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,

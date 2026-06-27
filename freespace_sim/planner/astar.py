@@ -215,9 +215,10 @@ class AStarPlanner:
         d_cap = d_term.capacity if d_term else 1
 
         # Fixed exit lanes (issue #18). A shared-terminal takeoff/landing routes through one of the hub's
-        # canonical boundary-hex lanes, each a capacity-1 conflict-graph resource. ``o_lanes``/``d_lanes``
-        # are the boundary cells + graze sets (memoised); empty when the flag is off or the end isn't a
-        # terminal, in which case the legacy fold/exit_clear path runs.
+        # canonical boundary-hex lanes; same-hub launches are deconflicted by exact cell occupancy
+        # (``svc.is_blocked`` sees committed sibling exit corridors). ``o_lanes``/``d_lanes`` are the
+        # memoised boundary cells; empty when the flag is off or the end isn't a terminal, in which case
+        # the legacy fold/exit_clear path runs.
         fixed_lanes = cfg.fixed_exit_lanes
         o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
         d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
@@ -265,12 +266,10 @@ class AStarPlanner:
                     # the dest column opens at the cell-arrival time (window matches the committed lane box).
                     L = d_lane_by_cell.get((st[1], st[2]))
                     if L is not None:
-                        t_arr = st[3] * dt
-                        gz = tuple(d_lanes[j].cell for j in L.graze)
-                        goal_ok = (tcap.dwell_ok(d_term, dest, t_arr, d_cap)
-                                   and tcap.cell_admits(d_term.id, L.cell, gz,
-                                                        (st[3] - 1) * dt - cfg.time_buffer_s,
-                                                        t_arr + cfg.time_buffer_s))
+                        # The approach corridor into this boundary cell was already is_blocked-checked
+                        # (it now sees committed sibling approach lanes in the footprint — issue #18), so
+                        # the goal only needs the column/capacity dwell to admit here.
+                        goal_ok = tcap.dwell_ok(d_term, dest, st[3] * dt, d_cap)
                 elif st[1] == gq and st[2] == grr:
                     # Legacy: gate landing capacity at the COMMITTED (tail-folded edge) arrival, not the
                     # goal-hex step time — they differ by the centre→edge fold; see _committed_arrival.
@@ -359,13 +358,15 @@ class AStarPlanner:
                     return out
                 cap_col_ok = tcap.dwell_ok(o_term, origin, s * dt, o_cap)
                 o_r = terminal_radius(o_term, cfg)
-                w0, w1 = ts * dt - cfg.time_buffer_s, (ts + 1) * dt + cfg.time_buffer_s
                 for L in o_lanes:
                     lq, lr = L.cell
+                    # is_blocked now sees committed sibling exit corridors inside the column footprint
+                    # (issue #18): a lane cell whose cruise corridor a same-hub launch already occupies
+                    # over this window is blocked, so divergent lanes stay concurrent while two launches
+                    # into the same corridor serialise (ground-wait). No bearing graze-set needed.
                     if svc.is_blocked(lq, lr, ts, own):
                         continue
-                    gz = tuple(o_lanes[j].cell for j in L.graze)
-                    if cap_col_ok and tcap.cell_admits(o_term.id, L.cell, gz, w0, w1):
+                    if cap_col_ok:
                         out.append((("a", lq, lr, ts),
                                     climb_cost + cfg.cost_air_lateral_per_m * (L.dist - o_r)))
                 return out
@@ -429,17 +430,14 @@ class AStarPlanner:
             if horiz < _EPS:
                 n_hover += 1
         if cfg.fixed_exit_lanes and edges:
-            # Tag the exit/approach lane boxes with their boundary cell so TerminalCapacity records the
-            # per-cell dwell. Force terminal_id too: a far boundary cell's box may not graze the column
-            # (so segment_overlaps_column left it untagged), yet on_commit keys cell_dwells on
-            # (terminal_id, lane_cell). The conflict-graph gate (_edges / landing) reserved this cell.
-            Rh = hg.circumradius(cfg)
+            # Force the hub tag on the first/last (boundary-cell) box: it leaves from / arrives at the
+            # column edge and can graze the shared column, and an untagged box grazing it would conflict
+            # at commit (different tid) — the cruise-box-clip. segment_overlaps_column tags interior
+            # boxes; this guarantees the boundary box too.
             if origin_term is not None:
-                c0 = hg.enu_to_axial(float(wps[0][0][0]), float(wps[0][0][1]), Rh)
-                edges[0] = replace(edges[0], terminal_id=origin_term.id, lane_cell=c0)
+                edges[0] = replace(edges[0], terminal_id=origin_term.id)
             if dest_term is not None:
-                cN = hg.enu_to_axial(float(wps[-1][0][0]), float(wps[-1][0][1]), Rh)
-                edges[-1] = replace(edges[-1], terminal_id=dest_term.id, lane_cell=cN)
+                edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
         t_takeoff = (base + ground_steps) * cfg.dt_s
         t_arrive = wps[-1][1]
         volumes = [

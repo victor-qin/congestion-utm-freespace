@@ -23,7 +23,7 @@ import numpy as np
 from ..config import SimConfig
 from ..geometry import BoxSpec
 from ..types import as_terminal
-from ..volumes import Volume4D, exit_radius, graze_angle, terminal_radius
+from ..volumes import Volume4D, exit_radius
 
 SQRT3 = math.sqrt(3.0)
 AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
@@ -67,17 +67,16 @@ def _axial_round(qf: float, rf: float) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class Lane:
-    """A hub's canonical exit/approach lane: a boundary hex just outside the column.
+    """A hub's canonical exit/approach lane: a boundary hex just outside the column (issue #18).
 
-    Each lane is a capacity-1 conflict-graph resource (issue #18). ``graze`` holds the indices (into the
-    hub's lane list) of the other lanes whose corridors would overlap this one at the column edge —
-    reserving this lane locks those too, so same-direction launches serialise while divergent ones stay
-    concurrent."""
+    Same-hub launches are deconflicted by exact cell occupancy at plan time (``HexOccupancyService``),
+    not by any per-lane graze graph — two flights whose corridors share a footprint cell serialise,
+    divergent ones stay concurrent. So a lane is just its ``cell`` plus descriptors: ``bearing`` (the
+    stable sort order of the ring) and ``dist`` (used by the A* heuristic and the takeoff edge cost)."""
 
     cell: tuple[int, int]
-    bearing: float            # degrees, from the hub centre
+    bearing: float            # degrees, from the hub centre (the lane ring's stable sort key)
     dist: float               # metres, hub centre → cell centre
-    graze: tuple[int, ...]
 
 
 _LANE_CACHE: dict = {}
@@ -88,19 +87,14 @@ def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
     return math.degrees(math.atan2(by - cy, bx - cx))
 
 
-def _ang_gap(a: float, b: float) -> float:
-    return abs((a - b + 180.0) % 360.0 - 180.0)
-
-
 def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
-    """A hub's fixed exit-lane set: the **boundary hexes** of its column.
+    """A hub's fixed exit-lane set: the **boundary hexes** of its column, sorted by bearing.
 
     Classify hexes by centre distance to the hub: *covered* if within ``exit_radius`` (flood-filled out
     from the home hex), *boundary* if not covered but hex-adjacent to a covered cell. The boundary ring
     is the canonical exit-lane set — fully determined by the hub position and the fixed grid (no
-    snapping). Each lane records which other lanes it would graze (bearings within
-    :func:`volumes.graze_angle`). Deterministic in ``(center, term, cfg)`` and memoised — hubs don't
-    move during a run. See issue #18."""
+    snapping). Deterministic in ``(center, term, cfg)`` and memoised — hubs don't move during a run.
+    See issue #18."""
     term = as_terminal(term)
     cx, cy = float(center[0]), float(center[1])
     key = (round(cx, 3), round(cy, 3), term, cfg)
@@ -121,21 +115,11 @@ def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
             stack.extend(hex_neighbors(*h))
     boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
     cells = sorted(boundary, key=lambda c: _bearing_deg(c, cx, cy, R))
-    bearings = [_bearing_deg(c, cx, cy, R) for c in cells]
     hub = np.array([cx, cy])
-    # Graze set: two lanes lock each other when their bearings differ by less than θ_min
-    # (:func:`volumes.graze_angle`) — i.e. their exit corridors would overlap at the column edge. This is
-    # an approximation (the committed first cruise box can bend toward the destination), so a small
-    # near-threshold residual remains; the ledger stays the backstop. See issue #18.
-    th = graze_angle(term, cfg)
     lanes = [
-        Lane(
-            cell=c,
-            bearing=bearings[i],
-            dist=float(np.linalg.norm(hex_center(*c, R) - hub)),
-            graze=tuple(j for j in range(len(cells)) if j != i and _ang_gap(bearings[i], bearings[j]) < th),
-        )
-        for i, c in enumerate(cells)
+        Lane(cell=c, bearing=_bearing_deg(c, cx, cy, R),
+             dist=float(np.linalg.norm(hex_center(*c, R) - hub)))
+        for c in cells
     ]
     _LANE_CACHE[key] = lanes
     return lanes

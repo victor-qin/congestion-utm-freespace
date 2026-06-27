@@ -125,16 +125,30 @@ class HexOccupancyService:
     def is_blocked(self, q: int, r: int, s: int, own: Collection[Hashable] = ()) -> bool:
         """Is hex (q, r) an obstacle at step ``s``?
 
-        A flight owns its vertiports: a cell inside its **own** terminal column is passable even if a
-        (strict) corridor's inflated footprint spills onto it — the flight climbs/descends through its
-        shared column, and any real corridor-vs-corridor overlap is caught by the ledger, not the
-        search grid. A cell under a *foreign* terminal column is a hard wall (cruise reroutes around
-        busy vertiports). Otherwise it's an ordinary corridor obstacle for everyone."""
+        A flight owns its vertiports: a cell inside its **own** terminal column is passable — the flight
+        climbs/descends through its shared column. A cell under a *foreign* terminal column is a hard
+        wall (cruise reroutes around busy vertiports). Otherwise it's an ordinary corridor obstacle for
+        everyone.
+
+        **Same-hub exit lanes (issue #18, ``fixed_exit_lanes``).** A hub's own-column footprint inflates
+        ~99 m past the 90 m column, swallowing the exit-lane cells (120-205 m out). That own-column
+        transparency is what lets a hub's flights share their climb space — but it also hid *committed
+        sibling exit corridors* sitting in that footprint, so two same-hub launches into the same cruise
+        corridor only collided at commit (``conflict_filed``). The bearing graze-set could not express
+        that conflict (it conflated hub-bearing with cruise direction). So under the flag we do NOT
+        blanket-transparent the footprint: an own-only column cell that also carries a committed corridor
+        (a sibling's tagged exit lane, recorded in ``blocked`` outside the 90 m interior) still blocks —
+        the exact same-hub cell occupancy. The flight's own (uncommitted) corridor is absent during its
+        plan, so this never self-blocks; the 90 m interior is skipped from ``blocked`` (``add_volume``
+        ``own_cols``), so the climb stays clear. Flag off ⇒ ``False`` here, i.e. unchanged."""
         if self.term_cells:                      # zero-overhead when no terminals exist
             here = self.term_cells.get(s, _EMPTY).get((q, r))
             if here is not None:
-                # own column → transparent (overrides any corridor spillover); foreign → wall
-                return any(tid not in own for tid in here)
+                if any(tid not in own for tid in here):
+                    return True                  # foreign column → wall
+                # own-only column: transparent for the climb, unless (fixed lanes) a committed sibling
+                # corridor occupies this footprint cell — the same-hub serialisation A* must see.
+                return self.cfg.fixed_exit_lanes and (q, r) in self.blocked.get(s, ())
         return (q, r) in self.blocked.get(s, ())
 
     def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int) -> bool:

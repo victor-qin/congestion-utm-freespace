@@ -67,11 +67,12 @@ class SimConfig:
 
     # --- fixed terminal exit lanes (issue #18) ---
     # When True, a shared-terminal takeoff/landing routes through one of the hub's canonical *boundary
-    # hexes* (the cells just outside the column), each a capacity-1 resource that locks only the cells
-    # whose corridors would graze it (conflict-graph reservation). Replaces the per-flight fold +
-    # exit_clear gate, eliminating same-hub exit-lane CONFLICT_FILED structurally. False ⇒ the legacy
-    # fold/exit_clear path (unchanged). Default off until A/B-validated.
-    fixed_exit_lanes: bool = False
+    # hexes* (the cells just outside the column). Same-hub launches are deconflicted by exact CELL
+    # occupancy: ``is_blocked`` sees a committed sibling's exit corridor in the column footprint, so two
+    # launches into the same cruise corridor serialise (a ground-wait) while divergent ones stay
+    # concurrent — eliminating same-hub exit-lane CONFLICT_FILED structurally. False ⇒ the legacy
+    # per-flight fold/exit_clear path. Default on (A/B-validated: astar 11→0, shortcut 34→0; see #18).
+    fixed_exit_lanes: bool = True
 
     # ----- DERIVED (kept inside SimConfig) -----
     @property

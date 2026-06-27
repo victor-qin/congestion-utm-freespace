@@ -113,7 +113,9 @@ def test_committed_arrival_gates_at_the_folded_dest_column_time_not_the_goal_ste
     # rebuilds the candidate path and folds it through the SAME _fold_path _build uses, so the gate time
     # and the committed dest-column t_start agree bit-for-bit; and that time is strictly earlier than the
     # goal-hex step (proving we no longer gate at st[3]*dt, which over-subscribed pads on 7/8 dallas seeds).
-    cfg = SimConfig()
+    # Legacy path only: fixed exit lanes root the corridor at the boundary cell (no tail fold), so
+    # _committed_arrival / _fold_path are the fixed_exit_lanes=False landing gate.
+    cfg = SimConfig(fixed_exit_lanes=False)
     dt, R = cfg.dt_s, hg.circumradius(cfg)
     dest = vec(0, 0, 0)
     dest_term = Terminal("H", 2, radius=300.0)            # wide column → the straight-in tail clearly folds

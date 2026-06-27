@@ -65,13 +65,11 @@ class SimConfig:
     # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
     planner: str = "astar"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
 
-    # --- fixed terminal exit lanes (issue #18) ---
-    # When True, a shared-terminal takeoff/landing routes through one of the hub's canonical *boundary
-    # hexes* (the cells just outside the column). Same-hub launches are deconflicted by exact CELL
-    # occupancy: ``is_blocked`` sees a committed sibling's exit corridor in the column footprint, so two
-    # launches into the same cruise corridor serialise (a ground-wait) while divergent ones stay
-    # concurrent — eliminating same-hub exit-lane CONFLICT_FILED structurally. False ⇒ the legacy
-    # per-flight fold/exit_clear path. Default on (A/B-validated: astar 11→0, shortcut 34→0; see #18).
+    # --- fixed terminal exit lanes (issue #18); A* only ---
+    # When True, A* (and astar_shortcut) routes shared-terminal takeoff/landing through the hub's
+    # boundary-hex lanes and deconflicts same-hub launches by exact cell occupancy (is_blocked), killing
+    # same-hub exit-lane CONFLICT_FILED. False ⇒ the legacy A* fold/exit_clear path. Other planners
+    # (milp/opt/rrt) don't route through lanes — the flag only tags their hub boxes. Default on (#18).
     fixed_exit_lanes: bool = True
 
     # ----- DERIVED (kept inside SimConfig) -----

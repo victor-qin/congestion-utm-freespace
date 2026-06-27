@@ -65,6 +65,13 @@ class SimConfig:
     # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
     planner: str = "astar"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
 
+    # --- fixed terminal exit lanes (issue #18); A* only ---
+    # When True, A* (and astar_shortcut) routes shared-terminal takeoff/landing through the hub's
+    # boundary-hex lanes and deconflicts same-hub launches by exact cell occupancy (is_blocked), killing
+    # same-hub exit-lane CONFLICT_FILED. False ⇒ the legacy A* fold/exit_clear path. Other planners
+    # (milp/opt/rrt) don't route through lanes — the flag only tags their hub boxes. Default on (#18).
+    fixed_exit_lanes: bool = True
+
     # ----- DERIVED (kept inside SimConfig) -----
     @property
     def corridor_segment_len_m(self) -> float:

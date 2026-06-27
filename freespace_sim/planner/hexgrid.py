@@ -16,15 +16,22 @@ the true continuous gap, and FCL verify is the backstop.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
 from ..config import SimConfig
 from ..geometry import BoxSpec
-from ..volumes import Volume4D
+from ..types import as_terminal
+from ..volumes import Volume4D, exit_radius
 
 SQRT3 = math.sqrt(3.0)
 AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
+
+
+def hex_neighbors(q: int, r: int) -> list[tuple[int, int]]:
+    """The 6 axial neighbours of hex (q, r)."""
+    return [(q + dq, r + dr) for dq, dr in AXIAL_NEIGHBORS]
 
 
 def circumradius(cfg: SimConfig) -> float:
@@ -56,6 +63,66 @@ def _axial_round(qf: float, rf: float) -> tuple[int, int]:
     else:
         rz = -rx - ry
     return int(rx), int(rz)
+
+
+@dataclass(frozen=True)
+class Lane:
+    """A hub's canonical exit/approach lane: a boundary hex just outside the column (issue #18).
+
+    Same-hub launches are deconflicted by exact cell occupancy at plan time (``HexOccupancyService``),
+    not by any per-lane graze graph — two flights whose corridors share a footprint cell serialise,
+    divergent ones stay concurrent. So a lane is just its ``cell`` plus descriptors: ``bearing`` (the
+    stable sort order of the ring) and ``dist`` (used by the A* heuristic and the takeoff edge cost)."""
+
+    cell: tuple[int, int]
+    bearing: float            # degrees, from the hub centre (the lane ring's stable sort key)
+    dist: float               # metres, hub centre → cell centre
+
+
+_LANE_CACHE: dict = {}
+
+
+def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
+    bx, by = hex_center(*cell, R)
+    return math.degrees(math.atan2(by - cy, bx - cx))
+
+
+def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
+    """A hub's fixed exit-lane set: the **boundary hexes** of its column, sorted by bearing.
+
+    Classify hexes by centre distance to the hub: *covered* if within ``exit_radius`` (flood-filled out
+    from the home hex), *boundary* if not covered but hex-adjacent to a covered cell. The boundary ring
+    is the canonical exit-lane set — fully determined by the hub position and the fixed grid (no
+    snapping). Deterministic in ``(center, term, cfg)`` and memoised — hubs don't move during a run.
+    See issue #18."""
+    term = as_terminal(term)
+    cx, cy = float(center[0]), float(center[1])
+    key = (round(cx, 3), round(cy, 3), term, cfg)
+    cached = _LANE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    R = circumradius(cfg)
+    er = exit_radius(term, cfg)
+    covered: set = set()
+    stack = [enu_to_axial(cx, cy, R)]                    # the home hex is always covered (er > R)
+    while stack:
+        h = stack.pop()
+        if h in covered:
+            continue
+        hx, hy = hex_center(*h, R)
+        if math.hypot(hx - cx, hy - cy) < er - 1e-9:
+            covered.add(h)
+            stack.extend(hex_neighbors(*h))
+    boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
+    cells = sorted(boundary, key=lambda c: _bearing_deg(c, cx, cy, R))
+    hub = np.array([cx, cy])
+    lanes = [
+        Lane(cell=c, bearing=_bearing_deg(c, cx, cy, R),
+             dist=float(np.linalg.norm(hex_center(*c, R) - hub)))
+        for c in cells
+    ]
+    _LANE_CACHE[key] = lanes
+    return lanes
 
 
 def _cruise_overlap(vol: Volume4D, cfg: SimConfig) -> bool:

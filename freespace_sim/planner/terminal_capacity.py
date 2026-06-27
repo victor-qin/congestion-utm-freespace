@@ -100,17 +100,20 @@ class TerminalCapacity:
         return not self.ledger.any_conflict([col])
 
     def exit_clear(self, term, center, toward, t0: float) -> bool:
-        """Step 1b — exit/approach lane: the corridor lane the flight flies from the column EDGE toward
-        ``toward`` (origin→dest on takeoff; dest←origin on landing) is free of committed conflict over
-        the dwell window ``[t0, t0 + hover + climb)``.
+        """Step 1b — exit/approach lane, LEGACY path only (``fixed_exit_lanes=False``): the corridor the
+        flight flies from the column EDGE toward ``toward`` (origin→dest on takeoff; dest←origin on
+        landing) is free of committed conflict over the dwell window ``[t0, t0 + hover + climb)``. Only
+        reached via ``dwell_ok(..., toward=...)``; the default fixed-lane path does the same job with
+        exact cell occupancy in :meth:`planner.occupancy.HexOccupancyService.is_blocked` (issue #18) and
+        never calls this.
 
-        This is the PRECISE (FCL) check the hex grid is too coarse to make at the shared edge. Same-hub
-        SIBLING exit lanes are box↔box — NOT column-exempt (``conflict.volumes_conflict`` needs a
-        cylinder) — so two flights launching the SAME direction at once collide, while DIVERGENT lanes
-        (spatially disjoint) do not. A*'s ``is_blocked`` cannot draw that line: at the edge the
-        corridor's hex inflation (~corridor_half + R ≈ 129 m at R=69) exceeds the spacing between
-        divergent lanes (~127 m for 90°-apart launches off a 90 m column), so a grid check would
-        serialize concurrent launches too. Gating the real box geometry here keeps both behaviors.
+        It is the PRECISE (FCL) check: same-hub SIBLING exit lanes are box↔box — NOT column-exempt
+        (``conflict.volumes_conflict`` needs a cylinder) — so two flights launching the SAME direction at
+        once collide, while DIVERGENT lanes (spatially disjoint) do not. The *legacy* ``is_blocked``
+        could not draw that line (its ~corridor_half + R ≈ 129 m inflation exceeded the ~127 m spacing
+        between 90°-apart lanes off a 90 m column, so a grid check serialized concurrent launches too);
+        issue #18 fixed that for the default path by recording the sibling corridor as exact cell
+        occupancy, so a fixed-lane launch sees it without this box check.
 
         The lane box is built EXACTLY as ``astar._build`` builds the exit lane — rooted flush at the
         column edge (:func:`volumes.exit_radius`, the one fold radius the commit also uses), one segment

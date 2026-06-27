@@ -8,7 +8,7 @@ takeoff/landing climb/descent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Hashable
 
 import numpy as np
@@ -52,7 +52,7 @@ class Volume4D:
 
 
 def corridor_segment_volume(
-    p0: Vec, t0: float, p1: Vec, t1: float, cfg: SimConfig, *, terminal_id: Hashable = None
+    p0: Vec, t0: float, p1: Vec, t1: float, cfg: SimConfig, *, terminal_id: Hashable = None,
 ) -> Volume4D:
     """Build the single corridor box for one segment (p0,t0)→(p1,t1).
 
@@ -184,6 +184,17 @@ def build_reservation_from_corners(
             t = t_next
             cum_horiz += horiz
             cum_dz += dz
+    if cfg.fixed_exit_lanes and edges and (origin_term is not None or dest_term is not None):
+        # Fixed exit lanes: force the hub tag on the first/last (boundary-cell) box. It leaves from /
+        # arrives at the column edge and can graze the shared column; an untagged box grazing it would
+        # conflict at commit (different tid) — the cruise-box-clip. ``segment_overlaps_column`` tags
+        # interior boxes; this guarantees the boundary box too (mirrors ``astar._build``).
+        if origin_term is not None:
+            edges[0] = replace(edges[0], terminal_id=origin_term.id)
+        # Single-box hub→hub corridor: edges[-1] IS edges[0]; tag dest only when distinct so it can't
+        # clobber the origin tag above (mirrors astar._build).
+        if dest_term is not None and not (origin_term is not None and len(edges) == 1):
+            edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,

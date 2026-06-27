@@ -33,9 +33,10 @@ from ..types import (
     TimedPoint,
     as_terminal,
 )
+from ..geometry import CylinderSpec
 from ..volumes import terminal_radius
 from . import hexgrid as hg
-from .astar import AStarPlanner, _committed_arrival
+from .astar import AStarPlanner, _absorb, _committed_arrival
 
 _EPS = 1e-6
 
@@ -46,43 +47,113 @@ def _deny(req, reason):
     )
 
 
+class SafeIntervalIndex:
+    """Cell-keyed inverse of the committed occupancy — the v2 engine behind SIPP's speedup.
+
+    ``HexOccupancyService`` maps ``step -> {cells}``; to build a cell's safe intervals SIPP needs the
+    OPPOSITE (``cell -> occupied steps``). v1 recovered it by scanning ``is_blocked`` over the full
+    ``[base, max_step]`` horizon PER CELL (dominated by the empty ground-delay tail) — which made SIPP
+    slower than A*. This index instead records, per hex cell, the corridor-blocked steps and the
+    per-step column hub-coverage, fed incrementally by the ledger commit hook (the same dual-sweep
+    rasterization ``HexOccupancyService`` uses). A cell's safe intervals are then built in
+    O(#occupied steps of that cell) — O(1) for the common never-touched cell — and :meth:`cell_blocked`
+    exactly replicates ``HexOccupancyService.is_blocked`` (pinned by a test).
+
+    NOTE: storage is not reclaimed on eviction yet — the search only ever reads steps >= the request
+    clock (so this is correct), but memory reclaim for very long runs is a follow-up."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.R = hg.circumradius(cfg)
+        self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
+        self.infl_pad = cfg.effective_hover_radius_m + self.R
+        self.corr: dict[tuple[int, int], set[int]] = {}          # cell -> corridor-blocked steps
+        self.cols: dict[tuple[int, int], dict[int, set]] = {}    # cell -> step -> {hub_id}
+        self.n_added = 0
+        self.evicted_before: int | None = None
+
+    def on_commit(self, _flight_id, volumes) -> None:
+        own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
+                         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        for v in volumes:
+            self._add(v, own_cols)
+        self.n_added += len(volumes)
+
+    def _inside_a_column(self, q, r, cols) -> bool:
+        c = hg.hex_center(q, r, self.R)
+        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
+
+    def _add(self, vol, own_cols) -> None:
+        tid = vol.terminal_id
+        is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
+        for q, r, s, in_blk in hg.rasterize_volume_dual(
+            vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
+        ):
+            if not in_blk:
+                continue                                        # is_blocked only consults in_blk cells
+            if is_column:
+                self.cols.setdefault((q, r), {}).setdefault(s, set()).add(tid)
+            elif not (own_cols and self._inside_a_column(q, r, own_cols)):
+                self.corr.setdefault((q, r), set()).add(s)      # (skip own terminal interior, as occupancy)
+
+    def evict_before(self, step) -> None:
+        if self.evicted_before is None or step > self.evicted_before:
+            self.evicted_before = step   # queries read steps >= request clock; storage reclaim is TODO
+
+    def reset(self) -> None:
+        self.corr.clear(); self.cols.clear(); self.n_added = 0; self.evicted_before = None
+
+    def cell_blocked(self, q, r, s, own, fixed_lanes) -> bool:
+        """Exact replica of ``HexOccupancyService.is_blocked(q, r, s, own)``."""
+        cc = self.cols.get((q, r))
+        hubs = cc.get(s) if cc else None
+        if hubs is not None:
+            if any(t not in own for t in hubs):
+                return True                                     # foreign column → wall
+            return fixed_lanes and s in self.corr.get((q, r), ())   # own column + sibling corridor
+        return s in self.corr.get((q, r), ())
+
+    def free_intervals(self, q, r, own, base, max_step, fixed_lanes):
+        """Maximal free ``[lo,hi]`` step-runs in ``[base,max_step]`` — complement of the cell's blocked
+        steps. O(#occupied steps of the cell); O(1) for a never-occupied cell (the common case)."""
+        corr = self.corr.get((q, r))
+        cols = self.cols.get((q, r))
+        if not corr and not cols:
+            return [(base, max_step)]
+        cand = set()
+        if corr:
+            cand.update(s for s in corr if base <= s <= max_step)
+        if cols:
+            cand.update(s for s in cols if base <= s <= max_step)
+        blk = sorted(s for s in cand if self.cell_blocked(q, r, s, own, fixed_lanes))
+        out, lo = [], base
+        for s in blk:
+            if s > lo:
+                out.append((lo, s - 1))
+            lo = s + 1
+        if lo <= max_step:
+            out.append((lo, max_step))
+        return out
+
+
 class _SafeIntervals:
-    """Lazy, per-plan, per-cell safe-interval index over the shared occupancy service.
+    """Per-plan memoised view over :class:`SafeIntervalIndex`: a cell's free intervals for THIS flight
+    (its ``own`` terminals, step domain, and the ``fixed_lanes`` flag)."""
 
-    A cell's safe intervals are the maximal runs of steps in ``[base, max_step]`` where
-    ``svc.is_blocked(q, r, s, own)`` is False. ``is_blocked`` already composes universal-blocked +
-    foreign-column + own-exemption + (issue #18) same-hub sibling corridors, so no terminal
-    special-casing is needed here. Built on first touch and memoised (v1 = forward scan; a maintained
-    cell→interval index on the commit hook is the noted follow-up)."""
-
-    def __init__(self, svc, own, base, max_step):
-        self.svc = svc
+    def __init__(self, sidx, own, base, max_step, fixed_lanes):
+        self.sidx = sidx
         self.own = own
         self.base = base
         self.max_step = max_step
+        self.fixed_lanes = fixed_lanes
         self._cache: dict[tuple[int, int], list[tuple[int, int]]] = {}
 
     def intervals(self, q, r):
         iv = self._cache.get((q, r))
         if iv is None:
-            iv = self._scan(q, r)
+            iv = self.sidx.free_intervals(q, r, self.own, self.base, self.max_step, self.fixed_lanes)
             self._cache[(q, r)] = iv
         return iv
-
-    def _scan(self, q, r):
-        out: list[tuple[int, int]] = []
-        blk, own, mx = self.svc.is_blocked, self.own, self.max_step
-        s = self.base
-        while s <= mx:
-            if blk(q, r, s, own):
-                s += 1
-                continue
-            lo = s
-            while s + 1 <= mx and not blk(q, r, s + 1, own):
-                s += 1
-            out.append((lo, s))
-            s += 1
-        return out
 
     def index_of(self, q, r, step):
         for i, (lo, hi) in enumerate(self.intervals(q, r)):
@@ -104,16 +175,43 @@ def _nondominated(frontier, key, t, g, w):
     if F is None:
         frontier[key] = [(t, g)]
         return True
+    evict = False
     for (t2, g2) in F:
         if t2 <= t and g2 + (t - t2) * w <= g + 1e-9:
-            return False
-    frontier[key] = [(t2, g2) for (t2, g2) in F if not (t <= t2 and g + (t2 - t) * w <= g2 + 1e-9)]
-    frontier[key].append((t, g))
+            return False                                   # dominated by a stored label → skip
+        if t <= t2 and g + (t2 - t) * w <= g2 + 1e-9:
+            evict = True                                   # new label dominates this stored one
+    if evict:                                              # rare: rebuild dropping now-dominated labels
+        frontier[key] = [(t2, g2) for (t2, g2) in F if not (t <= t2 and g + (t2 - t) * w <= g2 + 1e-9)]
+        frontier[key].append((t, g))
+    else:
+        F.append((t, g))                                   # common case: append in place (no realloc)
     return True
 
 
 class SIPPPlanner(AStarPlanner):
     """Safe-interval cost-aware planner; inherits occupancy/terminal sync and corridor build from A*."""
+
+    def __init__(self, max_expansions: int = 600_000):
+        super().__init__(max_expansions)
+        self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
+        self._sidx_ledger = None
+
+    def _sipp_index(self, req, ledger, cfg) -> "SafeIntervalIndex":
+        """Maintain the SafeIntervalIndex in lockstep with the ledger (mirrors ``_occupancy``): first use
+        subscribes the commit hook + absorbs existing volumes; a ledger shrink rebuilds; then evict to
+        the request clock."""
+        sidx = self._sidx
+        if sidx is None or self._sidx_ledger is not ledger:
+            sidx = self._sidx = SafeIntervalIndex(cfg)
+            self._sidx_ledger = ledger
+            ledger.subscribe(sidx.on_commit)
+            _absorb(sidx, ledger)
+        elif ledger.n_volumes < sidx.n_added:
+            sidx.reset()
+            _absorb(sidx, ledger)
+        sidx.evict_before(int(req.t_request // cfg.dt_s))
+        return sidx
 
     def plan(self, req, ledger, cfg):
         # ---- setup: identical to AStarPlanner.plan (so cost/terminals/output match exactly) ----
@@ -133,6 +231,7 @@ class SIPPPlanner(AStarPlanner):
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
 
         svc = self._occupancy(req, ledger, cfg)
+        sidx = self._sipp_index(req, ledger, cfg)
         tcap = self._tcap
         dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
 
@@ -160,7 +259,7 @@ class SIPPPlanner(AStarPlanner):
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6
 
-        SI = _SafeIntervals(svc, own, base, max_step)
+        SI = _SafeIntervals(sidx, own, base, max_step, fixed_lanes)
         came: dict = {}
 
         def is_goal_cell(q, r):
@@ -185,12 +284,13 @@ class SIPPPlanner(AStarPlanner):
         wait_steps: dict = {}
         frontier: dict = {}
         counter = itertools.count()
-        pq = [(h_ground, next(counter), start, 0.0)]
+        c_hold = cfg.cost_air_hold_per_s
+        pq = [(h_ground, next(counter), start, 0.0, -1)]   # heap: (f, tie, AS, g, interval-index)
         goal_state = None
         expansions = 0
 
         while pq:
-            _, _, st, gst = heapq.heappop(pq)
+            _, _, st, gst, iv = heapq.heappop(pq)
             if gst > g.get(st, math.inf):
                 continue                                   # stale (a cheaper label for this AS won)
             if st[0] == "a" and is_goal_cell(st[1], st[2]) and goal_ok(st):
@@ -199,27 +299,25 @@ class SIPPPlanner(AStarPlanner):
             expansions += 1
             if expansions > self.max_expansions:
                 break
-            for nst, cost, w in self._succ(
-                st, SI, cfg, pitch, climb_steps, climb_cost, dwell_steps, own, o_cap, o_term,
+            for nst, cost, w, niv in self._succ(
+                st, iv, SI, cfg, pitch, climb_steps, climb_cost, dwell_steps, own, o_cap, o_term,
                 origin, tcap, dest, o_lanes, o_r, fixed_lanes, max_step, is_goal_cell,
             ):
                 ng = gst + cost
-                # Pareto frontier applies only to ordinary AIR cruise cells. The ground state is a
-                # separate per-step ray, and a GOAL cell carries a per-step landing gate
-                # (dwell_ok/pad_clear) the frontier can't see — cross-step dominance there would prune a
-                # later gate-passing arrival under an earlier gate-failing one. Both are exempt (A*'s
-                # per-step states never dominate across steps), gated only by ``g``/lazy-skip.
-                if nst[0] == "a" and not is_goal_cell(nst[1], nst[2]):
-                    niv = SI.index_of(nst[1], nst[2], nst[3])
-                    if niv >= 0 and not _nondominated(frontier, (nst[1], nst[2], niv),
-                                                      nst[3] * dt, ng, cfg.cost_air_hold_per_s):
-                        continue                           # dominated at its (cell, interval) → prune
-                if ng < g.get(nst, math.inf):
-                    g[nst] = ng
-                    came[nst] = st
-                    wait_steps[nst] = w
-                    hh = h_air(nst[1], nst[2]) if nst[0] == "a" else h_ground
-                    heapq.heappush(pq, (ng + hh, next(counter), nst, ng))
+                if ng >= g.get(nst, math.inf):
+                    continue                               # a same cell-step label is already ≤ this cost
+                # Pareto frontier applies only to ordinary AIR cruise cells; the ground ray (niv=-1) and
+                # goal cells (per-step landing gate the frontier can't see) are exempt. `niv` comes from
+                # _succ (no index_of). The g early-out above means this fires only for cost-improving
+                # successors — the dominant cost saver (the frontier check is otherwise ~half the run).
+                if niv >= 0 and not is_goal_cell(nst[1], nst[2]) and \
+                        not _nondominated(frontier, (nst[1], nst[2], niv), nst[3] * dt, ng, c_hold):
+                    continue                               # dominated at its (cell, interval) → prune
+                g[nst] = ng
+                came[nst] = st
+                wait_steps[nst] = w
+                hh = h_air(nst[1], nst[2]) if nst[0] == "a" else h_ground
+                heapq.heappush(pq, (ng + hh, next(counter), nst, ng, niv))
 
         if goal_state is None:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
@@ -267,13 +365,15 @@ class SIPPPlanner(AStarPlanner):
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _succ(self, st, SI, cfg, pitch, climb_steps, climb_cost, dwell_steps, own, o_cap, o_term,
+    def _succ(self, st, iv, SI, cfg, pitch, climb_steps, climb_cost, dwell_steps, own, o_cap, o_term,
               origin, tcap, dest, o_lanes, o_r, fixed_lanes, max_step, is_goal_cell):
-        """Successors as ``(AS, edge_cost, wait_steps)``. Ground-wait is a per-step ray and takeoff is
-        emitted at the current ground step (so the per-step pad gates match A*); the air reroute is the
-        SIPP collapse (one successor per reachable neighbour safe-interval, folding the pre-move hover
-        into the cost at the air rate); a standalone hover is emitted only at a goal cell (to retry the
-        per-step landing gate). Mirrors :meth:`AStarPlanner._edges`."""
+        """Successors as ``(AS, edge_cost, wait_steps, interval_index)``. ``iv`` is the popped state's
+        interval index (carried in the heap → no ``index_of`` scan in the hot loop), and each emitted air
+        successor carries its OWN interval index (``-1`` for ground). Ground-wait is a per-step ray and
+        takeoff is emitted at the current ground step (so the per-step pad gates match A*); the air
+        reroute is the SIPP collapse (one successor per reachable neighbour interval, folding pre-move
+        hover at the air rate); a standalone hover is emitted only at a goal cell (to retry the per-step
+        landing gate). Mirrors :meth:`AStarPlanner._edges`."""
         dt = cfg.dt_s
         c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
                                cfg.cost_air_lateral_per_m)
@@ -282,7 +382,7 @@ class SIPPPlanner(AStarPlanner):
         out = []
         if tag == "g":
             if s + 1 <= max_step:
-                out.append((("g", q, r, s + 1), c_gd * dt, 0))          # ground-wait ray (== A* g→g)
+                out.append((("g", q, r, s + 1), c_gd * dt, 0, -1))      # ground-wait ray (== A* g→g)
             ts = s + climb_steps
             if ts > max_step:
                 return out
@@ -291,28 +391,26 @@ class SIPPPlanner(AStarPlanner):
                     for L in o_lanes:
                         lq, lr = L.cell
                         if not svc.is_blocked(lq, lr, ts, own):
-                            out.append((("a", lq, lr, ts),
-                                        climb_cost + c_lat * (L.dist - o_r), 0))   # one edge per lane
+                            out.append((("a", lq, lr, ts), climb_cost + c_lat * (L.dist - o_r), 0,
+                                        SI.index_of(lq, lr, ts)))        # one edge per lane
             else:
                 pad_ok = (tcap.dwell_ok(o_term, origin, s * dt, o_cap, dest) if o_term is not None
                           else svc.pad_clear(q, r, s, dwell_steps))
                 if not svc.is_blocked(q, r, ts, own) and pad_ok:
-                    out.append((("a", q, r, ts), climb_cost, 0))        # takeoff (legacy/no-terminal)
+                    out.append((("a", q, r, ts), climb_cost, 0, SI.index_of(q, r, ts)))   # takeoff
             return out
 
-        ivs = SI.intervals(q, r)
-        iv = SI.index_of(q, r, s)
-        hi_c = ivs[iv][1] if iv >= 0 else s                            # last step this cell stays free
+        hi_c = SI.intervals(q, r)[iv][1] if iv >= 0 else s             # last step this cell stays free
         for dq, dr in hg.AXIAL_NEIGHBORS:                              # reroute (collapsed)
             nq, nr = q + dq, r + dr
-            for (lo, hi) in SI.intervals(nq, nr):
+            for j, (lo, hi) in enumerate(SI.intervals(nq, nr)):
                 arr = max(s + 1, lo)
                 if arr > hi or arr > max_step:
                     continue
                 if arr - 1 > hi_c:                                     # can't wait here that long
                     break                                             # later intervals need even more
                 wait = arr - (s + 1)                                   # folded pre-move hover
-                out.append((("a", nq, nr, arr), c_hold * dt * wait + c_lat * pitch, wait))
+                out.append((("a", nq, nr, arr), c_hold * dt * wait + c_lat * pitch, wait, j))
         if is_goal_cell(q, r) and s + 1 <= hi_c and s + 1 <= max_step:
-            out.append((("a", q, r, s + 1), c_hold * dt, 0))           # hover to retry the landing gate
+            out.append((("a", q, r, s + 1), c_hold * dt, 0, iv))       # hover to retry the landing gate
         return out

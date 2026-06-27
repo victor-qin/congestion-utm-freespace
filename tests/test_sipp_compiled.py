@@ -152,15 +152,44 @@ def test_compiled_replay_exact_metro(lam):
         assert fb < 0.10 * len(rows), f"kernel fell back too often ({fb}/{len(rows)})"
 
 
+def _short_reqs(W, n, rmin, rmax, horizon, seed):
+    """Dallas-shaped demand: short hub→customer flights (``rmin``..``rmax`` m) in a big ``W`` box."""
+    from freespace_sim.types import vec
+    rng = np.random.default_rng(seed)
+    out = []
+    for i in range(n):
+        o = rng.uniform([0, 0], [W, W])
+        ang, rad = rng.uniform(0, 2 * np.pi), rng.uniform(rmin, rmax)
+        d = np.clip(o + rad * np.array([np.cos(ang), np.sin(ang)]), 0, W)
+        out.append(FlightRequest(i, vec(o[0], o[1], 0), vec(d[0], d[1], 0), float(rng.uniform(0, horizon))))
+    return sorted(out, key=lambda r: (r.t_request, r.flight_id))
+
+
 @pytest.mark.slow
-def test_compiled_replay_exact_big_region():
-    """Long flights (20 km region) — the regime SIPP's node collapse targets — still exact."""
-    rows, fb = _replay_cc("uniform", 1500.0, 900.0, 0, region=20000.0)
+def test_compiled_replay_exact_big_dense_short_flights():
+    """The Dallas regime: short (4-8 km) flights in a big DENSE 24 km box. Region size only sizes the
+    kernel box; the search depth is per-flight, so this is the winning regime — and exact."""
+    from freespace_sim.uss import USS
+    W = 24000.0
+    cfg = SimConfig(region_size_m=(W, W), lam_per_hour=600.0, horizon_s=1800.0, seed=0)
+    reqs = _short_reqs(W, 700, 4000.0, 8000.0, 1800.0, 0)
+    sc = scenario_from_requests(reqs)
+    led = ReservationLedger(cfg)
+    dss = DSS(ledger=led, mechanism=FCFSMechanism())
+    astar = get_planner("astar"); sipp, sref = get_planner("sipp"), get_planner("sipp_ref")
+    usses = {u: USS(u, dss, cfg, astar) for u in sc.uss_ids}
+    rows = []
+    for ev in sc.events:
+        rq = ev.request
+        c = sipp.plan(rq, led, cfg)
+        r = sref.plan(rq, led, cfg)
+        usses[rq.uss_id].handle_request(rq)
+        rows.append((c.accepted, r.accepted, c.cost, r.cost))
     assert rows
-    assert all(ca == ra for ca, ra, _, _, _, _ in rows), "accept-set mismatch"
-    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
+    assert all(ca == ra for ca, ra, _, _ in rows), "accept-set mismatch"
+    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc in rows if ca), "cost mismatch vs reference"
     if _COMPILED:
-        assert fb < 0.15 * len(rows), f"kernel fell back too often ({fb}/{len(rows)})"
+        assert getattr(sipp, "_fb", 0) < 0.10 * len(rows), "kernel fell back too often"
 
 
 # ---- end-to-end ASTM conflict-freeness ----

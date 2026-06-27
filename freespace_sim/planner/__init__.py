@@ -73,6 +73,17 @@ def get_planner(name: str) -> Planner:
         from .astar import AStarPlanner
 
         return AStarPlanner()
+    if name == "sipp":
+        from .sipp import SIPPPlanner
+
+        # Safe Interval Path Planning: same cost model + terminal gating + output as A*, but the air
+        # search collapses the per-step axis into safe intervals (cost-aware Pareto). Drop-in for astar.
+        return SIPPPlanner()
+    if name == "sipp_shortcut":
+        from .shortcut import ShortcutRefiner
+        from .sipp import SIPPPlanner
+
+        return ShortcutRefiner(SIPPPlanner(), label="sipp_sc")
     if name == "opt_astar":
         from .astar import AStarPlanner
         from .opt import NLPOptPlanner

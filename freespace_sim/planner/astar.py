@@ -419,7 +419,8 @@ class AStarPlanner:
             # grazing the shared column would otherwise conflict (different tid) at commit — the
             # cruise-box-clip bug. The number of such boxes is geometry-dependent (radius × exit angle),
             # so we test each box, not a fixed index. Far cruise boxes stay untagged; two same-hub boxes
-            # still conflict (box↔box), so same-direction launches contend → gated by exit_clear.
+            # still conflict (box↔box), so same-direction launches contend — serialised by is_blocked
+            # cell occupancy under fixed lanes, or by exit_clear on the legacy path.
             tid = (origin_term.id if origin_term is not None and segment_overlaps_column(a, b, o_xy, o_r, cfg)
                    else dest_term.id if dest_term is not None and segment_overlaps_column(a, b, d_xy, d_r, cfg)
                    else None)
@@ -436,7 +437,10 @@ class AStarPlanner:
             # boxes; this guarantees the boundary box too.
             if origin_term is not None:
                 edges[0] = replace(edges[0], terminal_id=origin_term.id)
-            if dest_term is not None:
+            # When a single-box corridor is both the origin exit and the dest approach (a degenerate
+            # hub→hub short hop), edges[-1] IS edges[0]; tag dest only when it is a distinct box, so it
+            # can't clobber the origin tag above (which would conflict the box against the origin column).
+            if dest_term is not None and not (origin_term is not None and len(edges) == 1):
                 edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
         t_takeoff = (base + ground_steps) * cfg.dt_s
         t_arrive = wps[-1][1]

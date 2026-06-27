@@ -191,7 +191,9 @@ def build_reservation_from_corners(
         # interior boxes; this guarantees the boundary box too (mirrors ``astar._build``).
         if origin_term is not None:
             edges[0] = replace(edges[0], terminal_id=origin_term.id)
-        if dest_term is not None:
+        # Single-box hub→hub corridor: edges[-1] IS edges[0]; tag dest only when distinct so it can't
+        # clobber the origin tag above (mirrors astar._build).
+        if dest_term is not None and not (origin_term is not None and len(edges) == 1):
             edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,

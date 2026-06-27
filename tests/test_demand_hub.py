@@ -175,8 +175,9 @@ def test_return_flights_roundtrip_and_terminals():
     cfg = _radius_cfg()
     nd = len(HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=False).generate(
         cfg, np.random.default_rng(0)))
-    rs = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=True).generate(
-        cfg, np.random.default_rng(0))
+    # clip off so every delivery keeps its return — this test is about the round-trip pairing
+    rs = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=True,
+                         clip_returns_to_horizon=False).generate(cfg, np.random.default_rng(0))
     assert len(rs) == 2 * nd                                      # one return per delivery
     deliveries = [r for r in rs if r.origin_terminal is not None]
     returns = [r for r in rs if r.dest_terminal is not None]
@@ -187,6 +188,26 @@ def test_return_flights_roundtrip_and_terminals():
     # round trip: every (origin→dest) leg has its reverse among the flights
     legs = {(tuple(np.round(_xy(r.origin), 2)), tuple(np.round(_xy(r.dest), 2))) for r in rs}
     assert all((d, o) in legs for (o, d) in legs)
+
+
+def test_clip_returns_to_horizon_drops_only_post_horizon_returns():
+    """clip=True ends demand at the horizon: returns landing past H are dropped, deliveries untouched."""
+    cfg = _radius_cfg()
+    kw = dict(n_hubs_per_uss={"a": 4}, return_flights=True)
+    tail = HubRadiusDemand(**kw, clip_returns_to_horizon=False).generate(cfg, np.random.default_rng(0))
+    clip = HubRadiusDemand(**kw, clip_returns_to_horizon=True).generate(cfg, np.random.default_rng(0))
+
+    # every kept return lands strictly before the horizon
+    assert all(r.t_request < cfg.horizon_s for r in clip if r.dest_terminal is not None)
+    # at least one return was actually past the horizon (else the test proves nothing)
+    assert any(r.t_request >= cfg.horizon_s for r in tail if r.dest_terminal is not None)
+    # deliveries are an identically-labelled, identical-geometry subset (fid still advances on a drop)
+    dt = {r.flight_id: r for r in tail if r.origin_terminal is not None}
+    dc = {r.flight_id: r for r in clip if r.origin_terminal is not None}
+    assert set(dc) == set(dt)
+    assert all(dc[i].t_request == dt[i].t_request and np.allclose(dc[i].dest, dt[i].dest) for i in dc)
+    # the only difference is the dropped post-horizon returns
+    assert len(clip) < len(tail)
 
 
 def test_radius_demand_run_verified_astar():

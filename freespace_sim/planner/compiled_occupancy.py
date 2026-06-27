@@ -46,7 +46,6 @@ class CompiledOccupancy:
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
         self.NC = qspan * rspan
         self.MAXS = maxs
-        self.cols: dict[tuple[int, int], dict[int, set]] = {}   # Phase-2 terminal coverage
         self._init_pool()
 
     def _box(self, cfg, margin):
@@ -115,14 +114,18 @@ class CompiledOccupancy:
         ):
             if not in_blk:
                 continue
-            if is_column:
-                self.cols.setdefault((q, r), {}).setdefault(s, set()).add(tid)   # Phase 2
-            elif not (own_cols and self._inside_a_column(q, r, own_cols)):
-                c = self.cell_id(q, r)
-                if c < 0:
-                    raise IndexError(
-                        f"committed corridor cell ({q},{r}) outside kernel box — widen margin")
-                self._block(c, int(s))
+            # corridor cell inside the COMMITTING flight's own column = its unreserved interior (skip);
+            # everything else — corridors AND all terminal columns — blocks the global pool. A column is
+            # foreign-to-everyone here; the planning flight's own columns are exempted per-flight (overlay).
+            if not is_column and own_cols and self._inside_a_column(q, r, own_cols):
+                continue
+            c = self.cell_id(q, r)
+            if c < 0:
+                if is_column:
+                    continue                              # a column footprint cell just past the box edge
+                raise IndexError(
+                    f"committed corridor cell ({q},{r}) outside kernel box — widen margin")
+            self._block(c, int(s))
 
     def _block(self, c: int, s: int) -> None:
         """Split cell ``c``'s free interval containing step ``s`` (linked-list pool, in place)."""
@@ -152,7 +155,6 @@ class CompiledOccupancy:
             self.evicted_before = step             # queries read steps >= request clock; reclaim is TODO
 
     def reset(self) -> None:
-        self.cols.clear()
         self.n_added = 0
         self.evicted_before = None
         self._init_pool()

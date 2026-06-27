@@ -35,9 +35,11 @@ FALLBACK = 2          # out-of-box stray or label/heap capacity → host falls b
 
 @njit(cache=True)
 def _search(
-    iv_lo, iv_hi, iv_nxt, qmin, rmin, rspan, qspan, base, max_step,   # interval pool + box
+    iv_lo, iv_hi, iv_nxt,                                            # global interval pool (slot < cap)
+    ov_lo, ov_hi, ov_nxt, ov_head, ov_gen, cap,                      # per-flight overlay (slot >= cap)
+    qmin, rmin, rspan, qspan, base, max_step,                        # box + step window
     start_cell, start_slot, start_arr, start_g, n_start,              # takeoff start labels
-    gq, grr, lf_lo, lf_hi, lf_n,                                      # goal cell + landing-feasible ivals
+    goal_gen, lf_lo, lf_hi, lf_n,                                     # goal cells (version-stamped) + landing ivals
     c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,         # cost + heuristic params
     gen, front_head, front_tail, front_gen,                          # per-slot sorted-by-arr staircase
     lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_prev, lab_dead, max_lab,  # labels
@@ -97,7 +99,7 @@ def _search(
         cell = lab_cell[L]; slot = lab_slot[L]; arr = lab_arr[L]; g = lab_g[L]
         iq = cell // rspan
         q = iq + qmin; r = cell - iq * rspan + rmin
-        is_goal = (q == gq and r == grr)
+        is_goal = goal_gen[cell] == gen
 
         if is_goal:                                     # goal acceptance within a landing-feasible run
             feasible = False
@@ -118,7 +120,7 @@ def _search(
                 return m, g, n_exp, OK
 
         n_exp += 1
-        hh = iv_hi[slot]
+        hh = ov_hi[slot - cap] if slot >= cap else iv_hi[slot]
         hi_c = hh if hh < max_step else max_step        # current cell free-until (how long we may hover)
 
         for d in range(6):                              # reroute: one successor per neighbour interval
@@ -138,13 +140,15 @@ def _search(
             if niq < 0 or niq >= qspan or nir < 0 or nir >= rspan:
                 return -1, 0.0, n_exp, FALLBACK         # out-of-box stray → host reference
             ncell = niq * rspan + nir
-            ngoal = (nq == gq and nr == grr)
-            sj = ncell                                  # walk the neighbour cell's interval chain
+            ngoal = goal_gen[ncell] == gen
+            sj = ov_head[ncell] if ov_gen[ncell] == gen else ncell   # neighbour interval chain (overlay/pool)
             while sj != -1:
-                lo = iv_lo[sj]
+                if sj >= cap:
+                    jj = sj - cap; lo = ov_lo[jj]; hi = ov_hi[jj]; nxts = ov_nxt[jj]
+                else:
+                    lo = iv_lo[sj]; hi = iv_hi[sj]; nxts = iv_nxt[sj]
                 if lo < base:
                     lo = base
-                hi = iv_hi[sj]
                 if hi > max_step:
                     hi = max_step
                 if lo <= hi:
@@ -224,7 +228,7 @@ def _search(
                                 ii = par
                             else:
                                 break
-                sj = iv_nxt[sj]
+                sj = nxts
 
         if is_goal and arr + 1 <= hi_c:                 # goal-cell hover: retry the per-step landing gate
             if nlab >= max_lab or size >= max_heap:

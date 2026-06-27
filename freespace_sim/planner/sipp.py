@@ -250,8 +250,8 @@ class SIPPPlanner(AStarPlanner):
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
-        if o_term is not None or d_term is not None:
-            return self._plan_reference(req, ledger, cfg)
+        if (o_term is not None or d_term is not None) and not cfg.fixed_exit_lanes:
+            return self._plan_reference(req, ledger, cfg)   # legacy-terminal landing needs _committed_arrival
         return self._plan_compiled(req, ledger, cfg)
 
     def _plan_reference(self, req, ledger, cfg):
@@ -427,9 +427,18 @@ class SIPPPlanner(AStarPlanner):
         plans — reset is a ``self._gen`` bump, not an O(N) clear."""
         if self._k_cap < cocc.cap:                       # frontier: one slot per pool interval
             self._k_cap = cocc.cap
-            self._k_front_head = np.full(cocc.cap, -1, np.int64)
-            self._k_front_tail = np.full(cocc.cap, -1, np.int64)   # sorted-by-arr staircase per slot
-            self._k_front_gen = np.zeros(cocc.cap, np.int64)
+            ovcap = 1 << 14                              # overlay interval pool (own terminal lane cells)
+            self._k_ovcap = ovcap
+            tot = cocc.cap + ovcap                       # frontier covers pool slots [0,cap) + overlay [cap,..)
+            self._k_front_head = np.full(tot, -1, np.int64)
+            self._k_front_tail = np.full(tot, -1, np.int64)   # sorted-by-arr staircase per slot
+            self._k_front_gen = np.zeros(tot, np.int64)
+            self._k_goal_gen = np.zeros(cocc.cap, np.int64)        # per-cell goal flag (version-stamped)
+            self._k_ov_head = np.full(cocc.cap, -1, np.int64)      # per-cell overlay redirect (slot >= cap)
+            self._k_ov_gen = np.zeros(cocc.cap, np.int64)          # version-stamped (own-cell transparency)
+            self._k_ov_lo = np.empty(ovcap, np.int64)
+            self._k_ov_hi = np.empty(ovcap, np.int64)
+            self._k_ov_nxt = np.empty(ovcap, np.int64)
         if self._k_lab_cell is None:                     # labels + heap: allocate once
             ml = 1 << 21
             self._k_max = ml
@@ -449,6 +458,43 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_r = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_s = np.empty(cocc.MAXS + 8, np.int64)
 
+    def _build_overlay(self, cocc, sidx, cells, own, base, max_step, fixed) -> bool:
+        """Fill the overlay interval pool with the OWN-exempt (transparent) free-intervals of ``cells`` —
+        the flight's own terminal lane cells, which the global pool blocks as foreign columns. Overlay
+        slots live at ``cap + idx``; ``ov_head[cell]``/``ov_gen[cell]`` (version-stamped) redirect the
+        kernel there. Returns False on overlay overflow (caller falls back)."""
+        cap = cocc.cap
+        gen = self._gen
+        n = 0
+        for (cq, cr) in cells:
+            c = cocc.cell_id(cq, cr)
+            if c < 0 or self._k_ov_gen[c] == gen:        # out of box, or already built this plan
+                continue
+            head = prev = -1
+            for lo, hi in sidx.free_intervals(cq, cr, own, base, max_step, fixed):
+                if n >= self._k_ovcap:
+                    return False
+                self._k_ov_lo[n] = lo; self._k_ov_hi[n] = hi; self._k_ov_nxt[n] = -1
+                slot = cap + n
+                if prev < 0:
+                    head = slot
+                else:
+                    self._k_ov_nxt[prev - cap] = slot
+                prev = slot; n += 1
+            self._k_ov_head[c] = head; self._k_ov_gen[c] = gen
+        return True
+
+    def _overlay_slot(self, cocc, cell, step):
+        """Overlay slot (``>= cap``) of ``cell``'s transparent interval containing ``step``; -1 if none."""
+        cap = cocc.cap
+        slot = self._k_ov_head[cell]
+        while slot >= 0:
+            j = slot - cap
+            if self._k_ov_lo[j] <= step <= self._k_ov_hi[j]:
+                return slot
+            slot = self._k_ov_nxt[j]
+        return -1
+
     def _plan_compiled(self, req, ledger, cfg):
         from .sipp_kernel import FALLBACK, NO_PATH
         dt = cfg.dt_s
@@ -467,7 +513,16 @@ class SIPPPlanner(AStarPlanner):
         svc = self._occupancy(req, ledger, cfg)
         cocc = self._compiled_occ(req, ledger, cfg)
         dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
-        own = frozenset()
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        own = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        o_cap = o_term.capacity if o_term is not None else 1
+        d_cap = d_term.capacity if d_term is not None else 1
+        fixed = cfg.fixed_exit_lanes
+        o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed and o_term is not None else []
+        d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed and d_term is not None else []
+        h_off = max((L.dist for L in d_lanes), default=0.0)
+        o_r = terminal_radius(o_term, cfg) if o_term is not None else 0.0
+        tcap = self._tcap
         c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
                                cfg.cost_air_lateral_per_m)
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
@@ -477,46 +532,77 @@ class SIPPPlanner(AStarPlanner):
         if ocell < 0 or gcell < 0:
             return self._plan_reference(req, ledger, cfg)          # out of kernel box → reference
 
-        # ---- start labels: ground-delayed climb-in-place takeoffs at the origin cell ----
+        # ---- per-plan kernel state + own-lane transparency overlay (pool blocks columns foreign-to-all) ----
+        self._kernel_state(cocc)
+        self._gen += 1
+        if fixed and (o_term is not None or d_term is not None):
+            sidx = self._sipp_index(req, ledger, cfg)
+            lanes = [L.cell for L in o_lanes] + [L.cell for L in d_lanes]
+            if not self._build_overlay(cocc, sidx, lanes, own, base, max_step, fixed):
+                return self._plan_reference(req, ledger, cfg)      # overlay overflow → reference
+
+        # ---- start labels: ground-delayed takeoffs (lane exits if fixed+terminal, else climb-in-place) ----
         smax = base + int(math.ceil(cfg.max_ground_delay_s / dt))
         s_cell, s_slot, s_arr, s_g = [], [], [], []
         for s in range(base, smax + 1):
             ts = s + climb_steps
             if ts > max_step:
                 break
-            if svc.is_blocked(oq, orr, ts, own) or not svc.pad_clear(oq, orr, s, dwell_steps):
-                continue
-            slot = _iv_index_global(cocc, ocell, ts)
-            if slot < 0:
-                continue                                      # ts blocked (unreachable post is_blocked)
-            s_cell.append(ocell); s_slot.append(slot); s_arr.append(ts)
-            s_g.append((s - base) * c_gd * dt + climb_cost)   # ground delay billed per-second (×dt)
+            if fixed and o_term is not None:                  # exit-lane takeoffs (column gated by dwell_ok)
+                if not tcap.dwell_ok(o_term, origin, s * dt, o_cap):
+                    continue
+                for L in o_lanes:
+                    lcell = cocc.cell_id(L.cell[0], L.cell[1])
+                    if lcell < 0:
+                        continue
+                    slot = self._overlay_slot(cocc, lcell, ts)    # own-transparent interval at ts (>= cap)
+                    if slot < 0:
+                        continue                                  # lane blocked at ts (own-exempt view)
+                    s_cell.append(lcell); s_slot.append(slot); s_arr.append(ts)
+                    s_g.append((s - base) * c_gd * dt + climb_cost + c_lat * (L.dist - o_r))
+            else:                                             # climb in place (non-terminal pad)
+                if svc.is_blocked(oq, orr, ts, own) or not svc.pad_clear(oq, orr, s, dwell_steps):
+                    continue
+                slot = _iv_index_global(cocc, ocell, ts)
+                if slot < 0:
+                    continue
+                s_cell.append(ocell); s_slot.append(slot); s_arr.append(ts)
+                s_g.append((s - base) * c_gd * dt + climb_cost)
         if not s_cell:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
-        # ---- landing-feasible step intervals at the dest cell (folds the per-step pad gate) ----
+        # ---- goal cell(s) + landing-feasible step intervals (folds the per-step landing gate) ----
+        if fixed and d_term is not None:                      # dest exit-lane cells; column-capacity landing
+            goal_cells = [c for c in (cocc.cell_id(L.cell[0], L.cell[1]) for L in d_lanes) if c >= 0]
+            if not goal_cells:
+                return self._plan_reference(req, ledger, cfg)
+            for c in goal_cells:
+                self._k_goal_gen[c] = self._gen
+            landing = [tcap.dwell_ok(d_term, dest, s * dt, d_cap) for s in range(base, max_step + 1)]
+        else:                                                 # single dest hex; pad-clear landing
+            self._k_goal_gen[gcell] = self._gen
+            landing = [svc.pad_clear(gq, grr, s, dwell_steps) for s in range(base, max_step + 1)]
         lf_lo, lf_hi, lo = [], [], -1
-        for s in range(base, max_step + 1):
-            if svc.pad_clear(gq, grr, s, dwell_steps):
+        for i, ok in enumerate(landing):
+            if ok:
                 if lo < 0:
-                    lo = s
+                    lo = base + i
             elif lo >= 0:
-                lf_lo.append(lo); lf_hi.append(s - 1); lo = -1
+                lf_lo.append(lo); lf_hi.append(base + i - 1); lo = -1
         if lo >= 0:
             lf_lo.append(lo); lf_hi.append(max_step)
         if not lf_lo:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
         # ---- call the kernel ----
-        self._kernel_state(cocc)
-        self._gen += 1
         n, _cost, _n_exp, flag = self._kernel(
-            cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt, cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan,
-            base, max_step,
+            cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt,
+            self._k_ov_lo, self._k_ov_hi, self._k_ov_nxt, self._k_ov_head, self._k_ov_gen, cocc.cap,
+            cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan, base, max_step,
             np.asarray(s_cell, np.int64), np.asarray(s_slot, np.int64), np.asarray(s_arr, np.int64),
             np.asarray(s_g, np.float64), len(s_cell),
-            gq, grr, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64), len(lf_lo),
-            c_hold, c_lat, pitch, dt, gx, gy, R, 0.0, climb_cost,
+            self._k_goal_gen, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64), len(lf_lo),
+            c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,
             self._gen, self._k_front_head, self._k_front_tail, self._k_front_gen,
             self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
             self._k_lab_next, self._k_lab_prev, self._k_lab_dead, self._k_max,

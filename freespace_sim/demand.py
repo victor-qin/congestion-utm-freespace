@@ -229,6 +229,11 @@ class HubRadiusDemand:
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True                      # each delivery → a return to its origin hub
     turnaround_s: float = 0.0                      # delay before the return is filed (after est. arrival)
+    # End the demand at the horizon: drop returns that would file at/after horizon_s. Keeps the
+    # filing rate a constant 2λ up to H (deliveries + returns) ⇒ steady airborne density to the end,
+    # instead of planning the low-density post-horizon return tail. False ⇒ returns span past H (the
+    # tail-spanning behaviour the replay was built around).
+    clip_returns_to_horizon: bool = True
     uss_share: dict[str, float] | None = None
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F
@@ -303,9 +308,13 @@ class HubRadiusDemand:
             fid += 1
             if self.return_flights:                                  # return: customer → same hub
                 t_ret = t_req + self._est_trip_s(hub, customer, cfg) + self.turnaround_s
-                requests.append(FlightRequest(
-                    fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
-                    uss_id=uss_id, dest_terminal=terminal))
+                # clip: a return landing past the horizon is the low-density tail — drop it so density
+                # stays steady to H. The decision consumes no RNG and fid still advances, so the kept
+                # flights are an identically-labelled subset of the unclipped run.
+                if not self.clip_returns_to_horizon or t_ret < cfg.horizon_s:
+                    requests.append(FlightRequest(
+                        fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
+                        uss_id=uss_id, dest_terminal=terminal))
                 fid += 1
 
         requests.sort(key=lambda r: (r.t_request, r.flight_id))

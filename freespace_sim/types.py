@@ -48,14 +48,17 @@ class DenialReason(Enum):
     """Why a request was denied — keeps real congestion separate from compute artifacts.
 
     BUDGET_EXCEEDED is *physics*: no plan exists within the operator's budgets (delay/detour) — the
-    congestion signal the experiment measures. SEARCH_EXHAUSTED is a *possible artifact*: the
-    bounded planner gave up; a higher sample cap might have found a path. Reporting them separately
-    lets the headline denial-rate count real congestion and lets us audit the artifact's size.
+    congestion signal the experiment measures. It covers a path that busts the delay/detour budget AND
+    an exhaustive planner (A*) emptying its queue with no feasible plan inside the horizon (a saturated
+    hub with no launch/landing slot). SEARCH_EXHAUSTED is a *possible artifact*: the planner stopped at
+    its compute cap before exhausting the space; a higher cap might have found a path. Reporting them
+    separately lets the headline denial-rate count real congestion and audit the artifact's size.
     """
 
     NONE = "none"
-    BUDGET_EXCEEDED = "budget_exceeded"      # no plan within max_ground_delay_s / max_detour_factor
-    SEARCH_EXHAUSTED = "search_exhausted"    # hit the RRT* sample cap (compute-bounded)
+    BUDGET_EXCEEDED = "budget_exceeded"      # no feasible plan within max_ground_delay_s / max_detour_factor
+                                             #   (incl. A* exhausting its bounded horizon — real congestion)
+    SEARCH_EXHAUSTED = "search_exhausted"    # stopped at the compute cap: RRT* sample cap / A* max_expansions
     CONFLICT_AT_COMMIT = "conflict_at_commit"  # lost a commit-time race (multi-USS, future)
     CONFLICT_FILED = "conflict_filed"  # filing has a conflict (multi-USS, future)
 

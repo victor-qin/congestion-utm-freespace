@@ -251,6 +251,7 @@ class AStarPlanner:
         closed: set = set()
         goal_state = None
         expansions = 0
+        truncated = False                                # True ⇒ stopped at the expansion cap (compute)
 
         while pq:
             _, _, st = heapq.heappop(pq)
@@ -288,6 +289,7 @@ class AStarPlanner:
             # keep expanding (the ground-wait/hover levers find an arrival whose dwell is clear).
             expansions += 1
             if expansions > self.max_expansions:
+                truncated = True
                 break
             base_g = g[st]
             for nst, cost in self._edges(
@@ -302,7 +304,12 @@ class AStarPlanner:
                     heapq.heappush(pq, (ng + hh, next(counter), nst))
 
         if goal_state is None:
-            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+            # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
+            # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /
+            # max_step — real congestion ⇒ BUDGET_EXCEEDED. We stopped at the expansion cap ⇒ the search
+            # was truncated before exhausting — a compute artifact a higher cap might beat ⇒ SEARCH_EXHAUSTED.
+            return _deny(req, DenialReason.SEARCH_EXHAUSTED if truncated
+                         else DenialReason.BUDGET_EXCEEDED)
 
         # reconstruct the path
         path = [goal_state]

@@ -1,3 +1,5 @@
+import dataclasses as dc
+
 import numpy as np
 import pytest
 
@@ -8,7 +10,7 @@ from freespace_sim.planner import get_planner, hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner, _committed_arrival
 from freespace_sim.planner.opt import NLPOptPlanner
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
+from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
@@ -52,6 +54,27 @@ def test_astar_uses_ground_delay_for_a_busy_destination_pad():
     assert intent.status is IntentStatus.ACCEPTED
     assert intent.ground_delay_s > 0.0               # cheapest lever: wait on the pad
     assert not led.any_conflict(intent.volumes)
+
+
+def test_astar_compute_cap_truncation_is_search_exhausted():
+    # Stopping at the expansion cap is a COMPUTE artifact -> SEARCH_EXHAUSTED (a higher cap might have
+    # found a path). max_expansions=0 truncates the search on its first expansion.
+    led = ReservationLedger(CFG)
+    intent = AStarPlanner(max_expansions=0).plan(_req(), led, CFG)
+    assert intent.status is IntentStatus.REJECTED
+    assert intent.denial_reason is DenialReason.SEARCH_EXHAUSTED
+
+
+def test_astar_no_feasible_plan_is_budget_exceeded():
+    # Exhausting the bounded search with NO feasible plan (here: dest pad blocked past the horizon) is
+    # real congestion -> BUDGET_EXCEEDED, not the compute-artifact SEARCH_EXHAUSTED. A* is complete
+    # within the horizon, so an emptied queue PROVES infeasibility — distinct from giving up on compute.
+    cfg = dc.replace(CFG, max_ground_delay_s=20.0)
+    led = ReservationLedger(cfg)
+    led.commit(99, [Volume4D(CylinderSpec(400, 0, 60, 0, 150), 0.0, 1e5)])   # dest pad blocked ~forever
+    intent = AStarPlanner().plan(FlightRequest(1, vec(0, 0, 0), vec(400, 0, 0), 0.0), led, cfg)
+    assert intent.status is IntentStatus.REJECTED
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
 
 
 def test_astar_is_deterministic():

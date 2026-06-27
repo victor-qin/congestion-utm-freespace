@@ -39,8 +39,8 @@ def _search(
     start_cell, start_slot, start_arr, start_g, n_start,              # takeoff start labels
     gq, grr, lf_lo, lf_hi, lf_n,                                      # goal cell + landing-feasible ivals
     c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,         # cost + heuristic params
-    gen, front_head, front_gen,                                      # frontier (linked-list heads/slot)
-    lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_dead, max_lab,  # labels
+    gen, front_head, front_tail, front_gen,                          # per-slot sorted-by-arr staircase
+    lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_prev, lab_dead, max_lab,  # labels
     heap_f, heap_c, heap_n, max_heap,                                # binary heap
     out_q, out_r, out_s,                                             # output path buffers
 ):
@@ -48,6 +48,7 @@ def _search(
     size = 0
     ctr = 0
     n_exp = 0
+    ch_dt = c_hold * dt                                 # per-step air-hover cost (staircase key slope)
 
     for i in range(n_start):                            # seed takeoff start labels into the heap
         if nlab >= max_lab or size >= max_heap:
@@ -156,39 +157,59 @@ def _search(
                     if a - 1 > hi_c:                     # cannot hover here long enough (chain ascends)
                         break
                     wait = a - (arr + 1)
-                    ng = g + c_hold * dt * wait + c_lat * pitch
-                    dominated = False
-                    if not ngoal and front_gen[sj] == gen:  # walk slot frontier: dominated? + evict dominees
-                        t = a * dt
-                        prevm = -1
-                        mlab = front_head[sj]
-                        while mlab != -1:
-                            t2 = lab_arr[mlab] * dt; g2 = lab_g[mlab]
-                            nxtm = lab_next[mlab]
-                            if t2 <= t and g2 + (t - t2) * c_hold <= ng + 1e-9:
-                                dominated = True
-                                break
-                            if t <= t2 and ng + (t2 - t) * c_hold <= g2 + 1e-9:
-                                lab_dead[mlab] = gen        # new dominates stored → evict (unlink + skip)
-                                if prevm == -1:
-                                    front_head[sj] = nxtm
-                                else:
-                                    lab_next[prevm] = nxtm
-                            else:
-                                prevm = mlab
-                            mlab = nxtm
-                    if not dominated:
+                    ng = g + ch_dt * wait + c_lat * pitch
+                    # --- dominance on the (ncell, sj) staircase: largest stored arr2 <= a (walk tail←) ---
+                    make = True
+                    m = -1
+                    if not ngoal:
+                        if front_gen[sj] != gen:
+                            front_gen[sj] = gen; front_head[sj] = -1; front_tail[sj] = -1
+                        m = front_tail[sj]
+                        while m != -1 and lab_arr[m] > a:
+                            m = lab_prev[m]
+                        if m != -1 and lab_g[m] + (a - lab_arr[m]) * ch_dt <= ng + 1e-9:
+                            make = False                     # dominated by the predecessor (min staircase v)
+                    if make:
                         if nlab >= max_lab or size >= max_heap:
                             return -1, 0.0, n_exp, FALLBACK
                         L2 = nlab; nlab += 1
                         lab_cell[L2] = ncell; lab_slot[L2] = sj; lab_arr[L2] = a
                         lab_g[L2] = ng; lab_par[L2] = L
                         if ngoal:
-                            lab_next[L2] = -1
-                        elif front_gen[sj] != gen:
-                            front_gen[sj] = gen; lab_next[L2] = -1; front_head[sj] = L2
+                            lab_next[L2] = -1; lab_prev[L2] = -1
                         else:
-                            lab_next[L2] = front_head[sj]; front_head[sj] = L2
+                            if m != -1 and lab_arr[m] == a:      # same arr, new is cheaper → evict it
+                                pm = lab_prev[m]; nm = lab_next[m]
+                                lab_dead[m] = gen
+                                if pm == -1:
+                                    front_head[sj] = nm
+                                else:
+                                    lab_next[pm] = nm
+                                if nm == -1:
+                                    front_tail[sj] = pm
+                                else:
+                                    lab_prev[nm] = pm
+                                m = pm
+                            nx2 = front_head[sj] if m == -1 else lab_next[m]    # splice L2 in after m
+                            lab_prev[L2] = m; lab_next[L2] = nx2
+                            if m == -1:
+                                front_head[sj] = L2
+                            else:
+                                lab_next[m] = L2
+                            if nx2 == -1:
+                                front_tail[sj] = L2
+                            else:
+                                lab_prev[nx2] = L2
+                            e = nx2                              # forward-evict the contiguous dominated run
+                            while e != -1 and ng + (lab_arr[e] - a) * ch_dt <= lab_g[e] + 1e-9:
+                                ne = lab_next[e]
+                                lab_dead[e] = gen
+                                lab_next[L2] = ne
+                                if ne == -1:
+                                    front_tail[sj] = L2
+                                else:
+                                    lab_prev[ne] = L2
+                                e = ne
                         dxx = R * _SQRT3 * (nq + nr / 2.0) - gx
                         dyy = R * 1.5 * nr - gy
                         f = ng + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost
@@ -210,7 +231,7 @@ def _search(
                 return -1, 0.0, n_exp, FALLBACK
             L2 = nlab; nlab += 1
             lab_cell[L2] = cell; lab_slot[L2] = slot; lab_arr[L2] = arr + 1
-            lab_g[L2] = g + c_hold * dt; lab_par[L2] = L; lab_next[L2] = -1
+            lab_g[L2] = g + ch_dt; lab_par[L2] = L; lab_next[L2] = -1; lab_prev[L2] = -1
             dxx = R * _SQRT3 * (q + r / 2.0) - gx
             dyy = R * 1.5 * r - gy
             f = (g + c_hold * dt) + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost

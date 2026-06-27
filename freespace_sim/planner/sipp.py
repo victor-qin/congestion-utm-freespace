@@ -428,6 +428,7 @@ class SIPPPlanner(AStarPlanner):
         if self._k_cap < cocc.cap:                       # frontier: one slot per pool interval
             self._k_cap = cocc.cap
             self._k_front_head = np.full(cocc.cap, -1, np.int64)
+            self._k_front_tail = np.full(cocc.cap, -1, np.int64)   # sorted-by-arr staircase per slot
             self._k_front_gen = np.zeros(cocc.cap, np.int64)
         if self._k_lab_cell is None:                     # labels + heap: allocate once
             ml = 1 << 21
@@ -438,6 +439,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_lab_g = np.empty(ml, np.float64)
             self._k_lab_par = np.empty(ml, np.int64)
             self._k_lab_next = np.empty(ml, np.int64)
+            self._k_lab_prev = np.empty(ml, np.int64)      # doubly-linked sorted frontier
             self._k_lab_dead = np.full(ml, -1, np.int64)   # version-stamped: == gen ⇒ evicted, skip at pop
             self._k_heap_f = np.empty(ml, np.float64)
             self._k_heap_c = np.empty(ml, np.int64)
@@ -515,9 +517,9 @@ class SIPPPlanner(AStarPlanner):
             np.asarray(s_g, np.float64), len(s_cell),
             gq, grr, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64), len(lf_lo),
             c_hold, c_lat, pitch, dt, gx, gy, R, 0.0, climb_cost,
-            self._gen, self._k_front_head, self._k_front_gen,
+            self._gen, self._k_front_head, self._k_front_tail, self._k_front_gen,
             self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
-            self._k_lab_next, self._k_lab_dead, self._k_max,
+            self._k_lab_next, self._k_lab_prev, self._k_lab_dead, self._k_max,
             self._k_heap_f, self._k_heap_c, self._k_heap_n, self._k_max,
             self._k_out_q, self._k_out_r, self._k_out_s,
         )

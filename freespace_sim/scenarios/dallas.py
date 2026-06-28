@@ -34,9 +34,7 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         "dallas_full", region_m=(60000.0, 45000.0), lam_per_hour=34500.0, horizon_s=1800.0,
         demand=DemandSpec(
             pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(20, 240),
-            # service radii: wide, overlapping disks (16 km Walmart / 8 km strip-mall) ⇒ long flights,
-            # heavy cross-region traffic, and customers spread thin near any one foreign column.
-            radius_m={"walmart_uss": 16000.0, "stripmall_uss": 8000.0},
+            radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0},
             terminal_radius_m={"walmart_uss": 180.0, "stripmall_uss": 105.0},
             pads_per_hub={"walmart_uss": 40, "stripmall_uss": 16},
             uss_share={"walmart_uss": 1.0, "stripmall_uss": 2.0},

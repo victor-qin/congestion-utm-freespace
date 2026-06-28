@@ -156,7 +156,7 @@ def _search(
                     if a < lo:
                         a = lo
                     if a > hi:
-                        sj = iv_nxt[sj]
+                        sj = nxts                   # next interval in THIS chain (overlay or pool)
                         continue
                     if a - 1 > hi_c:                     # cannot hover here long enough (chain ascends)
                         break

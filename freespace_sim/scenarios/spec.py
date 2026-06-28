@@ -28,7 +28,7 @@ class DemandSpec:
     direction: str = "delivery"            # hub pattern: "delivery" (hub→customer) | "pickup"
     # --- hub_radius extras (multi-pad hubs, radius service areas, return flights) ---
     radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS dict)
-    pads_per_hub: int = 1                  # terminal capacity N per hub
+    pads_per_hub: "int | dict[str, int]" = 1   # terminal capacity N per hub (scalar or per-USS dict)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub

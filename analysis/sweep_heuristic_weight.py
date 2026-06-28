@@ -61,10 +61,13 @@ def build_warm():
 
 
 print(f"lam={lam} warm={warm_n} timed={timed}  region=60x45km hubs=20+240 pads=24/8", flush=True)
-print(f"{'w':>5} {'ms/flight':>10} {'exp/flight':>11} {'mean_cost':>11} {'cost/opt':>9} "
-      f"{'acc':>5} {'den':>5} {'speedup':>8}", flush=True)
+# grd_s/air_s = mean ground / air delay (s) of accepted; air/opt = air inflation vs w=1 (the metric
+# weighting distorts — a faithful weight keeps this ~1.0); speedup vs w=1 wall time.
+print(f"{'w':>5} {'ms/flt':>8} {'exp/flt':>9} {'grd_s':>7} {'air_s':>7} {'air/opt':>8} "
+      f"{'cost/opt':>9} {'acc':>5} {'den':>5} {'speedup':>8}", flush=True)
 
-base_ms = base_cost = None
+vmps = base_cfg.nominal_speed_mps
+base_ms = base_cost = base_air = None
 for w in weights:
     cfg = replace(base_cfg, heuristic_weight=w)      # trial w; warm-up stays w=1 (identical field)
     ledger, dss, planner = build_warm()              # reuse the warmed planner → no orphan svc
@@ -72,6 +75,8 @@ for w in weights:
 
     acc = den = exp_sum = 0
     costs: list[float] = []
+    grd: list[float] = []
+    air: list[float] = []
     t0 = time.monotonic()
     for req in reqs[warm_n:warm_n + timed]:
         intent = usses[req.uss_id].handle_request(req)
@@ -79,13 +84,18 @@ for w in weights:
         if intent.accepted:
             acc += 1
             costs.append(intent.cost)
+            grd.append(intent.ground_delay_s)
+            air.append(intent.air_hold_s + intent.air_detour_m / vmps)   # air delay = hold + detour-time
         else:
             den += 1
     elapsed = time.monotonic() - t0
 
     ms = elapsed / timed * 1000.0
     mean_cost = float(np.mean(costs)) if costs else float("nan")
+    mean_grd = float(np.mean(grd)) if grd else float("nan")
+    mean_air = float(np.mean(air)) if air else float("nan")
     if base_ms is None:
-        base_ms, base_cost = ms, mean_cost
-    print(f"{w:>5.2f} {ms:>10.1f} {exp_sum / timed:>11.0f} {mean_cost:>11.1f} "
-          f"{mean_cost / base_cost:>9.3f} {acc:>5} {den:>5} {base_ms / ms:>7.2f}x", flush=True)
+        base_ms, base_cost, base_air = ms, mean_cost, mean_air
+    print(f"{w:>5.2f} {ms:>8.1f} {exp_sum / timed:>9.0f} {mean_grd:>7.1f} {mean_air:>7.1f} "
+          f"{mean_air / base_air:>8.2f} {mean_cost / base_cost:>9.3f} {acc:>5} {den:>5} "
+          f"{base_ms / ms:>7.2f}x", flush=True)

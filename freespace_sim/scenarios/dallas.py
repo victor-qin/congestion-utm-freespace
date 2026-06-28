@@ -23,17 +23,22 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         ),
     ),
     # the full metro world (issue #9): 60×45 km, 20 Walmarts + 240 strip malls, λ=34.5k deliveries
-    # (~2× with returns). Demand splits 1:2 Walmart:strip-mall (uss_share). Pads sized for ground
-    # congestion ≈ 0 so AIR delay dominates: Walmart 24 (~17.6 Erlang offered load), strip-mall 8
-    # (~2.9 Erlang). Column radius is a REQUIREMENT, not a preference — strip malls at 90 m (not their
-    # 60 m hover footprint) so divergent same-hub launches stay concurrent under the flush exit default.
+    # (~2× with returns). Demand splits 1:2 Walmart:strip-mall (uss_share). Pads AND boundary-hex exit
+    # lanes (issue #18/19) provisioned ABOVE the measured peak per-hub demand at λ=34.5k so neither pad
+    # capacity nor exit lanes constrain takeoffs — leaving path-planning (air congestion) as the only
+    # delay source. Two time-scales: a column dwell holds a PAD for 55 s (hover+climb) → Walmart peak
+    # demand ~37 → 40 pads; an exit lane holds a boundary hex for only ~12 s (corridor transit) →
+    # Walmart lane demand ~14 → 180 m column = 18 lanes. Strip-mall: 13 dwell / 6 lane demand → 16 pads,
+    # 105 m = 12 lanes. (Earlier 24/8 pads + 125 m were pad-bound: peak 28-37 dwells ≫ 24 → saturation.)
     "dallas_full": ScenarioSpec(
         "dallas_full", region_m=(60000.0, 45000.0), lam_per_hour=34500.0, horizon_s=1800.0,
         demand=DemandSpec(
             pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(20, 240),
-            radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0},
-            terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
-            pads_per_hub={"walmart_uss": 24, "stripmall_uss": 8},
+            # service radii: wide, overlapping disks (16 km Walmart / 8 km strip-mall) ⇒ long flights,
+            # heavy cross-region traffic, and customers spread thin near any one foreign column.
+            radius_m={"walmart_uss": 16000.0, "stripmall_uss": 8000.0},
+            terminal_radius_m={"walmart_uss": 180.0, "stripmall_uss": 105.0},
+            pads_per_hub={"walmart_uss": 40, "stripmall_uss": 16},
             uss_share={"walmart_uss": 1.0, "stripmall_uss": 2.0},
             return_flights=True,
         ),

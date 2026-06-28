@@ -139,6 +139,25 @@ def run(
     usses = {uid: USS(uid, dss, cfg, get_planner(pname)) for uid in scenario.uss_ids}
     default_uss = next(iter(usses.values()))
 
+    if cfg.terminal_airspace_always_active:
+        # Hand every A* planner the full hub set so it can permanently wall each terminal off from
+        # foreign cruise traffic. A hub centre = the request endpoint that carries its terminal (a
+        # delivery's origin / a return's dest). Unwrap refiners (ShortcutRefiner.inner) to reach the A*.
+        terms: dict = {}
+        for ev in scenario.events:
+            rq = ev.request
+            if rq.origin_terminal is not None:
+                terms.setdefault(rq.origin_terminal.id, (rq.origin, rq.origin_terminal))
+            if rq.dest_terminal is not None:
+                terms.setdefault(rq.dest_terminal.id, (rq.dest, rq.dest_terminal))
+        static_terms = list(terms.values())
+        for u in usses.values():
+            p = u.planner
+            while p is not None:
+                if hasattr(p, "static_terminals"):
+                    p.static_terminals = static_terms
+                p = getattr(p, "inner", None)
+
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
     intents: list[OperationalIntent] = []

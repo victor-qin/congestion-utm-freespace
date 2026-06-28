@@ -18,6 +18,7 @@ from typing import Protocol
 import numpy as np
 
 from .config import SimConfig
+from .planner.hexgrid import circumradius
 from .types import FlightRequest, Terminal, vec
 
 
@@ -219,6 +220,25 @@ class HubRadiusDemand:
         ids, probs = self._shares()
         n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
 
+        # foreign-column filter (cfg.terminal_airspace_always_active): a customer inside ANY OTHER hub's
+        # reserved column — OR within the approach corridor's footprint clearance of its edge — is
+        # unreachable (the corridor can't fit between the customer and the wall), so the delivery is
+        # spurious. Threshold = exit_radius + (corridor_half + hex circumradius), the same inflation
+        # is_blocked applies, so a kept customer always has room for an approach lane. Own hub exempted.
+        filter_foreign = cfg.terminal_airspace_always_active
+        if filter_foreign:
+            clearance = cfg.corridor_width_m / 2.0 + circumradius(cfg)   # ~99 m: corridor footprint
+            f_centers, f_er2, f_idx = [], [], {}
+            for uid, pts in hubs.items():
+                er = (self._terminal_radius_for(uid) + cfg.corridor_width_m / 2.0
+                      - (self.corridor_overlap_m or 0.0) + clearance)
+                for hj in range(pts.shape[0]):
+                    f_idx[(uid, hj)] = len(f_centers)
+                    f_centers.append(pts[hj])
+                    f_er2.append(er * er)
+            f_centers = np.asarray(f_centers, float)
+            f_er2 = np.asarray(f_er2, float)
+
         requests: list[FlightRequest] = []
         fid = 0
         for _ in range(n):
@@ -238,16 +258,22 @@ class HubRadiusDemand:
             if customer is None:
                 customer = np.clip(c, [0.0, 0.0], [w, h])
             t_req = float(rng.uniform(0, cfg.horizon_s))
-            requests.append(FlightRequest(                            # delivery: hub → customer
-                fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
-                uss_id=uss_id, origin_terminal=terminal))
+            drop = False
+            if filter_foreign:                                       # customer inside a FOREIGN column?
+                d2 = ((f_centers - customer) ** 2).sum(axis=1)
+                d2[f_idx[(uss_id, hi)]] = np.inf                     # own column is transparent — exempt
+                drop = bool((d2 < f_er2).any())                      # drop both legs; fid still advances
+            if not drop:
+                requests.append(FlightRequest(                        # delivery: hub → customer
+                    fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
+                    uss_id=uss_id, origin_terminal=terminal))
             fid += 1
             if self.return_flights:                                  # return: customer → same hub
                 t_ret = t_req + self._est_trip_s(hub, customer, cfg) + self.turnaround_s
                 # clip: a return landing past the horizon is the low-density tail — drop it so density
                 # stays steady to H. The decision consumes no RNG and fid still advances, so the kept
                 # flights are an identically-labelled subset of the unclipped run.
-                if not self.clip_returns_to_horizon or t_ret < cfg.horizon_s:
+                if not drop and (not self.clip_returns_to_horizon or t_ret < cfg.horizon_s):
                     requests.append(FlightRequest(
                         fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
                         uss_id=uss_id, dest_terminal=terminal))

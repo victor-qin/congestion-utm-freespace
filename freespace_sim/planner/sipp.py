@@ -421,6 +421,16 @@ class SIPPPlanner(AStarPlanner):
         cocc.evict_before(int(req.t_request // cfg.dt_s))
         return cocc
 
+    def share_occupancy_from(self, master) -> None:
+        """Plan against MASTER's committed occupancy (``cocc``/``svc``/``tcap``/``sidx``) without
+        subscribing the ledger hook or re-absorbing — for optimistic-batch worker threads (#8 Track A).
+        The caller must keep the ledger FROZEN (no commits) while workers plan in parallel; each worker
+        keeps its OWN kernel state (``_k_*``), so the only shared mutation is the benign
+        ``evict_before`` watermark. With the ``nogil`` kernel, N workers search on N real threads."""
+        self._svc = master._svc; self._svc_ledger = master._svc_ledger; self._tcap = master._tcap
+        self._cocc = master._cocc; self._cocc_ledger = master._cocc_ledger
+        self._sidx = master._sidx; self._sidx_ledger = master._sidx_ledger
+
     def _kernel_state(self, cocc) -> None:
         """(Re)allocate version-stamped kernel work arrays. The frontier is sized to the interval pool
         (grows with the ledger); labels/heap are fixed-cap (overflow → fallback); both are reused across

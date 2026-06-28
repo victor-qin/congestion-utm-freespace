@@ -33,7 +33,7 @@ NO_PATH = 1
 FALLBACK = 2          # out-of-box stray or label/heap capacity → host falls back to the reference
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)   # nogil: release the GIL so a batch of plans runs on real threads (#8 Track A)
 def _search(
     iv_lo, iv_hi, iv_nxt,                                            # global interval pool (slot < cap)
     ov_lo, ov_hi, ov_nxt, ov_head, ov_gen, cap,                      # per-flight overlay (slot >= cap)

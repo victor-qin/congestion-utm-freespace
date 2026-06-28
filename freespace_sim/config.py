@@ -79,6 +79,14 @@ class SimConfig:
     # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
     planner: str = "astar"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
 
+    # --- always-active terminal airspace (foreign-transit isolation) ---
+    # When True, every hub's column + exit lanes are permanently reserved as a FOREIGN-no-fly zone for
+    # the whole horizon (not just during dwell windows): foreign cruise traffic routes AROUND the
+    # terminal (extra air detour) instead of crossing it and ground-blocking same-hub takeoffs via
+    # column_clear. Converts foreign-transit GROUND delay into airspace-density AIR delay. A*-only;
+    # the demand generator drops deliveries whose customer falls inside a foreign column (unreachable).
+    terminal_airspace_always_active: bool = False
+
     # --- fixed terminal exit lanes (issue #18); A* only ---
     # When True, A* (and astar_shortcut) routes shared-terminal takeoff/landing through the hub's
     # boundary-hex lanes and deconflicts same-hub launches by exact cell occupancy (is_blocked), killing

@@ -42,6 +42,7 @@ from collections.abc import Collection, Hashable
 from . import hexgrid as hg
 from ..config import SimConfig
 from ..geometry import CylinderSpec
+from ..types import as_terminal
 from ..volumes import Volume4D
 
 _EMPTY: dict = {}
@@ -57,6 +58,10 @@ class HexOccupancyService:
         self.pad: dict[int, set[tuple[int, int, int]]] = {}       # step -> {(q, r, L)}  (non-terminal)
         # shared terminal columns: step -> (q, r, L) -> {terminal_id}  (which hubs' columns cover the cell)
         self.term_cells: dict[int, dict[tuple[int, int, int], set[Hashable]]] = {}
+        # always-active terminals (cfg.terminal_airspace_always_active): step- AND level-INDEPENDENT
+        # (q, r) -> {tid} of hub column+lane cells permanently walled off from foreign cruise traffic at
+        # EVERY flight level. Empty when off.
+        self.static_term_cells: dict[tuple[int, int], set[Hashable]] = {}
         self.n_added = 0                  # committed volumes absorbed (shrink tripwire)
         self.evicted_before: int | None = None   # lowest retained step
 
@@ -92,6 +97,13 @@ class HexOccupancyService:
                 # TerminalCapacity).
                 self.term_cells.setdefault(s, {}).setdefault((q, r, L), set()).add(tid)
         self.n_added += 1
+
+    def register_static_terminal(self, center, term) -> None:
+        """Permanently wall a hub's terminal airspace (column + exit lanes) off from foreign traffic
+        (``cfg.terminal_airspace_always_active``). Step-independent: the cells are foreign obstacles at
+        EVERY step, so cruise traffic detours around them for the whole horizon. Idempotent per hub."""
+        for cell in hg.terminal_cells(center, term, self.cfg):
+            self.static_term_cells.setdefault(cell, set()).add(as_terminal(term).id)
 
     def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
         c = hg.hex_center(q, r, self.R)
@@ -142,11 +154,16 @@ class HexOccupancyService:
         the exact same-hub cell occupancy. The flight's own (uncommitted) corridor is absent during its
         plan, so this never self-blocks; the 90 m interior is skipped from ``blocked`` (``add_volume``
         ``own_cols``), so the climb stays clear. Flag off ⇒ ``False`` here, i.e. unchanged."""
-        if self.term_cells:                      # zero-overhead when no terminals exist
+        # ``static_term_cells`` (always-active terminals) adds step- AND level-independent foreign walls,
+        # merged with the per-step, per-level ``term_cells`` so a cell covered by EITHER (foreign) blocks.
+        # Both empty ⇒ unchanged.
+        if self.term_cells or self.static_term_cells:      # zero-overhead when no terminals exist
             here = self.term_cells.get(s, _EMPTY).get((q, r, L))
-            if here is not None:
-                if any(tid not in own for tid in here):
-                    return True                  # foreign column → wall
+            stat = self.static_term_cells.get((q, r))      # always-active wall spans all levels/steps
+            if here is not None or stat is not None:
+                if (here is not None and any(tid not in own for tid in here)) or \
+                        (stat is not None and any(tid not in own for tid in stat)):
+                    return True                  # foreign column (transient or always-active) → wall
                 # own-only column: transparent for the climb, unless (fixed lanes) a committed sibling
                 # corridor occupies this footprint cell at this level — the same-hub serialisation A* sees.
                 return self.cfg.fixed_exit_lanes and (q, r, L) in self.blocked.get(s, ())

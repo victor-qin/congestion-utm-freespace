@@ -192,6 +192,54 @@ def test_compiled_replay_exact_big_dense_short_flights():
         assert getattr(sipp, "_fb", 0) < 0.10 * len(rows), "kernel fell back too often"
 
 
+# ---- saturation regression: kernel must respect the own-lane overlay intervals ----
+
+@pytest.mark.slow
+def test_compiled_terminal_path_never_routes_through_blocked():
+    """Regression for the overlay-chain-walk OOB (``_search`` skip-ahead used the global pool's
+    ``iv_nxt`` for OVERLAY slots ``sj >= cap``, reading out of bounds and fabricating "free" space
+    across blocked steps). At saturation the own-lane overlays fragment, so the bug made the kernel
+    hover/route a flight THROUGH a foreign corridor occupying its own landing lane. Guard the exact
+    invariant the bug broke: no accepted compiled terminal path visits an ``is_blocked`` cell-step.
+
+    A strict ``compiled == reference`` assertion can't be used here — at this density the two settle
+    on different (occupancy-VALID) optima via the bounded fixed-lanes tie — so we assert occupancy
+    validity directly, which is robust to that tie and is precisely what the OOB violated.
+    """
+    if not _COMPILED:
+        pytest.skip("numba unavailable; every plan falls back to the reference")
+    from freespace_sim.uss import USS
+    spec = with_overrides(
+        get_scenario("dallas_hub_2uss_large"), lam_per_hour=12000.0, horizon_s=1200.0, seed=0,
+        demand_overrides={"pads_per_hub": {"walmart_uss": 40, "stripmall_uss": 16},
+                          "terminal_radius_m": {"walmart_uss": 135.0, "stripmall_uss": 90.0},
+                          "radius_m": 6000.0})
+    cfg = spec.config()
+    reqs = spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))
+    sc = scenario_from_requests(reqs)
+    led = ReservationLedger(cfg)
+    dss = DSS(ledger=led, mechanism=FCFSMechanism())
+    sipp = get_planner("sipp")
+    usses = {u: USS(u, dss, cfg, sipp) for u in sc.uss_ids}
+    WARM = 1200
+    for ev in sc.events[:WARM]:                       # warm to saturation → own-lane overlays fragment
+        usses[ev.request.uss_id].handle_request(ev.request)
+    violations, checked = [], 0
+    for ev in sc.events[WARM:WARM + 200]:
+        rq = ev.request
+        fb0 = sipp._fb
+        c = sipp.plan(rq, led, cfg)
+        if not c.accepted or sipp._fb != fb0:         # skip denied / fell-back-to-reference plans
+            continue
+        own, svc = sipp._own, sipp._svc
+        for (q, r, s) in sipp._air:                    # the per-step compiled search path
+            if svc.is_blocked(q, r, s, own):
+                violations.append((rq.flight_id, q, r, s))
+        checked += 1
+    assert checked > 20, f"too few terminal plans exercised the kernel ({checked})"
+    assert not violations, f"compiled path routed through {len(violations)} blocked cell-steps: {violations[:5]}"
+
+
 # ---- end-to-end ASTM conflict-freeness ----
 
 def test_compiled_full_run_verified_and_matches_reference():

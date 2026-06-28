@@ -525,6 +525,7 @@ class SIPPPlanner(AStarPlanner):
         dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         own = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        self._own = own            # last plan's own terminal-id set (diagnostics + occupancy tests)
         o_cap = o_term.capacity if o_term is not None else 1
         d_cap = d_term.capacity if d_term is not None else 1
         fixed = cfg.fixed_exit_lanes
@@ -635,6 +636,7 @@ class SIPPPlanner(AStarPlanner):
             if i + 1 < len(labels):
                 for k in range(a + 1, labels[i + 1][2]):
                     air.append((q, r, k))
+        self._air = air            # last compiled per-step search path [(q,r,step)] (diagnostics + tests)
         ground_steps = air[0][2] - climb_steps - base
         delay = ground_steps * dt
         cruise_wps: list[TimedPoint] = [

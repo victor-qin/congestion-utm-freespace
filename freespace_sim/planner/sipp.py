@@ -82,6 +82,7 @@ class SafeIntervalIndex:
         self.infl_pad = cfg.effective_hover_radius_m + self.R
         self.corr: dict[tuple[int, int], set[int]] = {}          # cell -> corridor-blocked steps
         self.cols: dict[tuple[int, int], dict[int, set]] = {}    # cell -> step -> {hub_id}
+        self.static_cols: dict[tuple[int, int], set] = {}        # always-active: cell -> {hub_id} (step-indep)
         self.n_added = 0
         self.evicted_before: int | None = None
 
@@ -115,20 +116,35 @@ class SafeIntervalIndex:
 
     def reset(self) -> None:
         self.corr.clear(); self.cols.clear(); self.n_added = 0; self.evicted_before = None
+        # static_cols intentionally preserved: always-active walls are infrastructure, not commit-derived
+
+    def register_static_terminal(self, center, term) -> None:
+        """Permanently wall a hub's terminal airspace (column + exit lanes) off from FOREIGN traffic
+        (``cfg.terminal_airspace_always_active``) — the SafeIntervalIndex twin of
+        ``HexOccupancyService.register_static_terminal``. Step-independent; idempotent per hub."""
+        tid = as_terminal(term).id
+        for cell in hg.terminal_cells(center, term, self.cfg):
+            self.static_cols.setdefault(cell, set()).add(tid)
 
     def cell_blocked(self, q, r, s, own, fixed_lanes) -> bool:
-        """Exact replica of ``HexOccupancyService.is_blocked(q, r, s, own)``."""
+        """Exact replica of ``HexOccupancyService.is_blocked(q, r, s, own)`` — including the always-active
+        ``static_cols`` walls (foreign in EITHER the per-step columns OR the static set ⇒ blocked)."""
         cc = self.cols.get((q, r))
         hubs = cc.get(s) if cc else None
-        if hubs is not None:
-            if any(t not in own for t in hubs):
-                return True                                     # foreign column → wall
-            return fixed_lanes and s in self.corr.get((q, r), ())   # own column + sibling corridor
+        stat = self.static_cols.get((q, r)) if self.static_cols else None
+        if hubs is not None or stat is not None:
+            if (hubs is not None and any(t not in own for t in hubs)) or \
+                    (stat is not None and any(t not in own for t in stat)):
+                return True                                     # foreign column (transient or static) → wall
+            return fixed_lanes and s in self.corr.get((q, r), ())   # own-only column + sibling corridor
         return s in self.corr.get((q, r), ())
 
     def free_intervals(self, q, r, own, base, max_step, fixed_lanes):
         """Maximal free ``[lo,hi]`` step-runs in ``[base,max_step]`` — complement of the cell's blocked
         steps. O(#occupied steps of the cell); O(1) for a never-occupied cell (the common case)."""
+        stat = self.static_cols.get((q, r)) if self.static_cols else None
+        if stat is not None and any(t not in own for t in stat):
+            return []                            # always-active FOREIGN wall ⇒ blocked at EVERY step
         corr = self.corr.get((q, r))
         cols = self.cols.get((q, r))
         if not corr and not cols:
@@ -237,9 +253,11 @@ class SIPPPlanner(AStarPlanner):
             self._sidx_ledger = ledger
             ledger.subscribe(sidx.on_commit)
             _absorb(sidx, ledger)
+            self._register_static(sidx, cfg)
         elif ledger.n_volumes < sidx.n_added:
             sidx.reset()
             _absorb(sidx, ledger)
+            self._register_static(sidx, cfg)
         sidx.evict_before(int(req.t_request // cfg.dt_s))
         return sidx
 
@@ -415,11 +433,21 @@ class SIPPPlanner(AStarPlanner):
             self._cocc_ledger = ledger
             ledger.subscribe(cocc.on_commit)
             _absorb(cocc, ledger)
+            self._register_static(cocc, cfg)
         elif ledger.n_volumes < cocc.n_added:
             cocc.reset()
             _absorb(cocc, ledger)
+            self._register_static(cocc, cfg)
         cocc.evict_before(int(req.t_request // cfg.dt_s))
         return cocc
+
+    def _register_static(self, occ, cfg) -> None:
+        """Register the always-active terminal walls (set by ``run()`` on ``self.static_terminals``) into a
+        freshly (re)built occupancy structure (``SafeIntervalIndex`` / ``CompiledOccupancy``). No-op unless
+        ``cfg.terminal_airspace_always_active``. Mirrors ``AStarPlanner._occupancy``'s static registration."""
+        if getattr(cfg, "terminal_airspace_always_active", False):
+            for center, term in self.static_terminals:
+                occ.register_static_terminal(center, term)
 
     def share_occupancy_from(self, master) -> None:
         """Plan against MASTER's committed occupancy (``cocc``/``svc``/``tcap``/``sidx``) without

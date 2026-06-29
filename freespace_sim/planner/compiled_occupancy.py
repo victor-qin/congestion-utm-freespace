@@ -159,6 +159,17 @@ class CompiledOccupancy:
         self.evicted_before = None
         self._init_pool()
 
+    def register_static_terminal(self, center, term) -> None:
+        """Permanently wall a hub's terminal airspace (column + exit lanes) off from FOREIGN traffic
+        (``cfg.terminal_airspace_always_active``): force each footprint cell's pool interval EMPTY, so the
+        kernel finds no free interval there and routes around. The planning flight's OWN hub lanes are
+        restored per-flight by the overlay (built from ``SafeIntervalIndex``, which exempts own walls).
+        Call AFTER ``_init_pool``/absorb; idempotent (re-emptying an empty interval is a no-op)."""
+        for (q, r) in hg.terminal_cells(center, term, self.cfg):
+            c = self.cell_id(q, r)
+            if c >= 0:
+                self.iv_lo[c] = 0; self.iv_hi[c] = -1; self.iv_nxt[c] = -1   # empty (lo>hi) ⇒ fully blocked
+
     # ---------- pure-Python reader (kernel parity oracle + tests) ----------
     def free_intervals_py(self, q: int, r: int, base: int, max_step: int):
         """Cell's free intervals clipped to ``[base, max_step]`` — the exact view the kernel walks.

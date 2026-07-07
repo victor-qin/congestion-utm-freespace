@@ -169,3 +169,92 @@ def test_cross_uss_spread_zero_for_single_uss():
     assert agg["n_uss"] == 1
     assert agg["denial_rate_spread"] == 0.0
     assert agg["mean_delay_spread"] == 0.0
+
+
+# --- cost ⇄ time dual decomposition (the vertical-flight / cost-transparency metrics) ----------
+
+from freespace_sim.cost import trajectory_cost                       # noqa: E402
+from freespace_sim.types import IntentStatus, OperationalIntent      # noqa: E402
+
+
+def _accepted(**kw):
+    """Synthesize an accepted intent with `cost` set exactly as a planner would (trajectory_cost)."""
+    intent = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0),
+                               IntentStatus.ACCEPTED, **kw)
+    intent.cost = trajectory_cost(intent, CFG)
+    return intent
+
+
+def test_cost_breakdown_reconciles_to_intent_cost():
+    # the four COST levers sum to exactly intent.cost (== trajectory_cost) for every accepted flight
+    res = run(SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1200.0, seed=2))
+    acc = metrics.flight_frame(res).query("accepted")
+    recombined = (acc["ground_delay_cost"] + acc["air_hold_cost"]
+                  + acc["air_detour_cost"] + acc["altitude_cost"])
+    assert ((recombined - acc["cost"]).abs() < 1e-6).all()
+
+
+def test_cost_and_time_diverge_by_their_weights():
+    # the headline of "exposing costs AND their real-time": a lever's COST and its TIME differ by exactly
+    # its weight — that gap is why we record both currencies.
+    intent = _accepted(air_hold_s=10.0, air_detour_m=300.0)
+    cb, db = metrics.cost_breakdown(intent, CFG), metrics.delay_breakdown_s(intent, CFG)
+    # air hold: costs 3×/s but is one real second per second
+    assert math.isclose(cb["air_hold_cost"], CFG.cost_air_hold_per_s * db["air_hold_s"])
+    assert math.isclose(db["air_hold_s"], 10.0)
+    # lateral: a detour metre costs c_lat but is 1/speed real seconds
+    assert math.isclose(cb["air_detour_cost"], CFG.cost_air_lateral_per_m * 300.0)
+    assert math.isclose(db["detour_time_s"], 300.0 / CFG.nominal_speed_mps)
+
+
+def test_altitude_recorded_as_cost_and_both_time_readings():
+    # a flight pushed up to level 1 (z=70): altitude_change 140, floor 60 ⇒ 80 m of congestion climb
+    intent = _accepted(altitude_change_m=2.0 * 70.0)
+    cb, db = metrics.cost_breakdown(intent, CFG), metrics.delay_breakdown_s(intent, CFG)
+    assert math.isclose(cb["altitude_cost"], CFG.cost_altitude_change_per_m * 140.0)        # FULL climb
+    assert math.isclose(db["excess_altitude_m"], 80.0)                                       # above floor
+    # A (physical) and B (cost-equivalent) — BOTH recorded, and genuinely different (12× at defaults)
+    assert math.isclose(db["altitude_delay_phys_s"], 80.0 / CFG.climb_rate_mps)              # ≈13.3 s
+    assert math.isclose(db["altitude_delay_costeq_s"],
+                        80.0 * CFG.cost_altitude_change_per_m / CFG.cost_ground_delay_per_s)  # 160 s
+    assert db["altitude_delay_costeq_s"] > db["altitude_delay_phys_s"]
+
+
+def test_excess_altitude_is_zero_at_the_floor():
+    # multi-level A* in empty airspace cruises at the lowest level ⇒ no congestion climb, no alt delay
+    res = run(SimConfig(planner="astar"),
+              requests=[FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0)])
+    r = metrics.flight_frame(res).iloc[0]
+    assert r["accepted"]
+    assert math.isclose(r["altitude_change_m"], metrics.nominal_altitude_change_m(res.config))
+    assert math.isclose(r["excess_altitude_m"], 0.0, abs_tol=1e-9)
+    assert math.isclose(r["altitude_delay_phys_s"], 0.0, abs_tol=1e-9)
+    assert math.isclose(r["altitude_delay_costeq_s"], 0.0, abs_tol=1e-9)
+
+
+def test_congestion_cost_is_cost_minus_the_mandatory_climb():
+    # congestion_cost omits the mandatory floor climb every flight pays (which `cost` carries in full),
+    # so it == cost − c_alt·nominal_altitude_change. Detour-robust: holds whatever the hex path does.
+    res = run(SimConfig(planner="astar"),
+              requests=[FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0)])
+    r = metrics.flight_frame(res).iloc[0]
+    baseline = res.config.cost_altitude_change_per_m * metrics.nominal_altitude_change_m(res.config)
+    assert math.isclose(r["congestion_cost"], r["cost"] - baseline, abs_tol=1e-6)
+    assert r["cost"] > 0.0      # still paid the mandatory baseline-altitude cost
+
+
+def test_breakdowns_are_nan_for_denied():
+    denied = OperationalIntent(FlightRequest(1, vec(0, 0, 0), vec(2400, 0, 0), 0.0),
+                               IntentStatus.REJECTED)
+    assert not denied.accepted
+    assert all(math.isnan(v) for v in metrics.cost_breakdown(denied, CFG).values())
+    assert all(math.isnan(v) for v in metrics.delay_breakdown_s(denied, CFG).values())
+
+
+def test_aggregate_exposes_cost_and_altitude_rollups():
+    res = run(SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1200.0, seed=2))
+    agg = metrics.aggregate(res)
+    for k in ("mean_ground_delay_cost", "mean_air_hold_cost", "mean_air_detour_cost",
+              "mean_altitude_cost", "mean_congestion_cost", "mean_excess_altitude_m",
+              "p95_excess_altitude_m", "mean_altitude_delay_phys_s", "mean_altitude_delay_costeq_s"):
+        assert k in agg and agg[k] >= 0.0

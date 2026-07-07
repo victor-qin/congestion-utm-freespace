@@ -1,7 +1,7 @@
 """Visualize what the A* planner treats as *blocked* in the wall scenario.
 
 A* never sees the wall geometry: it rasterizes every committed Volume4D into a set of
-``(q, r, step)`` hex cells (``hexgrid.rasterize_volume``), conservatively inflating each obstacle by
+``(q, r, L, step)`` hex cells (``hexgrid.rasterize_volume``), conservatively inflating each obstacle by
 ``corridor_width/2 + R`` (one hex circumradius). This script rebuilds that blocked-set *exactly the
 way the planner does*, plans the route through it, and draws all three layers on the hex lattice:
 
@@ -58,7 +58,7 @@ def blocked_cells(ledger: ReservationLedger, cfg: SimConfig, R: float, step: int
     """
     cells: dict[tuple[int, int], set[int]] = {}
     for _fid, vol in ledger.iter_committed():
-        for q, r, s in hg.rasterize_volume(vol, cfg, R):
+        for q, r, _L, s in hg.rasterize_volume(vol, cfg, R):   # collapse flight levels for the 2D view
             if step is not None and s != step:
                 continue
             cells.setdefault((q, r), set()).add(s)

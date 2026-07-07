@@ -95,8 +95,14 @@ def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:
 
 
 def nominal_flight_time_s(straight_m: float, cfg: SimConfig) -> float:
-    """Unimpeded door-to-door air time (s): straight cruise + the mandatory climb and descent."""
-    return straight_m / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s
+    """Unimpeded door-to-door air time (s): straight cruise + the mandatory climb and descent.
+
+    The climb baseline is the LOWEST flight level — the same "straight line at the lowest altitude"
+    floor as :func:`nominal_altitude_change_m`, so the time and altitude nominals agree. Single-plane
+    planners cruise at ``cruise_level_m`` instead, so (as with ``excess_altitude_m``) their real
+    unimpeded trip is a constant few seconds longer than this nominal — a structural offset shared by
+    every flight in a run, not a per-flight bias."""
+    return straight_m / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_to(cfg.flight_levels_m[0])
 
 
 def nominal_altitude_change_m(cfg: SimConfig) -> float:
@@ -275,7 +281,8 @@ def _rollup(df: pd.DataFrame, cfg: SimConfig) -> dict:
         "mean_stretch": float(acc["stretch"].mean()) if len(acc) else 1.0,
         "mean_cost": float(acc["cost"].mean()) if len(acc) else 0.0,
         # COST decomposition by lever (planner-objective units) — "where did the congestion cost go?".
-        # The four reconcile to mean_cost minus the mandatory baseline-altitude cost every flight pays.
+        # The four reconcile to mean_cost EXACTLY (altitude_cost is the full climb+descent); it is
+        # mean_congestion_cost that equals mean_cost minus the mandatory baseline-altitude cost.
         "mean_ground_delay_cost": _mean(acc["ground_delay_cost"]),
         "mean_air_hold_cost": _mean(acc["air_hold_cost"]),
         "mean_air_detour_cost": _mean(acc["air_detour_cost"]),

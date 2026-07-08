@@ -1,8 +1,14 @@
 from freespace_sim.config import SimConfig
-from freespace_sim.cost import trajectory_cost
+from freespace_sim.cost import endpoint_altitude_change_m, trajectory_cost
 from freespace_sim.types import FlightRequest, IntentStatus, OperationalIntent, vec
 
 CFG = SimConfig()
+
+
+def test_endpoint_altitude_change_m_books_both_endpoints_and_interior():
+    # climb ground→z0 + interior climb/descent dz + descent z1→ground — the shared altitude booking
+    assert endpoint_altitude_change_m(30.0, 70.0, 10.0, CFG) == (30 - 0) + (70 - 0) + 10   # 110
+    assert endpoint_altitude_change_m(75.0, 75.0, 0.0, CFG) == 2.0 * 75.0                  # single plane
 
 
 def _intent(**kw):

@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..config import SimConfig
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent
 from ..volumes import build_reservation_from_corners
@@ -120,8 +120,9 @@ class ShortcutRefiner:
             request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
             ground_delay_s=g_delay, air_hold_s=0.0,
             air_detour_m=max(0.0, cum_horiz - straight),
-            altitude_change_m=(float(np.asarray(centerline[0][0])[2]) - cfg.ground_level_m)
-            + (float(np.asarray(centerline[-1][0])[2]) - cfg.ground_level_m) + cum_dz,
+            altitude_change_m=endpoint_altitude_change_m(
+                float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),
+                cum_dz, cfg),
             planner=self.label or f"{intent.planner}+sc",
         )
         refined.cost = trajectory_cost(refined, cfg)

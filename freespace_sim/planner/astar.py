@@ -26,7 +26,7 @@ from dataclasses import replace
 import numpy as np
 
 from ..config import SimConfig
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..ledger import ReservationLedger
 from ..types import (
     DenialReason,
@@ -362,7 +362,7 @@ class AStarPlanner:
             ground_delay_s=delay,
             air_hold_s=n_hover * dt,
             air_detour_m=max(0.0, cum_horiz - straight),
-            altitude_change_m=(z_takeoff - ground_z) + cruise_dz + (z_land - ground_z),
+            altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="astar",
         )
         intent.cost = trajectory_cost(intent, cfg)

@@ -20,7 +20,7 @@ import casadi as ca
 import numpy as np
 
 from ..config import SimConfig
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent
@@ -171,8 +171,8 @@ class NLPOptPlanner:
             centerline=centerline,
             ground_delay_s=d_opt,
             air_detour_m=max(0.0, cum_horiz - straight_horiz),
-            altitude_change_m=(float(corners[0][2]) - cfg.ground_level_m)
-            + (float(corners[-1][2]) - cfg.ground_level_m) + cum_dz,
+            altitude_change_m=endpoint_altitude_change_m(
+                float(corners[0][2]), float(corners[-1][2]), cum_dz, cfg),
             planner="opt",
         )
         intent.cost = trajectory_cost(intent, cfg)

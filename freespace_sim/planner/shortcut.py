@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..config import SimConfig
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent
 from ..volumes import build_reservation_from_corners
@@ -102,7 +102,10 @@ class ShortcutRefiner:
             return intent
 
         g_delay = intent.ground_delay_s
-        t_depart = intent.centerline[0][1] - g_delay - cfg.climb_time_s   # exact inverse of the build
+        # exact inverse of the build: recover the takeoff time using the climb to the FIRST cruise
+        # point's altitude (its flight level), matching build_reservation_from_corners' corner-z timing.
+        t_depart = (intent.centerline[0][1] - g_delay
+                    - cfg.climb_time_to(float(np.asarray(intent.centerline[0][0])[2])))
         ot, dt = req.origin_terminal, req.dest_terminal
         simplified = shortcut_corners(corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger, ot, dt)
         if len(simplified) >= len(corners):
@@ -117,7 +120,9 @@ class ShortcutRefiner:
             request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
             ground_delay_s=g_delay, air_hold_s=0.0,
             air_detour_m=max(0.0, cum_horiz - straight),
-            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m) + cum_dz,
+            altitude_change_m=endpoint_altitude_change_m(
+                float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),
+                cum_dz, cfg),
             planner=self.label or f"{intent.planner}+sc",
         )
         refined.cost = trajectory_cost(refined, cfg)

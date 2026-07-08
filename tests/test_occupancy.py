@@ -21,7 +21,7 @@ def _batch(volumes, infl):
 
 
 def _flatten(buckets):
-    return {(q, r, s) for s, cells in buckets.items() for (q, r) in cells}
+    return {(q, r, L, s) for s, cells in buckets.items() for (q, r, L) in cells}
 
 
 def _accepted_volumes():
@@ -51,10 +51,10 @@ def test_evict_drops_past_keeps_future():
         svc.on_commit(fid, vols)
         seen.extend(vols)
     full_b = _batch(seen, INF_B)
-    steps = sorted({s for (_, _, s) in full_b})
+    steps = sorted({s for (_, _, _, s) in full_b})
     watermark = steps[len(steps) // 2]
     svc.evict_before(watermark)
-    assert _flatten(svc.blocked) == {(q, r, s) for (q, r, s) in full_b if s >= watermark}
+    assert _flatten(svc.blocked) == {(q, r, L, s) for (q, r, L, s) in full_b if s >= watermark}
     assert min(svc.blocked) >= watermark
     # eviction is monotonic — an earlier watermark is a no-op
     before = _flatten(svc.blocked)
@@ -65,7 +65,7 @@ def test_evict_drops_past_keeps_future():
 # --- shared terminal columns — per-cell hub-id set for the cruise own-hub exemption ------------
 # (pad capacity is NOT here anymore — it's gated temporally by TerminalCapacity; see test_terminal_capacity)
 
-from freespace_sim.volumes import hover_reservation   # noqa: E402
+from freespace_sim.volumes import corridor_segment_volume, hover_reservation   # noqa: E402
 
 
 def _hub_cell_and_step(svc):
@@ -86,10 +86,10 @@ def test_terminal_column_stays_out_of_binary_maps():
 def test_own_hub_column_transparent_foreign_blocks():
     svc = HexOccupancyService(CFG)
     svc.add_volume(hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H"))
-    (q, r), s = _hub_cell_and_step(svc)
-    assert svc.is_blocked(q, r, s)                          # default own=∅ → walls off cruise
-    assert not svc.is_blocked(q, r, s, own={"H"})          # the hub's own flights pass through
-    assert svc.is_blocked(q, r, s, own={"other"})          # a different hub still sees a wall
+    (q, r, L), s = _hub_cell_and_step(svc)
+    assert svc.is_blocked(q, r, L, s)                       # default own=∅ → walls off cruise
+    assert not svc.is_blocked(q, r, L, s, own={"H"})       # the hub's own flights pass through
+    assert svc.is_blocked(q, r, L, s, own={"other"})       # a different hub still sees a wall
 
 
 def test_evict_drops_terminal_cells_in_lockstep():
@@ -118,3 +118,45 @@ def test_publish_hook_feeds_service_on_commit():
     assert _flatten(svc.blocked) == _batch(seen, INF_B)
     assert _flatten(svc.pad) == _batch(seen, INF_P)
     assert svc.n_added == led.n_volumes
+
+
+# --- multi-altitude: per-level keying -----------------------------------------------------------
+
+def test_per_level_keying_separates_levels():
+    """A corridor at level 0 occupies (q,r,0) cells only; the same hex at level 1 is clear."""
+    from freespace_sim.types import vec
+    svc = HexOccupancyService(CFG)
+    z0 = CFG.level_z(0)
+    svc.add_volume(corridor_segment_volume(vec(500, 0, z0), 0.0, vec(620, 0, z0), CFG.dt_s, CFG))
+    s = next(iter(svc.blocked))
+    assert {L for (_, _, L) in svc.blocked[s]} == {0}        # corridor lands on its own level only
+    q, r, L = next(iter(svc.blocked[s]))
+    assert svc.is_blocked(q, r, 0, s)                        # blocked at level 0
+    assert not svc.is_blocked(q, r, 1, s)                    # clear one level up
+
+
+def test_terminal_column_recorded_at_all_levels():
+    """A [ground, ceiling] tagged column records its hub at every in-band level."""
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.volumes import Volume4D
+    svc = HexOccupancyService(CFG)
+    col = Volume4D(CylinderSpec(1000.0, 1000.0, 90.0, CFG.ground_level_m, CFG.airspace_ceiling_m),
+                   0.0, 60.0, terminal_id="H")
+    svc.add_volume(col)
+    s = next(iter(svc.term_cells))
+    assert {L for (_, _, L) in svc.term_cells[s]} == {0, 1, 2}
+    q, r, L = next(iter(svc.term_cells[s]))
+    assert svc.is_blocked(q, r, L, s)                        # foreign cruise walled at every level
+    assert not svc.is_blocked(q, r, L, s, own={"H"})        # the hub's own flights pass through
+
+
+def test_pad_clear_blocked_by_corridor_at_any_level():
+    """The pad (full-tube column) is blocked by a committed corridor at ANY flight level."""
+    from freespace_sim.types import vec
+    svc = HexOccupancyService(CFG)
+    z1 = CFG.level_z(1)
+    svc.add_volume(corridor_segment_volume(vec(1000, 0, z1), 0.0, vec(1120, 0, z1), CFG.dt_s, CFG))
+    s = next(iter(svc.pad))
+    q, r, L = next(iter(svc.pad[s]))
+    assert L == 1                                            # the corridor sits at level 1
+    assert not svc.pad_clear(q, r, s, 0)                     # but the pad's column spans all levels

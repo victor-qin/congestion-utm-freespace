@@ -26,7 +26,7 @@ from dataclasses import replace
 import numpy as np
 
 from ..config import SimConfig
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..ledger import ReservationLedger
 from ..types import (
     DenialReason,
@@ -132,14 +132,19 @@ def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, des
         air.append(s)
         s = came.get(s)
     air.reverse()
-    wps = [[np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), step * dt]
-           for (_, q, r, step) in air]
+    wps = [[np.array([*hg.hex_center(q, r, R), cfg.flight_levels_m[L]]), step * dt]
+           for (_, q, r, L, step) in air]
     return _fold_path(wps, origin, dest, origin_term, dest_term, cfg)[-1][1]
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 600_000):
+    def __init__(self, max_expansions: int = 600_000, vertical_edges: bool = True):
         self.max_expansions = max_expansions
+        # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an
+        # all-levels column-clearance check, so they dominate the multi-altitude search cost; the
+        # capacity gain comes from per-level TAKEOFF, which is independent. Disable on huge scenarios to
+        # recover most of the single-plane speed and keep the gain.
+        self.vertical_edges = vertical_edges
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
@@ -186,8 +191,17 @@ class AStarPlanner:
         dest = np.asarray(req.dest, float)
         t_depart = req.t_departure                       # types enforces it is set and >= t_request
         base = int(math.ceil(t_depart / dt))             # ceil ⇒ base*dt >= t_depart: never depart before filing
-        climb_steps = max(1, int(math.ceil(cfg.climb_time_s / dt)))
-        climb_cost = cfg.cost_altitude_change_per_m * (cfg.cruise_level_m - cfg.ground_level_m)
+        levels = cfg.flight_levels_m
+        ground_z = cfg.ground_level_m
+        c_alt = cfg.cost_altitude_change_per_m
+        # per-level takeoff: integer climb-steps (≥1) and the climb cost ground → each cruise level
+        takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)
+        takeoff_cost = tuple(c_alt * (z - ground_z) for z in levels)
+        # per-rung (L ↔ L+1) mid-route layer change: step count ceil(Δz/(climb_rate·dt)) and cost c_alt·Δz,
+        # precomputed once (like takeoff_*) and indexed by min(L, L2) in _edges — not recomputed per node.
+        rung_steps = tuple(max(1, int(math.ceil((levels[L + 1] - levels[L]) / (cfg.climb_rate_mps * dt))))
+                           for L in range(len(levels) - 1))
+        rung_cost = tuple(c_alt * (levels[L + 1] - levels[L]) for L in range(len(levels) - 1))
 
         oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
@@ -203,7 +217,9 @@ class AStarPlanner:
         # through mid-descent (else post-build CONFLICT_FILED). See occupancy.py.
         svc = self._occupancy(req, ledger, cfg)
         tcap = self._tcap
-        dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
+        # per-level dwell window: hover plus the ACTUAL climb to that level (takeoff or landing)
+        dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
+                            for z in levels)
 
         # Shared-terminal context (Phase B). A flight owns its origin/dest vertiports: their columns are
         # transparent to its search (``own``). A shared-hub takeoff/landing dwell is gated by
@@ -233,15 +249,20 @@ class AStarPlanner:
         # value np.linalg.norm returns for a length-2 vector, but ~19x cheaper (no array alloc / ufunc).
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
 
-        def h_air(q, r):
+        def h_air(q, r, L):
             dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
-            return c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off) + climb_cost
+            return (c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off)
+                    + takeoff_cost[L])                       # == c_alt*(levels[L]-ground_z), precomputed
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
-        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * climb_cost
+        h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off)
+                    + 2.0 * takeoff_cost[0])                 # mandatory descent from the lowest level + back
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
-        max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6
+        climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
+                      if cfg.n_levels > 1 else 0)
+        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
+                    + 3 * n_hops + 2 * climb_span + 6)
 
         start = ("g", oq, orr, base)
         g = {start: 0.0}
@@ -261,16 +282,13 @@ class AStarPlanner:
             if st[0] == "a":
                 goal_ok = False
                 if fixed_lanes and d_term is not None:
-                    # Fixed exit lanes: the goal is reaching one of the dest's boundary-hex lanes, gated
-                    # by the per-cell conflict-graph reservation (+ pad capacity + column). The corridor
-                    # ends at the boundary cell; the descent into the column is the hover reservation, so
-                    # the dest column opens at the cell-arrival time (window matches the committed lane box).
-                    L = d_lane_by_cell.get((st[1], st[2]))
-                    if L is not None:
-                        # The approach corridor into this boundary cell was already is_blocked-checked
-                        # (it now sees committed sibling approach lanes in the footprint — issue #18), so
-                        # the goal only needs the column/capacity dwell to admit here.
-                        goal_ok = tcap.dwell_ok(d_term, dest, st[3] * dt, d_cap)
+                    # Fixed exit lanes: the goal is reaching one of the dest's boundary-hex lanes (at any
+                    # flight level st[3]), gated by capacity + column; same-hub siblings at this cell+level
+                    # were already seen by the approach corridor's is_blocked check (issue #18).
+                    lane = d_lane_by_cell.get((st[1], st[2]))
+                    if lane is not None:
+                        # window uses THIS flight's descent-from-level time (st[3]), matching the commit
+                        goal_ok = tcap.dwell_ok(d_term, dest, st[4] * dt, d_cap, z=levels[st[3]])
                 elif st[1] == gq and st[2] == grr:
                     # Legacy: gate landing capacity at the COMMITTED (tail-folded edge) arrival, not the
                     # goal-hex step time — they differ by the centre→edge fold; see _committed_arrival.
@@ -278,9 +296,9 @@ class AStarPlanner:
                         tcap.dwell_ok(
                             d_term, dest,
                             _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term),
-                            d_cap, origin,
+                            d_cap, origin, levels[st[3]],
                         ) if d_term is not None
-                        else svc.pad_clear(gq, grr, st[3], dwell_steps)
+                        else svc.pad_clear(gq, grr, st[4], dwell_steps[st[3]])
                     )
                 if goal_ok:
                     goal_state = st
@@ -293,14 +311,14 @@ class AStarPlanner:
                 break
             base_g = g[st]
             for nst, cost in self._edges(
-                st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-                own, o_cap, o_term, origin, tcap, dest, o_lanes,
+                st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost, dwell_steps,
+                c_alt, svc, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
                     g[nst] = ng
                     came[nst] = st
-                    hh = h_air(nst[1], nst[2]) if nst[0] == "a" else h_ground
+                    hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
                     heapq.heappush(pq, (ng + hh, next(counter), nst))
 
         if goal_state is None:
@@ -317,12 +335,12 @@ class AStarPlanner:
             path.append(came[path[-1]])
         path.reverse()
         air = [s for s in path if s[0] == "a"]
-        ground_steps = air[0][3] - climb_steps - base
+        ground_steps = air[0][4] - takeoff_steps[air[0][3]] - base
         delay = ground_steps * dt
 
         cruise_wps: list[TimedPoint] = [
-            (np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), s * dt)
-            for (_, q, r, s) in air
+            (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt)
+            for (_, q, r, L, s) in air
         ]
         volumes, centerline, cum_horiz, n_hover = self._build(
             cruise_wps, origin, dest, base, ground_steps, cfg,
@@ -333,6 +351,9 @@ class AStarPlanner:
         if ledger.any_conflict(volumes):
             return _deny(req, DenialReason.CONFLICT_FILED)   # raster slack / hover contention
 
+        # true vertical travel: takeoff climb + every cruise layer change + landing descent
+        z_takeoff, z_land = levels[air[0][3]], levels[air[-1][3]]
+        cruise_dz = sum(abs(levels[air[i + 1][3]] - levels[air[i][3]]) for i in range(len(air) - 1))
         intent = OperationalIntent(
             request=req,
             status=IntentStatus.ACCEPTED,
@@ -341,61 +362,74 @@ class AStarPlanner:
             ground_delay_s=delay,
             air_hold_s=n_hover * dt,
             air_detour_m=max(0.0, cum_horiz - straight),
-            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m),
+            altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="astar",
         )
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _edges(self, st, cfg, pitch, climb_steps, climb_cost, svc, max_step, dwell_steps,
-               own=(), o_cap=1, o_term=None, origin=None, tcap=None, dest=None, o_lanes=()):
+    def _edges(self, st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
+               dwell_steps, c_alt, svc, max_step, own=(), o_cap=1, o_term=None, origin=None, tcap=None,
+               dest=None, o_lanes=()):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
             _, q, r, s = st
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
-            ts = s + climb_steps
             if cfg.fixed_exit_lanes and o_term is not None:
-                # Fixed exit lanes: emit one takeoff edge per boundary-hex lane. The climb happens in the
-                # column; the lateral traverse out to the lane cell is folded into the edge COST (and the
-                # cell is reached at the climb-completion step, so ground_steps + the gate/commit windows
-                # stay exact). Gated by capacity+column AND the per-cell conflict-graph reservation.
-                if ts > max_step:
-                    return out
-                cap_col_ok = tcap.dwell_ok(o_term, origin, s * dt, o_cap)
+                # Fixed exit lanes × multi-altitude: one takeoff edge per (boundary-hex lane, flight
+                # level). The capacity/column dwell window is PER-LEVEL (the committed column lasts
+                # hover + climb_time_to(level); a top-level climb outlasts the preferred plane), so gate
+                # each level with its own window — computed once per level, reused across lanes. Same-hub
+                # siblings are deconflicted by exact cell occupancy at (lane cell, level): is_blocked sees
+                # committed sibling exit corridors, so divergent lanes / different levels stay concurrent
+                # while two launches into the same cell+level serialise (ground-wait). The lateral
+                # traverse out to the lane cell is folded into the edge cost.
                 o_r = terminal_radius(o_term, cfg)
-                for L in o_lanes:
-                    lq, lr = L.cell
-                    # is_blocked now sees committed sibling exit corridors inside the column footprint
-                    # (issue #18): a lane cell whose cruise corridor a same-hub launch already occupies
-                    # over this window is blocked, so divergent lanes stay concurrent while two launches
-                    # into the same corridor serialise (ground-wait). No bearing graze-set needed.
-                    if svc.is_blocked(lq, lr, ts, own):
-                        continue
-                    if cap_col_ok:
-                        out.append((("a", lq, lr, ts),
-                                    climb_cost + cfg.cost_air_lateral_per_m * (L.dist - o_r)))
+                level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
+                for lane in o_lanes:
+                    lq, lr = lane.cell
+                    for L in range(len(levels)):
+                        ts = s + takeoff_steps[L]
+                        if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
+                            out.append((("a", lq, lr, L, ts),
+                                        takeoff_cost[L] + cfg.cost_air_lateral_per_m * (lane.dist - o_r)))
                 return out
-            # takeoff: the climb-completion air cell must be clear AND the origin pad must admit the whole
-            # takeoff dwell starting at ground step s — a shared hub via TerminalCapacity (capacity +
-            # column activation + exit-lane toward dest, gated at the exact takeoff time s*dt), an
-            # ordinary pad via svc.pad_clear.
-            pad_ok = (tcap.dwell_ok(o_term, origin, s * dt, o_cap, dest) if o_term is not None
-                      else svc.pad_clear(q, r, s, dwell_steps))
-            if ts <= max_step and not svc.is_blocked(q, r, ts, own) and pad_ok:
-                out.append((("a", q, r, ts), climb_cost))                            # takeoff
+            # legacy / non-terminal takeoff: ONE successor per flight level at the origin hex. The hub
+            # gate's capacity+column are level-agnostic (computed once in dwell_ok_levels), the exit lane
+            # per level; an ordinary pad uses svc.pad_clear (which scans all levels of the tube).
+            hub_ok = (tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels, toward=dest)
+                      if o_term is not None else None)
+            for L in range(len(levels)):
+                ts = s + takeoff_steps[L]
+                pad_ok = hub_ok[L] if o_term is not None else svc.pad_clear(q, r, s, dwell_steps[L])
+                if ts <= max_step and not svc.is_blocked(q, r, L, ts, own) and pad_ok:
+                    out.append((("a", q, r, L, ts), takeoff_cost[L]))                # takeoff to level L
             return out
-        _, q, r, s = st
+        _, q, r, L, s = st
         ns = s + 1
         if ns > max_step:
             return out
-        for dq, dr in hg.AXIAL_NEIGHBORS:                                            # reroute
+        for dq, dr in hg.AXIAL_NEIGHBORS:                                            # reroute (same level)
             nq, nr = q + dq, r + dr
-            if not svc.is_blocked(nq, nr, ns, own):
-                out.append((("a", nq, nr, ns), cfg.cost_air_lateral_per_m * pitch))
-        if not svc.is_blocked(q, r, ns, own):                                       # hover
-            out.append((("a", q, r, ns), cfg.cost_air_hold_per_s * dt))
+            if not svc.is_blocked(nq, nr, L, ns, own):
+                out.append((("a", nq, nr, L, ns), cfg.cost_air_lateral_per_m * pitch))
+        if not svc.is_blocked(q, r, L, ns, own):                                     # hover (same level)
+            out.append((("a", q, r, L, ns), cfg.cost_air_hold_per_s * dt))
+        for dL in (-1, 1) if self.vertical_edges else ():                           # vertical layer change
+            L2 = L + dL
+            if 0 <= L2 < len(levels):
+                rung = L if dL == 1 else L2                              # index of the L ↔ L+1 rung
+                ts = s + rung_steps[rung]                                # ≥2 steps for a 40 m rung, precomputed
+                # the rebuilt climb box occupies only the levels it traverses ({L, L2}): volumes.py sizes
+                # its z-extent to [z_L, z_L2] ± corridor_height/2, matching _levels_overlapped, so require
+                # clearance on exactly those two levels across the window (s, ts] — not every level.
+                if ts <= max_step and all(
+                    not svc.is_blocked(q, r, Lk, sk, own)
+                    for Lk in (L, L2) for sk in range(s + 1, ts + 1)
+                ):
+                    out.append((("a", q, r, L2, ts), rung_cost[rung]))
         return out
 
     def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
@@ -435,7 +469,7 @@ class AStarPlanner:
             centerline.append((b.copy(), tb))
             horiz = float(np.linalg.norm((b - a)[:2]))
             cum_horiz += horiz
-            if horiz < _EPS:
+            if horiz < _EPS and abs(float(b[2] - a[2])) < _EPS:   # genuine hover (a layer change is not)
                 n_hover += 1
         if cfg.fixed_exit_lanes and edges:
             # Force the hub tag on the first/last (boundary-cell) box: it leaves from / arrives at the
@@ -451,13 +485,18 @@ class AStarPlanner:
                 edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
         t_takeoff = (base + ground_steps) * cfg.dt_s
         t_arrive = wps[-1][1]
+        # the takeoff/landing columns span the regulated tube (z_hi defaults to airspace_ceiling_m);
+        # their dwell window covers the ACTUAL climb to the chosen cruise level (first/last waypoint z).
+        z_takeoff, z_land = float(wps[0][0][2]), float(wps[-1][0][2])
         volumes = [
             hover_reservation(origin, t_takeoff, cfg,
                               terminal_id=origin_term.id if origin_term else None,
-                              radius=terminal_radius(origin_term, cfg) if origin_term else None),
+                              radius=terminal_radius(origin_term, cfg) if origin_term else None,
+                              climb_time_s=cfg.climb_time_to(z_takeoff)),
             *edges,
             hover_reservation(dest, t_arrive, cfg,
                               terminal_id=dest_term.id if dest_term else None,
-                              radius=terminal_radius(dest_term, cfg) if dest_term else None),
+                              radius=terminal_radius(dest_term, cfg) if dest_term else None,
+                              climb_time_s=cfg.climb_time_to(z_land)),
         ]
         return volumes, centerline, cum_horiz, n_hover

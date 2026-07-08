@@ -14,7 +14,7 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     # region with radius service areas + return flights — funnels demand onto few hubs to exercise pad
     # capacity under load. λ counts deliveries (returns ~2×).
     "dallas_hub_2uss_large": ScenarioSpec(
-        "dallas_hub_2uss_large", region_m=(10000.0, 10000.0), lam_per_hour=34500.0, horizon_s=1800.0,
+        "dallas_hub_2uss_large", region_m=(10000.0, 10000.0), lam_per_hour=8000.0, horizon_s=1800.0,
         demand=DemandSpec(
             pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(6, 20),
             # fewer Walmarts ⇒ each reaches farther; many strip malls ⇒ tighter local delivery

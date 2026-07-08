@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -150,4 +150,8 @@ def run(
             report(done, total, intent)
 
     verified = verify.find_interflight_conflict(intents, cfg) is None
-    return SimResult(config=cfg, intents=intents, ledger=ledger, verified=verified)
+    # Carry the planner that ACTUALLY flew: a planner_name= override must be reflected in the stored
+    # config, or downstream metrics/aggregate (which key on cfg.planner — e.g. the altitude baseline)
+    # and the reported planner label would describe cfg.planner, not the planner that ran.
+    result_cfg = cfg if pname == cfg.planner else replace(cfg, planner=pname)
+    return SimResult(config=result_cfg, intents=intents, ledger=ledger, verified=verified)

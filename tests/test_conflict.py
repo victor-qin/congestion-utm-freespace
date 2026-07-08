@@ -38,6 +38,13 @@ def test_altitude_separation_no_conflict():
     assert not volumes_conflict(low, high)
 
 
+def test_adjacent_flight_level_boxes_do_not_conflict():
+    # the tightest valid case: corridors on ADJACENT levels (gap 40 > corridor_height 30) stay disjoint
+    a = box_vol(0, 0, 30, 0, 10)      # level 0 band [15, 45]
+    b = box_vol(0, 0, 70, 0, 10)      # level 1 band [55, 85]
+    assert not volumes_conflict(a, b)   # the gap the config validator enforces ⇒ no FCL touch
+
+
 def test_hover_cylinder_blocks_overlapping_corridor():
     hover = Volume4D(CylinderSpec(0, 0, 60, 0, 150), 0, 60)
     corridor = box_vol(0, 0, 150, 10, 20)  # cruise box passing over the pad while it's hovering

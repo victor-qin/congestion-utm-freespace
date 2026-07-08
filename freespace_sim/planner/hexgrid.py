@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import SimConfig
-from ..geometry import BoxSpec
+from ..geometry import BoxSpec, CylinderSpec
 from ..types import as_terminal
 from ..volumes import Volume4D, exit_radius
 
@@ -125,12 +125,14 @@ def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
     return lanes
 
 
-def _cruise_overlap(vol: Volume4D, cfg: SimConfig) -> bool:
-    """Does the volume's altitude span overlap the cruise band the new corridor occupies?"""
+def _levels_overlapped(vol: Volume4D, cfg: SimConfig) -> list[int]:
+    """Indices of the flight levels whose corridor band ``[z_L ± corridor_height/2]`` overlaps the
+    volume's z-AABB. A level corridor box touches exactly one; a slanted/climb box touches ≥2; a
+    ``[ground, ceiling]`` hover/terminal column touches every in-band level (the regulated tube)."""
     lo, hi = vol.aabb()
-    band_lo = cfg.cruise_level_m - cfg.corridor_height_m / 2.0
-    band_hi = cfg.cruise_level_m + cfg.corridor_height_m / 2.0
-    return lo[2] <= band_hi and band_lo <= hi[2]
+    zlo, zhi = float(lo[2]), float(hi[2])
+    half = cfg.corridor_height_m / 2.0
+    return [L for L, z in enumerate(cfg.flight_levels_m) if zlo <= z + half and z - half <= zhi]
 
 
 def _hexes_in_box(amin, amax, R):
@@ -146,40 +148,46 @@ def _hexes_in_box(amin, amax, R):
             yield q, r
 
 
-def _footprint_contains(shape, c: np.ndarray, infl: float, cfg: SimConfig) -> bool:
-    p = np.array([c[0], c[1], cfg.cruise_level_m])
+def _footprint_contains(shape, c: np.ndarray, infl: float, cfg: SimConfig,
+                        z: float | None = None) -> bool:
+    z = cfg.cruise_level_m if z is None else z
+    p = np.array([c[0], c[1], z])
     if isinstance(shape, BoxSpec):
         local = shape.rotation().T @ (p - np.array(shape.center, float))
         half = np.array(shape.extents, float) / 2.0 + infl
         return bool(np.all(np.abs(local) <= half))
     # cylinder
     d = float(np.hypot(p[0] - shape.cx, p[1] - shape.cy))
-    return d <= shape.radius + infl and (shape.z_lo - infl <= cfg.cruise_level_m <= shape.z_hi + infl)
+    return d <= shape.radius + infl and (shape.z_lo - infl <= z <= shape.z_hi + infl)
 
 
-def _footprint_slack(shape, cx: np.ndarray, cy: np.ndarray, cfg: SimConfig) -> np.ndarray:
-    """Vectorized inflation margin for hex centres (cx, cy arrays): a centre is inside the footprint
-    at inflation ``x`` iff ``slack <= x``. Computes the shape geometry ONCE for all candidate hexes,
-    so a single matmul/reduce replaces the millions of per-hex :func:`_footprint_contains` calls.
+def _footprint_slack(shape, cx: np.ndarray, cy: np.ndarray, cfg: SimConfig,
+                     z: float | None = None) -> np.ndarray:
+    """Vectorized inflation margin for hex centres (cx, cy arrays) at altitude probe ``z`` (defaults to
+    the preferred cruise level): a centre is inside the footprint at inflation ``x`` iff ``slack <= x``.
+    Computes the shape geometry ONCE for all candidate hexes, so a single matmul/reduce replaces the
+    millions of per-hex :func:`_footprint_contains` calls. Callers probe once per flight level ``z_L``.
 
     Equivalence to the scalar test: for a box, ``all(|local_d| <= half_d + x)`` ⟺
     ``max_d(|local_d| - half_d) <= x``; for a cylinder the radial (``d - radius``) and altitude-band
     margins both reduce to ``margin <= x``. ``rotᵀ·v`` (column) equals ``v·rot`` (row), batched.
     """
+    z = cfg.cruise_level_m if z is None else z
     if isinstance(shape, BoxSpec):
         center = np.array(shape.center, float)
-        p = np.column_stack([cx, cy, np.full(cx.shape, cfg.cruise_level_m)])
+        p = np.column_stack([cx, cy, np.full(cx.shape, z)])
         local = np.abs((p - center) @ shape.rotation())
         half = np.array(shape.extents, float) / 2.0
         return np.max(local - half, axis=1)
     radial = np.hypot(cx - shape.cx, cy - shape.cy) - shape.radius
-    z_slack = max(shape.z_lo - cfg.cruise_level_m, cfg.cruise_level_m - shape.z_hi)
+    z_slack = max(shape.z_lo - z, z - shape.z_hi)
     return np.maximum(radial, z_slack)
 
 
-def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float):
+def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float, z: float | None = None):
     """Candidate axial hexes (centres within the volume AABB inflated by ``infl``) and each one's
-    :func:`_footprint_slack`. The (q, r) enumeration reproduces :func:`_hexes_in_box` as arrays."""
+    :func:`_footprint_slack` at altitude probe ``z``. The (q, r) enumeration reproduces
+    :func:`_hexes_in_box` as arrays."""
     lo, hi = vol.aabb()
     amin = lo[:2] - infl
     amax = hi[:2] + infl
@@ -196,7 +204,7 @@ def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float):
     r_grid = r_grid.ravel()
     cx = R * SQRT3 * (q_grid + r_grid / 2.0)
     cy = R * 1.5 * r_grid
-    return q_grid, r_grid, _footprint_slack(vol.shape, cx, cy, cfg)
+    return q_grid, r_grid, _footprint_slack(vol.shape, cx, cy, cfg, z=z)
 
 
 def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
@@ -209,6 +217,17 @@ def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
     return range(s0, s1 + 1)
 
 
+def _cylinder_z_independent(vol: Volume4D, cfg: SimConfig, levels: list[int]) -> bool:
+    """True when ``vol`` is a vertical cylinder whose z-band contains every overlapped level. Its (q,r)
+    footprint is then z-INDEPENDENT — the radial slack doesn't depend on z and the altitude-band slack is
+    ≤ 0 in-band, so the mask reduces to the radial term — hence the masked cell set is identical at each
+    level and the per-level loop can compute it ONCE. (All committed hover/terminal columns span the whole
+    [ground, ceiling] tube, so this is their common case.)"""
+    return (isinstance(vol.shape, CylinderSpec)
+            and vol.shape.z_lo <= cfg.flight_levels_m[levels[0]]
+            and cfg.flight_levels_m[levels[-1]] <= vol.shape.z_hi)
+
+
 def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None = None):
     """Yield (q, r, step) cruise-level cells a committed volume blocks (conservatively inflated).
 
@@ -217,16 +236,27 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
     hover cylinder) pass ``effective_hover_radius_m + R`` instead, so the blocked footprint matches
     the wider cylinder rather than the corridor. Vectorized — see :func:`_footprint_slack`.
     """
-    if not _cruise_overlap(vol, cfg):
+    levels = _levels_overlapped(vol, cfg)
+    if not levels:
         return
     if infl is None:
         infl = cfg.corridor_width_m / 2.0 + R      # corridor half-width + one hex (conservative)
-    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl)
-    mask = slack <= infl
     steps = _step_range(vol, cfg)
-    for q, r in zip(q_grid[mask].tolist(), r_grid[mask].tolist()):
-        for s in steps:
-            yield q, r, s
+    if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl, z=cfg.flight_levels_m[levels[0]])
+        mask = slack <= infl
+        cells = list(zip(q_grid[mask].tolist(), r_grid[mask].tolist()))
+        for L in levels:
+            for q, r in cells:
+                for s in steps:
+                    yield q, r, L, s
+        return
+    for L in levels:
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl, z=cfg.flight_levels_m[L])
+        mask = slack <= infl
+        for q, r in zip(q_grid[mask].tolist(), r_grid[mask].tolist()):
+            for s in steps:
+                yield q, r, L, s
 
 
 def rasterize_volume_dual(
@@ -237,14 +267,26 @@ def rasterize_volume_dual(
     ``infl_pad >= infl_blocked`` so pad cells are a superset of blocked cells. Replaces two
     :func:`rasterize_volume` passes with a single geometry computation per volume (the A* hot path).
     """
-    if not _cruise_overlap(vol, cfg):
+    levels = _levels_overlapped(vol, cfg)
+    if not levels:
         return
-    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad)
-    in_pad = slack <= infl_pad
-    in_blk = (slack[in_pad] <= infl_blocked).tolist()
-    qp = q_grid[in_pad].tolist()
-    rp = r_grid[in_pad].tolist()
     steps = _step_range(vol, cfg)
-    for q, r, b in zip(qp, rp, in_blk):
-        for s in steps:
-            yield q, r, s, b
+    if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[levels[0]])
+        in_pad = slack <= infl_pad
+        rows = list(zip(q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
+                        (slack[in_pad] <= infl_blocked).tolist()))
+        for L in levels:
+            for q, r, b in rows:
+                for s in steps:
+                    yield q, r, L, s, b
+        return
+    for L in levels:
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[L])
+        in_pad = slack <= infl_pad
+        in_blk = (slack[in_pad] <= infl_blocked).tolist()
+        qp = q_grid[in_pad].tolist()
+        rp = r_grid[in_pad].tolist()
+        for q, r, b in zip(qp, rp, in_blk):
+            for s in steps:
+                yield q, r, L, s, b

@@ -8,6 +8,7 @@ takeoff/landing climb/descent.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Hashable
 
@@ -62,16 +63,22 @@ def corridor_segment_volume(
     conflict. The box is purely segment-local (depends only on its own endpoints + cfg), which is
     what makes per-edge checking equivalent to whole-corridor checking.
 
-    Geometry: configured width/height, extended longitudinally by half the corridor width at each
-    end so consecutive boxes overlap (ASTM §4.3.5 contiguity); time window buffered by
-    ``time_buffer_s`` on both sides so neighbours overlap in time too.
+    Geometry: configured width/height, extended longitudinally at each end so consecutive boxes overlap
+    (ASTM §4.3.5 contiguity); time window buffered by ``time_buffer_s`` on both sides so neighbours
+    overlap in time too. The extension is **anisotropic** — half the box's footprint *in the travel
+    direction*: ``corridor_width/2`` in the horizontal plane, ``corridor_height/2`` in the vertical. This
+    matters for a mid-route layer change (a fixed-xy segment moving in z): a flat ``corridor_width/2``
+    would balloon the box in z past the levels it traverses (and above the ceiling); the vertical term
+    keeps its z-extent at ``[z0, z1] ± corridor_height/2`` — the drone's real vertical footprint.
     """
     p0 = np.asarray(p0, float)
     p1 = np.asarray(p1, float)
     d = p1 - p0
     length = float(np.linalg.norm(d))
     u = d / length if length > 1e-9 else np.array([1.0, 0.0, 0.0])
-    ext = cfg.corridor_width_m / 2.0
+    # half the cross-section along travel: width when horizontal, height when vertical (== width/2 for a
+    # level cruise/exit box → those are unchanged; == height/2 for a pure climb → no z overshoot).
+    ext = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(u[0], u[1]), cfg.corridor_height_m * u[2])
     a = p0 - u * ext        # extend behind the start
     b = p1 + u * ext        # and beyond the end → overlap with neighbours
     spec = box_from_segment(a, b, cfg.corridor_width_m, cfg.corridor_height_m)
@@ -152,7 +159,11 @@ def build_reservation_from_corners(
     column; every box clear of the column stays strict (untagged). Returns (volumes, centerline, horiz, dz).
     """
     origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
-    t = t_depart + g_delay + cfg.climb_time_s
+    # the corner z is the source of truth for climb timing: cruise starts after the climb to the
+    # FIRST corner's altitude (its flight level), not a fixed preferred-level climb.
+    z_takeoff = float(np.asarray(corners[0], float)[2])
+    z_land = float(np.asarray(corners[-1], float)[2])
+    t = t_depart + g_delay + cfg.climb_time_to(z_takeoff)
     centerline: list[TimedPoint] = [(np.asarray(corners[0], float).copy(), t)]
     edges: list[Volume4D] = []
     cum_horiz = cum_dz = 0.0
@@ -198,31 +209,39 @@ def build_reservation_from_corners(
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,
-                          radius=terminal_radius(origin_term, cfg) if origin_term else None),
+                          radius=terminal_radius(origin_term, cfg) if origin_term else None,
+                          climb_time_s=cfg.climb_time_to(z_takeoff)),
         *edges,
         hover_reservation(dest, t, cfg,
                           terminal_id=dest_term.id if dest_term else None,
-                          radius=terminal_radius(dest_term, cfg) if dest_term else None),
+                          radius=terminal_radius(dest_term, cfg) if dest_term else None,
+                          climb_time_s=cfg.climb_time_to(z_land)),
     ]
     return volumes, centerline, cum_horiz, cum_dz
 
 
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,
-                      radius: float | None = None) -> Volume4D:
+                      radius: float | None = None, z_hi: float | None = None,
+                      climb_time_s: float | None = None) -> Volume4D:
     """A vertical hover cylinder at ``center`` (ASTM area-based intent, §4.3.5).
 
     ``radius`` (default ``effective_hover_radius_m``) lets a multi-pad vertiport size its shared column
-    bigger than a single pad. Altitude band [ground, cruise] so it covers the climb or descent; active
-    for ``hover_time_s + climb_time_s`` from ``t0``. When ``terminal_id`` is set this cylinder is a
-    shared terminal column — transparent to its own hub's flights, opaque to everyone else (see
-    :func:`conflict.volumes_conflict`).
+    bigger than a single pad. Altitude band [ground, ``z_hi``] — ``z_hi`` defaults to
+    ``airspace_ceiling_m`` so the column spans the full regulated tube (a vertiport owns its vertical
+    column of regulated airspace). Active for ``hover_time_s + climb_time_s`` from ``t0``; pass
+    ``climb_time_s`` (e.g. :meth:`SimConfig.climb_time_to` of the flight's cruise level) to size the
+    window to the actual climb instead of the preferred-level default. When ``terminal_id`` is set this
+    cylinder is a shared terminal column — transparent to its own hub's flights, opaque to everyone else
+    (see :func:`conflict.volumes_conflict`).
     """
     center = np.asarray(center, float)
+    z_hi = cfg.airspace_ceiling_m if z_hi is None else float(z_hi)
+    ct = cfg.climb_time_s if climb_time_s is None else float(climb_time_s)
     spec = CylinderSpec(
         cx=float(center[0]),
         cy=float(center[1]),
         radius=cfg.effective_hover_radius_m if radius is None else float(radius),
         z_lo=cfg.ground_level_m,
-        z_hi=cfg.cruise_level_m,
+        z_hi=z_hi,
     )
-    return Volume4D(spec, t0, t0 + cfg.hover_time_s + cfg.climb_time_s, terminal_id=terminal_id)
+    return Volume4D(spec, t0, t0 + cfg.hover_time_s + ct, terminal_id=terminal_id)

@@ -25,11 +25,13 @@ def _payload(result: SimResult) -> dict:
         for v in intent.volumes or []:
             if isinstance(v.shape, BoxSpec):
                 boxes.append({"poly": box_footprint(v.shape).round(1).tolist(),
+                              "z": round(float(v.shape.center[2]), 1),   # altitude → flight-level styling
                               "t0": v.t_start, "t1": v.t_end})
             elif isinstance(v.shape, CylinderSpec):
                 cyls.append({"cx": v.shape.cx, "cy": v.shape.cy, "r": v.shape.radius,
                              "t0": v.t_start, "t1": v.t_end})
-        path = [[float(p[0]), float(p[1]), float(t)] for p, t in (intent.centerline or [])]
+        path = [[float(p[0]), float(p[1]), float(t), float(p[2])]      # x, y, time, altitude
+                for p, t in (intent.centerline or [])]
         o, d = intent.request.origin, intent.request.dest
         flights.append({
             "id": intent.request.flight_id,
@@ -62,6 +64,7 @@ def _payload(result: SimResult) -> dict:
         "hex_available": hex_available,
         "hex_R": circumradius(cfg) if hex_available else 0.0,
         "planner": cfg.planner,
+        "flight_levels": [round(float(z), 1) for z in cfg.flight_levels_m],
     }
 
 
@@ -100,6 +103,15 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
  </div>
 </div><script>
 const DATA = {data};
+const LEVELS = DATA.flight_levels || [];               // discrete cruise altitudes (A* multi-altitude)
+const LEVEL_DASH = [[], [6,4], [2,4], [1,5], [8,3,2,3]];  // solid / dash / dot / fine / dash-dot — per level
+function levelOf(z){{ let bi=0, bd=1e9;
+  for(let i=0;i<LEVELS.length;i++){{ const d=Math.abs(LEVELS[i]-z); if(d<bd){{ bd=d; bi=i; }} }}
+  return bi % LEVEL_DASH.length; }}
+function altAt(path, t){{ if(!path.length) return null;
+  for(let i=0;i<path.length-1;i++){{ const a=path[i], b=path[i+1];
+    if(a[2]<=t && t<=b[2]){{ const f=(b[2]-a[2])<1e-9?0:(t-a[2])/(b[2]-a[2]); return a[3]+f*(b[3]-a[3]); }} }}
+  return path[path.length-1][3]; }}
 const hidden = new Set();                              // USS ids toggled off via the legend
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const [W, H] = DATA.region, PAD = 20, S = (cv.width - 2*PAD) / Math.max(W, H);
@@ -140,13 +152,17 @@ function draw(t){{
     ctx.lineWidth=0.6;
     for(const bx of fl.boxes){{ if(!active(bx,t)) continue; on=true;
       ctx.beginPath(); bx.poly.forEach((p,i)=> i?ctx.lineTo(sx(p[0]),sy(p[1])):ctx.moveTo(sx(p[0]),sy(p[1])));
-      ctx.closePath(); ctx.fillStyle=fl.color+'55'; ctx.fill(); ctx.strokeStyle=fl.color; ctx.stroke(); }}
+      ctx.closePath(); ctx.fillStyle=fl.color+'55'; ctx.fill();
+      ctx.save(); ctx.setLineDash(LEVEL_DASH[levelOf(bx.z)]); ctx.strokeStyle=fl.color; ctx.stroke(); ctx.restore(); }}
     for(const cy of fl.cyls){{ if(!active(cy,t)) continue; on=true;
       ctx.beginPath(); ctx.arc(sx(cy.cx),sy(cy.cy),cy.r*S,0,2*Math.PI);
       ctx.fillStyle=fl.color+'33'; ctx.fill(); ctx.strokeStyle=fl.color; ctx.stroke(); }}
     const p = posAt(fl.path, t);
     if(p){{ on=true; ctx.beginPath(); ctx.arc(sx(p[0]),sy(p[1]),4,0,2*Math.PI);
-      ctx.fillStyle=fl.color; ctx.fill(); ctx.strokeStyle='#000'; ctx.lineWidth=0.5; ctx.stroke(); }}
+      ctx.fillStyle=fl.color; ctx.fill(); ctx.strokeStyle='#000'; ctx.lineWidth=0.5; ctx.stroke();
+      const az=altAt(fl.path,t);                       // current altitude readout (multi-altitude)
+      if(az!=null && LEVELS.length>1){{ ctx.fillStyle='#aeb6c2'; ctx.font='8px monospace';
+        ctx.fillText(Math.round(az)+'m', sx(p[0])+6, sy(p[1])-4); }} }}
     if(on){{                                          // dashed straight origin→dest for active flights
       ctx.save(); ctx.setLineDash([6,5]); ctx.lineWidth=1; ctx.strokeStyle=fl.color+'aa';
       ctx.beginPath(); ctx.moveTo(sx(fl.o[0]),sy(fl.o[1])); ctx.lineTo(sx(fl.d[0]),sy(fl.d[1]));
@@ -194,6 +210,15 @@ document.addEventListener('keydown', e=>{{
     lab.appendChild(cb); lab.appendChild(sw); lab.appendChild(document.createTextNode(u));
     legend.appendChild(lab);
   }}
+}})();
+(function buildLevelLegend(){{                          // flight-level dash key (A* multi-altitude)
+  if(LEVELS.length < 2) return;
+  const legend = document.getElementById('legend');
+  const NAMES = ['solid','dashed','dotted','fine','dash-dot'];
+  const tag = document.createElement('span'); tag.style.cssText='opacity:.6'; tag.textContent='levels:';
+  legend.appendChild(tag);
+  LEVELS.forEach((z,i)=>{{ const s=document.createElement('span'); s.style.cssText='opacity:.85;font-size:11px';
+    s.textContent = Math.round(z)+'m '+NAMES[i % NAMES.length]; legend.appendChild(s); }});
 }})();
 draw(0);
 </script></body></html>"""

@@ -63,6 +63,32 @@ def test_lanes_sorted_by_bearing():
     assert [L.bearing for L in lanes] == sorted(L.bearing for L in lanes)
 
 
+# ----- always-active terminal airspace (terminal_airspace_always_active) -----
+
+def test_terminal_cells_is_column_plus_lanes():
+    """terminal_cells = covered column ∪ boundary lanes — a strict superset of the lane ring."""
+    center = tuple(hg.hex_center(0, 0, R))
+    lanes = {L.cell for L in hg.terminal_lanes(center, _term(120), CFG)}
+    cells = hg.terminal_cells(center, _term(120), CFG)
+    assert lanes <= cells and len(cells) > len(lanes)   # lanes plus the column interior
+
+
+def test_static_terminal_walls_foreign_keeps_own_passable():
+    """register_static_terminal makes a hub's cells a permanent FOREIGN wall (any step), while the
+    hub's own flights pass through (transparent, absent a committed sibling corridor)."""
+    from freespace_sim.planner.occupancy import HexOccupancyService
+
+    svc = HexOccupancyService(CFG)
+    center, term = tuple(hg.hex_center(0, 0, R)), _term(120)
+    svc.register_static_terminal(center, term)
+    q, r = next(iter(hg.terminal_cells(center, term, CFG)))
+    top = CFG.n_levels - 1                                  # the always-active column is the [ground,
+    #                                                        ceiling] tube ⇒ it walls EVERY flight level
+    assert svc.is_blocked(q, r, 0, 5, own=())              # foreign flight → wall (level 0)
+    assert svc.is_blocked(q, r, top, 9999, own=("OTHER",)) # foreign at any step AND any level
+    assert not svc.is_blocked(q, r, 0, 5, own=(term.id,))  # own hub → transparent (no committed corridor)
+
+
 # ----- smoothness of creation -----
 
 def test_offset_sweep_count_is_smooth():

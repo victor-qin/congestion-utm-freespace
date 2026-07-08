@@ -189,6 +189,20 @@ def test_return_flights_roundtrip_and_terminals():
     assert all((d, o) in legs for (o, d) in legs)
 
 
+def test_terminal_airspace_filter_drops_foreign_column_customers_keeps_subset():
+    """terminal_airspace_always_active: customers inside a FOREIGN hub's column are dropped (spurious),
+    and the RNG/fid stream is preserved so the kept flights are a clean subset of the unfiltered run."""
+    import dataclasses as dc
+
+    cfg = _radius_cfg()
+    cfg_on = dc.replace(cfg, terminal_airspace_always_active=True)
+    kw = dict(n_hubs_per_uss={"a": 6}, radius_m=6000.0, terminal_radius_m=1500.0)  # big columns ⇒ drops
+    off = HubRadiusDemand(**kw).generate(cfg, np.random.default_rng(0))
+    on = HubRadiusDemand(**kw).generate(cfg_on, np.random.default_rng(0))
+    assert len(on) < len(off)                                          # spurious customers dropped
+    assert {r.flight_id for r in on} <= {r.flight_id for r in off}     # clean subset (rng/fid preserved)
+
+
 def test_radius_demand_run_verified_astar():
     cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0),
                     lam_per_hour=120.0, horizon_s=900.0, seed=1)

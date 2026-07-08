@@ -16,6 +16,9 @@ from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Termi
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
+# Single-plane pin for our weighted-A* / terminal-airspace work: that behaviour was characterised on one
+# cruise level (issue #2 multi-altitude landed on main). Validate it there for now; widen levels later.
+CFG1 = dc.replace(CFG, flight_levels_m=(70.0,), cruise_level_m=70.0, z_min_m=70.0, z_max_m=70.0)
 
 
 def _req(fid=1):
@@ -47,6 +50,36 @@ def test_astar_reroutes_around_a_wall_that_straight_cannot_pass():
     assert intent.status is IntentStatus.ACCEPTED
     assert not led.any_conflict(intent.volumes)
     assert intent.air_detour_m > 0.0                 # deterministically routed around
+
+
+def test_weighted_astar_w1_is_the_optimal_baseline():
+    """heuristic_weight=1.0 must be bit-identical to the default (1.0*h == h in IEEE-754)."""
+    led = ReservationLedger(CFG1)
+    led.commit(99, [_wall()])
+    opt = AStarPlanner().plan(_req(), led, CFG1)
+    w1 = AStarPlanner().plan(_req(), led, dc.replace(CFG1, heuristic_weight=1.0))
+    assert w1.cost == opt.cost
+    assert len(w1.volumes) == len(opt.volumes)
+    assert [c for _, c in w1.centerline] == [c for _, c in opt.centerline]   # same path, same times
+
+
+def test_weighted_astar_trades_optimality_for_fewer_expansions():
+    """w>1: still accepted + separation-safe, realized cost within w*optimal here, never more expansions."""
+    led = ReservationLedger(CFG1)
+    led.commit(99, [_wall()])
+    p_opt = AStarPlanner()
+    opt = p_opt.plan(_req(), led, CFG1)
+
+    for w in (1.5, 2.0, 3.0):
+        p = AStarPlanner()
+        intent = p.plan(_req(), led, dc.replace(CFG1, heuristic_weight=w))
+        assert intent.status is IntentStatus.ACCEPTED            # weighting changes cost, not feasibility
+        assert not led.any_conflict(intent.volumes)              # safety is gate-enforced, not cost-enforced
+        assert intent.cost <= w * opt.cost + 1e-6                # realized trajectory cost within w*optimal
+        #                                                          (this instance; proxy for the search-g bound)
+        assert p.last_expansions <= p_opt.last_expansions        # fewer expansions on this instance (the
+        #                                                          point of w>1; inadmissible h ⇒ not a
+        #                                                          general guarantee, but holds on this fixture)
 
 
 def test_astar_uses_ground_delay_for_a_busy_destination_pad():

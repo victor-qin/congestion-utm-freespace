@@ -70,3 +70,24 @@ def test_lazy_planner_demand_run_is_verified():
     assert res.verified
     s = res.summary()
     assert s["n_accepted"] + s["n_denied"] == s["n_requests"]
+
+
+def test_planner_name_override_is_reflected_in_stored_config():
+    # run(planner_name=...) overrides the planner used to plan; the stored config must reflect the planner
+    # that ACTUALLY flew, so downstream metrics (which key the altitude baseline on cfg.planner) and the
+    # reported planner label describe the real planner, not the original cfg.planner.
+    from freespace_sim import metrics
+    res = run(SimConfig(planner="straight"), planner_name="astar",
+              requests=[FlightRequest(0, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+    assert res.config.planner == "astar"                 # not the original "straight"
+    assert res.accepted[0].planner == "astar"            # A* actually planned it
+    # the altitude baseline now keys on the real planner (ladder floor), not the "straight" cruise plane
+    assert metrics.nominal_altitude_change_m(res.config) == 2.0 * res.config.flight_levels_m[0]
+    assert metrics.aggregate(res)["planner"] == "astar"
+
+
+def test_no_planner_name_override_preserves_config_identity():
+    # the common path (no override) must not perturb the stored config — same object, no needless replace()
+    cfg = SimConfig(planner="astar")
+    res = run(cfg, requests=[FlightRequest(0, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+    assert res.config is cfg

@@ -47,13 +47,15 @@ def test_aggregate_arithmetic_and_bounds():
 
 
 def test_total_delay_decomposes_into_levers():
-    # total_delay_s = ground_hold + air_loiter + detour-time; excludes mandatory climb
+    # total_delay_s = ground_hold + air_loiter + detour-time + traffic-forced climb; excludes the
+    # mandatory climb. (Single-plane 'straight' has no altitude lever ⇒ that 4th term is 0.)
     res = run(SimConfig(planner="straight"),
               requests=[FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0),
                         FlightRequest(1, vec(0, 0, 0), vec(2400, 0, 0), 0.0)])
     df = metrics.flight_frame(res)
     for _, r in df[df["accepted"]].iterrows():
-        expected = r["ground_delay_s"] + r["air_hold_s"] + r["air_detour_m"] / CFG.nominal_speed_mps
+        expected = (r["ground_delay_s"] + r["air_hold_s"] + r["air_detour_m"] / CFG.nominal_speed_mps
+                    + r["altitude_delay_phys_s"])
         assert math.isclose(r["total_delay_s"], expected, rel_tol=1e-9)
     # the FCFS straight case is pure ground-hold: total delay equals the hold, no detour component
     held = df.loc[df["ground_delay_s"] > 0].iloc[0]
@@ -76,10 +78,11 @@ def test_delay_pct_is_bounded_and_consistent():
 
 
 def test_delay_sources_sum_to_total_delay():
-    # the breakdown is exact: ground_delay + air_hold + detour_time == total_delay (no residual)
+    # the breakdown is exact: ground_delay + air_hold + detour_time + altitude_delay_phys == total_delay
     res = run(SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1200.0, seed=2))
     acc = metrics.flight_frame(res).query("accepted")
-    recombined = acc["ground_delay_s"] + acc["air_hold_s"] + acc["detour_time_s"]
+    recombined = (acc["ground_delay_s"] + acc["air_hold_s"] + acc["detour_time_s"]
+                  + acc["altitude_delay_phys_s"])
     assert ((recombined - acc["total_delay_s"]).abs() < 1e-9).all()
 
 
@@ -178,7 +181,9 @@ from freespace_sim.types import IntentStatus, OperationalIntent      # noqa: E40
 
 
 def _accepted(**kw):
-    """Synthesize an accepted intent with `cost` set exactly as a planner would (trajectory_cost)."""
+    """Synthesize an accepted intent with `cost` set exactly as a planner would (trajectory_cost). The
+    excess-altitude baseline keys on cfg.planner (the run), not intent.planner, so a test passes the cfg
+    whose planner it means — CFG (astar → ladder floor) or SimConfig(planner='straight') (cruise)."""
     intent = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0),
                                IntentStatus.ACCEPTED, **kw)
     intent.cost = trajectory_cost(intent, CFG)
@@ -258,3 +263,25 @@ def test_aggregate_exposes_cost_and_altitude_rollups():
               "mean_altitude_cost", "mean_congestion_cost", "mean_excess_altitude_m",
               "p95_excess_altitude_m", "mean_altitude_delay_phys_s", "mean_altitude_delay_costeq_s"):
         assert k in agg and agg[k] >= 0.0
+
+
+def test_single_plane_planner_reads_no_altitude_congestion():
+    # Baseline fix: keyed on cfg.planner, a single-plane run (cruise_level_m, no altitude lever) reads
+    # ZERO excess altitude — no spurious congestion floor in empty airspace.
+    sp = SimConfig(planner="straight")
+    intent = _accepted(altitude_change_m=2.0 * sp.cruise_level_m)       # 2·75 = 150 (cruise round trip)
+    db = metrics.delay_breakdown_s(intent, sp)
+    assert db["excess_altitude_m"] == 0.0
+    assert db["altitude_delay_phys_s"] == 0.0
+    assert metrics.total_delay_s(intent, sp) == 0.0                     # no ground/hold/detour either
+
+
+def test_total_delay_counts_a_traffic_forced_climb_like_congestion_cost():
+    # Twin fix: on an A* run, a flight pushed up one level purely by traffic (no ground hold / detour) is
+    # NOT zero-congestion — total_delay_s counts the climb TIME; congestion_cost counts the same COST.
+    intent = _accepted(altitude_change_m=2.0 * CFG.level_z(1))          # CFG is astar → cruised at level 1
+    excess = 2.0 * CFG.level_z(1) - metrics.nominal_altitude_change_m(CFG)   # 140 − 60 = 80 m
+    td = metrics.total_delay_s(intent, CFG)
+    assert td > 0.0 and math.isclose(td, excess / CFG.climb_rate_mps)   # the vertical lever, in time
+    assert math.isclose(metrics.flight_row(intent, CFG)["congestion_cost"],
+                        excess * CFG.cost_altitude_change_per_m)         # ... and in cost

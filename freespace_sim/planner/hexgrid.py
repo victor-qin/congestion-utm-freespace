@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import SimConfig
-from ..geometry import BoxSpec
+from ..geometry import BoxSpec, CylinderSpec
 from ..types import as_terminal
 from ..volumes import Volume4D, exit_radius
 
@@ -217,6 +217,17 @@ def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
     return range(s0, s1 + 1)
 
 
+def _cylinder_z_independent(vol: Volume4D, cfg: SimConfig, levels: list[int]) -> bool:
+    """True when ``vol`` is a vertical cylinder whose z-band contains every overlapped level. Its (q,r)
+    footprint is then z-INDEPENDENT — the radial slack doesn't depend on z and the altitude-band slack is
+    ≤ 0 in-band, so the mask reduces to the radial term — hence the masked cell set is identical at each
+    level and the per-level loop can compute it ONCE. (All committed hover/terminal columns span the whole
+    [ground, ceiling] tube, so this is their common case.)"""
+    return (isinstance(vol.shape, CylinderSpec)
+            and vol.shape.z_lo <= cfg.flight_levels_m[levels[0]]
+            and cfg.flight_levels_m[levels[-1]] <= vol.shape.z_hi)
+
+
 def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None = None):
     """Yield (q, r, step) cruise-level cells a committed volume blocks (conservatively inflated).
 
@@ -231,6 +242,15 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
     if infl is None:
         infl = cfg.corridor_width_m / 2.0 + R      # corridor half-width + one hex (conservative)
     steps = _step_range(vol, cfg)
+    if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl, z=cfg.flight_levels_m[levels[0]])
+        mask = slack <= infl
+        cells = list(zip(q_grid[mask].tolist(), r_grid[mask].tolist()))
+        for L in levels:
+            for q, r in cells:
+                for s in steps:
+                    yield q, r, L, s
+        return
     for L in levels:
         q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl, z=cfg.flight_levels_m[L])
         mask = slack <= infl
@@ -251,6 +271,16 @@ def rasterize_volume_dual(
     if not levels:
         return
     steps = _step_range(vol, cfg)
+    if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[levels[0]])
+        in_pad = slack <= infl_pad
+        rows = list(zip(q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
+                        (slack[in_pad] <= infl_blocked).tolist()))
+        for L in levels:
+            for q, r, b in rows:
+                for s in steps:
+                    yield q, r, L, s, b
+        return
     for L in levels:
         q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[L])
         in_pad = slack <= infl_pad

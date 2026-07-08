@@ -77,44 +77,52 @@ def _straight_horizontal_m(intent: OperationalIntent) -> float:
     return float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
 
 
-def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:
-    """Unified congestion lateness (s): the seconds a flight loses *to other traffic*.
+def _unimpeded_cruise_z(cfg: SimConfig) -> float:
+    """The altitude the run's planner cruises at when UNIMPEDED. The A* family deconflicts by altitude on
+    the discrete ladder, so its unimpeded cruise is the lowest flight level; the continuous single-plane
+    planners (straight / rrt / milp / opt / …) are pinned to ``cruise_level_m`` (no altitude lever).
 
-    Ground hold + air loiter + detour-time (extra horizontal metres ÷ cruise speed). This is the
-    free-space analog of the hex repo's single ``delay`` scalar — excess over the unimpeded flight.
-    Mandatory takeoff/landing climb is deliberately excluded: it's a constant every flight pays, not
-    a congestion signal. NaN for denied flights (they never arrive). See :func:`flight_row`.
+    Keyed on ``cfg.planner`` — the run's registry name ('astar' / 'opt_astar' / 'astar_milp' all contain
+    'astar'; 'straight' / 'opt' / 'milp' don't) — NOT ``intent.planner``, which a refiner relabels to its
+    own stage (``opt_astar`` stamps 'opt', ``astar_milp`` stamps 'milp'), dropping the A* origin. So a
+    single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced A*
+    climb above the floor reads positive excess (real congestion)."""
+    return cfg.cruise_level_m if "astar" not in cfg.planner else cfg.flight_levels_m[0]
+
+
+def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:
+    """Unified congestion lateness (s): the seconds a flight loses *to other traffic*, across ALL four
+    levers — ground hold + air loiter + detour-time + a traffic-forced vertical climb (excess altitude ÷
+    climb rate). Each is excess over the unimpeded flight (a straight dash at the planner's own cruise
+    altitude), so the mandatory takeoff/landing climb is excluded but a climb *forced by congestion* is
+    NOT (that is exactly the vertical lever this project adds). This is the time-space twin of
+    ``congestion_cost``. NaN for denied flights (they never arrive). See :func:`flight_row`.
     """
     if not intent.accepted:
         return float("nan")
+    excess_m = max(0.0, intent.altitude_change_m - nominal_altitude_change_m(cfg))
     return (
         intent.ground_delay_s
         + intent.air_hold_s
         + intent.air_detour_m / cfg.nominal_speed_mps
+        + excess_m / cfg.climb_rate_mps
     )
 
 
 def nominal_flight_time_s(straight_m: float, cfg: SimConfig) -> float:
-    """Unimpeded door-to-door air time (s): straight cruise + the mandatory climb and descent.
-
-    The climb baseline is the LOWEST flight level — the same "straight line at the lowest altitude"
-    floor as :func:`nominal_altitude_change_m`, so the time and altitude nominals agree. Single-plane
-    planners cruise at ``cruise_level_m`` instead, so (as with ``excess_altitude_m``) their real
-    unimpeded trip is a constant few seconds longer than this nominal — a structural offset shared by
-    every flight in a run, not a per-flight bias."""
-    return straight_m / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_to(cfg.flight_levels_m[0])
+    """Unimpeded door-to-door air time (s): straight cruise + the mandatory climb and descent to the
+    run's cruise altitude (:func:`_unimpeded_cruise_z` — the ladder floor for A*, ``cruise_level_m`` for
+    single-plane planners), so the time nominal agrees with :func:`nominal_altitude_change_m` and
+    ``delay_pct`` is measured against the true unimpeded trip."""
+    return straight_m / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_to(_unimpeded_cruise_z(cfg))
 
 
 def nominal_altitude_change_m(cfg: SimConfig) -> float:
-    """Mandatory vertical travel of an unimpeded flight: climb to the LOWEST flight level and descend
-    back (climb + descent ⇒ the factor of 2). This is the reference the congestion metric measures
-    *excess* altitude against — the "straight line at the lowest altitude" baseline.
-
-    A multi-level A* flight in empty airspace cruises at this floor, so it reads zero excess; a flight
-    that traffic pushed to a higher level reads the extra metres. Single-plane planners always cruise at
-    ``cruise_level_m`` (no altitude lever), so they read a *constant* positive excess against this floor
-    — a structural offset, not congestion; read their ``excess_altitude_m`` with that in mind."""
-    return 2.0 * (cfg.flight_levels_m[0] - cfg.ground_level_m)
+    """Mandatory vertical travel of an unimpeded flight: climb to the flight's own cruise altitude
+    (:func:`_unimpeded_cruise_z`) and descend back (climb + descent ⇒ the factor of 2). This is the
+    reference ``excess_altitude_m`` measures against, so a single-plane planner (cruise == baseline) reads
+    zero excess and only a traffic-forced A* climb above its ladder floor reads positive excess."""
+    return 2.0 * (_unimpeded_cruise_z(cfg) - cfg.ground_level_m)
 
 
 _COST_LEVERS = ("ground_delay_cost", "air_hold_cost", "air_detour_cost", "altitude_cost")
@@ -158,7 +166,7 @@ def delay_breakdown_s(intent: OperationalIntent, cfg: SimConfig) -> dict[str, fl
 
     The two differ by ``c_alt · climb_rate / c_ground`` (12× at defaults) — that gap *is* the cost-vs-time
     story this surface exists to tell. ``excess_m`` is altitude above :func:`nominal_altitude_change_m`
-    (the traffic-forced climb). NaN for a denied flight."""
+    (the traffic-forced climb, measured against the flight's own planner baseline). NaN for a denied flight."""
     if not intent.accepted:
         return dict.fromkeys(_DELAY_LEVERS, float("nan"))
     excess_m = max(0.0, intent.altitude_change_m - nominal_altitude_change_m(cfg))
@@ -190,9 +198,10 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
     # seconds, with altitude read both physically and as a cost-equivalent). See the module docstring.
     cb = cost_breakdown(intent, cfg)
     db = delay_breakdown_s(intent, cfg)
-    # cost-space twin of total_delay_s: congestion paid above an unimpeded straight flight at the floor —
-    # the three horizontal levers (already excess) + altitude's EXCESS only (the mandatory climb is not
-    # congestion). Differs from `cost`, which also carries that mandatory baseline-altitude cost.
+    # cost-space twin of total_delay_s: the four congestion levers above an unimpeded straight flight at
+    # the planner's own cruise altitude — ground/hold/detour (already excess) + altitude's EXCESS only
+    # (the mandatory climb is not congestion). Same four levers total_delay_s sums in TIME; differs from
+    # `cost`, which also carries the mandatory baseline-altitude cost.
     congestion_cost = ((cb["ground_delay_cost"] + cb["air_hold_cost"] + cb["air_detour_cost"]
                         + cfg.cost_altitude_change_per_m * db["excess_altitude_m"])
                        if intent.accepted else float("nan"))
@@ -208,14 +217,15 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig) -> dict:
         "ground_delay_s": intent.ground_delay_s,
         "air_hold_s": intent.air_hold_s,
         "air_detour_m": intent.air_detour_m,
-        # detour expressed as lateness-seconds; ground_delay + air_hold + detour_time == total_delay
-        "detour_time_s": (intent.air_detour_m / cfg.nominal_speed_mps) if intent.accepted else float("nan"),
+        # detour as lateness-seconds; ground_delay_s + air_hold_s + detour_time_s + altitude_delay_phys_s
+        # == total_delay_s (the four time-space congestion levers). Reuse db so the formula lives once.
+        "detour_time_s": db["detour_time_s"],
         "altitude_change_m": intent.altitude_change_m,
-        # congestion-driven vertical travel (above the lowest-level floor) + its two time readings
+        # congestion-driven vertical travel (above the flight's own cruise baseline) + its two time readings
         "excess_altitude_m": db["excess_altitude_m"],
         "altitude_delay_phys_s": db["altitude_delay_phys_s"],      # physical: excess_m / climb_rate
         "altitude_delay_costeq_s": db["altitude_delay_costeq_s"],  # cost-equivalent: excess_m·c_alt/c_gd
-        "total_delay_s": td,                      # unified congestion lateness (s), HORIZONTAL levers
+        "total_delay_s": td,                      # unified congestion lateness (s): all four levers
         "delay_pct": delay_pct,                    # ... as % of the flight's total trip time
         "trip_time_ratio": trip_time_ratio,        # (straight-line time + delay) / straight-line time
         # per-lever COST split (units of the planner objective); the four reconcile to `cost`

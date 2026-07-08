@@ -197,6 +197,11 @@ class AStarPlanner:
         # per-level takeoff: integer climb-steps (≥1) and the climb cost ground → each cruise level
         takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)
         takeoff_cost = tuple(c_alt * (z - ground_z) for z in levels)
+        # per-rung (L ↔ L+1) mid-route layer change: step count ceil(Δz/(climb_rate·dt)) and cost c_alt·Δz,
+        # precomputed once (like takeoff_*) and indexed by min(L, L2) in _edges — not recomputed per node.
+        rung_steps = tuple(max(1, int(math.ceil((levels[L + 1] - levels[L]) / (cfg.climb_rate_mps * dt))))
+                           for L in range(len(levels) - 1))
+        rung_cost = tuple(c_alt * (levels[L + 1] - levels[L]) for L in range(len(levels) - 1))
 
         oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
@@ -247,11 +252,11 @@ class AStarPlanner:
         def h_air(q, r, L):
             dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
             return (c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off)
-                    + c_alt * (levels[L] - ground_z))
+                    + takeoff_cost[L])                       # == c_alt*(levels[L]-ground_z), precomputed
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
         h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off)
-                    + 2.0 * c_alt * (levels[0] - ground_z))
+                    + 2.0 * takeoff_cost[0])                 # mandatory descent from the lowest level + back
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
@@ -306,8 +311,8 @@ class AStarPlanner:
                 break
             base_g = g[st]
             for nst, cost in self._edges(
-                st, cfg, pitch, levels, takeoff_steps, takeoff_cost, dwell_steps, c_alt,
-                svc, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
+                st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost, dwell_steps,
+                c_alt, svc, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -363,8 +368,9 @@ class AStarPlanner:
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _edges(self, st, cfg, pitch, levels, takeoff_steps, takeoff_cost, dwell_steps, c_alt,
-               svc, max_step, own=(), o_cap=1, o_term=None, origin=None, tcap=None, dest=None, o_lanes=()):
+    def _edges(self, st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
+               dwell_steps, c_alt, svc, max_step, own=(), o_cap=1, o_term=None, origin=None, tcap=None,
+               dest=None, o_lanes=()):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -414,9 +420,8 @@ class AStarPlanner:
         for dL in (-1, 1) if self.vertical_edges else ():                           # vertical layer change
             L2 = L + dL
             if 0 <= L2 < len(levels):
-                dz = abs(levels[L2] - levels[L])
-                vsteps = max(1, int(math.ceil(dz / (cfg.climb_rate_mps * dt))))      # ≥2 steps for a 40m rung
-                ts = s + vsteps
+                rung = L if dL == 1 else L2                              # index of the L ↔ L+1 rung
+                ts = s + rung_steps[rung]                                # ≥2 steps for a 40 m rung, precomputed
                 # the rebuilt climb box occupies only the levels it traverses ({L, L2}): volumes.py sizes
                 # its z-extent to [z_L, z_L2] ± corridor_height/2, matching _levels_overlapped, so require
                 # clearance on exactly those two levels across the window (s, ts] — not every level.
@@ -424,7 +429,7 @@ class AStarPlanner:
                     not svc.is_blocked(q, r, Lk, sk, own)
                     for Lk in (L, L2) for sk in range(s + 1, ts + 1)
                 ):
-                    out.append((("a", q, r, L2, ts), c_alt * dz))
+                    out.append((("a", q, r, L2, ts), rung_cost[rung]))
         return out
 
     def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):

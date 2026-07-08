@@ -251,9 +251,12 @@ def test_single_level_config_recovers_legacy_behavior():
 def _air_edges(planner, cfg, svc, st, max_step=999):
     """Expand an AIR state (reroute/hover/vertical-edge only). The ground-branch params (takeoff_steps,
     tcap, …) aren't consulted for an ``("a", …)`` state, so dummies are fine."""
-    n = cfg.n_levels
-    return planner._edges(st, cfg, cfg.corridor_segment_len_m, cfg.flight_levels_m,
-                          (0,) * n, (0.0,) * n, (1,) * n, cfg.cost_altitude_change_per_m, svc, max_step)
+    n, lv = cfg.n_levels, cfg.flight_levels_m
+    rung_steps = tuple(max(1, math.ceil((lv[L + 1] - lv[L]) / (cfg.climb_rate_mps * cfg.dt_s)))
+                       for L in range(n - 1))
+    rung_cost = tuple(cfg.cost_altitude_change_per_m * (lv[L + 1] - lv[L]) for L in range(n - 1))
+    return planner._edges(st, cfg, cfg.corridor_segment_len_m, lv, (0,) * n, (0.0,) * n,
+                          rung_steps, rung_cost, (1,) * n, cfg.cost_altitude_change_per_m, svc, max_step)
 
 
 def test_vertical_edge_checks_only_traversed_levels_not_all():

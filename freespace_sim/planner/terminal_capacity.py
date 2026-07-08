@@ -24,14 +24,41 @@ whose corridor intrudes it. (Found in a Dallas replay; it converted a ground-del
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Hashable
 
 from ..config import SimConfig
+from ..conflict import volumes_conflict
 from ..geometry import CylinderSpec
 from ..ledger import ReservationLedger
 from ..types import as_terminal
 from ..volumes import corridor_segment_volume, exit_radius, hover_reservation, terminal_radius
+
+
+def _merge_intervals(ivs):
+    """Sort ``[(lo, hi), ...]`` and coalesce overlapping/adjacent runs into a sorted, DISJOINT list."""
+    if not ivs:
+        return []
+    ivs = sorted(ivs)
+    out = [ivs[0]]
+    for lo, hi in ivs[1:]:
+        plo, phi = out[-1]
+        if lo <= phi:                              # overlaps or touches the previous run → extend it
+            out[-1] = (plo, hi if hi > phi else phi)
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def _overlaps(ivs, lo, hi) -> bool:
+    """True iff ``[lo, hi)`` intersects any interval in the sorted, DISJOINT list ``ivs`` (O(log n)).
+    STRICT (half-open) to match ``conflict.volumes_conflict``'s ``a.t_start < b.t_end and b.t_start <
+    a.t_end`` — a volume ending exactly at ``lo`` (or starting exactly at ``hi``) does NOT overlap."""
+    if not ivs:
+        return False
+    i = bisect.bisect_left(ivs, (hi, float("-inf")))   # first interval starting at/after hi
+    return i > 0 and ivs[i - 1][1] > lo                # last one starting < hi ends strictly after lo?
 
 
 class TerminalCapacity:
@@ -47,6 +74,13 @@ class TerminalCapacity:
         self.dwells: dict[Hashable, list[tuple[float, float]]] = {}   # tid -> [(t_start, t_end), ...]
         self.radius: dict[Hashable, float] = {}                       # tid -> the hub's one column radius
         self.evicted_before: float | None = None
+        # foreign-transit index: per hub, the merged time intervals a FOREIGN volume sits over its column.
+        # Replaces column_clear's per-step ledger scan with an O(log) lookup — built lazily/incrementally
+        # from the ledger (``_ftn[tid]`` = # ledger volumes already indexed for that hub). Same answer as
+        # ``not ledger.any_conflict([column])`` because the build reuses ``volumes_conflict`` verbatim.
+        self._ft: dict[Hashable, list[tuple[float, float]]] = {}
+        self._ftn: dict[Hashable, int] = {}
+        self._ft_seen = 0                                             # ledger length at last query (shrink tripwire)
 
     # ----- maintenance (push, via ledger.subscribe) -----
     def on_commit(self, _flight_id, volumes) -> None:
@@ -75,12 +109,21 @@ class TerminalCapacity:
                 self.dwells[tid] = kept
             else:
                 del self.dwells[tid]
+        for tid in list(self._ft):                      # foreign-transit index: same monotonic drop
+            kept = [iv for iv in self._ft[tid] if iv[1] > t]
+            if kept:
+                self._ft[tid] = kept
+            else:
+                del self._ft[tid]
         self.evicted_before = t
 
     def reset(self) -> None:
         self.dwells.clear()
         self.radius.clear()
         self.evicted_before = None
+        self._ft.clear()
+        self._ftn.clear()
+        self._ft_seen = 0
 
     # ----- queries (plan time) -----
     def admits(self, terminal_id: Hashable, t0: float, t1: float, capacity: int) -> bool:
@@ -100,15 +143,44 @@ class TerminalCapacity:
         return self.cfg.climb_time_s if z is None else self.cfg.climb_time_to(z)
 
     def column_clear(self, term, center, t0: float, z: float | None = None) -> bool:
-        """Step 1 — column activation: can the column deploy at ``t0`` with no FOREIGN transit? Build the
-        column cylinder (lifetime ``[t0, t0 + hover + climb_time_to(z))``, the SAME window the committed
-        column uses) and ask the ledger — same-hub volumes are exempt (``conflict.volumes_conflict``), so
-        a conflict means a foreign volume crosses the hub. Always queries; see the class docstring for
-        why the "already-deployed" shortcut is unsound."""
-        col = hover_reservation(center, t0, self.cfg, terminal_id=term.id,
-                                radius=terminal_radius(term, self.cfg),
-                                climb_time_s=self._dwell_climb_s(z))
-        return not self.ledger.any_conflict([col])
+        """Step 1 — column activation: is the hub's column free of FOREIGN transit over the dwell window
+        ``[t0, t0 + hover + climb_time_to(z))``? Exactly ``not ledger.any_conflict([column at t0])``
+        (same-hub volumes exempt), served from the per-hub foreign-transit index: first bring the index
+        current with any newly-committed volumes — each spatially AABB-pruned, then confirmed by the SAME
+        ``volumes_conflict`` the ledger uses — then answer with an O(log) overlap query. Order-independent,
+        so (unlike the rejected 'already-deployed' shortcut, see class docstring) it never misses a
+        late-committed intruder or a same-hub cruise corridor. ``z`` (cruise level) sets only the QUERY
+        window length via :meth:`_dwell_climb_s`; the indexed foreign intervals are level-independent (a
+        foreign volume crosses the hub's spatial footprint over its own lifetime, or it does not)."""
+        term = as_terminal(term)
+        tid = term.id
+        vols = self.ledger._vols                              # committed volumes, in commit order (same pkg)
+        n = len(vols)
+        if n < self._ft_seen:                                 # ledger shrank (release) → cached index is stale
+            self._ft.clear(); self._ftn.clear()
+        self._ft_seen = n
+        start = self._ftn.get(tid, 0)
+        if start < n:                                         # index the newly-committed tail for this hub
+            r = terminal_radius(term, self.cfg)
+            cx, cy = float(center[0]), float(center[1])
+            zlo, zhi = self.cfg.ground_level_m, self.cfg.cruise_level_m
+            new: list[tuple[float, float]] = []
+            for idx in range(start, n):
+                v = vols[idx]
+                if v.terminal_id == tid:                      # same-hub + column ⇒ exempt
+                    continue
+                vlo, vhi = v.aabb()
+                if (cx + r < vlo[0] or vhi[0] < cx - r or cy + r < vlo[1] or vhi[1] < cy - r
+                        or zhi < vlo[2] or vhi[2] < zlo):      # spatial AABB miss ⇒ can't intrude the column
+                    continue
+                col = hover_reservation(center, v.t_start, self.cfg, terminal_id=tid, radius=r)
+                if volumes_conflict(col, v):                   # exact predicate the ledger's any_conflict uses
+                    new.append((v.t_start, v.t_end))
+            if new:
+                self._ft[tid] = _merge_intervals((self._ft.get(tid) or []) + new)
+            self._ftn[tid] = n
+        t1 = t0 + self.cfg.hover_time_s + self._dwell_climb_s(z)   # per-level query window (multi-altitude)
+        return not _overlaps(self._ft.get(tid), t0, t1)
 
     def exit_clear(self, term, center, toward, t0: float, z: float | None = None) -> bool:
         """Step 1b — exit/approach lane, LEGACY path only (``fixed_exit_lanes=False``): the corridor the

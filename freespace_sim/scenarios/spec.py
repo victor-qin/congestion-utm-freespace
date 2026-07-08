@@ -87,6 +87,7 @@ class ScenarioSpec:
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
     heuristic_weight: float | None = None  # None → SimConfig default (1.0, optimal); >1 ⇒ weighted A*
     terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
+    vertical_edges: bool | None = None     # None → SimConfig default (on); False drops A*'s mid-route rungs
     # altitude ladder overrides (None → SimConfig default (30,70,110) multi-level). Pin a scenario to a
     # single plane with flight_levels_m=(z,) + cruise_level_m=z + z_min_m=z_max_m=z; widen to multi-level
     # later by listing more levels.
@@ -109,6 +110,7 @@ class ScenarioSpec:
             **({"heuristic_weight": self.heuristic_weight} if self.heuristic_weight is not None else {}),
             **({"terminal_airspace_always_active": self.terminal_airspace_always_active}
                if self.terminal_airspace_always_active is not None else {}),
+            **({"vertical_edges": self.vertical_edges} if self.vertical_edges is not None else {}),
             **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
             **({"cruise_level_m": self.cruise_level_m} if self.cruise_level_m is not None else {}),
             **({"z_min_m": self.z_min_m} if self.z_min_m is not None else {}),

@@ -67,6 +67,13 @@ class SimConfig:
     # gate and the exact ledger conflict check at commit, neither of which the heuristic touches.
     heuristic_weight: float = 1.0
 
+    # A* multi-altitude only: generate mid-route climb/descend edges at every air node so a flight can
+    # change flight level en route. These dominate the multi-level search cost (an all-levels column
+    # check per air node) — set False on large multi-level runs to recover most of the single-plane
+    # speed while keeping the per-level TAKEOFF capacity gain (which is independent). No effect when
+    # n_levels == 1 (a single plane has no rungs to climb).
+    vertical_edges: bool = True
+
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
     max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this

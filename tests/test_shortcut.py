@@ -106,3 +106,42 @@ def test_astar_shortcut_slants_the_climb_staircase():
                   and abs(float(cl[i + 1][0][2]) - float(cl[i][0][2])) > 1.0
                   for i in range(len(cl) - 1))
     assert slanted   # A*'s orthogonal cruise→climb→cruise staircase fused into a DIAGONAL climb
+
+
+def _diagonal_segments(centerline):
+    """Count centerline segments that move BOTH horizontally and vertically — a slanted diagonal climb
+    box (vs A*'s orthogonal pure-vertical rung / pure-horizontal cruise)."""
+    return sum((abs(float(b[0] - a[0])) > 1.0 or abs(float(b[1] - a[1])) > 1.0)
+               and abs(float(b[2] - a[2])) > 1.0
+               for (a, _), (b, _) in zip(centerline, centerline[1:]))
+
+
+def test_astar_shortcut_dense_multilevel_run_stays_verified():
+    # The refiner's diagonal climb-boxes must stay FCL-conflict-free UNDER LOAD — against other traffic at
+    # other levels, not just the static walls the single-flight tests use. Dense crossing traffic with
+    # capped ground delay makes altitude the deconfliction lever, forcing many climbs the shortcut fuses
+    # into diagonals. (test_shortcut_demand_run_is_verified @ λ=40 is far too sparse to force any climb;
+    # multilevel_e2e uses plain astar — so nothing else covers this path under load.)
+    cfg = SimConfig(planner="astar_shortcut", lam_per_hour=3000.0, horizon_s=300.0,
+                    region_size_m=(1200.0, 1200.0), seed=1, max_ground_delay_s=60.0)
+    res = run(cfg)
+    assert res.verified                                    # FCL replay: no phantom cross-level collision
+    # not vacuous: the run actually produced climbs the refiner slanted into diagonal segments
+    floor = 2.0 * cfg.flight_levels_m[0]
+    assert sum(i.altitude_change_m > floor + 1.0 for i in res.accepted) >= 5    # many climbed the ladder
+    assert sum(_diagonal_segments(i.centerline) for i in res.accepted) >= 5     # ... and were slanted
+
+
+def test_astar_shortcut_diagonal_climb_deconflicts_from_committed_traffic():
+    # Two opposite-direction flights on a shared corridor: the first is committed, the second must climb
+    # OVER it — and the refiner slants that climb into a DIAGONAL box which must stay clear of the first's
+    # committed corridor (build-then-check + FCL). The diagonal climb-box vs real traffic, deterministic.
+    led = ReservationLedger(CFG)
+    i1 = get_planner("astar_shortcut").plan(FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0), led, CFG)
+    assert i1.accepted
+    led.commit(1, i1.volumes)
+    i2 = get_planner("astar_shortcut").plan(FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0), led, CFG)
+    assert i2.accepted
+    assert not led.any_conflict(i2.volumes)                # the (slanted) climb clears the committed flight
+    assert max(round(float(p[2]), 1) for p, _ in i2.centerline) >= CFG.level_z(1)   # it climbed a level
+    assert _diagonal_segments(i2.centerline) >= 1          # the climb was slanted, not a pure rung

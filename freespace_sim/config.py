@@ -60,6 +60,13 @@ class SimConfig:
     cost_air_hold_per_s: float = 3.0          # loiter/hover mid-route (expensive)
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
+    # --- search (A*) ---
+    # Weighted A*: priority is g + heuristic_weight * h. 1.0 = optimal (admissible). >1.0 trades
+    # bounded suboptimality (path cost <= w * optimal) for far fewer expansions — safe here because
+    # path cost is a soft FCFS proxy; separation is enforced independently by the hex-occupancy search
+    # gate and the exact ledger conflict check at commit, neither of which the heuristic touches.
+    heuristic_weight: float = 1.0
+
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
     max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this
@@ -78,6 +85,15 @@ class SimConfig:
     # same-hub exit-lane CONFLICT_FILED. False ⇒ the legacy A* fold/exit_clear path. Other planners
     # (milp/opt/rrt) don't route through lanes — the flag only tags their hub boxes. Default on (#18).
     fixed_exit_lanes: bool = True
+
+    # --- always-active terminal airspace (foreign-transit isolation); A* only ---
+    # When True, every hub's column + exit lanes are permanently reserved as a FOREIGN-no-fly zone for
+    # the whole horizon (not just during dwell windows): foreign cruise traffic routes AROUND the
+    # terminal (extra air detour) instead of crossing it and ground-blocking same-hub takeoffs. Converts
+    # foreign-transit GROUND delay into airspace-density AIR delay. The static column spans every flight
+    # level (the [ground, ceiling] tube). The demand generator drops deliveries whose customer falls
+    # inside a foreign column (unreachable).
+    terminal_airspace_always_active: bool = False
 
     # ----- DERIVED (kept inside SimConfig) -----
     @property

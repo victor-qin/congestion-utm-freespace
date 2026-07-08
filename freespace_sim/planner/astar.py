@@ -148,6 +148,10 @@ class AStarPlanner:
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
+        self.last_expansions = 0                        # nodes expanded by the most recent plan()
+        self.static_terminals: list = []               # (center, term) per hub; set by sim.run() when
+        #                                                cfg.terminal_airspace_always_active, registered
+        #                                                into the occupancy as permanent foreign walls.
 
     def _occupancy(self, req, ledger, cfg) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
@@ -162,6 +166,9 @@ class AStarPlanner:
             ledger.subscribe(self._tcap.on_commit)
             _absorb(svc, ledger)                             # absorb anything already committed
             _absorb(self._tcap, ledger)
+            if cfg.terminal_airspace_always_active:          # permanent foreign walls (whole horizon)
+                for center, term in self.static_terminals:
+                    svc.register_static_terminal(center, term)
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
@@ -264,11 +271,12 @@ class AStarPlanner:
         max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
                     + 3 * n_hops + 2 * climb_span + 6)
 
+        w = cfg.heuristic_weight                          # weighted A*: f = g + w*h (w=1 ⇒ optimal)
         start = ("g", oq, orr, base)
         g = {start: 0.0}
         came: dict = {}
         counter = itertools.count()
-        pq = [(h_ground, next(counter), start)]
+        pq = [(w * h_ground, next(counter), start)]
         closed: set = set()
         goal_state = None
         expansions = 0
@@ -319,8 +327,9 @@ class AStarPlanner:
                     g[nst] = ng
                     came[nst] = st
                     hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
-                    heapq.heappush(pq, (ng + hh, next(counter), nst))
+                    heapq.heappush(pq, (ng + w * hh, next(counter), nst))
 
+        self.last_expansions = expansions     # search-effort telemetry (analysis/benchmarks)
         if goal_state is None:
             # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
             # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /

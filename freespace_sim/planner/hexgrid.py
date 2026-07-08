@@ -87,6 +87,38 @@ def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
     return math.degrees(math.atan2(by - cy, bx - cx))
 
 
+def _covered_boundary(center, term, cfg: SimConfig) -> tuple[set, set]:
+    """Flood-fill a hub's column: ``covered`` hexes (centre within ``exit_radius`` of the hub) and the
+    ``boundary`` ring just outside them (neighbours of a covered cell that aren't themselves covered).
+    Shared by :func:`terminal_lanes` (boundary = the exit lanes) and :func:`terminal_cells`
+    (covered ∪ boundary = the full reserved terminal airspace)."""
+    term = as_terminal(term)
+    cx, cy = float(center[0]), float(center[1])
+    R = circumradius(cfg)
+    er = exit_radius(term, cfg)
+    covered: set = set()
+    stack = [enu_to_axial(cx, cy, R)]                    # the home hex is always covered (er > R)
+    while stack:
+        h = stack.pop()
+        if h in covered:
+            continue
+        hx, hy = hex_center(*h, R)
+        if math.hypot(hx - cx, hy - cy) < er - 1e-9:
+            covered.add(h)
+            stack.extend(hex_neighbors(*h))
+    boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
+    return covered, boundary
+
+
+def terminal_cells(center, term, cfg: SimConfig) -> set:
+    """Every hex of a hub's reserved terminal airspace — the column (covered) plus its exit lanes
+    (boundary). Used to wall the terminal off from FOREIGN cruise traffic when
+    ``cfg.terminal_airspace_always_active`` (foreign flights route around instead of crossing); see
+    :meth:`freespace_sim.planner.occupancy.HexOccupancyService.register_static_terminal`."""
+    covered, boundary = _covered_boundary(center, term, cfg)
+    return covered | boundary
+
+
 def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
     """A hub's fixed exit-lane set: the **boundary hexes** of its column, sorted by bearing.
 
@@ -102,18 +134,7 @@ def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
     if cached is not None:
         return cached
     R = circumradius(cfg)
-    er = exit_radius(term, cfg)
-    covered: set = set()
-    stack = [enu_to_axial(cx, cy, R)]                    # the home hex is always covered (er > R)
-    while stack:
-        h = stack.pop()
-        if h in covered:
-            continue
-        hx, hy = hex_center(*h, R)
-        if math.hypot(hx - cx, hy - cy) < er - 1e-9:
-            covered.add(h)
-            stack.extend(hex_neighbors(*h))
-    boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
+    _covered, boundary = _covered_boundary(center, term, cfg)
     cells = sorted(boundary, key=lambda c: _bearing_deg(c, cx, cy, R))
     hub = np.array([cx, cy])
     lanes = [

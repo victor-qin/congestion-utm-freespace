@@ -23,7 +23,7 @@ from .ledger import ReservationLedger
 from .mechanism import FCFSMechanism, Mechanism
 from .planner import get_planner
 from .scenario import Scenario, scenario_from_requests
-from .types import FlightRequest, IntentStatus, OperationalIntent
+from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
 from .uss import USS
 
 # Called after each flight is planned: (done, total, latest_intent). Return value ignored.
@@ -138,6 +138,33 @@ def run(
     pname = planner_name or cfg.planner
     usses = {uid: USS(uid, dss, cfg, get_planner(pname)) for uid in scenario.uss_ids}
     default_uss = next(iter(usses.values()))
+
+    if cfg.terminal_airspace_always_active:
+        # Hand every A* planner the full hub set so it can permanently wall each terminal off from
+        # foreign cruise traffic. A hub centre = the request endpoint that carries its terminal (a
+        # delivery's origin / a return's dest). Normalize (id, capacity) tuple terminals to Terminal so
+        # downstream register_static_terminal / terminal_cells get a real column radius.
+        terms: dict = {}
+        for ev in scenario.events:
+            rq = ev.request
+            for pt, t in ((rq.origin, rq.origin_terminal), (rq.dest, rq.dest_terminal)):
+                term = as_terminal(t)
+                if term is not None:
+                    terms.setdefault(term.id, (pt, term))
+        static_terms = list(terms.values())
+        reached = False
+        for u in usses.values():
+            p = u.planner
+            while p is not None:                        # descend refiners (.inner) AND opt/milp warm A*
+                if hasattr(p, "static_terminals"):      # (.warm_planner) so every A* layer is reached
+                    p.static_terminals = static_terms
+                    reached = True
+                p = getattr(p, "inner", None) or getattr(p, "warm_planner", None)
+        if not reached:                                 # loud failure beats a silent wrong result: the
+            raise ValueError(                           # demand filter already dropped foreign customers,
+                f"terminal_airspace_always_active=True but planner {pname!r} exposes no A* layer to "
+                "install static terminal walls (looked through .inner/.warm_planner) — foreign-column "
+                "customers would be dropped with no compensating walls.")
 
     total = len(scenario.events)
     report = _resolve_progress(progress, total)

@@ -8,6 +8,7 @@ takeoff/landing climb/descent.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Hashable
 
@@ -62,16 +63,22 @@ def corridor_segment_volume(
     conflict. The box is purely segment-local (depends only on its own endpoints + cfg), which is
     what makes per-edge checking equivalent to whole-corridor checking.
 
-    Geometry: configured width/height, extended longitudinally by half the corridor width at each
-    end so consecutive boxes overlap (ASTM §4.3.5 contiguity); time window buffered by
-    ``time_buffer_s`` on both sides so neighbours overlap in time too.
+    Geometry: configured width/height, extended longitudinally at each end so consecutive boxes overlap
+    (ASTM §4.3.5 contiguity); time window buffered by ``time_buffer_s`` on both sides so neighbours
+    overlap in time too. The extension is **anisotropic** — half the box's footprint *in the travel
+    direction*: ``corridor_width/2`` in the horizontal plane, ``corridor_height/2`` in the vertical. This
+    matters for a mid-route layer change (a fixed-xy segment moving in z): a flat ``corridor_width/2``
+    would balloon the box in z past the levels it traverses (and above the ceiling); the vertical term
+    keeps its z-extent at ``[z0, z1] ± corridor_height/2`` — the drone's real vertical footprint.
     """
     p0 = np.asarray(p0, float)
     p1 = np.asarray(p1, float)
     d = p1 - p0
     length = float(np.linalg.norm(d))
     u = d / length if length > 1e-9 else np.array([1.0, 0.0, 0.0])
-    ext = cfg.corridor_width_m / 2.0
+    # half the cross-section along travel: width when horizontal, height when vertical (== width/2 for a
+    # level cruise/exit box → those are unchanged; == height/2 for a pure climb → no z overshoot).
+    ext = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(u[0], u[1]), cfg.corridor_height_m * u[2])
     a = p0 - u * ext        # extend behind the start
     b = p1 + u * ext        # and beyond the end → overlap with neighbours
     spec = box_from_segment(a, b, cfg.corridor_width_m, cfg.corridor_height_m)

@@ -1,4 +1,5 @@
 import dataclasses as dc
+import math
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner, hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner, _committed_arrival
+from freespace_sim.planner.occupancy import HexOccupancyService
 from freespace_sim.planner.opt import NLPOptPlanner
 from freespace_sim.sim import run
 from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
@@ -244,3 +246,33 @@ def test_single_level_config_recovers_legacy_behavior():
     assert intent.status is IntentStatus.ACCEPTED
     assert _cruise_levels(intent) == [150.0]
     assert intent.altitude_change_m == 2.0 * (150.0 - cfg.ground_level_m)
+
+
+def _air_edges(planner, cfg, svc, st, max_step=999):
+    """Expand an AIR state (reroute/hover/vertical-edge only). The ground-branch params (takeoff_steps,
+    tcap, …) aren't consulted for an ``("a", …)`` state, so dummies are fine."""
+    n = cfg.n_levels
+    return planner._edges(st, cfg, cfg.corridor_segment_len_m, cfg.flight_levels_m,
+                          (0,) * n, (0.0,) * n, (1,) * n, cfg.cost_altitude_change_per_m, svc, max_step)
+
+
+def test_vertical_edge_checks_only_traversed_levels_not_all():
+    """A 0→1 layer-change edge must require clearance only on the levels it traverses ({0, 1}): an
+    obstacle on the UNtraversed level 2 over the same column must NOT block it, while one on the
+    destination level 1 must. (Before the fix the edge required ALL levels clear.)"""
+    planner = AStarPlanner()
+    q, r, s = 0, 0, 5
+    vsteps = max(1, math.ceil((CFG.level_z(1) - CFG.level_z(0)) / (CFG.climb_rate_mps * CFG.dt_s)))
+    climb_edge = ("a", q, r, 1, s + vsteps)                          # the 0→1 rung successor
+
+    blocked_above = HexOccupancyService(CFG)
+    for sk in range(s + 1, s + vsteps + 1):
+        blocked_above.blocked.setdefault(sk, set()).add((q, r, 2))   # obstacle two levels up
+    got = {e[0] for e in _air_edges(planner, CFG, blocked_above, ("a", q, r, 0, s))}
+    assert climb_edge in got, "an obstacle on untraversed level 2 wrongly blocked a 0→1 climb"
+
+    blocked_dest = HexOccupancyService(CFG)
+    for sk in range(s + 1, s + vsteps + 1):
+        blocked_dest.blocked.setdefault(sk, set()).add((q, r, 1))    # obstacle on the destination level
+    got2 = {e[0] for e in _air_edges(planner, CFG, blocked_dest, ("a", q, r, 0, s))}
+    assert climb_edge not in got2, "an obstacle on the destination level must block the climb"

@@ -125,3 +125,11 @@ def test_single_level_rasterize_tags_zero():
     assert {(q, r, s) for (q, r, L, s) in cells} == {
         (q, r, s) for (q, r, L, s) in _scalar_rasterize(box, cfg1, R, cfg1.corridor_width_m / 2.0 + R)
     }
+
+
+def test_vertical_climb_box_overlaps_only_its_traversed_levels():
+    # A 30→70 climb box must map to levels {0,1} only — never level 2. (The ±corridor_width/2 z-inflation
+    # reached z=100 and _levels_overlapped wrongly returned [0, 1, 2].)
+    box = corridor_segment_volume(vec(500, 0, CFG.level_z(0)), 0.0,
+                                  vec(500, 0, CFG.level_z(1)), 2 * CFG.dt_s, CFG)
+    assert hg._levels_overlapped(box, CFG) == [0, 1]

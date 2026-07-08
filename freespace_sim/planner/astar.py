@@ -417,11 +417,12 @@ class AStarPlanner:
                 dz = abs(levels[L2] - levels[L])
                 vsteps = max(1, int(math.ceil(dz / (cfg.climb_rate_mps * dt))))      # ≥2 steps for a 40m rung
                 ts = s + vsteps
-                # the rebuilt climb box is a vertical tube sweeping the whole (q,r) column (all levels +
-                # box z-extension) across the window, so require it clear at every level for steps (s, ts].
+                # the rebuilt climb box occupies only the levels it traverses ({L, L2}): volumes.py sizes
+                # its z-extent to [z_L, z_L2] ± corridor_height/2, matching _levels_overlapped, so require
+                # clearance on exactly those two levels across the window (s, ts] — not every level.
                 if ts <= max_step and all(
                     not svc.is_blocked(q, r, Lk, sk, own)
-                    for Lk in range(len(levels)) for sk in range(s + 1, ts + 1)
+                    for Lk in (L, L2) for sk in range(s + 1, ts + 1)
                 ):
                     out.append((("a", q, r, L2, ts), c_alt * dz))
         return out

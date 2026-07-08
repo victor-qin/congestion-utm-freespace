@@ -282,7 +282,8 @@ class AStarPlanner:
                     # were already seen by the approach corridor's is_blocked check (issue #18).
                     lane = d_lane_by_cell.get((st[1], st[2]))
                     if lane is not None:
-                        goal_ok = tcap.dwell_ok(d_term, dest, st[4] * dt, d_cap)
+                        # window uses THIS flight's descent-from-level time (st[3]), matching the commit
+                        goal_ok = tcap.dwell_ok(d_term, dest, st[4] * dt, d_cap, z=levels[st[3]])
                 elif st[1] == gq and st[2] == grr:
                     # Legacy: gate landing capacity at the COMMITTED (tail-folded edge) arrival, not the
                     # goal-hex step time — they differ by the centre→edge fold; see _committed_arrival.
@@ -372,25 +373,27 @@ class AStarPlanner:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             if cfg.fixed_exit_lanes and o_term is not None:
                 # Fixed exit lanes × multi-altitude: one takeoff edge per (boundary-hex lane, flight
-                # level). Capacity+column are level-agnostic (computed once); same-hub siblings are
-                # deconflicted by exact cell occupancy at (lane cell, level) — is_blocked sees committed
-                # sibling exit corridors, so divergent lanes / different levels stay concurrent while two
-                # launches into the same cell+level serialise (ground-wait). The lateral traverse out to
-                # the lane cell is folded into the edge cost.
-                if tcap.dwell_ok(o_term, origin, s * dt, o_cap):
-                    o_r = terminal_radius(o_term, cfg)
-                    for lane in o_lanes:
-                        lq, lr = lane.cell
-                        for L in range(len(levels)):
-                            ts = s + takeoff_steps[L]
-                            if ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
-                                out.append((("a", lq, lr, L, ts),
-                                            takeoff_cost[L] + cfg.cost_air_lateral_per_m * (lane.dist - o_r)))
+                # level). The capacity/column dwell window is PER-LEVEL (the committed column lasts
+                # hover + climb_time_to(level); a top-level climb outlasts the preferred plane), so gate
+                # each level with its own window — computed once per level, reused across lanes. Same-hub
+                # siblings are deconflicted by exact cell occupancy at (lane cell, level): is_blocked sees
+                # committed sibling exit corridors, so divergent lanes / different levels stay concurrent
+                # while two launches into the same cell+level serialise (ground-wait). The lateral
+                # traverse out to the lane cell is folded into the edge cost.
+                o_r = terminal_radius(o_term, cfg)
+                level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
+                for lane in o_lanes:
+                    lq, lr = lane.cell
+                    for L in range(len(levels)):
+                        ts = s + takeoff_steps[L]
+                        if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
+                            out.append((("a", lq, lr, L, ts),
+                                        takeoff_cost[L] + cfg.cost_air_lateral_per_m * (lane.dist - o_r)))
                 return out
             # legacy / non-terminal takeoff: ONE successor per flight level at the origin hex. The hub
             # gate's capacity+column are level-agnostic (computed once in dwell_ok_levels), the exit lane
             # per level; an ordinary pad uses svc.pad_clear (which scans all levels of the tube).
-            hub_ok = (tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, dest, levels)
+            hub_ok = (tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels, toward=dest)
                       if o_term is not None else None)
             for L in range(len(levels)):
                 ts = s + takeoff_steps[L]

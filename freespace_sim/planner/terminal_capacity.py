@@ -90,13 +90,24 @@ class TerminalCapacity:
         n = sum(1 for (a, b) in self.dwells.get(terminal_id, ()) if a < t1 and t0 < b)
         return n < capacity
 
-    def column_clear(self, term, center, t0: float) -> bool:
+    def _dwell_climb_s(self, z: float | None) -> float:
+        """Climb time that sets a dwell/column window length. ``z`` is the flight's climb-to level (its
+        cruise level); the committed hover column lasts ``hover + climb_time_to(z)`` (multi-altitude), so
+        the gate window MUST use the same per-level climb — not the fixed preferred-plane ``climb_time_s``
+        — or a level whose climb exceeds the preferred one (the top level) is under-checked and the pad
+        silently over-subscribes. ``z=None`` (single-plane planners / capacity-only checks) keeps the
+        preferred-plane climb, which is exactly their column length."""
+        return self.cfg.climb_time_s if z is None else self.cfg.climb_time_to(z)
+
+    def column_clear(self, term, center, t0: float, z: float | None = None) -> bool:
         """Step 1 — column activation: can the column deploy at ``t0`` with no FOREIGN transit? Build the
-        column cylinder (lifetime ``[t0, t0 + hover + climb)``) and ask the ledger — same-hub volumes are
-        exempt (``conflict.volumes_conflict``), so a conflict means a foreign volume crosses the hub.
-        Always queries; see the class docstring for why the "already-deployed" shortcut is unsound."""
+        column cylinder (lifetime ``[t0, t0 + hover + climb_time_to(z))``, the SAME window the committed
+        column uses) and ask the ledger — same-hub volumes are exempt (``conflict.volumes_conflict``), so
+        a conflict means a foreign volume crosses the hub. Always queries; see the class docstring for
+        why the "already-deployed" shortcut is unsound."""
         col = hover_reservation(center, t0, self.cfg, terminal_id=term.id,
-                                radius=terminal_radius(term, self.cfg))
+                                radius=terminal_radius(term, self.cfg),
+                                climb_time_s=self._dwell_climb_s(z))
         return not self.ledger.any_conflict([col])
 
     def exit_clear(self, term, center, toward, t0: float, z: float | None = None) -> bool:
@@ -132,7 +143,7 @@ class TerminalCapacity:
         seg = self.cfg.corridor_segment_len_m
         edge = [cx + exit_r * ux, cy + exit_r * uy, z]
         far = [cx + (exit_r + seg) * ux, cy + (exit_r + seg) * uy, z]
-        t1 = t0 + self.cfg.hover_time_s + self.cfg.climb_time_s
+        t1 = t0 + self.cfg.hover_time_s + self._dwell_climb_s(z)
         lane = corridor_segment_volume(edge, t0, far, t1, self.cfg, terminal_id=term.id)
         return not self.ledger.any_conflict([lane])
 
@@ -142,18 +153,30 @@ class TerminalCapacity:
         given — the exit/approach lane toward it (at cruise level ``z``) is clear of committed sibling
         lanes (:meth:`exit_clear`). ``toward=None`` skips the lane check (capacity/column only)."""
         term = as_terminal(term)
-        t1 = t0 + self.cfg.hover_time_s + self.cfg.climb_time_s
+        t1 = t0 + self.cfg.hover_time_s + self._dwell_climb_s(z)
         return (self.admits(term.id, t0, t1, capacity)
-                and self.column_clear(term, center, t0)
+                and self.column_clear(term, center, t0, z)
                 and (toward is None or self.exit_clear(term, center, toward, t0, z)))
 
-    def dwell_ok_levels(self, term, center, t0: float, capacity: int, toward, zs) -> list[bool]:
-        """Multi-altitude fast path: capacity + column activation are level-AGNOSTIC (the column spans
-        the whole [ground, ceiling] tube), so compute them ONCE; only the exit lane varies per cruise
-        level. Returns a bool per ``z`` in ``zs``. (Used by the legacy fold/exit_clear takeoff path; the
-        fixed-lane path deconflicts siblings by cell occupancy instead and doesn't need it.)"""
+    def dwell_ok_levels(self, term, center, t0: float, capacity: int, zs, toward=None) -> list[bool]:
+        """Per-level takeoff/landing feasibility — a bool per cruise level ``z`` in ``zs`` — for BOTH
+        takeoff paths (fixed-lane passes ``toward=None`` and deconflicts siblings by cell occupancy;
+        the legacy path passes ``toward`` for the per-level exit-lane check).
+
+        The dwell window is per-level (the committed column lasts ``hover + climb_time_to(z)``), so:
+          * ``admits`` (capacity) is genuinely per-level — a higher level's column dwells longer;
+          * ``column_clear`` (foreign transit) is level-MONOTONE — the cylinder's radius and [ground,
+            ceiling] extent are level-independent, so a larger ``z`` only lengthens the time window ⇒ a
+            strict superset. Probe the ledger ONCE at the longest window; if it clears, every shorter
+            level clears too, and only the cheap ``admits`` varies. Re-probe per level only in the rare
+            case the top window has a foreign transit (a shorter window may still clear).
+
+        Net: 1 ledger query + N cheap ``admits`` in the common case, instead of one FCL query per level
+        (the A* ground-state hot path)."""
         term = as_terminal(term)
-        t1 = t0 + self.cfg.hover_time_s + self.cfg.climb_time_s
-        if not (self.admits(term.id, t0, t1, capacity) and self.column_clear(term, center, t0)):
-            return [False] * len(zs)
-        return [self.exit_clear(term, center, toward, t0, z) for z in zs]
+        hover = self.cfg.hover_time_s
+        col_top_ok = self.column_clear(term, center, t0, max(zs))
+        return [self.admits(term.id, t0, t0 + hover + self._dwell_climb_s(z), capacity)
+                and (col_top_ok or self.column_clear(term, center, t0, z))
+                and (toward is None or self.exit_clear(term, center, toward, t0, z))
+                for z in zs]

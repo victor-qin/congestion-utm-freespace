@@ -31,7 +31,8 @@ _SQRT3 = 1.7320508075688772
 
 OK = 0
 NO_PATH = 1
-FALLBACK = 2          # out-of-box stray or label/heap capacity → host falls back to the reference
+FB_OOB = 2            # fallback: a reroute strayed outside the kernel box (rare edge-skirting geometry)
+FB_CAP = 3            # fallback: label/heap capacity overflow (search too big — a hard/near-infeasible flight)
 
 
 @njit(cache=True, nogil=True)   # nogil: release the GIL so a batch of plans runs on real threads (#8 Track A)
@@ -79,7 +80,7 @@ def _search(
             if slot < 0:                                # lane cell blocked at ts (own-exempt view) → no takeoff
                 continue
             if nlab >= max_lab or size >= max_heap:
-                return -1, 0.0, n_exp, FALLBACK
+                return -1, 0.0, n_exp, FB_CAP
             L = nlab; nlab += 1
             g = g0 + lane_lat[li]
             lab_cell[L] = cell; lab_slot[L] = slot; lab_arr[L] = ts
@@ -163,7 +164,7 @@ def _search(
                 nq = q - 1; nr = r + 1
             niq = nq - qmin; nir = nr - rmin
             if niq < 0 or niq >= qspan or nir < 0 or nir >= rspan:
-                return -1, 0.0, n_exp, FALLBACK         # out-of-box stray → host reference
+                return -1, 0.0, n_exp, FB_OOB           # out-of-box stray → host fallback
             ncell = niq * rspan + nir
             ngoal = goal_gen[ncell] == gen
             sj = ov_head[ncell] if ov_gen[ncell] == gen else ncell   # neighbour interval chain (overlay/pool)
@@ -200,7 +201,7 @@ def _search(
                             make = False                     # dominated by the predecessor (min staircase v)
                     if make:
                         if nlab >= max_lab or size >= max_heap:
-                            return -1, 0.0, n_exp, FALLBACK
+                            return -1, 0.0, n_exp, FB_CAP
                         L2 = nlab; nlab += 1
                         lab_cell[L2] = ncell; lab_slot[L2] = sj; lab_arr[L2] = a
                         lab_g[L2] = ng; lab_par[L2] = L
@@ -257,7 +258,7 @@ def _search(
 
         if is_goal and arr + 1 <= hi_c:                 # goal-cell hover: retry the per-step landing gate
             if nlab >= max_lab or size >= max_heap:
-                return -1, 0.0, n_exp, FALLBACK
+                return -1, 0.0, n_exp, FB_CAP
             L2 = nlab; nlab += 1
             lab_cell[L2] = cell; lab_slot[L2] = slot; lab_arr[L2] = arr + 1
             lab_g[L2] = g + ch_dt; lab_par[L2] = L; lab_next[L2] = -1; lab_prev[L2] = -1

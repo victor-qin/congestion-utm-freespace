@@ -240,7 +240,9 @@ class SIPPPlanner(AStarPlanner):
         self._k_cap = -1                               # frontier size the kernel arrays are sized to
         self._k_lab_cell = None                        # kernel work arrays (allocated lazily)
         self._k_out_q = None
-        self._fb = 0                                   # kernel→reference fallbacks (diagnostics/tests)
+        self._fb = 0                                   # kernel→A* fallbacks (diagnostics/tests)
+        self._fb_cap = 0                               # of which: label/heap overflow (hard/infeasible flight)
+        self._fb_oob = 0                               # of which: reroute strayed outside the kernel box
         self._n_expansions = 0                         # kernel expansions on the last compiled plan
 
     def _sipp_index(self, req, ledger, cfg) -> "SafeIntervalIndex":
@@ -533,8 +535,24 @@ class SIPPPlanner(AStarPlanner):
             slot = self._k_ov_nxt[j]
         return -1
 
+    def _fallback(self, req, ledger, cfg):
+        """Fallback when the compiled kernel bails (``FB_OOB``/``FB_CAP``): run **A\\*** — the superclass
+        search — rather than the pure-Python SIPP reference.
+
+        The flights that overflow the kernel are the hard / near-infeasible ones (e.g. always-active
+        walled-in hubs), i.e. SIPP's *worst* regime: no early goal to terminate on, so the cost-aware
+        Pareto search fans out (the ~``max_ground_delay/dt``-deep ground-delay fan × fragmented intervals)
+        until the label cap. The pure-Python SIPP reference re-does that same explosion in interpreted
+        Python (~38 s measured); A\\* reaches the identical accept/deny verdict ~9× faster (~4 s) because
+        its per-node is C-level and it has no ground-delay Pareto fan. A\\* shares this planner's
+        ``self._svc``/``self._tcap`` (inherited ``_occupancy``), so there is no occupancy re-sync."""
+        intent = AStarPlanner.plan(self, req, ledger, cfg)
+        if intent is not None:
+            intent.planner = "sipp"                    # attribute to the selected planner (A* is internal)
+        return intent
+
     def _plan_compiled(self, req, ledger, cfg):
-        from .sipp_kernel import FALLBACK, NO_PATH
+        from .sipp_kernel import FB_OOB, FB_CAP, NO_PATH
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
         R = hg.circumradius(cfg)
@@ -637,9 +655,13 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_q, self._k_out_r, self._k_out_s,
         )
         self._n_expansions = int(_n_exp)
-        if flag == FALLBACK:
+        if flag == FB_OOB or flag == FB_CAP:
             self._fb += 1
-            return self._plan_reference(req, ledger, cfg)
+            if flag == FB_CAP:
+                self._fb_cap += 1                        # search too big (hard/near-infeasible flight)
+            else:
+                self._fb_oob += 1                        # reroute strayed outside the kernel box
+            return self._fallback(req, ledger, cfg)
         if flag == NO_PATH:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 

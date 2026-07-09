@@ -841,8 +841,14 @@ class AStarPlanner:
         air = [(int(ks["out_q"][i]), int(ks["out_r"][i]), int(ks["out_L"][i]), int(ks["out_s"][i]))
                for i in range(n_out) if ks["out_L"][i] >= 0]
         air.reverse()
-        if not air:                                      # defensive: an accepted path always ends at an
-            self._ref_dispatch["empty-air"] += 1         # air goal, but never index air[0] on an empty list
+        if not air:                                      # an accepted kernel path ALWAYS ends at an air goal,
+            self._fb += 1                                # so an empty air list is a kernel ANOMALY, not a
+            self._fb_reasons["empty-air"] += 1           # routine dispatch — surface it as a fallback + warn
+            warnings.warn(
+                f"astar compiled kernel returned a goal with no air states for flight "
+                f"{getattr(req, 'id', '?')}; running reference (kernel anomaly)",
+                RuntimeWarning, stacklevel=2,
+            )
             return self._plan_reference(req, ledger, cfg)
         ground_steps = air[0][3] - takeoff_steps[air[0][2]] - base
         cruise_wps: list[TimedPoint] = [

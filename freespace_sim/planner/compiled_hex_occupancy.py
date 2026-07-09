@@ -32,6 +32,7 @@ hover tail) are dropped by ``_Pool.block``, which is harmless: every kernel quer
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 
@@ -148,9 +149,12 @@ class CompiledHexOccupancy:
         self.MAXS = maxs
         self.corr = _Pool(self.NC, self.MAXS)
         self.col = _Pool(self.NC, self.MAXS)
-        # cell → {terminal ids whose column ever covers it}. Lets the host detect an own∩foreign shared
-        # cell (issue #3) and fall back to the reference, instead of the overlay boolean silently treating a
-        # foreign column as transparent. Column cells only (a small footprint), so the memory is tiny.
+        # cell → {terminal ids whose column EVER covers it, across all steps}. Lets the host detect an
+        # own∩foreign shared cell (issue #3) and fall back to the reference, instead of the overlay boolean
+        # silently treating a foreign column as transparent. Deliberately TIME-COLLAPSED and NOT pruned by
+        # evict_before: it's a conservative SUPERSET of live columns, so the overlap check may fall back for
+        # a temporally-past foreign column — safe (the reference is exact), and bounded by the hub layout
+        # (distinct column cells × owning hubs, not per-flight), so it does not grow unboundedly.
         self.col_owners: dict[int, set] = {}
         # committed corridor cells that fell outside the box: skipped (never a crash); any query to such a
         # cell gets cell_id < 0 and the kernel falls back via FB_OOB. Non-zero ⇒ consider widening `margin`.
@@ -215,7 +219,12 @@ class CompiledHexOccupancy:
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue
                 if c < 0:                               # outside the box → skip (never crash on commit);
-                    self.oob_corridor_cells += 1        # a query to this cell gets cell_id<0 → kernel FB_OOB
+                    if self.oob_corridor_cells == 0:    # a query to this cell gets cell_id<0 → kernel FB_OOB.
+                        warnings.warn(                  # warn once: a nonzero count means `margin` is too
+                            "CompiledHexOccupancy: a committed corridor cell fell outside the kernel box — "
+                            "skipped (its flights fall back via FB_OOB). Consider widening `margin`.",
+                            RuntimeWarning, stacklevel=2)
+                    self.oob_corridor_cells += 1
                     continue
                 self.corr.block(c, int(s))
 

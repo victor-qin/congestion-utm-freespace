@@ -21,7 +21,7 @@ from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.compiled_hex_occupancy import CompiledHexOccupancy
 from freespace_sim.planner.occupancy import HexOccupancyService
-from freespace_sim.types import FlightRequest, IntentStatus, vec
+from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
@@ -159,6 +159,30 @@ def test_compiled_occupancy_matches_is_blocked():
             assert ref == got, f"occ mismatch at (q={q},r={r},L={L},s={s}): is_blocked={ref} pool={got}"
             checked += 1; blocked += ref
     assert checked > 1000 and blocked > 0
+
+
+def test_compiled_own_foreign_shared_cell_falls_back_exact():
+    """Issue #3: when the flight's OWN hub column shares a rasterized cell with a FOREIGN hub's committed
+    column, the single-boolean overlay cannot represent it — the host detects it via `col_owners` and falls
+    back to the reference (without which the kernel would treat the foreign column as transparent and route
+    through it, then file a spurious CONFLICT_FILED). Two hubs 150 m apart share footprint cells; commit a
+    foreign-hub landing, then plan an own-hub landing → the own∩foreign fallback MUST fire, and the result
+    MUST equal the reference oracle."""
+    cfg = SimConfig()
+    hub_a, hub_b = Terminal("uss_a#0", 8, 90.0), Terminal("uss_b#0", 8, 90.0)
+    Pa, Pb = vec(2000, 2000, 0), vec(2150, 2000, 0)          # 150 m apart → footprints share cells
+    foreign = FlightRequest(1, vec(2000, 4000, 0), Pb, 0.0, uss_id="uss_b", dest_terminal=hub_b)
+    own = FlightRequest(2, vec(2000, 500, 0), Pa, 20.0, uss_id="uss_a", dest_terminal=hub_a)
+    ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    lr, lc = ReservationLedger(cfg), ReservationLedger(cfg)
+    fa = ref.plan(foreign, lr, cfg)                          # commit the SAME foreign column to both ledgers
+    assert fa.accepted
+    lr.commit(1, fa.volumes); lc.commit(1, fa.volumes)
+    a, b = ref.plan(own, lr, cfg), com.plan(own, lc, cfg)
+    assert com._fb_reasons.get("own-foreign-overlap", 0) > 0, "issue-3 own∩foreign fallback did not fire"
+    assert a.status is b.status and a.denial_reason is b.denial_reason
+    if a.accepted:
+        assert abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
 
 
 def test_compiled_mask_widen_re_run_exact():

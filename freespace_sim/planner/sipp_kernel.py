@@ -18,8 +18,9 @@ dedup and no stale-skip (pure speedups — omitting them costs extra expansions,
 
 Dominance (matches ``sipp._nondominated``): stored ``(t2,g2)`` dominates new ``(t,g)`` iff
 ``t2 <= t and g2 + (t - t2)*c_hold <= g``. Goal cells are frontier-EXEMPT (their per-step landing gate
-is not interval-captured). Ground delay (the cheap ``c_gd`` lever) is folded into the *start labels* by
-the host, so every in-air wait here is air-hover at ``c_hold``.
+is not interval-captured). Ground delay (the cheap ``c_gd`` lever) is enumerated into the *start labels*
+by the kernel's own takeoff loop (from a host-precomputed dwell_ok/pad_clear feasibility mask), so every
+in-air wait here is air-hover at ``c_hold``.
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ def _search(
     iv_lo, iv_hi, iv_nxt,                                            # global interval pool (slot < cap)
     ov_lo, ov_hi, ov_nxt, ov_head, ov_gen, cap,                      # per-flight overlay (slot >= cap)
     qmin, rmin, rspan, qspan, base, max_step,                        # box + step window
-    start_cell, start_slot, start_arr, start_g, n_start,              # takeoff start labels
+    lane_cell, lane_lat, n_lanes, to_ok, n_to, c_gd, climb_steps,     # takeoff lanes + ground-delay enumeration
     goal_gen, lf_lo, lf_hi, lf_n,                                     # goal cells (version-stamped) + landing ivals
     c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,         # cost + heuristic params
     gen, front_head, front_tail, front_gen,                          # per-slot sorted-by-arr staircase
@@ -52,29 +53,53 @@ def _search(
     n_exp = 0
     ch_dt = c_hold * dt                                 # per-step air-hover cost (staircase key slope)
 
-    for i in range(n_start):                            # seed takeoff start labels into the heap
-        if nlab >= max_lab or size >= max_heap:
-            return -1, 0.0, n_exp, FALLBACK
-        L = nlab; nlab += 1
-        cell = start_cell[i]
-        lab_cell[L] = cell; lab_slot[L] = start_slot[i]; lab_arr[L] = start_arr[i]
-        lab_g[L] = start_g[i]; lab_par[L] = -1; lab_next[L] = -1
-        iq = cell // rspan
-        q = iq + qmin; r = cell - iq * rspan + rmin
-        dxx = R * _SQRT3 * (q + r / 2.0) - gx
-        dyy = R * 1.5 * r - gy
-        f = start_g[i] + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost
-        heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L; ctr += 1
-        ii = size; size += 1
-        while ii > 0:
-            par = (ii - 1) // 2
-            if heap_f[ii] < heap_f[par] or (heap_f[ii] == heap_f[par] and heap_c[ii] < heap_c[par]):
-                tf = heap_f[ii]; heap_f[ii] = heap_f[par]; heap_f[par] = tf
-                tc = heap_c[ii]; heap_c[ii] = heap_c[par]; heap_c[par] = tc
-                tn = heap_n[ii]; heap_n[ii] = heap_n[par]; heap_n[par] = tn
-                ii = par
-            else:
-                break
+    # ---- folded takeoff enumeration: the host's `for s: for lane:` loop, in njit. Ground delay is the
+    # cheap c_gd lever, so a start label at ground-step s = base+si, lane li is (lane cell, arrival
+    # ts=s+climb, g = si*c_gd*dt + climb_cost + lane_lat). Order (s-major, lane-minor, ts>max_step break,
+    # to_ok gate) matches the old host enumeration EXACTLY, so labels + ctr + f are byte-identical. ----
+    for si in range(n_to):
+        ts = base + si + climb_steps
+        if ts > max_step:
+            break
+        if not to_ok[si]:                               # dwell_ok (terminal) / pad_clear (non-terminal) gate
+            continue
+        g0 = si * c_gd * dt + climb_cost                # ground-delay cost + climb (lane lateral added below)
+        for li in range(n_lanes):                       # exit lanes (terminal) or the origin cell (climb-in-place)
+            cell = lane_cell[li]
+            sj = ov_head[cell] if ov_gen[cell] == gen else cell   # own-lane overlay, else the global pool
+            slot = -1
+            while sj != -1:                             # the interval (slot) whose free run contains ts
+                if sj >= cap:
+                    jj = sj - cap; lo = ov_lo[jj]; hi = ov_hi[jj]; nxt = ov_nxt[jj]
+                else:
+                    lo = iv_lo[sj]; hi = iv_hi[sj]; nxt = iv_nxt[sj]
+                if lo <= ts <= hi:
+                    slot = sj; break
+                sj = nxt
+            if slot < 0:                                # lane cell blocked at ts (own-exempt view) → no takeoff
+                continue
+            if nlab >= max_lab or size >= max_heap:
+                return -1, 0.0, n_exp, FALLBACK
+            L = nlab; nlab += 1
+            g = g0 + lane_lat[li]
+            lab_cell[L] = cell; lab_slot[L] = slot; lab_arr[L] = ts
+            lab_g[L] = g; lab_par[L] = -1; lab_next[L] = -1
+            iq = cell // rspan
+            q = iq + qmin; r = cell - iq * rspan + rmin
+            dxx = R * _SQRT3 * (q + r / 2.0) - gx
+            dyy = R * 1.5 * r - gy
+            f = g + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + climb_cost
+            heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L; ctr += 1
+            ii = size; size += 1
+            while ii > 0:
+                par = (ii - 1) // 2
+                if heap_f[ii] < heap_f[par] or (heap_f[ii] == heap_f[par] and heap_c[ii] < heap_c[par]):
+                    tf = heap_f[ii]; heap_f[ii] = heap_f[par]; heap_f[par] = tf
+                    tc = heap_c[ii]; heap_c[ii] = heap_c[par]; heap_c[par] = tc
+                    tn = heap_n[ii]; heap_n[ii] = heap_n[par]; heap_n[par] = tn
+                    ii = par
+                else:
+                    break
 
     while size > 0:
         L = heap_n[0]

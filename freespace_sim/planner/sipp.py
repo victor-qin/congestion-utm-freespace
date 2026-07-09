@@ -580,34 +580,22 @@ class SIPPPlanner(AStarPlanner):
             if not self._build_overlay(cocc, sidx, lanes, own, base, max_step, fixed):
                 return self._plan_reference(req, ledger, cfg)      # overlay overflow → reference
 
-        # ---- start labels: ground-delayed takeoffs (lane exits if fixed+terminal, else climb-in-place) ----
+        # ---- takeoff lanes + ground-delay feasibility mask; the KERNEL folds the `for s: for lane:`
+        # enumeration (dwell_ok/pad_clear precomputed here per step, the lane free-interval lookup in njit).
+        # Terminal: the exit lanes (own-transparent via the overlay). Non-terminal: the origin cell itself
+        # (climb-in-place; the kernel's pool lookup reproduces `is_blocked`, so only pad_clear stays here). ----
         smax = base + int(math.ceil(cfg.max_ground_delay_s / dt))
-        s_cell, s_slot, s_arr, s_g = [], [], [], []
-        for s in range(base, smax + 1):
-            ts = s + climb_steps
-            if ts > max_step:
-                break
-            if fixed and o_term is not None:                  # exit-lane takeoffs (column gated by dwell_ok)
-                if not tcap.dwell_ok(o_term, origin, s * dt, o_cap):
-                    continue
-                for L in o_lanes:
-                    lcell = cocc.cell_id(L.cell[0], L.cell[1])
-                    if lcell < 0:
-                        continue
-                    slot = self._overlay_slot(cocc, lcell, ts)    # own-transparent interval at ts (>= cap)
-                    if slot < 0:
-                        continue                                  # lane blocked at ts (own-exempt view)
-                    s_cell.append(lcell); s_slot.append(slot); s_arr.append(ts)
-                    s_g.append((s - base) * c_gd * dt + climb_cost + c_lat * (L.dist - o_r))
-            else:                                             # climb in place (non-terminal pad)
-                if svc.is_blocked(oq, orr, ts, own) or not svc.pad_clear(oq, orr, s, dwell_steps):
-                    continue
-                slot = _iv_index_global(cocc, ocell, ts)
-                if slot < 0:
-                    continue
-                s_cell.append(ocell); s_slot.append(slot); s_arr.append(ts)
-                s_g.append((s - base) * c_gd * dt + climb_cost)
-        if not s_cell:
+        if fixed and o_term is not None:
+            lane_cells, lane_lat = [], []
+            for L in o_lanes:
+                lc = cocc.cell_id(L.cell[0], L.cell[1])
+                if lc >= 0:
+                    lane_cells.append(lc); lane_lat.append(c_lat * (L.dist - o_r))
+            to_ok = [tcap.dwell_ok(o_term, origin, s * dt, o_cap) for s in range(base, smax + 1)]
+        else:
+            lane_cells, lane_lat = [ocell], [0.0]
+            to_ok = [svc.pad_clear(oq, orr, s, dwell_steps) for s in range(base, smax + 1)]
+        if not lane_cells or not any(to_ok):
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
         # ---- goal cell(s) + landing-feasible step intervals (folds the per-step landing gate) ----
@@ -638,8 +626,8 @@ class SIPPPlanner(AStarPlanner):
             cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt,
             self._k_ov_lo, self._k_ov_hi, self._k_ov_nxt, self._k_ov_head, self._k_ov_gen, cocc.cap,
             cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan, base, max_step,
-            np.asarray(s_cell, np.int64), np.asarray(s_slot, np.int64), np.asarray(s_arr, np.int64),
-            np.asarray(s_g, np.float64), len(s_cell),
+            np.asarray(lane_cells, np.int64), np.asarray(lane_lat, np.float64), len(lane_cells),
+            np.asarray(to_ok, np.bool_), len(to_ok), c_gd, climb_steps,
             self._k_goal_gen, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64), len(lf_lo),
             c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,
             self._gen, self._k_front_head, self._k_front_tail, self._k_front_gen,

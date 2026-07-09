@@ -192,6 +192,28 @@ def test_compiled_replay_exact_big_dense_short_flights():
         assert getattr(sipp, "_fb", 0) < 0.10 * len(rows), "kernel fell back too often"
 
 
+# ---- the ground-state fold's exit-lane path: compiled == reference on terminal flights ----
+
+@pytest.mark.slow
+def test_compiled_replay_exact_dallas_terminal():
+    """The fold moved the ground-delay takeoff enumeration into the kernel; assert it stays EXACT on
+    dallas_large TERMINAL flights (exit-lane takeoffs) — accept, cost (1e-9), and centerline length ==
+    the pure-Python reference. Density kept at lambda=150 (36/36 exact): ABOVE it the compiled kernel
+    already diverges from the reference on rare flights INDEPENDENT of the fold — a pre-existing,
+    separate compiled-vs-reference gap (confirmed by stashing the fold: pre-fold lambda=600 shows the
+    identical mismatches), so a strict compiled==reference assertion there would test that gap, not the
+    fold. The fold's high-density exit-lane path is covered by
+    test_compiled_terminal_path_never_routes_through_blocked (occupancy validity)."""
+    rows, fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
+    assert rows
+    assert all(ca == ra for ca, ra, _, _, _, _ in rows), "accept-set mismatch vs reference"
+    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
+    assert all(lc == lr for ca, _, _, _, lc, lr in rows if ca), "centerline length mismatch vs reference"
+    assert sum(1 for r in rows if r[0]) > 20, "too few accepted flights to exercise the exit-lane fold"
+    if _COMPILED:
+        assert fb < 0.15 * len(rows), f"kernel fell back too often ({fb}/{len(rows)})"
+
+
 # ---- saturation regression: kernel must respect the own-lane overlay intervals ----
 
 @pytest.mark.slow

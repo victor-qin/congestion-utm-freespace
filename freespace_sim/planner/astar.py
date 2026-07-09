@@ -757,21 +757,6 @@ class AStarPlanner:
         # the search reaches a ground/goal step beyond it the kernel returns FB_MASK, and we rebuild over
         # the FULL range and re-run. Exact — the widened run IS the full-mask search — and no reference
         # fallback, just the rare re-run. Most flights finish in one tight pass. ----
-        # ---- own-column overlay: window-independent, so build it ONCE above the widen loop (was rebuilt
-        # per re-run). If any own cell is also under a FOREIGN hub's column, the single-boolean overlay
-        # can't represent it exactly → fall back to the reference (issue #3). ----
-        self._gen += 1                                   # bump: stale-stamps the reused ov_own_gen array
-        gen = self._gen
-        if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
-            self._fb += 1
-            self._fb_reasons["own-foreign-overlap"] += 1
-            warnings.warn(
-                f"astar own∩foreign column cell for flight {getattr(req, 'id', '?')} "
-                f"O={tuple(req.origin)}→D={tuple(req.dest)}; running reference (boolean overlay).",
-                RuntimeWarning, stacklevel=2,
-            )
-            return self._plan_reference(req, ledger, cfg)
-
         n_gsteps = min(full_ng, 3 * n_hops + 2 * climb_span + 134)
         while True:
             to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
@@ -795,6 +780,23 @@ class AStarPlanner:
                     for Lv in range(n_levels):
                         land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
 
+            # `gen` version-stamps BOTH the own-column overlay AND the kernel's open-addressing hash (its
+            # O(1) reset — `g_gen[i] != gen` marks a slot empty). The FB_MASK widen re-run therefore needs a
+            # FRESH gen; DO NOT hoist this above the loop, or the re-run reuses the tight pass's closed nodes
+            # and returns a spurious NO_PATH. The overlay is window-independent (re-stamped cheaply on the
+            # rare widen); the overlap→reference check (issue #3) is identical each pass, so it aborts the
+            # whole plan on the first iteration.
+            self._gen += 1
+            gen = self._gen
+            if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
+                self._fb += 1
+                self._fb_reasons["own-foreign-overlap"] += 1
+                warnings.warn(
+                    f"astar own∩foreign column cell for flight {getattr(req, 'id', '?')} "
+                    f"O={tuple(req.origin)}→D={tuple(req.dest)}; running reference (boolean overlay).",
+                    RuntimeWarning, stacklevel=2,
+                )
+                return self._plan_reference(req, ledger, cfg)
             n_out, cost, n_exp, status, aux = self._kernel(
                 cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
                 ks["ov_own_gen"],

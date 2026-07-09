@@ -161,6 +161,22 @@ def test_compiled_occupancy_matches_is_blocked():
     assert checked > 1000 and blocked > 0
 
 
+def test_compiled_mask_widen_re_run_exact():
+    """A long time-block forces a ground delay PAST the tight mask window, so the kernel returns FB_MASK
+    once and re-runs over the full range (com._remask > 0). Regression guard: the per-plan `gen` bump also
+    version-resets the kernel's hash, so it must run inside the widen loop — hoisting it made the re-run
+    reuse the tight pass's closed nodes and return a spurious BUDGET_EXCEEDED while the reference ACCEPTED.
+    Assert compiled == reference exactly THROUGH the widen, and that the widen path was actually taken."""
+    wall = Volume4D(box_from_segment(vec(200, -400, 150), vec(200, 400, 150), 200, 400), 0.0, 1000.0)
+    req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)
+    _, b = _assert_exact(req, [(99, [wall])])          # full exact check incl. last_expansions node-parity
+    assert b.accepted
+    com = AStarPlanner(compiled=True)
+    lc = ReservationLedger(CFG); lc.commit(99, [wall])
+    com.plan(req, lc, CFG)
+    assert com._remask > 0, "mask-widen re-run not exercised — the regression guard would be vacuous"
+
+
 def test_out_of_box_committed_corridor_skipped_not_crash():
     """Issue #2: a committed corridor cell that maps outside the kernel box is SKIPPED (counted in
     ``oob_corridor_cells``), never a crash. Any later query to that cell gets ``cell_id < 0`` so the kernel

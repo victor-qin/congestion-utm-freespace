@@ -91,17 +91,21 @@ def main() -> None:
         A = by_fid.get(last.get("p"))
         rp = ref.plan(req, led, cfg)               # reference on the SAME pre-commit ledger
         rr = rp.denial_reason.value if rp.status is IntentStatus.REJECTED else "ACCEPTED"
-        gap = math.hypot(*(np.asarray(req.origin[:2]) - np.asarray(A.dest[:2]))) if A else float("nan")
         print(f"\nreached in {time.monotonic() - t0:.0f}s with {led.n_volumes} committed volumes\n"
               f"  B  fid{B_FID}  uss={req.uss_id!r}  O={tuple(round(x) for x in req.origin)} "
               f"→ D={tuple(round(x) for x in req.dest)}\n"
-              f"  A  fid{A_FID}  uss={A.uss_id!r}  lands at foreign hub {A.dest_terminal.id!r} "
-              f"({gap:.0f} m from B's origin)\n"
               f"  compiled kernel : {cr}\n"
               f"  python reference: {rr}", flush=True)
-        ok = cr == rr == "conflict_filed" and A is not None and A.uss_id != req.uss_id
+        if A is not None:
+            gap = math.hypot(*(np.asarray(req.origin[:2]) - np.asarray(A.dest[:2])))
+            hub = A.dest_terminal.id if A.dest_terminal else None
+            print(f"  conflict partner: fid{A.flight_id} uss={A.uss_id!r}  lands at foreign hub {hub!r} "
+                  f"({gap:.0f} m from B's origin)", flush=True)
+        # verdict requires the partner to be the INTENDED flight A_FID (not just any cross-labeled flight)
+        ok = (cr == rr == "conflict_filed" and A is not None
+              and A.flight_id == A_FID and A.uss_id != req.uss_id)
         verdict = ("CROSS-USS raster-slack CONFLICT_FILED — compiled == reference (genuine #22 slack)"
-                   if ok else "did not reproduce")
+                   if ok else f"did not reproduce (compiled={cr}, partner=fid{A.flight_id if A else None})")
         print(f"\n  VERDICT: {verdict}", flush=True)
         return
     print("B flight not found — demand indices changed?", flush=True)

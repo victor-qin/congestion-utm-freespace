@@ -66,11 +66,14 @@ _MAX_HUB_ATTEMPTS = 20000
 def _scatter_hubs(cfg, rng, n_hubs_per_uss, radius_of, gap_m):
     """Uniform-scatter hub centres, reject-sampled so **no two terminal airspaces overlap**.
 
-    Every accepted centre keeps a distance of at least ``r_i + r_j + gap_m`` to every other hub, where
-    ``r`` is the hub's terminal (column) radius and ``gap_m`` is the clearance left between airspace
-    *edges* — enough for an approach corridor to fit between neighbours. Without this, an unconstrained
-    ``rng.uniform`` scatter occasionally drops two same-operator hubs within a radius of each other, and
-    under ``terminal_airspace_always_active`` one hub's permanent wall then engulfs the other's landing
+    Every accepted centre keeps a distance of at least ``r_i + r_j + gap_m`` to every other hub —
+    **across all operators**, since each candidate is checked against the one shared set of
+    already-placed centres, not a per-USS one — where ``r`` is the hub's terminal (column) radius and
+    ``gap_m`` is the clearance left between airspace *edges* (enough for an approach corridor to fit
+    between neighbours). Without this, an unconstrained ``rng.uniform`` scatter occasionally drops two
+    hubs within a radius of each other (the observed engulfment happened to be same-operator —
+    ``stripmall_uss#11``/``#17`` — but the check spans operators), and under
+    ``terminal_airspace_always_active`` one hub's permanent wall then engulfs the other's landing
     approach, making its flights near-infeasible (the walls are transient without the flag, so the
     overlap is a latent modelling wart there rather than a hard failure).
 

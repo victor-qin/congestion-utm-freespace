@@ -250,7 +250,8 @@ def test_vertical_edge_step_count_matches_climb_kinematics():
     led = ReservationLedger(CFG)
     led.commit(98, [_level_wall(CFG.level_z(1), x=900.0)])           # level 1 blocked early → fly low
     led.commit(97, [_level_wall(CFG.level_z(0), x=1500.0)])          # level 0 blocked late → must climb
-    intent = AStarPlanner().plan(_req(), led, CFG)
+    intent = AStarPlanner(vertical_edges=True).plan(_req(), led, CFG)   # feature test: force rungs on
+    #                                                                     (SimConfig default is now off)
     assert intent.status is IntentStatus.ACCEPTED
     assert not led.any_conflict(intent.volumes)
     cl = intent.centerline
@@ -296,7 +297,7 @@ def test_vertical_edge_checks_only_traversed_levels_not_all():
     """A 0→1 layer-change edge must require clearance only on the levels it traverses ({0, 1}): an
     obstacle on the UNtraversed level 2 over the same column must NOT block it, while one on the
     destination level 1 must. (Before the fix the edge required ALL levels clear.)"""
-    planner = AStarPlanner()
+    planner = AStarPlanner(vertical_edges=True)          # feature test: force rungs on (default now off)
     q, r, s = 0, 0, 5
     vsteps = max(1, math.ceil((CFG.level_z(1) - CFG.level_z(0)) / (CFG.climb_rate_mps * CFG.dt_s)))
     climb_edge = ("a", q, r, 1, s + vsteps)                          # the 0→1 rung successor

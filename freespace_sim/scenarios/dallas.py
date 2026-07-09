@@ -15,11 +15,16 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     # capacity under load. λ counts deliveries (returns ~2×).
     "dallas_hub_2uss_large": ScenarioSpec(
         "dallas_hub_2uss_large", region_m=(10000.0, 10000.0), lam_per_hour=8000.0, horizon_s=1800.0,
+        flight_levels_m=(30.0, 70.0, 110.0),
+        terminal_airspace_always_active=True,
         demand=DemandSpec(
             pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(6, 20),
             # fewer Walmarts ⇒ each reaches farther; many strip malls ⇒ tighter local delivery
-            radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0}, pads_per_hub=4,
+            radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0},
+            terminal_radius_m={"walmart_uss": 180.0, "stripmall_uss": 105.0},
+            pads_per_hub={"walmart_uss": 40, "stripmall_uss": 16},
             return_flights=True,
+
         ),
     ),
     # the full metro world (issue #9): 60×45 km, 20 Walmarts + 240 strip malls, λ=34.5k deliveries
@@ -35,7 +40,8 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         # Single cruise plane at 70 m for now (issue #2 multi-altitude landed on main; widening
         # flight_levels_m to route this scenario across levels is the next step). At 70 m the pad dwell
         # is ~42 s (hover 30 + climb 70/6≈12), so the 40/16 pads below stay comfortably over-provisioned.
-        flight_levels_m=(70.0,), cruise_level_m=70.0, z_min_m=70.0, z_max_m=70.0,
+        flight_levels_m=(30.0, 70.0, 110.0),
+        terminal_airspace_always_active=True,
         demand=DemandSpec(
             pattern="hub_radius", uss=("walmart_uss", "stripmall_uss"), hubs=(20, 240),
             radius_m={"walmart_uss": 8000.0, "stripmall_uss": 4000.0},

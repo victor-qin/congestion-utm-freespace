@@ -1,0 +1,238 @@
+"""Compiled (numba) A* kernel ↔ pure-Python reference EXACT-equivalence tests (issue #8, Track B).
+
+The pure-Python ``AStarPlanner(compiled=False)`` is the oracle (the current production planner). The
+compiled kernel is validated by asserting ``compiled == reference`` **exactly** — identical accept/deny,
+cost within 1e-9, byte-identical centerline (positions + flight level + times), AND identical
+``last_expansions`` (the kernel explores the same search in the same order). Plus occupancy parity, the
+terminal replay, and the transparent-fallback safety valve.
+"""
+from __future__ import annotations
+
+import itertools
+import warnings
+
+import numpy as np
+import pytest
+
+from freespace_sim.config import SimConfig
+from freespace_sim.geometry import CylinderSpec, box_from_segment
+from freespace_sim.ledger import ReservationLedger
+from freespace_sim.planner import get_planner
+from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.compiled_hex_occupancy import CompiledHexOccupancy
+from freespace_sim.planner.occupancy import HexOccupancyService
+from freespace_sim.types import FlightRequest, IntentStatus, vec
+from freespace_sim.volumes import Volume4D
+
+CFG = SimConfig()
+
+
+def _req(fid=1, dx=2000.0):
+    return FlightRequest(fid, vec(0, 0, 0), vec(dx, 0, 0), 0.0)
+
+
+def _wall():
+    return Volume4D(box_from_segment(vec(1000, -200, 150), vec(1000, 200, 150), 40, 400), 0.0, 1e6)
+
+
+def _level_wall(z, x=1000.0, half_y=400.0):
+    return Volume4D(
+        box_from_segment(vec(x, -half_y, z), vec(x, half_y, z), 40, CFG.corridor_height_m), 0.0, 1e6)
+
+
+def _clkey(intent):
+    return [(round(float(p[0]), 6), round(float(p[1]), 6), round(float(p[2]), 3), round(float(t), 6))
+            for p, t in (intent.centerline or [])]
+
+
+def _assert_exact(req, commits, cfg=CFG):
+    """Plan ``req`` with reference and compiled against the SAME committed ledger; assert exact equality."""
+    ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    lr, lc = ReservationLedger(cfg), ReservationLedger(cfg)
+    for fid, vols in commits:
+        lr.commit(fid, vols); lc.commit(fid, vols)
+    a = ref.plan(req, lr, cfg)
+    b = com.plan(req, lc, cfg)
+    assert com._fb == 0, "unexpected fallback — compiled path did not actually run"
+    assert a.status is b.status, f"status {a.status} != {b.status}"
+    assert a.denial_reason is b.denial_reason
+    if a.accepted:
+        assert abs(a.cost - b.cost) < 1e-9, f"cost {a.cost} != {b.cost}"
+        assert ref.last_expansions == com.last_expansions, \
+            f"expansions {ref.last_expansions} != {com.last_expansions}"
+        assert _clkey(a) == _clkey(b), "centerline differs"
+    return a, b
+
+
+# ---------------- A/C: compiled == reference exact (non-terminal + multi-altitude) ----------------
+
+def test_compiled_empty_airspace_exact():
+    a, _ = _assert_exact(_req(), [])
+    assert a.status is IntentStatus.ACCEPTED
+
+
+def test_compiled_reroute_wall_exact():
+    _assert_exact(_req(), [(99, [_wall()])])
+
+
+def test_compiled_ground_delay_exact():
+    _assert_exact(_req(), [(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])])
+
+
+def test_compiled_climb_over_blocked_low_level_exact():
+    _assert_exact(_req(), [(99, [_level_wall(CFG.level_z(0))])])
+
+
+def test_compiled_midroute_climb_exact():
+    _assert_exact(_req(), [(98, [_level_wall(CFG.level_z(1), x=900.0)]),
+                           (97, [_level_wall(CFG.level_z(0), x=1500.0)])])
+
+
+def test_compiled_share_corridor_by_altitude_exact():
+    # commit a forward flight (reference), then plan the reverse flight compiled-vs-reference
+    fwd = FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0)
+    rev = FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0)
+    la = ReservationLedger(CFG)
+    ia = AStarPlanner(compiled=False).plan(fwd, la, CFG)
+    _assert_exact(rev, [(1, ia.volumes)])
+
+
+def test_compiled_single_level_config_exact():
+    cfg = SimConfig(cruise_level_m=150.0, flight_levels_m=(150.0,), airspace_ceiling_m=165.0,
+                    z_min_m=150.0, z_max_m=150.0)
+    _assert_exact(_req(), [], cfg=cfg)
+
+
+def test_compiled_denial_budget_exceeded_exact():
+    import dataclasses as dc
+    cfg = dc.replace(CFG, max_ground_delay_s=20.0)
+    _assert_exact(FlightRequest(1, vec(0, 0, 0), vec(400, 0, 0), 0.0),
+                  [(99, [Volume4D(CylinderSpec(400, 0, 60, 0, 150), 0.0, 1e5)])], cfg=cfg)
+
+
+def test_compiled_deterministic():
+    led = ReservationLedger(CFG)
+    led.commit(99, [_wall()])
+    com = AStarPlanner(compiled=True)
+    a = com.plan(_req(), led, CFG)
+    b = com.plan(_req(), led, CFG)
+    assert a.cost == b.cost and _clkey(a) == _clkey(b)
+
+
+# ---------------- D: occupancy parity (compiled pool == is_blocked over a committed ledger) --------
+
+@pytest.mark.slow
+def test_compiled_occupancy_matches_is_blocked():
+    from freespace_sim.demand import HubRadiusDemand
+    from freespace_sim.uss import USS
+    from freespace_sim.dss import DSS
+    from freespace_sim.mechanism import FCFSMechanism
+    cfg = SimConfig(region_size_m=(20000.0, 15000.0), lam_per_hour=3000.0, horizon_s=300.0,
+                    planner="astar", seed=0)
+    demand = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 6, "stripmall_uss": 30},
+                             radius_m={"walmart_uss": 6000.0, "stripmall_uss": 3000.0},
+                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                             pads_per_hub=8, return_flights=True)
+    reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
+    led = ReservationLedger(cfg)
+    dss = DSS(ledger=led, mechanism=FCFSMechanism())
+    astar = get_planner("astar_ref")
+    usses = {u: USS(u, dss, cfg, astar) for u in {r.uss_id for r in reqs}}
+    for ev in reqs[:400]:
+        usses[ev.uss_id].handle_request(ev)
+    svc = HexOccupancyService(cfg)
+    cocc = CompiledHexOccupancy(cfg)
+    for fid, grp in itertools.groupby(led.iter_committed(), key=lambda fv: fv[0]):
+        vols = [v for _, v in grp]
+        svc.on_commit(fid, vols); cocc.on_commit(fid, vols)
+    cells = set()
+    for s in list(svc.blocked) + list(svc.term_cells):
+        cells |= set(svc.blocked.get(s, ())) | set(svc.term_cells.get(s, {}))
+    assert len(cells) > 100
+    import random
+    random.seed(0)
+    checked = blocked = 0
+    for (q, r, L) in random.sample(sorted(cells), min(300, len(cells))):
+        for s in range(0, cocc.MAXS, 5):
+            ref = svc.is_blocked(q, r, L, s, own=())          # own=∅ ⇒ all columns foreign (pool alone)
+            got = cocc.blocked_py(q, r, L, s, own_cells=None)
+            assert ref == got, f"occ mismatch at (q={q},r={r},L={L},s={s}): is_blocked={ref} pool={got}"
+            checked += 1; blocked += ref
+    assert checked > 1000 and blocked > 0
+
+
+# ---------------- E: safety valves / fallback ----------------
+
+def test_compiled_absent_falls_back_to_reference():
+    # numba-absent story: compiled=False is byte-identical to the reference.
+    ref = AStarPlanner(compiled=False)
+    com = AStarPlanner(compiled=False)
+    led = ReservationLedger(CFG); led.commit(99, [_wall()])
+    a = ref.plan(_req(), ReservationLedger(CFG), CFG)  # empty
+    b = com.plan(_req(), ReservationLedger(CFG), CFG)
+    assert a.cost == b.cost
+
+
+def test_compiled_fallback_on_kernel_valve_matches_reference():
+    # Force the kernel to report FB_HASH → the plan must transparently fall back to the reference,
+    # count the fallback, warn, and return the reference result exactly.
+    from freespace_sim.planner import astar_kernel as K
+
+    def led():
+        lg = ReservationLedger(CFG); lg.commit(99, [_wall()]); return lg
+
+    com = AStarPlanner(compiled=True)
+    ref_intent = AStarPlanner(compiled=False).plan(_req(), led(), CFG)   # same (wall) ledger state
+    orig = com._kernel
+    com._kernel = lambda *a, **k: (0, 0.0, 0, K.FB_HASH, -1)
+    try:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            got = com.plan(_req(), led(), CFG)
+        assert com._fb == 1 and com._fb_reasons.get("hash-full") == 1
+        assert any(issubclass(x.category, RuntimeWarning) for x in w)
+        assert got.status is ref_intent.status
+        assert abs(got.cost - ref_intent.cost) < 1e-9
+        assert _clkey(got) == _clkey(ref_intent)
+    finally:
+        com._kernel = orig
+
+
+# ---------------- A (terminal) / F: terminal replay + end-to-end ----------------
+
+@pytest.mark.slow
+def test_compiled_replay_exact_dallas_terminal():
+    """Per-plan compiled-vs-reference replay against a reference-committed terminal ledger
+    (``fixed_exit_lanes=True``): exact accept/deny, cost, centerline, and expansions across the batch."""
+    from freespace_sim.demand import HubRadiusDemand
+    cfg = SimConfig(region_size_m=(20000.0, 15000.0), lam_per_hour=2000.0, horizon_s=300.0,
+                    planner="astar", seed=1)
+    assert cfg.fixed_exit_lanes and cfg.n_levels >= 2
+    demand = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 5, "stripmall_uss": 20},
+                             radius_m={"walmart_uss": 6000.0, "stripmall_uss": 3000.0},
+                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                             pads_per_hub=8, return_flights=True)
+    reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
+    led = ReservationLedger(cfg)
+    ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    n_term = 0
+    for k, rq in enumerate(reqs[:120]):
+        a = ref.plan(rq, led, cfg)
+        b = com.plan(rq, led, cfg)
+        n_term += (rq.origin_terminal is not None or rq.dest_terminal is not None)
+        assert a.status is b.status, f"flight {k}: status {a.status} != {b.status}"
+        if a.accepted:
+            assert abs(a.cost - b.cost) < 1e-9, f"flight {k}: cost {a.cost} != {b.cost}"
+            assert ref.last_expansions == com.last_expansions, f"flight {k}: expansions differ"
+            assert _clkey(a) == _clkey(b), f"flight {k}: centerline differs"
+            led.commit(getattr(rq, "id", k), a.volumes)
+    assert com._fb == 0, f"unexpected fallbacks: {dict(com._fb_reasons)}"
+    assert n_term > 100
+
+
+@pytest.mark.slow
+def test_compiled_demand_run_is_verified():
+    from freespace_sim.sim import run
+    cfg = SimConfig(planner="astar", lam_per_hour=40.0, horizon_s=900.0, seed=4,
+                    region_size_m=(4000.0, 4000.0))
+    assert run(cfg).verified

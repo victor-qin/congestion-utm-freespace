@@ -21,6 +21,7 @@ import heapq
 import itertools
 import math
 import warnings
+from collections import Counter
 from dataclasses import replace
 
 import numpy as np
@@ -138,19 +139,41 @@ def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, des
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 600_000, vertical_edges: bool = True):
+    def __init__(self, max_expansions: int = 600_000, vertical_edges: bool = True,
+                 compiled: bool = True):
         self.max_expansions = max_expansions
         # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an
         # all-levels column-clearance check, so they dominate the multi-altitude search cost; the
         # capacity gain comes from per-level TAKEOFF, which is independent. Disable on huge scenarios to
         # recover most of the single-plane speed and keep the gain.
         self.vertical_edges = vertical_edges
+        self.last_expansions = 0                        # nodes expanded by the most recent plan (telemetry)
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
         self.static_terminals: list = []               # (center, term) per hub; set by sim.run() when
         #                                                cfg.terminal_airspace_always_active, registered
         #                                                into the occupancy as permanent foreign walls.
+        # ---- compiled (numba) air-search kernel: reproduces the pure-Python search EXACTLY, ~multiple-x
+        # faster; auto-falls back to `_plan_reference` if numba is absent or a safety valve trips. ----
+        self.compiled = compiled
+        self._kernel = None
+        if compiled:
+            try:
+                from .astar_kernel import _search
+                self._kernel = _search
+            except ImportError:
+                self.compiled = False                   # numba absent → pure-Python everywhere
+        self._cocc = None                               # CompiledHexOccupancy (per ledger)
+        self._cocc_ledger: ReservationLedger | None = None
+        self._gen = 0                                   # version stamp for the reused kernel state
+        self._ks = None                                 # lazily-allocated kernel work arrays (hash/heap/…)
+        self._fb = 0                                    # kernel→reference fallback count (diagnostics/tests)
+        self._fb_reasons: Counter = Counter()           # fallback reason histogram (bench summary)
+        self._own: frozenset = frozenset()              # last plan's own terminal ids (diagnostics/tests)
+        self._warmed = False
+        if self.compiled:
+            self._warm_jit()
 
     def _occupancy(self, req, ledger, cfg) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
@@ -188,6 +211,21 @@ class AStarPlanner:
         return svc
 
     def plan(
+        self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
+    ) -> OperationalIntent:
+        """Dispatch to the compiled kernel when it can reproduce the reference cost exactly; else the
+        pure-Python reference. The compiled path handles the default ``fixed_exit_lanes=True`` terminals
+        and all non-terminal flights; **legacy terminals** (``fixed_exit_lanes=False`` with a terminal
+        end) route to the reference because their landing gate is path-dependent (``_committed_arrival``
+        needs the search's ``came`` mid-flight), which the flat-array kernel cannot serve."""
+        if not self.compiled:
+            return self._plan_reference(req, ledger, cfg)
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        if (o_term is not None or d_term is not None) and not cfg.fixed_exit_lanes:
+            return self._plan_reference(req, ledger, cfg)
+        return self._plan_compiled(req, ledger, cfg)
+
+    def _plan_reference(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
     ) -> OperationalIntent:
         dt = cfg.dt_s
@@ -327,6 +365,7 @@ class AStarPlanner:
                     hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
                     heapq.heappush(pq, (ng + hh, next(counter), nst))
 
+        self.last_expansions = expansions               # search-effort telemetry (node-count parity gate)
         if goal_state is None:
             # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
             # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /
@@ -506,3 +545,274 @@ class AStarPlanner:
                               climb_time_s=cfg.climb_time_to(z_land)),
         ]
         return volumes, centerline, cum_horiz, n_hover
+
+    # ==================================================================================================
+    # Compiled (numba) path — reproduces `_plan_reference` EXACTLY, ~multiple-x faster.
+    # ==================================================================================================
+    def _compiled_occ(self, req, ledger, cfg):
+        """The flat-array occupancy (corridor + column pools), kept in lockstep with the ledger exactly
+        as ``_occupancy`` keeps ``HexOccupancyService`` (first-use subscribe+absorb, shrink→rebuild,
+        evict to the request clock). Coexists with ``_occupancy`` — the host still needs the reference
+        service for ``pad_clear`` (non-terminal takeoff/landing gate)."""
+        cocc = self._cocc
+        if cocc is None or self._cocc_ledger is not ledger:
+            from .compiled_hex_occupancy import CompiledHexOccupancy
+            cocc = self._cocc = CompiledHexOccupancy(cfg)
+            self._cocc_ledger = ledger
+            ledger.subscribe(cocc.on_commit)
+            _absorb(cocc, ledger)
+        elif ledger.n_volumes < cocc.n_added:
+            cocc.reset()
+            _absorb(cocc, ledger)
+        cocc.evict_before(int(req.t_request // cfg.dt_s))
+        return cocc
+
+    def _kernel_state(self, cocc):
+        """(Re)allocate the version-stamped kernel work arrays, reused across plans (gen bump → O(1)
+        reset). Sized once; ``ov_own_gen`` (per-cell own-column mark) grows if a new ledger's box is bigger."""
+        NC = cocc.NC
+        if self._ks is None:
+            log2 = 20
+            cap = 1 << log2
+            mh = 1 << 20
+            self._ks = {
+                "g_key": np.empty(cap, np.int64), "g_gen": np.zeros(cap, np.int64),
+                "g_val": np.empty(cap, np.float64), "g_came": np.empty(cap, np.int64),
+                "g_flag": np.empty(cap, np.int8), "cap": cap, "log2": log2,
+                "heap_f": np.empty(mh, np.float64), "heap_c": np.empty(mh, np.int64),
+                "heap_n": np.empty(mh, np.int64), "mh": mh,
+                "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
+                "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
+                "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
+            }
+        ks = self._ks
+        if ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
+            ks["ov_own_gen"] = np.zeros(NC, np.int32); ks["NC"] = NC
+            for k in ("out_q", "out_r", "out_L", "out_s"):
+                ks[k] = np.empty(cocc.MAXS + 8, np.int64)
+        return ks
+
+    def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen):
+        """Mark this flight's OWN-column footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
+        ``_blocked`` treats them as transparent (own column) instead of walls. Cheap: rasterize the 1–2
+        own hub columns (same rasterizer that built the column pool) and mark their in_blk cells — no
+        per-step scan. Exact when own/foreign columns don't share a cell (hub spacing ≫ column radius)."""
+        ov = self._ks["ov_own_gen"]
+        cfg = cocc.cfg
+        z_hi = cfg.flight_levels_m[-1]
+        for term, center in ((o_term, origin), (d_term, dest)):
+            if term is None:
+                continue
+            col = hover_reservation(np.asarray(center, float), 0.0, cfg,
+                                    terminal_id=term.id, radius=terminal_radius(term, cfg),
+                                    climb_time_s=cfg.climb_time_to(z_hi))
+            for q, r, L, _s, in_blk in hg.rasterize_volume_dual(
+                col, cfg, cocc.R, cocc.infl_blocked, cocc.infl_pad
+            ):
+                if not in_blk:
+                    continue
+                c = cocc.cell_id(q, r, L)
+                if c >= 0:
+                    ov[c] = gen
+
+    def _warm_jit(self):
+        """Compile the kernel once at construction with a tiny synthetic input (off the hot path)."""
+        if self._warmed or self._kernel is None:
+            return
+        try:
+            NC, MAXS = 9, 5
+            z = lambda dt: np.zeros(NC, dt)                                    # noqa: E731
+            iv_lo = np.zeros(NC, np.int32); iv_hi = np.full(NC, MAXS, np.int32); iv_nxt = np.full(NC, -1, np.int32)
+            cv_lo = np.zeros(NC, np.int32); cv_hi = np.full(NC, MAXS, np.int32); cv_nxt = np.full(NC, -1, np.int32)
+            ng = 6
+            self._kernel(
+                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, np.zeros(NC, np.int32),
+                0, 0, 3, 3, 1, 0, MAXS,
+                1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]), 1,
+                np.array([1], np.int64), np.array([0.0]), np.ones(ng, np.bool_), ng, 1.0,
+                np.array([1], np.int64), np.array([0.0]), 1.0, 3.0, False,
+                np.array([1], np.int64), np.array([1], np.int64), 1, np.ones(ng, np.bool_),
+                0.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                1, np.empty(64, np.int64), np.zeros(64, np.int64), np.empty(64, np.float64),
+                np.empty(64, np.int64), np.empty(64, np.int8), 64, 6,
+                np.empty(64, np.float64), np.empty(64, np.int64), np.empty(64, np.int64), 64,
+                np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
+                1000,
+            )
+            self._warmed = True
+        except Exception:                                                     # numba trouble → stay usable
+            self._warmed = True
+
+    def _plan_compiled(self, req, ledger, cfg):
+        from . import astar_kernel as K
+
+        # ---- setup: IDENTICAL to _plan_reference's head, so the kernel gets identical inputs ----
+        dt = cfg.dt_s
+        pitch = cfg.nominal_speed_mps * dt
+        R = hg.circumradius(cfg)
+        origin = np.asarray(req.origin, float)
+        dest = np.asarray(req.dest, float)
+        base = int(math.ceil(req.t_departure / dt))
+        levels = cfg.flight_levels_m
+        ground_z = cfg.ground_level_m
+        c_alt = cfg.cost_altitude_change_per_m
+        takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)
+        takeoff_cost = tuple(c_alt * (z - ground_z) for z in levels)
+        rung_steps = tuple(max(1, int(math.ceil((levels[L + 1] - levels[L]) / (cfg.climb_rate_mps * dt))))
+                           for L in range(len(levels) - 1))
+        rung_cost = tuple(c_alt * (levels[L + 1] - levels[L]) for L in range(len(levels) - 1))
+
+        oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
+        gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
+        gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr
+        straight = float(np.linalg.norm(dest[:2] - origin[:2]))
+
+        svc = self._occupancy(req, ledger, cfg)
+        tcap = self._tcap
+        cocc = self._compiled_occ(req, ledger, cfg)
+        dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
+                            for z in levels)
+
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        own = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        o_cap = o_term.capacity if o_term else 1
+        d_cap = d_term.capacity if d_term else 1
+        fixed_lanes = cfg.fixed_exit_lanes
+        o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
+        d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
+        h_off = max((L.dist for L in d_lanes), default=0.0)
+
+        sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
+        dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
+        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * takeoff_cost[0]
+        n_hops = int(math.ceil(max(straight, pitch) / pitch))
+        climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
+                      if cfg.n_levels > 1 else 0)
+        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
+                    + 3 * n_hops + 2 * climb_span + 6)
+
+        # ---- box / window membership guard: else fall back to the reference ----
+        if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:
+            return self._plan_reference(req, ledger, cfg)
+
+        self._gen += 1
+        gen = self._gen
+        ks = self._kernel_state(cocc)
+        if own:
+            self._build_overlay(cocc, o_term, d_term, origin, dest, gen)
+
+        n_levels = len(levels)
+        n_gsteps = max_step - base + 1
+
+        # ---- takeoff fan (lanes) + per-(ground-step, level) feasibility mask `to_ok` ----
+        if fixed_lanes and o_term is not None:
+            o_r = terminal_radius(o_term, cfg)
+            lane_q = np.asarray([L.cell[0] for L in o_lanes], np.int64)
+            lane_r = np.asarray([L.cell[1] for L in o_lanes], np.int64)
+            lane_lat = np.asarray([c_lat * (L.dist - o_r) for L in o_lanes], np.float64)
+            to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
+            for gi in range(n_gsteps):
+                lvl_ok = tcap.dwell_ok_levels(o_term, origin, (base + gi) * dt, o_cap, levels)
+                for Lv in range(n_levels):
+                    to_ok[gi * n_levels + Lv] = lvl_ok[Lv]
+        else:                                            # non-terminal origin (legacy-terminal fell back)
+            lane_q = np.asarray([oq], np.int64)
+            lane_r = np.asarray([orr], np.int64)
+            lane_lat = np.asarray([0.0], np.float64)
+            to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
+            hub_ok = None
+            if o_term is not None:
+                pass                                     # unreachable: legacy-terminal dispatched to ref
+            for gi in range(n_gsteps):
+                for Lv in range(n_levels):
+                    to_ok[gi * n_levels + Lv] = svc.pad_clear(oq, orr, base + gi, dwell_steps[Lv])
+
+        # ---- goal cells + per-(step, level) landing feasibility mask `land_ok` ----
+        if fixed_lanes and d_term is not None:
+            goal_q = np.asarray([L.cell[0] for L in d_lanes], np.int64)
+            goal_r = np.asarray([L.cell[1] for L in d_lanes], np.int64)
+            land_ok = np.zeros(n_gsteps * n_levels, np.bool_)
+            for gi in range(n_gsteps):
+                for Lv in range(n_levels):
+                    land_ok[gi * n_levels + Lv] = tcap.dwell_ok(
+                        d_term, dest, (base + gi) * dt, d_cap, z=levels[Lv])
+        else:                                            # non-terminal destination
+            goal_q = np.asarray([gq], np.int64)
+            goal_r = np.asarray([grr], np.int64)
+            land_ok = np.zeros(n_gsteps * n_levels, np.bool_)
+            for gi in range(n_gsteps):
+                for Lv in range(n_levels):
+                    land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
+
+        # ---- call the kernel (no early-out on empty masks: let the search reach the reference's exact
+        # queue-empty (BUDGET_EXCEEDED) vs cap-hit (SEARCH_EXHAUSTED) conclusion) ----
+        rs = np.asarray(rung_steps if rung_steps else (0,), np.int64)
+        rc = np.asarray(rung_cost if rung_cost else (0.0,), np.float64)
+        n_out, cost, n_exp, status, aux = self._kernel(
+            cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
+            ks["ov_own_gen"],
+            cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
+            oq, orr, lane_q, lane_r, lane_lat, len(lane_q),
+            np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
+            to_ok, n_gsteps, cfg.cost_ground_delay_per_s * dt,
+            rs, rc, c_lat * pitch, cfg.cost_air_hold_per_s * dt, self.vertical_edges,
+            goal_q, goal_r, len(goal_q), land_ok,
+            gx, gy, R, h_off, c_lat, h_ground,
+            gen, ks["g_key"], ks["g_gen"], ks["g_val"], ks["g_came"], ks["g_flag"], ks["cap"], ks["log2"],
+            ks["heap_f"], ks["heap_c"], ks["heap_n"], ks["mh"],
+            ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
+        )
+        self.last_expansions = n_exp
+        self._own = own
+
+        # ---- status handling ----
+        if status >= K.FB_OOB:                           # safety valve → pure-Python reference
+            reason = {K.FB_OOB: "out-of-box", K.FB_HASH: "hash-full", K.FB_HEAP: "heap-full"}[status]
+            cell = ""
+            if status == K.FB_OOB:
+                cell = f", straddled q={aux // 65536 - 32768} r={aux % 65536 - 32768}"
+            self._fb += 1
+            self._fb_reasons[reason] += 1
+            warnings.warn(
+                f"astar compiled kernel FALLBACK ({reason}) for flight {getattr(req, 'id', '?')} "
+                f"O={tuple(req.origin)}→D={tuple(req.dest)}{cell}, n_exp={n_exp}; running reference",
+                RuntimeWarning, stacklevel=2,
+            )
+            return self._plan_reference(req, ledger, cfg)
+        if status == K.NO_PATH_TRUNC:
+            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+        if status == K.NO_PATH_EMPTY:
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
+
+        # ---- reconstruct (out_* is goal-first; keep air states, reverse to start-first) ----
+        air = [(int(ks["out_q"][i]), int(ks["out_r"][i]), int(ks["out_L"][i]), int(ks["out_s"][i]))
+               for i in range(n_out) if ks["out_L"][i] >= 0]
+        air.reverse()
+        ground_steps = air[0][3] - takeoff_steps[air[0][2]] - base
+        cruise_wps: list[TimedPoint] = [
+            (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt) for (q, r, L, s) in air
+        ]
+        volumes, centerline, cum_horiz, n_hover = self._build(
+            cruise_wps, origin, dest, base, ground_steps, cfg,
+            origin_term=req.origin_terminal, dest_term=req.dest_terminal,
+        )
+        if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
+        if ledger.any_conflict(volumes):
+            return _deny(req, DenialReason.CONFLICT_FILED)
+
+        z_takeoff, z_land = levels[air[0][2]], levels[air[-1][2]]
+        cruise_dz = sum(abs(levels[air[i + 1][2]] - levels[air[i][2]]) for i in range(len(air) - 1))
+        intent = OperationalIntent(
+            request=req,
+            status=IntentStatus.ACCEPTED,
+            volumes=volumes,
+            centerline=centerline,
+            ground_delay_s=ground_steps * dt,
+            air_hold_s=n_hover * dt,
+            air_detour_m=max(0.0, cum_horiz - straight),
+            altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
+            planner="astar",
+        )
+        intent.cost = trajectory_cost(intent, cfg)
+        return intent

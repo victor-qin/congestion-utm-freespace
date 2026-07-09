@@ -72,7 +72,11 @@ def get_planner(name: str) -> Planner:
     if name == "astar":
         from .astar import AStarPlanner
 
-        return AStarPlanner()
+        return AStarPlanner(compiled=True)               # numba kernel + auto-fallback to the reference
+    if name == "astar_ref":
+        from .astar import AStarPlanner
+
+        return AStarPlanner(compiled=False)              # pure-Python reference oracle (A/B + fallback)
     if name == "opt_astar":
         from .astar import AStarPlanner
         from .opt import NLPOptPlanner

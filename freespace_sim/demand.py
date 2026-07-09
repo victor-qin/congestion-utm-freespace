@@ -60,6 +60,57 @@ def nearest_hub(point: np.ndarray, hubs: np.ndarray) -> np.ndarray:
     return hubs[int(np.argmin(np.linalg.norm(hubs - point, axis=1)))]
 
 
+_MAX_HUB_ATTEMPTS = 20000
+
+
+def _scatter_hubs(cfg, rng, n_hubs_per_uss, radius_of, gap_m):
+    """Uniform-scatter hub centres, reject-sampled so **no two terminal airspaces overlap**.
+
+    Every accepted centre keeps a distance of at least ``r_i + r_j + gap_m`` to every other hub, where
+    ``r`` is the hub's terminal (column) radius and ``gap_m`` is the clearance left between airspace
+    *edges* — enough for an approach corridor to fit between neighbours. Without this, an unconstrained
+    ``rng.uniform`` scatter occasionally drops two same-operator hubs within a radius of each other, and
+    under ``terminal_airspace_always_active`` one hub's permanent wall then engulfs the other's landing
+    approach, making its flights near-infeasible (the walls are transient without the flag, so the
+    overlap is a latent modelling wart there rather than a hard failure).
+
+    Deterministic in ``rng``; placement depends only on the region, hub counts and radii (not pad
+    capacity or the demand seed). Raises ``ValueError`` if the region is too crowded to satisfy the
+    separation — a mis-specified scenario fails loudly instead of silently overlapping."""
+    w, h = cfg.region_size_m
+    xs: list[float] = []
+    ys: list[float] = []
+    rs: list[float] = []
+    out: dict[str, np.ndarray] = {}
+    for uid, k in n_hubs_per_uss.items():
+        r = float(radius_of(uid))
+        pts = np.empty((k, 2), float)
+        for i in range(k):
+            for _ in range(_MAX_HUB_ATTEMPTS):
+                c = rng.uniform([0.0, 0.0], [w, h])
+                ok = True
+                for j in range(len(xs)):
+                    need = r + rs[j] + gap_m
+                    if (c[0] - xs[j]) ** 2 + (c[1] - ys[j]) ** 2 < need * need:
+                        ok = False
+                        break
+                if ok:
+                    xs.append(float(c[0]))
+                    ys.append(float(c[1]))
+                    rs.append(r)
+                    pts[i] = c
+                    break
+            else:
+                raise ValueError(
+                    f"place_hubs: could not position a '{uid}' hub with a {gap_m:.0f} m edge gap after "
+                    f"{_MAX_HUB_ATTEMPTS} attempts — region {w:.0f}x{h:.0f} m is too crowded for "
+                    f"{sum(n_hubs_per_uss.values())} hubs at these terminal radii "
+                    f"(lower min_hub_gap_m, shrink terminal radii, or enlarge the region)."
+                )
+        out[uid] = pts
+    return out
+
+
 @dataclass
 class HubVoronoiDemand:
     """Hub-and-spoke demand: each USS serves a fixed set of synthetic ground hubs (think one USS for
@@ -83,19 +134,18 @@ class HubVoronoiDemand:
     direction: str = "delivery"                     # "delivery" hub→customer | "pickup" customer→hub
     min_od_separation_m: float = 200.0              # reject trivially-short customer↔hub pairs
     hub_seed: int = 0xA17F                          # infrastructure RNG, independent of cfg.seed
+    min_hub_gap_m: float = 100.0                    # clearance between terminal-airspace EDGES (no overlap)
 
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Return ``{uss_id: (n_hubs, 2)}`` hub positions in region ENU metres.
 
         DESIGN KNOB — this is where the *spatial structure* of demand is decided. The default
-        scatters hubs uniformly (already differentiating the USSs by density); swap in a clustered
-        process (town-centre seeds + Gaussian spread) to mimic real retail geography.
+        scatters hubs uniformly (already differentiating the USSs by density) but reject-samples so no
+        two hubs' terminal airspaces overlap (:func:`_scatter_hubs`); swap in a clustered process
+        (town-centre seeds + Gaussian spread) to mimic real retail geography.
         """
-        w, h = cfg.region_size_m
-        return {
-            uid: rng.uniform([0.0, 0.0], [w, h], size=(k, 2))
-            for uid, k in self.n_hubs_per_uss.items()
-        }
+        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss,
+                             lambda uid: cfg.terminal_radius_m, self.min_hub_gap_m)
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
         ids = list(self.n_hubs_per_uss)
@@ -175,13 +225,17 @@ class HubRadiusDemand:
     uss_share: dict[str, float] | None = None
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F
+    min_hub_gap_m: float = 100.0                     # clearance between terminal-airspace EDGES (no overlap)
 
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
-        """Return ``{uss_id: (n_hubs, 2)}`` single-point hub centres. DESIGN KNOB for spatial structure
-        (swap the uniform scatter for a clustered process to mimic real retail geography)."""
-        w, h = cfg.region_size_m
-        return {uid: rng.uniform([0.0, 0.0], [w, h], size=(k, 2))
-                for uid, k in self.n_hubs_per_uss.items()}
+        """Return ``{uss_id: (n_hubs, 2)}`` single-point hub centres, reject-sampled so no two hubs'
+        terminal airspaces overlap (:func:`_scatter_hubs`; each USS's column radius is
+        ``terminal_radius_m`` or the ``cfg`` hover footprint). DESIGN KNOB for spatial structure (swap
+        the uniform scatter for a clustered process to mimic real retail geography)."""
+        def radius_of(uid: str) -> float:
+            tr = self._terminal_radius_for(uid)
+            return cfg.terminal_radius_m if tr is None else float(tr)
+        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
 
     def _radius_for(self, uss_id: str) -> float:
         return float(self.radius_m[uss_id] if isinstance(self.radius_m, dict) else self.radius_m)

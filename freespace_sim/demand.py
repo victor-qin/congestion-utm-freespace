@@ -134,18 +134,22 @@ class HubVoronoiDemand:
     direction: str = "delivery"                     # "delivery" hub→customer | "pickup" customer→hub
     min_od_separation_m: float = 200.0              # reject trivially-short customer↔hub pairs
     hub_seed: int = 0xA17F                          # infrastructure RNG, independent of cfg.seed
-    min_hub_gap_m: float = 100.0                    # clearance between terminal-airspace EDGES (no overlap)
 
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Return ``{uss_id: (n_hubs, 2)}`` hub positions in region ENU metres.
 
         DESIGN KNOB — this is where the *spatial structure* of demand is decided. The default
-        scatters hubs uniformly (already differentiating the USSs by density) but reject-samples so no
-        two hubs' terminal airspaces overlap (:func:`_scatter_hubs`); swap in a clustered process
-        (town-centre seeds + Gaussian spread) to mimic real retail geography.
+        scatters hubs uniformly (already differentiating the USSs by density); swap in a clustered
+        process (town-centre seeds + Gaussian spread) to mimic real retail geography. Unlike
+        :class:`HubRadiusDemand`, these flights carry no ``origin_terminal``/``dest_terminal`` (see
+        ``generate`` below), so there are no terminal airspaces to overlap — hence no
+        minimum-separation reject-sampling here (that belongs only where hubs build walls).
         """
-        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss,
-                             lambda uid: cfg.terminal_radius_m, self.min_hub_gap_m)
+        w, h = cfg.region_size_m
+        return {
+            uid: rng.uniform([0.0, 0.0], [w, h], size=(k, 2))
+            for uid, k in self.n_hubs_per_uss.items()
+        }
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
         ids = list(self.n_hubs_per_uss)

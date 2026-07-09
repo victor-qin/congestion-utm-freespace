@@ -1,12 +1,14 @@
 """Hub placement keeps terminal airspaces from overlapping.
 
-``place_hubs`` reject-samples hub centres so no two hubs' terminal columns overlap — the headline,
-non-flaky invariant is a pairwise geometric one: for every pair of hubs the centre distance is at least
-``r_i + r_j`` (their radii), enforced across BOTH operators. Before this, an unconstrained uniform
-scatter could drop two same-operator hubs within a radius of each other (e.g. ``stripmall_uss#11`` and
-``#17`` landed 45 m apart with 90 m radii), which under ``terminal_airspace_always_active`` makes one
-hub's landing approach infeasible. Placement stays deterministic in ``hub_seed`` and independent of pad
-capacity, and a region too crowded to satisfy the separation fails loudly.
+``HubRadiusDemand.place_hubs`` reject-samples hub centres so no two hubs' terminal columns overlap — the
+headline, non-flaky invariant is a pairwise geometric one: for every pair of hubs the centre distance is
+at least ``r_i + r_j`` (their radii), across both operators. Before this, an unconstrained uniform
+scatter could drop two hubs within a radius of each other (e.g. ``stripmall_uss#11`` and ``#17`` landed
+45 m apart with 90 m radii), which under ``terminal_airspace_always_active`` makes one hub's landing
+approach infeasible. ``HubVoronoiDemand`` flights carry no terminals, so it keeps the plain scatter
+(nothing to overlap). Placement is deterministic in ``hub_seed`` and independent of pad capacity; a
+region too crowded to satisfy the separation fails loudly; and the clearance is reachable from a
+scenario via ``DemandSpec.min_hub_gap_m``.
 """
 from itertools import combinations
 
@@ -19,9 +21,7 @@ from freespace_sim.scenarios import get_scenario
 
 
 def _radius_of(dm, uss, cfg):
-    tr = dm._terminal_radius_for(uss) if hasattr(dm, "_terminal_radius_for") else None
-    if isinstance(tr, dict):
-        tr = tr.get(uss)
+    tr = dm._terminal_radius_for(uss)          # already collapses a per-USS dict to a scalar (or None)
     return cfg.terminal_radius_m if tr is None else float(tr)
 
 
@@ -46,26 +46,18 @@ def _worst_overlap(hubs):
     return worst
 
 
-# ---- headline: shipped scenarios have no overlapping terminal airspaces ----
+# ---- headline: the shipped hub_radius scenario has no overlapping terminal airspaces ----
 
-@pytest.mark.parametrize("name", ["dallas_hub_2uss", "dallas_hub_2uss_large"])
-def test_scenario_hubs_have_no_overlapping_airspaces(name):
-    spec = get_scenario(name)
+def test_dallas_large_hubs_have_no_overlapping_airspaces():
+    # dallas_hub_2uss_large is the scenario where stripmall_uss#11/#17 engulfed each other (45 m apart,
+    # 90 m radii) under the old unconstrained scatter — the worst-overlap assert below IS that pair's
+    # regression. (dallas_hub_2uss uses HubVoronoiDemand, whose flights carry no terminals to overlap.)
+    spec = get_scenario("dallas_hub_2uss_large")
     cfg, dm = spec.config(), spec.demand_model()
     hubs = _hubs_with_radii(dm, cfg)
     assert len(hubs) == 26
     slack, i, j = _worst_overlap(hubs)
-    assert slack >= 0.0, f"{name}: {i} and {j} terminal airspaces overlap by {-slack:.0f} m"
-
-
-def test_regression_stripmall_11_17_no_longer_engulfed():
-    """The exact pair that broke always-active (45 m apart, 90 m radii) is now separated."""
-    spec = get_scenario("dallas_hub_2uss_large")
-    cfg, dm = spec.config(), spec.demand_model()
-    hubs = dict(((hid, (c, r)) for hid, c, r in _hubs_with_radii(dm, cfg)))
-    c11, r11 = hubs["stripmall_uss#11"]
-    c17, r17 = hubs["stripmall_uss#17"]
-    assert float(np.linalg.norm(c11 - c17)) >= r11 + r17
+    assert slack >= 0.0, f"{i} and {j} terminal airspaces overlap by {-slack:.0f} m"
 
 
 # ---- the general placement contract, on both demand classes ----
@@ -79,11 +71,27 @@ def test_min_hub_gap_is_respected_across_operators():
         assert float(np.linalg.norm(c1 - c2)) >= r1 + r2 + 150.0 - 1e-6, f"{i1}/{i2} closer than the gap"
 
 
-def test_voronoi_scatter_also_separated():
-    cfg = SimConfig(region_size_m=(8000.0, 8000.0))                 # terminal_radius_m defaults to 90 m
-    hubs = _hubs_with_radii(HubVoronoiDemand(), cfg)
-    slack, i, j = _worst_overlap(hubs)
-    assert slack >= 0.0, f"{i} and {j} overlap"
+def test_voronoi_keeps_plain_unconstrained_scatter():
+    """HubVoronoiDemand flights have no terminals, so it must NOT reject-sample — its placement is the
+    plain uniform scatter (guards against re-adding a min-separation that has no physical referent)."""
+    cfg = SimConfig(region_size_m=(6000.0, 6000.0))
+    dm = HubVoronoiDemand(n_hubs_per_uss={"a": 30})
+    got = dm.place_hubs(cfg, np.random.default_rng(dm.hub_seed))["a"]
+    want = np.random.default_rng(dm.hub_seed).uniform([0.0, 0.0], [6000.0, 6000.0], size=(30, 2))
+    assert np.allclose(got, want)
+
+
+def test_demand_spec_threads_min_hub_gap():
+    """min_hub_gap_m set on a DemandSpec reaches the built model AND its placement — before, the knob
+    the crowded-region ValueError told you to tune was frozen at its default, unreachable from specs."""
+    from freespace_sim.scenarios.spec import DemandSpec
+    dm = DemandSpec(pattern="hub_radius", uss=("a", "b"), hubs=(3, 5),
+                    terminal_radius_m=90.0, min_hub_gap_m=300.0).build()
+    assert dm.min_hub_gap_m == 300.0
+    cfg = SimConfig(region_size_m=(12000.0, 12000.0))
+    hubs = _hubs_with_radii(dm, cfg)
+    for (i1, c1, r1), (i2, c2, r2) in combinations(hubs, 2):
+        assert float(np.linalg.norm(c1 - c2)) >= r1 + r2 + 300.0 - 1e-6, f"{i1}/{i2} ignores spec gap"
 
 
 def test_placement_deterministic_in_hub_seed():

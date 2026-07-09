@@ -25,7 +25,7 @@ import math
 
 import numpy as np
 
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..types import (
     DenialReason,
     IntentStatus,
@@ -285,8 +285,15 @@ class SIPPPlanner(AStarPlanner):
         dest = np.asarray(req.dest, float)
         t_depart = req.t_departure
         base = int(math.ceil(t_depart / dt))
-        climb_steps = max(1, int(math.ceil(cfg.climb_time_s / dt)))
-        climb_cost = cfg.cost_altitude_change_per_m * (cfg.cruise_level_m - cfg.ground_level_m)
+        levels = cfg.flight_levels_m
+        ground_z = cfg.ground_level_m
+        c_alt = cfg.cost_altitude_change_per_m
+        # per-level takeoff climb-steps/cost + per-rung (L↔L+1) mid-route change — mirror AStarPlanner.plan
+        takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)
+        takeoff_cost = tuple(c_alt * (z - ground_z) for z in levels)
+        rung_steps = tuple(max(1, int(math.ceil((levels[L + 1] - levels[L]) / (cfg.climb_rate_mps * dt))))
+                           for L in range(len(levels) - 1))
+        rung_cost = tuple(c_alt * (levels[L + 1] - levels[L]) for L in range(len(levels) - 1))
 
         oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
@@ -296,7 +303,8 @@ class SIPPPlanner(AStarPlanner):
         svc = self._occupancy(req, ledger, cfg)
         sidx = self._sipp_index(req, ledger, cfg)
         tcap = self._tcap
-        dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
+        dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
+                            for z in levels)          # per-level dwell (hover + actual climb to that level)
 
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         own = frozenset(t.id for t in (o_term, d_term) if t is not None)
@@ -312,15 +320,18 @@ class SIPPPlanner(AStarPlanner):
 
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
 
-        def h_air(q, r):
+        def h_air(q, r, L):
             dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
-            return c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off) + climb_cost
+            return c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off) + takeoff_cost[L]
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
-        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * climb_cost
+        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * takeoff_cost[0]
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
-        max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6
+        climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
+                      if cfg.n_levels > 1 else 0)      # extra step budget for mid-route rungs
+        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
+                    + 3 * n_hops + 2 * climb_span + 6)
 
         SI = _SafeIntervals(sidx, own, base, max_step, fixed_lanes)
         came: dict = {}
@@ -331,15 +342,15 @@ class SIPPPlanner(AStarPlanner):
             return q == gq and r == grr
 
         def goal_ok(st):
-            q, r, s = st[1], st[2], st[3]
+            q, r, L, s = st[1], st[2], st[3], st[4]     # air state now carries the flight level L
             if d_term is not None and fixed_lanes:
-                return (q, r) in d_lane_by_cell and tcap.dwell_ok(d_term, dest, s * dt, d_cap)
+                return (q, r) in d_lane_by_cell and tcap.dwell_ok(d_term, dest, s * dt, d_cap, z=levels[L])
             if not (q == gq and r == grr):
                 return False
             if d_term is not None:
                 arr = _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term)
-                return tcap.dwell_ok(d_term, dest, arr, d_cap, origin)
-            return svc.pad_clear(gq, grr, s, dwell_steps)
+                return tcap.dwell_ok(d_term, dest, arr, d_cap, origin, levels[L])
+            return svc.pad_clear(gq, grr, s, dwell_steps[L])
 
         # ---- cost-aware safe-interval search; AS = ("g"/"a", q, r, step), A*-shaped ----
         start = ("g", oq, orr, base)
@@ -363,8 +374,9 @@ class SIPPPlanner(AStarPlanner):
             if expansions > self.max_expansions:
                 break
             for nst, cost, w, niv in self._succ(
-                st, iv, SI, cfg, pitch, climb_steps, climb_cost, dwell_steps, own, o_cap, o_term,
-                origin, tcap, dest, o_lanes, o_r, fixed_lanes, max_step, is_goal_cell,
+                st, iv, SI, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
+                dwell_steps, own, o_cap, o_term, origin, tcap, dest, o_lanes, o_r, fixed_lanes,
+                max_step, is_goal_cell,
             ):
                 ng = gst + cost
                 if ng >= g.get(nst, math.inf):
@@ -373,13 +385,15 @@ class SIPPPlanner(AStarPlanner):
                 # goal cells (per-step landing gate the frontier can't see) are exempt. `niv` comes from
                 # _succ (no index_of). The g early-out above means this fires only for cost-improving
                 # successors — the dominant cost saver (the frontier check is otherwise ~half the run).
+                # The frontier key includes the flight level L (nst[3]): an interval index is per-(cell, L),
+                # so two levels' interval 0 are distinct staircases; the step is now nst[4].
                 if niv >= 0 and not is_goal_cell(nst[1], nst[2]) and \
-                        not _nondominated(frontier, (nst[1], nst[2], niv), nst[3] * dt, ng, c_hold):
-                    continue                               # dominated at its (cell, interval) → prune
+                        not _nondominated(frontier, (nst[1], nst[2], nst[3], niv), nst[4] * dt, ng, c_hold):
+                    continue                               # dominated at its (cell, level, interval) → prune
                 g[nst] = ng
                 came[nst] = st
                 wait_steps[nst] = w
-                hh = h_air(nst[1], nst[2]) if nst[0] == "a" else h_ground
+                hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
                 heapq.heappush(pq, (ng + hh, next(counter), nst, ng, niv))
 
         if goal_state is None:
@@ -395,15 +409,15 @@ class SIPPPlanner(AStarPlanner):
             expanded.append(cur)
             if i + 1 < len(path):
                 w = wait_steps.get(path[i + 1], 0)         # hover steps spent IN cur before the move
-                for k in range(1, w + 1):
-                    expanded.append((cur[0], cur[1], cur[2], cur[3] + k))
+                for k in range(1, w + 1):                  # w>0 only for an air reroute ⇒ cur is a 5-tuple
+                    expanded.append((cur[0], cur[1], cur[2], cur[3], cur[4] + k))
         air = [s for s in expanded if s[0] == "a"]
-        ground_steps = air[0][3] - climb_steps - base
+        ground_steps = air[0][4] - takeoff_steps[air[0][3]] - base
         delay = ground_steps * dt
 
         cruise_wps: list[TimedPoint] = [
-            (np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), s * dt)
-            for (_, q, r, s) in air
+            (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt)
+            for (_, q, r, L, s) in air
         ]
         volumes, centerline, cum_horiz, n_hover = self._build(
             cruise_wps, origin, dest, base, ground_steps, cfg,
@@ -414,6 +428,9 @@ class SIPPPlanner(AStarPlanner):
         if ledger.any_conflict(volumes):
             return _deny(req, DenialReason.CONFLICT_FILED)
 
+        # true vertical travel: takeoff climb + every cruise layer change + landing descent (mirror A*)
+        z_takeoff, z_land = levels[air[0][3]], levels[air[-1][3]]
+        cruise_dz = sum(abs(levels[air[i + 1][3]] - levels[air[i][3]]) for i in range(len(air) - 1))
         intent = OperationalIntent(
             request=req,
             status=IntentStatus.ACCEPTED,
@@ -422,7 +439,7 @@ class SIPPPlanner(AStarPlanner):
             ground_delay_s=delay,
             air_hold_s=n_hover * dt,
             air_detour_m=max(0.0, cum_horiz - straight),
-            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m),
+            altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="sipp",
         )
         intent.cost = trajectory_cost(intent, cfg)
@@ -697,52 +714,75 @@ class SIPPPlanner(AStarPlanner):
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _succ(self, st, iv, SI, cfg, pitch, climb_steps, climb_cost, dwell_steps, own, o_cap, o_term,
-              origin, tcap, dest, o_lanes, o_r, fixed_lanes, max_step, is_goal_cell):
-        """Successors as ``(AS, edge_cost, wait_steps, interval_index)``. ``iv`` is the popped state's
-        interval index (carried in the heap → no ``index_of`` scan in the hot loop), and each emitted air
-        successor carries its OWN interval index (``-1`` for ground). Ground-wait is a per-step ray and
-        takeoff is emitted at the current ground step (so the per-step pad gates match A*); the air
-        reroute is the SIPP collapse (one successor per reachable neighbour interval, folding pre-move
-        hover at the air rate); a standalone hover is emitted only at a goal cell (to retry the per-step
-        landing gate). Mirrors :meth:`AStarPlanner._edges`."""
+    def _succ(self, st, iv, SI, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
+              dwell_steps, own, o_cap, o_term, origin, tcap, dest, o_lanes, o_r, fixed_lanes,
+              max_step, is_goal_cell):
+        """Successors as ``(AS, edge_cost, wait_steps, interval_index)`` — the multi-altitude safe-interval
+        collapse. ``iv`` is the popped state's interval index (carried in the heap → no ``index_of`` scan in
+        the hot loop); each air successor carries its OWN interval index (``-1`` for ground). Ground →
+        ground-wait ray + a per-level takeoff at the current step (per-step pad/dwell gates match A*). Air →
+        same-level reroute (one successor per reachable neighbour interval, folding pre-move hover) + vertical
+        rungs to L±1 (folding pre-rung hover; both levels clear across the climb window — the interval-collapse
+        image of the njit kernel's rung block) + a goal-cell hover to retry the landing gate. Mirrors
+        :meth:`AStarPlanner._edges`."""
         dt = cfg.dt_s
         c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
                                cfg.cost_air_lateral_per_m)
         svc = self._svc
-        tag, q, r, s = st
         out = []
-        if tag == "g":
+        if st[0] == "g":
+            _, q, r, s = st
             if s + 1 <= max_step:
                 out.append((("g", q, r, s + 1), c_gd * dt, 0, -1))      # ground-wait ray (== A* g→g)
-            ts = s + climb_steps
-            if ts > max_step:
+            if fixed_lanes and o_term is not None:                       # one takeoff edge per (lane, level)
+                level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
+                for lane in o_lanes:
+                    lq, lr = lane.cell
+                    for L in range(len(levels)):
+                        ts = s + takeoff_steps[L]
+                        if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
+                            out.append((("a", lq, lr, L, ts),
+                                        takeoff_cost[L] + c_lat * (lane.dist - o_r), 0,
+                                        SI.index_of(lq, lr, L, ts)))
                 return out
-            if fixed_lanes and o_term is not None:
-                if tcap.dwell_ok(o_term, origin, s * dt, o_cap):        # capacity + column at takeoff
-                    for L in o_lanes:
-                        lq, lr = L.cell
-                        if not svc.is_blocked(lq, lr, ts, own):
-                            out.append((("a", lq, lr, ts), climb_cost + c_lat * (L.dist - o_r), 0,
-                                        SI.index_of(lq, lr, ts)))        # one edge per lane
-            else:
-                pad_ok = (tcap.dwell_ok(o_term, origin, s * dt, o_cap, dest) if o_term is not None
-                          else svc.pad_clear(q, r, s, dwell_steps))
-                if not svc.is_blocked(q, r, ts, own) and pad_ok:
-                    out.append((("a", q, r, ts), climb_cost, 0, SI.index_of(q, r, ts)))   # takeoff
+            hub_ok = (tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels, toward=dest)
+                      if o_term is not None else None)
+            for L in range(len(levels)):                                 # legacy / non-terminal: per level
+                ts = s + takeoff_steps[L]
+                pad_ok = hub_ok[L] if o_term is not None else svc.pad_clear(q, r, s, dwell_steps[L])
+                if ts <= max_step and not svc.is_blocked(q, r, L, ts, own) and pad_ok:
+                    out.append((("a", q, r, L, ts), takeoff_cost[L], 0, SI.index_of(q, r, L, ts)))
             return out
 
-        hi_c = SI.intervals(q, r)[iv][1] if iv >= 0 else s             # last step this cell stays free
-        for dq, dr in hg.AXIAL_NEIGHBORS:                              # reroute (collapsed)
+        _, q, r, L, s = st
+        hi_c = SI.intervals(q, r, L)[iv][1] if iv >= 0 else s            # last step this cell stays free
+        for dq, dr in hg.AXIAL_NEIGHBORS:                                # reroute (same level, collapsed)
             nq, nr = q + dq, r + dr
-            for j, (lo, hi) in enumerate(SI.intervals(nq, nr)):
+            for j, (lo, hi) in enumerate(SI.intervals(nq, nr, L)):
                 arr = max(s + 1, lo)
                 if arr > hi or arr > max_step:
                     continue
-                if arr - 1 > hi_c:                                     # can't wait here that long
-                    break                                             # later intervals need even more
-                wait = arr - (s + 1)                                   # folded pre-move hover
-                out.append((("a", nq, nr, arr), c_hold * dt * wait + c_lat * pitch, wait, j))
+                if arr - 1 > hi_c:                                       # can't wait here that long
+                    break                                               # later intervals need even more
+                wait = arr - (s + 1)                                     # folded pre-move hover
+                out.append((("a", nq, nr, L, arr), c_hold * dt * wait + c_lat * pitch, wait, j))
+        for dL in ((-1, 1) if self.vertical_edges else ()):             # vertical rungs to an adjacent level
+            L2 = L + dL
+            if not (0 <= L2 < len(levels)):
+                continue
+            rung = L if dL == 1 else L2                                  # rung index = min(L, L2)
+            rsteps = rung_steps[rung]
+            if s + rsteps > hi_c:                                        # current level not free through climb
+                continue
+            for j, (lo, hi) in enumerate(SI.intervals(q, r, L2)):
+                ap = max(s, lo - 1)                                      # rung-start step (fold pre-rung hover)
+                if ap > hi_c - rsteps:                                   # current level can't hold climb window
+                    break                                               # later target intervals need even more
+                a = ap + rsteps                                          # arrival on the target level
+                if a > hi or a > max_step:
+                    continue                                            # target interval too short for transit
+                wait = ap - s
+                out.append((("a", q, r, L2, a), c_hold * dt * wait + rung_cost[rung], wait, j))
         if is_goal_cell(q, r) and s + 1 <= hi_c and s + 1 <= max_step:
-            out.append((("a", q, r, s + 1), c_hold * dt, 0, iv))       # hover to retry the landing gate
+            out.append((("a", q, r, L, s + 1), c_hold * dt, 0, iv))     # hover to retry the landing gate
         return out

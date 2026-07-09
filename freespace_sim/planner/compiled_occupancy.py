@@ -95,6 +95,14 @@ class CompiledOccupancy:
             return -1
         return (iq * self.rspan + ir) * self.nlevels + L
 
+    def qr_index(self, q: int, r: int) -> int:
+        """Level-less ``(iq*rspan+ir)`` index (``-1`` if out of box); the kernel's ``lane_qr`` — it
+        completes it with the flight level as ``qr_index*nlevels + L`` (== :meth:`cell_id`)."""
+        iq, ir = q - self.qmin, r - self.rmin
+        if iq < 0 or iq >= self.qspan or ir < 0 or ir >= self.rspan:
+            return -1
+        return iq * self.rspan + ir
+
     # ---------- commit hook (mirrors SafeIntervalIndex) ----------
     def on_commit(self, _flight_id, volumes) -> None:
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes

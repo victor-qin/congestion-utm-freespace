@@ -223,7 +223,12 @@ def _nondominated(frontier, key, t, g, w):
 class SIPPPlanner(AStarPlanner):
     """Safe-interval cost-aware planner; inherits occupancy/terminal sync and corridor build from A*."""
 
-    def __init__(self, max_expansions: int = 600_000, compiled: bool = True):
+    def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True):
+        # Default budget is aligned with the compiled kernel's label cap (``_k_max = 1<<21``): the
+        # pure-Python reference is the kernel's correctness ORACLE, so it must be able to reach at least
+        # as far — a long multi-altitude flight can need ~700k expansions (3× the 2D count), which the old
+        # 600k default truncated while the kernel (bigger cap) found the identical optimum. Only affects
+        # ``_plan_reference`` / the A* ``_fallback``; the compiled path caps on ``_k_max`` directly.
         super().__init__(max_expansions)
         self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
         self._sidx_ledger = None
@@ -396,6 +401,7 @@ class SIPPPlanner(AStarPlanner):
                 hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
                 heapq.heappush(pq, (ng + hh, next(counter), nst, ng, niv))
 
+        self.last_expansions = expansions          # search-effort telemetry (mirrors A*; benchmarks/tests)
         if goal_state is None:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
@@ -516,6 +522,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_q = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_r = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_s = np.empty(cocc.MAXS + 8, np.int64)
+            self._k_out_L = np.empty(cocc.MAXS + 8, np.int64)      # flight level per output waypoint
 
     def _build_overlay(self, cocc, sidx, cells, own, base, max_step, fixed) -> bool:
         """Fill the overlay interval pool with the OWN-exempt (transparent) free-intervals of ``cells`` —
@@ -526,21 +533,22 @@ class SIPPPlanner(AStarPlanner):
         gen = self._gen
         n = 0
         for (cq, cr) in cells:
-            c = cocc.cell_id(cq, cr)
-            if c < 0 or self._k_ov_gen[c] == gen:        # out of box, or already built this plan
-                continue
-            head = prev = -1
-            for lo, hi in sidx.free_intervals(cq, cr, own, base, max_step, fixed):
-                if n >= self._k_ovcap:
-                    return False
-                self._k_ov_lo[n] = lo; self._k_ov_hi[n] = hi; self._k_ov_nxt[n] = -1
-                slot = cap + n
-                if prev < 0:
-                    head = slot
-                else:
-                    self._k_ov_nxt[prev - cap] = slot
-                prev = slot; n += 1
-            self._k_ov_head[c] = head; self._k_ov_gen[c] = gen
+            for L in range(cocc.nlevels):                # own lane cells are transparent at EVERY level
+                c = cocc.cell_id(cq, cr, L)
+                if c < 0 or self._k_ov_gen[c] == gen:    # out of box, or already built this plan
+                    continue
+                head = prev = -1
+                for lo, hi in sidx.free_intervals(cq, cr, L, own, base, max_step, fixed):
+                    if n >= self._k_ovcap:
+                        return False
+                    self._k_ov_lo[n] = lo; self._k_ov_hi[n] = hi; self._k_ov_nxt[n] = -1
+                    slot = cap + n
+                    if prev < 0:
+                        head = slot
+                    else:
+                        self._k_ov_nxt[prev - cap] = slot
+                    prev = slot; n += 1
+                self._k_ov_head[c] = head; self._k_ov_gen[c] = gen
         return True
 
     def _overlay_slot(self, cocc, cell, step):
@@ -578,8 +586,15 @@ class SIPPPlanner(AStarPlanner):
         origin = np.asarray(req.origin, float)
         dest = np.asarray(req.dest, float)
         base = int(math.ceil(req.t_departure / dt))
-        climb_steps = max(1, int(math.ceil(cfg.climb_time_s / dt)))
-        climb_cost = cfg.cost_altitude_change_per_m * (cfg.cruise_level_m - cfg.ground_level_m)
+        levels = cfg.flight_levels_m
+        nlev = cfg.n_levels
+        ground_z = cfg.ground_level_m
+        c_alt = cfg.cost_altitude_change_per_m
+        takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)          # per-level climb-steps/cost
+        takeoff_cost = tuple(c_alt * (z - ground_z) for z in levels)
+        rung_steps = tuple(max(1, int(math.ceil((levels[L + 1] - levels[L]) / (cfg.climb_rate_mps * dt))))
+                           for L in range(nlev - 1))
+        rung_cost = tuple(c_alt * (levels[L + 1] - levels[L]) for L in range(nlev - 1))
         oq, orr = hg.enu_to_axial(origin[0], origin[1], R)
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
         gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr
@@ -587,7 +602,8 @@ class SIPPPlanner(AStarPlanner):
 
         svc = self._occupancy(req, ledger, cfg)
         cocc = self._compiled_occ(req, ledger, cfg)
-        dwell_steps = max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_s) / dt)))
+        dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
+                            for z in levels)              # per-level dwell (hover + actual climb to that level)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         own = frozenset(t.id for t in (o_term, d_term) if t is not None)
         self._own = own            # last plan's own terminal-id set (diagnostics + occupancy tests)
@@ -602,10 +618,13 @@ class SIPPPlanner(AStarPlanner):
         c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
                                cfg.cost_air_lateral_per_m)
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
-        max_step = base + climb_steps + int(math.ceil(cfg.max_ground_delay_s / dt)) + 3 * n_hops + 6
+        climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
+                      if nlev > 1 else 0)
+        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
+                    + 3 * n_hops + 2 * climb_span + 6)
 
-        ocell, gcell = cocc.cell_id(oq, orr), cocc.cell_id(gq, grr)
-        if ocell < 0 or gcell < 0:
+        oqr, gqr = cocc.qr_index(oq, orr), cocc.qr_index(gq, grr)   # level-less lane/goal indices
+        if oqr < 0 or gqr < 0:
             return self._plan_reference(req, ledger, cfg)          # out of kernel box → reference
 
         # ---- per-plan kernel state + own-lane transparency overlay (pool blocks columns foreign-to-all) ----
@@ -622,39 +641,52 @@ class SIPPPlanner(AStarPlanner):
         # Terminal: the exit lanes (own-transparent via the overlay). Non-terminal: the origin cell itself
         # (climb-in-place; the kernel's pool lookup reproduces `is_blocked`, so only pad_clear stays here). ----
         smax = base + int(math.ceil(cfg.max_ground_delay_s / dt))
-        if fixed and o_term is not None:
-            lane_cells, lane_lat = [], []
-            for L in o_lanes:
-                lc = cocc.cell_id(L.cell[0], L.cell[1])
-                if lc >= 0:
-                    lane_cells.append(lc); lane_lat.append(c_lat * (L.dist - o_r))
-            to_ok = [tcap.dwell_ok(o_term, origin, s * dt, o_cap) for s in range(base, smax + 1)]
-        else:
-            lane_cells, lane_lat = [ocell], [0.0]
-            to_ok = [svc.pad_clear(oq, orr, s, dwell_steps) for s in range(base, smax + 1)]
-        if not lane_cells or not any(to_ok):
+        n_to = smax - base + 1                                 # ground-delay steps; to_ok is per (step, level)
+        to_ok = []                                             # flat mask, indexed [si*nlev + L]
+        if fixed and o_term is not None:                       # exit lanes (level-less qr; kernel adds L)
+            lane_qr, lane_lat = [], []
+            for lane in o_lanes:
+                lq = cocc.qr_index(lane.cell[0], lane.cell[1])
+                if lq >= 0:
+                    lane_qr.append(lq); lane_lat.append(c_lat * (lane.dist - o_r))
+            for s in range(base, smax + 1):                    # per-(step, level) dwell/column, lane-independent
+                lv = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
+                to_ok.extend(bool(lv[L]) for L in range(nlev))
+        else:                                                  # non-terminal: origin cell, per-level pad-clear
+            lane_qr, lane_lat = [oqr], [0.0]
+            for s in range(base, smax + 1):
+                to_ok.extend(svc.pad_clear(oq, orr, s, dwell_steps[L]) for L in range(nlev))
+        if not lane_qr or not any(to_ok):
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
-        # ---- goal cell(s) + landing-feasible step intervals (folds the per-step landing gate) ----
+        # ---- goal cell(s) at EVERY level + PER-LEVEL landing-feasible step intervals (lf_off[L]:lf_off[L+1]) ----
         if fixed and d_term is not None:                      # dest exit-lane cells; column-capacity landing
-            goal_cells = [c for c in (cocc.cell_id(L.cell[0], L.cell[1]) for L in d_lanes) if c >= 0]
-            if not goal_cells:
+            goal_qr = [q for q in (cocc.qr_index(lane.cell[0], lane.cell[1]) for lane in d_lanes) if q >= 0]
+            if not goal_qr:
                 return self._plan_reference(req, ledger, cfg)
-            for c in goal_cells:
-                self._k_goal_gen[c] = self._gen
-            landing = [tcap.dwell_ok(d_term, dest, s * dt, d_cap) for s in range(base, max_step + 1)]
+
+            def _land(s, L):
+                return tcap.dwell_ok(d_term, dest, s * dt, d_cap, z=levels[L])
         else:                                                 # single dest hex; pad-clear landing
-            self._k_goal_gen[gcell] = self._gen
-            landing = [svc.pad_clear(gq, grr, s, dwell_steps) for s in range(base, max_step + 1)]
-        lf_lo, lf_hi, lo = [], [], -1
-        for i, ok in enumerate(landing):
-            if ok:
-                if lo < 0:
-                    lo = base + i
-            elif lo >= 0:
-                lf_lo.append(lo); lf_hi.append(base + i - 1); lo = -1
-        if lo >= 0:
-            lf_lo.append(lo); lf_hi.append(max_step)
+            goal_qr = [gqr]
+
+            def _land(s, L):
+                return svc.pad_clear(gq, grr, s, dwell_steps[L])
+        for q in goal_qr:                                     # land from ANY level ⇒ mark the cell at all levels
+            for L in range(nlev):
+                self._k_goal_gen[q * nlev + L] = self._gen
+        lf_lo, lf_hi, lf_off = [], [], [0]                    # per-level landing runs, concatenated
+        for L in range(nlev):
+            lo = -1
+            for s in range(base, max_step + 1):
+                if _land(s, L):
+                    if lo < 0:
+                        lo = s
+                elif lo >= 0:
+                    lf_lo.append(lo); lf_hi.append(s - 1); lo = -1
+            if lo >= 0:
+                lf_lo.append(lo); lf_hi.append(max_step)
+            lf_off.append(len(lf_lo))
         if not lf_lo:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
@@ -662,16 +694,19 @@ class SIPPPlanner(AStarPlanner):
         n, _cost, _n_exp, flag = self._kernel(
             cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt,
             self._k_ov_lo, self._k_ov_hi, self._k_ov_nxt, self._k_ov_head, self._k_ov_gen, cocc.cap,
-            cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan, base, max_step,
-            np.asarray(lane_cells, np.int64), np.asarray(lane_lat, np.float64), len(lane_cells),
-            np.asarray(to_ok, np.bool_), len(to_ok), c_gd, climb_steps,
-            self._k_goal_gen, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64), len(lf_lo),
-            c_hold, c_lat, pitch, dt, gx, gy, R, h_off, climb_cost,
+            cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan, base, max_step, nlev,
+            np.asarray(lane_qr, np.int64), np.asarray(lane_lat, np.float64), len(lane_qr),
+            np.asarray(to_ok, np.bool_), n_to, c_gd,
+            np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
+            np.asarray(rung_steps, np.int64), np.asarray(rung_cost, np.float64),
+            self._k_goal_gen, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64),
+            np.asarray(lf_off, np.int64),
+            c_hold, c_lat, pitch, dt, gx, gy, R, h_off,
             self._gen, self._k_front_head, self._k_front_tail, self._k_front_gen,
             self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
             self._k_lab_next, self._k_lab_prev, self._k_lab_dead, self._k_max,
             self._k_heap_f, self._k_heap_c, self._k_heap_n, self._k_max,
-            self._k_out_q, self._k_out_r, self._k_out_s,
+            self._k_out_q, self._k_out_r, self._k_out_s, self._k_out_L,
         )
         self._n_expansions = int(_n_exp)
         if flag == FB_OOB or flag == FB_CAP:
@@ -684,20 +719,24 @@ class SIPPPlanner(AStarPlanner):
         if flag == NO_PATH:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
 
-        # ---- reconstruct: out_* is goal→start; reverse + re-expand folded hover waits ----
-        labels = [(int(self._k_out_q[i]), int(self._k_out_r[i]), int(self._k_out_s[i]))
+        # ---- reconstruct: out_* is goal→start; reverse + re-expand folded hover (a rung's climb is a gap) ----
+        labels = [(int(self._k_out_q[i]), int(self._k_out_r[i]), int(self._k_out_L[i]), int(self._k_out_s[i]))
                   for i in range(n - 1, -1, -1)]
         air = []
-        for i, (q, r, a) in enumerate(labels):
-            air.append((q, r, a))
+        for i, (q, r, L, a) in enumerate(labels):
+            air.append((q, r, L, a))
             if i + 1 < len(labels):
-                for k in range(a + 1, labels[i + 1][2]):
-                    air.append((q, r, k))
-        self._air = air            # last compiled per-step search path [(q,r,step)] (diagnostics + tests)
-        ground_steps = air[0][2] - climb_steps - base
+                nq, nr, nL, na = labels[i + 1]
+                # fill folded pre-move hover at (q,r,L); a vertical rung's climb steps stay a GAP (the
+                # transition segment), exactly as the reference/A* leave them, so cruise_wps matches
+                stop = (na - rung_steps[min(L, nL)] + 1) if (nq == q and nr == r and nL != L) else na
+                for k in range(a + 1, stop):
+                    air.append((q, r, L, k))
+        self._air = air            # last compiled per-step search path [(q,r,L,step)] (diagnostics + tests)
+        ground_steps = air[0][3] - takeoff_steps[air[0][2]] - base
         delay = ground_steps * dt
         cruise_wps: list[TimedPoint] = [
-            (np.array([*hg.hex_center(q, r, R), cfg.cruise_level_m]), a * dt) for (q, r, a) in air]
+            (np.array([*hg.hex_center(q, r, R), levels[L]]), a * dt) for (q, r, L, a) in air]
         volumes, centerline, cum_horiz, n_hover = self._build(
             cruise_wps, origin, dest, base, ground_steps, cfg,
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
@@ -706,10 +745,12 @@ class SIPPPlanner(AStarPlanner):
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
         if ledger.any_conflict(volumes):
             return _deny(req, DenialReason.CONFLICT_FILED)
+        z_takeoff, z_land = levels[air[0][2]], levels[air[-1][2]]     # true vertical travel (mirror A*)
+        cruise_dz = sum(abs(levels[air[i + 1][2]] - levels[air[i][2]]) for i in range(len(air) - 1))
         intent = OperationalIntent(
             request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
             ground_delay_s=delay, air_hold_s=n_hover * dt, air_detour_m=max(0.0, cum_horiz - straight),
-            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m), planner="sipp",
+            altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg), planner="sipp",
         )
         intent.cost = trajectory_cost(intent, cfg)
         return intent

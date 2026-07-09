@@ -103,10 +103,10 @@ def test_compiled_occupancy_matches_safe_interval_index():
     cocc = CompiledOccupancy(cfg); _absorb(cocc, led)
     own = frozenset()
     checked = 0
-    for (q, r) in list(sidx.corr.keys())[:1500]:       # every committed (non-terminal) cell
-        ref = sidx.free_intervals(q, r, own, 0, cocc.MAXS, False)
-        got = cocc.free_intervals_py(q, r, 0, cocc.MAXS)
-        assert got is not None and ref == got, f"interval mismatch at ({q},{r}): {ref} vs {got}"
+    for (q, r, L) in list(sidx.corr.keys())[:1500]:    # every committed (non-terminal) cell, per flight level
+        ref = sidx.free_intervals(q, r, L, own, 0, cocc.MAXS, False)
+        got = cocc.free_intervals_py(q, r, L, 0, cocc.MAXS)
+        assert got is not None and ref == got, f"interval mismatch at ({q},{r},{L}): {ref} vs {got}"
         checked += 1
     assert checked > 50
 
@@ -254,9 +254,9 @@ def test_compiled_terminal_path_never_routes_through_blocked():
         if not c.accepted or sipp._fb != fb0:         # skip denied / fell-back-to-reference plans
             continue
         own, svc = sipp._own, sipp._svc
-        for (q, r, s) in sipp._air:                    # the per-step compiled search path
-            if svc.is_blocked(q, r, s, own):
-                violations.append((rq.flight_id, q, r, s))
+        for (q, r, L, s) in sipp._air:                 # the per-step compiled search path (per flight level)
+            if svc.is_blocked(q, r, L, s, own):
+                violations.append((rq.flight_id, q, r, L, s))
         checked += 1
     assert checked > 20, f"too few terminal plans exercised the kernel ({checked})"
     assert not violations, f"compiled path routed through {len(violations)} blocked cell-steps: {violations[:5]}"

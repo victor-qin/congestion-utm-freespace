@@ -105,9 +105,12 @@ def run(*, nlevels, base=0, max_step=20,
     goal_gen = np.zeros(NC, np.int64)
     for gc in goal_cells:
         goal_gen[gc] = gen
-    lf_lo = np.asarray(lf_lo, np.int64)
-    lf_hi = np.asarray(lf_hi, np.int64)
-    lf_n = lf_lo.size
+    # per-level landing intervals: replicate the given window to every level (lf_off[L]:lf_off[L+1])
+    lf_lo_in, lf_hi_in = list(lf_lo), list(lf_hi)
+    k = len(lf_lo_in)
+    lf_lo = np.asarray(lf_lo_in * nlevels, np.int64)
+    lf_hi = np.asarray(lf_hi_in * nlevels, np.int64)
+    lf_off = np.asarray([i * k for i in range(nlevels + 1)], np.int64)
 
     front_head = np.full(cap, -1, np.int64)
     front_tail = np.full(cap, -1, np.int64)
@@ -137,7 +140,7 @@ def run(*, nlevels, base=0, max_step=20,
         QMIN, RMIN, RSPAN, QSPAN, base, max_step, nlevels,
         lane_qr, lane_lat, n_lanes, to_ok, n_to, c_gd,
         takeoff_steps, takeoff_cost, rung_steps, rung_cost,
-        goal_gen, lf_lo, lf_hi, lf_n,
+        goal_gen, lf_lo, lf_hi, lf_off,
         c_hold, c_lat, pitch, dt, gx, gy, R, h_off,
         gen, front_head, front_tail, front_gen,
         lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_prev, lab_dead, max_lab,

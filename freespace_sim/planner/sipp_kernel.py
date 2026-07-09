@@ -42,7 +42,7 @@ def _search(
     qmin, rmin, rspan, qspan, base, max_step, nlevels,              # box + step window + flight-level axis
     lane_qr, lane_lat, n_lanes, to_ok, n_to, c_gd,                  # takeoff lanes (level-less qr) + gd mask
     takeoff_steps, takeoff_cost, rung_steps, rung_cost,            # per-level takeoff + per-rung vertical edges
-    goal_gen, lf_lo, lf_hi, lf_n,                                     # goal cells (version-stamped) + landing ivals
+    goal_gen, lf_lo, lf_hi, lf_off,                                  # goal cells + PER-LEVEL landing ivals (lf_off[L]:lf_off[L+1])
     c_hold, c_lat, pitch, dt, gx, gy, R, h_off,                     # cost + heuristic params
     gen, front_head, front_tail, front_gen,                          # per-slot sorted-by-arr staircase
     lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_prev, lab_dead, max_lab,  # labels
@@ -134,7 +134,7 @@ def _search(
 
         if is_goal:                                     # goal acceptance within a landing-feasible run
             feasible = False
-            for k in range(lf_n):
+            for k in range(lf_off[Lc], lf_off[Lc + 1]):  # only THIS level's landing intervals
                 if lf_lo[k] <= arr <= lf_hi[k]:
                     feasible = True
                     break

@@ -161,6 +161,24 @@ def test_compiled_occupancy_matches_is_blocked():
     assert checked > 1000 and blocked > 0
 
 
+def test_out_of_box_committed_corridor_skipped_not_crash():
+    """Issue #2: a committed corridor cell that maps outside the kernel box is SKIPPED (counted in
+    ``oob_corridor_cells``), never a crash. Any later query to that cell gets ``cell_id < 0`` so the kernel
+    falls back via FB_OOB and the reference stays the oracle. Pre-fix this raised an uncaught IndexError
+    inside ``on_commit`` (fired for every commit, even fallback flights'), crashing the whole run."""
+    cfg = SimConfig()
+    cocc = CompiledHexOccupancy(cfg, margin=0)          # box == region bbox (no reroute margin)
+    # a short corridor 5 km BEYOND the region's origin corner → every rasterized cell maps outside the box
+    far = Volume4D(box_from_segment(vec(-5000, -5000, 150), vec(-4400, -5000, 150), 40, 400), 0.0, 5.0)
+    cocc.on_commit(7, [far])                            # must NOT raise
+    assert cocc.oob_corridor_cells > 0, "expected out-of-box corridor cells for a volume outside the region"
+    # a normal in-region commit records cleanly and never trips the counter
+    near = Volume4D(box_from_segment(vec(3000, 3000, 150), vec(3600, 3000, 150), 40, 400), 0.0, 5.0)
+    ok = CompiledHexOccupancy(cfg)
+    ok.on_commit(8, [near])
+    assert ok.oob_corridor_cells == 0
+
+
 # ---------------- E: safety valves / fallback ----------------
 
 def test_compiled_absent_falls_back_to_reference():

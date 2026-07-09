@@ -21,10 +21,13 @@ per plan by rasterizing the flight's 1–2 own hub columns — O(footprint), no 
 when own and foreign columns don't share a cell (hub spacing ≫ column radius); the node-count parity test
 guards the assumption.
 
-Cells live in a box from the region corners + a reroute ``margin`` (a committed corridor cell outside is
-an error — widen ``margin``). ``MAXS`` covers the worst-case per-flight ``max_step`` (a region-diagonal
-flight's search horizon), so the pools' free intervals never end before a reachable step. The kernel
-bound-checks query cells/steps and falls back to the reference on any stray.
+Cells live in a box from the region corners + a reroute ``margin``. A committed corridor cell outside the
+box is skipped (counted in ``oob_corridor_cells``) — safe, because any *query* to that cell gets
+``cell_id < 0`` and the kernel falls back via ``FB_OOB``; it never crashes on commit. ``MAXS`` covers the
+worst-case per-flight ``max_step`` (a region-diagonal, latest-departing flight — see ``_box``), so every
+reachable query step lies inside the seed interval. Committed steps *beyond* ``MAXS`` (a landing column's
+hover tail) are dropped by ``_Pool.block``, which is harmless: every kernel query is ``≤ max_step ≤ MAXS``
+(guarded in ``_plan_compiled``), so those far-future steps are never read.
 """
 from __future__ import annotations
 
@@ -34,6 +37,26 @@ import numpy as np
 
 from ..geometry import CylinderSpec
 from . import hexgrid as hg
+
+
+def search_horizon(base: int, takeoff_steps_max: int, n_hops: int, climb_span: int, cfg) -> int:
+    """The largest ``step`` an A* plan can reach: takeoff + a 3× lateral detour budget + a full ground-
+    delay allowance + the mid-route climb span. ONE definition (issue #5) — ``_plan_reference``,
+    ``_plan_compiled``, and ``CompiledHexOccupancy._box`` (with worst-case args) all call it, so the
+    kernel's search bound, the box guard, and ``MAXS`` cannot drift apart. Monotone in ``base``/``n_hops``,
+    so ``_box``'s worst-case value bounds every per-flight one."""
+    return (base + takeoff_steps_max + int(math.ceil(cfg.max_ground_delay_s / cfg.dt_s))
+            + 3 * n_hops + 2 * climb_span + 6)
+
+
+def hover_tail_steps(cfg) -> int:
+    """Extra steps a committed landing column occupies PAST the arrival step — hover dwell + climb to the
+    top level + the ASTM time buffer, in dt units (mirrors ``volumes.hover_reservation`` /
+    ``hexgrid._step_range``). ``MAXS`` adds this so ``_Pool.block`` never silently drops a committed step;
+    query correctness never needs it (every query is ``≤ max_step ≤ MAXS``), but it removes the old
+    hand-tuned ``+16`` slack that only happened to cover the tail on default numbers (issue #1)."""
+    max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
+    return int(math.ceil((cfg.hover_time_s + max_climb + cfg.time_buffer_s) / cfg.dt_s)) + 2
 
 
 class _Pool:
@@ -125,6 +148,13 @@ class CompiledHexOccupancy:
         self.MAXS = maxs
         self.corr = _Pool(self.NC, self.MAXS)
         self.col = _Pool(self.NC, self.MAXS)
+        # cell → {terminal ids whose column ever covers it}. Lets the host detect an own∩foreign shared
+        # cell (issue #3) and fall back to the reference, instead of the overlay boolean silently treating a
+        # foreign column as transparent. Column cells only (a small footprint), so the memory is tiny.
+        self.col_owners: dict[int, set] = {}
+        # committed corridor cells that fell outside the box: skipped (never a crash); any query to such a
+        # cell gets cell_id < 0 and the kernel falls back via FB_OOB. Non-zero ⇒ consider widening `margin`.
+        self.oob_corridor_cells = 0
 
     def _box(self, cfg, margin):
         w, h = cfg.region_size_m
@@ -135,8 +165,8 @@ class CompiledHexOccupancy:
             qs.append(q); rs.append(r)
         qmin, qmax = min(qs) - margin, max(qs) + margin
         rmin, rmax = min(rs) - margin, max(rs) + margin
-        # MAXS must be >= the largest per-flight max_step (astar.py: base + takeoff + ground_delay +
-        # 3*n_hops + 2*climb_span + 6). Worst case: latest departure and a region-DIAGONAL flight.
+        # MAXS = the worst-case per-flight search_horizon (latest departure + region-DIAGONAL flight; >=
+        # every flight's max_step since search_horizon is monotone) + the committed landing hover tail.
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
         levels = cfg.flight_levels_m
@@ -145,8 +175,7 @@ class CompiledHexOccupancy:
         n_hops_max = int(math.ceil(math.hypot(w, h) / max(pitch, 1e-9)))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        maxs = (base_max + takeoff_max + int(math.ceil(cfg.max_ground_delay_s / dt))
-                + 3 * n_hops_max + 2 * climb_span + 6 + 16)
+        maxs = search_horizon(base_max, takeoff_max, n_hops_max, climb_span, cfg) + hover_tail_steps(cfg)
         return qmin, rmin, qmax - qmin + 1, rmax - rmin + 1, maxs
 
     def cell_id(self, q: int, r: int, L: int) -> int:
@@ -181,12 +210,13 @@ class CompiledHexOccupancy:
             if is_column:                               # → column pool (all columns; own/foreign per plan)
                 if c >= 0:
                     self.col.block(c, int(s))
+                    self.col_owners.setdefault(c, set()).add(tid)
             else:                                       # → corridor pool (minus committing own interior)
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue
-                if c < 0:
-                    raise IndexError(
-                        f"committed corridor cell ({q},{r},L={L}) outside kernel box — widen margin")
+                if c < 0:                               # outside the box → skip (never crash on commit);
+                    self.oob_corridor_cells += 1        # a query to this cell gets cell_id<0 → kernel FB_OOB
+                    continue
                 self.corr.block(c, int(s))
 
     def evict_before(self, step) -> None:
@@ -196,6 +226,8 @@ class CompiledHexOccupancy:
     def reset(self) -> None:
         self.n_added = 0
         self.evicted_before = None
+        self.col_owners.clear()
+        self.oob_corridor_cells = 0
         self.corr.reset()
         self.col.reset()
 

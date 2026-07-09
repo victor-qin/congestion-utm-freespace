@@ -45,6 +45,7 @@ from ..volumes import (
     terminal_radius,
 )
 from . import hexgrid as hg
+from .compiled_hex_occupancy import search_horizon
 from .occupancy import HexOccupancyService
 from .terminal_capacity import TerminalCapacity
 
@@ -168,10 +169,12 @@ class AStarPlanner:
         self._cocc_ledger: ReservationLedger | None = None
         self._gen = 0                                   # version stamp for the reused kernel state
         self._ks = None                                 # lazily-allocated kernel work arrays (hash/heap/…)
-        self._fb = 0                                    # kernel→reference fallback count (diagnostics/tests)
+        self._fb = 0                                    # IN-KERNEL fallback count (FB_OOB/HASH/HEAP + overlap)
         self._fb_reasons: Counter = Counter()           # fallback reason histogram (bench summary)
+        # PRE-kernel reference dispatches (legacy-terminal / box-guard) — counted separately from in-kernel
+        # FB_* so a bench's "kernel coverage" isn't overstated (these plans run pure Python end to end).
+        self._ref_dispatch: Counter = Counter()
         self._remask = 0                                # bounded-mask → full-range widen count (diagnostics)
-        self._own: frozenset = frozenset()              # last plan's own terminal ids (diagnostics/tests)
         self._warmed = False
         if self.compiled:
             self._warm_jit()
@@ -223,6 +226,7 @@ class AStarPlanner:
             return self._plan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         if (o_term is not None or d_term is not None) and not cfg.fixed_exit_lanes:
+            self._ref_dispatch["legacy-terminal"] += 1        # pre-kernel: ran pure Python end to end
             return self._plan_reference(req, ledger, cfg)
         return self._plan_compiled(req, ledger, cfg)
 
@@ -306,8 +310,7 @@ class AStarPlanner:
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
-                    + 3 * n_hops + 2 * climb_span + 6)
+        max_step = search_horizon(base, max(takeoff_steps), n_hops, climb_span, cfg)
 
         start = ("g", oq, orr, base)
         g = {start: 0.0}
@@ -593,14 +596,22 @@ class AStarPlanner:
                 ks[k] = np.empty(cocc.MAXS + 8, np.int64)
         return ks
 
-    def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen):
+    def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
         """Mark this flight's OWN-column footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
         ``_blocked`` treats them as transparent (own column) instead of walls. Cheap: rasterize the 1–2
         own hub columns (same rasterizer that built the column pool) and mark their in_blk cells — no
-        per-step scan. Exact when own/foreign columns don't share a cell (hub spacing ≫ column radius)."""
+        per-step scan.
+
+        Returns ``True`` if any own cell is ALSO covered by a FOREIGN hub's column (via ``col_owners``):
+        the single-boolean overlay cannot distinguish "own here" from "own AND foreign here", so the
+        caller falls back to the reference for exactness (issue #3). ``demand.py`` reject-samples hub
+        spacing (#27), making this rare, but detecting it keeps the kernel exact regardless of spacing
+        rather than *assuming* hub spacing ≫ column radius."""
         ov = self._ks["ov_own_gen"]
         cfg = cocc.cfg
         z_hi = cfg.flight_levels_m[-1]
+        own_ids = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        overlap = False
         for term, center in ((o_term, origin), (d_term, dest)):
             if term is None:
                 continue
@@ -615,6 +626,10 @@ class AStarPlanner:
                 c = cocc.cell_id(q, r, L)
                 if c >= 0:
                     ov[c] = gen
+                    owners = cocc.col_owners.get(c)
+                    if owners is not None and not owners <= own_ids:   # a FOREIGN column shares this cell
+                        overlap = True
+        return overlap
 
     def _warm_jit(self):
         """Compile the kernel once at construction with a tiny synthetic input (off the hot path)."""
@@ -641,8 +656,15 @@ class AStarPlanner:
                 1000,
             )
             self._warmed = True
-        except Exception:                                                     # numba trouble → stay usable
-            self._warmed = True
+        except Exception as e:                                # compile failure → degrade to pure Python
+            warnings.warn(
+                f"astar numba kernel failed to warm/compile ({e!r}); falling back to the pure-Python "
+                f"reference planner for ALL plans. Install a compatible numba, or clear stale "
+                f".nbi/.nbc caches after a kernel-signature change.",
+                RuntimeWarning, stacklevel=2,
+            )
+            self.compiled = False                             # dispatch every plan to _plan_reference
+            self._kernel = None
 
     def _plan_compiled(self, req, ledger, cfg):
         from . import astar_kernel as K
@@ -689,11 +711,11 @@ class AStarPlanner:
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
-                    + 3 * n_hops + 2 * climb_span + 6)
+        max_step = search_horizon(base, max(takeoff_steps), n_hops, climb_span, cfg)
 
         # ---- box / window membership guard: else fall back to the reference ----
         if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:
+            self._ref_dispatch["box-guard"] += 1
             return self._plan_reference(req, ledger, cfg)
 
         ks = self._kernel_state(cocc)
@@ -735,6 +757,21 @@ class AStarPlanner:
         # the search reaches a ground/goal step beyond it the kernel returns FB_MASK, and we rebuild over
         # the FULL range and re-run. Exact — the widened run IS the full-mask search — and no reference
         # fallback, just the rare re-run. Most flights finish in one tight pass. ----
+        # ---- own-column overlay: window-independent, so build it ONCE above the widen loop (was rebuilt
+        # per re-run). If any own cell is also under a FOREIGN hub's column, the single-boolean overlay
+        # can't represent it exactly → fall back to the reference (issue #3). ----
+        self._gen += 1                                   # bump: stale-stamps the reused ov_own_gen array
+        gen = self._gen
+        if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
+            self._fb += 1
+            self._fb_reasons["own-foreign-overlap"] += 1
+            warnings.warn(
+                f"astar own∩foreign column cell for flight {getattr(req, 'id', '?')} "
+                f"O={tuple(req.origin)}→D={tuple(req.dest)}; running reference (boolean overlay).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return self._plan_reference(req, ledger, cfg)
+
         n_gsteps = min(full_ng, 3 * n_hops + 2 * climb_span + 134)
         while True:
             to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
@@ -758,10 +795,6 @@ class AStarPlanner:
                     for Lv in range(n_levels):
                         land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
 
-            self._gen += 1                               # bump per attempt (stale-stamps the reused arrays)
-            gen = self._gen
-            if own:
-                self._build_overlay(cocc, o_term, d_term, origin, dest, gen)
             n_out, cost, n_exp, status, aux = self._kernel(
                 cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
                 ks["ov_own_gen"],
@@ -781,7 +814,6 @@ class AStarPlanner:
                 continue
             break
         self.last_expansions = n_exp
-        self._own = own
 
         # ---- status handling ----
         if status >= K.FB_OOB:                           # safety valve → pure-Python reference
@@ -807,6 +839,9 @@ class AStarPlanner:
         air = [(int(ks["out_q"][i]), int(ks["out_r"][i]), int(ks["out_L"][i]), int(ks["out_s"][i]))
                for i in range(n_out) if ks["out_L"][i] >= 0]
         air.reverse()
+        if not air:                                      # defensive: an accepted path always ends at an
+            self._ref_dispatch["empty-air"] += 1         # air goal, but never index air[0] on an empty list
+            return self._plan_reference(req, ledger, cfg)
         ground_steps = air[0][3] - takeoff_steps[air[0][2]] - base
         cruise_wps: list[TimedPoint] = [
             (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt) for (q, r, L, s) in air

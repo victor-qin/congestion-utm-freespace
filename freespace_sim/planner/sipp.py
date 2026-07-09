@@ -100,15 +100,15 @@ class SafeIntervalIndex:
     def _add(self, vol, own_cols) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, s, in_blk in hg.rasterize_volume_dual(
+        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:
                 continue                                        # is_blocked only consults in_blk cells
             if is_column:
-                self.cols.setdefault((q, r), {}).setdefault(s, set()).add(tid)
+                self.cols.setdefault((q, r, L), {}).setdefault(s, set()).add(tid)
             elif not (own_cols and self._inside_a_column(q, r, own_cols)):
-                self.corr.setdefault((q, r), set()).add(s)      # (skip own terminal interior, as occupancy)
+                self.corr.setdefault((q, r, L), set()).add(s)   # (skip own terminal interior, as occupancy)
 
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:
@@ -126,27 +126,29 @@ class SafeIntervalIndex:
         for cell in hg.terminal_cells(center, term, self.cfg):
             self.static_cols.setdefault(cell, set()).add(tid)
 
-    def cell_blocked(self, q, r, s, own, fixed_lanes) -> bool:
-        """Exact replica of ``HexOccupancyService.is_blocked(q, r, s, own)`` — including the always-active
-        ``static_cols`` walls (foreign in EITHER the per-step columns OR the static set ⇒ blocked)."""
-        cc = self.cols.get((q, r))
+    def cell_blocked(self, q, r, L, s, own, fixed_lanes) -> bool:
+        """Exact replica of ``HexOccupancyService.is_blocked(q, r, L, s, own)`` — per-level ``cols``/``corr``
+        plus the always-active ``static_cols`` walls, which are level-INDEPENDENT (a foreign hub column
+        walls (q, r) at every flight level). Foreign in EITHER the per-step column OR the static set ⇒
+        blocked."""
+        cc = self.cols.get((q, r, L))
         hubs = cc.get(s) if cc else None
-        stat = self.static_cols.get((q, r)) if self.static_cols else None
+        stat = self.static_cols.get((q, r)) if self.static_cols else None   # level-independent
         if hubs is not None or stat is not None:
             if (hubs is not None and any(t not in own for t in hubs)) or \
                     (stat is not None and any(t not in own for t in stat)):
                 return True                                     # foreign column (transient or static) → wall
-            return fixed_lanes and s in self.corr.get((q, r), ())   # own-only column + sibling corridor
-        return s in self.corr.get((q, r), ())
+            return fixed_lanes and s in self.corr.get((q, r, L), ())   # own-only column + sibling corridor
+        return s in self.corr.get((q, r, L), ())
 
-    def free_intervals(self, q, r, own, base, max_step, fixed_lanes):
-        """Maximal free ``[lo,hi]`` step-runs in ``[base,max_step]`` — complement of the cell's blocked
-        steps. O(#occupied steps of the cell); O(1) for a never-occupied cell (the common case)."""
+    def free_intervals(self, q, r, L, own, base, max_step, fixed_lanes):
+        """Maximal free ``[lo,hi]`` step-runs in ``[base,max_step]`` for cell ``(q, r, L)`` — complement of
+        its blocked steps. O(#occupied steps of the cell); O(1) for a never-occupied cell (the common case)."""
         stat = self.static_cols.get((q, r)) if self.static_cols else None
         if stat is not None and any(t not in own for t in stat):
-            return []                            # always-active FOREIGN wall ⇒ blocked at EVERY step
-        corr = self.corr.get((q, r))
-        cols = self.cols.get((q, r))
+            return []                            # always-active FOREIGN wall ⇒ blocked at EVERY step/level
+        corr = self.corr.get((q, r, L))
+        cols = self.cols.get((q, r, L))
         if not corr and not cols:
             return [(base, max_step)]
         cand = set()
@@ -154,7 +156,7 @@ class SafeIntervalIndex:
             cand.update(s for s in corr if base <= s <= max_step)
         if cols:
             cand.update(s for s in cols if base <= s <= max_step)
-        blk = sorted(s for s in cand if self.cell_blocked(q, r, s, own, fixed_lanes))
+        blk = sorted(s for s in cand if self.cell_blocked(q, r, L, s, own, fixed_lanes))
         out, lo = [], base
         for s in blk:
             if s > lo:
@@ -175,17 +177,17 @@ class _SafeIntervals:
         self.base = base
         self.max_step = max_step
         self.fixed_lanes = fixed_lanes
-        self._cache: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        self._cache: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
 
-    def intervals(self, q, r):
-        iv = self._cache.get((q, r))
+    def intervals(self, q, r, L):
+        iv = self._cache.get((q, r, L))
         if iv is None:
-            iv = self.sidx.free_intervals(q, r, self.own, self.base, self.max_step, self.fixed_lanes)
-            self._cache[(q, r)] = iv
+            iv = self.sidx.free_intervals(q, r, L, self.own, self.base, self.max_step, self.fixed_lanes)
+            self._cache[(q, r, L)] = iv
         return iv
 
-    def index_of(self, q, r, step):
-        for i, (lo, hi) in enumerate(self.intervals(q, r)):
+    def index_of(self, q, r, L, step):
+        for i, (lo, hi) in enumerate(self.intervals(q, r, L)):
             if lo <= step <= hi:
                 return i
         return -1   # step is blocked (no interval) — the search never targets such a step

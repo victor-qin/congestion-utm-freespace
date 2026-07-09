@@ -42,9 +42,10 @@ class CompiledOccupancy:
         self.n_added = 0
         self.evicted_before: int | None = None
 
+        self.nlevels = cfg.n_levels                  # flight-level axis (multi-altitude): cell = (q, r, L)
         qmin, rmin, qspan, rspan, maxs = self._box(cfg, margin)
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
-        self.NC = qspan * rspan
+        self.NC = qspan * rspan * self.nlevels        # one pre-seeded slot per (q, r, L) cell
         self.MAXS = maxs
         self._init_pool()
 
@@ -88,11 +89,11 @@ class CompiledOccupancy:
         self.nslots += 1
         return s
 
-    def cell_id(self, q: int, r: int) -> int:
+    def cell_id(self, q: int, r: int, L: int) -> int:
         iq, ir = q - self.qmin, r - self.rmin
-        if iq < 0 or iq >= self.qspan or ir < 0 or ir >= self.rspan:
+        if iq < 0 or iq >= self.qspan or ir < 0 or ir >= self.rspan or L < 0 or L >= self.nlevels:
             return -1
-        return iq * self.rspan + ir
+        return (iq * self.rspan + ir) * self.nlevels + L
 
     # ---------- commit hook (mirrors SafeIntervalIndex) ----------
     def on_commit(self, _flight_id, volumes) -> None:
@@ -109,7 +110,7 @@ class CompiledOccupancy:
     def _add(self, vol, own_cols) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, s, in_blk in hg.rasterize_volume_dual(
+        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:
@@ -119,12 +120,12 @@ class CompiledOccupancy:
             # foreign-to-everyone here; the planning flight's own columns are exempted per-flight (overlay).
             if not is_column and own_cols and self._inside_a_column(q, r, own_cols):
                 continue
-            c = self.cell_id(q, r)
+            c = self.cell_id(q, r, L)
             if c < 0:
                 if is_column:
                     continue                              # a column footprint cell just past the box edge
                 raise IndexError(
-                    f"committed corridor cell ({q},{r}) outside kernel box — widen margin")
+                    f"committed corridor cell ({q},{r},L={L}) outside kernel box — widen margin")
             self._block(c, int(s))
 
     def _block(self, c: int, s: int) -> None:
@@ -166,15 +167,16 @@ class CompiledOccupancy:
         restored per-flight by the overlay (built from ``SafeIntervalIndex``, which exempts own walls).
         Call AFTER ``_init_pool``/absorb; idempotent (re-emptying an empty interval is a no-op)."""
         for (q, r) in hg.terminal_cells(center, term, self.cfg):
-            c = self.cell_id(q, r)
-            if c >= 0:
-                self.iv_lo[c] = 0; self.iv_hi[c] = -1; self.iv_nxt[c] = -1   # empty (lo>hi) ⇒ fully blocked
+            for L in range(self.nlevels):                # always-active walls the column at EVERY level
+                c = self.cell_id(q, r, L)
+                if c >= 0:
+                    self.iv_lo[c] = 0; self.iv_hi[c] = -1; self.iv_nxt[c] = -1   # empty (lo>hi) ⇒ blocked
 
     # ---------- pure-Python reader (kernel parity oracle + tests) ----------
-    def free_intervals_py(self, q: int, r: int, base: int, max_step: int):
-        """Cell's free intervals clipped to ``[base, max_step]`` — the exact view the kernel walks.
-        Returns ``None`` only if out-of-box (the kernel would fall back to the reference)."""
-        c = self.cell_id(q, r)
+    def free_intervals_py(self, q: int, r: int, L: int, base: int, max_step: int):
+        """Cell ``(q, r, L)``'s free intervals clipped to ``[base, max_step]`` — the exact view the kernel
+        walks. Returns ``None`` only if out-of-box (the kernel would fall back to the reference)."""
+        c = self.cell_id(q, r, L)
         if c < 0:
             return None
         out = []

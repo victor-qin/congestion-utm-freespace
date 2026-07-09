@@ -34,6 +34,8 @@ NO_PATH_TRUNC = 2          # hit max_expansions → host maps SEARCH_EXHAUSTED
 FB_OOB = 3                 # reroute left the occupancy box  → host reference
 FB_HASH = 4                # g/closed/came hash saturated    → host reference
 FB_HEAP = 5                # priority queue overflowed        → host reference
+FB_MASK = 6                # search reached a ground/goal step beyond the bounded to_ok/land_ok masks →
+#                            host widens the masks and re-runs (NOT a reference fallback; stays exact)
 
 
 @njit(cache=True, nogil=True)
@@ -215,6 +217,8 @@ def _search(
                 if q == goal_q[gidx] and r == goal_r[gidx]:
                     is_goal = True
                     break
+            if is_goal and sp >= n_gsteps:             # goal reached beyond the bounded mask → widen+re-run
+                return 0, 0.0, n_exp, FB_MASK, step
             if is_goal and land_ok[sp * n_levels + L]:
                 m = 0                                  # reconstruct: walk came goal→start into out_*
                 cur = st_key
@@ -239,6 +243,8 @@ def _search(
         # ============ expand (inlined _edges, exact successor order) ============
         if L < 0:                                      # ---- ground state (astar.py:376-409) ----
             gi = step - base
+            if gi >= n_gsteps:                          # ground step beyond the bounded mask → widen+re-run
+                return 0, 0.0, n_exp, FB_MASK, step
             if step + 1 <= max_step:                    # ground-wait g→g (emitted FIRST)
                 nkey = ((iq0 * rspan + ir0) * nlp1 + 0) * step_span + (step + 1 - base)
                 ng = base_g + c_gd_dt

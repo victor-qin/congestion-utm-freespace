@@ -170,6 +170,7 @@ class AStarPlanner:
         self._ks = None                                 # lazily-allocated kernel work arrays (hash/heap/…)
         self._fb = 0                                    # kernel→reference fallback count (diagnostics/tests)
         self._fb_reasons: Counter = Counter()           # fallback reason histogram (bench summary)
+        self._remask = 0                                # bounded-mask → full-range widen count (diagnostics)
         self._own: frozenset = frozenset()              # last plan's own terminal ids (diagnostics/tests)
         self._warmed = False
         if self.compiled:
@@ -695,79 +696,97 @@ class AStarPlanner:
         if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:
             return self._plan_reference(req, ledger, cfg)
 
-        self._gen += 1
-        gen = self._gen
         ks = self._kernel_state(cocc)
-        if own:
-            self._build_overlay(cocc, o_term, d_term, origin, dest, gen)
-
         n_levels = len(levels)
-        n_gsteps = max_step - base + 1
+        full_ng = max_step - base + 1
 
-        # ---- takeoff fan (lanes) + per-(ground-step, level) feasibility mask `to_ok` ----
+        # ---- takeoff lanes (once; independent of the mask window) ----
         if fixed_lanes and o_term is not None:
             o_r = terminal_radius(o_term, cfg)
             lane_q = np.asarray([L.cell[0] for L in o_lanes], np.int64)
             lane_r = np.asarray([L.cell[1] for L in o_lanes], np.int64)
             lane_lat = np.asarray([c_lat * (L.dist - o_r) for L in o_lanes], np.float64)
-            to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
-            for gi in range(n_gsteps):
-                lvl_ok = tcap.dwell_ok_levels(o_term, origin, (base + gi) * dt, o_cap, levels)
-                for Lv in range(n_levels):
-                    to_ok[gi * n_levels + Lv] = lvl_ok[Lv]
+            to_terminal = True
         else:                                            # non-terminal origin (legacy-terminal fell back)
             lane_q = np.asarray([oq], np.int64)
             lane_r = np.asarray([orr], np.int64)
             lane_lat = np.asarray([0.0], np.float64)
-            to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
-            hub_ok = None
-            if o_term is not None:
-                pass                                     # unreachable: legacy-terminal dispatched to ref
-            for gi in range(n_gsteps):
-                for Lv in range(n_levels):
-                    to_ok[gi * n_levels + Lv] = svc.pad_clear(oq, orr, base + gi, dwell_steps[Lv])
-
-        # ---- goal cells + per-(step, level) landing feasibility mask `land_ok` ----
+            to_terminal = False
+        # ---- goal cells (once) ----
         if fixed_lanes and d_term is not None:
             goal_q = np.asarray([L.cell[0] for L in d_lanes], np.int64)
             goal_r = np.asarray([L.cell[1] for L in d_lanes], np.int64)
-            land_ok = np.zeros(n_gsteps * n_levels, np.bool_)
-            for gi in range(n_gsteps):
-                for Lv in range(n_levels):
-                    land_ok[gi * n_levels + Lv] = tcap.dwell_ok(
-                        d_term, dest, (base + gi) * dt, d_cap, z=levels[Lv])
+            land_terminal = True
         else:                                            # non-terminal destination
             goal_q = np.asarray([gq], np.int64)
             goal_r = np.asarray([grr], np.int64)
-            land_ok = np.zeros(n_gsteps * n_levels, np.bool_)
-            for gi in range(n_gsteps):
-                for Lv in range(n_levels):
-                    land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
+            land_terminal = False
 
-        # ---- call the kernel (no early-out on empty masks: let the search reach the reference's exact
-        # queue-empty (BUDGET_EXCEEDED) vs cap-hit (SEARCH_EXHAUSTED) conclusion) ----
         rs = np.asarray(rung_steps if rung_steps else (0,), np.int64)
         rc = np.asarray(rung_cost if rung_cost else (0.0,), np.float64)
-        n_out, cost, n_exp, status, aux = self._kernel(
-            cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
-            ks["ov_own_gen"],
-            cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
-            oq, orr, lane_q, lane_r, lane_lat, len(lane_q),
-            np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
-            to_ok, n_gsteps, cfg.cost_ground_delay_per_s * dt,
-            rs, rc, c_lat * pitch, cfg.cost_air_hold_per_s * dt, self.vertical_edges,
-            goal_q, goal_r, len(goal_q), land_ok,
-            gx, gy, R, h_off, c_lat, h_ground,
-            gen, ks["g_key"], ks["g_gen"], ks["g_val"], ks["g_came"], ks["g_flag"], ks["cap"], ks["log2"],
-            ks["heap_f"], ks["heap_c"], ks["heap_n"], ks["mh"],
-            ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
-        )
+        tks = np.asarray(takeoff_steps, np.int64)
+        tkc = np.asarray(takeoff_cost, np.float64)
+        c_gd_dt, c_hold_dt, c_lat_pitch = (cfg.cost_ground_delay_per_s * dt,
+                                           cfg.cost_air_hold_per_s * dt, c_lat * pitch)
+
+        # ---- two-phase BOUNDED mask. ``max_step`` (hence the full mask width) is blown up ~7x by the
+        # ground-delay allowance, which flights almost never use. Build the per-(step, level) takeoff/
+        # landing feasibility masks over a TIGHT window first (a full detour + a modest ground delay); if
+        # the search reaches a ground/goal step beyond it the kernel returns FB_MASK, and we rebuild over
+        # the FULL range and re-run. Exact — the widened run IS the full-mask search — and no reference
+        # fallback, just the rare re-run. Most flights finish in one tight pass. ----
+        n_gsteps = min(full_ng, 3 * n_hops + 2 * climb_span + 134)
+        while True:
+            to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
+            if to_terminal:
+                for gi in range(n_gsteps):
+                    lvl_ok = tcap.dwell_ok_levels(o_term, origin, (base + gi) * dt, o_cap, levels)
+                    for Lv in range(n_levels):
+                        to_ok[gi * n_levels + Lv] = lvl_ok[Lv]
+            else:
+                for gi in range(n_gsteps):
+                    for Lv in range(n_levels):
+                        to_ok[gi * n_levels + Lv] = svc.pad_clear(oq, orr, base + gi, dwell_steps[Lv])
+            land_ok = np.zeros(n_gsteps * n_levels, np.bool_)
+            if land_terminal:
+                for gi in range(n_gsteps):
+                    for Lv in range(n_levels):
+                        land_ok[gi * n_levels + Lv] = tcap.dwell_ok(
+                            d_term, dest, (base + gi) * dt, d_cap, z=levels[Lv])
+            else:
+                for gi in range(n_gsteps):
+                    for Lv in range(n_levels):
+                        land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
+
+            self._gen += 1                               # bump per attempt (stale-stamps the reused arrays)
+            gen = self._gen
+            if own:
+                self._build_overlay(cocc, o_term, d_term, origin, dest, gen)
+            n_out, cost, n_exp, status, aux = self._kernel(
+                cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
+                ks["ov_own_gen"],
+                cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
+                oq, orr, lane_q, lane_r, lane_lat, len(lane_q),
+                tks, tkc, to_ok, n_gsteps, c_gd_dt,
+                rs, rc, c_lat_pitch, c_hold_dt, self.vertical_edges,
+                goal_q, goal_r, len(goal_q), land_ok,
+                gx, gy, R, h_off, c_lat, h_ground,
+                gen, ks["g_key"], ks["g_gen"], ks["g_val"], ks["g_came"], ks["g_flag"], ks["cap"], ks["log2"],
+                ks["heap_f"], ks["heap_c"], ks["heap_n"], ks["mh"],
+                ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
+            )
+            if status == K.FB_MASK and n_gsteps < full_ng:
+                self._remask += 1
+                n_gsteps = full_ng                       # widen to the full range and re-run (exact)
+                continue
+            break
         self.last_expansions = n_exp
         self._own = own
 
         # ---- status handling ----
         if status >= K.FB_OOB:                           # safety valve → pure-Python reference
-            reason = {K.FB_OOB: "out-of-box", K.FB_HASH: "hash-full", K.FB_HEAP: "heap-full"}[status]
+            reason = {K.FB_OOB: "out-of-box", K.FB_HASH: "hash-full", K.FB_HEAP: "heap-full",
+                      K.FB_MASK: "mask-exhausted-at-full"}[status]   # FB_MASK here ⇒ bug (full mask signaled)
             cell = ""
             if status == K.FB_OOB:
                 cell = f", straddled q={aux // 65536 - 32768} r={aux % 65536 - 32768}"

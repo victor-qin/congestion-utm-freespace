@@ -50,7 +50,8 @@ class DemandSpec:
         """Construct the DemandModel, or ``None`` to use the simulator's bare single-USS default."""
         if self.pattern == "hub":
             labels, counts = self._hub_labels_counts()
-            return HubVoronoiDemand(n_hubs_per_uss=dict(zip(labels, counts)), direction=self.direction)
+            return HubVoronoiDemand(n_hubs_per_uss=dict(zip(labels, counts)), direction=self.direction,
+                                    uss_share=self.uss_share)
         if self.pattern == "hub_radius":
             labels, counts = self._hub_labels_counts()
             return HubRadiusDemand(
@@ -86,14 +87,10 @@ class ScenarioSpec:
     planner: str | None = None             # None → SimConfig's default planner
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
     terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
-    # altitude ladder overrides (None → SimConfig default (30,70,110) multi-level). Pin a scenario to a
-    # single plane with flight_levels_m=(z,) + cruise_level_m=z + z_min_m=z_max_m=z; widen to multi-level
-    # later by listing more levels.
+    # flight-level ladder override (None → SimConfig default (30,70,110) multi-level). Pin a scenario to
+    # one A* plane with flight_levels_m=(z,); widen by listing more levels. (cruise/z bounds are the
+    # single-plane samplers' band — no registered scenario overrides them, so they're not exposed here.)
     flight_levels_m: "tuple[float, ...] | None" = None
-    cruise_level_m: float | None = None
-    z_min_m: float | None = None
-    z_max_m: float | None = None
-    airspace_ceiling_m: float | None = None
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -108,10 +105,6 @@ class ScenarioSpec:
             **({"terminal_airspace_always_active": self.terminal_airspace_always_active}
                if self.terminal_airspace_always_active is not None else {}),
             **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
-            **({"cruise_level_m": self.cruise_level_m} if self.cruise_level_m is not None else {}),
-            **({"z_min_m": self.z_min_m} if self.z_min_m is not None else {}),
-            **({"z_max_m": self.z_max_m} if self.z_max_m is not None else {}),
-            **({"airspace_ceiling_m": self.airspace_ceiling_m} if self.airspace_ceiling_m is not None else {}),
         )
 
     def demand_model(self) -> DemandModel | None:

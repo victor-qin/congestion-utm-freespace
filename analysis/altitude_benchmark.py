@@ -30,7 +30,7 @@ lam = float(sys.argv[2]) if len(sys.argv) > 2 else 12000.0
 
 spec = with_overrides(get_scenario("dallas_full"), lam_per_hour=lam, horizon_s=1800.0)
 cfg = spec.config()
-# Pin the whole world to a SINGLE flight level at `alt` (dallas_full defaults to (70,); this benchmark
+# Pin the whole world to a SINGLE flight level at `alt` (dallas_full ships 3-level (30,70,110); this benchmark
 # sweeps that plane). Raise the ceiling if `alt`'s corridor box would poke through the default 125 m.
 ceiling = max(cfg.airspace_ceiling_m, alt + cfg.corridor_height_m)
 cfg = dc.replace(cfg, flight_levels_m=(alt,), cruise_level_m=alt, z_min_m=alt, z_max_m=alt,

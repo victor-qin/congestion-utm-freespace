@@ -128,8 +128,12 @@ def test_landing_capacity_accurate_to_arrival_and_not_oversubscribed(seed, pads)
     #      seeds (capacity-2 hubs reaching 3 concurrent dwells); capacity has no commit-time backstop
     #      (same-hub columns are conflict-exempt in volumes_conflict / verify), so ONLY this gate prevents
     #      it. (`slow`: one full ~100-flight hub run per case.)
-    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), demand_overrides={"pads_per_hub": pads},
-                          planner="astar", lam_per_hour=600.0, horizon_s=300.0, seed=seed)
+    # Same pin as _replay: this is an issue-#15 landing-capacity regression, not a taa one — keep
+    # dallas_hub_2uss_large's always-active walls + wide columns out of the pad-capacity signal.
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
+                          demand_overrides={"pads_per_hub": pads, "terminal_radius_m": None},
+                          planner="astar", lam_per_hour=600.0, horizon_s=300.0, seed=seed,
+                          terminal_airspace_always_active=False)
     res = run(spec.config(), demand=spec.demand_model())
     assert res.verified
     dwells: dict = {}

@@ -61,12 +61,6 @@ class SimConfig:
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
     # --- search (A*) ---
-    # Weighted A*: priority is g + heuristic_weight * h. 1.0 = optimal (admissible). >1.0 trades
-    # bounded suboptimality (path cost <= w * optimal) for far fewer expansions — safe here because
-    # path cost is a soft FCFS proxy; separation is enforced independently by the hex-occupancy search
-    # gate and the exact ledger conflict check at commit, neither of which the heuristic touches.
-    heuristic_weight: float = 1.0
-
     # A* multi-altitude only: generate mid-route climb/descend edges at every air node so a flight can
     # change flight level en route. These dominate the multi-level search cost (an all-levels column
     # check per air node) — set False on large multi-level runs to recover most of the single-plane

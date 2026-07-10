@@ -152,19 +152,22 @@ def run(
                 if term is not None:
                     terms.setdefault(term.id, (pt, term))
         static_terms = list(terms.values())
-        reached = False
+        # A*-ONLY feature: a refiner/optimizer (astar_shortcut / opt_astar / astar_milp) re-checks
+        # feasibility only against the committed ledger, not these static walls — so it would straighten
+        # the polished corridor back through walled terminal airspace (the walls aren't ledger volumes).
+        # Require a bare 'astar' planner and fail loudly otherwise, rather than silently mis-measure.
         for u in usses.values():
             p = u.planner
-            while p is not None:                        # descend refiners (.inner) AND opt/milp warm A*
-                if hasattr(p, "static_terminals"):      # (.warm_planner) so every A* layer is reached
-                    p.static_terminals = static_terms
-                    reached = True
-                p = getattr(p, "inner", None) or getattr(p, "warm_planner", None)
-        if not reached:                                 # loud failure beats a silent wrong result: the
-            raise ValueError(                           # demand filter already dropped foreign customers,
-                f"terminal_airspace_always_active=True but planner {pname!r} exposes no A* layer to "
-                "install static terminal walls (looked through .inner/.warm_planner) — foreign-column "
-                "customers would be dropped with no compensating walls.")
+            if hasattr(p, "inner") or hasattr(p, "warm_planner"):
+                raise ValueError(
+                    f"terminal_airspace_always_active=True needs a bare 'astar' planner, but {pname!r} "
+                    "wraps A* in a refiner/optimizer whose ledger-only feasibility check ignores the "
+                    "static terminal walls (the polished corridor could cross walled airspace).")
+            if not hasattr(p, "static_terminals"):
+                raise ValueError(
+                    f"terminal_airspace_always_active=True but planner {pname!r} is not A*-based — no "
+                    "layer to install the static terminal walls into.")
+            p.static_terminals = static_terms
 
     total = len(scenario.events)
     report = _resolve_progress(progress, total)

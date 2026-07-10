@@ -138,13 +138,12 @@ def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, des
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 600_000, vertical_edges: bool | None = None):
+    def __init__(self, max_expansions: int = 600_000, vertical_edges: bool = True):
         self.max_expansions = max_expansions
         # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an
         # all-levels column-clearance check, so they dominate the multi-altitude search cost; the
-        # capacity gain comes from per-level TAKEOFF, which is independent. None ⇒ take cfg.vertical_edges
-        # per-plan (the normal path — set the knob on SimConfig); an explicit True/False here overrides
-        # the config (e.g. a benchmark forcing rungs off regardless of scenario).
+        # capacity gain comes from per-level TAKEOFF, which is independent. Disable on huge scenarios to
+        # recover most of the single-plane speed and keep the gain.
         self.vertical_edges = vertical_edges
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
@@ -424,8 +423,7 @@ class AStarPlanner:
                 out.append((("a", nq, nr, L, ns), cfg.cost_air_lateral_per_m * pitch))
         if not svc.is_blocked(q, r, L, ns, own):                                     # hover (same level)
             out.append((("a", q, r, L, ns), cfg.cost_air_hold_per_s * dt))
-        veff = cfg.vertical_edges if self.vertical_edges is None else self.vertical_edges   # cfg unless overridden
-        for dL in (-1, 1) if veff else ():                                          # vertical layer change
+        for dL in (-1, 1) if self.vertical_edges else ():                           # vertical layer change
             L2 = L + dL
             if 0 <= L2 < len(levels):
                 rung = L if dL == 1 else L2                              # index of the L ↔ L+1 rung

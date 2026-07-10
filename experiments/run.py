@@ -43,8 +43,6 @@ def spec_from_args(args):
         top["planner"] = args.planner
     if args.terminal_airspace_always_active is not None:
         top["terminal_airspace_always_active"] = args.terminal_airspace_always_active
-    if args.vertical_edges is not None:
-        top["vertical_edges"] = args.vertical_edges
 
     demand: dict = {}
     if args.demand is not None:
@@ -84,10 +82,6 @@ def main() -> None:
                    default=None, dest="terminal_airspace_always_active",
                    help="permanently wall each hub's column+lanes off from foreign traffic (foreign "
                         "transit → air detour instead of ground-block); A* only")
-    p.add_argument("--vertical-edges", action=argparse.BooleanOptionalAction, default=None,
-                   dest="vertical_edges",
-                   help="A* multi-altitude mid-route climb/descend edges (default on). --no-vertical-edges "
-                        "drops the expensive rungs on big multi-level runs, keeping per-level takeoff")
     p.add_argument("--demand", choices=("uniform", "hub", "hub_radius"), default=None,
                    help="demand pattern")
     p.add_argument("--uss", nargs="+", default=None, help="USS labels (multi-operator demand)")

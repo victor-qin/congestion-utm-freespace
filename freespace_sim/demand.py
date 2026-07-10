@@ -19,6 +19,7 @@ import numpy as np
 
 from .config import SimConfig
 from .planner.hexgrid import circumradius, enu_to_axial, terminal_cells
+from .volumes import exit_radius
 from .types import FlightRequest, Terminal, vec
 
 
@@ -242,6 +243,13 @@ class HubRadiusDemand:
         the uniform scatter for a clustered process to mimic real retail geography)."""
         def radius_of(uid: str) -> float:
             tr = self._terminal_radius_for(uid)
+            # always-active terminals wall the WIDER terminal_cells (column + one boundary-hex ring), not
+            # just the column — reject-sample on that extent so neighbouring hubs' permanent walls never
+            # overlap and foreign-block each other's exit lanes. Flag off ⇒ the bare column radius (the
+            # transient dwell walls don't engulf).
+            if cfg.terminal_airspace_always_active:
+                term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
+                return exit_radius(term, cfg) + circumradius(cfg)
             return cfg.terminal_radius_m if tr is None else float(tr)
         return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
 

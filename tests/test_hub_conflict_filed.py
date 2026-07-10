@@ -45,9 +45,13 @@ EXIT_COLLISION = (44, 92)     # stripmall#5 deliveries; their exit lanes collide
 
 def _replay(fids, fixed=False):
     """Plan just ``fids`` (FCFS-ordered) from the seed-0 dallas demand; return {flight_id: intent}."""
+    # Pin the baseline the fixture flight-ids were extracted from: no always-active walls (else the
+    # foreign-column filter drops fixture flights) and the default hover-footprint terminal radius (else
+    # #27 reject-sampling places hubs differently). This is a fixed_exit_lanes regression test, not a taa one.
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
-                          demand_overrides={"pads_per_hub": 4}, planner="astar",
-                          lam_per_hour=600.0, horizon_s=300.0, seed=0, fixed_exit_lanes=fixed)
+                          demand_overrides={"pads_per_hub": 4, "terminal_radius_m": None}, planner="astar",
+                          lam_per_hour=600.0, horizon_s=300.0, seed=0, fixed_exit_lanes=fixed,
+                          terminal_airspace_always_active=False)
     cfg = spec.config()
     byid = {r.flight_id: r for r in spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))}
     sub = sorted((byid[i] for i in fids), key=lambda r: (r.t_request, r.flight_id))

@@ -37,9 +37,10 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     # 105 m = 12 lanes. (Earlier 24/8 pads + 125 m were pad-bound: peak 28-37 dwells ≫ 24 → saturation.)
     "dallas_full": ScenarioSpec(
         "dallas_full", region_m=(60000.0, 45000.0), lam_per_hour=34500.0, horizon_s=1800.0,
-        # Single cruise plane at 70 m for now (issue #2 multi-altitude landed on main; widening
-        # flight_levels_m to route this scenario across levels is the next step). At 70 m the pad dwell
-        # is ~42 s (hover 30 + climb 70/6≈12), so the 40/16 pads below stay comfortably over-provisioned.
+        # Three A* flight levels (30/70/110 m) + always-active terminal airspace: foreign transit routes
+        # AROUND terminals (air detour) instead of ground-blocking same-hub takeoffs, so the congestion
+        # measured here is airspace-density AIR delay. Pad dwell = hover(30) + climb-to-level (30/70/110 m
+        # ⇒ 5/12/18 s), so the 40/16 pads stay over-provisioned even at the 110 m top level.
         flight_levels_m=(30.0, 70.0, 110.0),
         terminal_airspace_always_active=True,
         demand=DemandSpec(

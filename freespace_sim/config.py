@@ -60,14 +60,6 @@ class SimConfig:
     cost_air_hold_per_s: float = 3.0          # loiter/hover mid-route (expensive)
     cost_altitude_change_per_m: float = 2.0   # climb/descend
 
-    # --- search (A*) ---
-    # A* multi-altitude only: generate mid-route climb/descend edges at every air node so a flight can
-    # change flight level en route. These dominate the multi-level search cost (an all-levels column
-    # check per air node) — set False on large multi-level runs to recover most of the single-plane
-    # speed while keeping the per-level TAKEOFF capacity gain (which is independent). No effect when
-    # n_levels == 1 (a single plane has no rungs to climb).
-    vertical_edges: bool = False
-
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
     max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this

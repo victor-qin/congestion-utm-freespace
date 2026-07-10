@@ -148,6 +148,7 @@ class AStarPlanner:
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
+        self.last_expansions = 0                        # nodes expanded by the most recent plan()
         self.static_terminals: list = []               # (center, term) per hub; set by sim.run() when
         #                                                cfg.terminal_airspace_always_active, registered
         #                                                into the occupancy as permanent foreign walls.
@@ -273,8 +274,9 @@ class AStarPlanner:
         start = ("g", oq, orr, base)
         g = {start: 0.0}
         came: dict = {}
+        w = cfg.heuristic_weight                          # weighted A*: f = g + w*h (w=1 ⇒ optimal)
         counter = itertools.count()
-        pq = [(h_ground, next(counter), start)]
+        pq = [(w * h_ground, next(counter), start)]
         closed: set = set()
         goal_state = None
         expansions = 0
@@ -325,8 +327,9 @@ class AStarPlanner:
                     g[nst] = ng
                     came[nst] = st
                     hh = h_air(nst[1], nst[2], nst[3]) if nst[0] == "a" else h_ground
-                    heapq.heappush(pq, (ng + hh, next(counter), nst))
+                    heapq.heappush(pq, (ng + w * hh, next(counter), nst))
 
+        self.last_expansions = expansions     # search-effort telemetry (analysis/benchmarks)
         if goal_state is None:
             # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
             # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /

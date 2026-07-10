@@ -43,6 +43,8 @@ def spec_from_args(args):
         top["planner"] = args.planner
     if args.terminal_airspace_always_active is not None:
         top["terminal_airspace_always_active"] = args.terminal_airspace_always_active
+    if args.heuristic_weight is not None:
+        top["heuristic_weight"] = args.heuristic_weight
 
     demand: dict = {}
     if args.demand is not None:
@@ -82,6 +84,8 @@ def main() -> None:
                    default=None, dest="terminal_airspace_always_active",
                    help="permanently wall each hub's column+lanes off from foreign traffic (foreign "
                         "transit → air detour instead of ground-block); A* only")
+    p.add_argument("--heuristic-weight", type=float, default=None, dest="heuristic_weight",
+                   help="weighted A*: f = g + w*h (1.0=optimal; ~1.25 ≈ 5-7x faster, ~2%% cost)")
     p.add_argument("--demand", choices=("uniform", "hub", "hub_radius"), default=None,
                    help="demand pattern")
     p.add_argument("--uss", nargs="+", default=None, help="USS labels (multi-operator demand)")
@@ -106,8 +110,9 @@ def main() -> None:
     demand = spec.demand_model()
     tag = args.tag or spec.name
     # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
-    print(f"scenario={spec.name} tag={tag} planner={cfg.planner} demand={spec.demand.pattern} "
-          f"region={cfg.region_size_m} λ={cfg.lam_per_hour}/h horizon={cfg.horizon_s}s seed={cfg.seed}",
+    print(f"scenario={spec.name} tag={tag} planner={cfg.planner} w={cfg.heuristic_weight} "
+          f"demand={spec.demand.pattern} region={cfg.region_size_m} λ={cfg.lam_per_hour}/h "
+          f"horizon={cfg.horizon_s}s seed={cfg.seed}",
           file=sys.stderr)
 
     t0 = time.time()

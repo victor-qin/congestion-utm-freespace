@@ -87,6 +87,7 @@ class ScenarioSpec:
     planner: str | None = None             # None → SimConfig's default planner
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
     terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
+    heuristic_weight: float | None = None  # None → SimConfig default (1.0, optimal); >1 ⇒ weighted A*
     # flight-level ladder override (None → SimConfig default (30,70,110) multi-level). Pin a scenario to
     # one A* plane with flight_levels_m=(z,); widen by listing more levels. (cruise/z bounds are the
     # single-plane samplers' band — no registered scenario overrides them, so they're not exposed here.)
@@ -104,6 +105,7 @@ class ScenarioSpec:
             **({"fixed_exit_lanes": self.fixed_exit_lanes} if self.fixed_exit_lanes is not None else {}),
             **({"terminal_airspace_always_active": self.terminal_airspace_always_active}
                if self.terminal_airspace_always_active is not None else {}),
+            **({"heuristic_weight": self.heuristic_weight} if self.heuristic_weight is not None else {}),
             **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
         )
 

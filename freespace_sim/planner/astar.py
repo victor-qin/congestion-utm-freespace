@@ -792,7 +792,7 @@ class AStarPlanner:
                 self._fb += 1
                 self._fb_reasons["own-foreign-overlap"] += 1
                 warnings.warn(
-                    f"astar own∩foreign column cell for flight {getattr(req, 'id', '?')} "
+                    f"astar own∩foreign column cell for flight {req.flight_id} "
                     f"O={tuple(req.origin)}→D={tuple(req.dest)}; running reference (boolean overlay).",
                     RuntimeWarning, stacklevel=2,
                 )
@@ -827,7 +827,7 @@ class AStarPlanner:
             self._fb += 1
             self._fb_reasons[reason] += 1
             warnings.warn(
-                f"astar compiled kernel FALLBACK ({reason}) for flight {getattr(req, 'id', '?')} "
+                f"astar compiled kernel FALLBACK ({reason}) for flight {req.flight_id} "
                 f"O={tuple(req.origin)}→D={tuple(req.dest)}{cell}, n_exp={n_exp}; running reference",
                 RuntimeWarning, stacklevel=2,
             )
@@ -846,7 +846,7 @@ class AStarPlanner:
             self._fb_reasons["empty-air"] += 1           # routine dispatch — surface it as a fallback + warn
             warnings.warn(
                 f"astar compiled kernel returned a goal with no air states for flight "
-                f"{getattr(req, 'id', '?')}; running reference (kernel anomaly)",
+                f"{req.flight_id}; running reference (kernel anomaly)",
                 RuntimeWarning, stacklevel=2,
             )
             return self._plan_reference(req, ledger, cfg)

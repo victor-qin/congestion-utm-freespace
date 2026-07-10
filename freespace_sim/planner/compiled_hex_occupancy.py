@@ -159,6 +159,7 @@ class CompiledHexOccupancy:
         # committed corridor cells that fell outside the box: skipped (never a crash); any query to such a
         # cell gets cell_id < 0 and the kernel falls back via FB_OOB. Non-zero ⇒ consider widening `margin`.
         self.oob_corridor_cells = 0
+        self._warned_oob = False                        # warn ONCE per instance (persists across reset())
 
     def _box(self, cfg, margin):
         w, h = cfg.region_size_m
@@ -219,11 +220,12 @@ class CompiledHexOccupancy:
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue
                 if c < 0:                               # outside the box → skip (never crash on commit);
-                    if self.oob_corridor_cells == 0:    # a query to this cell gets cell_id<0 → kernel FB_OOB.
-                        warnings.warn(                  # warn once: a nonzero count means `margin` is too
+                    if not self._warned_oob:            # a query to this cell gets cell_id<0 → kernel FB_OOB.
+                        warnings.warn(                  # warn once/instance (a nonzero count ⇒ margin small)
                             "CompiledHexOccupancy: a committed corridor cell fell outside the kernel box — "
                             "skipped (its flights fall back via FB_OOB). Consider widening `margin`.",
                             RuntimeWarning, stacklevel=2)
+                        self._warned_oob = True
                     self.oob_corridor_cells += 1
                     continue
                 self.corr.block(c, int(s))

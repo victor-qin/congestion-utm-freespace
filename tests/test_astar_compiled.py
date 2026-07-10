@@ -166,8 +166,10 @@ def test_compiled_own_foreign_shared_cell_falls_back_exact():
     column, the single-boolean overlay cannot represent it — the host detects it via `col_owners` and falls
     back to the reference (without which the kernel would treat the foreign column as transparent and route
     through it, then file a spurious CONFLICT_FILED). Two hubs 150 m apart share footprint cells; commit a
-    foreign-hub landing, then plan an own-hub landing → the own∩foreign fallback MUST fire, and the result
-    MUST equal the reference oracle."""
+    foreign-hub landing, then plan an own-hub landing → assert the own∩foreign fallback FIRES (the
+    `col_owners` detection works). The outcome-equality check is a determinism sanity check, NOT kernel
+    parity: once the fallback fires, the compiled planner IS running the reference for this flight — which
+    is exactly the intended behavior. (The exact kernel-vs-reference contract lives in the other tests.)"""
     cfg = SimConfig()
     hub_a, hub_b = Terminal("uss_a#0", 8, 90.0), Terminal("uss_b#0", 8, 90.0)
     Pa, Pb = vec(2000, 2000, 0), vec(2150, 2000, 0)          # 150 m apart → footprints share cells

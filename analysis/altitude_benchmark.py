@@ -1,16 +1,16 @@
-"""Altitude benchmark: rerun the dallas_full world at a lower cruise level to isolate what altitude
-buys. climb_time = cruise_level_m / climb_rate, and the pad/column DWELL = hover + climb, so lowering
-the cruise plane shortens the climb -> shorter dwell -> pads and exit lanes cycle faster -> less
-same-hub serialisation (the constraint that dominates ground delay). Everything else matches the 150 m
-terminal-airspace-active run, so the measured delta is altitude alone. Prints the saved run folder.
+"""Altitude benchmark: rerun the dallas_full world pinned to a SINGLE flight level at `alt` to isolate
+what altitude buys. climb_time = alt / climb_rate, and the pad/column DWELL = hover + climb, so a lower
+plane shortens the climb -> shorter dwell -> pads and exit lanes cycle faster -> less same-hub
+serialisation (the constraint that dominates ground delay). The shipped dallas_full routes across three
+levels (30/70/110 m); this pins one plane so the measured delta is altitude alone. Prints the run folder.
 
-Overrides cruise_level_m / z_min_m / z_max_m on the built config via dataclasses.replace rather than
-adding a ScenarioSpec field, deliberately: the SimConfig 150 m default is assumed across the test suite,
-so keeping the change scoped here avoids perturbing it.
+Overrides flight_levels_m=(alt,) / cruise_level_m / z bounds on the built config via dataclasses.replace
+rather than adding more ScenarioSpec fields, deliberately: SimConfig defaults to the multi-level ladder
+(30/70/110 m, cruise 75 m, ceiling 125 m) and the test suite assumes it, so the pin stays scoped here.
 
-Finding (50 m vs 150 m, lam=12k, 1800 s): ground delay ~-10%, air delay flat (the lateral hex geometry
-is invariant to which single cruise plane you fly), ~-27% wall clock -> altitude is a weak, ground-only
-lever; the binding constraint is horizontal.
+Finding (single 50 m plane vs a single 150 m plane, the pre-multi-altitude comparison, lam=12k, 1800 s):
+ground delay ~-10%, air delay flat (the lateral hex geometry is invariant to which single cruise plane
+you fly), ~-27% wall clock -> altitude is a weak, ground-only lever; the binding constraint is horizontal.
 
 Usage: uv run python analysis/altitude_benchmark.py [alt_m] [lam]
        uv run python analysis/altitude_benchmark.py 50 12000

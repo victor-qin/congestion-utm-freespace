@@ -140,18 +140,21 @@ def run(
     default_uss = next(iter(usses.values()))
 
     if cfg.terminal_airspace_always_active:
-        # Hand every A* planner the full hub set so it can permanently wall each terminal off from
-        # foreign cruise traffic. A hub centre = the request endpoint that carries its terminal (a
-        # delivery's origin / a return's dest). Normalize (id, capacity) tuple terminals to Terminal so
-        # downstream register_static_terminal / terminal_cells get a real column radius.
-        terms: dict = {}
-        for ev in scenario.events:
-            rq = ev.request
-            for pt, t in ((rq.origin, rq.origin_terminal), (rq.dest, rq.dest_terminal)):
-                term = as_terminal(t)
-                if term is not None:
-                    terms.setdefault(term.id, (pt, term))
-        static_terms = list(terms.values())
+        # Wall EVERY placed hub's terminal off from foreign cruise traffic for the whole horizon. Prefer
+        # the demand model's FULL placed-hub set (permanent infrastructure — a vertiport is walled even
+        # when it draws no request this horizon, matching the demand foreign-column filter which drops
+        # against ALL placed hubs); fall back to the flight-carrying hubs from the scenario otherwise.
+        if demand is not None and hasattr(demand, "terminals"):
+            static_terms = list(demand.terminals(cfg))
+        else:
+            terms: dict = {}
+            for ev in scenario.events:
+                rq = ev.request
+                for pt, t in ((rq.origin, rq.origin_terminal), (rq.dest, rq.dest_terminal)):
+                    term = as_terminal(t)
+                    if term is not None:
+                        terms.setdefault(term.id, (pt, term))
+            static_terms = list(terms.values())
         # A*-ONLY feature: a refiner/optimizer (astar_shortcut / opt_astar / astar_milp) re-checks
         # feasibility only against the committed ledger, not these static walls — so it would straighten
         # the polished corridor back through walled terminal airspace (the walls aren't ledger volumes).

@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCENARIO="${1:-dallas_hub_2uss}"
-PLANNER="${2:-astar_shortcut}"
+PLANNER="${2:-astar}"     # astar (not astar_shortcut): refiners are incompatible with always-active walls
 LAMBDA="${3:-34500}"
 HORIZON="${4:-1800}"
 

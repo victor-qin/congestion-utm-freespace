@@ -18,7 +18,7 @@ from typing import Protocol
 import numpy as np
 
 from .config import SimConfig
-from .planner.hexgrid import circumradius, enu_to_axial, terminal_cells
+from .planner.hexgrid import SQRT3, circumradius, enu_to_axial, terminal_cells
 from .volumes import exit_radius
 from .types import FlightRequest, Terminal, vec
 
@@ -245,13 +245,24 @@ class HubRadiusDemand:
             tr = self._terminal_radius_for(uid)
             # always-active terminals wall the WIDER terminal_cells (column + one boundary-hex ring), not
             # just the column — reject-sample on that extent so neighbouring hubs' permanent walls never
-            # overlap and foreign-block each other's exit lanes. Flag off ⇒ the bare column radius (the
-            # transient dwell walls don't engulf).
+            # overlap and foreign-block each other's exit lanes. A boundary-hex centre sits within one hex
+            # pitch (SQRT3·circumradius) of the exit_radius edge, so that rigorously upper-bounds the ring
+            # for any gap ≥ 0. Flag off ⇒ the bare column radius (transient dwell walls don't engulf).
             if cfg.terminal_airspace_always_active:
                 term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
-                return exit_radius(term, cfg) + circumradius(cfg)
+                return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
             return cfg.terminal_radius_m if tr is None else float(tr)
         return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
+
+    def terminals(self, cfg: SimConfig) -> list:
+        """All placed hubs as ``(center, Terminal)`` — permanent vertiport infrastructure, EVERY hub
+        regardless of whether it draws a flight this horizon. Under terminal_airspace_always_active the
+        sim walls this whole set, matching the foreign-column filter (which drops against ALL placed
+        hubs) — else a zero-flight hub would be filtered against but never walled."""
+        hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
+        return [(pts[hj], Terminal(f"{uid}#{hj}", self._pads_for(uid),
+                                   self._terminal_radius_for(uid), self.corridor_overlap_m))
+                for uid, pts in hubs.items() for hj in range(pts.shape[0])]
 
     def _radius_for(self, uss_id: str) -> float:
         return float(self.radius_m[uss_id] if isinstance(self.radius_m, dict) else self.radius_m)

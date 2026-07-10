@@ -42,6 +42,7 @@ from collections.abc import Collection, Hashable
 from . import hexgrid as hg
 from ..config import SimConfig
 from ..geometry import CylinderSpec
+from ..types import as_terminal
 from ..volumes import Volume4D
 
 _EMPTY: dict = {}
@@ -57,6 +58,11 @@ class HexOccupancyService:
         self.pad: dict[int, set[tuple[int, int, int]]] = {}       # step -> {(q, r, L)}  (non-terminal)
         # shared terminal columns: step -> (q, r, L) -> {terminal_id}  (which hubs' columns cover the cell)
         self.term_cells: dict[int, dict[tuple[int, int, int], set[Hashable]]] = {}
+        # always-active terminals (cfg.terminal_airspace_always_active): permanent FOREIGN walls, step- AND
+        # level-independent (the column is the [ground, ceiling] tube), keyed by (q, r) only. Empty unless
+        # register_static_terminal is called ⇒ zero overhead when the flag is off. NOT ledger-derived, so
+        # reset() (a from-scratch rebuild on ledger shrink) leaves it intact — the hub set doesn't change.
+        self.static_term_cells: dict[tuple[int, int], set[Hashable]] = {}
         self.n_added = 0                  # committed volumes absorbed (shrink tripwire)
         self.evicted_before: int | None = None   # lowest retained step
 
@@ -105,6 +111,16 @@ class HexOccupancyService:
         for v in volumes:
             self.add_volume(v, own_cols=own_cols)
 
+    def register_static_terminal(self, center, term) -> None:
+        """Wall a hub's whole terminal airspace (column + exit lanes) off from FOREIGN traffic for the
+        ENTIRE horizon — the always-active feature (``cfg.terminal_airspace_always_active``). Recorded in
+        ``static_term_cells`` keyed by ``(q, r)``: step- and level-independent (the column is the
+        [ground, ceiling] tube), so :meth:`is_blocked` walls it at every step and every flight level,
+        while the hub's own flights pass through (own-hub exemption). Idempotent per hub (set-based)."""
+        tid = as_terminal(term).id
+        for cell in hg.terminal_cells(center, term, self.cfg):
+            self.static_term_cells.setdefault(cell, set()).add(tid)
+
     def evict_before(self, step: int) -> None:
         """Drop all cells at steps < ``step`` (cells the sim clock has passed; no future plan can
         query them). Monotonic — calls with an earlier ``step`` are no-ops."""
@@ -142,11 +158,16 @@ class HexOccupancyService:
         the exact same-hub cell occupancy. The flight's own (uncommitted) corridor is absent during its
         plan, so this never self-blocks; the 90 m interior is skipped from ``blocked`` (``add_volume``
         ``own_cols``), so the climb stays clear. Flag off ⇒ ``False`` here, i.e. unchanged."""
-        if self.term_cells:                      # zero-overhead when no terminals exist
+        # ``static_term_cells`` (always-active terminals) adds step- and level-independent foreign walls
+        # (the [ground, ceiling] tube), merged with the per-step/level ``term_cells`` so a cell covered by
+        # EITHER (foreign) blocks. Both empty ⇒ unchanged (zero overhead).
+        if self.term_cells or self.static_term_cells:      # zero-overhead when no terminals exist
             here = self.term_cells.get(s, _EMPTY).get((q, r, L))
-            if here is not None:
-                if any(tid not in own for tid in here):
-                    return True                  # foreign column → wall
+            stat = self.static_term_cells.get((q, r)) if self.static_term_cells else None
+            if here is not None or stat is not None:
+                if (here is not None and any(tid not in own for tid in here)) or \
+                        (stat is not None and any(tid not in own for tid in stat)):
+                    return True                  # foreign column (transient or always-active) → wall
                 # own-only column: transparent for the climb, unless (fixed lanes) a committed sibling
                 # corridor occupies this footprint cell at this level — the same-hub serialisation A* sees.
                 return self.cfg.fixed_exit_lanes and (q, r, L) in self.blocked.get(s, ())

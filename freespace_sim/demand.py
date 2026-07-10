@@ -18,6 +18,8 @@ from typing import Protocol
 import numpy as np
 
 from .config import SimConfig
+from .planner.hexgrid import SQRT3, circumradius, enu_to_axial, terminal_cells
+from .volumes import exit_radius
 from .types import FlightRequest, Terminal, vec
 
 
@@ -224,7 +226,7 @@ class HubRadiusDemand:
         default_factory=lambda: {"walmart_uss": 6, "stripmall_uss": 20}
     )
     radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS)
-    pads_per_hub: int = 1                            # terminal capacity N per hub
+    pads_per_hub: "int | dict[str, int]" = 1         # terminal capacity N per hub (scalar, or per-USS)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True                      # each delivery → a return to its origin hub
@@ -241,8 +243,26 @@ class HubRadiusDemand:
         the uniform scatter for a clustered process to mimic real retail geography)."""
         def radius_of(uid: str) -> float:
             tr = self._terminal_radius_for(uid)
+            # always-active terminals wall the WIDER terminal_cells (column + one boundary-hex ring), not
+            # just the column — reject-sample on that extent so neighbouring hubs' permanent walls never
+            # overlap and foreign-block each other's exit lanes. A boundary-hex centre sits within one hex
+            # pitch (SQRT3·circumradius) of the exit_radius edge, so that rigorously upper-bounds the ring
+            # for any gap ≥ 0. Flag off ⇒ the bare column radius (transient dwell walls don't engulf).
+            if cfg.terminal_airspace_always_active:
+                term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
+                return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
             return cfg.terminal_radius_m if tr is None else float(tr)
         return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
+
+    def terminals(self, cfg: SimConfig) -> list:
+        """All placed hubs as ``(center, Terminal)`` — permanent vertiport infrastructure, EVERY hub
+        regardless of whether it draws a flight this horizon. Under terminal_airspace_always_active the
+        sim walls this whole set, matching the foreign-column filter (which drops against ALL placed
+        hubs) — else a zero-flight hub would be filtered against but never walled."""
+        hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
+        return [(pts[hj], Terminal(f"{uid}#{hj}", self._pads_for(uid),
+                                   self._terminal_radius_for(uid), self.corridor_overlap_m))
+                for uid, pts in hubs.items() for hj in range(pts.shape[0])]
 
     def _radius_for(self, uss_id: str) -> float:
         return float(self.radius_m[uss_id] if isinstance(self.radius_m, dict) else self.radius_m)
@@ -252,6 +272,10 @@ class HubRadiusDemand:
         if tr is None:
             return None                              # builder defaults to the hover footprint
         return float(tr[uss_id] if isinstance(tr, dict) else tr)
+
+    def _pads_for(self, uss_id: str) -> int:
+        p = self.pads_per_hub
+        return int(p[uss_id] if isinstance(p, dict) else p)
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
         ids = list(self.n_hubs_per_uss)
@@ -271,13 +295,30 @@ class HubRadiusDemand:
         ids, probs = self._shares()
         n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
 
+        # foreign-column filter (cfg.terminal_airspace_always_active): a delivery whose customer's hex
+        # falls inside ANY OTHER hub's permanently-walled terminal cells is unreachable — A* finds the
+        # goal hex is_blocked and denies it. Test the EXACT cell set the occupancy walls
+        # (hexgrid.terminal_cells, keyed by terminal id just as register_static_terminal builds
+        # static_term_cells), so a kept customer's endpoint hex is guaranteed clear for its own flight —
+        # no geometric-margin gap. Own hub exempt. terminal_cells resolves radius=None like the wall path.
+        filter_foreign = cfg.terminal_airspace_always_active
+        if filter_foreign:
+            R = circumradius(cfg)
+            foreign_cells: dict[tuple[int, int], set] = {}
+            for uid, pts in hubs.items():
+                for hj in range(pts.shape[0]):
+                    term = Terminal(f"{uid}#{hj}", self._pads_for(uid),
+                                    self._terminal_radius_for(uid), self.corridor_overlap_m)
+                    for cell in terminal_cells(pts[hj], term, cfg):
+                        foreign_cells.setdefault(cell, set()).add(term.id)
+
         requests: list[FlightRequest] = []
         fid = 0
         for _ in range(n):
             uss_id = ids[int(rng.choice(len(ids), p=probs))]
             hi = int(rng.integers(hubs[uss_id].shape[0]))
             hub = hubs[uss_id][hi]
-            terminal = Terminal(f"{uss_id}#{hi}", int(self.pads_per_hub),
+            terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id),
                                 self._terminal_radius_for(uss_id), self.corridor_overlap_m)
             radius = self._radius_for(uss_id)
             customer = None
@@ -290,15 +331,22 @@ class HubRadiusDemand:
             if customer is None:
                 customer = np.clip(c, [0.0, 0.0], [w, h])
             t_req = float(rng.uniform(0, cfg.horizon_s))
-            requests.append(FlightRequest(                            # delivery: hub → customer
-                fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
-                uss_id=uss_id, origin_terminal=terminal))
+            drop = False
+            if filter_foreign:                                       # customer hex inside a FOREIGN wall?
+                walls = foreign_cells.get(enu_to_axial(customer[0], customer[1], R))
+                # own column is transparent — drop (both legs) only if a FOREIGN terminal walls the hex
+                drop = walls is not None and any(tid != terminal.id for tid in walls)
+            if not drop:
+                requests.append(FlightRequest(                        # delivery: hub → customer
+                    fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
+                    uss_id=uss_id, origin_terminal=terminal))
             fid += 1
             if self.return_flights:                                  # return: customer → same hub
                 t_ret = t_req + self._est_trip_s(hub, customer, cfg) + self.turnaround_s
-                requests.append(FlightRequest(
-                    fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
-                    uss_id=uss_id, dest_terminal=terminal))
+                if not drop:                                          # foreign-column filter drops both legs
+                    requests.append(FlightRequest(
+                        fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
+                        uss_id=uss_id, dest_terminal=terminal))
                 fid += 1
 
         requests.sort(key=lambda r: (r.t_request, r.flight_id))

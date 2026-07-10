@@ -8,10 +8,12 @@
 set -euo pipefail
 
 SCENARIO="${1:-dallas_hub_2uss}"
-PLANNER="${2:-astar_shortcut}"
+PLANNER="${2:-astar}"     # astar (not astar_shortcut): refiners are incompatible with always-active walls
+LAMBDA="${3:-34500}"
+HORIZON="${4:-1800}"
 
 FOLDER=$(uv run python -m experiments.run --scenario "$SCENARIO" --planner "$PLANNER" \
-  --lam 34500 --horizon 1800 --tag demo --no-progress | tail -1)
+  --lam "$LAMBDA" --horizon "$HORIZON" --tag demo --no-progress | tail -1)
 echo "EXECUTE → $FOLDER"
 
 uv run python -m experiments.readouts.replay        "$FOLDER"

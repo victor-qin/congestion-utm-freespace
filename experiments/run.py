@@ -41,6 +41,8 @@ def spec_from_args(args):
         top["seed"] = args.seed
     if args.planner is not None:
         top["planner"] = args.planner
+    if args.terminal_airspace_always_active is not None:
+        top["terminal_airspace_always_active"] = args.terminal_airspace_always_active
 
     demand: dict = {}
     if args.demand is not None:
@@ -76,6 +78,10 @@ def main() -> None:
     p.add_argument("--horizon", type=float, default=None, help="sim horizon (s)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--planner", default=None, help="override planner")
+    p.add_argument("--terminal-airspace-always-active", action=argparse.BooleanOptionalAction,
+                   default=None, dest="terminal_airspace_always_active",
+                   help="permanently wall each hub's column+lanes off from foreign traffic (foreign "
+                        "transit → air detour instead of ground-block); A* only")
     p.add_argument("--demand", choices=("uniform", "hub", "hub_radius"), default=None,
                    help="demand pattern")
     p.add_argument("--uss", nargs="+", default=None, help="USS labels (multi-operator demand)")

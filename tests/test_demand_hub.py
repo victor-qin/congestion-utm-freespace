@@ -189,6 +189,37 @@ def test_return_flights_roundtrip_and_terminals():
     assert all((d, o) in legs for (o, d) in legs)
 
 
+def test_terminal_airspace_filter_drops_foreign_column_customers():
+    """terminal_airspace_always_active: a delivery whose customer hex sits in a FOREIGN hub's walled
+    terminal_cells is unreachable and dropped; every KEPT delivery is clear of foreign walls. (Asserts
+    the real reachability invariant directly — comparing to a taa-off run is meaningless because turning
+    the flag on widens the reject radius, relocating every hub.)"""
+    import dataclasses as dc
+
+    from freespace_sim.planner.hexgrid import circumradius, enu_to_axial, terminal_cells
+    from freespace_sim.types import Terminal
+
+    cfg = dc.replace(_radius_cfg(), terminal_airspace_always_active=True)
+    dm = HubRadiusDemand(n_hubs_per_uss={"a": 6}, radius_m=6000.0, terminal_radius_m=1500.0)  # big cols ⇒ drops
+    R = circumradius(cfg)
+    hubs = dm.place_hubs(cfg, np.random.default_rng(dm.hub_seed))
+    foreign: dict = {}                                        # cell -> {walling terminal ids}
+    for uid, pts in hubs.items():
+        for hj in range(pts.shape[0]):
+            term = Terminal(f"{uid}#{hj}", dm._pads_for(uid), dm._terminal_radius_for(uid), dm.corridor_overlap_m)
+            for c in terminal_cells(pts[hj], term, cfg):
+                foreign.setdefault(c, set()).add(term.id)
+    reqs = dm.generate(cfg, np.random.default_rng(0))
+    # every KEPT delivery's customer hex is clear of every FOREIGN terminal's walls (own hub exempt) —
+    # exactly the reachability invariant the filter enforces
+    for r in reqs:
+        if r.origin_terminal is not None:                    # a delivery: dest is the customer
+            walls = foreign.get(enu_to_axial(r.dest[0], r.dest[1], R))
+            assert not (walls and any(t != r.origin_terminal.id for t in walls)), "kept customer in a foreign wall"
+    # and the filter actually dropped some flights: fid advances on a drop, so kept fids have gaps
+    assert reqs and len(reqs) < max(r.flight_id for r in reqs) + 1
+
+
 def test_radius_demand_run_verified_astar():
     cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0),
                     lam_per_hour=120.0, horizon_s=900.0, seed=1)

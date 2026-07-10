@@ -17,11 +17,17 @@ import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.demand import HubRadiusDemand, HubVoronoiDemand
+from freespace_sim.planner.hexgrid import SQRT3, circumradius
 from freespace_sim.scenarios import get_scenario
+from freespace_sim.types import Terminal
+from freespace_sim.volumes import exit_radius
 
 
 def _radius_of(dm, uss, cfg):
     tr = dm._terminal_radius_for(uss)          # already collapses a per-USS dict to a scalar (or None)
+    if cfg.terminal_airspace_always_active:    # match place_hubs: taa reject-samples on the WIDER walled
+        term = Terminal(f"{uss}#0", dm._pads_for(uss), tr, dm.corridor_overlap_m)   # extent (column+ring)
+        return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
     return cfg.terminal_radius_m if tr is None else float(tr)
 
 

@@ -28,11 +28,12 @@ class DemandSpec:
     direction: str = "delivery"            # hub pattern: "delivery" (hub→customer) | "pickup"
     # --- hub_radius extras (multi-pad hubs, radius service areas, return flights) ---
     radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS dict)
-    pads_per_hub: int = 1                  # terminal capacity N per hub
+    pads_per_hub: "int | dict[str, int]" = 1   # terminal capacity N per hub (scalar, or per-USS dict)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
+    uss_share: "dict[str, float] | None" = None      # demand split across USSs (None ⇒ equal weight)
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -49,7 +50,8 @@ class DemandSpec:
         """Construct the DemandModel, or ``None`` to use the simulator's bare single-USS default."""
         if self.pattern == "hub":
             labels, counts = self._hub_labels_counts()
-            return HubVoronoiDemand(n_hubs_per_uss=dict(zip(labels, counts)), direction=self.direction)
+            return HubVoronoiDemand(n_hubs_per_uss=dict(zip(labels, counts)), direction=self.direction,
+                                    uss_share=self.uss_share)
         if self.pattern == "hub_radius":
             labels, counts = self._hub_labels_counts()
             return HubRadiusDemand(
@@ -57,6 +59,7 @@ class DemandSpec:
                 radius_m=self.radius_m, pads_per_hub=self.pads_per_hub,
                 terminal_radius_m=self.terminal_radius_m, corridor_overlap_m=self.corridor_overlap_m,
                 return_flights=self.return_flights, turnaround_s=self.turnaround_s,
+                uss_share=self.uss_share,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":
@@ -83,6 +86,11 @@ class ScenarioSpec:
     seed: int = 0
     planner: str | None = None             # None → SimConfig's default planner
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
+    terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
+    # flight-level ladder override (None → SimConfig default (30,70,110) multi-level). Pin a scenario to
+    # one A* plane with flight_levels_m=(z,); widen by listing more levels. (cruise/z bounds are the
+    # single-plane samplers' band — no registered scenario overrides them, so they're not exposed here.)
+    flight_levels_m: "tuple[float, ...] | None" = None
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -94,6 +102,9 @@ class ScenarioSpec:
             seed=self.seed,
             **({"planner": self.planner} if self.planner else {}),
             **({"fixed_exit_lanes": self.fixed_exit_lanes} if self.fixed_exit_lanes is not None else {}),
+            **({"terminal_airspace_always_active": self.terminal_airspace_always_active}
+               if self.terminal_airspace_always_active is not None else {}),
+            **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
         )
 
     def demand_model(self) -> DemandModel | None:

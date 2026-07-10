@@ -45,9 +45,13 @@ EXIT_COLLISION = (44, 92)     # stripmall#5 deliveries; their exit lanes collide
 
 def _replay(fids, fixed=False):
     """Plan just ``fids`` (FCFS-ordered) from the seed-0 dallas demand; return {flight_id: intent}."""
+    # Pin the baseline the fixture flight-ids were extracted from: no always-active walls (else the
+    # foreign-column filter drops fixture flights) and the default hover-footprint terminal radius (else
+    # #27 reject-sampling places hubs differently). This is a fixed_exit_lanes regression test, not a taa one.
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
-                          demand_overrides={"pads_per_hub": 4}, planner="astar",
-                          lam_per_hour=600.0, horizon_s=300.0, seed=0, fixed_exit_lanes=fixed)
+                          demand_overrides={"pads_per_hub": 4, "terminal_radius_m": None}, planner="astar",
+                          lam_per_hour=600.0, horizon_s=300.0, seed=0, fixed_exit_lanes=fixed,
+                          terminal_airspace_always_active=False)
     cfg = spec.config()
     byid = {r.flight_id: r for r in spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))}
     sub = sorted((byid[i] for i in fids), key=lambda r: (r.t_request, r.flight_id))
@@ -124,8 +128,12 @@ def test_landing_capacity_accurate_to_arrival_and_not_oversubscribed(seed, pads)
     #      seeds (capacity-2 hubs reaching 3 concurrent dwells); capacity has no commit-time backstop
     #      (same-hub columns are conflict-exempt in volumes_conflict / verify), so ONLY this gate prevents
     #      it. (`slow`: one full ~100-flight hub run per case.)
-    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), demand_overrides={"pads_per_hub": pads},
-                          planner="astar", lam_per_hour=600.0, horizon_s=300.0, seed=seed)
+    # Same pin as _replay: this is an issue-#15 landing-capacity regression, not a taa one — keep
+    # dallas_hub_2uss_large's always-active walls + wide columns out of the pad-capacity signal.
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
+                          demand_overrides={"pads_per_hub": pads, "terminal_radius_m": None},
+                          planner="astar", lam_per_hour=600.0, horizon_s=300.0, seed=seed,
+                          terminal_airspace_always_active=False)
     res = run(spec.config(), demand=spec.demand_model())
     assert res.verified
     dwells: dict = {}

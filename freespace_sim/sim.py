@@ -23,7 +23,7 @@ from .ledger import ReservationLedger
 from .mechanism import FCFSMechanism, Mechanism
 from .planner import get_planner
 from .scenario import Scenario, scenario_from_requests
-from .types import FlightRequest, IntentStatus, OperationalIntent
+from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
 from .uss import USS
 
 # Called after each flight is planned: (done, total, latest_intent). Return value ignored.
@@ -138,6 +138,39 @@ def run(
     pname = planner_name or cfg.planner
     usses = {uid: USS(uid, dss, cfg, get_planner(pname)) for uid in scenario.uss_ids}
     default_uss = next(iter(usses.values()))
+
+    if cfg.terminal_airspace_always_active:
+        # Wall EVERY placed hub's terminal off from foreign cruise traffic for the whole horizon. Prefer
+        # the demand model's FULL placed-hub set (permanent infrastructure — a vertiport is walled even
+        # when it draws no request this horizon, matching the demand foreign-column filter which drops
+        # against ALL placed hubs); fall back to the flight-carrying hubs from the scenario otherwise.
+        if demand is not None and hasattr(demand, "terminals"):
+            static_terms = list(demand.terminals(cfg))
+        else:
+            terms: dict = {}
+            for ev in scenario.events:
+                rq = ev.request
+                for pt, t in ((rq.origin, rq.origin_terminal), (rq.dest, rq.dest_terminal)):
+                    term = as_terminal(t)
+                    if term is not None:
+                        terms.setdefault(term.id, (pt, term))
+            static_terms = list(terms.values())
+        # A*-ONLY feature: a refiner/optimizer (astar_shortcut / opt_astar / astar_milp) re-checks
+        # feasibility only against the committed ledger, not these static walls — so it would straighten
+        # the polished corridor back through walled terminal airspace (the walls aren't ledger volumes).
+        # Require a bare 'astar' planner and fail loudly otherwise, rather than silently mis-measure.
+        for u in usses.values():
+            p = u.planner
+            if hasattr(p, "inner") or hasattr(p, "warm_planner"):
+                raise ValueError(
+                    f"terminal_airspace_always_active=True needs a bare 'astar' planner, but {pname!r} "
+                    "wraps A* in a refiner/optimizer whose ledger-only feasibility check ignores the "
+                    "static terminal walls (the polished corridor could cross walled airspace).")
+            if not hasattr(p, "static_terminals"):
+                raise ValueError(
+                    f"terminal_airspace_always_active=True but planner {pname!r} is not A*-based — no "
+                    "layer to install the static terminal walls into.")
+            p.static_terminals = static_terms
 
     total = len(scenario.events)
     report = _resolve_progress(progress, total)

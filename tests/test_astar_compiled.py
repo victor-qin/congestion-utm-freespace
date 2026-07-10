@@ -214,10 +214,11 @@ def test_compiled_always_active_static_terminal_exact():
     hub = Terminal("foreign_hub#0", 8, 180.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, uss_id="uss_a")   # foreign to the hub
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    assert com.compiled, "numba kernel inactive — this kernel-exactness guard would be vacuous (ref vs ref)"
     ref.static_terminals = com.static_terminals = [((1000.0, 0.0), hub)]         # wall dead on the path
     a = ref.plan(req, ReservationLedger(cfg), cfg)
     b = com.plan(req, ReservationLedger(cfg), cfg)
-    assert com._ref_dispatch.get("static-terminals", 0) == 0, "preventative gate should be gone"
+    assert not com._ref_dispatch, "no pre-kernel reference dispatch — the kernel handled it (gate is gone)"
     assert com._fb == 0, "kernel must handle static terminals, not fall back"
     assert a.status is b.status and a.accepted and abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
     assert ref.last_expansions == com.last_expansions, "node-count parity through the static wall"
@@ -234,11 +235,12 @@ def test_compiled_always_active_own_hub_transparent_foreign_walled_exact():
     own_hub, foreign_hub = Terminal("own_uss#0", 8, 180.0), Terminal("foreign_uss#0", 8, 180.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(5000, 0, 0), 0.0, uss_id="own_uss", origin_terminal=own_hub)
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    assert com.compiled, "numba kernel inactive — this kernel-exactness guard would be vacuous (ref vs ref)"
     statics = [((0.0, 0.0), own_hub), ((2500.0, 0.0), foreign_hub)]   # own at origin, foreign on the route
     ref.static_terminals = com.static_terminals = statics
     a = ref.plan(req, ReservationLedger(cfg), cfg)
     b = com.plan(req, ReservationLedger(cfg), cfg)
-    assert com._fb == 0 and com._ref_dispatch.get("static-terminals", 0) == 0, "own-hub flight stays compiled"
+    assert com._fb == 0 and not com._ref_dispatch, "own-hub flight stays on the kernel (no reference dispatch)"
     assert a.status is b.status and a.accepted
     assert abs(a.cost - b.cost) < 1e-9 and ref.last_expansions == com.last_expansions and _clkey(a) == _clkey(b)
 
@@ -268,6 +270,51 @@ def test_compiled_static_terminal_occupancy_parity():
                     f"own mismatch (q={q},r={r},L={L},s={s})"
                 checked += 1; walls += foreign_ref
     assert checked > 40 and walls == checked, "every static cell must be a foreign wall at every step/level"
+
+
+def test_compiled_static_terminal_survives_reset():
+    """A ledger release triggers CompiledHexOccupancy.reset() (a from-scratch rebuild). Static terminals are
+    NOT ledger-derived, so reset() must re-apply them from _static_terms (static_col + col_owners) — else a
+    foreign flight would route straight THROUGH the permanent wall after any release (the safety bug this
+    feature fixes). reset() clears col_owners, so this guards the re-apply loop specifically."""
+    import freespace_sim.planner.hexgrid as hg
+    cfg = SimConfig(terminal_airspace_always_active=True)
+    hub = Terminal("h#0", 8, 180.0)
+    center = (3000.0, 3000.0)
+    cocc = CompiledHexOccupancy(cfg)
+    cocc.register_static_terminal(center, hub)
+    q0, r0 = sorted(hg.terminal_cells(center, hub, cfg))[0]
+    cell = cocc.cell_id(q0, r0, 0)
+    assert cell >= 0 and cocc.static_col[cell] and hub.id in cocc.col_owners.get(cell, set())
+    cocc.reset()                                    # ledger-shrink rebuild: clears col_owners + pools
+    assert cocc.static_col[cell], "static_col dropped after reset()"
+    assert hub.id in cocc.col_owners.get(cell, set()), "col_owners static owner dropped after reset()"
+    assert cocc.blocked_py(q0, r0, 0, 7, own_cells=None) is True, "foreign wall lost after reset()"
+    assert len(cocc._static_terms) == 1, "reset() must not duplicate the static-terminal registration"
+
+
+def test_compiled_static_terminal_own_foreign_overlap_falls_back():
+    """The col_owners wiring in _mark_static exists so an own-hub cell that a FOREIGN static hub ALSO owns
+    triggers the overlap→reference fallback (the single boolean overlay can't encode own-AND-foreign). Two
+    static hubs placed so their terminal_cells share a cell: an own-hub flight must fall back exact, not
+    treat the foreign wall as transparent. (demand.py reject-samples hub spacing so this never occurs in a
+    real always-active run — see _build_overlay; the guard keeps the kernel exact regardless.)"""
+    import freespace_sim.planner.hexgrid as hg
+    cfg = SimConfig(terminal_airspace_always_active=True)
+    own_hub, foreign_hub = Terminal("own#0", 8, 180.0), Terminal("foreign#0", 8, 180.0)
+    own_c, for_c = (2000.0, 2000.0), (2200.0, 2000.0)          # 200 m apart → terminal_cells overlap
+    assert hg.terminal_cells(own_c, own_hub, cfg) & hg.terminal_cells(for_c, foreign_hub, cfg), \
+        "hubs must share a terminal cell for this test to exercise the overlap"
+    req = FlightRequest(1, vec(2000, 2000, 0), vec(5000, 2000, 0), 0.0, uss_id="own", origin_terminal=own_hub)
+    ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    assert com.compiled
+    ref.static_terminals = com.static_terminals = [(own_c, own_hub), (for_c, foreign_hub)]
+    a = ref.plan(req, ReservationLedger(cfg), cfg)
+    b = com.plan(req, ReservationLedger(cfg), cfg)
+    assert com._fb_reasons.get("own-foreign-overlap", 0) > 0, "static own∩foreign overlap fallback did not fire"
+    assert a.status is b.status and a.denial_reason is b.denial_reason
+    if a.accepted:
+        assert abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
 
 
 def test_out_of_box_committed_corridor_skipped_not_crash():

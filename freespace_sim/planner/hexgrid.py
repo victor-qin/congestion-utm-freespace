@@ -80,6 +80,7 @@ class Lane:
 
 
 _LANE_CACHE: dict = {}
+_COVERED_CACHE: dict = {}
 
 
 def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
@@ -91,9 +92,19 @@ def _covered_boundary(center, term, cfg: SimConfig) -> tuple[set, set]:
     """Flood-fill a hub's column: ``covered`` hexes (centre within ``exit_radius`` of the hub) and the
     ``boundary`` ring just outside them (neighbours of a covered cell that aren't themselves covered).
     Shared by :func:`terminal_lanes` (boundary = the exit lanes) and :func:`terminal_cells`
-    (covered ∪ boundary = the full reserved terminal airspace)."""
+    (covered ∪ boundary = the full reserved terminal airspace).
+
+    Memoised per ``(center, term, cfg)`` — hubs don't move during a run, and ``terminal_cells`` is now on
+    the compiled A* hot path (the own-hub overlay, once per terminal flight); without the cache each of
+    the thousands of same-hub plans re-ran this flood-fill. The returned sets are treated as read-only by
+    callers (``terminal_cells`` unions into a fresh set; ``terminal_lanes`` sorts/iterates), so sharing the
+    cached instances is safe. Mirrors ``_LANE_CACHE``."""
     term = as_terminal(term)
     cx, cy = float(center[0]), float(center[1])
+    key = (round(cx, 3), round(cy, 3), term, cfg)
+    cached = _COVERED_CACHE.get(key)
+    if cached is not None:
+        return cached
     R = circumradius(cfg)
     er = exit_radius(term, cfg)
     covered: set = set()
@@ -107,7 +118,9 @@ def _covered_boundary(center, term, cfg: SimConfig) -> tuple[set, set]:
             covered.add(h)
             stack.extend(hex_neighbors(*h))
     boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
-    return covered, boundary
+    result = (covered, boundary)
+    _COVERED_CACHE[key] = result
+    return result
 
 
 def terminal_cells(center, term, cfg: SimConfig) -> set:

@@ -643,6 +643,15 @@ class AStarPlanner:
                 if in_blk:
                     mark(cocc.cell_id(q, r, L))
             if cfg.terminal_airspace_always_active:      # the permanent static wall's wider geometry (#24)
+                # COUPLING: this own-hub exemption is GEOMETRIC (terminal_cells at `center`), whereas the
+                # reference is.blocked exempts by terminal ID (occupancy.is_blocked, geometry-independent).
+                # They agree only because `center` (the flight's terminal endpoint) is bit-identical to the
+                # hub center registered into the static wall (both from demand.place_hubs). A future demand
+                # model that offset a terminal endpoint from its hub center would leave some own static cells
+                # unmarked here → the kernel would wall its own terminal → divergence. Holds for all shipped
+                # demand models. (This own-static path is only reachable when fixed_exit_lanes=True — a
+                # terminal flight with fixed_exit_lanes=False dispatches to the reference — so the kernel's
+                # non-gating of the fixed-lane sibling rule never bites here.)
                 for q, r in hg.terminal_cells(center, term, cfg):
                     for L in range(cfg.n_levels):
                         mark(cocc.cell_id(q, r, L))

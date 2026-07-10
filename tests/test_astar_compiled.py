@@ -203,6 +203,24 @@ def test_compiled_mask_widen_re_run_exact():
     assert com._remask > 0, "mask-widen re-run not exercised — the regression guard would be vacuous"
 
 
+def test_compiled_always_active_static_terminal_falls_back_exact():
+    """#24 always-active static terminals (permanent foreign column walls) live only in the reference
+    `HexOccupancyService.static_term_cells`; the compiled pools (ledger-fed) don't carry them, so the kernel
+    would fly straight THROUGH them (unsafe — they're not in the ledger, so any_conflict can't catch it).
+    The dispatch routes any flight to the reference when static terminals are registered. A foreign flight
+    crossing a static hub must match the reference (which reroutes), and the fallback must be counted."""
+    cfg = SimConfig(terminal_airspace_always_active=True)
+    hub = Terminal("foreign_hub#0", 8, 180.0)
+    req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, uss_id="uss_a")   # foreign to the hub
+    ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    ref.static_terminals = com.static_terminals = [((1000.0, 0.0), hub)]         # wall dead on the path
+    a = ref.plan(req, ReservationLedger(cfg), cfg)
+    b = com.plan(req, ReservationLedger(cfg), cfg)
+    assert com._ref_dispatch.get("static-terminals", 0) > 0, "static-terminal fallback did not fire"
+    assert a.status is b.status and a.accepted and abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
+    assert a.cost > 200, "reference should reroute around the wall (straight-through would be ~160)"
+
+
 def test_out_of_box_committed_corridor_skipped_not_crash():
     """Issue #2: a committed corridor cell that maps outside the kernel box is SKIPPED (counted in
     ``oob_corridor_cells``), never a crash. Any later query to that cell gets ``cell_id < 0`` so the kernel

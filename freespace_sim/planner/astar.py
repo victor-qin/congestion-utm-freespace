@@ -221,9 +221,17 @@ class AStarPlanner:
         pure-Python reference. The compiled path handles the default ``fixed_exit_lanes=True`` terminals
         and all non-terminal flights; **legacy terminals** (``fixed_exit_lanes=False`` with a terminal
         end) route to the reference because their landing gate is path-dependent (``_committed_arrival``
-        needs the search's ``came`` mid-flight), which the flat-array kernel cannot serve."""
+        needs the search's ``came`` mid-flight), which the flat-array kernel cannot serve. **Always-active
+        terminals** (``cfg.terminal_airspace_always_active``, #24) also route to the reference: their
+        permanent foreign-column walls live in ``HexOccupancyService.static_term_cells``, which the compiled
+        pools (``CompiledHexOccupancy``, ledger-fed only) do not carry — so the kernel would fly straight
+        through them. This is a correctness/safety gate, not a perf choice; carrying static terminals in the
+        compiled occupancy is the follow-up that restores the speedup for that regime."""
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)
+        if self.static_terminals:                             # always-active foreign walls (#24) are in the
+            self._ref_dispatch["static-terminals"] += 1       # reference occupancy only, not the compiled
+            return self._plan_reference(req, ledger, cfg)     # pools → kernel would fly through them (unsafe)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         if (o_term is not None or d_term is not None) and not cfg.fixed_exit_lanes:
             self._ref_dispatch["legacy-terminal"] += 1        # pre-kernel: ran pure Python end to end

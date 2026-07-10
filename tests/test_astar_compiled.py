@@ -203,12 +203,13 @@ def test_compiled_mask_widen_re_run_exact():
     assert com._remask > 0, "mask-widen re-run not exercised — the regression guard would be vacuous"
 
 
-def test_compiled_always_active_static_terminal_falls_back_exact():
-    """#24 always-active static terminals (permanent foreign column walls) live only in the reference
-    `HexOccupancyService.static_term_cells`; the compiled pools (ledger-fed) don't carry them, so the kernel
-    would fly straight THROUGH them (unsafe — they're not in the ledger, so any_conflict can't catch it).
-    The dispatch routes any flight to the reference when static terminals are registered. A foreign flight
-    crossing a static hub must match the reference (which reroutes), and the fallback must be counted."""
+def test_compiled_always_active_static_terminal_exact():
+    """#24 always-active static terminals (permanent foreign column walls) are carried in
+    ``CompiledHexOccupancy.static_col`` (the SAME ``hg.terminal_cells`` the reference walls), so the kernel
+    deconflicts against them EXACTLY instead of falling back. A foreign flight whose straight path crosses a
+    static hub must reroute (cost > 200, not the ~160 straight-through) byte-identically to the reference,
+    with node-count parity and NO fallback (the old preventative gate is gone). This is the regression guard
+    for the safety bug where the kernel flew straight through a permanent no-fly wall."""
     cfg = SimConfig(terminal_airspace_always_active=True)
     hub = Terminal("foreign_hub#0", 8, 180.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, uss_id="uss_a")   # foreign to the hub
@@ -216,9 +217,57 @@ def test_compiled_always_active_static_terminal_falls_back_exact():
     ref.static_terminals = com.static_terminals = [((1000.0, 0.0), hub)]         # wall dead on the path
     a = ref.plan(req, ReservationLedger(cfg), cfg)
     b = com.plan(req, ReservationLedger(cfg), cfg)
-    assert com._ref_dispatch.get("static-terminals", 0) > 0, "static-terminal fallback did not fire"
+    assert com._ref_dispatch.get("static-terminals", 0) == 0, "preventative gate should be gone"
+    assert com._fb == 0, "kernel must handle static terminals, not fall back"
     assert a.status is b.status and a.accepted and abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
+    assert ref.last_expansions == com.last_expansions, "node-count parity through the static wall"
     assert a.cost > 200, "reference should reroute around the wall (straight-through would be ~160)"
+
+
+def test_compiled_always_active_own_hub_transparent_foreign_walled_exact():
+    """Own-hub exemption under always-active: a flight departing its OWN static hub flies THROUGH its own
+    terminal (``_build_overlay`` marks the hub's full ``terminal_cells`` own, so the permanent wall is
+    transparent to the hub that owns it), while a FOREIGN static hub on its route stays a wall. Kernel ==
+    reference exactly (node parity + centerline), no fallback — proving the overlay covers the wider
+    ``terminal_cells`` geometry, not merely the hover column."""
+    cfg = SimConfig(terminal_airspace_always_active=True)          # fixed_exit_lanes defaults True
+    own_hub, foreign_hub = Terminal("own_uss#0", 8, 180.0), Terminal("foreign_uss#0", 8, 180.0)
+    req = FlightRequest(1, vec(0, 0, 0), vec(5000, 0, 0), 0.0, uss_id="own_uss", origin_terminal=own_hub)
+    ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    statics = [((0.0, 0.0), own_hub), ((2500.0, 0.0), foreign_hub)]   # own at origin, foreign on the route
+    ref.static_terminals = com.static_terminals = statics
+    a = ref.plan(req, ReservationLedger(cfg), cfg)
+    b = com.plan(req, ReservationLedger(cfg), cfg)
+    assert com._fb == 0 and com._ref_dispatch.get("static-terminals", 0) == 0, "own-hub flight stays compiled"
+    assert a.status is b.status and a.accepted
+    assert abs(a.cost - b.cost) < 1e-9 and ref.last_expansions == com.last_expansions and _clkey(a) == _clkey(b)
+
+
+def test_compiled_static_terminal_occupancy_parity():
+    """``blocked_py`` (the kernel's oracle) folds ``static_col`` identically to
+    ``HexOccupancyService.is_blocked`` folding ``static_term_cells``: register the SAME hub into both and
+    assert cell-for-cell agreement over the terminal's cells at every level and step — for own=∅ (all
+    foreign → wall) AND own={hub} (transparent). Guards the fold the kernel's ``_blocked`` compiles."""
+    import freespace_sim.planner.hexgrid as hg
+    cfg = SimConfig(terminal_airspace_always_active=True)
+    hub = Terminal("h#0", 8, 180.0)
+    center = (3000.0, 3000.0)
+    svc = HexOccupancyService(cfg); svc.register_static_terminal(center, hub)
+    cocc = CompiledHexOccupancy(cfg); cocc.register_static_terminal(center, hub)
+    cells = sorted(hg.terminal_cells(center, hub, cfg))
+    assert len(cells) > 10, "expected a non-trivial terminal footprint"
+    own_cells = {cocc.cell_id(q, r, L) for (q, r) in cells for L in range(cfg.n_levels)}
+    checked = walls = 0
+    for (q, r) in cells:
+        for L in range(cfg.n_levels):
+            for s in (0, 5, 100, cocc.MAXS - 1):
+                foreign_ref = svc.is_blocked(q, r, L, s, own=())            # own=∅ ⇒ static cell is a wall
+                assert foreign_ref == cocc.blocked_py(q, r, L, s, own_cells=None)
+                own_ref = svc.is_blocked(q, r, L, s, own=frozenset({hub.id}))   # own hub ⇒ transparent
+                assert own_ref == cocc.blocked_py(q, r, L, s, own_cells=own_cells), \
+                    f"own mismatch (q={q},r={r},L={L},s={s})"
+                checked += 1; walls += foreign_ref
+    assert checked > 40 and walls == checked, "every static cell must be a foreign wall at every step/level"
 
 
 def test_out_of_box_committed_corridor_skipped_not_crash():

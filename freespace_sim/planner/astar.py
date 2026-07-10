@@ -218,20 +218,16 @@ class AStarPlanner:
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
     ) -> OperationalIntent:
         """Dispatch to the compiled kernel when it can reproduce the reference cost exactly; else the
-        pure-Python reference. The compiled path handles the default ``fixed_exit_lanes=True`` terminals
-        and all non-terminal flights; **legacy terminals** (``fixed_exit_lanes=False`` with a terminal
-        end) route to the reference because their landing gate is path-dependent (``_committed_arrival``
-        needs the search's ``came`` mid-flight), which the flat-array kernel cannot serve. **Always-active
-        terminals** (``cfg.terminal_airspace_always_active``, #24) also route to the reference: their
-        permanent foreign-column walls live in ``HexOccupancyService.static_term_cells``, which the compiled
-        pools (``CompiledHexOccupancy``, ledger-fed only) do not carry — so the kernel would fly straight
-        through them. This is a correctness/safety gate, not a perf choice; carrying static terminals in the
-        compiled occupancy is the follow-up that restores the speedup for that regime."""
+        pure-Python reference. The compiled path handles the default ``fixed_exit_lanes=True`` terminals,
+        all non-terminal flights, and **always-active terminals** (``cfg.terminal_airspace_always_active``,
+        #24): their permanent foreign-column walls are carried in ``CompiledHexOccupancy.static_col`` (the
+        same ``terminal_cells`` the reference walls), so the kernel deconflicts against them exactly and the
+        own hub's flights fly through their own terminal (the ``_build_overlay`` own-cell mark). **Legacy
+        terminals** (``fixed_exit_lanes=False`` with a terminal end) still route to the reference because
+        their landing gate is path-dependent (``_committed_arrival`` needs the search's ``came`` mid-flight),
+        which the flat-array kernel cannot serve."""
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)
-        if self.static_terminals:                             # always-active foreign walls (#24) are in the
-            self._ref_dispatch["static-terminals"] += 1       # reference occupancy only, not the compiled
-            return self._plan_reference(req, ledger, cfg)     # pools → kernel would fly through them (unsafe)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         if (o_term is not None or d_term is not None) and not cfg.fixed_exit_lanes:
             self._ref_dispatch["legacy-terminal"] += 1        # pre-kernel: ran pure Python end to end
@@ -573,6 +569,9 @@ class AStarPlanner:
             self._cocc_ledger = ledger
             ledger.subscribe(cocc.on_commit)
             _absorb(cocc, ledger)
+            if cfg.terminal_airspace_always_active:      # permanent foreign walls (whole horizon), #24 —
+                for center, term in self.static_terminals:   # same set the reference registers in _occupancy
+                    cocc.register_static_terminal(center, term)
         elif ledger.n_volumes < cocc.n_added:
             cocc.reset()
             _absorb(cocc, ledger)
@@ -605,21 +604,33 @@ class AStarPlanner:
         return ks
 
     def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
-        """Mark this flight's OWN-column footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
+        """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
         ``_blocked`` treats them as transparent (own column) instead of walls. Cheap: rasterize the 1–2
         own hub columns (same rasterizer that built the column pool) and mark their in_blk cells — no
-        per-step scan.
+        per-step scan. Under ``terminal_airspace_always_active`` (#24) ALSO mark the hub's full
+        ``terminal_cells`` (the wider flood-fill geometry the reference walls), so the permanent static wall
+        is transparent to the hub that owns it — matching ``is_blocked``'s tid-based own-hub exemption.
 
         Returns ``True`` if any own cell is ALSO covered by a FOREIGN hub's column (via ``col_owners``):
         the single-boolean overlay cannot distinguish "own here" from "own AND foreign here", so the
         caller falls back to the reference for exactness (issue #3). ``demand.py`` reject-samples hub
-        spacing (#27), making this rare, but detecting it keeps the kernel exact regardless of spacing
-        rather than *assuming* hub spacing ≫ column radius."""
+        spacing (#27, and #24 on the wider ``exit_radius`` extent for static walls), making this rare, but
+        detecting it keeps the kernel exact regardless of spacing rather than *assuming* separation."""
         ov = self._ks["ov_own_gen"]
         cfg = cocc.cfg
         z_hi = cfg.flight_levels_m[-1]
         own_ids = frozenset(t.id for t in (o_term, d_term) if t is not None)
         overlap = False
+
+        def mark(c):                                     # mark cell own; flag if a FOREIGN column shares it
+            nonlocal overlap
+            if c < 0:
+                return
+            ov[c] = gen
+            owners = cocc.col_owners.get(c)
+            if owners is not None and not owners <= own_ids:
+                overlap = True
+
         for term, center in ((o_term, origin), (d_term, dest)):
             if term is None:
                 continue
@@ -629,14 +640,12 @@ class AStarPlanner:
             for q, r, L, _s, in_blk in hg.rasterize_volume_dual(
                 col, cfg, cocc.R, cocc.infl_blocked, cocc.infl_pad
             ):
-                if not in_blk:
-                    continue
-                c = cocc.cell_id(q, r, L)
-                if c >= 0:
-                    ov[c] = gen
-                    owners = cocc.col_owners.get(c)
-                    if owners is not None and not owners <= own_ids:   # a FOREIGN column shares this cell
-                        overlap = True
+                if in_blk:
+                    mark(cocc.cell_id(q, r, L))
+            if cfg.terminal_airspace_always_active:      # the permanent static wall's wider geometry (#24)
+                for q, r in hg.terminal_cells(center, term, cfg):
+                    for L in range(cfg.n_levels):
+                        mark(cocc.cell_id(q, r, L))
         return overlap
 
     def _warm_jit(self):
@@ -650,7 +659,7 @@ class AStarPlanner:
             cv_lo = np.zeros(NC, np.int32); cv_hi = np.full(NC, MAXS, np.int32); cv_nxt = np.full(NC, -1, np.int32)
             ng = 6
             self._kernel(
-                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, np.zeros(NC, np.int32),
+                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
                 0, 0, 3, 3, 1, 0, MAXS,
                 1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]), 1,
                 np.array([1], np.int64), np.array([0.0]), np.ones(ng, np.bool_), ng, 1.0,
@@ -807,7 +816,7 @@ class AStarPlanner:
                 return self._plan_reference(req, ledger, cfg)
             n_out, cost, n_exp, status, aux = self._kernel(
                 cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
-                ks["ov_own_gen"],
+                cocc.static_col, ks["ov_own_gen"],
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
                 oq, orr, lane_q, lane_r, lane_lat, len(lane_q),
                 tks, tkc, to_ok, n_gsteps, c_gd_dt,

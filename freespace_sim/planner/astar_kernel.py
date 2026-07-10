@@ -121,11 +121,12 @@ def _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
 
 @njit(cache=True, nogil=True)
 def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
-             iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen, gen):
+             iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen):
     """0 = free, 1 = blocked, -1 = out-of-box. Reproduces ``occupancy.is_blocked`` via the corridor pool
-    (``iv_*``) + column pool (``cv_*``) + this flight's own-column mark (``ov_own_gen[cell] == gen``):
-    a FOREIGN column is a wall; an OWN column is transparent unless a corridor (fixed-lane sibling) also
-    covers it; a plain cell is the corridor pool."""
+    (``iv_*``) + column pool (``cv_*``) + always-active static walls (``static_col``) + this flight's
+    own-column mark (``ov_own_gen[cell] == gen``): a FOREIGN column (transient OR always-active) is a wall;
+    an OWN column is transparent unless a corridor (fixed-lane sibling) also covers it; a plain cell is the
+    corridor pool."""
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
@@ -138,6 +139,8 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
             colb = 0
             break
         slot = cv_nxt[slot]
+    if static_col[cell]:                               # always-active terminal: permanent column wall (all s)
+        colb = 1
     if colb == 1 and ov_own_gen[cell] != gen:
         return 1                                       # foreign column → wall
     # corridor pool
@@ -162,8 +165,8 @@ def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost):
 
 @njit(cache=True, nogil=True)
 def _search(
-    # ---- occupancy pool + per-flight overlay (CompiledHexOccupancy) ----
-    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen,
+    # ---- occupancy pool + static walls + per-flight overlay (CompiledHexOccupancy) ----
+    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen,
     qmin, rmin, qspan, rspan, n_levels, base, max_step,
     # ---- ground / takeoff-fan (host masks) ----
     oq, orr, lane_q, lane_r, lane_lat, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
@@ -265,7 +268,7 @@ def _search(
                         if not to_ok[gi * n_levels + Lv]:
                             continue
                         if _blocked(lq, lr, Lv, ts, qmin, rmin, qspan, rspan, n_levels,
-                                    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen, gen) != 0:
+                                    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) != 0:
                             continue
                         liq = lq - qmin; lir = lr - rmin
                         nkey = ((liq * rspan + lir) * nlp1 + (Lv + 1)) * step_span + (ts - base)
@@ -298,7 +301,7 @@ def _search(
             else:
                 nq = q; nr = r + 1
             b = _blocked(nq, nr, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                         iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen, gen)
+                         iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen)
             if b == -1:                                  # out-of-box stray → host reference
                 return 0, 0.0, n_exp, FB_OOB, (nq + 32768) * 65536 + (nr + 32768)
             if b == 1:
@@ -315,7 +318,7 @@ def _search(
                 return 0, 0.0, n_exp, FB_HEAP, -1
         # hover (same level)
         if _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen, gen) == 0:
+                    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt
             hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost)
@@ -339,9 +342,9 @@ def _search(
                 sk = step + 1
                 while sk <= ts:
                     if _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen, gen) != 0 or \
+                                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) != 0 or \
                        _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, ov_own_gen, gen) != 0:
+                                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) != 0:
                         clear = False
                         break
                     sk += 1

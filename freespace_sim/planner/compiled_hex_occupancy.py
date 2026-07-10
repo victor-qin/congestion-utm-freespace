@@ -9,10 +9,14 @@ incrementally from the ledger commit hook via :func:`hexgrid.rasterize_volume_du
     committing flight's own-column interior). Equals ``HexOccupancyService.blocked`` cell-for-cell.
   * **column pool** (``col``) — every terminal column's inner footprint. Equals ``term_cells`` (which
     hubs, dropped — only presence matters; own/foreign is resolved per-flight).
+  * **static column** (``static_col``) — a per-cell bool for always-active terminals
+    (``cfg.terminal_airspace_always_active``, #24): a permanent, step- AND level-independent foreign wall.
+    Equals ``HexOccupancyService.static_term_cells``. NOT ledger-derived (survives ``reset()``); empty and
+    zero-overhead when the flag is off.
 
 ``is_blocked(q,r,L,s,own)`` then folds to (kernel ``_blocked``):
 
-    colb = column-blocked(cell,s);  corb = corridor-blocked(cell,s)
+    colb = column-blocked(cell,s) OR static_col(cell);  corb = corridor-blocked(cell,s)
     if colb and cell not in the flight's OWN-column footprint:  return True   # foreign column → wall
     return corb                                                  # corridor / own-col fixed-lane sibling
 
@@ -37,6 +41,7 @@ import warnings
 import numpy as np
 
 from ..geometry import CylinderSpec
+from ..types import as_terminal
 from . import hexgrid as hg
 
 
@@ -156,6 +161,13 @@ class CompiledHexOccupancy:
         # a temporally-past foreign column — safe (the reference is exact), and bounded by the hub layout
         # (distinct column cells × owning hubs, not per-flight), so it does not grow unboundedly.
         self.col_owners: dict[int, set] = {}
+        # Always-active terminals (cfg.terminal_airspace_always_active, #24): permanent FOREIGN column walls,
+        # step- AND level-independent (the [ground, ceiling] tube). A per-cell bool over the SAME (q,r,L) index
+        # as the pools — a static cell reads as column-blocked at EVERY step (the kernel folds it into `colb`).
+        # NOT ledger-derived, so reset() re-applies it from `_static_terms` (the hub set doesn't change); the
+        # array itself is never cleared. Empty unless register_static_terminal is called ⇒ zero overhead off.
+        self.static_col = np.zeros(self.NC, np.bool_)
+        self._static_terms: list = []                   # (center, term) per walled hub, for reset() re-apply
         # committed corridor cells that fell outside the box: skipped (never a crash); any query to such a
         # cell gets cell_id < 0 and the kernel falls back via FB_OOB. Non-zero ⇒ consider widening `margin`.
         self.oob_corridor_cells = 0
@@ -230,6 +242,28 @@ class CompiledHexOccupancy:
                     continue
                 self.corr.block(c, int(s))
 
+    def register_static_terminal(self, center, term) -> None:
+        """Wall a hub's whole terminal airspace off from FOREIGN traffic for the ENTIRE horizon — the
+        always-active feature (``cfg.terminal_airspace_always_active``, #24). Marks ``static_col`` at every
+        flight level for each terminal hex (``hg.terminal_cells`` — the SAME cell set as
+        ``HexOccupancyService.static_term_cells``, so the compiled wall is byte-identical to the reference)
+        and records the owning ``tid`` in ``col_owners`` so the own∩foreign overlap check (issue #3) still
+        fires. The hub's own flights pass through (the host overlay marks these cells own — see
+        ``_build_overlay``). Idempotent per hub; survives ``reset()``."""
+        self._static_terms.append((center, term))
+        self._mark_static(center, term)
+
+    def _mark_static(self, center, term) -> None:
+        """Set ``static_col`` + ``col_owners`` for one hub's terminal cells (all levels). Split from
+        ``register_static_terminal`` so ``reset()`` can re-apply without re-appending to ``_static_terms``."""
+        tid = as_terminal(term).id
+        for q, r in hg.terminal_cells(center, term, self.cfg):
+            for L in range(self.n_levels):
+                c = self.cell_id(q, r, L)
+                if c >= 0:                              # OOB static cell ⇒ any query gets cell_id<0 → FB_OOB
+                    self.static_col[c] = True
+                    self.col_owners.setdefault(c, set()).add(tid)
+
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:
             self.evicted_before = step
@@ -241,6 +275,11 @@ class CompiledHexOccupancy:
         self.oob_corridor_cells = 0
         self.corr.reset()
         self.col.reset()
+        # Static terminals are NOT ledger-derived (a shrink rebuild must keep them) — re-mark them into the
+        # freshly-cleared col_owners (static_col was never cleared, so this is idempotent). Mirrors
+        # HexOccupancyService.reset() leaving static_term_cells intact.
+        for center, term in self._static_terms:
+            self._mark_static(center, term)
 
     # ---------- pure-Python oracle (kernel parity + tests) ----------
     def blocked_py(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
@@ -252,7 +291,7 @@ class CompiledHexOccupancy:
         c = self.cell_id(q, r, L)
         if c < 0:
             return True
-        colb = self.col.blocked_at(c, s)
+        colb = self.col.blocked_at(c, s) or bool(self.static_col[c])   # transient OR always-active column
         if colb and (own_cells is None or c not in own_cells):
             return True                                 # foreign column → wall
         return self.corr.blocked_at(c, s)               # corridor / own-column fixed-lane sibling

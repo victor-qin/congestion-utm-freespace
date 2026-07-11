@@ -448,11 +448,14 @@ def test_compiled_demand_run_is_verified():
 
 @pytest.mark.slow
 def test_compiled_replay_exact_saturated_terminal():
-    """A1 guard: stress the fixed-lane terminal TAKEOFF edge under heavy ground-delay saturation (pads=1,
-    high λ), where the kernel's ``base_g + (takeoff_cost + lane_lat)`` must match the reference's single-float
-    ``base_g + cost`` EXACTLY. The left-assoc form ``(base_g + takeoff_cost) + lane_lat`` differs by ~1 ULP
-    for a fraction of large-base_g takeoffs (float + is non-associative), which can flip a heap tie and break
-    the node-count/centerline parity. Full compiled==reference across a saturated batch, 0 fallbacks."""
+    """Saturated fixed-lane terminal replay (pads=1, high λ ⇒ large ground delays): full compiled==reference
+    parity — status, cost, last_expansions, centerline — across the batch, 0 fallbacks. This is COVERAGE of
+    the terminal-takeoff path under heavy base_g, NOT a discriminating guard for the A1 associativity fix:
+    reverting the parenthesisation at astar_kernel.py leaves this green, because the ~1-ULP takeoff-edge
+    difference (~3.7% of takeoff-lane edges here) never flips a heap ``(f, counter)`` tie in practice
+    (verified by reverting + re-running). The fix is correct-by-construction — the kernel now assembles
+    ``base_g + (takeoff_cost + lane_lat)`` exactly as the reference builds its single-float edge cost — so no
+    behavioural test can distinguish it; this guards the surrounding parity under load instead."""
     from freespace_sim.demand import HubRadiusDemand
     cfg = SimConfig(region_size_m=(8000.0, 6000.0), lam_per_hour=9000.0, horizon_s=300.0, planner="astar", seed=1)
     assert cfg.fixed_exit_lanes and cfg.n_levels >= 2
@@ -463,18 +466,20 @@ def test_compiled_replay_exact_saturated_terminal():
     reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
-    n_term = 0
+    n_accepted = 0
     max_gdelay = 0.0
+    assert all(r.origin_terminal is not None or r.dest_terminal is not None for r in reqs[:120])  # all terminal
     for k, rq in enumerate(reqs[:120]):
         a = ref.plan(rq, led, cfg)
         b = com.plan(rq, led, cfg)
-        n_term += (rq.origin_terminal is not None or rq.dest_terminal is not None)
         assert a.status is b.status, f"flight {k}: status {a.status} != {b.status}"
         if a.accepted:
+            n_accepted += 1
             max_gdelay = max(max_gdelay, a.ground_delay_s)
             assert abs(a.cost - b.cost) < 1e-9, f"flight {k}: cost {a.cost} != {b.cost}"
             assert ref.last_expansions == com.last_expansions, f"flight {k}: expansions differ (associativity?)"
             assert _clkey(a) == _clkey(b), f"flight {k}: centerline differs (associativity?)"
             led.commit(getattr(rq, "id", k), a.volumes)
     assert com._fb == 0, f"unexpected fallbacks: {dict(com._fb_reasons)}"
-    assert n_term > 80 and max_gdelay > 200.0, "must actually stress large-base_g terminal takeoffs"
+    # non-vacuous: the batch actually committed a real load AND drove large ground delays (the base_g regime)
+    assert n_accepted > 50 and max_gdelay > 200.0, f"weak scenario: {n_accepted} accepted, max_gdelay {max_gdelay}"

@@ -65,6 +65,27 @@ def hover_tail_steps(cfg) -> int:
     return int(math.ceil((cfg.hover_time_s + max_climb + cfg.time_buffer_s) / cfg.dt_s)) + 2
 
 
+def schedulable_horizon_steps(cfg) -> int:
+    """``MAXS`` — the largest step ANY committed corridor can occupy: the worst-case per-flight
+    ``search_horizon`` (latest departure + a region-DIAGONAL flight; monotone, so it bounds every flight's
+    ``max_step``) plus the landing hover tail. ONE definition shared by ``CompiledHexOccupancy._box`` (the
+    occupancy box depth) AND ``volumes.permanent_terminal_reservation`` (the ledger wall's ``t_end = MAXS·dt``)
+    — both must cover exactly the times a committed corridor can reach, so they cannot drift. Note the lateral
+    budget is the search's fixed ``3·n_hops`` (which ground-wait/hover can consume as time), NOT
+    ``max_detour_factor``: a late corridor can arrive well past ``horizon_s + max_ground_delay_s``, so a
+    seconds-budget keyed on ``max_detour_factor`` would under-cover when that factor is tight."""
+    w, h = cfg.region_size_m
+    dt = cfg.dt_s
+    pitch = cfg.nominal_speed_mps * dt
+    levels = cfg.flight_levels_m
+    base_max = int(math.ceil(cfg.horizon_s / dt))
+    takeoff_max = max(cfg.climb_steps_to(z) for z in levels)
+    n_hops_max = int(math.ceil(math.hypot(w, h) / max(pitch, 1e-9)))
+    climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
+                  if cfg.n_levels > 1 else 0)
+    return search_horizon(base_max, takeoff_max, n_hops_max, climb_span, cfg) + hover_tail_steps(cfg)
+
+
 class _Pool:
     """Flat linked-list free-interval pool: cell ``c``'s intervals are walked from slot ``c`` along
     ``nxt``; a blocked step splits the containing interval in place. Slot 0..NC-1 pre-seeded ``[0, MAXS]``."""
@@ -182,17 +203,7 @@ class CompiledHexOccupancy:
             qs.append(q); rs.append(r)
         qmin, qmax = min(qs) - margin, max(qs) + margin
         rmin, rmax = min(rs) - margin, max(rs) + margin
-        # MAXS = the worst-case per-flight search_horizon (latest departure + region-DIAGONAL flight; >=
-        # every flight's max_step since search_horizon is monotone) + the committed landing hover tail.
-        dt = cfg.dt_s
-        pitch = cfg.nominal_speed_mps * dt
-        levels = cfg.flight_levels_m
-        base_max = int(math.ceil(cfg.horizon_s / dt))
-        takeoff_max = max(cfg.climb_steps_to(z) for z in levels)
-        n_hops_max = int(math.ceil(math.hypot(w, h) / max(pitch, 1e-9)))
-        climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
-                      if cfg.n_levels > 1 else 0)
-        maxs = search_horizon(base_max, takeoff_max, n_hops_max, climb_span, cfg) + hover_tail_steps(cfg)
+        maxs = schedulable_horizon_steps(cfg)   # worst-case search_horizon + hover tail (see the shared fn)
         return qmin, rmin, qmax - qmin + 1, rmax - rmin + 1, maxs
 
     def cell_id(self, q: int, r: int, L: int) -> int:

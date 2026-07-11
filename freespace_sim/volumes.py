@@ -268,22 +268,19 @@ def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4
     terminal_cells``, any corridor A* routes around ``terminal_cells`` also clears this column with margin (no
     spurious commit-time denials).
 
-    **Time window spans the whole SCHEDULABLE horizon, not just ``horizon_s``.** A corridor's latest volume
-    is bounded by: latest departure (``horizon_s``) + full ground-delay budget + a max-detour lateral
-    traversal + the VERTICAL time (climb to the top level at the origin, then the landing hover + descent) +
-    the ASTM buffer. A shorter ``t_end`` would leave the wall inactive during late cruise/landing, so
-    ``any_conflict`` / ``verify`` / a ledger-only refiner could cross the terminal late in the schedule
-    undetected (and a gap-jump planner could deliberately ground-delay *past* the wall and fly through). The
-    ``2·max_climb + hover`` term matters when ``max_detour_factor`` is tight (near 1): the lateral term is
-    then small and the omitted vertical dwell (a top-level climb ≫ ``time_buffer_s``) would otherwise let a
-    late near-diagonal crossing escape. The A* occupancy routing wall is time-invariant, so the ledger wall
-    must be too — hence this strict upper bound."""
+    **Time window = the search's reachability (``MAXS·dt``), not just ``horizon_s``.** A committed corridor's
+    latest volume is bounded by the A* search's own step cap ``MAXS`` (``schedulable_horizon_steps``): latest
+    departure + the full ground-delay + 3×-hop lateral + vertical budgets (any of which ground-wait/hover can
+    spend as *time*) + the landing hover tail. A shorter ``t_end`` would leave the wall inactive during late
+    cruise/landing, so ``any_conflict`` / ``verify`` / a ledger-only refiner could cross the terminal late in
+    the schedule undetected (and a gap-jump planner could deliberately ground-delay *past* the wall and fly
+    through). Keying the bound on ``max_detour_factor`` instead under-covers when that factor is tight: the
+    search still explores the fixed 3×-hop budget, so a corridor can arrive later than a detour-scaled seconds
+    estimate. Sharing ``MAXS`` with the occupancy box gives the ledger wall and the time-invariant A* routing
+    wall one time depth that cannot drift."""
     term = as_terminal(term)
-    w, h = cfg.region_size_m
-    max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)   # top-level climb; descent is symmetric
-    t_end = (cfg.horizon_s + cfg.max_ground_delay_s
-             + cfg.max_detour_factor * math.hypot(w, h) / cfg.nominal_speed_mps
-             + 2.0 * max_climb + cfg.hover_time_s + cfg.time_buffer_s)   # origin climb + landing hover/descent
+    from .planner.compiled_hex_occupancy import schedulable_horizon_steps   # lazy: avoid a core→planner cycle
+    t_end = schedulable_horizon_steps(cfg) * cfg.dt_s
     return replace(
         hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),
         t_end=t_end)

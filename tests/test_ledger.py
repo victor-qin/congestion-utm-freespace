@@ -170,21 +170,27 @@ def test_static_wall_grid_matches_bruteforce_scan():
     assert led.any_conflict([big]) is True                                     # and it really does cross hub walls
 
 
-def test_static_wall_covers_vertical_dwell_under_tight_detour():
-    """G1: under a TIGHT max_detour_factor the lateral term is small, so the wall's t_end must still include
-    the vertical dwell — a top-level climb (~18 s) + the landing hover/descent — which the old formula omitted
-    (it added only time_buffer_s = 4 s). A late crossing PAST the old bound but within the true reachable
-    window must still be walled; before the fix it escaped any_conflict."""
+def test_static_wall_covers_full_search_reachability_under_tight_detour():
+    """G1: the wall's t_end must cover the SEARCH's actual reachability (MAXS*dt = schedulable_horizon_steps),
+    NOT a max_detour_factor-scaled seconds budget. Under a tight max_detour_factor the search still explores
+    the fixed 3x-hop step budget, and ground-wait/hover can spend it as time, so a committed corridor can
+    arrive LATER than any detour-scaled estimate. A crossing in that gap must still be walled; the old
+    detour-scaled bound let it escape any_conflict/verify."""
     import math
+    from freespace_sim.planner.compiled_hex_occupancy import schedulable_horizon_steps
     cfg = SimConfig(max_detour_factor=1.2)
     hx, hy = 3000.0, 3000.0
     led = ReservationLedger(cfg)
     led.register_static_terminal((hx, hy), Terminal("h#0", 8, 180.0))
     w, h = cfg.region_size_m
-    lateral = cfg.max_detour_factor * math.hypot(w, h) / cfg.nominal_speed_mps
-    old_tend = cfg.horizon_s + cfg.max_ground_delay_s + lateral + cfg.time_buffer_s   # pre-G1 (vertical-omitting)
     max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
-    t_cross = old_tend + max_climb                        # past the old bound, inside the true reachable window
+    # the OLD detour-scaled bound (pre-fix, incl. the interim vertical-dwell terms) vs the search reachability
+    detour_tend = (cfg.horizon_s + cfg.max_ground_delay_s
+                   + cfg.max_detour_factor * math.hypot(w, h) / cfg.nominal_speed_mps
+                   + 2.0 * max_climb + cfg.hover_time_s + cfg.time_buffer_s)
+    reach_tend = schedulable_horizon_steps(cfg) * cfg.dt_s          # the true bound the wall now uses (the fix)
+    assert reach_tend > detour_tend + 1.0, "the fix must extend the wall past the detour-scaled bound"
+    t_cross = 0.5 * (detour_tend + reach_tend)                      # in the gap: missed by old, caught by the fix
     box = Volume4D(box_from_segment(vec(hx - 200, hy, 150), vec(hx + 200, hy, 150), 40, 300),
                    t_cross, t_cross + cfg.dt_s)
-    assert led.any_conflict([box]) is True, "a late crossing within the climb/hover window must still be walled"
+    assert led.any_conflict([box]) is True, "a crossing within the search's reachability must still be walled"

@@ -62,6 +62,19 @@ def test_shortcut_demand_run_is_verified():
     assert run(cfg).verified
 
 
+def test_astar_shortcut_runs_under_always_active():
+    """The payoff + the lifted ban: with the terminal walls now PERMANENT LEDGER VOLUMES, the shortcut
+    refiner's ``any_conflict`` recheck respects them, so ``sim.run`` no longer raises for an A*-wrapping
+    planner under ``terminal_airspace_always_active`` (it used to be a hard ``ValueError``) — and the result
+    stays verified: the refiner does not straighten a corridor through a walled terminal column."""
+    from freespace_sim.scenarios import get_scenario, with_overrides
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), horizon_s=8.0)
+    cfg = spec.config()
+    assert cfg.terminal_airspace_always_active
+    r = run(cfg, demand=spec.demand_model(), planner_name="astar_shortcut")   # must NOT raise
+    assert r.verified, "shortcut refiner must respect the ledger walls (verified conflict-free)"
+
+
 @pytest.mark.slow
 def test_milp_shortcut_never_worsens_the_milp_solution():
     base = get_planner("astar_milp").plan(_req(), _wall_led(), CFG)

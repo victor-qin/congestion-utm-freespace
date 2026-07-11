@@ -165,7 +165,7 @@ class CompiledHexOccupancy:
         # step- AND level-independent (the [ground, ceiling] tube). A per-cell bool over the SAME (q,r,L) index
         # as the pools — a static cell reads as column-blocked at EVERY step (the kernel folds it into `colb`).
         # NOT ledger-derived, so reset() re-applies it from `_static_terms` (the hub set doesn't change); the
-        # array itself is never cleared. Empty unless register_static_terminal is called ⇒ zero overhead off.
+        # array itself is never cleared. Empty unless `_on_static` fires (ledger subscribe_static hook) ⇒ off = free.
         self.static_col = np.zeros(self.NC, np.bool_)
         self._static_terms: list = []                   # (center, term) per walled hub, for reset() re-apply
         # committed corridor cells that fell outside the box: skipped (never a crash); any query to such a
@@ -242,20 +242,23 @@ class CompiledHexOccupancy:
                     continue
                 self.corr.block(c, int(s))
 
-    def register_static_terminal(self, center, term) -> None:
-        """Wall a hub's whole terminal airspace off from FOREIGN traffic for the ENTIRE horizon — the
-        always-active feature (``cfg.terminal_airspace_always_active``, #24). Marks ``static_col`` at every
-        flight level for each terminal hex (``hg.terminal_cells`` — the SAME cell set as
-        ``HexOccupancyService.static_term_cells``, so the compiled wall is byte-identical to the reference)
-        and records the owning ``tid`` in ``col_owners`` so the own∩foreign overlap check (issue #3) still
-        fires. The hub's own flights pass through (the host overlay marks these cells own — see
-        ``_build_overlay``). Idempotent per hub; survives ``reset()``."""
+    def _on_static(self, center, term) -> None:
+        """Derive the compiled routing wall from a ledger static-terminal registration — the
+        ``ReservationLedger.subscribe_static`` hook target (bound in ``AStarPlanner._compiled_occ``, and named
+        ``_on_static`` to match ``HexOccupancyService._on_static`` / the ``on_commit`` observer convention). Marks
+        ``static_col`` at every flight level for each terminal hex (``hg.terminal_cells`` — the SAME cell set
+        as ``HexOccupancyService.static_term_cells``, so the compiled wall is byte-identical to the
+        reference) and records the owning ``tid`` in ``col_owners`` so the own∩foreign overlap check (issue
+        #3) still fires. Appends to ``_static_terms`` so ``reset()`` re-applies it (col_owners is cleared on
+        reset — unlike the reference's `static_term_cells` which reset() never touches). The hub's own
+        flights pass through (the host overlay marks these cells own — see ``_build_overlay``). Idempotent
+        per hub. The authoritative wall is the ledger's permanent volume; this is the derived routing view."""
         self._static_terms.append((center, term))
         self._mark_static(center, term)
 
     def _mark_static(self, center, term) -> None:
         """Set ``static_col`` + ``col_owners`` for one hub's terminal cells (all levels). Split from
-        ``register_static_terminal`` so ``reset()`` can re-apply without re-appending to ``_static_terms``."""
+        ``_on_static`` so ``reset()`` can re-apply without re-appending to ``_static_terms``."""
         tid = as_terminal(term).id
         for q, r in hg.terminal_cells(center, term, self.cfg):
             for L in range(self.n_levels):

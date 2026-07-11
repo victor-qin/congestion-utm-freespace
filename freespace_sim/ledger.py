@@ -17,10 +17,14 @@ import numpy as np
 
 from .config import SimConfig
 from .conflict import volumes_conflict
-from .volumes import Volume4D
+from .volumes import Volume4D, permanent_terminal_reservation
 
 
 class ReservationLedger:
+    # Partner-id sentinel reported by `conflicts` for an always-active terminal WALL (a permanent
+    # `_static_vols` entry owns no flight). Callers treat it as "static wall", never a real flight id.
+    STATIC_WALL_FID = -1
+
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         self._vols: list[Volume4D] = []
@@ -28,12 +32,43 @@ class ReservationLedger:
         self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
         self._buckets: dict[int, list[int]] = {}
         self._observers: list = []   # commit subscribers (publish hook); see subscribe()
+        # Always-active terminal walls (cfg.terminal_airspace_always_active): PERMANENT, whole-horizon
+        # reservations filed once at sim setup. Kept OUT of the per-step _buckets (time-invariant — bucketing
+        # a whole-horizon volume would flood every step); scanned separately in conflicts/any_conflict. The
+        # (center, term) pairs feed the A* occupancy-derivation hook (subscribe_static). Empty unless
+        # register_static_terminal is called ⇒ zero overhead when the flag is off.
+        self._static_vols: list[Volume4D] = []
+        self._static_aabb: list[tuple[float, float, float, float, float, float]] = []  # per-wall flat AABB
+        self._static_terms: list[tuple] = []   # (center, term) pairs, for the occupancy-derivation replay
+        self._static_subs: list = []           # static-terminal subscribers (occupancy routing-wall hook)
 
     def subscribe(self, callback) -> None:
         """Register ``callback(flight_id, volumes)``, fired after each successful commit — the
         publish hook (ASTM F3548-21 Subscription/notification analogue). Used by the A* planner's
         incremental hex-occupancy service to absorb new volumes without rebuilding from scratch."""
         self._observers.append(callback)
+
+    def register_static_terminal(self, center, term) -> None:
+        """File a hub's always-active terminal airspace as a PERMANENT ledger volume (whole horizon), so
+        ``any_conflict`` / ``verify`` / the ledger-only refiners see it — instead of an off-ledger
+        occupancy side-structure. NOT bucketed (time-invariant); scanned separately in
+        ``conflicts``/``any_conflict``. Fires the static-subscribe hook so the A* occupancy services derive
+        their (discrete) routing walls from the same source. Called once per hub at sim setup."""
+        self._static_terms.append((center, term))
+        vol = permanent_terminal_reservation(center, term, self.cfg)
+        self._static_vols.append(vol)
+        self._static_aabb.append(self._flat_aabb(vol))
+        for cb in self._static_subs:
+            cb(center, term)
+
+    def subscribe_static(self, callback) -> None:
+        """Register ``callback(center, term)`` for static-terminal registrations — and REPLAY it
+        immediately for every already-registered hub. The replay is essential (unlike ``subscribe``): the
+        A* occupancy services bind lazily on their first plan, i.e. AFTER ``sim.run`` has already registered
+        every hub, so a subscribe-only hook would miss them all and the routing walls would be empty."""
+        self._static_subs.append(callback)
+        for center, term in self._static_terms:
+            callback(center, term)
 
     # ----- internals -----
     def _steps(self, vol: Volume4D) -> range:
@@ -89,7 +124,9 @@ class ReservationLedger:
 
     # ----- reads -----
     def conflicts(self, volumes: list[Volume4D]) -> list[tuple[int, Volume4D]]:
-        """Every committed (flight_id, volume) that conflicts with any of ``volumes``."""
+        """Every committed (flight_id, volume) that conflicts with any of ``volumes``. A permanent
+        always-active terminal wall has no flight id — it surfaces as ``(-1, static_vol)``, the documented
+        sentinel (callers treat ``-1`` as 'static wall', never a real flight id)."""
         out: list[tuple[int, Volume4D]] = []
         for v in volumes:
             vbb = self._flat_aabb(v)
@@ -99,10 +136,16 @@ class ReservationLedger:
                 cv = self._vols[idx]
                 if volumes_conflict(v, cv):
                     out.append((self._fids[idx], cv))
+            for i, sv in enumerate(self._static_vols):        # always-active walls: unbucketed, time-invariant
+                if self._aabb_miss(vbb, self._static_aabb[i]):
+                    continue
+                if volumes_conflict(v, sv):
+                    out.append((self.STATIC_WALL_FID, sv))
         return out
 
     def any_conflict(self, volumes: list[Volume4D]) -> bool:
-        """Fast feasibility check: True as soon as one committed volume conflicts (planner hot path)."""
+        """Fast feasibility check: True as soon as one committed volume — or an always-active terminal wall
+        — conflicts (planner hot path)."""
         for v in volumes:
             vbb = self._flat_aabb(v)
             for idx in self._candidate_indices(v):
@@ -110,11 +153,17 @@ class ReservationLedger:
                     continue
                 if volumes_conflict(v, self._vols[idx]):
                     return True
+            for i, sv in enumerate(self._static_vols):        # always-active walls: unbucketed, time-invariant
+                if self._aabb_miss(vbb, self._static_aabb[i]):
+                    continue
+                if volumes_conflict(v, sv):
+                    return True
         return False
 
     def conflicting_flights(self, volumes: list[Volume4D]) -> set[int]:
-        """The set of committed flight_ids that block ``volumes`` (for reroute targeting)."""
-        return {fid for fid, _ in self.conflicts(volumes)}
+        """The set of committed flight_ids that block ``volumes`` (for reroute targeting). Excludes the
+        static-wall sentinel (a permanent terminal wall owns no flight and cannot be a reroute target)."""
+        return {fid for fid, _ in self.conflicts(volumes) if fid != self.STATIC_WALL_FID}
 
     def iter_committed(self):
         """Yield every committed (flight_id, Volume4D) — used by verify and viz."""

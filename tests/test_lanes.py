@@ -74,13 +74,14 @@ def test_terminal_cells_is_column_plus_lanes():
 
 
 def test_static_terminal_walls_foreign_keeps_own_passable():
-    """register_static_terminal makes a hub's cells a permanent FOREIGN wall (any step), while the
-    hub's own flights pass through (transparent, absent a committed sibling corridor)."""
+    """The occupancy's ledger subscribe_static hook (``_on_static``) makes a hub's cells a permanent FOREIGN
+    wall (any step), while the hub's own flights pass through (transparent, absent a committed sibling
+    corridor). (``_on_static`` is the body the ``ReservationLedger.subscribe_static`` replay drives.)"""
     from freespace_sim.planner.occupancy import HexOccupancyService
 
     svc = HexOccupancyService(CFG)
     center, term = tuple(hg.hex_center(0, 0, R)), _term(120)
-    svc.register_static_terminal(center, term)
+    svc._on_static(center, term)
     q, r = next(iter(hg.terminal_cells(center, term, CFG)))
     top = CFG.n_levels - 1                                  # the always-active column is the [ground,
     #                                                        ceiling] tube ⇒ it walls EVERY flight level

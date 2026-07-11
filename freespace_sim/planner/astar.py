@@ -152,9 +152,9 @@ class AStarPlanner:
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
-        self.static_terminals: list = []               # (center, term) per hub; set by sim.run() when
-        #                                                cfg.terminal_airspace_always_active, registered
-        #                                                into the occupancy as permanent foreign walls.
+        # Always-active terminal walls (cfg.terminal_airspace_always_active) are PERMANENT ledger volumes now
+        # (filed by sim.run via ledger.register_static_terminal); the occupancy services derive their routing
+        # walls from the ledger via subscribe_static in _occupancy/_compiled_occ. No planner-held list.
         # ---- compiled (numba) air-search kernel: reproduces the pure-Python search EXACTLY, ~multiple-x
         # faster; auto-falls back to `_plan_reference` if numba is absent or a safety valve trips. ----
         self.compiled = compiled
@@ -192,9 +192,9 @@ class AStarPlanner:
             ledger.subscribe(self._tcap.on_commit)
             _absorb(svc, ledger)                             # absorb anything already committed
             _absorb(self._tcap, ledger)
-            if cfg.terminal_airspace_always_active:          # permanent foreign walls (whole horizon)
-                for center, term in self.static_terminals:
-                    svc.register_static_terminal(center, term)
+            ledger.subscribe_static(svc._on_static)          # derive always-active routing walls from the
+            #                                                  ledger's permanent terminal volumes (replays
+            #                                                  all already-registered hubs; no-op if none)
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
@@ -569,9 +569,9 @@ class AStarPlanner:
             self._cocc_ledger = ledger
             ledger.subscribe(cocc.on_commit)
             _absorb(cocc, ledger)
-            if cfg.terminal_airspace_always_active:      # permanent foreign walls (whole horizon), #24 —
-                for center, term in self.static_terminals:   # same set the reference registers in _occupancy
-                    cocc.register_static_terminal(center, term)
+            ledger.subscribe_static(cocc._on_static)         # derive the compiled routing walls from the
+            #                                                  ledger's permanent terminal volumes (replays
+            #                                                  all already-registered hubs; no-op if none)
         elif ledger.n_volumes < cocc.n_added:
             cocc.reset()
             _absorb(cocc, ledger)

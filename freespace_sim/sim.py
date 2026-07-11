@@ -110,6 +110,27 @@ class SimResult:
         }
 
 
+def _reaches_astar(planner) -> bool:
+    """True if ``planner``'s committed corridor originates from A* — directly, or via an inner/warm-start
+    A* whose (terminal-TAGGED) intent it rebuilds or falls back to. Walks the ``inner``/``warm_planner``
+    chain (astar_shortcut → inner, opt_astar/astar_milp → warm_planner, astar_milp_shortcut → both). Used
+    only to gate ``terminal_airspace_always_active`` (see ``run``): A* tags its terminal columns so they are
+    exempt from their own hub's permanent wall, whereas a planner that builds untagged near-hub columns
+    would collide with it."""
+    from .planner.astar import AStarPlanner
+    seen: set = set()
+    stack = [planner]
+    while stack:
+        p = stack.pop()
+        if p is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        if isinstance(p, AStarPlanner):
+            return True
+        stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
+    return False
+
+
 def run(
     cfg: SimConfig,
     *,
@@ -139,6 +160,7 @@ def run(
     usses = {uid: USS(uid, dss, cfg, get_planner(pname)) for uid in scenario.uss_ids}
     default_uss = next(iter(usses.values()))
 
+    static_terms: list = []                              # (center, term) per walled hub; [] unless always-active
     if cfg.terminal_airspace_always_active:
         # Wall EVERY placed hub's terminal off from foreign cruise traffic for the whole horizon. Prefer
         # the demand model's FULL placed-hub set (permanent infrastructure — a vertiport is walled even
@@ -155,22 +177,23 @@ def run(
                     if term is not None:
                         terms.setdefault(term.id, (pt, term))
             static_terms = list(terms.values())
-        # A*-ONLY feature: a refiner/optimizer (astar_shortcut / opt_astar / astar_milp) re-checks
-        # feasibility only against the committed ledger, not these static walls — so it would straighten
-        # the polished corridor back through walled terminal airspace (the walls aren't ledger volumes).
-        # Require a bare 'astar' planner and fail loudly otherwise, rather than silently mis-measure.
+        # File each hub's terminal airspace as a PERMANENT ledger volume (whole horizon). any_conflict /
+        # verify / the ledger-only refiners now ALL see the walls, and the A* occupancy services derive their
+        # discrete routing walls from the ledger (subscribe_static).
+        for center, term in static_terms:
+            ledger.register_static_terminal(center, term)
+        # The walls are per-hub TAGGED CylinderSpecs, so a flight's own-hub column must also be tagged to be
+        # exempt from its own hub's wall (conflict.volumes_conflict same-tid+cylinder). A*-based planners tag
+        # their terminal columns (astar, astar_shortcut, opt_astar, astar_milp, ...); a planner that builds
+        # UNTAGGED near-hub columns (bare rrt / opt / milp / straight / lazy) would collide with its OWN hub's
+        # wall and deny every hub flight. This lifts the old bare-'astar'-only ban to allow A*-based refiners,
+        # but still refuses untagged planners LOUDLY rather than let them silently mis-plan.
         for u in usses.values():
-            p = u.planner
-            if hasattr(p, "inner") or hasattr(p, "warm_planner"):
+            if not _reaches_astar(u.planner):
                 raise ValueError(
-                    f"terminal_airspace_always_active=True needs a bare 'astar' planner, but {pname!r} "
-                    "wraps A* in a refiner/optimizer whose ledger-only feasibility check ignores the "
-                    "static terminal walls (the polished corridor could cross walled airspace).")
-            if not hasattr(p, "static_terminals"):
-                raise ValueError(
-                    f"terminal_airspace_always_active=True but planner {pname!r} is not A*-based — no "
-                    "layer to install the static terminal walls into.")
-            p.static_terminals = static_terms
+                    f"terminal_airspace_always_active=True needs an A*-based planner (its terminal columns "
+                    f"are tagged, hence exempt from their own hub's permanent wall), but {pname!r} builds "
+                    f"untagged near-hub columns that would collide with the wall and deny every hub flight.")
 
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
@@ -182,7 +205,7 @@ def run(
         if report:
             report(done, total, intent)
 
-    verified = verify.find_interflight_conflict(intents, cfg) is None
+    verified = verify.find_interflight_conflict(intents, cfg, static_terminals=static_terms) is None
     # Carry the planner that ACTUALLY flew: a planner_name= override must be reflected in the stored
     # config, or downstream metrics/aggregate (which key on cfg.planner — e.g. the altitude baseline)
     # and the reported planner label would describe cfg.planner, not the planner that ran.

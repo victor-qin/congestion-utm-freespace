@@ -245,3 +245,39 @@ def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Ha
         z_hi=z_hi,
     )
     return Volume4D(spec, t0, t0 + cfg.hover_time_s + ct, terminal_id=terminal_id)
+
+
+def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4D:
+    """A hub's whole-horizon terminal-airspace reservation — the ledger volume that makes an
+    ``cfg.terminal_airspace_always_active`` wall a first-class part of the committed airspace (visible to
+    ``ledger.any_conflict`` / ``verify`` / the ledger-only refiners) instead of an off-ledger occupancy
+    side-structure.
+
+    Spans the full ``[ground, ceiling]`` tube for the whole horizon and is tagged with ``terminal_id`` so
+    the column-involved exemption in :func:`conflict.volumes_conflict` keeps it transparent to its own
+    hub's flights while walling foreign cruise.
+
+    **Radius = ``terminal_radius`` — the reserved column, exactly what the per-flight dwell column reserves
+    (:func:`hover_reservation` in ``build_reservation_from_corners`` / ``AStarPlanner._build``).** The ledger
+    records only the *safety-critical reserved volume* (the hover column where drones actually are); it does
+    NOT include the ``+corridor_width/2`` of ``exit_radius`` (that is exit-LANE geometry — where lanes start
+    flush with the column edge — a routing/lane concern, not a reservation) nor the wider ``terminal_cells``
+    flood-fill (A*'s discrete keep-out, for search margin). So the permanent wall is byte-identical to the
+    transient dwell column, just permanent — the "active ⟺ on the ledger" model applied to the *same* volume
+    (built by reusing :func:`hover_reservation`, so the two cannot drift). Because ``terminal_radius ⊂
+    terminal_cells``, any corridor A* routes around ``terminal_cells`` also clears this column with margin (no
+    spurious commit-time denials).
+
+    **Time window spans the whole SCHEDULABLE horizon, not just ``horizon_s``.** A corridor's time can reach
+    the latest departure (``horizon_s``) + the full ground-delay budget + a max-detour traversal of the
+    region — well past ``horizon_s``. A shorter ``t_end`` would leave the wall inactive during late cruise, so
+    ``any_conflict`` / ``verify`` / a ledger-only refiner could cross the terminal late in the schedule
+    undetected (and a gap-jump planner could deliberately ground-delay *past* the wall and fly through). The
+    A* occupancy routing wall is time-invariant, so the ledger wall must be too — hence the generous bound."""
+    term = as_terminal(term)
+    w, h = cfg.region_size_m
+    t_end = (cfg.horizon_s + cfg.max_ground_delay_s
+             + cfg.max_detour_factor * math.hypot(w, h) / cfg.nominal_speed_mps + cfg.time_buffer_s)
+    return replace(
+        hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),
+        t_end=t_end)

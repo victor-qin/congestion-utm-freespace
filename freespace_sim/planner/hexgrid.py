@@ -127,7 +127,8 @@ def terminal_cells(center, term, cfg: SimConfig) -> set:
     """Every hex of a hub's reserved terminal airspace — the column (covered) plus its exit lanes
     (boundary). Used to wall the terminal off from FOREIGN cruise traffic when
     ``cfg.terminal_airspace_always_active`` (foreign flights route around instead of crossing); see
-    :meth:`freespace_sim.planner.occupancy.HexOccupancyService.register_static_terminal`."""
+    :meth:`freespace_sim.ledger.ReservationLedger.register_static_terminal` (which the occupancy derives its
+    routing wall from via :meth:`~freespace_sim.planner.occupancy.HexOccupancyService._on_static`)."""
     covered, boundary = _covered_boundary(center, term, cfg)
     return covered | boundary
 

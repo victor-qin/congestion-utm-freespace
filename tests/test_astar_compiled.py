@@ -215,9 +215,11 @@ def test_compiled_always_active_static_terminal_exact():
     req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, uss_id="uss_a")   # foreign to the hub
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
     assert com.compiled, "numba kernel inactive — this kernel-exactness guard would be vacuous (ref vs ref)"
-    ref.static_terminals = com.static_terminals = [((1000.0, 0.0), hub)]         # wall dead on the path
-    a = ref.plan(req, ReservationLedger(cfg), cfg)
-    b = com.plan(req, ReservationLedger(cfg), cfg)
+    lr, lc = ReservationLedger(cfg), ReservationLedger(cfg)
+    for c, t in [((1000.0, 0.0), hub)]:                 # wall dead on the path — now a permanent ledger volume
+        lr.register_static_terminal(c, t); lc.register_static_terminal(c, t)
+    a = ref.plan(req, lr, cfg)
+    b = com.plan(req, lc, cfg)
     assert not com._ref_dispatch, "no pre-kernel reference dispatch — the kernel handled it (gate is gone)"
     assert com._fb == 0, "kernel must handle static terminals, not fall back"
     assert a.status is b.status and a.accepted and abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
@@ -237,9 +239,11 @@ def test_compiled_always_active_own_hub_transparent_foreign_walled_exact():
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
     assert com.compiled, "numba kernel inactive — this kernel-exactness guard would be vacuous (ref vs ref)"
     statics = [((0.0, 0.0), own_hub), ((2500.0, 0.0), foreign_hub)]   # own at origin, foreign on the route
-    ref.static_terminals = com.static_terminals = statics
-    a = ref.plan(req, ReservationLedger(cfg), cfg)
-    b = com.plan(req, ReservationLedger(cfg), cfg)
+    lr, lc = ReservationLedger(cfg), ReservationLedger(cfg)
+    for c, t in statics:
+        lr.register_static_terminal(c, t); lc.register_static_terminal(c, t)
+    a = ref.plan(req, lr, cfg)
+    b = com.plan(req, lc, cfg)
     assert com._fb == 0 and not com._ref_dispatch, "own-hub flight stays on the kernel (no reference dispatch)"
     assert a.status is b.status and a.accepted
     assert abs(a.cost - b.cost) < 1e-9 and ref.last_expansions == com.last_expansions and _clkey(a) == _clkey(b)
@@ -254,8 +258,8 @@ def test_compiled_static_terminal_occupancy_parity():
     cfg = SimConfig(terminal_airspace_always_active=True)
     hub = Terminal("h#0", 8, 180.0)
     center = (3000.0, 3000.0)
-    svc = HexOccupancyService(cfg); svc.register_static_terminal(center, hub)
-    cocc = CompiledHexOccupancy(cfg); cocc.register_static_terminal(center, hub)
+    svc = HexOccupancyService(cfg); svc._on_static(center, hub)          # the ledger subscribe_static hook body
+    cocc = CompiledHexOccupancy(cfg); cocc._on_static(center, hub)
     cells = sorted(hg.terminal_cells(center, hub, cfg))
     assert len(cells) > 10, "expected a non-trivial terminal footprint"
     own_cells = {cocc.cell_id(q, r, L) for (q, r) in cells for L in range(cfg.n_levels)}
@@ -282,7 +286,7 @@ def test_compiled_static_terminal_survives_reset():
     hub = Terminal("h#0", 8, 180.0)
     center = (3000.0, 3000.0)
     cocc = CompiledHexOccupancy(cfg)
-    cocc.register_static_terminal(center, hub)
+    cocc._on_static(center, hub)                  # the ledger subscribe_static hook body (full register)
     q0, r0 = sorted(hg.terminal_cells(center, hub, cfg))[0]
     cell = cocc.cell_id(q0, r0, 0)
     assert cell >= 0 and cocc.static_col[cell] and hub.id in cocc.col_owners.get(cell, set())
@@ -308,13 +312,43 @@ def test_compiled_static_terminal_own_foreign_overlap_falls_back():
     req = FlightRequest(1, vec(2000, 2000, 0), vec(5000, 2000, 0), 0.0, uss_id="own", origin_terminal=own_hub)
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
     assert com.compiled
-    ref.static_terminals = com.static_terminals = [(own_c, own_hub), (for_c, foreign_hub)]
-    a = ref.plan(req, ReservationLedger(cfg), cfg)
-    b = com.plan(req, ReservationLedger(cfg), cfg)
+    lr, lc = ReservationLedger(cfg), ReservationLedger(cfg)
+    for c, t in [(own_c, own_hub), (for_c, foreign_hub)]:
+        lr.register_static_terminal(c, t); lc.register_static_terminal(c, t)
+    a = ref.plan(req, lr, cfg)
+    b = com.plan(req, lc, cfg)
     assert com._fb_reasons.get("own-foreign-overlap", 0) > 0, "static own∩foreign overlap fallback did not fire"
     assert a.status is b.status and a.denial_reason is b.denial_reason
     if a.accepted:
         assert abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
+
+
+def test_always_active_false_files_no_static_vols():
+    """False-mode regression: ``terminal_airspace_always_active=False`` files NOTHING permanent on the
+    ledger — 'on the ledger when active' means only the transient dwell columns (unchanged). Guards that the
+    new ledger static machinery is truly off in the default mode."""
+    from freespace_sim import sim
+    from freespace_sim.scenarios import get_scenario, with_overrides
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), horizon_s=8.0,
+                          terminal_airspace_always_active=False)
+    cfg = spec.config()
+    assert not cfg.terminal_airspace_always_active
+    r = sim.run(cfg, demand=spec.demand_model(), planner_name="astar")
+    assert r.ledger._static_vols == [], "False mode must file no permanent terminal volumes"
+    assert r.verified
+
+
+def test_always_active_refuses_untagged_planner():
+    """The narrowed always-active guard: an A*-based planner (tagged terminal columns, exempt from its own
+    hub's wall) is allowed, but a planner that builds UNTAGGED near-hub columns (bare `rrt`) would collide
+    with its own hub's permanent ledger wall and deny every hub flight — so `sim.run` refuses it LOUDLY
+    rather than silently mis-plan. (astar_shortcut, an A*-sourced refiner, is allowed — tested separately.)"""
+    from freespace_sim import sim
+    from freespace_sim.scenarios import get_scenario, with_overrides
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), horizon_s=8.0)
+    cfg = spec.config()
+    with pytest.raises(ValueError, match="untagged near-hub"):
+        sim.run(cfg, demand=spec.demand_model(), planner_name="rrt")
 
 
 def test_out_of_box_committed_corridor_skipped_not_crash():

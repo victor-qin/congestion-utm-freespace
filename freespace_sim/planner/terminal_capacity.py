@@ -144,14 +144,17 @@ class TerminalCapacity:
 
     def column_clear(self, term, center, t0: float, z: float | None = None) -> bool:
         """Step 1 — column activation: is the hub's column free of FOREIGN transit over the dwell window
-        ``[t0, t0 + hover + climb_time_to(z))``? Exactly ``not ledger.any_conflict([column at t0, z])``
-        (same-hub volumes exempt), served from the per-hub foreign-transit index: bring the index current
-        with any newly-committed volumes (each spatially AABB-pruned, then confirmed by the SAME
-        ``volumes_conflict`` the ledger uses — recorded as its ``[t_start, t_end)`` transit interval), then
-        answer with an O(log) overlap query. The column footprint is level-independent, so the index is
-        z-independent; only the query window length uses ``z`` (per-level climb). Order-independent, so
-        (unlike the rejected 'already-deployed' shortcut, see class docstring) it never misses a
-        late-committed intruder or a same-hub cruise corridor."""
+        ``[t0, t0 + hover + climb_time_to(z))``? Reproduces ``not ledger.any_conflict([column at t0, z])`` over
+        the COMMITTED (transient) volumes (same-hub volumes exempt), served from the per-hub foreign-transit
+        index: bring the index current with any newly-committed volumes (each spatially AABB-pruned, then
+        confirmed by the SAME ``volumes_conflict`` the ledger uses — recorded as its ``[t_start, t_end)``
+        transit interval), then answer with an O(log) overlap query. The column footprint is level-independent,
+        so the index is z-independent; only the query window length uses ``z`` (per-level climb).
+        Order-independent, so (unlike the rejected 'already-deployed' shortcut, see class docstring) it never
+        misses a late-committed intruder or a same-hub cruise corridor. NOTE: it scans ``ledger._vols`` only,
+        NOT the always-active ``_static_vols`` walls — a foreign hub's permanent wall never overlaps this hub's
+        own column under the demand's hub spacing, and the commit-time ``any_conflict`` is the authoritative
+        backstop regardless, so at worst this diverges on the denial REASON, never admitting a real conflict."""
         term = as_terminal(term)
         tid = term.id
         vols = self.ledger._vols                              # committed volumes, commit order (same pkg)

@@ -247,6 +247,12 @@ def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Ha
     return Volume4D(spec, t0, t0 + cfg.hover_time_s + ct, terminal_id=terminal_id)
 
 
+# Effectively-unbounded but FINITE t_end for the time-invariant terminal wall (see
+# permanent_terminal_reservation): finite so ``int(t_end/dt)`` can never overflow, huge (~31000 yr) so no
+# committed corridor — including a late-departing return flight — can ever outlast the wall.
+_WALL_T_END_S = 1e12
+
+
 def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4D:
     """A hub's whole-horizon terminal-airspace reservation — the ledger volume that makes an
     ``cfg.terminal_airspace_always_active`` wall a first-class part of the committed airspace (visible to
@@ -268,19 +274,16 @@ def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4
     terminal_cells``, any corridor A* routes around ``terminal_cells`` also clears this column with margin (no
     spurious commit-time denials).
 
-    **Time window = the search's reachability (``MAXS·dt``), not just ``horizon_s``.** A committed corridor's
-    latest volume is bounded by the A* search's own step cap ``MAXS`` (``schedulable_horizon_steps``): latest
-    departure + the full ground-delay + 3×-hop lateral + vertical budgets (any of which ground-wait/hover can
-    spend as *time*) + the landing hover tail. A shorter ``t_end`` would leave the wall inactive during late
-    cruise/landing, so ``any_conflict`` / ``verify`` / a ledger-only refiner could cross the terminal late in
-    the schedule undetected (and a gap-jump planner could deliberately ground-delay *past* the wall and fly
-    through). Keying the bound on ``max_detour_factor`` instead under-covers when that factor is tight: the
-    search still explores the fixed 3×-hop budget, so a corridor can arrive later than a detour-scaled seconds
-    estimate. Sharing ``MAXS`` with the occupancy box gives the ledger wall and the time-invariant A* routing
-    wall one time depth that cannot drift."""
+    **Time-invariant — active for ALL time, mirroring the occupancy routing wall.** The A* occupancy
+    ``static_col`` blocks these cells at EVERY queried step (it has no time dimension), so the ledger wall
+    must too. Any finite, ``cfg``-derived ``t_end`` has a hole: a committed corridor can land after it — most
+    sharply a return flight departing at ``t_request + est_trip + turnaround_s > horizon_s`` (``turnaround_s``
+    is a demand-model field, invisible here) — and then a foreign crossing in that window would escape
+    ``any_conflict`` / ``verify``. So ``t_end`` is a large sentinel (:data:`_WALL_T_END_S`): effectively
+    unbounded, but FINITE (not ``inf``) so ``int(t_end/dt)`` never overflows should a static wall ever reach
+    the step machinery. The wall's ``t_end`` is only ever a comparison in :func:`conflict.volumes_conflict`
+    (walls are never bucketed, never hit ``_steps``), so this is both cheap and safe."""
     term = as_terminal(term)
-    from .planner.compiled_hex_occupancy import schedulable_horizon_steps   # lazy: avoid a core→planner cycle
-    t_end = schedulable_horizon_steps(cfg) * cfg.dt_s
     return replace(
         hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),
-        t_end=t_end)
+        t_end=_WALL_T_END_S)

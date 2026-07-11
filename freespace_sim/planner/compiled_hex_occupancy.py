@@ -66,14 +66,12 @@ def hover_tail_steps(cfg) -> int:
 
 
 def schedulable_horizon_steps(cfg) -> int:
-    """``MAXS`` — the largest step ANY committed corridor can occupy: the worst-case per-flight
-    ``search_horizon`` (latest departure + a region-DIAGONAL flight; monotone, so it bounds every flight's
-    ``max_step``) plus the landing hover tail. ONE definition shared by ``CompiledHexOccupancy._box`` (the
-    occupancy box depth) AND ``volumes.permanent_terminal_reservation`` (the ledger wall's ``t_end = MAXS·dt``)
-    — both must cover exactly the times a committed corridor can reach, so they cannot drift. Note the lateral
-    budget is the search's fixed ``3·n_hops`` (which ground-wait/hover can consume as time), NOT
-    ``max_detour_factor``: a late corridor can arrive well past ``horizon_s + max_ground_delay_s``, so a
-    seconds-budget keyed on ``max_detour_factor`` would under-cover when that factor is tight."""
+    """``MAXS`` — the occupancy box's step depth: the worst-case per-flight ``search_horizon`` (latest
+    departure ``≤ horizon_s`` + a region-DIAGONAL flight; monotone, so it bounds every IN-BOX flight's
+    ``max_step``) plus the landing hover tail. A flight whose ``base`` exceeds this (e.g. a late-departing
+    return, ``t_departure > horizon_s``) box-guards to the pure-Python reference, so the kernel never queries a
+    step past ``MAXS``. Hence this need NOT cover late departures — unlike the permanent terminal WALL, which
+    is time-invariant and uses its own sentinel ``t_end`` (see ``volumes.permanent_terminal_reservation``)."""
     w, h = cfg.region_size_m
     dt = cfg.dt_s
     pitch = cfg.nominal_speed_mps * dt

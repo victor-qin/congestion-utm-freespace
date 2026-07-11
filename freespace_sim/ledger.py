@@ -19,6 +19,45 @@ from .config import SimConfig
 from .conflict import volumes_conflict
 from .volumes import Volume4D, permanent_terminal_reservation
 
+_STATIC_GRID_CELL_M = 1024.0   # coarse xy-cell edge for the always-active-wall spatial index (_StaticWallGrid)
+
+
+class _StaticWallGrid:
+    """Coarse uniform xy-grid over the always-active terminal walls — the SPATIAL analogue of the ledger's
+    per-step time buckets, for obstacles that are fixed in space and permanent in time (so neither a time
+    bucket nor a rebuild helps them). Built once as hubs register; a query returns only the walls whose
+    xy-cell the query box touches, pruning the wall scan from O(all hubs) to O(hubs near the box).
+
+    Exact — no false negatives: a wall is indexed in every cell its xy-AABB overlaps and a query visits
+    every cell its xy-AABB overlaps, so any (wall, query) pair whose AABBs overlap in xy necessarily shares
+    a cell. The candidate set is therefore a superset of everything the downstream ``_aabb_miss`` would keep,
+    so the conflict result is byte-identical to the old full linear scan.
+    """
+
+    __slots__ = ("_cell", "_cells")
+
+    def __init__(self, cell: float):
+        self._cell = cell
+        self._cells: dict[tuple[int, int], list[int]] = {}
+
+    def _span(self, aabb):        # (xmin,ymin,zmin,xmax,ymax,zmax) → the xy-cells the box touches
+        c = self._cell
+        for cx in range(int(aabb[0] // c), int(aabb[3] // c) + 1):
+            for cy in range(int(aabb[1] // c), int(aabb[4] // c) + 1):
+                yield (cx, cy)
+
+    def insert(self, idx: int, aabb) -> None:
+        for key in self._span(aabb):
+            self._cells.setdefault(key, []).append(idx)
+
+    def candidates(self, aabb) -> list[int]:
+        if not self._cells:
+            return []
+        hit: set[int] = set()
+        for key in self._span(aabb):
+            hit.update(self._cells.get(key, ()))
+        return sorted(hit)        # ascending index order == the old enumerate order (stable conflicts() output)
+
 
 class ReservationLedger:
     # Partner-id sentinel reported by `conflicts` for an always-active terminal WALL (a permanent
@@ -34,11 +73,13 @@ class ReservationLedger:
         self._observers: list = []   # commit subscribers (publish hook); see subscribe()
         # Always-active terminal walls (cfg.terminal_airspace_always_active): PERMANENT, whole-horizon
         # reservations filed once at sim setup. Kept OUT of the per-step _buckets (time-invariant — bucketing
-        # a whole-horizon volume would flood every step); scanned separately in conflicts/any_conflict. The
-        # (center, term) pairs feed the A* occupancy-derivation hook (subscribe_static). Empty unless
-        # register_static_terminal is called ⇒ zero overhead when the flag is off.
+        # a whole-horizon volume would flood every step); instead they get their own xy spatial index
+        # (_static_grid) and are scanned grid-pruned in conflicts/any_conflict. The (center, term) pairs feed
+        # the A* occupancy-derivation hook (subscribe_static). Empty unless register_static_terminal is
+        # called ⇒ zero overhead when the flag is off.
         self._static_vols: list[Volume4D] = []
         self._static_aabb: list[tuple[float, float, float, float, float, float]] = []  # per-wall flat AABB
+        self._static_grid = _StaticWallGrid(_STATIC_GRID_CELL_M)   # xy prune over the (fixed) hub walls
         self._static_terms: list[tuple] = []   # (center, term) pairs, for the occupancy-derivation replay
         self._static_subs: list = []           # static-terminal subscribers (occupancy routing-wall hook)
 
@@ -58,6 +99,7 @@ class ReservationLedger:
         vol = permanent_terminal_reservation(center, term, self.cfg)
         self._static_vols.append(vol)
         self._static_aabb.append(self._flat_aabb(vol))
+        self._static_grid.insert(len(self._static_vols) - 1, self._static_aabb[-1])
         for cb in self._static_subs:
             cb(center, term)
 
@@ -136,7 +178,8 @@ class ReservationLedger:
                 cv = self._vols[idx]
                 if volumes_conflict(v, cv):
                     out.append((self._fids[idx], cv))
-            for i, sv in enumerate(self._static_vols):        # always-active walls: unbucketed, time-invariant
+            for i in self._static_grid.candidates(vbb):       # always-active walls: xy-grid-pruned, time-invariant
+                sv = self._static_vols[i]
                 if self._aabb_miss(vbb, self._static_aabb[i]):
                     continue
                 if volumes_conflict(v, sv):
@@ -153,7 +196,8 @@ class ReservationLedger:
                     continue
                 if volumes_conflict(v, self._vols[idx]):
                     return True
-            for i, sv in enumerate(self._static_vols):        # always-active walls: unbucketed, time-invariant
+            for i in self._static_grid.candidates(vbb):       # always-active walls: xy-grid-pruned, time-invariant
+                sv = self._static_vols[i]
                 if self._aabb_miss(vbb, self._static_aabb[i]):
                     continue
                 if volumes_conflict(v, sv):

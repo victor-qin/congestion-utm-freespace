@@ -182,18 +182,26 @@ def run(
         # discrete routing walls from the ledger (subscribe_static).
         for center, term in static_terms:
             ledger.register_static_terminal(center, term)
-        # The walls are per-hub TAGGED CylinderSpecs, so a flight's own-hub column must also be tagged to be
-        # exempt from its own hub's wall (conflict.volumes_conflict same-tid+cylinder). A*-based planners tag
-        # their terminal columns (astar, astar_shortcut, opt_astar, astar_milp, ...); a planner that builds
-        # UNTAGGED near-hub columns (bare rrt / opt / milp / straight / lazy) would collide with its OWN hub's
-        # wall and deny every hub flight. This lifts the old bare-'astar'-only ban to allow A*-based refiners,
-        # but still refuses untagged planners LOUDLY rather than let them silently mis-plan.
+        # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its own hub's
+        # wall only if it too is tagged (conflict.volumes_conflict same-tid+cylinder). Two tiers of A*-reaching
+        # planner are safe:
+        #   • astar / astar_shortcut TAG their terminal columns (astar._build / shortcut pass the terminal id),
+        #     so they refine fully under always-active.
+        #   • opt_astar / astar_milp build UNTAGGED columns (their build_reservation_from_corners calls omit the
+        #     terminal id): the optimized hub path then collides with the hub's own wall, their any_conflict
+        #     recheck rejects it, and they fall back to the TAGGED A* warm start — feasible, just unrefined at
+        #     hubs. They are left untagged DELIBERATELY: they optimize the ground delay freely, and a same-tid
+        #     exemption would let the optimizer pull a flight into a same-hub pad overlap that the untagged
+        #     column currently catches (astar can tag safely only because TerminalCapacity serialises the pad).
+        # A planner that never reaches A* (bare rrt / opt / milp / straight / lazy) has no wall-respecting
+        # fallback, so it would commit untagged near-hub columns that collide with the wall (or ignore it) and
+        # deny / mis-plan every hub flight — refused LOUDLY below rather than allowed to silently mis-plan.
         for u in usses.values():
             if not _reaches_astar(u.planner):
                 raise ValueError(
-                    f"terminal_airspace_always_active=True needs an A*-based planner (its terminal columns "
-                    f"are tagged, hence exempt from their own hub's permanent wall), but {pname!r} builds "
-                    f"untagged near-hub columns that would collide with the wall and deny every hub flight.")
+                    f"terminal_airspace_always_active=True needs an A*-reaching planner (so its committed hub "
+                    f"path is wall-aware — tagged, or falling back to tagged A*), but {pname!r} never reaches A* "
+                    f"and would commit untagged near-hub columns that collide with the wall and deny every hub flight.")
 
     total = len(scenario.events)
     report = _resolve_progress(progress, total)

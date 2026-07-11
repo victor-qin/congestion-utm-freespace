@@ -140,7 +140,7 @@ def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, des
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 600_000, vertical_edges: bool = True,
+    def __init__(self, max_expansions: int = 900_000, vertical_edges: bool = True,
                  compiled: bool = True):
         self.max_expansions = max_expansions
         # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an
@@ -175,7 +175,6 @@ class AStarPlanner:
         # FB_* so a bench's "kernel coverage" isn't overstated (these plans run pure Python end to end).
         self._ref_dispatch: Counter = Counter()
         self._remask = 0                                # bounded-mask → full-range widen count (diagnostics)
-        self._warmed = False
         if self.compiled:
             self._warm_jit()
 
@@ -583,9 +582,15 @@ class AStarPlanner:
         reset). Sized once; ``ov_own_gen`` (per-cell own-column mark) grows if a new ledger's box is bigger."""
         NC = cocc.NC
         if self._ks is None:
-            log2 = 20
+            # The g-hash and frontier heap MUST stay ahead of the search cap, or the kernel silently
+            # falls back to pure Python on exactly the hardest flights (the ones that reach
+            # max_expansions) — the catastrophic-tail failure mode (a few long fallbacks eat the run).
+            # Derive both from max_expansions so bumping the cap can never desync them: >=2x headroom
+            # keeps the open-addressing load factor low and the frontier from overflowing. (Overflow only
+            # ever triggers a SAFE reference fallback, so this governs the fallback RATE, not correctness.)
+            log2 = max(20, (self.max_expansions * 2 - 1).bit_length())
             cap = 1 << log2
-            mh = 1 << 20
+            mh = cap
             self._ks = {
                 "g_key": np.empty(cap, np.int64), "g_gen": np.zeros(cap, np.int64),
                 "g_val": np.empty(cap, np.float64), "g_came": np.empty(cap, np.int64),
@@ -659,11 +664,10 @@ class AStarPlanner:
 
     def _warm_jit(self):
         """Compile the kernel once at construction with a tiny synthetic input (off the hot path)."""
-        if self._warmed or self._kernel is None:
+        if self._kernel is None:
             return
         try:
             NC, MAXS = 9, 5
-            z = lambda dt: np.zeros(NC, dt)                                    # noqa: E731
             iv_lo = np.zeros(NC, np.int32); iv_hi = np.full(NC, MAXS, np.int32); iv_nxt = np.full(NC, -1, np.int32)
             cv_lo = np.zeros(NC, np.int32); cv_hi = np.full(NC, MAXS, np.int32); cv_nxt = np.full(NC, -1, np.int32)
             ng = 6
@@ -681,7 +685,6 @@ class AStarPlanner:
                 np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
                 1000,
             )
-            self._warmed = True
         except Exception as e:                                # compile failure → degrade to pure Python
             warnings.warn(
                 f"astar numba kernel failed to warm/compile ({e!r}); falling back to the pure-Python "
@@ -823,7 +826,7 @@ class AStarPlanner:
                     RuntimeWarning, stacklevel=2,
                 )
                 return self._plan_reference(req, ledger, cfg)
-            n_out, cost, n_exp, status, aux = self._kernel(
+            n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
                 cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
                 cocc.static_col, ks["ov_own_gen"],
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,

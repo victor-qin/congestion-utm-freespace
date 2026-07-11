@@ -272,7 +272,12 @@ def _search(
                             continue
                         liq = lq - qmin; lir = lr - rmin
                         nkey = ((liq * rspan + lir) * nlp1 + (Lv + 1)) * step_span + (ts - base)
-                        ng = base_g + takeoff_cost[Lv] + lane_lat[li]
+                        # parenthesised to match the reference's single-float edge cost EXACTLY: astar.py
+                        # builds ``takeoff_cost[L] + c_lat*(lane.dist-o_r)`` first, then ``base_g + cost`` — so
+                        # the kernel must add ``(a+b)`` to base_g, not left-assoc ``(base_g+a)+b`` (float + is
+                        # non-associative: the two differ by ~1 ULP for ~0.7% of large-base_g takeoffs, which
+                        # can flip a heap tie and break the compiled==reference node-count/centerline parity).
+                        ng = base_g + (takeoff_cost[Lv] + lane_lat[li])
                         hh = _h_air(lq, lr, Lv, gx, gy, R, h_off, c_lat, takeoff_cost)
                         size, ctr, rc = _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
                                                heap_f, heap_c, heap_n, size, max_heap,

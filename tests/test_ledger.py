@@ -128,3 +128,63 @@ def test_subscribe_static_replays_already_registered():
     seen = []
     led.subscribe_static(lambda center, term: seen.append((center, term.id)))
     assert seen == [(_HUB, "h#0")], "a late subscriber must be replayed the already-registered hub"
+
+
+def _brute_static_any_conflict(led, vols):
+    """The pre-F1 behaviour: scan EVERY static wall (no spatial index) — the oracle the grid must match."""
+    from freespace_sim.conflict import volumes_conflict
+    for v in vols:
+        vbb = led._flat_aabb(v)
+        for i in range(len(led._static_vols)):
+            if led._aabb_miss(vbb, led._static_aabb[i]):
+                continue
+            if volumes_conflict(v, led._static_vols[i]):
+                return True
+    return False
+
+
+def test_static_wall_grid_matches_bruteforce_scan():
+    """F1: the xy spatial index over the static walls is only a broadphase prune, so any_conflict must give
+    byte-identical answers to a full linear scan across a dallas-like field of hubs — no overlap missed, no
+    false positive. Probes span through-hub, between-hub, and far-outside boxes, plus a multi-cell box."""
+    import random
+    led = ReservationLedger(CFG)
+    hubs = [(float(x), float(y)) for x in range(1000, 20000, 1500) for y in range(1000, 15000, 1500)]
+    for i, c in enumerate(hubs):
+        led.register_static_terminal(c, Terminal(f"h#{i}", 8, 150.0))
+    assert len(led._static_vols) == len(hubs) > 100        # a real field, not a toy
+    rng = random.Random(0)
+    n_hit = n_clear = 0
+    for _ in range(500):
+        cx, cy = rng.uniform(-2000, 22000), rng.uniform(-2000, 17000)
+        q = Volume4D(box_from_segment(vec(cx - 150, cy, 150), vec(cx + 150, cy, 150), 40, 300), 0.0, 50.0)
+        grid, brute = led.any_conflict([q]), _brute_static_any_conflict(led, [q])
+        assert grid == brute, f"grid {grid} != brute {brute} at ({cx:.0f},{cy:.0f})"
+        n_hit += grid
+        n_clear += not grid
+    assert n_hit > 0 and n_clear > 0, "probes must exercise BOTH walled and clear cells (not vacuous)"
+    # a big box spanning many grid cells and several hubs — exercises multi-cell insert AND query. Routed
+    # ALONG a hub row (y=2500 ∈ range(1000,15000,1500)) so it genuinely crosses walls, not between rows.
+    big = Volume4D(box_from_segment(vec(1000, 2500, 150), vec(9000, 2500, 150), 40, 300), 0.0, 50.0)
+    assert led.any_conflict([big]) == _brute_static_any_conflict(led, [big])   # grid == brute over many cells
+    assert led.any_conflict([big]) is True                                     # and it really does cross hub walls
+
+
+def test_static_wall_covers_vertical_dwell_under_tight_detour():
+    """G1: under a TIGHT max_detour_factor the lateral term is small, so the wall's t_end must still include
+    the vertical dwell — a top-level climb (~18 s) + the landing hover/descent — which the old formula omitted
+    (it added only time_buffer_s = 4 s). A late crossing PAST the old bound but within the true reachable
+    window must still be walled; before the fix it escaped any_conflict."""
+    import math
+    cfg = SimConfig(max_detour_factor=1.2)
+    hx, hy = 3000.0, 3000.0
+    led = ReservationLedger(cfg)
+    led.register_static_terminal((hx, hy), Terminal("h#0", 8, 180.0))
+    w, h = cfg.region_size_m
+    lateral = cfg.max_detour_factor * math.hypot(w, h) / cfg.nominal_speed_mps
+    old_tend = cfg.horizon_s + cfg.max_ground_delay_s + lateral + cfg.time_buffer_s   # pre-G1 (vertical-omitting)
+    max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
+    t_cross = old_tend + max_climb                        # past the old bound, inside the true reachable window
+    box = Volume4D(box_from_segment(vec(hx - 200, hy, 150), vec(hx + 200, hy, 150), 40, 300),
+                   t_cross, t_cross + cfg.dt_s)
+    assert led.any_conflict([box]) is True, "a late crossing within the climb/hover window must still be walled"

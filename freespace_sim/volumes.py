@@ -245,3 +245,47 @@ def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Ha
         z_hi=z_hi,
     )
     return Volume4D(spec, t0, t0 + cfg.hover_time_s + ct, terminal_id=terminal_id)
+
+
+# Effectively-unbounded but FINITE t_end for the time-invariant terminal wall (see
+# permanent_terminal_reservation). Huge (~31000 yr) so no committed corridor — incl. a late-departing return
+# — can outlast the wall. Finite (not inf) belt-and-suspenders; the real safety is that a static wall is never
+# committed, so it never reaches step-range code (where a huge t_end would HANG the range(), not just overflow).
+_WALL_T_END_S = 1e12
+
+
+def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4D:
+    """A hub's whole-horizon terminal-airspace reservation — the ledger volume that makes an
+    ``cfg.terminal_airspace_always_active`` wall a first-class part of the committed airspace (visible to
+    ``ledger.any_conflict`` / ``verify`` / the ledger-only refiners) instead of an off-ledger occupancy
+    side-structure.
+
+    Spans the full ``[ground, ceiling]`` tube for the whole horizon and is tagged with ``terminal_id`` so
+    the column-involved exemption in :func:`conflict.volumes_conflict` keeps it transparent to its own
+    hub's flights while walling foreign cruise.
+
+    **Radius = ``terminal_radius`` — the reserved column, exactly what the per-flight dwell column reserves
+    (:func:`hover_reservation` in ``build_reservation_from_corners`` / ``AStarPlanner._build``).** The ledger
+    records only the *safety-critical reserved volume* (the hover column where drones actually are); it does
+    NOT include the ``+corridor_width/2`` of ``exit_radius`` (that is exit-LANE geometry — where lanes start
+    flush with the column edge — a routing/lane concern, not a reservation) nor the wider ``terminal_cells``
+    flood-fill (A*'s discrete keep-out, for search margin). So the permanent wall is byte-identical to the
+    transient dwell column, just permanent — the "active ⟺ on the ledger" model applied to the *same* volume
+    (built by reusing :func:`hover_reservation`, so the two cannot drift). Because ``terminal_radius ⊂
+    terminal_cells``, any corridor A* routes around ``terminal_cells`` also clears this column with margin (no
+    spurious commit-time denials).
+
+    **Time-invariant — active for ALL time, mirroring the occupancy routing wall.** The A* occupancy
+    ``static_col`` blocks these cells at EVERY queried step (it has no time dimension), so the ledger wall
+    must too. Any finite, ``cfg``-derived ``t_end`` has a hole: a committed corridor can land after it — most
+    sharply a return flight departing at ``t_request + est_trip + turnaround_s > horizon_s`` (``turnaround_s``
+    is a demand-model field, invisible here) — and then a foreign crossing in that window would escape
+    ``any_conflict`` / ``verify``. So ``t_end`` is a large sentinel (:data:`_WALL_T_END_S`): effectively
+    unbounded, but FINITE (not ``inf``) as belt-and-suspenders. It is safe because a static wall is never
+    committed, so it never reaches the step-range/bucketing arithmetic (``ledger._steps`` /
+    ``hexgrid.rasterize_volume``); it surfaces only via ``ledger.conflicts`` (the ``-1`` sentinel), where the
+    sole arithmetic readers — ``straight`` / ``rrt`` ``min(cv.t_end)`` — are refused under always-active."""
+    term = as_terminal(term)
+    return replace(
+        hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),
+        t_end=_WALL_T_END_S)

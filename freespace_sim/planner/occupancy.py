@@ -59,9 +59,10 @@ class HexOccupancyService:
         # shared terminal columns: step -> (q, r, L) -> {terminal_id}  (which hubs' columns cover the cell)
         self.term_cells: dict[int, dict[tuple[int, int, int], set[Hashable]]] = {}
         # always-active terminals (cfg.terminal_airspace_always_active): permanent FOREIGN walls, step- AND
-        # level-independent (the column is the [ground, ceiling] tube), keyed by (q, r) only. Empty unless
-        # register_static_terminal is called ⇒ zero overhead when the flag is off. NOT ledger-derived, so
-        # reset() (a from-scratch rebuild on ledger shrink) leaves it intact — the hub set doesn't change.
+        # level-independent (the column is the [ground, ceiling] tube), keyed by (q, r) only. Derived from the
+        # ledger's PERMANENT terminal volumes via the `subscribe_static` hook (`_on_static`), NOT from
+        # committed corridor volumes — so `reset()` (a from-scratch rebuild on ledger shrink) leaves it intact
+        # (the hub set doesn't change). Empty ⇒ zero overhead when the flag is off.
         self.static_term_cells: dict[tuple[int, int], set[Hashable]] = {}
         self.n_added = 0                  # committed volumes absorbed (shrink tripwire)
         self.evicted_before: int | None = None   # lowest retained step
@@ -111,12 +112,14 @@ class HexOccupancyService:
         for v in volumes:
             self.add_volume(v, own_cols=own_cols)
 
-    def register_static_terminal(self, center, term) -> None:
-        """Wall a hub's whole terminal airspace (column + exit lanes) off from FOREIGN traffic for the
-        ENTIRE horizon — the always-active feature (``cfg.terminal_airspace_always_active``). Recorded in
-        ``static_term_cells`` keyed by ``(q, r)``: step- and level-independent (the column is the
-        [ground, ceiling] tube), so :meth:`is_blocked` walls it at every step and every flight level,
-        while the hub's own flights pass through (own-hub exemption). Idempotent per hub (set-based)."""
+    def _on_static(self, center, term) -> None:
+        """Derive this hub's discrete routing wall from a ledger static-terminal registration — the
+        ``ReservationLedger.subscribe_static`` hook target (bound in ``AStarPlanner._occupancy``). Records
+        the whole terminal airspace (column + exit lanes) in ``static_term_cells`` keyed by ``(q, r)``:
+        step- and level-independent (the column is the [ground, ceiling] tube), so :meth:`is_blocked` walls
+        it at every step and every flight level while the hub's own flights pass through (own-hub
+        exemption). Idempotent per hub (set-based). The *authoritative* wall is the ledger's permanent
+        volume (seen by ``any_conflict``/verify); this is the derived view A* routes around proactively."""
         tid = as_terminal(term).id
         for cell in hg.terminal_cells(center, term, self.cfg):
             self.static_term_cells.setdefault(cell, set()).add(tid)

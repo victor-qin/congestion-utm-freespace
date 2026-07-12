@@ -248,8 +248,9 @@ def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Ha
 
 
 # Effectively-unbounded but FINITE t_end for the time-invariant terminal wall (see
-# permanent_terminal_reservation): finite so ``int(t_end/dt)`` can never overflow, huge (~31000 yr) so no
-# committed corridor — including a late-departing return flight — can ever outlast the wall.
+# permanent_terminal_reservation). Huge (~31000 yr) so no committed corridor — incl. a late-departing return
+# — can outlast the wall. Finite (not inf) belt-and-suspenders; the real safety is that a static wall is never
+# committed, so it never reaches step-range code (where a huge t_end would HANG the range(), not just overflow).
 _WALL_T_END_S = 1e12
 
 
@@ -280,9 +281,10 @@ def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4
     sharply a return flight departing at ``t_request + est_trip + turnaround_s > horizon_s`` (``turnaround_s``
     is a demand-model field, invisible here) — and then a foreign crossing in that window would escape
     ``any_conflict`` / ``verify``. So ``t_end`` is a large sentinel (:data:`_WALL_T_END_S`): effectively
-    unbounded, but FINITE (not ``inf``) so ``int(t_end/dt)`` never overflows should a static wall ever reach
-    the step machinery. The wall's ``t_end`` is only ever a comparison in :func:`conflict.volumes_conflict`
-    (walls are never bucketed, never hit ``_steps``), so this is both cheap and safe."""
+    unbounded, but FINITE (not ``inf``) as belt-and-suspenders. It is safe because a static wall is never
+    committed, so it never reaches the step-range/bucketing arithmetic (``ledger._steps`` /
+    ``hexgrid.rasterize_volume``); it surfaces only via ``ledger.conflicts`` (the ``-1`` sentinel), where the
+    sole arithmetic readers — ``straight`` / ``rrt`` ``min(cv.t_end)`` — are refused under always-active."""
     term = as_terminal(term)
     return replace(
         hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),

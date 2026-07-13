@@ -186,3 +186,68 @@ def test_static_wall_is_time_invariant_covers_late_departures():
         box = Volume4D(box_from_segment(vec(hx - 200, hy, 150), vec(hx + 200, hy, 150), 40, 300),
                        t_cross, t_cross + cfg.dt_s)
         assert led.any_conflict([box]) is True, f"a crossing at t={t_cross} past MAXS*dt must still be walled"
+
+
+# ---------------- dynamic committed-volume xy sub-index (issue #30) ----------------
+# The per-step _buckets are keyed by (step, cell_x, cell_y): a TIME bucket crossed with an xy SPATIAL sub-index,
+# so a query scans only volumes sharing its timestep AND near its xy. That is only a broadphase prune, so
+# any_conflict / conflicts must stay byte-identical (as a SET of hits) to a full linear scan over every volume.
+
+
+def _brute_dynamic_conflicts(led, vols):
+    """Oracle: full linear scan over EVERY committed volume (no bucket index) — the pre-#30 behaviour the
+    (step, cell) sub-index must match. Returns (fid, vol) pairs exactly as ``ledger.conflicts``, so result SETS
+    compare directly (cell/bucket iteration order is unspecified; the set of hits is the contract)."""
+    from freespace_sim.conflict import volumes_conflict
+    out = []
+    for v in vols:
+        vbb = led._flat_aabb(v)
+        for idx in range(len(led._vols)):
+            if led._aabb_miss(vbb, led._aabb[idx]):        # same broadphase test the index feeds into
+                continue
+            if volumes_conflict(v, led._vols[idx]):
+                out.append((led._fids[idx], led._vols[idx]))
+    return out
+
+
+def test_dynamic_bucket_grid_matches_bruteforce_scan():
+    """Issue #30: the xy sub-index over the committed volumes is only a broadphase prune, so any_conflict and
+    conflicts must give byte-identical answers (as hit SETS) to a full linear scan across a dense field of
+    committed corridor boxes — no overlap missed, no false positive. Probes span conflicting, clear, altitude-
+    separated (same xy-cell, different z), a multi-cell big box, and a temporal-only miss."""
+    import random
+    rng = random.Random(0)
+    led = ReservationLedger(CFG)
+    committed = []
+    for k in range(400):                               # dense, scattered field — many share a step, few a (step,cell)
+        cx, cy = rng.uniform(0, 8000), rng.uniform(0, 6000)
+        z = rng.choice([30.0, 70.0, 110.0])            # three altitude bands (z NOT in the key → filtered by _aabb_miss)
+        t0 = rng.uniform(0.0, 60.0)
+        box = Volume4D(box_from_segment(vec(cx, cy, z), vec(cx + 150, cy, z), 80, 40), t0, t0 + 8.0)
+        led.commit(k, [box])
+        committed.append(box)
+    assert len(led._buckets) > 100                     # a real multi-cell/multi-step index, not a toy
+    n_hit = n_clear = 0
+    for _ in range(500):
+        cx, cy = rng.uniform(-500, 8500), rng.uniform(-500, 6500)
+        z = rng.choice([30.0, 70.0, 110.0])
+        t0 = rng.uniform(-20.0, 80.0)
+        q = Volume4D(box_from_segment(vec(cx, cy, z), vec(cx + 150, cy, z), 80, 40), t0, t0 + 8.0)
+        grid_any = led.any_conflict([q])
+        brute = _brute_dynamic_conflicts(led, [q])
+        assert grid_any == bool(brute), f"any_conflict {grid_any} != brute {bool(brute)} at ({cx:.0f},{cy:.0f},z={z:.0f})"
+        assert set(led.conflicts([q])) == set(brute), "conflicts() hit-set must match the full scan"
+        n_hit += grid_any
+        n_clear += not grid_any
+    assert n_hit > 0 and n_clear > 0, "probes must exercise BOTH conflicting and clear queries (not vacuous)"
+    # guaranteed hits: re-querying a committed box conflicts with itself — grid == brute, and genuinely True
+    for box in committed[:20]:
+        assert led.any_conflict([box]) is True
+        assert set(led.conflicts([box])) == set(_brute_dynamic_conflicts(led, [box]))
+    # a big box spanning many xy cells and several steps — exercises multi-cell insert AND query
+    big = Volume4D(box_from_segment(vec(0, 3000, 70), vec(8000, 3000, 70), 80, 40), 0.0, 70.0)
+    assert led.any_conflict([big]) == bool(_brute_dynamic_conflicts(led, [big]))
+    assert set(led.conflicts([big])) == set(_brute_dynamic_conflicts(led, [big]))     # index == brute over many cells
+    # temporal-only miss: shares xy-cells with the field but sits at a step no committed box reaches → clear
+    late = Volume4D(box_from_segment(vec(4000, 3000, 70), vec(4150, 3000, 70), 80, 40), 100000.0, 100008.0)
+    assert not led.any_conflict([late]) and not _brute_dynamic_conflicts(led, [late])

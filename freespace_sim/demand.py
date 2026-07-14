@@ -326,7 +326,9 @@ class HubRadiusDemand:
             # the wall — and that column is UNTAGGED (a customer, not the hub), so it is not exempt from the
             # wall (conflict.volumes_conflict) → a spurious conflict_filed that denies the delivery+return.
             # Require the customer ≥ 1.5× the hub's terminal (wall) radius away (and never below the existing
-            # min_od_separation_m floor), which clears the wall+column overlap for every hub size.
+            # min_od_separation_m floor), which clears the wall+column overlap for every hub size. Assumes the
+            # service ``radius`` exceeds ``min_r`` (true for every configured scenario: radius ≫ terminal_radius);
+            # otherwise the redraw loop can't satisfy it and falls back to a clipped, possibly too-close point.
             min_r = max(self.min_od_separation_m, 1.5 * terminal_radius(terminal, cfg))
             customer = None
             for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint

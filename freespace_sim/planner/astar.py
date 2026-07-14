@@ -181,7 +181,8 @@ class AStarPlanner:
 
     def _file_deny(self, req, reason, volumes, ledger):
         """Deny with the built (rejected) corridor recorded for forensics — observer-only. With telemetry
-        on, capture the filed volumes and, for a conflict, the blocker(s) via ``ledger.conflicts``; then
+        on, capture the filed volumes and, for a conflict, the blocker(s) via ``ledger.conflicts`` (a second,
+        non-short-circuiting ledger scan — but only on a denial and only when telemetry is enabled); then
         deny exactly as ``_deny`` (the returned intent is UNCHANGED ⇒ verify/reservations stay byte-exact)."""
         if self._tele is not None:
             hits = ledger.conflicts(volumes) if reason is DenialReason.CONFLICT_FILED else None

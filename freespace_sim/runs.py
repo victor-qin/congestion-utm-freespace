@@ -85,7 +85,10 @@ def _term_to_json(t) -> str | None:
     round-trips — including for DENIED flights, whose geometry is otherwise unrecoverable. ``None`` for a
     non-hub endpoint. The id round-trips exactly for str/int ids (the common case)."""
     t = as_terminal(t)
-    return None if t is None else json.dumps([t.id, t.capacity, t.radius, t.corridor_overlap])
+    if t is None:
+        return None
+    tid = t.id if isinstance(t.id, (str, int, float, bool)) else str(t.id)   # JSON-safe (str for exotic ids)
+    return json.dumps([tid, t.capacity, t.radius, t.corridor_overlap])
 
 
 def _term_from_json(s):
@@ -209,13 +212,18 @@ def save_run(
     metrics.flight_frame(result).to_parquet(folder / "flights.parquet", index=False)
     metrics.per_uss_frame(result).to_parquet(folder / "per_uss.parquet", index=False)   # per-operator slice
 
+    # The always-active terminal walls belong to the run regardless of telemetry — the replay overlay and
+    # the full end-of-run ledger both need them — so persist them whenever they exist (cheap: one row/hub).
+    walls = _ledger_end_frame(result)
+    if len(walls):
+        walls.to_parquet(folder / "ledger_end.parquet", index=False, compression="zstd")
+
     if result.telemetry is not None:
         # observer-only congestion telemetry (issue: run instrumentation) — the streams post-hoc can't
-        # recover: rejected-corridor geometry + conflict culprits + per-hub metadata + the ledger's walls.
+        # recover: rejected-corridor geometry + conflict culprits + per-hub metadata.
         terminal_frame(result).to_parquet(folder / "terminal_telemetry.parquet", index=False, compression="zstd")
         conflict_frame(result).to_parquet(folder / "conflict_events.parquet", index=False, compression="zstd")
         filed_volume_frame(result).to_parquet(folder / "filed_volumes.parquet", index=False, compression="zstd")
-        _ledger_end_frame(result).to_parquet(folder / "ledger_end.parquet", index=False, compression="zstd")
 
     if write_replay:
         from . import viz_html

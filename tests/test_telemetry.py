@@ -101,7 +101,9 @@ def test_terminal_snapshot_and_peak_occupancy_from_reservations():
 def test_save_run_persists_telemetry_and_roundtrips_terminals(tmp_path):
     res = _hub_run()
     folder = runs.save_run(res, root=tmp_path, write_replay=False)
-    for name in ("terminal_telemetry", "conflict_events", "filed_volumes", "ledger_end"):
+    # ledger_end.parquet is walls-conditional (only under terminal_airspace_always_active) — this hub run
+    # has no static walls, so it's covered by test_walls_render_in_replay_and_persist_without_telemetry.
+    for name in ("terminal_telemetry", "conflict_events", "filed_volumes"):
         assert (folder / f"{name}.parquet").exists()
     # load_run round-trips terminal (hub) membership onto the rebuilt request
     loaded = runs.load_run(folder)
@@ -114,3 +116,19 @@ def test_save_run_persists_telemetry_and_roundtrips_terminals(tmp_path):
     # the cross-run index carries has_telemetry
     idx = runs.load_index(tmp_path)
     assert "has_telemetry" in idx.columns and bool(idx["has_telemetry"].any())
+
+
+def test_walls_render_in_replay_and_persist_without_telemetry(tmp_path):
+    # always-active terminal walls must reach the replay overlay AND survive save_run/load_run even with
+    # telemetry OFF (they belong to the run, not the telemetry) — otherwise a reloaded replay loses them.
+    from freespace_sim import viz_html
+    hub = Terminal("hubA", 2)
+    reqs = [FlightRequest(0, vec(2000, 2000, 0), vec(3500, 2000, 0), 0.0, origin_terminal=hub)]
+    cfg = SimConfig(planner="astar", horizon_s=600.0, region_size_m=(5000.0, 5000.0),
+                    terminal_airspace_always_active=True)
+    res = run(cfg, requests=reqs)                            # NO telemetry
+    assert len(viz_html._payload(res)["walls"]) >= 1         # live replay renders the wall (from the ledger)
+    folder = runs.save_run(res, root=tmp_path, write_replay=False)
+    assert (folder / "ledger_end.parquet").exists()          # walls persisted regardless of telemetry
+    loaded = runs.load_run(folder)
+    assert len(viz_html._payload(loaded)["walls"]) >= 1       # reloaded replay renders the wall too

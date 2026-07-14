@@ -29,11 +29,11 @@ from freespace_sim import viz
 
 
 def _steady_subset(folder, acc, window_frac):
-    """The steady-state-windowed slice of ``acc`` (accepted flights filed in the density plateau), with
-    the window stashed in ``.attrs["window"]``. ``None`` when there is no window, no ``t_request``
-    column, or the window trims nothing (no plateau ⇒ identical to the whole run, so an overlay would be
-    redundant). Default reads the window ``save_run`` stored in ``summary.json``; ``window_frac``
-    recomputes it from the reloaded run's reservations (issue #25)."""
+    """The steady-state-windowed slice of ``acc`` (accepted flights filed in the density plateau) as
+    ``(subset, (t_lo, t_hi))``. ``None`` when there is no window, no ``t_request`` column, or the window
+    trims nothing (no plateau ⇒ identical to the whole run, so an overlay would be redundant). Default
+    reads the window ``save_run`` stored in ``summary.json``; ``window_frac`` recomputes it from the
+    reloaded run's reservations (issue #25)."""
     if "t_request" not in acc.columns:
         return None
     win = None
@@ -52,9 +52,7 @@ def _steady_subset(folder, acc, window_frac):
     sub = acc[(acc["t_request"] >= lo) & (acc["t_request"] < hi)]
     if not 0 < len(sub) < len(acc):   # no plateau trimmed anything → skip the (redundant) overlay
         return None
-    sub = sub.copy()
-    sub.attrs["window"] = (lo, hi)
-    return sub
+    return sub, (lo, hi)
 
 
 def main() -> None:
@@ -85,10 +83,10 @@ def main() -> None:
     # steady-state window (issue #25): overlay the density-plateau distribution on the whole-run one so
     # the leftward ramp-tail bias reads off directly. Default reads the window save_run stored in
     # summary.json; --window-frac recomputes it from the reloaded run's reservations.
-    acc_steady = _steady_subset(folder, acc, args.window_frac)
-    win_note = ""
-    if acc_steady is not None:
-        lo, hi = acc_steady.attrs["window"]
+    steady = _steady_subset(folder, acc, args.window_frac)
+    acc_steady, win_note = None, ""
+    if steady is not None:
+        acc_steady, (lo, hi) = steady
         win_note = f"  ·  steady [{lo:.0f},{hi:.0f}]s"
 
     def ov(col):   # the windowed twin of `col`, or None when no plateau trimmed anything

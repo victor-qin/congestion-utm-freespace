@@ -16,7 +16,7 @@ FOLDER=$(uv run python -m experiments.run --scenario "$SCENARIO" --planner "$PLA
   --lam "$LAMBDA" --horizon "$HORIZON" --tag demo --no-progress | tail -1)
 echo "EXECUTE → $FOLDER"
 
-uv run python -m experiments.readouts.replay        "$FOLDER"
+uv run python -m experiments.readouts.replay        "$FOLDER" --no-clip  # demo: show the return-flight tail
 uv run python -m experiments.readouts.figures       "$FOLDER" --no-3d
 uv run python -m experiments.readouts.uss_breakdown "$FOLDER"
 uv run python -m experiments.readouts.histograms    "$FOLDER"

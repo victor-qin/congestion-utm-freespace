@@ -98,6 +98,12 @@ def main() -> None:
                    help="emit a return flight to the origin pad for each delivery")
     p.add_argument("--turnaround", type=float, default=None, help="return-flight turnaround (s)")
     p.add_argument("--tag", default=None, help="run-folder label + index join key (default: scenario name)")
+    p.add_argument("--window-frac", type=float, default=0.9,
+                   help="steady-state plateau threshold: measure where airborne density ≥ frac×peak "
+                        "(issue #25). summary.json always reports both whole-run and this windowed twin")
+    p.add_argument("--telemetry", action="store_true",
+                   help="capture observer-only congestion telemetry (filed-but-rejected corridors, "
+                        "conflict_filed culprits, per-hub metadata, end-of-run walls) into extra parquets")
     p.add_argument("--no-progress", action="store_true", help="silence the live progress line")
     args = p.parse_args()
 
@@ -111,17 +117,26 @@ def main() -> None:
           file=sys.stderr)
 
     t0 = time.time()
-    res = run(cfg, demand=demand, progress=not args.no_progress)
+    res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry)
     wall = time.time() - t0
 
     folder = runs.save_run(
         res, label=tag, experiment="run", scenario=spec.name, demand=spec.demand.pattern,
         experiment_args={"scenario": spec.name, "tag": tag, "overrides": vars(args)},
         wall_seconds=wall, write_replay=False,   # execute persists data only; replay is a readout
+        window_frac=args.window_frac,
     )
     s = res.summary()
     print(f"  n={s['n_requests']} acc={s['n_accepted']} den={s['n_denied']} "
           f"verified={res.verified} ({wall:.1f}s) → {folder}", file=sys.stderr)
+    # the steady-state twin vs the whole-run number (read back from the summary save_run just wrote,
+    # so it's the exact persisted value — no recompute). window == full horizon when no plateau exists.
+    import json
+    summ = json.loads((folder / "summary.json").read_text())
+    st = summ.get("steady_state", {})
+    print(f"  steady window [{st.get('window_lo', 0):.0f},{st.get('window_hi', 0):.0f}]s · mean delay "
+          f"{st.get('mean_total_delay_s', 0):.1f}s (whole-run {summ.get('mean_total_delay_s', 0):.1f}s)",
+          file=sys.stderr)
     print(folder)   # LAST stdout line: the run folder, for `FOLDER=$(... | tail -1)`
 
 

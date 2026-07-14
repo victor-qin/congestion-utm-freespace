@@ -149,6 +149,7 @@ class AStarPlanner:
         # recover most of the single-plane speed and keep the gain.
         self.vertical_edges = vertical_edges
         self.last_expansions = 0                        # nodes expanded by the most recent plan (telemetry)
+        self._tele = None                               # TelemetryCollector | None (observer-only; sim.run sets it)
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
@@ -177,6 +178,15 @@ class AStarPlanner:
         self._remask = 0                                # bounded-mask → full-range widen count (diagnostics)
         if self.compiled:
             self._warm_jit()
+
+    def _file_deny(self, req, reason, volumes, ledger):
+        """Deny with the built (rejected) corridor recorded for forensics — observer-only. With telemetry
+        on, capture the filed volumes and, for a conflict, the blocker(s) via ``ledger.conflicts``; then
+        deny exactly as ``_deny`` (the returned intent is UNCHANGED ⇒ verify/reservations stay byte-exact)."""
+        if self._tele is not None:
+            hits = ledger.conflicts(volumes) if reason is DenialReason.CONFLICT_FILED else None
+            self._tele.on_deny(req.flight_id, reason.value, volumes, hits)
+        return _deny(req, reason)
 
     def _occupancy(self, req, ledger, cfg) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
@@ -399,9 +409,9 @@ class AStarPlanner:
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
         if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
-            return _deny(req, DenialReason.BUDGET_EXCEEDED)
+            return self._file_deny(req, DenialReason.BUDGET_EXCEEDED, volumes, ledger)
         if ledger.any_conflict(volumes):
-            return _deny(req, DenialReason.CONFLICT_FILED)   # raster slack / hover contention
+            return self._file_deny(req, DenialReason.CONFLICT_FILED, volumes, ledger)  # raster slack / hover
 
         # true vertical travel: takeoff climb + every cruise layer change + landing descent
         z_takeoff, z_land = levels[air[0][3]], levels[air[-1][3]]
@@ -888,9 +898,9 @@ class AStarPlanner:
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
         if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
-            return _deny(req, DenialReason.BUDGET_EXCEEDED)
+            return self._file_deny(req, DenialReason.BUDGET_EXCEEDED, volumes, ledger)
         if ledger.any_conflict(volumes):
-            return _deny(req, DenialReason.CONFLICT_FILED)
+            return self._file_deny(req, DenialReason.CONFLICT_FILED, volumes, ledger)
 
         z_takeoff, z_land = levels[air[0][2]], levels[air[-1][2]]
         cruise_dz = sum(abs(levels[air[i + 1][2]] - levels[air[i][2]]) for i in range(len(air) - 1))

@@ -23,6 +23,7 @@ from .ledger import ReservationLedger
 from .mechanism import FCFSMechanism, Mechanism
 from .planner import get_planner
 from .scenario import Scenario, scenario_from_requests
+from .telemetry import TelemetryCollector, build_terminal_snapshot
 from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
 from .uss import USS
 
@@ -80,6 +81,7 @@ class SimResult:
     intents: list[OperationalIntent]
     ledger: ReservationLedger
     verified: bool
+    telemetry: TelemetryCollector | None = None   # observer-only congestion capture (default off)
 
     @property
     def accepted(self) -> list[OperationalIntent]:
@@ -131,6 +133,23 @@ def _reaches_astar(planner) -> bool:
     return False
 
 
+def _astar_planners(planner) -> list:
+    """Every ``AStarPlanner`` reachable from ``planner`` via the inner/warm_planner chain — so telemetry
+    attaches to the A* inside refiner / warm-start wrappers (astar_shortcut, opt_astar, …), not just a bare
+    top-level planner."""
+    from .planner.astar import AStarPlanner
+    out, seen, stack = [], set(), [planner]
+    while stack:
+        p = stack.pop()
+        if p is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        if isinstance(p, AStarPlanner):
+            out.append(p)
+        stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
+    return out
+
+
 def run(
     cfg: SimConfig,
     *,
@@ -140,6 +159,7 @@ def run(
     planner_name: str | None = None,
     mechanism: Mechanism | None = None,
     progress: bool | ProgressCallback | None = None,
+    telemetry: bool | TelemetryCollector = False,
 ) -> SimResult:
     """Run one strategic-layer simulation. Provide a scenario, an explicit request list, a `demand`
     model, or none (a default `UniformPoissonDemand` is then generated from `cfg`).
@@ -147,6 +167,11 @@ def run(
     ``progress`` gives live feedback through long runs: ``True`` prints a throttled status line
     (done/total, accepted/denied, elapsed, ETA); a callable is invoked as ``progress(done, total,
     intent)`` after each flight; ``None``/``False`` (default) stays silent.
+
+    ``telemetry`` (default off → byte-identical to today) attaches an observer-only
+    :class:`~freespace_sim.telemetry.TelemetryCollector` capturing the non-recoverable congestion streams
+    (filed-but-rejected corridors, `conflict_filed` culprits, per-hub metadata) onto ``SimResult.telemetry``
+    for `save_run` to persist. Pass ``True`` or a preexisting collector.
     """
     if scenario is None:
         if requests is None:
@@ -203,6 +228,14 @@ def run(
                     f"path is wall-aware — tagged, or falling back to tagged A*), but {pname!r} never reaches A* "
                     f"and would commit untagged near-hub columns that collide with the wall and deny every hub flight.")
 
+    collector: TelemetryCollector | None = None
+    if telemetry:
+        collector = telemetry if isinstance(telemetry, TelemetryCollector) else TelemetryCollector()
+        collector.terminals = build_terminal_snapshot(cfg, demand, scenario.events)
+        for u in usses.values():                     # observer-only; reaches A* inside wrapper planners too
+            for p in _astar_planners(u.planner):
+                p._tele = collector
+
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
     intents: list[OperationalIntent] = []
@@ -218,4 +251,5 @@ def run(
     # config, or downstream metrics/aggregate (which key on cfg.planner — e.g. the altitude baseline)
     # and the reported planner label would describe cfg.planner, not the planner that ran.
     result_cfg = cfg if pname == cfg.planner else replace(cfg, planner=pname)
-    return SimResult(config=result_cfg, intents=intents, ledger=ledger, verified=verified)
+    return SimResult(config=result_cfg, intents=intents, ledger=ledger, verified=verified,
+                     telemetry=collector)

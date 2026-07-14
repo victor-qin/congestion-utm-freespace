@@ -101,6 +101,28 @@ def test_viz_html_is_selfcontained_and_parses(tmp_path):
     assert json.loads(blob)["horizon"] == res.config.horizon_s
 
 
+def test_replay_clips_to_horizon_by_default():
+    from freespace_sim.geometry import box_from_segment
+    from freespace_sim.volumes import Volume4D
+
+    res = _small_run()   # horizon 600 s; every flight clears well before it
+    # append a volume that extends past the horizon to one accepted flight (a stand-in return tail)
+    acc = res.accepted[0]
+    tail = Volume4D(box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30), 700.0, 900.0)
+    acc.volumes = (acc.volumes or []) + [tail]
+    # default clips the replay clock at the horizon, excluding the post-H tail
+    assert viz_html._payload(res, clip_to_horizon=True)["horizon"] == res.config.horizon_s
+    # opting out extends the clock to the last volume (return-flight demo)
+    assert viz_html._payload(res, clip_to_horizon=False)["horizon"] >= 900.0
+
+
+def test_delay_histogram_overlay_writes_two_series(tmp_path):
+    # the steady-state overlay draws both distributions on shared bins (issue #25)
+    viz.delay_histogram([10.0, 20.0, 30.0, 40.0], overlay=[25.0, 30.0, 35.0],
+                        out=tmp_path / "ov.png")
+    assert (tmp_path / "ov.png").stat().st_size > 0
+
+
 def test_delay_histogram_drops_nan_and_writes(tmp_path):
     viz.delay_histogram([10.0, 20.0, float("nan"), 30.0], out=tmp_path / "h.png")
     assert (tmp_path / "h.png").stat().st_size > 0

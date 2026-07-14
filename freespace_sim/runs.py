@@ -38,7 +38,8 @@ from . import metrics
 from .config import SimConfig
 from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
-from .types import DenialReason, FlightRequest, IntentStatus, OperationalIntent, vec
+from .telemetry import _vol_row, conflict_frame, filed_volume_frame, terminal_frame
+from .types import DenialReason, FlightRequest, IntentStatus, OperationalIntent, as_terminal, vec
 from .volumes import Volume4D
 
 DEFAULT_ROOT = Path("results")
@@ -79,8 +80,29 @@ def _env_info() -> dict:
 # --- flight-data frame builders --------------------------------------------
 
 
+def _term_to_json(t) -> str | None:
+    """Serialize a flight's terminal (id, capacity, radius, corridor_overlap) to JSON so hub membership
+    round-trips — including for DENIED flights, whose geometry is otherwise unrecoverable. ``None`` for a
+    non-hub endpoint. The id round-trips exactly for str/int ids (the common case)."""
+    t = as_terminal(t)
+    if t is None:
+        return None
+    tid = t.id if isinstance(t.id, (str, int, float, bool)) else str(t.id)   # JSON-safe (str for exotic ids)
+    return json.dumps([tid, t.capacity, t.radius, t.corridor_overlap])
+
+
+def _term_from_json(s):
+    """Inverse of :func:`_term_to_json` → an ``(id, capacity, radius, corridor_overlap)`` tuple
+    (as_terminal-friendly), or ``None``. Tolerates a NaN/None cell from parquet."""
+    if s is None or (isinstance(s, float) and s != s):
+        return None
+    return tuple(json.loads(s))
+
+
 def scenario_frame(result: SimResult) -> pd.DataFrame:
-    """Every generated flight request — the scenario, independent of what got accepted."""
+    """Every generated flight request — the scenario, independent of what got accepted. Carries each
+    endpoint's terminal (hub) membership so a saved run — including its denied flights — records which hub
+    each flight used (round-tripped by :func:`load_run`)."""
     rows = []
     for i in result.intents:
         r = i.request
@@ -91,6 +113,8 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "t_departure": r.t_departure if r.t_departure is not None else r.t_request,
             "origin_x": o[0], "origin_y": o[1], "origin_z": o[2],
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
+            "origin_terminal": _term_to_json(r.origin_terminal),
+            "dest_terminal": _term_to_json(r.dest_terminal),
         })
     return pd.DataFrame(rows)
 
@@ -112,21 +136,22 @@ def reservation_frame(result: SimResult) -> pd.DataFrame:
     ``rot``/``ext`` are JSON-encoded for boxes; ``radius``/``z_lo``/``z_hi`` carry cylinders. This is
     enough to rebuild the exact `Volume4D` (see :func:`load_run`) and to drive the replay.
     """
-    rows = []
-    for i in result.accepted:
-        for v in i.volumes or []:
-            s = v.shape
-            row = {"flight_id": i.request.flight_id, "t_start": v.t_start, "t_end": v.t_end,
-                   "terminal_id": None if v.terminal_id is None else str(v.terminal_id)}
-            if isinstance(s, BoxSpec):
-                row.update({"kind": "box", "cx": s.center[0], "cy": s.center[1], "cz": s.center[2],
-                            "rot": json.dumps(list(s.rot)), "ext": json.dumps(list(s.extents)),
-                            "radius": np.nan, "z_lo": np.nan, "z_hi": np.nan})
-            else:
-                row.update({"kind": "cyl", "cx": s.cx, "cy": s.cy, "cz": (s.z_lo + s.z_hi) / 2,
-                            "rot": "", "ext": "", "radius": s.radius, "z_lo": s.z_lo, "z_hi": s.z_hi})
-            rows.append(row)
+    rows = [{"flight_id": i.request.flight_id, **_vol_row(v)}
+            for i in result.accepted for v in (i.volumes or [])]
     cols = ["flight_id", "kind", "t_start", "t_end", "cx", "cy", "cz",
+            "rot", "ext", "radius", "z_lo", "z_hi", "terminal_id"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _ledger_end_frame(result: SimResult) -> pd.DataFrame:
+    """The always-active terminal WALLS (``ledger._static_vols``) — the part of the end-of-run ledger that
+    ``reservation_frame`` (accepted intents only) doesn't capture. Same geometry schema; empty when the run
+    used no always-active walls. ``reservations.parquet`` ∪ this == the full end-of-run ledger (see the
+    telemetry design §10)."""
+    ledger = getattr(result, "ledger", None)
+    vols = list(getattr(ledger, "_static_vols", []) or [])
+    rows = [{"wall_idx": j, **_vol_row(v)} for j, v in enumerate(vols)]
+    cols = ["wall_idx", "kind", "t_start", "t_end", "cx", "cy", "cz",
             "rot", "ext", "radius", "z_lo", "z_hi", "terminal_id"]
     return pd.DataFrame(rows, columns=cols)
 
@@ -145,13 +170,24 @@ def save_run(
     demand: str | None = None,
     write_replay: bool = True,
     index: bool = True,
+    clip_replay_to_horizon: bool = True,
+    window_frac: float = 0.9,
 ) -> Path:
     """Write the full self-contained run folder and return its path.
 
     Captures config/env/git, the experiment identity + args, the scenario, the flown trajectories,
-    the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML.
+    the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML. Everything
+    is parquet + json — deliberately NOT pickle: portable, inspectable, safe to sync to the run store,
+    and Python-version-independent. The analytical geometry stored in reservations/ledger_end is enough
+    to rebuild every ``Volume4D`` on load (see :func:`load_run` / :func:`_volume_from_row`).
+
+    ``summary.json`` carries the whole-run headline numbers **and** their steady-state twin (metrics
+    over the representative density plateau — issue #25) in a nested ``steady_state`` block; ``window_frac``
+    tunes the plateau threshold. ``clip_replay_to_horizon`` (default) stops ``replay.html`` at the horizon;
+    pass ``False`` to keep post-horizon return flights visible.
     """
     cfg = result.config
+    agg = metrics.aggregate_with_steady(result, frac=window_frac)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
     folder = Path(root) / f"{stamp}_{label}_{_config_hash(cfg)}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -171,7 +207,7 @@ def save_run(
         "n_requests": len(result.intents),
         "verified": result.verified,
     }, indent=2, default=str))
-    (folder / "summary.json").write_text(json.dumps(metrics.aggregate(result), indent=2))
+    (folder / "summary.json").write_text(json.dumps(agg, indent=2))
 
     scenario_frame(result).to_parquet(folder / "scenario.parquet", index=False)
     trajectory_frame(result).to_parquet(folder / "trajectories.parquet", index=False)
@@ -179,38 +215,63 @@ def save_run(
     metrics.flight_frame(result).to_parquet(folder / "flights.parquet", index=False)
     metrics.per_uss_frame(result).to_parquet(folder / "per_uss.parquet", index=False)   # per-operator slice
 
+    # The always-active terminal walls belong to the run regardless of telemetry — the replay overlay and
+    # the full end-of-run ledger both need them — so persist them whenever they exist (cheap: one row/hub).
+    walls = _ledger_end_frame(result)
+    if len(walls):
+        walls.to_parquet(folder / "ledger_end.parquet", index=False, compression="zstd")
+
+    if result.telemetry is not None:
+        # observer-only congestion telemetry (issue: run instrumentation) — the streams post-hoc can't
+        # recover: rejected-corridor geometry + conflict culprits + per-hub metadata.
+        terminal_frame(result).to_parquet(folder / "terminal_telemetry.parquet", index=False, compression="zstd")
+        conflict_frame(result).to_parquet(folder / "conflict_events.parquet", index=False, compression="zstd")
+        filed_volume_frame(result).to_parquet(folder / "filed_volumes.parquet", index=False, compression="zstd")
+
     if write_replay:
         from . import viz_html
-        viz_html.write_html(result, folder / "replay.html")
+        viz_html.write_html(result, folder / "replay.html", clip_to_horizon=clip_replay_to_horizon)
 
     if index:
         _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
-                      tag=label, demand=demand)
+                      tag=label, demand=demand, agg=agg)
     return folder
 
 
 def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: float | None,
                   *, scenario: str | None = None, tag: str | None = None,
-                  demand: str | None = None) -> None:
+                  demand: str | None = None, agg: dict | None = None) -> None:
     """Append one queryable row per run to ``results/index.parquet``.
 
     The ``scenario`` / ``tag`` / ``demand`` columns are the join keys cross-run readouts filter on:
     a batch sweep stamps every run with the same ``tag`` so a readout can select exactly its runs.
+    ``agg`` may be a precomputed :func:`metrics.aggregate_with_steady` (avoids recomputing it); the
+    ``steady_*`` / ``window_*`` columns carry the steady-state twin of the headline metrics so a
+    cross-run curve can plot the de-biased trend alongside the whole-run one (issue #25).
     """
     cfg = result.config
-    agg = metrics.aggregate(result)
+    if agg is None:
+        agg = metrics.aggregate_with_steady(result)
+    steady = agg.get("steady_state", {})
+    steady_cols = {f"steady_{k}": steady.get(k) for k in
+                   ("mean_total_delay_s", "p50_total_delay_s", "p95_total_delay_s",
+                    "throughput_per_h", "denial_rate", "congestion_denial_rate")}
+    steady_cols["window_lo"] = steady.get("window_lo")
+    steady_cols["window_hi"] = steady.get("window_hi")
     row = {"path": str(folder), "scenario": scenario, "tag": tag, "demand": demand,
            "planner": cfg.planner, "lam_per_hour": cfg.lam_per_hour, "seed": cfg.seed,
            "horizon_s": cfg.horizon_s,
            "region_w": cfg.region_size_m[0], "region_h": cfg.region_size_m[1],
            "wall_seconds": wall_seconds,
+           "has_telemetry": result.telemetry is not None,
            **{k: agg[k] for k in ("n_uss", "n_requests", "n_accepted", "n_denied", "denial_rate",
                                   "congestion_denial_rate", "offered_load_per_h", "throughput_per_h",
                                   "mean_total_delay_s", "p95_total_delay_s", "mean_air_detour_m",
                                   "mean_stretch", "mean_cost",
                                   "airspace_utilization", "denial_rate_spread", "mean_delay_spread",
                                   "mean_solve_time_s", "p95_solve_time_s",
-                                  "max_solve_time_s", "total_solve_time_s", "verified")}}
+                                  "max_solve_time_s", "total_solve_time_s", "verified")},
+           **steady_cols}
     path = root / INDEX_FILENAME
     df = pd.DataFrame([row])
     if path.exists():
@@ -246,6 +307,7 @@ class LoadedRun:
     config: SimConfig
     intents: list[OperationalIntent]
     verified: bool
+    static_walls: list = dataclasses.field(default_factory=list)   # always-active walls (from ledger_end)
 
     @property
     def accepted(self) -> list[OperationalIntent]:
@@ -256,7 +318,7 @@ class LoadedRun:
         return [i for i in self.intents if i.status is IntentStatus.REJECTED]
 
     def summary(self) -> dict:
-        return metrics.aggregate(self)  # type: ignore[arg-type]
+        return metrics.aggregate_with_steady(self)  # type: ignore[arg-type]
 
 
 def load_run(folder: Path | str) -> LoadedRun:
@@ -293,7 +355,9 @@ def load_run(folder: Path | str) -> LoadedRun:
         t_dep = None if s.t_departure == s.t_request else float(s.t_departure)
         req = FlightRequest(fid, vec(s.origin_x, s.origin_y, s.origin_z),
                             vec(s.dest_x, s.dest_y, s.dest_z), float(s.t_request),
-                            t_departure=t_dep, uss_id=str(s.uss_id))
+                            t_departure=t_dep, uss_id=str(s.uss_id),
+                            origin_terminal=_term_from_json(getattr(s, "origin_terminal", None)),
+                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)))
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(
             request=req,
@@ -305,7 +369,11 @@ def load_run(folder: Path | str) -> LoadedRun:
             cost=float(fr.cost), denial_reason=DenialReason(fr.denial_reason), planner=str(fr.planner),
             solve_time_s=float(fr.solve_time_s),
         ))
-    return LoadedRun(config=cfg, intents=intents, verified=bool(json.loads(
+    walls = []
+    if (folder / "ledger_end.parquet").exists():   # always-active terminal walls → replay overlay
+        walls = [_volume_from_row(r)
+                 for r in pd.read_parquet(folder / "ledger_end.parquet").itertuples(index=False)]
+    return LoadedRun(config=cfg, intents=intents, static_walls=walls, verified=bool(json.loads(
         (folder / "experiment.json").read_text()).get("verified", True)))
 
 

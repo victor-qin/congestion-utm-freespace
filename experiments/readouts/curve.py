@@ -38,17 +38,29 @@ def _mean_by_lambda(df, key):
 def plot_curve(df, out_png, title) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     lam, _ = _mean_by_lambda(df, "denial_rate")
+    # steady-state twins (issue #25) — plotted dotted alongside the whole-run curves when the index
+    # carries them (runs saved after the window feature landed). Each guarded by column presence.
+    has_steady = "steady_mean_total_delay_s" in df.columns
 
     ax = axes[0, 0]
     ax.plot(*_mean_by_lambda(df, "denial_rate"), "o-", label="all denials")
     if "congestion_denial_rate" in df.columns:
         ax.plot(*_mean_by_lambda(df, "congestion_denial_rate"), "s--", label="budget-exceeded")
+    if "steady_denial_rate" in df.columns:
+        ax.plot(*_mean_by_lambda(df, "steady_denial_rate"), "o:", color="gray",
+                label="all denials (steady)")
     ax.set_title("Denial rate vs demand"); ax.set_xlabel("offered load λ (req/h)")
     ax.set_ylabel("fraction denied"); ax.legend()
 
     ax = axes[0, 1]
     ax.plot(*_mean_by_lambda(df, "mean_total_delay_s"), "o-", label="mean")
     ax.plot(*_mean_by_lambda(df, "p95_total_delay_s"), "s--", label="p95")
+    if has_steady:
+        ax.plot(*_mean_by_lambda(df, "steady_mean_total_delay_s"), "o:", color="tab:red",
+                label="mean (steady-state)")
+        if "steady_p95_total_delay_s" in df.columns:
+            ax.plot(*_mean_by_lambda(df, "steady_p95_total_delay_s"), "s:", color="tab:red",
+                    alpha=0.6, label="p95 (steady-state)")
     ax.set_title("Total delay vs demand"); ax.set_xlabel("offered load λ (req/h)")
     ax.set_ylabel("total delay (s)"); ax.legend()
 
@@ -59,10 +71,16 @@ def plot_curve(df, out_png, title) -> None:
 
     ax = axes[1, 1]
     ax.plot(*_mean_by_lambda(df, "throughput_per_h"), "o-", label="throughput (acc/h)")
+    if "steady_throughput_per_h" in df.columns:
+        ax.plot(*_mean_by_lambda(df, "steady_throughput_per_h"), "o:", color="tab:purple",
+                label="throughput (steady)")
     ax.plot(lam, lam, ":", color="gray", label="offered = accepted")
     ax.set_title("Throughput vs demand (saturation)"); ax.set_xlabel("offered load λ (req/h)")
     ax.set_ylabel("accepted/h"); ax.legend()
 
+    if has_steady:
+        fig.text(0.5, 0.005, "dotted = steady-state window (density plateau; ramp-up/-down tails dropped)",
+                 ha="center", fontsize=9, color="dimgray")
     fig.suptitle(title, fontsize=13)
     fig.tight_layout()
     fig.savefig(out_png, dpi=120)

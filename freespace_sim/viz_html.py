@@ -15,8 +15,23 @@ from .sim import SimResult
 from .viz import box_footprint, flight_color_by_uss, result_uss_hues, uss_swatch_hex
 
 
-def _payload(result: SimResult) -> dict:
-    """Flatten the accepted intents into a compact, JSON-serialisable scene description."""
+def _static_walls(result: SimResult):
+    """The run's always-active terminal walls (permanent no-fly columns): from the live ledger
+    (``SimResult.ledger._static_vols``) or a loaded run's ``static_walls`` (populated by ``load_run`` from
+    ``ledger_end.parquet``). Empty otherwise. These are NOT in any accepted intent's volumes, so the replay
+    must render them separately — otherwise a denial's blocker is invisible (see the telemetry design §10)."""
+    led = getattr(result, "ledger", None)
+    if led is not None and getattr(led, "_static_vols", None):
+        return list(led._static_vols)
+    return list(getattr(result, "static_walls", None) or [])
+
+
+def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
+    """Flatten the accepted intents into a compact, JSON-serialisable scene description.
+
+    ``clip_to_horizon`` (default) stops the replay clock at ``cfg.horizon_s`` so the density/overlay
+    display excludes the unrepresentative ramp-down tail (issue #25). Pass ``False`` to extend the clock
+    to the last volume to clear — the way to keep post-horizon return flights visible for a demo."""
     hues = result_uss_hues(result)
     flights = []
     for intent in result.accepted:
@@ -46,20 +61,28 @@ def _payload(result: SimResult) -> dict:
     hex_available = "astar" in cfg.planner
     from .planner.hexgrid import circumradius
     uss_colors = {uid: uss_swatch_hex(uid, hues) for uid in sorted(hues)}
-    # The replay clock must span the LAST volume to clear, not just the demand horizon: return flights
-    # are scheduled after their delivery + turnaround, so they fly well past cfg.horizon_s and would be
-    # clipped off the right edge of the slider otherwise. For return-free runs this stays == horizon_s.
+    # By default the replay clock stops at the demand horizon so the density/overlay display excludes
+    # the ramp-down tail (issue #25). With clip_to_horizon=False it spans the LAST volume to clear:
+    # return flights are scheduled after their delivery + turnaround, so they fly well past cfg.horizon_s
+    # and would be clipped off the right edge of the slider — pass False to keep them visible.
     play_end = cfg.horizon_s
-    for f in flights:
-        for seg in f["boxes"]:
-            play_end = max(play_end, seg["t1"])
-        for seg in f["cyls"]:
-            play_end = max(play_end, seg["t1"])
+    if not clip_to_horizon:
+        for f in flights:
+            for seg in f["boxes"]:
+                play_end = max(play_end, seg["t1"])
+            for seg in f["cyls"]:
+                play_end = max(play_end, seg["t1"])
+    # always-active terminal WALLS (permanent no-fly columns) live in the ledger, NOT in any accepted
+    # intent's volumes — render them as permanent overlays so a denial's blocker is visible.
+    walls = [{"cx": float(v.shape.cx), "cy": float(v.shape.cy), "r": float(v.shape.radius),
+              "tid": None if v.terminal_id is None else str(v.terminal_id)}
+             for v in _static_walls(result) if isinstance(v.shape, CylinderSpec)]
     return {
         "horizon": play_end,
         "dt": cfg.dt_s,
         "region": list(cfg.region_size_m),
         "flights": flights,
+        "walls": walls,                     # permanent terminal no-fly columns (always-active)
         "uss_colors": uss_colors,           # {uss_id: #rrggbb} for the legend / per-USS slice
         "hex_available": hex_available,
         "hex_R": circumradius(cfg) if hex_available else 0.0,
@@ -145,6 +168,11 @@ function draw(t){{
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.strokeStyle='#30363d'; ctx.strokeRect(sx(0),sy(H),W*S,H*S);
   if(document.getElementById('hexToggle').checked) drawHexGrid();
+  for(const wl of (DATA.walls||[])){{                     // permanent terminal walls (always-active no-fly)
+    ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*S,0,2*Math.PI);
+    ctx.fillStyle='#f59e0b1f'; ctx.fill();
+    ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle='#b45309aa'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
+  }}
   let nActive=0;
   for(const fl of DATA.flights){{
     if(hidden.has(fl.uss)) continue;                 // per-USS slice (legend toggles)
@@ -224,9 +252,12 @@ draw(0);
 </script></body></html>"""
 
 
-def write_html(result: SimResult, out) -> str:
-    """Render ``result`` to a standalone HTML scrubber at ``out``; returns the path written."""
-    payload = _payload(result)
+def write_html(result: SimResult, out, clip_to_horizon: bool = True) -> str:
+    """Render ``result`` to a standalone HTML scrubber at ``out``; returns the path written.
+
+    ``clip_to_horizon`` (default) stops the replay at ``cfg.horizon_s``; pass ``False`` to keep the
+    post-horizon return-flight tail visible (see :func:`_payload`)."""
+    payload = _payload(result, clip_to_horizon)
     html = _HTML.format(horizon=int(payload["horizon"]), data=json.dumps(payload))
     with open(out, "w") as f:
         f.write(html)

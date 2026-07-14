@@ -187,8 +187,8 @@ def conflict_frame(result: "SimResult") -> pd.DataFrame:
     # a flight's own hub id(s), to tell sibling from foreign
     hub_of: dict = {}
     for i in result.intents:
-        ids = {as_terminal(t).id for t in (i.request.origin_terminal, i.request.dest_terminal)
-               if as_terminal(t) is not None}
+        ids = {t2.id for t in (i.request.origin_terminal, i.request.dest_terminal)
+               if (t2 := as_terminal(t)) is not None}
         hub_of[i.request.flight_id] = ids
     rows = []
     for e in events:

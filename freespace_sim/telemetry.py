@@ -14,7 +14,7 @@ is byte-identical):
 Per-hub **dwell occupancy** is NOT here — it is recoverable post-hoc from `reservations.parquet` (the
 ledger is append-only; committed columns are persisted), so :func:`terminal_frame` sweep-lines them.
 **Gate attribution** (pad/air/lane) and **kernel byte-exactness parity** are deferred follow-ups (see
-`experiments/TELEMETRY_DESIGN.md` §3b.2 / §9); the `gate_reject` field is present but not yet emitted.
+`experiments/TELEMETRY_DESIGN.md` §3b.2 / §9) — not emitted here, and not carried as empty columns.
 
 See :func:`freespace_sim.runs.save_run` for persistence and `TELEMETRY_DESIGN.md` for the full design.
 """
@@ -65,9 +65,6 @@ class TelemetryCollector:
     enabled: bool = True
     # per-hub metadata snapshot, filled at sim.run setup (the one place the demand model is in scope)
     terminals: dict[Hashable, dict] = field(default_factory=dict)   # tid -> {cx,cy,capacity,radius}
-    # gate attribution — DEFERRED (see module docstring); tid -> [pad, air, lane]. Present so the schema is
-    # stable; nothing emits into it yet.
-    gate_reject: dict[Hashable, list[int]] = field(default_factory=dict)
     conflict_events: list[dict] = field(default_factory=list)       # one row per CULPRIT (blocker)
     filed_volumes: list[dict] = field(default_factory=list)         # the REJECTED corridor's own volumes
 
@@ -82,9 +79,6 @@ class TelemetryCollector:
                 "flight_id": int(flight_id), "culprit_fid": int(fid),
                 "culprit_tid": None if vol.terminal_id is None else str(vol.terminal_id),
                 "shape": type(vol.shape).__name__, "t_start": vol.t_start, "t_end": vol.t_end})
-
-    def on_gate_reject(self, tid: Hashable, kind: int) -> None:   # DEFERRED — not yet called
-        self.gate_reject.setdefault(tid, [0, 0, 0])[kind] += 1
 
 
 def build_terminal_snapshot(cfg, demand, events) -> dict:
@@ -159,14 +153,12 @@ def terminal_frame(result: "SimResult") -> pd.DataFrame:
         meta = terms.get(tid, {})
         cx, cy = meta.get("cx"), meta.get("cy")
         gd = dep_delays.get(tid, [])
-        gate = tele.gate_reject.get(tid, [0, 0, 0]) if tele else [0, 0, 0]
         rows.append({
             "tid": str(tid), "type": uss_of.get(tid),
             "cx": cx, "cy": cy, "pads": meta.get("capacity"), "radius": meta.get("radius"),
             "dist_to_edge_m": (min(cx, w - cx, cy, h - cy) if cx is not None else np.nan),
             "n_departures": len(gd), "n_arrivals": arrivals.get(tid, 0),
             "peak_pad_occupancy": _peak_overlap(dwells.get(tid, [])),
-            "pad_reject": gate[0], "air_reject": gate[1], "lane_reject": gate[2],   # DEFERRED → 0
             "mean_ground_delay_s": float(np.mean(gd)) if gd else 0.0,
             "max_ground_delay_s": float(np.max(gd)) if gd else 0.0,
         })

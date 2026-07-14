@@ -14,8 +14,8 @@ at BOTH compiled + reference deny sites in `astar.py`, `sim.run(telemetry=…)` 
 persistence (`terminal_telemetry`/`conflict_events`/`filed_volumes`/`ledger_end` parquets + `has_telemetry`
 index col), the terminal-membership round-trip in `scenario_frame`/`load_run`, `--telemetry` on
 `experiments/run.py`, and `tests/test_telemetry.py` (telemetry-off is byte-identical). **DEFERRED as separate
-follow-ups:** gate attribution (§3b.2 — the `gate_reject` field/columns exist but emit 0 until the
-plan-outcome binding-gate derivation lands) and §9 kernel-parity (a separate `--kernel-parity` CI audit).
+follow-ups:** gate attribution (§3b.2 — the plan-outcome binding-gate derivation is not implemented; NO empty
+`pad/air/lane_reject` columns are carried) and §9 kernel-parity (a separate `--kernel-parity` CI audit, tracked in **#35**).
 Revised after the plan-critic review + the #28 rebase — see §2, §3, §5.6, §10.
 
 ---
@@ -74,17 +74,14 @@ class TelemetryCollector:
     # terminal metadata SNAPSHOT — captured at sim.run setup where the demand model is in scope (§3c),
     # because save_run only receives a demand *string*, not the model (plan-critic MOD).
     terminals: dict[Hashable, dict] = field(default_factory=dict)   # tid -> {cx,cy,capacity,radius,type}
-    # gate attribution PER ACCEPTED FLIGHT-ENDPOINT (NOT per search node — plan-critic MOD): the binding
-    # constraint over the waited interval. kind: 0=pad(admits) 1=air(column_clear) 2=lane(exit_clear).
-    gate_reject: dict[Hashable, list[int]] = ...   # tid -> [pad, air, lane]
+    # gate attribution (pad/air/lane) is DEFERRED (§3b.2, own follow-up): when built it adds a `gate_reject`
+    # field here + the pad/air/lane_reject columns to terminal_frame. NOT in the shipped collector — no empty
+    # columns are carried.
     conflict_events: list[dict] = field(default_factory=list)       # one row per CULPRIT (blocker)
     filed_volumes: list[dict] = field(default_factory=list)         # the REJECTED corridor's own volumes
 
     # NOTE: no on_commit/dwells hook — per-hub dwell occupancy is recovered post-hoc from
     # reservations.parquet (see §2, §3e). This collector captures only the non-recoverable streams.
-
-    def on_gate_reject(self, tid, kind):                # called once per accepted flight-endpoint, §3b.2
-        self.gate_reject.setdefault(tid, [0, 0, 0])[kind] += 1
 
     def on_deny(self, flight_id, reason, volumes, hits=None):   # EVERY deny that built a corridor
         for j, v in enumerate(volumes or []):           # the FILED (rejected) corridor — error forensics
@@ -147,7 +144,8 @@ Guarded by `if result.telemetry is not None:` — write the new parquet artifact
 - **`terminal_telemetry.parquet`** — one row per hub, joining `collector.terminals` (the run-time
   snapshot) + a sweep-line over the accepted terminal-tagged cylinders (from `reservation_frame`) +
   per-hub flight stats: `tid, type, cx, cy, pads, radius, dist_to_edge_m, n_departures, n_arrivals,
-  peak_pad_occupancy, pad_reject, air_reject, lane_reject, mean_ground_delay_s, max_ground_delay_s`.
+  peak_pad_occupancy, mean_ground_delay_s, max_ground_delay_s`. (Gate rejects — pad/air/lane — are
+  DEFERRED, §3b.2, and NOT carried as empty columns.)
 - **`conflict_events.parquet`** — one row per culprit: `flight_id, culprit_fid, culprit_kind
    (static_wall|sibling|foreign), culprit_tid, shape, t_start, t_end`.
 - **`filed_volumes.parquet`** — the rejected corridor geometry for every `conflict_filed` flight (error
@@ -244,8 +242,7 @@ edge-hub scatter) belong as new scripts under `experiments/readouts/` next to `c
 results/<run>/terminal_telemetry.parquet   # per hub
   tid  type  cx  cy  pads  radius  dist_to_edge_m
   n_departures  n_arrivals  peak_pad_occupancy
-  pad_reject  air_reject  lane_reject         # binding gate per accepted flight-endpoint
-  mean_ground_delay_s  max_ground_delay_s
+  mean_ground_delay_s  max_ground_delay_s          # (gate rejects pad/air/lane DEFERRED, §3b.2 — no columns)
 results/<run>/conflict_events.parquet        # per culprit of a conflict_filed
   flight_id  culprit_fid  culprit_kind  culprit_tid  shape  t_start  t_end
 results/<run>/filed_volumes.parquet          # the REJECTED corridor geometry (error forensics)
@@ -288,7 +285,7 @@ The chat-session scratchpad monkeypatch scripts capture the SAME data ad-hoc and
   becomes first-class.
 - `df1800_astar_instr.pkl` / `df1800_shortcut.pkl` — the emitted data shape the parquets should match.
 
-## 9. Numerical-parity telemetry (kernel byte-exactness) — a SECOND, distinct category
+## 9. Numerical-parity telemetry (kernel byte-exactness) — a SECOND, distinct category  (tracked in #35)
 
 Streams 1–3 measure the **simulation** (congestion physics). This stream measures the **solver's
 numerical fidelity**: how often floating-point associativity in the A* g-value accumulation could break
@@ -400,7 +397,7 @@ and terminal membership):
 | Denied corridor geometry — `conflict_at_commit` (multi-USS; v0-inert) | `mechanism.py` mirror hook | `filed_volumes.parquet` |
 | The blocker(s) a conflict hit | `ledger.conflicts(volumes)` at the deny site | `conflict_events.parquet` |
 | Always-active terminal **walls** | `ledger._static_vols` dump | `ledger_end.parquet` |
-| Gate attribution (pad / air / lane) | per-flight-endpoint `on_gate_reject` | `terminal_telemetry.parquet` |
+| Gate attribution (pad / air / lane) | **DEFERRED** (§3b.2) — not emitted, no empty columns | — |
 | Per-hub metadata (pads, radius, center), incl. **zero-traffic** hubs | run-time terminal snapshot (§3c) | `terminal_telemetry.parquet` |
 | **Per-flight terminal membership** | `origin_terminal`/`dest_terminal` columns | `scenario.parquet` (+ `load_run` restore) |
 | No-goal `budget_exceeded` / `search_exhausted` | (no corridor was ever built) | `flights.parquet` (already) |

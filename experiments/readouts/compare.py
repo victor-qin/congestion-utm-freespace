@@ -24,6 +24,10 @@ _AGG = {
     "mean_total_delay_s": "mean", "mean_air_detour_m": "mean", "mean_cost": "mean",
     "airspace_utilization": "mean", "mean_solve_time_s": "mean", "wall_seconds": "mean",
     "verified": "all",
+    # steady-state twin (issue #25) — present on runs saved after the window feature landed; the
+    # `if k in df.columns` filter below silently drops them for older index rows.
+    "steady_mean_total_delay_s": "mean", "steady_p95_total_delay_s": "mean",
+    "steady_throughput_per_h": "mean", "steady_denial_rate": "mean",
 }
 
 

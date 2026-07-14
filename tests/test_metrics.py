@@ -20,11 +20,13 @@ def test_shape_volume_box_and_cylinder():
 
 
 def test_reserved_volume_seconds_clamps_open_window():
-    # an open-ended reservation (t_end ~ 1e6) must be clamped to the horizon, not run away
+    # an open-ended reservation (t_end ~ 1e6) must be clamped to the window, not run away
     box = BoxSpec(center=(0, 0, 0), rot=tuple(np.eye(3).flatten()), extents=(1.0, 1.0, 1.0))
     vol = Volume4D(box, 0.0, 1e6)
-    got = metrics.reserved_volume_seconds([vol], horizon_s=100.0)
+    got = metrics.reserved_volume_seconds([vol], 0.0, 100.0)
     assert math.isclose(got, 1.0 * 100.0, rel_tol=1e-9)   # 1 m³ × 100 s, not 1e6 s
+    # a sub-window clamps on both ends: the reservation's [20, 50) slice → 30 s
+    assert math.isclose(metrics.reserved_volume_seconds([vol], 20.0, 50.0), 30.0, rel_tol=1e-9)
 
 
 def test_flight_frame_one_row_per_intent():
@@ -285,3 +287,110 @@ def test_total_delay_counts_a_traffic_forced_climb_like_congestion_cost():
     assert td > 0.0 and math.isclose(td, excess / CFG.climb_rate_mps)   # the vertical lever, in time
     assert math.isclose(metrics.flight_row(intent, CFG)["congestion_cost"],
                         excess * CFG.cost_altitude_change_per_m)         # ... and in cost
+
+
+# --- steady-state measurement window (issue #25) -----------------------------------------------
+
+from freespace_sim.sim import SimResult   # noqa: E402
+
+
+def _accepted_over(fid, t0, t1):
+    """A minimal accepted intent airborne over [t0, t1] via a 2-point centerline (no volumes → the
+    density helpers fall back to the centerline span)."""
+    cl = [(vec(0, 0, 75), float(t0)), (vec(100, 0, 75), float(t1))]
+    return OperationalIntent(FlightRequest(fid, vec(0, 0, 0), vec(100, 0, 0), 0.0),
+                             IntentStatus.ACCEPTED, centerline=cl)
+
+
+def _synthetic_result(intents, horizon_s=1000.0):
+    return SimResult(config=SimConfig(planner="straight", horizon_s=horizon_s),
+                     intents=intents, ledger=None, verified=True)
+
+
+def test_widest_hot_run_picks_widest_earliest():
+    hot = np.array([0, 1, 1, 0, 1, 1, 1, 1, 0, 1], dtype=bool)   # runs [1,2], [4,7], [9,9]
+    assert metrics._widest_hot_run(hot) == (4, 7)
+    assert metrics._widest_hot_run(np.zeros(5, dtype=bool)) is None
+    assert metrics._widest_hot_run(np.array([1, 1, 0, 1, 1], dtype=bool)) == (0, 1)  # earliest on ties
+
+
+def test_density_timeseries_counts_concurrency():
+    intents = [_accepted_over(0, 0, 100), _accepted_over(1, 50, 150), _accepted_over(2, 60, 70)]
+    t, d = metrics.density_timeseries(_synthetic_result(intents), dt=1.0)
+    assert d.max() == 3.0        # all three overlap around t ∈ [60, 70)
+    assert d[10] == 1.0          # at t=10 only flight 0 is airborne
+    # nothing flew → safe, non-empty degenerate arrays
+    _, d0 = metrics.density_timeseries(_synthetic_result([]), dt=1.0)
+    assert d0.max() == 0.0
+
+
+def test_steady_state_window_recovers_trapezoid_plateau():
+    # flight k airborne over [4k, 4k+80] → concurrency trapezoid; the full-overlap plateau is [80, 196]
+    step, dur, n = 4.0, 80.0, 50
+    res = _synthetic_result([_accepted_over(k, k * step, k * step + dur) for k in range(n)])
+    # frac=1 on the raw density → exactly the flat top (smooth_s=0 keeps the trapezoid crisp)
+    lo, hi = metrics.steady_state_window(res, frac=1.0, dt=step, smooth_s=0.0)
+    assert lo > 0.0 and hi < (n - 1) * step + dur                  # both ramp tails trimmed
+    assert lo <= dur + step and hi >= (n - 1) * step - step        # recovers the plateau within dt
+
+
+def test_steady_state_window_falls_back_when_degenerate():
+    # no accepted flights → the whole horizon (steady == whole-run)
+    assert metrics.steady_state_window(_synthetic_result([], 1000.0)) == (0.0, 1000.0)
+    # accepted but with no geometry (no volumes/centerline) → empty density → whole horizon
+    ghost = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(1, 0, 0), 0.0), IntentStatus.ACCEPTED)
+    assert metrics.steady_state_window(_synthetic_result([ghost], 1000.0)) == (0.0, 1000.0)
+
+
+def test_density_grid_bounded_against_open_ended_volume():
+    # a hand-built accepted intent carrying an open-ended (t_end ~ 1e6) volume must not blow up the grid
+    from freespace_sim.geometry import box_from_segment
+    box = box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30)
+    ghost = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(60, 0, 0), 0.0), IntentStatus.ACCEPTED,
+                              volumes=[Volume4D(box, 0.0, 1e6)])
+    res = _synthetic_result([ghost], 1000.0)
+    t, _ = metrics.density_timeseries(res, dt=4.0)
+    assert t[-1] <= 4.0 * res.config.horizon_s + 4.0   # capped at ~4×horizon, not 1e6
+
+
+def test_windowed_aggregate_uses_window_duration_and_records_provenance():
+    res = run(SimConfig(planner="straight", lam_per_hour=200.0, horizon_s=1800.0, seed=3))
+    full = metrics.aggregate(res)
+    lo, hi = win = metrics.steady_state_window(res)
+    w = metrics.aggregate(res, window=win)
+    # provenance on the windowed view, absent on the full one
+    assert (w["window_lo"], w["window_hi"]) == (lo, hi)
+    assert "window_lo" not in full and "window_hi" not in full
+    # rate denominators divide by the WINDOW duration, not the horizon
+    dur_h = (hi - lo) / 3600.0
+    assert math.isclose(w["offered_load_per_h"], w["n_requests"] / dur_h, rel_tol=1e-9)
+    assert math.isclose(w["throughput_per_h"], w["n_accepted"] / dur_h, rel_tol=1e-9)
+    # airspace_utilization stays a valid fraction under the window
+    assert 0.0 <= w["airspace_utilization"] <= 1.0
+
+
+def test_window_drops_post_horizon_filed_flights():
+    # a return flight filed AFTER the horizon (t_request > H) is windowed out by filing-time membership —
+    # the principled replacement for the removed clip_returns_to_horizon demand hack
+    H = 600.0
+    reqs = [FlightRequest(0, vec(0, 0, 0), vec(1500, 0, 0), 10.0),
+            FlightRequest(1, vec(0, 0, 0), vec(1500, 0, 0), H + 300.0)]   # filed past the horizon
+    res = run(SimConfig(planner="straight", horizon_s=H, region_size_m=(2000.0, 2000.0)), requests=reqs)
+    assert len(metrics.flight_frame(res)) == 2                       # whole run keeps both
+    win = metrics.flight_frame(res, window=(0.0, H))
+    assert set(win["flight_id"]) == {0}                             # windowed set drops the late one
+
+
+def test_aggregate_with_steady_reports_both_views():
+    res = run(SimConfig(planner="straight", lam_per_hour=150.0, horizon_s=1800.0, seed=1))
+    agg = metrics.aggregate_with_steady(res)
+    assert "steady_state" in agg
+    st = agg["steady_state"]
+    assert "window_lo" in st and "window_hi" in st
+    # run-identity keys live only at the top level, not duplicated in the block
+    for k in ("lam_per_hour", "seed", "planner", "n_uss", "verified"):
+        assert k in agg and k not in st
+    # the top-level (whole-run) numbers are unchanged vs a plain aggregate
+    full = metrics.aggregate(res)
+    assert agg["mean_total_delay_s"] == full["mean_total_delay_s"]
+    assert agg["n_requests"] == full["n_requests"]

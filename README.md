@@ -158,6 +158,17 @@ straight), **total delay** (hold + loiter + detour-time, excluding the mandatory
 budget-vs-search-artifact split), throughput, and **airspace utilization** (reserved volume-seconds
 ÷ region × horizon — the free-space analog of the hex repo's occupancy).
 
+**Steady-state window.** A run's airborne density is a trapezoid — it ramps up from an empty sky,
+plateaus, then ramps down as the last flights (and post-horizon returns) land. Metrics over the whole
+run are diluted by the low-density ramps, so `metrics.steady_state_window(result)` finds the plateau
+(the widest interval where density ≥ `frac`×peak, `frac=0.9` default) and every surface reports both
+the whole-run number **and** its steady-state twin measured over that window: `summary.json` carries a
+nested `steady_state` block, `index.parquet` gains `steady_*` / `window_*` columns, and the `curve` /
+`compare` / `histograms` readouts overlay the two. `--window-frac` tunes the plateau threshold; the
+replay clips to the horizon by default (`--no-clip` keeps the return tail). This **supersedes** the
+removed `clip_returns_to_horizon` demand hack (issue #25): run the natural demand, but *measure* only
+the representative window instead of mutilating the flight set.
+
 ## Status
 
 - **Done:** 3D geometry + FCL conflict engine, all planners, FCFS sim, metrics, run capture,

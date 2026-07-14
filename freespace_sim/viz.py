@@ -149,21 +149,39 @@ def congestion_heatmap(result: SimResult, out=None, bins: int = 60):
 
 
 def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distribution",
-                    xlabel="total delay (s)", unit=" s", meanfmt=".0f"):
+                    xlabel="total delay (s)", unit=" s", meanfmt=".0f",
+                    overlay=None, labels=("all flights", "steady-state")):
     """Histogram of delay — how many flights suffered how much congestion lateness.
 
     ``xlabel``/``unit``/``meanfmt`` let the same plotter serve absolute seconds, the percent-of-trip
     flavour (see :func:`delay_pct_histogram`), and the unbounded trip-time-inflation ratio (see
     :func:`trip_ratio_histogram`). NaN (denied) flights are dropped.
+
+    Pass ``overlay`` (a second series) to draw the whole-run distribution and its steady-state-windowed
+    twin on shared bins — the leftward ramp-tail bias then reads off directly (issue #25). ``labels``
+    names the two series.
     """
     vals = np.asarray([v for v in values if v == v], float)  # drop NaN (denied) flights
     own = ax is None
     if own:
         _, ax = plt.subplots(figsize=(7, 4.5))
-    ax.hist(vals, bins=bins, color="#2563eb", edgecolor="white", linewidth=0.5)
-    mean = float(vals.mean()) if len(vals) else 0.0
-    ax.axvline(mean, color="#dc2626", linestyle="--", lw=1.2, label=f"mean = {mean:{meanfmt}}{unit}")
-    ax.set_title(f"{title}   (n={len(vals)})")
+    if overlay is None:
+        ax.hist(vals, bins=bins, color="#2563eb", edgecolor="white", linewidth=0.5)
+        mean = float(vals.mean()) if len(vals) else 0.0
+        ax.axvline(mean, color="#dc2626", linestyle="--", lw=1.2, label=f"mean = {mean:{meanfmt}}{unit}")
+        ax.set_title(f"{title}   (n={len(vals)})")
+    else:
+        ovals = np.asarray([v for v in overlay if v == v], float)
+        # shared bin edges so the two distributions are directly comparable
+        if np.isscalar(bins):
+            pool = np.concatenate([vals, ovals]) if len(vals) or len(ovals) else np.array([0.0, 1.0])
+            bins = np.histogram_bin_edges(pool, bins=bins)
+        for series, color, lab in ((vals, "#2563eb", labels[0]), (ovals, "#f59e0b", labels[1])):
+            m = float(series.mean()) if len(series) else 0.0
+            ax.hist(series, bins=bins, color=color, alpha=0.55, edgecolor="white", linewidth=0.5,
+                    label=f"{lab}  (n={len(series)}, mean {m:{meanfmt}}{unit})")
+            ax.axvline(m, color=color, linestyle="--", lw=1.2)
+        ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("flights")
     ax.legend()
@@ -213,19 +231,21 @@ def delay_histograms_by_lambda(per_flight_df, out=None, col="total_delay_s", xla
     return fig
 
 
-def delay_pct_histogram(values, out=None, title="Delay as % of flight time"):
-    """Histogram of delay as a percentage of total trip time (bounded [0, 100))."""
+def delay_pct_histogram(values, out=None, title="Delay as % of flight time", overlay=None):
+    """Histogram of delay as a percentage of total trip time (bounded [0, 100)). ``overlay`` draws the
+    steady-state-windowed twin alongside (see :func:`delay_histogram`)."""
     return delay_histogram(values, out=out, title=title, bins=np.linspace(0, 100, 21),
-                           xlabel="delay (% of flight time)", unit="%")
+                           xlabel="delay (% of flight time)", unit="%", overlay=overlay)
 
 
-def trip_ratio_histogram(values, out=None, title="Trip-time inflation"):
+def trip_ratio_histogram(values, out=None, title="Trip-time inflation", overlay=None):
     """Histogram of (straight-line flight time + delay) / straight-line flight time — the trip-time
     inflation factor. Unbounded (≥ 1): 1.0 = flew the ideal with no wait, 2.0 = took twice as long.
-    The unbounded complement of :func:`delay_pct_histogram` (auto-ranged so the tail is visible)."""
+    The unbounded complement of :func:`delay_pct_histogram` (auto-ranged so the tail is visible).
+    ``overlay`` draws the steady-state-windowed twin alongside."""
     return delay_histogram(values, out=out, title=title, bins=25,
                            xlabel="trip time ÷ straight-line time  (≥ 1, unbounded)", unit="×",
-                           meanfmt=".2f")
+                           meanfmt=".2f", overlay=overlay)
 
 
 def delay_pct_histograms_by_lambda(per_flight_df, out=None):

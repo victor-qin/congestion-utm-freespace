@@ -20,6 +20,20 @@ from .conflict import volumes_conflict
 from .volumes import Volume4D, permanent_terminal_reservation
 
 _STATIC_GRID_CELL_M = 1024.0   # coarse xy-cell edge for the always-active-wall spatial index (_StaticWallGrid)
+_DYNAMIC_GRID_CELL_M = 1024.0  # coarse xy-cell edge for the per-step committed-volume sub-index (commit/_candidate_indices)
+
+
+def _xy_cell_span(aabb, cell):
+    """The (cx, cy) xy-grid cells a flat AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)`` touches.
+
+    Shared by the always-active-wall grid (:class:`_StaticWallGrid`) and the per-step committed-volume xy
+    sub-index (:meth:`ReservationLedger.commit` / :meth:`ReservationLedger._candidate_indices`). Floor-division
+    so the slightly-negative coords a boundary corridor box can produce map to the correct (negative) cell — and
+    so a box is indexed in, and a query visits, EVERY cell its xy-AABB overlaps. That is the no-false-negative
+    property both indexes rely on: if two xy-AABBs overlap they cannot be cell-separated, so they share a cell."""
+    for cx in range(int(aabb[0] // cell), int(aabb[3] // cell) + 1):
+        for cy in range(int(aabb[1] // cell), int(aabb[4] // cell) + 1):
+            yield (cx, cy)
 
 
 class _StaticWallGrid:
@@ -41,10 +55,7 @@ class _StaticWallGrid:
         self._cells: dict[tuple[int, int], list[int]] = {}
 
     def _span(self, aabb):        # (xmin,ymin,zmin,xmax,ymax,zmax) → the xy-cells the box touches
-        c = self._cell
-        for cx in range(int(aabb[0] // c), int(aabb[3] // c) + 1):
-            for cy in range(int(aabb[1] // c), int(aabb[4] // c) + 1):
-                yield (cx, cy)
+        yield from _xy_cell_span(aabb, self._cell)
 
     def insert(self, idx: int, aabb) -> None:
         for key in self._span(aabb):
@@ -69,7 +80,10 @@ class ReservationLedger:
         self._vols: list[Volume4D] = []
         self._fids: list[int] = []
         self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
-        self._buckets: dict[int, list[int]] = {}
+        # committed-volume index keyed by (step, cell_x, cell_y): a TIME bucket (discrete step) CROSSED with an
+        # xy SPATIAL sub-index, so a query scans only volumes sharing its timestep AND near its xy — not every
+        # volume metro-wide that merely shares the step (issue #30). See commit / _candidate_indices.
+        self._buckets: dict[tuple[int, int, int], list[int]] = {}
         self._observers: list = []   # commit subscribers (publish hook); see subscribe()
         # Always-active terminal walls (cfg.terminal_airspace_always_active): PERMANENT, whole-horizon
         # reservations filed once at sim setup. Kept OUT of the per-step _buckets (time-invariant — bucketing
@@ -118,10 +132,15 @@ class ReservationLedger:
         s1 = int(np.floor(vol.t_end / self.cfg.dt_s))
         return range(s0, s1 + 1)
 
-    def _candidate_indices(self, vol: Volume4D) -> set[int]:
+    def _candidate_indices(self, vol: Volume4D, vbb: tuple[float, ...]) -> set[int]:
+        """Committed volumes sharing BOTH a timestep and an xy-cell with the query box ``vol`` (flat AABB
+        ``vbb``). A superset of the true 3D overlaps — a real conflict needs xy-AABB overlap AND time overlap,
+        so it must share a (step, cell) key — which ``_aabb_miss`` + ``volumes_conflict`` then filter exactly."""
         seen: set[int] = set()
+        cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))
         for s in self._steps(vol):
-            seen.update(self._buckets.get(s, ()))
+            for key in cells:                # same FULL cross product as commit (a diagonal would miss conflicts)
+                seen.update(self._buckets.get((s, *key), ()))
         return seen
 
     @staticmethod
@@ -151,9 +170,12 @@ class ReservationLedger:
             idx = len(self._vols)
             self._vols.append(v)
             self._fids.append(flight_id)
-            self._aabb.append(self._flat_aabb(v))
+            vbb = self._flat_aabb(v)
+            self._aabb.append(vbb)
+            cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))   # xy-cells this box touches (enumerate once)
             for s in self._steps(v):
-                self._buckets.setdefault(s, []).append(idx)
+                for key in cells:            # FULL cross product steps × cells — a diagonal pairing would miss conflicts
+                    self._buckets.setdefault((s, *key), []).append(idx)
         for cb in self._observers:           # publish hook: notify subscribers of the new volumes
             cb(flight_id, volumes)
 
@@ -172,7 +194,7 @@ class ReservationLedger:
         out: list[tuple[int, Volume4D]] = []
         for v in volumes:
             vbb = self._flat_aabb(v)
-            for idx in self._candidate_indices(v):
+            for idx in self._candidate_indices(v, vbb):
                 if self._aabb_miss(vbb, self._aabb[idx]):
                     continue
                 cv = self._vols[idx]
@@ -191,7 +213,7 @@ class ReservationLedger:
         — conflicts (planner hot path)."""
         for v in volumes:
             vbb = self._flat_aabb(v)
-            for idx in self._candidate_indices(v):
+            for idx in self._candidate_indices(v, vbb):
                 if self._aabb_miss(vbb, self._aabb[idx]):
                     continue
                 if volumes_conflict(v, self._vols[idx]):

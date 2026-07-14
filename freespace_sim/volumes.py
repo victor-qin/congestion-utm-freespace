@@ -130,19 +130,27 @@ def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool
     Used to tag EVERY near-hub box that reaches into a flight's own column — not just box[0]/box[-1].
     The count of such boxes is geometry-dependent (radius × exit angle), so a fixed "tag the first N"
     rule is unsound (e.g. a 500 m column can need boxes [1] and [2] tagged); this geometric test scales.
-    Far cruise boxes stay untagged, so foreign/same-hub overflight still deconflicts."""
-    a2 = np.asarray(a, float)[:2]
-    b2 = np.asarray(b, float)[:2]
-    c2 = np.asarray(center, float)[:2]
-    seg = b2 - a2
-    L = float(np.linalg.norm(seg))
-    u = seg / L if L > 1e-9 else np.array([1.0, 0.0])
+    Far cruise boxes stay untagged, so foreign/same-hub overflight still deconflicts.
+
+    The xy point-to-segment distance is computed with scalars (norm via ``math.sqrt``, dot as a scalar sum)
+    — bit-for-bit identical to the numpy form but without its per-call ufunc dispatch, since this runs once
+    per corridor sub-box during every rebuild (issue #30 lever #8; same idiom as ``geometry.segment_frame``
+    and ``astar.h_air``). See ``tests/test_volumes.py`` for the frozen-numpy byte-identity oracle."""
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    cx, cy = float(center[0]), float(center[1])
+    segx, segy = bx - ax, by - ay
+    length = math.sqrt(segx * segx + segy * segy)         # == np.linalg.norm(seg) on the xy pair
+    ux, uy = (segx / length, segy / length) if length > 1e-9 else (1.0, 0.0)
     ext = cfg.corridor_width_m / 2.0
-    p0, p1 = a2 - u * ext, b2 + u * ext              # box centerline incl. longitudinal extension
-    ab = p1 - p0
-    t = float(np.clip((c2 - p0).dot(ab) / max(ab.dot(ab), 1e-12), 0.0, 1.0))
-    d = float(np.linalg.norm(c2 - (p0 + t * ab)))    # distance center → extended centerline
-    return d < radius + cfg.corridor_width_m / 2.0   # + box half-width
+    p0x, p0y = ax - ux * ext, ay - uy * ext               # box centerline incl. longitudinal extension
+    p1x, p1y = bx + ux * ext, by + uy * ext
+    abx, aby = p1x - p0x, p1y - p0y
+    t = ((cx - p0x) * abx + (cy - p0y) * aby) / max(abx * abx + aby * aby, 1e-12)
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t         # == np.clip(t, 0.0, 1.0)
+    dx, dy = cx - (p0x + t * abx), cy - (p0y + t * aby)
+    d = math.sqrt(dx * dx + dy * dy)                      # distance center → extended centerline
+    return d < radius + cfg.corridor_width_m / 2.0        # + box half-width
 
 
 def build_reservation_from_corners(

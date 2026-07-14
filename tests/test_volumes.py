@@ -5,6 +5,7 @@ from freespace_sim.conflict import volumes_conflict
 from freespace_sim.types import vec
 from freespace_sim.volumes import (
     Volume4D, build_corridor, build_reservation_from_corners, corridor_segment_volume, hover_reservation,
+    segment_overlaps_column,
 )
 
 CFG = SimConfig()
@@ -122,3 +123,56 @@ def test_climb_box_does_not_conflict_with_the_level_above():
     cruise = corridor_segment_volume(vec(440, 0, CFG.level_z(2)), 0.0,
                                      vec(560, 0, CFG.level_z(2)), 2 * CFG.dt_s, CFG)  # level 2 over (500,0)
     assert not volumes_conflict(climb, cruise)
+
+
+# ---------------- byte-identity of the scalarized hub-tagging test (issue #30 lever #8) ----------------
+# segment_overlaps_column was rewritten from numpy (np.linalg.norm / .dot / np.clip) to plain scalars to
+# shed numpy's per-call ufunc dispatch. Its boolean output must be identical to the original numpy code; the
+# oracle below is a VERBATIM frozen copy of the pre-change body — DO NOT EDIT (byte-identity reference only).
+
+
+def _segment_overlaps_column_numpy_original(a, b, center, radius, cfg):
+    a2 = np.asarray(a, float)[:2]
+    b2 = np.asarray(b, float)[:2]
+    c2 = np.asarray(center, float)[:2]
+    seg = b2 - a2
+    L = float(np.linalg.norm(seg))
+    u = seg / L if L > 1e-9 else np.array([1.0, 0.0])
+    ext = cfg.corridor_width_m / 2.0
+    p0, p1 = a2 - u * ext, b2 + u * ext
+    ab = p1 - p0
+    t = float(np.clip((c2 - p0).dot(ab) / max(ab.dot(ab), 1e-12), 0.0, 1.0))
+    d = float(np.linalg.norm(c2 - (p0 + t * ab)))
+    return d < radius + cfg.corridor_width_m / 2.0
+
+
+def test_segment_overlaps_column_byte_identical_to_original_numpy():
+    """The scalarized segment_overlaps_column returns the SAME boolean as the frozen numpy original — over
+    random, degenerate (zero-length), near-threshold, and real corridor geometry. The underlying distance is
+    bit-exact (verified separately), so the `<` decision cannot flip."""
+    import random
+    rng = random.Random(0)
+
+    def check(a, b, center, radius):
+        got = segment_overlaps_column(a, b, center, radius, CFG)
+        exp = _segment_overlaps_column_numpy_original(a, b, center, radius, CFG)
+        assert got == exp, f"overlap {got} != {exp} for a={a} b={b} c={center} r={radius}"
+
+    for _ in range(5000):                                  # random, varied magnitude (incl. negative coords)
+        scale = 10 ** rng.uniform(-1, 4)
+        a = [rng.uniform(-1, 1) * scale for _ in range(3)]
+        b = [rng.uniform(-1, 1) * scale for _ in range(3)]
+        center = [rng.uniform(-1, 1) * scale for _ in range(2)]
+        check(a, b, center, rng.uniform(0, 200))
+
+    check([5, 5, 0], [5, 5, 0], [5, 10, 0], 3.0)           # zero-length segment → the length<1e-9 branch
+    thresh = 90.0 + CFG.corridor_width_m / 2.0              # exact overlap boundary for a level segment
+    for off in (0.0, -1e-6, 1e-6, -5.0, 5.0):              # straddle the `d < radius + width/2` threshold
+        check([0, 0, 0], [100, 0, 0], [50, thresh + off, 0], 90.0)
+
+    # real geometry: the hub-tagging calls build_reservation_from_corners actually makes near a hub column
+    corners = [vec(0, 0, 30), vec(1200, 300, 70), vec(2400, -200, 110)]
+    for a, b in zip(corners, corners[1:]):
+        for r in (90.0, 180.0):
+            check(a, b, np.asarray(corners[0], float)[:2], r)
+            check(a, b, np.asarray(corners[-1], float)[:2], r)

@@ -27,7 +27,6 @@ from collections import defaultdict
 import numpy as np
 
 from freespace_sim import ledger as ledger_mod
-from freespace_sim import volumes as volumes_mod
 from freespace_sim.dss import DSS
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism

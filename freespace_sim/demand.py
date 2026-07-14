@@ -19,7 +19,7 @@ import numpy as np
 
 from .config import SimConfig
 from .planner.hexgrid import SQRT3, circumradius, enu_to_axial, terminal_cells
-from .volumes import exit_radius
+from .volumes import exit_radius, terminal_radius
 from .types import FlightRequest, Terminal, vec
 
 
@@ -321,11 +321,18 @@ class HubRadiusDemand:
             terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id),
                                 self._terminal_radius_for(uss_id), self.corridor_overlap_m)
             radius = self._radius_for(uss_id)
+            # Keep customers clear of the hub's own always-active WALL. A customer within
+            # (terminal_radius + hover_radius) of its serving hub has its landing/takeoff column overlap
+            # the wall — and that column is UNTAGGED (a customer, not the hub), so it is not exempt from the
+            # wall (conflict.volumes_conflict) → a spurious conflict_filed that denies the delivery+return.
+            # Require the customer ≥ 1.5× the hub's terminal (wall) radius away (and never below the existing
+            # min_od_separation_m floor), which clears the wall+column overlap for every hub size.
+            min_r = max(self.min_od_separation_m, 1.5 * terminal_radius(terminal, cfg))
             customer = None
-            for _ in range(20):  # redraw until in-region and a non-trivial hop from the hub
+            for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint
                 c = _sample_in_disk(hub, radius, rng)
                 if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
-                        np.linalg.norm(c - hub) >= self.min_od_separation_m:
+                        np.linalg.norm(c - hub) >= min_r:
                     customer = c
                     break
             if customer is None:

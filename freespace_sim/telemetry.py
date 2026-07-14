@@ -13,10 +13,10 @@ is byte-identical):
 
 Per-hub **dwell occupancy** is NOT here — it is recoverable post-hoc from `reservations.parquet` (the
 ledger is append-only; committed columns are persisted), so :func:`terminal_frame` sweep-lines them.
-**Gate attribution** (pad/air/lane) and **kernel byte-exactness parity** are deferred follow-ups (see
-`experiments/TELEMETRY_DESIGN.md` §3b.2 / §9) — not emitted here, and not carried as empty columns.
+**Gate attribution** (pad/air/lane) and **kernel byte-exactness parity** (tracked in issue #35) are
+deferred follow-ups — not emitted here, and not carried as empty columns.
 
-See :func:`freespace_sim.runs.save_run` for persistence and `TELEMETRY_DESIGN.md` for the full design.
+See :func:`freespace_sim.runs.save_run` for how these streams are persisted.
 """
 
 from __future__ import annotations

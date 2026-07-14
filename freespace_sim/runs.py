@@ -176,7 +176,10 @@ def save_run(
     """Write the full self-contained run folder and return its path.
 
     Captures config/env/git, the experiment identity + args, the scenario, the flown trajectories,
-    the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML.
+    the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML. Everything
+    is parquet + json — deliberately NOT pickle: portable, inspectable, safe to sync to the run store,
+    and Python-version-independent. The analytical geometry stored in reservations/ledger_end is enough
+    to rebuild every ``Volume4D`` on load (see :func:`load_run` / :func:`_volume_from_row`).
 
     ``summary.json`` carries the whole-run headline numbers **and** their steady-state twin (metrics
     over the representative density plateau — issue #25) in a nested ``steady_state`` block; ``window_frac``

@@ -1,3 +1,5 @@
+import logging
+
 from freespace_sim.config import SimConfig
 from freespace_sim.sim import run
 from freespace_sim.types import FlightRequest, vec
@@ -66,8 +68,6 @@ def test_milestone_recordings_at_horizon_marks(caplog):
     # stretch makes one flight carry every mark it jumped over (one line per mark). horizon=100 →
     # marks at 5,10,…,100. Flights at t=0 (before any mark), t=7 (carries @5%), t=52 (carries
     # @10%…@50%, nine marks). Marks @55%+ never fire — no flight files after them.
-    import logging
-
     caplog.set_level(logging.INFO, logger="freespace_sim.sim")
     cfg = SimConfig(planner="straight", horizon_s=100.0)
     run(cfg, requests=[
@@ -86,7 +86,6 @@ def test_milestone_recordings_at_horizon_marks(caplog):
 def test_milestone_every_n_planned_flights(caplog):
     # the flight-count cadence, exercised directly with every_n=2 (1000 needs a huge run): lines at
     # done=2 and done=4 carrying the triggering flight + running acc/den; huge horizon → no recordings.
-    import logging
     from types import SimpleNamespace
 
     from freespace_sim.sim import _MilestoneLog
@@ -103,6 +102,28 @@ def test_milestone_every_n_planned_flights(caplog):
     assert lines[0].startswith("planned 2/5: flight=1 sim_t=2.0s") and "acc=1 den=1" in lines[0]
     assert lines[1].startswith("planned 4/5: flight=3 sim_t=4.0s") and "acc=3 den=1" in lines[1]
     assert not [m for m in caplog.messages if m.startswith("recording @")]
+
+
+def test_milestone_mark_hit_exactly_is_carried_by_that_flight(caplog):
+    # a flight filing EXACTLY on a horizon mark carries that mark. Guards the mark arithmetic:
+    # horizon*0.05*k overshoots the true fraction for many (horizon, k) pairs (1.0*0.05*3 =
+    # 0.15000000000000002), which silently deferred the mark past an exactly-on-time flight;
+    # marks are now horizon*k/n_marks, exact for round times. h=1 → flight at t=0.15 crosses
+    # @5%, @10% and — exactly — @15%.
+    from types import SimpleNamespace
+
+    from freespace_sim.sim import _MilestoneLog
+    from freespace_sim.types import IntentStatus
+
+    caplog.set_level(logging.INFO, logger="freespace_sim.sim")
+    ml = _MilestoneLog(total=1, horizon_s=1.0)
+    ml(1, FlightRequest(0, vec(0, 0, 0), vec(100, 0, 0), 0.15),
+       SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED))
+    recs = [m for m in caplog.messages if m.startswith("recording @")]
+    assert [m.split(":")[0] for m in recs] == [
+        "recording @5% horizon (mark 0s)", "recording @10% horizon (mark 0s)",
+        "recording @15% horizon (mark 0s)"]                    # @15% NOT deferred past t=0.15
+    assert all("flight=0" in m for m in recs)
 
 
 def test_lazy_planner_demand_run_is_verified():

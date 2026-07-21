@@ -28,6 +28,8 @@ from .telemetry import TelemetryCollector, build_terminal_snapshot
 from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
 from .uss import USS
 
+log = logging.getLogger(__name__)
+
 # Called after each flight is planned: (done, total, latest_intent). Return value ignored.
 ProgressCallback = Callable[[int, int, OperationalIntent], None]
 
@@ -76,9 +78,6 @@ def _resolve_progress(progress, total: int) -> ProgressCallback | None:
     return progress
 
 
-log = logging.getLogger(__name__)
-
-
 class _MilestoneLog:
     """Discrete INFO status milestones through a run — independent of the live ``progress`` ticker.
 
@@ -99,8 +98,11 @@ class _MilestoneLog:
         self.acc = 0
         self.den = 0
         n_marks = max(1, round(1.0 / every_frac))
-        self.marks = [horizon_s * every_frac * k for k in range(1, n_marks + 1)]
-        self.pcts = [round(100.0 * every_frac * k) for k in range(1, n_marks + 1)]
+        # k/n_marks division, NOT horizon*every_frac*k: 0.05 is not float-representable and the
+        # product overshoots the true fraction for ~a third of (horizon, k) pairs (1.0*0.05*3 =
+        # 0.15000000000000002), silently deferring a mark past a flight that files EXACTLY on it.
+        self.marks = [horizon_s * k / n_marks for k in range(1, n_marks + 1)]
+        self.pcts = [round(100.0 * k / n_marks) for k in range(1, n_marks + 1)]
         self.mi = 0                                     # next un-recorded horizon mark
 
     def __call__(self, done: int, req: FlightRequest, intent: OperationalIntent) -> None:
@@ -211,7 +213,10 @@ def run(
 
     ``progress`` gives live feedback through long runs: ``True`` prints a throttled status line
     (done/total, accepted/denied, elapsed, ETA); a callable is invoked as ``progress(done, total,
-    intent)`` after each flight; ``None``/``False`` (default) stays silent.
+    intent)`` after each flight; ``None``/``False`` (default) stays silent. Independent of it,
+    :class:`_MilestoneLog` emits INFO status milestones (every 1000 planned flights + each 5% of the
+    horizon) via ``logging`` — visible when the host configures logging (``experiments.run`` does),
+    silent otherwise.
 
     ``telemetry`` (default off → byte-identical to today) attaches an observer-only
     :class:`~freespace_sim.telemetry.TelemetryCollector` capturing the non-recoverable congestion streams

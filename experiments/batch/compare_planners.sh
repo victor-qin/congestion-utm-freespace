@@ -10,11 +10,14 @@ SUFFIX="${1:-run}"
 SCENARIO="${2:-metro_2uss}"
 TAG="cmp_${SUFFIX}"
 PLANNERS=(straight lazy astar astar_shortcut)
+LAM=240
+HORIZON=900
+SEED=0
 
-echo "EXECUTE planner comparison tag=$TAG scenario=$SCENARIO"
+echo "EXECUTE planner comparison tag=$TAG scenario=$SCENARIO planners=[${PLANNERS[*]}] lam=$LAM horizon=${HORIZON}s seed=$SEED"
 for P in "${PLANNERS[@]}"; do
   uv run python -m experiments.run --scenario "$SCENARIO" --planner "$P" \
-    --lam 240 --horizon 900 --seed 0 --tag "$TAG" --no-progress >/dev/null
+    --lam "$LAM" --horizon "$HORIZON" --seed "$SEED" --tag "$TAG" --no-progress >/dev/null
 done
 
 echo "READ OUT comparison table (no re-sim, from the index)"

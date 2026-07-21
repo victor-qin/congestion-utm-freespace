@@ -20,6 +20,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+import sys
 import warnings
 from collections import Counter
 from dataclasses import replace
@@ -139,6 +140,23 @@ def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, des
     return _fold_path(wps, origin, dest, origin_term, dest_term, cfg)[-1][1]
 
 
+_kernel_fallback_warned = False
+
+
+def _warn_kernel_fallback() -> None:
+    """One stderr line, once per process, when the compiled kernel was REQUESTED but numba won't
+    import. The fallback is byte-exact so nothing downstream ever notices — which is exactly how a
+    ~5-7× slowdown stayed invisible across whole sweeps (issue #30). Explicit ``compiled=False``
+    (the ``astar_ref`` oracle) is a request for the reference and does not warn."""
+    global _kernel_fallback_warned
+    if _kernel_fallback_warned:
+        return
+    _kernel_fallback_warned = True
+    print("WARNING: compiled A* kernel unavailable (numba import failed) — using the pure-Python "
+          "reference search, ~5-7x slower. Results are identical. Fix: run via plain `uv run` "
+          "(numba is in tool.uv default-groups) or `uv sync`.", file=sys.stderr)
+
+
 class AStarPlanner:
     def __init__(self, max_expansions: int = 900_000, vertical_edges: bool = True,
                  compiled: bool = True):
@@ -166,6 +184,7 @@ class AStarPlanner:
                 self._kernel = _search
             except ImportError:
                 self.compiled = False                   # numba absent → pure-Python everywhere
+                _warn_kernel_fallback()
         self._cocc = None                               # CompiledHexOccupancy (per ledger)
         self._cocc_ledger: ReservationLedger | None = None
         self._gen = 0                                   # version stamp for the reused kernel state

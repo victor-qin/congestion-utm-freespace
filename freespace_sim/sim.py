@@ -8,6 +8,7 @@ execution is perfect conformance, so there is no separate tactical step — the 
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -26,6 +27,8 @@ from .scenario import Scenario, scenario_from_requests
 from .telemetry import TelemetryCollector, build_terminal_snapshot
 from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
 from .uss import USS
+
+log = logging.getLogger(__name__)
 
 # Called after each flight is planned: (done, total, latest_intent). Return value ignored.
 ProgressCallback = Callable[[int, int, OperationalIntent], None]
@@ -73,6 +76,50 @@ def _resolve_progress(progress, total: int) -> ProgressCallback | None:
     if progress is True:
         return ConsoleProgress(total)
     return progress
+
+
+class _MilestoneLog:
+    """Discrete INFO status milestones through a run — independent of the live ``progress`` ticker.
+
+    Two cadences, both observer-only (results are byte-identical):
+      • every ``every_n`` planned flights (accepted or denied), and
+      • a "recording" at each ``every_frac`` of the horizon, carried by the first flight filing AT or
+        after the mark — events are FCFS-sorted by ``t_request`` so a single advancing cursor suffices,
+        and a sparse stretch makes one flight carry several consecutive marks (one line each).
+    Each line reports the flight id, the sim time it appears (``t_request``), elapsed wall clock, and
+    running planned/accepted/denied counts. Emitted at INFO via ``logging``: ``experiments.run``
+    configures INFO→stderr so every batch-script run shows them; bare library/test use has no handler
+    and stays silent (the level check short-circuits, so the quiet path costs nothing)."""
+
+    def __init__(self, total: int, horizon_s: float, every_n: int = 1000, every_frac: float = 0.05):
+        self.total = total
+        self.every_n = every_n
+        self.t0 = time.monotonic()
+        self.acc = 0
+        self.den = 0
+        n_marks = max(1, round(1.0 / every_frac))
+        # k/n_marks division, NOT horizon*every_frac*k: 0.05 is not float-representable and the
+        # product overshoots the true fraction for ~a third of (horizon, k) pairs (1.0*0.05*3 =
+        # 0.15000000000000002), silently deferring a mark past a flight that files EXACTLY on it.
+        self.marks = [horizon_s * k / n_marks for k in range(1, n_marks + 1)]
+        self.pcts = [round(100.0 * k / n_marks) for k in range(1, n_marks + 1)]
+        self.mi = 0                                     # next un-recorded horizon mark
+
+    def __call__(self, done: int, req: FlightRequest, intent: OperationalIntent) -> None:
+        if intent.accepted:
+            self.acc += 1
+        elif intent.status is IntentStatus.REJECTED:
+            self.den += 1
+        wall = time.monotonic() - self.t0
+        while self.mi < len(self.marks) and req.t_request >= self.marks[self.mi]:
+            log.info("recording @%d%% horizon (mark %.0fs): flight=%d sim_t=%.1fs wall=%.1fs "
+                     "planned=%d/%d acc=%d den=%d",
+                     self.pcts[self.mi], self.marks[self.mi], req.flight_id, req.t_request, wall,
+                     done, self.total, self.acc, self.den)
+            self.mi += 1
+        if done % self.every_n == 0:
+            log.info("planned %d/%d: flight=%d sim_t=%.1fs wall=%.1fs acc=%d den=%d",
+                     done, self.total, req.flight_id, req.t_request, wall, self.acc, self.den)
 
 
 @dataclass
@@ -166,7 +213,10 @@ def run(
 
     ``progress`` gives live feedback through long runs: ``True`` prints a throttled status line
     (done/total, accepted/denied, elapsed, ETA); a callable is invoked as ``progress(done, total,
-    intent)`` after each flight; ``None``/``False`` (default) stays silent.
+    intent)`` after each flight; ``None``/``False`` (default) stays silent. Independent of it,
+    :class:`_MilestoneLog` emits INFO status milestones (every 1000 planned flights + each 5% of the
+    horizon) via ``logging`` — visible when the host configures logging (``experiments.run`` does),
+    silent otherwise.
 
     ``telemetry`` (default off → byte-identical to today) attaches an observer-only
     :class:`~freespace_sim.telemetry.TelemetryCollector` capturing the non-recoverable congestion streams
@@ -238,11 +288,13 @@ def run(
 
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
+    status = _MilestoneLog(total, cfg.horizon_s)        # INFO milestones; silent without a log handler
     intents: list[OperationalIntent] = []
     for done, ev in enumerate(scenario.events, 1):
         uss = usses.get(ev.request.uss_id, default_uss)
         intent = uss.handle_request(ev.request)
         intents.append(intent)
+        status(done, ev.request, intent)
         if report:
             report(done, total, intent)
 

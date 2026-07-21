@@ -19,12 +19,31 @@ readouts can filter to exactly the runs a batch produced.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 
 from freespace_sim import runs
 from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
 from freespace_sim.sim import run
+
+log = logging.getLogger("experiments.run")
+
+
+def _kernel_status(planner_name: str) -> str:
+    """One-line compiled-kernel status for the startup INFO block. Mirrors AStarPlanner's own import
+    probe; the module lands in ``sys.modules`` so the sim's later import is free. Only the astar
+    family has a kernel — anything else reports n/a rather than paying the numba import."""
+    if "astar" not in planner_name:
+        return "n/a (planner has no compiled kernel)"
+    if planner_name == "astar_ref":
+        return "pure-Python reference (explicitly requested via astar_ref)"
+    try:
+        from freespace_sim.planner import astar_kernel  # noqa: F401
+        return "compiled (numba kernel active)"
+    except ImportError:
+        return ("REFERENCE FALLBACK — numba unavailable, ~5-7x slower search. "
+                "Run via plain `uv run` (numba is in tool.uv default-groups) or `uv sync`.")
 
 
 def spec_from_args(args):
@@ -112,9 +131,12 @@ def main() -> None:
     demand = spec.demand_model()
     tag = args.tag or spec.name
     # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
-    print(f"scenario={spec.name} tag={tag} planner={cfg.planner} demand={spec.demand.pattern} "
-          f"region={cfg.region_size_m} λ={cfg.lam_per_hour}/h horizon={cfg.horizon_s}s seed={cfg.seed}",
-          file=sys.stderr)
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
+    log.info("invocation: python -m experiments.run %s", " ".join(sys.argv[1:]) or "(no arguments)")
+    log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h horizon=%ss seed=%s",
+             spec.name, tag, cfg.planner, spec.demand.pattern, cfg.region_size_m,
+             cfg.lam_per_hour, cfg.horizon_s, cfg.seed)
+    log.info("A* kernel: %s", _kernel_status(cfg.planner))
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry)
@@ -127,16 +149,16 @@ def main() -> None:
         window_frac=args.window_frac,
     )
     s = res.summary()
-    print(f"  n={s['n_requests']} acc={s['n_accepted']} den={s['n_denied']} "
-          f"verified={res.verified} ({wall:.1f}s) → {folder}", file=sys.stderr)
+    log.info("n=%s acc=%s den=%s verified=%s (%.1fs) → %s",
+             s["n_requests"], s["n_accepted"], s["n_denied"], res.verified, wall, folder)
     # the steady-state twin vs the whole-run number (read back from the summary save_run just wrote,
     # so it's the exact persisted value — no recompute). window == full horizon when no plateau exists.
     import json
     summ = json.loads((folder / "summary.json").read_text())
     st = summ.get("steady_state", {})
-    print(f"  steady window [{st.get('window_lo', 0):.0f},{st.get('window_hi', 0):.0f}]s · mean delay "
-          f"{st.get('mean_total_delay_s', 0):.1f}s (whole-run {summ.get('mean_total_delay_s', 0):.1f}s)",
-          file=sys.stderr)
+    log.info("steady window [%.0f,%.0f]s · mean delay %.1fs (whole-run %.1fs)",
+             st.get("window_lo", 0), st.get("window_hi", 0),
+             st.get("mean_total_delay_s", 0), summ.get("mean_total_delay_s", 0))
     print(folder)   # LAST stdout line: the run folder, for `FOLDER=$(... | tail -1)`
 
 

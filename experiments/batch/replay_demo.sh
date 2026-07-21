@@ -12,6 +12,7 @@ PLANNER="${2:-astar}"     # astar (not astar_shortcut): refiners are incompatibl
 LAMBDA="${3:-34500}"
 HORIZON="${4:-1800}"
 
+echo "EXECUTE demo scenario=$SCENARIO planner=$PLANNER lam=$LAMBDA horizon=${HORIZON}s tag=demo"
 FOLDER=$(uv run python -m experiments.run --scenario "$SCENARIO" --planner "$PLANNER" \
   --lam "$LAMBDA" --horizon "$HORIZON" --tag demo --no-progress | tail -1)
 echo "EXECUTE → $FOLDER"

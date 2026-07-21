@@ -274,6 +274,11 @@ dev = [
     { name = "ruff" },
 ]
 
+[package.dev-dependencies]
+compiled = [
+    { name = "numba" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "casadi", specifier = ">=3.7.2" },
@@ -292,6 +297,9 @@ requires-dist = [
     { name = "trimesh", specifier = ">=4.0" },
 ]
 provides-extras = ["dev", "cloud", "compiled"]
+
+[package.metadata.requires-dev]
+compiled = [{ name = "numba", specifier = ">=0.59" }]
 
 [[package]]
 name = "fsspec"

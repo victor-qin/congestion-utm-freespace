@@ -19,7 +19,7 @@ SEEDS=(0 1)
 
 SWEEP="results/sweeps/${TAG}"   # shell owns multiplicity; per-run histograms collect here
 
-echo "EXECUTE sweep tag=$TAG scenario=$SCENARIO planner=$PLANNER horizon=${HORIZON}s"
+echo "EXECUTE sweep tag=$TAG scenario=$SCENARIO planner=$PLANNER horizon=${HORIZON}s lams=[${LAMS[*]}] seeds=[${SEEDS[*]}]"
 for L in "${LAMS[@]}"; do
   for S in "${SEEDS[@]}"; do
     # capture each run's folder off stdout, then feed it to the per-run histograms readout

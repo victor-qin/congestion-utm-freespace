@@ -21,6 +21,17 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 cloud = ["huggingface_hub>=0.20"]   # optional: push/pull run folders to a HF Hub dataset repo
 compiled = ["numba>=0.59"]          # optional: numba JIT for the compiled A* air-search kernel (astar_kernel)
 
+[dependency-groups]
+# Mirrors the `compiled` extra (keep the pin in sync). Listed in tool.uv.default-groups so EVERY
+# plain `uv run` / `uv sync` installs numba: the kernel is byte-exact and ~5-7× the reference search,
+# so there is no reason to run without it — and forgetting `--extra compiled` used to silently fall
+# back to the slow pure-Python A* (issue #30). `--extra compiled` still works for old invocations.
+# Opt out (e.g. to exercise the reference fallback deliberately) with `uv run --no-default-groups`.
+compiled = ["numba>=0.59"]
+
+[tool.uv]
+default-groups = ["compiled"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

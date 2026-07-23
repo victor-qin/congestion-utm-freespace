@@ -11,8 +11,8 @@ takeoff/landing *edge* exists at a candidate time:
     it returns True iff a FOREIGN volume intrudes).
 
 Unlike :class:`~freespace_sim.planner.occupancy.HexOccupancyService` this holds **no hex state** —
-capacity is 1-D in time, not 3-D in cells — so it is the one authority every planner (A* today;
-MILP next, #36) can consult at plan time. The column radius is a **per-hub constant** (asserted on
+capacity is 1-D in time, not 3-D in cells — so it is the one authority every planner (A* and the
+MILP family) can consult at plan time. The column radius is a **per-hub constant** (asserted on
 record).
 
 There is deliberately **no "already-deployed → skip the ledger" shortcut**. It looks safe (a sibling's

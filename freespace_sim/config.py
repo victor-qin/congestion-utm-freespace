@@ -16,12 +16,14 @@ class SimConfig:
     # --- dimensionality & altitude (full 3D, regulated band [ground_level_m, airspace_ceiling_m]) ---
     dims: int = 3
     ground_level_m: float = 0.0
-    cruise_level_m: float = 75.0       # single-plane planners' cruise altitude (MILP/straight)
-    # Continuous-optimizer band (MILP). Collapsed to the single cruise level so those planners stay
-    # on one plane. A* instead deconflicts by altitude on the DISCRETE ``flight_levels_m`` ladder below;
-    # widening this band (z_min_m < z_max_m) to give the MILP multi-altitude too is a follow-up.
-    z_min_m: float = 75.0
-    z_max_m: float = 75.0
+    cruise_level_m: float = 75.0       # single-plane planners' cruise altitude (straight/decoupled)
+    # Continuous-optimizer cruise band (MILP): the solver's ``pz`` knots live anywhere in
+    # [z_min_m, z_max_m], so altitude is a deconfliction lever (defaults = the A* ladder's floor/top).
+    # A* instead deconflicts on the DISCRETE ``flight_levels_m`` ladder below; ``straight``/``decoupled``
+    # stay pinned to the single ``cruise_level_m`` plane. Collapse the band (z_min == z_max) to recover
+    # the legacy single-plane MILP.
+    z_min_m: float = 30.0
+    z_max_m: float = 110.0
     # Regulated airspace ceiling: every hover/terminal column spans [ground_level_m, airspace_ceiling_m].
     airspace_ceiling_m: float = 125.0
     # A*'s discrete cruise levels. Strictly ascending; adjacent gaps must EXCEED corridor_height_m (so
@@ -166,3 +168,7 @@ class SimConfig:
             raise ValueError(
                 f"cruise_level_m {self.cruise_level_m} outside "
                 f"[{self.ground_level_m}, {self.airspace_ceiling_m}]")
+        if not (self.ground_level_m <= self.z_min_m <= self.z_max_m <= self.airspace_ceiling_m):
+            raise ValueError(
+                f"continuous cruise band [z_min_m, z_max_m] = [{self.z_min_m}, {self.z_max_m}] must "
+                f"be ordered and inside [{self.ground_level_m}, {self.airspace_ceiling_m}]")

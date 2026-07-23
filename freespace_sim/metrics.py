@@ -194,15 +194,19 @@ def _straight_horizontal_m(intent: OperationalIntent) -> float:
 
 def _unimpeded_cruise_z(cfg: SimConfig) -> float:
     """The altitude the run's planner cruises at when UNIMPEDED. The A* family deconflicts by altitude on
-    the discrete ladder, so its unimpeded cruise is the lowest flight level; the continuous single-plane
-    planners (straight / milp / …) are pinned to ``cruise_level_m`` (no altitude lever).
+    the discrete ladder, so its unimpeded cruise is the lowest flight level; the MILP cruises the
+    continuous band [z_min_m, z_max_m], so its unimpeded cruise is the band floor; only the truly
+    single-plane planners (straight / decoupled) are pinned to ``cruise_level_m`` (no altitude lever).
 
-    Keyed on ``cfg.planner`` — the run's registry name ('astar' / 'astar_milp' / 'astar_shortcut' all
-    contain 'astar'; 'straight' / 'milp' don't) — NOT ``intent.planner``, which a refiner relabels to its
-    own stage (``astar_milp`` stamps 'milp'), dropping the A* origin. So a
-    single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced A*
+    Keyed on ``cfg.planner`` — the run's registry name — NOT ``intent.planner``, which a refiner
+    relabels to its own stage (``astar_milp`` stamps 'milp'), dropping the A* origin. So a
+    single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced
     climb above the floor reads positive excess (real congestion)."""
-    return cfg.cruise_level_m if "astar" not in cfg.planner else cfg.flight_levels_m[0]
+    if "astar" in cfg.planner:
+        return cfg.flight_levels_m[0]
+    if "milp" in cfg.planner:
+        return cfg.z_min_m           # MILP band floor (astar_milp takes the astar branch — same value)
+    return cfg.cruise_level_m        # straight / decoupled: single-plane
 
 
 def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:

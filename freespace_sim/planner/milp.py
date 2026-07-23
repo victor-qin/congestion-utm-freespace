@@ -28,12 +28,13 @@ import numpy as np
 import pulp
 
 from ..config import SimConfig
-from ..cost import trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
-from ..types import FlightRequest, IntentStatus, OperationalIntent
-from ..volumes import build_reservation_from_corners
+from ..types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
+from ..volumes import build_reservation_from_corners, fold_corners_to_columns
 from .straight import StraightLineTimeShift
+from .terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
 
@@ -52,7 +53,13 @@ class MILPOptPlanner:
       variable — faster).
     - `lock_homotopy=True`: also pin the which-side binaries to the warm path, so CBC solves a near-LP
       that only tightens geometry within the warm homotopy. `astar_milp` = A* warm + both flags.
+
+    Terminal-aware: hub geometry is folded to the column edge, tagged, and pad-capacity gated via
+    ``TerminalCapacity`` (see ``_verify_with_delay`` / ``_capacity_ok``), so the sim admits the MILP
+    family under ``terminal_airspace_always_active``.
     """
+
+    plans_terminal_airspace = True   # consumed by sim._wall_aware (always-active admission gate)
 
     def __init__(
         self,
@@ -66,7 +73,7 @@ class MILPOptPlanner:
         lock_margin_m: float = 80.0,  # only pin a knot's side when the warm path is this clearly outside
         max_steps: int = 60,
         max_obstacles: int = 40,
-        time_limit_s: float = 5.0,     # hard cap (backstop for genuinely hard MILPs the gap can't close)
+        time_limit_s: float = 20.0,    # hard cap (backstop for genuinely hard MILPs the gap can't close)
         gap_rel: float | None = 0.01,  # stop CBC once the incumbent is within 1% of optimal
     ):
         self.warm_planner = warm_planner or StraightLineTimeShift()
@@ -81,6 +88,10 @@ class MILPOptPlanner:
         self.max_steps = max_steps
         self.max_obstacles = max_obstacles
         self.time_limit_s = time_limit_s
+        # per-ledger pad-capacity authority (bound lazily in _capacity, AStarPlanner._occupancy-style)
+        self._tcap: TerminalCapacity | None = None
+        self._tcap_ledger: ReservationLedger | None = None
+        self._tcap_seen = 0
 
     def plan(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
@@ -94,10 +105,12 @@ class MILPOptPlanner:
         warm = self.warm_planner.plan(req, ledger, cfg)   # candidate + fallback (+ delay if fixed)
         fixed = None if self.optimize_delay else (warm.ground_delay_s if warm.accepted else 0.0)
         ref = warm.centerline if (self.lock_homotopy and warm.accepted and warm.centerline) else None
+        o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
+        tcap = self._capacity(ledger, cfg, req.t_request)
         try:
-            milp = self._solve(req, ledger, cfg, fixed, ref)
+            milp = self._solve(req, ledger, cfg, fixed, ref, o_term, d_term, tcap)
             if milp is None and ref is not None:
-                milp = self._solve(req, ledger, cfg, fixed, None)   # locked LP infeasible → unlock
+                milp = self._solve(req, ledger, cfg, fixed, None, o_term, d_term, tcap)  # unlock
         except Exception:
             milp = None
         cands = [i for i in (warm, milp) if i is not None and i.accepted]
@@ -108,27 +121,73 @@ class MILPOptPlanner:
         best.planner = "milp"
         return best
 
-    def _solve(self, req, ledger, cfg, fixed_delay=None, ref_path=None) -> OperationalIntent | None:
+    def _capacity(self, ledger, cfg, t_request) -> TerminalCapacity:
+        """Per-ledger ``TerminalCapacity`` binding — the pad-capacity authority, same lifecycle as
+        ``AStarPlanner._occupancy``: construct + subscribe ONCE per ledger and absorb the committed
+        backlog; on a ledger shrink (a release) reset + re-absorb WITHOUT re-subscribing (a second
+        subscription would leak a dead observer); evict expired dwells every plan."""
+        if self._tcap_ledger is not ledger:
+            self._tcap = TerminalCapacity(cfg, ledger)
+            ledger.subscribe(self._tcap.on_commit)
+            self._absorb_committed(ledger)
+            self._tcap_ledger = ledger
+        elif ledger.n_volumes < self._tcap_seen:
+            self._tcap.reset()
+            self._absorb_committed(ledger)
+        self._tcap_seen = ledger.n_volumes
+        self._tcap.evict_before(t_request)
+        return self._tcap
+
+    def _absorb_committed(self, ledger) -> None:
+        by_fid: dict = {}
+        for fid, vol in ledger.iter_committed():
+            by_fid.setdefault(fid, []).append(vol)
+        for fid, vols in by_fid.items():
+            self._tcap.on_commit(fid, vols)
+
+    def _capacity_ok(self, volumes, o_term, d_term, tcap) -> bool:
+        """Pad-capacity gate on the REBUILT tagged dwell columns (their windows carry the exact
+        committed timing, so no window math is duplicated here). This is the check ``any_conflict``
+        cannot make: same-hub columns are conflict-EXEMPT, so only ``TerminalCapacity.admits``'
+        interval count stands between the plan and an over-subscribed pad."""
+        if tcap is None or (o_term is None and d_term is None):
+            return True
+        for v in volumes:
+            if v.terminal_id is None or not isinstance(v.shape, CylinderSpec):
+                continue
+            term = o_term if (o_term is not None and v.terminal_id == o_term.id) else d_term
+            if term is not None and v.terminal_id == term.id and not tcap.admits(
+                    v.terminal_id, v.t_start, v.t_end, term.capacity):
+                return False
+        return True
+
+    def _solve(self, req, ledger, cfg, fixed_delay=None, ref_path=None,
+               o_term=None, d_term=None, tcap=None) -> OperationalIntent | None:
         """Build and solve the big-M MILP for one flight; return an ACCEPTED intent or None.
 
-        Variables: cruise position per step (endpoints pinned by bounds); per-segment horizontal
-        length ``L_k`` (a polyhedral-norm lower bound on ‖Δxy‖) and vertical travel ``V_k``; and the
-        departure delay ``d`` (a variable, or the ``fixed_delay`` constant). Cruise time at knot k is
-        ``t0 + d + ΣL/v`` — tied to path LENGTH (not a fixed dt/step), so the vehicle can't "slow down
-        for free" to dodge a time window, and the timing matches the speed-based rebuild.
+        Variables: cruise position per step (xy endpoints pinned by bounds; the entry/exit cruise
+        ALTITUDE ``pz[0]``/``pz[-1]`` is free in the band [z_min_m, z_max_m] — choosing the level is
+        part of the solve); per-segment horizontal length ``L_k`` (a polyhedral-norm lower bound on
+        ‖Δxy‖) and vertical travel ``V_k``; and the departure delay ``d`` (a variable, or the
+        ``fixed_delay`` constant). Cruise time at knot k is ``t_depart + d + climb(pz₀) + ΣL/v`` —
+        the entry climb is affine in the chosen level, and time is otherwise tied to path LENGTH
+        (not a fixed dt/step), so the vehicle can't "slow down for free" to dodge a time window.
+        Mid-route climb time is NOT in this clock (only the rebuild charges it); `_verify_with_delay`
+        absorbs the residual by delay-bumping.
 
         Each nearby obstacle adds, per segment, a disjunction "outside it on one spatial face OR the
         whole segment passes before/after its window" (big-M binaries, ≥1 enforced). With ``ref_path``
         set, those binaries are pinned to the warm path's choices, turning the solve into a fast LP.
-        Objective = c_lat·ΣL + c_alt·ΣV + c_gd·d. The solved corners are rebuilt into real committed
-        boxes and re-checked (`_verify_with_delay`) — correctness never relies on the LP being exact.
+        Objective = c_lat·ΣL + c_alt·(ΣV + entry climb + exit descent) + c_gd·d. The solved corners
+        are rebuilt into real committed boxes and re-checked (`_verify_with_delay`) — correctness
+        never relies on the LP being exact.
         """
         origin = np.asarray(req.origin, float)
         dest = np.asarray(req.dest, float)
         t_depart = req.t_departure if req.t_departure is not None else req.t_request
-        z = cfg.cruise_level_m
-        start = np.array([origin[0], origin[1], z])
-        goal = np.array([dest[0], dest[1], z])
+        z_lo, z_hi = cfg.z_min_m, cfg.z_max_m
+        start = np.array([origin[0], origin[1], z_lo])
+        goal = np.array([dest[0], dest[1], z_lo])
         straight_horiz = float(np.linalg.norm(goal[:2] - start[:2]))
         v_step = cfg.nominal_speed_mps * cfg.dt_s
         z_step = cfg.climb_rate_mps * cfg.dt_s
@@ -136,15 +195,22 @@ class MILPOptPlanner:
             return None
 
         N = min(self.max_steps, int(np.ceil(self.detour_allow * straight_horiz / v_step)) + 2)
+        # the max_steps cap must never make the trip ITSELF infeasible: the speed polygon's inradius
+        # is v_step, so (N−1)·v_step ≥ straight is the kinematic floor. A flight past the cap gets
+        # less DETOUR headroom (delay/altitude stay free) — never a vacuously infeasible model
+        # (pre-#36 this silently denied every >7 km flight once no spatial warm masked it).
+        N = max(N, int(np.ceil(straight_horiz / v_step)) + 2)
         # the warm path resampled to the MILP grid → tells us which side/when the homotopy goes
         ref_pos, ref_t = (None, None)
         if ref_path is not None and len(ref_path) >= 2:
             ref_pos, ref_t = self._resample(ref_path, N)
-        t0 = t_depart + cfg.climb_time_s             # cruise start at ZERO delay
-        # reachable absolute-time range across all delays in [0, max_ground_delay]
-        t_lo = t0 - cfg.time_buffer_s
-        t_hi = t0 + cfg.max_ground_delay_s + (N - 1) * cfg.dt_s + cfg.time_buffer_s
-        obstacles = self._nearby_obstacles(ledger, start, goal, t_lo, t_hi, cfg)
+        # reachable absolute-time range across all delays in [0, max_ground_delay] AND all entry
+        # levels in the band (the actual cruise start is the affine t_depart + d + climb(pz[0]))
+        t_lo = t_depart + cfg.climb_time_to(z_lo) - cfg.time_buffer_s
+        t_hi = (t_depart + cfg.max_ground_delay_s + cfg.climb_time_to(z_hi)
+                + (N - 1) * cfg.dt_s + cfg.time_buffer_s)
+        exempt_tids = frozenset(t.id for t in (o_term, d_term) if t is not None)
+        obstacles = self._nearby_obstacles(ledger, start, goal, t_lo, t_hi, cfg, exempt_tids)
 
         # TIGHT, problem-scaled big-Ms — a loose M wrecks the LP relaxation and CBC crawls.
         m_space = 3.0 * max(cfg.region_size_m)       # bounds |Rᵀ(p−c)| over the region
@@ -156,11 +222,13 @@ class MILPOptPlanner:
         d = float(fixed_delay) if fixed_delay is not None else pulp.LpVariable(
             "delay", 0, cfg.max_ground_delay_s
         )
-        # position variables (endpoints fixed by tight bounds)
+        # position variables: xy endpoints fixed by tight bounds; z endpoints FREE in the band —
+        # the ground↔cruise climb is flown inside the hover column, so pz[0]/pz[-1] are the chosen
+        # entry/exit cruise levels, priced in the objective and timed by the affine climb below
         px = [pulp.LpVariable(f"x{k}", 0, cfg.region_size_m[0]) for k in range(N)]
         py = [pulp.LpVariable(f"y{k}", 0, cfg.region_size_m[1]) for k in range(N)]
-        pz = [pulp.LpVariable(f"z{k}", cfg.z_min_m, cfg.z_max_m) for k in range(N)]
-        for arr, s, g in ((px, start[0], goal[0]), (py, start[1], goal[1]), (pz, start[2], goal[2])):
+        pz = [pulp.LpVariable(f"z{k}", z_lo, z_hi) for k in range(N)]
+        for arr, s, g in ((px, start[0], goal[0]), (py, start[1], goal[1])):
             arr[0].lowBound = arr[0].upBound = s
             arr[-1].lowBound = arr[-1].upBound = g
 
@@ -185,6 +253,9 @@ class MILPOptPlanner:
         cumL = [pulp.LpAffineExpression()]
         for k in range(N - 1):
             cumL.append(cumL[-1] + L[k])
+        # cruise-clock origin: the ENTRY climb is affine in the (free) entry altitude pz[0] — a
+        # higher chosen level starts the cruise later, exactly as the rebuild's climb_time_to(z₀)
+        climb0 = (pz[0] - cfg.ground_level_m) / cfg.climb_rate_mps
 
         # big-M obstacle avoidance. SPATIAL faces are per SEGMENT and shared by both endpoints: a
         # keepout face is a half-space, so both endpoints outside the SAME face ⇒ the whole straight
@@ -192,10 +263,29 @@ class MILPOptPlanner:
         # and no hopping a thin obstacle within one step. TEMPORAL faces are per segment too and use
         # the segment's start/end time — because the committed corridor box spans the whole segment
         # (± time_buffer), so the whole segment must clear the window, not just one instant.
+        #
+        # (obs, segment) REACHABILITY PRUNING: knot k lies within k·cap of the pinned start and
+        # (N-1-k)·cap of the pinned goal (each step's xy displacement is bounded by the circumscribed
+        # speed polygon), so a pair whose obstacle lies outside either lens can never be violated —
+        # its whole disjunction is omitted. Sound, and it kills the O(obstacles × segments) binary
+        # blow-up that made CBC time out with no incumbent once committed traffic accumulated.
+        cap = v_step / float(np.cos(np.pi / self.n_dirs)) + 1e-6
+        sx, sy = float(start[0]), float(start[1])
+        gx, gy = float(goal[0]), float(goal[1])
         for oi, obs in enumerate(obstacles):
+            if obs["kind"] == "box":
+                ocx, ocy = float(obs["c"][0]), float(obs["c"][1])
+                orad = float(np.linalg.norm(obs["half"])) + self.keepout_margin_m
+            else:
+                ocx, ocy = float(obs["cx"]), float(obs["cy"])
+                orad = float(obs["radius"]) + self.keepout_margin_m
+            d_s = float(np.hypot(ocx - sx, ocy - sy)) - orad
+            d_g = float(np.hypot(ocx - gx, ocy - gy)) - orad
             for k in range(N - 1):
-                t_start = t0 + d + cumL[k] / v
-                t_end = t0 + d + (cumL[k] + L[k]) / v
+                if d_s > (k + 1) * cap or d_g > (N - 1 - k) * cap:
+                    continue                                     # segment k can never touch this obstacle
+                t_start = t_depart + d + climb0 + cumL[k] / v
+                t_end = t_depart + d + climb0 + (cumL[k] + L[k]) / v
                 # margin = box time-buffer + one segment-time, since the obstacle crossing can fall
                 # mid-segment while we constrain the segment's start/end time (keeps the rebuild safe)
                 tmarg = cfg.time_buffer_s + cfg.dt_s
@@ -226,13 +316,20 @@ class MILPOptPlanner:
                                           temporal_locked=tlock)
 
         prob += (cfg.cost_air_lateral_per_m * pulp.lpSum(L)
-                 + cfg.cost_altitude_change_per_m * pulp.lpSum(V)
-                 + cfg.cost_ground_delay_per_s * d)             # trade detour against delay globally
+                 + cfg.cost_altitude_change_per_m * (
+                     pulp.lpSum(V)                              # interior climbs/descents
+                     + (pz[0] - cfg.ground_level_m)             # entry climb to the chosen level
+                     + (pz[-1] - cfg.ground_level_m))           # final descent from the exit level
+                 + cfg.cost_ground_delay_per_s * d)             # detour vs altitude vs delay, globally
         solver_kw = {"msg": 0, "timeLimit": self.time_limit_s}
         if self.gap_rel is not None:
             solver_kw["gapRel"] = self.gap_rel   # quit proving optimality past a 2% gap (big-M tail)
         prob.solve(pulp.PULP_CBC_CMD(**solver_kw))
-        if pulp.LpStatus[prob.status] not in ("Optimal",) or px[1].value() is None:
+        # "Not Solved" = CBC stopped on its budget; when it holds an incumbent it LOADS the values
+        # (else they stay None). A loaded incumbent is a perfectly usable candidate — correctness
+        # comes from the rebuild + ledger recheck below, never from the optimality proof — so only
+        # a truly valueless stop (infeasible / no incumbent) returns None.
+        if pulp.LpStatus[prob.status] not in ("Optimal", "Not Solved") or px[1].value() is None:
             return None
 
         d_opt = float(fixed_delay) if fixed_delay is not None else float(d.value() or 0.0)
@@ -240,7 +337,7 @@ class MILPOptPlanner:
         # The MILP fixes the spatial homotopy + an approximate delay; polish the delay with a small
         # jump-to-gap on the *rebuilt* path so it verifies exactly (absorbs the LP↔rebuild timing gap).
         polished = self._verify_with_delay(corners, origin, dest, t_depart, d_opt, straight_horiz,
-                                           cfg, ledger)
+                                           cfg, ledger, o_term, d_term, tcap)
         if polished is None:
             return None
         volumes, centerline, cum_horiz, cum_dz, d_final = polished
@@ -251,41 +348,48 @@ class MILPOptPlanner:
             centerline=centerline,
             ground_delay_s=d_final,
             air_detour_m=max(0.0, cum_horiz - straight_horiz),
-            altitude_change_m=2.0 * (cfg.cruise_level_m - cfg.ground_level_m) + cum_dz,
+            altitude_change_m=endpoint_altitude_change_m(
+                float(corners[0][2]), float(corners[-1][2]), cum_dz, cfg),
             planner="milp",
         )
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
     def _verify_with_delay(self, corners, origin, dest, t_depart, d_start, straight_horiz, cfg,
-                           ledger):
-        """Step the delay up from the MILP's value until the rebuilt path is conflict-free, then
-        splice out redundant knots at that delay.
+                           ledger, o_term=None, d_term=None, tcap=None):
+        """Fold the corners to the terminal column edges, then step the delay up from the MILP's
+        value until the rebuilt path is conflict-free AND pad-capacity-admitted, then splice out
+        redundant knots at that delay.
 
         Returns (volumes, centerline, cum_horiz, cum_dz, delay) or None if the spatial path can't be
         made feasible by waiting within budget (then the caller falls back to the warm intent).
         """
+        corners = fold_corners_to_columns(corners, origin, dest, o_term, d_term, cfg)
         d = max(0.0, d_start)
         while d <= cfg.max_ground_delay_s + _EPS:
             volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
-                corners, origin, dest, t_depart, d, cfg
+                corners, origin, dest, t_depart, d, cfg, origin_term=o_term, dest_term=d_term
             )
             if straight_horiz > _EPS and cum_horiz / straight_horiz > cfg.max_detour_factor:
                 return None
-            if not ledger.any_conflict(volumes):
+            if (not ledger.any_conflict(volumes)
+                    and self._capacity_ok(volumes, o_term, d_term, tcap)):
                 built = self._splice(corners, origin, dest, t_depart, d, cfg, ledger,
-                                     (volumes, centerline, cum_horiz, cum_dz))
+                                     (volumes, centerline, cum_horiz, cum_dz), o_term, d_term, tcap)
                 return (*built, d)
             d += cfg.dt_s
         return None
 
-    def _splice(self, corners, origin, dest, t_depart, d, cfg, ledger, best):
+    def _splice(self, corners, origin, dest, t_depart, d, cfg, ledger, best,
+                o_term=None, d_term=None, tcap=None):
         """Greedy single-knot splice at the verified delay — the ShortcutRefiner fixpoint sweep on
         the raw solved corners. It removes the lateral wiggle CBC cannot see: the polyhedral ``L`` is
         a lower bound on true L2 length (up to ~2% short at 16 directions) and ``gapRel`` adds more
         slack, so CBC's vertex can wander metres off the chord "for free"; the rebuild would bill
-        that as air detour. A removal is kept iff the rebuilt reservation stays conflict-free — it
-        can only shorten the path (triangle inequality), so the detour budget never re-trips.
+        that as air detour. A removal is kept iff the rebuilt reservation stays conflict-free AND
+        still pad-capacity-admitted — a shorter path lands EARLIER, shifting the dest dwell window,
+        so capacity must be re-checked. Removals only shorten the path (triangle inequality), so the
+        detour budget never re-trips.
         """
         corners = [np.asarray(c, float) for c in corners]
         changed = True
@@ -294,8 +398,10 @@ class MILPOptPlanner:
             i = 1
             while i < len(corners) - 1:
                 cand = corners[:i] + corners[i + 1:]
-                rebuilt = build_reservation_from_corners(cand, origin, dest, t_depart, d, cfg)
-                if not ledger.any_conflict(rebuilt[0]):
+                rebuilt = build_reservation_from_corners(
+                    cand, origin, dest, t_depart, d, cfg, origin_term=o_term, dest_term=d_term)
+                if (not ledger.any_conflict(rebuilt[0])
+                        and self._capacity_ok(rebuilt[0], o_term, d_term, tcap)):
                     corners, best, changed = cand, rebuilt, True
                 else:
                     i += 1
@@ -404,23 +510,46 @@ class MILPOptPlanner:
                 # feasible; the endpoints straddle faces exactly where the warm path turns a corner)
         return len(faces)
 
-    def _nearby_obstacles(self, ledger, start, goal, t_lo, t_hi, cfg) -> list[dict]:
-        """Committed volumes that could constrain this flight → obstacle dicts for the MILP.
+    def _nearby_obstacles(self, ledger, start, goal, t_lo, t_hi, cfg,
+                          exempt_tids: frozenset = frozenset()) -> list[dict]:
+        """Committed volumes + always-active walls that could constrain this flight → obstacle dicts.
 
         Keeps volumes whose time window overlaps [t_lo, t_hi] and whose footprint falls in an xy reach
         box around the route (capped at ``max_obstacles``). Each footprint is inflated by the new
         corridor's half-width (Minkowski) and its window clamped to the reachable horizon — so a
         permanent obstacle within the flight gets a finite ``t1`` the tight big-M can disable. Box →
         ``{R, c, half}``; cylinder → ``{cx, cy, cz, radius, hz}``; both carry ``t0``/``t1``.
+
+        Own-hub exemption (``exempt_tids`` = the flight's origin/dest terminal ids): committed and
+        static CYLINDERS with an exempt tag are skipped — this flight's tagged geometry may share its
+        own hub's columns/wall (conflict.volumes_conflict same-tid+cylinder), and pad capacity is
+        gated separately by ``TerminalCapacity``. Sibling corridor BOXES stay obstacles (box↔box is
+        never exempt). Foreign hubs' static walls are harvested FIRST — they are few and permanent,
+        and must not be crowded out of the ``max_obstacles`` cap by transient traffic.
         """
         reach = self.detour_allow * float(np.linalg.norm(goal[:2] - start[:2])) + cfg.corridor_width_m
         lo = np.minimum(start, goal) - reach
         hi = np.maximum(start, goal) + reach
         infl = cfg.corridor_width_m / 2.0
         out: list[dict] = []
+        for vol in ledger.static_volumes():          # always-active foreign-hub walls (cylinders)
+            if vol.terminal_id in exempt_tids:
+                continue
+            amin, amax = vol.aabb()
+            if bool(np.any(amax < lo) or np.any(amin > hi)):
+                continue
+            s = vol.shape
+            if isinstance(s, CylinderSpec) and len(out) < self.max_obstacles:
+                out.append({"kind": "cyl", "cx": s.cx, "cy": s.cy, "cz": (s.z_lo + s.z_hi) / 2.0,
+                            "radius": s.radius + infl, "hz": (s.z_hi - s.z_lo) / 2.0 + infl,
+                            "t0": t_lo, "t1": t_hi})
         for _fid, vol in ledger.iter_committed():
+            if len(out) >= self.max_obstacles:
+                break
             if not (vol.t_start < t_hi and t_lo < vol.t_end):
                 continue
+            if vol.terminal_id in exempt_tids and isinstance(vol.shape, CylinderSpec):
+                continue                             # own-hub column — shared, capacity-gated instead
             amin, amax = vol.aabb()
             if bool(np.any(amax < lo) or np.any(amin > hi)):
                 continue

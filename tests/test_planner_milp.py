@@ -75,3 +75,58 @@ def test_milp_detours_when_the_same_wide_wall_is_permanent():
     assert intent.status is IntentStatus.ACCEPTED
     assert intent.air_detour_m > 10.0
     assert not led.any_conflict(intent.volumes)
+
+
+# --- multi-altitude: the continuous cruise band [z_min_m, z_max_m] ---------------------------------
+
+def _z_profile(intent):
+    """Rounded cruise altitudes along the centerline."""
+    return [round(float(p[2]), 1) for p, _ in intent.centerline]
+
+
+def _low_wall(x=1000.0, half_y=800.0):
+    """A wide permanent wall spanning z 15..70: blocks the band floor (30) AND the straight warm
+    planner's 75 m plane, but leaves the upper band clear — the only cheap lever is to climb."""
+    return Volume4D(box_from_segment(vec(x, -half_y, 42.5), vec(x, half_y, 42.5), 40, 55.0), 0.0, 1e6)
+
+
+def test_milp_cruises_at_band_floor_in_empty_airspace():
+    cfg = SimConfig()
+    led = ReservationLedger(cfg)
+    intent = MILPOptPlanner().plan(_req(), led, cfg)
+    assert intent.status is IntentStatus.ACCEPTED
+    assert max(_z_profile(intent)) <= cfg.z_min_m + 1e-6      # cheapest descent ⇒ the band floor
+    assert abs(intent.altitude_change_m - 2.0 * (cfg.z_min_m - cfg.ground_level_m)) < 1e-6
+
+
+def test_milp_climbs_over_a_wall_blocking_the_floor_and_the_warm_plane():
+    cfg = SimConfig()
+    led = ReservationLedger(cfg)
+    led.commit(99, [_low_wall()])
+    # the straight warm start is blocked too (its 75 m corridor overlaps the wall) → the accepted
+    # intent is the MILP solver's own, and climbing beats the ~1.6 km lateral berth
+    assert StraightLineTimeShift().plan(_req(), led, cfg).status is IntentStatus.REJECTED
+    intent = MILPOptPlanner().plan(_req(), led, cfg)
+    assert intent.status is IntentStatus.ACCEPTED
+    assert not led.any_conflict(intent.volumes)
+    assert max(_z_profile(intent)) > cfg.z_min_m + 10.0       # used the vertical lever
+    assert intent.air_detour_m < 200.0                        # not a big lateral berth
+
+
+def test_milp_single_plane_band_recovers_legacy():
+    cfg = SimConfig(z_min_m=75.0, z_max_m=75.0)
+    intent = MILPOptPlanner().plan(_req(), ReservationLedger(cfg), cfg)
+    assert intent.status is IntentStatus.ACCEPTED
+    assert set(_z_profile(intent)) == {75.0}
+    assert abs(intent.altitude_change_m - 2.0 * (75.0 - cfg.ground_level_m)) < 1e-6
+
+
+def test_milp_altitude_change_books_endpoint_formula():
+    from freespace_sim.cost import endpoint_altitude_change_m
+
+    cfg = SimConfig()
+    intent = MILPOptPlanner().plan(_req(), ReservationLedger(cfg), cfg)
+    zs = [float(p[2]) for p, _ in intent.centerline]
+    interior = sum(abs(b - a) for a, b in zip(zs, zs[1:]))
+    expect = endpoint_altitude_change_m(zs[0], zs[-1], interior, cfg)
+    assert abs(intent.altitude_change_m - expect) < 1e-6

@@ -11,7 +11,14 @@ def test_default_config_is_multilevel():
     assert c.n_levels == 3
     assert c.airspace_ceiling_m == 125.0
     assert c.cruise_level_m == 75.0
-    assert c.z_min_m == c.z_max_m == 75.0
+    assert (c.z_min_m, c.z_max_m) == (30.0, 110.0)   # MILP's continuous band = ladder floor/top
+
+
+def test_validation_rejects_inverted_or_out_of_band_z_band():
+    with pytest.raises(ValueError, match="cruise band"):
+        SimConfig(z_min_m=110.0, z_max_m=30.0)                 # inverted
+    with pytest.raises(ValueError, match="cruise band"):
+        SimConfig(z_min_m=30.0, z_max_m=200.0)                 # above the ceiling
 
 
 def test_equidistant_levels_builds_ladder():

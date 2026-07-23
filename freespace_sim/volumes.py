@@ -153,6 +153,56 @@ def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool
     return d < radius + cfg.corridor_width_m / 2.0        # + box half-width
 
 
+def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: SimConfig):
+    """Drop in-column head/tail corners and re-root the polyline at the column edge (``exit_radius``).
+
+    The centre→edge leg is flown but UNRESERVED — the tagged hover column covers it. This is the
+    continuous planners' analogue of A*'s boundary-lane rooting: a strict corridor rooted at the hub
+    CENTRE would contend box↔box with every same-hub sibling's corridor (box↔box pairs are never
+    exempt), serializing divergent launches that the shared column is meant to admit concurrently.
+
+    Degenerate flights bail out UNFOLDED (returned as given): the whole path inside a column, a
+    perimeter direction that is undefined (waypoint at the hub centre), or fewer than two surviving
+    points. Bailing is safe — tags still apply, only same-hub concurrency degrades for that flight.
+    """
+    pts = [np.asarray(p, float) for p in corners]
+    o_term, d_term = as_terminal(origin_term), as_terminal(dest_term)
+
+    def _outside(p, center, r):
+        dx, dy = float(p[0]) - float(center[0]), float(p[1]) - float(center[1])
+        return math.sqrt(dx * dx + dy * dy) >= r
+
+    def _edge_point(center, toward, r):
+        dx, dy = float(toward[0]) - float(center[0]), float(toward[1]) - float(center[1])
+        n = math.sqrt(dx * dx + dy * dy)
+        if n < 1e-9:
+            return None
+        return np.array([float(center[0]) + r * dx / n, float(center[1]) + r * dy / n,
+                         float(toward[2])])
+
+    if o_term is not None:
+        r_o = exit_radius(o_term, cfg)
+        i = next((k for k, p in enumerate(pts) if _outside(p, origin, r_o)), None)
+        if i is None:
+            return corners                       # whole path inside the origin column → bail
+        ep = _edge_point(origin, pts[i], r_o)
+        if ep is None:
+            return corners
+        pts = [ep] + pts[i:]
+    if d_term is not None:
+        r_d = exit_radius(d_term, cfg)
+        j = next((k for k in range(len(pts) - 1, -1, -1) if _outside(pts[k], dest, r_d)), None)
+        if j is None:
+            return corners                       # whole (head-folded) path inside the dest column → bail
+        ep = _edge_point(dest, pts[j], r_d)
+        if ep is None:
+            return corners
+        pts = pts[: j + 1] + [ep]
+    if len(pts) < 2:
+        return corners
+    return pts
+
+
 def build_reservation_from_corners(
     corners: list[Vec], origin: Vec, dest: Vec, t_depart: float, g_delay: float, cfg: SimConfig,
     *, origin_term=None, dest_term=None,

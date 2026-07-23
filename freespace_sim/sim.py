@@ -159,13 +159,14 @@ class SimResult:
         }
 
 
-def _reaches_astar(planner) -> bool:
-    """True if ``planner``'s committed corridor originates from A* — directly, or via an inner/warm-start
-    A* whose (terminal-TAGGED) intent it rebuilds or falls back to. Walks the ``inner``/``warm_planner``
-    chain (astar_shortcut → inner, astar_milp → warm_planner, astar_milp_shortcut → both). Used
-    only to gate ``terminal_airspace_always_active`` (see ``run``): A* tags its terminal columns so they are
-    exempt from their own hub's permanent wall, whereas a planner that builds untagged near-hub columns
-    would collide with it."""
+def _wall_aware(planner) -> bool:
+    """True if ``planner``'s committed corridor is wall-aware under always-active terminal airspace:
+    it TAGS its terminal columns and gates pad capacity itself (A*, or any planner declaring
+    ``plans_terminal_airspace`` — the MILP family), or it reaches such a planner through its
+    ``inner``/``warm_planner`` chain and so rebuilds or falls back to a tagged intent. Walks the chain
+    (astar_shortcut → inner, astar_milp → warm_planner, astar_milp_shortcut → both). Used only to gate
+    ``terminal_airspace_always_active`` (see ``run``): tagged columns are exempt from their own hub's
+    permanent wall, whereas a planner that builds untagged near-hub columns would collide with it."""
     from .planner.astar import AStarPlanner
     seen: set = set()
     stack = [planner]
@@ -174,7 +175,7 @@ def _reaches_astar(planner) -> bool:
         if p is None or id(p) in seen:
             continue
         seen.add(id(p))
-        if isinstance(p, AStarPlanner):
+        if isinstance(p, AStarPlanner) or getattr(p, "plans_terminal_airspace", False):
             return True
         stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
     return False
@@ -258,25 +259,24 @@ def run(
         for center, term in static_terms:
             ledger.register_static_terminal(center, term)
         # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its own hub's
-        # wall only if it too is tagged (conflict.volumes_conflict same-tid+cylinder). Two tiers of A*-reaching
-        # planner are safe:
+        # wall only if it too is tagged (conflict.volumes_conflict same-tid+cylinder). Wall-aware planners:
         #   • astar / astar_shortcut TAG their terminal columns (astar._build / shortcut pass the terminal id),
         #     so they refine fully under always-active.
-        #   • astar_milp builds UNTAGGED columns (its build_reservation_from_corners calls omit the
-        #     terminal id): the optimized hub path then collides with the hub's own wall, its any_conflict
-        #     recheck rejects it, and it falls back to the TAGGED A* warm start — feasible, just unrefined at
-        #     hubs. It is left untagged DELIBERATELY: it optimizes the ground delay freely, and a same-tid
-        #     exemption would let the optimizer pull a flight into a same-hub pad overlap that the untagged
-        #     column currently catches (astar can tag safely only because TerminalCapacity serialises the pad).
-        # A planner that never reaches A* (bare milp / straight / decoupled) has no wall-respecting
-        # fallback, so it would commit untagged near-hub columns that collide with the wall (or ignore it) and
-        # deny / mis-plan every hub flight — refused LOUDLY below rather than allowed to silently mis-plan.
+        #   • the MILP family (plans_terminal_airspace) folds its corners to the column edge, TAGS the rebuilt
+        #     columns/near-hub boxes, and gates pad capacity through its own TerminalCapacity — tagging is safe
+        #     for it for the same reason it is for astar: the capacity authority serialises the pad, so the
+        #     same-tid exemption cannot pull a flight into a same-hub pad overlap.
+        #   • refiners/warm-start wrappers qualify through their chain (they rebuild or fall back to a tagged
+        #     intent).
+        # A planner that is none of these (bare straight / decoupled) has no wall-respecting geometry, so it
+        # would commit untagged near-hub columns that collide with the wall (or ignore it) and deny / mis-plan
+        # every hub flight — refused LOUDLY below rather than allowed to silently mis-plan.
         for u in usses.values():
-            if not _reaches_astar(u.planner):
+            if not _wall_aware(u.planner):
                 raise ValueError(
-                    f"terminal_airspace_always_active=True needs an A*-reaching planner (so its committed hub "
-                    f"path is wall-aware — tagged, or falling back to tagged A*), but {pname!r} never reaches A* "
-                    f"and would commit untagged near-hub columns that collide with the wall and deny every hub flight.")
+                    f"terminal_airspace_always_active=True needs a wall-aware planner (tagged terminal "
+                    f"columns — A*-reaching or terminal-aware MILP), but {pname!r} is neither and would "
+                    f"commit untagged near-hub columns that collide with the wall and deny every hub flight.")
 
     collector: TelemetryCollector | None = None
     if telemetry:

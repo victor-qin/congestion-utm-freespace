@@ -19,8 +19,8 @@ from .types import FlightRequest, OperationalIntent
 def _warn_if_terminal_dropped(req: FlightRequest, intent: OperationalIntent) -> None:
     """Make it *loud* when a planner ignores multi-pad terminal airspace.
 
-    Only A*-based geometry tags a hub flight's terminal column; the refiners (shortcut/MILP) and
-    the non-A* planners (straight) rebuild corridors and drop the tag, which silently disables the
+    A*-based geometry and the terminal-aware MILP family tag a hub flight's terminal column; a
+    planner that rebuilds corridors without threading the terminal (straight) drops the tag, which silently disables the
     shared-terminal exemption and pad capacity. If an accepted flight asked for a terminal but its
     committed volumes don't carry it, warn — better an obvious RuntimeWarning than a wrong result.
     """

@@ -235,6 +235,10 @@ class ReservationLedger:
         """Yield every committed (flight_id, Volume4D) — used by verify and viz."""
         yield from zip(self._fids, self._vols)
 
+    def static_volumes(self) -> tuple:
+        """The permanent always-active terminal walls (read-only view; empty unless registered)."""
+        return tuple(self._static_vols)
+
     @property
     def n_volumes(self) -> int:
         return len(self._vols)

@@ -86,7 +86,7 @@ delay vs air detour vs air hold vs altitude change), so they are directly compar
 |---|---|
 | `straight` | direct path + departure time-shift into a free slot (deny if space is blocked) |
 | **`astar`** (default) | A\* on a fixed hex lattice (pitch = speed·dt); ground delay + reroute + hover |
-| `milp` | MILP trajectory optimization (Richards & How big-M) |
+| `milp` | MILP trajectory optimization (Richards & How big-M); continuous multi-altitude band, shared-terminal + pad-capacity aware |
 | `astar_milp` | A\* picks the homotopy + delay; a homotopy-locked MILP refines the geometry as a fast LP |
 | `astar_shortcut` | A\* + a deterministic greedy shortcut pass — solver-free berth tightening |
 | `astar_milp_shortcut` | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |

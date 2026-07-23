@@ -49,8 +49,7 @@ bash experiments/batch/compare_planners.sh demo        # several planners → co
 
 > **Planner speed:** the default planner is `astar` (A\* on the hex lattice) — fast and 0-denial on the
 > metro scenarios. Pass `--planner astar_shortcut` for tighter berths (solver-free), or
-> `astar_milp_shortcut` for headline-quality MILP refinement (~1–5 s/flight); `lazy` is fastest for
-> rough sweeps.
+> `astar_milp_shortcut` for headline-quality MILP refinement (~1–5 s/flight).
 
 ## Architecture
 
@@ -86,11 +85,8 @@ delay vs air detour vs air hold vs altitude change), so they are directly compar
 | name | strategy |
 |---|---|
 | `straight` | direct path + departure time-shift into a free slot (deny if space is blocked) |
-| `rrt` | space-time RRT\* — reroute / delay / hover / altitude in one search |
-| `lazy` | straight first, escalate to RRT\* only for blocked flights |
 | **`astar`** (default) | A\* on a fixed hex lattice (pitch = speed·dt); ground delay + reroute + hover |
 | `milp` | MILP trajectory optimization (Richards & How big-M) |
-| `opt` / `opt_astar` | NLP (CasADi/IPOPT) continuous polish; `opt_astar` warm-starts from A\* |
 | `astar_milp` | A\* picks the homotopy + delay; a homotopy-locked MILP refines the geometry as a fast LP |
 | `astar_shortcut` | A\* + a deterministic greedy shortcut pass — solver-free berth tightening |
 | `astar_milp_shortcut` | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |

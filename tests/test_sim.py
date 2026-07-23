@@ -126,17 +126,6 @@ def test_milestone_mark_hit_exactly_is_carried_by_that_flight(caplog):
     assert all("flight=0" in m for m in recs)
 
 
-def test_lazy_planner_demand_run_is_verified():
-    # the default-style escalation planner on generated demand must stay conflict-free
-    cfg = SimConfig(
-        planner="lazy", lam_per_hour=80.0, horizon_s=1800.0, seed=3, region_size_m=(5000.0, 5000.0)
-    )
-    res = run(cfg)
-    assert res.verified
-    s = res.summary()
-    assert s["n_accepted"] + s["n_denied"] == s["n_requests"]
-
-
 def test_planner_name_override_is_reflected_in_stored_config():
     # run(planner_name=...) overrides the planner used to plan; the stored config must reflect the planner
     # that ACTUALLY flew, so downstream metrics (which key the altitude baseline on cfg.planner) and the

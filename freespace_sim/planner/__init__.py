@@ -21,50 +21,16 @@ class Planner(Protocol):
     ) -> OperationalIntent: ...
 
 
-class LazyPlanner:
-    """Lazy escalation: deterministic straight-line time-shift first; RRT* only if that denies.
-
-    Ground delay is owned by the cheap tier and searched exhaustively, so RRT* is invoked only when
-    no pure-time solution exists and you must bend in space — the blocked minority pays its cost.
-    """
-
-    def __init__(self):
-        from .rrt import SpaceTimeRRTStar
-        from .straight import StraightLineTimeShift
-
-        self.straight = StraightLineTimeShift()
-        self.rrt = SpaceTimeRRTStar()
-
-    def plan(
-        self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
-    ) -> OperationalIntent:
-        intent = self.straight.plan(req, ledger, cfg)
-        if not intent.accepted:
-            intent = self.rrt.plan(req, ledger, cfg)
-        intent.planner = "lazy"
-        return intent
-
-
 def get_planner(name: str) -> Planner:
     """Resolve a planner by name."""
     if name == "straight":
         from .straight import StraightLineTimeShift
 
         return StraightLineTimeShift()
-    if name == "rrt":
-        from .rrt import SpaceTimeRRTStar
-
-        return SpaceTimeRRTStar()
     if name == "decoupled":
         from .decoupled import DecoupledPlanner
 
         return DecoupledPlanner()
-    if name == "lazy":
-        return LazyPlanner()
-    if name == "opt":
-        from .opt import NLPOptPlanner
-
-        return NLPOptPlanner()
     if name == "milp":
         from .milp import MILPOptPlanner
 
@@ -77,11 +43,6 @@ def get_planner(name: str) -> Planner:
         from .astar import AStarPlanner
 
         return AStarPlanner(compiled=False)              # pure-Python reference oracle (A/B + fallback)
-    if name == "opt_astar":
-        from .astar import AStarPlanner
-        from .opt import NLPOptPlanner
-
-        return NLPOptPlanner(warm_planner=AStarPlanner())   # A* homotopy + NLP continuous polish
     if name == "astar_milp":
         return _astar_milp()
     if name == "astar_shortcut":

@@ -3,8 +3,7 @@ from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.milp import MILPOptPlanner
-from freespace_sim.planner.opt import NLPOptPlanner
-from freespace_sim.planner.rrt import SpaceTimeRRTStar
+from freespace_sim.planner.straight import StraightLineTimeShift
 from freespace_sim.types import FlightRequest, IntentStatus, vec
 from freespace_sim.volumes import Volume4D
 
@@ -30,26 +29,25 @@ def test_milp_empty_airspace_optimal_and_conflict_free():
     assert not led.any_conflict(intent.volumes)
 
 
-def test_milp_global_optimum_beats_rrt_and_nlp_around_wall():
+def test_milp_global_optimum_around_wall():
+    # the straight warm start DENIES here (a permanent wall admits no time-shift), so the accepted
+    # intent is the MILP solver's own — the near-optimal berth proves the global solve, not a fallback
     cfg = SimConfig()
     led = ReservationLedger(cfg)
     led.commit(99, [_wall()])                       # planners don't mutate the ledger → share it
-    rrt = SpaceTimeRRTStar().plan(_req(), led, cfg)
-    nlp = NLPOptPlanner().plan(_req(), led, cfg)
+    assert StraightLineTimeShift().plan(_req(), led, cfg).status is IntentStatus.REJECTED
     milp = MILPOptPlanner().plan(_req(), led, cfg)
     assert milp.status is IntentStatus.ACCEPTED
     assert not led.any_conflict(milp.volumes)       # rebuilt + re-checked boxes
-    assert milp.cost < rrt.cost                     # global beats first-feasible RRT*
-    assert milp.cost <= nlp.cost + 1e-6             # global is at least as good as the local NLP
     assert milp.air_detour_m < 80.0                 # near the ~47 m geometric minimum
 
 
-def test_milp_never_worse_than_rrt():
+def test_milp_never_worse_than_warm():
     cfg = SimConfig()
     led = ReservationLedger(cfg)
-    rrt = SpaceTimeRRTStar().plan(_req(), led, cfg)
+    warm = StraightLineTimeShift().plan(_req(), led, cfg)
     milp = MILPOptPlanner().plan(_req(), led, cfg)
-    assert milp.cost <= rrt.cost + 1e-6
+    assert milp.cost <= warm.cost + 1e-6            # plan() returns min(warm, solver) by cost
 
 
 def _wide_wall(clear_t):

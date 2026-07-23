@@ -10,7 +10,6 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner, hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner, _committed_arrival
 from freespace_sim.planner.occupancy import HexOccupancyService
-from freespace_sim.planner.opt import NLPOptPlanner
 from freespace_sim.sim import run
 from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import Volume4D
@@ -26,9 +25,8 @@ def _wall():
     return Volume4D(box_from_segment(vec(1000, -200, 150), vec(1000, 200, 150), 40, 400), 0.0, 1e6)
 
 
-def test_get_planner_astar_and_opt_astar():
+def test_get_planner_astar():
     assert isinstance(get_planner("astar"), AStarPlanner)
-    assert isinstance(get_planner("opt_astar"), NLPOptPlanner)
 
 
 def test_astar_empty_airspace_accepted_and_conflict_free():
@@ -88,16 +86,6 @@ def test_astar_is_deterministic():
     assert len(a.centerline) == len(b.centerline)
 
 
-def test_opt_astar_smooths_the_staircase_and_never_worsens():
-    led = ReservationLedger(CFG)
-    astar = get_planner("astar").plan(_req(), led, CFG)
-    opt = get_planner("opt_astar").plan(_req(), led, CFG)
-    assert opt.status is IntentStatus.ACCEPTED
-    assert not led.any_conflict(opt.volumes)
-    assert opt.air_detour_m <= astar.air_detour_m + 1e-6   # NLP polish never worsens
-    assert opt.air_detour_m < astar.air_detour_m           # and in open space it removes the staircase
-
-
 def test_astar_milp_refiner_keeps_astars_delay_and_smooths():
     # delay-dominated case: A* picks the 120 s wait, the fixed-delay MILP refines the geometry fast
     led = ReservationLedger(CFG)
@@ -112,8 +100,8 @@ def test_astar_milp_refiner_keeps_astars_delay_and_smooths():
 
 @pytest.mark.slow
 def test_astar_milp_refiner_restructures_the_wide_berth():
-    # the MILP refiner cuts A*'s conservative 400 m berth to the global optimum — which the NLP
-    # (opt_astar) cannot, because it can't change the number of segments or the homotopy.
+    # the MILP refiner cuts A*'s conservative 400 m berth to the global optimum — restructuring the
+    # segment count within the homotopy, which a pure smoothing polish cannot.
     led = ReservationLedger(CFG)
     led.commit(99, [_wall()])
     astar = get_planner("astar").plan(_req(), led, CFG)

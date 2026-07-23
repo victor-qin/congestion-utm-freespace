@@ -340,15 +340,16 @@ def test_always_active_false_files_no_static_vols():
 
 def test_always_active_refuses_untagged_planner():
     """The narrowed always-active guard: an A*-based planner (tagged terminal columns, exempt from its own
-    hub's wall) is allowed, but a planner that builds UNTAGGED near-hub columns (bare `rrt`) would collide
-    with its own hub's permanent ledger wall and deny every hub flight — so `sim.run` refuses it LOUDLY
-    rather than silently mis-plan. (astar_shortcut, an A*-sourced refiner, is allowed — tested separately.)"""
+    hub's wall) is allowed, but a planner that builds UNTAGGED near-hub columns (bare `straight`) would
+    collide with its own hub's permanent ledger wall and deny every hub flight — so `sim.run` refuses it
+    LOUDLY rather than silently mis-plan. (astar_shortcut, an A*-sourced refiner, is allowed — tested
+    separately.)"""
     from freespace_sim import sim
     from freespace_sim.scenarios import get_scenario, with_overrides
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"), horizon_s=8.0)
     cfg = spec.config()
     with pytest.raises(ValueError, match="untagged near-hub"):
-        sim.run(cfg, demand=spec.demand_model(), planner_name="rrt")
+        sim.run(cfg, demand=spec.demand_model(), planner_name="straight")
 
 
 def test_out_of_box_committed_corridor_skipped_not_crash():

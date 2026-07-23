@@ -58,7 +58,7 @@ class DenialReason(Enum):
     NONE = "none"
     BUDGET_EXCEEDED = "budget_exceeded"      # no feasible plan within max_ground_delay_s / max_detour_factor
                                              #   (incl. A* exhausting its bounded horizon — real congestion)
-    SEARCH_EXHAUSTED = "search_exhausted"    # stopped at the compute cap: RRT* sample cap / A* max_expansions
+    SEARCH_EXHAUSTED = "search_exhausted"    # stopped at the compute cap: A* max_expansions
     CONFLICT_AT_COMMIT = "conflict_at_commit"  # lost a commit-time race (multi-USS, future)
     CONFLICT_FILED = "conflict_filed"  # filing has a conflict (multi-USS, future)
 

@@ -121,6 +121,21 @@ def test_milp_single_plane_band_recovers_legacy():
     assert abs(intent.altitude_change_m - 2.0 * (75.0 - cfg.ground_level_m)) < 1e-6
 
 
+def test_milp_long_flight_past_max_steps_capacity_still_solves():
+    # regression (#36 denial root-cause): max_steps=60 caps path capacity at 59·v_step = 7,080 m,
+    # which made every longer flight's model kinematically INFEASIBLE before obstacles entered
+    # (CBC proved it instantly; the flight was denied whenever no warm start rescued it). The N
+    # feasibility floor must keep such flights solvable. _solve is called directly so the warm
+    # planner cannot mask a vacuous model.
+    cfg = SimConfig()
+    led = ReservationLedger(cfg)
+    cap_m = (MILPOptPlanner().max_steps - 1) * cfg.nominal_speed_mps * cfg.dt_s
+    req = FlightRequest(1, vec(0, 0, 0), vec(cap_m + 1000.0, 0, 0), 0.0)
+    intent = MILPOptPlanner()._solve(req, led, cfg)
+    assert intent is not None and intent.status is IntentStatus.ACCEPTED
+    assert intent.air_detour_m < 5.0                          # straight through empty airspace
+
+
 def test_milp_altitude_change_books_endpoint_formula():
     from freespace_sim.cost import endpoint_altitude_change_m
 

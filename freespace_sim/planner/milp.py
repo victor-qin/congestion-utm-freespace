@@ -24,6 +24,8 @@ Default solver is open-source CBC (bundled with PuLP); Gurobi/MISOCP (exact L2) 
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pulp
 
@@ -71,7 +73,7 @@ class MILPOptPlanner:
         detour_allow: float = 1.7,   # step budget = this × straight distance
         keepout_margin_m: float = 4.0,
         lock_margin_m: float = 80.0,  # only pin a knot's side when the warm path is this clearly outside
-        max_steps: int = 60,
+        max_steps: int = 60,         # knot cap; floored by kinematic feasibility in _solve
         max_obstacles: int = 40,
         time_limit_s: float = 20.0,    # hard cap (backstop for genuinely hard MILPs the gap can't close)
         gap_rel: float | None = 0.01,  # stop CBC once the incumbent is within 1% of optimal
@@ -111,7 +113,13 @@ class MILPOptPlanner:
             milp = self._solve(req, ledger, cfg, fixed, ref, o_term, d_term, tcap)
             if milp is None and ref is not None:
                 milp = self._solve(req, ledger, cfg, fixed, None, o_term, d_term, tcap)  # unlock
-        except Exception:
+        except Exception as e:
+            # Degrade to the warm candidate, but never SILENTLY: a swallowed bug in the solver /
+            # fold / capacity path looks exactly like a hard flight (warm fallback or denial), which
+            # is how two real defects stayed invisible. The warning is the tripwire.
+            warnings.warn(
+                f"milp _solve raised {type(e).__name__}: {e} — falling back to the warm candidate",
+                RuntimeWarning, stacklevel=2)
             milp = None
         cands = [i for i in (warm, milp) if i is not None and i.accepted]
         if not cands:
@@ -125,7 +133,11 @@ class MILPOptPlanner:
         """Per-ledger ``TerminalCapacity`` binding — the pad-capacity authority, same lifecycle as
         ``AStarPlanner._occupancy``: construct + subscribe ONCE per ledger and absorb the committed
         backlog; on a ledger shrink (a release) reset + re-absorb WITHOUT re-subscribing (a second
-        subscription would leak a dead observer); evict expired dwells every plan."""
+        subscription would leak a dead observer); evict expired dwells every plan.
+
+        Per-planner-instance by design (the established A* pattern): in ``astar_milp`` both the MILP
+        and its warm A* keep an index on the shared ledger — duplicated commit work, consistent by
+        construction; a shared per-ledger authority is a possible future dedup."""
         if self._tcap_ledger is not ledger:
             self._tcap = TerminalCapacity(cfg, ledger)
             ledger.subscribe(self._tcap.on_commit)
@@ -212,7 +224,9 @@ class MILPOptPlanner:
         exempt_tids = frozenset(t.id for t in (o_term, d_term) if t is not None)
         obstacles = self._nearby_obstacles(ledger, start, goal, t_lo, t_hi, cfg, exempt_tids)
 
-        # TIGHT, problem-scaled big-Ms — a loose M wrecks the LP relaxation and CBC crawls.
+        # Problem-scaled big-Ms — a loose M weakens the LP relaxation and slows CBC. m_space is a
+        # safe over-bound (~2× the region diagonal); tightening it toward the diagonal is a possible
+        # future speedup, but model SIZE (see the lens pruning below) is the dominant lever.
         m_space = 3.0 * max(cfg.region_size_m)       # bounds |Rᵀ(p−c)| over the region
         m_time = (t_hi - t_lo) + cfg.max_ground_delay_s + 100.0   # bounds the time-face range
 
@@ -284,35 +298,41 @@ class MILPOptPlanner:
             for k in range(N - 1):
                 if d_s > (k + 1) * cap or d_g > (N - 1 - k) * cap:
                     continue                                     # segment k can never touch this obstacle
-                t_start = t_depart + d + climb0 + cumL[k] / v
-                t_end = t_depart + d + climb0 + (cumL[k] + L[k]) / v
                 # margin = box time-buffer + one segment-time, since the obstacle crossing can fall
                 # mid-segment while we constrain the segment's start/end time (keeps the rebuild safe)
                 tmarg = cfg.time_buffer_s + cfg.dt_s
-                b_before = pulp.LpVariable(f"tb{oi}_{k}", cat="Binary")
-                b_after = pulp.LpVariable(f"ta{oi}_{k}", cat="Binary")
-                prob += t_end <= (obs["t0"] - tmarg) + m_time * b_before     # whole seg before window
-                prob += t_start >= (obs["t1"] + tmarg) - m_time * b_after    # whole seg after window
-
-                # HOMOTOPY LOCK: copy the warm path's temporal choice (pass before / after / neither)
                 tlock = False
-                if ref_pos is not None:
-                    if ref_t[k + 1] + tmarg <= obs["t0"]:                    # warm passes before
-                        _fix(b_before, 0)
-                        _fix(b_after, 1)
-                        tlock = True
-                    elif ref_t[k] - tmarg >= obs["t1"]:                      # warm passes after
-                        _fix(b_after, 0)
-                        _fix(b_before, 1)
-                        tlock = True
-                    else:                                                    # warm avoids spatially
-                        _fix(b_before, 1)
-                        _fix(b_after, 1)
+                if obs["t0"] <= t_lo + _EPS and obs["t1"] >= t_hi - _EPS:
+                    # permanent within the reachable horizon (an always-active wall, or a committed
+                    # volume clamped to it): no temporal escape exists — omit the two dead binaries
+                    temporal = []
+                else:
+                    t_start = t_depart + d + climb0 + cumL[k] / v
+                    t_end = t_depart + d + climb0 + (cumL[k] + L[k]) / v
+                    b_before = pulp.LpVariable(f"tb{oi}_{k}", cat="Binary")
+                    b_after = pulp.LpVariable(f"ta{oi}_{k}", cat="Binary")
+                    prob += t_end <= (obs["t0"] - tmarg) + m_time * b_before   # whole seg before window
+                    prob += t_start >= (obs["t1"] + tmarg) - m_time * b_after  # whole seg after window
+
+                    # HOMOTOPY LOCK: copy the warm path's temporal choice (before / after / neither)
+                    if ref_pos is not None:
+                        if ref_t[k + 1] + tmarg <= obs["t0"]:                  # warm passes before
+                            _fix(b_before, 0)
+                            _fix(b_after, 1)
+                            tlock = True
+                        elif ref_t[k] - tmarg >= obs["t1"]:                    # warm passes after
+                            _fix(b_after, 0)
+                            _fix(b_before, 1)
+                            tlock = True
+                        else:                                                  # warm avoids spatially
+                            _fix(b_before, 1)
+                            _fix(b_after, 1)
+                    temporal = [b_before, b_after]
 
                 ends = ((px[k], py[k], pz[k]), (px[k + 1], py[k + 1], pz[k + 1]))
                 ref_ends = None if ref_pos is None else (ref_pos[k], ref_pos[k + 1])
                 self._add_spatial_keepout(prob, f"{oi}_{k}", ends, obs, m_space,
-                                          [b_before, b_after], ref_ends=ref_ends,
+                                          temporal, ref_ends=ref_ends,
                                           temporal_locked=tlock)
 
         prob += (cfg.cost_air_lateral_per_m * pulp.lpSum(L)
@@ -323,7 +343,7 @@ class MILPOptPlanner:
                  + cfg.cost_ground_delay_per_s * d)             # detour vs altitude vs delay, globally
         solver_kw = {"msg": 0, "timeLimit": self.time_limit_s}
         if self.gap_rel is not None:
-            solver_kw["gapRel"] = self.gap_rel   # quit proving optimality past a 2% gap (big-M tail)
+            solver_kw["gapRel"] = self.gap_rel   # stop proving within gap_rel of optimal (big-M tail)
         prob.solve(pulp.PULP_CBC_CMD(**solver_kw))
         # "Not Solved" = CBC stopped on its budget; when it holds an incumbent it LOADS the values
         # (else they stay None). A loaded incumbent is a perfectly usable candidate — correctness

@@ -69,7 +69,7 @@ def _git_info() -> dict:
 
 def _env_info() -> dict:
     versions = {}
-    for mod in ("numpy", "fcl", "pandas", "pulp", "casadi", "trimesh"):
+    for mod in ("numpy", "fcl", "pandas", "pulp", "trimesh"):
         try:
             versions[mod] = __import__(mod).__version__
         except (ImportError, AttributeError):

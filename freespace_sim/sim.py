@@ -162,7 +162,7 @@ class SimResult:
 def _reaches_astar(planner) -> bool:
     """True if ``planner``'s committed corridor originates from A* — directly, or via an inner/warm-start
     A* whose (terminal-TAGGED) intent it rebuilds or falls back to. Walks the ``inner``/``warm_planner``
-    chain (astar_shortcut → inner, opt_astar/astar_milp → warm_planner, astar_milp_shortcut → both). Used
+    chain (astar_shortcut → inner, astar_milp → warm_planner, astar_milp_shortcut → both). Used
     only to gate ``terminal_airspace_always_active`` (see ``run``): A* tags its terminal columns so they are
     exempt from their own hub's permanent wall, whereas a planner that builds untagged near-hub columns
     would collide with it."""
@@ -182,7 +182,7 @@ def _reaches_astar(planner) -> bool:
 
 def _astar_planners(planner) -> list:
     """Every ``AStarPlanner`` reachable from ``planner`` via the inner/warm_planner chain — so telemetry
-    attaches to the A* inside refiner / warm-start wrappers (astar_shortcut, opt_astar, …), not just a bare
+    attaches to the A* inside refiner / warm-start wrappers (astar_shortcut, astar_milp, …), not just a bare
     top-level planner."""
     from .planner.astar import AStarPlanner
     out, seen, stack = [], set(), [planner]
@@ -262,13 +262,13 @@ def run(
         # planner are safe:
         #   • astar / astar_shortcut TAG their terminal columns (astar._build / shortcut pass the terminal id),
         #     so they refine fully under always-active.
-        #   • opt_astar / astar_milp build UNTAGGED columns (their build_reservation_from_corners calls omit the
-        #     terminal id): the optimized hub path then collides with the hub's own wall, their any_conflict
-        #     recheck rejects it, and they fall back to the TAGGED A* warm start — feasible, just unrefined at
-        #     hubs. They are left untagged DELIBERATELY: they optimize the ground delay freely, and a same-tid
+        #   • astar_milp builds UNTAGGED columns (its build_reservation_from_corners calls omit the
+        #     terminal id): the optimized hub path then collides with the hub's own wall, its any_conflict
+        #     recheck rejects it, and it falls back to the TAGGED A* warm start — feasible, just unrefined at
+        #     hubs. It is left untagged DELIBERATELY: it optimizes the ground delay freely, and a same-tid
         #     exemption would let the optimizer pull a flight into a same-hub pad overlap that the untagged
         #     column currently catches (astar can tag safely only because TerminalCapacity serialises the pad).
-        # A planner that never reaches A* (bare rrt / opt / milp / straight / lazy) has no wall-respecting
+        # A planner that never reaches A* (bare milp / straight / decoupled) has no wall-respecting
         # fallback, so it would commit untagged near-hub columns that collide with the wall (or ignore it) and
         # deny / mis-plan every hub flight — refused LOUDLY below rather than allowed to silently mis-plan.
         for u in usses.values():

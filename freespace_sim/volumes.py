@@ -57,7 +57,7 @@ def corridor_segment_volume(
 ) -> Volume4D:
     """Build the single corridor box for one segment (p0,t0)→(p1,t1).
 
-    **This is the contract between the planners and the ledger.** A planner (RRT* per edge, or the
+    **This is the contract between the planners and the ledger.** A planner (A* per edge, or the
     straight-line planner via :func:`build_corridor`) checks *this exact* box against the ledger and
     commits *this exact* box — there is no separate post-hoc inflation that could reintroduce a
     conflict. The box is purely segment-local (depends only on its own endpoints + cfg), which is
@@ -159,7 +159,7 @@ def build_reservation_from_corners(
 ) -> tuple[list[Volume4D], list[TimedPoint], float, float]:
     """Resample a corner polyline to ≤segment-length boxes, time at nominal speed, assemble.
 
-    Shared by the RRT* smoother, the NLP/MILP planners, and the shortcut refiner so they all emit the
+    Shared by the MILP planner and the shortcut refiner so they all emit the
     *same* contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are
     given, the hub **hover column** is tagged shared (sized to the terminal's radius) AND **every corridor
     box that reaches into that column** (``segment_overlaps_column`` — not just the first/last) is tagged
@@ -292,7 +292,7 @@ def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4
     unbounded, but FINITE (not ``inf``) as belt-and-suspenders. It is safe because a static wall is never
     committed, so it never reaches the step-range/bucketing arithmetic (``ledger._steps`` /
     ``hexgrid.rasterize_volume``); it surfaces only via ``ledger.conflicts`` (the ``-1`` sentinel), where the
-    sole arithmetic readers — ``straight`` / ``rrt`` ``min(cv.t_end)`` — are refused under always-active."""
+    sole arithmetic reader — ``straight``'s jump-to-gap ``min(cv.t_end)`` — is refused under always-active."""
     term = as_terminal(term)
     return replace(
         hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),

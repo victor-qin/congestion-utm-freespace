@@ -16,10 +16,10 @@ class SimConfig:
     # --- dimensionality & altitude (full 3D, regulated band [ground_level_m, airspace_ceiling_m]) ---
     dims: int = 3
     ground_level_m: float = 0.0
-    cruise_level_m: float = 75.0       # single-plane planners' cruise altitude (RRT*/MILP/NLP/straight)
-    # Continuous-sampler band (RRT*/MILP/NLP). Collapsed to the single cruise level so those planners stay
+    cruise_level_m: float = 75.0       # single-plane planners' cruise altitude (MILP/straight)
+    # Continuous-optimizer band (MILP). Collapsed to the single cruise level so those planners stay
     # on one plane. A* instead deconflicts by altitude on the DISCRETE ``flight_levels_m`` ladder below;
-    # widening this band (z_min_m < z_max_m) to give the samplers multi-altitude too is a follow-up.
+    # widening this band (z_min_m < z_max_m) to give the MILP multi-altitude too is a follow-up.
     z_min_m: float = 75.0
     z_max_m: float = 75.0
     # Regulated airspace ceiling: every hover/terminal column spans [ground_level_m, airspace_ceiling_m].
@@ -70,13 +70,13 @@ class SimConfig:
     seed: int = 0
 
     # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
-    planner: str = "astar"  # "straight"|"rrt"|"lazy"|"astar"|"milp"|"astar_milp"|...
+    planner: str = "astar"  # "straight"|"astar"|"astar_shortcut"|"milp"|"astar_milp"|...
 
     # --- fixed terminal exit lanes (issue #18); A* only ---
     # When True, A* (and astar_shortcut) routes shared-terminal takeoff/landing through the hub's
     # boundary-hex lanes and deconflicts same-hub launches by exact cell occupancy (is_blocked), killing
     # same-hub exit-lane CONFLICT_FILED. False ⇒ the legacy A* fold/exit_clear path. Other planners
-    # (milp/opt/rrt) don't route through lanes — the flag only tags their hub boxes. Default on (#18).
+    # (milp/straight) don't route through lanes — the flag only tags their hub boxes. Default on (#18).
     fixed_exit_lanes: bool = True
 
     # --- always-active terminal airspace (foreign-transit isolation); A* only ---

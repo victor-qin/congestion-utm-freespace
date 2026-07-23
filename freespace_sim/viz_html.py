@@ -56,7 +56,7 @@ def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
             "o": [float(o[0]), float(o[1])], "d": [float(d[0]), float(d[1])],
         })
     cfg = result.config
-    # The hex lattice only exists if an A*-based planner ran (astar / astar_milp / opt_astar). When
+    # The hex lattice only exists if an A*-based planner ran (astar / astar_milp / astar_shortcut). When
     # it did, expose its circumradius so the replay can overlay the exact grid A* searched on.
     hex_available = "astar" in cfg.planner
     from .planner.hexgrid import circumradius

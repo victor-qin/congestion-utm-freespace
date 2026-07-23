@@ -1,15 +1,15 @@
-"""MILP trajectory-optimization planner (Richards & How big-M), bootstrapped from RRT*.
+"""MILP trajectory-optimization planner (Richards & How big-M), warm-started.
 
-The *global* counterpart to the NLP `opt` planner. On an absolute-time step grid, position per step
+The *global* trajectory optimizer. On an absolute-time step grid, position per step
 is continuous; a **binary per obstacle face per active step** encodes the non-convex "stay outside"
 disjunction (pass left/right/over/under), so branch-and-bound enumerates *which side* of every
-obstacle to pass and returns the globally cheapest route — the homotopy choice the local NLP can't
-make. Boxes map to their (oriented) linear faces; cylinders to a circumscribed polygon; the L2
+obstacle to pass and returns the globally cheapest route — the homotopy choice a local smoother
+can't make. Boxes map to their (oriented) linear faces; cylinders to a circumscribed polygon; the L2
 detour length to a polyhedral norm (linear). Departure delay is a decision variable too, carrying
 two temporal faces per obstacle ("pass before / after its window"), so a single solve trades delay
 against detour globally.
 
-A *warm planner* (RRT* by default, or A*) supplies a candidate + fallback, and two flags reshape the
+A *warm planner* (straight-line by default; A* in `astar_milp`) supplies a candidate + fallback, and two flags reshape the
 solve (see `MILPOptPlanner`): `optimize_delay=False` fixes the delay to the warm path's (a pure
 spatial refiner); `lock_homotopy=True` additionally pins each obstacle's which-side binary to the
 warm path — collapsing the search to a fast LP that only *tightens* the geometry within the chosen
@@ -33,7 +33,7 @@ from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent
 from ..volumes import build_reservation_from_corners
-from .rrt import SpaceTimeRRTStar
+from .straight import StraightLineTimeShift
 
 _EPS = 1e-6
 
@@ -69,7 +69,7 @@ class MILPOptPlanner:
         time_limit_s: float = 5.0,     # hard cap (backstop for genuinely hard MILPs the gap can't close)
         gap_rel: float | None = 0.01,  # stop CBC once the incumbent is within 1% of optimal
     ):
-        self.warm_planner = warm_planner or SpaceTimeRRTStar()
+        self.warm_planner = warm_planner or StraightLineTimeShift()
         self.gap_rel = gap_rel
         self.optimize_delay = optimize_delay
         self.lock_homotopy = lock_homotopy
@@ -264,7 +264,7 @@ class MILPOptPlanner:
         """Step the delay up from the MILP's value until the rebuilt path is conflict-free.
 
         Returns (volumes, centerline, cum_horiz, cum_dz, delay) or None if the spatial path can't be
-        made feasible by waiting within budget (then the caller falls back to RRT*).
+        made feasible by waiting within budget (then the caller falls back to the warm intent).
         """
         d = max(0.0, d_start)
         while d <= cfg.max_ground_delay_s + _EPS:

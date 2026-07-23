@@ -3,7 +3,7 @@
 Isolates the *temporal* deconfliction story: keep the geometric path, and slot it into free time
 windows by choosing a departure delay (the shared jump-to-gap search) at a few cruise speeds.
 Deterministic and fast; the trade-off is that it never bends in space, so it denies where only a
-spatial detour would work (that's RRT*'s job).
+spatial detour would work (that's A*'s job).
 """
 
 from __future__ import annotations

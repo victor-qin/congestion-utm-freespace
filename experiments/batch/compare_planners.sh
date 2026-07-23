@@ -9,7 +9,7 @@ set -euo pipefail
 SUFFIX="${1:-run}"
 SCENARIO="${2:-metro_2uss}"
 TAG="cmp_${SUFFIX}"
-PLANNERS=(straight lazy astar astar_shortcut)
+PLANNERS=(straight astar astar_shortcut)
 LAM=240
 HORIZON=900
 SEED=0

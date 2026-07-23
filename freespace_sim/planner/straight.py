@@ -1,11 +1,11 @@
-"""Straight-line + time-shift planner (lazy-escalation tier 1).
+"""Straight-line + time-shift planner (the cheap temporal tier).
 
 Geometry is fixed (the direct path at cruise altitude); the only lever is *when* to depart. The fix
 for a conflict is the **jump-to-gap time-shift**: ask the ledger which committed volumes block us and
 slide the whole schedule forward to when the earliest blocker clears — not a blind dt-by-dt scan.
 
 It can only ever produce a ground delay. When no time gap exists within ``max_ground_delay_s`` it
-returns REJECTED(BUDGET_EXCEEDED) — the cue for a spatial planner (RRT*) to take over.
+returns REJECTED(BUDGET_EXCEEDED) — the cue for a spatial planner (A*) to take over.
 
 `plan_timeshift` is factored out with a speed factor so the decoupled planner can reuse the exact
 same time search at different cruise speeds.

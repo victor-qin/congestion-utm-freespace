@@ -1,4 +1,4 @@
-"""Compare the trajectory optimizers (RRT*, NLP, MILP) on scenarios that exercise each lever.
+"""Compare the trajectory optimizers (A*, MILP) on scenarios that exercise each lever.
 
 Reports per-flight cost (lower = better), the levers used (delay / detour), conflict-free, and
 wall-time. The MILP is the global optimum, so its cost is the yardstick the others are measured
@@ -39,7 +39,7 @@ SCENARIOS = {
 
 
 def main() -> None:
-    planners = ["straight", "rrt", "opt", "milp"]
+    planners = ["straight", "astar", "milp", "astar_milp"]
     print(f'{"scenario":>28} | {"planner":>8} {"cost":>8} {"delay":>6} {"detour":>7} {"cf":>3} {"sec":>6}')
     print("-" * 80)
     for name, obs in SCENARIOS.items():

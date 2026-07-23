@@ -6,9 +6,9 @@ conflict-free against the ledger and within the detour budget — the same build
 every planner obeys. Triangle inequality guarantees a removal never lengthens the horizontal path,
 so the result is always ≤ the input length and never invents a new conflict.
 
-This is the shared, deterministic cousin of RRT*'s randomized ``_smooth`` (rrt.py): a single-knot
-fixpoint sweep, so a hex staircase collapses (each removal re-enables the next) without depending on
-random shortcut draws. It re-checks against the *real committed obstacles*, not A*'s conservative
+A deterministic single-knot fixpoint sweep, so a hex staircase collapses (each removal re-enables
+the next) without depending on random shortcut draws. It re-checks against the *real committed
+obstacles*, not A*'s conservative
 inflated raster, so it can tighten A*'s over-wide berth toward the true continuous clearance — much
 of what the MILP does, but greedy and solver-free. Wrap any planner with ``ShortcutRefiner``.
 """

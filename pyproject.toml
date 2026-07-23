@@ -12,7 +12,6 @@ dependencies = [
     "matplotlib>=3.8",
     "shapely>=2.0",      # optional: top-down 2D projections of volumes in figures only
     "scipy>=1.17.1",
-    "casadi>=3.7.2",
     "pulp>=3.3.2",
 ]
 

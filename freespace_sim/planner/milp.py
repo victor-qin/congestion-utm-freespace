@@ -186,11 +186,12 @@ class MILPOptPlanner:
         for k in range(N - 1):
             cumL.append(cumL[-1] + L[k])
 
-        # big-M obstacle avoidance. SPATIAL faces are per sampled point (so a thin obstacle can't be
-        # hopped over in one step). TEMPORAL faces are per SEGMENT and use the segment's start/end
-        # time — because the committed corridor box spans the whole segment (± time_buffer), so the
-        # whole segment must clear the window, not just the sampled instant.
-        samples = (0.0, 1.0 / 3.0, 2.0 / 3.0)
+        # big-M obstacle avoidance. SPATIAL faces are per SEGMENT and shared by both endpoints: a
+        # keepout face is a half-space, so both endpoints outside the SAME face ⇒ the whole straight
+        # segment is outside it (convexity) — no corner-cutting between differently-faced samples,
+        # and no hopping a thin obstacle within one step. TEMPORAL faces are per segment too and use
+        # the segment's start/end time — because the committed corridor box spans the whole segment
+        # (± time_buffer), so the whole segment must clear the window, not just one instant.
         for oi, obs in enumerate(obstacles):
             for k in range(N - 1):
                 t_start = t0 + d + cumL[k] / v
@@ -218,14 +219,11 @@ class MILPOptPlanner:
                         _fix(b_before, 1)
                         _fix(b_after, 1)
 
-                for si, s in enumerate(samples):
-                    xe = (1 - s) * px[k] + s * px[k + 1]
-                    ye = (1 - s) * py[k] + s * py[k + 1]
-                    ze = (1 - s) * pz[k] + s * pz[k + 1]
-                    ref_pt = None if ref_pos is None else (1 - s) * ref_pos[k] + s * ref_pos[k + 1]
-                    self._add_spatial_keepout(prob, f"{oi}_{k}_{si}", xe, ye, ze, obs, m_space,
-                                              [b_before, b_after], ref_pt=ref_pt,
-                                              temporal_locked=tlock)
+                ends = ((px[k], py[k], pz[k]), (px[k + 1], py[k + 1], pz[k + 1]))
+                ref_ends = None if ref_pos is None else (ref_pos[k], ref_pos[k + 1])
+                self._add_spatial_keepout(prob, f"{oi}_{k}", ends, obs, m_space,
+                                          [b_before, b_after], ref_ends=ref_ends,
+                                          temporal_locked=tlock)
 
         prob += (cfg.cost_air_lateral_per_m * pulp.lpSum(L)
                  + cfg.cost_altitude_change_per_m * pulp.lpSum(V)
@@ -261,7 +259,8 @@ class MILPOptPlanner:
 
     def _verify_with_delay(self, corners, origin, dest, t_depart, d_start, straight_horiz, cfg,
                            ledger):
-        """Step the delay up from the MILP's value until the rebuilt path is conflict-free.
+        """Step the delay up from the MILP's value until the rebuilt path is conflict-free, then
+        splice out redundant knots at that delay.
 
         Returns (volumes, centerline, cum_horiz, cum_dz, delay) or None if the spatial path can't be
         made feasible by waiting within budget (then the caller falls back to the warm intent).
@@ -274,9 +273,33 @@ class MILPOptPlanner:
             if straight_horiz > _EPS and cum_horiz / straight_horiz > cfg.max_detour_factor:
                 return None
             if not ledger.any_conflict(volumes):
-                return volumes, centerline, cum_horiz, cum_dz, d
+                built = self._splice(corners, origin, dest, t_depart, d, cfg, ledger,
+                                     (volumes, centerline, cum_horiz, cum_dz))
+                return (*built, d)
             d += cfg.dt_s
         return None
+
+    def _splice(self, corners, origin, dest, t_depart, d, cfg, ledger, best):
+        """Greedy single-knot splice at the verified delay — the ShortcutRefiner fixpoint sweep on
+        the raw solved corners. It removes the lateral wiggle CBC cannot see: the polyhedral ``L`` is
+        a lower bound on true L2 length (up to ~2% short at 16 directions) and ``gapRel`` adds more
+        slack, so CBC's vertex can wander metres off the chord "for free"; the rebuild would bill
+        that as air detour. A removal is kept iff the rebuilt reservation stays conflict-free — it
+        can only shorten the path (triangle inequality), so the detour budget never re-trips.
+        """
+        corners = [np.asarray(c, float) for c in corners]
+        changed = True
+        while changed and len(corners) > 2:
+            changed = False
+            i = 1
+            while i < len(corners) - 1:
+                cand = corners[:i] + corners[i + 1:]
+                rebuilt = build_reservation_from_corners(cand, origin, dest, t_depart, d, cfg)
+                if not ledger.any_conflict(rebuilt[0]):
+                    corners, best, changed = cand, rebuilt, True
+                else:
+                    i += 1
+        return best
 
     def _resample(self, centerline, n):
         """Resample a timed polyline to n points evenly by arc length → (positions, times).
@@ -328,15 +351,17 @@ class MILPOptPlanner:
         idx = int(np.argmax(margins))
         return idx, float(margins[idx])
 
-    def _add_spatial_keepout(self, prob, tag, x, y, zz, obs, m_space, temporal,
-                             ref_pt=None, temporal_locked=False) -> int:
-        """Spatial big-M faces for one sampled point, OR'd with the segment's shared temporal faces.
+    def _add_spatial_keepout(self, prob, tag, ends, obs, m_space, temporal,
+                             ref_ends=None, temporal_locked=False) -> int:
+        """Spatial big-M faces for one SEGMENT (both endpoints share the binaries), OR'd with the
+        segment's temporal faces.
 
-        The disjunction is: outside the obstacle in at least one spatial dimension OR the whole
-        segment passes before/after the window (the two `temporal` binaries, shared across the
-        segment's samples). When ``ref_pt`` is given, the binaries are pinned to the warm path's
-        choice (which side / before-after) so CBC doesn't re-enumerate — the MILP becomes an LP that
-        tightens *within* that homotopy. Returns the number of binaries in the disjunction.
+        The disjunction is: BOTH endpoints beyond the same spatial face — a face is a half-space, so
+        by convexity the whole straight segment is then outside the obstacle (no corner-cutting, no
+        hopping a thin obstacle mid-step) — OR the whole segment passes before/after the window (the
+        two `temporal` binaries). When ``ref_ends`` is given, the binaries are pinned to the warm
+        path's choice (which side / before-after) so CBC doesn't re-enumerate — the MILP becomes an
+        LP that tightens *within* that homotopy. Returns the number of binaries in the disjunction.
         """
         m = self.keepout_margin_m
         faces = list(temporal)
@@ -344,35 +369,39 @@ class MILPOptPlanner:
         if obs["kind"] == "box":
             R, c, half = obs["R"], obs["c"], obs["half"] + m
             bs = [pulp.LpVariable(f"b{tag}_{a}_{s}", cat="Binary") for a in range(3) for s in (0, 1)]
-            for a in range(3):
-                # local_a = column a of R dotted with (p - c)
-                la = R[0, a] * (x - c[0]) + R[1, a] * (y - c[1]) + R[2, a] * (zz - c[2])
-                prob += la >= half[a] - m_space * bs[2 * a]           # beyond +face a
-                prob += la <= -half[a] + m_space * bs[2 * a + 1]      # beyond -face a
+            for x, y, zz in ends:
+                for a in range(3):
+                    # local_a = column a of R dotted with (p - c)
+                    la = R[0, a] * (x - c[0]) + R[1, a] * (y - c[1]) + R[2, a] * (zz - c[2])
+                    prob += la >= half[a] - m_space * bs[2 * a]           # beyond +face a
+                    prob += la <= -half[a] + m_space * bs[2 * a + 1]      # beyond -face a
         else:
             # cylinder → circumscribed polygon + two z-faces
             cx, cy, cz = obs["cx"], obs["cy"], obs["cz"]
             r, hz = obs["radius"] + m, obs["hz"] + m
             bs = [pulp.LpVariable(f"c{tag}_{i}", cat="Binary") for i in range(self.cyl_faces + 2)]
-            for i in range(self.cyl_faces):
-                a = 2 * np.pi * i / self.cyl_faces
-                prob += np.cos(a) * (x - cx) + np.sin(a) * (y - cy) >= r - m_space * bs[i]
-            prob += (zz - cz) >= hz - m_space * bs[self.cyl_faces]
-            prob += (zz - cz) <= -hz + m_space * bs[self.cyl_faces + 1]
+            for x, y, zz in ends:
+                for i in range(self.cyl_faces):
+                    a = 2 * np.pi * i / self.cyl_faces
+                    prob += np.cos(a) * (x - cx) + np.sin(a) * (y - cy) >= r - m_space * bs[i]
+                prob += (zz - cz) >= hz - m_space * bs[self.cyl_faces]
+                prob += (zz - cz) <= -hz + m_space * bs[self.cyl_faces + 1]
 
         faces += bs
         prob += pulp.lpSum(faces) <= len(faces) - 1              # ≥1 face (spatial OR temporal) enforced
 
-        if ref_pt is not None:                                   # pin spatial binaries to warm choice
+        if ref_ends is not None:                                 # pin spatial binaries to warm choice
             if temporal_locked:
                 for b in bs:                                     # a temporal face already carries it
                     _fix(b, 1)
             else:
-                idx, margin = self._best_spatial_face(obs, ref_pt, m)
-                if margin > self.lock_margin_m:                  # warm is CLEARLY on one side → pin it
+                (i0, m0), (i1, m1) = (self._best_spatial_face(obs, rp, m) for rp in ref_ends)
+                if i0 == i1 and min(m0, m1) > self.lock_margin_m:
+                    # BOTH warm endpoints clearly beyond the same face → pin the segment to it
                     for j, b in enumerate(bs):
-                        _fix(b, 0 if j == idx else 1)
-                # else: a transition knot near the obstacle — leave it free for CBC (keeps it feasible)
+                        _fix(b, 0 if j == i0 else 1)
+                # else: a transition segment near the obstacle — leave it free for CBC (keeps it
+                # feasible; the endpoints straddle faces exactly where the warm path turns a corner)
         return len(faces)
 
     def _nearby_obstacles(self, ledger, start, goal, t_lo, t_hi, cfg) -> list[dict]:

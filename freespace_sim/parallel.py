@@ -145,7 +145,10 @@ class ParallelConfig:
     ``run_parallel`` writes a ``stats`` dict (serial replans, re-specs, canary count, dirty rate)
     onto the instance after the run."""
 
-    n_workers: int = max(1, (os.cpu_count() or 4) - 2)
+    # Capped at 8: the dallas_full sweep showed speedup PEAKS at ~4 workers (exact) / ~8 (relaxed) and
+    # regresses hard past that — a shared cluster-L2 + ordered-commit-stall effect, not core count — so
+    # `cpu-2` (18 here) would be a catastrophic default. Pass n_workers explicitly to go higher.
+    n_workers: int = min(8, max(1, (os.cpu_count() or 4) - 2))
     window: int | None = None              # None → 4 × n_workers
     mode: str = "exact"                    # "exact" | "relaxed"
     pin_prefixes: bool = True              # relaxed only: deterministic snapshot prefixes

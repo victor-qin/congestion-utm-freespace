@@ -124,15 +124,18 @@ def main() -> None:
                    help="capture observer-only congestion telemetry (filed-but-rejected corridors, "
                         "conflict_filed culprits, per-hub metadata, end-of-run walls) into extra parquets")
     p.add_argument("--no-progress", action="store_true", help="silence the live progress line")
-    p.add_argument("--parallel", type=int, default=None, metavar="N",
-                   help="speculative worker-pool sim with N worker processes (issue #8 Track A); "
-                        "exact mode is byte-identical to the serial run")
-    p.add_argument("--parallel-mode", choices=("exact", "relaxed"), default="exact",
-                   help="exact: byte-identical to serial (default). relaxed: keep any still-feasible "
-                        "speculation — a valid FCFS-class allocation (deterministic via pinned "
-                        "prefixes; results then depend on N and the window)")
+    p.add_argument("--mode", choices=("sequential", "exact", "relaxed"), default="exact",
+                   help="execution mode (issue #8 Track A). exact (default): speculative worker-pool "
+                        "sim, byte-identical to the serial run and faster. sequential: the classic "
+                        "serial loop. relaxed: keep any still-feasible speculation — a valid "
+                        "FCFS-class allocation, faster and scales to more workers, at a small delay "
+                        "cost (deterministic via pinned prefixes; result depends on workers+window). "
+                        "Non-astar planners always run sequential regardless of this flag.")
+    p.add_argument("--workers", type=int, default=None, metavar="N",
+                   help="worker processes for exact/relaxed mode (default min(8, cores-2); the "
+                        "benchmark sweet spot is ~4 workers for exact, ~8 for relaxed)")
     p.add_argument("--parallel-window", type=int, default=None,
-                   help="speculation window (default 4×N); in relaxed mode this is result-affecting")
+                   help="speculation window (default 4×workers); result-affecting in relaxed mode")
     args = p.parse_args()
 
     spec = spec_from_args(args)
@@ -148,12 +151,17 @@ def main() -> None:
     log.info("A* kernel: %s", _kernel_status(cfg.planner))
 
     pcfg = None
-    if args.parallel is not None:
-        from freespace_sim.parallel import ParallelConfig
-        pcfg = ParallelConfig(n_workers=args.parallel, window=args.parallel_window,
-                              mode=args.parallel_mode)
-        log.info("parallel: %d workers, window=%d, mode=%s", pcfg.n_workers,
-                 pcfg.resolved_window, pcfg.mode)
+    if args.mode != "sequential":
+        from freespace_sim.parallel import PARALLEL_PLANNERS, ParallelConfig
+        if cfg.planner in PARALLEL_PLANNERS:
+            kw = {"mode": args.mode, "window": args.parallel_window}
+            if args.workers is not None:                 # else ParallelConfig's own capped default
+                kw["n_workers"] = args.workers
+            pcfg = ParallelConfig(**kw)
+            log.info("mode=%s: %d workers, window=%d", pcfg.mode, pcfg.n_workers, pcfg.resolved_window)
+        else:                                            # MILP/straight/etc. have no envelope-recording
+            log.info("planner %r has no parallel kernel — running sequential (--mode %s ignored)",
+                     cfg.planner, args.mode)
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,

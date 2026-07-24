@@ -406,6 +406,12 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
     next_commit = 0
     cursor_box = [0]                        # next fresh flight index not yet in `fresh`
     n_serial = n_respec = n_canary = n_dirty = n_deferred = 0
+    # coordinator wall accounting (issue #8 Phase E/F): is the serial commit floor binding, or is the
+    # coordinator idle waiting on straggler workers? t_commit = time inside the ordered-commit block
+    # (dss.commit + occupancy hooks + delta broadcast, all serial); t_wait = time blocked in
+    # connection.wait for any worker to return. t_commit ≫ t_wait ⇒ shrink the floor; t_wait ≫
+    # t_commit ⇒ the bottleneck is worker plan variance, not the coordinator.
+    t_commit = t_wait = 0.0
     # live window: adaptive only where it is a pure throughput knob (exact / unpinned relaxed) —
     # in relaxed+pinned mode W is SEMANTIC (part of the pinned prefixes) and must stay fixed.
     adapt = (AdaptiveWindow(lo=pcfg.n_workers, hi=W)
@@ -477,6 +483,7 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
         _dispatch()
         while next_commit < total:
             # ---- commit everything ready at the frontier, strictly in order ----
+            _tc0 = time.monotonic()
             while next_commit in pending:
                 k = next_commit
                 intent, env, P_used, tele_rows = pending.pop(k)
@@ -544,6 +551,7 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
                         retries[j] = retries.get(j, 0) + 1
                         respec_q.append(j)
                         n_respec += 1
+            t_commit += time.monotonic() - _tc0
             if next_commit >= total:
                 break
             _dispatch()
@@ -553,7 +561,10 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
                 # frontier not pending and nothing in flight ⇒ it must be queued for re-spec;
                 # dispatch made no progress only if there are no idle workers — impossible here.
                 continue
-            for conn in mp_connection.wait(busy_conns):
+            _tw0 = time.monotonic()
+            ready = mp_connection.wait(busy_conns)
+            t_wait += time.monotonic() - _tw0
+            for conn in ready:
                 widx = conn_to_w[conn]
                 try:
                     msg = conn.recv()
@@ -587,5 +598,6 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
         "n_respec": n_respec, "n_canary": n_canary, "n_deferred": n_deferred,
         "dirty_rate": n_dirty / total, "predictive": predictive,
         "final_window": adapt.w if adapt is not None else W,
+        "t_commit_s": t_commit, "t_wait_s": t_wait,
     }
     return results

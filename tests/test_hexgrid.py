@@ -87,6 +87,64 @@ def test_vectorized_rasterize_matches_scalar_reference():
         assert pad == _scalar_rasterize(v, CFG, R, infl_p)
 
 
+def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
+    """``rasterize_ranges`` (issue #8 Phase E) collapses the step axis to a contiguous span per cell.
+    Expanding every range back over its steps must reproduce :func:`rasterize_volume_dual` EXACTLY
+    (byte-coverage: the compiled pool blocks the whole span in one split, and this is why that stays
+    byte-identical), and the memo must reuse the geometry (the point: one sweep for both images)."""
+    z = CFG.cruise_level_m
+    vols = [
+        corridor_segment_volume(vec(800, 200, z), 40.0, vec(920, 260, z), 44.0, CFG),   # multi-step box
+        hover_reservation(vec(1500, -700, 0.0), 60.0, CFG),                             # cylinder
+    ]
+    infl_b = CFG.corridor_width_m / 2.0 + R
+    infl_p = CFG.effective_hover_radius_m + R
+
+    calls = {"n": 0}
+    real = hg.rasterize_volume_ranges
+    def _counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+    monkeypatch.setattr(hg, "rasterize_volume_ranges", _counting)
+    hg._RANGE_CACHE.clear()
+
+    for v in vols:
+        want = list(hg.rasterize_volume_dual(v, CFG, R, infl_b, infl_p))
+        before = calls["n"]
+        ranges = hg.rasterize_ranges(v, CFG, R, infl_b, infl_p)   # cold: computes
+        again = hg.rasterize_ranges(v, CFG, R, infl_b, infl_p)    # warm: reused, no recompute
+        assert again is ranges                                    # the SECOND consumer reuses it
+        assert calls["n"] == before + 1                           # exactly one underlying sweep
+        expanded = [(q, r, L, s, b) for q, r, L, s_lo, s_hi, b in ranges
+                    for s in range(s_lo, s_hi + 1)]
+        assert expanded == want                                   # ranges ⇒ dual sweep, byte-for-byte
+        assert len(ranges) < len(want)                            # the collapse actually happened
+    hg._RANGE_CACHE.clear()
+
+
+def test_block_range_equals_per_step_blocking():
+    """``_Pool.block_range`` (issue #8 Phase E) must leave the free/blocked step set byte-identical to
+    blocking every step of the span individually — including when the span straddles holes an earlier
+    block punched (the multi-interval case). A reference pool blocks step-by-step; the test pool uses
+    block_range; they must agree on ``blocked_at`` at every step for every cell."""
+    from freespace_sim.planner.compiled_hex_occupancy import _Pool
+
+    NC, MAXS = 4, 40
+    rng = np.random.default_rng(0)
+    ref = _Pool(NC, MAXS)                                  # blocks each step individually
+    rng_pool = _Pool(NC, MAXS)                             # blocks whole spans via block_range
+    for _ in range(60):
+        c = int(rng.integers(0, NC))
+        lo = int(rng.integers(-2, MAXS))
+        hi = lo + int(rng.integers(0, 12))
+        for s in range(max(0, lo), min(MAXS, hi) + 1):
+            ref.block(c, s)
+        rng_pool.block_range(c, lo, hi)                    # single call, may span prior holes
+        for cc in range(NC):
+            for s in range(0, MAXS + 1):
+                assert ref.blocked_at(cc, s) == rng_pool.blocked_at(cc, s), (cc, s)
+
+
 def test_rasterize_box_lands_on_its_level_only():
     """A level corridor box marks cells at exactly its own flight level."""
     z = CFG.level_z(1)                                      # 70 m

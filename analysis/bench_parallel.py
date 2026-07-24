@@ -61,7 +61,7 @@ def main(argv=None) -> None:
           f"({1000 * t_seq / max(1, len(seq.intents)):.0f} ms/flight), verified={seq.verified}\n")
 
     hdr = (f"{'mode':>8} {'N':>3} {'W':>4} {'wall_s':>7} {'speedup':>8} {'dirty%':>7}"
-           f" {'serial':>7} {'respec':>7} {'defer':>6} {'canary':>7} {'exact?':>7}")
+           f" {'serial':>7} {'respec':>7} {'commit_s':>9} {'wait_s':>8} {'canary':>7} {'exact?':>7}")
     print(hdr + "\n" + "-" * len(hdr))
     for mode in args.modes:
         for n in args.workers:
@@ -80,8 +80,8 @@ def main(argv=None) -> None:
                 assert par.verified
                 print(f"{mode:>8} {n:>3} {s['window']:>4} {wall:>7.1f} {t_seq / wall:>7.2f}x"
                       f" {100 * s['dirty_rate']:>6.1f}% {s['n_serial_replans']:>7}"
-                      f" {s['n_respec']:>7} {s['n_deferred']:>6} {s['n_canary']:>7}"
-                      f" {'yes' if same else 'NO':>7}", flush=True)
+                      f" {s['n_respec']:>7} {s.get('t_commit_s', 0):>9.1f} {s.get('t_wait_s', 0):>8.1f}"
+                      f" {s['n_canary']:>7} {'yes' if same else 'NO':>7}", flush=True)
 
 
 if __name__ == "__main__":

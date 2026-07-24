@@ -122,27 +122,27 @@ def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
     hg._RANGE_CACHE.clear()
 
 
-def test_block_range_equals_per_step_blocking():
-    """``_Pool.block_range`` (issue #8 Phase E) must leave the free/blocked step set byte-identical to
-    blocking every step of the span individually — including when the span straddles holes an earlier
-    block punched (the multi-interval case). A reference pool blocks step-by-step; the test pool uses
-    block_range; they must agree on ``blocked_at`` at every step for every cell."""
+def test_block_range_matches_free_set_oracle():
+    """``_Pool.block_range`` (issue #8 Phase E) vs an INDEPENDENT oracle — a plain per-cell set of
+    still-free steps. (``block`` now delegates to ``block_range``, so comparing the two would be
+    circular; the oracle validates the interval surgery from first principles instead.) Random spans,
+    some straddling holes earlier spans punched (the multi-interval case) and some running off both
+    ends, must leave ``blocked_at`` agreeing with the oracle at every step of every cell."""
     from freespace_sim.planner.compiled_hex_occupancy import _Pool
 
     NC, MAXS = 4, 40
     rng = np.random.default_rng(0)
-    ref = _Pool(NC, MAXS)                                  # blocks each step individually
-    rng_pool = _Pool(NC, MAXS)                             # blocks whole spans via block_range
-    for _ in range(60):
+    pool = _Pool(NC, MAXS)
+    free = [set(range(MAXS + 1)) for _ in range(NC)]      # oracle: the still-free steps per cell
+    for _ in range(80):
         c = int(rng.integers(0, NC))
-        lo = int(rng.integers(-2, MAXS))
-        hi = lo + int(rng.integers(0, 12))
-        for s in range(max(0, lo), min(MAXS, hi) + 1):
-            ref.block(c, s)
-        rng_pool.block_range(c, lo, hi)                    # single call, may span prior holes
+        lo = int(rng.integers(-3, MAXS + 2))              # spans may run off either end
+        hi = lo + int(rng.integers(0, 14))
+        pool.block_range(c, lo, hi)
+        free[c] -= set(range(max(0, lo), min(MAXS, hi) + 1))   # clamp mirrors block_range
         for cc in range(NC):
             for s in range(0, MAXS + 1):
-                assert ref.blocked_at(cc, s) == rng_pool.blocked_at(cc, s), (cc, s)
+                assert pool.blocked_at(cc, s) == (s not in free[cc]), (cc, s, lo, hi)
 
 
 def test_rasterize_box_lands_on_its_level_only():

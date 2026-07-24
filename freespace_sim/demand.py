@@ -408,6 +408,9 @@ class HubRadiusDemand:
         else:
             # Per-USS path: an independent Poisson stream per operator; cfg.lam_per_hour / uss_share unused.
             for uss_id in self.n_hubs_per_uss:
+                # Omitting a hub USS from lam_per_uss is ALLOWED and means zero demand (infrastructure-only
+                # hub). A MISTYPED key is not: __post_init__ rejects lam_per_uss keys absent from
+                # n_hubs_per_uss, so the only way to reach this default-0 is a deliberate omission.
                 lam = float(self.lam_per_uss.get(uss_id, 0.0))
                 n_uss = int(rng.poisson(lam * cfg.horizon_s / 3600.0))
                 for _ in range(n_uss):

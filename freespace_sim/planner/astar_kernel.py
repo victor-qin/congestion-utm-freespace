@@ -9,9 +9,12 @@ Python host.
 
 **State** ``(q, r, L, step)`` — a hex cell at flight level ``L`` and time ``step`` — plus the ground state
 (packed with ``L=-1``). There is no dense id for this 4-D space, so ``g``/``closed``/``came`` live in an
-**open-addressing hash** in flat arrays, version-stamped by ``gen`` (bump per plan → O(1) reset). The
-priority queue is a hand-rolled binary min-heap keyed ``(f, insertion_counter)`` — byte-identical to the
-host's ``heapq`` ``(priority, next(counter))`` tie-break, which is what makes the expansion order match.
+**open-addressing hash** of packed 32 B records, version-stamped by ``gen`` (bump per plan → O(1)
+reset); see ``_packed`` for why the layout is array-of-structs rather than the natural struct-of-arrays.
+
+The priority queue is a hand-rolled binary min-heap keyed ``(f, insertion_counter)`` — byte-identical
+to the host's ``heapq`` ``(priority, next(counter))`` tie-break, which is what makes the expansion
+order match.
 
 **Occupancy** is :class:`CompiledHexOccupancy`'s two interval pools (corridor + column, per-``(q,r,L)``
 free intervals) plus this flight's cheap per-cell own-column **mark** (``ov_own_gen``); ``_blocked`` folds
@@ -24,8 +27,11 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 
+from ._packed import GEN_MASK
+
 _SQRT3 = 1.7320508075688772
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)          # Fibonacci hashing multiplier
+_GEN_MASK = GEN_MASK                            # ~1 — strip the closed bit from a packed gen stamp
 
 # status codes
 OK = 0
@@ -62,6 +68,17 @@ def _hpush(heap_f, heap_c, heap_n, size, f, c, node):
 
 @njit(cache=True, nogil=True)
 def _hpop(heap_f, heap_c, heap_n, size):
+    """Pop the minimum. Deliberately still a **binary heap over three separate arrays** — the one hot
+    structure in this kernel that the array-of-structs treatment does NOT help.
+
+    Measured (issue #8 memory plan): packing these three into 32 B records and going 4-ary — which
+    makes a node's four children one aligned cache line — was byte-exact but **21% slower end to end**
+    (64.4 → 78.1 ms/flight). The g-hash and the interval pools are accessed at random and thrash a
+    shared cluster L2; a heap is not. Its sift path concentrates on the top few levels, which stay
+    resident whatever the layout, and the one deep access per operation sits at index ``size``, which
+    moves by ±1 and prefetches perfectly. So packing bought no locality here, while the variable-bound
+    4-ary child loop and the int64/float64 aliasing (which blocks alias analysis across the swap) cost
+    real cycles. Do not "finish the job" by packing this one too."""
     node = heap_n[0]
     size -= 1
     heap_f[0] = heap_f[size]; heap_c[0] = heap_c[size]; heap_n[0] = heap_n[size]
@@ -82,35 +99,41 @@ def _hpop(heap_f, heap_c, heap_n, size):
 
 
 @njit(cache=True, nogil=True)
-def _probe(g_key, g_gen, gen, key, cap, log2cap):
+def _probe(g_pack, gen, key, cap, log2cap):
     """Linear-probe the open-addressing table for ``key``; return the slot holding it OR the first empty
-    (this-generation) slot; -1 if the table is full (probe budget = cap)."""
+    (this-generation) slot; -1 if the table is full (probe budget = cap).
+
+    Both fields the probe reads — the generation stamp and the key — live in the SAME 32 B record, so
+    a probe step touches one cache line instead of two separate multi-MB arrays (see ``_packed``).
+    ``gen`` is always even; bit 0 of the stamp is the closed flag and is masked off here."""
     i = _slot0(key, log2cap)
     mask = cap - 1
     for _ in range(cap):
-        if g_gen[i] != gen:
+        if (g_pack[i, 1] & _GEN_MASK) != gen:
             return i                                   # empty (stale) slot → key not present
-        if g_key[i] == key:
+        if g_pack[i, 0] == key:
             return i                                   # found
         i = (i + 1) & mask
     return -1
 
 
 @njit(cache=True, nogil=True)
-def _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
+def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
            heap_f, heap_c, heap_n, size, max_heap, nkey, ng, f, ctr, st_key):
     """Relax edge into ``nkey`` at cost ``ng``, priority ``f``. Mirrors astar.py:317-322:
     push iff ``ng < g.get(nkey, inf)``; on relax, update g/came but PRESERVE the closed bit (the
     reference never reopens — with a consistent heuristic a closed node is never relaxed anyway).
     Returns ``(size, ctr, rc)`` with rc: 1 pushed, 0 no-op, -1 hash-full, -2 heap-full."""
-    nslot = _probe(g_key, g_gen, gen, nkey, hash_cap, log2cap)
+    nslot = _probe(g_pack, gen, nkey, hash_cap, log2cap)
     if nslot < 0:
         return size, ctr, -1
-    if g_gen[nslot] != gen:                             # new node this generation
-        g_key[nslot] = nkey; g_gen[nslot] = gen; g_val[nslot] = ng
-        g_came[nslot] = st_key; g_flag[nslot] = 0
-    elif ng < g_val[nslot]:                            # relax existing (preserve g_flag/closed)
-        g_val[nslot] = ng; g_came[nslot] = st_key
+    if (g_pack[nslot, 1] & _GEN_MASK) != gen:           # new node this generation
+        g_pack[nslot, 0] = nkey
+        g_pack[nslot, 1] = gen                          # even ⇒ also clears the closed bit
+        g_packf[nslot, 2] = ng
+        g_pack[nslot, 3] = st_key
+    elif ng < g_packf[nslot, 2]:                       # relax existing (stamp untouched ⇒ closed kept)
+        g_packf[nslot, 2] = ng; g_pack[nslot, 3] = st_key
     else:
         return size, ctr, 0
     if size >= max_heap:
@@ -121,24 +144,46 @@ def _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
 
 @njit(cache=True, nogil=True)
 def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
-             iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen):
+             iv, cv, static_col, ov_own_gen, gen, read_bbox):
     """0 = free, 1 = blocked, -1 = out-of-box. Reproduces ``occupancy.is_blocked`` via the corridor pool
     (``iv_*``) + column pool (``cv_*``) + always-active static walls (``static_col``) + this flight's
     own-column mark (``ov_own_gen[cell] == gen``): a FOREIGN column (transient OR always-active) is a wall;
     an OWN column is transparent unless a corridor (fixed-lane sibling) also covers it; a plain cell is the
-    corridor pool."""
+    corridor pool.
+
+    ``read_bbox`` (int64[8]: qmin,qmax,rmin,rmax,Lmin,Lmax,smin,smax) accumulates every IN-BOX probe —
+    the plan's read set, consumed by the Track-A exact-mode commit validation (``parallel.PlanEnvelope``).
+    Write-only w.r.t. the search: it cannot change any decision, so kernel==reference parity is untouched.
+    Out-of-box probes are excluded deliberately: the -1 answer is pure box geometry, independent of every
+    commit, so it can never be dirtied."""
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
+    if q < read_bbox[0]:
+        read_bbox[0] = q
+    if q > read_bbox[1]:
+        read_bbox[1] = q
+    if r < read_bbox[2]:
+        read_bbox[2] = r
+    if r > read_bbox[3]:
+        read_bbox[3] = r
+    if L < read_bbox[4]:
+        read_bbox[4] = L
+    if L > read_bbox[5]:
+        read_bbox[5] = L
+    if s < read_bbox[6]:
+        read_bbox[6] = s
+    if s > read_bbox[7]:
+        read_bbox[7] = s
     cell = (iq * rspan + ir) * n_levels + L
     # column pool: is `cell` column-blocked at s? (blocked iff s is in no free interval)
     colb = 1
     slot = cell
     while slot != -1:
-        if cv_lo[slot] <= s <= cv_hi[slot]:
+        if cv[slot, 0] <= s <= cv[slot, 1]:            # (lo, hi, nxt) share one 16 B row → one line
             colb = 0
             break
-        slot = cv_nxt[slot]
+        slot = cv[slot, 2]
     if static_col[cell]:                               # always-active terminal: permanent column wall (all s)
         colb = 1
     if colb == 1 and ov_own_gen[cell] != gen:
@@ -146,9 +191,9 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
     # corridor pool
     slot = cell
     while slot != -1:
-        if iv_lo[slot] <= s <= iv_hi[slot]:
+        if iv[slot, 0] <= s <= iv[slot, 1]:
             return 0
-        slot = iv_nxt[slot]
+        slot = iv[slot, 2]
     return 1
 
 
@@ -166,7 +211,7 @@ def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost):
 @njit(cache=True, nogil=True)
 def _search(
     # ---- occupancy pool + static walls + per-flight overlay (CompiledHexOccupancy) ----
-    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen,
+    iv, cv, static_col, ov_own_gen,
     qmin, rmin, qspan, rspan, n_levels, base, max_step,
     # ---- ground / takeoff-fan (host masks) ----
     oq, orr, lane_q, lane_r, lane_lat, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
@@ -176,12 +221,14 @@ def _search(
     goal_q, goal_r, n_goal, land_ok,
     # ---- heuristic ----
     gx, gy, R, h_off, c_lat, h_ground,
-    # ---- g/closed/came open-addressing hash (version-stamped) ----
-    gen, g_key, g_gen, g_val, g_came, g_flag, hash_cap, log2cap,
-    # ---- heap ----
+    # ---- g/closed/came open-addressing hash (version-stamped, packed 32 B records: see _packed) ----
+    gen, g_pack, g_packf, hash_cap, log2cap,
+    # ---- heap (binary, three arrays — see _hpop for why this one is NOT packed) ----
     heap_f, heap_c, heap_n, max_heap,
     # ---- output ----
     out_q, out_r, out_L, out_s, max_expansions,
+    # ---- read-set telemetry (Track A, issue #8): in/out int64[8] bbox over every in-box probe ----
+    read_bbox,
 ):
     step_span = max_step - base + 1
     nlp1 = n_levels + 1
@@ -189,21 +236,21 @@ def _search(
 
     # ---- seed: start = ground ("g", oq, orr, base), g=0, f=h_ground ----
     start_key = ((iq0 * rspan + ir0) * nlp1 + 0) * step_span + 0
-    slot = _probe(g_key, g_gen, gen, start_key, hash_cap, log2cap)
+    slot = _probe(g_pack, gen, start_key, hash_cap, log2cap)
     if slot < 0:
         return 0, 0.0, 0, FB_HASH, -1
-    g_key[slot] = start_key; g_gen[slot] = gen; g_val[slot] = 0.0; g_came[slot] = -1; g_flag[slot] = 0
+    g_pack[slot, 0] = start_key; g_pack[slot, 1] = gen; g_packf[slot, 2] = 0.0; g_pack[slot, 3] = -1
     size = _hpush(heap_f, heap_c, heap_n, 0, h_ground, 0, start_key)
     ctr = 1
     n_exp = 0
 
     while size > 0:
         st_key, size = _hpop(heap_f, heap_c, heap_n, size)
-        sslot = _probe(g_key, g_gen, gen, st_key, hash_cap, log2cap)
-        if g_flag[sslot] & 1:                          # already closed → skip (lazy-deletion heap)
+        sslot = _probe(g_pack, gen, st_key, hash_cap, log2cap)
+        if g_pack[sslot, 1] & 1:                       # already closed → skip (lazy-deletion heap)
             continue
-        g_flag[sslot] |= 1                             # close on first pop
-        base_g = g_val[sslot]
+        g_pack[sslot, 1] |= 1                          # close on first pop
+        base_g = g_packf[sslot, 2]
 
         # unpack st_key → (q, r, L, step)
         sp = st_key % step_span
@@ -234,8 +281,8 @@ def _search(
                     ciq = ccell // rspan
                     out_q[m] = ciq + qmin; out_r[m] = cir + rmin
                     out_L[m] = cLp - 1; out_s[m] = csp + base
-                    cslot = _probe(g_key, g_gen, gen, cur, hash_cap, log2cap)
-                    cur = g_came[cslot]
+                    cslot = _probe(g_pack, gen, cur, hash_cap, log2cap)
+                    cur = g_pack[cslot, 3]
                     m += 1
                 return m, base_g, n_exp, OK, -1
 
@@ -251,7 +298,7 @@ def _search(
             if step + 1 <= max_step:                    # ground-wait g→g (emitted FIRST)
                 nkey = ((iq0 * rspan + ir0) * nlp1 + 0) * step_span + (step + 1 - base)
                 ng = base_g + c_gd_dt
-                size, ctr, rc = _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
+                size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                        heap_f, heap_c, heap_n, size, max_heap,
                                        nkey, ng, ng + h_ground, ctr, st_key)
                 if rc == -1:
@@ -268,7 +315,8 @@ def _search(
                         if not to_ok[gi * n_levels + Lv]:
                             continue
                         if _blocked(lq, lr, Lv, ts, qmin, rmin, qspan, rspan, n_levels,
-                                    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) != 0:
+                                    iv, cv, static_col, ov_own_gen, gen,
+                                    read_bbox) != 0:
                             continue
                         liq = lq - qmin; lir = lr - rmin
                         nkey = ((liq * rspan + lir) * nlp1 + (Lv + 1)) * step_span + (ts - base)
@@ -279,7 +327,7 @@ def _search(
                         # can flip a heap tie and break the compiled==reference node-count/centerline parity).
                         ng = base_g + (takeoff_cost[Lv] + lane_lat[li])
                         hh = _h_air(lq, lr, Lv, gx, gy, R, h_off, c_lat, takeoff_cost)
-                        size, ctr, rc = _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
+                        size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                                heap_f, heap_c, heap_n, size, max_heap,
                                                nkey, ng, ng + hh, ctr, st_key)
                         if rc == -1:
@@ -306,7 +354,7 @@ def _search(
             else:
                 nq = q; nr = r + 1
             b = _blocked(nq, nr, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                         iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen)
+                         iv, cv, static_col, ov_own_gen, gen, read_bbox)
             if b == -1:                                  # out-of-box stray → host reference
                 return 0, 0.0, n_exp, FB_OOB, (nq + 32768) * 65536 + (nr + 32768)
             if b == 1:
@@ -315,7 +363,7 @@ def _search(
             nkey = ((niq * rspan + nir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_lat_pitch
             hh = _h_air(nq, nr, L, gx, gy, R, h_off, c_lat, takeoff_cost)
-            size, ctr, rc = _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
+            size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                    heap_f, heap_c, heap_n, size, max_heap, nkey, ng, ng + hh, ctr, st_key)
             if rc == -1:
                 return 0, 0.0, n_exp, FB_HASH, -1
@@ -323,11 +371,11 @@ def _search(
                 return 0, 0.0, n_exp, FB_HEAP, -1
         # hover (same level)
         if _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                    iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) == 0:
+                    iv, cv, static_col, ov_own_gen, gen, read_bbox) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt
             hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost)
-            size, ctr, rc = _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
+            size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                    heap_f, heap_c, heap_n, size, max_heap, nkey, ng, ng + hh, ctr, st_key)
             if rc == -1:
                 return 0, 0.0, n_exp, FB_HASH, -1
@@ -347,9 +395,11 @@ def _search(
                 sk = step + 1
                 while sk <= ts:
                     if _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) != 0 or \
+                                iv, cv, static_col, ov_own_gen, gen,
+                                read_bbox) != 0 or \
                        _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, static_col, ov_own_gen, gen) != 0:
+                                iv, cv, static_col, ov_own_gen, gen,
+                                read_bbox) != 0:
                         clear = False
                         break
                     sk += 1
@@ -358,7 +408,7 @@ def _search(
                 nkey = ((iq * rspan + ir) * nlp1 + (L2 + 1)) * step_span + (ts - base)
                 ng = base_g + rung_cost[rung]
                 hh = _h_air(q, r, L2, gx, gy, R, h_off, c_lat, takeoff_cost)
-                size, ctr, rc = _relax(g_key, g_gen, g_val, g_came, g_flag, gen, hash_cap, log2cap,
+                size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                        heap_f, heap_c, heap_n, size, max_heap, nkey, ng, ng + hh, ctr, st_key)
                 if rc == -1:
                     return 0, 0.0, n_exp, FB_HASH, -1

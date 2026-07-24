@@ -124,6 +124,15 @@ def main() -> None:
                    help="capture observer-only congestion telemetry (filed-but-rejected corridors, "
                         "conflict_filed culprits, per-hub metadata, end-of-run walls) into extra parquets")
     p.add_argument("--no-progress", action="store_true", help="silence the live progress line")
+    p.add_argument("--parallel", type=int, default=None, metavar="N",
+                   help="speculative worker-pool sim with N worker processes (issue #8 Track A); "
+                        "exact mode is byte-identical to the serial run")
+    p.add_argument("--parallel-mode", choices=("exact", "relaxed"), default="exact",
+                   help="exact: byte-identical to serial (default). relaxed: keep any still-feasible "
+                        "speculation — a valid FCFS-class allocation (deterministic via pinned "
+                        "prefixes; results then depend on N and the window)")
+    p.add_argument("--parallel-window", type=int, default=None,
+                   help="speculation window (default 4×N); in relaxed mode this is result-affecting")
     args = p.parse_args()
 
     spec = spec_from_args(args)
@@ -138,9 +147,20 @@ def main() -> None:
              cfg.lam_per_hour, cfg.horizon_s, cfg.seed)
     log.info("A* kernel: %s", _kernel_status(cfg.planner))
 
+    pcfg = None
+    if args.parallel is not None:
+        from freespace_sim.parallel import ParallelConfig
+        pcfg = ParallelConfig(n_workers=args.parallel, window=args.parallel_window,
+                              mode=args.parallel_mode)
+        log.info("parallel: %d workers, window=%d, mode=%s", pcfg.n_workers,
+                 pcfg.resolved_window, pcfg.mode)
+
     t0 = time.time()
-    res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry)
+    res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
+              parallel=pcfg)
     wall = time.time() - t0
+    if pcfg is not None and pcfg.stats:
+        log.info("parallel stats: %s", pcfg.stats)
 
     folder = runs.save_run(
         res, label=tag, experiment="run", scenario=spec.name, demand=spec.demand.pattern,

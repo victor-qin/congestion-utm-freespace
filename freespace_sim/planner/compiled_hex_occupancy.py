@@ -43,6 +43,7 @@ import numpy as np
 from ..geometry import CylinderSpec
 from ..types import as_terminal
 from . import hexgrid as hg
+from ._packed import P_HI, P_LO, P_NXT, aligned_2d
 
 
 def search_horizon(base: int, takeoff_steps_max: int, n_hops: int, climb_span: int, cfg) -> int:
@@ -86,72 +87,75 @@ def schedulable_horizon_steps(cfg) -> int:
 
 class _Pool:
     """Flat linked-list free-interval pool: cell ``c``'s intervals are walked from slot ``c`` along
-    ``nxt``; a blocked step splits the containing interval in place. Slot 0..NC-1 pre-seeded ``[0, MAXS]``."""
+    ``nxt``; a blocked step splits the containing interval in place. Slot 0..NC-1 pre-seeded ``[0, MAXS]``.
+
+    Rows are packed ``(lo, hi, nxt, pad)`` int32 in one ``iv`` block — 16 B, 8 rows per cache line — so
+    a list walk touches ONE line per node instead of one in each of three separate multi-MB arrays.
+    This is the hottest layout in the whole search: the kernel's ``_blocked`` walks two of these lists
+    for every neighbour of every expansion. See ``_packed`` for the measurement behind it."""
 
     def __init__(self, NC: int, MAXS: int):
         self.NC = NC
         self.MAXS = MAXS
-        cap = max(2 * NC, 1 << 18)
-        self.cap = cap
-        self.lo = np.empty(cap, np.int32)
-        self.hi = np.empty(cap, np.int32)
-        self.nxt = np.empty(cap, np.int32)
-        self.lo[:NC] = 0
-        self.hi[:NC] = MAXS
-        self.nxt[:NC] = -1
-        self.nslots = NC
+        self.cap = max(2 * NC, 1 << 18)
+        self.iv = aligned_2d(self.cap, 4, np.int32)
+        self.reset()
 
     def reset(self):
-        self.lo[: self.NC] = 0
-        self.hi[: self.NC] = self.MAXS
-        self.nxt[: self.NC] = -1
+        self.iv[: self.NC, P_LO] = 0
+        self.iv[: self.NC, P_HI] = self.MAXS
+        self.iv[: self.NC, P_NXT] = -1
         self.nslots = self.NC
 
     def _grow(self):
         cap = self.cap * 2
-        for name in ("lo", "hi", "nxt"):
-            a = np.empty(cap, np.int32)
-            a[: self.cap] = getattr(self, name)
-            setattr(self, name, a)
+        iv = aligned_2d(cap, 4, np.int32)
+        iv[: self.cap] = self.iv
+        self.iv = iv
         self.cap = cap
 
     def _alloc(self, lo, hi, nxt) -> int:
         if self.nslots >= self.cap:
             self._grow()
         s = self.nslots
-        self.lo[s] = lo; self.hi[s] = hi; self.nxt[s] = nxt
+        self.iv[s, P_LO] = lo; self.iv[s, P_HI] = hi; self.iv[s, P_NXT] = nxt
         self.nslots += 1
         return s
 
     def block(self, c: int, s: int) -> None:
-        """Split cell ``c``'s free interval containing ``s`` (in place)."""
+        """Split cell ``c``'s free interval containing ``s`` (in place).
+
+        Every access goes through ``self.iv`` rather than a hoisted local: ``_alloc`` can ``_grow``,
+        which REPLACES the array, so a cached reference would write the split link into the dead
+        buffer and silently lose the interval."""
         if s < 0 or s > self.MAXS:
             return
         slot = c
         while slot != -1:
-            a, b = int(self.lo[slot]), int(self.hi[slot])
+            a, b = int(self.iv[slot, P_LO]), int(self.iv[slot, P_HI])
             if a <= s <= b:
                 if s + 1 <= b:
                     if a <= s - 1:
-                        self.hi[slot] = s - 1
-                        ns = self._alloc(s + 1, b, int(self.nxt[slot]))
-                        self.nxt[slot] = ns
+                        self.iv[slot, P_HI] = s - 1
+                        ns = self._alloc(s + 1, b, int(self.iv[slot, P_NXT]))
+                        self.iv[slot, P_NXT] = ns
                     else:
-                        self.lo[slot] = s + 1
+                        self.iv[slot, P_LO] = s + 1
                 elif a <= s - 1:
-                    self.hi[slot] = s - 1
+                    self.iv[slot, P_HI] = s - 1
                 else:
-                    self.lo[slot] = s + 1
+                    self.iv[slot, P_LO] = s + 1
                 return
-            slot = int(self.nxt[slot])
+            slot = int(self.iv[slot, P_NXT])
 
     def blocked_at(self, c: int, s: int) -> bool:
         """True iff step ``s`` is in NO free interval of cell ``c``."""
+        iv = self.iv                                   # no allocation here, so hoisting is safe
         slot = c
         while slot != -1:
-            if int(self.lo[slot]) <= s <= int(self.hi[slot]):
+            if int(iv[slot, P_LO]) <= s <= int(iv[slot, P_HI]):
                 return False
-            slot = int(self.nxt[slot])
+            slot = int(iv[slot, P_NXT])
         return True
 
 

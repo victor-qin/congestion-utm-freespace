@@ -114,7 +114,7 @@ def test_milp_climbs_over_a_wall_blocking_the_floor_and_the_warm_plane():
 
 
 def test_milp_single_plane_band_recovers_legacy():
-    cfg = SimConfig(z_min_m=75.0, z_max_m=75.0)
+    cfg = SimConfig(flight_levels_m=(75.0,))   # one plane ⇒ derived band z_min==z_max==75 (collapsed)
     intent = MILPOptPlanner().plan(_req(), ReservationLedger(cfg), cfg)
     assert intent.status is IntentStatus.ACCEPTED
     assert set(_z_profile(intent)) == {75.0}

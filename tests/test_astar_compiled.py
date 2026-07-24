@@ -98,8 +98,7 @@ def test_compiled_share_corridor_by_altitude_exact():
 
 
 def test_compiled_single_level_config_exact():
-    cfg = SimConfig(cruise_level_m=150.0, flight_levels_m=(150.0,), airspace_ceiling_m=165.0,
-                    z_min_m=150.0, z_max_m=150.0)
+    cfg = SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0)   # cruise/z derive to 150
     _assert_exact(_req(), [], cfg=cfg)
 
 

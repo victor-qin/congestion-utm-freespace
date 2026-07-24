@@ -34,6 +34,12 @@ class DemandSpec:
     return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
     uss_share: "dict[str, float] | None" = None      # demand split across USSs (None ⇒ equal weight)
+    # hub_radius: per-USS delivery Poisson rate (/hr). When set, REPLACES cfg.lam_per_hour × uss_share —
+    # each USS is its own independent stream. None ⇒ the global-λ path.
+    lam_per_uss: "dict[str, float] | None" = None
+    # hub_radius: per-USS desired-departure lead as ``(mean_s, std_s)`` — t_departure = t_request +
+    # max(0, N(mean, std)). Absent USSs (or None) depart on filing. Applies to delivery and return legs.
+    departure_offset_s: "dict[str, tuple[float, float]] | None" = None
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -60,6 +66,8 @@ class DemandSpec:
                 terminal_radius_m=self.terminal_radius_m, corridor_overlap_m=self.corridor_overlap_m,
                 return_flights=self.return_flights, turnaround_s=self.turnaround_s,
                 uss_share=self.uss_share,
+                lam_per_uss=self.lam_per_uss,
+                departure_offset_s=self.departure_offset_s,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":
@@ -88,8 +96,9 @@ class ScenarioSpec:
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
     terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
     # flight-level ladder override (None → SimConfig default (30,70,110) multi-level). Pin a scenario to
-    # one A* plane with flight_levels_m=(z,); widen by listing more levels. (cruise/z bounds are the
-    # single-plane samplers' band — no registered scenario overrides them, so they're not exposed here.)
+    # one A* plane with flight_levels_m=(z,); widen by listing more levels. This is the single altitude
+    # knob: SimConfig derives the single-plane samplers' cruise + z-band from it, so a scenario needn't
+    # (and can't) set cruise_level_m / z_min_m / z_max_m separately.
     flight_levels_m: "tuple[float, ...] | None" = None
     demand: DemandSpec = field(default_factory=DemandSpec)
 

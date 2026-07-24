@@ -232,9 +232,32 @@ class HubRadiusDemand:
     return_flights: bool = True                      # each delivery → a return to its origin hub
     turnaround_s: float = 0.0                      # delay before the return is filed (after est. arrival)
     uss_share: dict[str, float] | None = None
+    # Per-USS delivery Poisson rate (/hr). When set it REPLACES the global cfg.lam_per_hour × uss_share
+    # path entirely: each USS is its own independent Poisson stream (Poisson thinning ⇒ a strict
+    # generalization). ``uss_share`` and ``cfg.lam_per_hour`` are then ignored for this model. None ⇒ the
+    # legacy global-λ-then-share behaviour (byte-for-byte unchanged).
+    lam_per_uss: "dict[str, float] | None" = None
+    # Per-USS desired-departure lead as a Gaussian ``(mean_s, std_s)``: a leg filed at t is scheduled to
+    # depart at ``t + max(0, N(mean, std))`` (floored at 0 so t_departure ≥ t_request always holds). Set
+    # for some USSs to model per-operator scheduling lead / advance booking; absent USSs (or None) depart
+    # on filing exactly as today (and draw NO extra randomness). Applies to BOTH the delivery and its
+    # return leg — each operation carries the operator's lead.
+    departure_offset_s: "dict[str, tuple[float, float]] | None" = None
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F
     min_hub_gap_m: float = 100.0                     # clearance between terminal-airspace EDGES (no overlap)
+
+    def __post_init__(self):
+        # Fail fast on a mistyped USS key — an experiment silently generating zero flights for a hub is a
+        # worse failure mode than a config error at construction.
+        hubs = set(self.n_hubs_per_uss)
+        for name, d in (("lam_per_uss", self.lam_per_uss),
+                        ("departure_offset_s", self.departure_offset_s)):
+            unknown = set(d) - hubs if d is not None else set()
+            if unknown:
+                raise ValueError(
+                    f"{name} references USS(es) {sorted(unknown)} absent from "
+                    f"n_hubs_per_uss {sorted(hubs)}")
 
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Return ``{uss_id: (n_hubs, 2)}`` single-point hub centres, reject-sampled so no two hubs'
@@ -283,6 +306,19 @@ class HubRadiusDemand:
              else np.array([self.uss_share.get(uid, 0.0) for uid in ids], float))
         return ids, p / p.sum()
 
+    def _departure_for(self, uss_id: str, t_base: float, rng: np.random.Generator) -> "float | None":
+        """Desired ``t_departure`` for a leg filed at ``t_base``: ``t_base + max(0, N(mean, std))`` when
+        this USS has a configured lead, else ``None`` (⇒ ``FlightRequest`` defaults ``t_departure`` to
+        ``t_request``). The None branch consumes NO ``rng`` — that is what keeps the legacy path (no
+        ``departure_offset_s``) byte-for-byte identical."""
+        if self.departure_offset_s is None:
+            return None
+        ms = self.departure_offset_s.get(uss_id)
+        if ms is None:
+            return None
+        mean, std = ms
+        return t_base + max(0.0, float(rng.normal(mean, std)))   # floored ⇒ t_departure ≥ t_base
+
     def _est_trip_s(self, o: np.ndarray, d: np.ndarray, cfg: SimConfig) -> float:
         """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell."""
         dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
@@ -292,8 +328,6 @@ class HubRadiusDemand:
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
-        ids, probs = self._shares()
-        n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
 
         # foreign-column filter (cfg.terminal_airspace_always_active): a delivery whose customer's hex
         # falls inside ANY OTHER hub's permanently-walled terminal cells is unreachable — A* finds the
@@ -314,9 +348,13 @@ class HubRadiusDemand:
 
         requests: list[FlightRequest] = []
         fid = 0
-        for _ in range(n):
-            uss_id = ids[int(rng.choice(len(ids), p=probs))]
-            hi = int(rng.integers(hubs[uss_id].shape[0]))
+
+        def emit(uss_id: str, hi: int) -> None:
+            """One delivery (+ optional return) from hub ``hi`` of ``uss_id``. Draws rng in the same order
+            as the legacy inline loop (disk redraw → t_req), then — only when this USS has a configured
+            lead — one N(mean,std) per leg. With ``departure_offset_s`` None it draws nothing extra, so the
+            legacy path stays byte-for-byte identical."""
+            nonlocal fid
             hub = hubs[uss_id][hi]
             terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id),
                                 self._terminal_radius_for(uss_id), self.corridor_overlap_m)
@@ -340,6 +378,7 @@ class HubRadiusDemand:
             if customer is None:
                 customer = np.clip(c, [0.0, 0.0], [w, h])
             t_req = float(rng.uniform(0, cfg.horizon_s))
+            t_dep = self._departure_for(uss_id, t_req, rng)          # None ⇒ depart on filing (no rng)
             drop = False
             if filter_foreign:                                       # customer hex inside a FOREIGN wall?
                 walls = foreign_cells.get(enu_to_axial(customer[0], customer[1], R))
@@ -348,15 +387,31 @@ class HubRadiusDemand:
             if not drop:
                 requests.append(FlightRequest(                        # delivery: hub → customer
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
-                    uss_id=uss_id, origin_terminal=terminal))
+                    t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal))
             fid += 1
             if self.return_flights:                                  # return: customer → same hub
                 t_ret = t_req + self._est_trip_s(hub, customer, cfg) + self.turnaround_s
+                t_ret_dep = self._departure_for(uss_id, t_ret, rng)  # the return carries its own lead
                 if not drop:                                          # foreign-column filter drops both legs
                     requests.append(FlightRequest(
                         fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
-                        uss_id=uss_id, dest_terminal=terminal))
+                        t_departure=t_ret_dep, uss_id=uss_id, dest_terminal=terminal))
                 fid += 1
+
+        if self.lam_per_uss is None:
+            # Legacy path: one global Poisson count, each flight's USS drawn from uss_share.
+            ids, probs = self._shares()
+            n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
+            for _ in range(n):
+                uss_id = ids[int(rng.choice(len(ids), p=probs))]
+                emit(uss_id, int(rng.integers(hubs[uss_id].shape[0])))
+        else:
+            # Per-USS path: an independent Poisson stream per operator; cfg.lam_per_hour / uss_share unused.
+            for uss_id in self.n_hubs_per_uss:
+                lam = float(self.lam_per_uss.get(uss_id, 0.0))
+                n_uss = int(rng.poisson(lam * cfg.horizon_s / 3600.0))
+                for _ in range(n_uss):
+                    emit(uss_id, int(rng.integers(hubs[uss_id].shape[0])))
 
         requests.sort(key=lambda r: (r.t_request, r.flight_id))
         return requests

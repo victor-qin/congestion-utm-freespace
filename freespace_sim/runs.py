@@ -329,10 +329,13 @@ def load_run(folder: Path | str) -> LoadedRun:
     """
     folder = Path(folder)
     cfg_payload = json.loads((folder / "config.json").read_text())
-    for k in ("region_size_m", "region_center_latlon"):
+    for k in ("region_size_m", "region_center_latlon", "flight_levels_m"):
         if isinstance(cfg_payload.get(k), list):
             cfg_payload[k] = tuple(cfg_payload[k])
-    cfg = SimConfig(**cfg_payload)
+    # Tolerate schema drift: drop keys that are no longer SimConfig fields (e.g. cruise_level_m / z_min_m /
+    # z_max_m — now derived @properties) so runs archived before that change still load.
+    _fields = {f.name for f in dataclasses.fields(SimConfig)}
+    cfg = SimConfig(**{k: v for k, v in cfg_payload.items() if k in _fields})
 
     scen = pd.read_parquet(folder / "scenario.parquet")
     traj = pd.read_parquet(folder / "trajectories.parquet")

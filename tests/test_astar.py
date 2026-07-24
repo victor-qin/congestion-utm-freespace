@@ -182,8 +182,13 @@ def test_astar_climbs_over_a_blocked_low_level_without_lateral_detour():
     assert intent.altitude_change_m == 2.0 * (CFG.level_z(1) - CFG.ground_level_m)   # 2·70 = 140
 
 
-def test_two_flights_share_a_corridor_deconflict_by_altitude():
-    """Opposite-direction flights on a long shared corridor: the second climbs rather than wait/detour."""
+def test_two_flights_share_a_corridor_deconflict_by_ground_delay():
+    """Opposite-direction flights on a long shared corridor. Under the default cost weights a climb costs
+    more than a ground hold, so the second flight WAITS on the pad (deconflicts by ground delay) rather
+    than climbing a level or detouring laterally. (The altitude lever is exercised under load — capped
+    ground delay forcing climbs — by test_astar_shortcut_dense_multilevel_run_stays_verified and the
+    compiled climb-over-wall tests.)
+    """
     led = ReservationLedger(CFG)
     a = FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0)
     b = FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0)         # reverse, same departure
@@ -193,9 +198,9 @@ def test_two_flights_share_a_corridor_deconflict_by_altitude():
     i2 = AStarPlanner().plan(b, led, CFG)
     assert i2.status is IntentStatus.ACCEPTED
     assert not led.any_conflict(i2.volumes)
-    assert max(_cruise_levels(i2)) >= CFG.level_z(1)                 # crossed at a higher level
-    assert i2.air_detour_m < 600.0                                   # not a big lateral detour
-    assert i2.ground_delay_s < 100.0                                 # not a long ground wait
+    assert i2.ground_delay_s > 100.0                                 # deconflicts by waiting on the pad
+    assert max(_cruise_levels(i2)) < CFG.level_z(1)                  # stayed low — no climb to a higher level
+    assert i2.air_detour_m < 600.0                                   # and no big lateral detour
 
 
 def test_vertical_edge_step_count_matches_climb_kinematics():
@@ -228,8 +233,7 @@ def test_astar_multilevel_is_deterministic():
 
 def test_single_level_config_recovers_legacy_behavior():
     """One flight level at the old cruise plane ⇒ the legacy single-plane A* (no vertical lever)."""
-    cfg = SimConfig(cruise_level_m=150.0, flight_levels_m=(150.0,), airspace_ceiling_m=165.0,
-                    z_min_m=150.0, z_max_m=150.0)
+    cfg = SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0)   # cruise/z derive to 150
     intent = AStarPlanner().plan(_req(), ReservationLedger(cfg), cfg)
     assert intent.status is IntentStatus.ACCEPTED
     assert _cruise_levels(intent) == [150.0]

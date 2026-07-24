@@ -10,15 +10,9 @@ def test_default_config_is_multilevel():
     assert c.flight_levels_m == (30.0, 70.0, 110.0)
     assert c.n_levels == 3
     assert c.airspace_ceiling_m == 125.0
-    assert c.cruise_level_m == 75.0
-    assert (c.z_min_m, c.z_max_m) == (30.0, 110.0)   # MILP's continuous band = ladder floor/top
-
-
-def test_validation_rejects_inverted_or_out_of_band_z_band():
-    with pytest.raises(ValueError, match="cruise band"):
-        SimConfig(z_min_m=110.0, z_max_m=30.0)                 # inverted
-    with pytest.raises(ValueError, match="cruise band"):
-        SimConfig(z_min_m=30.0, z_max_m=200.0)                 # above the ceiling
+    # cruise + band DERIVE from the ladder: cruise = middle level; MILP band = floor→top
+    assert c.cruise_level_m == 70.0
+    assert c.z_min_m == 30.0 and c.z_max_m == 110.0
 
 
 def test_equidistant_levels_builds_ladder():
@@ -46,12 +40,12 @@ def test_climb_time_to_and_steps():
 
 def test_validation_rejects_unsorted_levels():
     with pytest.raises(ValueError):
-        SimConfig(flight_levels_m=(110.0, 70.0, 30.0), cruise_level_m=75.0)
+        SimConfig(flight_levels_m=(110.0, 70.0, 30.0))
 
 
 def test_validation_rejects_levels_too_close():
     with pytest.raises(ValueError, match="corridor_height"):
-        SimConfig(flight_levels_m=(25.0, 55.0), cruise_level_m=25.0)   # gap 30 == corridor_height
+        SimConfig(flight_levels_m=(25.0, 55.0))                        # gap 30 == corridor_height
 
 
 def test_validation_rejects_top_above_ceiling():
@@ -61,20 +55,22 @@ def test_validation_rejects_top_above_ceiling():
 
 def test_validation_rejects_lowest_below_ground():
     with pytest.raises(ValueError):
-        SimConfig(flight_levels_m=(10.0, 70.0, 110.0), cruise_level_m=10.0)   # 10 - 15 < 0
+        SimConfig(flight_levels_m=(10.0, 70.0, 110.0))                 # 10 - 15 < 0
 
 
-def test_validation_rejects_cruise_outside_band():
-    with pytest.raises(ValueError):
-        SimConfig(cruise_level_m=200.0)
+def test_cruise_and_band_derive_from_ladder():
+    c = SimConfig(flight_levels_m=(30.0, 70.0, 110.0))   # derived, not settable
+    assert c.cruise_level_m == 70.0                      # cruise = middle level (straight/decoupled)
+    assert c.z_min_m == 30.0 and c.z_max_m == 110.0      # MILP band = ladder floor→top
 
 
-def test_validation_allows_cruise_not_a_level():
-    c = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), cruise_level_m=75.0)   # 75 ∉ levels, OK
-    assert c.cruise_level_m == 75.0
+def test_altitudes_derive_from_single_level_ladder():
+    c = SimConfig(flight_levels_m=(100.0,))          # e.g. density_test: one plane at 100 m
+    assert c.cruise_level_m == c.z_min_m == c.z_max_m == 100.0   # single level ⇒ band collapses
 
 
 def test_single_level_config_supported():
     c = SimConfig(flight_levels_m=(75.0,))                             # ceiling stays 125
     assert c.n_levels == 1
     assert c.flight_levels_m == (75.0,)
+    assert c.cruise_level_m == c.z_min_m == c.z_max_m == 75.0          # all derive onto the lone level

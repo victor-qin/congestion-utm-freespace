@@ -55,4 +55,25 @@ SCENARIOS: dict[str, ScenarioSpec] = {
             return_flights=True,
         ),
     ),
+
+    "density_test": ScenarioSpec(
+        "density_test", region_m=(60000.0, 60000.0), lam_per_hour=34500.0, horizon_s=1800.0,
+        # Three A* flight levels (30/70/110 m) + always-active terminal airspace: foreign transit routes
+        # AROUND terminals (air detour) instead of ground-blocking same-hub takeoffs, so the congestion
+        # measured here is airspace-density AIR delay. Pad dwell = hover(30) + climb-to-level (30/70/110 m
+        # ⇒ 5/12/18 s), so the 46/20 pads stay provisioned even at the 110 m top level.
+        flight_levels_m=(100.0,),
+        terminal_airspace_always_active=True,
+        demand=DemandSpec(
+            pattern="hub_radius", uss=("delivery_uss",), hubs=(182,),
+            radius_m={"delivery_uss": 16000.0},
+            terminal_radius_m={"delivery_uss": 180.0},
+            pads_per_hub={"delivery_uss": 46},
+            uss_share={"delivery_uss": 1.0},
+            lam_per_uss={"delivery_uss": 4850.0},     # NEW: per-USS rates
+            departure_offset_s={"delivery_uss": (450.0, 60.0)},
+            return_flights=True,
+        ),
+    ),
+
 }

@@ -33,7 +33,7 @@ cfg = spec.config()
 # Pin the whole world to a SINGLE flight level at `alt` (dallas_full ships 3-level (30,70,110); this benchmark
 # sweeps that plane). Raise the ceiling if `alt`'s corridor box would poke through the default 125 m.
 ceiling = max(cfg.airspace_ceiling_m, alt + cfg.corridor_height_m)
-cfg = dc.replace(cfg, flight_levels_m=(alt,), cruise_level_m=alt, z_min_m=alt, z_max_m=alt,
+cfg = dc.replace(cfg, flight_levels_m=(alt,),   # cruise/z derive to alt (single plane)
                  airspace_ceiling_m=ceiling, terminal_airspace_always_active=True)
 demand = spec.demand_model()
 tag = f"dallas_full_{int(lam/1000)}k_alt{int(alt)}_taa"

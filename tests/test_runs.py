@@ -65,6 +65,21 @@ def test_load_run_roundtrip_is_faithful(tmp_path):
     assert math.isclose(a1["mean_stretch"], a0["mean_stretch"], rel_tol=1e-9)
 
 
+def test_load_run_tolerates_dropped_legacy_altitude_keys(tmp_path):
+    # runs archived before cruise_level_m/z_min_m/z_max_m became derived @properties carry those keys in
+    # config.json; load_run must whitelist-filter them (not TypeError) and re-derive off flight_levels_m.
+    import json
+    folder = runs.save_run(_small(), root=tmp_path, label="legacy")
+    cfg_path = folder / "config.json"
+    payload = json.loads(cfg_path.read_text())
+    payload.update(cruise_level_m=75.0, z_min_m=42.0, z_max_m=99.0)   # legacy stored fields, now removed
+    payload["flight_levels_m"] = list(payload["flight_levels_m"])     # JSON round-trips the tuple as a list
+    cfg_path.write_text(json.dumps(payload))
+    cfg = runs.load_run(folder).config                               # must NOT raise TypeError
+    assert cfg.z_min_m == cfg.flight_levels_m[0]                      # re-derived off the ladder; 42 dropped
+    assert cfg.z_max_m == cfg.flight_levels_m[-1]                     # ... 99 dropped too
+
+
 def test_load_run_replay_payload_matches(tmp_path):
     from freespace_sim import viz_html
 

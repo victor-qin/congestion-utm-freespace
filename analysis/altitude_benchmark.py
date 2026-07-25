@@ -4,9 +4,10 @@ plane shortens the climb -> shorter dwell -> pads and exit lanes cycle faster ->
 serialisation (the constraint that dominates ground delay). The shipped dallas_full routes across three
 levels (30/70/110 m); this pins one plane so the measured delta is altitude alone. Prints the run folder.
 
-Overrides flight_levels_m=(alt,) / cruise_level_m / z bounds on the built config via dataclasses.replace
-rather than adding more ScenarioSpec fields, deliberately: SimConfig defaults to the multi-level ladder
-(30/70/110 m, cruise 75 m, ceiling 125 m) and the test suite assumes it, so the pin stays scoped here.
+Overrides flight_levels_m=(alt,) on the built config via dataclasses.replace (cruise + z-band now DERIVE
+from the ladder, so they follow automatically) rather than adding more ScenarioSpec fields, deliberately:
+SimConfig defaults to the multi-level ladder (30/70/110 m, cruise = middle level 70 m, ceiling 125 m) and
+the test suite assumes it, so the pin stays scoped here.
 
 Finding (single 50 m plane vs a single 150 m plane, the pre-multi-altitude comparison, lam=12k, 1800 s):
 ground delay ~-10%, air delay flat (the lateral hex geometry is invariant to which single cruise plane
@@ -33,7 +34,7 @@ cfg = spec.config()
 # Pin the whole world to a SINGLE flight level at `alt` (dallas_full ships 3-level (30,70,110); this benchmark
 # sweeps that plane). Raise the ceiling if `alt`'s corridor box would poke through the default 125 m.
 ceiling = max(cfg.airspace_ceiling_m, alt + cfg.corridor_height_m)
-cfg = dc.replace(cfg, flight_levels_m=(alt,), cruise_level_m=alt, z_min_m=alt, z_max_m=alt,
+cfg = dc.replace(cfg, flight_levels_m=(alt,),   # cruise/z derive to alt (single plane)
                  airspace_ceiling_m=ceiling, terminal_airspace_always_active=True)
 demand = spec.demand_model()
 tag = f"dallas_full_{int(lam/1000)}k_alt{int(alt)}_taa"

@@ -271,7 +271,7 @@ def test_single_plane_planner_reads_no_altitude_congestion():
     # Baseline fix: keyed on cfg.planner, a single-plane run (cruise_level_m, no altitude lever) reads
     # ZERO excess altitude — no spurious congestion floor in empty airspace.
     sp = SimConfig(planner="straight")
-    intent = _accepted(altitude_change_m=2.0 * sp.cruise_level_m)       # 2·75 = 150 (cruise round trip)
+    intent = _accepted(altitude_change_m=2.0 * sp.cruise_level_m)       # 2·70 = 140 (cruise round trip)
     db = metrics.delay_breakdown_s(intent, sp)
     assert db["excess_altitude_m"] == 0.0
     assert db["altitude_delay_phys_s"] == 0.0

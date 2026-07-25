@@ -14,8 +14,8 @@ from freespace_sim.sim import run
 
 def _saturated(levels):
     return SimConfig(
-        planner="astar", cruise_level_m=75.0, flight_levels_m=levels, airspace_ceiling_m=125.0,
-        z_min_m=75.0, z_max_m=75.0, lam_per_hour=3000.0, horizon_s=300.0,
+        planner="astar", flight_levels_m=levels, airspace_ceiling_m=125.0,
+        lam_per_hour=3000.0, horizon_s=300.0,
         region_size_m=(900.0, 900.0), seed=1, max_ground_delay_s=120.0,
     )
 

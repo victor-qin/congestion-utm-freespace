@@ -6,6 +6,7 @@ demand seed. Distribution-shape checks (lengths, shares, counts) use fixed seeds
 """
 
 import numpy as np
+import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.demand import (
@@ -244,3 +245,81 @@ def test_more_pads_per_hub_cut_ground_delay():
         return float(np.mean([a.ground_delay_s for a in res.accepted]))
 
     assert mean_delay(4) < 0.5 * mean_delay(1)   # 1→4 pads cuts mean delay by far more than half
+
+
+# --- HubRadiusDemand: per-USS Poisson rates + Gaussian departure offsets (issue: pure density tests) ---
+
+def test_lam_per_uss_counts_scale_and_ignore_global_lambda():
+    # per-USS Poisson streams: counts track lam_per_uss, NOT cfg.lam_per_hour / uss_share.
+    cfg = SimConfig(region_size_m=(20000.0, 20000.0), lam_per_hour=99999.0, horizon_s=3600.0)
+    m = HubRadiusDemand(n_hubs_per_uss={"a": 3, "b": 4},
+                        lam_per_uss={"a": 1000.0, "b": 250.0},
+                        uss_share={"a": 1.0, "b": 9.0},          # a 1:9 split IF the global path were used
+                        return_flights=False)
+    reqs = m.generate(cfg, np.random.default_rng(0))
+    na = sum(r.uss_id == "a" for r in reqs)
+    nb = sum(r.uss_id == "b" for r in reqs)
+    assert 850 <= na <= 1150 and 175 <= nb <= 325             # ≈ lam·horizon/3600 = 1000 / 250 (Poisson)
+    assert 3.0 <= na / nb <= 5.0                              # ≈ 4:1 from lam, NOT 1:9 from share/global
+
+
+def test_lam_per_uss_absent_uss_gets_zero_demand():
+    # a USS present in n_hubs_per_uss but OMITTED from lam_per_uss draws zero flights (an
+    # infrastructure-only hub) — the intentional counterpart to the __post_init__ unknown-key guard.
+    cfg = _radius_cfg()
+    m = HubRadiusDemand(n_hubs_per_uss={"a": 3, "b": 3}, lam_per_uss={"a": 500.0}, return_flights=False)
+    reqs = m.generate(cfg, np.random.default_rng(0))
+    assert reqs and all(r.uss_id == "a" for r in reqs)        # "b" omitted ⇒ no flights
+
+
+def test_departure_offset_unset_departs_on_filing():
+    # legacy path: with no departure_offset_s every leg departs when filed (t_departure == t_request).
+    cfg = _radius_cfg()
+    m = HubRadiusDemand(n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 800.0})
+    reqs = m.generate(cfg, np.random.default_rng(0))
+    assert reqs and all(r.t_departure == r.t_request for r in reqs)
+
+
+def test_departure_offset_applies_to_both_legs_with_distribution():
+    # the per-USS Gaussian lead applies to BOTH the delivery and its return, ~N(mean, std).
+    cfg = SimConfig(region_size_m=(20000.0, 20000.0), horizon_s=3600.0)
+    m = HubRadiusDemand(n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 2000.0},
+                        departure_offset_s={"a": (450.0, 60.0)}, return_flights=True)
+    reqs = m.generate(cfg, np.random.default_rng(1))
+    deliveries = [r for r in reqs if r.origin_terminal is not None]
+    returns = [r for r in reqs if r.dest_terminal is not None]
+    assert deliveries and returns
+    for legs in (deliveries, returns):                        # each leg carries its own drawn lead
+        offs = np.array([r.t_departure - r.t_request for r in legs])
+        assert abs(offs.mean() - 450.0) < 25.0 and abs(offs.std() - 60.0) < 20.0
+
+
+def test_departure_offset_clamped_nonnegative():
+    # the max(0, N(mean,std)) floor keeps FlightRequest's t_departure >= t_request even when the Gaussian
+    # would go negative (mean 0, wide std ⇒ ~half the draws clamp) — no ValueError, and the clamp fires.
+    cfg = SimConfig(region_size_m=(20000.0, 20000.0), horizon_s=3600.0)
+    m = HubRadiusDemand(n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 1500.0},
+                        departure_offset_s={"a": (0.0, 1000.0)}, return_flights=False)
+    reqs = m.generate(cfg, np.random.default_rng(2))
+    offs = [r.t_departure - r.t_request for r in reqs]
+    assert reqs and all(o >= 0.0 for o in offs)               # invariant t_departure >= t_request holds
+    assert any(o == 0.0 for o in offs)                        # the clamp actually fired (draws went negative)
+
+
+def test_departure_offset_absent_uss_departs_on_filing():
+    # a USS not named in departure_offset_s draws NO offset (and no rng) ⇒ departs on filing.
+    cfg = _radius_cfg()
+    m = HubRadiusDemand(n_hubs_per_uss={"a": 3, "b": 3}, lam_per_uss={"a": 500.0, "b": 500.0},
+                        departure_offset_s={"a": (300.0, 10.0)}, return_flights=False)
+    reqs = m.generate(cfg, np.random.default_rng(0))
+    a_off = [r.t_departure - r.t_request for r in reqs if r.uss_id == "a"]
+    b_off = [r.t_departure - r.t_request for r in reqs if r.uss_id == "b"]
+    assert a_off and all(o > 0.0 for o in a_off)              # "a" leads its departures (~300 s)
+    assert b_off and all(o == 0.0 for o in b_off)             # "b" (absent) departs on filing
+
+
+def test_unknown_uss_in_lam_or_offset_raises():
+    with pytest.raises(ValueError, match="lam_per_uss"):
+        HubRadiusDemand(n_hubs_per_uss={"a": 3}, lam_per_uss={"b": 100.0})
+    with pytest.raises(ValueError, match="departure_offset_s"):
+        HubRadiusDemand(n_hubs_per_uss={"a": 3}, departure_offset_s={"typo": (10.0, 1.0)})

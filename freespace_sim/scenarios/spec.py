@@ -34,6 +34,12 @@ class DemandSpec:
     return_flights: bool = True            # each delivery → a return to its origin hub
     turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
     uss_share: "dict[str, float] | None" = None      # demand split across USSs (None ⇒ equal weight)
+    # hub_radius: per-USS delivery Poisson rate (/hr). When set, REPLACES cfg.lam_per_hour × uss_share —
+    # each USS is its own independent stream. None ⇒ the global-λ path.
+    lam_per_uss: "dict[str, float] | None" = None
+    # hub_radius: per-USS desired-departure lead as ``(mean_s, std_s)`` — t_departure = t_request +
+    # max(0, N(mean, std)). Absent USSs (or None) depart on filing. Applies to delivery and return legs.
+    departure_offset_s: "dict[str, tuple[float, float]] | None" = None
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -60,6 +66,8 @@ class DemandSpec:
                 terminal_radius_m=self.terminal_radius_m, corridor_overlap_m=self.corridor_overlap_m,
                 return_flights=self.return_flights, turnaround_s=self.turnaround_s,
                 uss_share=self.uss_share,
+                lam_per_uss=self.lam_per_uss,
+                departure_offset_s=self.departure_offset_s,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":

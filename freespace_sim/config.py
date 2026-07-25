@@ -58,9 +58,9 @@ class SimConfig:
 
     # --- COST MODEL (shared by every planner; the FCFS trade-off knobs) ---
     cost_ground_delay_per_s: float = 1.0      # wait on the pad
-    cost_air_lateral_per_m: float = 1.0       # extra detour length flown
+    cost_air_lateral_per_m: float = 3.0       # extra detour length flown
     cost_air_hold_per_s: float = 3.0          # loiter/hover mid-route (expensive)
-    cost_altitude_change_per_m: float = 2.0   # climb/descend
+    cost_altitude_change_per_m: float = 4.0   # climb/descend
 
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0

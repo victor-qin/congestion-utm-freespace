@@ -145,16 +145,18 @@ def test_astar_shortcut_dense_multilevel_run_stays_verified():
     assert sum(_diagonal_segments(i.centerline) for i in res.accepted) >= 5     # ... and were slanted
 
 
-def test_astar_shortcut_diagonal_climb_deconflicts_from_committed_traffic():
-    # Two opposite-direction flights on a shared corridor: the first is committed, the second must climb
-    # OVER it — and the refiner slants that climb into a DIAGONAL box which must stay clear of the first's
-    # committed corridor (build-then-check + FCL). The diagonal climb-box vs real traffic, deterministic.
+def test_astar_shortcut_deconflicts_from_committed_traffic_by_ground_delay():
+    # Two opposite-direction flights on a shared corridor: the first is committed, the second meets it.
+    # Under the default cost weights a climb costs more than a ground hold, so the shortcut planner WAITS
+    # for the committed corridor to clear (deconflict by ground delay) rather than climbing over it — and
+    # the refiner must still produce a conflict-free plan. (The refiner's DIAGONAL climb-boxes are exercised
+    # under load — capped ground delay forcing climbs — by test_astar_shortcut_dense_multilevel_run_stays_verified.)
     led = ReservationLedger(CFG)
     i1 = get_planner("astar_shortcut").plan(FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0), led, CFG)
     assert i1.accepted
     led.commit(1, i1.volumes)
     i2 = get_planner("astar_shortcut").plan(FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0), led, CFG)
     assert i2.accepted
-    assert not led.any_conflict(i2.volumes)                # the (slanted) climb clears the committed flight
-    assert max(round(float(p[2]), 1) for p, _ in i2.centerline) >= CFG.level_z(1)   # it climbed a level
-    assert _diagonal_segments(i2.centerline) >= 1          # the climb was slanted, not a pure rung
+    assert not led.any_conflict(i2.volumes)                # the plan clears the committed flight
+    assert i2.ground_delay_s > 100.0                       # ... by waiting on the pad, not climbing over
+    assert max(round(float(p[2]), 1) for p, _ in i2.centerline) < CFG.level_z(1)   # stayed at the floor level

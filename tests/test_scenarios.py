@@ -99,6 +99,16 @@ def test_demand_hub_radius_builds_with_params():
     assert d.return_flights is False and d.turnaround_s == 90.0
 
 
+def test_demand_hub_radius_plumbs_lam_per_uss_and_departure_offset():
+    # the two per-USS knobs must survive DemandSpec.build() onto the HubRadiusDemand (guards a typo).
+    d = DemandSpec(pattern="hub_radius", uss=("a", "b"), hubs=(3, 5),
+                   lam_per_uss={"a": 1000.0, "b": 250.0},
+                   departure_offset_s={"a": (450.0, 60.0)}).build()
+    assert isinstance(d, HubRadiusDemand)
+    assert d.lam_per_uss == {"a": 1000.0, "b": 250.0}
+    assert d.departure_offset_s == {"a": (450.0, 60.0)}
+
+
 def test_dallas_large_scenario_uses_radius_pads_returns():
     spec = SCENARIOS["dallas_hub_2uss_large"]
     assert spec.region_m == (10000.0, 10000.0)

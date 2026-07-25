@@ -55,4 +55,27 @@ SCENARIOS: dict[str, ScenarioSpec] = {
             return_flights=True,
         ),
     ),
+
+    "density_test": ScenarioSpec(
+        "density_test", region_m=(60000.0, 60000.0), lam_per_hour=34500.0, horizon_s=1800.0,
+        # A SINGLE A* flight level at 100 m + always-active terminal airspace: foreign transit routes AROUND
+        # terminals (air detour) instead of ground-blocking same-hub takeoffs, so the congestion measured
+        # here is airspace-density AIR delay. One operator (delivery_uss, 182 hubs, wide 16 km radius) with a
+        # per-USS Poisson rate and a Gaussian desired-departure lead (N(450, 60) s). Pad dwell = hover(30) +
+        # climb to 100 m (~16.7 s), so the 46 pads stay provisioned at the single cruise level.
+        # (lam_per_hour above is a no-op here — lam_per_uss drives the per-operator stream.)
+        flight_levels_m=(100.0,),
+        terminal_airspace_always_active=True,
+        demand=DemandSpec(
+            pattern="hub_radius", uss=("delivery_uss",), hubs=(182,),
+            radius_m={"delivery_uss": 16000.0},
+            terminal_radius_m={"delivery_uss": 180.0},
+            pads_per_hub={"delivery_uss": 46},
+            uss_share={"delivery_uss": 1.0},
+            lam_per_uss={"delivery_uss": 4850.0},     # NEW: per-USS rates
+            departure_offset_s={"delivery_uss": (450.0, 60.0)},
+            return_flights=True,
+        ),
+    ),
+
 }

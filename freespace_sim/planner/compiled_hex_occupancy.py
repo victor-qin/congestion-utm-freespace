@@ -43,6 +43,7 @@ import numpy as np
 from ..geometry import CylinderSpec
 from ..types import as_terminal
 from . import hexgrid as hg
+from ._packed import P_HI, P_LO, P_NXT, aligned_2d
 
 
 def search_horizon(base: int, takeoff_steps_max: int, n_hops: int, climb_span: int, cfg) -> int:
@@ -86,72 +87,101 @@ def schedulable_horizon_steps(cfg) -> int:
 
 class _Pool:
     """Flat linked-list free-interval pool: cell ``c``'s intervals are walked from slot ``c`` along
-    ``nxt``; a blocked step splits the containing interval in place. Slot 0..NC-1 pre-seeded ``[0, MAXS]``."""
+    ``nxt``; a blocked step splits the containing interval in place. Slot 0..NC-1 pre-seeded ``[0, MAXS]``.
+
+    Rows are packed ``(lo, hi, nxt, pad)`` int32 in one ``iv`` block — 16 B, 8 rows per cache line — so
+    a list walk touches ONE line per node instead of one in each of three separate multi-MB arrays.
+    This is the hottest layout in the whole search: the kernel's ``_blocked`` walks two of these lists
+    for every neighbour of every expansion. See ``_packed`` for the measurement behind it."""
 
     def __init__(self, NC: int, MAXS: int):
         self.NC = NC
         self.MAXS = MAXS
-        cap = max(2 * NC, 1 << 18)
-        self.cap = cap
-        self.lo = np.empty(cap, np.int32)
-        self.hi = np.empty(cap, np.int32)
-        self.nxt = np.empty(cap, np.int32)
-        self.lo[:NC] = 0
-        self.hi[:NC] = MAXS
-        self.nxt[:NC] = -1
-        self.nslots = NC
+        self.cap = max(2 * NC, 1 << 18)
+        self.iv = aligned_2d(self.cap, 4, np.int32)
+        self.reset()
 
     def reset(self):
-        self.lo[: self.NC] = 0
-        self.hi[: self.NC] = self.MAXS
-        self.nxt[: self.NC] = -1
+        self.iv[: self.NC, P_LO] = 0
+        self.iv[: self.NC, P_HI] = self.MAXS
+        self.iv[: self.NC, P_NXT] = -1
         self.nslots = self.NC
 
     def _grow(self):
         cap = self.cap * 2
-        for name in ("lo", "hi", "nxt"):
-            a = np.empty(cap, np.int32)
-            a[: self.cap] = getattr(self, name)
-            setattr(self, name, a)
+        iv = aligned_2d(cap, 4, np.int32)
+        iv[: self.cap] = self.iv
+        self.iv = iv
         self.cap = cap
 
     def _alloc(self, lo, hi, nxt) -> int:
         if self.nslots >= self.cap:
             self._grow()
         s = self.nslots
-        self.lo[s] = lo; self.hi[s] = hi; self.nxt[s] = nxt
+        self.iv[s, P_LO] = lo; self.iv[s, P_HI] = hi; self.iv[s, P_NXT] = nxt
         self.nslots += 1
         return s
 
     def block(self, c: int, s: int) -> None:
-        """Split cell ``c``'s free interval containing ``s`` (in place)."""
-        if s < 0 or s > self.MAXS:
+        """Split cell ``c``'s free interval containing ``s`` (in place). Equivalent to
+        ``block_range(c, s, s)``; kept for callers/tests that block a single step."""
+        self.block_range(c, s, s)
+
+    def block_range(self, c: int, s0: int, s1: int) -> None:
+        """Remove the whole contiguous span ``[s0, s1]`` from cell ``c``'s free intervals in one pass.
+
+        A committed volume occupies each cell over a contiguous step range, so this replaces ``S``
+        single-step splits with one walk (issue #8 Phase E). The free-STEP set is identical to
+        blocking ``s0, s0+1, …, s1`` individually, so the compiled kernel is byte-unaffected.
+
+        The interval list (head = slot ``c``) is kept sorted ascending by ``block``/this. The span may
+        straddle several free intervals when earlier commits already punched holes: the first keeps a
+        left remainder ``[a, s0-1]``, the last a right remainder ``[s1+1, b]``, and any interval fully
+        inside ``[s0, s1]`` is marked empty (``lo>hi``, never matches a query) rather than unlinked —
+        the flat pool has no cheap way to drop its fixed head/middle slots, and a dead slot is
+        harmless (the kernel's interval walk simply skips it). Every access goes through ``self.iv``:
+        ``_alloc`` can ``_grow``, which REPLACES the array, so a hoisted reference would write into the
+        dead buffer."""
+        if s0 < 0:
+            s0 = 0
+        if s1 > self.MAXS:
+            s1 = self.MAXS
+        if s0 > s1:
             return
         slot = c
         while slot != -1:
-            a, b = int(self.lo[slot]), int(self.hi[slot])
-            if a <= s <= b:
-                if s + 1 <= b:
-                    if a <= s - 1:
-                        self.hi[slot] = s - 1
-                        ns = self._alloc(s + 1, b, int(self.nxt[slot]))
-                        self.nxt[slot] = ns
-                    else:
-                        self.lo[slot] = s + 1
-                elif a <= s - 1:
-                    self.hi[slot] = s - 1
-                else:
-                    self.lo[slot] = s + 1
+            a, b = int(self.iv[slot, P_LO]), int(self.iv[slot, P_HI])
+            nxt = int(self.iv[slot, P_NXT])
+            if b < s0:                                  # wholly left of the span → keep walking
+                slot = nxt
+                continue
+            if a > s1:                                  # wholly right (list sorted) → done
                 return
-            slot = int(self.nxt[slot])
+            keep_left = a <= s0 - 1
+            keep_right = s1 + 1 <= b
+            if keep_left and keep_right:                # span sits inside one interval → split once
+                self.iv[slot, P_HI] = s0 - 1
+                ns = self._alloc(s1 + 1, b, nxt)
+                self.iv[slot, P_NXT] = ns
+                return
+            if keep_right:                              # right remainder is > s1 → nothing past it
+                self.iv[slot, P_LO] = s1 + 1
+                return
+            if keep_left:                               # left remainder kept; span may reach further
+                self.iv[slot, P_HI] = s0 - 1
+            else:                                       # interval fully covered → mark empty (lo>hi)
+                self.iv[slot, P_LO] = 1
+                self.iv[slot, P_HI] = 0
+            slot = nxt
 
     def blocked_at(self, c: int, s: int) -> bool:
         """True iff step ``s`` is in NO free interval of cell ``c``."""
+        iv = self.iv                                   # no allocation here, so hoisting is safe
         slot = c
         while slot != -1:
-            if int(self.lo[slot]) <= s <= int(self.hi[slot]):
+            if int(iv[slot, P_LO]) <= s <= int(iv[slot, P_HI]):
                 return False
-            slot = int(self.nxt[slot])
+            slot = int(iv[slot, P_NXT])
         return True
 
 
@@ -225,17 +255,19 @@ class CompiledHexOccupancy:
     def _add(self, vol, own_cols) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
+        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:
                 continue
-            if self.evicted_before is not None and s < self.evicted_before:
+            if self.evicted_before is not None and s_lo < self.evicted_before:
+                s_lo = self.evicted_before             # clip the span, never resurrect an evicted step
+            if s_lo > s_hi:
                 continue
             c = self.cell_id(q, r, L)
             if is_column:                               # → column pool (all columns; own/foreign per plan)
                 if c >= 0:
-                    self.col.block(c, int(s))
+                    self.col.block_range(c, int(s_lo), int(s_hi))
                     self.col_owners.setdefault(c, set()).add(tid)
             else:                                       # → corridor pool (minus committing own interior)
                 if own_cols and self._inside_a_column(q, r, own_cols):
@@ -249,7 +281,7 @@ class CompiledHexOccupancy:
                         self._warned_oob = True
                     self.oob_corridor_cells += 1
                     continue
-                self.corr.block(c, int(s))
+                self.corr.block_range(c, int(s_lo), int(s_hi))
 
     def _on_static(self, center, term) -> None:
         """Derive the compiled routing wall from a ledger static-terminal registration — the

@@ -82,22 +82,29 @@ class HexOccupancyService:
         # box (an in-terminal exit lane) is still a corridor — it goes to blocked/pad like any other,
         # so it is never mistaken for a column cell. ("column ⟺ cylinder"; stored kind is issue #11.)
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
+        # The hex service is step-keyed (dict[s] → cell set), so it expands each cell's range back to
+        # its steps; the shared geometry sweep is still done once (via rasterize_ranges' memo), which
+        # is what the compiled image reuses. `own`/`in_blk`/`is_column` are per-cell, hoisted out of
+        # the step loop.
+        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
-            if self.evicted_before is not None and s < self.evicted_before:
-                continue                 # guard: never resurrect an already-evicted past step
+            if self.evicted_before is not None and s_lo < self.evicted_before:
+                s_lo = self.evicted_before   # guard: never resurrect an already-evicted past step
             if not is_column:
-                if own_cols and self._inside_a_column(q, r, own_cols):
+                own = own_cols and self._inside_a_column(q, r, own_cols)
+                if own:
                     continue             # the committing flight's own terminal interior — unreserved
-                self.pad.setdefault(s, set()).add((q, r, L))
-                if in_blk:
-                    self.blocked.setdefault(s, set()).add((q, r, L))
+                for s in range(s_lo, s_hi + 1):
+                    self.pad.setdefault(s, set()).add((q, r, L))
+                    if in_blk:
+                        self.blocked.setdefault(s, set()).add((q, r, L))
             elif in_blk:
                 # shared terminal column: record `tid` over its inner (blocked-strength) footprint at
                 # level L — the cells A* queries for the own-hub cruise exemption (capacity lives in
                 # TerminalCapacity).
-                self.term_cells.setdefault(s, {}).setdefault((q, r, L), set()).add(tid)
+                for s in range(s_lo, s_hi + 1):
+                    self.term_cells.setdefault(s, {}).setdefault((q, r, L), set()).add(tid)
         self.n_added += 1
 
     def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:

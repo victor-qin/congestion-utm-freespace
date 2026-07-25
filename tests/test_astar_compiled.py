@@ -207,7 +207,8 @@ def test_compiled_always_active_static_terminal_exact():
     """#24 always-active static terminals (permanent foreign column walls) are carried in
     ``CompiledHexOccupancy.static_col`` (the SAME ``hg.terminal_cells`` the reference walls), so the kernel
     deconflicts against them EXACTLY instead of falling back. A foreign flight whose straight path crosses a
-    static hub must reroute (cost > 200, not the ~160 straight-through) byte-identically to the reference,
+    static hub must reroute (its cost carries a lateral detour, well above the straight-through climb-only
+    cost) byte-identically to the reference,
     with node-count parity and NO fallback (the old preventative gate is gone). This is the regression guard
     for the safety bug where the kernel flew straight through a permanent no-fly wall."""
     cfg = SimConfig(terminal_airspace_always_active=True)
@@ -224,7 +225,11 @@ def test_compiled_always_active_static_terminal_exact():
     assert com._fb == 0, "kernel must handle static terminals, not fall back"
     assert a.status is b.status and a.accepted and abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
     assert ref.last_expansions == com.last_expansions, "node-count parity through the static wall"
-    assert a.cost > 200, "reference should reroute around the wall (straight-through would be ~160)"
+    # the reroute carries a lateral detour on top of the climb round-trip; the (blocked) straight-through
+    # would cost only the climb. Compare against that cfg-derived baseline so the check stays discriminating
+    # under any cost-weight regime (here: reroute ~1440 vs straight-through ~240 at cost_altitude=4).
+    straight_through = 2.0 * cfg.flight_levels_m[0] * cfg.cost_altitude_change_per_m
+    assert a.cost > straight_through + 100.0, "reference should reroute around the wall, not fly straight through"
 
 
 def test_compiled_always_active_own_hub_transparent_foreign_walled_exact():

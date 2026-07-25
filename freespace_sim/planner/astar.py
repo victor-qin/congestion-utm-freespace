@@ -158,7 +158,7 @@ def _warn_kernel_fallback() -> None:
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 900_000, vertical_edges: bool = True,
+    def __init__(self, max_expansions: int = 2_000_000, vertical_edges: bool = True,
                  compiled: bool = True):
         self.max_expansions = max_expansions
         # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an

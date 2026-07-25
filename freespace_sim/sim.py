@@ -208,6 +208,7 @@ def run(
     mechanism: Mechanism | None = None,
     progress: bool | ProgressCallback | None = None,
     telemetry: bool | TelemetryCollector = False,
+    parallel=None,
 ) -> SimResult:
     """Run one strategic-layer simulation. Provide a scenario, an explicit request list, a `demand`
     model, or none (a default `UniformPoissonDemand` is then generated from `cfg`).
@@ -223,6 +224,13 @@ def run(
     :class:`~freespace_sim.telemetry.TelemetryCollector` capturing the non-recoverable congestion streams
     (filed-but-rejected corridors, `conflict_filed` culprits, per-hub metadata) onto ``SimResult.telemetry``
     for `save_run` to persist. Pass ``True`` or a preexisting collector.
+
+    ``parallel`` (default off → the serial FCFS loop, byte-identical to today) runs the speculative
+    worker-pool sim (issue #8 Track A): a :class:`~freespace_sim.parallel.ParallelConfig`, or an int
+    as an ``n_workers`` shorthand. ``mode="exact"`` (default) is byte-identical to the serial run;
+    ``mode="relaxed"`` is a documented FCFS-class relaxation. Needs an envelope-recording planner
+    (``astar``/``astar_ref``/``astar_shortcut``). Composes with ``telemetry`` (worker streams are
+    merged in commit order).
     """
     if scenario is None:
         if requests is None:
@@ -289,14 +297,27 @@ def run(
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
     status = _MilestoneLog(total, cfg.horizon_s)        # INFO milestones; silent without a log handler
-    intents: list[OperationalIntent] = []
-    for done, ev in enumerate(scenario.events, 1):
-        uss = usses.get(ev.request.uss_id, default_uss)
-        intent = uss.handle_request(ev.request)
-        intents.append(intent)
-        status(done, ev.request, intent)
-        if report:
-            report(done, total, intent)
+    if parallel is not None:
+        from .parallel import PARALLEL_PLANNERS, ParallelConfig, run_parallel
+
+        pcfg = parallel if isinstance(parallel, ParallelConfig) else ParallelConfig(n_workers=int(parallel))
+        if pname not in PARALLEL_PLANNERS:
+            raise ValueError(
+                f"parallel mode needs an envelope-recording planner {PARALLEL_PLANNERS}, got {pname!r} "
+                f"(the MILP/opt refiners optimize outside any recorded read set — not supported in v1).")
+        # telemetry: workers capture per-flight on_deny rows and the coordinator merges them in
+        # commit order into `collector`; serial replans write into it directly.
+        intents = run_parallel(scenario, cfg, pcfg, ledger, dss, pname, static_terms, status, report,
+                               collector=collector)
+    else:
+        intents = []
+        for done, ev in enumerate(scenario.events, 1):
+            uss = usses.get(ev.request.uss_id, default_uss)
+            intent = uss.handle_request(ev.request)
+            intents.append(intent)
+            status(done, ev.request, intent)
+            if report:
+                report(done, total, intent)
 
     verified = verify.find_interflight_conflict(intents, cfg, static_terminals=static_terms) is None
     # Carry the planner that ACTUALLY flew: a planner_name= override must be reflected in the stored

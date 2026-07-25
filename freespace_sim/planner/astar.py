@@ -47,11 +47,58 @@ from ..volumes import (
 )
 from . import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
-from .compiled_hex_occupancy import search_horizon
+from .compiled_hex_occupancy import hover_tail_steps, search_horizon
 from .occupancy import HexOccupancyService
 from .terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
+_BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
+
+
+class _RecordingOcc:
+    """Occupancy shim for the pure-Python reference search: forwards ``is_blocked``/``pad_clear`` to
+    the real service while accumulating the (q, r, L, s) read bbox — the reference-path analogue of the
+    kernel's ``read_bbox`` accumulation (Track A, issue #8). Pure forwarding: cannot change any answer.
+
+    ``pad_clear`` is a WINDOW read, not a point read — the service scans every level over
+    ``[s0, s0 + dwell_steps]`` (occupancy.pad_clear) — so it marks that full step×level range; recording
+    only the call args would under-record the dwell window and let exact mode silently diverge."""
+
+    __slots__ = ("_svc", "_n_levels", "bbox")
+
+    def __init__(self, svc, n_levels: int):
+        self._svc = svc
+        self._n_levels = n_levels
+        self.bbox = [_BBOX_HUGE, -_BBOX_HUGE, _BBOX_HUGE, -_BBOX_HUGE,
+                     _BBOX_HUGE, -_BBOX_HUGE, _BBOX_HUGE, -_BBOX_HUGE]
+
+    def _mark(self, q, r, L, s):
+        b = self.bbox
+        if q < b[0]:
+            b[0] = q
+        if q > b[1]:
+            b[1] = q
+        if r < b[2]:
+            b[2] = r
+        if r > b[3]:
+            b[3] = r
+        if L < b[4]:
+            b[4] = L
+        if L > b[5]:
+            b[5] = L
+        if s < b[6]:
+            b[6] = s
+        if s > b[7]:
+            b[7] = s
+
+    def is_blocked(self, q, r, L, s, own=()):
+        self._mark(q, r, L, s)
+        return self._svc.is_blocked(q, r, L, s, own)
+
+    def pad_clear(self, q, r, s0, dwell_steps):
+        self._mark(q, r, 0, s0)
+        self._mark(q, r, self._n_levels - 1, s0 + dwell_steps)
+        return self._svc.pad_clear(q, r, s0, dwell_steps)
 
 
 def _deny(req, reason):
@@ -175,6 +222,13 @@ class AStarPlanner:
         self.vertical_edges = vertical_edges
         self.last_expansions = 0                        # nodes expanded by the most recent plan (telemetry)
         self._tele = None                               # TelemetryCollector | None (observer-only; sim.run sets it)
+        # ---- Track A (issue #8) read-envelope hooks: observer-only unless a parallel worker opts in ----
+        self.record_envelope = False                    # True → build parallel.PlanEnvelope per plan
+        self.last_envelope = None                       # PlanEnvelope | None (most recent plan's read set)
+        # Eviction floor (seconds). Parallel workers receive out-of-order re-dispatches, so they must
+        # evict occupancy/capacity state to the COORDINATOR's commit-frontier clock, never their own
+        # flight's clock — the floor only ever evicts LESS (the safe direction; see _occupancy).
+        self.evict_floor: float | None = None
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
@@ -248,10 +302,42 @@ class AStarPlanner:
         # step/time any plan reads is ``base >= floor(t_request/dt)`` — so the bare request-clock
         # watermark (no buffer) drops only un-readable state. EXACTLY TIGHT: it relies on that
         # ``base >= floor(t_request/dt)`` invariant, so don't loosen base/t_departure without re-checking.
-        wm = req.t_request
+        # ``evict_floor`` (Track A): a parallel worker's assignments are NOT monotone (eager
+        # re-speculation re-dispatches an earlier flight after a later one), so it caps the watermark
+        # at the coordinator's commit-frontier clock — evicting LESS, which is always safe (the
+        # tightness note above warns against evicting MORE). None → today's behavior byte-identically.
+        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
         svc.evict_before(int(wm // cfg.dt_s))
         self._tcap.evict_before(wm)
         return svc
+
+    def _mk_envelope(self, req, cfg, o_term, d_term, origin, dest, max_step, bbox, unbounded):
+        """Build ``last_envelope`` (Track A read-set summary) for the plan that just ran. ``bbox`` is
+        the 8-slot probe accumulator (kernel ``read_bbox`` or ``_RecordingOcc.bbox``); the o/d hub discs
+        cover the host-side reads no cell probe records: ``TerminalCapacity`` dwell/transit queries, the
+        compiled path's takeoff/landing masks, and the own-column overlay's ``col_owners`` lookups. The
+        time window is the plan's recorded reach ``[t_request, max_step·dt + hover tail]`` — every
+        occupancy/capacity read falls inside it (queries are ≤ max_step; committed-column tails extend at
+        most ``hover_tail_steps`` past)."""
+        from ..parallel import PlanEnvelope, cell_bbox_to_aabb
+
+        infl_pad = cfg.effective_hover_radius_m + hg.circumradius(cfg)   # occupancy pad inflation
+        hubs = []
+        for term, center in ((o_term, origin), (d_term, dest)):
+            base_r = (max(exit_radius(term, cfg), terminal_radius(term, cfg))
+                      if term is not None else cfg.effective_hover_radius_m)
+            hubs.append((float(center[0]), float(center[1]), base_r + infl_pad))
+        cell_bbox = None
+        if bbox is not None and bbox[0] <= bbox[1]:                      # any in-box probe happened
+            cell_bbox = tuple(int(v) for v in bbox)
+        self.last_envelope = PlanEnvelope(
+            cell_bbox=cell_bbox,
+            xy=cell_bbox_to_aabb(cell_bbox, cfg) if cell_bbox is not None else None,
+            hub_reads=tuple(hubs),
+            t_lo=float(req.t_request),
+            t_hi=float(max_step * cfg.dt_s + hover_tail_steps(cfg) * cfg.dt_s),
+            unbounded=bool(unbounded),
+        )
 
     def plan(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
@@ -265,6 +351,7 @@ class AStarPlanner:
         terminals** (``fixed_exit_lanes=False`` with a terminal end) still route to the reference because
         their landing gate is path-dependent (``_committed_arrival`` needs the search's ``came`` mid-flight),
         which the flat-array kernel cannot serve."""
+        self.last_envelope = None            # never leak a previous flight's read set to a consumer
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
@@ -309,7 +396,11 @@ class AStarPlanner:
         # through mid-descent (else post-build CONFLICT_FILED). See occupancy.py.
         svc = self._occupancy(req, ledger, cfg)
         tcap = self._tcap
-        svc_q = svc
+        # Track A read-set recording: wrap the occupancy in the accumulating shim so every search
+        # probe (is_blocked / pad_clear, incl. the goal-gate pad check) lands in the bbox. Pure
+        # forwarding — answers are byte-identical; zero overhead when recording is off.
+        rec = _RecordingOcc(svc, cfg.n_levels) if self.record_envelope else None
+        svc_q = rec if rec is not None else svc
         # per-level dwell window: hover plus the ACTUAL climb to that level (takeoff or landing)
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)
@@ -414,6 +505,13 @@ class AStarPlanner:
                     heapq.heappush(pq, (ng + hh, next(counter), nst))
 
         self.last_expansions = expansions               # search-effort telemetry (node-count parity gate)
+        if rec is not None:
+            # One build covers EVERY exit below (deny + accept): the bbox is final here, and the
+            # post-search reads (detour check is pure geometry; the filed-corridor any_conflict probes
+            # only cells on the found path ⊆ the recorded bbox ⊕ pad) add nothing outside it.
+            # truncated ⇒ SEARCH_EXHAUSTED: the read set was cut short, so it cannot certify cleanliness.
+            self._mk_envelope(req, cfg, o_term, d_term, origin, dest, max_step, rec.bbox,
+                              unbounded=truncated)
         if goal_state is None:
             # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
             # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /
@@ -615,7 +713,9 @@ class AStarPlanner:
         elif ledger.n_volumes < cocc.n_added:
             cocc.reset()
             _absorb(cocc, ledger)
-        cocc.evict_before(int(req.t_request // cfg.dt_s))
+        # same frontier-clock floor as _occupancy (out-of-order re-dispatch safety; evicts LESS)
+        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
+        cocc.evict_before(int(wm // cfg.dt_s))
         return cocc
 
     def _kernel_state(self, cocc, log2: int):
@@ -641,6 +741,7 @@ class AStarPlanner:
                 "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
                 "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
                 "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
+                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
             }
         kc = self._ks_caps.get(log2)
         if kc is None:
@@ -757,7 +858,7 @@ class AStarPlanner:
                 2, _warm_gp, _warm_gp.view(np.float64), 64, 6,
                 np.empty(64, np.float64), np.empty(64, np.int64), np.empty(64, np.int64), 64,
                 np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
-                1000,
+                1000, np.zeros(8, np.int64),
             )
         except Exception as e:                                # compile failure → degrade to pure Python
             warnings.warn(
@@ -863,6 +964,11 @@ class AStarPlanner:
         # the FULL range and re-run. Exact — the widened run IS the full-mask search — and no reference
         # fallback, just the rare re-run. Most flights finish in one tight pass. ----
         n_gsteps = min(full_ng, 3 * n_hops + 2 * climb_span + 134)
+        # per-plan probe-bbox reset OUTSIDE the widen loop: a FB_MASK re-run ACCUMULATES onto the tight
+        # pass's probes (both passes' reads belong to this plan's read set), and min>max ⇔ never probed.
+        rb = ks["read_bbox"]
+        rb[0] = rb[2] = rb[4] = rb[6] = _BBOX_HUGE
+        rb[1] = rb[3] = rb[5] = rb[7] = -_BBOX_HUGE
         while True:
             to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
             if to_terminal:
@@ -913,6 +1019,7 @@ class AStarPlanner:
                 gen, kc["g_pack"], kc["g_packf"], kc["cap"], kc["log2"],
                 kc["heap_f"], kc["heap_c"], kc["heap_n"], kc["mh"],
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
+                rb,
             )
             if status == K.FB_MASK and n_gsteps < full_ng:
                 self._remask += 1
@@ -928,6 +1035,12 @@ class AStarPlanner:
                 continue
             break
         self.last_expansions = n_exp
+        if self.record_envelope:
+            # One build covers every non-fallback exit below (deny + accept; the post-search detour /
+            # filed-corridor reads stay inside the recorded bbox ⊕ pad, as in _plan_reference). An FB_*
+            # fallback overwrites it: the reference rerun's recording is the authoritative read set.
+            self._mk_envelope(req, cfg, o_term, d_term, origin, dest, max_step, rb,
+                              unbounded=(status == K.NO_PATH_TRUNC))
 
         # ---- status handling ----
         if status >= K.FB_OOB:                           # safety valve → pure-Python reference

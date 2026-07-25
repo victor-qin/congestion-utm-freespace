@@ -228,8 +228,7 @@ def test_astar_multilevel_is_deterministic():
 
 def test_single_level_config_recovers_legacy_behavior():
     """One flight level at the old cruise plane ⇒ the legacy single-plane A* (no vertical lever)."""
-    cfg = SimConfig(cruise_level_m=150.0, flight_levels_m=(150.0,), airspace_ceiling_m=165.0,
-                    z_min_m=150.0, z_max_m=150.0)
+    cfg = SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0)   # cruise/z derive to 150
     intent = AStarPlanner().plan(_req(), ReservationLedger(cfg), cfg)
     assert intent.status is IntentStatus.ACCEPTED
     assert _cruise_levels(intent) == [150.0]

@@ -88,8 +88,9 @@ class ScenarioSpec:
     fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
     terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
     # flight-level ladder override (None → SimConfig default (30,70,110) multi-level). Pin a scenario to
-    # one A* plane with flight_levels_m=(z,); widen by listing more levels. (cruise/z bounds are the
-    # single-plane samplers' band — no registered scenario overrides them, so they're not exposed here.)
+    # one A* plane with flight_levels_m=(z,); widen by listing more levels. This is the single altitude
+    # knob: SimConfig derives the single-plane samplers' cruise + z-band from it, so a scenario needn't
+    # (and can't) set cruise_level_m / z_min_m / z_max_m separately.
     flight_levels_m: "tuple[float, ...] | None" = None
     demand: DemandSpec = field(default_factory=DemandSpec)
 

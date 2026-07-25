@@ -16,20 +16,16 @@ class SimConfig:
     # --- dimensionality & altitude (full 3D, regulated band [ground_level_m, airspace_ceiling_m]) ---
     dims: int = 3
     ground_level_m: float = 0.0
-    cruise_level_m: float = 75.0       # single-plane planners' cruise altitude (straight/decoupled)
-    # Continuous-optimizer cruise band (MILP): the solver's ``pz`` knots live anywhere in
-    # [z_min_m, z_max_m], so altitude is a deconfliction lever (defaults = the A* ladder's floor/top).
-    # A* instead deconflicts on the DISCRETE ``flight_levels_m`` ladder below; ``straight``/``decoupled``
-    # stay pinned to the single ``cruise_level_m`` plane. Collapse the band (z_min == z_max) to recover
-    # the legacy single-plane MILP.
-    z_min_m: float = 30.0
-    z_max_m: float = 110.0
+    # Altitude is defined by ONE knob: ``flight_levels_m`` (below). ``cruise_level_m`` / ``z_min_m`` /
+    # ``z_max_m`` are NOT stored; they are DERIVED @properties (see the DERIVED section): cruise = the
+    # ladder's middle level (straight/decoupled), and the MILP continuous band [z_min_m, z_max_m] = the
+    # ladder's floor→top. A single-level ladder collapses the band to that one plane.
     # Regulated airspace ceiling: every hover/terminal column spans [ground_level_m, airspace_ceiling_m].
     airspace_ceiling_m: float = 125.0
-    # A*'s discrete cruise levels. Strictly ascending; adjacent gaps must EXCEED corridor_height_m (so
-    # neighbouring level boxes don't touch in z and stay FCL-disjoint), and the top/bottom boxes
-    # (level ± corridor_height_m/2) must fit within [ground_level_m, airspace_ceiling_m]. Set
-    # ``flight_levels_m=(cruise_level_m,)`` (and matching ceiling) for legacy single-level behaviour.
+    # A*'s discrete cruise levels — the SINGLE altitude knob (cruise / z-band derive from it). Strictly
+    # ascending; adjacent gaps must EXCEED corridor_height_m (so neighbouring level boxes don't touch in z
+    # and stay FCL-disjoint), and the top/bottom boxes (level ± corridor_height_m/2) must fit within
+    # [ground_level_m, airspace_ceiling_m]. Set ``flight_levels_m=(z,)`` (+ matching ceiling) for one plane.
     flight_levels_m: tuple[float, ...] = (30.0, 70.0, 110.0)
 
     # --- region (continuous horizontal free space), local ENU metres ---
@@ -101,9 +97,29 @@ class SimConfig:
         """Hover-cylinder radius; defaults to the corridor width."""
         return self.hover_radius_m if self.hover_radius_m is not None else self.corridor_width_m
 
+    # ----- altitude, DERIVED from flight_levels_m (not stored) -----
+    @property
+    def cruise_level_m(self) -> float:
+        """Single-plane planners' cruise altitude (straight/decoupled) — the ladder's middle level.
+
+        Derived, never stored: ``flight_levels_m`` is the single source of truth. A* deconflicts on the
+        discrete ladder and MILP in the ``[z_min_m, z_max_m]`` band; only straight/decoupled pin here.
+        """
+        return self.flight_levels_m[len(self.flight_levels_m) // 2]
+
+    @property
+    def z_min_m(self) -> float:
+        """MILP continuous cruise-band floor = the ladder's lowest level. A single-level ladder ⇒ z_min==z_max."""
+        return self.flight_levels_m[0]
+
+    @property
+    def z_max_m(self) -> float:
+        """MILP continuous cruise-band ceiling = the ladder's highest level. A single-level ladder ⇒ z_min==z_max."""
+        return self.flight_levels_m[-1]
+
     @property
     def climb_time_s(self) -> float:
-        """Seconds to climb ground → the preferred cruise level (75 / 6 = 12.5 s).
+        """Seconds to climb ground → the single-plane cruise level at climb_rate (e.g. 70/6 ≈ 11.7 s).
 
         This is the single-plane planners' climb time; A* uses :meth:`climb_time_to` per flight level.
         """
@@ -146,7 +162,11 @@ class SimConfig:
         return tuple(z_lo + step * i for i in range(n))
 
     def __post_init__(self) -> None:
-        """Validate the flight-level ladder (frozen dataclass — raise only, never mutate)."""
+        """Validate the flight-level ladder (frozen dataclass — raise only, never mutate).
+
+        ``flight_levels_m`` is the single source of truth for altitude; the single-plane planners' cruise +
+        sampling band are DERIVED from it (the ``cruise_level_m`` / ``z_min_m`` / ``z_max_m`` properties).
+        """
         lv = self.flight_levels_m
         if not lv:
             raise ValueError("flight_levels_m must be non-empty")
@@ -164,11 +184,3 @@ class SimConfig:
                 raise ValueError(
                     f"levels {a},{b} gap {b - a} <= corridor_height_m {self.corridor_height_m}; "
                     "adjacent level boxes would overlap in z")
-        if not (self.ground_level_m <= self.cruise_level_m <= self.airspace_ceiling_m):
-            raise ValueError(
-                f"cruise_level_m {self.cruise_level_m} outside "
-                f"[{self.ground_level_m}, {self.airspace_ceiling_m}]")
-        if not (self.ground_level_m <= self.z_min_m <= self.z_max_m <= self.airspace_ceiling_m):
-            raise ValueError(
-                f"continuous cruise band [z_min_m, z_max_m] = [{self.z_min_m}, {self.z_max_m}] must "
-                f"be ordered and inside [{self.ground_level_m}, {self.airspace_ceiling_m}]")

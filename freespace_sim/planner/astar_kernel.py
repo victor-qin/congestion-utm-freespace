@@ -144,15 +144,37 @@ def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
 
 @njit(cache=True, nogil=True)
 def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
-             iv, cv, static_col, ov_own_gen, gen):
+             iv, cv, static_col, ov_own_gen, gen, read_bbox):
     """0 = free, 1 = blocked, -1 = out-of-box. Reproduces ``occupancy.is_blocked`` via the corridor pool
     (``iv_*``) + column pool (``cv_*``) + always-active static walls (``static_col``) + this flight's
     own-column mark (``ov_own_gen[cell] == gen``): a FOREIGN column (transient OR always-active) is a wall;
     an OWN column is transparent unless a corridor (fixed-lane sibling) also covers it; a plain cell is the
-    corridor pool."""
+    corridor pool.
+
+    ``read_bbox`` (int64[8]: qmin,qmax,rmin,rmax,Lmin,Lmax,smin,smax) accumulates every IN-BOX probe —
+    the plan's read set, consumed by the Track-A exact-mode commit validation (``parallel.PlanEnvelope``).
+    Write-only w.r.t. the search: it cannot change any decision, so kernel==reference parity is untouched.
+    Out-of-box probes are excluded deliberately: the -1 answer is pure box geometry, independent of every
+    commit, so it can never be dirtied."""
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
+    if q < read_bbox[0]:
+        read_bbox[0] = q
+    if q > read_bbox[1]:
+        read_bbox[1] = q
+    if r < read_bbox[2]:
+        read_bbox[2] = r
+    if r > read_bbox[3]:
+        read_bbox[3] = r
+    if L < read_bbox[4]:
+        read_bbox[4] = L
+    if L > read_bbox[5]:
+        read_bbox[5] = L
+    if s < read_bbox[6]:
+        read_bbox[6] = s
+    if s > read_bbox[7]:
+        read_bbox[7] = s
     cell = (iq * rspan + ir) * n_levels + L
     # column pool: is `cell` column-blocked at s? (blocked iff s is in no free interval)
     colb = 1
@@ -205,6 +227,8 @@ def _search(
     heap_f, heap_c, heap_n, max_heap,
     # ---- output ----
     out_q, out_r, out_L, out_s, max_expansions,
+    # ---- read-set telemetry (Track A, issue #8): in/out int64[8] bbox over every in-box probe ----
+    read_bbox,
 ):
     step_span = max_step - base + 1
     nlp1 = n_levels + 1
@@ -291,7 +315,8 @@ def _search(
                         if not to_ok[gi * n_levels + Lv]:
                             continue
                         if _blocked(lq, lr, Lv, ts, qmin, rmin, qspan, rspan, n_levels,
-                                    iv, cv, static_col, ov_own_gen, gen) != 0:
+                                    iv, cv, static_col, ov_own_gen, gen,
+                                    read_bbox) != 0:
                             continue
                         liq = lq - qmin; lir = lr - rmin
                         nkey = ((liq * rspan + lir) * nlp1 + (Lv + 1)) * step_span + (ts - base)
@@ -329,7 +354,7 @@ def _search(
             else:
                 nq = q; nr = r + 1
             b = _blocked(nq, nr, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                         iv, cv, static_col, ov_own_gen, gen)
+                         iv, cv, static_col, ov_own_gen, gen, read_bbox)
             if b == -1:                                  # out-of-box stray → host reference
                 return 0, 0.0, n_exp, FB_OOB, (nq + 32768) * 65536 + (nr + 32768)
             if b == 1:
@@ -346,7 +371,7 @@ def _search(
                 return 0, 0.0, n_exp, FB_HEAP, -1
         # hover (same level)
         if _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                    iv, cv, static_col, ov_own_gen, gen) == 0:
+                    iv, cv, static_col, ov_own_gen, gen, read_bbox) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt
             hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost)
@@ -370,9 +395,11 @@ def _search(
                 sk = step + 1
                 while sk <= ts:
                     if _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv, cv, static_col, ov_own_gen, gen) != 0 or \
+                                iv, cv, static_col, ov_own_gen, gen,
+                                read_bbox) != 0 or \
                        _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv, cv, static_col, ov_own_gen, gen) != 0:
+                                iv, cv, static_col, ov_own_gen, gen,
+                                read_bbox) != 0:
                         clear = False
                         break
                     sk += 1

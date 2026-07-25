@@ -46,6 +46,7 @@ from ..volumes import (
     terminal_radius,
 )
 from . import hexgrid as hg
+from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
 from .compiled_hex_occupancy import search_horizon
 from .occupancy import HexOccupancyService
 from .terminal_capacity import TerminalCapacity
@@ -159,8 +160,14 @@ def _warn_kernel_fallback() -> None:
 
 class AStarPlanner:
     def __init__(self, max_expansions: int = 2_000_000, vertical_edges: bool = True,
-                 compiled: bool = True):
+                 compiled: bool = True, kernel_log2_min: int | None = None):
         self.max_expansions = max_expansions
+        # starting g-hash/heap size (1 << kernel_log2_min slots): the ADAPTIVE floor of the kernel work
+        # arrays — overflow grows ×4 and re-runs exactly (see _kernel_state). None (default) starts at
+        # the ceiling = the old fixed sizing, so a lone sequential run is byte-identical in BEHAVIOR AND
+        # COST (no regrow re-runs on the big-search tail, measured ~+7% there). Parallel workers opt
+        # into a small floor (e.g. 18 ≈ ~15 MB hot set) to stay cache-resident under contention.
+        self.kernel_log2_min = kernel_log2_min
         # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an
         # all-levels column-clearance check, so they dominate the multi-altitude search cost; the
         # capacity gain comes from per-level TAKEOFF, which is independent. Disable on huge scenarios to
@@ -188,7 +195,9 @@ class AStarPlanner:
         self._cocc = None                               # CompiledHexOccupancy (per ledger)
         self._cocc_ledger: ReservationLedger | None = None
         self._gen = 0                                   # version stamp for the reused kernel state
-        self._ks = None                                 # lazily-allocated kernel work arrays (hash/heap/…)
+        self._ks = None                                 # occupancy-shaped kernel arrays (overlay/out/bbox)
+        self._ks_caps: dict[int, dict] = {}             # capacity-shaped arrays per log2 (adaptive g-hash/heap)
+        self._regrow = 0                                # FB_HASH/FB_HEAP grow-and-re-run count (diagnostics)
         self._fb = 0                                    # IN-KERNEL fallback count (FB_OOB/HASH/HEAP + overlap)
         self._fb_reasons: Counter = Counter()           # fallback reason histogram (bench summary)
         # PRE-kernel reference dispatches (legacy-terminal / box-guard) — counted separately from in-kernel
@@ -239,8 +248,9 @@ class AStarPlanner:
         # step/time any plan reads is ``base >= floor(t_request/dt)`` — so the bare request-clock
         # watermark (no buffer) drops only un-readable state. EXACTLY TIGHT: it relies on that
         # ``base >= floor(t_request/dt)`` invariant, so don't loosen base/t_departure without re-checking.
-        svc.evict_before(int(req.t_request // cfg.dt_s))
-        self._tcap.evict_before(req.t_request)
+        wm = req.t_request
+        svc.evict_before(int(wm // cfg.dt_s))
+        self._tcap.evict_before(wm)
         return svc
 
     def plan(
@@ -299,6 +309,7 @@ class AStarPlanner:
         # through mid-descent (else post-build CONFLICT_FILED). See occupancy.py.
         svc = self._occupancy(req, ledger, cfg)
         tcap = self._tcap
+        svc_q = svc
         # per-level dwell window: hover plus the ACTUAL climb to that level (takeoff or landing)
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)
@@ -379,7 +390,7 @@ class AStarPlanner:
                             _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term),
                             d_cap, origin, levels[st[3]],
                         ) if d_term is not None
-                        else svc.pad_clear(gq, grr, st[4], dwell_steps[st[3]])
+                        else svc_q.pad_clear(gq, grr, st[4], dwell_steps[st[3]])
                     )
                 if goal_ok:
                     goal_state = st
@@ -393,7 +404,7 @@ class AStarPlanner:
             base_g = g[st]
             for nst, cost in self._edges(
                 st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost, dwell_steps,
-                c_alt, svc, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
+                c_alt, svc_q, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -607,36 +618,67 @@ class AStarPlanner:
         cocc.evict_before(int(req.t_request // cfg.dt_s))
         return cocc
 
-    def _kernel_state(self, cocc):
-        """(Re)allocate the version-stamped kernel work arrays, reused across plans (gen bump → O(1)
-        reset). Sized once; ``ov_own_gen`` (per-cell own-column mark) grows if a new ledger's box is bigger."""
+    def _kernel_state(self, cocc, log2: int):
+        """The version-stamped kernel work arrays, reused across plans (gen bump → O(1) reset), split in
+        two pools:
+
+        * **occupancy-shaped** (``_ks``: overlay / out path / read bbox) — sized by the box, grown if a
+          new ledger's box is bigger;
+        * **capacity-shaped** (``_ks_caps[log2]``: g-hash + frontier heap) — ADAPTIVE (issue #8 Track A).
+          The old fixed sizing (from ``max_expansions``: 1<<21 slots ≈ ~120 MB) made every plan randomly
+          probe a working set far past the shared cache — measured to slow CONCURRENT worker plans ~1.75×
+          at 8 workers while a lone worker matched sequential speed. Plans now start at
+          ``kernel_log2_min`` (~12 MB hot set, ample for the typical search) and a rare overflow returns
+          ``FB_HASH``/``FB_HEAP``, which ``_plan_compiled`` handles by growing ×4 and re-running — the
+          same exact-retry discipline as the FB_MASK widen (fresh ``gen``, no partial output is ever
+          used), so results are byte-identical at ANY sufficient size. Only at the ceiling (the old
+          max_expansions-derived size, headroom unchanged) does overflow still mean the reference
+          fallback. Grown sizes are cached per planner, so a hot spot pays the growth once."""
         NC = cocc.NC
-        if self._ks is None:
-            # The g-hash and frontier heap MUST stay ahead of the search cap, or the kernel silently
-            # falls back to pure Python on exactly the hardest flights (the ones that reach
-            # max_expansions) — the catastrophic-tail failure mode (a few long fallbacks eat the run).
-            # Derive both from max_expansions so bumping the cap can never desync them: >=2x headroom
-            # keeps the open-addressing load factor low and the frontier from overflowing. (Overflow only
-            # ever triggers a SAFE reference fallback, so this governs the fallback RATE, not correctness.)
-            log2 = max(20, (self.max_expansions * 2 - 1).bit_length())
-            cap = 1 << log2
-            mh = cap
-            self._ks = {
-                "g_key": np.empty(cap, np.int64), "g_gen": np.zeros(cap, np.int64),
-                "g_val": np.empty(cap, np.float64), "g_came": np.empty(cap, np.int64),
-                "g_flag": np.empty(cap, np.int8), "cap": cap, "log2": log2,
-                "heap_f": np.empty(mh, np.float64), "heap_c": np.empty(mh, np.int64),
-                "heap_n": np.empty(mh, np.int64), "mh": mh,
+        ks = self._ks
+        if ks is None or ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
+            self._ks = ks = {
                 "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
                 "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
                 "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
             }
-        ks = self._ks
-        if ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
-            ks["ov_own_gen"] = np.zeros(NC, np.int32); ks["NC"] = NC
-            for k in ("out_q", "out_r", "out_L", "out_s"):
-                ks[k] = np.empty(cocc.MAXS + 8, np.int64)
-        return ks
+        kc = self._ks_caps.get(log2)
+        if kc is None:
+            cap = 1 << log2
+            gp = aligned_2d(cap, 4)                     # 32 B/slot: key | gen|closed | val | came
+            gp[:, G_GEN] = 0                            # 0 = "no generation" ⇒ every slot empty
+            self._ks_caps[log2] = kc = {
+                "g_pack": gp, "g_packf": gp.view(np.float64), "cap": cap, "log2": log2,
+                # heap stays struct-of-arrays on purpose — packing it measured 21% SLOWER (see _hpop)
+                "heap_f": np.empty(cap, np.float64), "heap_c": np.empty(cap, np.int64),
+                "heap_n": np.empty(cap, np.int64), "mh": cap,
+            }
+        return ks, kc
+
+    def _bump_gen(self) -> int:
+        """Advance the version stamp. Generations move by 2, not 1: bit 0 of a packed g-hash stamp is
+        the node's closed flag (see ``_packed``), so a stamp must never carry an odd value of its own.
+
+        Also re-stamps from zero before ``gen`` could outgrow ``ov_own_gen``'s int32 range — an O(cap)
+        event roughly every 5e8 plans, i.e. never in practice, but a silent wrap would alias stale
+        slots into the live generation and corrupt a plan, so it is guarded rather than assumed."""
+        self._gen += GEN_STEP
+        if self._gen >= GEN_WRAP:
+            for kc in self._ks_caps.values():
+                kc["g_pack"][:, G_GEN] = 0
+            if self._ks is not None:
+                self._ks["ov_own_gen"][:] = 0
+            self._gen = GEN_STEP
+        return self._gen
+
+    @property
+    def _log2_cap_max(self) -> int:
+        """The g-hash/heap size ceiling — the old fixed sizing. Derived from ``max_expansions`` so
+        bumping the cap can never desync them: >=2x headroom keeps the open-addressing load factor low
+        and the frontier from overflowing; overflow AT the ceiling triggers the safe reference fallback,
+        so this governs the fallback RATE, not correctness (the catastrophic-tail note: the hardest
+        flights — the ones that reach max_expansions — must fit here)."""
+        return max(20, (self.max_expansions * 2 - 1).bit_length())
 
     def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
         """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
@@ -698,19 +740,21 @@ class AStarPlanner:
             return
         try:
             NC, MAXS = 9, 5
-            iv_lo = np.zeros(NC, np.int32); iv_hi = np.full(NC, MAXS, np.int32); iv_nxt = np.full(NC, -1, np.int32)
-            cv_lo = np.zeros(NC, np.int32); cv_hi = np.full(NC, MAXS, np.int32); cv_nxt = np.full(NC, -1, np.int32)
+            _warm_iv = aligned_2d(NC, 4, np.int32); _warm_iv[:, P_LO] = 0
+            _warm_iv[:, P_HI] = MAXS; _warm_iv[:, P_NXT] = -1
+            _warm_cv = _warm_iv.copy()
             ng = 6
+            _warm_gp = aligned_2d(64, 4)                   # same 2-D packed layout as production, so
+            _warm_gp[:, G_GEN] = 0                        # this compiles the signature actually used
             self._kernel(
-                iv_lo, iv_hi, iv_nxt, cv_lo, cv_hi, cv_nxt, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
+                _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
                 0, 0, 3, 3, 1, 0, MAXS,
                 1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]), 1,
                 np.array([1], np.int64), np.array([0.0]), np.ones(ng, np.bool_), ng, 1.0,
                 np.array([1], np.int64), np.array([0.0]), 1.0, 3.0, False,
                 np.array([1], np.int64), np.array([1], np.int64), 1, np.ones(ng, np.bool_),
                 0.0, 0.0, 1.0, 0.0, 1.0, 0.0,
-                1, np.empty(64, np.int64), np.zeros(64, np.int64), np.empty(64, np.float64),
-                np.empty(64, np.int64), np.empty(64, np.int8), 64, 6,
+                2, _warm_gp, _warm_gp.view(np.float64), 64, 6,
                 np.empty(64, np.float64), np.empty(64, np.int64), np.empty(64, np.int64), 64,
                 np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
                 1000,
@@ -777,7 +821,9 @@ class AStarPlanner:
             self._ref_dispatch["box-guard"] += 1
             return self._plan_reference(req, ledger, cfg)
 
-        ks = self._kernel_state(cocc)
+        log2 = (self._log2_cap_max if self.kernel_log2_min is None
+                else min(self.kernel_log2_min, self._log2_cap_max))
+        ks, kc = self._kernel_state(cocc, log2)
         n_levels = len(levels)
         full_ng = max_step - base + 1
 
@@ -840,13 +886,12 @@ class AStarPlanner:
                         land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
 
             # `gen` version-stamps BOTH the own-column overlay AND the kernel's open-addressing hash (its
-            # O(1) reset — `g_gen[i] != gen` marks a slot empty). The FB_MASK widen re-run therefore needs a
+            # O(1) reset — a slot whose stamp != `gen` is empty). The FB_MASK widen re-run therefore needs a
             # FRESH gen; DO NOT hoist this above the loop, or the re-run reuses the tight pass's closed nodes
             # and returns a spurious NO_PATH. The overlay is window-independent (re-stamped cheaply on the
             # rare widen); the overlap→reference check (issue #3) is identical each pass, so it aborts the
             # whole plan on the first iteration.
-            self._gen += 1
-            gen = self._gen
+            gen = self._bump_gen()
             if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
                 self._fb += 1
                 self._fb_reasons["own-foreign-overlap"] += 1
@@ -857,7 +902,7 @@ class AStarPlanner:
                 )
                 return self._plan_reference(req, ledger, cfg)
             n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
-                cocc.corr.lo, cocc.corr.hi, cocc.corr.nxt, cocc.col.lo, cocc.col.hi, cocc.col.nxt,
+                cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
                 oq, orr, lane_q, lane_r, lane_lat, len(lane_q),
@@ -865,13 +910,21 @@ class AStarPlanner:
                 rs, rc, c_lat_pitch, c_hold_dt, self.vertical_edges,
                 goal_q, goal_r, len(goal_q), land_ok,
                 gx, gy, R, h_off, c_lat, h_ground,
-                gen, ks["g_key"], ks["g_gen"], ks["g_val"], ks["g_came"], ks["g_flag"], ks["cap"], ks["log2"],
-                ks["heap_f"], ks["heap_c"], ks["heap_n"], ks["mh"],
+                gen, kc["g_pack"], kc["g_packf"], kc["cap"], kc["log2"],
+                kc["heap_f"], kc["heap_c"], kc["heap_n"], kc["mh"],
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
             )
             if status == K.FB_MASK and n_gsteps < full_ng:
                 self._remask += 1
                 n_gsteps = full_ng                       # widen to the full range and re-run (exact)
+                continue
+            if status in (K.FB_HASH, K.FB_HEAP) and log2 < self._log2_cap_max:
+                # adaptive g-hash/heap: the search outgrew the cache-friendly arrays — grow ×4 and
+                # re-run (fresh gen ⇒ exact, like the FB_MASK widen). At the ceiling, fall through
+                # to the reference fallback exactly as the fixed sizing did.
+                self._regrow += 1
+                log2 = min(log2 + 2, self._log2_cap_max)
+                ks, kc = self._kernel_state(cocc, log2)
                 continue
             break
         self.last_expansions = n_exp

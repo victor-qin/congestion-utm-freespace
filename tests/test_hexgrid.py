@@ -87,6 +87,64 @@ def test_vectorized_rasterize_matches_scalar_reference():
         assert pad == _scalar_rasterize(v, CFG, R, infl_p)
 
 
+def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
+    """``rasterize_ranges`` (issue #8 Phase E) collapses the step axis to a contiguous span per cell.
+    Expanding every range back over its steps must reproduce :func:`rasterize_volume_dual` EXACTLY
+    (byte-coverage: the compiled pool blocks the whole span in one split, and this is why that stays
+    byte-identical), and the memo must reuse the geometry (the point: one sweep for both images)."""
+    z = CFG.cruise_level_m
+    vols = [
+        corridor_segment_volume(vec(800, 200, z), 40.0, vec(920, 260, z), 44.0, CFG),   # multi-step box
+        hover_reservation(vec(1500, -700, 0.0), 60.0, CFG),                             # cylinder
+    ]
+    infl_b = CFG.corridor_width_m / 2.0 + R
+    infl_p = CFG.effective_hover_radius_m + R
+
+    calls = {"n": 0}
+    real = hg.rasterize_volume_ranges
+    def _counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+    monkeypatch.setattr(hg, "rasterize_volume_ranges", _counting)
+    hg._RANGE_CACHE.clear()
+
+    for v in vols:
+        want = list(hg.rasterize_volume_dual(v, CFG, R, infl_b, infl_p))
+        before = calls["n"]
+        ranges = hg.rasterize_ranges(v, CFG, R, infl_b, infl_p)   # cold: computes
+        again = hg.rasterize_ranges(v, CFG, R, infl_b, infl_p)    # warm: reused, no recompute
+        assert again is ranges                                    # the SECOND consumer reuses it
+        assert calls["n"] == before + 1                           # exactly one underlying sweep
+        expanded = [(q, r, L, s, b) for q, r, L, s_lo, s_hi, b in ranges
+                    for s in range(s_lo, s_hi + 1)]
+        assert expanded == want                                   # ranges ⇒ dual sweep, byte-for-byte
+        assert len(ranges) < len(want)                            # the collapse actually happened
+    hg._RANGE_CACHE.clear()
+
+
+def test_block_range_matches_free_set_oracle():
+    """``_Pool.block_range`` (issue #8 Phase E) vs an INDEPENDENT oracle — a plain per-cell set of
+    still-free steps. (``block`` now delegates to ``block_range``, so comparing the two would be
+    circular; the oracle validates the interval surgery from first principles instead.) Random spans,
+    some straddling holes earlier spans punched (the multi-interval case) and some running off both
+    ends, must leave ``blocked_at`` agreeing with the oracle at every step of every cell."""
+    from freespace_sim.planner.compiled_hex_occupancy import _Pool
+
+    NC, MAXS = 4, 40
+    rng = np.random.default_rng(0)
+    pool = _Pool(NC, MAXS)
+    free = [set(range(MAXS + 1)) for _ in range(NC)]      # oracle: the still-free steps per cell
+    for _ in range(80):
+        c = int(rng.integers(0, NC))
+        lo = int(rng.integers(-3, MAXS + 2))              # spans may run off either end
+        hi = lo + int(rng.integers(0, 14))
+        pool.block_range(c, lo, hi)
+        free[c] -= set(range(max(0, lo), min(MAXS, hi) + 1))   # clamp mirrors block_range
+        for cc in range(NC):
+            for s in range(0, MAXS + 1):
+                assert pool.blocked_at(cc, s) == (s not in free[cc]), (cc, s, lo, hi)
+
+
 def test_rasterize_box_lands_on_its_level_only():
     """A level corridor box marks cells at exactly its own flight level."""
     z = CFG.level_z(1)                                      # 70 m

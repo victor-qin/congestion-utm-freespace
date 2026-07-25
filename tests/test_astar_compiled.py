@@ -411,6 +411,35 @@ def test_compiled_fallback_on_kernel_valve_matches_reference():
         com._kernel = orig
 
 
+def test_compiled_adaptive_kernel_state_regrows_exact():
+    """Adaptive g-hash/heap (issue #8): a tiny starting size forces FB_HASH/FB_HEAP grow-and-re-run
+    on a real search; the result must be byte-identical to the reference AND to a planner that
+    started at full size — the regrow path is exact, not a fallback."""
+    req = _req(dx=3000.0)
+    commits = [(99, [_wall()])]
+
+    def led():
+        lg = ReservationLedger(CFG)
+        for fid, vols in commits:
+            lg.commit(fid, vols)
+        return lg
+
+    ref_planner = AStarPlanner(compiled=False)
+    ref = ref_planner.plan(req, led(), CFG)
+    tiny = AStarPlanner(compiled=True, kernel_log2_min=8)      # 256 slots — must regrow
+    got = tiny.plan(req, led(), CFG)
+    assert tiny._regrow > 0, "tiny kernel state did not regrow — the adaptive path is untested"
+    assert tiny._fb == 0, "regrow must be exact, never a reference fallback"
+    assert got.status is ref.status and abs(got.cost - ref.cost) < 1e-9
+    assert tiny.last_expansions == ref_planner.last_expansions
+    full = AStarPlanner(compiled=True)
+    got_full = full.plan(req, led(), CFG)
+    assert full._regrow == 0                                   # default size fits this search
+    assert abs(got.cost - got_full.cost) < 1e-12
+    assert tiny.last_expansions == full.last_expansions
+    assert _clkey(got) == _clkey(got_full) == _clkey(ref)
+
+
 # ---------------- A (terminal) / F: terminal replay + end-to-end ----------------
 
 @pytest.mark.slow

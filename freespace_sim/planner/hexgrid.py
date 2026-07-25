@@ -16,6 +16,7 @@ the true continuous gap, and FCL verify is the backstop.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -325,3 +326,72 @@ def rasterize_volume_dual(
         for q, r, b in zip(qp, rp, in_blk):
             for s in steps:
                 yield q, r, L, s, b
+
+
+def rasterize_volume_ranges(
+    vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float
+):
+    """Like :func:`rasterize_volume_dual`, but yields one ``(q, r, L, s_lo, s_hi, in_blocked)`` per
+    *cell* with the step axis collapsed to its inclusive ``[s_lo, s_hi]`` range instead of one row
+    per (cell, step).
+
+    A committed volume occupies each cell over a *contiguous* step span (``_step_range`` is a plain
+    ``range``), so the per-step form yields ``S`` rows the consumers then process one at a time —
+    ``S`` interval-splits into the compiled pool, ``S`` dict inserts into the hex service. Handing the
+    range straight through lets the compiled pool block the whole span in ONE split (issue #8 Phase E:
+    the pool-splice half of the commit floor drops by the ~10-30 steps a volume spans). Byte-identical
+    coverage: expanding every yielded range back over ``s_lo..s_hi`` reproduces the dual sweep exactly."""
+    levels = _levels_overlapped(vol, cfg)
+    if not levels:
+        return
+    steps = _step_range(vol, cfg)
+    s_lo, s_hi = steps.start, steps.stop - 1               # range(s0, s1+1) → inclusive [s0, s1]
+    if s_hi < s_lo:
+        return
+    if _cylinder_z_independent(vol, cfg, levels):
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[levels[0]])
+        in_pad = slack <= infl_pad
+        rows = list(zip(q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
+                        (slack[in_pad] <= infl_blocked).tolist()))
+        for L in levels:
+            for q, r, b in rows:
+                yield q, r, L, s_lo, s_hi, b
+        return
+    for L in levels:
+        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[L])
+        in_pad = slack <= infl_pad
+        in_blk = (slack[in_pad] <= infl_blocked).tolist()
+        qp = q_grid[in_pad].tolist()
+        rp = r_grid[in_pad].tolist()
+        for q, r, b in zip(qp, rp, in_blk):
+            yield q, r, L, s_lo, s_hi, b
+
+
+_RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+# Both occupancy images consume the SAME volume with the SAME params on each commit (hex then
+# compiled), so the geometry sweep (`_candidate_slack`) is memoized once and reused by the second
+# consumer. The cap must exceed one flight's volume count for that reuse to fire — 128 dwarfs any
+# real trajectory (corridor segments + 2 terminal columns). Overshooting only wastes a miss's
+# recompute, never correctness; undershooting silently loses the sharing, so this errs high.
+_RANGE_CACHE_CAP = 128
+
+
+def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float):
+    """Materialized :func:`rasterize_volume_ranges`, shared between a commit's two occupancy consumers.
+
+    ~98% of the coordinator's serial commit floor is these two per-commit rasterizations (issue #8
+    Phase E), and the geometry is identical between them, so it is computed once here and reused. The
+    identity guard (``hit[0] is vol``) keeps reuse correct if a freed volume's ``id`` is recycled; the
+    LRU cap bounds retention. Only the two on_commit consumers use this — per-plan callers (e.g. the
+    own-column overlay) stay on the generator so they never evict the live commit-volume rows."""
+    key = (id(vol), R, infl_blocked, infl_pad)
+    hit = _RANGE_CACHE.get(key)
+    if hit is not None and hit[0] is vol:
+        _RANGE_CACHE.move_to_end(key)
+        return hit[1]
+    rows = list(rasterize_volume_ranges(vol, cfg, R, infl_blocked, infl_pad))
+    _RANGE_CACHE[key] = (vol, rows)
+    _RANGE_CACHE.move_to_end(key)
+    if len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
+        _RANGE_CACHE.popitem(last=False)
+    return rows

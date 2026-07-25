@@ -4,9 +4,10 @@ plane shortens the climb -> shorter dwell -> pads and exit lanes cycle faster ->
 serialisation (the constraint that dominates ground delay). The shipped dallas_full routes across three
 levels (30/70/110 m); this pins one plane so the measured delta is altitude alone. Prints the run folder.
 
-Overrides flight_levels_m=(alt,) / cruise_level_m / z bounds on the built config via dataclasses.replace
-rather than adding more ScenarioSpec fields, deliberately: SimConfig defaults to the multi-level ladder
-(30/70/110 m, cruise 75 m, ceiling 125 m) and the test suite assumes it, so the pin stays scoped here.
+Overrides flight_levels_m=(alt,) on the built config via dataclasses.replace (cruise + z-band now DERIVE
+from the ladder, so they follow automatically) rather than adding more ScenarioSpec fields, deliberately:
+SimConfig defaults to the multi-level ladder (30/70/110 m, cruise = middle level 70 m, ceiling 125 m) and
+the test suite assumes it, so the pin stays scoped here.
 
 Finding (single 50 m plane vs a single 150 m plane, the pre-multi-altitude comparison, lam=12k, 1800 s):
 ground delay ~-10%, air delay flat (the lateral hex geometry is invariant to which single cruise plane

@@ -65,8 +65,8 @@ def test_cruise_and_band_derive_from_ladder():
 
 
 def test_altitudes_derive_from_single_level_ladder():
-    c = SimConfig(flight_levels_m=(100.0,))          # e.g. density_test: one plane at 100 m
-    assert c.cruise_level_m == c.z_min_m == c.z_max_m == 100.0   # single level ⇒ band collapses
+    c = SimConfig(flight_levels_m=(100.0,))          # a scenario pinned to one plane at 100 m
+    assert c.cruise_level_m == c.z_min_m == c.z_max_m == 100.0   # single level ⇒ cruise + band collapse
 
 
 def test_single_level_config_supported():

@@ -88,6 +88,38 @@ def test_delay_sources_sum_to_total_delay():
     assert ((recombined - acc["total_delay_s"]).abs() < 1e-9).all()
 
 
+def _congested_multilevel():
+    """A dense A* run on the 3-level ladder where BOTH the climb and lattice levers actually fire.
+
+    The straight/single-plane run used above can't exercise either — it has no lattice and no ladder
+    to climb — which is how the missing-climb-band bug survived. Asserted non-vacuous below.
+    """
+    cfg = SimConfig(planner="astar", lam_per_hour=900.0, horizon_s=600.0,
+                    region_size_m=(2500.0, 2500.0), seed=3)
+    acc = metrics.flight_frame(run(cfg)).query("accepted")
+    assert (acc["excess_altitude_m"] > 0).any(), "no traffic-forced climb — climb-band check is vacuous"
+    assert (acc["lattice_overhead_m"] > 0).any(), "no hex staircase — lattice-band check is vacuous"
+    return acc
+
+
+def test_delay_sources_sum_to_total_delay_with_climb_and_lattice():
+    # Same exactness claim, but on a run where the climb lever is NON-ZERO: dropping the altitude term
+    # (as the chart did) leaves a shortfall that grows with load, and no single-plane run can catch it.
+    acc = _congested_multilevel()
+    recombined = (acc["ground_delay_s"] + acc["air_hold_s"] + acc["detour_time_s"]
+                  + acc["altitude_delay_phys_s"])
+    assert ((recombined - acc["total_delay_s"]).abs() < 1e-9).all()
+
+
+def test_detour_time_splits_exactly_into_lattice_and_traffic():
+    # the split is a partition of detour_time_s, not an independent estimate — it must re-sum exactly,
+    # and neither half may go negative (the lattice share is clamped to what air_detour_m can carry).
+    acc = _congested_multilevel()
+    assert (((acc["detour_lattice_s"] + acc["detour_traffic_s"]) - acc["detour_time_s"]).abs()
+            < 1e-9).all()
+    assert (acc["detour_lattice_s"] >= 0).all() and (acc["detour_traffic_s"] >= 0).all()
+
+
 def test_total_delay_is_nan_for_denied():
     # a fully-blocked straight flight is denied → no arrival → NaN delay (not a misleading 0)
     from freespace_sim.ledger import ReservationLedger

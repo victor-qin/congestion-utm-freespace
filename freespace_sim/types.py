@@ -147,6 +147,14 @@ class OperationalIntent:
     ground_delay_s: float = 0.0       # time held on the pad before departure
     air_hold_s: float = 0.0           # time loitering/hovering mid-route
     air_detour_m: float = 0.0         # flown horizontal length − straight-line length
+    # A*-ONLY diagnostic: the share of ``air_detour_m`` forced by the hex lattice rather than by
+    # traffic. A* moves on 6 axial directions, so the Euclidean straight line ``air_detour_m``
+    # measures against is UNREACHABLE — a wholly unimpeded flight still books up to
+    # 2/√3 − 1 ≈ 15.5% of pure geometry as if it were congestion (worst case at 30° off-axis, zero
+    # on-axis). Subtract this to read the traffic-attributable detour. 0.0 for the continuous
+    # planners (milp / straight), which have no lattice; reduced by ShortcutRefiner, which
+    # collapses the staircase.
+    lattice_overhead_m: float = 0.0
     altitude_change_m: float = 0.0    # total vertical travel (climb + descent)
     cost: float = 0.0
     denial_reason: "DenialReason" = field(default=None)  # type: ignore[assignment]

@@ -53,10 +53,18 @@ class SimConfig:
     terminal_radius_m: float = 90.0
 
     # --- COST MODEL (shared by every planner; the FCFS trade-off knobs) ---
-    cost_ground_delay_per_s: float = 1.0      # wait on the pad
-    cost_air_lateral_per_m: float = 3.0       # extra detour length flown
-    cost_air_hold_per_s: float = 3.0          # loiter/hover mid-route (expensive)
-    cost_altitude_change_per_m: float = 4.0   # climb/descend
+    # ONE currency: cost per SECOND. Every A* edge advances the clock by an integer number of dt
+    # steps, so seconds are the only basis on which the four levers are comparable. The per-METRE
+    # weights the planners actually multiply by are DERIVED (see the DERIVED section), which keeps
+    # the ratios below invariant under any dt_s / nominal_speed_mps / climb_rate_mps.
+    # Storing lateral/altitude per-metre (as this did before) silently scaled them by pitch=120 m
+    # and climb_rate*dt=24 m while ground/hold were scaled by dt=4 s, so the advertised 1:3:3:4
+    # was really 1:90:3:24 — one hex step cost as much as 360 s of ground delay and no detour or
+    # climb was ever rational. Per step, these now read exactly 1 : 3 : 3 : 4.
+    cost_ground_delay_per_s: float = 1.0        # wait on the pad          (1x, the numeraire)
+    cost_air_lateral_per_s: float = 3.0         # cruise flight            (3x)
+    cost_air_hold_per_s: float = 3.0            # loiter/hover mid-route   (3x)
+    cost_altitude_change_per_s: float = 4.0     # climb/descend            (4x)
 
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
@@ -96,6 +104,24 @@ class SimConfig:
     def effective_hover_radius_m(self) -> float:
         """Hover-cylinder radius; defaults to the corridor width."""
         return self.hover_radius_m if self.hover_radius_m is not None else self.corridor_width_m
+
+    # ----- cost weights per METRE, DERIVED from the per-second knobs (not stored) -----
+    # The planners charge lateral/vertical travel by LENGTH (``c_lat * pitch``, ``c_alt * dz``),
+    # but the levers are only commensurable in TIME. Converting here — rather than storing a
+    # per-metre number — is what makes the 1:3:3:4 step ratio hold for any speed/climb-rate/dt.
+    @property
+    def cost_air_lateral_per_m(self) -> float:
+        """Cost of one flown metre = per-second weight ÷ cruise speed (one metre takes 1/v s).
+
+        Keeps every planner's ``cost_air_lateral_per_m * pitch`` expression correct untouched:
+        pitch is ``nominal_speed_mps * dt_s``, so the product collapses to ``c_lat_per_s * dt``.
+        """
+        return self.cost_air_lateral_per_s / self.nominal_speed_mps
+
+    @property
+    def cost_altitude_change_per_m(self) -> float:
+        """Cost of one climbed/descended metre = per-second weight ÷ climb rate (1/climb_rate s)."""
+        return self.cost_altitude_change_per_s / self.climb_rate_mps
 
     # ----- altitude, DERIVED from flight_levels_m (not stored) -----
     @property

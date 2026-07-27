@@ -145,12 +145,13 @@ def test_astar_shortcut_dense_multilevel_run_stays_verified():
     assert sum(_diagonal_segments(i.centerline) for i in res.accepted) >= 5     # ... and were slanted
 
 
-def test_astar_shortcut_deconflicts_from_committed_traffic_by_ground_delay():
+def test_astar_shortcut_deconflicts_from_committed_traffic_laterally():
     # Two opposite-direction flights on a shared corridor: the first is committed, the second meets it.
-    # Under the default cost weights a climb costs more than a ground hold, so the shortcut planner WAITS
-    # for the committed corridor to clear (deconflict by ground delay) rather than climbing over it — and
-    # the refiner must still produce a conflict-free plan. (The refiner's DIAGONAL climb-boxes are exercised
-    # under load — capped ground delay forcing climbs — by test_astar_shortcut_dense_multilevel_run_stays_verified.)
+    # With the cost weights normalized to one per-second currency, giving way is cheapest as a short
+    # lateral berth (3x/s) rather than a climb over (4x/s applied to the much slower climb) — and the
+    # refiner must still produce a conflict-free plan through that berth. Asserts the cost ORDERING the
+    # weights imply, not a magic threshold. (The refiner's DIAGONAL climb-boxes are exercised under load
+    # — capped ground delay forcing climbs — by test_astar_shortcut_dense_multilevel_run_stays_verified.)
     led = ReservationLedger(CFG)
     i1 = get_planner("astar_shortcut").plan(FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0), led, CFG)
     assert i1.accepted
@@ -158,5 +159,8 @@ def test_astar_shortcut_deconflicts_from_committed_traffic_by_ground_delay():
     i2 = get_planner("astar_shortcut").plan(FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0), led, CFG)
     assert i2.accepted
     assert not led.any_conflict(i2.volumes)                # the plan clears the committed flight
-    assert i2.ground_delay_s > 100.0                       # ... by waiting on the pad, not climbing over
+    one_rung = CFG.cost_altitude_change_per_m * 2.0 * (CFG.level_z(1) - CFG.level_z(0))
+    assert i2.air_detour_m > 0.0                                            # gave way laterally ...
+    assert CFG.cost_air_lateral_per_m * i2.air_detour_m < one_rung          # ... undercutting a climb
+    assert CFG.cost_ground_delay_per_s * i2.ground_delay_s < one_rung       # and undercutting a hold
     assert max(round(float(p[2]), 1) for p, _ in i2.centerline) < CFG.level_z(1)   # stayed at the floor level

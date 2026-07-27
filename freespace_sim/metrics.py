@@ -216,6 +216,11 @@ def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:
     altitude), so the mandatory takeoff/landing climb is excluded but a climb *forced by congestion* is
     NOT (that is exactly the vertical lever this project adds). This is the time-space twin of
     ``congestion_cost``. NaN for denied flights (they never arrive). See :func:`flight_row`.
+
+    Caveat for the A* family: the detour term is built from ``air_detour_m``, which is measured
+    against the Euclidean straight line — unreachable on a 6-direction lattice — so for A* this
+    figure carries the hex-quantization share too, and *that* part is not lost "to other traffic".
+    ``flight_row``'s ``lattice_overhead_m`` / ``deconfliction_detour_m`` split it out.
     """
     if not intent.accepted:
         return float("nan")
@@ -267,6 +272,7 @@ def cost_breakdown(intent: OperationalIntent, cfg: SimConfig) -> dict[str, float
 
 
 _DELAY_LEVERS = ("ground_delay_s", "air_hold_s", "detour_time_s",
+                 "detour_lattice_s", "detour_traffic_s",
                  "excess_altitude_m", "altitude_delay_phys_s", "altitude_delay_costeq_s")
 
 
@@ -285,14 +291,22 @@ def delay_breakdown_s(intent: OperationalIntent, cfg: SimConfig) -> dict[str, fl
 
     The two differ by ``c_alt · climb_rate / c_ground`` (12× at defaults) — that gap *is* the cost-vs-time
     story this surface exists to tell. ``excess_m`` is altitude above :func:`nominal_altitude_change_m`
-    (the traffic-forced climb, measured against the flight's own planner baseline). NaN for a denied flight."""
+    (the traffic-forced climb, measured against the flight's own planner baseline). NaN for a denied flight.
+
+    ``detour_time_s`` additionally splits into ``detour_lattice_s`` + ``detour_traffic_s`` (exactly — the
+    two always re-sum to it) so a chart can separate hex quantization from a traffic-forced berth. See
+    ``OperationalIntent.lattice_overhead_m``; both are 0 for the continuous planners.
+    """
     if not intent.accepted:
         return dict.fromkeys(_DELAY_LEVERS, float("nan"))
     excess_m = max(0.0, intent.altitude_change_m - nominal_altitude_change_m(cfg))
+    lattice_m = min(intent.lattice_overhead_m, intent.air_detour_m)   # never exceed what it splits
     return {
         "ground_delay_s": intent.ground_delay_s,
         "air_hold_s": intent.air_hold_s,
         "detour_time_s": intent.air_detour_m / cfg.nominal_speed_mps,
+        "detour_lattice_s": lattice_m / cfg.nominal_speed_mps,
+        "detour_traffic_s": (intent.air_detour_m - lattice_m) / cfg.nominal_speed_mps,
         "excess_altitude_m": excess_m,
         "altitude_delay_phys_s": excess_m / cfg.climb_rate_mps,
         "altitude_delay_costeq_s": (excess_m * cfg.cost_altitude_change_per_m
@@ -342,9 +356,20 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         "ground_delay_s": intent.ground_delay_s,
         "air_hold_s": intent.air_hold_s,
         "air_detour_m": intent.air_detour_m,
+        # A*-only split of air_detour_m. The Euclidean baseline air_detour_m measures against is
+        # unreachable on a 6-direction lattice, so for A* it books pure geometry as congestion; these
+        # two separate the unavoidable quantization from the traffic-attributable berth. Both are 0
+        # for the continuous planners. air_detour_m itself is left untouched — it stays the
+        # cross-planner number, and cost / total_delay_s continue to be built from it.
+        "lattice_overhead_m": intent.lattice_overhead_m,
+        "deconfliction_detour_m": max(0.0, intent.air_detour_m - intent.lattice_overhead_m),
         # detour as lateness-seconds; ground_delay_s + air_hold_s + detour_time_s + altitude_delay_phys_s
         # == total_delay_s (the four time-space congestion levers). Reuse db so the formula lives once.
         "detour_time_s": db["detour_time_s"],
+        # ... and detour_time_s itself splits exactly into these two (see delay_breakdown_s), which is
+        # what lets viz.delay_sources stack a five-band decomposition that still reconciles to the total.
+        "detour_lattice_s": db["detour_lattice_s"],
+        "detour_traffic_s": db["detour_traffic_s"],
         "altitude_change_m": intent.altitude_change_m,
         # congestion-driven vertical travel (above the flight's own cruise baseline) + its two time readings
         "excess_altitude_m": db["excess_altitude_m"],
@@ -428,6 +453,13 @@ def _rollup(df: pd.DataFrame, cfg: SimConfig, dur_s: float | None = None) -> dic
         "p95_delay_pct": _q(acc["delay_pct"], 0.95),
         "mean_air_detour_m": float(acc["air_detour_m"].mean()) if len(acc) else 0.0,
         "p95_air_detour_m": _q(acc["air_detour_m"], 0.95),
+        # A*-only split of mean_air_detour_m: hex quantization vs. traffic-attributable berth. Read
+        # mean_deconfliction_detour_m, not mean_air_detour_m, when asking "how far did traffic push
+        # flights sideways?" — on a lattice the latter is dominated by geometry at low congestion.
+        "mean_lattice_overhead_m": float(acc["lattice_overhead_m"].mean()) if len(acc) else 0.0,
+        "mean_deconfliction_detour_m": (float(acc["deconfliction_detour_m"].mean())
+                                        if len(acc) else 0.0),
+        "p95_deconfliction_detour_m": _q(acc["deconfliction_detour_m"], 0.95),
         "mean_stretch": float(acc["stretch"].mean()) if len(acc) else 1.0,
         "mean_cost": float(acc["cost"].mean()) if len(acc) else 0.0,
         # COST decomposition by lever (planner-objective units) — "where did the congestion cost go?".

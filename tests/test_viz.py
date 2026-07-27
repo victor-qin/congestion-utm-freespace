@@ -163,3 +163,26 @@ def test_save_sweep_roundtrips(tmp_path):
     folder = runs.save_sweep(rows, root=tmp_path, label="s")
     df = pd.read_parquet(folder / "sweep.parquet")
     assert len(df) == 1 and "denial_rate" in df.columns
+
+
+def test_delay_sources_bands_reconcile_to_total_delay(tmp_path):
+    """The stacked chart must account for ALL of ``total_delay_s`` — driven off ``_DELAY_SOURCES``
+    itself, so editing the chart's band list can never silently reintroduce a shortfall.
+
+    Run on the 3-level ladder under load: the climb band is non-zero here, which is exactly the case
+    the old 3-band stack under-reported (and which no single-plane run can detect).
+    """
+    from freespace_sim import metrics
+
+    cfg = SimConfig(planner="astar", lam_per_hour=900.0, horizon_s=600.0,
+                    region_size_m=(2500.0, 2500.0), seed=3)
+    acc = metrics.flight_frame(run(cfg)).query("accepted")
+    assert (acc["excess_altitude_m"] > 0).any(), "no traffic-forced climb — the check would be vacuous"
+    assert (acc["lattice_overhead_m"] > 0).any(), "no hex staircase — the check would be vacuous"
+
+    stacked = sum(acc[key] for key, _, _, _ in viz._DELAY_SOURCES)
+    assert ((stacked - acc["total_delay_s"]).abs() < 1e-9).all()
+
+    out = tmp_path / "delay_sources.png"
+    viz.delay_sources(acc, out=out, by=None)
+    assert out.exists()

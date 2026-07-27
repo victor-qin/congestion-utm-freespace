@@ -6,7 +6,9 @@ distribution figures next to it (or into ``--out-dir``):
 
   delay_hist.png       — histogram of total delay (seconds)
   delay_pct_hist.png   — histogram of delay as % of trip time
-  delay_sources.png    — mean delay decomposed into ground-hold / air-hold / detour-time
+  delay_sources.png    — mean delay decomposed into the five levers of total_delay_s: ground-hold /
+                         air-hold / detour-traffic / detour-lattice (hatched: hex quantization, not
+                         congestion) / traffic-forced climb
 
 Multiplicity is the shell's job: to compare across λ or scenarios, the batch script loops `experiments.run`
 and feeds each resulting folder here one at a time (see experiments/batch/lambda_sweep.sh). The

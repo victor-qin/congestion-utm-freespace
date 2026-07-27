@@ -267,6 +267,7 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
            **{k: agg[k] for k in ("n_uss", "n_requests", "n_accepted", "n_denied", "denial_rate",
                                   "congestion_denial_rate", "offered_load_per_h", "throughput_per_h",
                                   "mean_total_delay_s", "p95_total_delay_s", "mean_air_detour_m",
+                                  "mean_lattice_overhead_m", "mean_deconfliction_detour_m",
                                   "mean_stretch", "mean_cost",
                                   "airspace_utilization", "denial_rate_spread", "mean_delay_spread",
                                   "mean_solve_time_s", "p95_solve_time_s",
@@ -332,6 +333,18 @@ def load_run(folder: Path | str) -> LoadedRun:
     for k in ("region_size_m", "region_center_latlon", "flight_levels_m"):
         if isinstance(cfg_payload.get(k), list):
             cfg_payload[k] = tuple(cfg_payload[k])
+    # Runs archived before the per-second cost normalization stored cost_air_lateral_per_m /
+    # cost_altitude_change_per_m directly; both are derived @properties now. Back-convert them into
+    # the per-second knobs BEFORE the whitelist drop below — otherwise the old value is silently
+    # discarded and the run replays under today's defaults (0.1 instead of 3.0), i.e. a different
+    # cost model than it was planned with. Multiplying back by the same speed/climb_rate the
+    # property divides by reproduces the archived weight exactly.
+    if "cost_air_lateral_per_m" in cfg_payload:
+        cfg_payload["cost_air_lateral_per_s"] = (
+            cfg_payload.pop("cost_air_lateral_per_m") * cfg_payload["nominal_speed_mps"])
+    if "cost_altitude_change_per_m" in cfg_payload:
+        cfg_payload["cost_altitude_change_per_s"] = (
+            cfg_payload.pop("cost_altitude_change_per_m") * cfg_payload["climb_rate_mps"])
     # Tolerate schema drift: drop keys that are no longer SimConfig fields (e.g. cruise_level_m / z_min_m /
     # z_max_m — now derived @properties) so runs archived before that change still load.
     _fields = {f.name for f in dataclasses.fields(SimConfig)}
@@ -369,6 +382,9 @@ def load_run(folder: Path | str) -> LoadedRun:
             centerline=cl_by_flight.get(fid) if accepted else None,
             ground_delay_s=float(fr.ground_delay_s), air_hold_s=float(fr.air_hold_s),
             air_detour_m=float(fr.air_detour_m), altitude_change_m=float(fr.altitude_change_m),
+            # getattr: runs archived before the lattice split have no such column (0.0 ⇒ the whole
+            # detour reads as traffic-attributable, which is what those runs already reported).
+            lattice_overhead_m=float(getattr(fr, "lattice_overhead_m", 0.0)),
             cost=float(fr.cost), denial_reason=DenialReason(fr.denial_reason), planner=str(fr.planner),
             solve_time_s=float(fr.solve_time_s),
         ))

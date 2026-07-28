@@ -368,22 +368,24 @@ def test_steady_state_window_recovers_trapezoid_plateau():
 
 
 def test_steady_state_window_falls_back_when_degenerate():
-    # no accepted flights → the whole horizon (steady == whole-run)
-    assert metrics.steady_state_window(_synthetic_result([], 1000.0)) == (0.0, 1000.0)
-    # accepted but with no geometry (no volumes/centerline) → empty density → whole horizon
+    # no accepted flights → there is no realized flight timeline
+    assert metrics.steady_state_window(_synthetic_result([], 1000.0)) == (0.0, 0.0)
+    # accepted but with no geometry (no volumes/centerline) → no realized flight timeline
     ghost = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(1, 0, 0), 0.0), IntentStatus.ACCEPTED)
-    assert metrics.steady_state_window(_synthetic_result([ghost], 1000.0)) == (0.0, 1000.0)
+    assert metrics.steady_state_window(_synthetic_result([ghost], 1000.0)) == (0.0, 0.0)
 
 
-def test_density_grid_bounded_against_open_ended_volume():
-    # a hand-built accepted intent carrying an open-ended (t_end ~ 1e6) volume must not blow up the grid
+def test_density_grid_spans_open_ended_volume_without_unbounded_allocation():
+    # A pathological hand-built t_end~1e6 fixture is fully represented by coarsening, not truncating:
+    # density runs land return traffic AFTER the horizon, so the grid must not clip at 4x horizon.
     from freespace_sim.geometry import box_from_segment
     box = box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30)
     ghost = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(60, 0, 0), 0.0), IntentStatus.ACCEPTED,
                               volumes=[Volume4D(box, 0.0, 1e6)])
     res = _synthetic_result([ghost], 1000.0)
     t, _ = metrics.density_timeseries(res, dt=4.0)
-    assert t[-1] <= 4.0 * res.config.horizon_s + 4.0   # capped at ~4×horizon, not 1e6
+    assert t[-1] >= 1e6                                 # complete time range, no horizon cutoff
+    assert len(t) <= 250_002                            # adaptive grid remains bounded in memory
 
 
 def test_windowed_aggregate_uses_window_duration_and_records_provenance():

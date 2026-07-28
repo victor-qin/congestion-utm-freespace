@@ -5,6 +5,7 @@ timestamped folder ``results/{ISO}_{label}_{hash}/`` holding **everything needed
 analyse, or replay it without re-running the sim**:
 
     config.json          the exact SimConfig used
+    scenario_spec.json   the resolved post-override ScenarioSpec recipe (when supplied)
     experiment.json      which experiment ran + its args + wall-clock seconds  (← "what was run")
     env.json / git.json  toolchain + commit (best-effort; this package is often used outside git)
     summary.json         headline aggregate
@@ -165,17 +166,17 @@ def save_run(
     label: str = "run",
     experiment: str | None = None,
     experiment_args: dict | None = None,
+    scenario_spec: dict | None = None,
     wall_seconds: float | None = None,
     scenario: str | None = None,
     demand: str | None = None,
     write_replay: bool = True,
     index: bool = True,
-    clip_replay_to_horizon: bool = True,
     window_frac: float = 0.9,
 ) -> Path:
     """Write the full self-contained run folder and return its path.
 
-    Captures config/env/git, the experiment identity + args, the scenario, the flown trajectories,
+    Captures config/env/git, the experiment identity + args, the resolved scenario, the flown trajectories,
     the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML. Everything
     is parquet + json — deliberately NOT pickle: portable, inspectable, safe to sync to the run store,
     and Python-version-independent. The analytical geometry stored in reservations/ledger_end is enough
@@ -183,8 +184,8 @@ def save_run(
 
     ``summary.json`` carries the whole-run headline numbers **and** their steady-state twin (metrics
     over the representative density plateau — issue #25) in a nested ``steady_state`` block; ``window_frac``
-    tunes the plateau threshold. ``clip_replay_to_horizon`` (default) stops ``replay.html`` at the horizon;
-    pass ``False`` to keep post-horizon return flights visible.
+    tunes the plateau threshold. A replay always spans the complete realized run, from the first flight
+    activity through the final landing; the configured horizon never clips it.
     """
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
@@ -195,9 +196,15 @@ def save_run(
     (folder / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2, default=str))
     (folder / "env.json").write_text(json.dumps(_env_info(), indent=2))
     (folder / "git.json").write_text(json.dumps(_git_info(), indent=2))
+    scenario_description = scenario_spec.get("description") if scenario_spec is not None else None
+    if scenario_spec is not None:
+        (folder / "scenario_spec.json").write_text(
+            json.dumps(scenario_spec, indent=2, default=str)
+        )
     (folder / "experiment.json").write_text(json.dumps({
         "experiment": experiment or label,
         "scenario": scenario,
+        "scenario_description": scenario_description,
         "demand": demand,
         "tag": label,
         "args": experiment_args or {},
@@ -205,6 +212,9 @@ def save_run(
         "timestamp": stamp,
         "planner": cfg.planner,
         "n_requests": len(result.intents),
+        "simulation_start_s": agg["simulation_start_s"],
+        "simulation_end_s": agg["simulation_end_s"],
+        "simulation_duration_s": agg["simulation_duration_s"],
         "verified": result.verified,
     }, indent=2, default=str))
     (folder / "summary.json").write_text(json.dumps(agg, indent=2))
@@ -230,17 +240,18 @@ def save_run(
 
     if write_replay:
         from . import viz_html
-        viz_html.write_html(result, folder / "replay.html", clip_to_horizon=clip_replay_to_horizon)
+        viz_html.write_html(result, folder / "replay.html", clip_to_horizon=False)
 
     if index:
         _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
-                      tag=label, demand=demand, agg=agg)
+                      scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
     return folder
 
 
 def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: float | None,
                   *, scenario: str | None = None, tag: str | None = None,
-                  demand: str | None = None, agg: dict | None = None) -> None:
+                  demand: str | None = None, agg: dict | None = None,
+                  scenario_description: str | None = None) -> None:
     """Append one queryable row per run to ``results/index.parquet``.
 
     The ``scenario`` / ``tag`` / ``demand`` columns are the join keys cross-run readouts filter on:
@@ -258,9 +269,14 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
                     "throughput_per_h", "denial_rate", "congestion_denial_rate")}
     steady_cols["window_lo"] = steady.get("window_lo")
     steady_cols["window_hi"] = steady.get("window_hi")
-    row = {"path": str(folder), "scenario": scenario, "tag": tag, "demand": demand,
+    row = {"path": str(folder), "scenario": scenario,
+           "scenario_description": scenario_description, "tag": tag, "demand": demand,
            "planner": cfg.planner, "lam_per_hour": cfg.lam_per_hour, "seed": cfg.seed,
            "horizon_s": cfg.horizon_s,
+           "demand_duration_s": cfg.effective_demand_duration_s,
+           "simulation_start_s": agg["simulation_start_s"],
+           "simulation_end_s": agg["simulation_end_s"],
+           "simulation_duration_s": agg["simulation_duration_s"],
            "region_w": cfg.region_size_m[0], "region_h": cfg.region_size_m[1],
            "wall_seconds": wall_seconds,
            "has_telemetry": result.telemetry is not None,
@@ -337,18 +353,14 @@ def load_run(folder: Path | str) -> LoadedRun:
     # cost_altitude_change_per_m directly; both are derived @properties now. Back-convert them into
     # the per-second knobs BEFORE the whitelist drop below — otherwise the old value is silently
     # discarded and the run replays under today's defaults (0.1 instead of 3.0), i.e. a different
-    # cost model than it was planned with. Multiplying back by the same speed/climb_rate the property
-    # divides by reproduces the archived weight exactly. Stay drift-tolerant like the rest of this
-    # function: fall back to the SimConfig default if the companion speed field predates the archive
-    # (a bare subscript here would KeyError inside the very block meant to absorb schema drift), and
-    # never clobber a per-second value the payload already carries.
-    for per_m_key, per_s_key, scale_key in (
-        ("cost_air_lateral_per_m", "cost_air_lateral_per_s", "nominal_speed_mps"),
-        ("cost_altitude_change_per_m", "cost_altitude_change_per_s", "climb_rate_mps"),
-    ):
-        if per_m_key in cfg_payload:
-            scale = cfg_payload.get(scale_key, getattr(SimConfig, scale_key))
-            cfg_payload.setdefault(per_s_key, cfg_payload.pop(per_m_key) * scale)
+    # cost model than it was planned with. Multiplying back by the same speed/climb_rate the
+    # property divides by reproduces the archived weight exactly.
+    if "cost_air_lateral_per_m" in cfg_payload:
+        cfg_payload["cost_air_lateral_per_s"] = (
+            cfg_payload.pop("cost_air_lateral_per_m") * cfg_payload["nominal_speed_mps"])
+    if "cost_altitude_change_per_m" in cfg_payload:
+        cfg_payload["cost_altitude_change_per_s"] = (
+            cfg_payload.pop("cost_altitude_change_per_m") * cfg_payload["climb_rate_mps"])
     # Tolerate schema drift: drop keys that are no longer SimConfig fields (e.g. cruise_level_m / z_min_m /
     # z_max_m — now derived @properties) so runs archived before that change still load.
     _fields = {f.name for f in dataclasses.fields(SimConfig)}

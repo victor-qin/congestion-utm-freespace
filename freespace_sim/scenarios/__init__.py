@@ -1,17 +1,21 @@
 """Scenario registry — named worlds an experiment runs on (mirrors the ``planner`` package layout).
 
 A :class:`ScenarioSpec` builds the ``(SimConfig, DemandModel)`` pair the simulator needs; ``SCENARIOS``
-names canonical worlds, assembled from one module per family (``metro``, ``dallas``). ``get_scenario``
+names canonical worlds, assembled from one module per family (``metro``, ``dallas``, ``density``). ``get_scenario``
 resolves a name to its spec — the scenario analogue of ``planner.get_planner``. Add a new family by
 dropping in a module with its own ``SCENARIOS`` dict and merging it below.
 """
 
 from __future__ import annotations
 
-from . import dallas, metro
+from . import dallas, density, metro
 from .spec import DemandSpec, ScenarioSpec, with_overrides
 
-SCENARIOS: dict[str, ScenarioSpec] = {**metro.SCENARIOS, **dallas.SCENARIOS}
+SCENARIOS: dict[str, ScenarioSpec] = {
+    **metro.SCENARIOS,
+    **dallas.SCENARIOS,
+    **density.SCENARIOS,
+}
 
 
 def get_scenario(name: str) -> ScenarioSpec:

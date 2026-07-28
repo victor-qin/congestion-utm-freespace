@@ -19,15 +19,28 @@ readouts can filter to exactly the runs a batch produced.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import sys
 import time
 
-from freespace_sim import runs
+from freespace_sim import metrics, runs
 from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
 from freespace_sim.sim import run
 
 log = logging.getLogger("experiments.run")
+
+
+def _scaled_lam_per_uss(spec, total_lam: float) -> dict[str, float]:
+    """Scale an explicit per-USS rate map while preserving its operator proportions."""
+    rates = spec.demand.lam_per_uss
+    if rates is None:
+        raise ValueError("scenario has no explicit lam_per_uss rates to scale")
+    current_total = sum(float(rate) for rate in rates.values())
+    if current_total <= 0.0:
+        raise ValueError("cannot scale lam_per_uss rates whose total is not positive")
+    scale = float(total_lam) / current_total
+    return {uss_id: float(rate) * scale for uss_id, rate in rates.items()}
 
 
 def _kernel_status(planner_name: str) -> str:
@@ -64,6 +77,8 @@ def spec_from_args(args):
         top["terminal_airspace_always_active"] = args.terminal_airspace_always_active
 
     demand: dict = {}
+    if args.lam is not None and spec.demand.lam_per_uss is not None:
+        demand["lam_per_uss"] = _scaled_lam_per_uss(spec, args.lam)
     if args.demand is not None:
         demand["pattern"] = args.demand
     if args.uss is not None:
@@ -139,15 +154,19 @@ def main() -> None:
     args = p.parse_args()
 
     spec = spec_from_args(args)
+    scenario_payload = dataclasses.asdict(spec)
     cfg = spec.config()
     demand = spec.demand_model()
     tag = args.tag or spec.name
     # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
     log.info("invocation: python -m experiments.run %s", " ".join(sys.argv[1:]) or "(no arguments)")
-    log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h horizon=%ss seed=%s",
+    log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h planner-envelope=%ss seed=%s",
              spec.name, tag, cfg.planner, spec.demand.pattern, cfg.region_size_m,
              cfg.lam_per_hour, cfg.horizon_s, cfg.seed)
+    if spec.description:
+        log.info("description: %s", spec.description)
+    log.info("active demand duration=%ss", cfg.effective_demand_duration_s)
     log.info("A* kernel: %s", _kernel_status(cfg.planner))
 
     pcfg = None
@@ -167,12 +186,20 @@ def main() -> None:
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
               parallel=pcfg)
     wall = time.time() - t0
+    sim_lo, sim_hi = metrics.simulation_window(res)
+    log.info(
+        "realized simulation: first activity %.1fs, final landing %.1fs, duration %.1fs",
+        sim_lo,
+        sim_hi,
+        sim_hi - sim_lo,
+    )
     if pcfg is not None and pcfg.stats:
         log.info("parallel stats: %s", pcfg.stats)
 
     folder = runs.save_run(
         res, label=tag, experiment="run", scenario=spec.name, demand=spec.demand.pattern,
         experiment_args={"scenario": spec.name, "tag": tag, "overrides": vars(args)},
+        scenario_spec=scenario_payload,
         wall_seconds=wall, write_replay=False,   # execute persists data only; replay is a readout
         window_frac=args.window_frac,
     )

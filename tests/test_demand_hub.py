@@ -252,6 +252,7 @@ def test_more_pads_per_hub_cut_ground_delay():
 def test_lam_per_uss_counts_scale_and_ignore_global_lambda():
     # per-USS Poisson streams: counts track lam_per_uss, NOT cfg.lam_per_hour / uss_share.
     cfg = SimConfig(region_size_m=(20000.0, 20000.0), lam_per_hour=99999.0, horizon_s=3600.0)
+    assert cfg.effective_demand_duration_s == cfg.horizon_s       # legacy default remains the horizon
     m = HubRadiusDemand(n_hubs_per_uss={"a": 3, "b": 4},
                         lam_per_uss={"a": 1000.0, "b": 250.0},
                         uss_share={"a": 1.0, "b": 9.0},          # a 1:9 split IF the global path were used
@@ -280,8 +281,8 @@ def test_departure_offset_unset_departs_on_filing():
     assert reqs and all(r.t_departure == r.t_request for r in reqs)
 
 
-def test_departure_offset_applies_to_both_legs_with_distribution():
-    # the per-USS Gaussian lead applies to BOTH the delivery and its return, ~N(mean, std).
+def test_legacy_request_mode_departure_offset_applies_to_both_legs_with_distribution():
+    # Legacy, non-paired request-first mode gives BOTH delivery and return independent ~N(mean, std) leads.
     cfg = SimConfig(region_size_m=(20000.0, 20000.0), horizon_s=3600.0)
     m = HubRadiusDemand(n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 2000.0},
                         departure_offset_s={"a": (450.0, 60.0)}, return_flights=True)
@@ -323,3 +324,158 @@ def test_unknown_uss_in_lam_or_offset_raises():
         HubRadiusDemand(n_hubs_per_uss={"a": 3}, lam_per_uss={"b": 100.0})
     with pytest.raises(ValueError, match="departure_offset_s"):
         HubRadiusDemand(n_hubs_per_uss={"a": 3}, departure_offset_s={"typo": (10.0, 1.0)})
+
+
+# --- HubRadiusDemand: departure-first demand windows + strategically paired returns ------------
+
+def test_departure_mode_uses_demand_duration_not_sim_horizon():
+    cfg = SimConfig(
+        region_size_m=(20000.0, 20000.0),
+        horizon_s=3600.0,
+        demand_duration_s=600.0,
+    )
+    m = HubRadiusDemand(
+        n_hubs_per_uss={"a": 3},
+        lam_per_uss={"a": 600.0},
+        return_flights=False,
+        timing_mode="departure",
+    )
+    reqs = m.generate(cfg, np.random.default_rng(0))
+    departures = np.array([r.t_departure for r in reqs])
+    assert 65 <= len(reqs) <= 135                         # Poisson(600 × 600/3600) ≈ 100, not 600
+    assert np.ptp(departures) <= cfg.demand_duration_s    # one 10-minute departure window
+
+
+def test_departure_mode_aligns_uss_departure_windows():
+    cfg = SimConfig(
+        region_size_m=(20000.0, 20000.0),
+        horizon_s=3600.0,
+        demand_duration_s=600.0,
+    )
+    m = HubRadiusDemand(
+        n_hubs_per_uss={"a": 3, "b": 3},
+        lam_per_uss={"a": 1200.0, "b": 1200.0},
+        departure_offset_s={"a": (120.0, 20.0), "b": (1800.0, 300.0)},
+        return_flights=False,
+        timing_mode="departure",
+    )
+    reqs = m.generate(cfg, np.random.default_rng(1))
+    dep_a = np.array([r.t_departure for r in reqs if r.uss_id == "a"])
+    dep_b = np.array([r.t_departure for r in reqs if r.uss_id == "b"])
+    assert len(dep_a) > 100 and len(dep_b) > 100
+    assert abs(dep_a.min() - dep_b.min()) < 60.0
+    assert abs(dep_a.max() - dep_b.max()) < 60.0
+    assert max(dep_a.max(), dep_b.max()) - min(dep_a.min(), dep_b.min()) <= 600.0
+
+
+def test_departure_mode_dynamic_preroll_keeps_filings_nonnegative():
+    cfg = SimConfig(
+        region_size_m=(20000.0, 20000.0),
+        horizon_s=3600.0,
+        demand_duration_s=600.0,
+    )
+    m = HubRadiusDemand(
+        n_hubs_per_uss={"a": 3},
+        lam_per_uss={"a": 600.0},
+        departure_offset_s={"a": (1800.0, 300.0)},
+        return_flights=False,
+        timing_mode="departure",
+    )
+    reqs = m.generate(cfg, np.random.default_rng(2))
+    assert reqs
+    assert min(r.t_request for r in reqs) == pytest.approx(0.0)
+    assert all(r.t_request >= 0.0 for r in reqs)
+    assert all(r.t_departure >= r.t_request for r in reqs)
+
+
+def test_departure_mode_preserves_gaussian_outbound_leads():
+    cfg = SimConfig(
+        region_size_m=(20000.0, 20000.0),
+        horizon_s=3600.0,
+        demand_duration_s=600.0,
+    )
+    m = HubRadiusDemand(
+        n_hubs_per_uss={"a": 4},
+        lam_per_uss={"a": 3600.0},
+        departure_offset_s={"a": (480.0, 90.0)},
+        return_flights=False,
+        timing_mode="departure",
+    )
+    reqs = m.generate(cfg, np.random.default_rng(3))
+    leads = np.array([r.t_departure - r.t_request for r in reqs])
+    assert abs(leads.mean() - 480.0) < 15.0
+    assert abs(leads.std() - 90.0) < 15.0
+
+
+def test_paired_return_shares_filing_time_and_follows_nominal_arrival():
+    cfg = SimConfig(
+        region_size_m=(20000.0, 20000.0),
+        horizon_s=3600.0,
+        demand_duration_s=600.0,
+    )
+    m = HubRadiusDemand(
+        n_hubs_per_uss={"a": 3},
+        lam_per_uss={"a": 600.0},
+        departure_offset_s={"a": (480.0, 90.0)},
+        return_flights=True,
+        turnaround_s=45.0,
+        timing_mode="departure",
+        paired_return_request=True,
+    )
+    reqs = m.generate(cfg, np.random.default_rng(4))
+    by_id = {r.flight_id: r for r in reqs}
+    outbounds = [r for r in reqs if r.origin_terminal is not None]
+    assert outbounds
+    for outbound in outbounds:
+        returned = by_id[outbound.flight_id + 1]
+        assert returned.dest_terminal == outbound.origin_terminal
+        assert returned.t_request == outbound.t_request
+        expected = m._est_trip_s(outbound.origin, outbound.dest, cfg) + m.turnaround_s
+        assert returned.t_departure - outbound.t_departure == pytest.approx(expected)
+
+
+def test_departure_stream_is_stable_when_second_uss_is_added():
+    cfg = SimConfig(
+        region_size_m=(20000.0, 20000.0),
+        horizon_s=3600.0,
+        demand_duration_s=600.0,
+    )
+    common = {
+        "radius_m": {"wing": 3000.0},
+        "pads_per_hub": {"wing": 4},
+        "terminal_radius_m": {"wing": 180.0},
+        "lam_per_uss": {"wing": 600.0},
+        "departure_offset_s": {"wing": (480.0, 90.0)},
+        "return_flights": False,
+        "timing_mode": "departure",
+    }
+    single = HubRadiusDemand(n_hubs_per_uss={"wing": 3}, **common)
+    mixed = HubRadiusDemand(
+        n_hubs_per_uss={"wing": 3, "amazon": 2},
+        radius_m={"wing": 3000.0, "amazon": 2500.0},
+        pads_per_hub={"wing": 4, "amazon": 4},
+        terminal_radius_m={"wing": 180.0, "amazon": 180.0},
+        lam_per_uss={"wing": 600.0, "amazon": 500.0},
+        departure_offset_s={"wing": (480.0, 90.0), "amazon": (1800.0, 300.0)},
+        return_flights=False,
+        timing_mode="departure",
+    )
+    a = sorted(single.generate(cfg, np.random.default_rng(5)), key=lambda r: r.flight_id)
+    b = sorted(
+        (r for r in mixed.generate(cfg, np.random.default_rng(5)) if r.uss_id == "wing"),
+        key=lambda r: r.flight_id,
+    )
+    assert len(a) == len(b)
+    assert all(np.array_equal(x.origin, y.origin) for x, y in zip(a, b))
+    assert all(np.array_equal(x.dest, y.dest) for x, y in zip(a, b))
+    assert np.allclose(
+        [x.t_departure - x.t_request for x in a],
+        [y.t_departure - y.t_request for y in b],
+    )
+    translations = np.array([y.t_departure - x.t_departure for x, y in zip(a, b)])
+    assert np.ptp(translations) < 1e-9                   # only the shared pre-roll origin may change
+
+
+def test_invalid_timing_mode_raises():
+    with pytest.raises(ValueError, match="timing_mode"):
+        HubRadiusDemand(timing_mode="filing-ish")

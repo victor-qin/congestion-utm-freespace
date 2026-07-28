@@ -524,7 +524,7 @@ class AStarPlanner:
             base_g = g[st]
             for nst, cost in self._edges(
                 st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost, dwell_steps,
-                c_alt, svc_q, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
+                c_alt, c_lat, svc_q, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -591,8 +591,8 @@ class AStarPlanner:
         return intent
 
     def _edges(self, st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
-               dwell_steps, c_alt, svc, max_step, own=(), o_cap=1, o_term=None, origin=None, tcap=None,
-               dest=None, o_lanes=()):
+               dwell_steps, c_alt, c_lat, svc, max_step, own=(), o_cap=1, o_term=None, origin=None,
+               tcap=None, dest=None, o_lanes=()):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -616,7 +616,7 @@ class AStarPlanner:
                         ts = s + takeoff_steps[L]
                         if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
                             out.append((("a", lq, lr, L, ts),
-                                        takeoff_cost[L] + cfg.cost_air_lateral_per_m * (lane.dist - o_r)))
+                                        takeoff_cost[L] + c_lat * (lane.dist - o_r)))
                 return out
             # legacy / non-terminal takeoff: ONE successor per flight level at the origin hex. The hub
             # gate's capacity+column are level-agnostic (computed once in dwell_ok_levels), the exit lane
@@ -636,7 +636,7 @@ class AStarPlanner:
         for dq, dr in hg.AXIAL_NEIGHBORS:                                            # reroute (same level)
             nq, nr = q + dq, r + dr
             if not svc.is_blocked(nq, nr, L, ns, own):
-                out.append((("a", nq, nr, L, ns), cfg.cost_air_lateral_per_m * pitch))
+                out.append((("a", nq, nr, L, ns), c_lat * pitch))
         if not svc.is_blocked(q, r, L, ns, own):                                     # hover (same level)
             out.append((("a", q, r, L, ns), cfg.cost_air_hold_per_s * dt))
         for dL in (-1, 1) if self.vertical_edges else ():                           # vertical layer change

@@ -337,6 +337,12 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
     # seconds, with altitude read both physically and as a cost-equivalent). See the module docstring.
     cb = cost_breakdown(intent, cfg)
     db = delay_breakdown_s(intent, cfg)
+    # air_detour_m's lattice/traffic split in METRES. Clamp exactly as delay_breakdown_s does for the
+    # seconds (line: `lattice_m = min(...)`, "never exceed what it splits"): the ShortcutRefiner can
+    # leave lattice_overhead_m a hair above air_detour_m, and without this the two metre columns (and
+    # the rollup means built off them) would overshoot air_detour_m while the seconds — taken from db —
+    # stayed reconciled, so the two surfaces would silently disagree.
+    lattice_m = min(intent.lattice_overhead_m, intent.air_detour_m)
     # cost-space twin of total_delay_s: the four congestion levers above an unimpeded straight flight at
     # the planner's own cruise altitude — ground/hold/detour (already excess) + altitude's EXCESS only
     # (the mandatory climb is not congestion). Same four levers total_delay_s sums in TIME; differs from
@@ -361,8 +367,8 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         # two separate the unavoidable quantization from the traffic-attributable berth. Both are 0
         # for the continuous planners. air_detour_m itself is left untouched — it stays the
         # cross-planner number, and cost / total_delay_s continue to be built from it.
-        "lattice_overhead_m": intent.lattice_overhead_m,
-        "deconfliction_detour_m": max(0.0, intent.air_detour_m - intent.lattice_overhead_m),
+        "lattice_overhead_m": lattice_m,
+        "deconfliction_detour_m": intent.air_detour_m - lattice_m,
         # detour as lateness-seconds; ground_delay_s + air_hold_s + detour_time_s + altitude_delay_phys_s
         # == total_delay_s (the four time-space congestion levers). Reuse db so the formula lives once.
         "detour_time_s": db["detour_time_s"],

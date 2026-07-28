@@ -210,3 +210,9 @@ class SimConfig:
                 raise ValueError(
                     f"levels {a},{b} gap {b - a} <= corridor_height_m {self.corridor_height_m}; "
                     "adjacent level boxes would overlap in z")
+        # The per-metre cost weights and the climb-time properties divide by these, so a zero would
+        # surface as a ZeroDivisionError deep in planner setup rather than here at construction.
+        if self.nominal_speed_mps <= 0.0 or self.climb_rate_mps <= 0.0:
+            raise ValueError(
+                f"nominal_speed_mps ({self.nominal_speed_mps}) and climb_rate_mps "
+                f"({self.climb_rate_mps}) must be positive")

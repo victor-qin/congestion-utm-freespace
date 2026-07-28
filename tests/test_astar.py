@@ -295,7 +295,8 @@ def _air_edges(planner, cfg, svc, st, max_step=999):
                        for L in range(n - 1))
     rung_cost = tuple(cfg.cost_altitude_change_per_m * (lv[L + 1] - lv[L]) for L in range(n - 1))
     return planner._edges(st, cfg, cfg.corridor_segment_len_m, lv, (0,) * n, (0.0,) * n,
-                          rung_steps, rung_cost, (1,) * n, cfg.cost_altitude_change_per_m, svc, max_step)
+                          rung_steps, rung_cost, (1,) * n, cfg.cost_altitude_change_per_m,
+                          cfg.cost_air_lateral_per_m, svc, max_step)
 
 
 def test_vertical_edge_checks_only_traversed_levels_not_all():

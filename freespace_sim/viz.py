@@ -294,6 +294,21 @@ def delay_sources(per_flight_df, out=None, by="lam_per_hour"):
     if "accepted" in df.columns:
         df = df[df["accepted"]]
     df = df.dropna(subset=["total_delay_s"])
+    # Frames archived before the lattice/traffic detour split (PR #49) carry detour_time_s but
+    # not its two sub-bands. Reconstruct them the way load_run treats legacy runs: no lattice
+    # info ⇒ the whole detour is traffic-attributable. Still partitions detour_time_s exactly,
+    # so the five bands keep reconciling to total_delay_s.
+    if "detour_traffic_s" not in df.columns:
+        df = df.assign(detour_traffic_s=df["detour_time_s"], detour_lattice_s=0.0)
+    # altitude_delay_phys_s postdates the ancient ground/air_hold levers but predates this PR, so a run
+    # older than the climb band lacks it; zero-fill JUST that one band (its climb info isn't recoverable
+    # from the parquet). Deliberately NOT a blanket fill over _DELAY_SOURCES: every planner emits all
+    # five bands (0 where a lever doesn't apply — e.g. the A*-only lattice split is 0 for the continuous
+    # planners), so a current-schema frame is only ever missing a CORE lever (ground_delay_s/air_hold_s)
+    # through a real upstream defect — that must still surface as a KeyError, not a silent 0 band under a
+    # wrong-but-reconciling total.
+    if "altitude_delay_phys_s" not in df.columns:
+        df = df.assign(altitude_delay_phys_s=0.0)
     if by and by in df.columns:
         groups = sorted(df[by].unique())
         labels = [f"{g:g}" for g in groups]

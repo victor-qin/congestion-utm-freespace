@@ -28,6 +28,9 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import warnings
+
+import numpy as np
 
 from . import volumes
 from .geometry import BoxSpec, CylinderSpec
@@ -40,7 +43,19 @@ _QT = 1000     # time quantum: milliseconds. Deliberately NOT dt-steps: astar_sh
                # segments that need not land on the dt grid, and ms costs nothing after delta+gzip.
                # Both quanta must keep the streams inside the browser's Int32Array: at these values a
                # position overflows only past a 214,000 km region and a time past a 24-day run.
-_REBUILD_TOL = 1e-6    # metres/seconds — a box counts as rebuildable only if it matches this closely
+# A box counts as rebuildable only if the browser's reconstruction lands this close to what was actually
+# reserved. It is deliberately NOT 1e-6: the browser rebuilds from the QUANTISED path, so a faithful
+# reconstruction still differs by up to ~a quantum (more on short segments, where the same endpoint
+# rounding rotates the direction further). 0.5 m is ~0.006 canvas pixels at 60 km — invisible — while
+# still catching the failure that matters: a segment short enough that quantisation collapses it to zero
+# length, or flips segment_frame's near-vertical branch, diverges by metres to tens of metres.
+_REBUILD_TOL = 0.5           # metres
+_REBUILD_TOL_T = 1.0 / _QT   # seconds — one time quantum, the most dequantisation can shift a window
+# Warn once this share of flights ships explicit polygons. A few always will — the straight planner's
+# final partial timestep leaves a centimetre-scale remainder segment that quantisation cannot preserve
+# (~1.5% of flights, no measurable size cost). The threshold is there to catch the *systemic* failure:
+# a planner or an archived corridor formula that makes the whole run non-rebuildable.
+_FALLBACK_WARN_FRAC = 0.10
 
 
 def _static_walls(result: SimResult):
@@ -55,27 +70,59 @@ def _static_walls(result: SimResult):
 
 
 def _delta(vals: list[int]) -> list[int]:
-    """First value, then successive differences — the form gzip compresses best."""
-    return [vals[0], *(b - a for a, b in zip(vals, vals[1:]))] if vals else []
+    """First value, then successive differences — the form gzip compresses best.
+
+    Written as a zero-seeded running difference so it is visibly the exact inverse of the JS
+    ``undelta``, which also starts from 0; the first element is not a special case in either."""
+    out, prev = [], 0
+    for v in vals:
+        out.append(v - prev)
+        prev = v
+    return out
 
 
-def _rebuildable(intent, cfg) -> bool:
-    """True when this flight's corridor boxes are exactly ``volumes.build_corridor(centerline)``.
+def _scene_json(payload: dict) -> str:
+    """The exact bytes that get gzipped into the page — shared with the tests so a size or
+    round-trip assertion cannot drift from what ``write_html`` actually compresses."""
+    return json.dumps(payload, separators=(",", ":"))
 
-    When they are, the browser can regenerate every box from the path it already has and the payload
-    can drop them — the single biggest lever on file size (see the module docstring). We compare against
-    the real builder rather than reimplementing its geometry here, so this check cannot drift from the
-    thing it is checking; the JS mirror of the same formula is pinned by ``test_viz`` instead.
+
+def _footprint_xy(spec: BoxSpec) -> tuple[float, ...]:
+    """The box's 4 ground-plane corners as 8 plain floats — the same quantity :func:`viz.box_footprint`
+    returns, but in scalars, since this runs once per box per flight on the write path.
+
+    ``rot`` is row-major with columns as the local axes, so local-x in world is ``(rot[0], rot[3])`` and
+    local-y is ``(rot[1], rot[4])``; a corner is ``centre ± (L/2)·x ± (W/2)·y``."""
+    cx, cy = spec.center[0], spec.center[1]
+    lx, wy = spec.extents[0] / 2.0, spec.extents[1] / 2.0
+    ax, ay = lx * spec.rot[0], lx * spec.rot[3]
+    bx, by = wy * spec.rot[1], wy * spec.rot[4]
+    return (cx + ax + bx, cy + ay + by, cx + ax - bx, cy + ay - by,
+            cx - ax - bx, cy - ay - by, cx - ax + bx, cy - ay + by)
+
+
+def _rebuildable(intent, cfg, quantised_centerline) -> bool:
+    """True when the browser's reconstruction of this flight's corridor boxes matches what was reserved.
+
+    When it does, the payload can drop the boxes entirely and let JS rebuild them — the single biggest
+    lever on file size (see the module docstring).
+
+    Two details make this an honest check rather than a tautology. First, we compare against the real
+    :func:`volumes.build_corridor` instead of reimplementing its geometry, so the check cannot drift from
+    the thing it is checking (the JS copy of the formula is pinned separately, by executing it in
+    ``test_viz``). Second — and this is the subtle one — we build from the **quantised** path, because
+    that is what the browser actually has. Verifying against the full-precision centerline would pass a
+    segment that quantisation collapses to zero length or pushes across ``segment_frame``'s near-vertical
+    branch, and the replay would then draw a corridor tens of metres from the one that was reserved.
     """
     got = [v for v in (intent.volumes or []) if isinstance(v.shape, BoxSpec)]
-    want = volumes.build_corridor(list(intent.centerline or []), cfg)
+    want = volumes.build_corridor(quantised_centerline, cfg)
     if len(got) != len(want):
         return False
     return all(
-        abs(a.t_start - b.t_start) <= _REBUILD_TOL and abs(a.t_end - b.t_end) <= _REBUILD_TOL
-        and all(abs(p - q) <= _REBUILD_TOL for p, q in
-                zip(a.shape.center + a.shape.rot + a.shape.extents,
-                    b.shape.center + b.shape.rot + b.shape.extents))
+        abs(a.t_start - b.t_start) <= _REBUILD_TOL_T and abs(a.t_end - b.t_end) <= _REBUILD_TOL_T
+        and abs(a.shape.center[2] - b.shape.center[2]) <= _REBUILD_TOL      # level dash styling
+        and all(abs(p - q) <= _REBUILD_TOL for p, q in zip(_footprint_xy(a.shape), _footprint_xy(b.shape)))
         for a, b in zip(got, want))
 
 
@@ -102,20 +149,28 @@ def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
         r, g, b = flight_color_by_uss(req.uss_id, req.flight_id, hues)
         cl = list(intent.centerline or [])
         vols = intent.volumes or []
+        # Quantise ONCE, then both encode from it and verify against it — so what we check is exactly
+        # what the browser will reconstruct, not the full-precision path it never sees.
+        qx = [q(p[0]) for p, _ in cl]
+        qy = [q(p[1]) for p, _ in cl]
+        qz = [q(p[2]) for p, _ in cl]
+        qtime = [qt(t) for _, t in cl]
         rec = {
             "i": req.flight_id,
             "u": uss_ix[req.uss_id],
             "k": f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}",
-            "x": _delta([q(p[0]) for p, _ in cl]),
-            "y": _delta([q(p[1]) for p, _ in cl]),
-            "z": _delta([q(p[2]) for p, _ in cl]),       # altitude → flight-level styling
-            "t": _delta([qt(t) for _, t in cl]),
+            "x": _delta(qx),
+            "y": _delta(qy),
+            "z": _delta(qz),                             # altitude → flight-level styling
+            "t": _delta(qtime),
             "o": [q(req.origin[0]), q(req.origin[1])],
             "d": [q(req.dest[0]), q(req.dest[1])],
             "c": [[q(v.shape.cx), q(v.shape.cy), q(v.shape.radius), qt(v.t_start), qt(v.t_end)]
                   for v in vols if isinstance(v.shape, CylinderSpec)],
         }
-        if not _rebuildable(intent, cfg):   # fall back to explicit polygons for just this flight
+        dequantised = [(np.array([x / _Q, y / _Q, z / _Q]), t / _QT)
+                       for x, y, z, t in zip(qx, qy, qz, qtime)]
+        if not _rebuildable(intent, cfg, dequantised):   # explicit polygons for just this flight
             n_explicit += 1
             rec["b"] = [[*(q(c) for corner in box_footprint(v.shape) for c in corner),
                          q(v.shape.center[2]), qt(v.t_start), qt(v.t_end)]
@@ -162,6 +217,39 @@ def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
     }
 
 
+_SEG_POLY_JS = """
+// Rebuild segment i's corridor box exactly as volumes.corridor_segment_volume does: extend the segment
+// by half its own cross-section ALONG travel (anisotropic — corridor width in the horizontal plane,
+// corridor height in the vertical, so a pure climb doesn't balloon in z), then take the footprint of the
+// oriented box. Lateral axis = unit(world_up x travel), falling back to world-x when near-vertical —
+// mirrors geometry.segment_frame.
+// sqrt(a*a+b*b) rather than Math.hypot: V8's hypot does overflow-safe scaling we cannot need at these
+// magnitudes, and it costs 4.5x here — this runs for every box of every active flight, every frame.
+const QUAD = [[1,1],[1,-1],[-1,-1],[-1,1]];               // local corners, same order as viz.box_footprint
+function segPoly(f, i, out){
+  const x0=f.x[i]*IQ, y0=f.y[i]*IQ, z0=f.z[i]*IQ;
+  const x1=f.x[i+1]*IQ, y1=f.y[i+1]*IQ, z1=f.z[i+1]*IQ;
+  const dx=x1-x0, dy=y1-y0, dz=z1-z0;
+  let L=Math.sqrt(dx*dx+dy*dy+dz*dz), ux=1, uy=0, uz=0;
+  if(L<1e-9) L=0; else { ux=dx/L; uy=dy/L; uz=dz/L; }
+  const h=Math.sqrt(ux*ux+uy*uy), ea=CW*h, eb=CH*uz;
+  const hl = L/2 + 0.5*Math.sqrt(ea*ea+eb*eb);
+  const cx=(x0+x1)/2, cy=(y0+y1)/2;
+  let vx, vy, n;
+  if(Math.abs(uz)<0.99){ n=h||1; vx=-uy/n; vy=ux/n; }
+  else { n=Math.sqrt(uy*uy+uz*uz)||1; vx=0; vy=-uz/n; }
+  for(let k=0;k<4;k++){ const a=QUAD[k][0]*hl, b=QUAD[k][1]*CW/2;
+    out[2*k]=cx+a*ux+b*vx; out[2*k+1]=cy+a*uy+b*vy; }
+  return (z0+z1)/2;                                       // box centre altitude → level dash styling
+}
+"""
+"""The corridor-box rebuild, kept OUT of ``_HTML`` so a test can execute this exact source in node and
+pin it against :func:`volumes.corridor_segment_volume`. Inlining it would make the shipped formula
+untestable — the drawn geometry could then silently drift from what was actually reserved, and because
+:func:`_rebuildable` compares Python against Python, nothing would notice. Depends on the globals
+``IQ`` / ``CW`` / ``CH``, which ``boot()`` sets from the payload."""
+
+
 _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</title>
 <style>
  body{{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#d7dde3}}
@@ -201,7 +289,6 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
 // have to agree on the quantisation and on the corridor-box formula rebuilt in segPoly() below.
 const B64 = "{b64}";
 const LEVEL_DASH = [[], [6,4], [2,4], [1,5], [8,3,2,3]];  // solid / dash / dot / fine / dash-dot — per level
-const QUAD = [[1,1],[1,-1],[-1,-1],[-1,1]];               // local box corners, same order as viz.box_footprint
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const slider = document.getElementById('slider');
 const hidden = new Set();                                 // USS indices toggled off via the legend
@@ -242,30 +329,7 @@ boot().catch(e => {{ document.getElementById('t').textContent = 'failed to load'
   document.getElementById('err').textContent = 'Replay could not be decompressed: ' + e.message; }});
 
 // ---------------------------------------------------------------- geometry
-// Rebuild segment i's corridor box exactly as volumes.corridor_segment_volume does: extend the segment
-// by half its own cross-section ALONG travel (anisotropic — corridor width in the horizontal plane,
-// corridor height in the vertical, so a pure climb doesn't balloon in z), then take the footprint of the
-// oriented box. Lateral axis = unit(world_up x travel), falling back to world-x when near-vertical —
-// mirrors geometry.segment_frame. Keep in sync with viz_html._rebuildable's builder.
-// sqrt(a*a+b*b) rather than Math.hypot: V8's hypot does overflow-safe scaling we cannot need at these
-// magnitudes, and it costs 4.5x here — this runs for every box of every active flight, every frame.
-// Results are bit-identical (verified over a real path), so the mirror in test_viz may use hypot.
-function segPoly(f, i, out){{
-  const x0=f.x[i]*IQ, y0=f.y[i]*IQ, z0=f.z[i]*IQ;
-  const x1=f.x[i+1]*IQ, y1=f.y[i+1]*IQ, z1=f.z[i+1]*IQ;
-  const dx=x1-x0, dy=y1-y0, dz=z1-z0;
-  let L=Math.sqrt(dx*dx+dy*dy+dz*dz), ux=1, uy=0, uz=0;
-  if(L<1e-9) L=0; else {{ ux=dx/L; uy=dy/L; uz=dz/L; }}
-  const h=Math.sqrt(ux*ux+uy*uy), ea=CW*h, eb=CH*uz;
-  const hl = L/2 + 0.5*Math.sqrt(ea*ea+eb*eb);
-  const cx=(x0+x1)/2, cy=(y0+y1)/2;
-  let vx, vy, n;
-  if(Math.abs(uz)<0.99){{ n=h||1; vx=-uy/n; vy=ux/n; }}
-  else {{ n=Math.sqrt(uy*uy+uz*uz)||1; vx=0; vy=-uz/n; }}
-  for(let k=0;k<4;k++){{ const a=QUAD[k][0]*hl, b=QUAD[k][1]*CW/2;
-    out[2*k]=cx+a*ux+b*vx; out[2*k+1]=cy+a*uy+b*vy; }}
-  return (z0+z1)/2;                                       // box centre altitude → level dash styling
-}}
+{seg_poly}
 function levelOf(z){{ let bi=0, bd=1e9;
   for(let i=0;i<LEVELS.length;i++){{ const d=Math.abs(LEVELS[i]-z); if(d<bd){{ bd=d; bi=i; }} }}
   return bi % LEVEL_DASH.length; }}
@@ -291,10 +355,13 @@ function buildIndex(){{
   const n = Math.max(1, Math.ceil(END/BW) + 1);
   buckets = Array.from({{length: n}}, () => []);
   DATA.flights.forEach((f, fi) => {{
-    if(!f.t.length) return;
-    let lo = f.t[0]*IQT - DATA.t_buffer, hi = f.t[f.t.length-1]*IQT + DATA.t_buffer;
+    // Widen over EVERY drawable: a flight with no path still has hover cylinders (and, if its boxes
+    // weren't rebuildable, explicit polygons) to render — keying off the path alone would hide it.
+    let lo = Infinity, hi = -Infinity;
+    if(f.t.length){{ lo = f.t[0]*IQT - DATA.t_buffer; hi = f.t[f.t.length-1]*IQT + DATA.t_buffer; }}
     for(const c of f.c){{ lo = Math.min(lo, c[3]*IQT); hi = Math.max(hi, c[4]*IQT); }}
     for(const b of (f.b || [])){{ lo = Math.min(lo, b[9]*IQT); hi = Math.max(hi, b[10]*IQT); }}
+    if(lo > hi) return;                                    // nothing this flight can ever draw
     const a = Math.max(0, Math.floor(lo/BW)), z = Math.min(n-1, Math.floor(hi/BW));
     for(let k=a;k<=z;k++) buckets[k].push(fi);             // pushed in flight order → stable z-ordering
   }});
@@ -426,10 +493,22 @@ function buildLevelLegend(){{                     // flight-level dash key (A* m
 def write_html(result: SimResult, out, clip_to_horizon: bool = True) -> str:
     """Render a `SimResult` to a standalone HTML scrubber; return the output path."""
     payload = _payload(result, clip_to_horizon=clip_to_horizon)
-    blob = json.dumps(payload, separators=(",", ":")).encode()
+    n_explicit, n_flights = payload["explicit_box_flights"], len(payload["flights"])
+    if n_flights and n_explicit > _FALLBACK_WARN_FRAC * n_flights:
+        # Loud, because this is the size lever failing: these flights ship their polygons verbatim, which
+        # is what took a dense replay to 78 MB. A planner that stopped reserving the swept centerline —
+        # or an archive planned under an older corridor formula — regresses silently otherwise.
+        warnings.warn(
+            f"replay: {n_explicit}/{n_flights} flights could not have their corridor boxes rebuilt from "
+            f"the path (planner={payload['planner']}); storing explicit polygons for those, so {out} "
+            f"will be substantially larger",
+            RuntimeWarning, stacklevel=2)
+    blob = _scene_json(payload).encode()
     # mtime=0 so the same run always produces a byte-identical file (gzip stamps the clock otherwise).
     b64 = base64.b64encode(gzip.compress(blob, compresslevel=9, mtime=0)).decode()
-    html = _HTML.format(horizon=json.dumps(payload["horizon"]), b64=b64)
-    with open(out, "w") as f:
+    html = _HTML.format(horizon=json.dumps(payload["horizon"]), b64=b64, seg_poly=_SEG_POLY_JS)
+    # encoding is explicit: the document declares utf-8 and the transport bar is full of non-ASCII
+    # glyphs, so a C/cp1252 locale would otherwise mojibake or raise at the very end of a long run.
+    with open(out, "w", encoding="utf-8") as f:
         f.write(html)
     return str(out)

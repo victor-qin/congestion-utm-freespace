@@ -2,7 +2,9 @@ import base64
 import dataclasses
 import gzip
 import json
-import math
+import shutil
+import subprocess
+import tempfile
 
 import numpy as np
 import pytest
@@ -14,10 +16,14 @@ from freespace_sim.sim import run
 from freespace_sim.types import FlightRequest, vec
 
 
+def _blob(html: str) -> str:
+    """The embedded base64 scene."""
+    return html.split('const B64 = "', 1)[1].split('"', 1)[0]
+
+
 def _embedded(html: str) -> dict:
     """Inflate the replay's base64+gzip scene exactly as the browser does."""
-    b64 = html.split('const B64 = "', 1)[1].split('"', 1)[0]
-    return json.loads(gzip.decompress(base64.b64decode(b64)))
+    return json.loads(gzip.decompress(base64.b64decode(_blob(html))))
 
 
 def _undelta(stream: list[int]) -> list[int]:
@@ -145,7 +151,7 @@ def test_viz_html_is_selfcontained_and_parses(tmp_path):
     res = _small_run()
     out = viz_html.write_html(res, tmp_path / "replay.html")
     html = open(out).read()
-    assert "<script>" in html and "src=" not in html    # standalone: no external assets to fetch
+    assert "<script>" in html and "<img" not in html    # standalone: no external assets to fetch
     payload = viz_html._payload(res)
     assert payload["flights"] and all(f["x"] and f["t"] for f in payload["flights"])
     # each flight carries its straight origin→dest endpoints (the dashed reference line)
@@ -172,54 +178,58 @@ def test_replay_clips_to_horizon_by_default():
     assert viz_html._payload(res, clip_to_horizon=False)["horizon"] >= 900.0
 
 
-def _js_seg_poly(p0, p1, cfg):
-    """Python mirror of the replay's JS ``segPoly`` — one corridor box footprint rebuilt from two
-    adjacent path points, with NO access to the stored volume.
+_SEG_CASES = [
+    ((0, 0, 100), (120, 0, 100)),                      # level, due east
+    ((0, 0, 100), (60, 103.9, 100)),                   # level, 60° bearing
+    ((500, 500, 100), (380, 500, 100)),                # level, due west (negative direction)
+    ((0, 0, 30), (120, 0, 70)),                        # climbing
+    ((0, 0, 110), (84.9, 84.9, 30)),                   # descending, diagonal
+    ((0, 0, 30), (2, 0, 110)),                         # near-vertical → world-x fallback branch
+    ((0, 0, 30), (0, 0, 110)),                         # pure vertical rung
+    ((0, 0, 100), (0, 0, 100)),                        # degenerate: hover in place
+]
 
-    Deliberately transcribed here rather than shared with ``viz_html``: the point of the test below is
-    that this formula reproduces :func:`volumes.corridor_segment_volume`, so it has to be an independent
-    copy of the JS. Change one, change the other.
+
+def _builder_footprints(cfg):
+    """What the ledger actually reserved, for each case in `_SEG_CASES`."""
+    return [viz.box_footprint(volumes.corridor_segment_volume(
+        np.array(p0, float), 0.0, np.array(p1, float), 4.0, cfg).shape) for p0, p1 in _SEG_CASES]
+
+
+def test_shipped_segpoly_js_reproduces_the_corridor_builder():
+    """Runs the REAL shipped `segPoly` source in node against `volumes.corridor_segment_volume`.
+
+    This is the load-bearing pin for the whole size lever: the replay stores no corridor polygons, so
+    if the JS drifts from the builder every archived replay silently draws wrong geometry — and
+    `_rebuildable` cannot catch it, because it compares Python against Python. A Python transcription
+    of the JS would not catch it either; only executing `viz_html._SEG_POLY_JS` itself does.
     """
-    dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
-    length = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if length < 1e-9:
-        length, (ux, uy, uz) = 0.0, (1.0, 0.0, 0.0)
-    else:
-        ux, uy, uz = dx / length, dy / length, dz / length
-    half_len = length / 2 + 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(ux, uy),
-                                             cfg.corridor_height_m * uz)
-    cx, cy = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
-    if abs(uz) < 0.99:                                     # lateral axis = unit(world_up x travel)
-        n = math.hypot(ux, uy) or 1.0
-        vx, vy = -uy / n, ux / n
-    else:                                                  # near-vertical falls back to world-x
-        n = math.hypot(uy, uz) or 1.0
-        vx, vy = 0.0, -uz / n
-    half_w = cfg.corridor_width_m / 2
-    return [(cx + a * half_len * ux + b * half_w * vx, cy + a * half_len * uy + b * half_w * vy)
-            for a, b in ((1, 1), (1, -1), (-1, -1), (-1, 1))]
-
-
-def test_replay_rebuilds_corridor_box_footprints_exactly():
-    """The replay ships no corridor polygons — it regenerates them in JS from the path (72% of the
-    payload). This pins that formula to the real builder across every segment orientation, including
-    the two branches a level-cruise scenario never exercises (near-vertical and zero-length)."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
     cfg = SimConfig()
-    segments = [
-        ((0, 0, 100), (120, 0, 100)),                      # level, due east
-        ((0, 0, 100), (60, 103.9, 100)),                   # level, 60° bearing
-        ((500, 500, 100), (380, 500, 100)),                # level, due west (negative direction)
-        ((0, 0, 30), (120, 0, 70)),                        # climbing
-        ((0, 0, 110), (84.9, 84.9, 30)),                   # descending, diagonal
-        ((0, 0, 30), (2, 0, 110)),                         # near-vertical → world-x fallback branch
-        ((0, 0, 30), (0, 0, 110)),                         # pure vertical rung
-        ((0, 0, 100), (0, 0, 100)),                        # degenerate: hover in place
-    ]
-    for p0, p1 in segments:
-        want = viz.box_footprint(
-            volumes.corridor_segment_volume(np.array(p0, float), 0.0, np.array(p1, float), 4.0, cfg).shape)
-        got = _js_seg_poly(p0, p1, cfg)
-        assert np.allclose(np.array(got), want, atol=1e-9), f"segment {p0}→{p1}"
+    harness = f"""
+const IQ = 1, CW = {cfg.corridor_width_m}, CH = {cfg.corridor_height_m};
+{viz_html._SEG_POLY_JS}
+const cases = {json.dumps(_SEG_CASES)};
+const out = [];
+for (const [p0, p1] of cases) {{
+  const f = {{x: [p0[0], p1[0]], y: [p0[1], p1[1]], z: [p0[2], p1[2]]}};
+  const poly = new Float64Array(8);
+  const z = segPoly(f, 0, poly);
+  out.push({{poly: Array.from(poly), z}});
+}}
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+
+    for (p0, p1), rec, want in zip(_SEG_CASES, got, _builder_footprints(cfg)):
+        assert np.allclose(np.array(rec["poly"]).reshape(4, 2), want, atol=1e-9), f"segment {p0}→{p1}"
+        # the returned altitude drives the flight-level dash styling, so pin it too
+        vol = volumes.corridor_segment_volume(np.array(p0, float), 0.0, np.array(p1, float), 4.0, cfg)
+        assert abs(rec["z"] - vol.shape.center[2]) < 1e-9, f"box centre altitude for {p0}→{p1}"
 
 
 def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
@@ -238,6 +248,32 @@ def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
             assert abs(qx / payload["q"] - p[0]) <= tol and abs(qy / payload["q"] - p[1]) <= tol
             assert abs(qz / payload["q"] - p[2]) <= tol
             assert abs(qt / payload["qt"] - t) <= 0.5 / payload["qt"]
+
+
+def test_sub_quantum_segment_forces_the_explicit_fallback():
+    """A segment shorter than the position quantum must NOT be rebuilt in the browser.
+
+    The browser only ever sees the decimetre-quantised path, so a centimetre-scale segment collapses to
+    zero length there and JS draws an x-aligned box instead of the real corridor — measured at up to
+    32 m off on a real `straight` run, whose final partial timestep leaves exactly such a remainder.
+    Verifying against the full-precision centerline passed all of those silently; verifying against the
+    quantised path is what makes them fall back.
+    """
+    cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0))
+    res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+    acc = res.accepted[0]
+    cl = list(acc.centerline)
+    # splice in a 3 cm near-vertical stub, the shape that quantisation destroys
+    (p, t), (_, t_next) = cl[0], cl[1]
+    stub_end = vec(float(p[0]), float(p[1]), float(p[2]) + 0.03)
+    acc.centerline = [cl[0], (stub_end, t + (t_next - t) / 2), *cl[1:]]
+    acc.volumes = volumes.build_corridor(acc.centerline, cfg) + [
+        v for v in acc.volumes if not isinstance(v.shape, BoxSpec)]
+
+    with pytest.warns(RuntimeWarning, match="could not have their corridor boxes rebuilt"):
+        payload = viz_html._payload(res), viz_html.write_html(res, tempfile.mkstemp(suffix=".html")[1])
+    assert payload[0]["explicit_box_flights"] == 1
+    assert "b" in payload[0]["flights"][0]      # its polygons ship verbatim rather than being mis-drawn
 
 
 def test_payload_keeps_explicit_boxes_when_not_rebuildable():
@@ -274,8 +310,8 @@ def test_embedded_scene_is_compressed_not_inlined(tmp_path):
     HTML shell can't mask a regression on the small runs the suite can afford to build."""
     res = _small_run()
     html = open(viz_html.write_html(res, tmp_path / "replay.html")).read()
-    blob = html.split('const B64 = "', 1)[1].split('"', 1)[0]
-    raw = json.dumps(viz_html._payload(res), separators=(",", ":"))
+    blob = _blob(html)
+    raw = viz_html._scene_json(viz_html._payload(res))   # the exact bytes write_html compresses
     assert len(blob) < len(raw)                          # base64(gzip(scene)) still beats the raw dump
     assert raw not in html                               # the scene is compressed, not inlined
     assert all(c.isalnum() or c in "+/=" for c in blob)  # ...and what IS embedded is pure base64

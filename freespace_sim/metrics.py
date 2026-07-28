@@ -501,8 +501,9 @@ def _mean(series: pd.Series) -> float:
 def _rollup(
     df: pd.DataFrame,
     cfg: SimConfig,
-    dur_s: float | None = None,
-    rate_dur_s: float | None = None,
+    *,
+    dur_s: float,
+    rate_dur_s: float,
 ) -> dict:
     """Group-level rollup of a (sub)frame of flight rows — shared by ``aggregate`` (the whole run)
     and ``per_uss_frame`` (one operator's slice). Denominators (duration, region capacity) are the
@@ -514,8 +515,6 @@ def _rollup(
     """
     acc = df[df["accepted"]]
     den = df[df["denied"]]
-    dur_s = cfg.horizon_s if dur_s is None else dur_s
-    rate_dur_s = dur_s if rate_dur_s is None else rate_dur_s
     rate_h = rate_dur_s / 3600.0
     # Vertical extent of the usable airspace. With discrete flight levels (n_levels > 1) the usable
     # tube is the regulated band [ground, airspace_ceiling]. Otherwise the continuous band is collapsed
@@ -576,11 +575,31 @@ def _rollup(
     }
 
 
+def _denominators(result: SimResult, window: tuple[float, float] | None):
+    """The measurement bounds and the two rollup denominators, derived in ONE place.
+
+    ``dur_s`` normalizes reserved-volume CAPACITY over the realized run; ``rate_dur_s`` normalizes
+    offered-load and throughput RATES over the active demand window. They differ only for a whole-run
+    measurement of a scenario whose demand window is shorter than its planner envelope (the density
+    family: 30 min of demand inside a 2 h envelope). A windowed measurement uses the window for both.
+
+    ``aggregate`` and ``per_uss_frame`` both need this pair; keeping one spelling stops the two from
+    drifting apart and silently normalizing an aggregate's totals differently from the per-USS rows
+    embedded in it.
+    """
+    if window is None:
+        sim_lo, sim_hi = simulation_window(result)
+        return sim_lo, sim_hi, sim_hi - sim_lo, result.config.effective_demand_duration_s
+    lo, hi = window
+    return lo, hi, hi - lo, hi - lo
+
+
 def _per_uss_table(
     df: pd.DataFrame,
     cfg: SimConfig,
-    dur_s: float | None = None,
-    rate_dur_s: float | None = None,
+    *,
+    dur_s: float,
+    rate_dur_s: float,
 ) -> pd.DataFrame:
     total_acc = int(df["accepted"].sum()) if len(df) else 0
     rows = []
@@ -601,16 +620,10 @@ def per_uss_frame(result: SimResult, window: tuple[float, float] | None = None) 
     reserved volume sum to the overall ``aggregate`` totals (see tests). ``window`` restricts to flights
     filed in ``[t_lo, t_hi)`` and uses the window duration for the rate/capacity denominators. Without
     a window, rates use the active demand duration and utilization uses the realized simulation duration."""
-    cfg = result.config
-    if window is None:
-        sim_lo, sim_hi = simulation_window(result)
-        dur_s = sim_hi - sim_lo
-        rate_dur_s = cfg.effective_demand_duration_s
-    else:
-        dur_s = rate_dur_s = window[1] - window[0]
+    _lo, _hi, dur_s, rate_dur_s = _denominators(result, window)
     return _per_uss_table(
         flight_frame(result, window),
-        cfg,
+        result.config,
         dur_s=dur_s,
         rate_dur_s=rate_dur_s,
     )
@@ -624,10 +637,10 @@ def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> d
     (default) measures the complete realized run from first activity through final landing. Use
     :func:`aggregate_with_steady` to report that whole-run view next to its steady-state twin."""
     cfg = result.config
-    sim_lo, sim_hi = simulation_window(result)
-    lo, hi = (sim_lo, sim_hi) if window is None else window
-    dur_s = hi - lo
-    rate_dur_s = cfg.effective_demand_duration_s if window is None else dur_s
+    # A windowed call must NOT pay for simulation_window: it is a full scan of every accepted flight's
+    # volumes (~2.4M Volume4D on the 27k-flight density runs) and aggregate_with_steady pops the
+    # simulation_* keys straight back off the steady block. _denominators only derives it when needed.
+    sim_lo, sim_hi, dur_s, rate_dur_s = _denominators(result, window)
     df = flight_frame(result, window)
     den = df[df["denied"]] if len(df) else df
     by_reason = den["denial_reason"].value_counts().to_dict() if len(den) else {}
@@ -657,7 +670,7 @@ def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> d
         "verified": result.verified,
     }
     if window is not None:
-        out["window_lo"], out["window_hi"] = float(lo), float(hi)
+        out["window_lo"], out["window_hi"] = float(sim_lo), float(sim_hi)
     return out
 
 

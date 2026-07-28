@@ -353,14 +353,18 @@ def load_run(folder: Path | str) -> LoadedRun:
     # cost_altitude_change_per_m directly; both are derived @properties now. Back-convert them into
     # the per-second knobs BEFORE the whitelist drop below — otherwise the old value is silently
     # discarded and the run replays under today's defaults (0.1 instead of 3.0), i.e. a different
-    # cost model than it was planned with. Multiplying back by the same speed/climb_rate the
-    # property divides by reproduces the archived weight exactly.
-    if "cost_air_lateral_per_m" in cfg_payload:
-        cfg_payload["cost_air_lateral_per_s"] = (
-            cfg_payload.pop("cost_air_lateral_per_m") * cfg_payload["nominal_speed_mps"])
-    if "cost_altitude_change_per_m" in cfg_payload:
-        cfg_payload["cost_altitude_change_per_s"] = (
-            cfg_payload.pop("cost_altitude_change_per_m") * cfg_payload["climb_rate_mps"])
+    # cost model than it was planned with. Multiplying back by the same speed/climb_rate the property
+    # divides by reproduces the archived weight exactly. Stay drift-tolerant like the rest of this
+    # function: fall back to the SimConfig default if the companion speed field predates the archive
+    # (a bare subscript here would KeyError inside the very block meant to absorb schema drift), and
+    # never clobber a per-second value the payload already carries.
+    for per_m_key, per_s_key, scale_key in (
+        ("cost_air_lateral_per_m", "cost_air_lateral_per_s", "nominal_speed_mps"),
+        ("cost_altitude_change_per_m", "cost_altitude_change_per_s", "climb_rate_mps"),
+    ):
+        if per_m_key in cfg_payload:
+            scale = cfg_payload.get(scale_key, getattr(SimConfig, scale_key))
+            cfg_payload.setdefault(per_s_key, cfg_payload.pop(per_m_key) * scale)
     # Tolerate schema drift: drop keys that are no longer SimConfig fields (e.g. cruise_level_m / z_min_m /
     # z_max_m — now derived @properties) so runs archived before that change still load.
     _fields = {f.name for f in dataclasses.fields(SimConfig)}

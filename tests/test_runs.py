@@ -80,6 +80,31 @@ def test_load_run_tolerates_dropped_legacy_altitude_keys(tmp_path):
     assert cfg.z_max_m == cfg.flight_levels_m[-1]                     # ... 99 dropped too
 
 
+def test_load_run_back_converts_legacy_per_metre_cost_weights(tmp_path):
+    """Runs archived before the per-second normalization stored cost_air_lateral_per_m /
+    cost_altitude_change_per_m, which are derived @properties now. Whitelist-filtering alone would
+    DROP them and silently replay the run under today's defaults — a different cost model than it was
+    planned with (0.1 vs 3.0 per lateral metre, a 30x change). They must be back-converted instead."""
+    import json
+
+    folder = runs.save_run(_small(), root=tmp_path, label="legacy_costs")
+    cfg_path = folder / "config.json"
+    payload = json.loads(cfg_path.read_text())
+    for k in ("cost_air_lateral_per_s", "cost_altitude_change_per_s"):
+        payload.pop(k, None)                                          # the old schema had neither
+    payload.update(cost_air_lateral_per_m=3.0, cost_altitude_change_per_m=4.0)
+    payload["flight_levels_m"] = list(payload["flight_levels_m"])
+    payload["region_size_m"] = list(payload["region_size_m"])
+    cfg_path.write_text(json.dumps(payload))
+
+    cfg = runs.load_run(folder).config
+    assert cfg.cost_air_lateral_per_m == 3.0                          # the archived weight, preserved
+    assert cfg.cost_altitude_change_per_m == 4.0
+    # ... which means the per-second knobs were reconstructed, not defaulted
+    assert cfg.cost_air_lateral_per_s == 3.0 * cfg.nominal_speed_mps
+    assert cfg.cost_altitude_change_per_s == 4.0 * cfg.climb_rate_mps
+
+
 def test_load_run_replay_payload_matches(tmp_path):
     from freespace_sim import viz_html
 

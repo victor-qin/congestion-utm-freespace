@@ -182,12 +182,15 @@ def test_astar_climbs_over_a_blocked_low_level_without_lateral_detour():
     assert intent.altitude_change_m == 2.0 * (CFG.level_z(1) - CFG.ground_level_m)   # 2·70 = 140
 
 
-def test_two_flights_share_a_corridor_deconflict_by_ground_delay():
-    """Opposite-direction flights on a long shared corridor. Under the default cost weights a climb costs
-    more than a ground hold, so the second flight WAITS on the pad (deconflicts by ground delay) rather
-    than climbing a level or detouring laterally. (The altitude lever is exercised under load — capped
-    ground delay forcing climbs — by test_astar_shortcut_dense_multilevel_run_stays_verified and the
-    compiled climb-over-wall tests.)
+def test_two_flights_share_a_corridor_deconflict_by_the_cheapest_lever():
+    """Opposite-direction flights on a long shared corridor: the second must give way, and it picks the
+    lever the cost weights actually make cheapest — a short lateral sidestep.
+
+    With the weights normalized to one per-second currency (ground 1x, lateral 3x, hover 3x, climb 4x
+    PER SECOND) stepping one hex aside costs 3 s-equivalents, while a rung to the next flight level is
+    charged the climb TIME at 4x — so a two-hex berth undercuts both a climb and any comparable hold.
+    Asserts that ORDERING rather than magic thresholds, so the test keeps its meaning if the weights are
+    retuned; only a change to the ranking itself should force a rewrite.
     """
     led = ReservationLedger(CFG)
     a = FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0)
@@ -198,9 +201,53 @@ def test_two_flights_share_a_corridor_deconflict_by_ground_delay():
     i2 = AStarPlanner().plan(b, led, CFG)
     assert i2.status is IntentStatus.ACCEPTED
     assert not led.any_conflict(i2.volumes)
-    assert i2.ground_delay_s > 100.0                                 # deconflicts by waiting on the pad
-    assert max(_cruise_levels(i2)) < CFG.level_z(1)                  # stayed low — no climb to a higher level
-    assert i2.air_detour_m < 600.0                                   # and no big lateral detour
+
+    berth = CFG.cost_air_lateral_per_m * i2.air_detour_m             # what it paid to step aside
+    one_rung = CFG.cost_altitude_change_per_m * 2.0 * (CFG.level_z(1) - CFG.level_z(0))
+    assert i2.air_detour_m > 0.0                                     # gave way laterally ...
+    assert berth < one_rung                                          # ... because that undercuts a climb
+    assert _cruise_levels(i2) == [CFG.level_z(0)]                    # so it never left the floor level
+    assert CFG.cost_ground_delay_per_s * i2.ground_delay_s < one_rung  # nor did it out-wait a climb
+    # The berth is traffic-forced, not hex staircase: this corridor is axis-aligned, so an unimpeded run
+    # quantizes to zero overhead and every metre of the detour is attributable to flight 1. It is also a
+    # whole number of hex steps, because that is the only way A* can move sideways.
+    assert i2.lattice_overhead_m == 0.0
+    pitch = CFG.nominal_speed_mps * CFG.dt_s
+    assert (i2.air_detour_m - i2.lattice_overhead_m) % pitch == 0.0
+
+
+@pytest.mark.parametrize("deg, on_axis", [(0.0, True), (60.0, True), (10.0, False), (30.0, False)])
+def test_lattice_overhead_absorbs_quantization_leaving_no_phantom_deconfliction(deg, on_axis):
+    """An unimpeded flight has no traffic to avoid, so every metre of ``air_detour_m`` must land in
+    ``lattice_overhead_m`` and NONE in the traffic residual — at ANY bearing.
+
+    ``air_detour_m`` is measured against the Euclidean straight line, which a 6-direction lattice
+    simply cannot fly: off a hex axis the shortest lattice path is up to 2/√3 − 1 ≈ 15.5% longer no
+    matter how empty the sky is. Without this split an entirely congestion-free run books that pure
+    geometry as congestion, and at low load it dominates the reported detour outright.
+    """
+    cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+                    region_size_m=(20_000.0, 20_000.0))
+    th, d = math.radians(deg), 6000.0
+    req = FlightRequest(1, vec(0, 0, 0), vec(d * math.cos(th), d * math.sin(th), 0), 0.0)
+    intent = AStarPlanner().plan(req, ReservationLedger(cfg), cfg)
+    assert intent.accepted
+    assert intent.air_detour_m - intent.lattice_overhead_m == 0.0     # nothing blamed on traffic
+    if on_axis:
+        assert intent.lattice_overhead_m == 0.0                      # an axis needs no staircase
+    else:
+        assert intent.lattice_overhead_m > 0.05 * d                  # ... off-axis it is substantial
+        # and still under the lattice ceiling, plus the snap of each endpoint onto a cell centre
+        assert intent.air_detour_m <= (2 / math.sqrt(3) - 1) * d + 2 * hg.circumradius(cfg)
+
+
+def test_continuous_planners_report_no_lattice_overhead():
+    """``lattice_overhead_m`` is an A*-family diagnostic: milp/straight plan on continuous geometry,
+    so their ``air_detour_m`` carries no quantization and must not be discounted by this split."""
+    cfg = SimConfig()
+    for name in ("milp", "straight"):
+        intent = get_planner(name).plan(_req(), ReservationLedger(cfg), cfg)
+        assert intent.accepted and intent.lattice_overhead_m == 0.0
 
 
 def test_vertical_edge_step_count_matches_climb_kinematics():
@@ -248,7 +295,8 @@ def _air_edges(planner, cfg, svc, st, max_step=999):
                        for L in range(n - 1))
     rung_cost = tuple(cfg.cost_altitude_change_per_m * (lv[L + 1] - lv[L]) for L in range(n - 1))
     return planner._edges(st, cfg, cfg.corridor_segment_len_m, lv, (0,) * n, (0.0,) * n,
-                          rung_steps, rung_cost, (1,) * n, cfg.cost_altitude_change_per_m, svc, max_step)
+                          rung_steps, rung_cost, (1,) * n, cfg.cost_altitude_change_per_m,
+                          cfg.cost_air_lateral_per_m, svc, max_step)
 
 
 def test_vertical_edge_checks_only_traversed_levels_not_all():

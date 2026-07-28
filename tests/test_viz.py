@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 from freespace_sim import runs, viz, viz_html
 from freespace_sim.config import SimConfig
@@ -163,3 +164,55 @@ def test_save_sweep_roundtrips(tmp_path):
     folder = runs.save_sweep(rows, root=tmp_path, label="s")
     df = pd.read_parquet(folder / "sweep.parquet")
     assert len(df) == 1 and "denial_rate" in df.columns
+
+
+def test_delay_sources_bands_reconcile_to_total_delay(tmp_path):
+    """The stacked chart must account for ALL of ``total_delay_s`` — driven off ``_DELAY_SOURCES``
+    itself, so editing the chart's band list can never silently reintroduce a shortfall.
+
+    Run on the 3-level ladder under load: the climb band is non-zero here, which is exactly the case
+    the old 3-band stack under-reported (and which no single-plane run can detect).
+    """
+    from freespace_sim import metrics
+
+    cfg = SimConfig(planner="astar", lam_per_hour=900.0, horizon_s=600.0,
+                    region_size_m=(2500.0, 2500.0), seed=3)
+    acc = metrics.flight_frame(run(cfg)).query("accepted")
+    assert (acc["excess_altitude_m"] > 0).any(), "no traffic-forced climb — the check would be vacuous"
+    assert (acc["lattice_overhead_m"] > 0).any(), "no hex staircase — the check would be vacuous"
+
+    stacked = sum(acc[key] for key, _, _, _ in viz._DELAY_SOURCES)
+    assert ((stacked - acc["total_delay_s"]).abs() < 1e-9).all()
+
+    out = tmp_path / "delay_sources.png"
+    viz.delay_sources(acc, out=out, by=None)
+    assert out.exists()
+
+
+def test_delay_sources_tolerates_legacy_frame_without_detour_split(tmp_path):
+    """A pre-#49 flights.parquet has detour_time_s but not the traffic/lattice split; a run older than
+    the climb band additionally lacks altitude_delay_phys_s. delay_sources must reconstruct the detour
+    split (whole detour → traffic) and zero-fill the legacy-only climb band rather than KeyError, and render."""
+    from freespace_sim import metrics
+    cfg = SimConfig(planner="astar", lam_per_hour=900.0, horizon_s=600.0,
+                    region_size_m=(2500.0, 2500.0), seed=3)
+    acc = metrics.flight_frame(run(cfg)).query("accepted")
+    # shape of an old parquet: no detour split, and (older still) no climb band
+    legacy = acc.drop(columns=["detour_traffic_s", "detour_lattice_s", "altitude_delay_phys_s"])
+    out = tmp_path / "delay_sources.png"
+    viz.delay_sources(legacy, out=out, by=None)                           # must not raise
+    assert out.exists()
+
+
+def test_delay_sources_raises_on_missing_core_band(tmp_path):
+    """The legacy back-stop stays NARROW: every planner emits all five bands (0 where a lever doesn't
+    apply), so a current-schema frame missing a core lever (ground_delay_s) is a real upstream defect,
+    not a schema gap. delay_sources must still surface it as a KeyError rather than silently plot a 0
+    band under a wrong-but-reconciling total — a guard against re-broadening the fill to _DELAY_SOURCES."""
+    from freespace_sim import metrics
+    cfg = SimConfig(planner="astar", lam_per_hour=900.0, horizon_s=600.0,
+                    region_size_m=(2500.0, 2500.0), seed=3)
+    acc = metrics.flight_frame(run(cfg)).query("accepted")
+    broken = acc.drop(columns=["ground_delay_s"])          # a core band vanishing ⇒ upstream bug, not legacy
+    with pytest.raises(KeyError):
+        viz.delay_sources(broken, out=tmp_path / "x.png", by=None)

@@ -255,45 +255,82 @@ def delay_pct_histograms_by_lambda(per_flight_df, out=None):
         bins=np.linspace(0, 100, 21), suptitle="Delay-as-%-of-flight-time distribution by offered demand")
 
 
+# The FIVE levers of total_delay_s, in stack order: (key, label, colour, hatch).
+#
+# Two were missing before, so the stack silently failed to reach ``total_delay_s``:
+#   * the climb lever was absent entirely — any multi-level run under-reported by the whole
+#     traffic-forced climb (7% of the total at λ=1029 on a 3-level ladder);
+#   * ``detour_time_s`` was one band, but on A*'s hex lattice most of it is quantization, not
+#     congestion — an unimpeded off-axis flight books up to 2/√3 − 1 ≈ 15.5% of pure geometry.
+# Splitting the detour keeps the stack reconciling exactly (nothing is dropped) while making the
+# non-congestion share visually obvious through the hatch.
 _DELAY_SOURCES = [
-    ("ground_delay_s", "ground delay", "#2563eb"),   # waited on the pad (FCFS queueing)
-    ("air_hold_s", "air hold", "#f59e0b"),            # loitered/hovered mid-route
-    ("detour_time_s", "detour time", "#10b981"),      # extra path length, as lateness-seconds
+    ("ground_delay_s", "ground delay", "#2563eb", None),          # waited on the pad (FCFS queueing)
+    ("air_hold_s", "air hold", "#f59e0b", None),                  # loitered/hovered mid-route
+    ("detour_traffic_s", "detour — traffic", "#10b981", None),    # berth forced by other flights
+    ("detour_lattice_s", "detour — lattice", "#9ca3af", "////"),  # hex quantization (see delay_sources)
+    ("altitude_delay_phys_s", "climb — traffic-forced", "#6366f1", None),   # excess_m / climb_rate
 ]
 
 
 def delay_sources(per_flight_df, out=None, by="lam_per_hour"):
-    """Where delay comes from: stacked mean delay by source (ground / air-hold / detour-time).
+    """Where delay comes from: stacked mean delay by source, over the five levers of ``total_delay_s``
+    (ground hold / air hold / detour-traffic / detour-lattice / traffic-forced climb).
 
-    Left panel = absolute seconds (how the total grows); right panel = % share (how the *mix*
-    shifts — e.g. detour-dominated when sparse, ground-delay-dominated once the airspace saturates).
-    Groups by ``by`` (λ) if that column is present, else shows a single aggregate bar. The three
-    sources sum exactly to ``total_delay_s``.
+    Left panel = absolute seconds (how the total grows); right panel = % share (how the *mix* shifts —
+    e.g. detour-dominated when sparse, ground-delay-dominated once the airspace saturates). Groups by
+    ``by`` (λ) if that column is present, else shows a single aggregate bar. The five sources sum
+    exactly to ``total_delay_s`` — see :func:`metrics.delay_breakdown_s`.
+
+    **Reading the hatched "detour — lattice" band.** It is real flight time, but for bare A* it is not
+    caused by other traffic: a 6-direction lattice cannot fly the Euclidean straight line
+    ``air_detour_m`` is measured against, so it stays pinned at the same value across every offered
+    load. Ignore it when asking "how hard is traffic pushing flights sideways?" — that is the green
+    band. Caveat for ``astar_shortcut``: there the refiner splices most of the staircase out, and what
+    survives *does* grow with load (heavier traffic blocks more splices), so under a refiner the band
+    is partly congestion-driven rather than pure geometry.
     """
     df = per_flight_df
     if "accepted" in df.columns:
         df = df[df["accepted"]]
     df = df.dropna(subset=["total_delay_s"])
+    # Frames archived before the lattice/traffic detour split (PR #49) carry detour_time_s but
+    # not its two sub-bands. Reconstruct them the way load_run treats legacy runs: no lattice
+    # info ⇒ the whole detour is traffic-attributable. Still partitions detour_time_s exactly,
+    # so the five bands keep reconciling to total_delay_s.
+    if "detour_traffic_s" not in df.columns:
+        df = df.assign(detour_traffic_s=df["detour_time_s"], detour_lattice_s=0.0)
+    # altitude_delay_phys_s postdates the ancient ground/air_hold levers but predates this PR, so a run
+    # older than the climb band lacks it; zero-fill JUST that one band (its climb info isn't recoverable
+    # from the parquet). Deliberately NOT a blanket fill over _DELAY_SOURCES: every planner emits all
+    # five bands (0 where a lever doesn't apply — e.g. the A*-only lattice split is 0 for the continuous
+    # planners), so a current-schema frame is only ever missing a CORE lever (ground_delay_s/air_hold_s)
+    # through a real upstream defect — that must still surface as a KeyError, not a silent 0 band under a
+    # wrong-but-reconciling total.
+    if "altitude_delay_phys_s" not in df.columns:
+        df = df.assign(altitude_delay_phys_s=0.0)
     if by and by in df.columns:
         groups = sorted(df[by].unique())
         labels = [f"{g:g}" for g in groups]
-        means = {k: np.array([df.loc[df[by] == g, k].mean() for g in groups]) for k, _, _ in _DELAY_SOURCES}
+        means = {k: np.array([df.loc[df[by] == g, k].mean() for g in groups])
+                 for k, _, _, _ in _DELAY_SOURCES}
         xlabel = "offered load λ (req/h)"
     else:
         labels = ["all flights"]
-        means = {k: np.array([df[k].mean()]) for k, _, _ in _DELAY_SOURCES}
+        means = {k: np.array([df[k].mean()]) for k, _, _, _ in _DELAY_SOURCES}
         xlabel = ""
 
     fig, (a_abs, a_pct) = plt.subplots(1, 2, figsize=(12, 4.5))
     x = np.arange(len(labels))
-    total = sum(means[k] for k, _, _ in _DELAY_SOURCES)
+    total = sum(means[k] for k, _, _, _ in _DELAY_SOURCES)
     total_safe = np.where(total == 0, 1.0, total)
 
     for ax, normalize in ((a_abs, False), (a_pct, True)):
         bottom = np.zeros(len(labels))
-        for k, name, color in _DELAY_SOURCES:
+        for k, name, color, hatch in _DELAY_SOURCES:
             v = means[k] / total_safe * 100 if normalize else means[k]
-            ax.bar(x, v, bottom=bottom, label=name, color=color, edgecolor="white", linewidth=0.5)
+            ax.bar(x, v, bottom=bottom, label=name, color=color, edgecolor="white", linewidth=0.5,
+                   hatch=hatch)
             bottom += v
         ax.set_xticks(x)
         ax.set_xticklabels(labels)

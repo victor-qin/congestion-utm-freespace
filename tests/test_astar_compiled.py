@@ -225,10 +225,13 @@ def test_compiled_always_active_static_terminal_exact():
     assert a.status is b.status and a.accepted and abs(a.cost - b.cost) < 1e-9 and _clkey(a) == _clkey(b)
     assert ref.last_expansions == com.last_expansions, "node-count parity through the static wall"
     # the reroute carries a lateral detour on top of the climb round-trip; the (blocked) straight-through
-    # would cost only the climb. Compare against that cfg-derived baseline so the check stays discriminating
-    # under any cost-weight regime (here: reroute ~1440 vs straight-through ~240 at cost_altitude=4).
+    # would cost only the climb. Both the baseline AND the margin are cfg-derived so the check stays
+    # discriminating under any cost-weight regime — the margin is two hex steps of lateral, i.e. strictly
+    # more berth than rounding could produce (an absolute constant here silently stopped discriminating
+    # once the weights were normalized to per-second, where every lateral metre got 30x cheaper).
     straight_through = 2.0 * cfg.flight_levels_m[0] * cfg.cost_altitude_change_per_m
-    assert a.cost > straight_through + 100.0, "reference should reroute around the wall, not fly straight through"
+    two_hexes = 2.0 * cfg.cost_air_lateral_per_m * cfg.nominal_speed_mps * cfg.dt_s
+    assert a.cost > straight_through + two_hexes, "reference should reroute around the wall, not fly straight through"
 
 
 def test_compiled_always_active_own_hub_transparent_foreign_walled_exact():

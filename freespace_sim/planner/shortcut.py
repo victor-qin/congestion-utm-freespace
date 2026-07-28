@@ -116,10 +116,18 @@ class ShortcutRefiner:
         if built is None:
             return intent
         volumes, centerline, cum_horiz, cum_dz = built
+        # Lattice overhead: decrement by what the sweep actually removed rather than inheriting the
+        # inner planner's figure (which would over-report staircase on an already-straightened path).
+        # Splicing out a redundant knot removes hex staircase before it removes any real berth, so
+        # attributing the removal to overhead first is the right first-order split — approximate for
+        # the refiner, exact for bare A*. Floored at 0 and monotone, so it can never invent overhead.
+        inner_horiz = float(np.linalg.norm(np.diff(np.array(corners)[:, :2], axis=0), axis=1).sum())
+        removed = max(0.0, inner_horiz - cum_horiz)
         refined = OperationalIntent(
             request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
             ground_delay_s=g_delay, air_hold_s=0.0,
             air_detour_m=max(0.0, cum_horiz - straight),
+            lattice_overhead_m=max(0.0, intent.lattice_overhead_m - removed),
             altitude_change_m=endpoint_altitude_change_m(
                 float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),
                 cum_dz, cfg),

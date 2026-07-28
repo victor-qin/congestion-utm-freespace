@@ -153,6 +153,28 @@ def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool
     return d < radius + cfg.corridor_width_m / 2.0        # + box half-width
 
 
+def column_dwell_s(center, term, cfg: SimConfig, z: float) -> float:
+    """How long a flight occupies its terminal column above the pad: climb, then egress traverse.
+
+    THE SINGLE SOURCE OF TRUTH for the column window, in the style of :func:`exit_radius`. Every site
+    that books, gates, or clocks a terminal column must call this — ``astar._build``,
+    :func:`build_reservation_from_corners`, and every ``TerminalCapacity`` window — so the gate, the
+    commit, and the corridor start cannot drift apart.
+
+    It exists because they DID drift, twice, in successive review rounds: first the rebuild path
+    booked a column 12 s shorter than the one it was gated against, then (after that was patched) the
+    same path still started its corridor before the egress was flown, so ``astar_shortcut`` / ``milp``
+    / ``astar_milp`` implied 42-54 m/s against a 30 m/s limit while bare ``astar`` was correct. Both
+    were one caller assembling the window itself instead of asking.
+
+    Returns the portion AFTER the pad hover — i.e. exactly what ``hover_reservation`` takes as
+    ``climb_time_s``, and exactly how long after takeoff the corridor may begin.
+    """
+    from .planner.hexgrid import max_lane_traverse_s   # local: hexgrid imports this module
+
+    return cfg.climb_time_to(z) + max_lane_traverse_s(center, term, cfg)
+
+
 # --- The three en-route rulers (issue #50) -------------------------------------------------------
 #
 #     ORIGIN HUB                                                             DEST HUB
@@ -293,7 +315,7 @@ def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: 
 
 def build_reservation_from_corners(
     corners: list[Vec], origin: Vec, dest: Vec, t_depart: float, g_delay: float, cfg: SimConfig,
-    *, origin_term=None, dest_term=None,
+    *, origin_term=None, dest_term=None, corridor_t0: float | None = None,
 ) -> tuple[list[Volume4D], list[TimedPoint], float, float]:
     """Resample a corner polyline to ≤segment-length boxes, time at nominal speed, assemble.
 
@@ -309,7 +331,13 @@ def build_reservation_from_corners(
     # FIRST corner's altitude (its flight level), not a fixed preferred-level climb.
     z_takeoff = float(np.asarray(corners[0], float)[2])
     z_land = float(np.asarray(corners[-1], float)[2])
-    t = t_depart + g_delay + cfg.climb_time_to(z_takeoff)
+    # The corridor may not start until the climb AND the egress traverse are flown (issue #52).
+    # ``corridor_t0`` overrides the derivation with a VERIFIED stamp: a refiner re-timing a path must
+    # anchor the corridor exactly where the inner planner's ledger-checked centerline starts —
+    # re-deriving here mixes this CONTINUOUS clock (climb_time_to + WORST lane) with A*'s QUANTISED
+    # stamp (climb_steps*dt + CHOSEN lane's steps) and shifted every rebuilt volume by -3..+1 s.
+    t = corridor_t0 if corridor_t0 is not None else (
+        t_depart + g_delay + column_dwell_s(origin, origin_term, cfg, z_takeoff))
     centerline: list[TimedPoint] = [(np.asarray(corners[0], float).copy(), t)]
     edges: list[Volume4D] = []
     cum_horiz = cum_dz = 0.0
@@ -356,12 +384,12 @@ def build_reservation_from_corners(
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,
                           radius=terminal_radius(origin_term, cfg) if origin_term else None,
-                          climb_time_s=cfg.climb_time_to(z_takeoff)),
+                          climb_time_s=column_dwell_s(origin, origin_term, cfg, z_takeoff)),
         *edges,
         hover_reservation(dest, t, cfg,
                           terminal_id=dest_term.id if dest_term else None,
                           radius=terminal_radius(dest_term, cfg) if dest_term else None,
-                          climb_time_s=cfg.climb_time_to(z_land)),
+                          climb_time_s=column_dwell_s(dest, dest_term, cfg, z_land)),
     ]
     return volumes, centerline, cum_horiz, cum_dz
 

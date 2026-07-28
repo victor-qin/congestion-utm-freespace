@@ -214,7 +214,7 @@ def _search(
     iv, cv, static_col, ov_own_gen,
     qmin, rmin, qspan, rspan, n_levels, base, max_step,
     # ---- ground / takeoff-fan (host masks) ----
-    oq, orr, lane_q, lane_r, lane_lat, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
+    oq, orr, lane_q, lane_r, lane_lat, lane_stp, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
     # ---- air edges ----
     rung_steps, rung_cost, c_lat_pitch, c_hold_dt, vertical_edges,
     # ---- goal (host masks) ----
@@ -308,8 +308,9 @@ def _search(
             if gi < n_gsteps:                           # takeoff fan: for lane: for level
                 for li in range(n_lanes):
                     lq = lane_q[li]; lr = lane_r[li]
+                    lst = lane_stp[li]              # issue #52: climb, THEN translate out to the lane
                     for Lv in range(n_levels):
-                        ts = step + takeoff_steps[Lv]
+                        ts = step + takeoff_steps[Lv] + lst
                         if ts > max_step:
                             continue
                         if not to_ok[gi * n_levels + Lv]:

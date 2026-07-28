@@ -11,8 +11,10 @@ intent* — a plan is a deterministic function of its read set.
 Conventions:
   * The cell bbox is conservative in z (levels are recorded but the meters conversion ignores them —
     committed columns span the tube anyway); xy + the recorded time window are the discriminators.
-  * The time window is RECORDED, not predicted (``[t_request, max_step*dt + hover tail]``); the
-    spatial-only rule applies to *pre-plan prediction* tubes (Phase 3), never to this validation.
+  * The time window is RECORDED, not predicted (``[t_request, max_step*dt + hover tail + worst
+    egress traverse]`` — the traverse term because a dwell read at the last step reaches
+    ``hover + climb + lane traverse`` past it, issue #52); the spatial-only rule applies to
+    *pre-plan prediction* tubes (Phase 3), never to this validation.
   * Hub discs cover the host-side reads the cell bbox can't see: ``TerminalCapacity`` dwell/transit
     queries, the compiled path's takeoff/landing masks, and ``col_owners`` overlay marks.
 

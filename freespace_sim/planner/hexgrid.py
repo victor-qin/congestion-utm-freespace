@@ -88,6 +88,7 @@ class Lane:
     cell: tuple[int, int]
     bearing: float            # degrees, from the hub centre (the lane ring's stable sort key)
     dist: float               # metres, hub centre → cell centre
+    steps: int = 0            # dt steps to translate ``dist`` at cruise speed (issue #52 egress)
 
 
 _LANE_CACHE: dict = {}
@@ -164,7 +165,8 @@ def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
     hub = np.array([cx, cy])
     lanes = [
         Lane(cell=c, bearing=_bearing_deg(c, cx, cy, R),
-             dist=float(np.linalg.norm(hex_center(*c, R) - hub)))
+             dist=(d := float(np.linalg.norm(hex_center(*c, R) - hub))),
+             steps=int(math.ceil(d / (cfg.nominal_speed_mps * cfg.dt_s))))
         for c in cells
     ]
     _LANE_CACHE[key] = lanes
@@ -405,3 +407,29 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     if len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
         _RANGE_CACHE.popitem(last=False)
     return rows
+
+
+
+def max_lane_traverse_s(center, term, cfg: SimConfig) -> float:
+    """Worst-case seconds to translate from the hub CENTRE out to one of its exit-lane cells.
+
+    The egress is modelled sequentially — climb inside the column, then translate out — so the drone
+    is still inside its own column for this long after topping out, and the column must stay reserved
+    for it. Taking the WORST lane keeps the window per-level rather than per-(lane, level), which
+    matters because ``dwell_ok_levels`` sits in the A* ground-state hot path.
+
+    Measured off ``Lane.steps * dt``, NOT ``dist / speed``. The A* clock advances in whole ``dt``
+    steps, so a continuous ``dist / speed`` window is SHORTER than the delay the planner actually
+    imposes and the column is released while the drone is still inside it — 10.583 s of window against
+    a 12.000 s clock for a 180 m hub AT THE GRID ORIGIN, i.e. 1.417 s of unreserved occupancy that two
+    same-hub flights could overlap in. (The exact traverse depends on where the hub sits relative to
+    the hex lattice — 10.799 s at (500,500), 10.695 s at (10000,10000) — so treat the figure as
+    illustrative; the quantisation below is what makes the guarantee position-independent.) Quantising here keeps the window and the clock identical by
+    construction. 0 when there are no lanes to traverse (no terminal, or ``fixed_exit_lanes`` off —
+    the legacy path folds instead).
+    """
+    term = as_terminal(term)
+    if term is None or not cfg.fixed_exit_lanes:
+        return 0.0
+    lanes = terminal_lanes(center, term, cfg)
+    return max((ln.steps for ln in lanes), default=0) * cfg.dt_s

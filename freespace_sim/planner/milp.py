@@ -36,6 +36,7 @@ from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
 from ..volumes import (build_reservation_from_corners, enroute_detour_m,
                        enroute_flown_m, enroute_reference_m, fold_corners_to_columns)
+from .hexgrid import max_lane_traverse_s
 from .straight import StraightLineTimeShift
 from .terminal_capacity import TerminalCapacity
 
@@ -219,10 +220,16 @@ class MILPOptPlanner:
         ref_pos, ref_t = (None, None)
         if ref_path is not None and len(ref_path) >= 2:
             ref_pos, ref_t = self._resample(ref_path, N)
+        # The model's clock must match the REBUILD's (issue #52): build_reservation_from_corners
+        # stamps the corridor `column_dwell_s = climb + egress traverse` after takeoff, so the model
+        # carries the same constant or every temporal disjunction is evaluated one traverse early
+        # (12 s at a 180 m hub, 20 s at 350 m — d-invariant, so the delay-bump loop can never
+        # realign it) and the prefilter window misses obstacles in the true reach's last seconds.
+        trav0 = max_lane_traverse_s(origin, o_term, cfg)
         # reachable absolute-time range across all delays in [0, max_ground_delay] AND all entry
-        # levels in the band (the actual cruise start is the affine t_depart + d + climb(pz[0]))
-        t_lo = t_depart + cfg.climb_time_to(z_lo) - cfg.time_buffer_s
-        t_hi = (t_depart + cfg.max_ground_delay_s + cfg.climb_time_to(z_hi)
+        # levels in the band (the actual cruise start is the affine t_depart + d + climb(pz[0]) + trav0)
+        t_lo = t_depart + cfg.climb_time_to(z_lo) + trav0 - cfg.time_buffer_s
+        t_hi = (t_depart + cfg.max_ground_delay_s + cfg.climb_time_to(z_hi) + trav0
                 + (N - 1) * cfg.dt_s + cfg.time_buffer_s)
         exempt_tids = frozenset(t.id for t in (o_term, d_term) if t is not None)
         obstacles = self._nearby_obstacles(ledger, start, goal, t_lo, t_hi, cfg, exempt_tids)
@@ -271,8 +278,9 @@ class MILPOptPlanner:
         for k in range(N - 1):
             cumL.append(cumL[-1] + L[k])
         # cruise-clock origin: the ENTRY climb is affine in the (free) entry altitude pz[0] — a
-        # higher chosen level starts the cruise later, exactly as the rebuild's climb_time_to(z₀)
-        climb0 = (pz[0] - cfg.ground_level_m) / cfg.climb_rate_mps
+        # higher chosen level starts the cruise later — plus the egress traverse, exactly as the
+        # rebuild's `column_dwell_s(z0) = climb_time_to(z0) + max_lane_traverse_s` (issue #52)
+        climb0 = (pz[0] - cfg.ground_level_m) / cfg.climb_rate_mps + trav0
 
         # big-M obstacle avoidance. SPATIAL faces are per SEGMENT and shared by both endpoints: a
         # keepout face is a half-space, so both endpoints outside the SAME face ⇒ the whole straight

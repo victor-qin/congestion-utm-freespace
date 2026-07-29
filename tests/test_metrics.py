@@ -30,6 +30,28 @@ def test_reserved_volume_seconds_clamps_open_window():
     assert math.isclose(metrics.reserved_volume_seconds([vol], 20.0, 50.0), 30.0, rel_tol=1e-9)
 
 
+def test_bare_flight_row_does_not_clamp_at_the_horizon():
+    """``flight_row``'s ``window=None`` must mean UNCLAMPED, matching what ``flight_frame`` measures.
+
+    It used to mean ``[0, horizon_s]``. Since ``flight_frame`` switched to ``simulation_window``,
+    that default made ``flight_row`` the last surface still truncating the post-horizon return tail —
+    two public entry points in this module reporting different ``reserved_vol_m3_s`` for one flight.
+    """
+    cfg = SimConfig(horizon_s=1800.0, planner="straight")
+    # a return leg reserving [1700, 2300): 100 s inside the horizon, 500 s past it
+    box = box_from_segment(vec(0, 0, 100), vec(100, 0, 100), 40, 120)
+    vol = Volume4D(box, 1700.0, 2300.0)
+    unclamped = metrics.reserved_volume_seconds([vol], -math.inf, math.inf)
+    at_horizon = metrics.reserved_volume_seconds([vol], 0.0, cfg.horizon_s)
+    assert unclamped == pytest.approx(6.0 * at_horizon)   # 600 s of reservation vs the 100 s pre-horizon
+
+    res = run(cfg, requests=[FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0)])
+    intent = res.intents[0]
+    bare = metrics.flight_row(intent, cfg)["reserved_vol_m3_s"]
+    framed = metrics.flight_frame(res).iloc[0]["reserved_vol_m3_s"]
+    assert bare == pytest.approx(framed)
+
+
 def test_flight_frame_one_row_per_intent():
     res = run(SimConfig(planner="straight"),
               requests=[FlightRequest(0, vec(0, 0, 0), vec(2400, 0, 0), 0.0)])
@@ -375,17 +397,40 @@ def test_steady_state_window_falls_back_when_degenerate():
     assert metrics.steady_state_window(_synthetic_result([ghost], 1000.0)) == (0.0, 0.0)
 
 
-def test_density_grid_spans_open_ended_volume_without_unbounded_allocation():
-    # A pathological hand-built t_end~1e6 fixture is fully represented by coarsening, not truncating:
-    # density runs land return traffic AFTER the horizon, so the grid must not clip at 4x horizon.
+def _open_ended_ghost(t_end: float) -> OperationalIntent:
+    """One accepted intent holding a reservation to ``t_end`` — forces the adaptive grid to coarsen."""
     from freespace_sim.geometry import box_from_segment
     box = box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30)
-    ghost = OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(60, 0, 0), 0.0), IntentStatus.ACCEPTED,
-                              volumes=[Volume4D(box, 0.0, 1e6)])
-    res = _synthetic_result([ghost], 1000.0)
+    return OperationalIntent(FlightRequest(0, vec(0, 0, 0), vec(60, 0, 0), 0.0), IntentStatus.ACCEPTED,
+                             volumes=[Volume4D(box, 0.0, t_end)])
+
+
+def test_density_grid_spans_open_ended_volume_without_unbounded_allocation():
+    # A pathological hand-built open-ended fixture is fully represented by coarsening, not truncating:
+    # density runs land return traffic AFTER the horizon, so the grid must not clip at 4x horizon.
+    # t_end must exceed 250_000 x dt to actually EXERCISE coarsening — at 1e6/dt=4 the grid step is
+    # max(4.0, 4.0), i.e. the cap is never reached and the coarsening branch is a no-op.
+    res = _synthetic_result([_open_ended_ghost(1e7)], 1000.0)
     t, _ = metrics.density_timeseries(res, dt=4.0)
-    assert t[-1] >= 1e6                                 # complete time range, no horizon cutoff
+    assert t[-1] >= 1e7                                 # complete time range, no horizon cutoff
     assert len(t) <= 250_002                            # adaptive grid remains bounded in memory
+    assert float(t[1] - t[0]) == pytest.approx(40.0)    # coarsened 10x from dt=4.0 (1e7 / 250_000)
+
+
+def test_steady_state_smoothing_kernel_is_measured_against_the_coarsened_grid():
+    """``smooth_s`` is seconds, so the kernel width must divide by the grid step actually returned.
+
+    ``density_timeseries`` coarsens to ``max(dt, span/250k)``. Dividing ``smooth_s`` by the *requested*
+    ``dt`` instead makes the kernel ``grid_dt/dt`` times too wide — 10x on this fixture — which smears
+    the plateau across the ramps and mislocates the window.
+    """
+    step, dur, n = 4.0, 80.0, 50          # plateau of full overlap is [80, 196]
+    flights = [_accepted_over(k, k * step, k * step + dur) for k in range(n)]
+    res = _synthetic_result([*flights, _open_ended_ghost(1e7)], 1000.0)
+    lo, hi = metrics.steady_state_window(res, frac=0.9, dt=step, smooth_s=dur)
+    # True full-overlap plateau is [80, 196]; grid_dt is 40 s, so allow one bin of slack each side.
+    # Dividing by dt instead of grid_dt yields [0, 440] — the window runs off the front of the ramp.
+    assert (lo, hi) == pytest.approx((80.0, 196.0), abs=40.0), f"plateau mislocated: got [{lo}, {hi}]"
 
 
 def test_windowed_aggregate_uses_window_duration_and_records_provenance():

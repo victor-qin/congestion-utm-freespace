@@ -69,6 +69,8 @@ def spec_from_args(args):
         top["lam_per_hour"] = args.lam
     if args.horizon is not None:
         top["horizon_s"] = args.horizon
+    if args.demand_duration is not None:
+        top["demand_duration_s"] = args.demand_duration
     if args.seed is not None:
         top["seed"] = args.seed
     if args.planner is not None:
@@ -103,13 +105,23 @@ def spec_from_args(args):
     return with_overrides(spec, demand_overrides=demand or None, **top)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from ``main`` so tests can construct a real args namespace.
+
+    Hand-mirroring this flag set in a test fixture silently rots the moment a flag is added —
+    ``spec_from_args`` reads attributes that the fixture doesn't have. Parse from here instead.
+    """
     p = argparse.ArgumentParser(description="Run one scenario and persist it (the execute box).")
     p.add_argument("--scenario", choices=sorted(SCENARIOS), default="metro_uniform",
                    help="named world from the registry (override individual fields with the flags below)")
     p.add_argument("--region", type=float, nargs=2, metavar=("W", "H"), default=None)
     p.add_argument("--lam", type=float, default=None, help="arrival rate (req/h)")
     p.add_argument("--horizon", type=float, default=None, help="sim horizon (s)")
+    p.add_argument("--demand-duration", type=float, default=None,
+                   help="offered-load window (s); demand is generated over this, the run continues to "
+                        "--horizon so the return tail is never clipped. Must be <= --horizon, so shrinking "
+                        "a density_* scenario for a smoke test needs BOTH (e.g. --horizon 900 "
+                        "--demand-duration 120). Unset keeps the scenario's own value.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--planner", default=None, help="override planner")
     p.add_argument("--terminal-airspace-always-active", action=argparse.BooleanOptionalAction,
@@ -151,7 +163,11 @@ def main() -> None:
                         "benchmark sweet spot is ~4 workers for exact, ~8 for relaxed)")
     p.add_argument("--parallel-window", type=int, default=None,
                    help="speculation window (default 4×workers); result-affecting in relaxed mode")
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     spec = spec_from_args(args)
     scenario_payload = dataclasses.asdict(spec)
@@ -193,6 +209,17 @@ def main() -> None:
         sim_hi,
         sim_hi - sim_lo,
     )
+    # SimConfig only validates demand_duration_s <= horizon_s, but what actually has to fit under the
+    # horizon is preroll + demand window + lead spread + trip. The preroll is a max-order statistic over
+    # the departure-lead draws (~2300 s for amazon_uss's N(1800, 300)), so a shrunken --horizon can pass
+    # validation and still push most departures past it — where the compiled A* box guard silently
+    # dispatches to the ~5-7x slower pure-Python reference. On a cluster that is the difference between
+    # a 6-hour job and a 30-hour one, so say it out loud rather than let the allocation absorb it.
+    late = sum(1 for i in res.intents if i.request.t_departure > cfg.horizon_s)
+    if late:
+        log.warning("%d/%d departures (%.0f%%) are past horizon_s=%.0fs — those flights fall back to "
+                    "the slow reference A* (box guard). Raise --horizon or lower --demand-duration.",
+                    late, len(res.intents), 100.0 * late / len(res.intents), cfg.horizon_s)
     if pcfg is not None and pcfg.stats:
         log.info("parallel stats: %s", pcfg.stats)
 

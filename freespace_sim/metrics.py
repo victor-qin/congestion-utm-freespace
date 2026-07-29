@@ -180,22 +180,28 @@ def steady_state_window(result: SimResult, frac: float = 0.9, dt: float | None =
     itself; ``0`` disables it (raw density, for controlled inputs). Falls back to the realized simulation
     window when no plateau is detectable."""
     cfg = result.config
-    full_window = simulation_window(result)
+    # simulation_window walks every accepted intent's volumes (~2.4M Volume4D on a 27k-flight density
+    # run), so pay for it only on the fallback paths that actually return it — not before the plateau
+    # search that usually discards it.
     if not result.accepted:
-        return full_window
+        return simulation_window(result)
     dt = cfg.dt_s if dt is None else dt
     t, d = density_timeseries(result, dt)
     if d.size == 0 or float(d.max()) <= 0.0:
-        return full_window
+        return simulation_window(result)
     if smooth_s is None:   # adapt to the median airborne span (≈ the trip duration = the ramp width)
         widths = [iv[1] - iv[0] for i in result.accepted if (iv := _airborne_interval(i)) is not None]
         smooth_s = float(np.median(widths)) if widths else 0.0
-    if smooth_s and smooth_s > dt:
-        k = max(1, int(round(smooth_s / dt)))
+    # Measure the kernel against the grid we actually got back, not the one we asked for:
+    # density_timeseries coarsens to max(dt, span/250k), so on a coarsened grid `smooth_s / dt`
+    # over-widens the kernel by grid_dt/dt and mislocates the plateau.
+    grid_dt = float(t[1] - t[0]) if t.size > 1 else dt
+    if smooth_s and smooth_s > grid_dt:
+        k = max(1, int(round(smooth_s / grid_dt)))
         d = np.convolve(d, np.ones(k) / k, mode="same")
     run = _widest_hot_run(d >= frac * float(d.max()))
     if run is None:
-        return full_window
+        return simulation_window(result)
     return (float(t[run[0]]), float(t[run[1]]))
 
 
@@ -375,10 +381,15 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
                window: tuple[float, float] | None = None) -> dict:
     """One tidy record for a single operational intent (accepted or denied).
 
-    ``window=(t_lo, t_hi)`` clamps this row's reserved volume-seconds to the measurement window
-    (default ``[0, horizon_s]``); it does not otherwise change the row (membership filtering by filing
-    time is :func:`flight_frame`'s job)."""
-    res_lo, res_hi = (0.0, cfg.horizon_s) if window is None else window
+    ``window=(t_lo, t_hi)`` clamps this row's reserved volume-seconds to the measurement window; it
+    does not otherwise change the row (membership filtering is :func:`flight_frame`'s job).
+
+    ``window=None`` means *unclamped*, NOT ``[0, horizon_s]``. It meant the latter until this became
+    the only surface still truncating the post-horizon return tail: :func:`flight_frame` passes
+    :func:`simulation_window`, so a bare ``flight_row`` reported several-fold less
+    ``reserved_vol_m3_s`` than ``flights.parquet`` did for the very same flight. A single intent
+    carries no run bounds, so the honest default is to invent none."""
+    res_lo, res_hi = (-math.inf, math.inf) if window is None else window
     straight = _straight_horizontal_m(intent, cfg)
     flown = _flown_horizontal_m(intent, cfg)
     stretch = (flown / straight) if (intent.accepted and straight > 1e-9) else float("nan")

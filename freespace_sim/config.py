@@ -210,8 +210,12 @@ class SimConfig:
             if self.demand_duration_s <= 0.0:
                 raise ValueError("demand_duration_s must be positive")
             if self.demand_duration_s > self.horizon_s:
+                # Deliberately fatal rather than clamped: clamping makes a shrunken horizon look like it
+                # worked, but the departure lead is unaffected, so every departure still lands past the
+                # horizon and the "quick smoke test" silently runs on the box-guard fallback path.
                 raise ValueError(
-                    f"demand_duration_s {self.demand_duration_s} exceeds horizon_s {self.horizon_s}")
+                    f"demand_duration_s {self.demand_duration_s} exceeds horizon_s {self.horizon_s} "
+                    f"— lower demand_duration_s too (CLI: --demand-duration alongside --horizon)")
         lv = self.flight_levels_m
         if not lv:
             raise ValueError("flight_levels_m must be non-empty")

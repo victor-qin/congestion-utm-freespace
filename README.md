@@ -31,8 +31,8 @@ Experiments are a three-stage pipeline joined through saved run folders on disk 
 **execute** it, **read out** artifacts — composed with plain shell (see [Experiments](#experiments)).
 
 ```bash
-uv sync
-uv run pytest -q -m "not slow"          # full test suite, ASTM invariant included
+uv sync                                 # installs numba too (default-group), so A* gets the compiled kernel
+uv run --extra dev pytest -q -m "not slow"   # full suite; pytest lives in the `dev` EXTRA, which uv sync does not install
 
 # EXECUTE one named scenario → a complete, reloadable run folder (the folder path is the last stdout line):
 FOLDER=$(uv run python -m experiments.run --scenario dallas_hub_2uss --planner astar_shortcut | tail -1)
@@ -151,8 +151,10 @@ index the loop populated.
 (`compare_optimizers.py` stays standalone: it's a planner micro-benchmark on hand-built obstacles, not
 the demand pipeline.)
 
-Every run folder is self-contained (`config.json`, `scenario_spec.json`, `experiment.json`, `scenario.parquet`,
-`trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `per_uss.parquet`) and a row is
+Every run folder is self-contained (`config.json`, `experiment.json`, `scenario.parquet`,
+`trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `per_uss.parquet`); runs launched
+through `experiments.run` also carry `scenario_spec.json`, the resolved post-override recipe, so the
+world is reproducible from the folder alone. A row is
 appended to `results/index.parquet` (with `scenario`/`tag`/`demand`/`n_uss` columns) for cross-run
 readouts. **Per-run** readouts (`replay`/`figures`/`uss_breakdown`/`histograms`) write *into* the run
 folder (or a collecting `--out-dir`); the **cross-run** `curve`/`compare` describe a run *set*, so they
@@ -167,16 +169,6 @@ A standalone webpage (no server) that plays the reservations back like a video:
   planner ran).
 - **Dashed origin→dest** reference line per active flight — the gap to its solid corridor *is* the
   detour the FCFS newcomer paid.
-
-**It stays small.** A dense run reserves hundreds of thousands of corridor boxes, and dumping them
-verbatim reached 78 MB at 4.7k flights (~400 MB at 26k) — too big to archive or open comfortably.
-Three encodings stack to **~140x smaller** (78 MB → 0.55 MB) with no loss of visual fidelity:
-corridor boxes are **not stored at all** but rebuilt in the browser from the path (they are exactly
-the swept centerline, which `viz_html._rebuildable` verifies per flight — a planner that reserves
-anything else keeps explicit polygons); coordinates are quantised to decimetres and delta-encoded;
-and the result is gzipped into one base64 string, inflated on load via `DecompressionStream`
-(Chrome 80+ / Safari 16.4+ / Firefox 113+). Loading got ~14x faster as a side effect, since the
-browser no longer parses tens of MB of JavaScript source.
 
 ## Metrics
 
@@ -193,7 +185,8 @@ run are diluted by the low-density ramps, so `metrics.steady_state_window(result
 the whole-run number **and** its steady-state twin measured over that window: `summary.json` carries a
 nested `steady_state` block, `index.parquet` gains `steady_*` / `window_*` columns, and the `curve` /
 `compare` / `histograms` readouts overlay the two. `--window-frac` tunes the plateau threshold; the
-replay always spans the first flight activity through the final landing. This **supersedes** the removed
+replay is written unclipped, so post-horizon return traffic stays visible instead of being cut at
+`horizon_s` (the clock still starts at 0 and never ends before the horizon). This **supersedes** the removed
 `clip_returns_to_horizon` demand hack (issue #25): run and preserve the natural demand and its full tail,
 while the separate steady-state view measures only the representative plateau.
 

@@ -165,6 +165,9 @@ def test_index_parquet_appends(tmp_path):
     idx = pd.read_parquet(tmp_path / "index.parquet")
     assert len(idx) == 2
     assert {"path", "planner", "verified", "mean_total_delay_s"} <= set(idx.columns)
+    # every row is stamped with the metric definition it was written under, so an appended index can
+    # never silently average rows whose airspace_utilization/steady_* meanings differ (see compare.py)
+    assert (idx["metrics_version"] == metrics.METRICS_VERSION).all()
 
 
 def test_index_records_scenario_tag_demand_for_cross_run_filter(tmp_path):

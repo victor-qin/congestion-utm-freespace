@@ -271,6 +271,10 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
     steady_cols["window_lo"] = steady.get("window_lo")
     steady_cols["window_hi"] = steady.get("window_hi")
     row = {"path": str(folder), "scenario": scenario,
+           # index.parquet is APPENDED to, so one file accumulates rows from different metric
+           # definitions. Without this stamp a cross-run mean silently mixes them — most sharply
+           # airspace_utilization, whose denominator changed for every scenario in version 2.
+           "metrics_version": metrics.METRICS_VERSION,
            "scenario_description": scenario_description, "tag": tag, "demand": demand,
            "planner": cfg.planner, "lam_per_hour": cfg.lam_per_hour, "seed": cfg.seed,
            "horizon_s": cfg.horizon_s,

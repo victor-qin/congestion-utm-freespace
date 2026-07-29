@@ -40,6 +40,15 @@ from .types import DenialReason, OperationalIntent
 from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
 
 
+# Bumped whenever a persisted metric changes MEANING (not when one is added). `runs._append_index`
+# stamps it on every row so `results/index.parquet` — which is appended to, and therefore accumulates
+# rows written by different versions of this file — can never silently average incomparable numbers.
+#   1  original: capacity + rate denominators both cfg.horizon_s; measurement window [0, horizon_s]
+#   2  denominators split (dur_s = realized run for capacity, rate_dur_s = demand window for rates);
+#      measurement window widened to simulation_window, so airspace_utilization changed for EVERY
+#      scenario, and window membership moved from the filing clock to the occupancy clock
+METRICS_VERSION = 2
+
 # The realized run may legitimately exceed horizon_s (post-horizon return tail) but not by orders of
 # magnitude. Generous on purpose: the density family's tail runs ~1.3x its envelope, and this only has
 # to catch a sentinel timestamp (1e12) that leaked into an accepted reservation.

@@ -397,6 +397,70 @@ def test_steady_state_window_falls_back_when_degenerate():
     assert metrics.steady_state_window(_synthetic_result([ghost], 1000.0)) == (0.0, 0.0)
 
 
+def test_all_denied_run_reports_its_denial_rate_in_the_steady_block():
+    """A zero-width window must not publish a block of structural zeros.
+
+    Nothing accepted ⇒ simulation_window is (0, 0) ⇒ a windowed cohort is empty ⇒ denial_rate is
+    0/max(1,0) == 0.0, i.e. a saturated run archives byte-identically to a flawless one. The steady
+    twin degenerates to the whole-run view instead, which is what the deleted fallbacks guaranteed.
+    """
+    denied = [OperationalIntent(FlightRequest(i, vec(0, 0, 0), vec(1, 0, 0), float(i)),
+                                IntentStatus.REJECTED) for i in range(5)]
+    agg = metrics.aggregate_with_steady(_synthetic_result(denied, 600.0))
+    assert agg["denial_rate"] == 1.0
+    steady = agg["steady_state"]
+    assert steady["n_requests"] == 5
+    assert steady["denial_rate"] == 1.0          # NOT 0.0
+    assert (steady["window_lo"], steady["window_hi"]) == (0.0, 0.0)   # provenance still recorded
+
+
+def test_steady_block_falls_back_when_a_positive_window_selects_no_takeoffs():
+    """A NON-degenerate steady window can still select an empty cohort — guard on the cohort, not width.
+
+    All 30 flights take off in [0, 29] but stay airborne to 2000, so the concurrency plateau (and thus
+    steady_state_window) centers hundreds of seconds later, around (808, 1208), where no flight's
+    occupancy clock falls. Guarding only zero-width windows (win[1] <= win[0]) would measure over this
+    positive-but-empty window and republish structural zeros; the cohort must fall back to the whole
+    run. This is reachable on any run whose trips outlast the takeoff burst, not just synthetic ones.
+    """
+    flights = [_accepted_over(k, float(k), 2000.0) for k in range(30)]
+    res = _synthetic_result(flights, 3000.0)
+
+    lo, hi = metrics.steady_state_window(res)
+    assert hi > lo, "fixture no longer yields a positive window — the check would be vacuous"
+    assert len(metrics.flight_frame(res, window=(lo, hi))) == 0, "fixture no longer empties the cohort"
+
+    steady = metrics.aggregate_with_steady(res)["steady_state"]
+    assert steady["n_requests"] == len(flights)              # fell back to the whole-run cohort, not 0
+    assert steady["n_accepted"] == len(flights)              # ...with its real (non-zero) numbers
+    assert (steady["window_lo"], steady["window_hi"]) == (lo, hi)   # window provenance preserved
+
+
+def test_window_membership_uses_the_occupancy_clock_not_the_filing_clock():
+    """Cohort selection and the window itself must be on one clock.
+
+    ``steady_state_window`` is derived from airborne density; filtering by ``t_request`` against it is
+    only correct when flights depart on filing. Under a scheduling lead the two clocks can be fully
+    disjoint (measured: t_request [0, 2823] vs t_occupancy [2892, 3780] on a density run), so the
+    filing-time cohort was empty and every steady metric published zeros.
+    """
+    lead = 500.0        # every flight files at t=0 but takes off ~lead later
+    flights = [_accepted_over(k, lead + 4.0 * k, lead + 4.0 * k + 80.0) for k in range(30)]
+    for f in flights:
+        object.__setattr__(f.request, "t_request", 0.0)
+    res = _synthetic_result(flights, 2000.0)
+
+    df_all = metrics.flight_frame(res)
+    assert "t_occupancy" in df_all.columns, "flights.parquet must carry the clock readouts filter on"
+    assert df_all["t_occupancy"].min() >= lead      # airborne clock, not the all-zero filing clock
+
+    lo, hi = metrics.steady_state_window(res)
+    assert hi > lo
+    sub = metrics.flight_frame(res, window=(lo, hi))
+    assert len(sub) > 0, "airborne-derived window selected nobody — clocks are crossed again"
+    assert len(sub) < len(df_all)                  # and it is a real subset, not everything
+
+
 def _open_ended_ghost(t_end: float) -> OperationalIntent:
     """One accepted intent holding a reservation to ``t_end`` — forces the adaptive grid to coarsen."""
     from freespace_sim.geometry import box_from_segment

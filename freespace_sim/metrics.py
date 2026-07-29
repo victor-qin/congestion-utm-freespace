@@ -28,6 +28,7 @@ separate from `SEARCH_EXHAUSTED` (a planner artifact) keeps that signal honest �
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,12 @@ from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
 from .types import DenialReason, OperationalIntent
 from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
+
+
+# The realized run may legitimately exceed horizon_s (post-horizon return tail) but not by orders of
+# magnitude. Generous on purpose: the density family's tail runs ~1.3x its envelope, and this only has
+# to catch a sentinel timestamp (1e12) that leaked into an accepted reservation.
+_MAX_PLAUSIBLE_RUN_FACTOR = 100.0
 
 
 def shape_volume_m3(shape) -> float:
@@ -85,6 +92,27 @@ def _airborne_interval(intent: OperationalIntent) -> tuple[float, float] | None:
     if intent.centerline:
         return (intent.centerline[0][1], intent.centerline[-1][1])
     return None
+
+
+def occupancy_time_s(intent: OperationalIntent) -> float:
+    """When this flight took (or wanted to take) the airspace — the clock every window is measured on.
+
+    Accepted: the start of its :func:`_airborne_interval` (actual takeoff). Denied: its desired
+    ``t_departure``, since it never became airborne but is the traffic the window is trying to
+    characterise; dropping denials would make ``denial_rate`` structurally 0 inside every window.
+
+    NOT ``t_request``. Filing time and airborne time are the same clock only when flights depart on
+    filing. Under ``timing_mode="departure"`` they are separated by the whole scheduling lead (~2300 s
+    for amazon_uss), so selecting a cohort by ``t_request`` against a window derived from airborne
+    density can miss it entirely — measured at 0 of 194 flights on a density run.
+
+    Known bias: an accepted flight's takeoff is pushed later by its ground delay while a denied
+    flight's stand-in is not, so denials skew slightly early relative to acceptances within a window.
+    That shift is tens of seconds against windows hundreds of seconds wide; it is the honest cost of
+    the only clock both cohorts can share.
+    """
+    iv = _airborne_interval(intent)
+    return float(iv[0]) if iv is not None else float(intent.request.t_departure)
 
 
 def simulation_window(result: SimResult) -> tuple[float, float]:
@@ -478,18 +506,25 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         "flown_m": flown,
         "stretch": stretch,
         "reserved_vol_m3_s": reserved_volume_seconds(intent.volumes, res_lo, res_hi),
+        # Persisted so a readout can reproduce flight_frame's window membership. flights.parquet used
+        # to carry only t_request, which is a DIFFERENT clock under timing_mode="departure" — that is
+        # why histograms.py silently dropped its steady overlay. See occupancy_time_s.
+        "t_occupancy": occupancy_time_s(intent),
     }
 
 
 def flight_frame(result: SimResult, window: tuple[float, float] | None = None) -> pd.DataFrame:
     """Per-flight metrics table — one row per intent, FCFS order preserved.
 
-    ``window=(t_lo, t_hi)`` restricts the table to flights *filed* in ``[t_lo, t_hi)`` (filing-time
-    membership — a flight's delay is fixed at entry, and this drops the ramp tails, incl. return flights
-    filed past the horizon) and clamps each row's reserved volume-seconds to the window. ``None``
+    ``window=(t_lo, t_hi)`` restricts the table to flights that took the airspace in ``[t_lo, t_hi)``
+    (see :func:`occupancy_time_s`) and clamps each row's reserved volume-seconds to the window. ``None``
     (default) is the whole run: every intent, volume measured across the complete realized simulation
     window — first accepted flight activity through final landing — identical to the persisted
-    ``flights.parquet``."""
+    ``flights.parquet``.
+
+    Membership is on the OCCUPANCY clock, not the filing clock, because every window this is called
+    with (``steady_state_window``, ``simulation_window``) is itself derived from airborne density.
+    Mixing the two silently produced empty cohorts under ``timing_mode="departure"``."""
     measurement_window = simulation_window(result) if window is None else window
     df = pd.DataFrame([
         flight_row(intent, result.config, measurement_window)
@@ -497,7 +532,7 @@ def flight_frame(result: SimResult, window: tuple[float, float] | None = None) -
     ])
     if window is not None and len(df):
         lo, hi = window
-        df = df[(df["t_request"] >= lo) & (df["t_request"] < hi)].reset_index(drop=True)
+        df = df[(df["t_occupancy"] >= lo) & (df["t_occupancy"] < hi)].reset_index(drop=True)
     return df
 
 
@@ -605,7 +640,20 @@ def _denominators(result: SimResult, window: tuple[float, float] | None):
     """
     if window is None:
         sim_lo, sim_hi = simulation_window(result)
-        return sim_lo, sim_hi, sim_hi - sim_lo, result.config.effective_demand_duration_s
+        dur = sim_hi - sim_lo
+        # The realized run is deliberately unbounded by horizon_s — that is the point of this PR, and
+        # the return tail legitimately runs past it. But it is bounded by PHYSICS: a run cannot last
+        # orders of magnitude longer than its planner envelope. A wall-style sentinel (_WALL_T_END_S
+        # = 1e12) reaching an accepted intent's .volumes would divide utilization by ~1e9 with no
+        # error, so warn instead of silently publishing it. Not a clamp: clamping would re-truncate
+        # the tail the whole change exists to keep.
+        if dur > _MAX_PLAUSIBLE_RUN_FACTOR * result.config.horizon_s:
+            warnings.warn(
+                f"realized run duration {dur:.0f}s exceeds {_MAX_PLAUSIBLE_RUN_FACTOR}x horizon_s "
+                f"({result.config.horizon_s:.0f}s) — a sentinel/open-ended reservation has probably "
+                f"reached an accepted intent; airspace_utilization is meaningless for this run",
+                RuntimeWarning, stacklevel=2)
+        return sim_lo, sim_hi, dur, result.config.effective_demand_duration_s
     lo, hi = window
     return lo, hi, hi - lo, hi - lo
 
@@ -709,7 +757,18 @@ def aggregate_with_steady(result: SimResult, frac: float = 0.9, smooth_s: float 
     the median trip duration, so the window tracks the plateau, not a transient concurrency spike)."""
     win = steady_state_window(result, frac=frac, dt=dt, smooth_s=smooth_s)
     out = aggregate(result)
-    steady = aggregate(result, window=win)
+    # The steady twin means something only if the window actually selected flights. Two ways it can
+    # come up empty and republish a block of structural zeros — an all-denied run would then archive
+    # steady_denial_rate 0.0, byte-identical to a flawless one:
+    #   * a zero-width window (nothing accepted ⇒ simulation_window is (0, 0)); and
+    #   * a positive window that no takeoff's occupancy clock falls inside (a low-λ plateau spanned end
+    #     to end by aircraft that departed earlier) ⇒ n_requests == 0 despite hi > lo.
+    # Either way, fall back to the whole-run view — what the deleted `(0, horizon_s)` fallbacks
+    # guaranteed. (dict(out) is a shallow copy; only the two scalar window keys are reassigned below.)
+    steady = aggregate(result, window=win) if win[1] > win[0] else dict(out)
+    if steady.get("n_requests", 0) == 0:
+        steady = dict(out)
+    steady["window_lo"], steady["window_hi"] = float(win[0]), float(win[1])
     for k in (
         "lam_per_hour",
         "demand_duration_s",

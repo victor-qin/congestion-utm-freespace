@@ -31,12 +31,18 @@ from freespace_sim import viz
 
 
 def _steady_subset(folder, acc, window_frac):
-    """The steady-state-windowed slice of ``acc`` (accepted flights filed in the density plateau) as
-    ``(subset, (t_lo, t_hi))``. ``None`` when there is no window, no ``t_request`` column, or the window
-    trims nothing (no plateau ⇒ identical to the whole run, so an overlay would be redundant). Default
-    reads the window ``save_run`` stored in ``summary.json``; ``window_frac`` recomputes it from the
-    reloaded run's reservations (issue #25)."""
-    if "t_request" not in acc.columns:
+    """The steady-state-windowed slice of ``acc`` (accepted flights that took the airspace during the
+    density plateau) as ``(subset, (t_lo, t_hi))``. ``None`` when there is no window, no ``t_occupancy``
+    column, or the window trims nothing (no plateau ⇒ identical to the whole run, so an overlay would be
+    redundant). Default reads the window ``save_run`` stored in ``summary.json``; ``window_frac``
+    recomputes it from the reloaded run's reservations (issue #25).
+
+    Membership must use ``t_occupancy``, the same clock ``metrics.flight_frame`` uses and the same one
+    the window is derived from. Filtering on ``t_request`` here silently produced an EMPTY subset on
+    every ``timing_mode="departure"`` run — the filing and airborne clocks are separated by the
+    scheduling lead — so the overlay vanished from the figures with no warning. Runs archived before
+    ``t_occupancy`` existed simply get no overlay rather than a wrong one."""
+    if "t_occupancy" not in acc.columns:
         return None
     win = None
     if window_frac is not None:
@@ -51,7 +57,7 @@ def _steady_subset(folder, acc, window_frac):
     if win is None:
         return None
     lo, hi = win
-    sub = acc[(acc["t_request"] >= lo) & (acc["t_request"] < hi)]
+    sub = acc[(acc["t_occupancy"] >= lo) & (acc["t_occupancy"] < hi)]
     if not 0 < len(sub) < len(acc):   # no plateau trimmed anything → skip the (redundant) overlay
         return None
     return sub, (lo, hi)

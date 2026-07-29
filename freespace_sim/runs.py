@@ -339,6 +339,25 @@ class LoadedRun:
         return metrics.aggregate_with_steady(self)  # type: ignore[arg-type]
 
 
+def load_scenario_spec(folder: Path | str):
+    """Rebuild the ``ScenarioSpec`` a run was launched from, or ``None`` if the folder has none.
+
+    Complements :func:`load_run`, which reconstructs the *result*. This reconstructs the *recipe* —
+    the resolved post-override world — so a run can be re-executed (at a new seed, planner, or λ)
+    from the folder alone instead of by remembering the command line.
+
+    ``None`` is expected, not exceptional: ``scenario_spec.json`` is written only when the caller
+    supplies one (``experiments.run`` does; ``analysis/altitude_benchmark.py`` does not), and no run
+    archived before the file existed has it.
+    """
+    from .scenarios.spec import ScenarioSpec
+
+    path = Path(folder) / "scenario_spec.json"
+    if not path.exists():
+        return None
+    return ScenarioSpec.from_json_dict(json.loads(path.read_text()))
+
+
 def load_run(folder: Path | str) -> LoadedRun:
     """Rebuild a `SimResult`-shaped object from a saved run folder (the reverse of `save_run`).
 

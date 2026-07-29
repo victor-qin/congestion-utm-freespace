@@ -8,7 +8,7 @@ flies, from where, in what pattern). It is the config recipe; :class:`freespace_
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from ..config import SimConfig
 from ..demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
@@ -16,6 +16,11 @@ from ..demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPois
 # default Walmart/strip-mall split for the hub patterns when counts aren't given explicitly
 _DEFAULT_HUB_LABELS = ("walmart_uss", "stripmall_uss")
 _DEFAULT_HUB_COUNTS = (6, 20)
+
+# Bumped when the persisted scenario_spec.json layout changes incompatibly. Stamped by
+# ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
+# reinterpreted under a schema it was not written with.
+_SPEC_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,53 @@ class ScenarioSpec:
 
     def demand_model(self) -> DemandModel | None:
         return self.demand.build()
+
+    def to_json_dict(self) -> dict:
+        """A JSON-safe dict that :meth:`from_json_dict` can turn back into an equal ``ScenarioSpec``.
+
+        ``dataclasses.asdict`` alone does NOT round-trip: JSON has no tuple, so ``region_m`` /
+        ``flight_levels_m`` / ``uss`` / ``hubs`` / the ``departure_offset_s`` pairs all come back as
+        lists, and the nested ``demand`` comes back a plain dict whose ``.build()`` raises
+        ``AttributeError``. A run folder that cannot rebuild its own recipe is not self-contained.
+        """
+        payload = asdict(self)
+        payload["schema_version"] = _SPEC_SCHEMA_VERSION
+        return payload
+
+    @classmethod
+    def from_json_dict(cls, payload: dict) -> "ScenarioSpec":
+        """Rebuild a ``ScenarioSpec`` from :meth:`to_json_dict` output (or a bare ``asdict``).
+
+        Unknown keys are dropped rather than raising, matching ``runs.load_run``'s whitelist so an
+        archived run stays loadable after a field is renamed — including pre-round-trip folders whose
+        JSON was a raw ``asdict`` with no ``schema_version``. A future or non-numeric schema version is
+        a hard ``ValueError`` (not a ``TypeError``): silently reinterpreting an old recipe is how you
+        replay under the wrong world.
+        """
+        payload = dict(payload)
+        version = payload.pop("schema_version", _SPEC_SCHEMA_VERSION)
+        if not isinstance(version, (int, float)) or isinstance(version, bool) or version > _SPEC_SCHEMA_VERSION:
+            raise ValueError(
+                f"scenario_spec schema_version {version!r} is not readable by this code "
+                f"(understands integer versions <= {_SPEC_SCHEMA_VERSION}) — upgrade freespace_sim")
+
+        demand_payload = dict(payload.pop("demand", None) or {})
+        demand_fields = DemandSpec.__dataclass_fields__
+        demand_kw = {k: v for k, v in demand_payload.items() if k in demand_fields}
+        for name in ("uss", "hubs"):
+            if demand_kw.get(name) is not None:
+                demand_kw[name] = tuple(demand_kw[name])
+        if demand_kw.get("departure_offset_s"):
+            demand_kw["departure_offset_s"] = {
+                k: (float(v[0]), float(v[1])) for k, v in demand_kw["departure_offset_s"].items()}
+
+        spec_fields = cls.__dataclass_fields__
+        kw = {k: v for k, v in payload.items() if k in spec_fields}
+        if kw.get("region_m") is not None:
+            kw["region_m"] = (float(kw["region_m"][0]), float(kw["region_m"][1]))
+        if kw.get("flight_levels_m") is not None:
+            kw["flight_levels_m"] = tuple(float(z) for z in kw["flight_levels_m"])
+        return cls(**kw, demand=DemandSpec(**demand_kw))
 
 
 def with_overrides(spec: ScenarioSpec, *, demand_overrides: dict | None = None, **overrides) -> ScenarioSpec:

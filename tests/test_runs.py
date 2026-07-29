@@ -1,6 +1,7 @@
 import math
 
 import pandas as pd
+import pytest
 
 from freespace_sim import metrics, runs
 from freespace_sim.config import SimConfig
@@ -33,6 +34,47 @@ def test_save_run_writes_full_bundle(tmp_path):
     import json
     meta = json.loads((folder / "experiment.json").read_text())
     assert meta["experiment"] == "unit" and meta["args"] == {"k": 1}
+
+
+def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
+    """A run folder must be able to rebuild the recipe it was launched from.
+
+    ``dataclasses.asdict`` + JSON does not survive the trip: every tuple returns as a list and the
+    nested ``demand`` returns a plain dict, so ``ScenarioSpec(**json.load(...)).demand_model()``
+    raised ``AttributeError: 'dict' object has no attribute 'build'``. The file existed but nothing
+    could read it, while the README advertised the folder as self-contained.
+    """
+    import json
+
+    from freespace_sim.scenarios import SCENARIOS
+    from freespace_sim.scenarios.spec import ScenarioSpec
+
+    spec = SCENARIOS["density_faa_wing_zipline_amazon"]        # tuples + a nested per-USS pair dict
+    folder = runs.save_run(_small(), root=tmp_path, label="t", experiment="unit",
+                           scenario_spec=spec.to_json_dict(), wall_seconds=0.5)
+
+    back = runs.load_scenario_spec(folder)
+    assert back == spec
+    assert isinstance(back.region_m, tuple) and isinstance(back.flight_levels_m, tuple)
+    assert isinstance(back.demand.uss, tuple) and isinstance(back.demand.hubs, tuple)
+    assert all(isinstance(v, tuple) for v in back.demand.departure_offset_s.values())
+    back.demand_model()          # used to raise AttributeError
+    back.config()
+
+    # every registry scenario must survive the trip, not just the richest one — a scenario-specific
+    # tuple field the reconstructor forgets would come back a list and fail equality here.
+    for name, s in SCENARIOS.items():
+        assert ScenarioSpec.from_json_dict(json.loads(json.dumps(s.to_json_dict()))) == s, name
+
+    # a folder without the file is a normal outcome, not an error
+    bare = runs.save_run(_small(), root=tmp_path, label="bare", experiment="unit", wall_seconds=0.5)
+    assert runs.load_scenario_spec(bare) is None
+
+    # a newer (or non-numeric) schema must refuse rather than silently reinterpret an unknown layout
+    future = json.loads(json.dumps(spec.to_json_dict()))
+    future["schema_version"] = 99
+    with pytest.raises(ValueError, match="schema_version"):
+        ScenarioSpec.from_json_dict(future)
 
 
 def test_scenario_frame_includes_every_request():

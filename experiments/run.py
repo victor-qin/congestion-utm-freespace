@@ -19,7 +19,6 @@ readouts can filter to exactly the runs a batch produced.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import logging
 import sys
 import time
@@ -170,7 +169,9 @@ def main() -> None:
     args = build_parser().parse_args()
 
     spec = spec_from_args(args)
-    scenario_payload = dataclasses.asdict(spec)
+    # to_json_dict, not asdict: the latter loses every tuple to a JSON list and leaves `demand` a
+    # plain dict, so the archived recipe could not be rebuilt. See ScenarioSpec.from_json_dict.
+    scenario_payload = spec.to_json_dict()
     cfg = spec.config()
     demand = spec.demand_model()
     tag = args.tag or spec.name

@@ -39,6 +39,7 @@ from ..types import (
     as_terminal,
 )
 from ..volumes import (
+    column_dwell_s,
     corridor_segment_volume,
     enroute_detour_m,
     enroute_flown_m,
@@ -345,9 +346,13 @@ class AStarPlanner:
         the 8-slot probe accumulator (kernel ``read_bbox`` or ``_RecordingOcc.bbox``); the o/d hub discs
         cover the host-side reads no cell probe records: ``TerminalCapacity`` dwell/transit queries, the
         compiled path's takeoff/landing masks, and the own-column overlay's ``col_owners`` lookups. The
-        time window is the plan's recorded reach ``[t_request, max_step·dt + hover tail]`` — every
-        occupancy/capacity read falls inside it (queries are ≤ max_step; committed-column tails extend at
-        most ``hover_tail_steps`` past)."""
+        time window is the plan's recorded reach ``[t_request, max_step·dt + hover tail + worst egress
+        traverse]`` — every occupancy/capacity read falls inside it: queries are ≤ max_step, and a
+        dwell/capacity probe at the last step reads ``hover + climb + lane traverse`` past it (issue
+        #52). ``hover_tail_steps`` covers hover + max climb + buffer only, and at ≥300 m radii the
+        traverse outruns the buffer (+3.67 s slack at 180 m, −4.33 s at 350 m) — so the traverse is
+        added explicitly, per terminal, or a concurrent commit in those last seconds would be
+        invisible to exact-mode revalidation."""
         from ..parallel import PlanEnvelope, cell_bbox_to_aabb
 
         infl_pad = cfg.effective_hover_radius_m + hg.circumradius(cfg)   # occupancy pad inflation
@@ -364,7 +369,9 @@ class AStarPlanner:
             xy=cell_bbox_to_aabb(cell_bbox, cfg) if cell_bbox is not None else None,
             hub_reads=tuple(hubs),
             t_lo=float(req.t_request),
-            t_hi=float(max_step * cfg.dt_s + hover_tail_steps(cfg) * cfg.dt_s),
+            t_hi=float(max_step * cfg.dt_s + hover_tail_steps(cfg) * cfg.dt_s
+                       + max(hg.max_lane_traverse_s(origin, o_term, cfg),
+                             hg.max_lane_traverse_s(dest, d_term, cfg))),
             unbounded=bool(unbounded),
         )
 
@@ -455,6 +462,10 @@ class AStarPlanner:
         # the legacy fold/exit_clear path runs.
         fixed_lanes = cfg.fixed_exit_lanes
         o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
+        # Sequential egress (issue #52): the drone climbs inside the column, THEN translates out to its
+        # lane cell, so the corridor cannot start until both are done. ``Lane.steps`` carries the
+        # per-lane traverse; this map inverts it to recover the ground delay from the goal step below.
+        lane_steps = {ln.cell: ln.steps for ln in o_lanes}
         d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
         d_lane_by_cell = {L.cell: L for L in d_lanes}
         # When the dest is a terminal the goal is a boundary cell, ~``d_max`` before the hub centre the
@@ -490,7 +501,12 @@ class AStarPlanner:
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        max_step = search_horizon(base, max(takeoff_steps), n_hops, climb_span, cfg)
+        # The takeoff term must carry the worst ORIGIN lane traverse (issue #52): the takeoff edge
+        # lands at takeoff_steps[L] + lane.steps, and max_step caps delay + takeoff + path as ONE
+        # sum — without the lane term the traverse silently ate the tail of the ground-delay/detour
+        # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
+        max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
+                                  n_hops, climb_span, cfg)
 
         start = ("g", oq, orr, base)
         g = {start: 0.0}
@@ -571,7 +587,8 @@ class AStarPlanner:
             path.append(came[path[-1]])
         path.reverse()
         air = [s for s in path if s[0] == "a"]
-        ground_steps = air[0][4] - takeoff_steps[air[0][3]] - base
+        ground_steps = (air[0][4] - takeoff_steps[air[0][3]] - base
+                        - lane_steps.get((air[0][1], air[0][2]), 0))   # issue #52
         delay = ground_steps * dt
 
         cruise_wps: list[TimedPoint] = [
@@ -632,8 +649,9 @@ class AStarPlanner:
                 level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
                 for lane in o_lanes:
                     lq, lr = lane.cell
+                    lane_st = lane.steps                   # issue #52: climb, THEN translate out
                     for L in range(len(levels)):
-                        ts = s + takeoff_steps[L]
+                        ts = s + takeoff_steps[L] + lane_st
                         if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
                             out.append((("a", lq, lr, L, ts),
                                         takeoff_cost[L] + c_lat * (lane.dist - o_r)))
@@ -734,12 +752,12 @@ class AStarPlanner:
             hover_reservation(origin, t_takeoff, cfg,
                               terminal_id=origin_term.id if origin_term else None,
                               radius=terminal_radius(origin_term, cfg) if origin_term else None,
-                              climb_time_s=cfg.climb_time_to(z_takeoff)),
+                              climb_time_s=column_dwell_s(origin, origin_term, cfg, z_takeoff)),
             *edges,
             hover_reservation(dest, t_arrive, cfg,
                               terminal_id=dest_term.id if dest_term else None,
                               radius=terminal_radius(dest_term, cfg) if dest_term else None,
-                              climb_time_s=cfg.climb_time_to(z_land)),
+                              climb_time_s=column_dwell_s(dest, dest_term, cfg, z_land)),
         ]
         return volumes, centerline, cum_horiz, n_hover
 
@@ -901,7 +919,8 @@ class AStarPlanner:
             self._kernel(
                 _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
                 0, 0, 3, 3, 1, 0, MAXS,
-                1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]), 1,
+                1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]),
+                np.array([0], np.int64), 1,
                 np.array([1], np.int64), np.array([0.0]), np.ones(ng, np.bool_), ng, 1.0,
                 np.array([1], np.int64), np.array([0.0]), 1.0, 3.0, False,
                 np.array([1], np.int64), np.array([1], np.int64), 1, np.ones(ng, np.bool_),
@@ -962,6 +981,10 @@ class AStarPlanner:
         d_cap = d_term.capacity if d_term else 1
         fixed_lanes = cfg.fixed_exit_lanes
         o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
+        # Sequential egress (issue #52): the drone climbs inside the column, THEN translates out to its
+        # lane cell, so the corridor cannot start until both are done. ``Lane.steps`` carries the
+        # per-lane traverse; this map inverts it to recover the ground delay from the goal step below.
+        lane_steps = {ln.cell: ln.steps for ln in o_lanes}
         d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
         h_off = max((L.dist for L in d_lanes), default=0.0)
         h_off_o = terminal_radius(o_term, cfg) if o_lanes else 0.0   # see _plan_reference for why
@@ -973,7 +996,12 @@ class AStarPlanner:
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        max_step = search_horizon(base, max(takeoff_steps), n_hops, climb_span, cfg)
+        # The takeoff term must carry the worst ORIGIN lane traverse (issue #52): the takeoff edge
+        # lands at takeoff_steps[L] + lane.steps, and max_step caps delay + takeoff + path as ONE
+        # sum — without the lane term the traverse silently ate the tail of the ground-delay/detour
+        # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
+        max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
+                                  n_hops, climb_span, cfg)
 
         # ---- box / window membership guard: else fall back to the reference ----
         if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:
@@ -992,11 +1020,13 @@ class AStarPlanner:
             lane_q = np.asarray([L.cell[0] for L in o_lanes], np.int64)
             lane_r = np.asarray([L.cell[1] for L in o_lanes], np.int64)
             lane_lat = np.asarray([c_lat * (L.dist - o_r) for L in o_lanes], np.float64)
+            lane_stp = np.asarray([L.steps for L in o_lanes], np.int64)   # issue #52 egress traverse
             to_terminal = True
         else:                                            # non-terminal origin (legacy-terminal fell back)
             lane_q = np.asarray([oq], np.int64)
             lane_r = np.asarray([orr], np.int64)
             lane_lat = np.asarray([0.0], np.float64)
+            lane_stp = np.asarray([0], np.int64)
             to_terminal = False
         # ---- goal cells (once) ----
         if fixed_lanes and d_term is not None:
@@ -1069,7 +1099,7 @@ class AStarPlanner:
                 cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
-                oq, orr, lane_q, lane_r, lane_lat, len(lane_q),
+                oq, orr, lane_q, lane_r, lane_lat, lane_stp, len(lane_q),
                 tks, tkc, to_ok, n_gsteps, c_gd_dt,
                 rs, rc, c_lat_pitch, c_hold_dt, self.vertical_edges,
                 goal_q, goal_r, len(goal_q), land_ok,
@@ -1133,7 +1163,8 @@ class AStarPlanner:
                 RuntimeWarning, stacklevel=2,
             )
             return self._plan_reference(req, ledger, cfg)
-        ground_steps = air[0][3] - takeoff_steps[air[0][2]] - base
+        ground_steps = (air[0][3] - takeoff_steps[air[0][2]] - base
+                        - lane_steps.get((air[0][0], air[0][1]), 0))   # issue #52
         cruise_wps: list[TimedPoint] = [
             (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt) for (q, r, L, s) in air
         ]

@@ -133,6 +133,20 @@ class TerminalCapacity:
         n = sum(1 for (a, b) in self.dwells.get(terminal_id, ()) if a < t1 and t0 < b)
         return n < capacity
 
+    def _window_s(self, term, center, z: float | None) -> float:
+        """The column window past the pad hover — :func:`volumes.column_dwell_s`, the single owner.
+
+        Gate and commit MUST agree; asking one function is what makes that structural rather than a
+        convention two call sites happen to follow. ``z=None`` (single-plane / capacity-only) keeps
+        the preferred-plane climb, which is exactly those planners' column length."""
+        from ..volumes import column_dwell_s
+
+        if z is None:
+            from .hexgrid import max_lane_traverse_s
+
+            return self.cfg.climb_time_s + max_lane_traverse_s(center, term, self.cfg)
+        return column_dwell_s(center, term, self.cfg, z)
+
     def _dwell_climb_s(self, z: float | None) -> float:
         """Climb time that sets a dwell/column window length. ``z`` is the flight's climb-to level (its
         cruise level); the committed hover column lasts ``hover + climb_time_to(z)`` (multi-altitude), so
@@ -184,7 +198,7 @@ class TerminalCapacity:
             if new:
                 self._ft[tid] = _merge_intervals((self._ft.get(tid) or []) + new)
             self._ftn[tid] = n
-        t1 = t0 + self.cfg.hover_time_s + self._dwell_climb_s(z)
+        t1 = t0 + self.cfg.hover_time_s + self._window_s(term, center, z)
         return not _overlaps(self._ft.get(tid), t0, t1)
 
     def exit_clear(self, term, center, toward, t0: float, z: float | None = None) -> bool:
@@ -220,7 +234,7 @@ class TerminalCapacity:
         seg = self.cfg.corridor_segment_len_m
         edge = [cx + exit_r * ux, cy + exit_r * uy, z]
         far = [cx + (exit_r + seg) * ux, cy + (exit_r + seg) * uy, z]
-        t1 = t0 + self.cfg.hover_time_s + self._dwell_climb_s(z)
+        t1 = t0 + self.cfg.hover_time_s + self._window_s(term, center, z)
         lane = corridor_segment_volume(edge, t0, far, t1, self.cfg, terminal_id=term.id)
         return not self.ledger.any_conflict([lane])
 
@@ -230,7 +244,7 @@ class TerminalCapacity:
         given — the exit/approach lane toward it (at cruise level ``z``) is clear of committed sibling
         lanes (:meth:`exit_clear`). ``toward=None`` skips the lane check (capacity/column only)."""
         term = as_terminal(term)
-        t1 = t0 + self.cfg.hover_time_s + self._dwell_climb_s(z)
+        t1 = t0 + self.cfg.hover_time_s + self._window_s(term, center, z)
         return (self.admits(term.id, t0, t1, capacity)
                 and self.column_clear(term, center, t0, z)
                 and (toward is None or self.exit_clear(term, center, toward, t0, z)))
@@ -253,7 +267,7 @@ class TerminalCapacity:
         term = as_terminal(term)
         hover = self.cfg.hover_time_s
         col_top_ok = self.column_clear(term, center, t0, max(zs))
-        return [self.admits(term.id, t0, t0 + hover + self._dwell_climb_s(z), capacity)
+        return [self.admits(term.id, t0, t0 + hover + self._window_s(term, center, z), capacity)
                 and (col_top_ok or self.column_clear(term, center, t0, z))
                 and (toward is None or self.exit_clear(term, center, toward, t0, z))
                 for z in zs]

@@ -72,7 +72,11 @@ def schedulable_horizon_steps(cfg) -> int:
     ``max_step``) plus the landing hover tail. A flight whose ``base`` exceeds this (e.g. a late-departing
     return, ``t_departure > horizon_s``) box-guards to the pure-Python reference, so the kernel never queries a
     step past ``MAXS``. Hence this need NOT cover late departures — unlike the permanent terminal WALL, which
-    is time-invariant and uses its own sentinel ``t_end`` (see ``volumes.permanent_terminal_reservation``)."""
+    is time-invariant and uses its own sentinel ``t_end`` (see ``volumes.permanent_terminal_reservation``).
+
+    Nor need it cover the origin lane traverse the per-flight horizon now adds (issue #52): lanes come
+    from DEMAND terminals whose radii can exceed ``cfg.terminal_radius_m``, so no cfg-only bound exists —
+    a flight whose lane steps push ``max_step`` past ``MAXS`` box-guards to the reference the same way."""
     w, h = cfg.region_size_m
     dt = cfg.dt_s
     pitch = cfg.nominal_speed_mps * dt

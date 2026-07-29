@@ -429,15 +429,76 @@ def test_accepted_stretch_respects_the_detour_budget():
     assert accepted, "every planner denied — the budget check never exercised the accept path"
 
 
-def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines():
-    """``astar_shortcut`` must book the identical origin/dest column as bare ``astar``.
+@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "milp", "astar_milp"])
+def test_takeoff_clock_includes_the_egress_traverse(planner):
+    """Issue #52: the corridor starts after climb AND the traverse out to the lane cell.
 
-    A refiner re-times a path; it does not get to re-decide when the flight leaves the pad or how long
-    its terminal column is held. Two builders produce those columns — ``astar._build`` and
-    ``volumes.build_reservation_from_corners`` — and they must agree, so this pins one against the
-    other. It is deliberately a standing guard rather than a regression for one bug: whenever the
-    column window gains a term, exactly this pair is what drifts (it did, twice, when the terminal
-    egress traverse was added and only one builder was updated).
+    Parametrized over EVERY planner, not just astar. The first version tested astar alone, and the
+    refiners kept the bug for two more review rounds: astar read a feasible 13.60 m/s while
+    astar_shortcut implied 54.42 and the MILP family 42.00, because they build through
+    ``volumes.build_reservation_from_corners`` rather than ``astar._build`` and that path started the
+    corridor before the egress was flown.
+
+    A* used to advance the clock by the climb alone, so the drone teleported sideways out of its own
+    column — 272 m in 8 s on a 180 m hub at the 30 m ladder floor, i.e. 34.0 m/s against a 30 m/s
+    limit (40.1 m/s is the worst bearing on the same hub; this flight's is 34.0). Nothing in the suite caught the whole change being reverted, so pin the physics directly:
+    the implied ground speed of the egress must not exceed nominal_speed_mps.
+    """
+    cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), airspace_ceiling_m=135.0,
+                    region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0)
+    hub = Terminal("hub#0", 8, 180.0)
+    req = FlightRequest(1, vec(10_000, 10_000, 0), vec(15_000, 12_000, 0), 0.0, origin_terminal=hub)
+    intent = get_planner(planner).plan(req, ReservationLedger(cfg), cfg)
+    assert intent.accepted
+
+    p0 = np.asarray(intent.centerline[0][0], float)
+    lead_m = float(np.linalg.norm(p0[:2] - np.asarray(req.origin, float)[:2]))
+    t0 = intent.centerline[0][1]                       # when the reserved corridor begins
+    # guard the guard: a hub wide enough that the lead does NOT fit inside the floor's climb, else
+    # the climb alone would already cover it and this proves nothing
+    assert lead_m / cfg.nominal_speed_mps > cfg.climb_time_to(30.0), "lead fits in the climb"
+    assert t0 > 0.0
+    assert lead_m / t0 <= cfg.nominal_speed_mps + 1e-9, (
+        f"{planner}: egress implies {lead_m / t0:.1f} m/s against a "
+        f"{cfg.nominal_speed_mps:.0f} m/s limit")
+    # ... and the column must still be reserved for the whole of it
+    assert intent.volumes[0].t_end >= t0 - 1e-9, "corridor starts after the column is released"
+
+
+def test_column_window_covers_the_actual_traverse():
+    """The reserved column must outlast the egress the drone physically flies (issue #52).
+
+    Asserting only ``window == max(steps)*dt`` would be a TAUTOLOGY — that is what the implementation
+    says. It has to be pinned against the PHYSICAL traverse instead: with a tautological assertion,
+    changing ``math.ceil`` to ``int`` in ``Lane.steps`` yields an 8.000 s window against a 10.583 s
+    traverse (2.583 s of unreserved occupancy, worse than the 1.417 s defect this was written for)
+    and still passes.
+    """
+    cfg = SimConfig(terminal_radius_m=180.0)
+    hub = Terminal("hub#0", 8, 180.0)
+    centre = vec(0, 0, 0)
+    lanes = hg.terminal_lanes(centre, hub, cfg)
+    assert lanes, "no lanes — the check would be vacuous"
+    window = hg.max_lane_traverse_s(centre, hub, cfg)
+    worst = max(ln.dist for ln in lanes)
+    assert worst / cfg.nominal_speed_mps > 0.0, "no traverse — vacuous"
+    # the independent claim: the window covers every lane's real flight time, at cruise speed
+    for ln in lanes:
+        assert window >= ln.dist / cfg.nominal_speed_mps - 1e-9, f"lane {ln.cell} outruns the window"
+    # ... and matches the clock A* actually imposes, so gate and commit cannot drift
+    assert window == max(ln.steps for ln in lanes) * cfg.dt_s
+
+
+def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines():
+    """``astar_shortcut`` must book the identical origin/dest column as bare ``astar`` (issue #52).
+
+    Two independent regressions hid here, both invisible to every other test:
+      * ``ShortcutRefiner`` recovered ``t_depart`` by subtracting only the climb from centerline[0],
+        but #52 put ``Lane.steps*dt`` in there too — so the whole rebuilt reservation started 15 s
+        LATE, leaving the origin column unreserved while the drone was still inside it;
+      * ``build_reservation_from_corners`` sized both columns ``hover + climb`` with no egress, so the
+        rebuilt column was 12 s SHORTER than the one the flight had been gated against.
+    Together the refined flight's column was [15, 50] where the planner's was [0, 47].
     """
     cfg = SimConfig(terminal_radius_m=180.0)
     hub = Terminal("hub#0", 8, 180.0)
@@ -448,22 +509,111 @@ def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines():
     assert bare.accepted and refined.accepted
     assert refined.planner != bare.planner, "refiner returned the inner intent — vacuous"
 
-    # guard the guard: a terminal flight whose column is actually non-trivial
-    assert bare.volumes[0].t_end > bare.volumes[0].t_start, "empty column — the check would be vacuous"
+    egress = hg.max_lane_traverse_s(req.origin, hub, cfg)
+    assert egress > 0.0, "no egress traverse — the check would be vacuous"
 
-    # NOT asserted: that the two origin columns START at the same time. They do not, and that is a
-    # PRE-EXISTING defect on main (measured +3.0 s there, unchanged by this PR): A* books its column
-    # from the dt-QUANTISED takeoff step while build_reservation_from_corners books from the
-    # continuous t_depart, and climb_steps_to*dt (8.0 s) != climb_time_to (5.0 s) at the 30 m floor.
-    # Filed separately — fixing it belongs with the two-builders work, not in a metrics PR. Do not
-    # "fix" it here by inverting the column instead of the centerline: that makes the starts agree
-    # but lands the rebuilt corridor 3 s before the one A* verified.
-    #
-    # What MUST hold is that the two builders agree on the column DURATION. Arrival legitimately
-    # moves earlier (a shorter path lands sooner), so only the window length is comparable.
+    # Departure must be identical: the refiner re-times the same takeoff, it does not move it.
+    assert refined.volumes[0].t_start == bare.volumes[0].t_start, (
+        f"origin column starts {refined.volumes[0].t_start - bare.volumes[0].t_start:+.1f}s off — "
+        "t_depart recovery lost the egress traverse")
+    # ... and the CORRIDOR too: the refiner re-times splices, never the takeoff. The rebuild's own
+    # clock is continuous (climb_time_to + WORST lane) while A* stamps quantised (climb_steps*dt +
+    # CHOSEN lane's steps), so re-deriving the start shifted every rebuilt volume by -3..+1 s,
+    # lane-dependent; corridor_t0 anchors the rebuild at the stamp the inner planner verified.
+    assert refined.centerline[0][1] == bare.centerline[0][1], (
+        f"refined corridor starts {refined.centerline[0][1] - bare.centerline[0][1]:+.1f}s off the "
+        "stamp the inner planner verified against the ledger")
+    # Both column DURATIONS must match. Arrival legitimately moves earlier (a shorter path lands
+    # sooner), so only the window length is comparable at the destination.
     for name, idx in (("origin", 0), ("dest", -1)):
         b, r = bare.volumes[idx], refined.volumes[idx]
         assert math.isclose(r.t_end - r.t_start, b.t_end - b.t_start, abs_tol=1e-9), (
-            f"{name} column is {(r.t_end - r.t_start) - (b.t_end - b.t_start):+.1f}s off — "
-            "the two builders disagree on the column window")
+            f"{name} column is {(r.t_end - r.t_start) - (b.t_end - b.t_start):+.1f}s shorter — "
+            "the rebuild dropped the egress tail")
     assert refined.volumes[-1].t_start <= bare.volumes[-1].t_start + 1e-9, "refined path arrives later?"
+
+
+def test_capacity_gate_probes_the_full_column_window_not_the_climb():
+    """The pad-capacity gate must probe hover + climb + egress traverse — the window the commit books.
+
+    The binding case is a prober sitting just BEFORE an already-committed dwell: FCFS-ordered probes
+    never expose a short gate window, because the RECORDED dwell interval carries the commit-side
+    tail regardless. Here A is committed with a delayed takeoff and B probes from t=0 underneath it:
+    with the gate reverted to a climb-only window, B is admitted at t=0 and its committed column
+    overlaps A's by 7.00 s at pad capacity 1 (measured) — the oversubscription the gate exists to
+    prevent.
+    """
+    cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), airspace_ceiling_m=135.0,
+                    region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0)
+    hub = Terminal("hub#0", 1, 180.0)                  # ONE pad: dwells must never overlap
+    led = ReservationLedger(cfg)
+    a = AStarPlanner().plan(FlightRequest(1, vec(500, 500, 0), vec(4300, 3100, 0), 0.0,
+                                          t_departure=40.0, origin_terminal=hub), led, cfg)
+    assert a.accepted
+    led.commit(1, a.volumes)
+    b = AStarPlanner().plan(FlightRequest(2, vec(500, 500, 0), vec(500, 4500, 0), 0.0,
+                                          origin_terminal=hub), led, cfg)
+    assert b.accepted
+    ca, cb = a.volumes[0], b.volumes[0]
+    # Guard the guard: A's dwell must start INSIDE B's climb→climb+traverse reach from t=0, i.e. a
+    # climb-only probe window would clear it while the full window conflicts — else nothing binds
+    # and the assertion below passes for free.
+    short_w = cfg.hover_time_s + cfg.climb_time_to(cfg.flight_levels_m[0])
+    full_w = short_w + hg.max_lane_traverse_s(np.asarray(a.request.origin, float), hub, cfg)
+    assert short_w < ca.t_start < full_w, "A's dwell no longer sits in the gate-sensitive band"
+    overlap = min(ca.t_end, cb.t_end) - max(ca.t_start, cb.t_start)
+    assert overlap <= 1e-9, (
+        f"same-hub columns overlap {overlap:.2f}s at pad capacity 1 — the capacity gate probed a "
+        "shorter window than the commit books")
+
+
+def test_read_envelope_covers_the_landing_dwell_traverse():
+    """Track A: a commit inside the LAST traverse seconds of a landing-dwell read must read as DIRTY.
+
+    A dwell/capacity probe at the plan's final step reads ``hover + climb + lane traverse`` past it,
+    but ``hover_tail_steps`` covers hover + max climb + buffer only — at 350 m radius the traverse
+    (20 s) outruns the buffer by 4.33 s, and pre-fix a commit in that sliver reported
+    ``envelope_intersects == False``: exact-mode revalidation would silently miss a real conflict.
+
+    Load-bearing anchor: for a fixed request the radius enters ``t_hi`` through exactly TWO terms —
+    ``search_horizon``'s takeoff term now carries the worst origin-lane steps (one traverse), and
+    ``_mk_envelope`` adds the worst-end traverse again for the dwell read past the last step — so
+    ``t_hi(350) - t_hi(90) == 2 * (traverse(350) - traverse(90))``. Reverting EITHER widening drops
+    the difference to one traverse (or zero for both) and fails this. Anchoring a sliver on
+    ``env.t_hi`` alone slides WITH the fix and passes with it reverted — measured, the first
+    version of this test did exactly that.
+    """
+    from freespace_sim.parallel import envelope_intersects
+    from freespace_sim.planner.compiled_hex_occupancy import hover_tail_steps
+
+    def env_at(radius):
+        cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), airspace_ceiling_m=135.0,
+                        region_size_m=(20_000.0, 20_000.0), terminal_radius_m=radius)
+        hub = Terminal("hub#0", 8, radius)
+        req = FlightRequest(1, vec(500, 500, 0), vec(4300, 3100, 0), 0.0,
+                            origin_terminal=hub, dest_terminal=hub)
+        p = AStarPlanner()
+        p.record_envelope = True
+        intent = p.plan(req, ReservationLedger(cfg), cfg)
+        assert intent.accepted and p.last_envelope is not None
+        return p.last_envelope, hg.max_lane_traverse_s(np.asarray(req.dest, float), hub, cfg), cfg, req
+
+    env90, trav90, _, _ = env_at(90.0)
+    env350, trav350, cfg, req = env_at(350.0)
+    assert trav350 > trav90, "traverse no longer grows with radius — the anchor premise is gone"
+    # Guard the guard: the hover tail alone must NOT cover a last-step dwell read at 350 m, or the
+    # widening is unnecessary at this config and the test proves nothing.
+    max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
+    assert hover_tail_steps(cfg) * cfg.dt_s < cfg.hover_time_s + max_climb + trav350, \
+        "hover tail covers the traverse at this config — the test lost its bite"
+    # The widening itself, pinned against the fix-independent r=90 run: one traverse from the
+    # search-horizon lane term + one from the envelope's dwell-read term.
+    assert math.isclose(env350.t_hi - env90.t_hi, 2.0 * (trav350 - trav90), abs_tol=1e-9), (
+        f"t_hi grew by {env350.t_hi - env90.t_hi:.1f}s, expected {2.0 * (trav350 - trav90):.1f}s — "
+        "either the horizon lane term or the envelope traverse term is missing")
+    # ... and the semantics: a commit 1 s past the unwidened bound, at the dest hub, reads DIRTY.
+    d = np.asarray(req.dest, float)
+    aabb = (d[0] - 1.0, d[1] - 1.0, 0.0, d[0] + 1.0, d[1] + 1.0, 200.0)
+    sliver = (aabb, env350.t_hi - trav350 + 1.0, env350.t_hi - trav350 + 5.0)
+    assert envelope_intersects(env350, [sliver]), (
+        "a commit inside the landing dwell's traverse tail is invisible to the read envelope")

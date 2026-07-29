@@ -28,15 +28,17 @@ _EPS = 1e-9
 
 
 def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
-             origin_term=None, dest_term=None):
+             origin_term=None, dest_term=None, corridor_t0=None):
     """Resample corners → ≤120 m corridor boxes, then budget + ledger conflict check.
 
     Returns (volumes, centerline, cum_horiz, cum_dz) or None if it busts the detour budget or
     overlaps a committed reservation. This is the feasibility oracle the greedy sweep consults.
-    ``origin_term``/``dest_term`` preserve the inner A*'s terminal tags through the rebuild.
+    ``origin_term``/``dest_term`` preserve the inner A*'s terminal tags through the rebuild;
+    ``corridor_t0`` anchors the corridor at the inner planner's VERIFIED first-cruise stamp.
     """
     volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
-        corners, origin, dest, t_depart, g_delay, cfg, origin_term=origin_term, dest_term=dest_term
+        corners, origin, dest, t_depart, g_delay, cfg, origin_term=origin_term, dest_term=dest_term,
+        corridor_t0=corridor_t0,
     )
     # Both sides span lane → lane via the same helper metrics uses (issue #50), so the gate enforces
     # exactly the ratio the caller will report as air_detour_m / stretch.
@@ -49,7 +51,7 @@ def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_hor
 
 
 def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
-                     ledger: ReservationLedger, origin_term=None, dest_term=None):
+                     ledger: ReservationLedger, origin_term=None, dest_term=None, corridor_t0=None):
     """Greedily drop interior knots whose removal stays conflict-free; return simplified corners.
 
     Deterministic single-knot fixpoint: sweep interior knots front-to-back, remove any whose removal
@@ -62,7 +64,7 @@ def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
         return corners
     straight_horiz = enroute_reference_m(origin, dest, origin_term, dest_term, cfg)
     if _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
-                origin_term, dest_term) is None:
+                origin_term, dest_term, corridor_t0) is None:
         return corners
     changed = True
     while changed and len(corners) > 2:
@@ -71,7 +73,7 @@ def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
         while i < len(corners) - 1:
             cand = corners[:i] + corners[i + 1:]
             if _rebuild(cand, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
-                        origin_term, dest_term) is not None:
+                        origin_term, dest_term, corridor_t0) is not None:
                 corners = cand           # removed knot i; re-test the same index (list shifted)
                 changed = True
             else:
@@ -106,21 +108,28 @@ class ShortcutRefiner:
             return intent
 
         g_delay = intent.ground_delay_s
-        # Exact inverse of the REBUILD, not of A*'s stamp — build_reservation_from_corners re-derives
-        # `t = t_depart + g_delay + climb_time_to(z0)`, so inverting that expression is what makes the
-        # rebuilt corridor land back on the centerline A* verified. Do NOT "simplify" this to
-        # `volumes[0].t_start - g_delay`: A* quantises the climb to whole dt steps
-        # (climb_steps_to*dt = 8.0 s where climb_time_to = 5.0 s at the 30 m floor), so that form
-        # round-trips 3 s EARLY and silently moved 50 of 134 refined paths (+9.1% air_detour_m).
-        t_depart = (intent.centerline[0][1] - g_delay
-                    - cfg.climb_time_to(float(np.asarray(intent.centerline[0][0])[2])))
+        # Read the takeoff time off the committed origin column rather than inverting the centerline.
+        # The old inverse subtracted only the climb, but issue #52 made centerline[0] land at
+        # `takeoff + climb + Lane.steps*dt`, so the recovered departure came out LATE by the traverse
+        # (measured 15 s on a 180 m hub: 12 s of lane traverse plus 3 s of pre-existing takeoff-step
+        # rounding, which the old inverse also dropped) and every rebuilt volume shifted with it —
+        # leaving the origin column unreserved while the drone was still in it. volumes[0].t_start IS
+        # the takeoff time in both builders, so this needs no knowledge of which lane was taken.
+        t_depart = intent.volumes[0].t_start - g_delay
+        # Anchor the rebuilt corridor at the inner planner's VERIFIED first-cruise stamp: a refiner
+        # re-times splices, not the takeoff. Re-deriving the start inside the rebuild mixes its
+        # continuous clock (climb_time_to + WORST lane) with A*'s quantised stamp (climb_steps*dt +
+        # CHOSEN lane's steps) — measured -3..+1 s on every rebuilt volume, lane-dependent.
+        t_first = float(intent.centerline[0][1])
         ot, dt = req.origin_terminal, req.dest_terminal
-        simplified = shortcut_corners(corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger, ot, dt)
+        simplified = shortcut_corners(corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger,
+                                      ot, dt, corridor_t0=t_first)
         if len(simplified) >= len(corners):
             return intent                              # nothing removed
 
         straight = enroute_reference_m(req.origin, req.dest, ot, dt, cfg)
-        built = _rebuild(simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight, ot, dt)
+        built = _rebuild(simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight,
+                         ot, dt, corridor_t0=t_first)
         if built is None:
             return intent
         volumes, centerline, cum_horiz, cum_dz = built

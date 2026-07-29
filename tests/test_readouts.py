@@ -89,3 +89,32 @@ def test_histograms_readout_collects_into_out_dir(tmp_path, monkeypatch):
     coll = tmp_path / "sweeps" / "mysweep"
     _main(monkeypatch, histograms, ["histograms", str(folder), "--out-dir", str(coll)])
     assert (coll / f"{folder.name}_delay_hist.png").stat().st_size > 0
+
+
+def test_histograms_steady_subset_filters_on_the_occupancy_clock(tmp_path):
+    """The overlay cohort must be selected on t_occupancy — the clock metrics.flight_frame and the
+    steady window both use. On t_request it went empty under timing_mode="departure" (filing and
+    airborne clocks separated by the scheduling lead), so the overlay silently vanished from the plots.
+    """
+    import json
+
+    import pandas as pd
+
+    from experiments.readouts.histograms import _steady_subset
+
+    # departure-mode shape: all 10 file at t=0 but take the airspace at 100..190
+    acc = pd.DataFrame({
+        "t_request": [0.0] * 10,
+        "t_occupancy": [100.0 + 10.0 * i for i in range(10)],
+        "accepted": [True] * 10,
+    })
+    (tmp_path / "summary.json").write_text(
+        json.dumps({"steady_state": {"window_lo": 120.0, "window_hi": 170.0}}))
+
+    got = _steady_subset(tmp_path, acc, None)
+    assert got is not None, "occupancy-clock window selected nobody — the overlay would vanish"
+    sub, (lo, hi) = got
+    assert (lo, hi) == (120.0, 170.0)
+    assert set(sub["t_occupancy"]) == {120.0, 130.0, 140.0, 150.0, 160.0}   # [120, 170)
+    # the same window on the filing clock (all zeros) selects nothing — the bug this membership guards
+    assert acc[(acc["t_request"] >= lo) & (acc["t_request"] < hi)].empty

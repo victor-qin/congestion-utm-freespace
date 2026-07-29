@@ -691,8 +691,9 @@ def _per_uss_table(
 def per_uss_frame(result: SimResult, window: tuple[float, float] | None = None) -> pd.DataFrame:
     """One metrics row per USS — the per-operator slice of a (multi-)USS run. Each row's counts and
     reserved volume sum to the overall ``aggregate`` totals (see tests). ``window`` restricts to flights
-    filed in ``[t_lo, t_hi)`` and uses the window duration for the rate/capacity denominators. Without
-    a window, rates use the active demand duration and utilization uses the realized simulation duration."""
+    that took the airspace in ``[t_lo, t_hi)`` (the occupancy clock; see :func:`occupancy_time_s`) and
+    uses the window duration for the rate/capacity denominators. Without a window, rates use the active
+    demand duration and utilization uses the realized simulation duration."""
     _lo, _hi, dur_s, rate_dur_s = _denominators(result, window)
     return _per_uss_table(
         flight_frame(result, window),
@@ -705,8 +706,9 @@ def per_uss_frame(result: SimResult, window: tuple[float, float] | None = None) 
 def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> dict:
     """Flat headline rollup for one run — the row a λ-sweep collects.
 
-    ``window=(t_lo, t_hi)`` measures only flights filed in that interval, with rate/capacity
-    denominators using the window duration and ``window_lo``/``window_hi`` added for provenance. ``None``
+    ``window=(t_lo, t_hi)`` measures only flights that took the airspace in that interval (the occupancy
+    clock, matching :func:`flight_frame`), with rate/capacity denominators using the window duration and
+    ``window_lo``/``window_hi`` added for provenance. ``None``
     (default) measures the complete realized run from first activity through final landing. Use
     :func:`aggregate_with_steady` to report that whole-run view next to its steady-state twin."""
     cfg = result.config

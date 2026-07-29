@@ -105,6 +105,18 @@ def main() -> None:
     if df.empty:
         raise SystemExit("no runs match the given --tag/--scenario/--planner filter")
 
+    # index.parquet is appended to over time, so a λ-sweep set can span rows written under different
+    # metric definitions. A curve that averages them plots a trend over no consistent quantity —
+    # airspace_utilization changed denominator for every scenario at version 2. Warn, matching compare.
+    if "metrics_version" in df.columns:
+        seen = sorted(df["metrics_version"].dropna().unique())
+        unversioned = int(df["metrics_version"].isna().sum())
+        if len(seen) + (1 if unversioned else 0) > 1:
+            print(f"WARNING mixing metrics_version {seen}"
+                  f"{f' + {unversioned} unversioned (pre-v2) rows' if unversioned else ''} — "
+                  "airspace_utilization and the steady_* curves are NOT comparable across versions; "
+                  "filter to one version or re-run the older points.")
+
     label = args.tag or args.scenario or "all"
     n_lam = df["lam_per_hour"].nunique()
     if n_lam < 2:

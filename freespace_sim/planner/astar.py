@@ -40,6 +40,9 @@ from ..types import (
 )
 from ..volumes import (
     corridor_segment_volume,
+    enroute_detour_m,
+    enroute_flown_m,
+    enroute_reference_m,
     exit_radius,
     hover_reservation,
     segment_overlaps_column,
@@ -117,8 +120,16 @@ def _lattice_overhead_m(cells, pitch, air_detour_m):
 
     Everything else in ``air_detour_m`` is geometry and lands here: the staircase a 6-direction
     lattice imposes on an off-axis bearing (0 on-axis, peaking at 2/√3 − 1 ≈ 15.5% at 30° off), plus
-    the endpoint snap of origin/dest onto cell centres. Counting cell-to-cell also makes ``_build``'s
-    terminal fold cancel instead of biasing the split.
+    the endpoint snap of origin/dest onto cell centres.
+
+    The IN-COLUMN part of the terminal fold does not land here: ``air_detour_m`` is measured exit
+    lane → exit lane on both sides (issue #50), so hub centre → column edge is outside the measurement
+    entirely — terminal operations, accounted as that hub's capacity.
+
+    What DOES land here is the column edge → lane-cell hop, because A*'s path starts on a boundary
+    hex rather than on the reference circle, so folding EXTENDS it (measured +169.58 m of a 724.41 m
+    band on an unimpeded hub flight). That is lane snap — the same quantization as (2), just at a
+    terminal — so the bucket is still "geometry, not traffic".
     """
     moves = sum(1 for a, b in zip(cells, cells[1:]) if a != b)
     forced = max(0, moves - hg.hex_distance(cells[0], cells[-1])) * pitch
@@ -404,6 +415,11 @@ class AStarPlanner:
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
         gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr   # goal hex centre, as scalars
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
+        # Two baselines, deliberately different. `straight` (centre→centre) sizes the SEARCH horizon —
+        # it is the larger of the two, so keeping it here can never shrink the budget. `straight_ref`
+        # (lane→lane) is what the detour and its gate measure against: a flight may not fly through its
+        # own hub column, so the centres are not a distance it could ever achieve (issue #50).
+        straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         # Incremental hex-occupancy service: holds the blocked (corridor footprint) and pad (wider
         # hover-cylinder footprint) cell maps, maintained across plans via the ledger's commit
@@ -562,11 +578,15 @@ class AStarPlanner:
             (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt)
             for (_, q, r, L, s) in air
         ]
-        volumes, centerline, cum_horiz, n_hover = self._build(
+        volumes, centerline, _cum_horiz, n_hover = self._build(
             cruise_wps, origin, dest, base, ground_steps, cfg,
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
-        if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
+        # Both sides span lane → lane via the SAME helper metrics uses, so the gate enforces exactly
+        # the ratio `stretch` later reports and the two can never drift (issue #50).
+        flown = enroute_flown_m([p for p, _ in centerline], origin, dest,
+                                req.origin_terminal, req.dest_terminal, cfg)
+        if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
             return self._file_deny(req, DenialReason.BUDGET_EXCEEDED, volumes, ledger)
         if ledger.any_conflict(volumes):
             return self._file_deny(req, DenialReason.CONFLICT_FILED, volumes, ledger)  # raster slack / hover
@@ -574,7 +594,7 @@ class AStarPlanner:
         # true vertical travel: takeoff climb + every cruise layer change + landing descent
         z_takeoff, z_land = levels[air[0][3]], levels[air[-1][3]]
         cruise_dz = sum(abs(levels[air[i + 1][3]] - levels[air[i][3]]) for i in range(len(air) - 1))
-        detour = max(0.0, cum_horiz - straight)
+        detour = enroute_detour_m(flown, straight_ref)
         intent = OperationalIntent(
             request=req,
             status=IntentStatus.ACCEPTED,
@@ -924,6 +944,11 @@ class AStarPlanner:
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
         gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
+        # Two baselines, deliberately different. `straight` (centre→centre) sizes the SEARCH horizon —
+        # it is the larger of the two, so keeping it here can never shrink the budget. `straight_ref`
+        # (lane→lane) is what the detour and its gate measure against: a flight may not fly through its
+        # own hub column, so the centres are not a distance it could ever achieve (issue #50).
+        straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         svc = self._occupancy(req, ledger, cfg)
         tcap = self._tcap
@@ -1112,18 +1137,20 @@ class AStarPlanner:
         cruise_wps: list[TimedPoint] = [
             (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt) for (q, r, L, s) in air
         ]
-        volumes, centerline, cum_horiz, n_hover = self._build(
+        volumes, centerline, _cum_horiz, n_hover = self._build(
             cruise_wps, origin, dest, base, ground_steps, cfg,
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
-        if straight > _EPS and cum_horiz / straight > cfg.max_detour_factor:
+        flown = enroute_flown_m([p for p, _ in centerline], origin, dest,      # issue #50
+                                req.origin_terminal, req.dest_terminal, cfg)
+        if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
             return self._file_deny(req, DenialReason.BUDGET_EXCEEDED, volumes, ledger)
         if ledger.any_conflict(volumes):
             return self._file_deny(req, DenialReason.CONFLICT_FILED, volumes, ledger)
 
         z_takeoff, z_land = levels[air[0][2]], levels[air[-1][2]]
         cruise_dz = sum(abs(levels[air[i + 1][2]] - levels[air[i][2]]) for i in range(len(air) - 1))
-        detour = max(0.0, cum_horiz - straight)
+        detour = enroute_detour_m(flown, straight_ref)
         intent = OperationalIntent(
             request=req,
             status=IntentStatus.ACCEPTED,

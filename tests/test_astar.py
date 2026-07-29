@@ -9,9 +9,18 @@ from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner, hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner, _committed_arrival
+from freespace_sim.planner.milp import MILPOptPlanner
 from freespace_sim.planner.occupancy import HexOccupancyService
+from freespace_sim.planner.shortcut import ShortcutRefiner
 from freespace_sim.sim import run
-from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
+from freespace_sim.types import (
+    DenialReason,
+    FlightRequest,
+    IntentStatus,
+    OperationalIntent,
+    Terminal,
+    vec,
+)
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
@@ -319,3 +328,142 @@ def test_vertical_edge_checks_only_traversed_levels_not_all():
         blocked_dest.blocked.setdefault(sk, set()).add((q, r, 1))    # obstacle on the destination level
     got2 = {e[0] for e in _air_edges(planner, CFG, blocked_dest, ("a", q, r, 0, s))}
     assert climb_edge not in got2, "an obstacle on the destination level must block the climb"
+
+
+class _DenyAll:
+    """A warm planner that always denies — see :func:`_folded_planner`."""
+
+    def plan(self, req, ledger, cfg):
+        return OperationalIntent(request=req, status=IntentStatus.REJECTED,
+                                 denial_reason=DenialReason.BUDGET_EXCEEDED, planner="deny")
+
+
+def _folded_planner(name):
+    """Resolve ``name`` to a planner that actually returns a TERMINAL-FOLDED path.
+
+    ``get_planner("milp")`` is a trap here: ``MILPOptPlanner.plan`` returns the CHEAPER of its warm
+    ``StraightLineTimeShift`` candidate and its own solve, and in empty airspace the warm one wins.
+    That candidate is never folded to the terminal columns — its centerline starts exactly at
+    ``req.origin`` — so the milp.py detour site never executes and every assertion below would pass
+    vacuously (reverting the milp.py hunk left this test green). Denying the warm start forces the
+    MILP's own folded path to come back.
+
+    ``intent.planner == "milp"`` would NOT be a usable guard: ``MILPOptPlanner.plan`` relabels
+    whichever candidate wins, including the warm one.
+    """
+    if name == "milp":
+        return MILPOptPlanner(warm_planner=_DenyAll())
+    return get_planner(name)
+
+
+def _terminal_case(**cfg_kw):
+    cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+                    region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0, **cfg_kw)
+    hub = Terminal("hub#0", 8, 180.0)
+    return cfg, FlightRequest(1, vec(0, 0, 0), vec(5000, 2000, 0), 0.0, origin_terminal=hub)
+
+
+@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "milp"])
+def test_stretch_never_below_one_leaving_a_terminal(planner):
+    """Regression for issue #50: a flight cannot fly SHORTER than the straight line.
+
+    One end only: ``_terminal_case`` sets ``origin_terminal`` and leaves ``dest_terminal`` None, so a
+    single column is folded — the asymmetric case, which is the harder one for ``stretch >= 1``.
+
+    Under ``fixed_exit_lanes`` the air path starts on a hub boundary lane cell, so the centerline
+    spans lane→lane while ``straight_line_m`` spans hub-centre→hub-centre. Comparing them directly
+    books a phantom shortcut (mean 210.0 m/flight on density_test, 172.9 on
+    dallas_hub_2uss_large) and drives ``stretch`` below 1.
+    Bare A*'s hex staircase used to mask it; ``astar_shortcut`` removes the staircase and exposes it
+    on ~71% of flights, so both are checked here — as is the continuous MILP.
+
+    Which arms actually carry the regression: reverting ``_flown_horizontal_m`` fails ONLY
+    ``astar_shortcut`` (measured stretch 0.9739). ``astar`` passes at 1.1130 because its staircase
+    still covers the fold — the very masking described above — and ``milp`` passes at 1.0007 because
+    it folds to a continuous column edge and barely leaves the ideal line. Both are kept as guards
+    against future drift, not as proof; do not read three green arms as three independent checks.
+    """
+    from freespace_sim import metrics
+    from freespace_sim.volumes import enroute_reference_m
+
+    cfg, req = _terminal_case()
+    intent = _folded_planner(planner).plan(req, ReservationLedger(cfg), cfg)
+    assert intent.accepted
+    # Guard the guard: the hub must actually shorten the baseline, else there is no bug to catch.
+    centre = float(np.linalg.norm(np.asarray(req.dest, float)[:2] - np.asarray(req.origin, float)[:2]))
+    assert enroute_reference_m(req.origin, req.dest, req.origin_terminal,
+                               req.dest_terminal, cfg) < centre - 100.0, \
+        f"{planner}: baseline is not lane->lane — this arm proves nothing"
+    row = metrics.flight_row(intent, cfg)
+    assert row["stretch"] >= 1.0 - 1e-9, f"{planner}: flew shorter than the straight line"
+    # ... and the flown length must actually reach both endpoints, not stop at the lane cell
+    assert row["flown_m"] >= row["straight_line_m"] - 1e-9
+
+
+def test_accepted_stretch_respects_the_detour_budget():
+    """The ``max_detour_factor`` gate and the reported ``stretch`` must measure the SAME ratio.
+
+    Issue #50's first cut corrected only the readout, leaving every gate comparing the lane->lane
+    ``cum_horiz`` against the centre->centre straight line. A terminal flight could then pass a
+    ``max_detour_factor`` gate and report a stretch above it — measured 1.1400 against a 1.07 budget.
+    Invisible at the default factor of 100.0, so pin it at a value the fold can actually breach.
+
+    NOT parametrized, deliberately. Once the gate is correct the two refiners simply DENY at this
+    budget (no path can shrink the unreserved fold), so as separate params they would be silent
+    no-ops that look like passing coverage. Looping here lets the test assert that at least one
+    planner actually reached the accept path — otherwise the whole check is vacuous.
+    """
+    from freespace_sim import metrics
+
+    cfg, req = _terminal_case(max_detour_factor=1.07)
+    accepted = 0
+    for planner in ("astar", "astar_shortcut", "milp"):
+        intent = _folded_planner(planner).plan(req, ReservationLedger(cfg), cfg)
+        if not intent.accepted:
+            continue                      # denying is a legitimate outcome; over-reporting is not
+        accepted += 1
+        stretch = metrics.flight_row(intent, cfg)["stretch"]
+        assert stretch <= cfg.max_detour_factor + 1e-9, (
+            f"{planner}: admitted at the gate but reports stretch {stretch:.4f} "
+            f"> max_detour_factor {cfg.max_detour_factor}")
+    assert accepted, "every planner denied — the budget check never exercised the accept path"
+
+
+def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines():
+    """``astar_shortcut`` must book the identical origin/dest column as bare ``astar``.
+
+    A refiner re-times a path; it does not get to re-decide when the flight leaves the pad or how long
+    its terminal column is held. Two builders produce those columns — ``astar._build`` and
+    ``volumes.build_reservation_from_corners`` — and they must agree, so this pins one against the
+    other. It is deliberately a standing guard rather than a regression for one bug: whenever the
+    column window gains a term, exactly this pair is what drifts (it did, twice, when the terminal
+    egress traverse was added and only one builder was updated).
+    """
+    cfg = SimConfig(terminal_radius_m=180.0)
+    hub = Terminal("hub#0", 8, 180.0)
+    req = FlightRequest(1, vec(500, 500, 0), vec(4300, 3100, 0), 0.0,
+                        origin_terminal=hub, dest_terminal=hub)
+    bare = AStarPlanner().plan(req, ReservationLedger(cfg), cfg)
+    refined = ShortcutRefiner(AStarPlanner()).plan(req, ReservationLedger(cfg), cfg)
+    assert bare.accepted and refined.accepted
+    assert refined.planner != bare.planner, "refiner returned the inner intent — vacuous"
+
+    # guard the guard: a terminal flight whose column is actually non-trivial
+    assert bare.volumes[0].t_end > bare.volumes[0].t_start, "empty column — the check would be vacuous"
+
+    # NOT asserted: that the two origin columns START at the same time. They do not, and that is a
+    # PRE-EXISTING defect on main (measured +3.0 s there, unchanged by this PR): A* books its column
+    # from the dt-QUANTISED takeoff step while build_reservation_from_corners books from the
+    # continuous t_depart, and climb_steps_to*dt (8.0 s) != climb_time_to (5.0 s) at the 30 m floor.
+    # Filed separately — fixing it belongs with the two-builders work, not in a metrics PR. Do not
+    # "fix" it here by inverting the column instead of the centerline: that makes the starts agree
+    # but lands the rebuilt corridor 3 s before the one A* verified.
+    #
+    # What MUST hold is that the two builders agree on the column DURATION. Arrival legitimately
+    # moves earlier (a shorter path lands sooner), so only the window length is comparable.
+    for name, idx in (("origin", 0), ("dest", -1)):
+        b, r = bare.volumes[idx], refined.volumes[idx]
+        assert math.isclose(r.t_end - r.t_start, b.t_end - b.t_start, abs_tol=1e-9), (
+            f"{name} column is {(r.t_end - r.t_start) - (b.t_end - b.t_start):+.1f}s off — "
+            "the two builders disagree on the column window")
+    assert refined.volumes[-1].t_start <= bare.volumes[-1].t_start + 1e-9, "refined path arrives later?"

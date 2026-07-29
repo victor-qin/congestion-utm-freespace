@@ -153,6 +153,94 @@ def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool
     return d < radius + cfg.corridor_width_m / 2.0        # + box half-width
 
 
+# --- The three en-route rulers (issue #50) -------------------------------------------------------
+#
+#     ORIGIN HUB                                                             DEST HUB
+#    ╭─────────╮                                                           ╭─────────╮
+#    │    ●╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌╌╌╌ centre→centre 5385 m ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│╌╌╌╌●    │
+#    │  centre ◆━━┓                                                    ┏━━◆  centre │
+#    ╰────┬────╯  ┗━━━━┓         actual path (folded)            ┏━━━━━┛  ╰────┬────╯
+#      r_o = 210       ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛         r_d = 210
+#         edge                                                              edge
+#
+#    enroute_reference_m = 5385 − 210 − 210  = 4965 m   IDEAL ruler: edge→edge straight line
+#    enroute_flown_m     = Σ ◆━━◆ segments   = 5689 m   ACTUAL ruler: path folded to both edges
+#    enroute_detour_m    = max(0, 5689−4965) =  724 m   the verdict: gate enforces it, stretch reports it
+#
+# Both rulers start and end on the SAME circles (exit_radius), so their difference is pure en-route
+# detour. Nothing inside a hub column counts — terminal flying consumes that hub's CAPACITY (tagged
+# column + pad gate), not en-route distance or delay — and there is no phantom shortcut from
+# mismatched endpoints (the #50 bug: flown was lane→lane while the baseline was centre→centre, so
+# refined flights measured stretch 0.9886, "shorter than a straight line"). Every planner gate and
+# metrics._flown/_straight go through these three functions, so the gate enforces exactly the ratio
+# stretch later reports and planner-vs-metrics drift is structurally impossible. The reference is
+# deliberately lane-AGNOSTIC — the minimum over every lane choice, which is what makes stretch >= 1
+# a triangle-inequality theorem — while the flown side reflects the lane actually taken, so a bad or
+# traffic-forced lane choice reads as detour (in lattice_overhead_m) instead of inflating the baseline.
+
+
+def enroute_reference_m(origin, dest, origin_term, dest_term, cfg: SimConfig) -> float:
+    """IDEAL ruler (diagram above): centre distance minus both :func:`exit_radius`, floored at 0.
+
+    LATENT EDGE — the 0-clamp (columns covering the whole trip) is NOT benign: every caller's
+    ``straight > _EPS`` guard then skips the ``max_detour_factor`` gate and :func:`enroute_detour_m`
+    books 0, so the flight escapes the only length term in ``trajectory_cost`` and ``stretch`` goes
+    NaN. Unreached in shipped scenarios (``HubRadiusDemand``'s ``min_r``; measured minimum reference
+    66.10 m on ``dallas_hub_2uss_large`` at its own seed/lambda/horizon) — but ``min_r`` does not
+    scale with ``corridor_overlap``, so ``--corridor-overlap <= -60`` reaches it (at -100: 18/8046
+    generated requests clamp to 0). Short flights are geometry-dominated either way — read
+    ``stretch``/``delay_pct`` with care there.
+    """
+    o = np.asarray(origin, float)[:2]
+    d = np.asarray(dest, float)[:2]
+    o_term, d_term = as_terminal(origin_term), as_terminal(dest_term)
+    gap = float(np.linalg.norm(d - o))
+    gap -= exit_radius(o_term, cfg) if o_term is not None else 0.0
+    gap -= exit_radius(d_term, cfg) if d_term is not None else 0.0
+    return max(0.0, gap)
+
+
+def enroute_detour_m(flown_m: float, reference_m: float) -> float:
+    """The verdict (diagram above): flown minus reference, floored at 0 — and 0 when the reference is 0.
+
+    The 0-reference guard is the point: without it ``max(0.0, flown - 0.0)`` books the ENTIRE path
+    of a flight that never left terminal airspace as detour — real cost and delay (measured: 250 m
+    at ``--corridor-overlap -100``). No en-route segment means no en-route detour. Callers still
+    guard ``reference > _EPS`` for ``stretch``, which stays NaN — undefined is the honest answer.
+    """
+    return 0.0 if reference_m <= 1e-9 else max(0.0, flown_m - reference_m)
+
+
+def enroute_flown_m(points, origin, dest, origin_term, dest_term, cfg: SimConfig) -> float:
+    """ACTUAL ruler (diagram above): the path folded to both column edges — through the SAME
+    :func:`fold_corners_to_columns` every reservation uses — then summed in the horizontal plane.
+    Single owner: every planner's ``air_detour_m``/gate and ``metrics._flown_horizontal_m`` call
+    this, so the two layers cannot drift (issue #50).
+
+    Three contracts:
+
+    - An endpoint with NO terminal extends to the true ``origin``/``dest`` — otherwise A*'s endpoint
+      snap onto a hex centre reads as a phantom shortcut (measured ``stretch`` 0.9946). The snap
+      (~80 m/flight) therefore stays on A*'s bill, wholly in ``lattice_overhead_m``, never in the
+      traffic band — see ``metrics.flight_row``.
+    - Re-folding an already-folded path is NEARLY idempotent, not exactly: the edge point re-roots
+      toward a different first waypoint (measured 2.93 m shorter on a hub->hub MILP flight).
+      Conservative direction, but do not rely on a second fold being free.
+    - Fold bail-outs pass through unfolded (whole path inside the origin ring). Contained: every
+      bail reachable with the shipped planners (under ``fixed_exit_lanes``) and shipped demand has
+      ``enroute_reference_m == 0``, where detour books 0 and ``stretch`` is NaN. If a guard is ever
+      added, fall back to the reference length (stretch -> 1, detour -> 0), NOT NaN — NaN would flow
+      into ``air_detour_m`` -> cost -> ``total_delay_s``.
+    """
+    pts = list(fold_corners_to_columns(list(points), origin, dest, origin_term, dest_term, cfg))
+    if as_terminal(origin_term) is None:
+        pts.insert(0, np.asarray(origin, float))
+    if as_terminal(dest_term) is None:
+        pts.append(np.asarray(dest, float))
+    xy = np.asarray([np.asarray(p, float)[:2] for p in pts], float)
+    return float(np.linalg.norm(np.diff(xy, axis=0), axis=1).sum()) if len(xy) >= 2 else 0.0
+
+
 def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: SimConfig):
     """Drop in-column head/tail corners and re-root the polyline at the column edge (``exit_radius``).
 

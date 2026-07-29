@@ -51,6 +51,18 @@ def main() -> None:
     if df.empty:
         raise SystemExit("no runs match the given --tag/--scenario filter")
 
+    # index.parquet is appended to over time, so one file can hold rows written under different metric
+    # definitions. Averaging across them yields a number describing no run — airspace_utilization
+    # changed denominator for EVERY scenario at version 2. Say so rather than quietly blending.
+    if "metrics_version" in df.columns:
+        seen = sorted(df["metrics_version"].dropna().unique())
+        unversioned = int(df["metrics_version"].isna().sum())
+        if len(seen) + (1 if unversioned else 0) > 1:
+            print(f"WARNING mixing metrics_version {seen}"
+                  f"{f' + {unversioned} unversioned (pre-v2) rows' if unversioned else ''} — "
+                  "airspace_utilization and the steady_* columns are NOT comparable across versions; "
+                  "filter to one version or re-run the older points.")
+
     cols = {k: v for k, v in _AGG.items() if k in df.columns}
     table = df.groupby(args.by).agg(cols)
     table.insert(0, "n_runs", df.groupby(args.by).size())

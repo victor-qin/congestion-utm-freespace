@@ -76,6 +76,10 @@ class SimConfig:
 
     # --- demand / horizon ---
     horizon_s: float = 14_400.0        # 4 h
+    # Active demand-generation duration. None preserves the legacy contract: demand is generated over
+    # the whole configured horizon. Density studies use a shorter offered-load window inside a longer
+    # planner envelope; the realized run still continues through the final landing without clipping.
+    demand_duration_s: float | None = None
     lam_per_hour: float = 200.0
     seed: int = 0
 
@@ -160,6 +164,11 @@ class SimConfig:
         """Number of discrete timesteps in the horizon."""
         return int(self.horizon_s / self.dt_s)
 
+    @property
+    def effective_demand_duration_s(self) -> float:
+        """Active demand duration, defaulting to the full simulation horizon."""
+        return self.horizon_s if self.demand_duration_s is None else self.demand_duration_s
+
     # ----- discrete flight levels (A*'s altitude ladder) -----
     @property
     def n_levels(self) -> int:
@@ -197,6 +206,16 @@ class SimConfig:
         ``flight_levels_m`` is the single source of truth for altitude; the single-plane planners' cruise +
         sampling band are DERIVED from it (the ``cruise_level_m`` / ``z_min_m`` / ``z_max_m`` properties).
         """
+        if self.demand_duration_s is not None:
+            if self.demand_duration_s <= 0.0:
+                raise ValueError("demand_duration_s must be positive")
+            if self.demand_duration_s > self.horizon_s:
+                # Deliberately fatal rather than clamped: clamping makes a shrunken horizon look like it
+                # worked, but the departure lead is unaffected, so every departure still lands past the
+                # horizon and the "quick smoke test" silently runs on the box-guard fallback path.
+                raise ValueError(
+                    f"demand_duration_s {self.demand_duration_s} exceeds horizon_s {self.horizon_s} "
+                    f"— lower demand_duration_s too (CLI: --demand-duration alongside --horizon)")
         lv = self.flight_levels_m
         if not lv:
             raise ValueError("flight_levels_m must be non-empty")

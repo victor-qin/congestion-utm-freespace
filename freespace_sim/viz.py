@@ -123,10 +123,16 @@ def snapshot(result: SimResult, t: float, ax=None, out=None, uss: str | None = N
 
 def congestion_heatmap(result: SimResult, out=None, bins: int = 60):
     """2D histogram of reserved volume-seconds projected onto the ground plane (where airspace is
-    busiest). The free-space analog of the sibling's hex-occupancy heatmap."""
-    from .metrics import shape_volume_m3
+    busiest). The free-space analog of the sibling's hex-occupancy heatmap.
+
+    Measured over :func:`metrics.simulation_window` — the same span ``metrics.flight_frame`` uses, so
+    the figure's total reconciles with ``summary.json``'s ``reserved_vol_m3_s``. This used to clamp at
+    ``cfg.horizon_s``, which silently omitted exactly the post-horizon return tail the density
+    scenarios exist to produce (4.6% of departures on dallas_full alone)."""
+    from .metrics import shape_volume_m3, simulation_window
 
     w, h = result.config.region_size_m
+    t_lo, t_hi = simulation_window(result)
     grid = np.zeros((bins, bins))
     for intent in result.accepted:
         for v in intent.volumes or []:
@@ -134,7 +140,7 @@ def congestion_heatmap(result: SimResult, out=None, bins: int = 60):
             cx, cy = (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2
             bx = int(np.clip(cx / w * bins, 0, bins - 1))
             by = int(np.clip(cy / h * bins, 0, bins - 1))
-            dur = max(0.0, min(v.t_end, result.config.horizon_s) - max(v.t_start, 0.0))
+            dur = max(0.0, min(v.t_end, t_hi) - max(v.t_start, t_lo))
             grid[by, bx] += shape_volume_m3(v.shape) * dur
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(grid, origin="lower", extent=[0, w, 0, h], cmap="magma", aspect="equal")

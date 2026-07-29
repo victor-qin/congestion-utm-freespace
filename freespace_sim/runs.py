@@ -5,6 +5,7 @@ timestamped folder ``results/{ISO}_{label}_{hash}/`` holding **everything needed
 analyse, or replay it without re-running the sim**:
 
     config.json          the exact SimConfig used
+    scenario_spec.json   the resolved post-override ScenarioSpec recipe (when supplied)
     experiment.json      which experiment ran + its args + wall-clock seconds  (← "what was run")
     env.json / git.json  toolchain + commit (best-effort; this package is often used outside git)
     summary.json         headline aggregate
@@ -165,17 +166,17 @@ def save_run(
     label: str = "run",
     experiment: str | None = None,
     experiment_args: dict | None = None,
+    scenario_spec: dict | None = None,
     wall_seconds: float | None = None,
     scenario: str | None = None,
     demand: str | None = None,
     write_replay: bool = True,
     index: bool = True,
-    clip_replay_to_horizon: bool = True,
     window_frac: float = 0.9,
 ) -> Path:
     """Write the full self-contained run folder and return its path.
 
-    Captures config/env/git, the experiment identity + args, the scenario, the flown trajectories,
+    Captures config/env/git, the experiment identity + args, the resolved scenario, the flown trajectories,
     the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML. Everything
     is parquet + json — deliberately NOT pickle: portable, inspectable, safe to sync to the run store,
     and Python-version-independent. The analytical geometry stored in reservations/ledger_end is enough
@@ -183,8 +184,9 @@ def save_run(
 
     ``summary.json`` carries the whole-run headline numbers **and** their steady-state twin (metrics
     over the representative density plateau — issue #25) in a nested ``steady_state`` block; ``window_frac``
-    tunes the plateau threshold. ``clip_replay_to_horizon`` (default) stops ``replay.html`` at the horizon;
-    pass ``False`` to keep post-horizon return flights visible.
+    tunes the plateau threshold. The replay is written with ``clip_to_horizon=False`` so the post-horizon
+    return tail these scenarios exist to produce stays visible; note that only extends the clock past
+    ``horizon_s``, it does not trim it — an early-finishing run still plays out to the horizon.
     """
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
@@ -195,9 +197,15 @@ def save_run(
     (folder / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2, default=str))
     (folder / "env.json").write_text(json.dumps(_env_info(), indent=2))
     (folder / "git.json").write_text(json.dumps(_git_info(), indent=2))
+    scenario_description = scenario_spec.get("description") if scenario_spec is not None else None
+    if scenario_spec is not None:
+        (folder / "scenario_spec.json").write_text(
+            json.dumps(scenario_spec, indent=2, default=str)
+        )
     (folder / "experiment.json").write_text(json.dumps({
         "experiment": experiment or label,
         "scenario": scenario,
+        "scenario_description": scenario_description,
         "demand": demand,
         "tag": label,
         "args": experiment_args or {},
@@ -205,6 +213,9 @@ def save_run(
         "timestamp": stamp,
         "planner": cfg.planner,
         "n_requests": len(result.intents),
+        "simulation_start_s": agg["simulation_start_s"],
+        "simulation_end_s": agg["simulation_end_s"],
+        "simulation_duration_s": agg["simulation_duration_s"],
         "verified": result.verified,
     }, indent=2, default=str))
     (folder / "summary.json").write_text(json.dumps(agg, indent=2))
@@ -230,17 +241,18 @@ def save_run(
 
     if write_replay:
         from . import viz_html
-        viz_html.write_html(result, folder / "replay.html", clip_to_horizon=clip_replay_to_horizon)
+        viz_html.write_html(result, folder / "replay.html", clip_to_horizon=False)
 
     if index:
         _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
-                      tag=label, demand=demand, agg=agg)
+                      scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
     return folder
 
 
 def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: float | None,
                   *, scenario: str | None = None, tag: str | None = None,
-                  demand: str | None = None, agg: dict | None = None) -> None:
+                  demand: str | None = None, agg: dict | None = None,
+                  scenario_description: str | None = None) -> None:
     """Append one queryable row per run to ``results/index.parquet``.
 
     The ``scenario`` / ``tag`` / ``demand`` columns are the join keys cross-run readouts filter on:
@@ -258,9 +270,18 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
                     "throughput_per_h", "denial_rate", "congestion_denial_rate")}
     steady_cols["window_lo"] = steady.get("window_lo")
     steady_cols["window_hi"] = steady.get("window_hi")
-    row = {"path": str(folder), "scenario": scenario, "tag": tag, "demand": demand,
+    row = {"path": str(folder), "scenario": scenario,
+           # index.parquet is APPENDED to, so one file accumulates rows from different metric
+           # definitions. Without this stamp a cross-run mean silently mixes them — most sharply
+           # airspace_utilization, whose denominator changed for every scenario in version 2.
+           "metrics_version": metrics.METRICS_VERSION,
+           "scenario_description": scenario_description, "tag": tag, "demand": demand,
            "planner": cfg.planner, "lam_per_hour": cfg.lam_per_hour, "seed": cfg.seed,
            "horizon_s": cfg.horizon_s,
+           "demand_duration_s": cfg.effective_demand_duration_s,
+           "simulation_start_s": agg["simulation_start_s"],
+           "simulation_end_s": agg["simulation_end_s"],
+           "simulation_duration_s": agg["simulation_duration_s"],
            "region_w": cfg.region_size_m[0], "region_h": cfg.region_size_m[1],
            "wall_seconds": wall_seconds,
            "has_telemetry": result.telemetry is not None,
@@ -320,6 +341,25 @@ class LoadedRun:
 
     def summary(self) -> dict:
         return metrics.aggregate_with_steady(self)  # type: ignore[arg-type]
+
+
+def load_scenario_spec(folder: Path | str):
+    """Rebuild the ``ScenarioSpec`` a run was launched from, or ``None`` if the folder has none.
+
+    Complements :func:`load_run`, which reconstructs the *result*. This reconstructs the *recipe* —
+    the resolved post-override world — so a run can be re-executed (at a new seed, planner, or λ)
+    from the folder alone instead of by remembering the command line.
+
+    ``None`` is expected, not exceptional: ``scenario_spec.json`` is written only when the caller
+    supplies one (``experiments.run`` does; ``analysis/altitude_benchmark.py`` does not), and no run
+    archived before the file existed has it.
+    """
+    from .scenarios.spec import ScenarioSpec
+
+    path = Path(folder) / "scenario_spec.json"
+    if not path.exists():
+        return None
+    return ScenarioSpec.from_json_dict(json.loads(path.read_text()))
 
 
 def load_run(folder: Path | str) -> LoadedRun:

@@ -8,7 +8,7 @@ flies, from where, in what pattern). It is the config recipe; :class:`freespace_
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from ..config import SimConfig
 from ..demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
@@ -16,6 +16,11 @@ from ..demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPois
 # default Walmart/strip-mall split for the hub patterns when counts aren't given explicitly
 _DEFAULT_HUB_LABELS = ("walmart_uss", "stripmall_uss")
 _DEFAULT_HUB_COUNTS = (6, 20)
+
+# Bumped when the persisted scenario_spec.json layout changes incompatibly. Stamped by
+# ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
+# reinterpreted under a schema it was not written with.
+_SPEC_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -37,9 +42,15 @@ class DemandSpec:
     # hub_radius: per-USS delivery Poisson rate (/hr). When set, REPLACES cfg.lam_per_hour × uss_share —
     # each USS is its own independent stream. None ⇒ the global-λ path.
     lam_per_uss: "dict[str, float] | None" = None
-    # hub_radius: per-USS desired-departure lead as ``(mean_s, std_s)`` — t_departure = t_request +
-    # max(0, N(mean, std)). Absent USSs (or None) depart on filing. Applies to delivery and return legs.
+    # hub_radius: per-USS desired-departure lead as ``(mean_s, std_s)``. Absent USSs (or None) depart on
+    # filing. Legacy returns draw a second lead; paired returns are filed with the outbound and do not.
     departure_offset_s: "dict[str, tuple[float, float]] | None" = None
+    # "request" samples filings then adds the lead; "departure" samples outbound desired departures
+    # over the common demand window, subtracts the lead, then shifts the full clock nonnegative.
+    timing_mode: str = "request"
+    # Strategic round-trip filing: return shares the outbound filing time and requests departure after
+    # the outbound's nominal arrival. False preserves the legacy independently-filed return behavior.
+    paired_return_request: bool = False
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -68,6 +79,8 @@ class DemandSpec:
                 uss_share=self.uss_share,
                 lam_per_uss=self.lam_per_uss,
                 departure_offset_s=self.departure_offset_s,
+                timing_mode=self.timing_mode,
+                paired_return_request=self.paired_return_request,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":
@@ -88,8 +101,10 @@ class ScenarioSpec:
     """
 
     name: str
+    description: str = ""
     region_m: tuple[float, float] = (8000.0, 8000.0)
     horizon_s: float = 3600.0
+    demand_duration_s: float | None = None
     lam_per_hour: float = 600.0
     seed: int = 0
     planner: str | None = None             # None → SimConfig's default planner
@@ -103,11 +118,21 @@ class ScenarioSpec:
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
-        """The override layer over SimConfig defaults (never edits config.py)."""
+        """The override layer over SimConfig defaults (never edits config.py).
+
+        ``demand_duration_s`` is forwarded UNCLAMPED, so overriding ``horizon_s`` below it raises
+        from :meth:`SimConfig.__post_init__`. That error is deliberate: clamping the demand window
+        to a shrunken horizon looks like it makes ``--horizon 600`` work, but the departure lead
+        (``departure_offset_s``, up to N(1800, 300) for amazon_uss) is unaffected by the clamp, so
+        every generated departure lands past the horizon and the "quick smoke test" silently becomes
+        a meaningless run on the box-guard fallback path. Shrink a density_* scenario by overriding
+        BOTH knobs — ``with_overrides(spec, horizon_s=..., demand_duration_s=...)``.
+        """
         return SimConfig(
             region_size_m=(float(self.region_m[0]), float(self.region_m[1])),
             lam_per_hour=self.lam_per_hour,
             horizon_s=self.horizon_s,
+            demand_duration_s=self.demand_duration_s,
             seed=self.seed,
             **({"planner": self.planner} if self.planner else {}),
             **({"fixed_exit_lanes": self.fixed_exit_lanes} if self.fixed_exit_lanes is not None else {}),
@@ -118,6 +143,53 @@ class ScenarioSpec:
 
     def demand_model(self) -> DemandModel | None:
         return self.demand.build()
+
+    def to_json_dict(self) -> dict:
+        """A JSON-safe dict that :meth:`from_json_dict` can turn back into an equal ``ScenarioSpec``.
+
+        ``dataclasses.asdict`` alone does NOT round-trip: JSON has no tuple, so ``region_m`` /
+        ``flight_levels_m`` / ``uss`` / ``hubs`` / the ``departure_offset_s`` pairs all come back as
+        lists, and the nested ``demand`` comes back a plain dict whose ``.build()`` raises
+        ``AttributeError``. A run folder that cannot rebuild its own recipe is not self-contained.
+        """
+        payload = asdict(self)
+        payload["schema_version"] = _SPEC_SCHEMA_VERSION
+        return payload
+
+    @classmethod
+    def from_json_dict(cls, payload: dict) -> "ScenarioSpec":
+        """Rebuild a ``ScenarioSpec`` from :meth:`to_json_dict` output (or a bare ``asdict``).
+
+        Unknown keys are dropped rather than raising, matching ``runs.load_run``'s whitelist so an
+        archived run stays loadable after a field is renamed — including pre-round-trip folders whose
+        JSON was a raw ``asdict`` with no ``schema_version``. A future or non-numeric schema version is
+        a hard ``ValueError`` (not a ``TypeError``): silently reinterpreting an old recipe is how you
+        replay under the wrong world.
+        """
+        payload = dict(payload)
+        version = payload.pop("schema_version", _SPEC_SCHEMA_VERSION)
+        if not isinstance(version, (int, float)) or isinstance(version, bool) or version > _SPEC_SCHEMA_VERSION:
+            raise ValueError(
+                f"scenario_spec schema_version {version!r} is not readable by this code "
+                f"(understands integer versions <= {_SPEC_SCHEMA_VERSION}) — upgrade freespace_sim")
+
+        demand_payload = dict(payload.pop("demand", None) or {})
+        demand_fields = DemandSpec.__dataclass_fields__
+        demand_kw = {k: v for k, v in demand_payload.items() if k in demand_fields}
+        for name in ("uss", "hubs"):
+            if demand_kw.get(name) is not None:
+                demand_kw[name] = tuple(demand_kw[name])
+        if demand_kw.get("departure_offset_s"):
+            demand_kw["departure_offset_s"] = {
+                k: (float(v[0]), float(v[1])) for k, v in demand_kw["departure_offset_s"].items()}
+
+        spec_fields = cls.__dataclass_fields__
+        kw = {k: v for k, v in payload.items() if k in spec_fields}
+        if kw.get("region_m") is not None:
+            kw["region_m"] = (float(kw["region_m"][0]), float(kw["region_m"][1]))
+        if kw.get("flight_levels_m") is not None:
+            kw["flight_levels_m"] = tuple(float(z) for z in kw["flight_levels_m"])
+        return cls(**kw, demand=DemandSpec(**demand_kw))
 
 
 def with_overrides(spec: ScenarioSpec, *, demand_overrides: dict | None = None, **overrides) -> ScenarioSpec:

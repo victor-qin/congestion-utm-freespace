@@ -6,7 +6,7 @@ stored, so the replay always matches the saved run.
 
     uv run python -m experiments.readouts.replay results/<folder>
     uv run python -m experiments.readouts.replay results/<folder> --open
-    uv run python -m experiments.readouts.replay results/<folder> --no-clip   # keep the post-horizon tail
+    uv run python -m experiments.readouts.replay results/<folder> --clip      # legacy: stop at the horizon
 """
 
 from __future__ import annotations
@@ -22,9 +22,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Regenerate replay.html from a saved run folder.")
     p.add_argument("folder", help="a results/ run folder written by experiments.run")
     p.add_argument("--open", action="store_true", help="open the replay in the default browser")
-    p.add_argument("--no-clip", action="store_true",
-                   help="don't clip the replay clock at the horizon — keep the post-horizon return-flight "
-                        "tail visible (by default the replay stops at cfg.horizon_s; issue #25)")
+    p.add_argument("--clip", action="store_true",
+                   help="clip the replay clock at cfg.horizon_s, dropping the post-horizon "
+                        "return-flight tail. OFF by default, matching what save_run writes: the "
+                        "replay spans first flight activity through final landing (issue #25).")
     args = p.parse_args()
 
     folder = Path(args.folder)
@@ -33,8 +34,8 @@ def main() -> None:
     print(f"loaded {s['n_requests']} flights · {s['n_accepted']} accepted · "
           f"{s['n_denied']} denied · planner={loaded.config.planner}")
 
-    out = viz_html.write_html(loaded, folder / "replay.html", clip_to_horizon=not args.no_clip)
-    print(f"replay → {out}" + ("  (unclipped: post-horizon tail shown)" if args.no_clip else ""))
+    out = viz_html.write_html(loaded, folder / "replay.html", clip_to_horizon=args.clip)
+    print(f"replay → {out}" + ("  (clipped at horizon)" if args.clip else "  (first flight activity through final landing)"))
     if args.open:
         webbrowser.open(f"file://{Path(out).resolve()}")
 

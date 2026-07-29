@@ -23,11 +23,23 @@ import logging
 import sys
 import time
 
-from freespace_sim import runs
+from freespace_sim import metrics, runs
 from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
 from freespace_sim.sim import run
 
 log = logging.getLogger("experiments.run")
+
+
+def _scaled_lam_per_uss(spec, total_lam: float) -> dict[str, float]:
+    """Scale an explicit per-USS rate map while preserving its operator proportions."""
+    rates = spec.demand.lam_per_uss
+    if rates is None:
+        raise ValueError("scenario has no explicit lam_per_uss rates to scale")
+    current_total = sum(float(rate) for rate in rates.values())
+    if current_total <= 0.0:
+        raise ValueError("cannot scale lam_per_uss rates whose total is not positive")
+    scale = float(total_lam) / current_total
+    return {uss_id: float(rate) * scale for uss_id, rate in rates.items()}
 
 
 def _kernel_status(planner_name: str) -> str:
@@ -56,6 +68,8 @@ def spec_from_args(args):
         top["lam_per_hour"] = args.lam
     if args.horizon is not None:
         top["horizon_s"] = args.horizon
+    if args.demand_duration is not None:
+        top["demand_duration_s"] = args.demand_duration
     if args.seed is not None:
         top["seed"] = args.seed
     if args.planner is not None:
@@ -64,6 +78,8 @@ def spec_from_args(args):
         top["terminal_airspace_always_active"] = args.terminal_airspace_always_active
 
     demand: dict = {}
+    if args.lam is not None and spec.demand.lam_per_uss is not None:
+        demand["lam_per_uss"] = _scaled_lam_per_uss(spec, args.lam)
     if args.demand is not None:
         demand["pattern"] = args.demand
     if args.uss is not None:
@@ -88,13 +104,23 @@ def spec_from_args(args):
     return with_overrides(spec, demand_overrides=demand or None, **top)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from ``main`` so tests can construct a real args namespace.
+
+    Hand-mirroring this flag set in a test fixture silently rots the moment a flag is added —
+    ``spec_from_args`` reads attributes that the fixture doesn't have. Parse from here instead.
+    """
     p = argparse.ArgumentParser(description="Run one scenario and persist it (the execute box).")
     p.add_argument("--scenario", choices=sorted(SCENARIOS), default="metro_uniform",
                    help="named world from the registry (override individual fields with the flags below)")
     p.add_argument("--region", type=float, nargs=2, metavar=("W", "H"), default=None)
     p.add_argument("--lam", type=float, default=None, help="arrival rate (req/h)")
     p.add_argument("--horizon", type=float, default=None, help="sim horizon (s)")
+    p.add_argument("--demand-duration", type=float, default=None,
+                   help="offered-load window (s); demand is generated over this, the run continues to "
+                        "--horizon so the return tail is never clipped. Must be <= --horizon, so shrinking "
+                        "a density_* scenario for a smoke test needs BOTH (e.g. --horizon 900 "
+                        "--demand-duration 120). Unset keeps the scenario's own value.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--planner", default=None, help="override planner")
     p.add_argument("--terminal-airspace-always-active", action=argparse.BooleanOptionalAction,
@@ -136,18 +162,28 @@ def main() -> None:
                         "benchmark sweet spot is ~4 workers for exact, ~8 for relaxed)")
     p.add_argument("--parallel-window", type=int, default=None,
                    help="speculation window (default 4×workers); result-affecting in relaxed mode")
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     spec = spec_from_args(args)
+    # to_json_dict, not asdict: the latter loses every tuple to a JSON list and leaves `demand` a
+    # plain dict, so the archived recipe could not be rebuilt. See ScenarioSpec.from_json_dict.
+    scenario_payload = spec.to_json_dict()
     cfg = spec.config()
     demand = spec.demand_model()
     tag = args.tag or spec.name
     # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
     log.info("invocation: python -m experiments.run %s", " ".join(sys.argv[1:]) or "(no arguments)")
-    log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h horizon=%ss seed=%s",
+    log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h planner-envelope=%ss seed=%s",
              spec.name, tag, cfg.planner, spec.demand.pattern, cfg.region_size_m,
              cfg.lam_per_hour, cfg.horizon_s, cfg.seed)
+    if spec.description:
+        log.info("description: %s", spec.description)
+    log.info("active demand duration=%ss", cfg.effective_demand_duration_s)
     log.info("A* kernel: %s", _kernel_status(cfg.planner))
 
     pcfg = None
@@ -167,12 +203,31 @@ def main() -> None:
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
               parallel=pcfg)
     wall = time.time() - t0
+    sim_lo, sim_hi = metrics.simulation_window(res)
+    log.info(
+        "realized simulation: first activity %.1fs, final landing %.1fs, duration %.1fs",
+        sim_lo,
+        sim_hi,
+        sim_hi - sim_lo,
+    )
+    # SimConfig only validates demand_duration_s <= horizon_s, but what actually has to fit under the
+    # horizon is preroll + demand window + lead spread + trip. The preroll is a max-order statistic over
+    # the departure-lead draws (~2300 s for amazon_uss's N(1800, 300)), so a shrunken --horizon can pass
+    # validation and still push most departures past it — where the compiled A* box guard silently
+    # dispatches to the ~5-7x slower pure-Python reference. On a cluster that is the difference between
+    # a 6-hour job and a 30-hour one, so say it out loud rather than let the allocation absorb it.
+    late = sum(1 for i in res.intents if i.request.t_departure > cfg.horizon_s)
+    if late:
+        log.warning("%d/%d departures (%.0f%%) are past horizon_s=%.0fs — those flights fall back to "
+                    "the slow reference A* (box guard). Raise --horizon or lower --demand-duration.",
+                    late, len(res.intents), 100.0 * late / len(res.intents), cfg.horizon_s)
     if pcfg is not None and pcfg.stats:
         log.info("parallel stats: %s", pcfg.stats)
 
     folder = runs.save_run(
         res, label=tag, experiment="run", scenario=spec.name, demand=spec.demand.pattern,
         experiment_args={"scenario": spec.name, "tag": tag, "overrides": vars(args)},
+        scenario_spec=scenario_payload,
         wall_seconds=wall, write_replay=False,   # execute persists data only; replay is a readout
         window_frac=args.window_frac,
     )

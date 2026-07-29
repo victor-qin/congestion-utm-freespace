@@ -12,6 +12,7 @@ two overlapping hub tessellations keep crossing traffic high.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -34,7 +35,8 @@ class UniformPoissonDemand:
 
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         w, h = cfg.region_size_m
-        n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
+        demand_duration_s = cfg.effective_demand_duration_s
+        n = int(rng.poisson(cfg.lam_per_hour * demand_duration_s / 3600.0))
         requests: list[FlightRequest] = []
         for fid in range(n):
             for _ in range(20):  # rejection-sample until O/D are far enough apart
@@ -42,7 +44,7 @@ class UniformPoissonDemand:
                 d = rng.uniform([0, 0], [w, h])
                 if np.linalg.norm(d - o) >= self.min_od_separation_m:
                     break
-            t_request = float(rng.uniform(0, cfg.horizon_s))
+            t_request = float(rng.uniform(0, demand_duration_s))
             uss_id = self.uss_ids[int(rng.integers(len(self.uss_ids)))]
             requests.append(
                 FlightRequest(
@@ -166,9 +168,10 @@ class HubVoronoiDemand:
 
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         w, h = cfg.region_size_m
+        demand_duration_s = cfg.effective_demand_duration_s
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
         ids, probs = self._shares()
-        n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
+        n = int(rng.poisson(cfg.lam_per_hour * demand_duration_s / 3600.0))
 
         requests: list[FlightRequest] = []
         for fid in range(n):
@@ -180,7 +183,7 @@ class HubVoronoiDemand:
                 if np.linalg.norm(customer - hub) >= self.min_od_separation_m:
                     break
             o, d = (hub, customer) if self.direction == "delivery" else (customer, hub)
-            t_request = float(rng.uniform(0, cfg.horizon_s))
+            t_request = float(rng.uniform(0, demand_duration_s))
             requests.append(
                 FlightRequest(
                     flight_id=fid,
@@ -201,6 +204,37 @@ def _sample_in_disk(center: np.ndarray, radius_m: float, rng: np.random.Generato
     return np.asarray(center, float) + r * np.array([np.cos(theta), np.sin(theta)])
 
 
+def _uss_rng(base_seed: int, uss_id: str) -> np.random.Generator:
+    """Return a stable child RNG for one USS, independent of registry insertion order."""
+    digest = hashlib.blake2b(
+        uss_id.encode("utf-8"),
+        digest_size=8,
+        person=b"fspace",
+    ).digest()
+    uss_key = int.from_bytes(digest, "little")
+    return np.random.default_rng(
+        np.random.SeedSequence(
+            [
+                int(base_seed) & 0xFFFFFFFF,
+                (int(base_seed) >> 32) & 0xFFFFFFFF,
+                uss_key & 0xFFFFFFFF,
+                (uss_key >> 32) & 0xFFFFFFFF,
+            ]
+        )
+    )
+
+
+def _shift_request_clock(requests: list[FlightRequest]) -> float:
+    """Shift every request and desired departure so the earliest filing is exactly zero."""
+    if not requests:
+        return 0.0
+    offset_s = -min(request.t_request for request in requests)
+    for request in requests:
+        request.t_request += offset_s
+        request.t_departure += offset_s
+    return offset_s
+
+
 @dataclass
 class HubRadiusDemand:
     """Hub-and-spoke demand for a realistic metro vertiport study — three differences from
@@ -216,7 +250,9 @@ class HubRadiusDemand:
       and bound flight length directly.
     - **return flights** (``return_flights``): each delivery (hub → customer) is followed by a return
       (customer → the *same hub*, landing on any open pad), filed at the delivery's estimated arrival
-      + ``turnaround_s``. The return's landing also consumes a pad, counted against the hub's N.
+      + ``turnaround_s`` in legacy mode. With ``paired_return_request``, both legs are filed together
+      and the return's desired departure follows the outbound's nominal arrival. The return's landing
+      also consumes a pad, counted against the hub's N.
 
     ``lam_per_hour`` counts *deliveries*; with returns on, the realised flight count is ~2×. Hubs are
     placed once under ``hub_seed`` (stable infrastructure); only demand varies with ``cfg.seed``.
@@ -240,14 +276,23 @@ class HubRadiusDemand:
     # Per-USS desired-departure lead as a Gaussian ``(mean_s, std_s)``: a leg filed at t is scheduled to
     # depart at ``t + max(0, N(mean, std))`` (floored at 0 so t_departure ≥ t_request always holds). Set
     # for some USSs to model per-operator scheduling lead / advance booking; absent USSs (or None) depart
-    # on filing exactly as today (and draw NO extra randomness). Applies to BOTH the delivery and its
-    # return leg — each operation carries the operator's lead.
+    # on filing exactly as today (and draw NO extra randomness). Legacy returns draw their own lead;
+    # strategically paired returns inherit their outbound filing and draw no second Gaussian.
     departure_offset_s: "dict[str, tuple[float, float]] | None" = None
+    # "request" samples filing times first (legacy behavior); "departure" samples every USS's outbound
+    # desired departures over the common demand window, then dynamically pre-rolls filings to time zero.
+    timing_mode: str = "request"
+    # When true, the outbound and its return are filed together. The return requests departure after the
+    # outbound's nominal arrival plus turnaround, with no second scheduling-lead draw.
+    paired_return_request: bool = False
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F
     min_hub_gap_m: float = 100.0                     # clearance between terminal-airspace EDGES (no overlap)
 
     def __post_init__(self):
+        if self.timing_mode not in {"request", "departure"}:
+            raise ValueError(
+                f"unknown timing_mode {self.timing_mode!r} (want 'request' | 'departure')")
         # Fail fast on a mistyped USS key — an experiment silently generating zero flights for a hub is a
         # worse failure mode than a config error at construction.
         hubs = set(self.n_hubs_per_uss)
@@ -306,18 +351,15 @@ class HubRadiusDemand:
              else np.array([self.uss_share.get(uid, 0.0) for uid in ids], float))
         return ids, p / p.sum()
 
-    def _departure_for(self, uss_id: str, t_base: float, rng: np.random.Generator) -> "float | None":
-        """Desired ``t_departure`` for a leg filed at ``t_base``: ``t_base + max(0, N(mean, std))`` when
-        this USS has a configured lead, else ``None`` (⇒ ``FlightRequest`` defaults ``t_departure`` to
-        ``t_request``). The None branch consumes NO ``rng`` — that is what keeps the legacy path (no
-        ``departure_offset_s``) byte-for-byte identical."""
+    def _lead_for(self, uss_id: str, rng: np.random.Generator) -> "float | None":
+        """Draw a nonnegative scheduling lead, or ``None`` without consuming the RNG."""
         if self.departure_offset_s is None:
             return None
         ms = self.departure_offset_s.get(uss_id)
         if ms is None:
             return None
         mean, std = ms
-        return t_base + max(0.0, float(rng.normal(mean, std)))   # floored ⇒ t_departure ≥ t_base
+        return max(0.0, float(rng.normal(mean, std)))
 
     def _est_trip_s(self, o: np.ndarray, d: np.ndarray, cfg: SimConfig) -> float:
         """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell."""
@@ -327,6 +369,7 @@ class HubRadiusDemand:
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
+        demand_duration_s = cfg.effective_demand_duration_s
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
 
         # foreign-column filter (cfg.terminal_airspace_always_active): a delivery whose customer's hex
@@ -349,11 +392,8 @@ class HubRadiusDemand:
         requests: list[FlightRequest] = []
         fid = 0
 
-        def emit(uss_id: str, hi: int) -> None:
-            """One delivery (+ optional return) from hub ``hi`` of ``uss_id``. Draws rng in the same order
-            as the legacy inline loop (disk redraw → t_req), then — only when this USS has a configured
-            lead — one N(mean,std) per leg. With ``departure_offset_s`` None it draws nothing extra, so the
-            legacy path stays byte-for-byte identical."""
+        def emit(uss_id: str, hi: int, event_rng: np.random.Generator) -> None:
+            """Emit one outbound delivery and, optionally, its return."""
             nonlocal fid
             hub = hubs[uss_id][hi]
             terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id),
@@ -370,15 +410,21 @@ class HubRadiusDemand:
             min_r = max(self.min_od_separation_m, 1.5 * terminal_radius(terminal, cfg))
             customer = None
             for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint
-                c = _sample_in_disk(hub, radius, rng)
+                c = _sample_in_disk(hub, radius, event_rng)
                 if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
                         np.linalg.norm(c - hub) >= min_r:
                     customer = c
                     break
             if customer is None:
                 customer = np.clip(c, [0.0, 0.0], [w, h])
-            t_req = float(rng.uniform(0, cfg.horizon_s))
-            t_dep = self._departure_for(uss_id, t_req, rng)          # None ⇒ depart on filing (no rng)
+            sampled_clock = float(event_rng.uniform(0, demand_duration_s))
+            lead_s = self._lead_for(uss_id, event_rng)
+            if self.timing_mode == "departure":
+                t_dep = sampled_clock
+                t_req = t_dep - (0.0 if lead_s is None else lead_s)
+            else:
+                t_req = sampled_clock
+                t_dep = t_req + (0.0 if lead_s is None else lead_s)
             drop = False
             if filter_foreign:                                       # customer hex inside a FOREIGN wall?
                 walls = foreign_cells.get(enu_to_axial(customer[0], customer[1], R))
@@ -390,8 +436,18 @@ class HubRadiusDemand:
                     t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal))
             fid += 1
             if self.return_flights:                                  # return: customer → same hub
-                t_ret = t_req + self._est_trip_s(hub, customer, cfg) + self.turnaround_s
-                t_ret_dep = self._departure_for(uss_id, t_ret, rng)  # the return carries its own lead
+                trip_and_turnaround_s = (
+                    self._est_trip_s(hub, customer, cfg) + self.turnaround_s
+                )
+                if self.paired_return_request:
+                    t_ret = t_req
+                    t_ret_dep = t_dep + trip_and_turnaround_s
+                else:
+                    # Legacy request-first semantics: file the return after the nominal outbound arrival,
+                    # then give it its own independently sampled scheduling lead.
+                    t_ret = t_req + trip_and_turnaround_s
+                    return_lead_s = self._lead_for(uss_id, event_rng)
+                    t_ret_dep = t_ret + (0.0 if return_lead_s is None else return_lead_s)
                 if not drop:                                          # foreign-column filter drops both legs
                     requests.append(FlightRequest(
                         fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
@@ -401,20 +457,34 @@ class HubRadiusDemand:
         if self.lam_per_uss is None:
             # Legacy path: one global Poisson count, each flight's USS drawn from uss_share.
             ids, probs = self._shares()
-            n = int(rng.poisson(cfg.lam_per_hour * cfg.horizon_s / 3600.0))
+            n = int(rng.poisson(cfg.lam_per_hour * demand_duration_s / 3600.0))
             for _ in range(n):
                 uss_id = ids[int(rng.choice(len(ids), p=probs))]
-                emit(uss_id, int(rng.integers(hubs[uss_id].shape[0])))
+                emit(uss_id, int(rng.integers(hubs[uss_id].shape[0])), rng)
         else:
             # Per-USS path: an independent Poisson stream per operator; cfg.lam_per_hour / uss_share unused.
+            # Departure-first scenarios receive stable child streams, so adding another USS cannot perturb
+            # an existing operator's candidate sequence. Request-first mode retains the legacy shared stream.
+            base_seed = (
+                int(rng.integers(0, np.iinfo(np.uint64).max, dtype=np.uint64))
+                if self.timing_mode == "departure"
+                else None
+            )
             for uss_id in self.n_hubs_per_uss:
                 # Omitting a hub USS from lam_per_uss is ALLOWED and means zero demand (infrastructure-only
                 # hub). A MISTYPED key is not: __post_init__ rejects lam_per_uss keys absent from
                 # n_hubs_per_uss, so the only way to reach this default-0 is a deliberate omission.
                 lam = float(self.lam_per_uss.get(uss_id, 0.0))
-                n_uss = int(rng.poisson(lam * cfg.horizon_s / 3600.0))
+                uss_rng = _uss_rng(base_seed, uss_id) if base_seed is not None else rng
+                n_uss = int(uss_rng.poisson(lam * demand_duration_s / 3600.0))
                 for _ in range(n_uss):
-                    emit(uss_id, int(rng.integers(hubs[uss_id].shape[0])))
+                    emit(
+                        uss_id,
+                        int(uss_rng.integers(hubs[uss_id].shape[0])),
+                        uss_rng,
+                    )
 
+        if self.timing_mode == "departure":
+            _shift_request_clock(requests)
         requests.sort(key=lambda r: (r.t_request, r.flight_id))
         return requests

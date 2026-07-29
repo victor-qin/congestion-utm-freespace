@@ -74,3 +74,19 @@ def test_single_level_config_supported():
     assert c.n_levels == 1
     assert c.flight_levels_m == (75.0,)
     assert c.cruise_level_m == c.z_min_m == c.z_max_m == 75.0          # all derive onto the lone level
+
+
+def test_demand_duration_defaults_to_horizon():
+    c = SimConfig(horizon_s=900.0)
+    assert c.demand_duration_s is None
+    assert c.effective_demand_duration_s == 900.0
+
+
+def test_demand_duration_must_be_positive():
+    with pytest.raises(ValueError, match="demand_duration_s must be positive"):
+        SimConfig(horizon_s=900.0, demand_duration_s=0.0)
+
+
+def test_demand_duration_cannot_exceed_horizon():
+    with pytest.raises(ValueError, match="exceeds horizon_s"):
+        SimConfig(horizon_s=900.0, demand_duration_s=901.0)

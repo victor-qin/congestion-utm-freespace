@@ -13,7 +13,8 @@ Two surfaces:
   pie). See :func:`cost_breakdown` / :func:`delay_breakdown_s`.
 - ``aggregate(result)`` → a flat dict of headline numbers for the λ-sweep: acceptance/denial,
   delay & detour distributions, throughput, and **airspace utilization** (reserved volume-seconds
-  ÷ the whole region × horizon) — the free-space analog of the sibling project's hex-occupancy.
+  ÷ the whole region × realized simulation duration) — the free-space analog of the sibling
+  project's hex-occupancy.
   ``aggregate`` also accepts a ``window`` to measure only a slice of the run; :func:`aggregate_with_steady`
   reports the whole-run numbers next to their **steady-state** twin (metrics over the representative
   density plateau, dropping the ramp-up/ramp-down tails — issue #25).
@@ -27,6 +28,7 @@ separate from `SEARCH_EXHAUSTED` (a planner artifact) keeps that signal honest �
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -36,6 +38,21 @@ from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
 from .types import DenialReason, OperationalIntent
 from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
+
+
+# Bumped whenever a persisted metric changes MEANING (not when one is added). `runs._append_index`
+# stamps it on every row so `results/index.parquet` — which is appended to, and therefore accumulates
+# rows written by different versions of this file — can never silently average incomparable numbers.
+#   1  original: capacity + rate denominators both cfg.horizon_s; measurement window [0, horizon_s]
+#   2  denominators split (dur_s = realized run for capacity, rate_dur_s = demand window for rates);
+#      measurement window widened to simulation_window, so airspace_utilization changed for EVERY
+#      scenario, and window membership moved from the filing clock to the occupancy clock
+METRICS_VERSION = 2
+
+# The realized run may legitimately exceed horizon_s (post-horizon return tail) but not by orders of
+# magnitude. Generous on purpose: the density family's tail runs ~1.3x its envelope, and this only has
+# to catch a sentinel timestamp (1e12) that leaked into an accepted reservation.
+_MAX_PLAUSIBLE_RUN_FACTOR = 100.0
 
 
 def shape_volume_m3(shape) -> float:
@@ -51,10 +68,9 @@ def shape_volume_m3(shape) -> float:
 def reserved_volume_seconds(volumes: list[Volume4D] | None, t_lo: float, t_hi: float) -> float:
     """Sum of (spatial volume × time-window duration) over a flight's reservation, in m³·s.
 
-    Each volume's window is clamped to ``[t_lo, t_hi]`` so (a) an open-ended hover reservation
-    (``t_end`` ~ 1e6 in some fixtures) can't dominate the sum with off-window seconds, and (b) a
-    steady-state window measures only the volume-seconds a flight spends inside it. Pass
-    ``(0.0, horizon_s)`` for the whole-run figure.
+    Each volume's window is clamped to ``[t_lo, t_hi]`` so a steady-state/windowed view measures only
+    the volume-seconds a flight spends inside it. Full-run callers pass :func:`simulation_window`, which
+    spans every accepted reservation without clipping.
     """
     if not volumes:
         return 0.0
@@ -87,9 +103,50 @@ def _airborne_interval(intent: OperationalIntent) -> tuple[float, float] | None:
     return None
 
 
+def occupancy_time_s(intent: OperationalIntent) -> float:
+    """When this flight took (or wanted to take) the airspace — the clock every window is measured on.
+
+    Accepted: the start of its :func:`_airborne_interval` (actual takeoff). Denied: its desired
+    ``t_departure``, since it never became airborne but is the traffic the window is trying to
+    characterise; dropping denials would make ``denial_rate`` structurally 0 inside every window.
+
+    NOT ``t_request``. Filing time and airborne time are the same clock only when flights depart on
+    filing. Under ``timing_mode="departure"`` they are separated by the whole scheduling lead (~2300 s
+    for amazon_uss), so selecting a cohort by ``t_request`` against a window derived from airborne
+    density can miss it entirely — measured at 0 of 194 flights on a density run.
+
+    Known bias: an accepted flight's takeoff is pushed later by its ground delay while a denied
+    flight's stand-in is not, so denials skew slightly early relative to acceptances within a window.
+    That shift is tens of seconds against windows hundreds of seconds wide; it is the honest cost of
+    the only clock both cohorts can share.
+    """
+    iv = _airborne_interval(intent)
+    return float(iv[0]) if iv is not None else float(intent.request.t_departure)
+
+
+def simulation_window(result: SimResult) -> tuple[float, float]:
+    """Realized run bounds: first accepted flight activity through the final landing reservation.
+
+    Flight reservations include takeoff and landing columns, so their earliest/latest timestamps are
+    the operational bounds the replay and full-run utilization need. A centerline is the fallback for
+    synthetic/legacy intents without volumes. No accepted flight activity yields ``(0.0, 0.0)``.
+    """
+    intervals = [
+        interval
+        for intent in result.accepted
+        if (interval := _airborne_interval(intent)) is not None
+    ]
+    if not intervals:
+        return (0.0, 0.0)
+    return (
+        float(min(lo for lo, _ in intervals)),
+        float(max(hi for _, hi in intervals)),
+    )
+
+
 def density_timeseries(result: SimResult, dt: float | None = None, kind: str = "count",
                        ) -> tuple[np.ndarray, np.ndarray]:
-    """Airborne density over time on a uniform ``dt`` grid spanning ``[0, T]``.
+    """Airborne density over time on a uniform grid spanning every accepted flight.
 
     ``kind="count"`` → concurrent airborne flights (each accepted flight contributes +1 over its
     :func:`_airborne_interval`); ``kind="volume"`` → active reserved spatial volume in m³ (each
@@ -111,18 +168,21 @@ def density_timeseries(result: SimResult, dt: float | None = None, kind: str = "
         raise ValueError(f"kind must be 'count' or 'volume', got {kind!r}")
     if not contribs:
         return np.array([0.0]), np.array([0.0])
-    # Cap the grid at a generous multiple of the horizon. Real accepted reservations end shortly after
-    # the last landing, but a hand-built fixture with an open-ended (``t_end`` ~ 1e6) volume must not
-    # blow up the grid; 4× horizon is far beyond any real ramp-down (a trip is a small fraction of H).
-    t_max = min(max(hi for _, hi, _ in contribs), 4.0 * cfg.horizon_s)
-    n = int(math.ceil(t_max / dt)) + 1
+    t_min = min(lo for lo, _, _ in contribs)
+    t_max = max(hi for _, hi, _ in contribs)
+    span_s = max(0.0, t_max - t_min)
+    # Never truncate the time range. For pathological synthetic open-ended reservations, coarsen the
+    # grid instead of allocating millions of bins; real runs retain cfg.dt_s resolution.
+    max_bins = 250_000
+    grid_dt = max(dt, span_s / max_bins) if span_s > 0.0 else dt
+    n = int(math.ceil(span_s / grid_dt)) + 1
     delta = np.zeros(n + 1)
     for lo, hi, w in contribs:
-        a = min(max(int(math.floor(lo / dt)), 0), n)
-        b = min(max(int(math.ceil(hi / dt)), 0), n)
+        a = min(max(int(math.floor((lo - t_min) / grid_dt)), 0), n)
+        b = min(max(int(math.ceil((hi - t_min) / grid_dt)), 0), n)
         delta[a] += w
         delta[b] -= w
-    return np.arange(n) * dt, np.cumsum(delta)[:n]
+    return t_min + np.arange(n) * grid_dt, np.cumsum(delta)[:n]
 
 
 def _widest_hot_run(hot: np.ndarray) -> tuple[int, int] | None:
@@ -154,25 +214,31 @@ def steady_state_window(result: SimResult, frac: float = 0.9, dt: float | None =
     the threshold tracks the *plateau* level, not a transient concurrency spike (a raw count density
     spikes well above its plateau, and ``0.9 × peak`` then latches onto a few bins around that spike).
     ``None`` (default) adapts the smoothing width to the median trip duration — the scale of the ramp
-    itself; ``0`` disables it (raw density, for controlled inputs). Falls back to ``(0, horizon_s)`` when
-    nothing flew or no plateau is detectable, so the window is always safe to feed to :func:`aggregate`
-    (there, steady == whole-run)."""
+    itself; ``0`` disables it (raw density, for controlled inputs). Falls back to the realized simulation
+    window when no plateau is detectable."""
     cfg = result.config
+    # simulation_window walks every accepted intent's volumes (~2.4M Volume4D on a 27k-flight density
+    # run), so pay for it only on the fallback paths that actually return it — not before the plateau
+    # search that usually discards it.
     if not result.accepted:
-        return (0.0, cfg.horizon_s)
+        return simulation_window(result)
     dt = cfg.dt_s if dt is None else dt
     t, d = density_timeseries(result, dt)
     if d.size == 0 or float(d.max()) <= 0.0:
-        return (0.0, cfg.horizon_s)
+        return simulation_window(result)
     if smooth_s is None:   # adapt to the median airborne span (≈ the trip duration = the ramp width)
         widths = [iv[1] - iv[0] for i in result.accepted if (iv := _airborne_interval(i)) is not None]
         smooth_s = float(np.median(widths)) if widths else 0.0
-    if smooth_s and smooth_s > dt:
-        k = max(1, int(round(smooth_s / dt)))
+    # Measure the kernel against the grid we actually got back, not the one we asked for:
+    # density_timeseries coarsens to max(dt, span/250k), so on a coarsened grid `smooth_s / dt`
+    # over-widens the kernel by grid_dt/dt and mislocates the plateau.
+    grid_dt = float(t[1] - t[0]) if t.size > 1 else dt
+    if smooth_s and smooth_s > grid_dt:
+        k = max(1, int(round(smooth_s / grid_dt)))
         d = np.convolve(d, np.ones(k) / k, mode="same")
     run = _widest_hot_run(d >= frac * float(d.max()))
     if run is None:
-        return (0.0, cfg.horizon_s)
+        return simulation_window(result)
     return (float(t[run[0]]), float(t[run[1]]))
 
 
@@ -352,10 +418,15 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
                window: tuple[float, float] | None = None) -> dict:
     """One tidy record for a single operational intent (accepted or denied).
 
-    ``window=(t_lo, t_hi)`` clamps this row's reserved volume-seconds to the measurement window
-    (default ``[0, horizon_s]``); it does not otherwise change the row (membership filtering by filing
-    time is :func:`flight_frame`'s job)."""
-    res_lo, res_hi = (0.0, cfg.horizon_s) if window is None else window
+    ``window=(t_lo, t_hi)`` clamps this row's reserved volume-seconds to the measurement window; it
+    does not otherwise change the row (membership filtering is :func:`flight_frame`'s job).
+
+    ``window=None`` means *unclamped*, NOT ``[0, horizon_s]``. It meant the latter until this became
+    the only surface still truncating the post-horizon return tail: :func:`flight_frame` passes
+    :func:`simulation_window`, so a bare ``flight_row`` reported several-fold less
+    ``reserved_vol_m3_s`` than ``flights.parquet`` did for the very same flight. A single intent
+    carries no run bounds, so the honest default is to invent none."""
+    res_lo, res_hi = (-math.inf, math.inf) if window is None else window
     straight = _straight_horizontal_m(intent, cfg)
     flown = _flown_horizontal_m(intent, cfg)
     stretch = (flown / straight) if (intent.accepted and straight > 1e-9) else float("nan")
@@ -444,21 +515,33 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         "flown_m": flown,
         "stretch": stretch,
         "reserved_vol_m3_s": reserved_volume_seconds(intent.volumes, res_lo, res_hi),
+        # Persisted so a readout can reproduce flight_frame's window membership. flights.parquet used
+        # to carry only t_request, which is a DIFFERENT clock under timing_mode="departure" — that is
+        # why histograms.py silently dropped its steady overlay. See occupancy_time_s.
+        "t_occupancy": occupancy_time_s(intent),
     }
 
 
 def flight_frame(result: SimResult, window: tuple[float, float] | None = None) -> pd.DataFrame:
     """Per-flight metrics table — one row per intent, FCFS order preserved.
 
-    ``window=(t_lo, t_hi)`` restricts the table to flights *filed* in ``[t_lo, t_hi)`` (filing-time
-    membership — a flight's delay is fixed at entry, and this drops the ramp tails, incl. return flights
-    filed past the horizon) and clamps each row's reserved volume-seconds to the window. ``None``
-    (default) is the whole run: every intent, volume clamped to ``[0, horizon_s]`` — identical to the
-    persisted ``flights.parquet``."""
-    df = pd.DataFrame([flight_row(i, result.config, window) for i in result.intents])
+    ``window=(t_lo, t_hi)`` restricts the table to flights that took the airspace in ``[t_lo, t_hi)``
+    (see :func:`occupancy_time_s`) and clamps each row's reserved volume-seconds to the window. ``None``
+    (default) is the whole run: every intent, volume measured across the complete realized simulation
+    window — first accepted flight activity through final landing — identical to the persisted
+    ``flights.parquet``.
+
+    Membership is on the OCCUPANCY clock, not the filing clock, because every window this is called
+    with (``steady_state_window``, ``simulation_window``) is itself derived from airborne density.
+    Mixing the two silently produced empty cohorts under ``timing_mode="departure"``."""
+    measurement_window = simulation_window(result) if window is None else window
+    df = pd.DataFrame([
+        flight_row(intent, result.config, measurement_window)
+        for intent in result.intents
+    ])
     if window is not None and len(df):
         lo, hi = window
-        df = df[(df["t_request"] >= lo) & (df["t_request"] < hi)].reset_index(drop=True)
+        df = df[(df["t_occupancy"] >= lo) & (df["t_occupancy"] < hi)].reset_index(drop=True)
     return df
 
 
@@ -470,19 +553,29 @@ def _mean(series: pd.Series) -> float:
     return float(series.mean()) if len(series) else 0.0
 
 
-def _rollup(df: pd.DataFrame, cfg: SimConfig, dur_s: float | None = None) -> dict:
+def _rollup(
+    df: pd.DataFrame,
+    cfg: SimConfig,
+    *,
+    dur_s: float,
+    rate_dur_s: float,
+) -> dict:
     """Group-level rollup of a (sub)frame of flight rows — shared by ``aggregate`` (the whole run)
-    and ``per_uss_frame`` (one operator's slice). Denominators (horizon, region capacity) are the
+    and ``per_uss_frame`` (one operator's slice). Denominators (duration, region capacity) are the
     *run's*, so a per-USS ``airspace_utilization`` reads as that operator's share of the whole sky.
 
-    ``dur_s`` (the measurement window's duration) overrides the horizon in the rate and capacity
-    denominators, so a windowed rollup divides throughput/offered-load by the window — not the full
-    horizon — and its ``airspace_utilization`` is volume-seconds ÷ region × window (see :func:`aggregate`).
+    ``dur_s`` controls the reserved-volume capacity denominator. ``rate_dur_s`` separately controls
+    offered-load and throughput rates. Both are REQUIRED — there is deliberately no default, because
+    the only sensible fallback (``cfg.horizon_s``) is the denominator this split replaced, so a caller
+    that silently got it would report horizon-normalized rates inside an otherwise realized-run
+    summary. Build them with :func:`_denominators`, the one place that policy lives. They differ only
+    for a whole-run measurement of a scenario whose demand window is shorter than its planner envelope
+    (the density family), which is how those studies report rates over their active demand window
+    while normalizing utilization over the realized run.
     """
     acc = df[df["accepted"]]
     den = df[df["denied"]]
-    dur_s = cfg.horizon_s if dur_s is None else dur_s
-    horizon_h = dur_s / 3600.0
+    rate_h = rate_dur_s / 3600.0
     # Vertical extent of the usable airspace. With discrete flight levels (n_levels > 1) the usable
     # tube is the regulated band [ground, airspace_ceiling]. Otherwise the continuous band is collapsed
     # to a single plane (z_max == z_min), so fall back to the corridor slab height — the vertical
@@ -499,8 +592,8 @@ def _rollup(df: pd.DataFrame, cfg: SimConfig, dur_s: float | None = None) -> dic
         "n_denied": int(len(den)),
         "denial_rate": len(den) / max(1, len(df)),
         "congestion_denial_rate": n_budget / max(1, len(df)),  # budget-only (real congestion)
-        "offered_load_per_h": len(df) / max(horizon_h, 1e-9),
-        "throughput_per_h": len(acc) / max(horizon_h, 1e-9),
+        "offered_load_per_h": len(df) / max(rate_h, 1e-9),
+        "throughput_per_h": len(acc) / max(rate_h, 1e-9),
         "mean_ground_delay_s": float(acc["ground_delay_s"].mean()) if len(acc) else 0.0,
         "p95_ground_delay_s": _q(acc["ground_delay_s"], 0.95),
         "mean_total_delay_s": float(acc["total_delay_s"].mean()) if len(acc) else 0.0,
@@ -542,14 +635,52 @@ def _rollup(df: pd.DataFrame, cfg: SimConfig, dur_s: float | None = None) -> dic
     }
 
 
-def _per_uss_table(df: pd.DataFrame, cfg: SimConfig, dur_s: float | None = None) -> pd.DataFrame:
+def _denominators(result: SimResult, window: tuple[float, float] | None):
+    """The measurement bounds and the two rollup denominators, derived in ONE place.
+
+    ``dur_s`` normalizes reserved-volume CAPACITY over the realized run; ``rate_dur_s`` normalizes
+    offered-load and throughput RATES over the active demand window. They differ only for a whole-run
+    measurement of a scenario whose demand window is shorter than its planner envelope (the density
+    family: 30 min of demand inside a 2 h envelope). A windowed measurement uses the window for both.
+
+    ``aggregate`` and ``per_uss_frame`` both need this pair; keeping one spelling stops the two from
+    drifting apart and silently normalizing an aggregate's totals differently from the per-USS rows
+    embedded in it.
+    """
+    if window is None:
+        sim_lo, sim_hi = simulation_window(result)
+        dur = sim_hi - sim_lo
+        # The realized run is deliberately unbounded by horizon_s — that is the point of this PR, and
+        # the return tail legitimately runs past it. But it is bounded by PHYSICS: a run cannot last
+        # orders of magnitude longer than its planner envelope. A wall-style sentinel (_WALL_T_END_S
+        # = 1e12) reaching an accepted intent's .volumes would divide utilization by ~1e9 with no
+        # error, so warn instead of silently publishing it. Not a clamp: clamping would re-truncate
+        # the tail the whole change exists to keep.
+        if dur > _MAX_PLAUSIBLE_RUN_FACTOR * result.config.horizon_s:
+            warnings.warn(
+                f"realized run duration {dur:.0f}s exceeds {_MAX_PLAUSIBLE_RUN_FACTOR}x horizon_s "
+                f"({result.config.horizon_s:.0f}s) — a sentinel/open-ended reservation has probably "
+                f"reached an accepted intent; airspace_utilization is meaningless for this run",
+                RuntimeWarning, stacklevel=2)
+        return sim_lo, sim_hi, dur, result.config.effective_demand_duration_s
+    lo, hi = window
+    return lo, hi, hi - lo, hi - lo
+
+
+def _per_uss_table(
+    df: pd.DataFrame,
+    cfg: SimConfig,
+    *,
+    dur_s: float,
+    rate_dur_s: float,
+) -> pd.DataFrame:
     total_acc = int(df["accepted"].sum()) if len(df) else 0
     rows = []
     for uss_id, g in df.groupby("uss_id", sort=True):
         acc = g[g["accepted"]]
         rows.append({
             "uss_id": uss_id,
-            **_rollup(g, cfg, dur_s=dur_s),
+            **_rollup(g, cfg, dur_s=dur_s, rate_dur_s=rate_dur_s),
             # per-USS-only: flight length (confirms hub-demand shortening) + share of the throughput
             "mean_straight_line_m": float(acc["straight_line_m"].mean()) if len(acc) else 0.0,
             "share_of_accepted": (len(acc) / total_acc) if total_acc else 0.0,
@@ -560,28 +691,37 @@ def _per_uss_table(df: pd.DataFrame, cfg: SimConfig, dur_s: float | None = None)
 def per_uss_frame(result: SimResult, window: tuple[float, float] | None = None) -> pd.DataFrame:
     """One metrics row per USS — the per-operator slice of a (multi-)USS run. Each row's counts and
     reserved volume sum to the overall ``aggregate`` totals (see tests). ``window`` restricts to flights
-    filed in ``[t_lo, t_hi)`` and uses the window duration for the rate/capacity denominators."""
-    cfg = result.config
-    lo, hi = (0.0, cfg.horizon_s) if window is None else window
-    return _per_uss_table(flight_frame(result, window), cfg, dur_s=hi - lo)
+    that took the airspace in ``[t_lo, t_hi)`` (the occupancy clock; see :func:`occupancy_time_s`) and
+    uses the window duration for the rate/capacity denominators. Without a window, rates use the active
+    demand duration and utilization uses the realized simulation duration."""
+    _lo, _hi, dur_s, rate_dur_s = _denominators(result, window)
+    return _per_uss_table(
+        flight_frame(result, window),
+        result.config,
+        dur_s=dur_s,
+        rate_dur_s=rate_dur_s,
+    )
 
 
 def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> dict:
     """Flat headline rollup for one run — the row a λ-sweep collects.
 
-    ``window=(t_lo, t_hi)`` measures only flights filed in that interval, with rate/capacity
-    denominators using the window duration and ``window_lo``/``window_hi`` added for provenance. ``None``
-    (default) is the whole run — every field identical to before this option existed. Use
-    :func:`aggregate_with_steady` to report the whole-run numbers next to their steady-state twin."""
+    ``window=(t_lo, t_hi)`` measures only flights that took the airspace in that interval (the occupancy
+    clock, matching :func:`flight_frame`), with rate/capacity denominators using the window duration and
+    ``window_lo``/``window_hi`` added for provenance. ``None``
+    (default) measures the complete realized run from first activity through final landing. Use
+    :func:`aggregate_with_steady` to report that whole-run view next to its steady-state twin."""
     cfg = result.config
-    lo, hi = (0.0, cfg.horizon_s) if window is None else window
-    dur_s = hi - lo
+    # A windowed call must NOT pay for simulation_window: it is a full scan of every accepted flight's
+    # volumes (~2.4M Volume4D on the 27k-flight density runs) and aggregate_with_steady pops the
+    # simulation_* keys straight back off the steady block. _denominators only derives it when needed.
+    sim_lo, sim_hi, dur_s, rate_dur_s = _denominators(result, window)
     df = flight_frame(result, window)
     den = df[df["denied"]] if len(df) else df
     by_reason = den["denial_reason"].value_counts().to_dict() if len(den) else {}
 
     # cross-USS fairness: does one operator systematically lose under FCFS? (0 when single-USS)
-    per_uss = _per_uss_table(df, cfg, dur_s=dur_s)
+    per_uss = _per_uss_table(df, cfg, dur_s=dur_s, rate_dur_s=rate_dur_s)
     n_uss = int(len(per_uss))
     if n_uss > 1:
         denial_rate_spread = float(per_uss["denial_rate"].max() - per_uss["denial_rate"].min())
@@ -591,17 +731,26 @@ def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> d
 
     out = {
         "lam_per_hour": cfg.lam_per_hour,
+        "demand_duration_s": cfg.effective_demand_duration_s,
         "seed": cfg.seed,
         "planner": cfg.planner,
-        **_rollup(df, cfg, dur_s=dur_s),
+        **_rollup(df, cfg, dur_s=dur_s, rate_dur_s=rate_dur_s),
         "denials_by_reason": by_reason,
         "n_uss": n_uss,
         "denial_rate_spread": denial_rate_spread,
         "mean_delay_spread": mean_delay_spread,
         "verified": result.verified,
     }
-    if window is not None:
-        out["window_lo"], out["window_hi"] = float(lo), float(hi)
+    if window is None:
+        # Only the whole-run view can honestly name these: for a windowed call `_denominators`
+        # returns the WINDOW, so emitting them here would publish the window under a key that says
+        # "simulation". aggregate_with_steady pops them off the steady block anyway, so the windowed
+        # path loses nothing — and skips the full simulation_window scan it would otherwise pay for.
+        out["simulation_start_s"] = sim_lo
+        out["simulation_end_s"] = sim_hi
+        out["simulation_duration_s"] = sim_hi - sim_lo
+    else:
+        out["window_lo"], out["window_hi"] = float(window[0]), float(window[1])
     return out
 
 
@@ -611,15 +760,37 @@ def aggregate_with_steady(result: SimResult, frac: float = 0.9, smooth_s: float 
     rollup measured over :func:`steady_state_window` (the representative density plateau) — the two
     views reported side by side (issue #25). The block carries ``window_lo``/``window_hi`` so a windowed
     number is self-describing; it drops the run-identity keys (lam/seed/planner/n_uss/verified) the two
-    views share. When no plateau is detectable (small / low-λ runs) the window is the whole horizon, so
-    the steady block simply equals the whole-run numbers.
+    views share. When no plateau is detectable (small / low-λ runs), the window is the realized run.
+    Its rate fields still use that explicit window, so they can differ from full-cohort rates when the
+    configured demand duration differs from that realized duration.
 
     ``smooth_s`` is forwarded to :func:`steady_state_window` (``None`` → adapt the smoothing width to
     the median trip duration, so the window tracks the plateau, not a transient concurrency spike)."""
     win = steady_state_window(result, frac=frac, dt=dt, smooth_s=smooth_s)
     out = aggregate(result)
-    steady = aggregate(result, window=win)
-    for k in ("lam_per_hour", "seed", "planner", "n_uss", "verified"):
+    # The steady twin means something only if the window actually selected flights. Two ways it can
+    # come up empty and republish a block of structural zeros — an all-denied run would then archive
+    # steady_denial_rate 0.0, byte-identical to a flawless one:
+    #   * a zero-width window (nothing accepted ⇒ simulation_window is (0, 0)); and
+    #   * a positive window that no takeoff's occupancy clock falls inside (a low-λ plateau spanned end
+    #     to end by aircraft that departed earlier) ⇒ n_requests == 0 despite hi > lo.
+    # Either way, fall back to the whole-run view — what the deleted `(0, horizon_s)` fallbacks
+    # guaranteed. (dict(out) is a shallow copy; only the two scalar window keys are reassigned below.)
+    steady = aggregate(result, window=win) if win[1] > win[0] else dict(out)
+    if steady.get("n_requests", 0) == 0:
+        steady = dict(out)
+    steady["window_lo"], steady["window_hi"] = float(win[0]), float(win[1])
+    for k in (
+        "lam_per_hour",
+        "demand_duration_s",
+        "simulation_start_s",
+        "simulation_end_s",
+        "simulation_duration_s",
+        "seed",
+        "planner",
+        "n_uss",
+        "verified",
+    ):
         steady.pop(k, None)
     out["steady_state"] = steady
     return out

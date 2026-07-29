@@ -31,8 +31,8 @@ Experiments are a three-stage pipeline joined through saved run folders on disk 
 **execute** it, **read out** artifacts — composed with plain shell (see [Experiments](#experiments)).
 
 ```bash
-uv sync
-uv run pytest -q -m "not slow"          # full test suite, ASTM invariant included
+uv sync                                 # installs numba too (default-group), so A* gets the compiled kernel
+uv run --extra dev pytest -q -m "not slow"   # full suite; pytest lives in the `dev` EXTRA, which uv sync does not install
 
 # EXECUTE one named scenario → a complete, reloadable run folder (the folder path is the last stdout line):
 FOLDER=$(uv run python -m experiments.run --scenario dallas_hub_2uss --planner astar_shortcut | tail -1)
@@ -97,8 +97,9 @@ Three composable stages, joined through saved run folders on disk — so analysi
 and the demand pattern / USS count is a property of the **scenario** (reused by every stage for free):
 
 **1. DEFINE** — a `ScenarioSpec` is a named *world* (region, horizon, λ, planner, demand pattern). The
-registry in [`scenarios.py`](freespace_sim/scenarios.py) ships `metro_uniform` (1 USS), `metro_2uss`
-(2 USS, uniform), and `dallas_hub_2uss` (2 USS, geographic hub-and-spoke). Any field is overridable.
+registry in [`scenarios/`](freespace_sim/scenarios) ships `metro_uniform` (1 USS), `metro_2uss`
+(2 USS, uniform), `dallas_hub_2uss` (2 USS, geographic hub-and-spoke), and the four explicit density
+worlds below. Any field is overridable.
 
 **2. EXECUTE** — `experiments.run` runs **one** scenario and persists it (no plots). Sweeps and
 comparisons are pure-shell loops over it, joined by a shared `--tag`:
@@ -106,6 +107,27 @@ comparisons are pure-shell loops over it, joined by a shared `--tag`:
 ```bash
 uv run python -m experiments.run --scenario dallas_hub_2uss --planner astar_shortcut --tag demo
 uv run python -m experiments.run --scenario metro_2uss --demand hub --uss a b --hubs 5 15 --lam 240
+```
+
+The density matrix has four canonical recipes:
+
+| scenario | operator mix |
+|---|---|
+| `density_faa_wing_zipline` | FAA-filing Wing/Zipline-type traffic |
+| `density_future_wing_zipline` | far-future Wing/Zipline-type traffic |
+| `density_faa_wing_zipline_amazon` | FAA-filing Wing/Zipline plus Amazon traffic |
+| `density_future_wing_zipline_amazon` | far-future Wing/Zipline plus Amazon traffic |
+
+In these scenarios λ counts outbound delivery missions. Each outbound is paired with a return, so the
+expected number of flight legs is twice the outbound count. Mixed scenarios use two distinct USS
+instances (`wing_zipline_uss` and `amazon_uss`), with independent demand streams and operator-specific
+service radii and scheduling leads. The canonical density runs generate outbound demand over 30 minutes
+inside a two-hour planner envelope used to size the scheduling machinery. That envelope is not a cutoff:
+every generated request is processed, and the realized simulation runs from the first flight activity
+through the final landing without diluting the reported hourly demand rate. Run the complete matrix with:
+
+```bash
+bash experiments/batch/density_matrix.sh paper 0 1 2
 ```
 
 **3. READ OUT** — standalone consumers that load saved data (never re-simulate):
@@ -125,12 +147,14 @@ folder. The only genuinely cross-run readout is `curve` (a *trend* needs many po
 index the loop populated.
 
 **Orchestration** lives in [`experiments/batch/`](experiments/batch) (`lambda_sweep.sh`,
-`compare_planners.sh`, `replay_demo.sh`) — plain shell composing the run box + readouts.
+`compare_planners.sh`, `density_matrix.sh`, `replay_demo.sh`) — plain shell composing the run box + readouts.
 (`compare_optimizers.py` stays standalone: it's a planner micro-benchmark on hand-built obstacles, not
 the demand pipeline.)
 
 Every run folder is self-contained (`config.json`, `experiment.json`, `scenario.parquet`,
-`trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `per_uss.parquet`) and a row is
+`trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `per_uss.parquet`); runs launched
+through `experiments.run` also carry `scenario_spec.json`, the resolved post-override recipe, so the
+world is reproducible from the folder alone. A row is
 appended to `results/index.parquet` (with `scenario`/`tag`/`demand`/`n_uss` columns) for cross-run
 readouts. **Per-run** readouts (`replay`/`figures`/`uss_breakdown`/`histograms`) write *into* the run
 folder (or a collecting `--out-dir`); the **cross-run** `curve`/`compare` describe a run *set*, so they
@@ -152,7 +176,7 @@ Per flight: ground delay, air hold, air detour, altitude change, cost, **stretch
 straight), **total delay** (hold + loiter + detour-time, excluding the mandatory climb), reserved
 **volume-seconds**, and **planner solve time**. Aggregates roll these up plus denial rate (with
 budget-vs-search-artifact split), throughput, and **airspace utilization** (reserved volume-seconds
-÷ region × horizon — the free-space analog of the hex repo's occupancy).
+÷ region × realized simulation duration — the free-space analog of the hex repo's occupancy).
 
 **Steady-state window.** A run's airborne density is a trapezoid — it ramps up from an empty sky,
 plateaus, then ramps down as the last flights (and post-horizon returns) land. Metrics over the whole
@@ -161,9 +185,10 @@ run are diluted by the low-density ramps, so `metrics.steady_state_window(result
 the whole-run number **and** its steady-state twin measured over that window: `summary.json` carries a
 nested `steady_state` block, `index.parquet` gains `steady_*` / `window_*` columns, and the `curve` /
 `compare` / `histograms` readouts overlay the two. `--window-frac` tunes the plateau threshold; the
-replay clips to the horizon by default (`--no-clip` keeps the return tail). This **supersedes** the
-removed `clip_returns_to_horizon` demand hack (issue #25): run the natural demand, but *measure* only
-the representative window instead of mutilating the flight set.
+replay is written unclipped, so post-horizon return traffic stays visible instead of being cut at
+`horizon_s` (the clock still starts at 0 and never ends before the horizon). This **supersedes** the removed
+`clip_returns_to_horizon` demand hack (issue #25): run and preserve the natural demand and its full tail,
+while the separate steady-state view measures only the representative plateau.
 
 ## Status
 

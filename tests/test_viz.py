@@ -82,6 +82,39 @@ def test_snapshot_and_heatmap_write_files(tmp_path):
     assert (tmp_path / "heat.png").stat().st_size > 0
 
 
+def test_congestion_heatmap_measures_over_simulation_window_not_horizon_clamp():
+    """congestion_heatmap must bin volume-seconds over simulation_window, not clamp at cfg.horizon_s.
+
+    The old clamp dropped every reservation-second past horizon_s — exactly the post-horizon return
+    tail the density scenarios exist to produce. This drives the ACTUAL function (via the grid it
+    plots onto the returned axis) rather than re-deriving the sum inline, so reverting viz.py to the
+    clamp makes it fail: (a) the plotted total no longer reconciles with metrics' reserved_vol_m3_s,
+    and (b) it collapses to the horizon-clamped total instead of exceeding it.
+    """
+    import math
+
+    from freespace_sim import metrics
+
+    res = run(SimConfig(planner="straight", lam_per_hour=200.0, horizon_s=600.0, seed=3))
+    t_lo, t_hi = metrics.simulation_window(res)
+    assert t_hi > res.config.horizon_s, "fixture has no post-horizon tail — the check is vacuous"
+
+    ax = viz.congestion_heatmap(res)                       # the real function, not a re-implementation
+    plotted_total = float(ax.images[0].get_array().sum())  # the grid it actually binned
+
+    # (a) the figure reconciles with the metric measured over the same (simulation) window
+    assert math.isclose(plotted_total, metrics.aggregate(res)["reserved_vol_m3_s"], rel_tol=1e-9)
+
+    # (b) and it is strictly MORE than the old horizon-clamped total — the dropped return tail. A
+    # revert to `min(v.t_end, horizon_s) - max(v.t_start, 0)` makes plotted_total == clamped, so this
+    # fails. (No reservation starts before t_lo, so the clamp's lower bound of 0 loses nothing there.)
+    clamped = sum(
+        metrics.shape_volume_m3(v.shape)
+        * max(0.0, min(v.t_end, res.config.horizon_s) - max(v.t_start, 0.0))
+        for i in res.accepted for v in (i.volumes or []))
+    assert plotted_total > clamped * (1.0 + 1e-9)
+
+
 def test_scene_3d_has_geometry():
     res = _small_run()
     scene = viz.scene_3d(res)

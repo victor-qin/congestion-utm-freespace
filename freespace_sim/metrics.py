@@ -510,8 +510,13 @@ def _rollup(
     *run's*, so a per-USS ``airspace_utilization`` reads as that operator's share of the whole sky.
 
     ``dur_s`` controls the reserved-volume capacity denominator. ``rate_dur_s`` separately controls
-    offered-load and throughput rates; it defaults to ``dur_s``. Full-cohort density studies therefore
-    report rates over their active demand window while normalizing utilization over the realized run.
+    offered-load and throughput rates. Both are REQUIRED — there is deliberately no default, because
+    the only sensible fallback (``cfg.horizon_s``) is the denominator this split replaced, so a caller
+    that silently got it would report horizon-normalized rates inside an otherwise realized-run
+    summary. Build them with :func:`_denominators`, the one place that policy lives. They differ only
+    for a whole-run measurement of a scenario whose demand window is shorter than its planner envelope
+    (the density family), which is how those studies report rates over their active demand window
+    while normalizing utilization over the realized run.
     """
     acc = df[df["accepted"]]
     den = df[df["denied"]]

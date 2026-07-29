@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from freespace_sim import metrics
 from freespace_sim.config import SimConfig
@@ -426,3 +427,127 @@ def test_aggregate_with_steady_reports_both_views():
     full = metrics.aggregate(res)
     assert agg["mean_total_delay_s"] == full["mean_total_delay_s"]
     assert agg["n_requests"] == full["n_requests"]
+
+
+class _DenyAll:
+    """A warm planner that always denies — see :func:`_hub_flight`."""
+
+    def plan(self, req, ledger, cfg):
+        from freespace_sim.types import DenialReason, IntentStatus, OperationalIntent
+
+        return OperationalIntent(request=req, status=IntentStatus.REJECTED,
+                                 denial_reason=DenialReason.BUDGET_EXCEEDED, planner="deny")
+
+
+def _hub_flight(planner, radius=180.0, levels=(100.0,)):
+    """An unimpeded flight between two hubs of ``radius`` on the given flight-level ladder.
+
+    ``get_planner("milp")`` returns MILPOptPlanner, whose ``plan`` yields the CHEAPER of its warm
+    StraightLineTimeShift candidate and its own solve — and in empty airspace the warm one wins. That
+    made the ``milp`` arm a byte-identical duplicate of the ``straight`` arm (same 46-point unfolded
+    centerline, same 0.0 detour) which never entered milp.py at all. Deny the warm start so the MILP's
+    own folded path comes back. Same trap, same fix as ``test_astar._folded_planner``.
+    """
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.planner.milp import MILPOptPlanner
+    from freespace_sim.types import Terminal
+
+    cfg = SimConfig(flight_levels_m=levels, airspace_ceiling_m=max(levels) + 25.0,
+                    region_size_m=(20_000.0, 20_000.0), terminal_radius_m=radius)
+    hub = Terminal("hub#0", 8, radius)
+    req = FlightRequest(1, vec(0, 0, 0), vec(5000, 2000, 0), 0.0,
+                        origin_terminal=hub, dest_terminal=hub)
+    resolved = MILPOptPlanner(warm_planner=_DenyAll()) if planner == "milp" else get_planner(planner)
+    intent = resolved.plan(req, ReservationLedger(cfg), cfg)
+    assert intent.accepted
+    return cfg, req, intent
+
+
+def test_enroute_metrics_exclude_terminal_airspace():
+    """Both sides of ``stretch`` span exit lane -> exit lane, never hub centre -> hub centre.
+
+    Flying inside a terminal column is terminal operations: it consumes that hub's capacity and is
+    neither en-route distance nor delay. Measuring against the centres books the two unreserved column
+    legs as avoidable detour, which drove ``stretch`` BELOW 1 once a refiner removed the hex staircase
+    that had been masking it (issue #50).
+    """
+    from freespace_sim.volumes import enroute_reference_m
+
+    cfg, req, intent = _hub_flight("astar")
+    row = metrics.flight_row(intent, cfg)
+    centre_to_centre = float(np.linalg.norm(
+        np.asarray(req.dest, float)[:2] - np.asarray(req.origin, float)[:2]))
+    ref = enroute_reference_m(req.origin, req.dest, req.origin_terminal, req.dest_terminal, cfg)
+    # guard the guard: two 180 m hubs must actually shorten the baseline, else this proves nothing
+    assert ref < centre_to_centre - 100.0, "baseline is not lane->lane"
+    assert math.isclose(row["straight_line_m"], ref, rel_tol=1e-9)
+    assert row["stretch"] >= 1.0 - 1e-9
+    # Pin the FLOWN side too — asserting only the reference let a full revert of enroute_flown_m pass,
+    # because the A* staircase is larger than the column legs so stretch stayed above 1 either way.
+    # Use `straight`, whose centerline runs hub centre -> hub centre unfolded: the excluded length is
+    # then EXACTLY the two column legs, 2 x exit_radius. (For A* the fold instead EXTENDS the path out
+    # to the column edge, since its centerline already starts on a boundary lane cell — so the sign of
+    # flown - raw is planner-dependent and only this case pins the exclusion exactly.)
+    from freespace_sim.volumes import exit_radius
+
+    cfg_s, req_s, intent_s = _hub_flight("straight")
+    raw = float(np.linalg.norm(
+        np.diff(np.asarray([np.asarray(p, float)[:2] for p, _ in intent_s.centerline]), axis=0),
+        axis=1).sum())
+    legs = 2.0 * exit_radius(req_s.origin_terminal, cfg_s)
+    assert math.isclose(metrics.flight_row(intent_s, cfg_s)["flown_m"], raw - legs, abs_tol=1e-6), \
+        "flown length does not exclude exactly the two terminal column legs"
+
+
+@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "milp", "straight"])
+def test_planner_detour_and_metrics_stretch_cannot_drift(planner):
+    """``air_detour_m`` (planner) and ``flown_m - straight_line_m`` (metrics) must agree EXACTLY.
+
+    They are computed in different layers off different inputs, so they drifted before: the planners
+    measured the raw reserved centerline while metrics measured it rooted at the column edges. Both now
+    go through ``volumes.enroute_flown_m``. A continuous planner flies the ideal line and must read
+    exactly 0 detour / 1.0 stretch — if it does not, the two rulers have diverged again.
+    """
+    cfg, _req, intent = _hub_flight(planner)
+    row = metrics.flight_row(intent, cfg)
+    assert math.isclose(intent.air_detour_m, row["flown_m"] - row["straight_line_m"], abs_tol=1e-6)
+    assert row["stretch"] >= 1.0 - 1e-9
+    if planner == "straight":
+        assert math.isclose(row["stretch"], 1.0, abs_tol=1e-9), "straight flies the ideal line exactly"
+    if planner == "milp":
+        # a REAL milp intent (denied warm start) discretizes into knots, so it lands just off the
+        # ideal line rather than exactly on it — but it must not carry the column legs
+        assert row["stretch"] < 1.01, f"milp stretch {row['stretch']:.4f} — column legs leaking in?"
+
+
+@pytest.mark.parametrize("planner", ["astar", "milp", "straight"])
+def test_overlapping_terminal_columns_book_no_enroute_detour(planner):
+    """A flight with no en-route segment must not have its whole path booked as detour.
+
+    ``enroute_reference_m`` clamps to 0 when two column radii cover the whole trip, and
+    ``max(0.0, flown - 0.0)`` then charged the ENTIRE flown path as ``air_detour_m`` — real seconds
+    and real cost — while the ``max_detour_factor`` gate was skipped by its own ``> _EPS`` guard.
+    Reachable through a shipped flag: ``--corridor-overlap -100`` (``exit_radius`` documents negative
+    overlap as "leaves a clearance gap"), which pushes exit_radius to 310 m.
+    """
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.types import Terminal
+    from freespace_sim.volumes import enroute_reference_m
+
+    cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+                    region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0,
+                    max_detour_factor=1.2)
+    hub = Terminal("hub#0", 8, 180.0, -100.0)          # exit_radius 310 m > the 250 m trip
+    req = FlightRequest(1, vec(5000, 5000, 0), vec(5000, 5250, 0), 0.0, origin_terminal=hub)
+    # guard the guard: this configuration must actually reach the clamp
+    assert enroute_reference_m(req.origin, req.dest, hub, None, cfg) == 0.0, "clamp not reached"
+
+    intent = get_planner(planner).plan(req, ReservationLedger(cfg), cfg)
+    if not intent.accepted:
+        return                                          # denying is fine; over-charging is not
+    assert intent.air_detour_m == 0.0, (
+        f"{planner}: booked {intent.air_detour_m:.1f} m of detour on a flight with no en-route "
+        "segment — the whole path was charged")
+    assert math.isnan(metrics.flight_row(intent, cfg)["stretch"]), "stretch must be undefined here"

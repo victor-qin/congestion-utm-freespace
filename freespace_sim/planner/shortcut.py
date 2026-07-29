@@ -21,7 +21,8 @@ from ..config import SimConfig
 from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent
-from ..volumes import build_reservation_from_corners
+from ..volumes import (build_reservation_from_corners, enroute_detour_m,
+                       enroute_flown_m, enroute_reference_m)
 
 _EPS = 1e-9
 
@@ -37,7 +38,10 @@ def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_hor
     volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
         corners, origin, dest, t_depart, g_delay, cfg, origin_term=origin_term, dest_term=dest_term
     )
-    if straight_horiz > _EPS and cum_horiz / straight_horiz > cfg.max_detour_factor:
+    # Both sides span lane → lane via the same helper metrics uses (issue #50), so the gate enforces
+    # exactly the ratio the caller will report as air_detour_m / stretch.
+    flown = enroute_flown_m([p for p, _ in centerline], origin, dest, origin_term, dest_term, cfg)
+    if straight_horiz > _EPS and flown / straight_horiz > cfg.max_detour_factor:
         return None
     if ledger.any_conflict(volumes):
         return None
@@ -56,7 +60,7 @@ def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
     corners = [np.asarray(c, float) for c in corners]
     if len(corners) <= 2:
         return corners
-    straight_horiz = float(np.linalg.norm((np.asarray(dest, float) - np.asarray(origin, float))[:2]))
+    straight_horiz = enroute_reference_m(origin, dest, origin_term, dest_term, cfg)
     if _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_horiz,
                 origin_term, dest_term) is None:
         return corners
@@ -102,8 +106,12 @@ class ShortcutRefiner:
             return intent
 
         g_delay = intent.ground_delay_s
-        # exact inverse of the build: recover the takeoff time using the climb to the FIRST cruise
-        # point's altitude (its flight level), matching build_reservation_from_corners' corner-z timing.
+        # Exact inverse of the REBUILD, not of A*'s stamp — build_reservation_from_corners re-derives
+        # `t = t_depart + g_delay + climb_time_to(z0)`, so inverting that expression is what makes the
+        # rebuilt corridor land back on the centerline A* verified. Do NOT "simplify" this to
+        # `volumes[0].t_start - g_delay`: A* quantises the climb to whole dt steps
+        # (climb_steps_to*dt = 8.0 s where climb_time_to = 5.0 s at the 30 m floor), so that form
+        # round-trips 3 s EARLY and silently moved 50 of 134 refined paths (+9.1% air_detour_m).
         t_depart = (intent.centerline[0][1] - g_delay
                     - cfg.climb_time_to(float(np.asarray(intent.centerline[0][0])[2])))
         ot, dt = req.origin_terminal, req.dest_terminal
@@ -111,7 +119,7 @@ class ShortcutRefiner:
         if len(simplified) >= len(corners):
             return intent                              # nothing removed
 
-        straight = float(np.linalg.norm((np.asarray(req.dest, float) - np.asarray(req.origin, float))[:2]))
+        straight = enroute_reference_m(req.origin, req.dest, ot, dt, cfg)
         built = _rebuild(simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight, ot, dt)
         if built is None:
             return intent
@@ -126,7 +134,9 @@ class ShortcutRefiner:
         refined = OperationalIntent(
             request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
             ground_delay_s=g_delay, air_hold_s=0.0,
-            air_detour_m=max(0.0, cum_horiz - straight),
+            air_detour_m=enroute_detour_m(
+                enroute_flown_m([p for p, _ in centerline], req.origin, req.dest, ot, dt, cfg),
+                straight),                                                              # issue #50
             lattice_overhead_m=max(0.0, intent.lattice_overhead_m - removed),
             altitude_change_m=endpoint_altitude_change_m(
                 float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),

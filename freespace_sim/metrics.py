@@ -35,7 +35,7 @@ from .config import SimConfig
 from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
 from .types import DenialReason, OperationalIntent
-from .volumes import Volume4D
+from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
 
 
 def shape_volume_m3(shape) -> float:
@@ -176,20 +176,28 @@ def steady_state_window(result: SimResult, frac: float = 0.9, dt: float | None =
     return (float(t[run[0]]), float(t[run[1]]))
 
 
-def _flown_horizontal_m(intent: OperationalIntent) -> float:
-    """Horizontal path length actually flown, summed along the (projected) centerline."""
+def _flown_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
+    """Horizontal length actually flown EN ROUTE — the centerline, rooted at both column edges.
+
+    Run through the same :func:`volumes.fold_corners_to_columns` every planner's reservation uses, so
+    A* (whose path already starts on a boundary lane cell) and the continuous planners (whose warm
+    candidates may still run centre → centre) are measured on one ruler. Without it a planner that
+    flies through its own column is charged for terminal airspace that the lane → lane baseline
+    excludes, and its stretch reads high for no en-route reason.
+
+    Pairs with :func:`_straight_horizontal_m`: both span exit lane → exit lane, so their difference is
+    en-route detour and nothing else (issue #50)."""
     if not intent.centerline:
         return float("nan")
-    pts = np.array([p[0][:2] for p in intent.centerline], float)
-    if len(pts) < 2:
-        return 0.0
-    return float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+    return enroute_flown_m([p[0] for p in intent.centerline],
+                           intent.request.origin, intent.request.dest,
+                           intent.request.origin_terminal, intent.request.dest_terminal, cfg)
 
 
-def _straight_horizontal_m(intent: OperationalIntent) -> float:
-    """Great-circle-free straight-line horizontal distance origin→dest."""
-    o, d = intent.request.origin[:2], intent.request.dest[:2]
-    return float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
+def _straight_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
+    """The straight-line reference: exit lane → exit lane (:func:`volumes.enroute_reference_m`)."""
+    return enroute_reference_m(intent.request.origin, intent.request.dest,
+                               intent.request.origin_terminal, intent.request.dest_terminal, cfg)
 
 
 def _unimpeded_cruise_z(cfg: SimConfig) -> float:
@@ -221,23 +229,48 @@ def total_delay_s(intent: OperationalIntent, cfg: SimConfig) -> float:
     against the Euclidean straight line — unreachable on a 6-direction lattice — so for A* this
     figure carries the hex-quantization share too, and *that* part is not lost "to other traffic".
     ``flight_row``'s ``lattice_overhead_m`` / ``deconfliction_detour_m`` split it out.
+
+    Hub flights measure the EN-ROUTE segment only. ``air_detour_m`` spans exit lane → exit lane on
+    both sides (issue #50), so the unreserved hub-column legs are in neither the flown length nor the
+    baseline. Flying inside a terminal is terminal operations: it consumes that hub's capacity — its
+    tagged column and its pad gate — and is not en-route distance or delay. Ground delay IS counted,
+    because waiting on the pad is time the flight loses whoever owns the airspace.
     """
     if not intent.accepted:
         return float("nan")
     excess_m = max(0.0, intent.altitude_change_m - nominal_altitude_change_m(cfg))
+    lattice_s, traffic_s = _detour_seconds(intent, cfg)
     return (
         intent.ground_delay_s
         + intent.air_hold_s
-        + intent.air_detour_m / cfg.nominal_speed_mps
+        + (lattice_s + traffic_s)
         + excess_m / cfg.climb_rate_mps
     )
 
 
+def _detour_seconds(intent: OperationalIntent, cfg: SimConfig) -> tuple[float, float]:
+    """``(lattice_s, traffic_s)`` — the exact two-way split of ``air_detour_m`` in seconds; the detour
+    time is their sum, by construction rather than as a third returned value.
+
+    A straight split of ``air_detour_m`` — there is no terminal fold to net out any more, because
+    ``air_detour_m`` is measured lane → lane on both sides (issue #50). ``detour_traffic_s`` is a real
+    measurement for the A* family (whole hex steps beyond the lattice geodesic) and nothing adjusts it.
+    """
+    lattice_m = min(intent.lattice_overhead_m, intent.air_detour_m)   # never exceed what it splits
+    lattice_s = lattice_m / cfg.nominal_speed_mps
+    traffic_s = (intent.air_detour_m - lattice_m) / cfg.nominal_speed_mps
+    return lattice_s, traffic_s
+
+
 def nominal_flight_time_s(straight_m: float, cfg: SimConfig) -> float:
-    """Unimpeded door-to-door air time (s): straight cruise + the mandatory climb and descent to the
-    run's cruise altitude (:func:`_unimpeded_cruise_z` — the ladder floor for A*, ``cruise_level_m`` for
-    single-plane planners), so the time nominal agrees with :func:`nominal_altitude_change_m` and
-    ``delay_pct`` is measured against the true unimpeded trip."""
+    """Unimpeded EN-ROUTE air time (s): straight cruise over ``straight_m`` + the mandatory climb and
+    descent to the run's cruise altitude (:func:`_unimpeded_cruise_z` — the ladder floor for A*,
+    ``cruise_level_m`` for single-plane planners), so the time nominal agrees with
+    :func:`nominal_altitude_change_m`.
+
+    NOT door-to-door: the caller passes the lane → lane reference (issue #50), so time spent flying
+    inside a terminal column is in neither this nominal nor ``total_delay_s`` — ``delay_pct`` and
+    ``trip_time_ratio`` are en-route ratios, consistent with every other en-route metric."""
     return straight_m / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_to(_unimpeded_cruise_z(cfg))
 
 
@@ -295,18 +328,19 @@ def delay_breakdown_s(intent: OperationalIntent, cfg: SimConfig) -> dict[str, fl
 
     ``detour_time_s`` additionally splits into ``detour_lattice_s`` + ``detour_traffic_s`` (exactly — the
     two always re-sum to it) so a chart can separate hex quantization from a traffic-forced berth. See
-    ``OperationalIntent.lattice_overhead_m``; both are 0 for the continuous planners.
+    ``OperationalIntent.lattice_overhead_m``; ``detour_lattice_s`` is 0 for the continuous planners.
+
     """
     if not intent.accepted:
         return dict.fromkeys(_DELAY_LEVERS, float("nan"))
     excess_m = max(0.0, intent.altitude_change_m - nominal_altitude_change_m(cfg))
-    lattice_m = min(intent.lattice_overhead_m, intent.air_detour_m)   # never exceed what it splits
+    lattice_s, traffic_s = _detour_seconds(intent, cfg)
     return {
         "ground_delay_s": intent.ground_delay_s,
         "air_hold_s": intent.air_hold_s,
-        "detour_time_s": intent.air_detour_m / cfg.nominal_speed_mps,
-        "detour_lattice_s": lattice_m / cfg.nominal_speed_mps,
-        "detour_traffic_s": (intent.air_detour_m - lattice_m) / cfg.nominal_speed_mps,
+        "detour_time_s": lattice_s + traffic_s,
+        "detour_lattice_s": lattice_s,
+        "detour_traffic_s": traffic_s,
         "excess_altitude_m": excess_m,
         "altitude_delay_phys_s": excess_m / cfg.climb_rate_mps,
         "altitude_delay_costeq_s": (excess_m * cfg.cost_altitude_change_per_m
@@ -322,10 +356,11 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
     (default ``[0, horizon_s]``); it does not otherwise change the row (membership filtering by filing
     time is :func:`flight_frame`'s job)."""
     res_lo, res_hi = (0.0, cfg.horizon_s) if window is None else window
-    straight = _straight_horizontal_m(intent)
-    flown = _flown_horizontal_m(intent)
+    straight = _straight_horizontal_m(intent, cfg)
+    flown = _flown_horizontal_m(intent, cfg)
     stretch = (flown / straight) if (intent.accepted and straight > 1e-9) else float("nan")
     td = total_delay_s(intent, cfg)
+    db = delay_breakdown_s(intent, cfg)
     # delay as a fraction of the actual trip time — bounded [0, 100), comparable across trip lengths
     nominal = nominal_flight_time_s(straight, cfg)
     delay_pct = (100.0 * td / (nominal + td)) if (intent.accepted and nominal + td > 0) else float("nan")
@@ -336,7 +371,6 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
     # the two parallel decompositions: COST (what the planner paid, reconciles to `cost`) and TIME (real
     # seconds, with altitude read both physically and as a cost-equivalent). See the module docstring.
     cb = cost_breakdown(intent, cfg)
-    db = delay_breakdown_s(intent, cfg)
     # air_detour_m's lattice/traffic split in METRES. Clamp exactly as delay_breakdown_s does for the
     # seconds (line: `lattice_m = min(...)`, "never exceed what it splits"): the ShortcutRefiner can
     # leave lattice_overhead_m a hair above air_detour_m, and without this the two metre columns (and
@@ -364,9 +398,26 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         "air_detour_m": intent.air_detour_m,
         # A*-only split of air_detour_m. The Euclidean baseline air_detour_m measures against is
         # unreachable on a 6-direction lattice, so for A* it books pure geometry as congestion; these
-        # two separate the unavoidable quantization from the traffic-attributable berth. Both are 0
-        # for the continuous planners. air_detour_m itself is left untouched — it stays the
-        # cross-planner number, and cost / total_delay_s continue to be built from it.
+        # two separate the unavoidable quantization from the traffic-attributable berth.
+        # lattice_overhead_m is 0 for the continuous planners — but their air_detour_m is NOT: a real
+        # MILP solve books its knot discretization (~5 m ≈ 0.1% of trip, measured at a hub) into
+        # air_detour_m, and with no lattice band to absorb it, ALL of it lands in
+        # deconfliction_detour_m — phantom "traffic" in empty airspace.
+        #
+        # air_detour_m is NOT planner-neutral, deliberately. It charges A* for two costs the
+        # continuous planners never pay: the staircase, and the endpoint/lane snap onto hex centres
+        # (~80 m/flight, measured). Both are real metres A* makes the drone fly, so they belong on
+        # A*'s bill — and they flow into cost / total_delay_s, which is why a hex planner reads
+        # worse than a continuous one on those columns. That is the honest comparison, not a bias to
+        # correct: giving MILP terminal airspace would not equalise it, because MILP folds to a
+        # continuous column edge and never acquires a lattice at all (measured: real MILP 1.0010
+        # stretch at a hub vs A* 1.1459 on the same flight).
+        #
+        # For "how hard is traffic pushing flights sideways?", read deconfliction_detour_m. The
+        # traffic share is derived exactly from hex step counts — independently of air_detour_m — so
+        # the snap and the staircase both land in lattice_overhead_m and the traffic number is
+        # unchanged by them. That follows from how _lattice_overhead_m is computed, not from any one
+        # run's numbers. Exact for the A* family only; for milp read it ± the knot noise above.
         "lattice_overhead_m": lattice_m,
         "deconfliction_detour_m": intent.air_detour_m - lattice_m,
         # detour as lateness-seconds; ground_delay_s + air_hold_s + detour_time_s + altitude_delay_phys_s

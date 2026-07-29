@@ -34,7 +34,8 @@ from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
-from ..volumes import build_reservation_from_corners, fold_corners_to_columns
+from ..volumes import (build_reservation_from_corners, enroute_detour_m,
+                       enroute_flown_m, enroute_reference_m, fold_corners_to_columns)
 from .straight import StraightLineTimeShift
 from .terminal_capacity import TerminalCapacity
 
@@ -201,6 +202,8 @@ class MILPOptPlanner:
         start = np.array([origin[0], origin[1], z_lo])
         goal = np.array([dest[0], dest[1], z_lo])
         straight_horiz = float(np.linalg.norm(goal[:2] - start[:2]))
+        # centre→centre sizes N (the kinematic knot floor); lane→lane is the metric baseline (issue #50)
+        straight_ref = enroute_reference_m(origin, dest, o_term, d_term, cfg)
         v_step = cfg.nominal_speed_mps * cfg.dt_s
         z_step = cfg.climb_rate_mps * cfg.dt_s
         if straight_horiz < _EPS:
@@ -356,7 +359,7 @@ class MILPOptPlanner:
         corners = [np.array([px[k].value(), py[k].value(), pz[k].value()], float) for k in range(N)]
         # The MILP fixes the spatial homotopy + an approximate delay; polish the delay with a small
         # jump-to-gap on the *rebuilt* path so it verifies exactly (absorbs the LP↔rebuild timing gap).
-        polished = self._verify_with_delay(corners, origin, dest, t_depart, d_opt, straight_horiz,
+        polished = self._verify_with_delay(corners, origin, dest, t_depart, d_opt, straight_ref,
                                            cfg, ledger, o_term, d_term, tcap)
         if polished is None:
             return None
@@ -367,7 +370,9 @@ class MILPOptPlanner:
             volumes=volumes,
             centerline=centerline,
             ground_delay_s=d_final,
-            air_detour_m=max(0.0, cum_horiz - straight_horiz),
+            air_detour_m=enroute_detour_m(
+                enroute_flown_m([p for p, _ in centerline], req.origin, req.dest, o_term, d_term, cfg),
+                straight_ref),                                                         # issue #50
             altitude_change_m=endpoint_altitude_change_m(
                 float(corners[0][2]), float(corners[-1][2]), cum_dz, cfg),
             planner="milp",
@@ -375,11 +380,14 @@ class MILPOptPlanner:
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    def _verify_with_delay(self, corners, origin, dest, t_depart, d_start, straight_horiz, cfg,
+    def _verify_with_delay(self, corners, origin, dest, t_depart, d_start, straight_ref, cfg,
                            ledger, o_term=None, d_term=None, tcap=None):
         """Fold the corners to the terminal column edges, then step the delay up from the MILP's
         value until the rebuilt path is conflict-free AND pad-capacity-admitted, then splice out
         redundant knots at that delay.
+
+        ``straight_ref`` is the en-route (lane → lane) reference, NOT the centre-to-centre
+        ``straight_horiz`` used for the knot floor in ``_solve``.
 
         Returns (volumes, centerline, cum_horiz, cum_dz, delay) or None if the spatial path can't be
         made feasible by waiting within budget (then the caller falls back to the warm intent).
@@ -390,7 +398,9 @@ class MILPOptPlanner:
             volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
                 corners, origin, dest, t_depart, d, cfg, origin_term=o_term, dest_term=d_term
             )
-            if straight_horiz > _EPS and cum_horiz / straight_horiz > cfg.max_detour_factor:
+            # Both sides span lane → lane via the same helper metrics uses (issue #50).
+            flown = enroute_flown_m([p for p, _ in centerline], origin, dest, o_term, d_term, cfg)
+            if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
                 return None
             if (not ledger.any_conflict(volumes)
                     and self._capacity_ok(volumes, o_term, d_term, tcap)):

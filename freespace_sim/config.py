@@ -68,7 +68,11 @@ class SimConfig:
 
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
-    max_detour_factor: float = 100.0     # deny if flown/straight-line exceeds this
+    # Deny if the EN-ROUTE ratio flown/reference exceeds this — both sides exit lane -> exit lane
+    # (volumes.enroute_*, issue #50), the same ratio metrics reports as `stretch`. Short hub flights
+    # have a small lane->lane reference, so tight budgets bind on fixed geometry (snap/staircase)
+    # before traffic — the shipped 100.0 is effectively "off".
+    max_detour_factor: float = 100.0
 
     # --- demand / horizon ---
     horizon_s: float = 14_400.0        # 4 h

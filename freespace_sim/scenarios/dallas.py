@@ -8,7 +8,10 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     # the headline: two operators, geographic hub-and-spoke demand (few Walmarts, many strip malls)
     "dallas_hub_2uss": ScenarioSpec(
         "dallas_hub_2uss", region_m=(10000.0, 10000.0),
-        demand=DemandSpec(pattern="hub", uss=("walmart_uss", "stripmall_uss"), hubs=(6, 20), pads_per_hub=2,),
+        # No pads_per_hub here: HubVoronoiDemand has no pad model. It used to carry pads_per_hub=2,
+        # which DemandSpec.build() dropped on the floor — dead config that read as a capacity limit
+        # this scenario never had. Use dallas_hub_2uss_large (pattern="hub_radius") for pad capacity.
+        demand=DemandSpec(pattern="hub", uss=("walmart_uss", "stripmall_uss"), hubs=(6, 20)),
     ),
     # hub-funnel: a few concentrated multi-pad vertiports (6 Walmarts, 20 strip malls) in a 10×10 km
     # region with radius service areas + return flights — funnels demand onto few hubs to exercise pad

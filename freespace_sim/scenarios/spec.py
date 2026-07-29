@@ -115,18 +115,19 @@ class ScenarioSpec:
     def config(self) -> SimConfig:
         """The override layer over SimConfig defaults (never edits config.py).
 
-        ``demand_duration_s`` is clamped to the horizon. Shrinking a scenario for a smoke test
-        (``--horizon 1200``, or ``with_overrides(spec, horizon_s=300.0)``) overrides the horizon
-        without touching the recipe's demand window, and ``SimConfig`` rejects a window longer than
-        the run containing it — so without this clamp every density_* scenario is unshrinkable.
+        ``demand_duration_s`` is forwarded UNCLAMPED, so overriding ``horizon_s`` below it raises
+        from :meth:`SimConfig.__post_init__`. That error is deliberate: clamping the demand window
+        to a shrunken horizon looks like it makes ``--horizon 600`` work, but the departure lead
+        (``departure_offset_s``, up to N(1800, 300) for amazon_uss) is unaffected by the clamp, so
+        every generated departure lands past the horizon and the "quick smoke test" silently becomes
+        a meaningless run on the box-guard fallback path. Shrink a density_* scenario by overriding
+        BOTH knobs — ``with_overrides(spec, horizon_s=..., demand_duration_s=...)``.
         """
-        demand_duration_s = (None if self.demand_duration_s is None
-                             else min(self.demand_duration_s, self.horizon_s))
         return SimConfig(
             region_size_m=(float(self.region_m[0]), float(self.region_m[1])),
             lam_per_hour=self.lam_per_hour,
             horizon_s=self.horizon_s,
-            demand_duration_s=demand_duration_s,
+            demand_duration_s=self.demand_duration_s,
             seed=self.seed,
             **({"planner": self.planner} if self.planner else {}),
             **({"fixed_exit_lanes": self.fixed_exit_lanes} if self.fixed_exit_lanes is not None else {}),

@@ -657,9 +657,6 @@ def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> d
     out = {
         "lam_per_hour": cfg.lam_per_hour,
         "demand_duration_s": cfg.effective_demand_duration_s,
-        "simulation_start_s": sim_lo,
-        "simulation_end_s": sim_hi,
-        "simulation_duration_s": sim_hi - sim_lo,
         "seed": cfg.seed,
         "planner": cfg.planner,
         **_rollup(df, cfg, dur_s=dur_s, rate_dur_s=rate_dur_s),
@@ -669,8 +666,16 @@ def aggregate(result: SimResult, window: tuple[float, float] | None = None) -> d
         "mean_delay_spread": mean_delay_spread,
         "verified": result.verified,
     }
-    if window is not None:
-        out["window_lo"], out["window_hi"] = float(sim_lo), float(sim_hi)
+    if window is None:
+        # Only the whole-run view can honestly name these: for a windowed call `_denominators`
+        # returns the WINDOW, so emitting them here would publish the window under a key that says
+        # "simulation". aggregate_with_steady pops them off the steady block anyway, so the windowed
+        # path loses nothing — and skips the full simulation_window scan it would otherwise pay for.
+        out["simulation_start_s"] = sim_lo
+        out["simulation_end_s"] = sim_hi
+        out["simulation_duration_s"] = sim_hi - sim_lo
+    else:
+        out["window_lo"], out["window_hi"] = float(window[0]), float(window[1])
     return out
 
 

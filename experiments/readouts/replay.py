@@ -23,8 +23,9 @@ def main() -> None:
     p.add_argument("folder", help="a results/ run folder written by experiments.run")
     p.add_argument("--open", action="store_true", help="open the replay in the default browser")
     p.add_argument("--clip", action="store_true",
-                   help="clip the replay clock at the horizon, dropping the post-horizon return-flight "
-                        "tail visible (by default the replay stops at cfg.horizon_s; issue #25)")
+                   help="clip the replay clock at cfg.horizon_s, dropping the post-horizon "
+                        "return-flight tail. OFF by default, matching what save_run writes: the "
+                        "replay spans first flight activity through final landing (issue #25).")
     args = p.parse_args()
 
     folder = Path(args.folder)

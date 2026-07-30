@@ -95,6 +95,7 @@ class ReservationLedger:
         self._static_aabb: list[tuple[float, float, float, float, float, float]] = []  # per-wall flat AABB
         self._static_grid = _StaticWallGrid(_STATIC_GRID_CELL_M)   # xy prune over the (fixed) hub walls
         self._static_terms: list[tuple] = []   # (center, term) pairs, for the occupancy-derivation replay
+        self._static_terminal_ids: set = set()  # O(1) proof that a queried hub has its permanent wall
         self._static_subs: list = []           # static-terminal subscribers (occupancy routing-wall hook)
 
     def subscribe(self, callback) -> None:
@@ -112,6 +113,7 @@ class ReservationLedger:
         self._static_terms.append((center, term))
         vol = permanent_terminal_reservation(center, term, self.cfg)
         self._static_vols.append(vol)
+        self._static_terminal_ids.add(vol.terminal_id)
         self._static_aabb.append(self._flat_aabb(vol))
         self._static_grid.insert(len(self._static_vols) - 1, self._static_aabb[-1])
         for cb in self._static_subs:
@@ -239,6 +241,15 @@ class ReservationLedger:
     def static_volumes(self) -> tuple:
         """The permanent always-active terminal walls (read-only view; empty unless registered)."""
         return tuple(self._static_vols)
+
+    def has_static_terminal(self, terminal_id) -> bool:
+        """Whether ``terminal_id`` has a registered permanent ground-to-ceiling ledger wall.
+
+        The always-active ``TerminalCapacity`` shortcut relies on this concrete registration, not merely
+        on the config flag expressing that walls are intended. Terminal IDs uniquely identify fixed hubs,
+        so membership is the O(1) proof that the queried column is backed by its permanent reservation.
+        """
+        return terminal_id in self._static_terminal_ids
 
     @property
     def n_volumes(self) -> int:

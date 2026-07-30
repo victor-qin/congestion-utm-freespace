@@ -63,6 +63,27 @@ def test_progress_none_is_silent_and_unchanged(capsys):
     assert capsys.readouterr().err == ""         # nothing printed when off
 
 
+def test_console_progress_rolling_and_eta_after_window_fills():
+    # the live ticker gets the same rolling treatment: wall/flight roll + ETA read n/a until the window
+    # (here 3) fills, then report. every_s=0 prints every flight; deltas are ~0 so values are small but real.
+    import io
+    import re
+    from types import SimpleNamespace
+
+    from freespace_sim.sim import ConsoleProgress
+    from freespace_sim.types import IntentStatus
+
+    buf = io.StringIO()
+    cp = ConsoleProgress(total=10, every_s=0.0, stream=buf, window=3)
+    acc = SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED)
+    for done in range(1, 6):
+        cp(done, 10, acc)
+    out = buf.getvalue()
+    assert "wall/flight avg=" in out                       # cumulative avg always shown
+    assert "roll[3]=n/a" in out and "ETA n/a" in out       # first prints: window not yet full
+    assert re.search(r"roll\[3\]=\d+ms", out) and re.search(r"ETA \d+s", out)   # then it populates
+
+
 def test_milestone_recordings_at_horizon_marks(caplog):
     # 5%-of-horizon "recordings": carried by the FIRST flight filing at-or-after each mark; a sparse
     # stretch makes one flight carry every mark it jumped over (one line per mark). horizon=100 →
@@ -92,8 +113,8 @@ def test_milestone_every_n_planned_flights(caplog):
     from freespace_sim.types import IntentStatus
 
     caplog.set_level(logging.INFO, logger="freespace_sim.sim")
-    acc = SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED)
-    den = SimpleNamespace(accepted=False, status=IntentStatus.REJECTED)
+    acc = SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED, solve_time_s=0.010)
+    den = SimpleNamespace(accepted=False, status=IntentStatus.REJECTED, solve_time_s=0.010)
     ml = _MilestoneLog(total=5, horizon_s=1e12, every_n=2)
     for done, outcome in enumerate([acc, den, acc, acc, den], 1):
         ml(done, FlightRequest(done - 1, vec(0, 0, 0), vec(100, 0, 0), float(done)), outcome)
@@ -101,7 +122,30 @@ def test_milestone_every_n_planned_flights(caplog):
     assert len(lines) == 2
     assert lines[0].startswith("planned 2/5: flight=1 sim_t=2.0s") and "acc=1 den=1" in lines[0]
     assert lines[1].startswith("planned 4/5: flight=3 sim_t=4.0s") and "acc=3 den=1" in lines[1]
+    # cumulative avg plan time is always reported (10 ms each); the rolling mean + ETA stay n/a because the
+    # 100-flight window never fills in this 5-flight run.
+    assert "solve/flight avg=10ms roll[100]=n/a ETA=n/a" in lines[0]
+    assert "solve/flight avg=10ms roll[100]=n/a ETA=n/a" in lines[1]
     assert not [m for m in caplog.messages if m.startswith("recording @")]
+
+
+def test_milestone_rolling_avg_and_eta_after_window_fills(caplog):
+    # rolling mean + ETA are n/a until the window (here 3) is full, then report: roll = mean of the last 3
+    # plan times, ETA = flights-left × that time. Every intent solves in 500 ms; total=10.
+    from types import SimpleNamespace
+
+    from freespace_sim.sim import _MilestoneLog
+    from freespace_sim.types import IntentStatus
+
+    caplog.set_level(logging.INFO, logger="freespace_sim.sim")
+    acc = SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED, solve_time_s=0.5)
+    ml = _MilestoneLog(total=10, horizon_s=1e12, every_n=2, roll_window=3)
+    for done in range(1, 7):
+        ml(done, FlightRequest(done - 1, vec(0, 0, 0), vec(100, 0, 0), float(done)), acc)
+    lines = [m for m in caplog.messages if m.startswith("planned ")]
+    # done=2: window has 2<3 samples → warming up; done=4: full → roll=500ms, ETA=(10-4)*0.5=3s
+    assert "solve/flight avg=500ms roll[3]=n/a ETA=n/a" in lines[0]
+    assert "solve/flight avg=500ms roll[3]=500ms ETA=3s" in lines[1]
 
 
 def test_milestone_mark_hit_exactly_is_carried_by_that_flight(caplog):
@@ -118,7 +162,7 @@ def test_milestone_mark_hit_exactly_is_carried_by_that_flight(caplog):
     caplog.set_level(logging.INFO, logger="freespace_sim.sim")
     ml = _MilestoneLog(total=1, horizon_s=1.0)
     ml(1, FlightRequest(0, vec(0, 0, 0), vec(100, 0, 0), 0.15),
-       SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED))
+       SimpleNamespace(accepted=True, status=IntentStatus.ACCEPTED, solve_time_s=0.005))
     recs = [m for m in caplog.messages if m.startswith("recording @")]
     assert [m.split(":")[0] for m in recs] == [
         "recording @5% horizon (mark 0s)", "recording @10% horizon (mark 0s)",

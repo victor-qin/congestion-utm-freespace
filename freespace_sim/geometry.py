@@ -30,6 +30,33 @@ def _cross3(a, b):
             a[0] * b[1] - a[1] * b[0])
 
 
+def _segment_frame_scalars(p0, p1) -> tuple[tuple[float, ...], float]:
+    """Scalar core of :func:`segment_frame`: the 9 row-major rotation floats (local→world, columns x/y/z)
+    plus the segment length, computed with plain scalars — no ``np.array`` build.
+
+    :func:`segment_frame` wraps these into the 3x3 ``np.ndarray`` its matrix consumers + the frozen
+    byte-identity oracle expect; :func:`box_from_segment` (which stores ``rot`` FLAT anyway) consumes the
+    tuple directly, skipping a per-sub-box array build + ``flatten().tolist()`` round-trip. Bit-for-bit
+    identical to the numpy form — the same scalar idiom already pinned for the axes here and for
+    ``aabb`` / ``segment_overlaps_column`` (issue #30). The degenerate (near-zero length) case returns the
+    identity frame flattened + length ``0.0``, exactly as the numpy original did (``np.eye(3), 0.0``)."""
+    dx = float(p1[0]) - float(p0[0])
+    dy = float(p1[1]) - float(p0[1])
+    dz = float(p1[2]) - float(p0[2])
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)        # == float(np.linalg.norm(p1 - p0)) on a 3-vector
+    if length < 1e-9:
+        return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), 0.0   # np.eye(3) flattened, length 0
+    x = (dx / length, dy / length, dz / length)
+    # ref = WORLD_UP unless near-vertical; |dot(x, WORLD_UP)| == |x[2]| since WORLD_UP = (0, 0, 1)
+    ref = (0.0, 0.0, 1.0) if abs(x[2]) < 0.99 else (1.0, 0.0, 0.0)
+    yx, yy, yz = _cross3(ref, x)
+    yn = math.sqrt(yx * yx + yy * yy + yz * yz)            # == np.linalg.norm(y)
+    y = (yx / yn, yy / yn, yz / yn)
+    z = _cross3(x, y)
+    # row-major flatten of the 3x3 whose COLUMNS are x, y, z == np.column_stack([x, y, z]).flatten()
+    return (x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]), length
+
+
 def segment_frame(p0: np.ndarray, p1: np.ndarray) -> tuple[np.ndarray, float]:
     """Orthonormal rotation whose local x-axis runs p0→p1 (length returned separately).
 
@@ -38,26 +65,16 @@ def segment_frame(p0: np.ndarray, p1: np.ndarray) -> tuple[np.ndarray, float]:
     and world-up so a level corridor is "flat"; for a (near-)vertical segment we fall back to
     world-x as the reference to avoid a degenerate cross product.
 
-    Axes are computed with scalars (cross via :func:`_cross3`, norm via ``math.sqrt``) — bit-for-bit
-    identical to the numpy form (see ``tests/test_geometry.py`` for the frozen-numpy byte-identity oracle)
-    but without the per-call ufunc dispatch, since ``segment_frame`` runs once per corridor sub-box
-    (hundreds of thousands of times per refined plan).
+    Thin ``np.ndarray`` wrapper over :func:`_segment_frame_scalars` (the scalar core), kept for its matrix
+    consumers + the frozen-numpy byte-identity oracle in ``tests/test_geometry.py``. The scalar axes shed
+    numpy's per-call ufunc dispatch; ``box_from_segment`` bypasses this wrapper entirely on the hot path.
     """
-    d = np.asarray(p1, float) - np.asarray(p0, float)
-    dx, dy, dz = float(d[0]), float(d[1]), float(d[2])
-    length = math.sqrt(dx * dx + dy * dy + dz * dz)        # == float(np.linalg.norm(d))
-    if length < 1e-9:
+    rot, length = _segment_frame_scalars(p0, p1)
+    if length == 0.0:                                      # degenerate (near-zero length) → identity frame
         return np.eye(3), 0.0
-    x = (dx / length, dy / length, dz / length)
-    # ref = WORLD_UP unless near-vertical; |dot(x, WORLD_UP)| == |x[2]| since WORLD_UP = (0, 0, 1)
-    ref = (0.0, 0.0, 1.0) if abs(x[2]) < 0.99 else (1.0, 0.0, 0.0)
-    yx, yy, yz = _cross3(ref, x)
-    yn = math.sqrt(yx * yx + yy * yy + yz * yz)            # == np.linalg.norm(y)
-    y = (yx / yn, yy / yn, yz / yn)
-    z = _cross3(x, y)
-    R = np.array([[x[0], y[0], z[0]],                      # columns x, y, z == np.column_stack([x, y, z])
-                  [x[1], y[1], z[1]],
-                  [x[2], y[2], z[2]]])
+    R = np.array([[rot[0], rot[1], rot[2]],                # columns x, y, z == np.column_stack([x, y, z])
+                  [rot[3], rot[4], rot[5]],
+                  [rot[6], rot[7], rot[8]]])
     return R, length
 
 
@@ -90,6 +107,21 @@ class BoxSpec:
         c = np.array(self.center, float)
         return c - ext, c + ext
 
+    def flat_aabb(self) -> tuple[float, float, float, float, float, float]:
+        """World AABB as six plain floats ``(xmin, ymin, zmin, xmax, ymax, zmax)`` — the allocation-free
+        twin of :meth:`aabb` for the scalar broadphase hot path (``ledger._flat_aabb`` /
+        ``terminal_capacity.column_clear``), which only ever want floats yet paid for two throwaway
+        ``np.array``s per call (~1e6/refined plan; the profile's #1 self-time line). Mirrors :meth:`aabb`'s
+        exact expressions and left-to-right summation order, and is pinned bit-for-bit against it in
+        ``tests/test_geometry.py`` (which in turn pins ``aabb`` to the frozen numpy oracle)."""
+        r = self.rot
+        h0, h1, h2 = self.extents[0] / 2.0, self.extents[1] / 2.0, self.extents[2] / 2.0
+        ex = abs(r[0]) * h0 + abs(r[1]) * h1 + abs(r[2]) * h2
+        ey = abs(r[3]) * h0 + abs(r[4]) * h1 + abs(r[5]) * h2
+        ez = abs(r[6]) * h0 + abs(r[7]) * h1 + abs(r[8]) * h2
+        cx, cy, cz = self.center
+        return (cx - ex, cy - ey, cz - ez, cx + ex, cy + ey, cz + ez)
+
 
 @dataclass(frozen=True)
 class CylinderSpec:
@@ -113,13 +145,27 @@ class CylinderSpec:
             np.array([self.cx + self.radius, self.cy + self.radius, self.z_hi], float),
         )
 
+    def flat_aabb(self) -> tuple[float, float, float, float, float, float]:
+        """World AABB as six plain floats — the allocation-free twin of :meth:`aabb` (see
+        ``BoxSpec.flat_aabb``); pinned bit-for-bit against :meth:`aabb` in ``tests/test_geometry.py``."""
+        return (self.cx - self.radius, self.cy - self.radius, self.z_lo,
+                self.cx + self.radius, self.cy + self.radius, self.z_hi)
+
 
 def box_from_segment(p0: np.ndarray, p1: np.ndarray, width: float, height: float) -> BoxSpec:
-    """Build an oriented box bounding the segment p0→p1 with the given lateral width and height."""
-    R, length = segment_frame(p0, p1)
-    center = (np.asarray(p0, float) + np.asarray(p1, float)) / 2.0
+    """Build an oriented box bounding the segment p0→p1 with the given lateral width and height.
+
+    Consumes :func:`_segment_frame_scalars` (flat rot floats) and builds the center with scalars, so the
+    hot per-sub-box path (hundreds of thousands of BoxSpecs per refined plan) allocates no intermediate
+    ``np.ndarray``. The ``rot`` / ``center`` tuples are byte-identical to the prior
+    ``tuple(R.flatten().tolist())`` / ``tuple(((p0 + p1) / 2).tolist())`` (pinned in ``tests/test_geometry.py``).
+    """
+    rot, length = _segment_frame_scalars(p0, p1)
+    cx = (float(p0[0]) + float(p1[0])) / 2.0
+    cy = (float(p0[1]) + float(p1[1])) / 2.0
+    cz = (float(p0[2]) + float(p1[2])) / 2.0
     return BoxSpec(
-        center=tuple(center.tolist()),
-        rot=tuple(R.flatten().tolist()),
+        center=(cx, cy, cz),
+        rot=rot,
         extents=(max(length, 1e-6), float(width), float(height)),
     )

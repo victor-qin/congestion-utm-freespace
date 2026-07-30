@@ -181,15 +181,20 @@ class TerminalCapacity:
             r = terminal_radius(term, self.cfg)
             col_ref = hover_reservation(center, 0.0, self.cfg, terminal_id=tid, radius=r,
                                         climb_time_s=self._dwell_climb_s(None))
-            clo, chi = col_ref.aabb()                         # column spatial footprint (level-independent)
+            col_bb = col_ref.flat_aabb()                      # column footprint (level-independent), flat floats
+            # Reuse the ledger's per-volume AABB (cached once at commit, index-aligned with _vols) + its OWN
+            # scalar broadphase, instead of recomputing v.aabb() here. This loop indexes each committed volume
+            # once per querying hub (O(vols × hubs)) and the miss test discards most — so the old per-idx
+            # v.aabb() was ~77% of all aabb() allocations in an astar_shortcut run. Same six comparisons in the
+            # same order ⇒ byte-identical result (see tests/test_terminal_capacity.py + test_geometry.py).
+            ledger_aabb = self.ledger._aabb
+            aabb_miss = self.ledger._aabb_miss
             new: list[tuple[float, float]] = []
             for idx in range(start, n):
                 v = vols[idx]
                 if v.terminal_id == tid:                      # same-hub + column ⇒ exempt
                     continue
-                vlo, vhi = v.aabb()
-                if (chi[0] < vlo[0] or vhi[0] < clo[0] or chi[1] < vlo[1] or vhi[1] < clo[1]
-                        or chi[2] < vlo[2] or vhi[2] < clo[2]):   # spatial AABB miss ⇒ can't intrude
+                if aabb_miss(col_bb, ledger_aabb[idx]):       # spatial AABB miss ⇒ can't intrude
                     continue
                 col = hover_reservation(center, v.t_start, self.cfg, terminal_id=tid, radius=r,
                                         climb_time_s=self._dwell_climb_s(None))

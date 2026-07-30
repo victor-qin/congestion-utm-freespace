@@ -190,12 +190,18 @@ class HexOccupancyService:
         sit under any hub's shared column. Shared-terminal dwells are gated *temporally* by
         :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, not here. (One level ⇒ the
         legacy single-cell check.)"""
+        # Build the (q, r, L) column once and hoist the dict handles out of the window loop: n_levels was a
+        # per-step @property hit (the profile's 1.18M-call line) and (q, r, L) was rebuilt per step*level.
+        # Same k-major, level-ascending, pad-before-term short-circuit ⇒ byte-identical result.
+        cells = [(q, r, L) for L in range(self.cfg.n_levels)]
+        pad = self.pad
+        term_cells = self.term_cells
         for k in range(s0, s0 + dwell_steps + 1):
-            padk = self.pad.get(k, ())
-            tck = self.term_cells.get(k, _EMPTY) if self.term_cells else _EMPTY
-            for L in range(self.cfg.n_levels):
-                if (q, r, L) in padk:
+            padk = pad.get(k, ())
+            tck = term_cells.get(k, _EMPTY) if term_cells else _EMPTY
+            for cell in cells:
+                if cell in padk:
                     return False                 # a committed corridor sweeps the pad at level L
-                if (q, r, L) in tck:
+                if cell in tck:
                     return False                 # an ordinary pad sitting under some hub's column
         return True

@@ -138,9 +138,10 @@ class ReservationLedger:
         so it must share a (step, cell) key — which ``_aabb_miss`` + ``volumes_conflict`` then filter exactly."""
         seen: set[int] = set()
         cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))
+        buckets = self._buckets              # hoist the dict handle out of the step*cell loop
         for s in self._steps(vol):
-            for key in cells:                # same FULL cross product as commit (a diagonal would miss conflicts)
-                seen.update(self._buckets.get((s, *key), ()))
+            for cx, cy in cells:             # same FULL cross product as commit (a diagonal would miss conflicts)
+                seen.update(buckets.get((s, cx, cy), ()))
         return seen
 
     @staticmethod

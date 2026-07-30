@@ -35,6 +35,16 @@ from ..ledger import ReservationLedger
 from ..types import as_terminal
 from ..volumes import corridor_segment_volume, exit_radius, hover_reservation, terminal_radius
 
+# When True (default), :meth:`TerminalCapacity.column_clear` short-circuits under
+# ``cfg.terminal_airspace_always_active``: the permanent terminal WALL already routes foreign cruise
+# traffic out of the column (its discrete projection over-covers the column — ``exit_radius =
+# terminal_radius + corridor_width/2`` plus a boundary ring), so the foreign-transit scan is vacuous
+# and returns True. Skipping it drops an O(committed-tail) per-hub catch-up scan (issue: column_clear
+# was ~40-70% of A* plan time in the always-active density scenarios). Byte-identical for always-active
+# hubs (commit-time ``any_conflict`` stays the authoritative backstop). Set False to force the legacy
+# scan — used by ``analysis/ab_column_clear.py`` as the A/B baseline.
+SKIP_FOREIGN_WHEN_WALLED = True
+
 
 def _merge_intervals(ivs):
     """Sort ``[(lo, hi), ...]`` and coalesce overlapping/adjacent runs into a sorted, DISJOINT list."""
@@ -171,6 +181,12 @@ class TerminalCapacity:
         backstop regardless, so at worst this diverges on the denial REASON, never admitting a real conflict."""
         term = as_terminal(term)
         tid = term.id
+        if SKIP_FOREIGN_WHEN_WALLED and self.cfg.terminal_airspace_always_active:
+            # Permanent wall over-covers the column ⇒ no foreign volume can transit it ⇒ the scan below
+            # is vacuous (always returns True). Skip the O(committed-tail) catch-up. Commit-time
+            # `any_conflict` remains the authoritative backstop; A/B-verified byte-identical (see module
+            # flag). Gated to always-active hubs only — the non-walled path still needs the real scan.
+            return True
         vols = self.ledger._vols                              # committed volumes, commit order (same pkg)
         n = len(vols)
         if n < self._ft_seen:                                 # ledger shrank (release) → cached index stale

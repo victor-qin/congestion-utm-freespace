@@ -160,3 +160,33 @@ def test_boxspec_aabb_byte_identical_to_original_numpy():
     assert len(boxes) > 5
     for spec in boxes:
         check(spec)
+
+
+def test_flat_aabb_byte_identical_to_aabb():
+    """``flat_aabb`` — the allocation-free scalar twin the ledger/terminal broadphase now uses instead of
+    ``aabb`` — is bit-for-bit the flattened ``aabb`` for boxes (incl. non-orthonormal rot), cylinders, and
+    every real corridor box. ``aabb`` itself stays pinned to the frozen numpy oracle above, so this
+    transitively pins ``flat_aabb`` to numpy. Exact ``==`` (not allclose)."""
+    import random
+    rng = random.Random(2)
+
+    def flattened(spec):
+        lo, hi = spec.aabb()
+        return (float(lo[0]), float(lo[1]), float(lo[2]), float(hi[0]), float(hi[1]), float(hi[2]))
+
+    for _ in range(5000):                                     # boxes: arbitrary non-orthonormal rot
+        spec = BoxSpec(
+            center=tuple(rng.uniform(-1e5, 1e5) for _ in range(3)),
+            rot=tuple(rng.uniform(-2, 2) for _ in range(9)),
+            extents=tuple(rng.uniform(1e-3, 1e4) for _ in range(3)),
+        )
+        assert spec.flat_aabb() == flattened(spec), f"box flat_aabb != aabb for {spec}"
+
+    for spec in _real_corridor_boxes():                       # real corridor geometry
+        assert spec.flat_aabb() == flattened(spec), f"real box flat_aabb != aabb for {spec}"
+
+    for _ in range(2000):                                     # cylinders (hover columns)
+        cyl = CylinderSpec(cx=rng.uniform(-1e5, 1e5), cy=rng.uniform(-1e5, 1e5),
+                           radius=rng.uniform(1e-3, 1e3),
+                           z_lo=rng.uniform(-100, 100), z_hi=rng.uniform(100, 400))
+        assert cyl.flat_aabb() == flattened(cyl), f"cyl flat_aabb != aabb for {cyl}"

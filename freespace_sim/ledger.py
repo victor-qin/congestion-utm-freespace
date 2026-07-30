@@ -138,22 +138,23 @@ class ReservationLedger:
         so it must share a (step, cell) key — which ``_aabb_miss`` + ``volumes_conflict`` then filter exactly."""
         seen: set[int] = set()
         cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))
+        buckets = self._buckets              # hoist the dict handle out of the step*cell loop
         for s in self._steps(vol):
-            for key in cells:                # same FULL cross product as commit (a diagonal would miss conflicts)
-                seen.update(self._buckets.get((s, *key), ()))
+            for cx, cy in cells:             # same FULL cross product as commit (a diagonal would miss conflicts)
+                seen.update(buckets.get((s, cx, cy), ()))
         return seen
 
     @staticmethod
     def _flat_aabb(vol: Volume4D) -> tuple[float, float, float, float, float, float]:
         """A volume's world AABB as six plain floats ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
 
-        Flattening once (here, at commit/query time) lets the per-pair overlap prune below run as
-        scalar comparisons. ``np.any`` on the 3-vector form costs ~34x more PER CALL — the arrays are
-        length 3, so the work is dwarfed by numpy's dispatch/alloc/box overhead — and ``_aabb_miss``
-        is the ledger's single hottest line (tens of millions of calls per run)."""
-        lo, hi = vol.aabb()
-        return (float(lo[0]), float(lo[1]), float(lo[2]),
-                float(hi[0]), float(hi[1]), float(hi[2]))
+        Delegates to ``vol.flat_aabb()``, which the shape computes directly as scalars — no ``np.array``
+        allocation and no ``float(...)`` unpack (the old ``vol.aabb()`` built two length-3 arrays here just
+        to read six floats back out; it was the profile's #1 self-time line via this path). Flattening lets
+        the per-pair overlap prune below run as scalar comparisons; ``_aabb_miss`` is the ledger's single
+        hottest line (tens of millions of calls per run). Bit-for-bit identical to the prior
+        ``float(vol.aabb()[...])`` — pinned in ``tests/test_geometry.py``."""
+        return vol.flat_aabb()
 
     @staticmethod
     def _aabb_miss(a: tuple[float, ...], b: tuple[float, ...]) -> bool:

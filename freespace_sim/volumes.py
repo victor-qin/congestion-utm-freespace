@@ -43,6 +43,11 @@ class Volume4D:
     def aabb(self) -> tuple[np.ndarray, np.ndarray]:
         return self.shape.aabb()
 
+    def flat_aabb(self) -> tuple[float, float, float, float, float, float]:
+        """World AABB as six plain floats ``(xmin, ymin, zmin, xmax, ymax, zmax)`` — allocation-free twin
+        of :meth:`aabb` for the scalar broadphase (``ledger._flat_aabb`` / ``terminal_capacity``)."""
+        return self.shape.flat_aabb()
+
     def time_overlaps(self, other: "Volume4D") -> bool:
         return self.t_start < other.t_end and other.t_start < self.t_end
 
@@ -71,16 +76,20 @@ def corridor_segment_volume(
     would balloon the box in z past the levels it traverses (and above the ceiling); the vertical term
     keeps its z-extent at ``[z0, z1] ± corridor_height/2`` — the drone's real vertical footprint.
     """
-    p0 = np.asarray(p0, float)
-    p1 = np.asarray(p1, float)
-    d = p1 - p0
-    length = float(np.linalg.norm(d))
-    u = d / length if length > 1e-9 else np.array([1.0, 0.0, 0.0])
+    # Scalar hot path (one box per ≤120 m sub-box, hundreds of thousands per refined plan): plain floats,
+    # no per-box np.asarray / np.linalg.norm / vector alloc. Bit-for-bit identical to the numpy form —
+    # math.sqrt(dx²+dy²+dz²) == float(np.linalg.norm(p1-p0)) is the same fact the segment_frame oracle pins,
+    # and box_from_segment takes the (a, b) tuples via float() indexing (issue #30; see tests + scenario A/B).
+    p0x, p0y, p0z = float(p0[0]), float(p0[1]), float(p0[2])
+    p1x, p1y, p1z = float(p1[0]), float(p1[1]), float(p1[2])
+    dx, dy, dz = p1x - p0x, p1y - p0y, p1z - p0z
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)                 # == float(np.linalg.norm(p1 - p0))
+    ux, uy, uz = (dx / length, dy / length, dz / length) if length > 1e-9 else (1.0, 0.0, 0.0)
     # half the cross-section along travel: width when horizontal, height when vertical (== width/2 for a
     # level cruise/exit box → those are unchanged; == height/2 for a pure climb → no z overshoot).
-    ext = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(u[0], u[1]), cfg.corridor_height_m * u[2])
-    a = p0 - u * ext        # extend behind the start
-    b = p1 + u * ext        # and beyond the end → overlap with neighbours
+    ext = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(ux, uy), cfg.corridor_height_m * uz)
+    a = (p0x - ux * ext, p0y - uy * ext, p0z - uz * ext)           # extend behind the start
+    b = (p1x + ux * ext, p1y + uy * ext, p1z + uz * ext)           # and beyond the end → overlap neighbours
     spec = box_from_segment(a, b, cfg.corridor_width_m, cfg.corridor_height_m)
     return Volume4D(spec, t0 - cfg.time_buffer_s, t1 + cfg.time_buffer_s, terminal_id=terminal_id)
 
@@ -346,17 +355,26 @@ def build_reservation_from_corners(
     d_xy = np.asarray(dest, float)[:2] if dest_term is not None else None
     o_r = terminal_radius(origin_term, cfg) if origin_term is not None else 0.0
     d_r = terminal_radius(dest_term, cfg) if dest_term is not None else 0.0
+    # Scalar hot path: the ≤120 m sub-box resample runs hundreds of thousands of times per refined plan.
+    # Endpoints (sa, sb) are computed and passed as plain-float tuples — segment_overlaps_column and
+    # corridor_segment_volume both index via float(), so no per-sub-box np.asarray / vector alloc / norm.
+    # Bit-for-bit identical to the numpy form: math.sqrt(Σd²) == float(np.linalg.norm(·)) is the same fact
+    # the segment_frame (3-vector) and segment_overlaps_column (2-vector) frozen oracles pin, and the
+    # interpolation sa/sb reuse the exact `a + (k/nsub)·d` operands. centerline keeps its np.ndarray points
+    # (built once per sub-box, == the old sb.copy()). Backstopped by the scenario A/B SHA256.
     for a, b in zip(corners, corners[1:]):
-        a = np.asarray(a, float)
-        b = np.asarray(b, float)
-        d = b - a
-        total = float(np.linalg.norm(d))
-        nsub = max(1, int(np.ceil(total / seg)))
+        ax, ay, az = float(a[0]), float(a[1]), float(a[2])
+        bx, by, bz = float(b[0]), float(b[1]), float(b[2])
+        dx, dy, dz_seg = bx - ax, by - ay, bz - az
+        total = math.sqrt(dx * dx + dy * dy + dz_seg * dz_seg)   # == float(np.linalg.norm(b - a))
+        nsub = max(1, math.ceil(total / seg))                    # == max(1, int(np.ceil(total / seg)))
         for k in range(1, nsub + 1):
-            sa = a + (k - 1) / nsub * d
-            sb = a + k / nsub * d
-            horiz = float(np.linalg.norm((sb - sa)[:2]))
-            dz = abs(float(sb[2] - sa[2]))
+            f0, f1 = (k - 1) / nsub, k / nsub
+            sa = (ax + f0 * dx, ay + f0 * dy, az + f0 * dz_seg)
+            sb = (ax + f1 * dx, ay + f1 * dy, az + f1 * dz_seg)
+            hx, hy = sb[0] - sa[0], sb[1] - sa[1]
+            horiz = math.sqrt(hx * hx + hy * hy)                 # == float(np.linalg.norm((sb - sa)[:2]))
+            dz = abs(sb[2] - sa[2])
             t_next = t + max(horiz / cfg.nominal_speed_mps, dz / cfg.climb_rate_mps, 1e-3)
             # Tag EVERY box reaching into its hub's own column (not just first/last), so a near-hub
             # cruise box grazing the shared column is column-exempt rather than a CONFLICT_FILED. See
@@ -365,7 +383,7 @@ def build_reservation_from_corners(
                    else dest_term.id if d_xy is not None and segment_overlaps_column(sa, sb, d_xy, d_r, cfg)
                    else None)
             edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg, terminal_id=tid))
-            centerline.append((sb.copy(), t_next))
+            centerline.append((np.array([sb[0], sb[1], sb[2]]), t_next))
             t = t_next
             cum_horiz += horiz
             cum_dz += dz

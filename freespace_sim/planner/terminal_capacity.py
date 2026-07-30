@@ -35,14 +35,13 @@ from ..ledger import ReservationLedger
 from ..types import as_terminal
 from ..volumes import corridor_segment_volume, exit_radius, hover_reservation, terminal_radius
 
-# When True (default), :meth:`TerminalCapacity.column_clear` short-circuits under
-# ``cfg.terminal_airspace_always_active``: the permanent terminal WALL already routes foreign cruise
-# traffic out of the column (its discrete projection over-covers the column — ``exit_radius =
-# terminal_radius + corridor_width/2`` plus a boundary ring), so the foreign-transit scan is vacuous
-# and returns True. Skipping it drops an O(committed-tail) per-hub catch-up scan (issue: column_clear
-# was ~40-70% of A* plan time in the always-active density scenarios). Byte-identical for always-active
-# hubs (commit-time ``any_conflict`` stays the authoritative backstop). Set False to force the legacy
-# scan — used by ``analysis/ab_column_clear.py`` as the A/B baseline.
+# When True (default), :meth:`TerminalCapacity.column_clear` may short-circuit for a hub whose permanent
+# terminal wall is actually registered on the ledger. That wall is the same-radius column cylinder as a
+# transient dwell and spans the full [ground, ceiling] tube; its derived hex projection is wider still.
+# Consequently no foreign committed volume can transit the column at any flight level, and the dynamic
+# foreign-transit scan is vacuous. Requiring the concrete per-terminal registration (in addition to the
+# config flag) preserves lower-level planner/ledger callers that have not installed their intended walls.
+# Set False only to force the legacy scan in ``analysis/ab_column_clear.py``.
 SKIP_FOREIGN_WHEN_WALLED = True
 
 
@@ -181,16 +180,18 @@ class TerminalCapacity:
         backstop regardless, so at worst this diverges on the denial REASON, never admitting a real conflict."""
         term = as_terminal(term)
         tid = term.id
-        if SKIP_FOREIGN_WHEN_WALLED and self.cfg.terminal_airspace_always_active:
-            # Permanent wall over-covers the column ⇒ no foreign volume can transit it ⇒ the scan below
-            # is vacuous (always returns True). Skip the O(committed-tail) catch-up. Commit-time
-            # `any_conflict` remains the authoritative backstop; A/B-verified byte-identical (see module
-            # flag). Gated to always-active hubs only — the non-walled path still needs the real scan.
+        if (SKIP_FOREIGN_WHEN_WALLED
+                and self.cfg.terminal_airspace_always_active
+                and self.ledger.has_static_terminal(tid)):
+            # The registered permanent cylinder exactly covers this column from ground to ceiling, while
+            # the derived routing wall over-covers it at every flight level. FCFS commit therefore cannot
+            # admit a foreign transit here, making the dynamic committed-tail scan below vacuous.
             return True
         vols = self.ledger._vols                              # committed volumes, commit order (same pkg)
         n = len(vols)
         if n < self._ft_seen:                                 # ledger shrank (release) → cached index stale
-            self._ft.clear(); self._ftn.clear()
+            self._ft.clear()
+            self._ftn.clear()
         self._ft_seen = n
         start = self._ftn.get(tid, 0)
         if start < n:                                         # index the newly-committed tail for this hub

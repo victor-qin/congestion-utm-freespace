@@ -1,10 +1,10 @@
 """Per-flight attribution harness — where does plan() time go as the ledger fills?
 
 Runs a real named scenario (default ``density_faa_wing_zipline``) **serially** through ``sim.run`` and,
-per window of flights, splits the mean per-flight ``solve_time_s`` into three timed buckets and
+per window of flights, splits the mean per-flight ``solve_time_s`` into exclusive timed buckets and
 normalizes the search bucket by node expansions:
 
-    total_ms  =  any_conflict_ms  +  tcap_gate_ms  +  search_ms
+    total_ms  =  direct_any_conflict_ms  +  column_clear_ms  +  exit_clear_ms  +  search_ms
     ns_per_expansion  =  search_ms / expansions_per_flight
 
 That separates the two things that grow with the committed-flight count N — which is exactly the
@@ -18,8 +18,9 @@ That separates the two things that grow with the committed-flight count N — wh
   * ``expansions/flight`` — rises with airspace DENSITY (more traffic ⇒ more reroutes). This is the
     *higher-density* slowdown and it is largely INHERENT deconfliction cost.
 
-``any_conflict_ms`` is measured directly (not inferred) so we can confirm the ledger's own conflict
-query is NOT the linear driver — post-#33 it is ``(step, cell)``-bucketed and once-per-flight.
+``any_conflict_ms`` is measured directly (not inferred) and strictly inside ``planner.plan`` so FCFS
+commit and final verification cannot contaminate the solve-time attribution. Calls nested under
+``exit_clear`` stay in that gate's bucket instead of being double-counted.
 
 Serial on purpose: the per-flight *algorithmic* cost is identical serial vs parallel (each worker's
 ``plan()`` runs against a full replica ledger); parallel only rescales wall-time and adds
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from functools import wraps
 from time import perf_counter
 
 import freespace_sim.sim as sim_mod
@@ -75,6 +77,17 @@ if LAM_SCALE != 1.0:
 
 cfg = spec.config()
 demand = spec.demand_model()
+if demand is None:
+    uss_ids = ("default",)
+elif hasattr(demand, "n_hubs_per_uss"):
+    uss_ids = tuple(demand.n_hubs_per_uss)
+else:
+    uss_ids = tuple(getattr(demand, "uss_ids", ("default",)))
+if len(uss_ids) > 1:
+    raise ValueError(
+        f"{SCENARIO} has {len(uss_ids)} USSs ({uss_ids}); this profiler attributes one planner only. "
+        "Choose a single-USS scenario."
+    )
 print(f"scenario={SCENARIO} smoke={SMOKE} lam_scale={LAM_SCALE} window={WINDOW}\n"
       f"region={cfg.region_size_m} horizon={cfg.horizon_s}s demand_window={cfg.demand_duration_s}s "
       f"lam={cfg.lam_per_hour}/h planner={cfg.planner} always_active={cfg.terminal_airspace_always_active}",
@@ -100,26 +113,51 @@ def _list_stats(pool, max_heads: int = 20000):
     return mx, tot / max(1, seen), frag
 
 
-# ---- capture the planner sim.run builds internally (single-USS scenario → exactly one) ----
+# ---- capture the planner and scope counters to its plan() call (not commit or verification) ----
 captured: list = []
 _orig_get = sim_mod.get_planner
-sim_mod.get_planner = lambda name: (lambda p: (captured.append(p), p)[1])(_orig_get(name))
+SCOPE = {"plan": 0, "tcap": 0}
 
-# ---- time any_conflict (ledger) and the terminal-capacity gate (cumulative; per-window deltas) ----
+
+def _capturing_get(name):
+    planner = _orig_get(name)
+    original_plan = planner.plan
+
+    @wraps(original_plan)
+    def _scoped_plan(*args, **kwargs):
+        SCOPE["plan"] += 1
+        try:
+            return original_plan(*args, **kwargs)
+        finally:
+            SCOPE["plan"] -= 1
+
+    planner.plan = _scoped_plan
+    captured.append(planner)
+    return planner
+
+
+sim_mod.get_planner = _capturing_get
+
+# ---- exclusive planner-time buckets (cumulative; per-window deltas) ----
 AC = {"t": 0.0, "n": 0}
 _orig_ac = ReservationLedger.any_conflict
 
 
 def _timed_ac(self, volumes):
+    # FCFS commit and final verification also call this method but sit outside planner.plan. Calls nested
+    # inside exit_clear belong to that terminal-capacity bucket, not here.
+    if not SCOPE["plan"] or SCOPE["tcap"]:
+        return _orig_ac(self, volumes)
     t0 = perf_counter()
-    out = _orig_ac(self, volumes)
-    AC["t"] += perf_counter() - t0
-    AC["n"] += 1
-    return out
+    try:
+        return _orig_ac(self, volumes)
+    finally:
+        AC["t"] += perf_counter() - t0
+        AC["n"] += 1
 
 
-# split the gate: column_clear (foreign-transit tail-scan — suspected grower) vs exit_clear (which
-# calls ledger.any_conflict internally, so its any_conflict slice also shows up in AC — a ≤AC% overlap).
+# Split the gate: column_clear (foreign-transit tail-scan) vs exit_clear. The tcap depth makes
+# any_conflict inside exit_clear exclusive to EC instead of double-counting it in AC.
 CC = {"t": 0.0, "n": 0}
 EC = {"t": 0.0, "n": 0}
 _orig_cc = TerminalCapacity.column_clear
@@ -127,19 +165,29 @@ _orig_ec = TerminalCapacity.exit_clear
 
 
 def _timed_cc(self, *a, **k):
+    if not SCOPE["plan"]:
+        return _orig_cc(self, *a, **k)
+    SCOPE["tcap"] += 1
     t0 = perf_counter()
-    out = _orig_cc(self, *a, **k)
-    CC["t"] += perf_counter() - t0
-    CC["n"] += 1
-    return out
+    try:
+        return _orig_cc(self, *a, **k)
+    finally:
+        CC["t"] += perf_counter() - t0
+        CC["n"] += 1
+        SCOPE["tcap"] -= 1
 
 
 def _timed_ec(self, *a, **k):
+    if not SCOPE["plan"]:
+        return _orig_ec(self, *a, **k)
+    SCOPE["tcap"] += 1
     t0 = perf_counter()
-    out = _orig_ec(self, *a, **k)
-    EC["t"] += perf_counter() - t0
-    EC["n"] += 1
-    return out
+    try:
+        return _orig_ec(self, *a, **k)
+    finally:
+        EC["t"] += perf_counter() - t0
+        EC["n"] += 1
+        SCOPE["tcap"] -= 1
 
 
 # ---- per-window accumulators + the per-flight hook (sim.run progress callback: done,total,intent) ----
@@ -154,7 +202,40 @@ def _reset_window():
     W.update(solve=0.0, exp=0, n=0, acc=0, den=0)
 
 
+def _emit_window(done, total):
+    if not W["n"]:
+        return
+    p = captured[0]
+    n = W["n"]
+    total_ms = W["solve"] / n * 1000.0
+    ac_ms = (AC["t"] - prev["ac_t"]) / n * 1000.0
+    cc_ms = (CC["t"] - prev["cc_t"]) / n * 1000.0     # column_clear (foreign-transit tail-scan)
+    ec_ms = (EC["t"] - prev["ec_t"]) / n * 1000.0     # exit_clear
+    search_ms = total_ms - ac_ms - cc_ms - ec_ms      # remainder after disjoint direct/gate buckets
+    exp = W["exp"] / n
+    ns_exp = (search_ms / exp * 1e6) if exp > 0 else float("nan")
+    cocc = p._cocc
+    corr_nslot, nc = cocc.corr.nslots, cocc.corr.NC
+    mx, _mean_len, _frag = _list_stats(cocc.corr)
+    row = {"done": done, "total_ms": total_ms, "ac_ms": ac_ms, "ac_pct": ac_ms / total_ms * 100.0,
+           "cc_ms": cc_ms, "ec_ms": ec_ms, "search_ms": search_ms, "exp": exp, "ns_exp": ns_exp,
+           "corr_nslot": corr_nslot, "frag_cell": (corr_nslot - nc) / nc, "maxlist": mx,
+           "n_added": cocc.n_added}
+    windows.append(row)
+    print(f"[{done:>5}/{total}] tot={total_ms:7.1f}ms ac={ac_ms:5.2f}({row['ac_pct']:4.1f}%) "
+          f"colclr={cc_ms:6.2f} exitclr={ec_ms:5.2f} srch={search_ms:7.1f} exp={exp:7.0f} "
+          f"ns/exp={ns_exp:8.1f} corr_nslot={corr_nslot:>8} frag/cell={row['frag_cell']:5.2f} "
+          f"maxlist={mx:>5} n_add={cocc.n_added:>7} acc={W['acc']} den={W['den']} {dict(reasons)}",
+          flush=True)
+    prev["ac_t"], prev["cc_t"], prev["ec_t"] = AC["t"], CC["t"], EC["t"]
+    _reset_window()
+
+
 def _hook(done, total, intent):
+    if len(captured) != 1:
+        raise RuntimeError(
+            f"expected one captured planner before the first progress hook, found {len(captured)}"
+        )
     p = captured[0]
     W["solve"] += intent.solve_time_s
     W["exp"] += p.last_expansions
@@ -170,31 +251,8 @@ def _hook(done, total, intent):
         TOT["den"] += 1
         reasons[intent.denial_reason.value] += 1
 
-    if done % WINDOW:
-        return
-    n = W["n"]
-    total_ms = W["solve"] / n * 1000.0
-    ac_ms = (AC["t"] - prev["ac_t"]) / n * 1000.0
-    cc_ms = (CC["t"] - prev["cc_t"]) / n * 1000.0     # column_clear (foreign-transit tail-scan)
-    ec_ms = (EC["t"] - prev["ec_t"]) / n * 1000.0     # exit_clear
-    search_ms = total_ms - ac_ms - cc_ms - ec_ms      # ≈ kernel (slight under-count: any_conflict-in-exit)
-    exp = W["exp"] / n
-    ns_exp = (search_ms / exp * 1e6) if exp > 0 else float("nan")
-    cocc = p._cocc
-    corr_nslot, nc = cocc.corr.nslots, cocc.corr.NC
-    mx, mean_len, _frag = _list_stats(cocc.corr)
-    row = {"done": done, "total_ms": total_ms, "ac_ms": ac_ms, "ac_pct": ac_ms / total_ms * 100.0,
-           "cc_ms": cc_ms, "ec_ms": ec_ms, "search_ms": search_ms, "exp": exp, "ns_exp": ns_exp,
-           "corr_nslot": corr_nslot, "frag_cell": (corr_nslot - nc) / nc, "maxlist": mx,
-           "n_added": cocc.n_added}
-    windows.append(row)
-    print(f"[{done:>5}/{total}] tot={total_ms:7.1f}ms ac={ac_ms:5.2f}({row['ac_pct']:4.1f}%) "
-          f"colclr={cc_ms:6.2f} exitclr={ec_ms:5.2f} srch={search_ms:7.1f} exp={exp:7.0f} "
-          f"ns/exp={ns_exp:8.1f} corr_nslot={corr_nslot:>8} frag/cell={row['frag_cell']:5.2f} "
-          f"maxlist={mx:>5} n_add={cocc.n_added:>7} acc={W['acc']} den={W['den']} {dict(reasons)}",
-          flush=True)
-    prev["ac_t"], prev["cc_t"], prev["ec_t"] = AC["t"], CC["t"], EC["t"]
-    _reset_window()
+    if done % WINDOW == 0:
+        _emit_window(done, total)
 
 
 # ---- run serially, then restore every patch ----
@@ -213,6 +271,7 @@ finally:
 assert len(set(map(id, captured))) == 1, (
     f"expected a single planner (single-USS scenario) but captured {len(set(map(id, captured)))}; "
     f"the [0] read in the hook is only valid for single-USS scenarios")
+_emit_window(TOT["n"], TOT["n"])             # retain a final partial window instead of silently dropping it
 
 # ---- closing readout: the decision rule, with numbers ----
 wall = perf_counter() - t0

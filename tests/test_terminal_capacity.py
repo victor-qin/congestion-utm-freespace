@@ -5,13 +5,20 @@ hex-free interval authority: capacity by interval-overlap count, column activati
 union-coverage + ledger fallback, lockstep eviction.
 """
 
+from dataclasses import replace
+
 import pytest
 
+import freespace_sim.planner.terminal_capacity as tc
+from analysis.ab_column_clear import _committed_digest, _intent_digest, _static_digest
 from freespace_sim.config import SimConfig
+from freespace_sim.demand import HubRadiusDemand
 from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
+from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.terminal_capacity import TerminalCapacity
-from freespace_sim.types import Terminal, vec
+from freespace_sim.sim import run
+from freespace_sim.types import DenialReason, FlightRequest, Terminal, vec
 from freespace_sim.volumes import Volume4D, hover_reservation
 
 CFG = SimConfig()
@@ -84,6 +91,120 @@ def test_column_clear_is_clear_in_empty_airspace():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
     term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
     assert tcap.column_clear(term, center, 0.0)
+
+
+def test_always_active_shortcut_requires_this_hubs_registered_wall():
+    """The config flag states that walls are intended; only the ledger registration proves this hub has one.
+
+    Lower-level planner callers can set always-active without going through sim.run's wall installation.
+    They must retain the real foreign-transit scan instead of turning a ground delay into a commit rejection.
+    Registering an unrelated hub is insufficient.
+    """
+    cfg = replace(CFG, terminal_airspace_always_active=True)
+    led = ReservationLedger(cfg)
+    led.commit(99, [_foreign_through_hub()])
+    tcap = TerminalCapacity(cfg, led)
+    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+
+    assert not led.has_static_terminal(term.id)
+    assert not tcap.column_clear(term, center, 0.0, z=70.0)
+
+    other = Terminal("OTHER", 4, radius=90.0)
+    led.register_static_terminal(vec(3000, 3000, 0), other)
+    assert led.has_static_terminal(other.id)
+    assert not led.has_static_terminal(term.id)
+    assert not tcap.column_clear(term, center, 0.0, z=70.0)
+
+
+def test_direct_planner_without_registered_wall_preserves_legacy_gate(monkeypatch):
+    """Tripwire for the reproduced config-only regression in lower-level planner callers.
+
+    With no registered wall, the real gate proves the origin column is unavailable and exhausts the
+    search budget. The old shortcut changed that false gate to true, built a conflicting corridor, and
+    changed the deterministic denial from ``budget_exceeded`` to ``conflict_filed``.
+    """
+    cfg = SimConfig(
+        terminal_airspace_always_active=True,
+        max_ground_delay_s=0.0,
+        flight_levels_m=(100.0,),
+        airspace_ceiling_m=125.0,
+        region_size_m=(2500.0, 2500.0),
+    )
+    foreign = Volume4D(
+        box_from_segment(vec(800, 1000, 100), vec(1200, 1000, 100), 40, 200),
+        0.0,
+        1e6,
+    )
+    request = FlightRequest(
+        1,
+        vec(1000, 1000, 0),
+        vec(1400, 1000, 0),
+        0.0,
+        origin_terminal=Terminal("H", 4, radius=90.0),
+    )
+
+    def plan(skip):
+        monkeypatch.setattr(tc, "SKIP_FOREIGN_WHEN_WALLED", skip)
+        ledger = ReservationLedger(cfg)
+        ledger.commit(99, [foreign])
+        return AStarPlanner().plan(request, ledger, cfg)
+
+    baseline = plan(False)
+    patched = plan(True)
+
+    assert baseline.denial_reason is DenialReason.BUDGET_EXCEEDED
+    assert _intent_digest(patched) == _intent_digest(baseline)
+
+
+def test_registered_wall_shortcut_covers_every_flight_level(monkeypatch):
+    cfg = replace(CFG, terminal_airspace_always_active=True)
+    led = ReservationLedger(cfg)
+    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+    led.register_static_terminal(center, term)
+    tcap = TerminalCapacity(cfg, led)
+
+    assert led.has_static_terminal(term.id)
+    assert led.static_volumes()[0].z_range == (cfg.ground_level_m, cfg.airspace_ceiling_m)
+
+    def _scan_started(*_args, **_kwargs):
+        raise AssertionError("registered always-active column should return before the dynamic scan")
+
+    monkeypatch.setattr(tc, "terminal_radius", _scan_started)
+    for z in cfg.flight_levels_m:
+        assert tcap.column_clear(term, center, 0.0, z=z)
+
+
+def test_always_active_shortcut_is_exact_with_multiple_flight_levels(monkeypatch):
+    """Compact integration guard for the same three-level path used by the 3,000-flight acceptance run."""
+    cfg = SimConfig(
+        terminal_airspace_always_active=True,
+        flight_levels_m=(30.0, 70.0, 110.0),
+        airspace_ceiling_m=125.0,
+        region_size_m=(6000.0, 6000.0),
+        horizon_s=240.0,
+        lam_per_hour=300.0,
+        seed=2,
+    )
+    demand = HubRadiusDemand(
+        n_hubs_per_uss={"wing_uss": 3},
+        radius_m=2000.0,
+        pads_per_hub=4,
+        terminal_radius_m=120.0,
+        return_flights=True,
+    )
+
+    monkeypatch.setattr(tc, "SKIP_FOREIGN_WHEN_WALLED", False)
+    baseline = run(cfg, demand=demand)
+    monkeypatch.setattr(tc, "SKIP_FOREIGN_WHEN_WALLED", True)
+    patched = run(cfg, demand=demand)
+
+    assert len(baseline.intents) > 10
+    assert baseline.verified and patched.verified
+    assert [_intent_digest(intent) for intent in baseline.intents] == [
+        _intent_digest(intent) for intent in patched.intents
+    ]
+    assert _committed_digest(baseline.ledger) == _committed_digest(patched.ledger)
+    assert _static_digest(baseline.ledger) == _static_digest(patched.ledger)
 
 
 # --- the takeoff/landing edge predicate -------------------------------------------------------

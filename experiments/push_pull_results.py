@@ -8,8 +8,13 @@ the ``results/`` folders that run produces.
 
 Requires the optional ``cloud`` extra and a one-time login::
 
-    uv sync --extra cloud
-    uv run huggingface-cli login            # or set $HF_TOKEN
+    uv sync --extra cloud                   # or, in a non-uv env: pip install huggingface_hub
+    uv run hf auth login                    # or set $HF_TOKEN
+
+``hf``, not ``huggingface-cli``: the extra resolves to huggingface_hub 1.x, where the old
+``huggingface-cli`` entry point is deprecated and *no longer works* ("Use `hf` instead").
+On a cluster, do BOTH steps on the login node — compute nodes have no internet, so a push
+from inside a batch job cannot reach the Hub no matter how it is authenticated.
 
 Repo id comes from ``--remote`` or ``$FREESPACE_HF_REPO``. Usage::
 
@@ -35,9 +40,14 @@ def _require_hf():
     try:
         import huggingface_hub as hf
     except ModuleNotFoundError as exc:
+        # NOT an auth failure — huggingface_hub simply is not installed in THIS interpreter.
+        # Name the interpreter: the usual cause is running a different python (conda on a
+        # cluster) than the uv venv the extra was synced into.
         raise SystemExit(
-            "cloud sync needs huggingface_hub: `uv sync --extra cloud`, "
-            "then authenticate once with `uv run huggingface-cli login` (or set $HF_TOKEN)."
+            f"cloud sync needs huggingface_hub, missing from {sys.executable}\n"
+            "  uv venv:   uv sync --extra cloud\n"
+            '  other env: python -m pip install "huggingface_hub>=0.20"\n'
+            "then authenticate once with `hf auth login` (or set $HF_TOKEN)."
         ) from exc
     return hf
 

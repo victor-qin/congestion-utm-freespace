@@ -187,6 +187,8 @@ def test_density_scenario_matrix(name, hubs, rates):
     [
         ("density_faa_wing_zipline_3lvl", "density_faa_wing_zipline"),
         ("density_future_wing_zipline_3lvl", "density_future_wing_zipline"),
+        ("density_faa_wing_zipline_amazon_3lvl", "density_faa_wing_zipline_amazon"),
+        ("density_future_wing_zipline_amazon_3lvl", "density_future_wing_zipline_amazon"),
     ],
 )
 def test_density_stacked_scenarios_are_three_levels(stacked_name, twin_name):
@@ -257,6 +259,8 @@ def test_density_scenarios_have_descriptions_and_remove_density_test():
         "density_future_wing_zipline_amazon",
         "density_faa_wing_zipline_3lvl",
         "density_future_wing_zipline_3lvl",
+        "density_faa_wing_zipline_amazon_3lvl",
+        "density_future_wing_zipline_amazon_3lvl",
     }
     assert all(SCENARIOS[name].description for name in density_names)
     assert "density_test" not in SCENARIOS

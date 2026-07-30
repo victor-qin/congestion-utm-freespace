@@ -115,6 +115,11 @@ class ScenarioSpec:
     # knob: SimConfig derives the single-plane samplers' cruise + z-band from it, so a scenario needn't
     # (and can't) set cruise_level_m / z_min_m / z_max_m separately.
     flight_levels_m: "tuple[float, ...] | None" = None
+    # Vertical protection-box height override (None → SimConfig default, 30 m). Each flight level is the
+    # centre of a corridor_height_m-tall box, so SimConfig requires adjacent levels to be spaced strictly
+    # MORE than this apart (else the boxes overlap in z). Lower it below the level gap to stack levels
+    # closer than 30 m — e.g. 14 m tubes let the (80, 95, 110) ladder sit 15 m apart and stay FCL-disjoint.
+    corridor_height_m: "float | None" = None
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -139,6 +144,7 @@ class ScenarioSpec:
             **({"terminal_airspace_always_active": self.terminal_airspace_always_active}
                if self.terminal_airspace_always_active is not None else {}),
             **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
+            **({"corridor_height_m": self.corridor_height_m} if self.corridor_height_m is not None else {}),
         )
 
     def demand_model(self) -> DemandModel | None:

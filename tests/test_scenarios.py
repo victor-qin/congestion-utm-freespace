@@ -182,6 +182,32 @@ def test_density_scenario_matrix(name, hubs, rates):
     assert demand.paired_return_request is True
 
 
+@pytest.mark.parametrize(
+    ("stacked_name", "twin_name"),
+    [
+        ("density_faa_wing_zipline_3lvl", "density_faa_wing_zipline"),
+        ("density_future_wing_zipline_3lvl", "density_future_wing_zipline"),
+    ],
+)
+def test_density_stacked_scenarios_are_three_levels(stacked_name, twin_name):
+    # config() constructing at all proves the (80, 95, 110) ladder clears SimConfig.__post_init__ — the
+    # 15 m gaps only validate because the scenario ships a 14 m corridor box (a 30 m box would raise).
+    cfg = SCENARIOS[stacked_name].config()
+    assert cfg.flight_levels_m == (80.0, 95.0, 110.0)
+    assert cfg.corridor_height_m == 14.0
+    assert cfg.n_levels == 3
+    assert (cfg.z_min_m, cfg.cruise_level_m, cfg.z_max_m) == (80.0, 95.0, 110.0)
+
+    # the stacked variant changes ONLY altitude — its demand world is identical to the single-level twin,
+    # which itself is untouched (still the 100 m plane on SimConfig's default 30 m box).
+    stacked, twin = SCENARIOS[stacked_name], SCENARIOS[twin_name]
+    assert stacked.lam_per_hour == twin.lam_per_hour
+    assert stacked.demand == twin.demand
+    twin_cfg = twin.config()
+    assert twin_cfg.flight_levels_m == (100.0,)
+    assert twin_cfg.corridor_height_m == 30.0
+
+
 def test_density_mixed_scenarios_use_two_distinct_uss():
     for name in (
         "density_faa_wing_zipline_amazon",
@@ -229,6 +255,8 @@ def test_density_scenarios_have_descriptions_and_remove_density_test():
         "density_future_wing_zipline",
         "density_faa_wing_zipline_amazon",
         "density_future_wing_zipline_amazon",
+        "density_faa_wing_zipline_3lvl",
+        "density_future_wing_zipline_3lvl",
     }
     assert all(SCENARIOS[name].description for name in density_names)
     assert "density_test" not in SCENARIOS

@@ -19,6 +19,13 @@ AMAZON_RADIUS_M = 12_000.0
 WING_ZIPLINE_LEAD_S = (8.0 * 60.0, 1.5 * 60.0)
 AMAZON_LEAD_S = (30.0 * 60.0, 5.0 * 60.0)
 
+# Vertically-stacked variant: three cruise levels 15 m apart. The 15 m gap is below the default 30 m
+# corridor_height_m, so the ladder ships its own 14 m box (±7 m tubes, a 1 m dead-band between adjacent
+# levels) — the tightest tidy height that keeps SimConfig's "gap > corridor_height_m" invariant (a 15 m
+# box would exactly touch and be rejected). Top box 110 + 7 = 117 m stays under the 125 m ceiling.
+STACKED_LEVELS_M = (80.0, 95.0, 110.0)
+STACKED_CORRIDOR_HEIGHT_M = 14.0
+
 
 def _density_scenario(
     name: str,
@@ -28,8 +35,15 @@ def _density_scenario(
     wing_rate_per_hub: float,
     amazon_hubs: int | None = None,
     amazon_rate_per_hub: float | None = None,
+    flight_levels_m: tuple[float, ...] = (CRUISE_ALTITUDE_M,),
+    corridor_height_m: float | None = None,
 ) -> ScenarioSpec:
-    """Build one density recipe, preserving Wing/Zipline-first USS and hub ordering."""
+    """Build one density recipe, preserving Wing/Zipline-first USS and hub ordering.
+
+    ``flight_levels_m`` defaults to the single 100 m cruise plane; pass a wider ladder (plus a matching
+    ``corridor_height_m`` if the levels sit closer than 30 m apart) to study vertically-stacked traffic.
+    ``corridor_height_m=None`` keeps SimConfig's 30 m default.
+    """
     if (amazon_hubs is None) != (amazon_rate_per_hub is None):
         raise ValueError("amazon_hubs and amazon_rate_per_hub must be supplied together")
 
@@ -59,7 +73,8 @@ def _density_scenario(
         lam_per_hour=round(sum(lam_per_uss.values()), 2),
         fixed_exit_lanes=True,
         terminal_airspace_always_active=True,
-        flight_levels_m=(CRUISE_ALTITUDE_M,),
+        flight_levels_m=flight_levels_m,
+        corridor_height_m=corridor_height_m,
         demand=DemandSpec(
             pattern="hub_radius",
             uss=tuple(uss),
@@ -105,5 +120,21 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         wing_rate_per_hub=57.4,
         amazon_hubs=14,
         amazon_rate_per_hub=157.0,
+    ),
+    "density_faa_wing_zipline_3lvl": _density_scenario(
+        "density_faa_wing_zipline_3lvl",
+        "FAA-filing density on three cruise levels 80/95/110 m (15 m separation, ±7 m tubes).",
+        wing_hubs=182,
+        wing_rate_per_hub=26.67,
+        flight_levels_m=STACKED_LEVELS_M,
+        corridor_height_m=STACKED_CORRIDOR_HEIGHT_M,
+    ),
+    "density_future_wing_zipline_3lvl": _density_scenario(
+        "density_future_wing_zipline_3lvl",
+        "Far-future density on three cruise levels 80/95/110 m (15 m separation, ±7 m tubes).",
+        wing_hubs=476,
+        wing_rate_per_hub=57.4,
+        flight_levels_m=STACKED_LEVELS_M,
+        corridor_height_m=STACKED_CORRIDOR_HEIGHT_M,
     ),
 }

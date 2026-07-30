@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -34,6 +35,38 @@ log = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int, OperationalIntent], None]
 
 
+class _RollingRate:
+    """Cumulative + rolling mean of a per-flight duration (s), and the ETA the rolling rate implies for
+    the flights still to come. Shared by the live ``ConsoleProgress`` ticker (fed WALL time per flight, so
+    its ETA tracks the real finish clock) and the ``_MilestoneLog`` INFO lines (fed planner ``solve_time_s``)
+    so both surface a saturation slowdown the same way: the rolling value pulls ABOVE the cumulative avg,
+    instead of the slowdown hiding in a lagging whole-run average. ``roll_ms``/``eta_s`` return ``None``
+    until the ``window`` fills, so a caller never reports an estimate off a partial sample."""
+
+    def __init__(self, window: int = 100):
+        self.window = window
+        self._recent: deque[float] = deque(maxlen=window)
+        self._sum = 0.0
+
+    def add(self, dt_s: float) -> None:
+        self._sum += dt_s
+        self._recent.append(dt_s)
+
+    def avg_ms(self, done: int) -> float:
+        return 1000.0 * self._sum / max(done, 1)
+
+    def _roll_s(self) -> float | None:
+        return sum(self._recent) / self.window if len(self._recent) >= self.window else None
+
+    def roll_ms(self) -> float | None:
+        r = self._roll_s()
+        return None if r is None else 1000.0 * r
+
+    def eta_s(self, done: int, total: int) -> float | None:
+        r = self._roll_s()
+        return None if r is None else max(0, total - done) * r
+
+
 class ConsoleProgress:
     """A throttled, single-line progress reporter for long simulations.
 
@@ -42,14 +75,16 @@ class ConsoleProgress:
     rate, and a linear ETA. Uses a carriage return so it updates in place.
     """
 
-    def __init__(self, total: int, every_s: float = 2.0, stream=None):
+    def __init__(self, total: int, every_s: float = 2.0, stream=None, window: int = 100):
         self.total = total
         self.every_s = every_s
         self.stream = stream if stream is not None else sys.stderr
         self.t0 = time.monotonic()
+        self.prev = self.t0              # wall clock at the previous flight, for per-flight deltas
         self.last = 0.0
         self.acc = 0
         self.den = 0
+        self.rate = _RollingRate(window)
 
     def __call__(self, done: int, total: int, intent: OperationalIntent) -> None:
         if intent.accepted:
@@ -57,15 +92,21 @@ class ConsoleProgress:
         elif intent.status is IntentStatus.REJECTED:
             self.den += 1
         now = time.monotonic()
+        self.rate.add(now - self.prev)   # this flight's WALL time — accrued EVERY flight so the rolling
+        self.prev = now                  # mean/ETA stay right even though we only print every every_s
         if done < total and now - self.last < self.every_s:
             return
         self.last = now
         elapsed = now - self.t0
-        rate = elapsed / max(done, 1)
-        eta = rate * (total - done)
+        roll, eta = self.rate.roll_ms(), self.rate.eta_s(done, total)
+        roll_str = f"{roll:.0f}ms" if roll is not None else "n/a"
+        eta_str = f"{eta:.0f}s" if eta is not None else "n/a"
         end = "\n" if done >= total else ""
-        print(f"\r  [{done:>4}/{total}] acc={self.acc} den={self.den}  "
-              f"elapsed={elapsed:5.0f}s  {rate * 1000:5.0f}ms/flight  ETA {eta:4.0f}s   ",
+        # ETA rides the rolling per-flight time, so it re-forecasts through a slowdown instead of trusting
+        # the whole-run average; avg (cumulative) is kept alongside so the two diverging shows saturation.
+        print(f"\r  [{done:>4}/{total}] acc={self.acc} den={self.den}  elapsed={elapsed:5.0f}s  "
+              f"wall/flight avg={self.rate.avg_ms(done):.0f}ms roll[{self.rate.window}]={roll_str}  "
+              f"ETA {eta_str}   ",
               end=end, file=self.stream, flush=True)
 
 
@@ -91,12 +132,17 @@ class _MilestoneLog:
     configures INFO→stderr so every batch-script run shows them; bare library/test use has no handler
     and stays silent (the level check short-circuits, so the quiet path costs nothing)."""
 
-    def __init__(self, total: int, horizon_s: float, every_n: int = 1000, every_frac: float = 0.05):
+    def __init__(self, total: int, horizon_s: float, every_n: int = 1000, every_frac: float = 0.05,
+                 roll_window: int = 100):
         self.total = total
         self.every_n = every_n
         self.t0 = time.monotonic()
         self.acc = 0
         self.den = 0
+        # Per-flight PLANNER time (``intent.solve_time_s``) as a cumulative avg + rolling mean + ETA — the
+        # same _RollingRate treatment as the live ConsoleProgress ticker (which feeds it wall time), so a
+        # saturation slowdown pulls roll above avg here too instead of hiding in the whole-run average.
+        self.plan = _RollingRate(roll_window)
         n_marks = max(1, round(1.0 / every_frac))
         # k/n_marks division, NOT horizon*every_frac*k: 0.05 is not float-representable and the
         # product overshoots the true fraction for ~a third of (horizon, k) pairs (1.0*0.05*3 =
@@ -110,16 +156,29 @@ class _MilestoneLog:
             self.acc += 1
         elif intent.status is IntentStatus.REJECTED:
             self.den += 1
+        self.plan.add(intent.solve_time_s)
         wall = time.monotonic() - self.t0
         while self.mi < len(self.marks) and req.t_request >= self.marks[self.mi]:
             log.info("recording @%d%% horizon (mark %.0fs): flight=%d sim_t=%.1fs wall=%.1fs "
-                     "planned=%d/%d acc=%d den=%d",
+                     "planned=%d/%d acc=%d den=%d %s",
                      self.pcts[self.mi], self.marks[self.mi], req.flight_id, req.t_request, wall,
-                     done, self.total, self.acc, self.den)
+                     done, self.total, self.acc, self.den, self._perf(done))
             self.mi += 1
         if done % self.every_n == 0:
-            log.info("planned %d/%d: flight=%d sim_t=%.1fs wall=%.1fs acc=%d den=%d",
-                     done, self.total, req.flight_id, req.t_request, wall, self.acc, self.den)
+            log.info("planned %d/%d: flight=%d sim_t=%.1fs wall=%.1fs acc=%d den=%d %s",
+                     done, self.total, req.flight_id, req.t_request, wall, self.acc, self.den,
+                     self._perf(done))
+
+    def _perf(self, done: int) -> str:
+        """This milestone's plan-time readout — cumulative avg always, plus the rolling mean and ETA once
+        the window fills (``n/a`` while warming up). Built from the shared :class:`_RollingRate`, so it
+        mirrors the live ConsoleProgress ticker; it's solve-time based, so its ETA slightly undershoots the
+        wall clock by the per-flight commit overhead the ticker's wall-based ETA does capture."""
+        roll, eta = self.plan.roll_ms(), self.plan.eta_s(done, self.total)
+        if roll is None:
+            return f"solve/flight avg={self.plan.avg_ms(done):.0f}ms roll[{self.plan.window}]=n/a ETA=n/a"
+        return (f"solve/flight avg={self.plan.avg_ms(done):.0f}ms "
+                f"roll[{self.plan.window}]={roll:.0f}ms ETA={eta:.0f}s")
 
 
 @dataclass

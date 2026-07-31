@@ -236,7 +236,7 @@ def _warn_kernel_fallback() -> None:
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 2_000_000, vertical_edges: bool = True,
+    def __init__(self, max_expansions: int = 3_000_000, vertical_edges: bool = True,
                  compiled: bool = True, kernel_log2_min: int | None = None):
         self.max_expansions = max_expansions
         # starting g-hash/heap size (1 << kernel_log2_min slots): the ADAPTIVE floor of the kernel work

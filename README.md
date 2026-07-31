@@ -170,6 +170,16 @@ A standalone webpage (no server) that plays the reservations back like a video:
 - **Dashed origin→dest** reference line per active flight — the gap to its solid corridor *is* the
   detour the FCFS newcomer paid.
 
+**It stays small.** A dense run reserves hundreds of thousands of corridor boxes, and dumping them
+verbatim reached 78 MB at 4.7k flights (~400 MB at 26k) — too big to archive or open comfortably.
+Three encodings stack to **~140x smaller** (78 MB → 0.55 MB) with no loss of visual fidelity:
+corridor boxes are **not stored at all** but rebuilt in the browser from the path (they are exactly
+the swept centerline, which `viz_html._rebuildable` verifies per flight — a planner that reserves
+anything else keeps explicit polygons); coordinates are quantised to decimetres and delta-encoded;
+and the result is gzipped into one base64 string, inflated on load via `DecompressionStream`
+(Chrome 80+ / Safari 16.4+ / Firefox 113+). Loading got ~14x faster as a side effect, since the
+browser no longer parses tens of MB of JavaScript source.
+
 ## Metrics
 
 Per flight: ground delay, air hold, air detour, altitude change, cost, **stretch** (flown ÷

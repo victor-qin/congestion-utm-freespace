@@ -433,7 +433,12 @@ function strokePoly(p, color, z){{
   ctx.save(); ctx.setLineDash(LEVEL_DASH[levelOf(z)]); ctx.strokeStyle=color; ctx.stroke(); ctx.restore();
 }}
 const POLY = new Float64Array(8);                            // scratch, reused every segment
-const LABEL_W = 28, LABEL_H = 11;                            // one altitude label's footprint, in px
+// Altitude-label size, in SCREEN px — the one knob. The declutter slot is DERIVED from it so the two
+// cannot drift apart: bump LABEL_PX alone and the slot grows to match, instead of labels quietly
+// starting to overlap again. Monospace glyphs are ~0.6em, and the widest label is 4 chars ('110m').
+const LABEL_PX = 13;
+const LABEL_FONT = LABEL_PX + 'px monospace';
+const LABEL_W = Math.ceil(LABEL_PX * 0.6 * 4) + 8, LABEL_H = LABEL_PX + 4;
 const labelSlots = new Map();                                // per-frame: slot -> {{n, z, X, Y}}
 // The altitude readout is drawn in SCREEN pixels and deliberately does NOT scale with zoom — a label
 // that grew with the view would swamp the map. What makes it LOOK like it scales is density: at fit a
@@ -451,9 +456,9 @@ function noteLabel(z, X, Y){{
   if(slot) slot.n++; else labelSlots.set(key, {{n: 1, z, X, Y}});
 }}
 function drawLabels(){{                                      // after every flight, so counts are final
-  ctx.fillStyle='#aeb6c2'; ctx.font='8px monospace';
+  ctx.fillStyle='#c6cedb'; ctx.font=LABEL_FONT;              // a touch brighter at this size
   for(const s of labelSlots.values())
-    if(s.n === 1) ctx.fillText(Math.round(s.z)+'m', s.X+6, s.Y-4);
+    if(s.n === 1) ctx.fillText(Math.round(s.z)+'m', s.X+7, s.Y-6);   // clear of the 4 px drone dot
 }}
 function draw(t){{
   if(!DATA) return;

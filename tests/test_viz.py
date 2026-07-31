@@ -2,6 +2,7 @@ import base64
 import dataclasses
 import gzip
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -345,23 +346,24 @@ def test_shipped_altitude_labels_are_fixed_size_and_only_drawn_when_unambiguous(
     if node is None:
         pytest.skip("node not available; cannot execute the shipped JS")
     html = viz_html._HTML
-    body = html[html.index("function noteLabel("):html.index("function draw(t)")]
+    # slice from LABEL_PX, not from noteLabel, so the test uses the SHIPPED size constants and the
+    # slot derivation with them — a slot that stopped tracking the font would show up here
+    body = html[html.index("const LABEL_PX"):html.index("function draw(t)")]
     harness = """
 const cv = {width: 760, height: 760};
 const drawn = [];
 const ctx = {set fillStyle(v){}, set font(v){this._f = v;}, get font(){return this._f;},
              fillText(txt, x, y){ drawn.push({txt, x, y, font: this._f}); }};
-const labelSlots = new Map();
-const LABEL_W = 28, LABEL_H = 11;
 """ + body.replace("{{", "{").replace("}}", "}") + """
 // two drones 3 px apart (same slot) plus one far away, all on screen
 labelSlots.clear();
-noteLabel(80, 100, 100); noteLabel(95, 103, 100); noteLabel(110, 400, 400);
+noteLabel(80, 100, 100); noteLabel(95, 103, 100); noteLabel(110, 100 + 6*LABEL_W, 400);
 drawLabels();
 const close = drawn.slice();
 // off-canvas points are never labelled
 labelSlots.clear(); drawn.length = 0;
 noteLabel(80, -5, 100); noteLabel(80, 100, 1000); noteLabel(95, 300, 300);
+if (LABEL_W < 8) throw new Error('slot narrower than the label it holds');
 drawLabels();
 console.log(JSON.stringify({close, offscreen: drawn.slice()}));
 """
@@ -371,8 +373,9 @@ console.log(JSON.stringify({close, offscreen: drawn.slice()}));
 
     # the crowded pair is suppressed; only the isolated drone is labelled
     assert [d["txt"] for d in got["close"]] == ["110m"]
-    # ...and the font is the fixed screen-space size, not derived from any zoom
-    assert got["close"][0]["font"] == "8px monospace"
+    # ...and the font is a fixed screen-space px size, not derived from any zoom (the exact value is
+    # a display knob, so pin the SHAPE rather than the number)
+    assert re.fullmatch(r"\d+px monospace", got["close"][0]["font"])
     # off-canvas drones contribute nothing, so they cannot suppress an on-screen neighbour either
     assert [d["txt"] for d in got["offscreen"]] == ["95m"]
 

@@ -263,7 +263,8 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
  h3{{margin:6px 0 0}} small{{color:#8b949e}} #err{{color:#f87171;max-width:760px}}
 </style></head><body><div id="wrap">
  <h3>FCFS strategic deconfliction — free-space replay</h3>
- <small>corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest</small>
+ <small>corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest<br>
+ scroll to zoom · drag to pan · double-click to zoom in · <kbd>0</kbd> to fit</small>
  <canvas id="c" width="760" height="760"></canvas>
  <div id="bar"><button id="play">▶ play</button>
   <button id="back" title="step back one timestep">⏮</button>
@@ -279,7 +280,12 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
     <option value="4">4&times;</option>
     <option value="8">8&times;</option>
    </select></label>
-  <label class="tog" id="hexWrap"><input type="checkbox" id="hexToggle"> hex grid (A*)</label>
+  <label class="tog" id="hexWrap"><input type="checkbox" id="hexToggle"> hex grid (A*)<span id="hexHint"></span></label>
+  <span class="tog" title="scroll to zoom at the cursor · drag to pan · double-click to zoom in">
+   <button id="zoomOut" title="zoom out (-)">&minus;</button>
+   <span id="zoomLbl" style="min-width:34px;text-align:center">1.0&times;</span>
+   <button id="zoomIn" title="zoom in (+)">+</button>
+   <button id="zoomFit" title="fit the whole region (0)">fit</button></span>
   <span id="legend" style="display:flex;gap:10px;flex-wrap:wrap"></span>
  </div>
  <div id="err"></div>
@@ -294,9 +300,12 @@ const slider = document.getElementById('slider');
 const hidden = new Set();                                 // USS indices toggled off via the legend
 let DATA=null, LEVELS=[], END=END_ABS, DURATION=0, IQ=1, IQT=1;             // IQ/IQT: quantised unit → metres / seconds
 let W=0, H=0, S=1, CW=0, CH=0, TBQ=0;                     // TBQ: the ASTM time buffer, in quantised units
+let Z=1, VS=1, VX=0, VY=0;                                // zoom, effective px/m (S*Z), view origin (world m)
+const ZMIN=1, ZMAX=64;
 let buckets=[], BW=1;                                     // time index: buckets[k] = flights active then
 const PAD = 20;
-const sx = x => PAD + x*S, sy = y => cv.height - PAD - y*S;   // flip y: north is up
+const sx = x => PAD + (x - VX)*VS, sy = y => cv.height - PAD - (y - VY)*VS;   // flip y: north is up
+const wx = px => (px - PAD)/VS + VX, wy = py => (cv.height - PAD - py)/VS + VY;   // screen px → world m
 
 // ---------------------------------------------------------------- load
 async function inflate(b64){{
@@ -317,12 +326,12 @@ async function boot(){{
   IQ = 1/DATA.q; IQT = 1/DATA.qt;
   LEVELS = DATA.flight_levels || [];
   END = DATA.simulation_end_s; DURATION = Math.max(0, DATA.simulation_duration_s);
-  [W, H] = DATA.region; S = (cv.width - 2*PAD)/Math.max(W, H);
+  [W, H] = DATA.region; S = (cv.width - 2*PAD)/Math.max(W, H); VS = S; Z = 1; VX = VY = 0;
   CW = DATA.corridor_w; CH = DATA.corridor_h; TBQ = DATA.t_buffer*DATA.qt;
   for(const f of DATA.flights){{ f.x=undelta(f.x); f.y=undelta(f.y); f.z=undelta(f.z); f.t=undelta(f.t); }}
   buildIndex();
   if(!DATA.hex_available) document.getElementById('hexWrap').style.display='none';
-  buildLegend(); buildLevelLegend(); wireTransport();
+  buildLegend(); buildLevelLegend(); wireTransport(); wireView();
   draw(START);
 }}
 boot().catch(e => {{ document.getElementById('t').textContent = 'failed to load';
@@ -371,10 +380,18 @@ function buildIndex(){{
 function drawHexGrid(){{
   const R = DATA.hex_R; if(!R) return;
   const SQRT3 = Math.sqrt(3);
+  // A hex is 2R across. Below ~6 px you cannot see it IS a hexagon, and drawing it anyway costs ~292k
+  // strokes on a 60 km region (280 ms/frame, measured) — so say "zoom in" rather than stutter to draw
+  // something nobody can read. Above the threshold, cull to the viewport: cost then scales with what
+  // is actually on screen, which is what makes the overlay usable at all.
+  if(2*R*VS < 6){{ hexHint(true); return; }}
+  hexHint(false);
   ctx.strokeStyle = '#39414f'; ctx.lineWidth = 0.4;          // faint lattice beneath the corridors
-  const rMax = Math.ceil(H/(1.5*R)) + 1;
-  for(let r=-1; r<=rMax; r++){{
-    const qLo = Math.floor(-r/2) - 1, qHi = Math.ceil(W/(SQRT3*R) - r/2) + 1;
+  const x0 = Math.max(0, wx(PAD)), x1 = Math.min(W, wx(cv.width - PAD));
+  const y0 = Math.max(0, wy(cv.height - PAD)), y1 = Math.min(H, wy(PAD));
+  const rMax = Math.ceil(y1/(1.5*R)) + 1;
+  for(let r=Math.floor(y0/(1.5*R)) - 1; r<=rMax; r++){{
+    const qLo = Math.floor(x0/(SQRT3*R) - r/2) - 1, qHi = Math.ceil(x1/(SQRT3*R) - r/2) + 1;
     for(let q=qLo; q<=qHi; q++){{
       const cx = R*SQRT3*(q + r/2), cy = R*1.5*r;
       ctx.beginPath();
@@ -384,6 +401,12 @@ function drawHexGrid(){{
       ctx.closePath(); ctx.stroke();
     }}
   }}
+}}
+let hexHinted = null;
+function hexHint(on){{                                     // tell the user WHY the lattice is absent
+  if(on === hexHinted) return;
+  hexHinted = on;
+  document.getElementById('hexHint').textContent = on ? ' — zoom in' : '';
 }}
 function strokePoly(p, color, z){{
   ctx.beginPath(); ctx.moveTo(sx(p[0]),sy(p[1]));
@@ -397,10 +420,10 @@ function draw(t){{
   ctx.clearRect(0,0,cv.width,cv.height);
   // set lineWidth explicitly: canvas state survives across frames, so the region border used to render
   // at whatever width the PREVIOUS frame's last flight happened to leave behind.
-  ctx.strokeStyle='#30363d'; ctx.lineWidth=0.6; ctx.strokeRect(sx(0),sy(H),W*S,H*S);
+  ctx.strokeStyle='#30363d'; ctx.lineWidth=0.6; ctx.strokeRect(sx(0),sy(H),W*VS,H*VS);
   if(document.getElementById('hexToggle').checked) drawHexGrid();
   for(const wl of (DATA.walls||[])){{                     // permanent terminal walls (always-active no-fly)
-    ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*S,0,2*Math.PI);
+    ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*VS,0,2*Math.PI);
     ctx.fillStyle='#f59e0b1f'; ctx.fill();
     ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle='#b45309aa'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
   }}
@@ -424,7 +447,7 @@ function draw(t){{
       for(let i=a;i<=z;i++){{ on=true; strokePoly(POLY, fl.k, segPoly(fl, i, POLY)); }}
     }}
     for(const cy of fl.c){{ if(cy[3]>tq || tq>=cy[4]) continue; on=true;
-      ctx.beginPath(); ctx.arc(sx(cy[0]*IQ),sy(cy[1]*IQ),cy[2]*IQ*S,0,2*Math.PI);
+      ctx.beginPath(); ctx.arc(sx(cy[0]*IQ),sy(cy[1]*IQ),cy[2]*IQ*VS,0,2*Math.PI);
       ctx.fillStyle=fl.k+'33'; ctx.fill(); ctx.strokeStyle=fl.k; ctx.stroke(); }}
     const p = posAt(fl, tq);
     if(p){{ on=true; ctx.beginPath(); ctx.arc(sx(p[0]),sy(p[1]),4,0,2*Math.PI);
@@ -439,6 +462,55 @@ function draw(t){{
     }}
   }}
   document.getElementById('t').textContent = 't = '+Math.round(t)+' s  ('+nActive+' active)';
+}}
+
+// ---------------------------------------------------------------- zoom / pan
+// The view is a world-space window: VX/VY is its bottom-left corner in metres, VS its px-per-metre.
+// Sizes that should stay legible (drone dots, line widths) are already in px and deliberately do NOT
+// scale; sizes that are real geometry (hover radii, the region border) go through VS.
+function clampView(){{                                    // keep the region from sliding off-screen
+  VX = Math.min(Math.max(0, W - (cv.width - 2*PAD)/VS), Math.max(0, VX));
+  VY = Math.min(Math.max(0, H - (cv.height - 2*PAD)/VS), Math.max(0, VY));
+}}
+function setZoom(z, ax, ay){{                             // zoom about the canvas point (ax, ay)
+  const nz = Math.max(ZMIN, Math.min(ZMAX, z));
+  if(nz === Z) return;
+  const bx = wx(ax), by = wy(ay);                         // world point to hold still
+  Z = nz; VS = S*Z;
+  VX = bx - (ax - PAD)/VS;
+  VY = by - (cv.height - PAD - ay)/VS;
+  clampView(); redraw();
+}}
+function resetView(){{ Z = 1; VS = S; VX = VY = 0; redraw(); }}
+function redraw(){{
+  document.getElementById('zoomLbl').textContent = Z.toFixed(Z < 10 ? 1 : 0) + '\u00d7';
+  draw(+slider.value);
+}}
+function wireView(){{
+  cv.style.cursor = 'grab';
+  cv.addEventListener('wheel', e => {{                     // wheel / trackpad pinch → zoom at cursor
+    e.preventDefault();
+    setZoom(Z * Math.pow(1.0015, -e.deltaY), e.offsetX, e.offsetY);
+  }}, {{passive: false}});
+  let dragging = false, lx = 0, ly = 0;
+  cv.addEventListener('mousedown', e => {{ dragging = true; lx = e.offsetX; ly = e.offsetY;
+    cv.style.cursor = 'grabbing'; }});
+  window.addEventListener('mouseup', () => {{ dragging = false; cv.style.cursor = 'grab'; }});
+  cv.addEventListener('mousemove', e => {{
+    if(!dragging) return;
+    VX -= (e.offsetX - lx)/VS; VY += (e.offsetY - ly)/VS;   // sy flips y, so dragging down raises VY
+    lx = e.offsetX; ly = e.offsetY; clampView(); redraw();
+  }});
+  cv.addEventListener('dblclick', e => setZoom(Z*2, e.offsetX, e.offsetY));
+  const mid = () => [cv.width/2, cv.height/2];
+  document.getElementById('zoomIn').onclick  = () => setZoom(Z*1.6, ...mid());
+  document.getElementById('zoomOut').onclick = () => setZoom(Z/1.6, ...mid());
+  document.getElementById('zoomFit').onclick = resetView;
+  document.addEventListener('keydown', e => {{             // + / - / 0, ignoring the transport keys
+    if(e.key === '+' || e.key === '=') setZoom(Z*1.6, ...mid());
+    else if(e.key === '-' || e.key === '_') setZoom(Z/1.6, ...mid());
+    else if(e.key === '0') resetView();
+  }});
 }}
 
 // ---------------------------------------------------------------- transport

@@ -249,6 +249,54 @@ console.log(JSON.stringify(out));
         assert abs(rec["z"] - vol.shape.center[2]) < 1e-9, f"box centre altitude for {p0}→{p1}"
 
 
+def test_shipped_view_transform_zooms_about_a_fixed_point():
+    """Runs the shipped zoom/pan maths in node: the world point under the cursor must not move.
+
+    An anchor that drifts is the classic zoom bug — the map slides away as you scroll — and it is
+    invisible to any Python-side test, since the transform only exists in the embedded JS.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    # clampView / setZoom / resetView — the whole view transform, and nothing below it, since redraw
+    # and wireView touch the DOM
+    body = html[html.index("function clampView()"):html.index("function redraw()")]
+    harness = """
+const PAD = 20, W = 60000, H = 60000;
+const cv = {width: 760, height: 760, style: {}};
+const S = (cv.width - 2*PAD)/Math.max(W, H);
+let Z = 1, VS = S, VX = 0, VY = 0;
+const ZMIN = 1, ZMAX = 64;
+const wx = px => (px - PAD)/VS + VX, wy = py => (cv.height - PAD - py)/VS + VY;
+function redraw(){}
+""" + body.replace("{{", "{").replace("}}", "}") + """
+const out = [];
+for (const [z, ax, ay] of [[8,300,400],[3.7,120,700],[64,700,60],[2,380,380]]) {
+  Z = 1; VS = S; VX = 0; VY = 0;                       // fit, then zoom about (ax, ay)
+  const before = [wx(ax), wy(ay)];
+  setZoom(z, ax, ay);
+  const after = [wx(ax), wy(ay)];
+  out.push({z: Z, drift: [Math.abs(after[0]-before[0]), Math.abs(after[1]-before[1])],
+            spanM: (cv.width - 2*PAD)/VS, VX, VY});
+}
+Z = 1; VS = S; VX = -1e9; VY = 1e9; clampView();       // the region cannot be panned off-screen
+out.push({clampedAtFit: [VX, VY]});
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+
+    for rec in got[:-1]:
+        # the anchored point holds still to floating-point noise, at every zoom level
+        assert max(rec["drift"]) < 1e-6, f"zoom to {rec['z']}x drifted by {rec['drift']} m"
+        # and the visible span is exactly the region divided by the zoom
+        assert abs(rec["spanM"] - 60000 / rec["z"]) < 1e-6
+        assert rec["VX"] >= 0 and rec["VY"] >= 0
+    assert got[-1]["clampedAtFit"] == [0, 0]   # at fit there is nowhere to pan to
+
+
 def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
     """Boxes are dropped when they are exactly the swept centerline, and the quantised delta streams
     decode back to the flown path within the decimetre quantum."""

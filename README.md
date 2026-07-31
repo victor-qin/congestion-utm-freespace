@@ -165,8 +165,12 @@ write into `results/sweeps/<tag-or-scenario>/` (stable per label — re-running 
 A standalone webpage (no server) that plays the reservations back like a video:
 
 - **Play / pause** and a **scrub slider**; **⏮ / ⏭** step one timestep (`dt`); **← / →** keys too.
+- **Zoom / pan** — scroll to zoom at the cursor, drag to pan, double-click to zoom in, `0` to fit
+  (also `+` / `−` and the on-screen buttons). 1–64×, clamped so the region can't slide off-screen.
 - **Hex-grid toggle** — overlays the exact lattice A\* searched on (only shown when an A\*-based
-  planner ran).
+  planner ran). The lattice is culled to the viewport and hidden below ~6 px per cell (it reads
+  `— zoom in`): on a 60 km region the full grid is ~292k hexagons, which is both illegible at fit
+  and far too slow to draw.
 - **Dashed origin→dest** reference line per active flight — the gap to its solid corridor *is* the
   detour the FCFS newcomer paid.
 - **The clock is the realized run**, not `[0, horizon_s]`: it opens on the first reservation and ends

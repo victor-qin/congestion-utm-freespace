@@ -35,6 +35,7 @@ import numpy as np
 from . import metrics, volumes
 from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
+from .types import as_terminal
 from .viz import box_footprint, flight_color_by_uss, result_uss_hues, uss_swatch_hex
 
 _Q = 10        # position quantum: decimetres. One canvas pixel is ~79 m on a 60 km region, so this is
@@ -187,10 +188,26 @@ def _payload(result: SimResult) -> dict:
     hex_available = "astar" in cfg.planner
     from .planner.hexgrid import circumradius
     # always-active terminal WALLS (permanent no-fly columns) live in the ledger, NOT in any accepted
-    # intent's volumes — render them as permanent overlays so a denial's blocker is visible.
-    walls = [{"cx": float(v.shape.cx), "cy": float(v.shape.cy), "r": float(v.shape.radius),
-              "tid": None if v.terminal_id is None else str(v.terminal_id)}
-             for v in _static_walls(result) if isinstance(v.shape, CylinderSpec)]
+    # intent's volumes — render them as permanent overlays so a denial's blocker is visible. Each also
+    # carries its EXIT-LANE radius: where the hub's reserved lanes actually begin. The annulus between
+    # the two is flown but deliberately unreserved (the vertiport deconflicts inside it tactically), so
+    # without the ring the replay shows corridors starting in mid-air a corridor-width off the column.
+    terms = {}
+    for intent in result.accepted:
+        for t in (intent.request.origin_terminal, intent.request.dest_terminal):
+            if (t := as_terminal(t)) is not None:
+                terms[str(t.id)] = t
+    walls = []
+    for v in _static_walls(result):
+        if not isinstance(v.shape, CylinderSpec):
+            continue
+        tid = None if v.terminal_id is None else str(v.terminal_id)
+        term = terms.get(tid)
+        walls.append({"cx": float(v.shape.cx), "cy": float(v.shape.cy), "r": float(v.shape.radius),
+                      "tid": tid,
+                      # volumes.exit_radius is the single source of truth for the lane edge — the same
+                      # radius the A* fold, the commit, and TerminalCapacity.exit_clear all root on.
+                      "er": volumes.exit_radius(term, cfg) if term is not None else None})
     return {
         "v": 2,                              # payload schema version
         "simulation_start_s": play_start,
@@ -264,6 +281,7 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
 </style></head><body><div id="wrap">
  <h3>FCFS strategic deconfliction — free-space replay</h3>
  <small>corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest<br>
+ amber disc = permanent terminal column (no-fly) · fine ring outside it = where its reserved exit lanes begin<br>
  scroll to zoom · drag to pan · double-click to zoom in · <kbd>0</kbd> to fit</small>
  <canvas id="c" width="760" height="760"></canvas>
  <div id="bar"><button id="play">▶ play</button>
@@ -426,6 +444,13 @@ function draw(t){{
     ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*VS,0,2*Math.PI);
     ctx.fillStyle='#f59e0b1f'; ctx.fill();
     ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle='#b45309aa'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
+    // The exit-lane ring: where this hub's RESERVED lanes begin. Drawn only once it is more than a
+    // pixel outside the column — at fit the gap is corridor_width/2 (0.4 px on a 60 km region), so
+    // below that it is 490 arcs a frame drawing nothing you can see.
+    if(wl.er && (wl.er - wl.r)*VS >= 1.5){{
+      ctx.save(); ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.er*VS,0,2*Math.PI);
+      ctx.setLineDash([2,3]); ctx.strokeStyle='#fbbf2466'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
+    }}
   }}
   const tq = (t - START)*DATA.qt, lo = tq - TBQ, hi = tq + TBQ;
   const bk = buckets[Math.max(0, Math.min(buckets.length-1, Math.floor((t - START)/BW)))] || [];

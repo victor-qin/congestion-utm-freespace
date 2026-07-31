@@ -297,6 +297,42 @@ console.log(JSON.stringify(out));
     assert got[-1]["clampedAtFit"] == [0, 0]   # at fit there is nowhere to pan to
 
 
+def test_walls_carry_the_exit_lane_radius():
+    """A permanent terminal column must ship the radius at which its RESERVED lanes begin.
+
+    The column is a no-fly disc; corridors start a corridor-width further out, at
+    `volumes.exit_radius`. Without it the replay draws reserved traffic beginning in mid-air, with no
+    indication that the gap is the unreserved leg the vertiport handles tactically.
+    """
+    from freespace_sim.types import Terminal
+
+    term = Terminal("hub", capacity=4, radius=180.0)
+    # astar, not straight: only the A*-based planners tag terminal airspace, and the straight planner
+    # warns (correctly) that the shared-terminal exemption is being dropped
+    cfg = SimConfig(planner="astar", horizon_s=600.0, region_size_m=(4000.0, 4000.0))
+    res = run(cfg, requests=[FlightRequest(1, vec(500, 500, 0), vec(3000, 3000, 0), 0.0,
+                                           origin_terminal=term)])
+    # stand in for the always-active wall the ledger would hold for a permanent column
+    res.static_walls = [volumes.hover_reservation(
+        vec(500, 500, 0), 0.0, cfg, terminal_id=term.id, radius=volumes.terminal_radius(term, cfg))]
+
+    walls = viz_html._payload(res)["walls"]
+    assert len(walls) == 1
+    assert walls[0]["r"] == volumes.terminal_radius(term, cfg) == 180.0
+    # pinned to the real helper, not a re-derived number — exit_radius is the single source of truth
+    assert walls[0]["er"] == volumes.exit_radius(term, cfg) == 210.0
+    assert walls[0]["er"] > walls[0]["r"], "the lane ring must sit outside the no-fly column"
+
+
+def test_wall_without_a_known_terminal_has_no_exit_ring():
+    """A wall whose terminal isn't on any request can't have its lane radius invented."""
+    cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(4000.0, 4000.0))
+    res = run(cfg, requests=[FlightRequest(1, vec(500, 500, 0), vec(3000, 3000, 0), 0.0)])
+    res.static_walls = [volumes.hover_reservation(
+        vec(500, 500, 0), 0.0, cfg, terminal_id="orphan", radius=90.0)]
+    assert viz_html._payload(res)["walls"][0]["er"] is None
+
+
 def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
     """Boxes are dropped when they are exactly the swept centerline, and the quantised delta streams
     decode back to the flown path within the decimetre quantum."""

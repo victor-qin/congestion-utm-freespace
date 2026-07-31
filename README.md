@@ -165,6 +165,12 @@ write into `results/sweeps/<tag-or-scenario>/` (stable per label — re-running 
 A standalone webpage (no server) that plays the reservations back like a video:
 
 - **Play / pause** and a **scrub slider**; **⏮ / ⏭** step one timestep (`dt`); **← / →** keys too.
+- **Terminal columns and their exit lanes** — a permanent (always-active) terminal airspace draws as
+  an amber no-fly disc at its column radius, with a fine ring outside it at `volumes.exit_radius`,
+  where the hub's *reserved* lanes actually begin. The annulus between them is flown but deliberately
+  unreserved — the vertiport deconflicts inside it tactically — so without the ring corridors appear
+  to start in mid-air. The gap is `corridor_width/2` (0.4 px at fit on a 60 km region), so the ring is
+  drawn only once zoom separates it from the column.
 - **Zoom / pan** — scroll to zoom at the cursor, drag to pan, double-click to zoom in, `0` to fit
   (also `+` / `−` and the on-screen buttons). 1–64×, clamped so the region can't slide off-screen.
 - **Hex-grid toggle** — overlays the exact lattice A\* searched on (only shown when an A\*-based

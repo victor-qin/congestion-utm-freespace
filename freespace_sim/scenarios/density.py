@@ -7,7 +7,7 @@ from .spec import DemandSpec, ScenarioSpec
 WING_ZIPLINE_USS = "wing_zipline_uss"
 AMAZON_USS = "amazon_uss"
 
-REGION_M = (60_000.0, 60_000.0)
+REGION_M = (60_000.0, 30_000.0)
 SIM_HORIZON_S = 2.0 * 60.0 * 60.0
 DEMAND_DURATION_S = 30.0 * 60.0
 CRUISE_ALTITUDE_M = 100.0

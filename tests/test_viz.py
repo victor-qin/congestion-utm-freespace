@@ -333,6 +333,50 @@ def test_wall_without_a_known_terminal_has_no_exit_ring():
     assert viz_html._payload(res)["walls"][0]["er"] is None
 
 
+def test_shipped_altitude_labels_are_fixed_size_and_only_drawn_when_unambiguous():
+    """Runs the shipped label logic in node.
+
+    Two properties, both invisible to any Python-side test since this lives only in the embedded JS:
+    the font is a fixed screen-space size at every zoom (it must not scale with the view), and a drone
+    only gets a label when it is ALONE in its label-sized slot — a label sitting between two adjacent
+    dots cannot be attributed to either, so neither gets one.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    body = html[html.index("function noteLabel("):html.index("function draw(t)")]
+    harness = """
+const cv = {width: 760, height: 760};
+const drawn = [];
+const ctx = {set fillStyle(v){}, set font(v){this._f = v;}, get font(){return this._f;},
+             fillText(txt, x, y){ drawn.push({txt, x, y, font: this._f}); }};
+const labelSlots = new Map();
+const LABEL_W = 28, LABEL_H = 11;
+""" + body.replace("{{", "{").replace("}}", "}") + """
+// two drones 3 px apart (same slot) plus one far away, all on screen
+labelSlots.clear();
+noteLabel(80, 100, 100); noteLabel(95, 103, 100); noteLabel(110, 400, 400);
+drawLabels();
+const close = drawn.slice();
+// off-canvas points are never labelled
+labelSlots.clear(); drawn.length = 0;
+noteLabel(80, -5, 100); noteLabel(80, 100, 1000); noteLabel(95, 300, 300);
+drawLabels();
+console.log(JSON.stringify({close, offscreen: drawn.slice()}));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+
+    # the crowded pair is suppressed; only the isolated drone is labelled
+    assert [d["txt"] for d in got["close"]] == ["110m"]
+    # ...and the font is the fixed screen-space size, not derived from any zoom
+    assert got["close"][0]["font"] == "8px monospace"
+    # off-canvas drones contribute nothing, so they cannot suppress an on-screen neighbour either
+    assert [d["txt"] for d in got["offscreen"]] == ["95m"]
+
+
 def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
     """Boxes are dropped when they are exactly the swept centerline, and the quantised delta streams
     decode back to the flown path within the decimetre quantum."""

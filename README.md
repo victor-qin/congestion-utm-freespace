@@ -165,6 +165,10 @@ write into `results/sweeps/<tag-or-scenario>/` (stable per label — re-running 
 A standalone webpage (no server) that plays the reservations back like a video:
 
 - **Play / pause** and a **scrub slider**; **⏮ / ⏭** step one timestep (`dt`); **← / →** keys too.
+- **Altitude readout** (multi-level runs only) — a fixed 8 px screen-space label, never scaled by the
+  view. A drone is labelled only when it is *alone* in its label-sized slot, since a label between two
+  adjacent dots can't be attributed to either; dense regions therefore stay clean and zooming in
+  annotates everything (4% of drones labelled at fit on a 28k-flight run, 100% by 16×).
 - **Terminal columns and their exit lanes** — a permanent (always-active) terminal airspace draws as
   an amber no-fly disc at its column radius, with a fine ring outside it at `volumes.exit_radius`,
   where the hub's *reserved* lanes actually begin. The annulus between them is flown but deliberately

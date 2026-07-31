@@ -433,6 +433,28 @@ function strokePoly(p, color, z){{
   ctx.save(); ctx.setLineDash(LEVEL_DASH[levelOf(z)]); ctx.strokeStyle=color; ctx.stroke(); ctx.restore();
 }}
 const POLY = new Float64Array(8);                            // scratch, reused every segment
+const LABEL_W = 28, LABEL_H = 11;                            // one altitude label's footprint, in px
+const labelSlots = new Map();                                // per-frame: slot -> {{n, z, X, Y}}
+// The altitude readout is drawn in SCREEN pixels and deliberately does NOT scale with zoom — a label
+// that grew with the view would swamp the map. What makes it LOOK like it scales is density: at fit a
+// dense run puts ~3 drones in every label-sized slot (5.5k into 1.8k, measured) and their labels
+// overprint into one illegible block, which then thins out as you zoom in.
+//
+// So the rule is not "shrink them" but "only draw a label you can attribute": a slot gets its label
+// only if exactly ONE drone is in it. Two drones a few pixels apart cannot be told apart by a label
+// sitting between them, so neither gets one. That is self-tuning — dense regions stay clean, sparse
+// ones are fully annotated, and zooming in reveals the rest because the drones themselves separate.
+function noteLabel(z, X, Y){{
+  if(X < 0 || X > cv.width || Y < 0 || Y > cv.height) return;   // off-canvas: never drawn
+  const key = Math.floor(X/LABEL_W) + ',' + Math.floor(Y/LABEL_H);
+  const slot = labelSlots.get(key);
+  if(slot) slot.n++; else labelSlots.set(key, {{n: 1, z, X, Y}});
+}}
+function drawLabels(){{                                      // after every flight, so counts are final
+  ctx.fillStyle='#aeb6c2'; ctx.font='8px monospace';
+  for(const s of labelSlots.values())
+    if(s.n === 1) ctx.fillText(Math.round(s.z)+'m', s.X+6, s.Y-4);
+}}
 function draw(t){{
   if(!DATA) return;
   ctx.clearRect(0,0,cv.width,cv.height);
@@ -452,6 +474,7 @@ function draw(t){{
       ctx.setLineDash([2,3]); ctx.strokeStyle='#fbbf2466'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
     }}
   }}
+  labelSlots.clear();
   const tq = (t - START)*DATA.qt, lo = tq - TBQ, hi = tq + TBQ;
   const bk = buckets[Math.max(0, Math.min(buckets.length-1, Math.floor((t - START)/BW)))] || [];
   let nActive = 0;
@@ -477,8 +500,7 @@ function draw(t){{
     const p = posAt(fl, tq);
     if(p){{ on=true; ctx.beginPath(); ctx.arc(sx(p[0]),sy(p[1]),4,0,2*Math.PI);
       ctx.fillStyle=fl.k; ctx.fill(); ctx.strokeStyle='#000'; ctx.lineWidth=0.5; ctx.stroke();
-      if(LEVELS.length>1){{ ctx.fillStyle='#aeb6c2'; ctx.font='8px monospace';   // altitude readout
-        ctx.fillText(Math.round(p[2])+'m', sx(p[0])+6, sy(p[1])-4); }} }}
+      if(LEVELS.length>1) noteLabel(p[2], sx(p[0]), sy(p[1])); }}   // altitude readout (see drawLabels)
     if(on){{                                          // dashed straight origin→dest for active flights
       ctx.save(); ctx.setLineDash([6,5]); ctx.lineWidth=1; ctx.strokeStyle=fl.k+'aa';
       ctx.beginPath(); ctx.moveTo(sx(fl.o[0]*IQ),sy(fl.o[1]*IQ));
@@ -486,6 +508,7 @@ function draw(t){{
       nActive++;
     }}
   }}
+  if(LEVELS.length>1) drawLabels();
   document.getElementById('t').textContent = 't = '+Math.round(t)+' s  ('+nActive+' active)';
 }}
 

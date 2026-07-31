@@ -1,0 +1,37 @@
+- generic [ref=f9e2]:
+  - heading "FCFS strategic deconfliction — free-space replay" [level=3] [ref=f9e3]
+  - generic [ref=f9e4]: corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest amber disc = permanent terminal column (no-fly) · fine ring outside it = where its reserved exit lanes begin scroll to zoom · drag to pan · double-click to zoom in · 0 to fit
+  - generic [ref=f9e6]:
+    - button "▶ play" [ref=f9e7] [cursor=pointer]
+    - button "⏮" [ref=f9e8] [cursor=pointer]
+    - button "⏭" [ref=f9e9] [cursor=pointer]
+    - slider [ref=f9e10]: "2556"
+    - generic [ref=f9e11]: t = 2556 s (8 active)
+    - generic [ref=f9e12] [cursor=pointer]:
+      - text: speed
+      - combobox "speed" [ref=f9e13]:
+        - option "0.25×"
+        - option "0.5×"
+        - option "1×" [selected]
+        - option "2×"
+        - option "4×"
+        - option "8×"
+    - generic [ref=f9e14] [cursor=pointer]:
+      - checkbox "hex grid (A*)" [ref=f9e15]
+      - text: hex grid (A*)
+    - generic "scroll to zoom at the cursor · drag to pan · double-click to zoom in" [ref=f9e16]:
+      - button "−" [ref=f9e17] [cursor=pointer]
+      - text: 1.0×
+      - button "+" [ref=f9e18] [cursor=pointer]
+      - button "fit" [ref=f9e19] [cursor=pointer]
+    - generic [ref=f9e20]:
+      - generic [ref=f9e21] [cursor=pointer]:
+        - checkbox "amazon_uss" [checked] [ref=f9e22]
+        - text: amazon_uss
+      - generic [ref=f9e24] [cursor=pointer]:
+        - checkbox "wing_zipline_uss" [checked] [ref=f9e25]
+        - text: wing_zipline_uss
+      - generic [ref=f9e27]: "levels:"
+      - generic [ref=f9e28]: 80m solid
+      - generic [ref=f9e29]: 95m dashed
+      - generic [ref=f9e30]: 110m dotted

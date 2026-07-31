@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from freespace_sim import runs, viz, viz_html, volumes
+from freespace_sim import metrics, runs, viz, viz_html, volumes
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import BoxSpec, box_from_segment
 from freespace_sim.sim import run
@@ -158,24 +158,41 @@ def test_viz_html_is_selfcontained_and_parses(tmp_path):
     assert all(len(f["o"]) == 2 and len(f["d"]) == 2 for f in payload["flights"])
     # the embedded scene must inflate to exactly the payload the browser will draw
     assert _embedded(html) == json.loads(json.dumps(payload))
-    assert _embedded(html)["horizon"] == res.config.horizon_s
-    # the slider bound is substituted as a plain number, outside the compressed blob
-    assert f'max="{payload["horizon"]}"' in html
+    # the slider bounds are substituted as plain numbers, outside the compressed blob
+    assert f'min="{payload["simulation_start_s"]}"' in html
+    assert f'max="{payload["simulation_end_s"]}"' in html
 
 
-def test_replay_clips_to_horizon_by_default():
+def test_replay_spans_the_realized_run_not_the_horizon():
+    """The clock is the realized operation, so it EXTENDS past an early horizon and TRIMS a late one.
+
+    `horizon_s` is a planner envelope, not a schedule: on the density scenarios flights are filed from
+    t=0 but the first departs ~768 s in, and the last lands ~3300 s before the envelope closes — 57% of
+    the old slider was empty sky at one end or the other."""
     from freespace_sim.geometry import box_from_segment
     from freespace_sim.volumes import Volume4D
 
     res = _small_run()   # horizon 600 s; every flight clears well before it
-    # append a volume that extends past the horizon to one accepted flight (a stand-in return tail)
+    # (a) TRIM: nothing is airborne near the horizon, so the clock must stop at the last landing
+    payload = viz_html._payload(res)
+    lo, hi = metrics.simulation_window(res)
+    assert (payload["simulation_start_s"], payload["simulation_end_s"]) == (lo, hi)
+    assert hi < res.config.horizon_s, "fixture clears well before the horizon — the trim check is real"
+
+    # (b) EXTEND: a post-horizon return tail must still be reachable on the slider
     acc = res.accepted[0]
-    tail = Volume4D(box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30), 700.0, 900.0)
-    acc.volumes = (acc.volumes or []) + [tail]
-    # default clips the replay clock at the horizon, excluding the post-H tail
-    assert viz_html._payload(res, clip_to_horizon=True)["horizon"] == res.config.horizon_s
-    # opting out extends the clock to the last volume (return-flight demo)
-    assert viz_html._payload(res, clip_to_horizon=False)["horizon"] >= 900.0
+    acc.volumes = (acc.volumes or []) + [
+        Volume4D(box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30), 700.0, 900.0)]
+    assert viz_html._payload(res)["simulation_end_s"] == 900.0
+
+
+def test_replay_clock_starts_at_first_departure_not_at_filing():
+    """A flight filed at t=0 but departing later must not leave the replay opening on an empty sky."""
+    res = run(SimConfig(planner="straight", horizon_s=900.0, region_size_m=(2200.0, 2200.0)),
+              requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, t_departure=300.0)])
+    payload = viz_html._payload(res)
+    assert payload["simulation_start_s"] >= 290.0    # the takeoff column opens just before the roll
+    assert payload["simulation_duration_s"] > 0
 
 
 _SEG_CASES = [

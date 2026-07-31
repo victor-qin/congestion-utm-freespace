@@ -13,3 +13,6 @@ runlogs/
 .claude/settings.local.json
 
 results/supercloud
+
+# browser-automation scratch (Playwright MCP page/console dumps)
+.playwright-mcp/

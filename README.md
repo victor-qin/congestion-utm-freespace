@@ -165,10 +165,16 @@ write into `results/sweeps/<tag-or-scenario>/` (stable per label — re-running 
 A standalone webpage (no server) that plays the reservations back like a video:
 
 - **Play / pause** and a **scrub slider**; **⏮ / ⏭** step one timestep (`dt`); **← / →** keys too.
+- **Zoom / pan** — scroll to zoom at the cursor, drag to pan, double-click to zoom in, `0` to fit
+  (also `+` / `−` and the on-screen buttons). 1–64×, clamped so the region can't slide off-screen.
 - **Hex-grid toggle** — overlays the exact lattice A\* searched on (only shown when an A\*-based
-  planner ran).
+  planner ran). The lattice is culled to the viewport and hidden below ~6 px per cell (it reads
+  `— zoom in`): on a 60 km region the full grid is ~292k hexagons, which is both illegible at fit
+  and far too slow to draw.
 - **Dashed origin→dest** reference line per active flight — the gap to its solid corridor *is* the
   detour the FCFS newcomer paid.
+- **The clock is the realized run**, not `[0, horizon_s]`: it opens on the first reservation and ends
+  on the last to clear, so the slider is all traffic and no empty sky.
 
 **It stays small.** A dense run reserves hundreds of thousands of corridor boxes, and dumping them
 verbatim reached 78 MB at 4.7k flights (~400 MB at 26k) — too big to archive or open comfortably.
@@ -195,8 +201,11 @@ run are diluted by the low-density ramps, so `metrics.steady_state_window(result
 the whole-run number **and** its steady-state twin measured over that window: `summary.json` carries a
 nested `steady_state` block, `index.parquet` gains `steady_*` / `window_*` columns, and the `curve` /
 `compare` / `histograms` readouts overlay the two. `--window-frac` tunes the plateau threshold; the
-replay is written unclipped, so post-horizon return traffic stays visible instead of being cut at
-`horizon_s` (the clock still starts at 0 and never ends before the horizon). This **supersedes** the removed
+replay spans the **realized operation** — first reservation through last to clear — so post-horizon
+return traffic stays visible *and* an early-finishing run no longer scrubs out to `horizon_s`. This
+matters because `horizon_s` is a planner envelope, not a schedule: on the density scenarios flights
+are filed from t=0 but the first departs ~768 s in and the last lands ~3300 s before the envelope
+closes, so anchoring on it left **57% of the slider empty**. This **supersedes** the removed
 `clip_returns_to_horizon` demand hack (issue #25): run and preserve the natural demand and its full tail,
 while the separate steady-state view measures only the representative plateau.
 

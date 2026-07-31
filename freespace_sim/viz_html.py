@@ -32,7 +32,7 @@ import warnings
 
 import numpy as np
 
-from . import volumes
+from . import metrics, volumes
 from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
 from .viz import box_footprint, flight_color_by_uss, result_uss_hues, uss_swatch_hex
@@ -126,22 +126,27 @@ def _rebuildable(intent, cfg, quantised_centerline) -> bool:
         for a, b in zip(got, want))
 
 
-def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
+def _payload(result: SimResult) -> dict:
     """Flatten the accepted intents into a compact, JSON-serialisable scene description.
 
-    ``clip_to_horizon`` (default) stops the replay clock at ``cfg.horizon_s`` so the density/overlay
-    display excludes the unrepresentative ramp-down tail (issue #25). Pass ``False`` to extend the clock
-    to the last volume to clear — the way to keep post-horizon return flights visible for a demo."""
+    The clock spans the **realized operation** — :func:`metrics.simulation_window`, i.e. the first
+    airspace reservation through the last one to clear — not ``[0, cfg.horizon_s]``. ``horizon_s`` is a
+    planner *envelope*, not a schedule: flights are filed from t=0 but depart on a lead of hundreds of
+    seconds, and they all land long before the envelope closes. Anchoring on it left the density replays
+    with 768 s of nothing at the head and 3329 s at the tail — 57% of the slider scrubbing through an
+    empty sky. This is a display choice only; the measurement window is a separate concern that
+    :func:`metrics.steady_state_window` owns (issue #25)."""
     cfg = result.config
     hues = result_uss_hues(result)
     usses = sorted(hues)
     uss_ix = {u: i for i, u in enumerate(usses)}
+    play_start, play_end = metrics.simulation_window(result)
 
     def q(v) -> int:                       # metres → quantised int
         return round(float(v) * _Q)
 
-    def qt(t) -> int:                      # seconds → quantised int
-        return round(float(t) * _QT)
+    def qt(t) -> int:                      # absolute seconds → quantised int, relative to play_start
+        return round((float(t) - play_start) * _QT)
 
     flights, n_explicit = [], 0
     for intent in result.accepted:
@@ -168,7 +173,7 @@ def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
             "c": [[q(v.shape.cx), q(v.shape.cy), q(v.shape.radius), qt(v.t_start), qt(v.t_end)]
                   for v in vols if isinstance(v.shape, CylinderSpec)],
         }
-        dequantised = [(np.array([x / _Q, y / _Q, z / _Q]), t / _QT)
+        dequantised = [(np.array([x / _Q, y / _Q, z / _Q]), t / _QT + play_start)
                        for x, y, z, t in zip(qx, qy, qz, qtime)]
         if not _rebuildable(intent, cfg, dequantised):   # explicit polygons for just this flight
             n_explicit += 1
@@ -181,15 +186,6 @@ def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
     # it did, expose its circumradius so the replay can overlay the exact grid A* searched on.
     hex_available = "astar" in cfg.planner
     from .planner.hexgrid import circumradius
-    # By default the replay clock stops at the demand horizon so the density/overlay display excludes
-    # the ramp-down tail (issue #25). With clip_to_horizon=False it spans the LAST volume to clear:
-    # return flights are scheduled after their delivery + turnaround, so they fly well past cfg.horizon_s
-    # and would be clipped off the right edge of the slider — pass False to keep them visible.
-    play_end = cfg.horizon_s
-    if not clip_to_horizon:
-        for intent in result.accepted:
-            for v in intent.volumes or []:
-                play_end = max(play_end, v.t_end)
     # always-active terminal WALLS (permanent no-fly columns) live in the ledger, NOT in any accepted
     # intent's volumes — render them as permanent overlays so a denial's blocker is visible.
     walls = [{"cx": float(v.shape.cx), "cy": float(v.shape.cy), "r": float(v.shape.radius),
@@ -197,7 +193,10 @@ def _payload(result: SimResult, clip_to_horizon: bool = True) -> dict:
              for v in _static_walls(result) if isinstance(v.shape, CylinderSpec)]
     return {
         "v": 2,                              # payload schema version
-        "horizon": play_end,
+        "simulation_start_s": play_start,
+        "simulation_end_s": play_end,
+        "simulation_duration_s": play_end - play_start,
+        "horizon": play_end,                 # compatibility alias for older payload consumers
         "dt": cfg.dt_s,
         "region": list(cfg.region_size_m),
         "q": _Q, "qt": _QT,                  # quantisation of the per-flight int streams
@@ -264,12 +263,13 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
  h3{{margin:6px 0 0}} small{{color:#8b949e}} #err{{color:#f87171;max-width:760px}}
 </style></head><body><div id="wrap">
  <h3>FCFS strategic deconfliction — free-space replay</h3>
- <small>corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest</small>
+ <small>corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest<br>
+ scroll to zoom · drag to pan · double-click to zoom in · <kbd>0</kbd> to fit</small>
  <canvas id="c" width="760" height="760"></canvas>
  <div id="bar"><button id="play">▶ play</button>
   <button id="back" title="step back one timestep">⏮</button>
   <button id="fwd" title="step forward one timestep">⏭</button>
-  <input id="slider" type="range" min="0" max="{horizon}" value="0" step="1">
+  <input id="slider" type="range" min="{start}" max="{end}" value="{start}" step="1">
   <span id="t">decompressing…</span>
   <label class="tog" for="speed">speed
    <select id="speed" title="playback speed">
@@ -280,7 +280,12 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
     <option value="4">4&times;</option>
     <option value="8">8&times;</option>
    </select></label>
-  <label class="tog" id="hexWrap"><input type="checkbox" id="hexToggle"> hex grid (A*)</label>
+  <label class="tog" id="hexWrap"><input type="checkbox" id="hexToggle"> hex grid (A*)<span id="hexHint"></span></label>
+  <span class="tog" title="scroll to zoom at the cursor · drag to pan · double-click to zoom in">
+   <button id="zoomOut" title="zoom out (-)">&minus;</button>
+   <span id="zoomLbl" style="min-width:34px;text-align:center">1.0&times;</span>
+   <button id="zoomIn" title="zoom in (+)">+</button>
+   <button id="zoomFit" title="fit the whole region (0)">fit</button></span>
   <span id="legend" style="display:flex;gap:10px;flex-wrap:wrap"></span>
  </div>
  <div id="err"></div>
@@ -288,15 +293,19 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
 // The scene is gzipped JSON in base64. See freespace_sim/viz_html.py for the encoding; the two halves
 // have to agree on the quantisation and on the corridor-box formula rebuilt in segPoly() below.
 const B64 = "{b64}";
+const START = {start}, END_ABS = {end};   // absolute seconds: the realized run bounds
 const LEVEL_DASH = [[], [6,4], [2,4], [1,5], [8,3,2,3]];  // solid / dash / dot / fine / dash-dot — per level
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const slider = document.getElementById('slider');
 const hidden = new Set();                                 // USS indices toggled off via the legend
-let DATA=null, LEVELS=[], END=0, IQ=1, IQT=1;             // IQ/IQT: quantised unit → metres / seconds
+let DATA=null, LEVELS=[], END=END_ABS, DURATION=0, IQ=1, IQT=1;             // IQ/IQT: quantised unit → metres / seconds
 let W=0, H=0, S=1, CW=0, CH=0, TBQ=0;                     // TBQ: the ASTM time buffer, in quantised units
+let Z=1, VS=1, VX=0, VY=0;                                // zoom, effective px/m (S*Z), view origin (world m)
+const ZMIN=1, ZMAX=64;
 let buckets=[], BW=1;                                     // time index: buckets[k] = flights active then
 const PAD = 20;
-const sx = x => PAD + x*S, sy = y => cv.height - PAD - y*S;   // flip y: north is up
+const sx = x => PAD + (x - VX)*VS, sy = y => cv.height - PAD - (y - VY)*VS;   // flip y: north is up
+const wx = px => (px - PAD)/VS + VX, wy = py => (cv.height - PAD - py)/VS + VY;   // screen px → world m
 
 // ---------------------------------------------------------------- load
 async function inflate(b64){{
@@ -316,14 +325,14 @@ async function boot(){{
   DATA = JSON.parse(await inflate(B64));
   IQ = 1/DATA.q; IQT = 1/DATA.qt;
   LEVELS = DATA.flight_levels || [];
-  END = DATA.horizon;
-  [W, H] = DATA.region; S = (cv.width - 2*PAD)/Math.max(W, H);
+  END = DATA.simulation_end_s; DURATION = Math.max(0, DATA.simulation_duration_s);
+  [W, H] = DATA.region; S = (cv.width - 2*PAD)/Math.max(W, H); VS = S; Z = 1; VX = VY = 0;
   CW = DATA.corridor_w; CH = DATA.corridor_h; TBQ = DATA.t_buffer*DATA.qt;
   for(const f of DATA.flights){{ f.x=undelta(f.x); f.y=undelta(f.y); f.z=undelta(f.z); f.t=undelta(f.t); }}
   buildIndex();
   if(!DATA.hex_available) document.getElementById('hexWrap').style.display='none';
-  buildLegend(); buildLevelLegend(); wireTransport();
-  draw(0);
+  buildLegend(); buildLevelLegend(); wireTransport(); wireView();
+  draw(START);
 }}
 boot().catch(e => {{ document.getElementById('t').textContent = 'failed to load';
   document.getElementById('err').textContent = 'Replay could not be decompressed: ' + e.message; }});
@@ -351,8 +360,8 @@ function posAt(f, tq){{                                   // interpolated [x, y,
 // Without this a frame would test every box in the run (>400k at 4.7k flights, millions at 26k) just to
 // find the few hundred on screen. Bucketing by activity window makes a frame cost what it draws.
 function buildIndex(){{
-  BW = Math.max(DATA.dt, END/1024 || DATA.dt);
-  const n = Math.max(1, Math.ceil(END/BW) + 1);
+  BW = Math.max(DATA.dt, DURATION/1024 || DATA.dt);
+  const n = Math.max(1, Math.ceil(DURATION/BW) + 1);
   buckets = Array.from({{length: n}}, () => []);
   DATA.flights.forEach((f, fi) => {{
     // Widen over EVERY drawable: a flight with no path still has hover cylinders (and, if its boxes
@@ -371,10 +380,18 @@ function buildIndex(){{
 function drawHexGrid(){{
   const R = DATA.hex_R; if(!R) return;
   const SQRT3 = Math.sqrt(3);
+  // A hex is 2R across. Below ~6 px you cannot see it IS a hexagon, and drawing it anyway costs ~292k
+  // strokes on a 60 km region (280 ms/frame, measured) — so say "zoom in" rather than stutter to draw
+  // something nobody can read. Above the threshold, cull to the viewport: cost then scales with what
+  // is actually on screen, which is what makes the overlay usable at all.
+  if(2*R*VS < 6){{ hexHint(true); return; }}
+  hexHint(false);
   ctx.strokeStyle = '#39414f'; ctx.lineWidth = 0.4;          // faint lattice beneath the corridors
-  const rMax = Math.ceil(H/(1.5*R)) + 1;
-  for(let r=-1; r<=rMax; r++){{
-    const qLo = Math.floor(-r/2) - 1, qHi = Math.ceil(W/(SQRT3*R) - r/2) + 1;
+  const x0 = Math.max(0, wx(PAD)), x1 = Math.min(W, wx(cv.width - PAD));
+  const y0 = Math.max(0, wy(cv.height - PAD)), y1 = Math.min(H, wy(PAD));
+  const rMax = Math.ceil(y1/(1.5*R)) + 1;
+  for(let r=Math.floor(y0/(1.5*R)) - 1; r<=rMax; r++){{
+    const qLo = Math.floor(x0/(SQRT3*R) - r/2) - 1, qHi = Math.ceil(x1/(SQRT3*R) - r/2) + 1;
     for(let q=qLo; q<=qHi; q++){{
       const cx = R*SQRT3*(q + r/2), cy = R*1.5*r;
       ctx.beginPath();
@@ -384,6 +401,12 @@ function drawHexGrid(){{
       ctx.closePath(); ctx.stroke();
     }}
   }}
+}}
+let hexHinted = null;
+function hexHint(on){{                                     // tell the user WHY the lattice is absent
+  if(on === hexHinted) return;
+  hexHinted = on;
+  document.getElementById('hexHint').textContent = on ? ' — zoom in' : '';
 }}
 function strokePoly(p, color, z){{
   ctx.beginPath(); ctx.moveTo(sx(p[0]),sy(p[1]));
@@ -397,15 +420,15 @@ function draw(t){{
   ctx.clearRect(0,0,cv.width,cv.height);
   // set lineWidth explicitly: canvas state survives across frames, so the region border used to render
   // at whatever width the PREVIOUS frame's last flight happened to leave behind.
-  ctx.strokeStyle='#30363d'; ctx.lineWidth=0.6; ctx.strokeRect(sx(0),sy(H),W*S,H*S);
+  ctx.strokeStyle='#30363d'; ctx.lineWidth=0.6; ctx.strokeRect(sx(0),sy(H),W*VS,H*VS);
   if(document.getElementById('hexToggle').checked) drawHexGrid();
   for(const wl of (DATA.walls||[])){{                     // permanent terminal walls (always-active no-fly)
-    ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*S,0,2*Math.PI);
+    ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*VS,0,2*Math.PI);
     ctx.fillStyle='#f59e0b1f'; ctx.fill();
     ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle='#b45309aa'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
   }}
-  const tq = t*DATA.qt, lo = tq - TBQ, hi = tq + TBQ;
-  const bk = buckets[Math.max(0, Math.min(buckets.length-1, Math.floor(t/BW)))] || [];
+  const tq = (t - START)*DATA.qt, lo = tq - TBQ, hi = tq + TBQ;
+  const bk = buckets[Math.max(0, Math.min(buckets.length-1, Math.floor((t - START)/BW)))] || [];
   let nActive = 0;
   for(const fi of bk){{
     const fl = DATA.flights[fi];
@@ -424,7 +447,7 @@ function draw(t){{
       for(let i=a;i<=z;i++){{ on=true; strokePoly(POLY, fl.k, segPoly(fl, i, POLY)); }}
     }}
     for(const cy of fl.c){{ if(cy[3]>tq || tq>=cy[4]) continue; on=true;
-      ctx.beginPath(); ctx.arc(sx(cy[0]*IQ),sy(cy[1]*IQ),cy[2]*IQ*S,0,2*Math.PI);
+      ctx.beginPath(); ctx.arc(sx(cy[0]*IQ),sy(cy[1]*IQ),cy[2]*IQ*VS,0,2*Math.PI);
       ctx.fillStyle=fl.k+'33'; ctx.fill(); ctx.strokeStyle=fl.k; ctx.stroke(); }}
     const p = posAt(fl, tq);
     if(p){{ on=true; ctx.beginPath(); ctx.arc(sx(p[0]),sy(p[1]),4,0,2*Math.PI);
@@ -441,15 +464,66 @@ function draw(t){{
   document.getElementById('t').textContent = 't = '+Math.round(t)+' s  ('+nActive+' active)';
 }}
 
+// ---------------------------------------------------------------- zoom / pan
+// The view is a world-space window: VX/VY is its bottom-left corner in metres, VS its px-per-metre.
+// Sizes that should stay legible (drone dots, line widths) are already in px and deliberately do NOT
+// scale; sizes that are real geometry (hover radii, the region border) go through VS.
+function clampView(){{                                    // keep the region from sliding off-screen
+  VX = Math.min(Math.max(0, W - (cv.width - 2*PAD)/VS), Math.max(0, VX));
+  VY = Math.min(Math.max(0, H - (cv.height - 2*PAD)/VS), Math.max(0, VY));
+}}
+function setZoom(z, ax, ay){{                             // zoom about the canvas point (ax, ay)
+  const nz = Math.max(ZMIN, Math.min(ZMAX, z));
+  if(nz === Z) return;
+  const bx = wx(ax), by = wy(ay);                         // world point to hold still
+  Z = nz; VS = S*Z;
+  VX = bx - (ax - PAD)/VS;
+  VY = by - (cv.height - PAD - ay)/VS;
+  clampView(); redraw();
+}}
+function resetView(){{ Z = 1; VS = S; VX = VY = 0; redraw(); }}
+function redraw(){{
+  document.getElementById('zoomLbl').textContent = Z.toFixed(Z < 10 ? 1 : 0) + '\u00d7';
+  draw(+slider.value);
+}}
+function wireView(){{
+  cv.style.cursor = 'grab';
+  cv.addEventListener('wheel', e => {{                     // wheel / trackpad pinch → zoom at cursor
+    e.preventDefault();
+    setZoom(Z * Math.pow(1.0015, -e.deltaY), e.offsetX, e.offsetY);
+  }}, {{passive: false}});
+  let dragging = false, lx = 0, ly = 0;
+  cv.addEventListener('mousedown', e => {{ dragging = true; lx = e.offsetX; ly = e.offsetY;
+    cv.style.cursor = 'grabbing'; }});
+  window.addEventListener('mouseup', () => {{ dragging = false; cv.style.cursor = 'grab'; }});
+  cv.addEventListener('mousemove', e => {{
+    if(!dragging) return;
+    VX -= (e.offsetX - lx)/VS; VY += (e.offsetY - ly)/VS;   // sy flips y, so dragging down raises VY
+    lx = e.offsetX; ly = e.offsetY; clampView(); redraw();
+  }});
+  cv.addEventListener('dblclick', e => setZoom(Z*2, e.offsetX, e.offsetY));
+  const mid = () => [cv.width/2, cv.height/2];
+  document.getElementById('zoomIn').onclick  = () => setZoom(Z*1.6, ...mid());
+  document.getElementById('zoomOut').onclick = () => setZoom(Z/1.6, ...mid());
+  document.getElementById('zoomFit').onclick = resetView;
+  document.addEventListener('keydown', e => {{             // + / - / 0, ignoring the transport keys
+    if(e.key === '+' || e.key === '=') setZoom(Z*1.6, ...mid());
+    else if(e.key === '-' || e.key === '_') setZoom(Z/1.6, ...mid());
+    else if(e.key === '0') resetView();
+  }});
+}}
+
 // ---------------------------------------------------------------- transport
-let playing=false, speed=1, clock=0;
+let playing=false, speed=1, clock=START;
 function step(d){{ playing=false; document.getElementById('play').textContent='▶ play';
-  clock = Math.max(0, Math.min(END, +slider.value + d)); slider.value=clock; draw(clock); }}
+  clock = Math.max(START, Math.min(END, +slider.value + d)); slider.value=clock; draw(clock); }}
 // the play position is a FLOAT clock, not the slider value — the range input snaps to step=1, so it
-// cannot hold sub-unit advances and speeds < 1 would round away. At 1x the full horizon plays in ~10s
-// (60fps · horizon/600 per frame); speed scales that per-frame step (0.25x ⇒ 40s, 8x ⇒ ~1.25s).
-function tick(){{ if(!playing) return; clock += speed*END/600;
-  if(clock>END) clock=0; slider.value=clock; draw(clock); requestAnimationFrame(tick); }}
+// cannot hold sub-unit advances and speeds < 1 would round away. At 1x the realized run plays in
+// ~10s (60fps · duration/600 per frame); speed scales that per-frame step (0.25x ⇒ 40s, 8x ⇒ ~1.25s).
+function tick(){{ if(!playing || DURATION<=0) return; clock += speed*DURATION/600;
+  if(clock>=END){{ clock=END; slider.value=clock; draw(clock); playing=false;
+    document.getElementById('play').textContent='▶ play'; return; }}
+  slider.value=clock; draw(clock); requestAnimationFrame(tick); }}
 function wireTransport(){{
   slider.oninput=()=>{{ clock=+slider.value; draw(clock); }};   // scrubbing re-seats the play clock
   document.getElementById('back').onclick=()=>step(-DATA.dt);   // one timestep back
@@ -457,7 +531,9 @@ function wireTransport(){{
   document.getElementById('hexToggle').onchange=()=>draw(+slider.value);
   document.getElementById('speed').onchange=function(){{ speed=+this.value; }};
   document.getElementById('play').onclick=function(){{ playing=!playing;
-    this.textContent = playing?'⏸ pause':'▶ play'; if(playing){{ clock=+slider.value; tick(); }} }};
+    if(playing && DURATION<=0) playing=false;
+    this.textContent = playing?'⏸ pause':'▶ play'; if(playing){{ clock=+slider.value;
+      if(clock>=END){{ clock=START; slider.value=clock; draw(clock); }} tick(); }} }};
   document.addEventListener('keydown', e=>{{      // ← / → step one timestep, space toggles play
     if(e.key==='ArrowLeft') step(-DATA.dt);
     else if(e.key==='ArrowRight') step(+DATA.dt);
@@ -490,9 +566,9 @@ function buildLevelLegend(){{                     // flight-level dash key (A* m
 </script></body></html>"""
 
 
-def write_html(result: SimResult, out, clip_to_horizon: bool = True) -> str:
-    """Render a `SimResult` to a standalone HTML scrubber; return the output path."""
-    payload = _payload(result, clip_to_horizon=clip_to_horizon)
+def write_html(result: SimResult, out) -> str:
+    """Render the realized run to a standalone HTML scrubber; return the output path."""
+    payload = _payload(result)
     n_explicit, n_flights = payload["explicit_box_flights"], len(payload["flights"])
     if n_flights and n_explicit > _FALLBACK_WARN_FRAC * n_flights:
         # Loud, because this is the size lever failing: these flights ship their polygons verbatim, which
@@ -506,7 +582,9 @@ def write_html(result: SimResult, out, clip_to_horizon: bool = True) -> str:
     blob = _scene_json(payload).encode()
     # mtime=0 so the same run always produces a byte-identical file (gzip stamps the clock otherwise).
     b64 = base64.b64encode(gzip.compress(blob, compresslevel=9, mtime=0)).decode()
-    html = _HTML.format(horizon=json.dumps(payload["horizon"]), b64=b64, seg_poly=_SEG_POLY_JS)
+    html = _HTML.format(start=json.dumps(payload["simulation_start_s"]),
+                        end=json.dumps(payload["simulation_end_s"]),
+                        b64=b64, seg_poly=_SEG_POLY_JS)
     # encoding is explicit: the document declares utf-8 and the transport bar is full of non-ASCII
     # glyphs, so a C/cp1252 locale would otherwise mojibake or raise at the very end of a long run.
     with open(out, "w", encoding="utf-8") as f:

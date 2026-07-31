@@ -184,9 +184,10 @@ def save_run(
 
     ``summary.json`` carries the whole-run headline numbers **and** their steady-state twin (metrics
     over the representative density plateau — issue #25) in a nested ``steady_state`` block; ``window_frac``
-    tunes the plateau threshold. The replay is written with ``clip_to_horizon=False`` so the post-horizon
-    return tail these scenarios exist to produce stays visible; note that only extends the clock past
-    ``horizon_s``, it does not trim it — an early-finishing run still plays out to the horizon.
+    tunes the plateau threshold. The replay spans the REALIZED operation — first reservation through last
+    to clear (:func:`metrics.simulation_window`) — so the post-horizon return tail these scenarios exist
+    to produce stays visible, and an early-finishing run no longer scrubs through an empty sky out to
+    ``horizon_s``.
     """
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
@@ -241,7 +242,7 @@ def save_run(
 
     if write_replay:
         from . import viz_html
-        viz_html.write_html(result, folder / "replay.html", clip_to_horizon=False)
+        viz_html.write_html(result, folder / "replay.html")
 
     if index:
         _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,

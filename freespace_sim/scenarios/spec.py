@@ -37,9 +37,15 @@ class DemandSpec:
     # hub_radius: per-USS delivery Poisson rate (/hr). When set, REPLACES cfg.lam_per_hour × uss_share —
     # each USS is its own independent stream. None ⇒ the global-λ path.
     lam_per_uss: "dict[str, float] | None" = None
-    # hub_radius: per-USS desired-departure lead as ``(mean_s, std_s)`` — t_departure = t_request +
-    # max(0, N(mean, std)). Absent USSs (or None) depart on filing. Applies to delivery and return legs.
+    # hub_radius: per-USS desired-departure lead as ``(mean_s, std_s)``. Absent USSs (or None) depart on
+    # filing. Legacy returns draw a second lead; paired returns are filed with the outbound and do not.
     departure_offset_s: "dict[str, tuple[float, float]] | None" = None
+    # "request" samples filings then adds the lead; "departure" samples outbound desired departures
+    # over the common demand window, subtracts the lead, then shifts the full clock nonnegative.
+    timing_mode: str = "request"
+    # Strategic round-trip filing: return shares the outbound filing time and requests departure after
+    # the outbound's nominal arrival. False preserves the legacy independently-filed return behavior.
+    paired_return_request: bool = False
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -68,6 +74,8 @@ class DemandSpec:
                 uss_share=self.uss_share,
                 lam_per_uss=self.lam_per_uss,
                 departure_offset_s=self.departure_offset_s,
+                timing_mode=self.timing_mode,
+                paired_return_request=self.paired_return_request,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":
@@ -88,8 +96,10 @@ class ScenarioSpec:
     """
 
     name: str
+    description: str = ""
     region_m: tuple[float, float] = (8000.0, 8000.0)
     horizon_s: float = 3600.0
+    demand_duration_s: float | None = None
     lam_per_hour: float = 600.0
     seed: int = 0
     planner: str | None = None             # None → SimConfig's default planner
@@ -108,6 +118,7 @@ class ScenarioSpec:
             region_size_m=(float(self.region_m[0]), float(self.region_m[1])),
             lam_per_hour=self.lam_per_hour,
             horizon_s=self.horizon_s,
+            demand_duration_s=self.demand_duration_s,
             seed=self.seed,
             **({"planner": self.planner} if self.planner else {}),
             **({"fixed_exit_lanes": self.fixed_exit_lanes} if self.fixed_exit_lanes is not None else {}),

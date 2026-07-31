@@ -28,7 +28,7 @@ from dataclasses import replace
 import numpy as np
 
 from ..config import SimConfig
-from ..cost import endpoint_altitude_change_m, trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost, unreserved_leg_m
 from ..ledger import ReservationLedger
 from ..types import (
     DenialReason,
@@ -105,6 +105,24 @@ def _deny(req, reason):
     return OperationalIntent(
         request=req, status=IntentStatus.REJECTED, denial_reason=reason, planner="astar"
     )
+
+
+def _lattice_overhead_m(cells, pitch, air_detour_m):
+    """The share of ``air_detour_m`` that is hex geometry rather than traffic, in metres.
+
+    The traffic share is derived EXACTLY and subtracted: every lateral edge is exactly one pitch, so
+    ``moves actually flown − the lattice geodesic between the first and last cell`` is the berth
+    traffic forced, in whole hex steps. That residual is exactly 0 for an unimpeded flight at ANY
+    bearing — which is the invariant that makes the congestion reading trustworthy.
+
+    Everything else in ``air_detour_m`` is geometry and lands here: the staircase a 6-direction
+    lattice imposes on an off-axis bearing (0 on-axis, peaking at 2/√3 − 1 ≈ 15.5% at 30° off), plus
+    the endpoint snap of origin/dest onto cell centres. Counting cell-to-cell also makes ``_build``'s
+    terminal fold cancel instead of biasing the split.
+    """
+    moves = sum(1 for a, b in zip(cells, cells[1:]) if a != b)
+    forced = max(0, moves - hg.hex_distance(cells[0], cells[-1])) * pitch
+    return max(0.0, air_detour_m - forced)
 
 
 def _absorb(svc, ledger):
@@ -206,7 +224,7 @@ def _warn_kernel_fallback() -> None:
 
 
 class AStarPlanner:
-    def __init__(self, max_expansions: int = 2_000_000, vertical_edges: bool = True,
+    def __init__(self, max_expansions: int = 6_000_000, vertical_edges: bool = True,
                  compiled: bool = True, kernel_log2_min: int | None = None):
         self.max_expansions = max_expansions
         # starting g-hash/heap size (1 << kernel_log2_min slots): the ADAPTIVE floor of the kernel work
@@ -426,6 +444,17 @@ class AStarPlanner:
         # When the dest is a terminal the goal is a boundary cell, ~``d_max`` before the hub centre the
         # heuristic targets — subtract it to stay admissible.
         h_off = max((L.dist for L in d_lanes), default=0.0)
+        # ORIGIN-side twin of h_off. The fixed-lane takeoff edge charges only the leg OUTSIDE the origin
+        # column (``c_lat * (lane.dist - o_r)``, below) — the centre→edge leg is flown but never reserved,
+        # so the search never pays for it. ``h_ground`` measures from the origin hex CENTRE, so without
+        # this term it claims a cost-to-go the takeoff edge will not charge: consistency needs
+        # ``D_origin→goal <= (lane.dist - o_r) + D_lane→goal`` but the triangle inequality only gives
+        # ``<= lane.dist + D_lane→goal``, so a lane pointing AT the goal breaks it by exactly o_r. The
+        # error always inflates ground states relative to air ones (i.e. biases the search toward flying
+        # a detour rather than waiting), and the closed set is never reopened, so it is never repaired.
+        # Only the fixed-lane path is affected: a non-terminal / legacy takeoff leaves from the origin
+        # hex itself with no lateral term, and is already consistent.
+        h_off_o = terminal_radius(o_term, cfg) if o_lanes else 0.0
 
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come.
         # h_air is evaluated for EVERY generated neighbour (the search hot path), so the hex centre is
@@ -439,7 +468,7 @@ class AStarPlanner:
                     + takeoff_cost[L])                       # == c_alt*(levels[L]-ground_z), precomputed
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
-        h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off)
+        h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off - h_off_o)
                     + 2.0 * takeoff_cost[0])                 # mandatory descent from the lowest level + back
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
@@ -545,6 +574,10 @@ class AStarPlanner:
         # true vertical travel: takeoff climb + every cruise layer change + landing descent
         z_takeoff, z_land = levels[air[0][3]], levels[air[-1][3]]
         cruise_dz = sum(abs(levels[air[i + 1][3]] - levels[air[i][3]]) for i in range(len(air) - 1))
+        # cum_horiz spans lane-cell → lane-cell; `straight` spans hub-centre → hub-centre. Add the
+        # flown-but-unreserved column legs so the two share endpoints (issue #50) — without it the
+        # detour is understated and clamps to 0 on most flights once a refiner removes the staircase.
+        detour = max(0.0, cum_horiz + unreserved_leg_m(centerline, origin, dest) - straight)
         intent = OperationalIntent(
             request=req,
             status=IntentStatus.ACCEPTED,
@@ -552,7 +585,8 @@ class AStarPlanner:
             centerline=centerline,
             ground_delay_s=delay,
             air_hold_s=n_hover * dt,
-            air_detour_m=max(0.0, cum_horiz - straight),
+            air_detour_m=detour,
+            lattice_overhead_m=_lattice_overhead_m([(s[1], s[2]) for s in air], pitch, detour),
             altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="astar",
         )
@@ -908,10 +942,12 @@ class AStarPlanner:
         o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
         d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
         h_off = max((L.dist for L in d_lanes), default=0.0)
+        h_off_o = terminal_radius(o_term, cfg) if o_lanes else 0.0   # see _plan_reference for why
 
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
-        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * takeoff_cost[0]
+        h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off - h_off_o)
+                    + 2.0 * takeoff_cost[0])
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
@@ -1090,6 +1126,7 @@ class AStarPlanner:
 
         z_takeoff, z_land = levels[air[0][2]], levels[air[-1][2]]
         cruise_dz = sum(abs(levels[air[i + 1][2]] - levels[air[i][2]]) for i in range(len(air) - 1))
+        detour = max(0.0, cum_horiz + unreserved_leg_m(centerline, origin, dest) - straight)  # issue #50
         intent = OperationalIntent(
             request=req,
             status=IntentStatus.ACCEPTED,
@@ -1097,7 +1134,8 @@ class AStarPlanner:
             centerline=centerline,
             ground_delay_s=ground_steps * dt,
             air_hold_s=n_hover * dt,
-            air_detour_m=max(0.0, cum_horiz - straight),
+            air_detour_m=detour,
+            lattice_overhead_m=_lattice_overhead_m([(a[0], a[1]) for a in air], pitch, detour),
             altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="astar",
         )

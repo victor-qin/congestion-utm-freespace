@@ -30,7 +30,7 @@ import numpy as np
 import pulp
 
 from ..config import SimConfig
-from ..cost import endpoint_altitude_change_m, trajectory_cost
+from ..cost import endpoint_altitude_change_m, trajectory_cost, unreserved_leg_m
 from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
@@ -367,7 +367,8 @@ class MILPOptPlanner:
             volumes=volumes,
             centerline=centerline,
             ground_delay_s=d_final,
-            air_detour_m=max(0.0, cum_horiz - straight_horiz),
+            air_detour_m=max(0.0, cum_horiz + unreserved_leg_m(centerline, req.origin, req.dest)
+                             - straight_horiz),                                        # issue #50
             altitude_change_m=endpoint_altitude_change_m(
                 float(corners[0][2]), float(corners[-1][2]), cum_dz, cfg),
             planner="milp",

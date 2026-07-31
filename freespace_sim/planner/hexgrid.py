@@ -35,6 +35,16 @@ def hex_neighbors(q: int, r: int) -> list[tuple[int, int]]:
     return [(q + dq, r + dr) for dq, dr in AXIAL_NEIGHBORS]
 
 
+def hex_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """Axial lattice distance in STEPS: the fewest 6-neighbour moves from `a` to `b`.
+
+    Every lateral A* edge is exactly one pitch, so this times the pitch is the shortest path the
+    lattice permits between two cells — the obstacle-free reference a detour is measured against.
+    """
+    dq, dr = b[0] - a[0], b[1] - a[1]
+    return (abs(dq) + abs(dq + dr) + abs(dr)) // 2
+
+
 def circumradius(cfg: SimConfig) -> float:
     """Hex circumradius R, from pitch = nominal_speed·dt and pitch = √3·R."""
     return cfg.nominal_speed_mps * cfg.dt_s / SQRT3

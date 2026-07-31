@@ -97,8 +97,9 @@ Three composable stages, joined through saved run folders on disk — so analysi
 and the demand pattern / USS count is a property of the **scenario** (reused by every stage for free):
 
 **1. DEFINE** — a `ScenarioSpec` is a named *world* (region, horizon, λ, planner, demand pattern). The
-registry in [`scenarios.py`](freespace_sim/scenarios.py) ships `metro_uniform` (1 USS), `metro_2uss`
-(2 USS, uniform), and `dallas_hub_2uss` (2 USS, geographic hub-and-spoke). Any field is overridable.
+registry in [`scenarios/`](freespace_sim/scenarios) ships `metro_uniform` (1 USS), `metro_2uss`
+(2 USS, uniform), `dallas_hub_2uss` (2 USS, geographic hub-and-spoke), and the four explicit density
+worlds below. Any field is overridable.
 
 **2. EXECUTE** — `experiments.run` runs **one** scenario and persists it (no plots). Sweeps and
 comparisons are pure-shell loops over it, joined by a shared `--tag`:
@@ -106,6 +107,27 @@ comparisons are pure-shell loops over it, joined by a shared `--tag`:
 ```bash
 uv run python -m experiments.run --scenario dallas_hub_2uss --planner astar_shortcut --tag demo
 uv run python -m experiments.run --scenario metro_2uss --demand hub --uss a b --hubs 5 15 --lam 240
+```
+
+The density matrix has four canonical recipes:
+
+| scenario | operator mix |
+|---|---|
+| `density_faa_wing_zipline` | FAA-filing Wing/Zipline-type traffic |
+| `density_future_wing_zipline` | far-future Wing/Zipline-type traffic |
+| `density_faa_wing_zipline_amazon` | FAA-filing Wing/Zipline plus Amazon traffic |
+| `density_future_wing_zipline_amazon` | far-future Wing/Zipline plus Amazon traffic |
+
+In these scenarios λ counts outbound delivery missions. Each outbound is paired with a return, so the
+expected number of flight legs is twice the outbound count. Mixed scenarios use two distinct USS
+instances (`wing_zipline_uss` and `amazon_uss`), with independent demand streams and operator-specific
+service radii and scheduling leads. The canonical density runs generate outbound demand over 30 minutes
+inside a two-hour planner envelope used to size the scheduling machinery. That envelope is not a cutoff:
+every generated request is processed, and the realized simulation runs from the first flight activity
+through the final landing without diluting the reported hourly demand rate. Run the complete matrix with:
+
+```bash
+bash experiments/batch/density_matrix.sh paper 0 1 2
 ```
 
 **3. READ OUT** — standalone consumers that load saved data (never re-simulate):
@@ -125,11 +147,11 @@ folder. The only genuinely cross-run readout is `curve` (a *trend* needs many po
 index the loop populated.
 
 **Orchestration** lives in [`experiments/batch/`](experiments/batch) (`lambda_sweep.sh`,
-`compare_planners.sh`, `replay_demo.sh`) — plain shell composing the run box + readouts.
+`compare_planners.sh`, `density_matrix.sh`, `replay_demo.sh`) — plain shell composing the run box + readouts.
 (`compare_optimizers.py` stays standalone: it's a planner micro-benchmark on hand-built obstacles, not
 the demand pipeline.)
 
-Every run folder is self-contained (`config.json`, `experiment.json`, `scenario.parquet`,
+Every run folder is self-contained (`config.json`, `scenario_spec.json`, `experiment.json`, `scenario.parquet`,
 `trajectories.parquet`, `reservations.parquet`, `flights.parquet`, `per_uss.parquet`) and a row is
 appended to `results/index.parquet` (with `scenario`/`tag`/`demand`/`n_uss` columns) for cross-run
 readouts. **Per-run** readouts (`replay`/`figures`/`uss_breakdown`/`histograms`) write *into* the run
@@ -146,13 +168,23 @@ A standalone webpage (no server) that plays the reservations back like a video:
 - **Dashed origin→dest** reference line per active flight — the gap to its solid corridor *is* the
   detour the FCFS newcomer paid.
 
+**It stays small.** A dense run reserves hundreds of thousands of corridor boxes, and dumping them
+verbatim reached 78 MB at 4.7k flights (~400 MB at 26k) — too big to archive or open comfortably.
+Three encodings stack to **~140x smaller** (78 MB → 0.55 MB) with no loss of visual fidelity:
+corridor boxes are **not stored at all** but rebuilt in the browser from the path (they are exactly
+the swept centerline, which `viz_html._rebuildable` verifies per flight — a planner that reserves
+anything else keeps explicit polygons); coordinates are quantised to decimetres and delta-encoded;
+and the result is gzipped into one base64 string, inflated on load via `DecompressionStream`
+(Chrome 80+ / Safari 16.4+ / Firefox 113+). Loading got ~14x faster as a side effect, since the
+browser no longer parses tens of MB of JavaScript source.
+
 ## Metrics
 
 Per flight: ground delay, air hold, air detour, altitude change, cost, **stretch** (flown ÷
 straight), **total delay** (hold + loiter + detour-time, excluding the mandatory climb), reserved
 **volume-seconds**, and **planner solve time**. Aggregates roll these up plus denial rate (with
 budget-vs-search-artifact split), throughput, and **airspace utilization** (reserved volume-seconds
-÷ region × horizon — the free-space analog of the hex repo's occupancy).
+÷ region × realized simulation duration — the free-space analog of the hex repo's occupancy).
 
 **Steady-state window.** A run's airborne density is a trapezoid — it ramps up from an empty sky,
 plateaus, then ramps down as the last flights (and post-horizon returns) land. Metrics over the whole
@@ -161,9 +193,9 @@ run are diluted by the low-density ramps, so `metrics.steady_state_window(result
 the whole-run number **and** its steady-state twin measured over that window: `summary.json` carries a
 nested `steady_state` block, `index.parquet` gains `steady_*` / `window_*` columns, and the `curve` /
 `compare` / `histograms` readouts overlay the two. `--window-frac` tunes the plateau threshold; the
-replay clips to the horizon by default (`--no-clip` keeps the return tail). This **supersedes** the
-removed `clip_returns_to_horizon` demand hack (issue #25): run the natural demand, but *measure* only
-the representative window instead of mutilating the flight set.
+replay always spans the first flight activity through the final landing. This **supersedes** the removed
+`clip_returns_to_horizon` demand hack (issue #25): run and preserve the natural demand and its full tail,
+while the separate steady-state view measures only the representative plateau.
 
 ## Status
 

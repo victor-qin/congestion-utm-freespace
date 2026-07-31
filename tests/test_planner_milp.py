@@ -84,9 +84,15 @@ def _z_profile(intent):
     return [round(float(p[2]), 1) for p, _ in intent.centerline]
 
 
-def _low_wall(x=1000.0, half_y=800.0):
+def _low_wall(x=1000.0, half_y=2000.0):
     """A wide permanent wall spanning z 15..70: blocks the band floor (30) AND the straight warm
-    planner's 75 m plane, but leaves the upper band clear — the only cheap lever is to climb."""
+    planner's 75 m plane, but leaves the upper band clear — the only cheap lever is to climb.
+
+    ``half_y`` must be wide enough that going AROUND is dearer than going over, and how wide that is
+    depends on the cost weights. Under the per-second currency a metre of climb costs 6.7x a metre of
+    cruise (climbing is 5x slower, at 4x vs 3x the rate), so the berth has to exceed ~930 m of extra
+    path before it loses: at the old 800 m the two levers landed within 12% of each other and the
+    solver's gap tolerance picked the winner. 2000 m puts climbing ahead ~3.5x, restoring the margin."""
     return Volume4D(box_from_segment(vec(x, -half_y, 42.5), vec(x, half_y, 42.5), 40, 55.0), 0.0, 1e6)
 
 
@@ -104,7 +110,7 @@ def test_milp_climbs_over_a_wall_blocking_the_floor_and_the_warm_plane():
     led = ReservationLedger(cfg)
     led.commit(99, [_low_wall()])
     # the straight warm start is blocked too (its 75 m corridor overlaps the wall) → the accepted
-    # intent is the MILP solver's own, and climbing beats the ~1.6 km lateral berth
+    # intent is the MILP solver's own, and climbing beats the ~2.6 km lateral berth (see _low_wall)
     assert StraightLineTimeShift().plan(_req(), led, cfg).status is IntentStatus.REJECTED
     intent = MILPOptPlanner().plan(_req(), led, cfg)
     assert intent.status is IntentStatus.ACCEPTED

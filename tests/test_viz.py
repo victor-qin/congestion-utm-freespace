@@ -1,13 +1,39 @@
+import base64
+import dataclasses
+import gzip
 import json
+import re
+import shutil
+import subprocess
+import tempfile
 
 import numpy as np
 import pytest
 
-from freespace_sim import runs, viz, viz_html
+from freespace_sim import metrics, runs, viz, viz_html, volumes
 from freespace_sim.config import SimConfig
-from freespace_sim.geometry import box_from_segment
+from freespace_sim.geometry import BoxSpec, box_from_segment
 from freespace_sim.sim import run
 from freespace_sim.types import FlightRequest, vec
+
+
+def _blob(html: str) -> str:
+    """The embedded base64 scene."""
+    return html.split('const B64 = "', 1)[1].split('"', 1)[0]
+
+
+def _embedded(html: str) -> dict:
+    """Inflate the replay's base64+gzip scene exactly as the browser does."""
+    return json.loads(gzip.decompress(base64.b64decode(_blob(html))))
+
+
+def _undelta(stream: list[int]) -> list[int]:
+    """Mirror of the replay's JS ``undelta``."""
+    out, v = [], 0
+    for d in stream:
+        v += d
+        out.append(v)
+    return out
 
 
 def _small_run():
@@ -61,8 +87,9 @@ def test_snapshot_uss_filter_writes_file(tmp_path):
 def test_payload_carries_uss_and_colors():
     res = _two_uss_run()
     payload = viz_html._payload(res)
-    assert all("uss" in f for f in payload["flights"])
-    assert set(payload["uss_colors"]) == {"walmart", "stripmall"}
+    # each flight stores an INDEX into payload["usses"], not the operator string (repeated 26k times)
+    assert all(payload["usses"][f["u"]] in {"walmart", "stripmall"} for f in payload["flights"])
+    assert set(payload["uss_colors"]) == {"walmart", "stripmall"} == set(payload["usses"])
     assert all(c.startswith("#") and len(c) == 7 for c in payload["uss_colors"].values())
 
 
@@ -125,29 +152,317 @@ def test_viz_html_is_selfcontained_and_parses(tmp_path):
     res = _small_run()
     out = viz_html.write_html(res, tmp_path / "replay.html")
     html = open(out).read()
-    assert "{horizon}" not in html and "{data}" not in html   # all tokens substituted
+    assert "<script>" in html and "<img" not in html    # standalone: no external assets to fetch
     payload = viz_html._payload(res)
-    assert payload["flights"] and all("path" in f for f in payload["flights"])
+    assert payload["flights"] and all(f["x"] and f["t"] for f in payload["flights"])
     # each flight carries its straight origin→dest endpoints (the dashed reference line)
     assert all(len(f["o"]) == 2 and len(f["d"]) == 2 for f in payload["flights"])
-    # the embedded DATA blob must be valid JSON
-    blob = html.split("const DATA = ", 1)[1].split(";\n", 1)[0]
-    assert json.loads(blob)["horizon"] == res.config.horizon_s
+    # the embedded scene must inflate to exactly the payload the browser will draw
+    assert _embedded(html) == json.loads(json.dumps(payload))
+    # the slider bounds are substituted as plain numbers, outside the compressed blob
+    assert f'min="{payload["simulation_start_s"]}"' in html
+    assert f'max="{payload["simulation_end_s"]}"' in html
 
 
-def test_replay_clips_to_horizon_by_default():
+def test_replay_spans_the_realized_run_not_the_horizon():
+    """The clock is the realized operation, so it EXTENDS past an early horizon and TRIMS a late one.
+
+    `horizon_s` is a planner envelope, not a schedule: on the density scenarios flights are filed from
+    t=0 but the first departs ~768 s in, and the last lands ~3300 s before the envelope closes — 57% of
+    the old slider was empty sky at one end or the other."""
     from freespace_sim.geometry import box_from_segment
     from freespace_sim.volumes import Volume4D
 
     res = _small_run()   # horizon 600 s; every flight clears well before it
-    # append a volume that extends past the horizon to one accepted flight (a stand-in return tail)
+    # (a) TRIM: nothing is airborne near the horizon, so the clock must stop at the last landing
+    payload = viz_html._payload(res)
+    lo, hi = metrics.simulation_window(res)
+    assert (payload["simulation_start_s"], payload["simulation_end_s"]) == (lo, hi)
+    assert hi < res.config.horizon_s, "fixture clears well before the horizon — the trim check is real"
+
+    # (b) EXTEND: a post-horizon return tail must still be reachable on the slider
     acc = res.accepted[0]
-    tail = Volume4D(box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30), 700.0, 900.0)
-    acc.volumes = (acc.volumes or []) + [tail]
-    # default clips the replay clock at the horizon, excluding the post-H tail
-    assert viz_html._payload(res, clip_to_horizon=True)["horizon"] == res.config.horizon_s
-    # opting out extends the clock to the last volume (return-flight demo)
-    assert viz_html._payload(res, clip_to_horizon=False)["horizon"] >= 900.0
+    acc.volumes = (acc.volumes or []) + [
+        Volume4D(box_from_segment(vec(0, 0, 75), vec(60, 0, 75), 60, 30), 700.0, 900.0)]
+    assert viz_html._payload(res)["simulation_end_s"] == 900.0
+
+
+def test_replay_clock_starts_at_first_departure_not_at_filing():
+    """A flight filed at t=0 but departing later must not leave the replay opening on an empty sky."""
+    res = run(SimConfig(planner="straight", horizon_s=900.0, region_size_m=(2200.0, 2200.0)),
+              requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0, t_departure=300.0)])
+    payload = viz_html._payload(res)
+    assert payload["simulation_start_s"] >= 290.0    # the takeoff column opens just before the roll
+    assert payload["simulation_duration_s"] > 0
+
+
+_SEG_CASES = [
+    ((0, 0, 100), (120, 0, 100)),                      # level, due east
+    ((0, 0, 100), (60, 103.9, 100)),                   # level, 60° bearing
+    ((500, 500, 100), (380, 500, 100)),                # level, due west (negative direction)
+    ((0, 0, 30), (120, 0, 70)),                        # climbing
+    ((0, 0, 110), (84.9, 84.9, 30)),                   # descending, diagonal
+    ((0, 0, 30), (2, 0, 110)),                         # near-vertical → world-x fallback branch
+    ((0, 0, 30), (0, 0, 110)),                         # pure vertical rung
+    ((0, 0, 100), (0, 0, 100)),                        # degenerate: hover in place
+]
+
+
+def _builder_footprints(cfg):
+    """What the ledger actually reserved, for each case in `_SEG_CASES`."""
+    return [viz.box_footprint(volumes.corridor_segment_volume(
+        np.array(p0, float), 0.0, np.array(p1, float), 4.0, cfg).shape) for p0, p1 in _SEG_CASES]
+
+
+def test_shipped_segpoly_js_reproduces_the_corridor_builder():
+    """Runs the REAL shipped `segPoly` source in node against `volumes.corridor_segment_volume`.
+
+    This is the load-bearing pin for the whole size lever: the replay stores no corridor polygons, so
+    if the JS drifts from the builder every archived replay silently draws wrong geometry — and
+    `_rebuildable` cannot catch it, because it compares Python against Python. A Python transcription
+    of the JS would not catch it either; only executing `viz_html._SEG_POLY_JS` itself does.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    cfg = SimConfig()
+    harness = f"""
+const IQ = 1, CW = {cfg.corridor_width_m}, CH = {cfg.corridor_height_m};
+{viz_html._SEG_POLY_JS}
+const cases = {json.dumps(_SEG_CASES)};
+const out = [];
+for (const [p0, p1] of cases) {{
+  const f = {{x: [p0[0], p1[0]], y: [p0[1], p1[1]], z: [p0[2], p1[2]]}};
+  const poly = new Float64Array(8);
+  const z = segPoly(f, 0, poly);
+  out.push({{poly: Array.from(poly), z}});
+}}
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+
+    for (p0, p1), rec, want in zip(_SEG_CASES, got, _builder_footprints(cfg)):
+        assert np.allclose(np.array(rec["poly"]).reshape(4, 2), want, atol=1e-9), f"segment {p0}→{p1}"
+        # the returned altitude drives the flight-level dash styling, so pin it too
+        vol = volumes.corridor_segment_volume(np.array(p0, float), 0.0, np.array(p1, float), 4.0, cfg)
+        assert abs(rec["z"] - vol.shape.center[2]) < 1e-9, f"box centre altitude for {p0}→{p1}"
+
+
+def test_shipped_view_transform_zooms_about_a_fixed_point():
+    """Runs the shipped zoom/pan maths in node: the world point under the cursor must not move.
+
+    An anchor that drifts is the classic zoom bug — the map slides away as you scroll — and it is
+    invisible to any Python-side test, since the transform only exists in the embedded JS.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    # clampView / setZoom / resetView — the whole view transform, and nothing below it, since redraw
+    # and wireView touch the DOM
+    body = html[html.index("function clampView()"):html.index("function redraw()")]
+    harness = """
+const PAD = 20, W = 60000, H = 60000;
+const cv = {width: 760, height: 760, style: {}};
+const S = (cv.width - 2*PAD)/Math.max(W, H);
+let Z = 1, VS = S, VX = 0, VY = 0;
+const ZMIN = 1, ZMAX = 64;
+const wx = px => (px - PAD)/VS + VX, wy = py => (cv.height - PAD - py)/VS + VY;
+function redraw(){}
+""" + body.replace("{{", "{").replace("}}", "}") + """
+const out = [];
+for (const [z, ax, ay] of [[8,300,400],[3.7,120,700],[64,700,60],[2,380,380]]) {
+  Z = 1; VS = S; VX = 0; VY = 0;                       // fit, then zoom about (ax, ay)
+  const before = [wx(ax), wy(ay)];
+  setZoom(z, ax, ay);
+  const after = [wx(ax), wy(ay)];
+  out.push({z: Z, drift: [Math.abs(after[0]-before[0]), Math.abs(after[1]-before[1])],
+            spanM: (cv.width - 2*PAD)/VS, VX, VY});
+}
+Z = 1; VS = S; VX = -1e9; VY = 1e9; clampView();       // the region cannot be panned off-screen
+out.push({clampedAtFit: [VX, VY]});
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+
+    for rec in got[:-1]:
+        # the anchored point holds still to floating-point noise, at every zoom level
+        assert max(rec["drift"]) < 1e-6, f"zoom to {rec['z']}x drifted by {rec['drift']} m"
+        # and the visible span is exactly the region divided by the zoom
+        assert abs(rec["spanM"] - 60000 / rec["z"]) < 1e-6
+        assert rec["VX"] >= 0 and rec["VY"] >= 0
+    assert got[-1]["clampedAtFit"] == [0, 0]   # at fit there is nowhere to pan to
+
+
+def test_walls_carry_the_exit_lane_radius():
+    """A permanent terminal column must ship the radius at which its RESERVED lanes begin.
+
+    The column is a no-fly disc; corridors start a corridor-width further out, at
+    `volumes.exit_radius`. Without it the replay draws reserved traffic beginning in mid-air, with no
+    indication that the gap is the unreserved leg the vertiport handles tactically.
+    """
+    from freespace_sim.types import Terminal
+
+    term = Terminal("hub", capacity=4, radius=180.0)
+    # astar, not straight: only the A*-based planners tag terminal airspace, and the straight planner
+    # warns (correctly) that the shared-terminal exemption is being dropped
+    cfg = SimConfig(planner="astar", horizon_s=600.0, region_size_m=(4000.0, 4000.0))
+    res = run(cfg, requests=[FlightRequest(1, vec(500, 500, 0), vec(3000, 3000, 0), 0.0,
+                                           origin_terminal=term)])
+    # stand in for the always-active wall the ledger would hold for a permanent column
+    res.static_walls = [volumes.hover_reservation(
+        vec(500, 500, 0), 0.0, cfg, terminal_id=term.id, radius=volumes.terminal_radius(term, cfg))]
+
+    walls = viz_html._payload(res)["walls"]
+    assert len(walls) == 1
+    assert walls[0]["r"] == volumes.terminal_radius(term, cfg) == 180.0
+    # pinned to the real helper, not a re-derived number — exit_radius is the single source of truth
+    assert walls[0]["er"] == volumes.exit_radius(term, cfg) == 210.0
+    assert walls[0]["er"] > walls[0]["r"], "the lane ring must sit outside the no-fly column"
+
+
+def test_wall_without_a_known_terminal_has_no_exit_ring():
+    """A wall whose terminal isn't on any request can't have its lane radius invented."""
+    cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(4000.0, 4000.0))
+    res = run(cfg, requests=[FlightRequest(1, vec(500, 500, 0), vec(3000, 3000, 0), 0.0)])
+    res.static_walls = [volumes.hover_reservation(
+        vec(500, 500, 0), 0.0, cfg, terminal_id="orphan", radius=90.0)]
+    assert viz_html._payload(res)["walls"][0]["er"] is None
+
+
+def test_shipped_altitude_labels_are_fixed_size_and_only_drawn_when_unambiguous():
+    """Runs the shipped label logic in node.
+
+    Two properties, both invisible to any Python-side test since this lives only in the embedded JS:
+    the font is a fixed screen-space size at every zoom (it must not scale with the view), and a drone
+    only gets a label when it is ALONE in its label-sized slot — a label sitting between two adjacent
+    dots cannot be attributed to either, so neither gets one.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    # slice from LABEL_PX, not from noteLabel, so the test uses the SHIPPED size constants and the
+    # slot derivation with them — a slot that stopped tracking the font would show up here
+    body = html[html.index("const LABEL_PX"):html.index("function draw(t)")]
+    harness = """
+const cv = {width: 760, height: 760};
+const drawn = [];
+const ctx = {set fillStyle(v){}, set font(v){this._f = v;}, get font(){return this._f;},
+             fillText(txt, x, y){ drawn.push({txt, x, y, font: this._f}); }};
+""" + body.replace("{{", "{").replace("}}", "}") + """
+// two drones 3 px apart (same slot) plus one far away, all on screen
+labelSlots.clear();
+noteLabel(80, 100, 100); noteLabel(95, 103, 100); noteLabel(110, 100 + 6*LABEL_W, 400);
+drawLabels();
+const close = drawn.slice();
+// off-canvas points are never labelled
+labelSlots.clear(); drawn.length = 0;
+noteLabel(80, -5, 100); noteLabel(80, 100, 1000); noteLabel(95, 300, 300);
+if (LABEL_W < 8) throw new Error('slot narrower than the label it holds');
+drawLabels();
+console.log(JSON.stringify({close, offscreen: drawn.slice()}));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+
+    # the crowded pair is suppressed; only the isolated drone is labelled
+    assert [d["txt"] for d in got["close"]] == ["110m"]
+    # ...and the font is a fixed screen-space px size, not derived from any zoom (the exact value is
+    # a display knob, so pin the SHAPE rather than the number)
+    assert re.fullmatch(r"\d+px monospace", got["close"][0]["font"])
+    # off-canvas drones contribute nothing, so they cannot suppress an on-screen neighbour either
+    assert [d["txt"] for d in got["offscreen"]] == ["95m"]
+
+
+def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
+    """Boxes are dropped when they are exactly the swept centerline, and the quantised delta streams
+    decode back to the flown path within the decimetre quantum."""
+    res = _small_run()
+    payload = viz_html._payload(res)
+    assert payload["explicit_box_flights"] == 0
+    assert all("b" not in f for f in payload["flights"])   # no polygons stored at all
+    tol = 0.5 / payload["q"]                               # half a quantum
+    for intent, f in zip(res.accepted, payload["flights"]):
+        xs, ys, zs = (_undelta(f[k]) for k in "xyz")
+        ts = _undelta(f["t"])
+        assert len(xs) == len(intent.centerline)
+        for (p, t), qx, qy, qz, qt in zip(intent.centerline, xs, ys, zs, ts):
+            assert abs(qx / payload["q"] - p[0]) <= tol and abs(qy / payload["q"] - p[1]) <= tol
+            assert abs(qz / payload["q"] - p[2]) <= tol
+            assert abs(qt / payload["qt"] - t) <= 0.5 / payload["qt"]
+
+
+def test_sub_quantum_segment_forces_the_explicit_fallback():
+    """A segment shorter than the position quantum must NOT be rebuilt in the browser.
+
+    The browser only ever sees the decimetre-quantised path, so a centimetre-scale segment collapses to
+    zero length there and JS draws an x-aligned box instead of the real corridor — measured at up to
+    32 m off on a real `straight` run, whose final partial timestep leaves exactly such a remainder.
+    Verifying against the full-precision centerline passed all of those silently; verifying against the
+    quantised path is what makes them fall back.
+    """
+    cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0))
+    res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+    acc = res.accepted[0]
+    cl = list(acc.centerline)
+    # splice in a 3 cm near-vertical stub, the shape that quantisation destroys
+    (p, t), (_, t_next) = cl[0], cl[1]
+    stub_end = vec(float(p[0]), float(p[1]), float(p[2]) + 0.03)
+    acc.centerline = [cl[0], (stub_end, t + (t_next - t) / 2), *cl[1:]]
+    acc.volumes = volumes.build_corridor(acc.centerline, cfg) + [
+        v for v in acc.volumes if not isinstance(v.shape, BoxSpec)]
+
+    with pytest.warns(RuntimeWarning, match="could not have their corridor boxes rebuilt"):
+        payload = viz_html._payload(res), viz_html.write_html(res, tempfile.mkstemp(suffix=".html")[1])
+    assert payload[0]["explicit_box_flights"] == 1
+    assert "b" in payload[0]["flights"][0]      # its polygons ship verbatim rather than being mis-drawn
+
+
+def test_payload_keeps_explicit_boxes_when_not_rebuildable():
+    """A planner that reserves something other than the swept centerline must still replay correctly —
+    the rebuild is *verified* per flight, not assumed, and a mismatch falls back to real polygons."""
+    res = _small_run()
+    acc = res.accepted[0]
+    vols = list(acc.volumes)
+    i = next(k for k, v in enumerate(vols) if isinstance(v.shape, BoxSpec))
+    moved = dataclasses.replace(vols[i].shape,
+                                center=(vols[i].shape.center[0] + 500.0, *vols[i].shape.center[1:]))
+    vols[i] = dataclasses.replace(vols[i], shape=moved)
+    acc.volumes = vols
+
+    payload = viz_html._payload(res)
+    assert payload["explicit_box_flights"] == 1
+    doctored = payload["flights"][0]
+    assert len(doctored["b"]) == len([v for v in vols if isinstance(v.shape, BoxSpec)])
+    assert all(len(box) == 11 for box in doctored["b"])    # 8 xy coords + z + t0 + t1
+    assert all("b" not in f for f in payload["flights"][1:])
+
+
+def test_write_html_is_byte_reproducible(tmp_path):
+    """gzip stamps the wall clock into its header unless told not to; two dumps of the same run must
+    match so archived replays don't churn."""
+    res = _small_run()
+    a = open(viz_html.write_html(res, tmp_path / "a.html"), "rb").read()
+    b = open(viz_html.write_html(res, tmp_path / "b.html"), "rb").read()
+    assert a == b
+
+
+def test_embedded_scene_is_compressed_not_inlined(tmp_path):
+    """Size regression guard. Asserts on the embedded blob rather than the file, so the fixed ~16 KB
+    HTML shell can't mask a regression on the small runs the suite can afford to build."""
+    res = _small_run()
+    html = open(viz_html.write_html(res, tmp_path / "replay.html")).read()
+    blob = _blob(html)
+    raw = viz_html._scene_json(viz_html._payload(res))   # the exact bytes write_html compresses
+    assert len(blob) < len(raw)                          # base64(gzip(scene)) still beats the raw dump
+    assert raw not in html                               # the scene is compressed, not inlined
+    assert all(c.isalnum() or c in "+/=" for c in blob)  # ...and what IS embedded is pure base64
 
 
 def test_delay_histogram_overlay_writes_two_series(tmp_path):

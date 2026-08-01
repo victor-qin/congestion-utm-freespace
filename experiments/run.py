@@ -150,23 +150,36 @@ def build_parser() -> argparse.ArgumentParser:
                    help="capture observer-only congestion telemetry (filed-but-rejected corridors, "
                         "conflict_filed culprits, per-hub metadata, end-of-run walls) into extra parquets")
     p.add_argument("--no-progress", action="store_true", help="silence the live progress line")
-    p.add_argument("--mode", choices=("sequential", "exact", "relaxed"), default="exact",
-                   help="execution mode (issue #8 Track A). exact (default): speculative worker-pool "
-                        "sim, byte-identical to the serial run and faster. sequential: the classic "
-                        "serial loop. relaxed: keep any still-feasible speculation — a valid "
-                        "FCFS-class allocation, faster and scales to more workers, at a small delay "
-                        "cost (deterministic via pinned prefixes; result depends on workers+window). "
-                        "Non-astar planners always run sequential regardless of this flag.")
+    p.add_argument("--mode", choices=("sequential", "exact", "relaxed"), default="sequential",
+                   help="execution strategy for the whole simulation (issue #8 Track A). "
+                        "sequential (default): the classic serial FCFS loop. exact: speculative "
+                        "worker-pool planning, byte-identical to the serial run and faster. relaxed: "
+                        "keep any still-feasible speculation — a valid FCFS-class allocation, faster "
+                        "and scalable to more workers, at a small delay cost (deterministic via pinned "
+                        "prefixes; result depends on workers+window). Parallel modes currently support "
+                        "only astar, astar_ref, and astar_shortcut; every other planner runs sequential.")
     p.add_argument("--workers", type=int, default=None, metavar="N",
-                   help="worker processes for exact/relaxed mode (default min(8, cores-2); the "
+                   help="worker processes for explicit exact/relaxed mode only (default min(8, cores-2); the "
                         "benchmark sweet spot is ~4 workers for exact, ~8 for relaxed)")
     p.add_argument("--parallel-window", type=int, default=None,
-                   help="speculation window (default 4×workers); result-affecting in relaxed mode")
+                   help="speculation window for explicit exact/relaxed mode only (default 4×workers); "
+                        "result-affecting in relaxed mode")
     return p
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse and validate the execute CLI's cross-argument execution-mode contract."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.mode == "sequential" and (
+        args.workers is not None or args.parallel_window is not None
+    ):
+        parser.error("--workers and --parallel-window require --mode exact or --mode relaxed")
+    return args
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    args = parse_args()
 
     spec = spec_from_args(args)
     # to_json_dict, not asdict: the latter loses every tuple to a JSON list and leaves `demand` a
@@ -198,6 +211,8 @@ def main() -> None:
         else:                                            # MILP/straight/etc. have no envelope-recording
             log.info("planner %r has no parallel kernel — running sequential (--mode %s ignored)",
                      cfg.planner, args.mode)
+    else:
+        log.info("mode=sequential: serial FCFS planning")
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,

@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import metrics
+from . import metrics, volumes
 from .config import SimConfig
 from .geometry import BoxSpec, CylinderSpec
 from .sim import SimResult
@@ -151,9 +151,22 @@ def _ledger_end_frame(result: SimResult) -> pd.DataFrame:
     telemetry design §10)."""
     ledger = getattr(result, "ledger", None)
     vols = list(getattr(ledger, "_static_vols", []) or [])
-    rows = [{"wall_idx": j, **_vol_row(v)} for j, v in enumerate(vols)]
+    # Static terminals need not appear on a request (a scenario may place an unused hub), so persist
+    # the lane edge alongside its wall.  Storing the derived radius also preserves the exact archived
+    # geometry if the exit-lane formula changes in a future release.
+    terms = {}
+    for _, raw in (getattr(ledger, "_static_terms", []) or []):
+        if (term := as_terminal(raw)) is not None:
+            terms[str(term.id)] = term
+    rows = []
+    for j, v in enumerate(vols):
+        tid = None if v.terminal_id is None else str(v.terminal_id)
+        term = terms.get(tid)
+        rows.append({"wall_idx": j, **_vol_row(v),
+                     "exit_radius": (volumes.exit_radius(term, result.config)
+                                     if term is not None else np.nan)})
     cols = ["wall_idx", "kind", "t_start", "t_end", "cx", "cy", "cz",
-            "rot", "ext", "radius", "z_lo", "z_hi", "terminal_id"]
+            "rot", "ext", "radius", "z_lo", "z_hi", "terminal_id", "exit_radius"]
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -331,6 +344,9 @@ class LoadedRun:
     intents: list[OperationalIntent]
     verified: bool
     static_walls: list = dataclasses.field(default_factory=list)   # always-active walls (from ledger_end)
+    # Lane edges persisted with static walls.  Old archives omit this field and remain loadable; their
+    # request-associated terminals can still be reconstructed from scenario.parquet.
+    static_exit_radii: dict[str, float] = dataclasses.field(default_factory=dict)
 
     @property
     def accepted(self) -> list[OperationalIntent]:
@@ -434,11 +450,18 @@ def load_run(folder: Path | str) -> LoadedRun:
             solve_time_s=float(fr.solve_time_s),
         ))
     walls = []
+    static_exit_radii = {}
     if (folder / "ledger_end.parquet").exists():   # always-active terminal walls → replay overlay
-        walls = [_volume_from_row(r)
-                 for r in pd.read_parquet(folder / "ledger_end.parquet").itertuples(index=False)]
-    return LoadedRun(config=cfg, intents=intents, static_walls=walls, verified=bool(json.loads(
-        (folder / "experiment.json").read_text()).get("verified", True)))
+        ledger_end = pd.read_parquet(folder / "ledger_end.parquet")
+        for row in ledger_end.itertuples(index=False):
+            wall = _volume_from_row(row)
+            walls.append(wall)
+            er = getattr(row, "exit_radius", np.nan)   # archives written before this column still load
+            if wall.terminal_id is not None and pd.notna(er):
+                static_exit_radii[str(wall.terminal_id)] = float(er)
+    return LoadedRun(config=cfg, intents=intents, static_walls=walls,
+                     static_exit_radii=static_exit_radii, verified=bool(json.loads(
+                         (folder / "experiment.json").read_text()).get("verified", True)))
 
 
 def _volume_from_row(r) -> Volume4D:

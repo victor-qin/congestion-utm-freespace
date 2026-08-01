@@ -14,7 +14,7 @@ from freespace_sim import metrics, runs, viz, viz_html, volumes
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import BoxSpec, box_from_segment
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, vec
+from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 
 
 def _blob(html: str) -> str:
@@ -162,6 +162,25 @@ def test_viz_html_is_selfcontained_and_parses(tmp_path):
     # the slider bounds are substituted as plain numbers, outside the compressed blob
     assert f'min="{payload["simulation_start_s"]}"' in html
     assert f'max="{payload["simulation_end_s"]}"' in html
+    assert 'step="any"' in html                 # fractional realized bounds remain reachable
+
+
+def test_replay_legacy_clip_modes_remain_compatible(tmp_path):
+    """Explicit booleans keep the old public API while omission selects the realized clock."""
+    res = _small_run()
+    realized = viz_html._payload(res)
+    clipped = viz_html._payload(res, clip_to_horizon=True)
+    extended = viz_html._payload(res, clip_to_horizon=False)
+
+    assert realized["simulation_start_s"] == metrics.simulation_window(res)[0]
+    assert (clipped["simulation_start_s"], clipped["simulation_end_s"]) == (
+        0.0, res.config.horizon_s)
+    assert (extended["simulation_start_s"], extended["simulation_end_s"]) == (
+        0.0, max(res.config.horizon_s, metrics.simulation_window(res)[1]))
+
+    # This keyword used to be public; invoking it must produce the requested bounds, not TypeError.
+    out = viz_html.write_html(res, tmp_path / "clipped.html", clip_to_horizon=True)
+    assert _embedded(open(out).read())["simulation_end_s"] == res.config.horizon_s
 
 
 def test_replay_spans_the_realized_run_not_the_horizon():
@@ -298,6 +317,52 @@ console.log(JSON.stringify(out));
     assert got[-1]["clampedAtFit"] == [0, 0]   # at fit there is nowhere to pan to
 
 
+def test_shipped_wheel_handler_normalizes_pixel_line_and_page_units():
+    """A three-line mouse-wheel event should zoom like its 48-pixel equivalent, not 16× less."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    helper = html[html.index("function wheelDeltaPx"):html.index("function redraw()")]
+    harness = helper.replace("{{", "{").replace("}}", "}") + """
+console.log(JSON.stringify([
+  wheelDeltaPx(48, 0, 760), wheelDeltaPx(3, 1, 760),
+  wheelDeltaPx(1, 2, 760), wheelDeltaPx(-2, 1, 760)
+]));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    assert json.loads(proc.stdout) == [48, 48, 760, -32]
+    # Pin the wiring too: a correct but unused helper would leave the original bug intact.
+    assert "wheelDeltaPx(e.deltaY, e.deltaMode, cv.height)" in html
+
+
+def test_shipped_transport_restarts_after_a_fractional_end():
+    """The float clock, not a range value sanitized to an integer, decides whether Play restarts."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    body = html[html.index("let playing=false"):html.index("function buildLegend()")]
+    harness = """
+const START=10.25, END=120.03300000000002, DURATION=END-START, DATA={dt: 1}, IQT=.001;
+const slider={value: 120.033};                     // Chromium's sanitized string for the fractional max
+const elements={slider, play:{textContent:''}, back:{}, fwd:{}, hexToggle:{}, speed:{}};
+const document={getElementById:id=>elements[id], addEventListener:()=>{}};
+const draws=[]; function draw(t){draws.push(t);} function requestAnimationFrame(){}
+""" + body.replace("{{", "{").replace("}}", "}") + """
+wireTransport();
+clock=+slider.value;                               // Chromium stringifies END as the slightly lower 120.033
+elements.play.onclick.call(elements.play);
+console.log(JSON.stringify({draws, playing, text:elements.play.textContent}));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout)
+    assert got["draws"][0] == 10.25              # sanitized value still counts as the endpoint
+    assert got["playing"] is True
+
+
 def test_walls_carry_the_exit_lane_radius():
     """A permanent terminal column must ship the radius at which its RESERVED lanes begin.
 
@@ -305,8 +370,6 @@ def test_walls_carry_the_exit_lane_radius():
     `volumes.exit_radius`. Without it the replay draws reserved traffic beginning in mid-air, with no
     indication that the gap is the unreserved leg the vertiport handles tactically.
     """
-    from freespace_sim.types import Terminal
-
     term = Terminal("hub", capacity=4, radius=180.0)
     # astar, not straight: only the A*-based planners tag terminal airspace, and the straight planner
     # warns (correctly) that the shared-terminal exemption is being dropped
@@ -334,13 +397,77 @@ def test_wall_without_a_known_terminal_has_no_exit_ring():
     assert viz_html._payload(res)["walls"][0]["er"] is None
 
 
+def test_denied_only_terminal_still_supplies_the_exit_ring():
+    """Terminal metadata belongs to every request, not just successful reservations."""
+    cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0))
+    term = Terminal("denied-hub", capacity=2, radius=90.0, corridor_overlap=-20.0)
+    res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+    res.intents[0].request.origin_terminal = term
+    res.intents[0].status = IntentStatus.REJECTED
+    res.intents[0].volumes = None
+    res.intents[0].centerline = None
+    res.static_walls = [volumes.hover_reservation(
+        vec(0, 0, 0), 0.0, cfg, terminal_id=term.id, radius=term.radius)]
+
+    assert viz_html._payload(res)["walls"][0]["er"] == volumes.exit_radius(term, cfg)
+
+
+def test_unused_static_terminal_ring_survives_save_and_load(tmp_path):
+    """An unused placed hub has no request metadata, so ledger_end must persist its lane edge."""
+    res = _small_run()
+    term = Terminal("unused-hub", capacity=3, radius=90.0, corridor_overlap=40.0)
+    res.ledger.register_static_terminal(vec(900, 900, 0), term)
+
+    live_wall = viz_html._payload(res)["walls"][0]
+    assert live_wall["er"] == volumes.exit_radius(term, res.config) == 80.0
+    assert live_wall["er"] < live_wall["r"]                # valid inside ring (positive overlap)
+
+    folder = runs.save_run(res, root=tmp_path, label="static", write_replay=False, index=False)
+    loaded = runs.load_run(folder)
+    archived_wall = viz_html._payload(loaded)["walls"][0]
+    assert archived_wall == live_wall
+
+
+def test_loaded_legacy_wall_without_exit_radius_remains_supported(tmp_path):
+    """Archives predating the new ledger column still load and use request terminal metadata."""
+    import pandas as pd
+
+    cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0))
+    term = Terminal("known-hub", capacity=2, radius=100.0, corridor_overlap=-10.0)
+    res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+    res.intents[0].request.origin_terminal = term
+    res.ledger.register_static_terminal(vec(0, 0, 0), term)
+    folder = runs.save_run(res, root=tmp_path, label="legacy", write_replay=False, index=False)
+    ledger_path = folder / "ledger_end.parquet"
+    pd.read_parquet(ledger_path).drop(columns="exit_radius").to_parquet(ledger_path, index=False)
+
+    loaded = runs.load_run(folder)
+    assert loaded.static_exit_radii == {}
+    assert viz_html._payload(loaded)["walls"][0]["er"] == volumes.exit_radius(term, cfg)
+
+
+def test_shipped_exit_ring_visibility_handles_inside_and_outside_radii():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    html = viz_html._HTML
+    body = html[html.index("function exitRingVisible"):html.index("function draw(t)")]
+    harness = "const VS=1;\n" + body.replace("{{", "{").replace("}}", "}") + """
+console.log(JSON.stringify([
+  exitRingVisible({r:90, er:80}), exitRingVisible({r:90, er:100}),
+  exitRingVisible({r:90, er:90.5}), exitRingVisible({r:90, er:null})
+]));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    assert json.loads(proc.stdout) == [True, True, False, False]
+
+
 def test_shipped_altitude_labels_are_fixed_size_and_only_drawn_when_unambiguous():
     """Runs the shipped label logic in node.
 
-    Two properties, both invisible to any Python-side test since this lives only in the embedded JS:
-    the font is a fixed screen-space size at every zoom (it must not scale with the view), and a drone
-    only gets a label when it is ALONE in its label-sized slot — a label sitting between two adjacent
-    dots cannot be attributed to either, so neither gets one.
+    The font stays fixed in screen space, and collisions are detected across grid-cell boundaries
+    without suppressing labels which happen to be in neighboring cells but do not actually overlap.
     """
     node = shutil.which("node")
     if node is None:
@@ -353,19 +480,39 @@ def test_shipped_altitude_labels_are_fixed_size_and_only_drawn_when_unambiguous(
 const cv = {width: 760, height: 760};
 const drawn = [];
 const ctx = {set fillStyle(v){}, set font(v){this._f = v;}, get font(){return this._f;},
+             measureText(txt){return {width: txt.length*7.8};},
              fillText(txt, x, y){ drawn.push({txt, x, y, font: this._f}); }};
 """ + body.replace("{{", "{").replace("}}", "}") + """
+initLabelGrid(4);
 // two drones 3 px apart (same slot) plus one far away, all on screen
-labelSlots.clear();
+resetLabels();
 noteLabel(80, 100, 100); noteLabel(95, 103, 100); noteLabel(110, 100 + 6*LABEL_W, 400);
 drawLabels();
 const close = drawn.slice();
+// Straddling a cell boundary must not evade collision detection.
+resetLabels(); drawn.length = 0;
+noteLabel(70, LABEL_W-.1, 200); noteLabel(90, LABEL_W+.1, 200);
+drawLabels();
+const boundary = drawn.slice();
+// Adjacent cells alone are not grounds to suppress: these are almost 2*LABEL_W apart.
+resetLabels(); drawn.length = 0;
+noteLabel(60, .1, 250); noteLabel(80, 2*LABEL_W-.1, 250);
+drawLabels();
+const separated = drawn.slice();
+// Valid high flight levels widen the grid using the actual font metrics; a six-character label
+// straddling the new boundary must still collide.
+const normalWidth=LABEL_W; initLabelGrid(6); const highWidth=LABEL_W;
+resetLabels(); drawn.length = 0;
+noteLabel(10000, LABEL_W-.1, 320); noteLabel(10001, LABEL_W+.1, 320);
+drawLabels();
+const high = drawn.slice();
 // off-canvas points are never labelled
-labelSlots.clear(); drawn.length = 0;
+resetLabels(); drawn.length = 0;
 noteLabel(80, -5, 100); noteLabel(80, 100, 1000); noteLabel(95, 300, 300);
 if (LABEL_W < 8) throw new Error('slot narrower than the label it holds');
 drawLabels();
-console.log(JSON.stringify({close, offscreen: drawn.slice()}));
+console.log(JSON.stringify({close, boundary, separated, high, normalWidth, highWidth,
+                            offscreen: drawn.slice()}));
 """
     proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, f"node failed: {proc.stderr}"
@@ -373,11 +520,32 @@ console.log(JSON.stringify({close, offscreen: drawn.slice()}));
 
     # the crowded pair is suppressed; only the isolated drone is labelled
     assert [d["txt"] for d in got["close"]] == ["110m"]
+    assert got["boundary"] == []
+    assert [d["txt"] for d in got["separated"]] == ["60m", "80m"]
+    assert got["high"] == [] and got["highWidth"] > got["normalWidth"]
     # ...and the font is a fixed screen-space px size, not derived from any zoom (the exact value is
     # a display knob, so pin the SHAPE rather than the number)
     assert re.fullmatch(r"\d+px monospace", got["close"][0]["font"])
     # off-canvas drones contribute nothing, so they cannot suppress an on-screen neighbour either
     assert [d["txt"] for d in got["offscreen"]] == ["95m"]
+
+
+def test_payload_sizes_the_label_grid_for_high_altitudes():
+    """The payload must not retain the old four-character ``110m`` width assumption."""
+    res = _small_run()
+    acc = res.accepted[0]
+    high_cl = []
+    for p, t in acc.centerline:
+        p = p.copy()
+        p[2] = 10_000.0
+        high_cl.append((p, t))
+    acc.centerline = high_cl
+    acc.volumes = volumes.build_corridor(high_cl, res.config) + [
+        v for v in acc.volumes if not isinstance(v.shape, BoxSpec)]
+
+    payload = viz_html._payload(res)
+    assert payload["label_chars"] >= len("10000m")
+    assert "initLabelGrid(DATA.label_chars || 4)" in viz_html._HTML
 
 
 def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
@@ -387,6 +555,7 @@ def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
     payload = viz_html._payload(res)
     assert payload["explicit_box_flights"] == 0
     assert all("b" not in f for f in payload["flights"])   # no polygons stored at all
+    assert payload["q"] > viz_html._Q                       # small maps receive finer quantisation
     tol = 0.5 / payload["q"]                               # half a quantum
     for intent, f in zip(res.accepted, payload["flights"]):
         xs, ys, zs = (_undelta(f[k]) for k in "xyz")
@@ -395,7 +564,23 @@ def test_payload_omits_rebuildable_boxes_and_round_trips_the_path():
         for (p, t), qx, qy, qz, qt in zip(intent.centerline, xs, ys, zs, ts):
             assert abs(qx / payload["q"] - p[0]) <= tol and abs(qy / payload["q"] - p[1]) <= tol
             assert abs(qz / payload["q"] - p[2]) <= tol
-            assert abs(qt / payload["qt"] - t) <= 0.5 / payload["qt"]
+            decoded_t = qt / payload["qt"] + payload["simulation_start_s"]
+            assert abs(decoded_t - t) <= 0.5 / payload["qt"]
+
+    # The acceptance gate is tied to the shipped fit scale and maximum zoom, never a world-space
+    # tolerance which becomes visibly large on a small region.
+    px_error = (viz_html._rebuild_tolerance_m(res.config)
+                * (viz_html._CANVAS_PX - 2 * viz_html._PAD_PX)
+                / max(res.config.region_size_m) * viz_html._MAX_ZOOM)
+    assert px_error <= viz_html._REBUILD_ERROR_PX
+
+
+def test_shipped_display_constants_match_the_rebuild_error_model():
+    """The Python half-pixel gate and browser view must not silently drift apart."""
+    html = viz_html._HTML
+    assert f'width="{viz_html._CANVAS_PX}" height="{viz_html._CANVAS_PX}"' in html
+    assert f"const ZMIN=1, ZMAX={viz_html._MAX_ZOOM};" in html
+    assert f"const PAD = {viz_html._PAD_PX};" in html
 
 
 def test_sub_quantum_segment_forces_the_explicit_fallback():
@@ -411,9 +596,10 @@ def test_sub_quantum_segment_forces_the_explicit_fallback():
     res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
     acc = res.accepted[0]
     cl = list(acc.centerline)
-    # splice in a 3 cm near-vertical stub, the shape that quantisation destroys
+    # Splice in a near-vertical stub below half of THIS payload's adaptive quantum, so it rounds away.
     (p, t), (_, t_next) = cl[0], cl[1]
-    stub_end = vec(float(p[0]), float(p[1]), float(p[2]) + 0.03)
+    stub_m = 0.25 / viz_html._position_q(cfg)
+    stub_end = vec(float(p[0]), float(p[1]), float(p[2]) + stub_m)
     acc.centerline = [cl[0], (stub_end, t + (t_next - t) / 2), *cl[1:]]
     acc.volumes = volumes.build_corridor(acc.centerline, cfg) + [
         v for v in acc.volumes if not isinstance(v.shape, BoxSpec)]
@@ -431,8 +617,10 @@ def test_payload_keeps_explicit_boxes_when_not_rebuildable():
     acc = res.accepted[0]
     vols = list(acc.volumes)
     i = next(k for k, v in enumerate(vols) if isinstance(v.shape, BoxSpec))
+    # 49 cm was accepted by the old fixed 0.5 m gate. On this 2.2 km map it is >10 px at 64×,
+    # so the browser must receive the actual polygon rather than silently rebuild the unshifted box.
     moved = dataclasses.replace(vols[i].shape,
-                                center=(vols[i].shape.center[0] + 500.0, *vols[i].shape.center[1:]))
+                                center=(vols[i].shape.center[0] + 0.49, *vols[i].shape.center[1:]))
     vols[i] = dataclasses.replace(vols[i], shape=moved)
     acc.volumes = vols
 
@@ -442,6 +630,32 @@ def test_payload_keeps_explicit_boxes_when_not_rebuildable():
     assert len(doctored["b"]) == len([v for v in vols if isinstance(v.shape, BoxSpec)])
     assert all(len(box) == 11 for box in doctored["b"])    # 8 xy coords + z + t0 + t1
     assert all("b" not in f for f in payload["flights"][1:])
+
+
+def test_shipped_undelta_widens_a_time_stream_past_int32():
+    """Thirty-day timestamps must not wrap negative in the browser's typed array."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+    res = _small_run()
+    acc = res.accepted[0]
+    acc.volumes = None
+    acc.centerline = [(vec(0, 0, 0), 0.0), (vec(100, 0, 0), 30 * 86400.0)]
+    payload = viz_html._payload(res)
+    rec = payload["flights"][0]
+    assert rec["T"] == 1
+    assert _undelta(rec["t"])[-1] == 2_592_000_000
+
+    html = viz_html._HTML
+    source = html[html.index("function undelta"):html.index("async function boot()")]
+    harness = source.replace("{{", "{").replace("}}", "}") + f"""
+const f={json.dumps(rec)};
+const decoded=undelta(f.t, f.T ? Float64Array : Int32Array);
+console.log(JSON.stringify({{last:decoded[decoded.length-1], type:decoded.constructor.name}}));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    assert json.loads(proc.stdout) == {"last": 2_592_000_000, "type": "Float64Array"}
 
 
 def test_write_html_is_byte_reproducible(tmp_path):

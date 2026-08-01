@@ -166,17 +166,15 @@ A standalone webpage (no server) that plays the reservations back like a video:
 
 - **Play / pause** and a **scrub slider**; **⏮ / ⏭** step one timestep (`dt`); **← / →** keys too.
 - **Altitude readout** (multi-level runs only) — a fixed 13 px screen-space label, never scaled by the
-  view (`LABEL_PX` in `viz_html` is the knob; the declutter slot derives from it, so the two cannot
-  drift apart). A drone is labelled only when it is *alone* in its label-sized slot, since a label
-  between two adjacent dots can't be attributed to either; dense regions therefore stay clean and
-  zooming in annotates everything (1% of drones labelled at fit on a 28k-flight run, 93% by 8×, 100%
-  by 16×).
+  view (`LABEL_PX` in `viz_html` is the knob; the declutter grid derives from it, so the two cannot
+  drift apart). A drone is labelled only when its label footprint does not overlap another drone's,
+  including across neighboring grid cells; dense regions therefore stay clean and zooming in annotates
+  everything (1% of drones labelled at fit on a 28k-flight run, 93% by 8×, 100% by 16×).
 - **Terminal columns and their exit lanes** — a permanent (always-active) terminal airspace draws as
-  an amber no-fly disc at its column radius, with a fine ring outside it at `volumes.exit_radius`,
-  where the hub's *reserved* lanes actually begin. The annulus between them is flown but deliberately
-  unreserved — the vertiport deconflicts inside it tactically — so without the ring corridors appear
-  to start in mid-air. The gap is `corridor_width/2` (0.4 px at fit on a 60 km region), so the ring is
-  drawn only once zoom separates it from the column.
+  an amber no-fly disc at its column radius, with a fine ring at `volumes.exit_radius`, where the hub's
+  *reserved* lanes begin. The ring may sit inside or outside the column according to the terminal's
+  configured corridor overlap. With the default flush geometry its separation is `corridor_width/2`
+  (0.4 px at fit on a 60 km region), so it is drawn only once zoom makes it distinct from the column.
 - **Zoom / pan** — scroll to zoom at the cursor, drag to pan, double-click to zoom in, `0` to fit
   (also `+` / `−` and the on-screen buttons). 1–64×, clamped so the region can't slide off-screen.
 - **Hex-grid toggle** — overlays the exact lattice A\* searched on (only shown when an A\*-based
@@ -193,7 +191,7 @@ verbatim reached 78 MB at 4.7k flights (~400 MB at 26k) — too big to archive o
 Three encodings stack to **~140x smaller** (78 MB → 0.55 MB) with no loss of visual fidelity:
 corridor boxes are **not stored at all** but rebuilt in the browser from the path (they are exactly
 the swept centerline, which `viz_html._rebuildable` verifies per flight — a planner that reserves
-anything else keeps explicit polygons); coordinates are quantised to decimetres and delta-encoded;
+anything else keeps explicit polygons); coordinates are quantised to decimetres or finer and delta-encoded;
 and the result is gzipped into one base64 string, inflated on load via `DecompressionStream`
 (Chrome 80+ / Safari 16.4+ / Firefox 113+). Loading got ~14x faster as a side effect, since the
 browser no longer parses tens of MB of JavaScript source.

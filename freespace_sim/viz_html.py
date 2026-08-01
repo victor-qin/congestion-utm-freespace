@@ -13,7 +13,7 @@ naive dump reaches 78 MB at 4.7k flights / ~400 MB at 26k. Three encodings stack
    ``volumes.corridor_segment_volume`` of one path segment, so its 4 footprint corners and both time
    bounds are a pure function of two adjacent path points plus ``corridor_width_m`` /
    ``corridor_height_m`` / ``time_buffer_s``. That alone is 72% of the naive payload. :func:`_rebuildable`
-   *verifies* the identity per flight rather than assuming it, so a planner that reserves something
+   *verifies* sub-pixel fidelity per flight rather than assuming it, so a planner that reserves something
    other than the swept centerline keeps explicit polygons and still replays correctly.
 2. **Coordinates are quantised integers**, delta-encoded per stream (see :data:`_Q` / :data:`_QT`).
    Path points advance by one lattice pitch per timestep, so the deltas collapse to a short run of
@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import math
 import warnings
 
 import numpy as np
@@ -38,20 +39,20 @@ from .sim import SimResult
 from .types import as_terminal
 from .viz import box_footprint, flight_color_by_uss, result_uss_hues, uss_swatch_hex
 
-_Q = 10        # position quantum: decimetres. One canvas pixel is ~79 m on a 60 km region, so this is
-               # ~800x finer than anything that can be seen — and it is finite, unlike a float64 repr.
+_Q = 10        # minimum position quantum: decimetres. Smaller regions use a finer adaptive quantum so
+               # reconstruction remains sub-pixel even at maximum zoom (see _position_q).
 _QT = 1000     # time quantum: milliseconds. Deliberately NOT dt-steps: astar_shortcut splices refined
                # segments that need not land on the dt grid, and ms costs nothing after delta+gzip.
-               # Both quanta must keep the streams inside the browser's Int32Array: at these values a
-               # position overflows only past a 214,000 km region and a time past a 24-day run.
-# A box counts as rebuildable only if the browser's reconstruction lands this close to what was actually
-# reserved. It is deliberately NOT 1e-6: the browser rebuilds from the QUANTISED path, so a faithful
-# reconstruction still differs by up to ~a quantum (more on short segments, where the same endpoint
-# rounding rotates the direction further). 0.5 m is ~0.006 canvas pixels at 60 km — invisible — while
-# still catching the failure that matters: a segment short enough that quantisation collapses it to zero
-# length, or flips segment_frame's near-vertical branch, diverges by metres to tens of metres.
-_REBUILD_TOL = 0.5           # metres
+               # Streams which exceed Int32 are selectively widened in the browser; ordinary runs retain
+               # the smaller typed arrays.
+# These mirror the literal canvas/view constants in _HTML; a regression test pins the two sides together.
+_CANVAS_PX = 760
+_PAD_PX = 20
+_MAX_ZOOM = 64
+_REBUILD_ERROR_PX = 0.5
+_REBUILD_TOL = 0.5           # metres; cap retained for large-region payloads
 _REBUILD_TOL_T = 1.0 / _QT   # seconds — one time quantum, the most dequantisation can shift a window
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 # Warn once this share of flights ships explicit polygons. A few always will — the straight planner's
 # final partial timestep leaves a centimetre-scale remainder segment that quantisation cannot preserve
 # (~1.5% of flights, no measurable size cost). The threshold is there to catch the *systemic* failure:
@@ -82,6 +83,22 @@ def _delta(vals: list[int]) -> list[int]:
     return out
 
 
+def _rebuild_tolerance_m(cfg) -> float:
+    """Largest world-space reconstruction error that remains half a pixel at maximum zoom."""
+    fit_px_per_m = (_CANVAS_PX - 2 * _PAD_PX) / max(cfg.region_size_m)
+    return min(_REBUILD_TOL, _REBUILD_ERROR_PX / (fit_px_per_m * _MAX_ZOOM))
+
+
+def _position_q(cfg) -> int:
+    """Position units/metre, tightened on small regions to leave room for angular quantisation error."""
+    return max(_Q, math.ceil(2.0 / _rebuild_tolerance_m(cfg)))
+
+
+def _needs_float64(*streams: list[int]) -> bool:
+    """Whether an undelta'd stream cannot be represented by a browser ``Int32Array``."""
+    return any(v < _INT32_MIN or v > _INT32_MAX for stream in streams for v in stream)
+
+
 def _scene_json(payload: dict) -> str:
     """The exact bytes that get gzipped into the page — shared with the tests so a size or
     round-trip assertion cannot drift from what ``write_html`` actually compresses."""
@@ -102,8 +119,8 @@ def _footprint_xy(spec: BoxSpec) -> tuple[float, ...]:
             cx - ax - bx, cy - ay - by, cx - ax + bx, cy - ay + by)
 
 
-def _rebuildable(intent, cfg, quantised_centerline) -> bool:
-    """True when the browser's reconstruction of this flight's corridor boxes matches what was reserved.
+def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
+    """True when the browser's reconstruction stays within ``tolerance_m`` of what was reserved.
 
     When it does, the payload can drop the boxes entirely and let JS rebuild them — the single biggest
     lever on file size (see the module docstring).
@@ -122,12 +139,13 @@ def _rebuildable(intent, cfg, quantised_centerline) -> bool:
         return False
     return all(
         abs(a.t_start - b.t_start) <= _REBUILD_TOL_T and abs(a.t_end - b.t_end) <= _REBUILD_TOL_T
-        and abs(a.shape.center[2] - b.shape.center[2]) <= _REBUILD_TOL      # level dash styling
-        and all(abs(p - q) <= _REBUILD_TOL for p, q in zip(_footprint_xy(a.shape), _footprint_xy(b.shape)))
+        and abs(a.shape.center[2] - b.shape.center[2]) <= tolerance_m      # level dash styling
+        and all(abs(p - q) <= tolerance_m
+                for p, q in zip(_footprint_xy(a.shape), _footprint_xy(b.shape)))
         for a, b in zip(got, want))
 
 
-def _payload(result: SimResult) -> dict:
+def _payload(result: SimResult, clip_to_horizon: bool | None = None) -> dict:
     """Flatten the accepted intents into a compact, JSON-serialisable scene description.
 
     The clock spans the **realized operation** — :func:`metrics.simulation_window`, i.e. the first
@@ -136,20 +154,33 @@ def _payload(result: SimResult) -> dict:
     seconds, and they all land long before the envelope closes. Anchoring on it left the density replays
     with 768 s of nothing at the head and 3329 s at the tail — 57% of the slider scrubbing through an
     empty sky. This is a display choice only; the measurement window is a separate concern that
-    :func:`metrics.steady_state_window` owns (issue #25)."""
+    :func:`metrics.steady_state_window` owns (issue #25).
+
+    ``clip_to_horizon`` is a compatibility switch for callers of the previous API. ``None`` (the new
+    default) uses the realized window; explicit ``True`` restores ``[0, horizon_s]`` and explicit
+    ``False`` restores ``[0, max(horizon_s, last activity)]``.
+    """
     cfg = result.config
     hues = result_uss_hues(result)
     usses = sorted(hues)
     uss_ix = {u: i for i, u in enumerate(usses)}
-    play_start, play_end = metrics.simulation_window(result)
+    realized_start, realized_end = metrics.simulation_window(result)
+    if clip_to_horizon is None:
+        play_start, play_end = realized_start, realized_end
+    elif clip_to_horizon:
+        play_start, play_end = 0.0, float(cfg.horizon_s)
+    else:
+        play_start, play_end = 0.0, max(float(cfg.horizon_s), realized_end)
+    position_q = _position_q(cfg)
+    rebuild_tolerance_m = _rebuild_tolerance_m(cfg)
 
     def q(v) -> int:                       # metres → quantised int
-        return round(float(v) * _Q)
+        return round(float(v) * position_q)
 
     def qt(t) -> int:                      # absolute seconds → quantised int, relative to play_start
         return round((float(t) - play_start) * _QT)
 
-    flights, n_explicit = [], 0
+    flights, n_explicit, label_chars = [], 0, 4
     for intent in result.accepted:
         req = intent.request
         r, g, b = flight_color_by_uss(req.uss_id, req.flight_id, hues)
@@ -161,6 +192,11 @@ def _payload(result: SimResult) -> dict:
         qy = [q(p[1]) for p, _ in cl]
         qz = [q(p[2]) for p, _ in cl]
         qtime = [qt(t) for _, t in cl]
+        if qz:
+            # Math.round(z*IQ)+'m' is what JS renders. Publish its maximum character count so the
+            # declutter grid grows with valid high/negative flight levels instead of assuming '110m'.
+            label_chars = max(label_chars, max(
+                len(str(math.floor(z / position_q + 0.5))) + 1 for z in qz))
         rec = {
             "i": req.flight_id,
             "u": uss_ix[req.uss_id],
@@ -174,9 +210,15 @@ def _payload(result: SimResult) -> dict:
             "c": [[q(v.shape.cx), q(v.shape.cy), q(v.shape.radius), qt(v.t_start), qt(v.t_end)]
                   for v in vols if isinstance(v.shape, CylinderSpec)],
         }
-        dequantised = [(np.array([x / _Q, y / _Q, z / _Q]), t / _QT + play_start)
+        if _needs_float64(qx, qy, qz):
+            rec["P"] = 1                  # only this flight pays for 64-bit position arrays in JS
+        if _needs_float64(qtime):
+            rec["T"] = 1                  # e.g. a >24.86-day clock; prevents signed Int32 wraparound
+        dequantised = [(np.array([x / position_q, y / position_q, z / position_q]),
+                        t / _QT + play_start)
                        for x, y, z, t in zip(qx, qy, qz, qtime)]
-        if not _rebuildable(intent, cfg, dequantised):   # explicit polygons for just this flight
+        if not _rebuildable(intent, cfg, dequantised, rebuild_tolerance_m):
+            # explicit polygons for just this flight
             n_explicit += 1
             rec["b"] = [[*(q(c) for corner in box_footprint(v.shape) for c in corner),
                          q(v.shape.center[2]), qt(v.t_start), qt(v.t_end)]
@@ -189,25 +231,37 @@ def _payload(result: SimResult) -> dict:
     from .planner.hexgrid import circumradius
     # always-active terminal WALLS (permanent no-fly columns) live in the ledger, NOT in any accepted
     # intent's volumes — render them as permanent overlays so a denial's blocker is visible. Each also
-    # carries its EXIT-LANE radius: where the hub's reserved lanes actually begin. The annulus between
-    # the two is flown but deliberately unreserved (the vertiport deconflicts inside it tactically), so
-    # without the ring the replay shows corridors starting in mid-air a corridor-width off the column.
+    # carries its EXIT-LANE radius: where the hub's reserved lanes begin. Configured overlap can place
+    # that edge inside or outside the column; without the ring the replay makes the transition look like
+    # unexplained missing corridor geometry.
     terms = {}
-    for intent in result.accepted:
+    for intent in result.intents:                         # denied-only hubs still own static walls
         for t in (intent.request.origin_terminal, intent.request.dest_terminal):
             if (t := as_terminal(t)) is not None:
                 terms[str(t.id)] = t
+    # A scenario can register a static hub which no request happens to use. The ledger is authoritative
+    # when its descriptor disagrees with request metadata.
+    ledger = getattr(result, "ledger", None)
+    for _, raw in (getattr(ledger, "_static_terms", []) or []):
+        if (term := as_terminal(raw)) is not None:
+            terms[str(term.id)] = term
+    persisted_radii = {str(k): float(v) for k, v in
+                       (getattr(result, "static_exit_radii", {}) or {}).items()
+                       if math.isfinite(float(v))}
     walls = []
     for v in _static_walls(result):
         if not isinstance(v.shape, CylinderSpec):
             continue
         tid = None if v.terminal_id is None else str(v.terminal_id)
         term = terms.get(tid)
+        er = persisted_radii.get(tid)
+        if er is None and term is not None:
+            er = volumes.exit_radius(term, cfg)
         walls.append({"cx": float(v.shape.cx), "cy": float(v.shape.cy), "r": float(v.shape.radius),
                       "tid": tid,
                       # volumes.exit_radius is the single source of truth for the lane edge — the same
                       # radius the A* fold, the commit, and TerminalCapacity.exit_clear all root on.
-                      "er": volumes.exit_radius(term, cfg) if term is not None else None})
+                      "er": er})
     return {
         "v": 2,                              # payload schema version
         "simulation_start_s": play_start,
@@ -216,13 +270,13 @@ def _payload(result: SimResult) -> dict:
         "horizon": play_end,                 # compatibility alias for older payload consumers
         "dt": cfg.dt_s,
         "region": list(cfg.region_size_m),
-        "q": _Q, "qt": _QT,                  # quantisation of the per-flight int streams
+        "q": position_q, "qt": _QT,          # quantisation of the per-flight int streams
         "corridor_w": cfg.corridor_width_m,  # the three scalars that let JS rebuild every corridor box
         "corridor_h": cfg.corridor_height_m,
         "t_buffer": cfg.time_buffer_s,
         "flights": flights,
-        "explicit_box_flights": n_explicit,  # flights whose boxes could NOT be rebuilt (0 for every
-                                             # centerline-swept planner; non-zero is worth investigating)
+        "explicit_box_flights": n_explicit,  # flights whose boxes could NOT be rebuilt faithfully
+                                             # (systemic non-zero is worth investigating)
         "walls": walls,                      # permanent terminal no-fly columns (always-active)
         "usses": usses,                      # index order for each flight's "u"
         "uss_colors": {uid: uss_swatch_hex(uid, hues) for uid in usses},   # legend / per-USS slice
@@ -230,6 +284,7 @@ def _payload(result: SimResult) -> dict:
         "hex_R": circumradius(cfg) if hex_available else 0.0,
         "planner": cfg.planner,
         "flight_levels": [round(float(z), 1) for z in cfg.flight_levels_m],
+        "label_chars": label_chars,
     }
 
 
@@ -281,13 +336,13 @@ _HTML = """<!doctype html><html><head><meta charset="utf-8"><title>FCFS replay</
 </style></head><body><div id="wrap">
  <h3>FCFS strategic deconfliction — free-space replay</h3>
  <small>corridors = trajectory intents · circles = hover reservations · dots = drones · dashed = straight origin→dest<br>
- amber disc = permanent terminal column (no-fly) · fine ring outside it = where its reserved exit lanes begin<br>
+ amber disc = permanent terminal column (no-fly) · fine ring = where its reserved exit lanes begin<br>
  scroll to zoom · drag to pan · double-click to zoom in · <kbd>0</kbd> to fit</small>
  <canvas id="c" width="760" height="760"></canvas>
  <div id="bar"><button id="play">▶ play</button>
   <button id="back" title="step back one timestep">⏮</button>
   <button id="fwd" title="step forward one timestep">⏭</button>
-  <input id="slider" type="range" min="{start}" max="{end}" value="{start}" step="1">
+  <input id="slider" type="range" min="{start}" max="{end}" value="{start}" step="any">
   <span id="t">decompressing…</span>
   <label class="tog" for="speed">speed
    <select id="speed" title="playback speed">
@@ -334,8 +389,8 @@ async function inflate(b64){{
   const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
   return new TextDecoder().decode(await new Response(stream).arrayBuffer());
 }}
-function undelta(a){{                                     // delta stream → absolute values, unboxed
-  const out = new Int32Array(a.length); let v = 0;
+function undelta(a, Out=Int32Array){{                     // delta stream → absolute values, unboxed
+  const out = new Out(a.length); let v = 0;
   for(let i=0;i<a.length;i++){{ v += a[i]; out[i] = v; }}
   return out;
 }}
@@ -346,7 +401,12 @@ async function boot(){{
   END = DATA.simulation_end_s; DURATION = Math.max(0, DATA.simulation_duration_s);
   [W, H] = DATA.region; S = (cv.width - 2*PAD)/Math.max(W, H); VS = S; Z = 1; VX = VY = 0;
   CW = DATA.corridor_w; CH = DATA.corridor_h; TBQ = DATA.t_buffer*DATA.qt;
-  for(const f of DATA.flights){{ f.x=undelta(f.x); f.y=undelta(f.y); f.z=undelta(f.z); f.t=undelta(f.t); }}
+  initLabelGrid(DATA.label_chars || 4);
+  for(const f of DATA.flights){{
+    const Pos = f.P ? Float64Array : Int32Array;          // widen only streams that cannot fit signed i32
+    f.x=undelta(f.x,Pos); f.y=undelta(f.y,Pos); f.z=undelta(f.z,Pos);
+    f.t=undelta(f.t,f.T ? Float64Array : Int32Array);
+  }}
   buildIndex();
   if(!DATA.hex_available) document.getElementById('hexWrap').style.display='none';
   buildLegend(); buildLevelLegend(); wireTransport(); wireView();
@@ -435,30 +495,68 @@ function strokePoly(p, color, z){{
 const POLY = new Float64Array(8);                            // scratch, reused every segment
 // Altitude-label size, in SCREEN px — the one knob. The declutter slot is DERIVED from it so the two
 // cannot drift apart: bump LABEL_PX alone and the slot grows to match, instead of labels quietly
-// starting to overlap again. Monospace glyphs are ~0.6em, and the widest label is 4 chars ('110m').
+// starting to overlap again. The payload supplies the widest altitude's character count.
 const LABEL_PX = 13;
 const LABEL_FONT = LABEL_PX + 'px monospace';
-const LABEL_W = Math.ceil(LABEL_PX * 0.6 * 4) + 8, LABEL_H = LABEL_PX + 4;
-const labelSlots = new Map();                                // per-frame: slot -> {{n, z, X, Y}}
+const LABEL_H = LABEL_PX + 4;
+let LABEL_W=40, LABEL_COLS=0, LABEL_ROWS=0;
+let labelHeads, labelCounts;                                  // fixed grid; nodes are pooled across frames
+const labelNodes = [];
+let labelCount = 0;
 // The altitude readout is drawn in SCREEN pixels and deliberately does NOT scale with zoom — a label
 // that grew with the view would swamp the map. What makes it LOOK like it scales is density: at fit a
 // dense run puts ~3 drones in every label-sized slot (5.5k into 1.8k, measured) and their labels
 // overprint into one illegible block, which then thins out as you zoom in.
 //
-// So the rule is not "shrink them" but "only draw a label you can attribute": a slot gets its label
-// only if exactly ONE drone is in it. Two drones a few pixels apart cannot be told apart by a label
-// sitting between them, so neither gets one. That is self-tuning — dense regions stay clean, sparse
-// ones are fully annotated, and zooming in reveals the rest because the drones themselves separate.
+// So the rule is not "shrink them" but "only draw a label you can attribute". The grid makes that
+// neighbor search linear in normal use; the overlap check reaches across cell boundaries, where two
+// labels can be only a fraction of a pixel apart despite belonging to different cells.
+function labelsOverlap(a,b){{
+  return Math.abs(a.X-b.X)<LABEL_W && Math.abs(a.Y-b.Y)<LABEL_H;
+}}
+function initLabelGrid(chars){{
+  ctx.font=LABEL_FONT;
+  // Monospace makes character count sufficient, while measureText uses the browser's actual font metric
+  // instead of assuming every platform renders a glyph at exactly 0.6em.
+  LABEL_W=Math.ceil(ctx.measureText('0'.repeat(Math.max(1,chars))).width)+8;
+  LABEL_COLS=Math.floor(cv.width/LABEL_W)+1; LABEL_ROWS=Math.floor(cv.height/LABEL_H)+1;
+  labelHeads=new Int32Array(LABEL_COLS*LABEL_ROWS);
+  labelCounts=new Uint32Array(LABEL_COLS*LABEL_ROWS);
+}}
+function resetLabels(){{
+  labelHeads.fill(-1); labelCounts.fill(0); labelCount=0;  // retain pooled node objects, avoid frame churn
+}}
 function noteLabel(z, X, Y){{
   if(X < 0 || X > cv.width || Y < 0 || Y > cv.height) return;   // off-canvas: never drawn
-  const key = Math.floor(X/LABEL_W) + ',' + Math.floor(Y/LABEL_H);
-  const slot = labelSlots.get(key);
-  if(slot) slot.n++; else labelSlots.set(key, {{n: 1, z, X, Y}});
+  const ix=Math.floor(X/LABEL_W), iy=Math.floor(Y/LABEL_H), ci=iy*LABEL_COLS+ix;
+  let rec=labelNodes[labelCount];
+  if(rec){{ rec.z=z; rec.X=X; rec.Y=Y; rec.ok=true; rec.next=-1; }}
+  else {{ rec={{z,X,Y,ok:true,next:-1}}; labelNodes.push(rec); }}
+
+  // Every point in the same half-open cell overlaps. By induction, after the second arrives every
+  // existing node there is already invalid, so touching the head is sufficient rather than O(n²).
+  if(labelCounts[ci]){{ rec.ok=false; labelNodes[labelHeads[ci]].ok=false; }}
+  for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){{
+    if((dx===0&&dy===0) || ix+dx<0 || ix+dx>=LABEL_COLS || iy+dy<0 || iy+dy>=LABEL_ROWS) continue;
+    const ni=(iy+dy)*LABEL_COLS+(ix+dx), n=labelCounts[ni];
+    if(!n) continue;
+    if(n===1){{                                           // the sole neighbor may still be drawable
+      const other=labelNodes[labelHeads[ni]];
+      if(labelsOverlap(rec,other)){{ rec.ok=false; other.ok=false; }}
+    }} else if(rec.ok){{                                  // crowded neighbors are already all suppressed
+      for(let j=labelHeads[ni];j>=0;j=labelNodes[j].next)
+        if(labelsOverlap(rec,labelNodes[j])){{ rec.ok=false; break; }}
+    }}
+  }}
+  rec.next=labelHeads[ci]; labelHeads[ci]=labelCount; labelCounts[ci]++; labelCount++;
 }}
 function drawLabels(){{                                      // after every flight, so counts are final
   ctx.fillStyle='#c6cedb'; ctx.font=LABEL_FONT;              // a touch brighter at this size
-  for(const s of labelSlots.values())
-    if(s.n === 1) ctx.fillText(Math.round(s.z)+'m', s.X+7, s.Y-6);   // clear of the 4 px drone dot
+  for(let i=0;i<labelCount;i++){{ const s=labelNodes[i];
+    if(s.ok) ctx.fillText(Math.round(s.z)+'m', s.X+7, s.Y-6); }}     // clear of the 4 px drone dot
+}}
+function exitRingVisible(wl){{
+  return Number.isFinite(wl.er) && wl.er>0 && Math.abs(wl.er-wl.r)*VS >= 1.5;
 }}
 function draw(t){{
   if(!DATA) return;
@@ -471,15 +569,15 @@ function draw(t){{
     ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.r*VS,0,2*Math.PI);
     ctx.fillStyle='#f59e0b1f'; ctx.fill();
     ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle='#b45309aa'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
-    // The exit-lane ring: where this hub's RESERVED lanes begin. Drawn only once it is more than a
-    // pixel outside the column — at fit the gap is corridor_width/2 (0.4 px on a 60 km region), so
+    // The exit-lane ring: where this hub's RESERVED lanes begin. Drawn only once it is visibly distinct
+    // from the column — at fit the usual gap is corridor_width/2 (0.4 px on a 60 km region), so
     // below that it is 490 arcs a frame drawing nothing you can see.
-    if(wl.er && (wl.er - wl.r)*VS >= 1.5){{
+    if(exitRingVisible(wl)){{
       ctx.save(); ctx.beginPath(); ctx.arc(sx(wl.cx),sy(wl.cy),wl.er*VS,0,2*Math.PI);
       ctx.setLineDash([2,3]); ctx.strokeStyle='#fbbf2466'; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
     }}
   }}
-  labelSlots.clear();
+  resetLabels();
   const tq = (t - START)*DATA.qt, lo = tq - TBQ, hi = tq + TBQ;
   const bk = buckets[Math.max(0, Math.min(buckets.length-1, Math.floor((t - START)/BW)))] || [];
   let nActive = 0;
@@ -535,6 +633,9 @@ function setZoom(z, ax, ay){{                             // zoom about the canv
   clampView(); redraw();
 }}
 function resetView(){{ Z = 1; VS = S; VX = VY = 0; redraw(); }}
+function wheelDeltaPx(deltaY, mode, pagePx){{             // WheelEvent line/page units → CSS pixels
+  return deltaY * (mode===1 ? 16 : mode===2 ? pagePx : 1);
+}}
 function redraw(){{
   document.getElementById('zoomLbl').textContent = Z.toFixed(Z < 10 ? 1 : 0) + '\u00d7';
   draw(+slider.value);
@@ -543,7 +644,8 @@ function wireView(){{
   cv.style.cursor = 'grab';
   cv.addEventListener('wheel', e => {{                     // wheel / trackpad pinch → zoom at cursor
     e.preventDefault();
-    setZoom(Z * Math.pow(1.0015, -e.deltaY), e.offsetX, e.offsetY);
+    const dy = wheelDeltaPx(e.deltaY, e.deltaMode, cv.height);
+    setZoom(Z * Math.pow(1.0015, -dy), e.offsetX, e.offsetY);
   }}, {{passive: false}});
   let dragging = false, lx = 0, ly = 0;
   cv.addEventListener('mousedown', e => {{ dragging = true; lx = e.offsetX; ly = e.offsetY;
@@ -568,13 +670,14 @@ function wireView(){{
 
 // ---------------------------------------------------------------- transport
 let playing=false, speed=1, clock=START;
+function atEnd(t){{ return t >= END - IQT/2; }}             // tolerate range-input decimal sanitization
 function step(d){{ playing=false; document.getElementById('play').textContent='▶ play';
   clock = Math.max(START, Math.min(END, +slider.value + d)); slider.value=clock; draw(clock); }}
-// the play position is a FLOAT clock, not the slider value — the range input snaps to step=1, so it
-// cannot hold sub-unit advances and speeds < 1 would round away. At 1x the realized run plays in
+// The play position is a FLOAT clock (rather than repeatedly reading the range control), so sub-unit
+// advances and fractional bounds survive browser value sanitization. At 1x the realized run plays in
 // ~10s (60fps · duration/600 per frame); speed scales that per-frame step (0.25x ⇒ 40s, 8x ⇒ ~1.25s).
 function tick(){{ if(!playing || DURATION<=0) return; clock += speed*DURATION/600;
-  if(clock>=END){{ clock=END; slider.value=clock; draw(clock); playing=false;
+  if(atEnd(clock)){{ clock=END; slider.value=clock; draw(clock); playing=false;
     document.getElementById('play').textContent='▶ play'; return; }}
   slider.value=clock; draw(clock); requestAnimationFrame(tick); }}
 function wireTransport(){{
@@ -585,8 +688,8 @@ function wireTransport(){{
   document.getElementById('speed').onchange=function(){{ speed=+this.value; }};
   document.getElementById('play').onclick=function(){{ playing=!playing;
     if(playing && DURATION<=0) playing=false;
-    this.textContent = playing?'⏸ pause':'▶ play'; if(playing){{ clock=+slider.value;
-      if(clock>=END){{ clock=START; slider.value=clock; draw(clock); }} tick(); }} }};
+    this.textContent = playing?'⏸ pause':'▶ play'; if(playing){{
+      if(atEnd(clock)){{ clock=START; slider.value=clock; draw(clock); }} tick(); }} }};
   document.addEventListener('keydown', e=>{{      // ← / → step one timestep, space toggles play
     if(e.key==='ArrowLeft') step(-DATA.dt);
     else if(e.key==='ArrowRight') step(+DATA.dt);
@@ -619,9 +722,13 @@ function buildLevelLegend(){{                     // flight-level dash key (A* m
 </script></body></html>"""
 
 
-def write_html(result: SimResult, out) -> str:
-    """Render the realized run to a standalone HTML scrubber; return the output path."""
-    payload = _payload(result)
+def write_html(result: SimResult, out, clip_to_horizon: bool | None = None) -> str:
+    """Render a standalone HTML scrubber; return its path.
+
+    With no compatibility argument the replay uses the realized operation. Explicit booleans retain
+    the previous API's horizon-clipped (``True``) and horizon-or-tail (``False``) clock modes.
+    """
+    payload = _payload(result, clip_to_horizon)
     n_explicit, n_flights = payload["explicit_box_flights"], len(payload["flights"])
     if n_flights and n_explicit > _FALLBACK_WARN_FRAC * n_flights:
         # Loud, because this is the size lever failing: these flights ship their polygons verbatim, which

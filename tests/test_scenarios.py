@@ -157,7 +157,7 @@ def test_density_scenario_matrix(name, hubs, rates):
     cfg = spec.config()
     demand = spec.demand_model()
 
-    assert cfg.region_size_m == (60_000.0, 60_000.0)
+    assert cfg.region_size_m == (60_000.0, 30_000.0)
     assert cfg.horizon_s == 7200.0
     assert cfg.demand_duration_s == 1800.0
     assert cfg.flight_levels_m == (100.0,)

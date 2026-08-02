@@ -276,7 +276,7 @@ def _unimpeded_cruise_z(cfg: SimConfig) -> float:
     relabels to its own stage (``astar_milp`` stamps 'milp'), dropping the A* origin. So a
     single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced
     climb above the floor reads positive excess (real congestion)."""
-    if "astar" in cfg.planner:
+    if "astar" in cfg.planner or "colgen" in cfg.planner:
         return cfg.flight_levels_m[0]
     if "milp" in cfg.planner:
         return cfg.z_min_m           # MILP band floor (astar_milp takes the astar branch — same value)

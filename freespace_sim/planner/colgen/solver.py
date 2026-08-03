@@ -22,9 +22,22 @@ import numpy as np
 from ...config import SimConfig
 from ...types import FlightRequest, as_terminal
 from .master import BackendTimeout, RestrictedMaster
-from .network import FlightGraph, RowIndex, RowKey, build_flight_graph, column_claims
+from .network import (
+    FlightGraph,
+    RowIndex,
+    RowKey,
+    StaticTerminalCatalog,
+    build_flight_graph,
+    column_claims,
+)
 from .params import ColGenParams
-from .pricing import PricingTimeout, price_flight, seed_column
+from .pricing import (
+    DualView,
+    PricingTimeout,
+    find_feasible_column,
+    price_flight,
+    seed_column,
+)
 from .translate import Column
 
 _FEASIBILITY_TOL = 1e-7
@@ -159,40 +172,103 @@ def _greedy_feasible_selection(
     params: ColGenParams,
     *,
     deadline: float,
+    initial: Mapping[int, Column] | None = None,
 ) -> tuple[dict[int, Column], bool]:
-    """Build a route-aware FCFS incumbent with exact forbidden-row pricing.
+    """Improve a complete seed incumbent with lazy best-first local searches.
 
     The shifted-seed schedule above is a cheap fallback, but it cannot route
-    around a busy cell.  This pass asks the same exact pricing DAG for the
-    minimum-delay column avoiding rows already saturated by earlier flights.
-    It is only an incumbent heuristic: timeout leaves a valid partial schedule
-    and never changes the master universe or any global bound.
+    around a busy cell.  This post-first-LP pass removes one flight at a time
+    from the incumbent, asks the pricing topology for a lower-delay replacement
+    avoiding every other selected column, and restores the old column when no
+    improvement is found.  A timeout therefore keeps a complete feasible
+    schedule instead of discarding a partially built prefix.  It remains only
+    an incumbent heuristic and never contributes to a global bound.
     """
 
-    selected: dict[int, Column] = {}
-    loads: Counter[RowKey] = Counter(fixed_loads)
+    selected: dict[int, Column] = dict(initial or {})
+    loads = _loads_for(selected, fixed_loads)
+    saturated = {
+        row for row, load in loads.items() if load >= row_index.cap(row)
+    }
+
+    def remove_claims(claims: frozenset[RowKey]) -> None:
+        for row in claims:
+            old_load = loads[row]
+            new_load = old_load - 1
+            if new_load:
+                loads[row] = new_load
+            else:
+                del loads[row]
+            if old_load >= row_index.cap(row) and new_load < row_index.cap(row):
+                saturated.discard(row)
+
+    def add_claims(claims: frozenset[RowKey]) -> None:
+        for row in claims:
+            old_load = loads[row]
+            new_load = old_load + 1
+            loads[row] = new_load
+            if old_load < row_index.cap(row) <= new_load:
+                saturated.add(row)
+
     order = sorted(
-        graphs.values(),
-        key=lambda graph: (graph.request.t_departure, graph.request.flight_id),
+        (
+            graph
+            for graph in graphs.values()
+            if graph.request.flight_id not in selected
+            or selected[graph.request.flight_id].delay_s > _OBJECTIVE_TOL
+        ),
+        key=lambda graph: (
+            -selected[graph.request.flight_id].delay_s
+            if graph.request.flight_id in selected
+            else -math.inf,
+            graph.request.t_departure,
+            graph.request.flight_id,
+        ),
     )
-    for graph in order:
+    candidate_limit = max(64, params.n_heuristic_tries * 16)
+    completed = len(order) <= candidate_limit
+    order = order[:candidate_limit]
+    for graph_index, graph in enumerate(order):
         if time.monotonic() >= deadline:
             return dict(sorted(selected.items())), False
-        saturated = frozenset(row for row, load in loads.items() if load >= row_index.cap(row))
+        flight_id = graph.request.flight_id
+        incumbent = selected.pop(flight_id, None)
+        if incumbent is not None:
+            remove_claims(incumbent.claims)
+
+        now = time.monotonic()
+        attempts_remaining = len(order) - graph_index
+        # Reserve an equal share for every remaining flight.  Easy A* searches
+        # return early and donate their unused share; a hard flight times out
+        # locally instead of preventing the rest of the sweep from being tried.
+        flight_deadline = min(deadline, now + (deadline - now) / attempts_remaining)
         try:
-            _reduced_cost, candidate = price_flight(
+            candidate = find_feasible_column(
                 graph,
-                {},
-                0.0,
                 cfg,
-                params,
                 forbidden_rows=saturated,
-                require_improving=False,
-                deadline=deadline,
+                improve_below_delay_s=(
+                    None if incumbent is None else incumbent.delay_s
+                ),
+                deadline=flight_deadline,
             )
         except PricingTimeout:
-            return dict(sorted(selected.items())), False
-        if candidate is None:
+            completed = False
+            if incumbent is not None:
+                selected[flight_id] = incumbent
+                add_claims(incumbent.claims)
+            continue
+        if candidate is None or (
+            incumbent is not None
+            and not _better_selection(
+                {flight_id: candidate},
+                {flight_id: incumbent},
+                benefit=0.0,
+            )
+        ):
+            if incumbent is not None:
+                selected[flight_id] = incumbent
+                add_claims(incumbent.claims)
             continue
         candidate = _canonical_column(candidate, graph, cfg)
         if any(loads[row] + 1 > row_index.cap(row) for row in candidate.claims):
@@ -200,9 +276,9 @@ def _greedy_feasible_selection(
                 f"greedy pricing returned an infeasible column for flight "
                 f"{graph.request.flight_id}"
             )
-        selected[graph.request.flight_id] = candidate
-        loads.update(candidate.claims)
-    return dict(sorted(selected.items())), True
+        selected[flight_id] = candidate
+        add_claims(candidate.claims)
+    return dict(sorted(selected.items())), completed
 
 
 def _column_key(column: Column) -> tuple[Any, ...]:
@@ -298,16 +374,32 @@ def _pre_master_timeout_result(
     flight_ids: Sequence[int],
     started: float,
     params: ColGenParams,
+    *,
+    stage: str = "startup",
+    graphs: Mapping[int, FlightGraph] | None = None,
+    catalog: StaticTerminalCatalog | None = None,
+    graph_build_elapsed_s: float = 0.0,
+    seed_elapsed_s: float = 0.0,
+    seeds_completed: int = 0,
+    seed_flights_processed: int = 0,
+    master: RestrictedMaster | None = None,
+    time_to_master_s: float = 0.0,
+    seedless_flight_ids: Sequence[int] = (),
 ) -> ColGenResult:
     """Return an explicit compute-cap verdict before a usable master exists."""
 
     elapsed_s = time.monotonic() - started
     denied = tuple(flight_ids)
     heuristic_cost = len(denied) * params.M
+    graph_values = tuple((graphs or {}).values())
+    arc_stats: Counter[str] = Counter()
+    for graph in graph_values:
+        arc_stats.update(graph.arc_cache_stats)
+    wall_stats = {} if catalog is None else catalog.wall_index.stats
     return ColGenResult(
         columns={},
         stats={
-            "backend": "none",
+            "backend": "none" if master is None else _backend_name(master),
             "iterations": 0,
             "termination_reason": "time_limit",
             "lp_objectives": (),
@@ -342,17 +434,38 @@ def _pre_master_timeout_result(
             "budget_denied_flight_ids": (),
             "search_exhausted_flight_ids": denied,
             "repair_added": 0,
-            "seedless_flight_ids": (),
+            "seedless_flight_ids": tuple(sorted(seedless_flight_ids)),
             "initial_heuristic_strategy": "time_limit",
             "initial_heuristic_flights": 0,
             "initial_heuristic_delay_s": 0.0,
             "initial_greedy_completed": False,
             "initial_greedy_flights": 0,
             "initial_greedy_elapsed_s": 0.0,
+            "initial_seed_columns": seeds_completed,
+            "graphs_built": len(graph_values),
+            "seeds_completed": seeds_completed,
+            "seed_flights_processed": seed_flights_processed,
+            "preprocessing_stage": stage,
+            "graph_build_elapsed_s": graph_build_elapsed_s,
+            "seed_elapsed_s": seed_elapsed_s,
+            "time_to_master_s": time_to_master_s,
+            "static_terminal_count": 0 if catalog is None else len(catalog.entries),
+            "static_excluded_cells": 0 if catalog is None else catalog.excluded_cell_count,
+            "corridor_domains_materialized": sum(
+                bool(getattr(graph.corridor_cells, "is_materialized", True))
+                for graph in graph_values
+            ),
+            "arc_expanded_nodes": arc_stats["expanded_nodes"],
+            "arc_checks": arc_stats["arc_checks"],
+            "arc_cache_hits": arc_stats["cache_hits"],
+            "arc_allowed": arc_stats["allowed_arcs"],
+            "arc_blocked": arc_stats["blocked_arcs"],
+            "wall_index_queries": int(wall_stats.get("queries", 0)),
+            "wall_index_candidates": int(wall_stats.get("candidates", 0)),
             "pricing_flights_completed": 0,
             "pricing_sweeps_completed": 0,
             "pricing_timeout_flight_id": None,
-            "n_columns": 0,
+            "n_columns": 0 if master is None else len(master.columns),
             "n_materialized_rows": 0,
             "lazy_rows_added": 0,
             "lazy_row_rounds": 0,
@@ -432,6 +545,24 @@ class ColGenSolver:
                     "initial_greedy_completed": True,
                     "initial_greedy_flights": 0,
                     "initial_greedy_elapsed_s": 0.0,
+                    "initial_seed_columns": 0,
+                    "graphs_built": 0,
+                    "seeds_completed": 0,
+                    "seed_flights_processed": 0,
+                    "preprocessing_stage": "empty",
+                    "graph_build_elapsed_s": 0.0,
+                    "seed_elapsed_s": 0.0,
+                    "time_to_master_s": 0.0,
+                    "static_terminal_count": 0,
+                    "static_excluded_cells": 0,
+                    "corridor_domains_materialized": 0,
+                    "arc_expanded_nodes": 0,
+                    "arc_checks": 0,
+                    "arc_cache_hits": 0,
+                    "arc_allowed": 0,
+                    "arc_blocked": 0,
+                    "wall_index_queries": 0,
+                    "wall_index_candidates": 0,
                     "pricing_flights_completed": 0,
                     "pricing_sweeps_completed": 0,
                     "pricing_timeout_flight_id": None,
@@ -446,19 +577,38 @@ class ColGenSolver:
 
         # ``static_terms`` is commonly a generator owned by the simulation.  Every
         # graph must see the identical wall catalogue, so snapshot it once.
-        static_term_snapshot = tuple(static_terms)
+        graph_build_started = time.monotonic()
+        static_catalog = StaticTerminalCatalog(static_terms, cfg)
+        static_term_snapshot = static_catalog.entries
         graphs: dict[int, FlightGraph] = {}
         for request in ordered_requests:
             if time.monotonic() >= pricing_deadline:
-                return _pre_master_timeout_result(flight_ids, started, params)
+                return _pre_master_timeout_result(
+                    flight_ids,
+                    started,
+                    params,
+                    stage="graph_build",
+                    graphs=graphs,
+                    catalog=static_catalog,
+                    graph_build_elapsed_s=time.monotonic() - graph_build_started,
+                )
             graphs[request.flight_id] = build_flight_graph(
                 request,
                 cfg,
-                static_term_snapshot,
+                static_catalog,
                 params,
             )
+        graph_build_elapsed_s = time.monotonic() - graph_build_started
         if time.monotonic() >= pricing_deadline:
-            return _pre_master_timeout_result(flight_ids, started, params)
+            return _pre_master_timeout_result(
+                flight_ids,
+                started,
+                params,
+                stage="graph_build",
+                graphs=graphs,
+                catalog=static_catalog,
+                graph_build_elapsed_s=graph_build_elapsed_s,
+            )
 
         row_index = RowIndex()
         for graph in graphs.values():
@@ -486,13 +636,29 @@ class ColGenSolver:
             seed=cfg.seed,
             fixed_loads=committed_loads,
         )
+        time_to_master_s = time.monotonic() - started
         seedless_flights: set[int] = set()
         seeds: dict[int, Column] = {}
+        seed_started = time.monotonic()
         for flight_id in flight_ids:
             try:
                 seed = seed_column(graphs[flight_id], cfg, deadline=pricing_deadline)
             except PricingTimeout:
-                return _pre_master_timeout_result(flight_ids, started, params)
+                return _pre_master_timeout_result(
+                    flight_ids,
+                    started,
+                    params,
+                    stage="seeding",
+                    graphs=graphs,
+                    catalog=static_catalog,
+                    graph_build_elapsed_s=graph_build_elapsed_s,
+                    seed_elapsed_s=time.monotonic() - seed_started,
+                    seeds_completed=len(seeds),
+                    seed_flights_processed=len(seeds) + len(seedless_flights),
+                    master=master,
+                    time_to_master_s=time_to_master_s,
+                    seedless_flight_ids=tuple(seedless_flights),
+                )
             except ValueError:
                 # A disconnected/static-blocked graph is a legitimate
                 # optimizer-verdict denial, not a batch-wide solver failure.
@@ -502,6 +668,7 @@ class ColGenSolver:
             seed = _canonical_column(seed, graphs[flight_id], cfg)
             seeds[flight_id] = seed
             master.add_column(seed)
+        seed_elapsed_s = time.monotonic() - seed_started
 
         shifted_seed_heuristic = _initial_feasible_selection(
             seeds,
@@ -511,25 +678,15 @@ class ColGenSolver:
             cfg,
             deadline=pricing_deadline,
         )
-        greedy_started = time.monotonic()
-        greedy_deadline = min(
-            pricing_deadline,
-            started + min(60.0, 0.55 * params.time_limit_s),
-        )
-        greedy_heuristic, greedy_completed = _greedy_feasible_selection(
-            graphs,
-            committed_loads,
-            row_index,
-            cfg,
-            params,
-            deadline=greedy_deadline,
-        )
-        greedy_elapsed_s = time.monotonic() - greedy_started
+        # Keep initialization deliberately small: one certified shortest seed
+        # per flight plus at most one time-shifted seed selected by the cheap
+        # claim-feasible pass above.  Route alternatives belong to reduced-cost
+        # pricing after the first LP, not to an eager all-flight prepass.
+        greedy_heuristic: dict[int, Column] = {}
+        greedy_completed = False
+        greedy_elapsed_s = 0.0
         initial_heuristic = dict(shifted_seed_heuristic)
         initial_heuristic_strategy = "shifted_seeds"
-        if _better_selection(greedy_heuristic, initial_heuristic, params.M):
-            initial_heuristic = dict(greedy_heuristic)
-            initial_heuristic_strategy = "greedy_pricing"
         best_heuristic = dict(initial_heuristic)
         for column in initial_heuristic.values():
             master.add_column(column)
@@ -586,6 +743,7 @@ class ColGenSolver:
             iterations = iteration + 1
             last_lp_objective = float(lp_objective)
             last_x = np.asarray(x, dtype=float)
+            columns_at_lp = len(master.columns)
 
             heuristic = master.round_heuristic(
                 last_x,
@@ -601,6 +759,34 @@ class ColGenSolver:
                 best_heuristic = dict(heuristic)
                 master.set_heuristic(best_heuristic)
 
+            if iteration == 0:
+                # The first LP has now established the real column-generation
+                # cycle.  Build at most one route-aware incumbent column per
+                # flight using the same lazy topology, bounded independently so
+                # formal reduced-cost pricing retains most of the solve budget.
+                greedy_started = time.monotonic()
+                greedy_budget_s = min(60.0, 0.55 * params.time_limit_s)
+                greedy_deadline = min(pricing_deadline, greedy_started + greedy_budget_s)
+                greedy_heuristic, greedy_completed = _greedy_feasible_selection(
+                    graphs,
+                    committed_loads,
+                    row_index,
+                    cfg,
+                    params,
+                    deadline=greedy_deadline,
+                    initial=best_heuristic,
+                )
+                greedy_elapsed_s = time.monotonic() - greedy_started
+                for column in greedy_heuristic.values():
+                    master.add_column(column)
+                if greedy_heuristic and _better_selection(
+                    greedy_heuristic,
+                    best_heuristic,
+                    params.M,
+                ):
+                    best_heuristic = dict(greedy_heuristic)
+                    master.set_heuristic(best_heuristic)
+
             best_reduced_costs: list[float] = []
             priced_columns: list[Column] = []
             pricing_order = sorted(
@@ -614,12 +800,14 @@ class ColGenSolver:
                 ),
             )
             pricing_complete = True
+            dual_view = DualView(capacity_duals, cfg)
+            flight_duals = master.flight_duals
             for flight_id in pricing_order:
                 try:
                     reduced_cost, column = price_flight(
                         graphs[flight_id],
-                        capacity_duals,
-                        master.flight_duals[flight_id],
+                        dual_view,
+                        flight_duals[flight_id],
                         cfg,
                         params,
                         deadline=pricing_deadline,
@@ -633,7 +821,7 @@ class ColGenSolver:
                 if column is not None and reduced_cost > _REDUCED_COST_TOL:
                     priced_columns.append(_canonical_column(column, graphs[flight_id], cfg))
 
-            before = len(master.columns)
+            before_pricing = len(master.columns)
             for column in sorted(
                 priced_columns, key=lambda item: (item.flight_id, _column_key(item))
             ):
@@ -665,17 +853,22 @@ class ColGenSolver:
             heuristic_objectives.append(heuristic_objective)
             heuristic_costs.append(heuristic_cost)
 
-            if lp_gap <= params.lp_gap:
+            new_columns_since_lp = len(master.columns) > columns_at_lp
+            if lp_gap <= params.lp_gap and not new_columns_since_lp:
                 termination_reason = "lp_gap"
                 break
-            if best_heuristic and heuristic_gap <= params.ip_gap:
+            if (
+                best_heuristic
+                and heuristic_gap <= params.ip_gap
+                and not new_columns_since_lp
+            ):
                 termination_reason = "heuristic_gap"
                 break
-            if not priced_columns:
+            if not priced_columns and not new_columns_since_lp:
                 termination_reason = "no_improving_columns"
                 break
 
-            if len(master.columns) == before:
+            if len(master.columns) == before_pricing and not new_columns_since_lp:
                 termination_reason = "no_new_columns"
                 break
         else:
@@ -739,6 +932,9 @@ class ColGenSolver:
             (graphs[flight_id] for flight_id in flight_ids if flight_id not in incumbent),
             key=lambda graph: (graph.request.t_departure, graph.request.flight_id),
         )
+        saturated = {
+            row for row, load in loads.items() if load >= row_index.cap(row)
+        }
         for repair_index, graph in enumerate(repair_order):
             if time.monotonic() >= deadline:
                 termination_reason = "time_limit"
@@ -746,7 +942,6 @@ class ColGenSolver:
                     pending.request.flight_id for pending in repair_order[repair_index:]
                 )
                 break
-            saturated = frozenset(row for row, load in loads.items() if load >= row_index.cap(row))
             try:
                 _reduced_cost, repaired = price_flight(
                     graph,
@@ -773,7 +968,12 @@ class ColGenSolver:
                     f"{graph.request.flight_id}"
                 )
             incumbent[graph.request.flight_id] = repaired
-            loads.update(repaired.claims)
+            for row in repaired.claims:
+                old_load = loads[row]
+                new_load = old_load + 1
+                loads[row] = new_load
+                if old_load < row_index.cap(row) <= new_load:
+                    saturated.add(row)
             repair_added += 1
 
         incumbent = dict(sorted(incumbent.items()))
@@ -790,6 +990,13 @@ class ColGenSolver:
         total_delay_s = math.fsum(column.delay_s for column in incumbent.values())
         master_objective = _selection_objective(incumbent, params.M)
         elapsed_s = time.monotonic() - started
+        arc_stats: Counter[str] = Counter()
+        for graph in graphs.values():
+            arc_stats.update(graph.arc_cache_stats)
+        corridor_domains_materialized = sum(
+            bool(getattr(graph.corridor_cells, "is_materialized", True))
+            for graph in graphs.values()
+        )
 
         materialized_rows = getattr(master, "materialized_rows", ())
         stats: dict[str, Any] = {
@@ -848,6 +1055,24 @@ class ColGenSolver:
             "initial_greedy_completed": greedy_completed,
             "initial_greedy_flights": len(greedy_heuristic),
             "initial_greedy_elapsed_s": greedy_elapsed_s,
+            "initial_seed_columns": len(seeds),
+            "graphs_built": len(graphs),
+            "seeds_completed": len(seeds),
+            "seed_flights_processed": len(flight_ids),
+            "preprocessing_stage": "complete",
+            "graph_build_elapsed_s": graph_build_elapsed_s,
+            "seed_elapsed_s": seed_elapsed_s,
+            "time_to_master_s": time_to_master_s,
+            "corridor_domains_materialized": corridor_domains_materialized,
+            "static_terminal_count": len(static_catalog.entries),
+            "static_excluded_cells": static_catalog.excluded_cell_count,
+            "arc_expanded_nodes": arc_stats["expanded_nodes"],
+            "arc_checks": arc_stats["arc_checks"],
+            "arc_cache_hits": arc_stats["cache_hits"],
+            "arc_allowed": arc_stats["allowed_arcs"],
+            "arc_blocked": arc_stats["blocked_arcs"],
+            "wall_index_queries": static_catalog.wall_index.stats["queries"],
+            "wall_index_candidates": static_catalog.wall_index.stats["candidates"],
             "pricing_flights_completed": pricing_flights_completed,
             "pricing_sweeps_completed": pricing_sweeps_completed,
             "pricing_timeout_flight_id": pricing_timeout_flight_id,

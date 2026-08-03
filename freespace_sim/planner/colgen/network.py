@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import math
 import operator
-from collections.abc import Hashable, Mapping
+import threading
+from collections import OrderedDict
+from collections.abc import Hashable, Mapping, Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -43,6 +45,253 @@ if TYPE_CHECKING:
     from .translate import Column
 
 Cell = tuple[int, int]
+FlatAabb = tuple[float, float, float, float, float, float]
+WallBound = tuple[Volume4D, FlatAabb]
+
+_ARC_INTERNAL = 1 << 0
+_ARC_FIRST = 1 << 1
+_ARC_LAST = 1 << 2
+_ARC_FIRST_LAST = 1 << 3
+_ALL_ARC_ROLES = _ARC_INTERNAL | _ARC_FIRST | _ARC_LAST | _ARC_FIRST_LAST
+_MAX_CERTIFIED_COLUMNS = 2
+
+
+def _aabbs_overlap(first: FlatAabb, second: FlatAabb) -> bool:
+    axmin, aymin, azmin, axmax, aymax, azmax = first
+    bxmin, bymin, bzmin, bxmax, bymax, bzmax = second
+    return not (
+        axmax < bxmin
+        or bxmax < axmin
+        or aymax < bymin
+        or bymax < aymin
+        or azmax < bzmin
+        or bzmax < azmin
+    )
+
+
+class _WallSpatialIndex:
+    """Exact broad phase for immutable permanent terminal cylinders.
+
+    Each wall is inserted into every uniform XY bucket touched by its AABB.
+    Query AABBs therefore cannot miss a possible intersection; the final full
+    3-D AABB test and ``volumes_conflict`` remain authoritative.  The index is
+    A solve-scoped terminal catalog shares one instance across flight graphs;
+    standalone graph construction still creates a self-contained instance.
+    """
+
+    __slots__ = (
+        "_bounds",
+        "_bucket_size",
+        "_buckets",
+        "_candidate_count",
+        "_lock",
+        "_query_count",
+        "_walls",
+    )
+
+    def __init__(self, walls: tuple[Volume4D, ...], bucket_size: float) -> None:
+        if not math.isfinite(bucket_size) or bucket_size <= 0.0:
+            raise ValueError("wall-index bucket size must be finite and positive")
+        self._walls = walls
+        self._bounds: tuple[WallBound, ...] = tuple(
+            (wall, wall.flat_aabb()) for wall in walls
+        )
+        self._bucket_size = float(bucket_size)
+        mutable: dict[tuple[int, int], list[int]] = {}
+        for wall_index, (_wall, bound) in enumerate(self._bounds):
+            xmin, ymin, _zmin, xmax, ymax, _zmax = bound
+            for x_bucket in range(
+                math.floor(xmin / self._bucket_size),
+                math.floor(xmax / self._bucket_size) + 1,
+            ):
+                for y_bucket in range(
+                    math.floor(ymin / self._bucket_size),
+                    math.floor(ymax / self._bucket_size) + 1,
+                ):
+                    mutable.setdefault((x_bucket, y_bucket), []).append(wall_index)
+        self._buckets = {
+            bucket: tuple(indices) for bucket, indices in mutable.items()
+        }
+        self._query_count = 0
+        self._candidate_count = 0
+        self._lock = threading.RLock()
+
+    def candidates(self, bound: FlatAabb) -> tuple[WallBound, ...]:
+        xmin, ymin, _zmin, xmax, ymax, _zmax = bound
+        indices: set[int] = set()
+        for x_bucket in range(
+            math.floor(xmin / self._bucket_size),
+            math.floor(xmax / self._bucket_size) + 1,
+        ):
+            for y_bucket in range(
+                math.floor(ymin / self._bucket_size),
+                math.floor(ymax / self._bucket_size) + 1,
+            ):
+                indices.update(self._buckets.get((x_bucket, y_bucket), ()))
+        result = tuple(
+            self._bounds[index]
+            for index in sorted(indices)
+            if _aabbs_overlap(bound, self._bounds[index][1])
+        )
+        with self._lock:
+            self._query_count += 1
+            self._candidate_count += len(result)
+        return result
+
+    @property
+    def all_bounds(self) -> tuple[WallBound, ...]:
+        return self._bounds
+
+    @property
+    def stats(self) -> Mapping[str, int]:
+        with self._lock:
+            return MappingProxyType(
+                {
+                    "queries": self._query_count,
+                    "candidates": self._candidate_count,
+                    "walls": len(self._walls),
+                }
+            )
+
+    def __reduce__(self):
+        # Query counters are diagnostics, not semantic state.
+        return type(self), (self._walls, self._bucket_size)
+
+
+class StaticTerminalCatalog:
+    """Solve-scoped read-only static geometry shared by every flight graph."""
+
+    __slots__ = (
+        "_cell_terminal_ids",
+        "_cfg",
+        "_entries",
+        "_wall_index",
+        "_walls",
+    )
+
+    def __init__(self, static_terms, cfg: SimConfig) -> None:
+        entries: list[tuple[tuple[float, ...], Terminal]] = []
+        walls: list[Volume4D] = []
+        cell_terminal_ids: dict[Cell, set[Hashable]] = {}
+        for center, raw_terminal in static_terms:
+            terminal = as_terminal(raw_terminal)
+            if terminal is None:
+                raise ValueError("static terminal entries must include terminal metadata")
+            frozen_center = tuple(float(coordinate) for coordinate in center)
+            if len(frozen_center) not in {2, 3}:
+                raise ValueError("static terminal centers must have two or three coordinates")
+            entries.append((frozen_center, terminal))
+            walls.append(permanent_terminal_reservation(frozen_center, terminal, cfg))
+            for cell in hg.terminal_cells(frozen_center, terminal, cfg):
+                cell_terminal_ids.setdefault(cell, set()).add(terminal.id)
+        self._cfg = cfg
+        self._entries = tuple(entries)
+        self._walls = tuple(walls)
+        self._cell_terminal_ids = {
+            cell: frozenset(terminal_ids)
+            for cell, terminal_ids in cell_terminal_ids.items()
+        }
+        self._wall_index = _WallSpatialIndex(
+            self._walls,
+            max(256.0, 4.0 * cfg.corridor_width_m),
+        )
+
+    @property
+    def entries(self) -> tuple[tuple[tuple[float, ...], Terminal], ...]:
+        return self._entries
+
+    @property
+    def walls(self) -> tuple[Volume4D, ...]:
+        return self._walls
+
+    @property
+    def wall_index(self) -> _WallSpatialIndex:
+        return self._wall_index
+
+    def terminal_ids_at(self, cell: Cell) -> frozenset[Hashable]:
+        return self._cell_terminal_ids.get(cell, frozenset())
+
+    @property
+    def excluded_cell_count(self) -> int:
+        return len(self._cell_terminal_ids)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, StaticTerminalCatalog):
+            return NotImplemented
+        return self._cfg == other._cfg and self.entries == other.entries
+
+    def __reduce__(self):
+        return type(self), (self._entries, self._cfg)
+
+
+class _ForeignTerminalCells(AbstractSet[Cell]):
+    """Per-flight view over shared terminal-cell membership by terminal id."""
+
+    __slots__ = ("_catalog", "_own_ids")
+
+    def __init__(
+        self,
+        catalog: StaticTerminalCatalog,
+        own_ids: frozenset[Hashable],
+    ) -> None:
+        self._catalog = catalog
+        self._own_ids = own_ids
+
+    def __contains__(self, raw_cell: object) -> bool:
+        if not isinstance(raw_cell, tuple) or len(raw_cell) != 2:
+            return False
+        try:
+            cell = operator.index(raw_cell[0]), operator.index(raw_cell[1])
+        except TypeError:
+            return False
+        return not self._catalog.terminal_ids_at(cell).issubset(self._own_ids)
+
+    def __iter__(self):
+        return (
+            cell
+            for cell in self._catalog._cell_terminal_ids
+            if cell in self
+        )
+
+    def __len__(self) -> int:
+        return sum(cell in self for cell in self._catalog._cell_terminal_ids)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _ForeignTerminalCells):
+            if self._catalog == other._catalog and self._own_ids == other._own_ids:
+                return True
+            return frozenset(self) == frozenset(other)
+        if isinstance(other, AbstractSet):
+            return frozenset(self) == other
+        return NotImplemented
+
+
+class _CombinedCellSet(AbstractSet[Cell]):
+    """Lazy union used by the compatibility ``static_exclusions`` field."""
+
+    __slots__ = ("_base", "_extra")
+
+    def __init__(self, base: AbstractSet[Cell], extra: frozenset[Cell]) -> None:
+        self._base = base
+        self._extra = extra
+
+    def __contains__(self, cell: object) -> bool:
+        return cell in self._extra or cell in self._base
+
+    def __iter__(self):
+        return iter(frozenset(self._base) | self._extra)
+
+    def __len__(self) -> int:
+        return len(frozenset(self._base) | self._extra)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _CombinedCellSet):
+            if self._base == other._base and self._extra == other._extra:
+                return True
+            return frozenset(self) == frozenset(other)
+        if isinstance(other, AbstractSet):
+            return frozenset(self) == other
+        return NotImplemented
 
 
 class _ImmutableCellIndex(Mapping[Cell, int]):
@@ -355,9 +604,185 @@ class RowIndex:
         return tuple((key, index) for index, key in enumerate(self._index_to_key))
 
 
+class _LazyCorridorCells(AbstractSet[Cell]):
+    """Implicit finite O-D ellipse with exact legacy membership semantics.
+
+    Pricing only needs membership checks while it explores a route.  Materializing
+    every cell (and then duplicating it into a tuple and index mapping) was a large
+    all-flight startup barrier at density scale.  Iteration remains available for
+    diagnostics/tests and materializes the legacy set exactly once on demand.
+    """
+
+    __slots__ = (
+        "_dest",
+        "_explicit_lanes",
+        "_foreign_exclusions",
+        "_lock",
+        "_materialized",
+        "_origin",
+        "_own_interiors",
+        "_shortest",
+        "_slack",
+    )
+
+    def __init__(
+        self,
+        origin: Cell,
+        dest: Cell,
+        slack: int,
+        foreign_exclusions: AbstractSet[Cell],
+        own_interiors: frozenset[Cell],
+        explicit_lanes: frozenset[Cell],
+    ) -> None:
+        self._origin = origin
+        self._dest = dest
+        self._slack = slack
+        self._shortest = hg.hex_distance(origin, dest)
+        self._foreign_exclusions = foreign_exclusions
+        self._own_interiors = own_interiors
+        self._explicit_lanes = explicit_lanes
+        self._materialized: frozenset[Cell] | None = None
+        self._lock = threading.RLock()
+
+    def __contains__(self, raw_cell: object) -> bool:
+        if not isinstance(raw_cell, tuple) or len(raw_cell) != 2:
+            return False
+        try:
+            cell = operator.index(raw_cell[0]), operator.index(raw_cell[1])
+        except TypeError:
+            return False
+        if cell in self._foreign_exclusions:
+            return False
+        if cell in self._explicit_lanes:
+            return True
+        if cell in self._own_interiors:
+            return False
+        return (
+            hg.hex_distance(self._origin, cell) + hg.hex_distance(cell, self._dest)
+            <= self._shortest + self._slack
+        )
+
+    def _cells(self) -> frozenset[Cell]:
+        materialized = self._materialized
+        if materialized is not None:
+            return materialized
+        with self._lock:
+            materialized = self._materialized
+            if materialized is None:
+                cells = _ellipse_cells(self._origin, self._dest, self._slack)
+                cells.difference_update(self._foreign_exclusions)
+                cells.difference_update(self._own_interiors)
+                cells.update(
+                    cell for cell in self._explicit_lanes if cell not in self._foreign_exclusions
+                )
+                materialized = frozenset(cells)
+                self._materialized = materialized
+            return materialized
+
+    def __iter__(self):
+        return iter(self._cells())
+
+    def __len__(self) -> int:
+        return len(self._cells())
+
+    def isdisjoint(self, other) -> bool:
+        # Terminal exclusion tests are normally much smaller than the ellipse.
+        return all(cell not in self for cell in other)
+
+    @property
+    def is_materialized(self) -> bool:
+        return self._materialized is not None
+
+    def _signature(self) -> tuple[Any, ...]:
+        return (
+            self._origin,
+            self._dest,
+            self._slack,
+            self._foreign_exclusions,
+            self._own_interiors,
+            self._explicit_lanes,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _LazyCorridorCells):
+            if self._signature() == other._signature():
+                return True
+            return self._cells() == other._cells()
+        if isinstance(other, AbstractSet):
+            return self._cells() == other
+        return NotImplemented
+
+    def __reduce__(self):
+        # The materialized diagnostic view is deliberately not serialized.
+        return type(self), self._signature()
+
+
+class _LazyCellCatalog:
+    """Compatibility view for the Phase-1 dense cell tuple/index API."""
+
+    __slots__ = ("_cells", "_corridor", "_index", "_lock")
+
+    def __init__(self, corridor: AbstractSet[Cell]) -> None:
+        self._corridor = corridor
+        self._cells: tuple[Cell, ...] | None = None
+        self._index: _ImmutableCellIndex | None = None
+        self._lock = threading.RLock()
+
+    @property
+    def cells(self) -> tuple[Cell, ...]:
+        cells = self._cells
+        if cells is None:
+            with self._lock:
+                cells = self._cells
+                if cells is None:
+                    cells = tuple(sorted(self._corridor))
+                    self._cells = cells
+        return cells
+
+    @property
+    def index(self) -> _ImmutableCellIndex:
+        index = self._index
+        if index is None:
+            with self._lock:
+                index = self._index
+                if index is None:
+                    index = _ImmutableCellIndex(tuple((cell, i) for i, cell in enumerate(self.cells)))
+                    self._index = index
+        return index
+
+    def __reduce__(self):
+        # Rebuild lazy views after transport instead of copying dense caches.
+        return type(self), (self._corridor,)
+
+
+class _FlightSearchCache:
+    """Mutable, answer-neutral cache kept outside frozen graph semantics."""
+
+    __slots__ = (
+        "lock",
+        "certified_claims",
+        "seed_columns",
+        "seed_delay_certified",
+        "seed_search_complete",
+    )
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.certified_claims: OrderedDict[
+            tuple[Any, ...], frozenset[RowKey]
+        ] = OrderedDict()
+        self.seed_columns: tuple[Any, ...] | None = None
+        self.seed_delay_certified = False
+        self.seed_search_complete = False
+
+    def __reduce__(self):
+        # Search workers start with a cold cache; no lock or path payload is shipped.
+        return type(self), ()
+
+
 @dataclass(frozen=True, slots=True)
 class FlightGraph:
-    """Immutable, flight-specific network domain consumed by pricing.
+    """Logically immutable flight domain with lazy, answer-neutral search caches.
 
     ``origin_lanes`` and ``dest_lanes`` preserve the full deterministic order returned by
     :func:`hexgrid.terminal_lanes`; a lane blocked by overlapping foreign terminal airspace stays
@@ -365,11 +790,10 @@ class FlightGraph:
     """
 
     request: FlightRequest = field(repr=False, compare=False)
+    _cfg: SimConfig = field(repr=False, compare=False)
     origin_cell: Cell
     dest_cell: Cell
-    corridor_cells: frozenset[Cell]
-    index_to_cell: tuple[Cell, ...]
-    cell_to_index: Mapping[Cell, int] = field(repr=False, compare=False)
+    corridor_cells: AbstractSet[Cell]
     levels: tuple[float, ...]
     takeoff_steps: tuple[int, ...]
     origin_terminal: Terminal | None
@@ -382,11 +806,27 @@ class FlightGraph:
     max_step: int
     shortest_hops: int
     detour_slack_hops: int
-    static_exclusions: frozenset[Cell]
-    foreign_exclusions: frozenset[Cell]
+    static_exclusions: AbstractSet[Cell]
+    foreign_exclusions: AbstractSet[Cell]
     own_terminal_interiors: frozenset[Cell]
     static_walls: tuple[Volume4D, ...] = field(repr=False, compare=False)
-    forbidden_hops: frozenset[tuple[Cell, Cell]]
+    _wall_index: _WallSpatialIndex = field(repr=False, compare=False)
+    forbidden_hops: frozenset[tuple[Cell, Cell]] | _LazyForbiddenHops
+    _cell_catalog: _LazyCellCatalog = field(repr=False, compare=False)
+    _search_cache: _FlightSearchCache = field(
+        default_factory=_FlightSearchCache,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def index_to_cell(self) -> tuple[Cell, ...]:
+        return self._cell_catalog.cells
+
+    @property
+    def cell_to_index(self) -> Mapping[Cell, int]:
+        return self._cell_catalog.index
 
     @property
     def cells(self) -> tuple[Cell, ...]:
@@ -395,6 +835,81 @@ class FlightGraph:
     @property
     def cell_index(self) -> Mapping[Cell, int]:
         return self.cell_to_index
+
+    def outgoing_neighbors(self, source: Cell) -> tuple[Cell, ...]:
+        """Generate/cache all admissible directed arcs leaving ``source``."""
+
+        lazy = self.forbidden_hops
+        if isinstance(lazy, _LazyForbiddenHops):
+            return lazy.outgoing(source)
+        if source not in self.corridor_cells:
+            return ()
+        sq, sr = source
+        return tuple(
+            target
+            for dq, dr in hg.AXIAL_NEIGHBORS
+            if (target := (sq + dq, sr + dr)) in self.corridor_cells
+            and (source, target) not in lazy
+        )
+
+    def hop_is_forbidden(self, source: Cell, target: Cell) -> bool:
+        """Return the path-independent permanent-wall verdict for one arc."""
+
+        return (source, target) in self.forbidden_hops
+
+    def hop_allowed_for_role(
+        self,
+        source: Cell,
+        target: Cell,
+        *,
+        first: bool,
+        last: bool,
+    ) -> bool:
+        """Return whether the arc is safe with its actual path-position tags."""
+
+        lazy = self.forbidden_hops
+        if isinstance(lazy, _LazyForbiddenHops):
+            return lazy.allows(source, target, first=first, last=last)
+        return (
+            source in self.corridor_cells
+            and target in self.corridor_cells
+            and (source, target) not in lazy
+        )
+
+    def __hash__(self) -> int:
+        """Hash stable graph identity without materializing lazy set fields."""
+
+        return hash(
+            (
+                self.origin_cell,
+                self.dest_cell,
+                self.levels,
+                self.base_step,
+                self.latest_departure_step,
+                self.max_step,
+                self.shortest_hops,
+                self.detour_slack_hops,
+            )
+        )
+
+    @property
+    def arc_cache_stats(self) -> Mapping[str, int]:
+        lazy = self.forbidden_hops
+        if isinstance(lazy, _LazyForbiddenHops):
+            return lazy.stats
+        return MappingProxyType(
+            {
+                "expanded_nodes": 0,
+                "arc_checks": 0,
+                "cache_hits": 0,
+                "allowed_arcs": 0,
+                "blocked_arcs": len(lazy),
+            }
+        )
+
+    @property
+    def wall_index_stats(self) -> Mapping[str, int]:
+        return self._wall_index.stats
 
     @property
     def o_cell(self) -> Cell:
@@ -622,10 +1137,350 @@ def _forbidden_static_hops(
     return frozenset(forbidden)
 
 
+def _static_hop_allowed_roles(
+    source: Cell,
+    target: Cell,
+    walls_with_bounds: tuple[WallBound, ...] | _WallSpatialIndex,
+    req: FlightRequest,
+    origin_terminal: Terminal | None,
+    dest_terminal: Terminal | None,
+    origin_lane_cells: frozenset[Cell],
+    dest_lane_cells: frozenset[Cell],
+    cfg: SimConfig,
+) -> int:
+    """Return a bit mask of wall-safe internal/endpoint roles for one hop."""
+
+    if isinstance(walls_with_bounds, _WallSpatialIndex):
+        all_wall_bounds = walls_with_bounds.all_bounds
+    else:
+        all_wall_bounds = walls_with_bounds
+    if not all_wall_bounds:
+        return _ALL_ARC_ROLES
+    radius = hg.circumradius(cfg)
+    z = cfg.flight_levels_m[0]
+    source_xy = hg.hex_center(*source, radius)
+    target_xy = hg.hex_center(*target, radius)
+    p0 = (float(source_xy[0]), float(source_xy[1]), float(z))
+    p1 = (float(target_xy[0]), float(target_xy[1]), float(z))
+
+    # Reproduce ``build_reservation_from_corners`` scalar interpolation.  A
+    # nominal edge can be a few ulps long and split into differently tagged boxes.
+    dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    nsub = max(1, math.ceil(length / cfg.corridor_segment_len_m))
+    subvolumes: list[Volume4D] = []
+    base_tags: list[Hashable | None] = []
+    for k in range(1, nsub + 1):
+        f0, f1 = (k - 1) / nsub, k / nsub
+        sa = (p0[0] + f0 * dx, p0[1] + f0 * dy, p0[2] + f0 * dz)
+        sb = (p0[0] + f1 * dx, p0[1] + f1 * dy, p0[2] + f1 * dz)
+        tag = _segment_terminal_id(sa, sb, req, origin_terminal, dest_terminal, cfg)
+        base_tags.append(tag)
+        subvolumes.append(
+            corridor_segment_volume(
+                sa,
+                (k - 1) * cfg.dt_s / nsub,
+                sb,
+                k * cfg.dt_s / nsub,
+                cfg,
+                terminal_id=tag,
+            )
+        )
+
+    # Builder endpoint overrides are path-position dependent.  Cache all four
+    # exact outcomes: the union is useful to discover a possible arc, while
+    # pricing consumes the bit matching its actual first/last role before any
+    # label dominance can discard an otherwise feasible path.
+    can_be_first = (
+        cfg.fixed_exit_lanes and origin_terminal is not None and source in origin_lane_cells
+    )
+    can_be_last = cfg.fixed_exit_lanes and dest_terminal is not None and target in dest_lane_cells
+
+    def role_tags(*, first: bool, last: bool) -> tuple[Hashable | None, ...]:
+        tags = list(base_tags)
+        if first and can_be_first:
+            assert origin_terminal is not None
+            tags[0] = origin_terminal.id
+        if last and can_be_last:
+            assert dest_terminal is not None
+            # On a one-subvolume first+last hop the builder's origin override
+            # wins; this mirrors ``build_reservation_from_corners`` exactly.
+            if not (first and can_be_first and len(tags) == 1):
+                tags[-1] = dest_terminal.id
+        return tuple(tags)
+
+    variants = (
+        (_ARC_INTERNAL, role_tags(first=False, last=False)),
+        (_ARC_FIRST, role_tags(first=True, last=False)),
+        (_ARC_LAST, role_tags(first=False, last=True)),
+        (_ARC_FIRST_LAST, role_tags(first=True, last=True)),
+    )
+
+    wall_candidates = tuple(
+        (
+            walls_with_bounds.candidates(base_volume.flat_aabb())
+            if isinstance(walls_with_bounds, _WallSpatialIndex)
+            else all_wall_bounds
+        )
+        for base_volume in subvolumes
+    )
+
+    def variant_conflicts(tags: tuple[Hashable | None, ...]) -> bool:
+        for base_volume, tag, candidates in zip(subvolumes, tags, wall_candidates):
+            hop = (
+                base_volume
+                if tag == base_volume.terminal_id
+                else replace(base_volume, terminal_id=tag)
+            )
+            hop_bound = hop.flat_aabb()
+            for wall, wall_bound in candidates:
+                if _aabbs_overlap(hop_bound, wall_bound) and volumes_conflict(hop, wall):
+                    return True
+        return False
+
+    conflict_by_tags: dict[tuple[Hashable | None, ...], bool] = {}
+    allowed_roles = 0
+    for role, tags in variants:
+        conflicts = conflict_by_tags.get(tags)
+        if conflicts is None:
+            conflicts = variant_conflicts(tags)
+            conflict_by_tags[tags] = conflicts
+        if not conflicts:
+            allowed_roles |= role
+    return allowed_roles
+
+
+def _static_hop_forbidden(
+    source: Cell,
+    target: Cell,
+    walls_with_bounds: tuple[WallBound, ...] | _WallSpatialIndex,
+    req: FlightRequest,
+    origin_terminal: Terminal | None,
+    dest_terminal: Terminal | None,
+    origin_lane_cells: frozenset[Cell],
+    dest_lane_cells: frozenset[Cell],
+    cfg: SimConfig,
+) -> bool:
+    """Compatibility predicate: forbid only when every possible role conflicts."""
+
+    return not _static_hop_allowed_roles(
+        source,
+        target,
+        walls_with_bounds,
+        req,
+        origin_terminal,
+        dest_terminal,
+        origin_lane_cells,
+        dest_lane_cells,
+        cfg,
+    )
+
+
+class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
+    """Generate and cache invariant outgoing spatial arcs one source at a time."""
+
+    __slots__ = (
+        "_allowed",
+        "_arc_checks",
+        "_blocked",
+        "_cache_hits",
+        "_cfg",
+        "_corridor",
+        "_dest_lane_cells",
+        "_dest_lanes",
+        "_dest_terminal",
+        "_lock",
+        "_origin_lane_cells",
+        "_origin_lanes",
+        "_origin_terminal",
+        "_request",
+        "_roles",
+        "_walls",
+        "_wall_index",
+    )
+
+    def __init__(
+        self,
+        corridor: AbstractSet[Cell],
+        walls: tuple[Volume4D, ...],
+        request: FlightRequest,
+        origin_terminal: Terminal | None,
+        dest_terminal: Terminal | None,
+        origin_lanes: tuple[hg.Lane, ...],
+        dest_lanes: tuple[hg.Lane, ...],
+        cfg: SimConfig,
+        wall_index: _WallSpatialIndex | None = None,
+    ) -> None:
+        self._corridor = corridor
+        self._walls = walls
+        self._wall_index = (
+            wall_index
+            if wall_index is not None
+            else _WallSpatialIndex(walls, max(256.0, 4.0 * cfg.corridor_width_m))
+        )
+        self._request = request
+        self._origin_terminal = origin_terminal
+        self._dest_terminal = dest_terminal
+        self._origin_lanes = origin_lanes
+        self._dest_lanes = dest_lanes
+        self._origin_lane_cells = frozenset(lane.cell for lane in origin_lanes)
+        self._dest_lane_cells = frozenset(lane.cell for lane in dest_lanes)
+        self._cfg = cfg
+        self._allowed: dict[Cell, tuple[Cell, ...]] = {}
+        self._blocked: set[tuple[Cell, Cell]] = set()
+        self._roles: dict[tuple[Cell, Cell], int] = {}
+        self._arc_checks = 0
+        self._cache_hits = 0
+        self._lock = threading.RLock()
+
+    def outgoing(self, source: Cell) -> tuple[Cell, ...]:
+        cached = self._allowed.get(source)
+        if cached is not None:
+            with self._lock:
+                self._cache_hits += 1
+            return cached
+        with self._lock:
+            cached = self._allowed.get(source)
+            if cached is not None:
+                self._cache_hits += 1
+                return cached
+            if source not in self._corridor:
+                self._allowed[source] = ()
+                return ()
+            sq, sr = source
+            allowed: list[Cell] = []
+            for dq, dr in hg.AXIAL_NEIGHBORS:
+                target = sq + dq, sr + dr
+                if target not in self._corridor:
+                    continue
+                self._arc_checks += 1
+                roles = _static_hop_allowed_roles(
+                    source,
+                    target,
+                    self._wall_index,
+                    self._request,
+                    self._origin_terminal,
+                    self._dest_terminal,
+                    self._origin_lane_cells,
+                    self._dest_lane_cells,
+                    self._cfg,
+                )
+                self._roles[(source, target)] = roles
+                if not roles:
+                    self._blocked.add((source, target))
+                else:
+                    allowed.append(target)
+            cached = tuple(allowed)
+            self._allowed[source] = cached
+            return cached
+
+    def allows(
+        self,
+        source: Cell,
+        target: Cell,
+        *,
+        first: bool,
+        last: bool,
+    ) -> bool:
+        if target not in self.outgoing(source):
+            return False
+        role = (
+            _ARC_FIRST_LAST
+            if first and last
+            else _ARC_FIRST
+            if first
+            else _ARC_LAST
+            if last
+            else _ARC_INTERNAL
+        )
+        return bool(self._roles[(source, target)] & role)
+
+    def __contains__(self, raw_hop: object) -> bool:
+        if not isinstance(raw_hop, tuple) or len(raw_hop) != 2:
+            return False
+        source, target = raw_hop
+        if not isinstance(source, tuple) or not isinstance(target, tuple):
+            return False
+        if hg.hex_distance(source, target) != 1:
+            return False
+        if source not in self._corridor or target not in self._corridor:
+            return False
+        return target not in self.outgoing(source)
+
+    def _materialized_blocked(self) -> frozenset[tuple[Cell, Cell]]:
+        for source in self._corridor:
+            self.outgoing(source)
+        with self._lock:
+            return frozenset(self._blocked)
+
+    def __iter__(self):
+        return iter(self._materialized_blocked())
+
+    def __len__(self) -> int:
+        return len(self._materialized_blocked())
+
+    @property
+    def stats(self) -> Mapping[str, int]:
+        with self._lock:
+            return MappingProxyType(
+                {
+                    "expanded_nodes": len(self._allowed),
+                    "arc_checks": self._arc_checks,
+                    "cache_hits": self._cache_hits,
+                    "allowed_arcs": sum(len(neighbours) for neighbours in self._allowed.values()),
+                    "blocked_arcs": len(self._blocked),
+                }
+            )
+
+    def _wall_signature(self) -> tuple[Any, ...]:
+        return tuple(
+            (bounds, wall.t_start, wall.t_end, wall.terminal_id, type(wall.shape).__name__)
+            for wall, bounds in self._wall_index.all_bounds
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _LazyForbiddenHops):
+            same_semantics = (
+                self._corridor == other._corridor
+                and self._wall_signature() == other._wall_signature()
+                and self._origin_terminal == other._origin_terminal
+                and self._dest_terminal == other._dest_terminal
+                and self._origin_lanes == other._origin_lanes
+                and self._dest_lanes == other._dest_lanes
+                and self._cfg == other._cfg
+                and self._request.flight_id == other._request.flight_id
+                and np.array_equal(self._request.origin, other._request.origin)
+                and np.array_equal(self._request.dest, other._request.dest)
+            )
+            if same_semantics:
+                return True
+            return self._materialized_blocked() == other._materialized_blocked()
+        if isinstance(other, AbstractSet):
+            return self._materialized_blocked() == other
+        return NotImplemented
+
+    def __reduce__(self):
+        # Geometry caches are deterministic and rebuilt cold in another process.
+        return (
+            type(self),
+            (
+                self._corridor,
+                self._walls,
+                self._request,
+                self._origin_terminal,
+                self._dest_terminal,
+                self._origin_lanes,
+                self._dest_lanes,
+                self._cfg,
+                self._wall_index,
+            ),
+        )
+
+
 def build_flight_graph(
     req: FlightRequest,
     cfg: SimConfig,
-    static_terms,
+    static_terms: object,
     params: ColGenParams,
 ) -> FlightGraph:
     """Build the frozen corridor and timing bounds for one flight.
@@ -676,17 +1531,14 @@ def build_flight_graph(
         terminal.id for terminal in (origin_terminal, dest_terminal) if terminal is not None
     )
 
-    normalized_static_terms: list[tuple[object, Terminal]] = []
-    static_walls: list[Volume4D] = []
-    foreign_exclusions: set[Cell] = set()
-    for center, raw_terminal in static_terms:
-        terminal = as_terminal(raw_terminal)
-        if terminal is None:
-            raise ValueError("static terminal entries must include terminal metadata")
-        normalized_static_terms.append((center, terminal))
-        static_walls.append(permanent_terminal_reservation(center, terminal, cfg))
-        if terminal.id not in own_ids:
-            foreign_exclusions.update(hg.terminal_cells(center, terminal, cfg))
+    if isinstance(static_terms, StaticTerminalCatalog):
+        catalog = static_terms
+        if catalog._cfg != cfg:
+            raise ValueError("static terminal catalog was built for a different SimConfig")
+    else:
+        catalog = StaticTerminalCatalog(static_terms, cfg)
+    normalized_static_terms = catalog.entries
+    foreign_exclusions = _ForeignTerminalCells(catalog, own_ids)
 
     # Static terminal walls are not master rows.  Reject an endpoint whose actual filed cylinder
     # would hit a differently tagged wall even when its snapped cell lies outside terminal_cells.
@@ -722,15 +1574,17 @@ def build_flight_graph(
         own_interiors.update(hg.terminal_cells(center, terminal, cfg) - lane_cells)
 
     shortest_hops = hg.hex_distance(origin_cell, dest_cell)
-    corridor = _ellipse_cells(origin_cell, dest_cell, slack)
-    static_exclusions = foreign_exclusions | own_interiors
-    corridor.difference_update(static_exclusions)
-
-    # Own lanes are explicit takeoff/arrival nodes, even when they fall just outside the centre-based
-    # O-D ellipse.  Foreign walls still win in the unlikely event that two terminal footprints overlap.
-    for lane in (*origin_lanes, *dest_lanes):
-        if lane.cell not in foreign_exclusions:
-            corridor.add(lane.cell)
+    frozen_own_interiors = frozenset(own_interiors)
+    static_exclusions = _CombinedCellSet(foreign_exclusions, frozen_own_interiors)
+    explicit_lanes = frozenset(lane.cell for lane in (*origin_lanes, *dest_lanes))
+    corridor = _LazyCorridorCells(
+        origin_cell,
+        dest_cell,
+        slack,
+        foreign_exclusions,
+        frozen_own_interiors,
+        explicit_lanes,
+    )
 
     if origin_terminal is None:
         if origin_cell not in corridor:
@@ -749,19 +1603,20 @@ def build_flight_graph(
     elif not any(lane.cell in corridor for lane in dest_lanes):
         raise ValueError(f"flight {req.flight_id} has no available destination terminal lane")
 
-    ordered_cells = tuple(sorted(corridor))
-    frozen_static_walls = tuple(static_walls)
-    forbidden_hops = _forbidden_static_hops(
-        frozenset(corridor),
+    frozen_static_walls = catalog.walls
+    frozen_request = _snapshot_request(req, origin_terminal, dest_terminal)
+    wall_index = catalog.wall_index
+    forbidden_hops = _LazyForbiddenHops(
+        corridor,
         frozen_static_walls,
-        req,
+        frozen_request,
         origin_terminal,
         dest_terminal,
         origin_lanes,
         dest_lanes,
         cfg,
+        wall_index,
     )
-    cell_to_index = _ImmutableCellIndex(tuple((cell, i) for i, cell in enumerate(ordered_cells)))
     base_step = int(math.ceil(req.t_departure / dt))
     # A departure is legal only when its reported hold, measured from ``base_step``, remains within
     # max_ground_delay_s.  Floor is therefore the correct outward network bound for this budget.
@@ -778,12 +1633,11 @@ def build_flight_graph(
     )
 
     return FlightGraph(
-        request=_snapshot_request(req, origin_terminal, dest_terminal),
+        request=frozen_request,
+        _cfg=cfg,
         origin_cell=origin_cell,
         dest_cell=dest_cell,
-        corridor_cells=frozenset(corridor),
-        index_to_cell=ordered_cells,
-        cell_to_index=cell_to_index,
+        corridor_cells=corridor,
         levels=levels,
         takeoff_steps=takeoff_steps,
         origin_terminal=origin_terminal,
@@ -796,11 +1650,13 @@ def build_flight_graph(
         max_step=max_step,
         shortest_hops=shortest_hops,
         detour_slack_hops=slack,
-        static_exclusions=frozenset(static_exclusions),
-        foreign_exclusions=frozenset(foreign_exclusions),
-        own_terminal_interiors=frozenset(own_interiors),
+        static_exclusions=static_exclusions,
+        foreign_exclusions=foreign_exclusions,
+        own_terminal_interiors=frozen_own_interiors,
         static_walls=frozen_static_walls,
+        _wall_index=wall_index,
         forbidden_hops=forbidden_hops,
+        _cell_catalog=_LazyCellCatalog(corridor),
     )
 
 
@@ -821,6 +1677,8 @@ def column_claims(
     fg: FlightGraph,
     cfg: SimConfig,
     W: int | tuple[int, int] | None = None,
+    *,
+    _intent=None,
 ) -> frozenset[RowKey]:
     """Return the de-duplicated capacity rows claimed by ``column``.
 
@@ -828,6 +1686,8 @@ def column_claims(
     notation.  The actual offsets always come from :func:`derive_cell_window`; a scalar width alone
     cannot describe the shifted ``(-1, 0)`` footprint used when ``time_buffer_s == 0``.
     """
+    if cfg != fg._cfg:
+        raise ValueError("column claims require the SimConfig used to build the flight graph")
     if column.flight_id != fg.request.flight_id:
         raise ValueError(
             f"column flight_id {column.flight_id} does not match graph flight "
@@ -860,6 +1720,20 @@ def column_claims(
                 )
 
     path = tuple(tuple(cell) for cell in column.cell_path)
+    certificate_key = (
+        column.flight_id,
+        column.departure_step,
+        column.level,
+        column.origin_lane_idx,
+        column.dest_lane_idx,
+        path,
+    )
+    with fg._search_cache.lock:
+        cached_claims = fg._search_cache.certified_claims.get(certificate_key)
+        if cached_claims is not None:
+            fg._search_cache.certified_claims.move_to_end(certificate_key)
+    if cached_claims is not None:
+        return cached_claims
     if len(path) < 2:
         raise ValueError("a column path must contain at least two cells and one lateral hop")
     if any(cell not in fg.corridor_cells for cell in path):
@@ -915,7 +1789,7 @@ def column_claims(
     z = fg.levels[column.level]
     from .translate import column_to_intent
 
-    intent = column_to_intent(column, fg.request, cfg)
+    intent = _intent if _intent is not None else column_to_intent(column, fg.request, cfg)
     if intent.status is not IntentStatus.ACCEPTED:
         raise ValueError(
             f"column violates max_detour_factor or another translation budget "
@@ -931,7 +1805,7 @@ def column_claims(
     # exemption is precisely the one applied again when the intent is filed.
     if fg.static_walls:
         for volume in intent.volumes:
-            for wall in fg.static_walls:
+            for wall, _wall_bound in fg._wall_index.candidates(volume.flat_aabb()):
                 if volumes_conflict(volume, wall):
                     raise ValueError(
                         f"column for flight {column.flight_id} overlaps permanent static "
@@ -972,7 +1846,13 @@ def column_claims(
             for row_step in endpoint_steps
         )
 
-    return frozenset(claims)
+    result = frozenset(claims)
+    with fg._search_cache.lock:
+        fg._search_cache.certified_claims[certificate_key] = result
+        fg._search_cache.certified_claims.move_to_end(certificate_key)
+        while len(fg._search_cache.certified_claims) > _MAX_CERTIFIED_COLUMNS:
+            fg._search_cache.certified_claims.popitem(last=False)
+    return result
 
 
 __all__ = [
@@ -980,6 +1860,7 @@ __all__ = [
     "FlightGraph",
     "RowIndex",
     "RowKey",
+    "StaticTerminalCatalog",
     "build_flight_graph",
     "column_claims",
 ]

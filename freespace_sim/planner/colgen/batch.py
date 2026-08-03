@@ -91,6 +91,8 @@ def run_batch(
     log.info(
         "colgen solver: backend=%s termination=%s iterations=%s objective_delay_s=%s "
         "lp_gap=%s ip_gap=%s selected=%s/%d search_exhausted=%s columns=%s rows=%s "
+        "stage=%s graphs=%s seeds=%s graph_s=%s seed_s=%s master_s=%s "
+        "arc_nodes=%s arc_checks=%s cache_hits=%s wall_queries=%s wall_candidates=%s "
         "elapsed_s=%.3f",
         stats.get("backend", "unknown"),
         stats.get("termination_reason", "unknown"),
@@ -103,6 +105,17 @@ def run_batch(
         len(stats.get("search_exhausted_flight_ids", ())),
         stats.get("n_columns", "unknown"),
         stats.get("n_materialized_rows", "unknown"),
+        stats.get("preprocessing_stage", "unknown"),
+        stats.get("graphs_built", "unknown"),
+        stats.get("seeds_completed", "unknown"),
+        stats.get("graph_build_elapsed_s", "unknown"),
+        stats.get("seed_elapsed_s", "unknown"),
+        stats.get("time_to_master_s", "unknown"),
+        stats.get("arc_expanded_nodes", "unknown"),
+        stats.get("arc_checks", "unknown"),
+        stats.get("arc_cache_hits", "unknown"),
+        stats.get("wall_index_queries", "unknown"),
+        stats.get("wall_index_candidates", "unknown"),
         solve_elapsed,
     )
 

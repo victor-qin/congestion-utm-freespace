@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
+import heapq
+import itertools
 from collections.abc import Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Hashable
@@ -324,30 +325,10 @@ def _destination_options(fg: FlightGraph) -> dict[Cell, tuple[int | None, ...]]:
     return {cell: tuple(indices) for cell, indices in result.items()}
 
 
-def _distance_to_destinations(
-    fg: FlightGraph,
-    destination_cells: AbstractSet[Cell],
-    *,
-    deadline: float | None = None,
-) -> dict[Cell, int]:
-    """Reverse BFS distances respecting directed static-hop exclusions."""
+def _distance_lower_bound(cell: Cell, destination_cells: AbstractSet[Cell]) -> int:
+    """Admissible spatial distance without forcing a reverse graph traversal."""
 
-    distance = {cell: 0 for cell in destination_cells if cell in fg.corridor_cells}
-    queue = deque(sorted(distance))
-    while queue:
-        _check_deadline(deadline)
-        target = queue.popleft()
-        next_distance = distance[target] + 1
-        tq, tr = target
-        for dq, dr in hg.AXIAL_NEIGHBORS:
-            predecessor = tq + dq, tr + dr
-            if predecessor not in fg.corridor_cells or predecessor in distance:
-                continue
-            if (predecessor, target) in fg.forbidden_hops:
-                continue
-            distance[predecessor] = next_distance
-            queue.append(predecessor)
-    return distance
+    return min(hg.hex_distance(cell, destination) for destination in destination_cells)
 
 
 def _shortest_cell_path(
@@ -357,29 +338,40 @@ def _shortest_cell_path(
     *,
     deadline: float | None = None,
 ) -> tuple[Cell, ...] | None:
-    """Return one deterministic directed BFS path inside the frozen corridor."""
+    """Return one deterministic shortest path using lazy, cached A* expansion."""
 
     if start == destination:
         return None  # A column must contain a real lateral hop.
-    predecessor: dict[Cell, Cell | None] = {start: None}
-    queue = deque((start,))
-    while queue:
+    start_path = (start,)
+    # (f=g+h, h, path, cell): preferring smaller h on equal f follows one
+    # promising geodesic instead of breadth-expanding every equal-f cell.
+    frontier: list[tuple[int, int, tuple[Cell, ...], Cell]] = [
+        (hg.hex_distance(start, destination), hg.hex_distance(start, destination), start_path, start)
+    ]
+    best: dict[Cell, tuple[int, tuple[Cell, ...]]] = {start: (0, start_path)}
+    while frontier:
         _check_deadline(deadline)
-        cell = queue.popleft()
-        for neighbour in sorted(hg.hex_neighbors(*cell)):
-            if neighbour not in fg.corridor_cells or neighbour in predecessor:
+        _estimate, _remaining, path, cell = heapq.heappop(frontier)
+        distance = len(path) - 1
+        if best.get(cell) != (distance, path):
+            continue
+        if cell == destination:
+            return path
+        for neighbour in sorted(fg.outgoing_neighbors(cell)):
+            next_distance = distance + 1
+            next_path = (*path, neighbour)
+            previous = best.get(neighbour)
+            if previous is not None and (
+                previous[0] < next_distance
+                or (previous[0] == next_distance and previous[1] <= next_path)
+            ):
                 continue
-            if (cell, neighbour) in fg.forbidden_hops:
-                continue
-            predecessor[neighbour] = cell
-            if neighbour == destination:
-                reversed_path = [destination]
-                cursor = cell
-                while cursor is not None:
-                    reversed_path.append(cursor)
-                    cursor = predecessor[cursor]
-                return tuple(reversed(reversed_path))
-            queue.append(neighbour)
+            best[neighbour] = next_distance, next_path
+            remaining = hg.hex_distance(neighbour, destination)
+            heapq.heappush(
+                frontier,
+                (next_distance + remaining, remaining, next_path, neighbour),
+            )
     return None
 
 
@@ -551,7 +543,7 @@ def _shifted_seed_incumbent(
     pi_f: float,
     cfg: SimConfig,
     benefit: float,
-    forbidden_rows: frozenset[RowKey],
+    forbidden_rows: AbstractSet[RowKey],
     incumbent: tuple[float, Column] | None,
     *,
     deadline: float | None = None,
@@ -625,7 +617,7 @@ def _canonical_candidate(
     pi_f: float,
     cfg: SimConfig,
     benefit: float,
-    forbidden_rows: frozenset[RowKey],
+    forbidden_rows: AbstractSet[RowKey],
 ) -> tuple[float, Column] | None:
     label = candidate.label
     provisional = Column(
@@ -637,8 +629,11 @@ def _canonical_candidate(
         cell_path=label.path,
         delay_s=candidate.delay_s,
     )
+    intent = column_to_intent(provisional, fg.request, cfg)
+    if intent.status is not IntentStatus.ACCEPTED:
+        return None
     try:
-        claims = column_claims(provisional, fg, cfg)
+        claims = column_claims(provisional, fg, cfg, _intent=intent)
     except (ValueError, NotImplementedError):
         return None
     if not claims.isdisjoint(forbidden_rows):
@@ -647,9 +642,6 @@ def _canonical_candidate(
     # ``column_claims`` already translated the path as its canonical budget
     # gate.  Translate once more to set the objective from precisely the same
     # metric fields exposed to callers; this is only done for top sink labels.
-    intent = column_to_intent(provisional, fg.request, cfg)
-    if intent.status is not IntentStatus.ACCEPTED:
-        return None
     exact_delay = (
         intent.ground_delay_s + intent.air_hold_s + intent.air_detour_m / cfg.nominal_speed_mps
     )
@@ -673,13 +665,125 @@ def _shortest_seed_columns(
     *,
     deadline: float | None = None,
 ) -> tuple[Column, ...]:
-    """Certify deterministic BFS columns for every endpoint-lane pairing."""
+    """Certify and cache one best deterministic shortest-delay seed column.
 
-    view = DualView({}, cfg)
-    candidates: list[_Candidate] = []
-    for origin_lane_idx, start, lane_steps in _origin_options(fg):
-        for destination, destination_lane_indices in sorted(_destination_options(fg).items()):
+    Endpoint lane pairs are ordered by an admissible delay lower bound.  Once a
+    canonical seed beats the remaining bounds, no further spatial path is
+    generated.  Exact ties are still explored for deterministic tie-breaking.
+    """
+
+    cache = fg._search_cache
+    with cache.lock:
+        if cache.seed_columns is not None:
+            return cache.seed_columns
+
+        view = DualView({}, cfg)
+        reference_time_s = enroute_reference_m(
+            fg.request.origin,
+            fg.request.dest,
+            fg.origin_terminal,
+            fg.dest_terminal,
+            cfg,
+        ) / cfg.nominal_speed_mps
+        specs: list[
+            tuple[float, int, int, int, int | None, Cell, int, int | None]
+        ] = []
+        destination_options = _destination_options(fg)
+        for origin_lane_idx, start, lane_steps in _origin_options(fg):
+            origin_lane_dist = (
+                None if origin_lane_idx is None else fg.origin_lanes[origin_lane_idx].dist
+            )
+            origin_fold = _fold_leg_s(
+                fg.request.origin,
+                fg.origin_terminal,
+                origin_lane_dist,
+                cfg,
+            )
+            if fg.origin_terminal is None:
+                origin_fold_lb = origin_fold
+                origin_exact = True
+            else:
+                origin_fold_lb, origin_exact = _terminal_fold_leg_s(
+                    fg.request.origin,
+                    fg.origin_terminal,
+                    start,
+                    cfg,
+                )
+            for destination, destination_lane_indices in sorted(destination_options.items()):
+                hops_lb = hg.hex_distance(start, destination)
+                for dest_lane_idx in destination_lane_indices:
+                    dest_lane_dist = (
+                        None if dest_lane_idx is None else fg.dest_lanes[dest_lane_idx].dist
+                    )
+                    destination_fold = _fold_leg_s(
+                        fg.request.dest,
+                        fg.dest_terminal,
+                        dest_lane_dist,
+                        cfg,
+                    )
+                    if fg.dest_terminal is None:
+                        destination_fold_lb = destination_fold
+                        destination_exact = True
+                    else:
+                        destination_fold_lb, destination_exact = _terminal_fold_leg_s(
+                            fg.request.dest,
+                            fg.dest_terminal,
+                            destination,
+                            cfg,
+                        )
+                    delay_lb = _arc_delay_lower_bound_s(
+                        ground_delay_s=0.0,
+                        origin_fold_s=origin_fold_lb,
+                        hops=0,
+                        remaining_hops=hops_lb,
+                        destination_fold_s=destination_fold_lb,
+                        reference_time_s=reference_time_s,
+                        dt_s=cfg.dt_s,
+                        folding_exact=(
+                            reference_time_s > 0.0 and origin_exact and destination_exact
+                        ),
+                    )
+                    specs.append(
+                        (
+                            delay_lb,
+                            hops_lb,
+                            -1 if origin_lane_idx is None else origin_lane_idx,
+                            -1 if dest_lane_idx is None else dest_lane_idx,
+                            origin_lane_idx,
+                            start,
+                            lane_steps,
+                            dest_lane_idx,
+                        )
+                    )
+
+        specs.sort(key=lambda spec: spec[:4])
+        best: Column | None = None
+        best_key: tuple[Any, ...] | None = None
+        # The path-independent arc oracle must admit an edge whenever any of
+        # its endpoint-tag roles is safe.  Consequently a complete path can
+        # still fail the canonical role-specific wall gate.  If that happens,
+        # one deterministic shortest path does not prove that another path of
+        # the same length is absent; retain the valid seed, but do not use it
+        # later as a global minimum-delay certificate.
+        unresolved_shortest_path = False
+        for (
+            delay_lb,
+            _hops_lb,
+            _origin_tie,
+            _dest_tie,
+            origin_lane_idx,
+            start,
+            lane_steps,
+            dest_lane_idx,
+        ) in specs:
             _check_deadline(deadline)
+            if best is not None and delay_lb > best.delay_s + _RECOMPUTE_EPS:
+                break
+            destination = (
+                fg.dest_cell
+                if dest_lane_idx is None
+                else fg.dest_lanes[dest_lane_idx].cell
+            )
             path = _shortest_cell_path(fg, start, destination, deadline=deadline)
             if path is None:
                 continue
@@ -688,24 +792,36 @@ def _shortest_seed_columns(
                 continue
             label = _Label(0.0, fg.base_step, origin_lane_idx, path, frozenset())
             delay_s = _path_delay_s(fg, cfg, label)
-            for dest_lane_idx in destination_lane_indices:
-                candidates.append(_Candidate(-delay_s, delay_s, label, dest_lane_idx))
+            candidate = _Candidate(-delay_s, delay_s, label, dest_lane_idx)
+            canonical = _canonical_candidate(
+                candidate,
+                fg,
+                view,
+                0.0,
+                cfg,
+                0.0,
+                _EMPTY_ROWS,
+            )
+            if canonical is None:
+                unresolved_shortest_path = True
+                continue
+            column = canonical[1]
+            key = (
+                column.delay_s,
+                len(column.cell_path) - 1,
+                column.departure_step,
+                -1 if column.origin_lane_idx is None else column.origin_lane_idx,
+                -1 if column.dest_lane_idx is None else column.dest_lane_idx,
+                column.cell_path,
+            )
+            if best_key is None or key < best_key:
+                best = column
+                best_key = key
 
-    candidates.sort(key=lambda candidate: (-candidate.reduced_cost, candidate.tie_key))
-    columns: list[Column] = []
-    for candidate in candidates:
-        canonical = _canonical_candidate(
-            candidate,
-            fg,
-            view,
-            0.0,
-            cfg,
-            0.0,
-            _EMPTY_ROWS,
-        )
-        if canonical is not None:
-            columns.append(canonical[1])
-    return tuple(columns)
+        result = () if best is None else (best,)
+        cache.seed_columns = result
+        cache.seed_delay_certified = best is not None and not unresolved_shortest_path
+        return result
 
 
 def _shortest_seed(
@@ -726,7 +842,7 @@ def _best_column(
     pi_f: float,
     cfg: SimConfig,
     benefit: float,
-    forbidden_rows: frozenset[RowKey],
+    forbidden_rows: AbstractSet[RowKey],
     *,
     seed: bool,
     incumbent: tuple[float, Column] | None = None,
@@ -743,7 +859,16 @@ def _best_column(
     destination_options = _destination_options(fg)
     if not destination_options:
         return -math.inf, None
-    distances = _distance_to_destinations(fg, set(destination_options), deadline=deadline)
+    destination_cells = frozenset(destination_options)
+    distance_cache: dict[Cell, int] = {}
+
+    def remaining_distance(cell: Cell) -> int:
+        cached = distance_cache.get(cell)
+        if cached is None:
+            cached = _distance_lower_bound(cell, destination_cells)
+            distance_cache[cell] = cached
+        return cached
+
     origin_options = _origin_options(fg)
     # ``detour_slack_hops`` sizes the spatial ellipse; it is not a route-length
     # budget.  Ordinary pricing may spend the clock slack on W-separated wide
@@ -1005,15 +1130,13 @@ def _best_column(
         if not origin_claims.isdisjoint(forbidden_rows):
             continue
         for lane_idx, cell, lane_steps in origin_options:
-            remaining_distance = distances.get(cell)
-            if remaining_distance is None:
-                continue
+            distance_to_go = remaining_distance(cell)
             start_step = departure_step + fg.takeoff_steps[0] + lane_steps
             if start_step >= fg.max_step:
                 continue
-            if start_step + remaining_distance > fg.max_step:
+            if start_step + distance_to_go > fg.max_step:
                 continue
-            if seed and remaining_distance > seed_hop_limit:
+            if seed and distance_to_go > seed_hop_limit:
                 continue
             visit_claims = _visit_claims(cell, 0, start_step, offsets)
             start_claims = origin_claims | visit_claims
@@ -1024,7 +1147,7 @@ def _best_column(
             if not completion_can_compete(
                 departure_step,
                 lane_idx,
-                remaining_distance,
+                distance_to_go,
                 start_dual_cost,
                 paid_duals_exact=True,
             ):
@@ -1038,9 +1161,54 @@ def _best_column(
                 layer[key] = label
 
     candidates: list[_Candidate] = []
+
+    def consider_sink(label: _Label, step: int, cell: Cell) -> None:
+        """Register one role-certified final arc before label dominance."""
+
+        nonlocal incumbent
+        hops = label.hops
+        for dest_lane_idx in destination_options[cell]:
+            destination_claims = _endpoint_claims(
+                fg,
+                cfg,
+                origin=False,
+                step=step,
+                timing_steps=hops,
+            )
+            if not destination_claims.isdisjoint(forbidden_rows):
+                continue
+            claims = _path_claims(fg, cfg, label, dest_lane_idx)
+            if not claims.isdisjoint(forbidden_rows):
+                continue
+            delay_s = _path_delay_s(fg, cfg, label)
+            reduced_cost = benefit - delay_s - dual_view.claim_cost(claims) - pi_f
+            candidate = _Candidate(
+                reduced_cost,
+                delay_s,
+                label,
+                dest_lane_idx,
+            )
+            candidates.append(candidate)
+            # A certified improving sink tightens the safe lower-bound pruning
+            # for every later time layer.
+            if incumbent is None or reduced_cost > incumbent[0] + _SCORE_EPS:
+                canonical = _canonical_candidate(
+                    candidate,
+                    fg,
+                    dual_view,
+                    pi_f,
+                    cfg,
+                    benefit,
+                    forbidden_rows,
+                )
+                if canonical is not None and (
+                    incumbent is None or canonical[0] > incumbent[0] + _SCORE_EPS
+                ):
+                    incumbent = canonical
+
     for step in range(fg.min_step, fg.max_step + 1):
         _check_deadline(deadline)
-        layer = layers.get(step)
+        layer = layers.pop(step, None)
         if not layer:
             continue
         for label_index, ((cell, recent, origin_paid_rows, first_hop), label) in enumerate(
@@ -1052,44 +1220,6 @@ def _best_column(
             if label_index % 128 == 0:
                 _check_deadline(deadline)
             hops = label.hops
-            if hops >= 1 and cell in destination_options:
-                for dest_lane_idx in destination_options[cell]:
-                    destination_claims = _endpoint_claims(
-                        fg,
-                        cfg,
-                        origin=False,
-                        step=step,
-                        timing_steps=hops,
-                    )
-                    if destination_claims.isdisjoint(forbidden_rows):
-                        claims = _path_claims(fg, cfg, label, dest_lane_idx)
-                        if claims.isdisjoint(forbidden_rows):
-                            delay_s = _path_delay_s(fg, cfg, label)
-                            reduced_cost = benefit - delay_s - dual_view.claim_cost(claims) - pi_f
-                            candidate = _Candidate(
-                                reduced_cost,
-                                delay_s,
-                                label,
-                                dest_lane_idx,
-                            )
-                            candidates.append(candidate)
-                            # A certified improving sink tightens the safe
-                            # lower-bound pruning for every later time layer.
-                            if incumbent is None or reduced_cost > incumbent[0] + _SCORE_EPS:
-                                canonical = _canonical_candidate(
-                                    candidate,
-                                    fg,
-                                    dual_view,
-                                    pi_f,
-                                    cfg,
-                                    benefit,
-                                    forbidden_rows,
-                                )
-                                if canonical is not None and (
-                                    incumbent is None or canonical[0] > incumbent[0] + _SCORE_EPS
-                                ):
-                                    incumbent = canonical
-
             if (seed and hops >= seed_hop_limit) or step + 1 > fg.max_step:
                 continue
             if incumbent is not None:
@@ -1098,7 +1228,7 @@ def _best_column(
                 # ``label.score`` is the negative sum of ground delay, flown
                 # time so far, and the de-duplicated duals paid so far.
                 paid_duals = -label.score - ground_delay - origin_leg - hops * cfg.dt_s
-                remaining_distance = distances[cell]
+                distance_to_go = remaining_distance(cell)
                 # The endpoint-aware envelope lower-bounds the positive price
                 # of the eventual row union without double-counting overlaps.
                 # It also handles exact RC ties in the same hops-first order as
@@ -1106,23 +1236,37 @@ def _best_column(
                 if not completion_can_compete(
                     label.departure_step,
                     label.origin_lane_idx,
-                    hops + remaining_distance,
+                    hops + distance_to_go,
                     paid_duals,
                     paid_duals_exact=False,
                 ):
                     continue
-            cq, cr = cell
-            for dq, dr in hg.AXIAL_NEIGHBORS:
-                neighbour = cq + dq, cr + dr
-                if neighbour not in fg.corridor_cells or neighbour in recent[:revisit_depth]:
+            for neighbour in fg.outgoing_neighbors(cell):
+                if neighbour in recent[:revisit_depth]:
                     continue
-                if (cell, neighbour) in fg.forbidden_hops:
+                first_arc = hops == 0
+                finish_allowed = (
+                    neighbour in destination_options
+                    and fg.hop_allowed_for_role(
+                        cell,
+                        neighbour,
+                        first=first_arc,
+                        last=True,
+                    )
+                )
+                continuation_allowed = fg.hop_allowed_for_role(
+                    cell,
+                    neighbour,
+                    first=first_arc,
+                    last=False,
+                )
+                if not finish_allowed and not continuation_allowed:
                     continue
-                remaining_distance = distances.get(neighbour)
+                distance_to_go = remaining_distance(neighbour)
                 next_step = step + 1
-                if remaining_distance is None or next_step + remaining_distance > fg.max_step:
+                if next_step + distance_to_go > fg.max_step:
                     continue
-                if seed and hops + 1 + remaining_distance > seed_hop_limit:
+                if seed and hops + 1 + distance_to_go > seed_hop_limit:
                     continue
                 claims = _visit_claims(neighbour, 0, next_step, offsets)
                 if not claims.isdisjoint(forbidden_rows):
@@ -1140,6 +1284,10 @@ def _best_column(
                     if track_first_hop
                     else None
                 )
+                if finish_allowed:
+                    consider_sink(next_label, next_step, neighbour)
+                if not continuation_allowed:
+                    continue
                 key = (
                     neighbour,
                     next_recent,
@@ -1199,6 +1347,338 @@ def _best_column(
     return (-math.inf, None) if best is None else best
 
 
+def find_feasible_column(
+    fg: FlightGraph,
+    cfg: SimConfig,
+    *,
+    forbidden_rows: AbstractSet[RowKey] = _EMPTY_ROWS,
+    improve_below_delay_s: float | None = None,
+    deadline: float | None = None,
+) -> Column | None:
+    """Best-first incumbent search over the lazy space-time topology.
+
+    This is deliberately an incumbent heuristic, not the reduced-cost oracle:
+    it runs only after the first LP and therefore cannot contribute to a global
+    pricing bound.  Static adjacency and the certified seed are reused, while
+    row exclusions and labels remain call-local.  A raw-hex delay lower bound
+    orders the frontier; the exact canonical gate judges every sink.  When
+    ``improve_below_delay_s`` is supplied, the first certified strict
+    improvement may be returned.  That early exit is useful for incumbent
+    construction but is intentionally unavailable to formal pricing.
+    """
+
+    _check_deadline(deadline)
+    if cfg != fg._cfg:
+        raise ValueError("feasible search requires the SimConfig used to build the flight graph")
+    if improve_below_delay_s is not None:
+        improve_below_delay_s = float(improve_below_delay_s)
+        if not math.isfinite(improve_below_delay_s):
+            raise ValueError("improvement delay threshold must be finite")
+    forbidden = forbidden_rows
+    destination_options = _destination_options(fg)
+    if not destination_options:
+        return None
+    destination_cells = frozenset(destination_options)
+    origin_options = _origin_options(fg)
+    offsets = derive_cell_window(cfg)
+    revisit_depth = offsets[1] - offsets[0]
+    state_history_depth = max(2, revisit_depth)
+    track_first_hop = bool(fg.static_walls and fg.origin_terminal is not None)
+    view = DualView({}, cfg)
+
+    reference_m = enroute_reference_m(
+        fg.request.origin,
+        fg.request.dest,
+        fg.origin_terminal,
+        fg.dest_terminal,
+        cfg,
+    )
+    reference_time_s = reference_m / cfg.nominal_speed_mps
+    origin_fold_lb: dict[int | None, tuple[float, bool]] = {}
+    for lane_idx, cell, _lane_steps in origin_options:
+        if fg.origin_terminal is None:
+            origin_fold_lb[lane_idx] = (
+                _fold_leg_s(fg.request.origin, None, None, cfg),
+                True,
+            )
+        else:
+            origin_fold_lb[lane_idx] = _terminal_fold_leg_s(
+                fg.request.origin,
+                fg.origin_terminal,
+                cell,
+                cfg,
+            )
+
+    destination_fold_exact = True
+    if fg.dest_terminal is None:
+        destination_fold_lb = _fold_leg_s(fg.request.dest, None, None, cfg)
+    else:
+        destination_folds: list[float] = []
+        for destination in destination_options:
+            fold_s, retained = _terminal_fold_leg_s(
+                fg.request.dest,
+                fg.dest_terminal,
+                destination,
+                cfg,
+            )
+            destination_folds.append(fold_s)
+            destination_fold_exact &= retained
+        destination_fold_lb = min(destination_folds)
+
+    def delay_bound(
+        departure_step: int,
+        lane_idx: int | None,
+        hops: int,
+        remaining_hops: int,
+    ) -> float:
+        origin_fold_s, origin_exact = origin_fold_lb[lane_idx]
+        return _arc_delay_lower_bound_s(
+            ground_delay_s=(departure_step - fg.base_step) * cfg.dt_s,
+            origin_fold_s=origin_fold_s,
+            hops=hops,
+            remaining_hops=remaining_hops,
+            destination_fold_s=destination_fold_lb,
+            reference_time_s=reference_time_s,
+            dt_s=cfg.dt_s,
+            folding_exact=(
+                reference_m > 1e-9 and origin_exact and destination_fold_exact
+            ),
+        )
+
+    best_column: Column | None = None
+    try:
+        seed = seed_column(fg, cfg, deadline=deadline)
+    except ValueError:
+        seed = None
+    if seed is not None:
+        if seed.claims.isdisjoint(forbidden):
+            best_column = seed
+            if (
+                improve_below_delay_s is not None
+                and seed.delay_s < improve_below_delay_s - _SCORE_EPS
+            ):
+                return seed
+        shifted = _shifted_seed_incumbent(
+            seed,
+            fg,
+            view,
+            0.0,
+            cfg,
+            0.0,
+            forbidden,
+            None if best_column is None else (-best_column.delay_s, best_column),
+            deadline=deadline,
+        )
+        if shifted is not None and (
+            best_column is None or shifted[1].delay_s < best_column.delay_s - _SCORE_EPS
+        ):
+            best_column = shifted[1]
+            if (
+                improve_below_delay_s is not None
+                and best_column.delay_s < improve_below_delay_s - _SCORE_EPS
+            ):
+                return best_column
+
+    def column_key(column: Column) -> tuple[Any, ...]:
+        return (
+            column.delay_s,
+            len(column.cell_path) - 1,
+            column.departure_step,
+            -1 if column.origin_lane_idx is None else column.origin_lane_idx,
+            -1 if column.dest_lane_idx is None else column.dest_lane_idx,
+            column.cell_path,
+        )
+
+    counter = itertools.count()
+    frontier: list[
+        tuple[
+            float,
+            int,
+            int,
+            int,
+            tuple[Cell, ...],
+            int,
+            int,
+            tuple[Cell, ...],
+            tuple[Cell, Cell] | None,
+            _Label,
+        ]
+    ] = []
+    best_state_path: dict[tuple[Any, ...], tuple[Cell, ...]] = {}
+    for departure_step in range(fg.base_step, fg.latest_departure_step + 1):
+        _check_deadline(deadline)
+        ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
+        if best_column is not None and ground_delay_s > best_column.delay_s + _RECOMPUTE_EPS:
+            break
+        origin_claims = _endpoint_claims(
+            fg,
+            cfg,
+            origin=True,
+            step=departure_step,
+            timing_steps=0,
+        )
+        if not origin_claims.isdisjoint(forbidden):
+            continue
+        for lane_idx, cell, lane_steps in origin_options:
+            start_step = departure_step + fg.takeoff_steps[0] + lane_steps
+            remaining = _distance_lower_bound(cell, destination_cells)
+            if start_step >= fg.max_step or start_step + remaining > fg.max_step:
+                continue
+            visit_claims = _visit_claims(cell, 0, start_step, offsets)
+            if not (origin_claims | visit_claims).isdisjoint(forbidden):
+                continue
+            path = (cell,)
+            recent = path
+            label = _Label(0.0, departure_step, lane_idx, path, frozenset())
+            bound = delay_bound(departure_step, lane_idx, 0, remaining)
+            if best_column is not None and bound > best_column.delay_s + _RECOMPUTE_EPS:
+                continue
+            state_key = (start_step, cell, recent, departure_step, lane_idx, None)
+            best_state_path[state_key] = path
+            heapq.heappush(
+                frontier,
+                (
+                    bound,
+                    remaining,
+                    departure_step,
+                    -1 if lane_idx is None else lane_idx,
+                    path,
+                    next(counter),
+                    start_step,
+                    recent,
+                    None,
+                    label,
+                ),
+            )
+
+    while frontier:
+        _check_deadline(deadline)
+        (
+            bound,
+            _estimated_hops,
+            departure_step,
+            _lane_tie,
+            path,
+            _serial,
+            step,
+            recent,
+            first_hop,
+            label,
+        ) = heapq.heappop(frontier)
+        if best_column is not None and bound > best_column.delay_s + _RECOMPUTE_EPS:
+            break
+        state_key = (
+            step,
+            path[-1],
+            recent,
+            departure_step,
+            label.origin_lane_idx,
+            first_hop,
+        )
+        if best_state_path.get(state_key) != path:
+            continue
+        cell = path[-1]
+        hops = len(path) - 1
+        if hops >= 1 and cell in destination_options:
+            for dest_lane_idx in destination_options[cell]:
+                destination_claims = _endpoint_claims(
+                    fg,
+                    cfg,
+                    origin=False,
+                    step=step,
+                    timing_steps=hops,
+                )
+                if not destination_claims.isdisjoint(forbidden):
+                    continue
+                claims = _path_claims(fg, cfg, label, dest_lane_idx)
+                if not claims.isdisjoint(forbidden):
+                    continue
+                delay_s = _path_delay_s(fg, cfg, label)
+                canonical = _canonical_candidate(
+                    _Candidate(-delay_s, delay_s, label, dest_lane_idx),
+                    fg,
+                    view,
+                    0.0,
+                    cfg,
+                    0.0,
+                    forbidden,
+                )
+                if canonical is None:
+                    continue
+                candidate = canonical[1]
+                if best_column is None or column_key(candidate) < column_key(best_column):
+                    best_column = candidate
+                    if (
+                        improve_below_delay_s is not None
+                        and candidate.delay_s < improve_below_delay_s - _SCORE_EPS
+                    ):
+                        return candidate
+
+        if step + 1 > fg.max_step:
+            continue
+        for neighbour in fg.outgoing_neighbors(cell):
+            if neighbour in recent[:revisit_depth]:
+                continue
+            next_step = step + 1
+            remaining = _distance_lower_bound(neighbour, destination_cells)
+            if next_step + remaining > fg.max_step:
+                continue
+            claims = _visit_claims(neighbour, 0, next_step, offsets)
+            if not claims.isdisjoint(forbidden):
+                continue
+            next_path = (*path, neighbour)
+            next_recent = (neighbour, *recent[: state_history_depth - 1])
+            next_first_hop = (
+                ((cell, neighbour) if first_hop is None else first_hop)
+                if track_first_hop
+                else None
+            )
+            next_bound = delay_bound(
+                departure_step,
+                label.origin_lane_idx,
+                hops + 1,
+                remaining,
+            )
+            if best_column is not None and next_bound > best_column.delay_s + _RECOMPUTE_EPS:
+                continue
+            next_key = (
+                next_step,
+                neighbour,
+                next_recent,
+                departure_step,
+                label.origin_lane_idx,
+                next_first_hop,
+            )
+            previous_path = best_state_path.get(next_key)
+            if previous_path is not None and previous_path <= next_path:
+                continue
+            best_state_path[next_key] = next_path
+            next_label = _Label(
+                0.0,
+                departure_step,
+                label.origin_lane_idx,
+                next_path,
+                frozenset(),
+            )
+            heapq.heappush(
+                frontier,
+                (
+                    next_bound,
+                    hops + 1 + remaining,
+                    departure_step,
+                    -1 if label.origin_lane_idx is None else label.origin_lane_idx,
+                    next_path,
+                    next(counter),
+                    next_step,
+                    next_recent,
+                    next_first_hop,
+                    next_label,
+                ),
+            )
+
+    return best_column
+
+
 def price_flight(
     fg: FlightGraph,
     duals: Mapping[RowKey | tuple[Any, ...], float] | DualView,
@@ -1206,7 +1686,7 @@ def price_flight(
     cfg: SimConfig,
     params: Any,
     *,
-    forbidden_rows: frozenset[RowKey] = _EMPTY_ROWS,
+    forbidden_rows: AbstractSet[RowKey] = _EMPTY_ROWS,
     require_improving: bool = True,
     deadline: float | None = None,
 ) -> tuple[float, Column | None]:
@@ -1223,6 +1703,8 @@ def price_flight(
 
     if not isinstance(require_improving, bool):
         raise TypeError("require_improving must be a boolean")
+    if cfg != fg._cfg:
+        raise ValueError("pricing requires the SimConfig used to build the flight graph")
     if deadline is not None:
         deadline = float(deadline)
         if not math.isfinite(deadline):
@@ -1232,17 +1714,11 @@ def price_flight(
     if not math.isfinite(pi_value):
         raise ValueError(f"flight-row dual must be finite, got {pi_f!r}")
     view = duals if isinstance(duals, DualView) else DualView(duals, cfg)
-    forbidden = frozenset(key if isinstance(key, RowKey) else RowKey(key) for key in forbidden_rows)
+    forbidden = forbidden_rows
     benefit = _benefit(params)
     incumbent: tuple[float, Column] | None = None
-    shortest_columns: tuple[Column, ...] = ()
     try:
-        shortest_columns = _shortest_seed_columns(fg, cfg, deadline=deadline)
-        seed = (
-            shortest_columns[0]
-            if shortest_columns
-            else seed_column(fg, cfg, deadline=deadline)
-        )
+        seed = seed_column(fg, cfg, deadline=deadline)
     except ValueError:
         # A deterministic shortest-path seed is an acceleration, not a
         # feasibility precondition.  The full DAG may still find a usable
@@ -1261,7 +1737,13 @@ def price_flight(
             # other side of the region must not trigger this flight's full DAG.
             # Tiny negative backend-tolerance duals deliberately disable the
             # shortcut because another route could collect their credit.
-            if seed_dual_cost == 0.0 and view.max_negative_credit == 0.0:
+            with fg._search_cache.lock:
+                seed_delay_certified = fg._search_cache.seed_delay_certified
+            if (
+                seed_delay_certified
+                and seed_dual_cost == 0.0
+                and view.max_negative_credit == 0.0
+            ):
                 if require_improving and seed_rc <= _pricing_tolerance(params):
                     return seed_rc, None
                 return seed_rc, seed
@@ -1276,26 +1758,6 @@ def price_flight(
             incumbent,
             deadline=deadline,
         )
-        for alternative in shortest_columns[1:]:
-            dual_free = False
-            if alternative.claims.isdisjoint(forbidden):
-                alternative_dual_cost = view.claim_cost(alternative.claims)
-                alternative_rc = benefit - alternative.delay_s - alternative_dual_cost - pi_value
-                if incumbent is None or alternative_rc > incumbent[0] + _SCORE_EPS:
-                    incumbent = alternative_rc, alternative
-                dual_free = alternative_dual_cost == 0.0 and view.max_negative_credit == 0.0
-            if not dual_free:
-                incumbent = _shifted_seed_incumbent(
-                    alternative,
-                    fg,
-                    view,
-                    pi_value,
-                    cfg,
-                    benefit,
-                    forbidden,
-                    incumbent,
-                    deadline=deadline,
-                )
     reduced_cost, column = _best_column(
         fg,
         view,
@@ -1327,13 +1789,24 @@ def seed_column(
     detour gates.
     """
 
+    if cfg != fg._cfg:
+        raise ValueError("seeding requires the SimConfig used to build the flight graph")
     if deadline is not None:
         deadline = float(deadline)
         if not math.isfinite(deadline):
             raise ValueError("seed deadline must be finite")
     _check_deadline(deadline)
+    with fg._search_cache.lock:
+        if fg._search_cache.seed_search_complete:
+            cached = fg._search_cache.seed_columns or ()
+            if cached:
+                return cached[0]
+            raise ValueError(f"flight {fg.request.flight_id} has no feasible seed column")
+
     direct = _shortest_seed(fg, cfg, deadline=deadline)
     if direct is not None:
+        with fg._search_cache.lock:
+            fg._search_cache.seed_search_complete = True
         return direct
 
     # Rare path-position-dependent terminal-wall tagging can invalidate the
@@ -1353,8 +1826,26 @@ def seed_column(
         deadline=deadline,
     )
     if column is None:
+        with fg._search_cache.lock:
+            fg._search_cache.seed_columns = ()
+            fg._search_cache.seed_delay_certified = False
+            fg._search_cache.seed_search_complete = True
         raise ValueError(f"flight {fg.request.flight_id} has no feasible seed column")
+    with fg._search_cache.lock:
+        fg._search_cache.seed_columns = (column,)
+        # The fallback is a bounded feasibility search.  It is a valid seed,
+        # but path-dependent wall tagging may mean it is not a globally
+        # minimum-delay column, so exact pricing must not take the zero-dual
+        # locality shortcut from it.
+        fg._search_cache.seed_delay_certified = False
+        fg._search_cache.seed_search_complete = True
     return column
 
 
-__all__ = ["DualView", "PricingTimeout", "price_flight", "seed_column"]
+__all__ = [
+    "DualView",
+    "PricingTimeout",
+    "find_feasible_column",
+    "price_flight",
+    "seed_column",
+]

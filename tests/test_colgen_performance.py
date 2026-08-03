@@ -54,6 +54,179 @@ def _graph(cfg: SimConfig, *, slack: int = 4):
     return build_flight_graph(request, cfg, (), params), params
 
 
+def test_seed_astar_expands_only_a_small_lazy_subset():
+    """A long seed follows a promising geodesic without materializing its ellipse."""
+
+    cfg = _cfg()
+    request = FlightRequest(101, _point((0, 0), cfg), _point((80, 0), cfg), 0.0, 0.0)
+    params = ColGenParams(solver="highs", detour_slack_hops=12)
+    graph = build_flight_graph(request, cfg, (), params)
+
+    assert not graph.corridor_cells.is_materialized
+    seed = seed_column(graph, cfg)
+    stats = dict(graph.arc_cache_stats)
+
+    assert len(seed.cell_path) - 1 == 80
+    assert stats["expanded_nodes"] <= 80
+    assert not graph.corridor_cells.is_materialized
+    assert stats["expanded_nodes"] < len(graph.corridor_cells) // 10
+
+
+def test_repeated_pricing_reuses_lazy_arcs_and_cached_seed():
+    cfg = _cfg()
+    graph, params = _graph(cfg, slack=2)
+    credited = RowKey.cell((-2, 0), 0, 5)
+
+    first = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
+    first_stats = dict(graph.arc_cache_stats)
+    second = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
+    second_stats = dict(graph.arc_cache_stats)
+
+    assert second == first
+    assert second_stats["arc_checks"] == first_stats["arc_checks"]
+    assert second_stats["expanded_nodes"] == first_stats["expanded_nodes"]
+    assert second_stats["cache_hits"] > first_stats["cache_hits"]
+
+
+def test_canonical_claim_cache_is_strictly_bounded():
+    cfg = _cfg()
+    graph, _params = _graph(cfg, slack=2)
+    seed = seed_column(graph, cfg)
+
+    for delta in range(6):
+        shifted = replace(
+            seed,
+            departure_step=seed.departure_step + delta,
+            claims=frozenset(),
+        )
+        column_claims(shifted, graph, cfg)
+
+    assert len(graph._search_cache.certified_claims) == 2
+
+
+def test_uncertified_wall_seed_cannot_skip_exact_pricing(monkeypatch):
+    """A valid fallback seed is an incumbent, not a global zero-dual proof."""
+
+    cfg = _cfg()
+    graph, params = _graph(cfg, slack=1)
+    seed_column(graph, cfg)
+    graph._search_cache.seed_delay_certified = False
+    original = pricing._best_column
+    calls = 0
+
+    def capture_exact_search(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_best_column", capture_exact_search)
+
+    _reduced_cost, column = price_flight(graph, {}, 0.0, cfg, params)
+
+    assert calls == 1
+    assert column is not None
+
+
+def test_role_specific_wall_arcs_survive_pricing_dominance():
+    """A wall-invalid prefix cannot dominate the only valid final-role path."""
+
+    cfg = SimConfig(
+        planner="colgen",
+        flight_levels_m=(100.0,),
+        airspace_ceiling_m=125.0,
+        region_size_m=(20_000.0, 20_000.0),
+        terminal_airspace_always_active=True,
+        max_ground_delay_s=0.0,
+        max_detour_factor=10.0,
+    )
+    params = ColGenParams(
+        solver="highs",
+        detour_slack_hops=6,
+        M=1_000_000.0,
+    )
+    origin = vec(34.27069337311164, -48.529334145873435, 0.0)
+    destination = vec(6.242554805910697, -463.9202302821416, 0.0)
+    origin_terminal = Terminal("A", 1, radius=120.0)
+    destination_terminal = Terminal("B", 1, radius=120.0)
+    request = FlightRequest(
+        1,
+        origin,
+        destination,
+        0.0,
+        0.0,
+        origin_terminal=origin_terminal,
+        dest_terminal=destination_terminal,
+    )
+    graph = build_flight_graph(
+        request,
+        cfg,
+        ((origin, origin_terminal), (destination, destination_terminal)),
+        params,
+    )
+    duals = {
+        RowKey.cell((-1, -1), 0, 7): -1000.0,
+        RowKey.cell((0, -2), 0, 8): -1000.0,
+        RowKey.cell((2, -3), 0, 10): -1000.0,
+        RowKey.cell((3, -3), 0, 11): -1000.0,
+        RowKey.cell((4, -4), 0, 12): -1000.0,
+        RowKey.cell((1, -3), 0, 9): 1.0,
+    }
+    expected = Column(
+        request.flight_id,
+        graph.base_step,
+        0,
+        0,
+        5,
+        (
+            (-1, -1),
+            (0, -2),
+            (1, -3),
+            (2, -3),
+            (3, -3),
+            (4, -4),
+        ),
+        0.0,
+    )
+    expected = replace(
+        expected,
+        delay_s=total_delay_s(column_to_intent(expected, request, cfg), cfg),
+        claims=column_claims(expected, graph, cfg),
+    )
+
+    invalid = replace(
+        expected,
+        cell_path=(
+            (-1, -1),
+            (0, -2),
+            (1, -2),
+            (2, -3),
+            (3, -3),
+            (4, -4),
+        ),
+        delay_s=0.0,
+        claims=frozenset(),
+    )
+    with pytest.raises(ValueError, match="permanent static terminal"):
+        column_claims(invalid, graph, cfg)
+
+    reduced_cost, column = price_flight(
+        graph,
+        duals,
+        0.0,
+        cfg,
+        params,
+        require_improving=False,
+    )
+    expected_reduced_cost = params.M - expected.delay_s - sum(
+        duals.get(row, 0.0) for row in expected.claims
+    )
+
+    assert expected.delay_s == pytest.approx(21.45534857624976)
+    assert expected_reduced_cost == pytest.approx(1_004_977.5446514237)
+    assert reduced_cost == pytest.approx(expected_reduced_cost)
+    assert column == expected
+
+
 def test_unrelated_rows_keep_the_canonical_seed_fast_path(monkeypatch):
     """Positive prices and exclusions elsewhere cannot make another route better."""
 

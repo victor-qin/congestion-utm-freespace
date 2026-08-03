@@ -9,6 +9,7 @@ the independent referee for selected columns.
 from __future__ import annotations
 
 import math
+import time
 from collections import Counter
 from dataclasses import replace
 
@@ -34,6 +35,7 @@ from freespace_sim.planner.colgen.pricing import PricingTimeout, price_flight, s
 from freespace_sim.planner.colgen.solver import (
     ColGenSolver,
     _fixed_loads,
+    _greedy_feasible_selection,
     _initial_feasible_selection,
     _shift_claims,
 )
@@ -740,6 +742,84 @@ def test_repair_covers_all_feasible_flights(monkeypatch):
     _assert_files_cleanly(requests, result.columns, cfg)
 
 
+def test_first_master_has_only_bounded_shortest_path_initialization(monkeypatch):
+    """Route alternatives are generated after, never before, the first LP."""
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+    events: list[str] = []
+    first_lp_counts: Counter[int] = Counter()
+    original_solve_lp = RestrictedMaster.solve_lp
+
+    def capture_first_lp(master):
+        events.append("lp")
+        if not first_lp_counts:
+            first_lp_counts.update(column.flight_id for column in master.columns)
+        return original_solve_lp(master)
+
+    def capture_greedy(*_args, **kwargs):
+        events.append("greedy")
+        return dict(kwargs["initial"]), True
+
+    monkeypatch.setattr(RestrictedMaster, "solve_lp", capture_first_lp)
+    monkeypatch.setattr(solver_module, "_greedy_feasible_selection", capture_greedy)
+
+    result = ColGenSolver().solve(requests, cfg, (), _params())
+
+    assert result.columns
+    assert first_lp_counts
+    assert set(first_lp_counts) == {1, 2}
+    assert max(first_lp_counts.values()) <= 2
+    assert events.index("lp") < events.index("greedy")
+
+
+def test_greedy_timeout_is_local_to_one_flight(monkeypatch):
+    cfg = _cfg(max_ground_delay_s=32.0)
+    params = _params()
+    requests = [
+        _request(1, (-4, -8), (4, -8), cfg),
+        _request(2, (-4, 8), (4, 8), cfg),
+    ]
+    graphs = {
+        request.flight_id: build_flight_graph(request, cfg, (), params)
+        for request in requests
+    }
+    initial = {
+        flight_id: solver_module._shift_column(
+            seed_column(graph, cfg),
+            graph.base_step + 1,
+            cfg,
+        )
+        for flight_id, graph in graphs.items()
+    }
+    calls: list[int] = []
+
+    def fake_search(graph, *_args, **_kwargs):
+        calls.append(graph.request.flight_id)
+        if graph.request.flight_id == 1:
+            raise PricingTimeout
+        return None
+
+    monkeypatch.setattr(solver_module, "find_feasible_column", fake_search)
+
+    selected, completed = _greedy_feasible_selection(
+        graphs,
+        {},
+        RowIndex(),
+        cfg,
+        params,
+        deadline=time.monotonic() + 10.0,
+        initial=initial,
+    )
+
+    assert calls == [1, 2]
+    assert selected == initial
+    assert completed is False
+
+
 def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
     """A detoured seed can be longer than the graph's nominal hop allowance."""
 
@@ -871,7 +951,14 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
     assert first.stats["lp_gap"] <= params.lp_gap + 1e-8
     assert first.columns == second.columns
     # Runtime is intentionally excluded from the reproducibility contract.
-    for key in set(first.stats) - {"elapsed_s", "initial_greedy_elapsed_s"}:
+    runtime_stats = {
+        "elapsed_s",
+        "graph_build_elapsed_s",
+        "initial_greedy_elapsed_s",
+        "seed_elapsed_s",
+        "time_to_master_s",
+    }
+    for key in set(first.stats) - runtime_stats:
         assert first.stats[key] == second.stats[key]
 
 
@@ -1063,7 +1150,7 @@ def test_ip_deadline_stops_lazy_separation_and_keeps_heuristic(monkeypatch):
 def test_preprocessing_deadline_returns_search_exhausted_without_building_graphs(monkeypatch):
     cfg = _cfg()
     request = _request(1, (-2, 0), (2, 0), cfg)
-    clock = iter((0.0, 2.0, 2.0))
+    clock = iter((0.0, 2.0, 2.0, 2.0, 2.0))
     monkeypatch.setattr(solver_module.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(
         solver_module,
@@ -1082,6 +1169,37 @@ def test_preprocessing_deadline_returns_search_exhausted_without_building_graphs
     assert result.stats["termination_reason"] == "time_limit"
     assert result.stats["search_exhausted_flight_ids"] == (request.flight_id,)
     assert result.stats["budget_denied_flight_ids"] == ()
+
+
+def test_seeding_timeout_reports_partial_master_progress(monkeypatch):
+    cfg = _cfg()
+    requests = [
+        _request(1, (-4, -4), (4, -4), cfg),
+        _request(2, (-4, 4), (4, 4), cfg),
+    ]
+    original_seed = solver_module.seed_column
+    calls = 0
+
+    def timeout_on_second(graph, solve_cfg, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PricingTimeout("test seeding timeout")
+        return original_seed(graph, solve_cfg, **kwargs)
+
+    monkeypatch.setattr(solver_module, "seed_column", timeout_on_second)
+
+    result = ColGenSolver().solve(requests, cfg, (), _params())
+
+    assert result.columns == {}
+    assert result.stats["backend"] == "highs"
+    assert result.stats["preprocessing_stage"] == "seeding"
+    assert result.stats["graphs_built"] == 2
+    assert result.stats["seed_flights_processed"] == 1
+    assert result.stats["seeds_completed"] == 1
+    assert result.stats["initial_seed_columns"] == 1
+    assert result.stats["n_columns"] == 1
+    assert result.stats["time_to_master_s"] > 0.0
 
 
 def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):

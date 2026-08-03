@@ -25,13 +25,16 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.metrics import flight_row, total_delay_s
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
+import freespace_sim.planner.colgen.network as network_module
 from freespace_sim.planner.colgen.network import (
     RowIndex,
     RowKey,
+    StaticTerminalCatalog,
     build_flight_graph,
     column_claims,
 )
 from freespace_sim.planner.colgen.params import ColGenParams
+from freespace_sim.planner.colgen.pricing import seed_column
 from freespace_sim.planner.colgen.translate import (
     Column,
     column_to_corners,
@@ -310,6 +313,192 @@ def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
         fg.request.origin_terminal = Terminal("mutated", 1)
     with pytest.raises(AttributeError, match="snapshot is immutable"):
         rebuilt.request.dest_terminal = Terminal("mutated", 1)
+
+
+def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
+    """Construction must not enumerate the ellipse or classify any directed hop."""
+
+    cfg = _cfg()
+    req = FlightRequest(
+        109,
+        _ground_point((-40, 0), cfg),
+        _ground_point((40, 0), cfg),
+        0.0,
+    )
+    wall = Terminal("far-wall", 1, radius=30.0)
+
+    def fail_if_checked(*_args, **_kwargs):
+        pytest.fail("build_flight_graph eagerly classified a static hop")
+
+    monkeypatch.setattr(network_module, "_static_hop_forbidden", fail_if_checked)
+    graph = build_flight_graph(
+        req,
+        cfg,
+        [(_ground_point((0, 20), cfg), wall)],
+        ColGenParams(detour_slack_hops=12),
+    )
+
+    assert not graph.corridor_cells.is_materialized
+    assert dict(graph.arc_cache_stats) == {
+        "expanded_nodes": 0,
+        "arc_checks": 0,
+        "cache_hits": 0,
+        "allowed_arcs": 0,
+        "blocked_arcs": 0,
+    }
+
+
+def test_static_catalog_is_shared_without_rebuilding_terminal_cells(monkeypatch):
+    cfg = _cfg()
+    terminals = tuple(
+        (_ground_point(cell, cfg), Terminal(f"wall-{index}", 1, radius=90.0))
+        for index, cell in enumerate(((40, 40), (50, 50), (60, 60)))
+    )
+    calls = 0
+    original_terminal_cells = hg.terminal_cells
+
+    def count_terminal_cells(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_terminal_cells(*args, **kwargs)
+
+    monkeypatch.setattr(hg, "terminal_cells", count_terminal_cells)
+    catalog = StaticTerminalCatalog(terminals, cfg)
+    catalog_calls = calls
+    requests = (
+        FlightRequest(120, _ground_point((-5, 0), cfg), _ground_point((5, 0), cfg), 0.0),
+        FlightRequest(121, _ground_point((-5, 5), cfg), _ground_point((5, 5), cfg), 0.0),
+    )
+    graphs = tuple(
+        build_flight_graph(request, cfg, catalog, ColGenParams(detour_slack_hops=2))
+        for request in requests
+    )
+
+    assert catalog_calls == len(terminals)
+    assert calls == catalog_calls
+    assert all(graph.static_walls is catalog.walls for graph in graphs)
+    assert all(graph._wall_index is catalog.wall_index for graph in graphs)
+    assert all(not graph.corridor_cells.is_materialized for graph in graphs)
+
+
+def test_many_far_walls_never_reach_narrow_phase(monkeypatch):
+    cfg = _cfg()
+    terminals = tuple(
+        (
+            _ground_point((80 + index, 80), cfg),
+            Terminal(f"far-{index}", 1, radius=90.0),
+        )
+        for index in range(100)
+    )
+    catalog = StaticTerminalCatalog(terminals, cfg)
+    request = FlightRequest(
+        122,
+        _ground_point((-5, 0), cfg),
+        _ground_point((5, 0), cfg),
+        0.0,
+    )
+    graph = build_flight_graph(
+        request,
+        cfg,
+        catalog,
+        ColGenParams(detour_slack_hops=2),
+    )
+    calls = 0
+    original_conflict = network_module.volumes_conflict
+
+    def count_conflicts(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_conflict(*args, **kwargs)
+
+    monkeypatch.setattr(network_module, "volumes_conflict", count_conflicts)
+
+    seed = seed_column(graph, cfg)
+
+    assert seed.claims
+    assert calls == 0
+    assert catalog.wall_index.stats["queries"] > 0
+    assert catalog.wall_index.stats["candidates"] == 0
+
+
+def test_lazy_outgoing_arcs_expand_each_source_once():
+    cfg = _cfg()
+    req = FlightRequest(
+        110,
+        _ground_point((-4, 0), cfg),
+        _ground_point((4, 0), cfg),
+        0.0,
+    )
+    graph = build_flight_graph(req, cfg, (), ColGenParams(detour_slack_hops=2))
+
+    first = graph.outgoing_neighbors(graph.origin_cell)
+    after_first = dict(graph.arc_cache_stats)
+    second = graph.outgoing_neighbors(graph.origin_cell)
+    after_second = dict(graph.arc_cache_stats)
+
+    assert first == second
+    assert first
+    assert after_first["expanded_nodes"] == 1
+    assert after_first["arc_checks"] == len(first)
+    assert after_second["expanded_nodes"] == 1
+    assert after_second["arc_checks"] == after_first["arc_checks"]
+    assert after_second["cache_hits"] == after_first["cache_hits"] + 1
+    assert not graph.corridor_cells.is_materialized
+
+
+def test_lazy_static_arc_verdicts_match_eager_reference():
+    """Laziness changes evaluation order, not the all-tag-variants predicate."""
+
+    cfg = _cfg()
+    wall_center = vec(-61.4786398, 33.5115978, 0.0)
+    wall = Terminal("small-wall", 1, radius=30.0)
+    req = FlightRequest(
+        1110,
+        _ground_point((-3, 0), cfg),
+        _ground_point((3, 0), cfg),
+        0.0,
+    )
+    graph = build_flight_graph(
+        req,
+        cfg,
+        ((wall_center, wall),),
+        ColGenParams(detour_slack_hops=2),
+    )
+    cells = frozenset(graph.corridor_cells)
+    eager = network_module._forbidden_static_hops(
+        cells,
+        graph.static_walls,
+        graph.request,
+        graph.origin_terminal,
+        graph.dest_terminal,
+        graph.origin_lanes,
+        graph.dest_lanes,
+        cfg,
+    )
+
+    for source in cells:
+        for target in hg.hex_neighbors(*source):
+            if target in cells:
+                assert graph.hop_is_forbidden(source, target) == ((source, target) in eager)
+
+
+def test_warmed_lazy_graph_pickles_with_cold_answer_equivalent_cache():
+    cfg = _cfg()
+    req = FlightRequest(
+        1111,
+        _ground_point((-4, 0), cfg),
+        _ground_point((4, 0), cfg),
+        0.0,
+    )
+    graph = build_flight_graph(req, cfg, (), ColGenParams(detour_slack_hops=2))
+    expected = graph.outgoing_neighbors(graph.origin_cell)
+    assert graph.arc_cache_stats["expanded_nodes"] == 1
+
+    rebuilt = pickle.loads(pickle.dumps(graph))
+
+    assert rebuilt == graph
+    assert rebuilt.arc_cache_stats["expanded_nodes"] == 0
+    assert rebuilt.outgoing_neighbors(rebuilt.origin_cell) == expected
 
 
 def test_corridor_prune_removes_foreign_terminal_cells():

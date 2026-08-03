@@ -2,7 +2,7 @@
 
 import pytest
 
-from experiments.run import build_parser, spec_from_args
+from experiments.run import parse_args, spec_from_args
 from freespace_sim.scenarios import SCENARIOS
 
 
@@ -12,7 +12,35 @@ def _args(scenario: str, *extra: str):
     A ``SimpleNamespace`` fixture has to list every attribute ``spec_from_args`` reads, so adding
     a flag breaks these tests with an ``AttributeError`` that says nothing about the actual change.
     """
-    return build_parser().parse_args(["--scenario", scenario, *extra])
+    return parse_args(["--scenario", scenario, *extra])
+
+
+@pytest.mark.parametrize("planner_args", [(), ("--planner", "astar"), ("--planner", "milp")])
+def test_execution_mode_defaults_to_sequential_for_every_planner(planner_args):
+    assert _args("metro_uniform", *planner_args).mode == "sequential"
+
+
+@pytest.mark.parametrize(
+    "parallel_args",
+    [
+        ("--workers", "2"),
+        ("--parallel-window", "8"),
+        ("--workers", "2", "--parallel-window", "8"),
+    ],
+)
+def test_sequential_mode_rejects_parallel_tuning_flags(parallel_args):
+    for mode_args in ((), ("--mode", "sequential")):
+        with pytest.raises(SystemExit) as exc:
+            _args("metro_uniform", *mode_args, *parallel_args)
+        assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("mode", ["exact", "relaxed"])
+def test_parallel_modes_are_explicit_opt_ins(mode):
+    args = _args(
+        "metro_uniform", "--mode", mode, "--workers", "2", "--parallel-window", "8"
+    )
+    assert (args.mode, args.workers, args.parallel_window) == (mode, 2, 8)
 
 
 def test_lam_override_scales_explicit_per_uss_rates():

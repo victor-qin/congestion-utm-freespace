@@ -20,12 +20,14 @@
 #   # expect: 0.66.0 2.4.6 3.3.2
 #   # `mamba create` may print "Could not set lock" warnings — the env is still created.
 #
-# Submit:  LLsub experiments/batch/supercloud_run.sh -s 24
+# Submit sequential default:  LLsub experiments/batch/supercloud_run.sh -s 1
 # Check:   sacct -j $JOBID -o JobID,MaxRSS,Elapsed --units=G
 #
-# -s picks BOTH cores and memory (4 GB/core). Peak RSS is ~(workers+1) x per-process,
-# and per-process is ~2.7 GB at 4680 flights / ~11 GB at 25902 (ledger + hex occupancy,
-# neither shared: run_parallel spawns, so every worker holds a full replica).
+# -s picks BOTH cores and memory (4 GB/core). Sequential uses one process: ~2.7 GB at
+# 4680 flights / ~11 GB at 25902. Parallel peak RSS is ~(workers+1) x that per-process
+# footprint (ledger + hex occupancy are not shared; run_parallel gives every worker a replica).
+# Parallel opt-in examples (the default is sequential):
+#   MODE=exact WORKERS=4 LLsub experiments/batch/supercloud_run.sh -s 24
 #   density_faa_wing_zipline     4680 flights  --workers 4  ~13 GB  -> -s 24 is ample
 #   density_future_wing_zipline 25902 flights  --workers 4  ~55 GB  -> -s 24 (96 GB)
 #                                              --workers 8  ~99 GB  -> LLsub -i full
@@ -34,10 +36,26 @@ set -euo pipefail
 SCENARIO="${SCENARIO:-density_faa_wing_zipline}"
 SEED="${SEED:-0}"
 TAG="${TAG:-calib}"
-MODE="${MODE:-exact}"
-# 4 is the exact-mode sweet spot, not a memory compromise: speedup peaks at ~4 and
-# regresses past it (see ParallelConfig, freespace_sim/parallel.py). Use 8 for relaxed.
-WORKERS="${WORKERS:-4}"
+MODE="${MODE:-sequential}"
+WORKERS="${WORKERS:-}"
+
+case "$MODE" in
+  sequential)
+    if [[ -n "$WORKERS" ]]; then
+      echo "FATAL: WORKERS requires MODE=exact or MODE=relaxed" >&2
+      exit 2
+    fi
+    ;;
+  exact|relaxed)
+    # 4 is the exact-mode sweet spot, not a memory compromise: speedup peaks at ~4 and
+    # regresses past it (see ParallelConfig, freespace_sim/parallel.py). Use 8 for relaxed.
+    WORKERS="${WORKERS:-4}"
+    ;;
+  *)
+    echo "FATAL: MODE must be sequential, exact, or relaxed (got $MODE)" >&2
+    exit 2
+    ;;
+esac
 
 REPO="${REPO:-$HOME/congestion-utm-freespace}"
 CONDA_ENV="${CONDA_ENV:-congestion-utm}"
@@ -51,7 +69,7 @@ module load anaconda/Python-ML-2024b
 # interpreter path is unambiguous and needs no shell state.
 PY="${PY:-$HOME/.conda/envs/$CONDA_ENV/bin/python}"
 
-# Each of the WORKERS+1 processes would otherwise start 48 BLAS/OpenMP threads.
+# Cap math-library threads for the sequential process and every explicit parallel worker.
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMBA_NUM_THREADS=1
 # The parent warms the JIT so spawned workers load from disk instead of racing to
 # compile; that needs a writable cache, and node-local scratch is the fast one.
@@ -69,8 +87,9 @@ cd "$REPO"
 }
 echo "python: $PY $("$PY" -V 2>&1)"
 
-FOLDER=$("$PY" -m experiments.run \
-  --scenario "$SCENARIO" --seed "$SEED" --tag "$TAG" \
-  --mode "$MODE" --workers "$WORKERS" --no-progress | tail -1)
+ARGS=(--scenario "$SCENARIO" --seed "$SEED" --tag "$TAG" --mode "$MODE" --no-progress)
+if [[ "$MODE" != "sequential" ]]; then ARGS+=(--workers "$WORKERS"); fi
+
+FOLDER=$("$PY" -m experiments.run "${ARGS[@]}" | tail -1)
 
 echo "run folder: $FOLDER"

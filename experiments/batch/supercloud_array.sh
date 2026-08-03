@@ -43,8 +43,8 @@ set -euo pipefail
 # ---------------------------------------------------------------- knobs (flag > env > default)
 SCENARIO="${SCENARIO:-density_faa_wing_zipline}"
 TAG="${TAG:-}"                      # default derived below, once MODE/WORKERS/WINDOW are known
-MODE="${MODE:-exact}"
-WORKERS="${WORKERS:-4}"             # exact-mode sweet spot; use 8 for relaxed
+MODE="${MODE:-sequential}"
+WORKERS="${WORKERS:-}"              # parallel only; empty sequential, defaults to 4 after validation
 WINDOW="${WINDOW:-}"                # --parallel-window; empty = ParallelConfig default (4 x workers)
 SEEDS="${SEEDS:-}"                  # comma list; empty = seed IS the array task id
 STAGGER_S="${STAGGER_S:-45}"        # per-task start offset — see "why stagger" below
@@ -65,6 +65,24 @@ while (($#)); do
     *)          PASSTHRU+=("$1"); shift ;;      # e.g. --lam 8000 --telemetry --window-frac 0.8
   esac
 done
+
+# Parallelism is explicit: worker/window knobs alongside sequential mode are almost certainly a
+# forgotten `--mode exact|relaxed`, so fail before deriving tags or cluster resources from them.
+case "$MODE" in
+  sequential)
+    if [[ -n "$WORKERS" || -n "$WINDOW" ]]; then
+      echo "FATAL: --workers/--window require --mode exact or --mode relaxed" >&2
+      exit 2
+    fi
+    ;;
+  exact|relaxed)
+    WORKERS="${WORKERS:-4}"          # exact sweet spot; pass 8 explicitly for relaxed
+    ;;
+  *)
+    echo "FATAL: --mode must be sequential, exact, or relaxed (got $MODE)" >&2
+    exit 2
+    ;;
+esac
 
 # ---------------------------------------------------------------- seed <- array task
 # SLURM_ARRAY_TASK_ID under sbatch --array; LLSUB_RANK under LLsub triples; 0 when run bare
@@ -98,24 +116,35 @@ else
   SEED="$TASK"                       # --array=0-4 -> seeds 0,1,2,3,4
 fi
 
-# Default tag records the configuration that produced the run. `window` is RESULT-AFFECTING in
-# relaxed mode and is NOT persisted in experiment.json (runs.py writes no parallel block), so
-# for relaxed runs the tag is the only record of it — keep it in there.
+# Default tag records the execution strategy in the folder name. `window` is RESULT-AFFECTING in
+# relaxed mode, so parallel tags retain the complete mode/worker/window tuple.
 if [[ -z "$TAG" ]]; then
-  TAG="${MODE}_w${WORKERS}${WINDOW:+_win${WINDOW}}"
+  if [[ "$MODE" == "sequential" ]]; then
+    TAG="sequential"
+  else
+    TAG="${MODE}_w${WORKERS}${WINDOW:+_win${WINDOW}}"
+  fi
 fi
 
 # ---------------------------------------------------------------- allocation sanity
 # getconf, not nproc: nproc is GNU coreutils and absent on macOS, so the off-cluster path died.
 CORES="${SLURM_CPUS_PER_TASK:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
-PROCS=$((WORKERS + 1))               # coordinator + workers, all independent (mp spawn)
+if [[ "$MODE" == "sequential" ]]; then
+  PROCS=1
+  WORKERS_LABEL="n/a"
+  WINDOW_LABEL="n/a"
+else
+  PROCS=$((WORKERS + 1))             # coordinator + workers, all independent (mp spawn)
+  WORKERS_LABEL="$WORKERS"
+  WINDOW_LABEL="${WINDOW:-default}"
+fi
 GB=$((CORES * 4))                    # xeon-p8: -c grants 4 GB per core
 case "$SCENARIO" in
   *future*) PER_PROC_GB=14 ;;        # ~25.9k flights: 0.93 + 0.47*25.9 extrapolated
   *)        PER_PROC_GB=4  ;;        # ~4.7k flights: 3.13 measured, rounded up
 esac
 NEED_GB=$((PROCS * PER_PROC_GB))
-echo "task=$TASK seed=$SEED scenario=$SCENARIO tag=$TAG mode=$MODE workers=$WORKERS window=${WINDOW:-default}"
+echo "task=$TASK seed=$SEED scenario=$SCENARIO tag=$TAG mode=$MODE workers=$WORKERS_LABEL window=$WINDOW_LABEL"
 echo "alloc: -c $CORES (~${GB} GB) | need: $PROCS procs x ~${PER_PROC_GB} GB = ~${NEED_GB} GB"
 # `if`, not `cond && echo`: under `set -e` an AND-list whose condition is FALSE exits non-zero
 # and kills the script. A passing sanity check must not abort the run.
@@ -152,8 +181,10 @@ mkdir -p "$NUMBA_CACHE_DIR" 2>/dev/null || {
 cd "$REPO"
 
 ARGS=(--scenario "$SCENARIO" --seed "$SEED" --tag "$TAG" --mode "$MODE" --no-progress)
-if [[ "$MODE" != "sequential" ]]; then ARGS+=(--workers "$WORKERS"); fi
-if [[ -n "$WINDOW" ]]; then ARGS+=(--parallel-window "$WINDOW"); fi
+if [[ "$MODE" != "sequential" ]]; then
+  ARGS+=(--workers "$WORKERS")
+  if [[ -n "$WINDOW" ]]; then ARGS+=(--parallel-window "$WINDOW"); fi
+fi
 ARGS+=("${PASSTHRU[@]+"${PASSTHRU[@]}"}")
 
 echo "exec: $PY -m experiments.run ${ARGS[*]}"

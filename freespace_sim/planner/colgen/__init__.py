@@ -11,13 +11,15 @@ from importlib import import_module
 
 from .params import ColGenParams
 
-# Phase 3 extends this public list when the batch module lands.  Keeping absent
-# names out for now makes ``from ...colgen import *`` safe during Phase 1 while
-# direct attribute access remains forward-compatible through ``__getattr__``.
-__all__ = ["ColGenParams"]
+# The Phase-2 solver stays lazy so importing the Phase-1 geometry surface does
+# not eagerly import SciPy.  Phase 3 extends this list with the batch planner.
+__all__ = ["ColGenParams", "ColGenResult", "ColGenSolver"]
 
 
 def __getattr__(name: str):
+    if name in {"ColGenResult", "ColGenSolver"}:
+        solver = import_module(f"{__name__}.solver")
+        return getattr(solver, name)
     if name in {"ColumnGenerationPlanner", "run_batch"}:
         try:
             batch = import_module(f"{__name__}.batch")

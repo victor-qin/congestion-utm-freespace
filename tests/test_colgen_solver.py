@@ -8,22 +8,35 @@ the independent referee for selected columns.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
+import freespace_sim.planner.colgen.master as master_module
+import freespace_sim.planner.colgen.solver as solver_module
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.metrics import total_delay_s
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
-from freespace_sim.planner.colgen.master import HighsBackend, RestrictedMaster, create_backend
+from freespace_sim.planner.colgen.master import (
+    BackendIpResult,
+    HighsBackend,
+    RestrictedMaster,
+    create_backend,
+)
 from freespace_sim.planner.colgen.network import RowIndex, RowKey, build_flight_graph, column_claims
 from freespace_sim.planner.colgen.params import ColGenParams
-from freespace_sim.planner.colgen.pricing import price_flight, seed_column
-from freespace_sim.planner.colgen.solver import ColGenSolver
+from freespace_sim.planner.colgen.pricing import PricingTimeout, price_flight, seed_column
+from freespace_sim.planner.colgen.solver import (
+    ColGenSolver,
+    _fixed_loads,
+    _initial_feasible_selection,
+    _shift_claims,
+)
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import (
     derive_cell_window,
@@ -510,6 +523,8 @@ def test_hand_checked_60deg_crossing():
 
     assert len(result.columns) == 2
     assert result.stats["objective"] == pytest.approx(16.0, abs=1e-8)
+    assert result.stats["initial_heuristic_flights"] == 2
+    assert result.stats["initial_heuristic_delay_s"] == pytest.approx(16.0, abs=1e-8)
     assert sorted(column.delay_s for column in result.columns.values()) == pytest.approx(
         [0.0, 16.0], abs=1e-8
     )
@@ -705,6 +720,14 @@ def test_repair_covers_all_feasible_flights(monkeypatch):
         _request(1, (-4, 0), (4, 0), cfg),
         _request(2, (0, -4), (0, 4), cfg),
     ]
+    monkeypatch.setattr(
+        "freespace_sim.planner.colgen.solver._initial_feasible_selection",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "freespace_sim.planner.colgen.solver._greedy_feasible_selection",
+        lambda *args, **kwargs: ({}, True),
+    )
     monkeypatch.setattr(RestrictedMaster, "round_heuristic", lambda *args, **kwargs: {})
     monkeypatch.setattr(RestrictedMaster, "solve_ip", lambda *args, **kwargs: {})
 
@@ -715,6 +738,55 @@ def test_repair_covers_all_feasible_flights(monkeypatch):
     assert result.stats["denied_flight_ids"] == ()
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg)
+
+
+def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
+    """A detoured seed can be longer than the graph's nominal hop allowance."""
+
+    cfg = _cfg(max_ground_delay_s=48.0)
+    request = _request(1, (-10, 0), (10, 0), cfg)
+    static_terms = tuple(
+        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=0.0))
+        for index, cell in enumerate(((3, 1), (1, -1)))
+    )
+    params = _params(detour_slack_hops=1)
+    graph = build_flight_graph(request, cfg, static_terms, params)
+    seed = seed_column(graph, cfg)
+    assert len(seed.cell_path) - 1 > graph.shortest_hops + graph.detour_slack_hops
+
+    invalid_latest_claims = _shift_claims(
+        seed.claims,
+        graph.latest_departure_step - seed.departure_step,
+    )
+    fixed_claims: list[frozenset[RowKey]] = []
+    used: set[RowKey] = set()
+    for departure_step in range(seed.departure_step, graph.latest_departure_step):
+        shifted = _shift_claims(seed.claims, departure_step - seed.departure_step)
+        row = sorted(shifted - invalid_latest_claims - used)[0]
+        fixed_claims.append(frozenset({row}))
+        used.add(row)
+
+    selected = _initial_feasible_selection(
+        {request.flight_id: seed},
+        {request.flight_id: graph},
+        _fixed_loads(fixed_claims),
+        RowIndex(),
+        cfg,
+    )
+
+    assert selected == {}
+    forbidden_rows = frozenset().union(*fixed_claims)
+    _reduced_cost, priced = price_flight(
+        graph,
+        {},
+        0.0,
+        cfg,
+        params,
+        forbidden_rows=forbidden_rows,
+        require_improving=False,
+    )
+    if priced is not None:
+        assert column_claims(priced, graph, cfg) == priced.claims
 
 
 def test_repair_finds_feasible_column_even_when_delay_exceeds_m():
@@ -799,7 +871,7 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
     assert first.stats["lp_gap"] <= params.lp_gap + 1e-8
     assert first.columns == second.columns
     # Runtime is intentionally excluded from the reproducibility contract.
-    for key in set(first.stats) - {"elapsed_s"}:
+    for key in set(first.stats) - {"elapsed_s", "initial_greedy_elapsed_s"}:
         assert first.stats[key] == second.stats[key]
 
 
@@ -865,32 +937,195 @@ def test_backend_parity_when_final_integer_master_runs():
     _assert_files_cleanly(requests, gurobi.columns, cfg)
 
 
-@pytest.mark.parametrize("solver", ["highs", "gurobi"])
-def test_final_ip_time_limit_without_native_incumbent_keeps_heuristic(solver):
+def test_final_ip_time_limit_without_native_incumbent_keeps_heuristic(monkeypatch):
     """A native timeout cannot discard the RMP's feasible incumbent."""
 
-    if solver == "gurobi":
-        pytest.importorskip("gurobipy")
-    cfg = _cfg(max_ground_delay_s=48.0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+    heuristic = {
+        flight_id: _synthetic_column(
+            flight_id,
+            float(flight_id),
+            frozenset({RowKey.cell((flight_id, 0), 0, 0)}),
+        )
+        for flight_id in (1, 2)
+    }
+    for column in heuristic.values():
+        master.add_column(column)
+    master.set_heuristic(heuristic)
+    monkeypatch.setattr(
+        master.backend,
+        "solve_ip",
+        lambda warm_start: BackendIpResult(
+            0.0,
+            np.zeros(len(master.columns), dtype=float),
+            math.inf,
+            "time_limit_no_incumbent",
+            False,
+        ),
+    )
+
+    selected = master.solve_ip()
+
+    assert selected == heuristic
+    assert master.last_ip_status == "time_limit_no_incumbent"
+    assert master.last_ip_objective == pytest.approx(master.objective_of(heuristic))
+    assert master.last_ip_bound == math.inf
+
+
+def test_incomplete_pricing_sweep_never_publishes_a_global_bound(monkeypatch):
+    """A mid-sweep deadline may add columns, but cannot certify missing RCs."""
+
+    cfg = _cfg(max_ground_delay_s=32.0)
     requests = [
         _request(1, (-4, 0), (4, 0), cfg),
         _request(2, (0, -4), (0, 4), cfg),
-        _request(3, (-4, 4), (4, -4), cfg),
     ]
-    params = _params(
-        solver=solver,
-        max_iterations=1,
-        lp_gap=0.0,
-        ip_gap=0.0,
-        time_limit_s=1e-6,
+    calls: list[int] = []
+
+    def timeout_on_second(graph, duals, pi_f, solve_cfg, params, **kwargs):
+        del duals, pi_f, kwargs
+        calls.append(graph.request.flight_id)
+        if len(calls) == 2:
+            raise PricingTimeout("test deadline")
+        column = seed_column(graph, solve_cfg)
+        return params.M - column.delay_s, column
+
+    monkeypatch.setattr(solver_module, "price_flight", timeout_on_second)
+    monkeypatch.setattr(
+        solver_module,
+        "_greedy_feasible_selection",
+        lambda *args, **kwargs: ({}, True),
     )
 
-    result = ColGenSolver().solve(requests, cfg, (), params)
+    result = ColGenSolver().solve(
+        requests,
+        cfg,
+        (),
+        _params(max_iterations=3, lp_gap=0.0, ip_gap=0.0),
+    )
 
-    assert result.stats["ip_skipped"] is False
-    assert result.stats["ip_status"] == "time_limit_no_incumbent"
-    assert result.stats["ip_objective"] == pytest.approx(result.stats["heuristic_objective"])
-    assert result.stats["ip_objective"] > 0.0
+    assert result.stats["termination_reason"] == "time_limit"
+    assert result.stats["pricing_flights_completed"] == 1
+    assert result.stats["pricing_sweeps_completed"] == 0
+    assert result.stats["pricing_timeout_flight_id"] == calls[-1]
+    assert result.stats["upper_bounds"] == ()
+    assert math.isinf(result.stats["upper_bound"])
     assert result.stats["denied_flight_ids"] == ()
     _assert_claim_feasible(result.columns)
-    _assert_files_cleanly(requests, result.columns, cfg)
+
+
+def test_ip_deadline_stops_lazy_separation_and_keeps_heuristic(monkeypatch):
+    shared = RowKey.cell((0, 0), 0, 0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+    shared_columns = {
+        flight_id: _synthetic_column(flight_id, 0.0, frozenset({shared}))
+        for flight_id in (1, 2)
+    }
+    heuristic = {
+        flight_id: _synthetic_column(
+            flight_id,
+            4.0,
+            frozenset({RowKey.cell((flight_id, 1), 0, 0)}),
+            departure_step=1,
+        )
+        for flight_id in (1, 2)
+    }
+    for flight_id in (1, 2):
+        master.add_column(shared_columns[flight_id])
+        master.add_column(heuristic[flight_id])
+    master.set_heuristic(heuristic)
+    calls = []
+
+    def overloaded_ip(_warm_start):
+        calls.append(master.backend.time_limit_s)
+        return BackendIpResult(
+            2 * master.params.M,
+            np.array([1.0, 0.0, 1.0, 0.0]),
+            2 * master.params.M,
+            "optimal",
+            True,
+        )
+
+    monkeypatch.setattr(master.backend, "solve_ip", overloaded_ip)
+    clock = iter((0.0, 2.0))
+    monkeypatch.setattr(master_module.time, "monotonic", lambda: next(clock))
+
+    selected = master.solve_ip(deadline=1.0)
+
+    assert selected == heuristic
+    assert calls == [pytest.approx(1.0)]
+    assert master.backend.time_limit_s == master.params.time_limit_s
+    assert shared in master.materialized_rows
+    assert master.last_ip_status == "time_limit_separation"
+    assert master.last_ip_bound == math.inf
+
+
+def test_preprocessing_deadline_returns_search_exhausted_without_building_graphs(monkeypatch):
+    cfg = _cfg()
+    request = _request(1, (-2, 0), (2, 0), cfg)
+    clock = iter((0.0, 2.0, 2.0))
+    monkeypatch.setattr(solver_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        solver_module,
+        "build_flight_graph",
+        lambda *_args, **_kwargs: pytest.fail("expired solve must not build another graph"),
+    )
+
+    result = ColGenSolver().solve(
+        [request],
+        cfg,
+        (),
+        _params(time_limit_s=1.0),
+    )
+
+    assert result.columns == {}
+    assert result.stats["termination_reason"] == "time_limit"
+    assert result.stats["search_exhausted_flight_ids"] == (request.flight_id,)
+    assert result.stats["budget_denied_flight_ids"] == ()
+
+
+def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+    monkeypatch.setattr(
+        solver_module,
+        "_initial_feasible_selection",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        solver_module,
+        "_greedy_feasible_selection",
+        lambda *args, **kwargs: ({}, True),
+    )
+    monkeypatch.setattr(
+        solver_module,
+        "price_flight",
+        lambda *args, **kwargs: (1.0, None),
+    )
+
+    def partial_ip(master, *args, **kwargs):
+        del args, kwargs
+        column = next(column for column in master.columns if column.flight_id == 1)
+        master.last_ip_objective = master.objective_of((column,))
+        master.last_ip_bound = math.inf
+        master.last_ip_status = "status_1"
+        master.last_ip_optimal = False
+        return {1: column}
+
+    monkeypatch.setattr(RestrictedMaster, "solve_ip", partial_ip)
+
+    result = ColGenSolver().solve(
+        requests,
+        cfg,
+        (),
+        _params(lp_gap=0.0, ip_gap=0.0),
+    )
+
+    assert result.stats["termination_reason"] == "time_limit"
+    assert result.stats["ip_status"] == "status_1"
+    assert len(result.stats["denied_flight_ids"]) == 1
+    assert result.stats["budget_denied_flight_ids"] == ()
+    assert result.stats["search_exhausted_flight_ids"] == result.stats["denied_flight_ids"]

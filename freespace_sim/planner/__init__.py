@@ -64,6 +64,10 @@ def get_planner(name: str) -> Planner:
         milp = MILPOptPlanner(
             warm_planner=ShortcutRefiner(AStarPlanner()), optimize_delay=False, lock_homotopy=True)
         return ShortcutRefiner(milp, label="astar_milp_sc")
+    if name == "colgen":
+        from .colgen import ColumnGenerationPlanner
+
+        return ColumnGenerationPlanner()
     raise ValueError(f"unknown planner: {name!r}")
 
 

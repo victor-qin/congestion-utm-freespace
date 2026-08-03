@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import operator
+import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -22,6 +23,10 @@ from scipy.sparse import csc_matrix
 from .network import RowIndex, RowKey
 from .params import ColGenParams
 from .translate import Column
+
+
+class BackendTimeout(TimeoutError):
+    """Raised when an LP backend reaches the caller-provided solve budget."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +71,7 @@ class LpBackend(Protocol):
 
     name: str
     flight_ids: tuple[int, ...]
+    time_limit_s: float
 
     def add_column(
         self,
@@ -225,8 +231,10 @@ class HighsBackend:
             # corrupts pricing's pi_f.
             bounds=(0.0, None),
             method="highs",
-            options={"presolve": True},
+            options={"presolve": True, "time_limit": self.time_limit_s},
         )
+        if result.status == 1:
+            raise BackendTimeout(f"HiGHS LP reached its limit: {result.message}")
         if not result.success or result.x is None or result.fun is None:
             raise RuntimeError(f"HiGHS LP failed (status {result.status}): {result.message}")
 
@@ -394,9 +402,11 @@ class GurobiBackend:
         for variable in self._variables:
             variable.VType = self._gp.GRB.CONTINUOUS
             variable.UB = self._gp.GRB.INFINITY
-        self._model.Params.TimeLimit = self._gp.GRB.INFINITY
+        self._model.Params.TimeLimit = self.time_limit_s
         self._model.update()
         self._model.optimize()
+        if self._model.Status == self._gp.GRB.TIME_LIMIT:
+            raise BackendTimeout("Gurobi LP reached its time limit")
         if self._model.Status != self._gp.GRB.OPTIMAL:
             raise RuntimeError(f"Gurobi LP failed with status {self._model.Status}")
         flight_duals = {
@@ -849,41 +859,68 @@ class RestrictedMaster:
     def solve_ip(
         self,
         heuristic: Mapping[int, Column] | None = None,
+        *,
+        deadline: float | None = None,
     ) -> dict[int, Column]:
         """Solve the current binary RMP, separating claim rows until it is clean."""
 
         if heuristic is not None:
             self.set_heuristic(heuristic)
+        if deadline is not None:
+            deadline = float(deadline)
+            if not math.isfinite(deadline):
+                raise ValueError("IP deadline must be finite")
         self.last_ip_objective = None
         self.last_ip_bound = None
         self.last_ip_status = None
         self.last_ip_optimal = None
-        while True:
-            result = self._backend.solve_ip(self._warm_start)
-            selection = self._selection_from_x(result.x)
-            violated = self.violated_claim_rows(selection)
-            if violated:
-                added = self.materialize_rows(violated)
-                if not added:
-                    raise RuntimeError("backend returned an IP solution violating an existing row")
-                continue
+        original_time_limit_s = self._backend.time_limit_s
+        try:
+            while True:
+                if deadline is not None:
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0.0:
+                        selection = dict(self._heuristic_selection)
+                        self.last_ip_objective = self.objective_of(selection)
+                        self.last_ip_bound = math.inf
+                        self.last_ip_status = "time_limit_separation"
+                        self.last_ip_optimal = False
+                        return selection
+                    self._backend.time_limit_s = max(
+                        1e-6,
+                        min(original_time_limit_s, remaining_s),
+                    )
+                result = self._backend.solve_ip(self._warm_start)
+                selection = self._selection_from_x(result.x)
+                violated = self.violated_claim_rows(selection)
+                if violated:
+                    added = self.materialize_rows(violated)
+                    if not added:
+                        raise RuntimeError(
+                            "backend returned an IP solution violating an existing row"
+                        )
+                    continue
 
-            # HiGHS has no MIP start and may stop on the time cap with a weaker
-            # incumbent.  Preserve the already feasible rounding incumbent.
-            if self._heuristic_selection and (
-                self.objective_of(self._heuristic_selection) > self.objective_of(selection) + 1e-9
-            ):
-                selection = dict(self._heuristic_selection)
-            self.last_ip_objective = self.objective_of(selection)
-            self.last_ip_bound = max(self.last_ip_objective, float(result.upper_bound))
-            self.last_ip_status = result.status
-            self.last_ip_optimal = result.optimal
-            return selection
+                # HiGHS has no MIP start and may stop on the time cap with a weaker
+                # incumbent.  Preserve the already feasible rounding incumbent.
+                if self._heuristic_selection and (
+                    self.objective_of(self._heuristic_selection)
+                    > self.objective_of(selection) + 1e-9
+                ):
+                    selection = dict(self._heuristic_selection)
+                self.last_ip_objective = self.objective_of(selection)
+                self.last_ip_bound = max(self.last_ip_objective, float(result.upper_bound))
+                self.last_ip_status = result.status
+                self.last_ip_optimal = result.optimal
+                return selection
+        finally:
+            self._backend.time_limit_s = original_time_limit_s
 
 
 __all__ = [
     "BackendIpResult",
     "BackendLpResult",
+    "BackendTimeout",
     "GurobiBackend",
     "HighsBackend",
     "LpBackend",

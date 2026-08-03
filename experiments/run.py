@@ -126,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--terminal-airspace-always-active", action=argparse.BooleanOptionalAction,
                    default=None, dest="terminal_airspace_always_active",
                    help="permanently wall each hub's column+lanes off from foreign traffic (foreign "
-                        "transit → air detour instead of ground-block); A* only")
+                        "transit → air detour instead of ground-block); needs a wall-aware planner")
     p.add_argument("--demand", choices=("uniform", "hub", "hub_radius"), default=None,
                    help="demand pattern")
     p.add_argument("--uss", nargs="+", default=None, help="USS labels (multi-operator demand)")
@@ -156,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "serial loop. relaxed: keep any still-feasible speculation — a valid "
                         "FCFS-class allocation, faster and scales to more workers, at a small delay "
                         "cost (deterministic via pinned prefixes; result depends on workers+window). "
-                        "Non-astar planners always run sequential regardless of this flag.")
+                        "Planners without a parallel kernel run sequential regardless of this flag.")
     p.add_argument("--workers", type=int, default=None, metavar="N",
                    help="worker processes for exact/relaxed mode (default min(8, cores-2); the "
                         "benchmark sweet spot is ~4 workers for exact, ~8 for relaxed)")
@@ -217,7 +217,7 @@ def main() -> None:
     # dispatches to the ~5-7x slower pure-Python reference. On a cluster that is the difference between
     # a 6-hour job and a 30-hour one, so say it out loud rather than let the allocation absorb it.
     late = sum(1 for i in res.intents if i.request.t_departure > cfg.horizon_s)
-    if late:
+    if late and "astar" in cfg.planner:
         log.warning("%d/%d departures (%.0f%%) are past horizon_s=%.0fs — those flights fall back to "
                     "the slow reference A* (box guard). Raise --horizon or lower --demand-duration.",
                     late, len(res.intents), 100.0 * late / len(res.intents), cfg.horizon_s)

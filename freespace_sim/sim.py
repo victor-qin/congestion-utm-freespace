@@ -356,6 +356,9 @@ def run(
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
     status = _MilestoneLog(total, cfg.horizon_s)        # INFO milestones; silent without a log handler
+    batch_planners = [
+        u.planner for u in usses.values() if getattr(u.planner, "plans_whole_schedule", False)
+    ]
     if parallel is not None:
         from .parallel import PARALLEL_PLANNERS, ParallelConfig, run_parallel
 
@@ -368,6 +371,25 @@ def run(
         # commit order into `collector`; serial replans write into it directly.
         intents = run_parallel(scenario, cfg, pcfg, ledger, dss, pname, static_terms, status, report,
                                collector=collector)
+    elif batch_planners:
+        from .planner.colgen import run_batch
+
+        if len(batch_planners) != len(usses):
+            raise ValueError("whole-schedule and per-flight planners cannot share one simulation")
+        params = batch_planners[0].params
+        if any(planner.params != params for planner in batch_planners[1:]):
+            raise ValueError("all whole-schedule planners must use identical parameters")
+        intents = run_batch(
+            scenario,
+            cfg,
+            ledger,
+            dss,
+            static_terms,
+            status,
+            report,
+            collector,
+            params=params,
+        )
     else:
         intents = []
         for done, ev in enumerate(scenario.events, 1):

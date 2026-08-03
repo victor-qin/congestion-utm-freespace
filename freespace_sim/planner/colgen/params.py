@@ -14,7 +14,10 @@ class ColGenParams:
     The gaps use relative objective units (``1e-4`` means 0.01%).  ``M`` is the
     per-flight benefit in the maximize master objective ``M - delay_s``; it is
     deliberately much larger than the shipped ground-delay budget so a usable
-    trajectory dominates cancellation.
+    trajectory dominates cancellation.  ``time_limit_s`` is a best-effort
+    whole-solve wall budget: pricing and native LP/IP calls receive the remaining
+    time, with checks between graph, seed, and lazy-separation rounds.  A single
+    synchronous geometry/backend call cannot be preempted and may overrun slightly.
     """
 
     detour_slack_hops: int = 12
@@ -26,6 +29,8 @@ class ColGenParams:
     M: float = 1_000_000.0
     epsilon: float = 1e-6
     n_heuristic_tries: int = 32
+    objective: str = "total_delay"
+    shortcut: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.detour_slack_hops, bool):
@@ -44,6 +49,13 @@ class ColGenParams:
         if solver not in {"auto", "gurobi", "highs"}:
             raise ValueError("solver must be one of 'auto', 'gurobi', or 'highs'")
         object.__setattr__(self, "solver", solver)
+
+        if not isinstance(self.objective, str):
+            raise TypeError("objective must be a string")
+        if self.objective != "total_delay":
+            raise ValueError("objective must be 'total_delay'")
+        if not isinstance(self.shortcut, bool):
+            raise TypeError("shortcut must be a boolean")
 
         for name in ("max_iterations", "n_heuristic_tries"):
             value = getattr(self, name)

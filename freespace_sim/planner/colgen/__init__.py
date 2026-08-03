@@ -11,9 +11,15 @@ from importlib import import_module
 
 from .params import ColGenParams
 
-# The Phase-2 solver stays lazy so importing the Phase-1 geometry surface does
-# not eagerly import SciPy.  Phase 3 extends this list with the batch planner.
-__all__ = ["ColGenParams", "ColGenResult", "ColGenSolver"]
+# The solver and batch integration stay lazy so importing the geometry surface
+# does not eagerly import SciPy.
+__all__ = [
+    "ColGenParams",
+    "ColGenResult",
+    "ColGenSolver",
+    "ColumnGenerationPlanner",
+    "run_batch",
+]
 
 
 def __getattr__(name: str):
@@ -21,14 +27,6 @@ def __getattr__(name: str):
         solver = import_module(f"{__name__}.solver")
         return getattr(solver, name)
     if name in {"ColumnGenerationPlanner", "run_batch"}:
-        try:
-            batch = import_module(f"{__name__}.batch")
-        except ModuleNotFoundError as exc:
-            if exc.name == f"{__name__}.batch":
-                raise AttributeError(
-                    f"{name} is added with colgen batch integration in PR A Phase 3"
-                ) from None
-            raise
-
+        batch = import_module(f"{__name__}.batch")
         return getattr(batch, name)
     raise AttributeError(name)

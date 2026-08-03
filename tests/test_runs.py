@@ -154,9 +154,9 @@ def test_load_run_replay_payload_matches(tmp_path):
     folder = runs.save_run(res, root=tmp_path, label="rt")
     loaded = runs.load_run(folder)
     p0, p1 = viz_html._payload(res), viz_html._payload(loaded)
-    assert len(p0["flights"]) == len(p1["flights"])
-    for a, b in zip(p0["flights"], p1["flights"]):
-        assert len(a["boxes"]) == len(b["boxes"]) and len(a["cyls"]) == len(b["cyls"])
+    # the replay encodes quantised ints, so a save/load round-trip must reproduce the scene EXACTLY —
+    # a stronger claim than the old count-only check, and it also pins the box-rebuild decision
+    assert p0 == p1
 
 
 def test_index_parquet_appends(tmp_path):

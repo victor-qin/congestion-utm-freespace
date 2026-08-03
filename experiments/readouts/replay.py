@@ -24,8 +24,7 @@ def main() -> None:
     p.add_argument("--open", action="store_true", help="open the replay in the default browser")
     p.add_argument("--clip", action="store_true",
                    help="clip the replay clock at cfg.horizon_s, dropping the post-horizon "
-                        "return-flight tail. OFF by default, matching what save_run writes: the "
-                        "replay spans first flight activity through final landing (issue #25).")
+                        "return-flight tail")
     args = p.parse_args()
 
     folder = Path(args.folder)
@@ -34,8 +33,12 @@ def main() -> None:
     print(f"loaded {s['n_requests']} flights · {s['n_accepted']} accepted · "
           f"{s['n_denied']} denied · planner={loaded.config.planner}")
 
-    out = viz_html.write_html(loaded, folder / "replay.html", clip_to_horizon=args.clip)
-    print(f"replay → {out}" + ("  (clipped at horizon)" if args.clip else "  (first flight activity through final landing)"))
+    # Pass None, not False, for the default: None selects the new realized-operation clock while an
+    # explicit False retains the previous API's [0, max(horizon, tail)] behavior.
+    out = viz_html.write_html(loaded, folder / "replay.html",
+                              clip_to_horizon=True if args.clip else None)
+    suffix = "clipped at horizon" if args.clip else "first flight activity through final landing"
+    print(f"replay → {out}  ({suffix})")
     if args.open:
         webbrowser.open(f"file://{Path(out).resolve()}")
 

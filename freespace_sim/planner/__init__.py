@@ -52,6 +52,23 @@ def get_planner(name: str) -> Planner:
         # A* → greedy shortcut: a solver-free alternative to the MILP refine (tightens the staircase
         # against the REAL committed obstacles, not A*'s conservative raster).
         return ShortcutRefiner(AStarPlanner(), label="astar_sc")
+    if name == "astar_heading_shortcut":
+        from .astar import AStarPlanner
+        from .shortcut import ShortcutRefiner
+
+        # Byte-equivalent A/B arm for the legacy ordering. Same-heading knots bypass their candidate
+        # rebuild only when the reservation subsegment partition is exactly unchanged. Keep the legacy
+        # label intentionally: accepted intents should differ only in solve_time, never in plan bytes.
+        return ShortcutRefiner(
+            AStarPlanner(), label="astar_sc", strategy="single_knot_heading")
+    if name == "astar_batched_shortcut":
+        from .astar import AStarPlanner
+        from .shortcut import ShortcutRefiner
+
+        # Experimental A/B arm: seed shortcuts at genuine 3D turns, then batch the maximal straight
+        # runs on either side. The established astar_shortcut remains unchanged for comparison.
+        return ShortcutRefiner(
+            AStarPlanner(), label="astar_batched_sc", strategy="batched_turns")
     if name == "astar_milp_shortcut":
         from .astar import AStarPlanner
         from .milp import MILPOptPlanner

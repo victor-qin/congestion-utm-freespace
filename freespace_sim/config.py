@@ -83,11 +83,13 @@ class SimConfig:
     lam_per_hour: float = 200.0
     seed: int = 0
 
-    # --- planner selection (pluggable; DEFAULT = A* → shortcut → MILP → shortcut sandwich) ---
-    planner: str = "astar"  # "straight"|"astar"|"astar_shortcut"|"milp"|"astar_milp"|...
+    # --- planner selection (pluggable; default = compiled A*) ---
+    # ``astar_heading_shortcut`` is the OperationalIntent-equivalent exact-heading A/B arm;
+    # ``astar_batched_shortcut`` is the route-changing turn-seeded/maximal-run arm.
+    planner: str = "astar"  # "straight"|"astar"|"astar_shortcut"|"astar_heading_shortcut"|...|"milp"
 
     # --- fixed terminal exit lanes (issue #18); A* only ---
-    # When True, A* (and astar_shortcut) routes shared-terminal takeoff/landing through the hub's
+    # When True, A* (and its shortcut refiners) routes shared-terminal takeoff/landing through the hub's
     # boundary-hex lanes and deconflicts same-hub launches by exact cell occupancy (is_blocked), killing
     # same-hub exit-lane CONFLICT_FILED. False ⇒ the legacy A* fold/exit_clear path. Other planners
     # (milp/straight) don't route through lanes — the flag only tags their hub boxes. Default on (#18).

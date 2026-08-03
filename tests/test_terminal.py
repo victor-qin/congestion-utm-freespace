@@ -223,13 +223,17 @@ def test_pad_capacity_gate_holds_across_radii(radius):
     assert any(a.ground_delay_s > 0.0 for a in res.accepted)
 
 
-def test_astar_shortcut_preserves_same_hub_concurrency():
+@pytest.mark.parametrize(
+    "planner_name",
+    ["astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"],
+)
+def test_astar_shortcut_preserves_same_hub_concurrency(planner_name):
     # The shortcut refiner rebuilds the corridor from the path corners (a DIFFERENT route than
     # astar._build), so it must inherit the exit-lane fold — not merely keep tags + verify, but keep
     # same-hub launches concurrent. A regression here would silently re-serialize refined runs.
     reqs = [_radial_delivery(_HUB, 0.0, 2500.0, 2, 0, radius=150.0),
             _radial_delivery(_HUB, 180.0, 2500.0, 2, 1, radius=150.0)]
-    res = run(SimConfig(planner="astar_shortcut", region_size_m=_REGION), requests=reqs)
+    res = run(SimConfig(planner=planner_name, region_size_m=_REGION), requests=reqs)
     assert res.verified and len(res.accepted) == 2
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)
 
@@ -286,11 +290,15 @@ def test_astar_planner_does_not_warn_on_terminal_flight():
     assert res.verified and res.accepted
 
 
-def test_astar_shortcut_preserves_terminal_tags_no_warning():
+@pytest.mark.parametrize(
+    "planner_name",
+    ["astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"],
+)
+def test_astar_shortcut_preserves_terminal_tags_no_warning(planner_name):
     # the refiner rebuilds the corridor but now keeps the inner A*'s terminal tags → no warning
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        res = run(SimConfig(planner="astar_shortcut", region_size_m=(5000.0, 5000.0)),
+        res = run(SimConfig(planner=planner_name, region_size_m=(5000.0, 5000.0)),
                   requests=[_terminal_req()])
     assert res.verified
     assert any(v.terminal_id == "H" for v in res.accepted[0].volumes)   # column tag survived the rebuild
@@ -348,12 +356,16 @@ def test_fixed_lane_exit_box_carries_terminal_tag():
     assert any(v.terminal_id is None for v in boxes)                    # far cruise boxes untagged
 
 
-def test_astar_shortcut_concurrency_fixed_lanes():
+@pytest.mark.parametrize(
+    "planner_name",
+    ["astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"],
+)
+def test_astar_shortcut_concurrency_fixed_lanes(planner_name):
     # the refiner rebuilds via build_reservation_from_corners; with the flag on it must keep the boundary
     # endpoints so divergent same-hub launches stay concurrent and verify.
     reqs = [_radial_delivery(_HUB, 0.0, 2500.0, 2, 0, radius=150.0),
             _radial_delivery(_HUB, 180.0, 2500.0, 2, 1, radius=150.0)]
-    res = run(SimConfig(planner="astar_shortcut", region_size_m=_REGION, fixed_exit_lanes=True), requests=reqs)
+    res = run(SimConfig(planner=planner_name, region_size_m=_REGION, fixed_exit_lanes=True), requests=reqs)
     assert res.verified and len(res.accepted) == 2
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)
 

@@ -489,7 +489,8 @@ def test_column_window_covers_the_actual_traverse():
     assert window == max(ln.steps for ln in lanes) * cfg.dt_s
 
 
-def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines():
+@pytest.mark.parametrize("strategy", ["single_knot", "single_knot_heading", "batched_turns"])
+def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines(strategy):
     """``astar_shortcut`` must book the identical origin/dest column as bare ``astar`` (issue #52).
 
     Two independent regressions hid here, both invisible to every other test:
@@ -505,7 +506,7 @@ def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines():
     req = FlightRequest(1, vec(500, 500, 0), vec(4300, 3100, 0), 0.0,
                         origin_terminal=hub, dest_terminal=hub)
     bare = AStarPlanner().plan(req, ReservationLedger(cfg), cfg)
-    refined = ShortcutRefiner(AStarPlanner()).plan(req, ReservationLedger(cfg), cfg)
+    refined = ShortcutRefiner(AStarPlanner(), strategy=strategy).plan(req, ReservationLedger(cfg), cfg)
     assert bare.accepted and refined.accepted
     assert refined.planner != bare.planner, "refiner returned the inner intent — vacuous"
 

@@ -160,6 +160,13 @@ def main() -> int:
         if hasattr(pricing_mod, name):
             ledger.wrap(pricing_mod, name, f"pricing.{name}")
     ledger.wrap(network_mod, "column_claims", "network.column_claims")
+    # Inner-loop suspects.  These run millions of times, so their wrapper overhead is
+    # material and is printed per row -- subtract it before believing the wall column.
+    for name in ("_distance_lower_bound", "_prefer", "_path_cmp"):
+        if hasattr(pricing_mod, name):
+            ledger.wrap(pricing_mod, name, f"pricing.{name}")
+    import freespace_sim.planner.hexgrid as hg_mod
+    ledger.wrap(hg_mod, "hex_distance", "hexgrid.hex_distance")
 
     started = time.perf_counter()
     try:
@@ -205,7 +212,8 @@ def main() -> int:
                   "pricing._canonical_candidate", "pricing._path_claims",
                   "pricing._path_delay_s", "pricing._endpoint_claims",
                   "pricing._visit_claims", "pricing._rows_hit_forbidden",
-                  "pricing._visit_hits_forbidden", "network.column_claims"):
+                  "pricing._visit_hits_forbidden", "pricing._distance_lower_bound",
+                  "hexgrid.hex_distance", "network.column_claims"):
         line(label, 3)
     ffc_children = sum(
         ledger.wall[k] for k in (
@@ -213,6 +221,7 @@ def main() -> int:
             "pricing._canonical_candidate", "pricing._path_claims", "pricing._path_delay_s",
             "pricing._endpoint_claims", "pricing._visit_claims",
             "pricing._rows_hit_forbidden", "pricing._visit_hits_forbidden",
+            "pricing._distance_lower_bound",
         )
     )
     ffc = ledger.wall["find_feasible_column"]

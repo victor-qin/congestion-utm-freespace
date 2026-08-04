@@ -1819,6 +1819,20 @@ def find_feasible_column(
     if not destination_options:
         return None
     destination_cells = frozenset(destination_options)
+    # ``_best_column`` has memoized this since it was written; this search never got the
+    # same treatment and paid for it: measured at 3,940,131 calls driving 24,760,154
+    # ``hex_distance`` calls (6.3 destination lanes each), ~9s of a 32s stage.  The value
+    # depends only on the cell and the fixed destination set, and the corridor holds a few
+    # thousand cells against millions of arc relaxations, so this is nearly all hits.
+    distance_cache: dict[Cell, int] = {}
+
+    def remaining_distance(cell: Cell) -> int:
+        cached = distance_cache.get(cell)
+        if cached is None:
+            cached = _distance_lower_bound(cell, destination_cells)
+            distance_cache[cell] = cached
+        return cached
+
     origin_options = _origin_options(fg)
     offsets = derive_cell_window(cfg)
     revisit_depth = offsets[1] - offsets[0]
@@ -1961,7 +1975,7 @@ def find_feasible_column(
             continue
         for lane_idx, cell, lane_steps in origin_options:
             start_step = departure_step + fg.takeoff_steps[0] + lane_steps
-            remaining = _distance_lower_bound(cell, destination_cells)
+            remaining = remaining_distance(cell)
             if start_step >= fg.max_step or start_step + remaining > fg.max_step:
                 continue
             # `origin_claims` was proven disjoint from `forbidden` immediately above and is
@@ -2063,7 +2077,7 @@ def find_feasible_column(
             if neighbour in recent[:revisit_depth]:
                 continue
             next_step = step + 1
-            remaining = _distance_lower_bound(neighbour, destination_cells)
+            remaining = remaining_distance(neighbour)
             if next_step + remaining > fg.max_step:
                 continue
             # Once per relaxed arc, and the set was built only to be tested: measured at

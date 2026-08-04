@@ -13,6 +13,7 @@ import pytest
 
 from freespace_sim.geo import DfwGeo
 from freespace_sim.scenarios import get_scenario, with_overrides
+from freespace_sim.sim import run
 
 _ARTIFACTS = Path(__file__).resolve().parents[1] / "freespace_sim" / "data" / "dfw"
 pytestmark = pytest.mark.skipif(
@@ -131,3 +132,16 @@ def test_tract_draw_follows_population_not_bbox_fill():
     in_square = float((pts[:, 0] < 5000.0).mean())
     assert abs(in_square - 0.5) < 0.05, in_square
     assert (np.linalg.norm(pts - hub, axis=1) <= radius).all()       # never leaves the service disk
+
+
+@pytest.mark.slow
+def test_dfw_scenario_plans_end_to_end_and_verifies():
+    """The family's only whole-pipeline guard: real hub coordinates and census destinations have to
+    survive PLANNING, not just demand generation — a real siting could seat hubs whose walls make each
+    other's traffic infeasible in a way no placement assertion sees. Shrunk on BOTH window knobs (see
+    ScenarioSpec.config), still long enough for a 16 km leg and its paired return to land."""
+    spec = with_overrides(get_scenario("dfw_faa_wing_zipline_amazon"),
+                          horizon_s=1200.0, demand_duration_s=120.0)
+    res = run(spec.config(), demand=spec.demand_model())
+    assert res.verified                                  # FCL replay finds no inter-flight conflict
+    assert not res.denied and len(res.accepted) >= 250   # real geography stays flyable

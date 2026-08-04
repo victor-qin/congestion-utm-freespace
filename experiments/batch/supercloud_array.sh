@@ -90,9 +90,10 @@ esac
 TASK="${SLURM_ARRAY_TASK_ID:-${LLSUB_RANK:-0}}"
 if [[ -n "$SEEDS" ]]; then
   IFS=',' read -ra SEED_LIST <<< "$SEEDS"
-  # Duplicate seeds would give two tasks an IDENTICAL SimConfig -> the same _config_hash, and
-  # save_run's folder is {stamp}_{tag}_{hash} with mkdir(exist_ok=True): same-second finishers
-  # would interleave parquet into ONE folder. Refuse rather than corrupt.
+  # Duplicate seeds are duplicate WORK: two tasks with an identical config compute the same run twice.
+  # save_run no longer merges them (the folder is {stamp}_{tag}_s{seed}_{hash} and a collision is
+  # suffixed __2 rather than written into), but the second row still lands in the index as a bogus
+  # replicate of the first, so a cross-run mean silently double-counts it. Refuse up front.
   if [[ $(printf '%s\n' "${SEED_LIST[@]}" | sort | uniq -d | wc -l) -gt 0 ]]; then
     echo "FATAL: --seeds has duplicates ($SEEDS) — identical configs collide in one run folder" >&2
     exit 1

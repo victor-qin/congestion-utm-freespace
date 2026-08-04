@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import platform
 import subprocess
 import sys
@@ -50,9 +51,24 @@ INDEX_FILENAME = "index.parquet"
 # --- metadata captures -----------------------------------------------------
 
 
-def _config_hash(cfg: SimConfig) -> str:
-    payload = json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=str).encode()
-    return hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:8]
+log = logging.getLogger(__name__)
+
+
+def _config_hash(cfg: SimConfig, scenario_spec: dict | None = None) -> str:
+    """Short digest of everything that makes a run a DIFFERENT run.
+
+    ``SimConfig`` alone is not enough. Two scenarios can share a byte-identical SimConfig and still be
+    different worlds, because the whole demand recipe — operator mix, per-USS rates, service radii, and
+    the scheduling leads the lead arms vary — lives in ``DemandSpec``, which SimConfig never sees. The
+    five FAA lead arms all hashed to a246cd5e, so under one ``--tag`` their run folders differed only by
+    a second-granularity timestamp and same-second finishers merged into one directory. Fold the
+    archived scenario recipe in when there is one.
+    """
+    payload = {"config": dataclasses.asdict(cfg)}
+    if scenario_spec is not None:
+        payload["scenario_spec"] = scenario_spec
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha1(blob, usedforsecurity=False).hexdigest()[:8]
 
 
 def _git_info() -> dict:
@@ -100,6 +116,13 @@ def _term_from_json(s):
     return tuple(json.loads(s))
 
 
+def _opt_int(v) -> int | None:
+    """A parquet cell back to ``int | None`` — None for a missing column or a NaN (unlinked) row."""
+    if v is None or (isinstance(v, float) and v != v):
+        return None
+    return int(v)
+
+
 def scenario_frame(result: SimResult) -> pd.DataFrame:
     """Every generated flight request — the scenario, independent of what got accepted. Carries each
     endpoint's terminal (hub) membership so a saved run — including its denied flights — records which hub
@@ -116,6 +139,12 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
             "origin_terminal": _term_to_json(r.origin_terminal),
             "dest_terminal": _term_to_json(r.dest_terminal),
+            # Round-trip link (return leg → its outbound). Without it a reloaded run cannot tell which
+            # legs were paired, so nothing downstream could re-derive the schedule slip or re-anchor a
+            # return post-hoc — the coupled t_departure above is the OUTCOME, not the relationship.
+            # pandas has no nullable-int dtype by default, so an unlinked leg stores NaN and
+            # load_run reads it back as None.
+            "paired_outbound_id": r.paired_outbound_id,
         })
     return pd.DataFrame(rows)
 
@@ -205,8 +234,24 @@ def save_run(
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
-    folder = Path(root) / f"{stamp}_{label}_{_config_hash(cfg)}"
-    folder.mkdir(parents=True, exist_ok=True)
+    # Seed in the name as well as the hash: a sweep's folders are read by eye far more often than they
+    # are parsed, and `_s0/_s1/_s2` is the axis one actually scans for. The hash still carries it.
+    base_name = f"{stamp}_{label}_s{cfg.seed}_{_config_hash(cfg, scenario_spec)}"
+    # exist_ok=False in a claim loop, NOT exist_ok=True. Two runs landing on one name used to merge
+    # their parquet into a single directory — a silent corruption, and the likeliest way to hit it is a
+    # Slurm array whose tasks share a tag and finish inside the same second. Suffixing keeps both runs
+    # (losing a finished multi-hour run to a raise would be worse) and says so.
+    folder = Path(root) / base_name
+    for attempt in range(2, 1000):
+        try:
+            folder.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            folder = Path(root) / f"{base_name}__{attempt}"
+            log.warning("run folder %s already exists — writing to %s instead, so the two runs cannot "
+                        "interleave parquet into one directory", base_name, folder.name)
+    else:
+        raise RuntimeError(f"could not find a free run folder for {base_name} after 998 attempts")
 
     (folder / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2, default=str))
     (folder / "env.json").write_text(json.dumps(_env_info(), indent=2))
@@ -434,7 +479,10 @@ def load_run(folder: Path | str) -> LoadedRun:
                             vec(s.dest_x, s.dest_y, s.dest_z), float(s.t_request),
                             t_departure=t_dep, uss_id=str(s.uss_id),
                             origin_terminal=_term_from_json(getattr(s, "origin_terminal", None)),
-                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)))
+                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)),
+                            # getattr + NaN check: runs archived before the column existed have neither
+                            # the attribute nor a value, and an unlinked leg stores NaN either way.
+                            paired_outbound_id=_opt_int(getattr(s, "paired_outbound_id", None)))
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(
             request=req,

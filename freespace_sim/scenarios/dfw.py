@@ -19,7 +19,6 @@ import math
 from dataclasses import replace
 
 from . import density
-from .demand_dfw import DEFAULT_FIXED_TYPES, DEFAULT_HUB_CATEGORIES
 from .density import AMAZON_USS, WING_ZIPLINE_USS
 from .spec import ScenarioSpec
 
@@ -37,11 +36,12 @@ DFW_REGION_M = (
 
 def _geo_twin(spec: ScenarioSpec) -> ScenarioSpec:
     """A ``density_*`` spec → its ``dfw_*`` twin: same numbers, wide frame, real-geography demand."""
+    # fixed_hub_types / hub_categories are left unset: DemandSpec.build() falls back to DfwGeoDemand's
+    # own defaults (DEFAULT_FIXED_TYPES / DEFAULT_HUB_CATEGORIES) when they're empty.
     demand = replace(
         spec.demand, pattern="dfw_geo", geo_dataset="dfw",
         sampled_hub_uss=(WING_ZIPLINE_USS,),
         fixed_hub_uss=(AMAZON_USS,) if AMAZON_USS in spec.demand.uss else (),
-        fixed_hub_types=DEFAULT_FIXED_TYPES, hub_categories=DEFAULT_HUB_CATEGORIES,
     )
     return replace(
         spec, name="dfw_" + spec.name.removeprefix("density_"),

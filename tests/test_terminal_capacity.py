@@ -52,6 +52,53 @@ def test_capacity_one_is_exclusive():
     assert not tcap.admits("H", 0.0, DWELL, capacity=1)    # capacity 1 ⟺ the old single pad
 
 
+def test_reservation_admitted_uses_half_open_capacity_windows():
+    tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
+    committed = replace(_col(t0=40.0), t_end=70.0)       # incumbent [40, 70)
+    tcap.on_commit(1, [committed])
+    term = Terminal("H", 1, radius=90.0)
+
+    overlap = replace(_col(t0=38.33), t_end=81.33)
+    touching = replace(_col(t0=70.0), t_end=100.0)
+    assert not tcap.reservation_admitted([overlap], dest_term=term)
+    assert tcap.reservation_admitted([touching], dest_term=term)  # [40,70) and [70,100) disjoint
+
+
+def test_reservation_admitted_respects_capacity_greater_than_one():
+    tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
+    term = Terminal("H", 2, radius=90.0)
+    candidate = replace(_col(t0=10.0), t_end=20.0)
+
+    tcap.on_commit(1, [replace(_col(t0=0.0), t_end=30.0)])
+    assert tcap.reservation_admitted([candidate], origin_term=term)  # room for pad 2
+    tcap.on_commit(2, [replace(_col(t0=5.0), t_end=25.0)])
+    assert not tcap.reservation_admitted([candidate], origin_term=term)
+
+
+def test_reservation_admitted_ignores_unrelated_or_untagged_volumes():
+    tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
+    tcap.on_commit(1, [replace(_col(t0=0.0), t_end=30.0)])
+    term = Terminal("H", 1, radius=90.0)
+    untagged_cylinder = replace(_col(t0=10.0), terminal_id=None, t_end=20.0)
+    unrelated_cylinder = replace(_col(t0=10.0, tid="OTHER"), t_end=20.0)
+    matching_box = replace(_foreign_through_hub(), terminal_id="H", t_start=10.0, t_end=20.0)
+
+    assert tcap.reservation_admitted(
+        [untagged_cylinder, unrelated_cylinder, matching_box], origin_term=term)
+    assert not tcap.reservation_admitted(
+        [replace(_col(t0=10.0), t_end=20.0)], origin_term=term)
+
+
+def test_reservation_admitted_rejects_inconsistent_capacity_for_one_terminal_id():
+    tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
+    with pytest.raises(ValueError, match="capacity must be constant"):
+        tcap.reservation_admitted(
+            [_col(t0=10.0)],
+            origin_term=Terminal("H", 2, radius=90.0),
+            dest_term=Terminal("H", 1, radius=90.0),
+        )
+
+
 def test_on_commit_records_both_cylinders_of_a_roundtrip():
     # a flight tagging BOTH origin and dest at hub H contributes two dwells (mirror add_volume)
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))

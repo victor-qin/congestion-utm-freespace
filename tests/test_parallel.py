@@ -8,8 +8,10 @@ Worker-pool tests spawn real processes (2 workers) — kept small so the suite s
 from __future__ import annotations
 
 import pickle   # mirrors the worker-pool IPC wire (trusted, same-process-tree data built in-test)
+from dataclasses import fields
 
 import numpy as np
+import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.demand import HubRadiusDemand
@@ -32,19 +34,30 @@ def _volkey(intent):
             for v in (intent.volumes or [])]
 
 
+def _intent_bytes(intent):
+    # Worker IPC can legitimately change aliasing between fields (for example, a centerline point may
+    # or may not share an ndarray object with a volume input). Serialize every dataclass field in
+    # isolation so the comparison remains bit-exact on values without treating object memo layout as
+    # plan semantics. ``solve_time_s`` is the one intentionally nondeterministic field.
+    return tuple(
+        (field.name, pickle.dumps(getattr(intent, field.name), protocol=pickle.HIGHEST_PROTOCOL))
+        for field in fields(intent)
+        if field.name != "solve_time_s"
+    )
+
+
 def _assert_byte_identical(seq, par):
     assert len(seq.intents) == len(par.intents)
     for k, (a, b) in enumerate(zip(seq.intents, par.intents)):
-        assert a.request.flight_id == b.request.flight_id, f"flight order differs at {k}"
-        assert a.status is b.status, f"flight {k}: {a.status} != {b.status}"
-        assert a.denial_reason is b.denial_reason, f"flight {k}: denial reason differs"
-        if a.accepted:
-            assert abs(a.cost - b.cost) < 1e-9, f"flight {k}: cost differs"
-            assert a.ground_delay_s == b.ground_delay_s and a.air_hold_s == b.air_hold_s
-            assert a.air_detour_m == b.air_detour_m
-            assert _clkey(a) == _clkey(b), f"flight {k}: centerline differs"
-            assert _volkey(a) == _volkey(b), f"flight {k}: committed volumes differ"
+        assert _intent_bytes(a) == _intent_bytes(b), f"flight {k}: serialized intent differs"
     assert seq.ledger.n_volumes == par.ledger.n_volumes
+    # As with an intent's cross-field aliases, IPC may change memo sharing between otherwise equal
+    # volumes from different flights. Compare each committed volume independently and in ledger order.
+    assert tuple(
+        pickle.dumps(volume, protocol=pickle.HIGHEST_PROTOCOL) for volume in seq.ledger._vols
+    ) == tuple(
+        pickle.dumps(volume, protocol=pickle.HIGHEST_PROTOCOL) for volume in par.ledger._vols
+    )
     assert seq.verified and par.verified
 
 
@@ -55,6 +68,21 @@ def test_exact_byte_identical_sparse():
     seq = run(cfg)
     pc = ParallelConfig(n_workers=2, window=8)
     par = run(cfg, parallel=pc)
+    _assert_byte_identical(seq, par)
+    assert pc.stats["n_canary"] == 0
+
+
+@pytest.mark.parametrize("planner_name", ["astar_heading_shortcut", "astar_batched_shortcut"])
+def test_exact_byte_identical_experimental_shortcuts(planner_name):
+    cfg = SimConfig(region_size_m=(5000.0, 3500.0), planner=planner_name)
+    reqs = [
+        FlightRequest(1, vec(0, 0, 0), vec(3000, 1200, 0), 0.0),
+        FlightRequest(2, vec(3000, 0, 0), vec(0, 1200, 0), 4.0),
+        FlightRequest(3, vec(0, 600, 0), vec(3000, 1800, 0), 8.0),
+    ]
+    seq = run(cfg, requests=list(reqs))
+    pc = ParallelConfig(n_workers=2, window=4)
+    par = run(cfg, requests=list(reqs), parallel=pc)
     _assert_byte_identical(seq, par)
     assert pc.stats["n_canary"] == 0
 
@@ -172,6 +200,66 @@ def test_relaxed_verified_and_deterministic():
         if x.accepted:
             assert abs(x.cost - y.cost) < 1e-12 and _clkey(x) == _clkey(y)
             assert _volkey(x) == _volkey(y)
+
+
+@pytest.mark.parametrize(
+    "planner_name",
+    ["astar", "astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"],
+)
+def test_relaxed_revalidates_terminal_capacity_at_ordered_commit(planner_name):
+    """Divergent lanes hide a stale same-hub dwell from geometric conflict validation."""
+    cfg = SimConfig(
+        region_size_m=(9000.0, 9000.0),
+        planner=planner_name,
+        max_ground_delay_s=300.0,
+    )
+    hub = Terminal("hub", 1, 90.0)
+
+    def requests():
+        return [
+            FlightRequest(
+                1, vec(4000, 4000, 0), vec(7500, 4000, 0), 0.0,
+                origin_terminal=hub,
+            ),
+            FlightRequest(
+                2, vec(4000, 4000, 0), vec(2250, 7031, 0), 0.0,
+                origin_terminal=hub,
+            ),
+        ]
+
+    sequential = run(cfg, requests=requests())
+    pcfg = ParallelConfig(
+        n_workers=2,
+        window=8,
+        mode="relaxed",
+        pin_prefixes=True,
+        max_respec=0,
+        predictive_dispatch=False,
+    )
+    parallel = run(cfg, requests=requests(), parallel=pcfg)
+
+    assert [intent.ground_delay_s for intent in parallel.intents] == [0.0, 44.0]
+    assert [intent.ground_delay_s for intent in parallel.intents] == [
+        intent.ground_delay_s for intent in sequential.intents
+    ]
+    assert pcfg.stats["n_dirty"] == 1
+    assert pcfg.stats["n_serial_replans"] == 1
+
+    intervals = [
+        (volume.t_start, volume.t_end)
+        for intent in parallel.intents
+        for volume in (intent.volumes or [])
+        if volume.terminal_id == hub.id and isinstance(volume.shape, CylinderSpec)
+    ]
+    events = sorted(
+        [(start, 1) for start, _ in intervals] + [(end, -1) for _, end in intervals],
+        key=lambda event: (event[0], event[1]),  # half-open: endings precede equal starts
+    )
+    occupancy = peak = 0
+    for _, delta in events:
+        occupancy += delta
+        peak = max(peak, occupancy)
+    assert peak <= hub.capacity
 
 
 def test_relaxed_denials_kept():

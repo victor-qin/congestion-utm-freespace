@@ -7,11 +7,11 @@ exact-mode soundness contract — while recording must never perturb the plan it
   * an independent class-level probe log (monkeypatched onto ``HexOccupancyService`` itself, so it
     catches call sites that bypass the recorder) is contained in the reported envelope;
   * the accepted corridor's committed volumes sit inside the envelope (the convex-hull lemma the
-    ``astar_shortcut`` allowlist relies on), exercised with knots ACTUALLY removed.
+    shortcut allowlist entries rely on), exercised with knots ACTUALLY removed.
 """
 from __future__ import annotations
 
-import numpy as np
+import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
@@ -182,9 +182,13 @@ def test_envelope_compiled_covers_reference_probes(monkeypatch):
 
 # ---------------- filed corridor ⊆ envelope with the shortcut refiner (hull lemma) ----------------
 
-def test_envelope_covers_filed_corridor_shortcut():
+@pytest.mark.parametrize(
+    "planner_name",
+    ["astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"],
+)
+def test_envelope_covers_filed_corridor_shortcut(planner_name):
     req = FlightRequest(1, vec(0, 0, 0), vec(2400, 1400, 0), 0.0)   # diagonal → staircase → knots removed
-    sc = get_planner("astar_shortcut")
+    sc = get_planner(planner_name)
     inner = sc.inner
     assert isinstance(inner, AStarPlanner)
     inner.record_envelope = True

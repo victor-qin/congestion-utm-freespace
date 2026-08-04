@@ -15,11 +15,13 @@ from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
+from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.milp import MILPOptPlanner
 from freespace_sim.planner.straight import StraightLineTimeShift
+from freespace_sim.planner.terminal_capacity import TerminalCapacity
 from freespace_sim.sim import _wall_aware, run
-from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
-from freespace_sim.volumes import exit_radius
+from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
+from freespace_sim.volumes import build_reservation_from_corners, exit_radius, hover_reservation
 
 PLANNERS = ["milp", "astar_milp"]
 
@@ -130,6 +132,129 @@ def test_milp_landing_capacity_not_oversubscribed():
     dwells = [(v.t_start, v.t_end) for a in res.accepted for v in a.volumes
               if v.terminal_id == "H" and isinstance(v.shape, CylinderSpec)]
     assert dwells and _max_concurrent(dwells) <= 2
+
+
+def test_milp_splice_uses_shared_reservation_capacity_gate(monkeypatch):
+    cfg = SimConfig()
+    ledger = ReservationLedger(cfg)
+    planner = MILPOptPlanner()
+    tcap = TerminalCapacity(cfg, ledger)
+    term = Terminal("H", 1, radius=90.0)
+    origin, dest = vec(0, 0, 0), vec(1200, 0, 0)
+    z = cfg.z_min_m
+    corners = [vec(0, 0, z), vec(600, 120, z), vec(1200, 0, z)]
+    best = build_reservation_from_corners(
+        corners, origin, dest, 0.0, 0.0, cfg, origin_term=term)
+    calls = []
+
+    def reject(volumes, origin_term=None, dest_term=None):
+        calls.append((volumes, origin_term, dest_term))
+        return False
+
+    monkeypatch.setattr(tcap, "reservation_admitted", reject)
+    out = planner._splice(
+        corners, origin, dest, 0.0, 0.0, cfg, ledger, best,
+        o_term=term, d_term=None, tcap=tcap)
+
+    assert out is best                            # rejected splice retains last verified reservation
+    assert len(calls) == 1
+    assert calls[0][1:] == (term, None)            # MILP delegated terminal context to shared gate
+
+
+def test_milp_capacity_authority_drops_released_dwell_before_next_plan():
+    cfg = SimConfig()
+    ledger = ReservationLedger(cfg)
+    planner = MILPOptPlanner()
+    tcap = planner._capacity(ledger, cfg, 0.0)
+    ledger.commit(1, [hover_reservation(vec(0, 0, 0), 0.0, cfg, terminal_id="H")])
+    assert tcap.dwells["H"]
+
+    ledger.release(1)
+    refreshed = planner._capacity(ledger, cfg, 0.0)
+
+    assert refreshed is tcap
+    assert tcap.dwells == {}
+    assert tcap._n_observed_volumes == ledger.n_volumes == 0
+
+
+def test_milp_capacity_authority_reabsorbs_partial_release_without_duplicates():
+    cfg = SimConfig()
+    ledger = ReservationLedger(cfg)
+    planner = MILPOptPlanner()
+    tcap = planner._capacity(ledger, cfg, 0.0)
+    first = hover_reservation(vec(0, 0, 0), 0.0, cfg, terminal_id="H")
+    second = hover_reservation(vec(0, 0, 0), 100.0, cfg, terminal_id="H")
+    ledger.commit(1, [first])
+    ledger.commit(2, [second])
+
+    ledger.release(1)  # release rebuild replays flight 2 through every existing subscriber
+    planner._capacity(ledger, cfg, 0.0)
+
+    assert tcap.dwells["H"] == [(second.t_start, second.t_end)]
+    assert tcap._n_observed_volumes == ledger.n_volumes == 1
+
+
+def test_bare_milp_does_not_return_untagged_terminal_warm_fallback(monkeypatch):
+    cfg = SimConfig(region_size_m=(4000.0, 4000.0))
+    ledger = ReservationLedger(cfg)
+    req = FlightRequest(
+        1, vec(500, 500, 0), vec(3000, 500, 0), 0.0,
+        origin_terminal=Terminal("H", 2, radius=90.0),
+    )
+    planner = MILPOptPlanner()
+    monkeypatch.setattr(planner, "_solve", lambda *_args, **_kwargs: None)
+
+    intent = planner.plan(req, ledger, cfg)
+
+    assert intent.status is IntentStatus.REJECTED
+    assert not intent.volumes
+    assert intent.planner == "milp"
+    # An untagged warm planner is a COMPUTE artifact, not congestion. REJECTED defaults to
+    # BUDGET_EXCEEDED, so an implicit reason would land in metrics' congestion_denial_rate.
+    assert intent.denial_reason is DenialReason.SEARCH_EXHAUSTED
+
+
+def test_bare_milp_over_capacity_warm_fallback_is_attributed_to_congestion(monkeypatch):
+    """The other ``_warm_terminal_denial`` branch: tagged windows the pad cannot admit IS physics."""
+    cfg = SimConfig(region_size_m=(4000.0, 4000.0))
+    ledger = ReservationLedger(cfg)
+    req = FlightRequest(
+        1, vec(500, 500, 0), vec(3000, 500, 0), 0.0,
+        origin_terminal=Terminal("H", 2, radius=90.0),
+    )
+    planner = MILPOptPlanner(warm_planner=AStarPlanner())      # tags its hub columns
+    monkeypatch.setattr(planner, "_solve", lambda *_args, **_kwargs: None)
+    # A* gates itself through admits/dwell_ok and never consults reservation_admitted, so this
+    # isolates the MILP-side capacity verdict without perturbing the warm plan.
+    monkeypatch.setattr(TerminalCapacity, "reservation_admitted",
+                        lambda *_args, **_kwargs: False)
+
+    intent = planner.plan(req, ledger, cfg)
+
+    assert intent.status is IntentStatus.REJECTED
+    assert intent.planner == "milp"
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
+
+
+def test_astar_milp_keeps_tagged_terminal_warm_fallback(monkeypatch):
+    cfg = SimConfig(region_size_m=(4000.0, 4000.0))
+    ledger = ReservationLedger(cfg)
+    req = FlightRequest(
+        1, vec(500, 500, 0), vec(3000, 500, 0), 0.0,
+        origin_terminal=Terminal("H", 2, radius=90.0),
+    )
+    planner = MILPOptPlanner(warm_planner=AStarPlanner())
+    monkeypatch.setattr(planner, "_solve", lambda *_args, **_kwargs: None)
+
+    intent = planner.plan(req, ledger, cfg)
+
+    assert intent.status is IntentStatus.ACCEPTED
+    tagged_dwells = [
+        volume for volume in intent.volumes
+        if volume.terminal_id == "H" and isinstance(volume.shape, CylinderSpec)
+    ]
+    assert len(tagged_dwells) == 1
+    assert intent.planner == "milp"
 
 
 # --- always-active admission -----------------------------------------------------------------------

@@ -223,7 +223,8 @@ def _wall_aware(planner) -> bool:
     it TAGS its terminal columns and gates pad capacity itself (A*, or any planner declaring
     ``plans_terminal_airspace`` — the MILP family), or it reaches such a planner through its
     ``inner``/``warm_planner`` chain and so rebuilds or falls back to a tagged intent. Walks the chain
-    (astar_shortcut → inner, astar_milp → warm_planner, astar_milp_shortcut → both). Used only to gate
+    (the A* shortcut variants → inner, astar_milp → warm_planner,
+    astar_milp_shortcut → both). Used only to gate
     ``terminal_airspace_always_active`` (see ``run``): tagged columns are exempt from their own hub's
     permanent wall, whereas a planner that builds untagged near-hub columns would collide with it."""
     from .planner.astar import AStarPlanner
@@ -242,8 +243,8 @@ def _wall_aware(planner) -> bool:
 
 def _astar_planners(planner) -> list:
     """Every ``AStarPlanner`` reachable from ``planner`` via the inner/warm_planner chain — so telemetry
-    attaches to the A* inside refiner / warm-start wrappers (astar_shortcut, astar_milp, …), not just a bare
-    top-level planner."""
+    attaches to the A* inside any shortcut refiner or a warm-start wrapper (astar_milp, …), not just
+    a bare top-level planner."""
     from .planner.astar import AStarPlanner
     out, seen, stack = [], set(), [planner]
     while stack:
@@ -288,7 +289,8 @@ def run(
     worker-pool sim (issue #8 Track A): a :class:`~freespace_sim.parallel.ParallelConfig`, or an int
     as an ``n_workers`` shorthand. ``mode="exact"`` (default) is byte-identical to the serial run;
     ``mode="relaxed"`` is a documented FCFS-class relaxation. Needs an envelope-recording planner
-    (``astar``/``astar_ref``/``astar_shortcut``). Composes with ``telemetry`` (worker streams are
+    (``astar``/``astar_ref``/``astar_shortcut``/``astar_heading_shortcut``/
+    ``astar_batched_shortcut``). Composes with ``telemetry`` (worker streams are
     merged in commit order).
     """
     if scenario is None:
@@ -327,7 +329,8 @@ def run(
             ledger.register_static_terminal(center, term)
         # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its own hub's
         # wall only if it too is tagged (conflict.volumes_conflict same-tid+cylinder). Wall-aware planners:
-        #   • astar / astar_shortcut TAG their terminal columns (astar._build / shortcut pass the terminal id),
+        #   • astar and all shortcut variants TAG their terminal columns
+        #     (astar._build / shortcut pass the terminal id),
         #     so they refine fully under always-active.
         #   • the MILP family (plans_terminal_airspace) folds its corners to the column edge, TAGS the rebuilt
         #     columns/near-hub boxes, and gates pad capacity through its own TerminalCapacity — tagging is safe

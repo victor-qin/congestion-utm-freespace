@@ -129,11 +129,12 @@ class ParallelConfig:
         recorded read-envelope; otherwise the coordinator replans it serially. ``n_workers`` /
         ``window`` are pure performance knobs — they cannot change results.
       * ``"relaxed"`` — a valid FCFS-class allocation: a speculation commits whenever its volumes
-        are still conflict-free against the full ledger (the interleaved obstacles it never saw
-        merely make its plan equal-or-cheaper than sequential's). With ``pin_prefixes`` (default)
-        each flight k plans against exactly the first ``max(0, k - window)`` commits, making
-        results a pure function of (scenario, config) — but note ``window`` thereby becomes a
-        RESULT-AFFECTING parameter, part of the allocation semantics.
+        are still conflict-free and its exact tagged terminal dwells still fit capacity against the
+        authoritative ledger (interleaved obstacles it never saw merely make its plan equal-or-cheaper
+        than sequential's). With ``pin_prefixes`` (default) each flight k plans against exactly the
+        first ``max(0, k - window)`` commits, making results a pure function of (scenario, config) —
+        but note ``window`` thereby becomes a RESULT-AFFECTING parameter, part of the allocation
+        semantics.
 
     Eager re-speculation (``max_respec`` > 0) re-dispatches a dirtied pending result to a worker
     immediately instead of stalling the commit frontier for a serial replan. Its trigger depends on
@@ -185,9 +186,11 @@ class ParallelConfig:
 
 
 #: Planners the parallel path supports in v1: every plan must come from an envelope-recording A*
-#: (bare, reference oracle, or wrapped by the shortcut refiner, whose probes stay inside the inner
-#: A*'s hull — the convex-hull lemma). The MILP family optimizes outside any recorded read set.
-PARALLEL_PLANNERS = ("astar", "astar_ref", "astar_shortcut")
+#: (bare, reference oracle, or wrapped by a shortcut strategy, whose chords stay inside the
+#: inner A* path's hull — the convex-hull lemma). The MILP family optimizes outside any recorded read set.
+PARALLEL_PLANNERS = (
+    "astar", "astar_ref", "astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut",
+)
 
 
 def spatial_tube(req, cfg: SimConfig, margin_m: float):
@@ -371,6 +374,7 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
     import multiprocessing as mp
 
     from .planner import get_planner
+    from .planner.terminal_capacity import TerminalCapacity
 
     events = scenario.events
     total = len(events)
@@ -384,6 +388,20 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
     for a in _iter_astar(serial):
         if collector is not None:
             a._tele = collector                             # serial replans feed the master directly
+
+    # Coordinator-side terminal authority for relaxed validation. Worker planners validate against
+    # their own snapshot, which is necessarily stale after an interleaved same-hub commit. Exact mode's
+    # hub-disc envelope already detects that read; relaxed mode needs this explicit pre-commit gate
+    # because same-terminal cylinders are intentionally exempt from geometric ledger conflicts.
+    commit_tcap = None
+    if pcfg.mode == "relaxed":
+        commit_tcap = TerminalCapacity(cfg, ledger)
+        backlog: dict = {}
+        for fid, volume in ledger.iter_committed():
+            backlog.setdefault(fid, []).append(volume)
+        for fid, volumes in backlog.items():
+            commit_tcap.on_commit(fid, volumes)
+        ledger.subscribe(commit_tcap.on_commit)
 
     ctx = mp.get_context("spawn")
     workers = []                                            # (process, conn)
@@ -497,8 +515,20 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
                     dirty = env is None or env.unbounded or (
                         bool(interleaved) and envelope_intersects(env, interleaved))
                 else:
-                    dirty = bool(intent.accepted and intent.volumes
-                                 and ledger.any_conflict(intent.volumes))
+                    filed = bool(intent.accepted and intent.volumes)
+                    if filed:
+                        commit_tcap.evict_before(intent.request.t_request)
+                    terminal_dirty = bool(
+                        filed
+                        and not commit_tcap.reservation_admitted(
+                            intent.volumes,
+                            intent.request.origin_terminal,
+                            intent.request.dest_terminal,
+                        )
+                    )
+                    dirty = filed and (
+                        terminal_dirty or ledger.any_conflict(intent.volumes)
+                    )
                 if adapt is not None:
                     adapt.observe(dirty)
                 if dirty:

@@ -16,8 +16,9 @@ warm path — collapsing the search to a fast LP that only *tightens* the geomet
 homotopy (this is how `astar_milp` gets MILP quality at ~LP speed).
 
 Correctness lives outside the solver: the MILP path is rebuilt into the exact committed boxes and
-re-checked against the ledger; on any conflict / infeasibility / non-improvement it falls back to
-the warm intent. So the planner is never worse than its warm planner.
+re-checked against the ledger and the shared terminal-capacity authority; on any conflict /
+over-capacity dwell / infeasibility / non-improvement it falls back to the warm intent. So the
+planner is never worse than its warm planner.
 
 Default solver is open-source CBC (bundled with PuLP); Gurobi/MISOCP (exact L2) is a future option.
 """
@@ -25,6 +26,7 @@ Default solver is open-source CBC (bundled with PuLP); Gurobi/MISOCP (exact L2) 
 from __future__ import annotations
 
 import warnings
+from collections import Counter
 
 import numpy as np
 import pulp
@@ -33,7 +35,8 @@ from ..config import SimConfig
 from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
-from ..types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
+from ..types import (DenialReason, FlightRequest, IntentStatus, OperationalIntent,
+                     as_terminal)
 from ..volumes import (build_reservation_from_corners, enroute_detour_m,
                        enroute_flown_m, enroute_reference_m, fold_corners_to_columns)
 from .hexgrid import max_lane_traverse_s
@@ -59,8 +62,8 @@ class MILPOptPlanner:
       that only tightens geometry within the warm homotopy. `astar_milp` = A* warm + both flags.
 
     Terminal-aware: hub geometry is folded to the column edge, tagged, and pad-capacity gated via
-    ``TerminalCapacity`` (see ``_verify_with_delay`` / ``_capacity_ok``), so the sim admits the MILP
-    family under ``terminal_airspace_always_active``.
+    ``TerminalCapacity`` (see ``_verify_with_delay`` / ``reservation_admitted``), so the sim admits
+    the MILP family under ``terminal_airspace_always_active``.
     """
 
     plans_terminal_airspace = True   # consumed by sim._wall_aware (always-active admission gate)
@@ -95,7 +98,6 @@ class MILPOptPlanner:
         # per-ledger pad-capacity authority (bound lazily in _capacity, AStarPlanner._occupancy-style)
         self._tcap: TerminalCapacity | None = None
         self._tcap_ledger: ReservationLedger | None = None
-        self._tcap_seen = 0
 
     def plan(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
@@ -123,13 +125,53 @@ class MILPOptPlanner:
                 f"milp _solve raised {type(e).__name__}: {e} — falling back to the warm candidate",
                 RuntimeWarning, stacklevel=2)
             milp = None
-        cands = [i for i in (warm, milp) if i is not None and i.accepted]
+        warm_denial = (self._warm_terminal_denial(warm, o_term, d_term, tcap)
+                       if warm.accepted else None)
+        cands = ([warm] if warm.accepted and warm_denial is None else [])
+        if milp is not None and milp.accepted:
+            cands.append(milp)
         if not cands:
-            warm.planner = "milp"
-            return warm                              # both denied
+            if not warm.accepted:
+                warm.planner = "milp"
+                return warm                          # both denied
+            # The solver failed and an accepted custom/default warm route did not satisfy the
+            # terminal-aware contract. Never relabel unsafe untagged volumes as a MILP intent — and
+            # carry the REASON explicitly, since OperationalIntent defaults a REJECTED status to
+            # BUDGET_EXCEEDED, the headline `congestion_denial_rate` numerator.
+            return OperationalIntent(request=req, status=IntentStatus.REJECTED,
+                                     denial_reason=warm_denial, planner="milp")
         best = min(cands, key=lambda i: i.cost)      # global delay-vs-detour trade-off, then min
         best.planner = "milp"
         return best
+
+    @staticmethod
+    def _warm_terminal_denial(warm, o_term, d_term,
+                              tcap: TerminalCapacity) -> DenialReason | None:
+        """Why a warm fallback fails MILP's terminal-aware public contract; None if it satisfies it.
+
+        Non-terminal warm plans retain the historical fast path. A terminal request must carry one
+        tagged dwell cylinder per requested endpoint (including two for a same-ID round trip) and
+        its exact windows must fit the shared capacity authority.
+
+        The two failures are attributed to DIFFERENT denial reasons on purpose. A warm planner that
+        never tags its hub columns — the default ``StraightLineTimeShift`` — is a COMPUTE artifact:
+        a solved MILP or a terminal-aware warm planner would have filed, so a bigger solver budget
+        might. Tagged windows the pad cannot admit is real hub saturation. Since ``OperationalIntent``
+        defaults a REJECTED status to ``BUDGET_EXCEEDED``, leaving the reason implicit would book the
+        artifact into ``congestion_denial_rate`` — the split this enum exists to preserve.
+        """
+        required = Counter(term.id for term in (o_term, d_term) if term is not None)
+        if not required:
+            return None
+        tagged = Counter(
+            volume.terminal_id for volume in (warm.volumes or ())
+            if volume.terminal_id is not None and isinstance(volume.shape, CylinderSpec)
+        )
+        if any(tagged[terminal_id] < count for terminal_id, count in required.items()):
+            return DenialReason.SEARCH_EXHAUSTED
+        if not tcap.reservation_admitted(warm.volumes, o_term, d_term):
+            return DenialReason.BUDGET_EXCEEDED
+        return None
 
     def _capacity(self, ledger, cfg, t_request) -> TerminalCapacity:
         """Per-ledger ``TerminalCapacity`` binding — the pad-capacity authority, same lifecycle as
@@ -145,10 +187,9 @@ class MILPOptPlanner:
             ledger.subscribe(self._tcap.on_commit)
             self._absorb_committed(ledger)
             self._tcap_ledger = ledger
-        elif ledger.n_volumes < self._tcap_seen:
+        elif ledger.n_volumes < self._tcap._n_observed_volumes:
             self._tcap.reset()
             self._absorb_committed(ledger)
-        self._tcap_seen = ledger.n_volumes
         self._tcap.evict_before(t_request)
         return self._tcap
 
@@ -158,22 +199,6 @@ class MILPOptPlanner:
             by_fid.setdefault(fid, []).append(vol)
         for fid, vols in by_fid.items():
             self._tcap.on_commit(fid, vols)
-
-    def _capacity_ok(self, volumes, o_term, d_term, tcap) -> bool:
-        """Pad-capacity gate on the REBUILT tagged dwell columns (their windows carry the exact
-        committed timing, so no window math is duplicated here). This is the check ``any_conflict``
-        cannot make: same-hub columns are conflict-EXEMPT, so only ``TerminalCapacity.admits``'
-        interval count stands between the plan and an over-subscribed pad."""
-        if tcap is None or (o_term is None and d_term is None):
-            return True
-        for v in volumes:
-            if v.terminal_id is None or not isinstance(v.shape, CylinderSpec):
-                continue
-            term = o_term if (o_term is not None and v.terminal_id == o_term.id) else d_term
-            if term is not None and v.terminal_id == term.id and not tcap.admits(
-                    v.terminal_id, v.t_start, v.t_end, term.capacity):
-                return False
-        return True
 
     def _solve(self, req, ledger, cfg, fixed_delay=None, ref_path=None,
                o_term=None, d_term=None, tcap=None) -> OperationalIntent | None:
@@ -392,7 +417,8 @@ class MILPOptPlanner:
                            ledger, o_term=None, d_term=None, tcap=None):
         """Fold the corners to the terminal column edges, then step the delay up from the MILP's
         value until the rebuilt path is conflict-free AND pad-capacity-admitted, then splice out
-        redundant knots at that delay.
+        redundant knots at that delay. Capacity is checked from the rebuilt tagged dwell windows by
+        :meth:`TerminalCapacity.reservation_admitted`; no timing is re-derived here.
 
         ``straight_ref`` is the en-route (lane → lane) reference, NOT the centre-to-centre
         ``straight_horiz`` used for the knot floor in ``_solve``.
@@ -411,7 +437,8 @@ class MILPOptPlanner:
             if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
                 return None
             if (not ledger.any_conflict(volumes)
-                    and self._capacity_ok(volumes, o_term, d_term, tcap)):
+                    and (tcap is None
+                         or tcap.reservation_admitted(volumes, o_term, d_term))):
                 built = self._splice(corners, origin, dest, t_depart, d, cfg, ledger,
                                      (volumes, centerline, cum_horiz, cum_dz), o_term, d_term, tcap)
                 return (*built, d)
@@ -426,8 +453,8 @@ class MILPOptPlanner:
         slack, so CBC's vertex can wander metres off the chord "for free"; the rebuild would bill
         that as air detour. A removal is kept iff the rebuilt reservation stays conflict-free AND
         still pad-capacity-admitted — a shorter path lands EARLIER, shifting the dest dwell window,
-        so capacity must be re-checked. Removals only shorten the path (triangle inequality), so the
-        detour budget never re-trips.
+        so capacity must be re-checked through :meth:`TerminalCapacity.reservation_admitted`.
+        Removals only shorten the path (triangle inequality), so the detour budget never re-trips.
         """
         corners = [np.asarray(c, float) for c in corners]
         changed = True
@@ -439,7 +466,8 @@ class MILPOptPlanner:
                 rebuilt = build_reservation_from_corners(
                     cand, origin, dest, t_depart, d, cfg, origin_term=o_term, dest_term=d_term)
                 if (not ledger.any_conflict(rebuilt[0])
-                        and self._capacity_ok(rebuilt[0], o_term, d_term, tcap)):
+                        and (tcap is None
+                             or tcap.reservation_admitted(rebuilt[0], o_term, d_term))):
                     corners, best, changed = cand, rebuilt, True
                 else:
                     i += 1

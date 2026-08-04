@@ -6,6 +6,7 @@ results/
 runlogs/
 *.parquet
 *.png
+!analysis/astar_batched_shortcut.png
 *.glb
 .pytest_cache/
 .ruff_cache/

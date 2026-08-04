@@ -1,8 +1,8 @@
-"""Re-profile astar_shortcut under always-active terminal airspace (issue #30).
+"""Compare shortcut refiners under always-active terminal airspace (issue #30).
 
 Reproduces dallas_full's bottleneck structure — the SAME 260 always-active hub walls, 3 flight
 levels, and tagged terminal columns — but at a smaller lam/horizon so the warm phase is fast. Then
-cProfiles a batch of astar_shortcut plans and attributes *tottime* (exclusive self-time, so the
+cProfiles a batch of the selected shortcut planner's intents and attributes *tottime* (exclusive self-time, so the
 buckets sum cleanly to the whole) into the categories issue #30 argues about:
 
     A* search  |  geometry rebuild  |  ledger.any_conflict  |  FCL narrowphase  |  shortcut driver
@@ -12,15 +12,15 @@ profile cannot: is the _StaticWallGrid (issue #30's already-landed lever #1) act
 260 static walls? We tally, per any_conflict query, how many walls the grid returns vs the old
 full-scan baseline of len(_static_vols).
 
-Usage: uv run python analysis/prof_shortcut.py [lam] [warm] [timed]
+Usage: uv run python analysis/prof_shortcut.py [lam] [warm] [timed] [--planner PLANNER]
 Defaults chosen so the run is a couple of minutes but the ledger is realistically dense.
 """
 from __future__ import annotations
 
+import argparse
 import cProfile
 import os
 import pstats
-import sys
 import time
 from collections import defaultdict
 
@@ -31,13 +31,23 @@ from freespace_sim.dss import DSS
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
+from freespace_sim.planner import shortcut as shortcut_mod
 from freespace_sim.scenarios.dallas import SCENARIOS
 from freespace_sim.scenarios.spec import with_overrides
 from freespace_sim.uss import USS
 
-lam = float(sys.argv[1]) if len(sys.argv) > 1 else 9000.0
-warm = int(sys.argv[2]) if len(sys.argv) > 2 else 700
-timed = int(sys.argv[3]) if len(sys.argv) > 3 else 220
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("lam", type=float, nargs="?", default=9000.0)
+parser.add_argument("warm", type=int, nargs="?", default=700)
+parser.add_argument("timed", type=int, nargs="?", default=220)
+parser.add_argument(
+    "--planner",
+    choices=("astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"),
+    default="astar_shortcut",
+    help="shortcut strategy to profile (default: established single-knot refiner)",
+)
+args = parser.parse_args()
+lam, warm, timed, planner_name = args.lam, args.warm, args.timed, args.planner
 
 # cell-size sweep hook: FS_DYNAMIC_CELL_M=512 patches the ledger's dynamic sub-index cell edge (dev-only;
 # production ships the module default). Set before any ledger is built so commit/_candidate_indices see it.
@@ -47,7 +57,7 @@ if os.environ.get("FS_DYNAMIC_CELL_M"):
 
 # dallas_full's exact world (260 hubs, 3 levels, always-active, tagged columns) at a reduced lam/horizon.
 spec = with_overrides(SCENARIOS["dallas_full"], lam_per_hour=lam, horizon_s=3600.0,
-                      planner="astar_shortcut")
+                      planner=planner_name)
 cfg = spec.config()
 demand = spec.demand_model()
 reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
@@ -55,7 +65,7 @@ assert warm + timed <= len(reqs), f"need {warm + timed} flights, demand made {le
 
 ledger = ReservationLedger(cfg)
 dss = DSS(ledger=ledger, mechanism=FCFSMechanism())
-planner = get_planner("astar_shortcut")
+planner = get_planner(planner_name)
 usses = {uid: USS(uid, dss, cfg, planner) for uid in {r.uss_id for r in reqs}}
 
 # Register EVERY hub's permanent terminal wall BEFORE the first plan (mirrors sim.run under
@@ -78,6 +88,10 @@ stats_counters = defaultdict(float)
 _orig_candidates = ledger_mod._StaticWallGrid.candidates
 _orig_any_conflict = ReservationLedger.any_conflict
 _orig_cand_indices = ReservationLedger._candidate_indices
+_orig_rebuild = shortcut_mod._rebuild
+_orig_shortcut_corners = shortcut_mod.shortcut_corners
+_orig_shortcut_turn_seeded = shortcut_mod._shortcut_turn_seeded
+_orig_merge_preserves_resampling = shortcut_mod._merge_preserves_resampling
 
 
 def _counting_candidates(self, aabb):
@@ -100,23 +114,75 @@ def _counting_any_conflict(self, volumes):
     return _orig_any_conflict(self, volumes)
 
 
+def _counting_rebuild(corners, *rebuild_args, **rebuild_kw):
+    """Count feasibility-oracle work without depending on either refiner's private driver state."""
+    stats_counters["rebuild_calls"] += 1
+    stats_counters["rebuild_input_corners"] += len(corners)
+    out = _orig_rebuild(corners, *rebuild_args, **rebuild_kw)
+    result = "success" if out is not None else "failure"
+    stats_counters[f"rebuild_{result}"] += 1
+    if out is not None:
+        # This is the candidate corner count accepted by the rebuild oracle, not the final intent's
+        # resampled centerline length and not necessarily the candidate the outer cost guard returns.
+        stats_counters["rebuild_success_corners"] += len(corners)
+        stats_counters["rebuild_output_volumes"] += len(out[0])
+    return out
+
+
+def _counting_shortcut_corners(corners, *driver_args, **driver_kw):
+    """Record the legacy driver's logical input/output, separate from resampled centerlines."""
+    stats_counters["shortcut_input_corners"] += len(corners)
+    out = _orig_shortcut_corners(corners, *driver_args, **driver_kw)
+    stats_counters["shortcut_output_corners"] += len(out)
+    stats_counters["shortcut_driver_calls"] += 1
+    stats_counters["shortcut_driver_changed"] += len(out) < len(corners)
+    return out
+
+
+def _counting_shortcut_turn_seeded(corners, *driver_args, **driver_kw):
+    """Record the batched driver's final accepted logical state, not every successful probe."""
+    stats_counters["shortcut_input_corners"] += len(corners)
+    state = _orig_shortcut_turn_seeded(corners, *driver_args, **driver_kw)
+    output_corners = len(corners) if state is None else len(state.knots)
+    stats_counters["shortcut_output_corners"] += output_corners
+    stats_counters["shortcut_driver_calls"] += 1
+    stats_counters["shortcut_driver_changed"] += state is not None and output_corners < len(corners)
+    return state
+
+
+def _counting_merge_preserves_resampling(*merge_args, **merge_kw):
+    stats_counters["heading_checks"] += 1
+    result = _orig_merge_preserves_resampling(*merge_args, **merge_kw)
+    stats_counters["heading_skips" if result else "heading_fallbacks"] += 1
+    return result
+
+
 ledger_mod._StaticWallGrid.candidates = _counting_candidates
 ReservationLedger._candidate_indices = _counting_cand_indices
 ReservationLedger.any_conflict = _counting_any_conflict
+shortcut_mod._rebuild = _counting_rebuild
+shortcut_mod.shortcut_corners = _counting_shortcut_corners
+shortcut_mod._shortcut_turn_seeded = _counting_shortcut_turn_seeded
+shortcut_mod._merge_preserves_resampling = _counting_merge_preserves_resampling
 
 # ---- profile the batch ----
 batch = reqs[warm:warm + timed]
 t0 = time.monotonic()
 pr = cProfile.Profile()
-pr.enable()
-for req in batch:
-    usses[req.uss_id].handle_request(req)
-pr.disable()
-wall = time.monotonic() - t0
-
-ledger_mod._StaticWallGrid.candidates = _orig_candidates
-ReservationLedger._candidate_indices = _orig_cand_indices
-ReservationLedger.any_conflict = _orig_any_conflict
+try:
+    pr.enable()
+    for req in batch:
+        usses[req.uss_id].handle_request(req)
+finally:
+    pr.disable()
+    wall = time.monotonic() - t0
+    ledger_mod._StaticWallGrid.candidates = _orig_candidates
+    ReservationLedger._candidate_indices = _orig_cand_indices
+    ReservationLedger.any_conflict = _orig_any_conflict
+    shortcut_mod._rebuild = _orig_rebuild
+    shortcut_mod.shortcut_corners = _orig_shortcut_corners
+    shortcut_mod._shortcut_turn_seeded = _orig_shortcut_turn_seeded
+    shortcut_mod._merge_preserves_resampling = _orig_merge_preserves_resampling
 
 # ---- bucket tottime into the categories issue #30 argues about ----
 st = pstats.Stats(pr)
@@ -179,6 +245,7 @@ split = {
 split["shortcut driver + misc"] = max(0.0, total_tt - sum(split.values()))
 
 print("\n" + "=" * 78)
+print(f"PLANNER {planner_name}")
 print(f"WALL {wall:.1f}s for {timed} plans = {wall / timed * 1000:.1f} ms/plan   "
       f"(profiled tottime total {total_tt:.1f}s)")
 print("=" * 78)
@@ -207,6 +274,25 @@ print("INSIDE any_conflict: static-wall scan (lever #1, LANDED) vs dynamic commi
 print("=" * 78)
 print(f"any_conflict calls: {int(stats_counters['any_conflict_calls'])}  "
       f"(avg {stats_counters['any_conflict_volumes'] / (stats_counters['any_conflict_calls'] or 1):.1f} volumes/call)")
+rb = stats_counters["rebuild_calls"] or 1
+rs = stats_counters["rebuild_success"] or 1
+print(f"rebuild oracle: {int(stats_counters['rebuild_calls'])} calls "
+      f"({int(stats_counters['rebuild_success'])} success / "
+      f"{int(stats_counters['rebuild_failure'])} failure), "
+      f"avg {stats_counters['rebuild_input_corners'] / rb:.1f} input corners/call, "
+      f"avg {stats_counters['rebuild_success_corners'] / rs:.1f} corners and "
+      f"{stats_counters['rebuild_output_volumes'] / rs:.1f} volumes/success")
+driver_calls = stats_counters["shortcut_driver_calls"] or 1
+print(f"shortcut logical corners: "
+      f"{stats_counters['shortcut_input_corners'] / driver_calls:.1f} input → "
+      f"{stats_counters['shortcut_output_corners'] / driver_calls:.1f} accepted output on average "
+      f"({int(stats_counters['shortcut_driver_changed'])}/"
+      f"{int(stats_counters['shortcut_driver_calls'])} driver states shortened; "
+      f"the outer cost guard may still retain an inner intent)")
+if stats_counters["heading_checks"]:
+    print(f"exact-heading fast path: {int(stats_counters['heading_skips'])}/"
+          f"{int(stats_counters['heading_checks'])} checks skipped a rebuild "
+          f"({stats_counters['heading_skips'] / stats_counters['heading_checks']:.1%} hit rate)")
 print(f"STATIC walls:  {int(sq)} queries, avg {avg_static:.2f} walls survive the xy-grid prune "
       f"(baseline full-scan = {len(static_terms)})")
 print(f"   => grid prunes the static scan ~{len(static_terms) / (avg_static or 1e-9):.0f}x  "

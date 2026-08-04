@@ -6,6 +6,8 @@ interval per hub (fed by the ledger commit publish hook) and answers, at plan ti
 takeoff/landing *edge* exists at a candidate time:
 
   * :meth:`admits` — **capacity** (step 2): fewer than ``capacity`` same-hub dwells overlap the window.
+  * :meth:`reservation_admitted` — apply that same capacity test to the exact tagged dwell
+    cylinders in a rebuilt candidate reservation.
   * :meth:`column_clear` — **column activation / foreign-transit** (step 1): build the column cylinder
     and ask the ledger (the same FCL conflict check that gates commit; same-hub volumes are exempt, so
     it returns True iff a FOREIGN volume intrudes).
@@ -74,7 +76,8 @@ class TerminalCapacity:
     """Ledger-fed temporal capacity + column-activation authority for shared vertiport terminals.
 
     Push: subscribe :meth:`on_commit` to the ledger so committed dwells auto-record. Pull: holds a
-    ledger reference for the lazy foreign-transit query in :meth:`column_clear`.
+    ledger reference for the lazy foreign-transit query in :meth:`column_clear`. Rebuilders pass
+    their exact tagged output to :meth:`reservation_admitted` before accepting a retimed candidate.
     """
 
     def __init__(self, cfg: SimConfig, ledger: ReservationLedger):
@@ -82,6 +85,10 @@ class TerminalCapacity:
         self.ledger = ledger
         self.dwells: dict[Hashable, list[tuple[float, float]]] = {}   # tid -> [(t_start, t_end), ...]
         self.radius: dict[Hashable, float] = {}                       # tid -> the hub's one column radius
+        # Every dynamic ledger volume observed through ``on_commit``. Unlike the dwell count, this
+        # includes untagged corridor boxes, so comparing it with ``ledger.n_volumes`` detects a
+        # release even when commits occurred between two planner calls.
+        self._n_observed_volumes = 0
         self.evicted_before: float | None = None
         # per-hub FOREIGN-TRANSIT index (lazy, incremental): tid -> merged time intervals during which
         # SOME foreign volume spatially transits the hub column ⇒ column_clear is an O(log) bisect instead
@@ -96,6 +103,7 @@ class TerminalCapacity:
         """Record every committed terminal-column cylinder as a per-hub dwell interval. A single flight
         may contribute two (origin + dest). The column radius is a hub constant — asserted here so the
         union-coverage skip in :meth:`column_clear` stays sound."""
+        self._n_observed_volumes += len(volumes)
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 r = self.radius.setdefault(v.terminal_id, v.shape.radius)
@@ -132,6 +140,7 @@ class TerminalCapacity:
         self._ft.clear()
         self._ftn.clear()
         self._ft_seen = 0
+        self._n_observed_volumes = 0
         self.evicted_before = None
 
     # ----- queries (plan time) -----
@@ -141,6 +150,43 @@ class TerminalCapacity:
         for me" (capacity 1 ⟺ the old exclusive pad)."""
         n = sum(1 for (a, b) in self.dwells.get(terminal_id, ()) if a < t1 and t0 < b)
         return n < capacity
+
+    def reservation_admitted(self, volumes, origin_term=None, dest_term=None) -> bool:
+        """True iff every request-terminal dwell in a rebuilt reservation has pad capacity.
+
+        Rebuilders already produced the authoritative windows, so inspect their exact tagged
+        :class:`~freespace_sim.geometry.CylinderSpec` volumes rather than re-deriving timing from
+        corners or flight levels. Untagged volumes, corridor boxes, and cylinders for terminal IDs
+        unrelated to this request are deliberately ignored. Interval overlap remains half-open via
+        :meth:`admits`, matching the ledger's time predicate.
+
+        This is separate from geometric conflict checking: same-terminal columns are intentionally
+        conflict-exempt, so ``ledger.any_conflict`` cannot detect pad over-subscription after a
+        rebuild shortens a path and moves its destination dwell earlier.
+        """
+        normalized = tuple(
+            term for term in (as_terminal(origin_term), as_terminal(dest_term))
+            if term is not None
+        )
+        if not normalized:
+            return True
+        terminals = {}
+        for term in normalized:
+            prior = terminals.get(term.id)
+            if prior is not None and prior.capacity != term.capacity:
+                raise ValueError(
+                    f"terminal {term.id!r}: capacity must be constant "
+                    f"({prior.capacity} vs {term.capacity})"
+                )
+            terminals[term.id] = term
+        for v in volumes:
+            if v.terminal_id is None or not isinstance(v.shape, CylinderSpec):
+                continue
+            term = terminals.get(v.terminal_id)
+            if (term is not None
+                    and not self.admits(v.terminal_id, v.t_start, v.t_end, term.capacity)):
+                return False
+        return True
 
     def _window_s(self, term, center, z: float | None) -> float:
         """The column window past the pad hover — :func:`volumes.column_dwell_s`, the single owner.

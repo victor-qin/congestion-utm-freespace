@@ -274,9 +274,18 @@ def _grow_one_turn(state: _ShortcutState, turn_id: int,
                    context: _ShortcutContext) -> _ShortcutState:
     """Seed E→G, batch A→G and A→I, then recover intermediate anchors on failures.
 
-    Failed probes are deliberately non-pruning: spatial and temporal feasibility are non-monotone
-    in chord length. The run endpoints and fallback order come from the immutable pre-splice snapshot;
-    stable IDs resolve them against the progressively shortened current state.
+    Failed probes are deliberately non-pruning WITHIN a side: spatial and temporal feasibility are
+    non-monotone in chord length (a shorter chord is differently oriented AND lands earlier, which
+    re-times every downstream volume), so a rejected A→G never stops D→G, C→G, B→G.
+
+    ACROSS sides the search is deliberately gated: the outgoing phase runs only once some left anchor
+    was accepted, so a turn whose every incoming probe fails is left alone rather than re-probed as
+    E→H / E→I. Those chords could succeed — but the legacy sweep cannot reach them either (it must
+    drop F before G becomes a corner), and spending the probes there costs most on exactly the turns
+    that have already proved expensive.
+
+    The run endpoints and fallback order come from the immutable pre-splice snapshot; stable IDs
+    resolve them against the progressively shortened current state.
     """
     snapshot = state
     turn_index = _knot_index(snapshot.knots, turn_id)
@@ -307,10 +316,10 @@ def _grow_one_turn(state: _ShortcutState, turn_id: int,
             best = maximal
             accepted_left_id = far_left.id
             far_left_accepted = True
-    elif accepted_left_id == far_left.id:
-        far_left_accepted = True
 
-    # Maximal failed: recover D→G, C→G, B→G. Keep probing after failures.
+    # Maximal failed: recover D→G, C→G, B→G. Keep probing after failures. A is already ruled out
+    # (the splice it would produce is the one just rejected), and the slice is empty when the
+    # incoming run is a single leg — exactly the case where there was no batch to attempt.
     if not far_left_accepted:
         intermediate_left = snapshot.knots[incoming_start + 1:turn_index - 1]
         for left in reversed(intermediate_left):

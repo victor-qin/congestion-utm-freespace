@@ -10,6 +10,12 @@ The deterministic workload contains 42 uniform requests in a 4 km × 4 km region
 Each measurement uses a fresh process and ledger; the compiled A* kernel is warmed before timing.
 Values below are medians of three unprofiled repetitions.
 
+**Scope:** the workload has **no terminals**, so `_rebuild`'s pad-capacity gate
+(`TerminalCapacity.reservation_admitted`) is a no-op throughout and contributes nothing to these
+timings. That gate's coverage lives in `tests/test_shortcut.py` and `tests/test_terminal.py`, which
+parametrize the terminal fixtures across all three strategies. Read the numbers below as en-route
+refinement cost only.
+
 | planner | rebuilds | success / failure | rebuild time | full run | verified | plans changed vs legacy | exact heading skips |
 |---|---:|---:|---:|---:|:---:|---:|---:|
 | `astar_shortcut` | 935 | 888 / 47 | 145.02 ms | 324.11 ms | yes | 0 / 42 | 0 |

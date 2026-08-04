@@ -31,6 +31,7 @@ from .network import (
     column_claims,
 )
 from .params import ColGenParams
+from .pricing_pool import ParallelPricingConfig, price_sweep
 from .pricing import (
     DualView,
     PricingTimeout,
@@ -486,8 +487,17 @@ class ColGenSolver:
         params: ColGenParams,
         *,
         fixed_claims: Sequence[frozenset[RowKey]] = (),
+        parallel: ParallelPricingConfig | None = None,
     ) -> ColGenResult:
+        """``parallel`` fans the per-iteration pricing sweep across processes.
+
+        It is a pure performance knob: the sweep's subproblems are independent given the
+        iteration's duals, and :func:`pricing_pool.price_sweep` reproduces the sequential
+        loop's timeout prefix, so the accepted columns and the objective are unchanged.
+        ``None`` (default) keeps the sequential sweep.
+        """
         started = time.monotonic()
+        parallel_sweeps: list = []
         deadline = started + params.time_limit_s
         # Leave a small tail for the final restricted-master IP.  An incomplete
         # pricing sweep cannot certify a global bound, but every completed
@@ -802,24 +812,48 @@ class ColGenSolver:
             pricing_complete = True
             dual_view = DualView(capacity_duals, cfg)
             flight_duals = master.flight_duals
-            for flight_id in pricing_order:
-                try:
-                    reduced_cost, column = price_flight(
-                        graphs[flight_id],
-                        dual_view,
-                        flight_duals[flight_id],
-                        cfg,
-                        params,
-                        deadline=pricing_deadline,
-                    )
-                except PricingTimeout:
+            if parallel is not None and parallel.enabled:
+                # Same duals, same graphs, same order -- only the dispatch differs.  The pool
+                # hands back the longest completed prefix of pricing_order, so the accepted
+                # column set matches what the sequential loop below would have produced.
+                sweep = price_sweep(
+                    graphs=graphs,
+                    pricing_order=pricing_order,
+                    dual_view=dual_view,
+                    flight_duals=flight_duals,
+                    cfg=cfg,
+                    params=params,
+                    deadline=pricing_deadline,
+                    pool_cfg=parallel,
+                )
+                parallel_sweeps.append(sweep)
+                for flight_id, reduced_cost, column in sweep.priced:
+                    pricing_flights_completed += 1
+                    best_reduced_costs.append(float(reduced_cost))
+                    if column is not None and reduced_cost > _REDUCED_COST_TOL:
+                        priced_columns.append(_canonical_column(column, graphs[flight_id], cfg))
+                if not sweep.complete:
                     pricing_complete = False
-                    pricing_timeout_flight_id = flight_id
-                    break
-                pricing_flights_completed += 1
-                best_reduced_costs.append(float(reduced_cost))
-                if column is not None and reduced_cost > _REDUCED_COST_TOL:
-                    priced_columns.append(_canonical_column(column, graphs[flight_id], cfg))
+                    pricing_timeout_flight_id = sweep.timeout_flight_id
+            else:
+                for flight_id in pricing_order:
+                    try:
+                        reduced_cost, column = price_flight(
+                            graphs[flight_id],
+                            dual_view,
+                            flight_duals[flight_id],
+                            cfg,
+                            params,
+                            deadline=pricing_deadline,
+                        )
+                    except PricingTimeout:
+                        pricing_complete = False
+                        pricing_timeout_flight_id = flight_id
+                        break
+                    pricing_flights_completed += 1
+                    best_reduced_costs.append(float(reduced_cost))
+                    if column is not None and reduced_cost > _REDUCED_COST_TOL:
+                        priced_columns.append(_canonical_column(column, graphs[flight_id], cfg))
 
             before_pricing = len(master.columns)
             for column in sorted(
@@ -1076,6 +1110,20 @@ class ColGenSolver:
             "pricing_flights_completed": pricing_flights_completed,
             "pricing_sweeps_completed": pricing_sweeps_completed,
             "pricing_timeout_flight_id": pricing_timeout_flight_id,
+            # Parallel-pricing telemetry.  `worker_processes` counts DISTINCT pids, so with
+            # max_tasks_per_child it exceeds n_workers and shows the recycling actually
+            # happening; `worker_peak_rss_bytes` is the max over workers, not their
+            # simultaneous total.
+            "parallel_workers": parallel.n_workers if parallel is not None else 0,
+            "parallel_worker_processes": len({
+                pid for sweep in parallel_sweeps for pid in sweep.worker_pids
+            }),
+            "parallel_worker_peak_rss_bytes": max(
+                (sweep.worker_peak_rss_bytes for sweep in parallel_sweeps), default=0
+            ),
+            "parallel_tasks_discarded": sum(
+                sweep.tasks_discarded for sweep in parallel_sweeps
+            ),
             "n_columns": len(master.columns),
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,

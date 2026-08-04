@@ -60,6 +60,7 @@ assert Path(freespace_sim.__file__).resolve().is_relative_to(REPO_ROOT), (
 
 from freespace_sim.planner.colgen import dp_kernel, solver as solver_mod  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
+from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -80,6 +81,39 @@ def _current_rss_bytes() -> float:
     return float(out) * 1024.0 if out else 0.0
 
 
+def _tree_rss_bytes() -> tuple[float, int]:
+    """RSS summed over this process and every descendant, plus the process count.
+
+    Under parallel pricing the label pools live in *worker* processes, so the parent's own
+    RSS understates the machine's requirement by roughly n_workers times the pool size --
+    which is exactly the number that decides whether a cluster task fits.  One ``ps`` call
+    and a walk down the ppid tree is enough and costs ~5 ms.
+    """
+    out = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,rss="], capture_output=True, text=True, check=False
+    ).stdout
+    children: dict[int, list[int]] = {}
+    rss: dict[int, float] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid, kb = int(parts[0]), int(parts[1]), float(parts[2])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        rss[pid] = kb * 1024.0
+    total, n, stack = 0.0, 0, [os.getpid()]
+    while stack:
+        pid = stack.pop()
+        if pid in rss:
+            total += rss[pid]
+            n += 1
+        stack.extend(children.get(pid, ()))
+    return total, n
+
+
 def _peak_rss_bytes() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _MAXRSS_SCALE
 
@@ -89,14 +123,15 @@ class _RssSampler:
 
     def __init__(self, interval_s: float = 0.25) -> None:
         self.interval_s = interval_s
-        self.samples: list[tuple[float, float]] = []       # (t_since_start, rss_bytes)
+        self.samples: list[tuple[float, float, int]] = []   # (t, tree_rss_bytes, n_procs)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._t0 = 0.0
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            self.samples.append((time.monotonic() - self._t0, _current_rss_bytes()))
+            total, n = _tree_rss_bytes()
+            self.samples.append((time.monotonic() - self._t0, total, n))
             self._stop.wait(self.interval_s)
 
     def __enter__(self) -> "_RssSampler":
@@ -109,7 +144,10 @@ class _RssSampler:
         self._thread.join(timeout=2.0)
 
     def peak(self) -> float:
-        return max((r for _, r in self.samples), default=0.0)
+        return max((r for _, r, _ in self.samples), default=0.0)
+
+    def max_procs(self) -> int:
+        return max((n for _, _, n in self.samples), default=0)
 
 
 # ------------------------------------------------------------- kernel-workspace instrumentation
@@ -230,6 +268,13 @@ def main() -> int:
     ap.add_argument("--max-iterations", type=int, default=1,
                     help="1 = fixed work (one pricing sweep), so memory is comparable run to run")
     ap.add_argument("--sample-interval", type=float, default=0.25)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="0 (default) = sequential sweep; N = fan the pricing sweep across N "
+                         "processes via colgen.pricing_pool")
+    ap.add_argument("--max-tasks-per-child", type=int, default=4,
+                    help="recycle each worker after this many flights, returning its arena to "
+                         "the OS; 0 = never recycle")
+    ap.add_argument("--start-method", default=None, choices=["spawn", "fork", "forkserver"])
     ap.add_argument("--label-limit-max", type=int, default=None,
                     help="override dp_kernel.search_dag's label ceiling (default 1<<23); "
                          "pricing.py calls search_dag positionally through the module, so the "
@@ -282,19 +327,38 @@ def main() -> int:
           f"detour_slack_hops={params.detour_slack_hops}")
     print()
 
+    pool_cfg = None
+    if args.workers > 0:
+        pool_cfg = ParallelPricingConfig(
+            n_workers=args.workers,
+            max_tasks_per_child=args.max_tasks_per_child or None,
+            start_method=args.start_method,
+        )
+        print(f"parallel  : {pool_cfg.n_workers} workers  "
+              f"max_tasks_per_child={pool_cfg.max_tasks_per_child}  "
+              f"start_method={pool_cfg.start_method or 'platform default'}")
+        print()
+
+    # In parallel mode price_flight runs in the WORKERS, so these parent-side patches never
+    # fire and the per-flight ladder detail is unavailable — deliberately, rather than
+    # silently reporting an empty ladder as if nothing climbed.
     kprobe = _KernelProbe()
     pprobe = _PriceProbe(kprobe, len(requests))
-    kprobe.install()
-    pprobe.install()
-    rss_start = _current_rss_bytes()
+    if pool_cfg is None:
+        kprobe.install()
+        pprobe.install()
+    rss_start, _ = _tree_rss_bytes()
     try:
         with _RssSampler(args.sample_interval) as sampler:
             t0 = time.perf_counter()
-            result = ColGenSolver().solve(requests, cfg, static_terms, params)
+            result = ColGenSolver().solve(
+                requests, cfg, static_terms, params, parallel=pool_cfg
+            )
             wall = time.perf_counter() - t0
     finally:
-        kprobe.restore()
-        pprobe.restore()
+        if pool_cfg is None:
+            kprobe.restore()
+            pprobe.restore()
 
     stats = result.stats
     peak_rusage = _peak_rss_bytes()
@@ -307,9 +371,20 @@ def main() -> int:
     print(f"backend         : {stats.get('backend')}")
     print()
     print(f"RSS at start    : {rss_start / _MB:8.1f} MB")
-    print(f"RSS peak (ps)   : {sampler.peak() / _MB:8.1f} MB")
-    print(f"RSS peak(maxrss): {peak_rusage / _MB:8.1f} MB   <-- headline")
-    print(f"RSS growth      : {(peak_rusage - rss_start) / _MB:8.1f} MB")
+    print(f"RSS peak (tree) : {sampler.peak() / _MB:8.1f} MB   <-- headline "
+          f"(parent + all workers, max {sampler.max_procs()} processes)")
+    print(f"RSS peak parent : {peak_rusage / _MB:8.1f} MB   (ru_maxrss, this process only)")
+    print(f"RSS growth      : {(sampler.peak() - rss_start) / _MB:8.1f} MB")
+    if pool_cfg is not None:
+        stats_par = {k: v for k, v in stats.items() if k.startswith("parallel_")}
+        print(f"worker processes: {stats_par.get('parallel_worker_processes')} distinct pids "
+              f"for {len(requests)} flights "
+              f"(recycling {'ON' if pool_cfg.max_tasks_per_child else 'OFF'})")
+        print(f"worker peak RSS : "
+              f"{stats_par.get('parallel_worker_peak_rss_bytes', 0) / _MB:8.1f} MB "
+              f"(max over workers, not their simultaneous total)")
+        print(f"tasks discarded : {stats_par.get('parallel_tasks_discarded')} "
+              f"(completed past the first timeout, dropped to keep the sweep deterministic)")
     print()
 
     if kprobe.calls:

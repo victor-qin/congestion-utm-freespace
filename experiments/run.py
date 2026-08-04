@@ -222,12 +222,16 @@ def main() -> None:
         log.info("mode=sequential: serial FCFS planning")
 
     if args.return_anchor == "realized":
-        # The coupling keys off FlightRequest.paired_outbound_id, which only the return-emitting hub
-        # models set. Without one there is nothing to re-anchor, so the flag would be a silent no-op.
-        if demand is None or not getattr(spec.demand, "return_flights", False):
+        # The coupling keys off FlightRequest.paired_outbound_id, which ONLY hub_radius sets. Testing
+        # `return_flights` alone is not enough: it defaults True on DemandSpec but the uniform and hub
+        # patterns ignore it entirely, so metro_2uss/dallas_hub_2uss would sail past the guard and the
+        # flag would be a silent no-op — the failure it exists to prevent.
+        if demand is None or spec.demand.pattern != "hub_radius" or not spec.demand.return_flights:
             raise SystemExit(
-                "--return-anchor realized needs a demand model that emits round-trip returns "
-                f"(scenario {spec.name!r} has none); drop the flag or pick a hub_radius scenario")
+                "--return-anchor realized needs round-trip returns, which only the hub_radius demand "
+                f"pattern emits (scenario {spec.name!r} is pattern={spec.demand.pattern!r}, "
+                f"return_flights={spec.demand.return_flights}); drop the flag or pick a hub_radius "
+                "scenario such as a density_* world")
         if pcfg is not None:
             # run() raises on this too; catching it here keeps the CLI failure a one-line message
             # rather than a traceback, and does it before the world is built.

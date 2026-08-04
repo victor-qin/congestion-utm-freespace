@@ -13,7 +13,11 @@ from freespace_sim.scenarios import (
     get_scenario,
     with_overrides,
 )
-from freespace_sim.scenarios.demand_dfw import DfwGeoDemand
+from freespace_sim.scenarios.demand_dfw import (
+    DEFAULT_FIXED_TYPES,
+    DEFAULT_HUB_CATEGORIES,
+    DfwGeoDemand,
+)
 from freespace_sim.scenarios.density import AMAZON_USS, WING_ZIPLINE_USS
 from freespace_sim.scenarios.dfw import DFW_FRAME, DFW_REGION_CENTER_LATLON, DFW_REGION_M
 
@@ -325,6 +329,16 @@ def test_dfw_frame_corners_map_onto_the_region_box():
         np.array([minlon, maxlon]), np.array([minlat, maxlat]), lat0, lon0, w, h)
     assert np.allclose(corners, [[0.0, 0.0], [w, h]], atol=1e-6)
     assert all(type(v) is float for v in DFW_REGION_M)
+
+
+def test_dfw_spec_pins_its_own_hub_siting_rules():
+    """An archived scenario_spec.json must fully describe the world it ran. Leaving these () and
+    letting DemandSpec.build() fill them from DfwGeoDemand's defaults means editing
+    DEFAULT_HUB_CATEGORIES silently replays every archived dfw_* run against a different hub pool —
+    exactly the silent reinterpretation the schema_version guard exists to prevent."""
+    payload = SCENARIOS["dfw_future_wing_zipline_amazon"].to_json_dict()["demand"]
+    assert tuple(payload["hub_categories"]) == DEFAULT_HUB_CATEGORIES
+    assert tuple(payload["fixed_hub_types"]) == DEFAULT_FIXED_TYPES
 
 
 def test_dfw_spec_json_round_trips_under_schema_v2():

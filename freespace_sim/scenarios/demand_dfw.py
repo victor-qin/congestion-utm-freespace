@@ -40,7 +40,8 @@ class DfwGeoDemand(HubRadiusDemand):
     fixed_hub_types: tuple = DEFAULT_FIXED_TYPES               # which facility types are drone hubs
     hub_categories: tuple = DEFAULT_HUB_CATEGORIES             # retail categories eligible as hub sites
     use_all_fixed_hubs: bool = False                          # True → every listed facility (ignore count)
-    geo_max_attempts: int = 40                                # tract-rejection tries before disk fallback
+    geo_max_attempts: int = 40                                # tract draws before the disk fallback
+    geo_point_attempts: int = 20                              # in-tract point draws per tract draw
 
     def __post_init__(self):
         super().__post_init__()
@@ -120,7 +121,9 @@ class DfwGeoDemand(HubRadiusDemand):
 
     # ---- destinations: census-tract population density ----
     def _hub_candidates(self, hub, radius: float, cfg):
-        """Cached (tract_indices, populations) for tracts whose bbox meets the hub's service disk."""
+        """Cached ``(tract_indices, population_probabilities)`` for populated tracts whose bbox meets
+        the hub's service disk. The normalised ``p`` is cached with the index set — it is redrawn for
+        every delivery but there are only ever as many distinct (hub, radius) keys as there are hubs."""
         cache = getattr(self, "_cand_cache", None)
         if cache is None:
             cache = self._cand_cache = {}
@@ -131,34 +134,42 @@ class DfwGeoDemand(HubRadiusDemand):
             hx, hy = float(hub[0]), float(hub[1])
             bb = geo.tract_bbox
             m = ((bb[:, 0] <= hx + radius) & (bb[:, 2] >= hx - radius)
-                 & (bb[:, 1] <= hy + radius) & (bb[:, 3] >= hy - radius))
+                 & (bb[:, 1] <= hy + radius) & (bb[:, 3] >= hy - radius)
+                 & (geo.tract_pop > 0.0))
             idx = np.flatnonzero(m)
-            hit = (idx, geo.tract_pop[idx])
+            pop = geo.tract_pop[idx]
+            hit = (idx, pop / pop.sum() if len(idx) else pop)
             cache[key] = hit
         return hit
 
     def _draw_customer(self, hub, radius, min_r, w, h, cfg, event_rng):
-        """Sample a tract ∝ population, then a uniform point inside it clipped to the hub's disk — so
-        destinations follow population density. Falls back to the base uniform-in-disk draw if the
-        rejection sampler can't seat a point (never fails to emit)."""
+        """Sample a tract ∝ population, then a uniform point inside THAT tract, restarting the whole
+        draw if the point misses the hub's service annulus or the region — so a tract's chance of
+        being used is ``pop × (its area inside the annulus / its total area)``, i.e. destinations
+        follow population density exactly. Falls back to the base uniform-in-disk draw if the sampler
+        can't seat a point at all (never fails to emit; zero fallbacks over a full dfw_future run).
+
+        The two loops are NOT interchangeable. Redrawing the *tract* on an in-tract rejection (rather
+        than only the point) re-weights every tract by how much of its bounding box the polygon fills
+        — 0.18-0.99 across the baked DFW tracts, uncorrelated with population — which sampled compact
+        tracts up to 5.7x more per resident than sprawling ones. Only rejections that genuinely carve
+        area off a tract (disk, ``min_r``, region) may restart the tract draw."""
         geo = self._geo(cfg)
-        idx, pop = self._hub_candidates(hub, radius, cfg)
-        if len(idx) and pop.sum() > 0.0:
-            p = pop / pop.sum()
+        idx, p = self._hub_candidates(hub, radius, cfg)
+        if len(idx):
             hx, hy = float(hub[0]), float(hub[1])
             r2, min_r2 = radius * radius, min_r * min_r
             for _ in range(self.geo_max_attempts):
                 t = int(idx[event_rng.choice(len(idx), p=p)])         # tract ∝ population
                 xmin, ymin, xmax, ymax = geo.tract_bbox[t]
-                lx, hxb = max(xmin, hx - radius), min(xmax, hx + radius)   # tract bbox ∩ disk bbox
-                ly, hyb = max(ymin, hy - radius), min(ymax, hy + radius)
-                if lx > hxb or ly > hyb:
-                    continue
-                cx = float(event_rng.uniform(lx, hxb))
-                cy = float(event_rng.uniform(ly, hyb))
+                for _ in range(self.geo_point_attempts):              # uniform INSIDE the drawn tract
+                    cx = float(event_rng.uniform(xmin, xmax))
+                    cy = float(event_rng.uniform(ymin, ymax))
+                    if point_in_polygon(cx, cy, geo.tract_rings[t]):
+                        break
+                else:
+                    continue                                          # sliver tract — draw another
                 d2 = (cx - hx) ** 2 + (cy - hy) ** 2
-                if d2 > r2 or d2 < min_r2 or not (0.0 <= cx <= w and 0.0 <= cy <= h):
-                    continue
-                if point_in_polygon(cx, cy, geo.tract_rings[t]):
+                if min_r2 <= d2 <= r2 and 0.0 <= cx <= w and 0.0 <= cy <= h:
                     return np.array([cx, cy], dtype=float)
         return super()._draw_customer(hub, radius, min_r, w, h, cfg, event_rng)

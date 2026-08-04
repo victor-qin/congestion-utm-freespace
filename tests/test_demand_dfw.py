@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from freespace_sim.geo import DfwGeo
 from freespace_sim.scenarios import get_scenario, with_overrides
 
 _ARTIFACTS = Path(__file__).resolve().parents[1] / "freespace_sim" / "data" / "dfw"
@@ -87,3 +88,36 @@ def test_retail_pool_exhaustion_raises_clearly():
     dm.n_hubs_per_uss = {"wing_zipline_uss": 10_000_000}             # more than the pool can seat
     with pytest.raises(ValueError, match="pool exhausted"):
         dm.place_hubs(cfg, np.random.default_rng(dm.hub_seed))
+
+
+def _two_tract_geo(pop_a: float = 1000.0, pop_b: float = 1000.0):
+    """A synthetic :class:`DfwGeo` with two equal-population tracts of very different bbox FILL: a
+    solid square (fill 1.00) and an L (area 1.75/4.00 = 0.44). Both sit wholly inside the hub's
+    service disk, so a population-proportional sampler must split draws ~50/50 between them."""
+    square = np.array([[3000., 4500.], [4000., 4500.], [4000., 5500.], [3000., 5500.]])
+    ell = np.array([[6000., 4000.], [8000., 4000.], [8000., 4500.],
+                    [6500., 4500.], [6500., 6000.], [6000., 6000.]])
+    empty = np.empty((0, 2), float)
+    return DfwGeo(
+        pois_xy=empty, pois_cat=np.array([]), pois_w=np.array([]),
+        amazon_xy=empty, amazon_type=np.array([]), amazon_w=np.array([]),
+        tract_pop=np.array([pop_a, pop_b]),
+        tract_bbox=np.array([[3000., 4500., 4000., 5500.], [6000., 4000., 8000., 6000.]]),
+        tract_rings=[[square], [ell]],
+    )
+
+
+def test_tract_draw_follows_population_not_bbox_fill():
+    """REGRESSION: redrawing the TRACT on an in-tract rejection (rather than only the point) weights
+    every tract by its bbox fill ratio — 0.18-0.99 across the real DFW tracts, uncorrelated with
+    population. Here that skew would hand the solid square 1.00/(1.00+0.44) = 70 % of two
+    equal-population tracts; a correct sampler gives 50 %."""
+    spec = get_scenario("dfw_faa_wing_zipline")
+    cfg, dm = spec.config(), spec.demand_model()
+    dm._geo = lambda _cfg: _two_tract_geo()                          # no artifacts needed
+    hub, radius, rng = np.array([5000.0, 5000.0]), 4000.0, np.random.default_rng(11)
+    pts = np.array([dm._draw_customer(hub, radius, 0.0, 10_000.0, 10_000.0, cfg, rng)
+                    for _ in range(3000)])
+    in_square = float((pts[:, 0] < 5000.0).mean())
+    assert abs(in_square - 0.5) < 0.05, in_square
+    assert (np.linalg.norm(pts - hub, axis=1) <= radius).all()       # never leaves the service disk

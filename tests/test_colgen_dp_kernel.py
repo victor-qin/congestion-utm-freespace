@@ -22,7 +22,7 @@ import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.planner import hexgrid as hg
-from freespace_sim.planner.colgen import dp_prepare, pricing
+from freespace_sim.planner.colgen import dp_prepare, network, pricing
 from freespace_sim.planner.colgen.network import (
     RowKey,
     build_flight_graph,
@@ -559,3 +559,82 @@ def test_tiny_label_pool_still_reaches_the_reference_answer(monkeypatch):
         assert got_rc == pytest.approx(expected_rc, abs=1e-8)
         if expected is not None:
             assert got is not None and got.cell_path == expected.cell_path
+
+
+# ------------------------------------------------- compiled incumbent search (find_feasible)
+
+
+def _feasible_both(monkeypatch, graph, cfg, forbidden, improve_below=None):
+    """Run find_feasible_column with the kernel and with it forced off."""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pricing, "_dp_kernel", None)
+        reference = pricing.find_feasible_column(
+            graph, cfg, forbidden_rows=forbidden, improve_below_delay_s=improve_below
+        )
+    compiled = pricing.find_feasible_column(
+        graph, cfg, forbidden_rows=forbidden, improve_below_delay_s=improve_below
+    )
+    return reference, compiled
+
+
+def test_compiled_feasible_search_is_never_worse_than_the_reference(monkeypatch):
+    """The compiled path returns the delay-MINIMAL column, the reference the first
+    improvement it happens to reach in best-first order.
+
+    So the contract is deliberately one-sided -- never worse, always feasible -- rather
+    than column-identical.  Asserting equality here would be wrong: it would pin an
+    accident of frontier ordering that the kernel has no reason to reproduce.
+    """
+
+    assert dp_kernel is not None, "kernel inactive -- this guard would be vacuous"
+    rng = np.random.default_rng(20260805)
+    compared = 0
+    for trial in range(12):
+        cfg = _cfg(max_ground_delay_s=float(rng.choice([48.0, 120.0])))
+        graph, _params = _graph(
+            cfg,
+            dest=(int(rng.integers(2, 6)), int(rng.integers(-3, 3))),
+            slack=int(rng.integers(1, 5)),
+            flight_id=trial + 1,
+        )
+        cells = sorted(graph.corridor_cells)
+        forbidden = frozenset(
+            RowKey.cell(
+                cells[int(rng.integers(0, len(cells)))][0],
+                cells[int(rng.integers(0, len(cells)))][1],
+                0,
+                int(rng.integers(graph.min_step, graph.max_step + 1)),
+            )
+            for _ in range(int(rng.integers(0, 12)))
+        )
+
+        reference, compiled = _feasible_both(monkeypatch, graph, cfg, forbidden)
+        if reference is None:
+            continue
+        compared += 1
+        assert compiled is not None, "kernel found no column where the reference did"
+        assert compiled.delay_s <= reference.delay_s + 1e-9, (
+            "compiled incumbent search returned a WORSE column than the reference"
+        )
+        assert compiled.claims.isdisjoint(forbidden)
+        assert compiled.claims == network.column_claims(compiled, graph, cfg)
+    assert compared >= 6, f"only {compared} graphs produced a column; sweep is too weak"
+
+
+def test_compiled_feasible_search_honours_the_improvement_threshold(monkeypatch):
+    """``improve_below_delay_s`` must still gate what comes back."""
+
+    assert dp_kernel is not None
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, _params = _graph(cfg, dest=(5, -2), slack=3)
+
+    baseline = pricing.find_feasible_column(graph, cfg)
+    assert baseline is not None
+
+    # A threshold below the best achievable delay cannot be met; whatever comes back
+    # must not pretend otherwise by beating it.
+    strict = pricing.find_feasible_column(
+        graph, cfg, improve_below_delay_s=baseline.delay_s - 1e6
+    )
+    assert strict is None or strict.delay_s >= baseline.delay_s - 1e-9

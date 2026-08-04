@@ -1217,6 +1217,94 @@ def _best_column_compiled(
     return best, proved
 
 
+_KERNEL_DECLINED = object()
+
+
+def _find_feasible_compiled(
+    fg: FlightGraph,
+    cfg: SimConfig,
+    forbidden: AbstractSet[RowKey],
+    incumbent_column: Column | None,
+    view: DualView,
+    *,
+    deadline: float | None,
+):
+    """Compiled replacement for the best-first incumbent search.
+
+    Returns the chosen ``Column`` (or ``None``), or ``_KERNEL_DECLINED`` when the caller
+    must run the reference search instead.
+
+    **Why the same kernel.**  This search minimises delay with zero duals, and
+    ``_search_dag`` maximises ``benefit - delay - dual_cost - pi_f``.  At
+    ``benefit = pi_f = 0`` with an all-zero ``DualView`` that is exactly ``-delay``, so
+    the label-setting DP already solves this problem; only row exclusions were missing,
+    and ``dp_prepare.prepare_forbidden`` now carries those.
+
+    **Why the selection rule transfers exactly.**  ``_certify_candidates`` orders by
+    ``(reduced_cost desc, _column_sort_key asc)``.  With ``rc == -delay_s`` that is
+    ``(delay_s asc, _column_sort_key asc)`` -- and this function's ``column_key`` is
+    literally ``(delay_s, *_column_sort_key)``.  Same winner, same tie-break.
+
+    **The one deliberate difference.**  The reference returns the FIRST certified column
+    that beats ``improve_below_delay_s``, in best-first order; this returns the
+    delay-MINIMAL one.  The caller (`solver._greedy_feasible_selection`) only ever asks
+    "is this better than the column I hold", so a minimum can never be a worse answer
+    than a first improvement -- but it can be a *different* column, which shifts the
+    greedy trajectory.  That is a semantics change, not a pure speedup.
+    """
+
+    from . import dp_prepare
+
+    topology = _topology_for(fg, cfg)
+    if topology.unsupported_reason is not None:
+        return _KERNEL_DECLINED
+
+    # The incumbent's delay is a valid cutoff: rc == -delay, so a column that cannot
+    # beat -incumbent.delay_s cannot beat the incumbent.
+    incumbent = (
+        None if incumbent_column is None else (-incumbent_column.delay_s, incumbent_column)
+    )
+    cutoff = incumbent[0] if incumbent is not None else None
+    duals = dp_prepare.prepare_duals(view, topology)
+    variants = dp_prepare.prepare_variants(
+        fg, cfg, view, topology, seed=False, benefit=0.0, pi_f=0.0, cost_cutoff=cutoff,
+    )
+    if variants.n_variants == 0:
+        return incumbent_column
+    forbidden_pack = dp_prepare.prepare_forbidden(forbidden, topology)
+
+    cancel_flag = np.zeros(1, dtype=np.uint8)
+    timer = None
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise PricingTimeout("column pricing reached its wall-clock deadline")
+        timer = threading.Timer(remaining, lambda: cancel_flag.__setitem__(0, 1))
+        timer.daemon = True
+        timer.start()
+    try:
+        result = _dp_kernel.search_dag(
+            topology, duals, variants,
+            cfg=cfg, benefit=0.0, pi_f=0.0, cost_cutoff=cutoff,
+            seed=False, forbidden=forbidden_pack, cancel_flag=cancel_flag,
+        )
+    finally:
+        if timer is not None:
+            timer.cancel()
+    if result.status == _dp_kernel.FB_CANCELLED:
+        raise PricingTimeout("column pricing reached its wall-clock deadline")
+    if not result.ok:
+        # Overflowed or hit the hash ceiling: the search is incomplete, so it cannot be
+        # trusted to hold the minimum.  Hand back to the reference rather than return a
+        # silently worse incumbent.
+        return _KERNEL_DECLINED
+
+    best = _certify_candidates(
+        result, fg, cfg, view, 0.0, 0.0, forbidden, incumbent, deadline=deadline
+    )
+    return None if best is None else best[1]
+
+
 def _column_sort_key(column: Column) -> tuple[Any, ...]:
     """The reference's canonical column ordering (pricing's final tie-break)."""
 
@@ -1942,6 +2030,13 @@ def find_feasible_column(
                 and best_column.delay_s < improve_below_delay_s - _SCORE_EPS
             ):
                 return best_column
+
+    if _dp_kernel is not None and len(fg.levels) == 1:
+        compiled = _find_feasible_compiled(
+            fg, cfg, forbidden, best_column, view, deadline=deadline
+        )
+        if compiled is not _KERNEL_DECLINED:
+            return compiled
 
     def column_key(column: Column) -> tuple[Any, ...]:
         return (

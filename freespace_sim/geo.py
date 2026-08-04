@@ -30,8 +30,14 @@ def project_lonlat_to_enu(
     lon: np.ndarray, lat: np.ndarray, lat0: float, lon0: float, w: float, h: float
 ) -> np.ndarray:
     """Equirectangular lon/lat → local ENU metres, mapping the anchor ``(lat0, lon0)`` to the region
-    CENTRE ``(w/2, h/2)`` (+east/+north). Distortion is < 0.3 % over a ~60 km metro window, and the
-    map is monotone per axis (x depends only on lon, y only on lat), so a projected bbox stays a bbox.
+    CENTRE ``(w/2, h/2)`` (+east/+north). The map is monotone per axis (x depends only on lon, y only
+    on lat), so a projected bbox stays a bbox.
+
+    East-west scale is frozen at ``cos(lat0)``, so it is exact on the anchor parallel and off by
+    ``cos(lat)/cos(lat0) - 1`` elsewhere: < 0.3 % over a ~60 km metro window, and +-0.75 % (~710 m of
+    absolute east-west shift) at the north/south edges of the full 147 km-tall DFW frame. That is a
+    scale error on *local* distances too, but at 0.75 % it is ~120 m over a 16 km delivery leg — far
+    below the hub separation and corridor widths the deconfliction actually keys on.
 
     Accepts scalars or arrays; returns ``(..., 2)`` stacked ``[x, y]``.
     """
@@ -40,6 +46,18 @@ def project_lonlat_to_enu(
     x = np.radians(lon - lon0) * np.cos(np.radians(lat0)) * _EARTH_R_M + w / 2.0
     y = np.radians(lat - lat0) * _EARTH_R_M + h / 2.0
     return np.stack([x, y], axis=-1)
+
+
+def region_size_for_frame(minlon: float, maxlon: float, minlat: float, maxlat: float
+                          ) -> tuple[float, float]:
+    """Region box ``(w, h)`` in metres for a lon/lat frame: the size at which
+    :func:`project_lonlat_to_enu`, anchored at the frame's centre, maps the frame's four corners
+    exactly onto ``[0, w] x [0, h]``. Lives beside the projection so the two share one Earth radius
+    and can never drift — a mismatch would silently clip or inset the geodata.
+    """
+    lat0 = (minlat + maxlat) / 2.0
+    return (float(np.radians(maxlon - minlon) * np.cos(np.radians(lat0)) * _EARTH_R_M),
+            float(np.radians(maxlat - minlat) * _EARTH_R_M))
 
 
 def point_in_polygon(px: float, py: float, rings: list[np.ndarray]) -> bool:
@@ -65,7 +83,7 @@ def point_in_polygon(px: float, py: float, rings: list[np.ndarray]) -> bool:
 
 
 def _in_region(xy: np.ndarray, w: float, h: float) -> np.ndarray:
-    """Boolean mask: point strictly within the ``[0, w] × [0, h]`` region box (inclusive edges)."""
+    """Boolean mask: point inside the ``[0, w] × [0, h]`` region box (edges included)."""
     return (xy[:, 0] >= 0.0) & (xy[:, 0] <= w) & (xy[:, 1] >= 0.0) & (xy[:, 1] <= h)
 
 

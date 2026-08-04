@@ -29,23 +29,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from freespace_sim.scenarios.demand_dfw import DEFAULT_HUB_CATEGORIES
+from freespace_sim.scenarios.dfw import DFW_FRAME, SCENARIOS
+
 # --- Census ACS geodatabase layers (2022 5-year, Texas) — same as the reference script ---
 GEO_LAYER = "ACS_2022_5YR_TRACT_48_TEXAS"          # tract polygons (COUNTYFP, GEOIDFQ)
 POP_LAYER, POP_FIELD = "X01_AGE_AND_SEX", "B01001_E001"   # total population, joined on GEOIDFQ
 SQMI_PER_SQM = 1.0 / 2_589_988.110336              # m² → sq-mi (density = people / sq-mi)
 AREA_EPSG = 32139                                  # NAD83 / Texas North Central (metres) for area
 
-# Wide DFW frame (reference display window) — clip tracts here so any region within the metro is
-# covered without a re-bake. Overture/Amazon inputs are already inside it.
-MINLON, MAXLON, MINLAT, MAXLAT = -97.9767, -95.9240, 32.1788, 33.5030
-
-# Region window the dfw_* scenarios actually run (SimConfig default centre + density REGION_M), used
-# only for the printed feasibility read-out. Keep in sync with config.region_center_latlon / density.REGION_M.
-REGION_CENTER_LATLON = (32.90, -97.04)
-REGION_M = (60_000.0, 30_000.0)
-# Retail categories the wing/zipline hubs are sampled from (keep in sync with scenarios/dfw.HUB_CATEGORIES).
-HUB_CATEGORIES = ("shopping_center", "shopping", "mall", "department_store", "grocery_store",
-                  "discount_store", "home_improvement_store", "building_supply_store")
+# Wide DFW frame — clip tracts here. This IS the region the dfw_* scenarios run (scenarios.dfw derives
+# its region box from the same frame), imported rather than restated so the bake and the run can't drift.
+MINLON, MAXLON, MINLAT, MAXLAT = DFW_FRAME
+# Retail categories the wing/zipline hubs are sampled from, and the largest hub count any dfw_* scenario
+# asks for — both imported so the feasibility read-out below measures what the scenarios actually need.
+HUB_CATEGORIES = DEFAULT_HUB_CATEGORIES
+MAX_SAMPLED_HUBS = max(s.demand.hubs[s.demand.uss.index(u)]
+                       for s in SCENARIOS.values() for u in s.demand.sampled_hub_uss)
 
 
 def _gdb_dataset(path: str) -> str:
@@ -58,14 +58,6 @@ def _gdb_dataset(path: str) -> str:
     if inner is None:
         raise SystemExit(f"no *.gdb directory found inside {path}")
     return f"/vsizip/{os.path.abspath(path)}/{inner}"
-
-
-def _region_bbox_latlon() -> tuple[float, float, float, float]:
-    """Region lon/lat bbox from centre + size (equirectangular), for the feasibility read-out."""
-    lat0, lon0 = REGION_CENTER_LATLON
-    dlat = (REGION_M[1] / 2.0) / 111_320.0
-    dlon = (REGION_M[0] / 2.0) / (111_320.0 * np.cos(np.radians(lat0)))
-    return lon0 - dlon, lon0 + dlon, lat0 - dlat, lat0 + dlat
 
 
 def _tracts_to_ragged(gdf) -> dict:
@@ -142,15 +134,14 @@ def main(gdb: str, overture_csv: str, amazon_xlsx: str, out_dir: str, simplify_d
     ragged = _tracts_to_ragged(tracts)
     np.savez_compressed(out / "tracts.npz", **ragged)
 
-    # --- feasibility read-out over the actual 60×30 km region window ---
-    lo_lon, hi_lon, lo_lat, hi_lat = _region_bbox_latlon()
-    in_box = poi["lon"].between(lo_lon, hi_lon) & poi["lat"].between(lo_lat, hi_lat)
+    # --- feasibility read-out over the frame the dfw_* scenarios actually run ---
+    in_box = poi["lon"].between(MINLON, MAXLON) & poi["lat"].between(MINLAT, MAXLAT)
     cand = poi[in_box & poi["category"].isin(HUB_CATEGORIES)]
     print(f"tracts baked: {len(ragged['population'])} (pop>0, wide frame) | "
           f"vertices: {len(ragged['poly_lonlat']):,}")
     print(f"retail POIs: {len(poi):,} | amazon facilities: {len(fac_out)} "
           f"({fac_out['type'].value_counts().to_dict()})")
-    print(f"hub candidates in the 60x30 km region ({len(cand)} total, need up to 476):")
+    print(f"hub candidates in the DFW frame ({len(cand)} total, need up to {MAX_SAMPLED_HUBS}):")
     for c, n in cand["category"].value_counts().items():
         print(f"    {n:5d}  {c}")
     print(f"wrote: {out/'retail_pois.csv'}, {out/'amazon_facilities.csv'}, {out/'tracts.npz'}")

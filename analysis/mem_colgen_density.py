@@ -399,6 +399,17 @@ def main() -> int:
         print(f"straggler       : {task_max:8.2f}s longest single task "
               f"= hard floor under the makespan "
               f"(max achievable sweep speedup {task_total / task_max if task_max else 0:.1f}x)")
+    # Printed for both modes: once the sweep is parallel these stages ARE the wall clock, so
+    # the breakdown says what to attack next rather than leaving "serial" as one opaque bar.
+    graph_s = stats.get("graph_build_elapsed_s", 0.0)
+    seed_s = stats.get("seed_elapsed_s", 0.0)
+    to_master_s = stats.get("time_to_master_s", 0.0)
+    greedy_s = stats.get("initial_greedy_elapsed_s", 0.0)
+    named = graph_s + seed_s + to_master_s + greedy_s
+    print(f"serial stages   : graph_build {graph_s:.2f}s  seeding {seed_s:.2f}s  "
+          f"initial_greedy {greedy_s:.2f}s  time_to_master {to_master_s:.2f}s")
+    print(f"                  {named:.2f}s named; the rest of the serial time is the "
+          f"master LP/IP re-solves and _canonical_column in the parent")
     print()
 
     if kprobe.calls:

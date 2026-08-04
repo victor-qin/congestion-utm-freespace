@@ -90,6 +90,16 @@ def test_retail_pool_exhaustion_raises_clearly():
         dm.place_hubs(cfg, np.random.default_rng(dm.hub_seed))
 
 
+def test_short_fixed_hub_placement_raises_instead_of_downgrading():
+    # lam_per_uss encodes the density parent's (hubs x per-hub rate), so seating fewer hubs would
+    # silently inflate every survivor's load — it must fail loudly, like _scatter_hubs does.
+    spec = get_scenario("dfw_faa_wing_zipline_amazon")
+    cfg, dm = spec.config(), spec.demand_model()
+    dm.n_hubs_per_uss = dict(dm.n_hubs_per_uss, amazon_uss=15)        # pool holds only 14 facilities
+    with pytest.raises(ValueError, match=r"only 14/15 fixed hubs"):
+        dm.place_hubs(cfg, np.random.default_rng(dm.hub_seed))
+
+
 def _two_tract_geo(pop_a: float = 1000.0, pop_b: float = 1000.0):
     """A synthetic :class:`DfwGeo` with two equal-population tracts of very different bbox FILL: a
     solid square (fill 1.00) and an L (area 1.75/4.00 = 0.44). Both sit wholly inside the hub's

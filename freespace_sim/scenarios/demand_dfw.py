@@ -10,7 +10,8 @@ a ``dfw_*`` scenario is its ``density_*`` twin with real geography:
   coordinates. Both respect the same non-overlap separation contract as the synthetic scatter
   (:func:`freespace_sim.demand._scatter_hubs`), fixed anchors placed first.
 - **_draw_customer** — a delivery's customer is drawn by sampling a Census tract ∝ population, then a
-  uniform point inside it (clipped to the hub's service disk), so destinations follow population density.
+  uniform point inside THAT tract, restarting the whole draw if the point falls outside the hub's
+  service annulus or the region, so destinations follow population density.
 
 All geodata is read (pure numpy) and projected once via :func:`freespace_sim.geo.load_dfw_geo`.
 """
@@ -95,11 +96,19 @@ class DfwGeoDemand(HubRadiusDemand):
                 if len(picks) >= cap:
                     break
                 if self._separated(xy[i], r, placed):
-                    picks.append(int(i)); placed.append((xy[i], r))
-            out[uid] = xy[picks] if picks else np.empty((0, 2), float)
-            if len(out[uid]) == 0 and float((self.lam_per_uss or {}).get(uid, 0.0)) > 0.0:
+                    picks.append(int(i))
+                    placed.append((xy[i], r))
+            # Short of the count is a FAILURE, not a quiet downgrade: lam_per_uss is the parent
+            # density scenario's (hubs x per-hub rate), so seating fewer silently inflates every
+            # surviving hub's load. Mirrors _scatter_hubs / the retail path, which also raise.
+            if not self.use_all_fixed_hubs and len(picks) < cap:
+                raise ValueError(f"only {len(picks)}/{cap} fixed hubs of types {self.fixed_hub_types} "
+                                 f"could be seated for {uid!r} without overlapping terminal airspace — "
+                                 f"widen fixed_hub_types, enlarge the region, or set use_all_fixed_hubs")
+            if self.use_all_fixed_hubs and not picks:              # no count to check against
                 raise ValueError(f"no fixed hubs of types {self.fixed_hub_types} for {uid!r} survived "
-                                 f"placement, but it has demand — widen fixed_hub_types or the region")
+                                 f"placement — widen fixed_hub_types or the region")
+            out[uid] = xy[picks]
 
         for uid in self.sampled_hub_uss:                       # retail POIs ∝ pop_density, no replacement
             r = self._sep_radius(uid, cfg)
@@ -115,7 +124,8 @@ class DfwGeoDemand(HubRadiusDemand):
                 i = int(rng.choice(idx, p=w[idx] / w[idx].sum()))
                 avail[i] = False
                 if self._separated(xy[i], r, placed):
-                    picks.append(i); placed.append((xy[i], r))
+                    picks.append(i)
+                    placed.append((xy[i], r))
             out[uid] = xy[picks]
         return out
 

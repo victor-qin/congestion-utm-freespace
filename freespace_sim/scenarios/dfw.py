@@ -19,6 +19,7 @@ from dataclasses import replace
 
 from ..geo import region_size_for_frame
 from . import density
+from .demand_dfw import DEFAULT_FIXED_TYPES, DEFAULT_HUB_CATEGORIES
 from .density import AMAZON_USS, WING_ZIPLINE_USS
 from .spec import ScenarioSpec
 
@@ -33,12 +34,15 @@ DFW_REGION_M = region_size_for_frame(*DFW_FRAME)
 
 def _geo_twin(spec: ScenarioSpec) -> ScenarioSpec:
     """A ``density_*`` spec → its ``dfw_*`` twin: same numbers, wide frame, real-geography demand."""
-    # fixed_hub_types / hub_categories are left unset: DemandSpec.build() falls back to DfwGeoDemand's
-    # own defaults (DEFAULT_FIXED_TYPES / DEFAULT_HUB_CATEGORIES) when they're empty.
+    # The siting rules are recorded EXPLICITLY rather than left () for DemandSpec.build() to fill from
+    # DfwGeoDemand's defaults. A spec that leans on those defaults does not pin its own world: editing
+    # DEFAULT_HUB_CATEGORIES would silently replay every archived dfw_* run against a different hub
+    # pool, with no schema_version bump to catch it — the reinterpretation that guard exists to stop.
     demand = replace(
         spec.demand, pattern="dfw_geo", geo_dataset="dfw",
         sampled_hub_uss=(WING_ZIPLINE_USS,),
         fixed_hub_uss=(AMAZON_USS,) if AMAZON_USS in spec.demand.uss else (),
+        hub_categories=DEFAULT_HUB_CATEGORIES, fixed_hub_types=DEFAULT_FIXED_TYPES,
     )
     return replace(
         spec, name="dfw_" + spec.name.removeprefix("density_"),

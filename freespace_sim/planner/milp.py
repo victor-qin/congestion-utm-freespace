@@ -35,7 +35,8 @@ from ..config import SimConfig
 from ..cost import endpoint_altitude_change_m, trajectory_cost
 from ..geometry import BoxSpec, CylinderSpec
 from ..ledger import ReservationLedger
-from ..types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
+from ..types import (DenialReason, FlightRequest, IntentStatus, OperationalIntent,
+                     as_terminal)
 from ..volumes import (build_reservation_from_corners, enroute_detour_m,
                        enroute_flown_m, enroute_reference_m, fold_corners_to_columns)
 from .hexgrid import max_lane_traverse_s
@@ -124,8 +125,9 @@ class MILPOptPlanner:
                 f"milp _solve raised {type(e).__name__}: {e} — falling back to the warm candidate",
                 RuntimeWarning, stacklevel=2)
             milp = None
-        warm_safe = warm.accepted and self._warm_terminal_safe(warm, o_term, d_term, tcap)
-        cands = ([warm] if warm_safe else [])
+        warm_denial = (self._warm_terminal_denial(warm, o_term, d_term, tcap)
+                       if warm.accepted else None)
+        cands = ([warm] if warm.accepted and warm_denial is None else [])
         if milp is not None and milp.accepted:
             cands.append(milp)
         if not cands:
@@ -133,30 +135,43 @@ class MILPOptPlanner:
                 warm.planner = "milp"
                 return warm                          # both denied
             # The solver failed and an accepted custom/default warm route did not satisfy the
-            # terminal-aware contract. Never relabel unsafe untagged volumes as a MILP intent.
-            return OperationalIntent(request=req, status=IntentStatus.REJECTED, planner="milp")
+            # terminal-aware contract. Never relabel unsafe untagged volumes as a MILP intent — and
+            # carry the REASON explicitly, since OperationalIntent defaults a REJECTED status to
+            # BUDGET_EXCEEDED, the headline `congestion_denial_rate` numerator.
+            return OperationalIntent(request=req, status=IntentStatus.REJECTED,
+                                     denial_reason=warm_denial, planner="milp")
         best = min(cands, key=lambda i: i.cost)      # global delay-vs-detour trade-off, then min
         best.planner = "milp"
         return best
 
     @staticmethod
-    def _warm_terminal_safe(warm, o_term, d_term, tcap: TerminalCapacity) -> bool:
-        """Whether a warm fallback satisfies MILP's terminal-aware public contract.
+    def _warm_terminal_denial(warm, o_term, d_term,
+                              tcap: TerminalCapacity) -> DenialReason | None:
+        """Why a warm fallback fails MILP's terminal-aware public contract; None if it satisfies it.
 
         Non-terminal warm plans retain the historical fast path. A terminal request must carry one
         tagged dwell cylinder per requested endpoint (including two for a same-ID round trip) and
         its exact windows must fit the shared capacity authority.
+
+        The two failures are attributed to DIFFERENT denial reasons on purpose. A warm planner that
+        never tags its hub columns — the default ``StraightLineTimeShift`` — is a COMPUTE artifact:
+        a solved MILP or a terminal-aware warm planner would have filed, so a bigger solver budget
+        might. Tagged windows the pad cannot admit is real hub saturation. Since ``OperationalIntent``
+        defaults a REJECTED status to ``BUDGET_EXCEEDED``, leaving the reason implicit would book the
+        artifact into ``congestion_denial_rate`` — the split this enum exists to preserve.
         """
         required = Counter(term.id for term in (o_term, d_term) if term is not None)
         if not required:
-            return True
+            return None
         tagged = Counter(
             volume.terminal_id for volume in (warm.volumes or ())
             if volume.terminal_id is not None and isinstance(volume.shape, CylinderSpec)
         )
         if any(tagged[terminal_id] < count for terminal_id, count in required.items()):
-            return False
-        return tcap.reservation_admitted(warm.volumes, o_term, d_term)
+            return DenialReason.SEARCH_EXHAUSTED
+        if not tcap.reservation_admitted(warm.volumes, o_term, d_term):
+            return DenialReason.BUDGET_EXCEEDED
+        return None
 
     def _capacity(self, ledger, cfg, t_request) -> TerminalCapacity:
         """Per-ledger ``TerminalCapacity`` binding — the pad-capacity authority, same lifecycle as

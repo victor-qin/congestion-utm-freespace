@@ -20,7 +20,7 @@ from freespace_sim.planner.milp import MILPOptPlanner
 from freespace_sim.planner.straight import StraightLineTimeShift
 from freespace_sim.planner.terminal_capacity import TerminalCapacity
 from freespace_sim.sim import _wall_aware, run
-from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
+from freespace_sim.types import DenialReason, FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import build_reservation_from_corners, exit_radius, hover_reservation
 
 PLANNERS = ["milp", "astar_milp"]
@@ -209,6 +209,31 @@ def test_bare_milp_does_not_return_untagged_terminal_warm_fallback(monkeypatch):
     assert intent.status is IntentStatus.REJECTED
     assert not intent.volumes
     assert intent.planner == "milp"
+    # An untagged warm planner is a COMPUTE artifact, not congestion. REJECTED defaults to
+    # BUDGET_EXCEEDED, so an implicit reason would land in metrics' congestion_denial_rate.
+    assert intent.denial_reason is DenialReason.SEARCH_EXHAUSTED
+
+
+def test_bare_milp_over_capacity_warm_fallback_is_attributed_to_congestion(monkeypatch):
+    """The other ``_warm_terminal_denial`` branch: tagged windows the pad cannot admit IS physics."""
+    cfg = SimConfig(region_size_m=(4000.0, 4000.0))
+    ledger = ReservationLedger(cfg)
+    req = FlightRequest(
+        1, vec(500, 500, 0), vec(3000, 500, 0), 0.0,
+        origin_terminal=Terminal("H", 2, radius=90.0),
+    )
+    planner = MILPOptPlanner(warm_planner=AStarPlanner())      # tags its hub columns
+    monkeypatch.setattr(planner, "_solve", lambda *_args, **_kwargs: None)
+    # A* gates itself through admits/dwell_ok and never consults reservation_admitted, so this
+    # isolates the MILP-side capacity verdict without perturbing the warm plan.
+    monkeypatch.setattr(TerminalCapacity, "reservation_admitted",
+                        lambda *_args, **_kwargs: False)
+
+    intent = planner.plan(req, ledger, cfg)
+
+    assert intent.status is IntentStatus.REJECTED
+    assert intent.planner == "milp"
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
 
 
 def test_astar_milp_keeps_tagged_terminal_warm_fallback(monkeypatch):

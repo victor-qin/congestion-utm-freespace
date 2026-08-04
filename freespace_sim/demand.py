@@ -366,6 +366,23 @@ class HubRadiusDemand:
         dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
         return dist / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
 
+    def _draw_customer(self, hub, radius, min_r, w, h, cfg, event_rng):
+        """Draw one delivery customer near ``hub`` — area-uniform in the service disk of ``radius``,
+        redrawn (≤20×) until it is in-region and ≥ ``min_r`` from the hub (clear of its wall footprint),
+        with a clipped fallback. Extracted from ``generate``'s ``emit`` VERBATIM so every non-geo scenario
+        draws the identical RNG sequence; :class:`~freespace_sim.scenarios.demand_dfw.DfwGeoDemand` overrides it to
+        land the customer by census-tract population density instead."""
+        customer = None
+        for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint
+            c = _sample_in_disk(hub, radius, event_rng)
+            if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
+                    np.linalg.norm(c - hub) >= min_r:
+                customer = c
+                break
+        if customer is None:
+            customer = np.clip(c, [0.0, 0.0], [w, h])
+        return customer
+
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
@@ -408,15 +425,7 @@ class HubRadiusDemand:
             # service ``radius`` exceeds ``min_r`` (true for every configured scenario: radius ≫ terminal_radius);
             # otherwise the redraw loop can't satisfy it and falls back to a clipped, possibly too-close point.
             min_r = max(self.min_od_separation_m, 1.5 * terminal_radius(terminal, cfg))
-            customer = None
-            for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint
-                c = _sample_in_disk(hub, radius, event_rng)
-                if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
-                        np.linalg.norm(c - hub) >= min_r:
-                    customer = c
-                    break
-            if customer is None:
-                customer = np.clip(c, [0.0, 0.0], [w, h])
+            customer = self._draw_customer(hub, radius, min_r, w, h, cfg, event_rng)
             sampled_clock = float(event_rng.uniform(0, demand_duration_s))
             lead_s = self._lead_for(uss_id, event_rng)
             if self.timing_mode == "departure":

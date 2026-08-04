@@ -12,7 +12,9 @@ from freespace_sim.scenarios import (
     get_scenario,
     with_overrides,
 )
+from freespace_sim.scenarios.demand_dfw import DfwGeoDemand
 from freespace_sim.scenarios.density import AMAZON_USS, WING_ZIPLINE_USS
+from freespace_sim.scenarios.dfw import DFW_REGION_CENTER_LATLON, DFW_REGION_M
 
 
 def test_get_scenario_resolves_and_rejects():
@@ -264,3 +266,54 @@ def test_density_scenarios_have_descriptions_and_remove_density_test():
     }
     assert all(SCENARIOS[name].description for name in density_names)
     assert "density_test" not in SCENARIOS
+
+
+# --- DFW real-geography twins: same numbers as density_*, only the spatial generation differs ---
+
+_DFW_TWINS = [
+    ("dfw_faa_wing_zipline", "density_faa_wing_zipline"),
+    ("dfw_future_wing_zipline", "density_future_wing_zipline"),
+    ("dfw_faa_wing_zipline_amazon", "density_faa_wing_zipline_amazon"),
+    ("dfw_future_wing_zipline_amazon", "density_future_wing_zipline_amazon"),
+    ("dfw_faa_wing_zipline_3lvl", "density_faa_wing_zipline_3lvl"),
+    ("dfw_future_wing_zipline_3lvl", "density_future_wing_zipline_3lvl"),
+    ("dfw_faa_wing_zipline_amazon_3lvl", "density_faa_wing_zipline_amazon_3lvl"),
+    ("dfw_future_wing_zipline_amazon_3lvl", "density_future_wing_zipline_amazon_3lvl"),
+]
+
+
+def test_dfw_registry_set_and_descriptions():
+    assert {n for n in SCENARIOS if n.startswith("dfw_")} == {dfw for dfw, _ in _DFW_TWINS}
+    assert all(SCENARIOS[dfw].description for dfw, _ in _DFW_TWINS)
+
+
+@pytest.mark.parametrize(("dfw_name", "den_name"), _DFW_TWINS)
+def test_dfw_twin_reuses_all_density_numbers(dfw_name, den_name):
+    """The whole point of the family: a dfw_* world keeps every DEMAND number of its density_* parent
+    (hub counts, hub sizes, per-USS demand, timing, levels) and changes only how hubs and destinations
+    are placed (pattern hub_radius → dfw_geo) — plus the region, which is WIDENED to the full metroplex
+    frame so the real metro-wide geography fits. Guards the "reuse density numbers" contract."""
+    dfw_spec, den_spec = SCENARIOS[dfw_name], SCENARIOS[den_name]
+    for field in ("horizon_s", "demand_duration_s", "lam_per_hour", "flight_levels_m",
+                  "corridor_height_m", "fixed_exit_lanes", "terminal_airspace_always_active"):
+        assert getattr(dfw_spec, field) == getattr(den_spec, field), field
+    # region is intentionally the full ~192×147 km frame, NOT the density 60×30 km window
+    assert dfw_spec.region_m == DFW_REGION_M and dfw_spec.region_m != den_spec.region_m
+    assert dfw_spec.region_center_latlon == DFW_REGION_CENTER_LATLON
+    a, b = dfw_spec.demand, den_spec.demand
+    for field in ("uss", "hubs", "radius_m", "pads_per_hub", "terminal_radius_m", "corridor_overlap_m",
+                  "return_flights", "turnaround_s", "uss_share", "lam_per_uss", "departure_offset_s",
+                  "timing_mode", "paired_return_request", "min_hub_gap_m"):
+        assert getattr(a, field) == getattr(b, field), field
+    # ONLY the spatial generation differs
+    assert b.pattern == "hub_radius" and a.pattern == "dfw_geo"
+    assert isinstance(dfw_spec.demand_model(), DfwGeoDemand)
+    assert a.sampled_hub_uss == (WING_ZIPLINE_USS,)
+    assert a.fixed_hub_uss == ((AMAZON_USS,) if AMAZON_USS in a.uss else ())
+
+
+def test_dfw_spec_json_round_trips_under_schema_v2():
+    # the new dfw_geo tuple fields must survive to_json_dict/from_json_dict (they default () elsewhere,
+    # so a missed coercion would break EVERY scenario's round-trip — this pins it for a geo spec).
+    spec = SCENARIOS["dfw_future_wing_zipline_amazon"]
+    assert ScenarioSpec.from_json_dict(spec.to_json_dict()) == spec

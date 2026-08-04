@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 _EARTH_R_M = 6_371_000.0
 _DATA_ROOT = Path(__file__).resolve().parent / "data"
@@ -87,9 +86,15 @@ def _in_region(xy: np.ndarray, w: float, h: float) -> np.ndarray:
     return (xy[:, 0] >= 0.0) & (xy[:, 0] <= w) & (xy[:, 1] >= 0.0) & (xy[:, 1] <= h)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class DfwGeo:
     """DFW geodata projected into one region's ENU frame (out-of-region points already DROPPED).
+
+    ``eq=False`` because every field is a numpy array: the generated ``__eq__`` would compare them
+    elementwise and raise ``ValueError: truth value of an array is ambiguous``, and ``frozen=True``
+    would then advertise a ``__hash__`` that doesn't exist. Identity equality/hashing is what a
+    projected-geodata blob actually wants — callers cache it by its (dataset, frame) KEY, never by
+    value (see :meth:`~freespace_sim.scenarios.demand_dfw.DfwGeoDemand._geo`).
 
     ``pois_*``/``amazon_*`` are the hub candidate pools; ``tract_*`` drives density-weighted destination
     sampling (``tract_rings[t]`` is a list of ENU ring arrays; ``tract_bbox`` is ``[xmin,ymin,xmax,ymax]``).
@@ -123,6 +128,10 @@ def load_dfw_geo(dataset: str, cfg) -> DfwGeo:
     relocated). Raises ``FileNotFoundError`` with a hint to run ``analysis/prep_dfw.py`` if the
     artifacts are missing.
     """
+    import pandas as pd   # deferred: scenarios/spec.py imports this module, so a module-level pandas
+    #                       would tax EVERY scenario-registry import with pandas' ~0.23 s startup —
+    #                       only the artifact read below needs it, and only for dfw_* scenarios.
+
     base = _DATA_ROOT / dataset
     if not base.is_dir():
         raise FileNotFoundError(

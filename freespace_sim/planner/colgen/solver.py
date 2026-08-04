@@ -1124,6 +1124,17 @@ class ColGenSolver:
             "parallel_tasks_discarded": sum(
                 sweep.tasks_discarded for sweep in parallel_sweeps
             ),
+            # `sweep_wall` is the makespan; `task_wall_total` is the useful work inside it and
+            # approximates what the sequential sweep would have cost. Their ratio against
+            # n_workers separates pool overhead from load imbalance, and `task_wall_max` is the
+            # straggler that puts a hard floor under any makespan.
+            "parallel_sweep_wall_s": sum(sweep.sweep_wall_s for sweep in parallel_sweeps),
+            "parallel_task_wall_total_s": sum(
+                sweep.task_wall_total_s for sweep in parallel_sweeps
+            ),
+            "parallel_task_wall_max_s": max(
+                (sweep.task_wall_max_s for sweep in parallel_sweeps), default=0.0
+            ),
             "n_columns": len(master.columns),
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,

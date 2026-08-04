@@ -99,3 +99,36 @@ def test_zero_workers_keeps_the_sequential_path():
 def test_invalid_pool_config_is_rejected(kwargs):
     with pytest.raises(ValueError):
         ParallelPricingConfig(**kwargs)
+
+
+def test_many_tasks_per_sweep_do_not_deadlock_the_pool():
+    """Recycling must survive many rounds, not just one.
+
+    This exists because ``concurrent.futures.ProcessPoolExecutor(max_tasks_per_child=...)``
+    deadlocks on CPython 3.14.2 once recycling actually fires repeatedly: the parent parks in
+    ``as_completed`` with no workers alive.  The bug is invisible below ``n_workers * k`` tasks,
+    which is exactly why the small-fixture tests above passed while a 100-flight sweep hung
+    indefinitely.  So this pins the *scale* that triggers it -- enough flights that a 2-worker
+    pool at k=2 must retire several generations of processes.
+    """
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(i, (-4, offset), (4, offset), cfg)
+        for i, offset in enumerate(range(-6, 6), start=1)
+    ]
+
+    params = _params(max_iterations=1)
+    sequential = ColGenSolver().solve(requests, cfg, (), params)
+    result = ColGenSolver().solve(
+        requests, cfg, (), params,
+        parallel=ParallelPricingConfig(n_workers=2, max_tasks_per_child=2),
+    )
+
+    # Reaching here at all is most of the point -- the failure mode is a hang, not a wrong
+    # answer -- but pin parity too so a "fix" that drops tasks cannot pass.
+    assert result.stats["objective"] == pytest.approx(
+        sequential.stats["objective"], abs=1e-12
+    )
+    assert set(result.columns) == set(sequential.columns)
+    # More processes than the pool is wide, i.e. recycling fired more than once.
+    assert result.stats["parallel_worker_processes"] > 4

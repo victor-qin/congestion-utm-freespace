@@ -385,6 +385,20 @@ def main() -> int:
               f"(max over workers, not their simultaneous total)")
         print(f"tasks discarded : {stats_par.get('parallel_tasks_discarded')} "
               f"(completed past the first timeout, dropped to keep the sweep deterministic)")
+        sweep_wall = stats_par.get("parallel_sweep_wall_s", 0.0)
+        task_total = stats_par.get("parallel_task_wall_total_s", 0.0)
+        task_max = stats_par.get("parallel_task_wall_max_s", 0.0)
+        n_w = max(1, pool_cfg.n_workers)
+        print(f"sweep makespan  : {sweep_wall:8.2f}s   "
+              f"(solve wall {wall:.2f}s -> {wall - sweep_wall:.2f}s is SERIAL: graph build, "
+              f"seeding, heuristic, master LP/IP)")
+        print(f"useful work     : {task_total:8.2f}s summed over tasks "
+              f"= what the sequential sweep costs")
+        print(f"efficiency      : {task_total / (sweep_wall * n_w) if sweep_wall else 0:8.2%} "
+              f"of the {n_w} worker-slots kept busy")
+        print(f"straggler       : {task_max:8.2f}s longest single task "
+              f"= hard floor under the makespan "
+              f"(max achievable sweep speedup {task_total / task_max if task_max else 0:.1f}x)")
     print()
 
     if kprobe.calls:

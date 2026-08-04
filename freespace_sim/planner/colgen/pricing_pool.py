@@ -39,7 +39,7 @@ import multiprocessing as mp
 import os
 import resource
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
 from dataclasses import dataclass
 
 from .params import ColGenParams
@@ -76,9 +76,9 @@ class ParallelPricingConfig:
 
 # --------------------------------------------------------------------------------- worker side
 
-# Set by _init_worker, read by _price_one.  A module global rather than a closure because
-# ProcessPoolExecutor pickles the callable, and the whole point is to keep the per-sweep
-# constants (cfg, params, duals) out of the per-task payload.
+# Set by _init_worker, read by _price_one.  A module global rather than a closure because the
+# pool pickles the callable, and the whole point is to keep the per-sweep constants
+# (cfg, params, duals) out of the per-task payload.
 _WORKER: dict = {}
 
 
@@ -97,11 +97,19 @@ def _init_worker(repo_root: str | None, cfg, params: ColGenParams, dual_view) ->
 
 
 def _price_one(task):
-    """Price one flight.  Returns ``(flight_id, reduced_cost, column, pid, peak_rss_bytes)``.
+    """Price one flight.
+
+    Returns ``(flight_id, reduced_cost, column, pid, peak_rss_bytes, task_wall_s)``.
 
     ``PricingTimeout`` is returned as a sentinel rather than raised, so the parent can rebuild
     the sequential prefix semantics instead of losing the whole sweep to one exception.
+
+    ``task_wall_s`` is the useful work in this task.  Summed over a sweep and compared against
+    ``n_workers * sweep_wall`` it separates the two ways a fan-out disappoints -- pool overhead
+    (sum is much less than the sequential total) versus load imbalance (sum matches, but the
+    makespan is pinned by one long task).  Without it, a bad speedup is unattributable.
     """
+    started = time.perf_counter()
     flight_id, graph, pi_f, deadline = task
     pricing_mod = _WORKER["pricing"]
     try:
@@ -111,7 +119,7 @@ def _price_one(task):
     except pricing_mod.PricingTimeout:
         reduced_cost, column = None, None
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _MAXRSS_SCALE
-    return flight_id, reduced_cost, column, os.getpid(), peak
+    return flight_id, reduced_cost, column, os.getpid(), peak, time.perf_counter() - started
 
 
 # --------------------------------------------------------------------------------- parent side
@@ -127,6 +135,15 @@ class SweepResult:
     worker_pids: set
     worker_peak_rss_bytes: int        # max over workers, not the simultaneous total
     tasks_discarded: int              # completed past the first timeout, dropped for determinism
+    sweep_wall_s: float               # makespan: submit -> last task back
+    task_wall_total_s: float          # sum of per-task work; ~= the sequential sweep cost
+    task_wall_max_s: float            # the straggler; a hard floor under sweep_wall_s
+
+    @property
+    def efficiency(self) -> float:
+        """Useful work divided by worker-seconds bought.  1.0 = perfect packing."""
+        denom = self.sweep_wall_s * max(1, len(self.worker_pids))
+        return self.task_wall_total_s / denom if denom else 0.0
 
 
 def price_sweep(
@@ -147,24 +164,39 @@ def price_sweep(
     results: dict = {}
     worker_pids: set = set()
     peak_rss = 0
-    with ProcessPoolExecutor(
-        max_workers=pool_cfg.n_workers,
-        mp_context=ctx,
+    task_walls: list[float] = []
+    sweep_started = time.perf_counter()
+    # multiprocessing.Pool rather than concurrent.futures.ProcessPoolExecutor, for one
+    # specific reason: ProcessPoolExecutor's `max_tasks_per_child` DEADLOCKS on CPython
+    # 3.14.2 as soon as recycling actually fires.  Reproduced with no initializer and 40
+    # trivial `return os.getpid()` tasks over 2 spawn workers -- the main thread parks in
+    # as_completed (_base.py:237) and the executor thread in wait_result_broken_or_wakeup,
+    # with zero workers alive.  `max_tasks_per_child=None` on the same code is fine, which
+    # is why a small smoke test misses it: with fewer tasks than n_workers * k, recycling
+    # never triggers.  mp.Pool's `maxtasksperchild` is an independent implementation and
+    # recycles correctly (40 tasks / k=4 -> exactly 10 distinct pids).
+    #
+    # imap_unordered with the default chunksize=1 preserves the dynamic one-task-per-flight
+    # dispatch that the skewed per-flight cost needs; it also pickles each graph lazily as a
+    # worker becomes free rather than all of them up front.
+    tasks = [
+        (flight_id, graphs[flight_id], flight_duals[flight_id], deadline)
+        for flight_id in pricing_order
+    ]
+    with ctx.Pool(
+        processes=pool_cfg.n_workers,
         initializer=_init_worker,
         initargs=(repo_root, cfg, params, dual_view),
-        max_tasks_per_child=pool_cfg.max_tasks_per_child,
-    ) as executor:
-        futures = {
-            executor.submit(
-                _price_one, (flight_id, graphs[flight_id], flight_duals[flight_id], deadline)
-            ): flight_id
-            for flight_id in pricing_order
-        }
-        for future in as_completed(futures):
-            flight_id, reduced_cost, column, pid, peak = future.result()
+        maxtasksperchild=pool_cfg.max_tasks_per_child,
+    ) as pool:
+        for flight_id, reduced_cost, column, pid, peak, task_wall in pool.imap_unordered(
+            _price_one, tasks
+        ):
             results[flight_id] = (reduced_cost, column)
             worker_pids.add(pid)
             peak_rss = max(peak_rss, peak)
+            task_walls.append(task_wall)
+    sweep_wall = time.perf_counter() - sweep_started
 
     # Rebuild the sequential prefix: stop at the first flight that timed out, and drop
     # everything after it even though it completed.  See the module docstring.
@@ -186,6 +218,9 @@ def price_sweep(
         worker_pids=worker_pids,
         worker_peak_rss_bytes=peak_rss,
         tasks_discarded=len(results) - len(priced) - (0 if complete else 1),
+        sweep_wall_s=sweep_wall,
+        task_wall_total_s=sum(task_walls),
+        task_wall_max_s=max(task_walls, default=0.0),
     )
 
 

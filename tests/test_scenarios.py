@@ -397,5 +397,10 @@ def test_density_scenarios_have_descriptions_and_remove_density_test():
         for token in LEAD_ARM_OPERATORS
         for arm in LEAD_ARMS
     }
+    # The arm half of that set is DERIVED from the same constants that generate the scenarios, so it
+    # would happily absorb a fourth lead rung or a third operator. Pin the shape explicitly too, or the
+    # registry is only checked against itself.
+    assert (len(LEAD_ARMS), len(LEAD_ARM_OPERATORS)) == (3, 2)
+    assert len(density_names) == 8 + 12
     assert all(SCENARIOS[name].description for name in density_names)
     assert "density_test" not in SCENARIOS

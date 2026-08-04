@@ -148,7 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight-line undelayed estimate of the outbound's arrival, fixed when demand "
                         "is generated — under congestion the return is scheduled before its aircraft "
                         "lands. realized: plan the outbound, then anchor its return to the arrival that "
-                        "actually happened (+ turnaround). Same cost; sequential mode only")
+                        "actually happened (+ turnaround). Same cost; sequential mode only. NOT a "
+                        "column in results/index.parquet (only experiment.json records it), so give "
+                        "the two anchors distinct --tag values or a cross-run readout cannot tell "
+                        "them apart")
     p.add_argument("--tag", default=None, help="run-folder label + index join key (default: scenario name)")
     p.add_argument("--window-frac", type=float, default=0.9,
                    help="steady-state plateau threshold: measure where airborne density ≥ frac×peak "

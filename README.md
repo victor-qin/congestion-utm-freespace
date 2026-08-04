@@ -135,6 +135,25 @@ through the final landing without diluting the reported hourly demand rate. Run 
 bash experiments/batch/density_matrix.sh paper 0 1 2
 ```
 
+The **`dfw_*`** scenarios are real-geography twins of the density matrix (one per density recipe,
+`dfw_faa_wing_zipline` … `dfw_future_wing_zipline_amazon_3lvl`): identical hub counts, hub sizes, demand
+rates and timing, but with hubs and destinations grounded in Dallas–Fort Worth data — Wing/Zipline hubs
+sampled from Overture retail POIs weighted by Census tract population density, Amazon hubs at real
+facility coordinates, and customers drawn by tract population density. They run on the **full ~192×147 km
+metroplex frame** (lon −97.98→−95.92, lat 32.18→33.50) rather than the compact density 60×30 km window,
+so the real metro-wide geography — including all Amazon last-mile facilities — fits and the Amazon hub
+counts match density (7 / 14). They read small committed artifacts under
+[`freespace_sim/data/dfw/`](freespace_sim/data/dfw); regenerate them from source with:
+
+```bash
+uv run --extra geo python analysis/prep_dfw.py \
+  --gdb <ACS_2022_5YR_TRACT_48_TEXAS.gdb.zip> --overture <overture_retail.csv> \
+  --amazon <amazon_dfw_facilities.xlsx> --out freespace_sim/data/dfw
+```
+
+The `geo` extra (geopandas/GDAL) is needed only for that one-time prep; the scenarios read the baked
+`.csv`/`.npz` with numpy alone, so plain `uv run` needs no geo stack.
+
 **3. READ OUT** — standalone consumers that load saved data (never re-simulate):
 
 | readout | scope | from | produces |

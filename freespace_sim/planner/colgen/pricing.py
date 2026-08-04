@@ -11,6 +11,8 @@ budget, and claim-membership gate.
 from __future__ import annotations
 
 import math
+import sys
+import threading
 import time
 import heapq
 import itertools
@@ -43,6 +45,36 @@ from .windows import (
 _SCORE_EPS = 1e-12
 _RECOMPUTE_EPS = 1e-8
 _EMPTY_ROWS: frozenset[RowKey] = frozenset()
+
+# Optional compiled search.  The kernel imports Numba unconditionally (as
+# ``astar_kernel`` does), so the availability guard lives here at the host import
+# site, mirroring ``AStarPlanner.__init__``.
+try:
+    from . import dp_kernel as _dp_kernel
+except ImportError:  # pragma: no cover - exercised by installs without the extra
+    _dp_kernel = None
+
+_kernel_fallback_warned = False
+
+
+def _warn_kernel_fallback() -> None:
+    """One stderr line, once per process, when the compiled pricing DP is absent.
+
+    The fallback is the reference oracle, so nothing downstream notices a missing
+    kernel except the clock -- which is exactly how a large slowdown can hide in a
+    whole sweep (see the same guard in ``astar.py``).
+    """
+
+    global _kernel_fallback_warned
+    if _kernel_fallback_warned:
+        return
+    _kernel_fallback_warned = True
+    print(
+        "WARNING: compiled colgen pricing kernel unavailable (numba import failed) -- "
+        "using the pure-Python reference DP. Results are identical. Fix: run via plain "
+        "`uv run` (numba is in tool.uv default-groups) or `uv sync`.",
+        file=sys.stderr,
+    )
 
 
 class PricingTimeout(TimeoutError):
@@ -157,6 +189,56 @@ class DualView:
         """Return the claim keys whose dual can affect a later union cost."""
 
         return frozenset(key for key in claims if self._duals.get(key, 0.0) != 0.0)
+
+    def shift_terms(
+        self, claims: Iterable[RowKey]
+    ) -> tuple[tuple[tuple[Any, ...], int], ...]:
+        """Pre-resolve a claim set for repeated integer-clock translation.
+
+        Returns ``(key_prefix, base_step)`` pairs, where ``key_prefix + (step,)`` is
+        a lookup key for :attr:`_duals`.  Two facts make this exact rather than
+        merely close:
+
+        * ``RowKey`` is a plain ``tuple`` subclass built by
+          ``tuple.__new__(cls, ("cell", q, r, level, step))``, so an ordinary tuple
+          with those contents has the same hash and compares equal -- the dict
+          lookup is identical, it just skips ``RowKey.__new__``'s validation and its
+          four ``operator.index`` calls.
+        * Rows whose *resource* carries no dual at any step are dropped.  They would
+          contribute exactly ``0.0`` at every translation, and adding exact zeros
+          cannot change an ``fsum``.
+
+        Translating a claim set is injective (every row's step moves by the same
+        delta), so no two rows can collide into one and summing the terms is exactly
+        summing the translated set.
+        """
+
+        terms: list[tuple[tuple[Any, ...], int]] = []
+        for row in claims:
+            if row.kind == "cell":
+                q, r = row.cell_coord
+                if (row.cell_coord, row.level) not in self._cell:
+                    continue
+                terms.append((("cell", q, r, row.level), row.step))
+            else:
+                if row.terminal_id not in self._terminal:
+                    continue
+                terms.append((("term", row.terminal_id), row.step))
+        return tuple(terms)
+
+    def shifted_claim_cost(
+        self, terms: tuple[tuple[tuple[Any, ...], int], ...], delta_steps: int
+    ) -> float:
+        """Cost of a pre-resolved claim set translated by ``delta_steps``.
+
+        Bit-identical to ``claim_cost(_shift_claims(claims, delta_steps))``: same
+        values, same exact ``fsum``.
+        """
+
+        duals = self._duals
+        return math.fsum(
+            duals.get(prefix + (step + delta_steps,), 0.0) for prefix, step in terms
+        )
 
     @property
     def has_active_duals(self) -> bool:
@@ -380,36 +462,56 @@ def _path_claims(
     cfg: SimConfig,
     label: _Label,
     dest_lane_idx: int | None,
+    endpoint_cache: dict[tuple[bool, int, int], frozenset[RowKey]] | None = None,
+    visit_cache: dict[tuple[Cell, int], frozenset[RowKey]] | None = None,
 ) -> frozenset[RowKey]:
-    """Build the intended row union cheaply before canonical certification."""
+    """Build the intended row union cheaply before canonical certification.
+
+    Both caches memoize pure functions across a batch of candidates, and both exist
+    because that batch overlaps far more than it looks:
+
+    * ``endpoint_cache`` -- the two endpoint row sets depend only on
+      ``(origin, step, timing_steps)``, of which a batch has very few distinct values.
+    * ``visit_cache`` -- sink proposals share path prefixes and corridor start steps,
+      so ``(cell, visit_step)`` repeats heavily.  Measured at 90% redundant (1106
+      calls, 114 distinct) on one ranking pass.
+    """
 
     del dest_lane_idx  # The selected destination lane changes geometry, not dwell row membership.
     origin_lane_steps = (
         0 if label.origin_lane_idx is None else fg.origin_lanes[label.origin_lane_idx].steps
     )
     corridor_start = label.departure_step + fg.takeoff_steps[0] + origin_lane_steps
-    claims = set(
-        _endpoint_claims(
-            fg,
-            cfg,
-            origin=True,
-            step=label.departure_step,
-            timing_steps=0,
-        )
-    )
+
+    def endpoints(origin: bool, step: int, timing_steps: int) -> frozenset[RowKey]:
+        if endpoint_cache is None:
+            return _endpoint_claims(
+                fg, cfg, origin=origin, step=step, timing_steps=timing_steps
+            )
+        key = (origin, step, timing_steps)
+        cached = endpoint_cache.get(key)
+        if cached is None:
+            cached = _endpoint_claims(
+                fg, cfg, origin=origin, step=step, timing_steps=timing_steps
+            )
+            endpoint_cache[key] = cached
+        return cached
+
+    claims = set(endpoints(True, label.departure_step, 0))
     offsets = derive_cell_window(cfg)
     for offset, cell in enumerate(label.path):
-        claims.update(_visit_claims(cell, 0, corridor_start + offset, offsets))
+        visit_step = corridor_start + offset
+        if visit_cache is None:
+            claims.update(_visit_claims(cell, 0, visit_step, offsets))
+        else:
+            key = (cell, visit_step)
+            cached = visit_cache.get(key)
+            if cached is None:
+                cached = _visit_claims(cell, 0, visit_step, offsets)
+                visit_cache[key] = cached
+            claims.update(cached)
     arrival_step = corridor_start + label.hops
-    claims.update(
-        _endpoint_claims(
-            fg,
-            cfg,
-            origin=False,
-            step=arrival_step,
-            timing_steps=label.hops,
-        )
-    )
+    claims.update(endpoints(False, arrival_step, label.hops))
     return frozenset(claims)
 
 
@@ -572,31 +674,46 @@ def _shifted_seed_incumbent(
     )
     latest_departure = min(fg.latest_departure_step, path_latest_departure)
     best = incumbent
+    # The scan asks each translation only for its dual cost, then throws the row set
+    # away; every translation that is not the winner was materialized for nothing.
+    # ``shift_terms`` resolves the seed's rows once so each step is a handful of dict
+    # lookups instead of rebuilding a frozenset of RowKey objects.  Row exclusions
+    # need the real set, so the repair path keeps the original form.
+    terms = None if forbidden_rows else duals.shift_terms(seed.claims)
+    best_delta: int | None = None
+    best_delay_s = 0.0
     for departure_step in range(seed.departure_step + 1, latest_departure + 1):
         _check_deadline(deadline)
         delta_steps = departure_step - seed.departure_step
-        claims = _shift_claims(seed.claims, delta_steps)
-        if not claims.isdisjoint(forbidden_rows):
-            continue
+        if terms is None:
+            claims = _shift_claims(seed.claims, delta_steps)
+            if not claims.isdisjoint(forbidden_rows):
+                continue
+            dual_cost = duals.claim_cost(claims)
+        else:
+            dual_cost = duals.shifted_claim_cost(terms, delta_steps)
         delay_s = seed.delay_s + delta_steps * cfg.dt_s
-        dual_cost = duals.claim_cost(claims)
         reduced_cost = benefit - delay_s - dual_cost - pi_f
         if best is None or reduced_cost > best[0] + _SCORE_EPS:
-            best = (
-                reduced_cost,
-                Column(
-                    flight_id=seed.flight_id,
-                    departure_step=departure_step,
-                    level=seed.level,
-                    origin_lane_idx=seed.origin_lane_idx,
-                    dest_lane_idx=seed.dest_lane_idx,
-                    cell_path=seed.cell_path,
-                    delay_s=delay_s,
-                    claims=claims,
-                ),
-            )
+            best = (reduced_cost, None)  # column built once, after the scan
+            best_delta = delta_steps
+            best_delay_s = delay_s
         if dual_cost == 0.0 and duals.max_negative_credit == 0.0:
             break
+    if best_delta is not None:
+        best = (
+            best[0],
+            Column(
+                flight_id=seed.flight_id,
+                departure_step=seed.departure_step + best_delta,
+                level=seed.level,
+                origin_lane_idx=seed.origin_lane_idx,
+                dest_lane_idx=seed.dest_lane_idx,
+                cell_path=seed.cell_path,
+                delay_s=best_delay_s,
+                claims=_shift_claims(seed.claims, best_delta),
+            ),
+        )
     return best
 
 
@@ -836,6 +953,216 @@ def _shortest_seed(
     return None if not columns else columns[0]
 
 
+def _topology_for(fg: FlightGraph, cfg: SimConfig):
+    """Return the flight's flat-array topology, building it at most once.
+
+    Built on first *compiled pricing* use, never at graph construction: the
+    zero-dual seed shortcut in :func:`price_flight` lets most flights in a batch
+    skip the DAG entirely, and they must not pay to drain the lazy arc oracle.
+    """
+
+    from . import dp_prepare
+
+    cache = fg._search_cache
+    with cache.lock:
+        topology = cache.topology
+        if topology is None:
+            topology = dp_prepare.prepare_topology(fg, cfg)
+            cache.topology = topology
+        return topology
+
+
+_MAX_KERNEL_ATTEMPTS = 3
+
+
+def _certify_candidates(
+    result,
+    fg: FlightGraph,
+    cfg: SimConfig,
+    dual_view: DualView,
+    pi_f: float,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    incumbent: tuple[float, Column] | None,
+    *,
+    deadline: float | None = None,
+    want_residual: bool = False,
+):
+    """Turn kernel proposals into a certified column, in the reference's order.
+
+    Returns ``best`` normally, or ``(best, residual)`` when ``want_residual``.  The
+    residual is the largest reduced-cost upper bound left unexamined -- the kernel's
+    own, raised by anything the tier-1 break skipped -- and is what licenses the
+    caller's optimality claim.
+    """
+
+    destination_options = _destination_options(fg)
+    endpoint_cache: dict[tuple[bool, int, int], frozenset[RowKey]] = {}
+    visit_cache: dict[tuple[Cell, int], frozenset[RowKey]] = {}
+    provisional: list[_Candidate] = []
+    residual = result.remaining_rc_upper_bound
+    best_provisional: float | None = None
+    # Tier 1 -- rank by a PROVISIONAL reduced cost built from real path geometry,
+    # not by the kernel's admissible bound.  That bound is deliberately loose (it
+    # prices the row union by a max, which can undershoot the true union), so
+    # ranking by it would leave the tier-2 early exit unable to fire and turn
+    # certification into the bottleneck.  This mirrors ``consider_sink``.
+    #
+    # Proposals arrive sorted by ``rc_upper_bound`` descending, and that bound
+    # dominates the provisional cost below, so once it falls under the best
+    # provisional score already seen the rest cannot win and need not be priced --
+    # measured at 62% of them.  Whatever is skipped is folded into ``residual``.
+    for proposal in result.candidates:
+        if (
+            best_provisional is not None
+            and proposal.rc_upper_bound <= best_provisional - _RECOMPUTE_EPS
+        ):
+            residual = max(residual, proposal.rc_upper_bound)
+            break
+        for dest_lane_idx in destination_options.get(proposal.cell_path[-1], ()):
+            label = _Label(
+                0.0, proposal.departure_step, proposal.origin_lane_idx,
+                proposal.cell_path, _EMPTY_ROWS,
+            )
+            claims = _path_claims(
+                fg, cfg, label, dest_lane_idx, endpoint_cache, visit_cache
+            )
+            if not claims.isdisjoint(forbidden_rows):
+                continue
+            delay_s = _path_delay_s(fg, cfg, label)
+            reduced_cost = benefit - delay_s - dual_view.claim_cost(claims) - pi_f
+            if best_provisional is None or reduced_cost > best_provisional:
+                best_provisional = reduced_cost
+            provisional.append(_Candidate(reduced_cost, delay_s, label, dest_lane_idx))
+    provisional.sort(key=lambda candidate: (-candidate.reduced_cost, candidate.tie_key))
+
+    # Tier 2 -- exact certification, in the reference's order and with its break.
+    best = incumbent
+    for index, candidate in enumerate(provisional):
+        if index % 128 == 0:
+            _check_deadline(deadline)
+        if best is not None and candidate.reduced_cost < best[0] - _RECOMPUTE_EPS:
+            break
+        canonical = _canonical_candidate(
+            candidate, fg, dual_view, pi_f, cfg, benefit, forbidden_rows
+        )
+        if canonical is None:
+            continue
+        if best is None:
+            best = canonical
+            continue
+        rc, column = canonical
+        if rc > best[0] + _SCORE_EPS or (
+            abs(rc - best[0]) <= _SCORE_EPS
+            and _column_sort_key(column) < _column_sort_key(best[1])
+        ):
+            best = canonical
+    return (best, residual) if want_residual else best
+
+
+def _best_column_compiled(
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    *,
+    seed: bool,
+    incumbent: tuple[float, Column] | None,
+    deadline: float | None,
+) -> tuple[tuple[float, Column] | None, bool]:
+    """Run the compiled DP and certify its proposals.
+
+    Returns ``(best, proved)``.  ``proved`` means the kernel's residual bound rules
+    out everything it did not return, so the answer is optimal with respect to the
+    same dominance the reference applies.  When it is ``False`` the caller runs the
+    reference search, warm-started with whatever was certified here.
+    """
+
+    from . import dp_prepare
+
+    topology = _topology_for(fg, cfg)
+    if topology.unsupported_reason is not None:
+        return incumbent, False
+
+    cutoff = incumbent[0] if incumbent is not None else None
+    duals = dp_prepare.prepare_duals(dual_view, topology)
+    variants = dp_prepare.prepare_variants(
+        fg, cfg, dual_view, topology, seed=seed,
+        benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
+    )
+    if variants.n_variants == 0:
+        # Every start option was ruled out by ground delay alone.  With a cutoff
+        # that is a proof; without one it just means an empty problem.
+        return incumbent, cutoff is not None
+
+    cancel_flag = np.zeros(1, dtype=np.uint8)
+    timer = None
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise PricingTimeout("column pricing reached its wall-clock deadline")
+        timer = threading.Timer(remaining, lambda: cancel_flag.__setitem__(0, 1))
+        timer.daemon = True
+        timer.start()
+    try:
+        # The reference tightens its own cutoff mid-sweep (``consider_sink``
+        # certifies improving sinks and feeds them straight to the bound), which is
+        # what collapses its search on hard flights.  The kernel cannot do that
+        # in-flight, so it is given the same advantage across runs: if a pass
+        # exhausts its label pool, certify the sinks it *did* reach and re-run with
+        # that stronger cutoff.  Each retry starts from a strictly better bound, so
+        # it explores strictly less.  Without this a hard flight burned the whole
+        # kernel budget, returned nothing, and paid for the reference DP as well.
+        for _attempt in range(_MAX_KERNEL_ATTEMPTS):
+            result = _dp_kernel.search_dag(
+                topology, duals, variants,
+                cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
+                seed=seed, cancel_flag=cancel_flag,
+            )
+            if result.status == _dp_kernel.FB_CANCELLED:
+                raise PricingTimeout("column pricing reached its wall-clock deadline")
+            if result.ok or not result.candidates:
+                break
+            improved = _certify_candidates(
+                result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent
+            )
+            if improved is None or (cutoff is not None and improved[0] <= cutoff + _SCORE_EPS):
+                break  # no tighter bound to retry with; let the reference finish
+            incumbent = improved
+            cutoff = improved[0]
+    finally:
+        if timer is not None:
+            timer.cancel()
+    if not result.ok:
+        return incumbent, False
+
+    # Tier 1 -- rank by a PROVISIONAL reduced cost built from real path geometry,
+    # not by the kernel's admissible bound.  The bound is deliberately loose (it
+    # prices the row union by a max, which can undershoot the true union), so
+    # ranking by it leaves the tier-2 early exit unable to fire and turns
+    # certification into the bottleneck.  This mirrors ``consider_sink``.
+    best, residual = _certify_candidates(
+        result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent,
+        deadline=deadline, want_residual=True,
+    )
+    proved = best is not None and residual <= best[0] + _RECOMPUTE_EPS
+    return best, proved
+
+
+def _column_sort_key(column: Column) -> tuple[Any, ...]:
+    """The reference's canonical column ordering (pricing's final tie-break)."""
+
+    return (
+        len(column.cell_path) - 1,
+        column.departure_step,
+        -1 if column.origin_lane_idx is None else column.origin_lane_idx,
+        -1 if column.dest_lane_idx is None else column.dest_lane_idx,
+        column.cell_path,
+    )
+
+
 def _best_column(
     fg: FlightGraph,
     dual_view: DualView,
@@ -849,6 +1176,18 @@ def _best_column(
     deadline: float | None = None,
 ) -> tuple[float, Column | None]:
     _check_deadline(deadline)
+    if _dp_kernel is not None and not forbidden_rows and len(fg.levels) == 1:
+        certified, proved = _best_column_compiled(
+            fg, dual_view, pi_f, cfg, benefit, forbidden_rows,
+            seed=seed, incumbent=incumbent, deadline=deadline,
+        )
+        if proved:
+            return certified if certified is not None else (-math.inf, None)
+        # Not proved: fall through to the reference search, warm-started with
+        # whatever the kernel did certify so its pruning starts tighter.
+        incumbent = certified if certified is not None else incumbent
+    elif _dp_kernel is None:
+        _warn_kernel_fallback()
     if len(fg.levels) != 1:
         raise NotImplementedError(
             "colgen v1 pricing supports a single flight level; multi-level pricing is planned"
@@ -868,6 +1207,31 @@ def _best_column(
             cached = _distance_lower_bound(cell, destination_cells)
             distance_cache[cell] = cached
         return cached
+
+    paid_cell_row_cache: dict[
+        frozenset[RowKey], tuple[frozenset[Cell], dict[tuple[Cell, int], float]]
+    ] = {}
+
+    def _paid_cell_rows(
+        paid: frozenset[RowKey],
+    ) -> tuple[frozenset[Cell], dict[tuple[Cell, int], float]]:
+        """Index one origin endpoint's already-paid rows for visit-window lookup.
+
+        Only single-level cell rows can recur in a later visit window; terminal
+        rows never can, so they are dropped rather than searched.  Keyed by the
+        frozenset itself because it is constant along a label's whole trajectory
+        and shared by every label from the same start option.
+        """
+
+        entry = paid_cell_row_cache.get(paid)
+        if entry is None:
+            lookup: dict[tuple[Cell, int], float] = {}
+            for row in paid:
+                if row.kind == "cell" and row.level == 0:
+                    lookup[(row.cell_coord, row.step)] = dual_view.row_cost(row)
+            entry = frozenset(cell for cell, _step in lookup), lookup
+            paid_cell_row_cache[paid] = entry
+        return entry
 
     origin_options = _origin_options(fg)
     # ``detour_slack_hops`` sizes the spatial ellipse; it is not a route-length
@@ -1177,6 +1541,8 @@ def _best_column(
             )
             if not destination_claims.isdisjoint(forbidden_rows):
                 continue
+            # Reference path: deliberately left uncached, so it stays the verbatim
+            # oracle the compiled path is measured and certified against.
             claims = _path_claims(fg, cfg, label, dest_lane_idx)
             if not claims.isdisjoint(forbidden_rows):
                 continue
@@ -1222,6 +1588,7 @@ def _best_column(
             hops = label.hops
             if (seed and hops >= seed_hop_limit) or step + 1 > fg.max_step:
                 continue
+            paid_cells, paid_cell_rows = _paid_cell_rows(origin_paid_rows)
             if incumbent is not None:
                 ground_delay = (label.departure_step - fg.base_step) * cfg.dt_s
                 origin_leg = origin_leg_by_lane[label.origin_lane_idx]
@@ -1268,12 +1635,27 @@ def _best_column(
                     continue
                 if seed and hops + 1 + distance_to_go > seed_hop_limit:
                     continue
-                claims = _visit_claims(neighbour, 0, next_step, offsets)
-                if not claims.isdisjoint(forbidden_rows):
+                if forbidden_rows and not _visit_claims(
+                    neighbour, 0, next_step, offsets
+                ).isdisjoint(forbidden_rows):
                     continue
+                # Price the visit window from ``DualView``'s prefix sums instead of
+                # materializing its ``RowKey`` set.  Building that set to sum it was
+                # measured at ~44% of this search (718k ``RowKey.__new__`` calls, each
+                # running ``operator.index`` four times, for one number).  Rows the
+                # origin endpoint already paid must not be charged twice; that overlap
+                # is confined to the endpoint's own cells, so the guard below is a
+                # miss on essentially every arc.
+                visit_cost = dual_view.visit_cost(neighbour, 0, next_step)
+                if neighbour in paid_cells:
+                    visit_cost -= math.fsum(
+                        price
+                        for row_step in visit_rows(next_step, offsets)
+                        if (price := paid_cell_rows.get((neighbour, row_step))) is not None
+                    )
                 next_recent = (neighbour, *recent[: state_history_depth - 1])
                 next_label = _Label(
-                    label.score - cfg.dt_s - dual_view.claim_cost(claims - origin_paid_rows),
+                    label.score - cfg.dt_s - visit_cost,
                     label.departure_step,
                     label.origin_lane_idx,
                     (*label.path, neighbour),

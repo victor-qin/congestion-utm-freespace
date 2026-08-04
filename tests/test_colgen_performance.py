@@ -73,6 +73,38 @@ def test_seed_astar_expands_only_a_small_lazy_subset():
 
 
 def test_repeated_pricing_reuses_lazy_arcs_and_cached_seed():
+    """A second pricing call must not re-derive any arc geometry.
+
+    ``arc_checks``/``expanded_nodes`` holding still is the invariant: no wall
+    geometry is recomputed and no new source cell is expanded.  How the second call
+    *reads* those arcs differs by search path, so the two are asserted separately:
+    the reference walks the lazy oracle again (cache hits grow), while the compiled
+    path answers from a flat topology built once and never touches the oracle at all
+    -- a strictly stronger form of the same reuse.
+    """
+
+    cfg = _cfg()
+    graph, params = _graph(cfg, slack=2)
+    credited = RowKey.cell((-2, 0), 0, 5)
+
+    first = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
+    first_stats = dict(graph.arc_cache_stats)
+    second = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
+    second_stats = dict(graph.arc_cache_stats)
+
+    assert second == first
+    assert second_stats["arc_checks"] == first_stats["arc_checks"]
+    assert second_stats["expanded_nodes"] == first_stats["expanded_nodes"]
+    if pricing._dp_kernel is None:
+        assert second_stats["cache_hits"] > first_stats["cache_hits"]
+    else:
+        assert second_stats["cache_hits"] == first_stats["cache_hits"]
+
+
+def test_repeated_pricing_on_the_reference_path_still_reuses_cached_arcs(monkeypatch):
+    """The original oracle-reuse contract, pinned on the path that still walks it."""
+
+    monkeypatch.setattr(pricing, "_dp_kernel", None)
     cfg = _cfg()
     graph, params = _graph(cfg, slack=2)
     credited = RowKey.cell((-2, 0), 0, 5)

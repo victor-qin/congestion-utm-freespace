@@ -31,7 +31,13 @@ from freespace_sim.planner.colgen.master import (
 )
 from freespace_sim.planner.colgen.network import RowIndex, RowKey, build_flight_graph, column_claims
 from freespace_sim.planner.colgen.params import ColGenParams
-from freespace_sim.planner.colgen.pricing import PricingTimeout, price_flight, seed_column
+from freespace_sim.planner.colgen.pricing import (
+    DualView,
+    PricingTimeout,
+    _visit_claims,
+    price_flight,
+    seed_column,
+)
 from freespace_sim.planner.colgen.solver import (
     ColGenSolver,
     _fixed_loads,
@@ -296,6 +302,56 @@ def test_pricing_recomputes_reduced_cost_from_deduplicated_claims():
     )
     assert reduced_cost == pytest.approx(expected, abs=1e-7)
     assert len(priced.claims) == len(set(priced.claims))
+
+
+@pytest.mark.parametrize("time_buffer_s", [4.0, 0.0])
+def test_visit_cost_prefix_sums_equal_the_explicit_claim_sum(time_buffer_s):
+    """``DualView`` exposes two ways to price one cell visit; pin them together.
+
+    ``visit_cost`` answers from per-resource prefix sums in O(1); ``claim_cost``
+    builds the explicit ``RowKey`` window and sums it.  Pricing has only ever used
+    the second, so the first had no caller and no coverage — yet it is the cheap
+    form any bulk pricing path wants.  Both offset regimes are exercised because
+    ``derive_cell_window`` is asymmetric: ``(-2, 1)`` by default, ``(-1, 0)`` at
+    ``time_buffer_s=0``.
+    """
+
+    cfg = _cfg(time_buffer_s=time_buffer_s)
+    offsets = derive_cell_window(cfg)
+    assert offsets == ((-2, 1) if time_buffer_s else (-1, 0))
+    rng = np.random.default_rng(20260803)
+
+    for _trial in range(60):
+        # A sparse, duplicated, mixed-sign dual map: duplicates exercise the
+        # normalizing accumulation, negatives the signed prefix arithmetic.
+        duals: dict[RowKey, float] = {}
+        for _entry in range(int(rng.integers(1, 14))):
+            cell = (int(rng.integers(-3, 4)), int(rng.integers(-3, 4)))
+            step = int(rng.integers(-4, 12))
+            key = RowKey.cell(cell, 0, step)
+            duals[key] = duals.get(key, 0.0) + float(rng.normal(0.0, 5.0))
+        view = DualView(duals, cfg)
+
+        for _probe in range(12):
+            cell = (int(rng.integers(-4, 5)), int(rng.integers(-4, 5)))
+            visit_step = int(rng.integers(-6, 14))
+            claims = _visit_claims(cell, 0, visit_step, offsets)
+            assert len(claims) == offsets[1] - offsets[0] + 1
+
+            assert view.visit_cost(cell, 0, visit_step) == pytest.approx(
+                view.claim_cost(claims), abs=1e-12
+            )
+
+            # The DP charges a visit net of rows an endpoint already paid, so the
+            # prefix form must also support subtracting an arbitrary paid subset.
+            paid = frozenset(
+                row for row in claims if rng.random() < 0.5
+            ) | _visit_claims((9, 9), 0, visit_step, offsets)
+            expected = view.claim_cost(claims - paid)
+            corrected = view.visit_cost(cell, 0, visit_step) - math.fsum(
+                view.row_cost(row) for row in claims & paid
+            )
+            assert corrected == pytest.approx(expected, abs=1e-12)
 
 
 def test_zero_buffer_pricing_keeps_predecessor_dependent_endpoint_duals():

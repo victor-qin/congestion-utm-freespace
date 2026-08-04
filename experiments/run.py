@@ -43,9 +43,17 @@ def _scaled_lam_per_uss(spec, total_lam: float) -> dict[str, float]:
 
 
 def _kernel_status(planner_name: str) -> str:
-    """One-line compiled-kernel status for the startup INFO block. Mirrors AStarPlanner's own import
-    probe; the module lands in ``sys.modules`` so the sim's later import is free. Only the astar
-    family has a kernel — anything else reports n/a rather than paying the numba import."""
+    """One-line compiled-kernel status for the startup INFO block. Mirrors each planner's own import
+    probe; the module lands in ``sys.modules`` so the sim's later import is free. Planners outside
+    the astar and colgen families report n/a rather than paying the numba import."""
+    if planner_name == "colgen":
+        try:
+            from freespace_sim.planner.colgen import dp_kernel  # noqa: F401
+            return "compiled (numba pricing DP active)"
+        except ImportError:
+            return ("REFERENCE FALLBACK — numba unavailable, pricing falls back to the "
+                    "pure-Python DP. Run via plain `uv run` (numba is in tool.uv "
+                    "default-groups) or `uv sync`.")
     if "astar" not in planner_name:
         return "n/a (planner has no compiled kernel)"
     if planner_name == "astar_ref":
@@ -184,7 +192,7 @@ def main() -> None:
     if spec.description:
         log.info("description: %s", spec.description)
     log.info("active demand duration=%ss", cfg.effective_demand_duration_s)
-    log.info("A* kernel: %s", _kernel_status(cfg.planner))
+    log.info("compiled kernel: %s", _kernel_status(cfg.planner))
 
     pcfg = None
     if args.mode != "sequential":

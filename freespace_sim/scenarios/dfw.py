@@ -15,23 +15,20 @@ families can never drift, and the artifacts under ``freespace_sim/data/dfw/`` (r
 
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 
+from ..geo import region_size_for_frame
 from . import density
 from .density import AMAZON_USS, WING_ZIPLINE_USS
 from .spec import ScenarioSpec
 
-# Full DFW metroplex frame (minlon, maxlon, minlat, maxlat) — matches analysis/prep_dfw.py's clip frame.
-# The region IS this box; DfwGeoDemand projects real lon/lat into it about the frame centre, the box size
-# derived with geo.project_lonlat_to_enu's constant so the four corners map onto [0, w] × [0, h].
+# Full DFW metroplex frame (minlon, maxlon, minlat, maxlat) — the SINGLE definition of the frame;
+# analysis/prep_dfw.py imports it to clip the baked artifacts to exactly this box. The region IS this
+# box: DfwGeoDemand projects real lon/lat into it about the frame centre, and region_size_for_frame
+# inverts geo.project_lonlat_to_enu so the four corners land exactly on [0, w] × [0, h].
 DFW_FRAME = (-97.9767, -95.9240, 32.1788, 33.5030)
 DFW_REGION_CENTER_LATLON = ((DFW_FRAME[2] + DFW_FRAME[3]) / 2.0, (DFW_FRAME[0] + DFW_FRAME[1]) / 2.0)
-_EARTH_R_M = 6_371_000.0
-DFW_REGION_M = (
-    math.radians(DFW_FRAME[1] - DFW_FRAME[0]) * math.cos(math.radians(DFW_REGION_CENTER_LATLON[0])) * _EARTH_R_M,
-    math.radians(DFW_FRAME[3] - DFW_FRAME[2]) * _EARTH_R_M,
-)
+DFW_REGION_M = region_size_for_frame(*DFW_FRAME)
 
 
 def _geo_twin(spec: ScenarioSpec) -> ScenarioSpec:

@@ -5,6 +5,7 @@ import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.demand import HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
+from freespace_sim.geo import project_lonlat_to_enu
 from freespace_sim.scenarios import (
     SCENARIOS,
     DemandSpec,
@@ -14,7 +15,7 @@ from freespace_sim.scenarios import (
 )
 from freespace_sim.scenarios.demand_dfw import DfwGeoDemand
 from freespace_sim.scenarios.density import AMAZON_USS, WING_ZIPLINE_USS
-from freespace_sim.scenarios.dfw import DFW_REGION_CENTER_LATLON, DFW_REGION_M
+from freespace_sim.scenarios.dfw import DFW_FRAME, DFW_REGION_CENTER_LATLON, DFW_REGION_M
 
 
 def test_get_scenario_resolves_and_rejects():
@@ -310,6 +311,20 @@ def test_dfw_twin_reuses_all_density_numbers(dfw_name, den_name):
     assert isinstance(dfw_spec.demand_model(), DfwGeoDemand)
     assert a.sampled_hub_uss == (WING_ZIPLINE_USS,)
     assert a.fixed_hub_uss == ((AMAZON_USS,) if AMAZON_USS in a.uss else ())
+
+
+def test_dfw_frame_corners_map_onto_the_region_box():
+    """The region box IS the lon/lat frame: geo.project_lonlat_to_enu must land the frame's corners
+    exactly on [0, w] x [0, h]. If the frame and the box size ever drift apart, every hub and tract
+    silently shifts (or gets clipped) with no other symptom. Also pins region_m to plain floats —
+    numpy scalars leak into scenario_spec.json and make json.dumps raise."""
+    minlon, maxlon, minlat, maxlat = DFW_FRAME
+    w, h = DFW_REGION_M
+    lat0, lon0 = DFW_REGION_CENTER_LATLON
+    corners = project_lonlat_to_enu(
+        np.array([minlon, maxlon]), np.array([minlat, maxlat]), lat0, lon0, w, h)
+    assert np.allclose(corners, [[0.0, 0.0], [w, h]], atol=1e-6)
+    assert all(type(v) is float for v in DFW_REGION_M)
 
 
 def test_dfw_spec_json_round_trips_under_schema_v2():

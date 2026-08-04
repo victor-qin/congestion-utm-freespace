@@ -725,3 +725,37 @@ def test_realized_anchor_warns_when_turnaround_cannot_be_recovered(caplog):
     with caplog.at_level("WARNING"):
         run(cfg, requests=reqs, demand=model, return_anchor="realized")
     assert not any("turnaround_s=0" in r.message for r in caplog.records)
+
+
+def test_realized_anchor_warns_on_links_it_cannot_use(caplog):
+    """A link is only usable if FCFS plans the outbound first. Both shipped return modes guarantee it,
+    but a hand-built list can name an absent or later-ordered outbound — which silently degrades that
+    leg to the nominal anchor."""
+    from freespace_sim.types import FlightRequest, vec
+
+    cfg = SimConfig(planner="astar_shortcut", region_size_m=(4000.0, 4000.0), horizon_s=1200.0)
+
+    # the return (id 1) files BEFORE its outbound (id 0), so FCFS plans it first
+    backwards = [FlightRequest(1, vec(2000, 0, 0), vec(0, 0, 0), 0.0, t_departure=600.0,
+                               paired_outbound_id=0),
+                 FlightRequest(0, vec(0, 0, 0), vec(2000, 0, 0), 100.0)]
+    with caplog.at_level("WARNING"):
+        res = run(cfg, requests=backwards, return_anchor="realized")
+    assert any("no earlier than the return" in r.message for r in caplog.records)
+    ret = next(i for i in res.intents if i.request.flight_id == 1)
+    assert ret.request.t_departure == 600.0          # degraded to nominal, as the warning says
+
+    # a dangling link (outbound absent entirely) is the same class
+    caplog.clear()
+    dangling = [FlightRequest(1, vec(2000, 0, 0), vec(0, 0, 0), 0.0, t_departure=600.0,
+                              paired_outbound_id=99)]
+    with caplog.at_level("WARNING"):
+        run(cfg, requests=dangling, return_anchor="realized")
+    assert any("absent from the scenario" in r.message for r in caplog.records)
+
+    # and a well-formed world does NOT trip it
+    caplog.clear()
+    good_cfg, model = _roundtrip_world()
+    with caplog.at_level("WARNING"):
+        run(good_cfg, demand=model, return_anchor="realized")
+    assert not any("no earlier than the return" in r.message for r in caplog.records)

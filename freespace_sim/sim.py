@@ -481,6 +481,22 @@ def run(
         if couple and not awaited:
             log.warning("return_anchor='realized' but no request carries paired_outbound_id — nothing "
                         "to re-anchor. Only the hub_radius demand model emits linked round-trip legs.")
+        elif couple:
+            # A link is only usable if its outbound is planned FIRST. Both shipped return modes
+            # guarantee that (a paired return shares its outbound's filing time and takes the next
+            # flight_id; a legacy one files strictly later), but a hand-built request list can point at
+            # a flight that is absent, or that FCFS orders after the return — in which case that leg
+            # silently keeps its nominal anchor. Check once, up front, rather than let it pass quietly.
+            pos = {ev.request.flight_id: k for k, ev in enumerate(scenario.events)}
+            unusable = sum(1 for k, ev in enumerate(scenario.events)
+                           if ev.request.paired_outbound_id is not None
+                           and pos.get(ev.request.paired_outbound_id, len(pos)) >= k)
+            if unusable:
+                log.warning(
+                    "return_anchor='realized': %d/%d linked return(s) name an outbound that is absent "
+                    "from the scenario or that FCFS orders no earlier than the return itself — their "
+                    "arrival is not known in time, so they keep the nominal anchor.",
+                    unusable, len(awaited))
         anchors: dict[int, float] = {}
         for done, ev in enumerate(scenario.events, 1):
             req = ev.request

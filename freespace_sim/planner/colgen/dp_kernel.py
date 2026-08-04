@@ -57,6 +57,13 @@ RECOMPUTE_EPS = 1e-8
 
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci hashing multiplier, as astar_kernel
 
+# Headroom over ``n_cells * n_steps`` when resizing the label pool after an overflow.
+# The state key carries more than (cell, step) -- the revisit history, the origin's
+# paid-row class and the first arc -- so several labels can share a cell-step and the
+# product is a floor, not a bound.  Measured overshoot was 1.03-1.58x; 2.0 buys margin
+# on a pool that is only ever allocated for a flight which already proved it overflows.
+_LABEL_GEOMETRY_SAFETY = 2.0
+
 # Arc role bits, mirroring network.py.
 ARC_INTERNAL = np.uint8(1 << 0)
 ARC_FIRST = np.uint8(1 << 1)
@@ -765,6 +772,7 @@ def search_dag(
     if cancel_flag is None:
         cancel_flag = np.zeros(1, dtype=np.uint8)
     limit = label_limit if label_limit is not None else max(4096, 64 * n_cells)
+    n_steps = topology.max_step - topology.min_step + 1
     depth = topology.state_history_depth
     regrow = 0
 
@@ -822,7 +830,28 @@ def search_dag(
         )
 
         if status in (FB_LABEL_OVERFLOW, FB_HASH_FULL) and limit < label_limit_max:
-            limit = min(limit * 4, label_limit_max)
+            # One overflow is enough to know the opening guess was wrong, and it is
+            # wrong *structurally*: ``64 * n_cells`` has no step term, while the label
+            # count tracks ``n_cells * n_steps`` closely -- measured ratio 1.03-1.58
+            # across every flight that overflowed on density_faa.  So jump to the
+            # geometry-derived size rather than climbing x4 and re-running the whole
+            # search at each rung.
+            #
+            # Sizing only kicks in AFTER an overflow on purpose.  58 of 100 flights
+            # never overflow, and opening at the geometric size would hand all of them
+            # a pool orders of magnitude larger than they use -- the dual cutoff keeps
+            # most searches tiny.  This way the common case is untouched and only the
+            # flights that proved they need room get it.
+            # Jumping on the FIRST overflow also uses less peak memory, which is the
+            # opposite of what it looks like.  The product over-shoots badly for
+            # well-pruned flights (measured ratios down to 0.07, a 16.7M pool holding
+            # 800k labels), so an intermediate x4 rung was tried to avoid that -- and
+            # measured worse on both axes (peak RSS 6809 MB vs 6656, wall 70.77s vs
+            # 70.07s).  The reason: every rung is itself allocated and its state table
+            # is ``np.full``-initialised, so an extra rung ADDS a transient peak rather
+            # than avoiding one, and peak is a max over the run, not a sum.
+            geometric = int(_LABEL_GEOMETRY_SAFETY * n_cells * n_steps)
+            limit = min(max(limit * 4, geometric), label_limit_max)
             regrow += 1
             continue
         break

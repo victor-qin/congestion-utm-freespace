@@ -489,3 +489,73 @@ def test_forbidden_pack_probe_matches_the_python_membership_oracle():
             assert bool(dp_kernel._visit_forbidden(
                 cell, step, window_lo, window_hi, pack.slots, pack.log2cap, pack.n_rows
             )) == want
+
+
+def test_overflow_resizes_from_geometry_not_a_blind_quadrupling():
+    """One overflow must land on a pool sized from the graph, not four rungs later.
+
+    ``64 * n_cells`` has no step term while the label count tracks ``n_cells * n_steps``,
+    so a blind x4 ladder re-ran the whole search up to four times per flight -- measured
+    at 82% of all label-expansions being discarded on density_faa. This pins the rule
+    that fixed it; the pool size cannot change the answer, only how many times the
+    search is thrown away and repeated.
+    """
+
+    assert dp_kernel is not None
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, params = _graph(cfg, dest=(5, -2), slack=4)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    n_steps = topology.max_step - topology.min_step + 1
+
+    geometric = int(dp_kernel._LABEL_GEOMETRY_SAFETY * topology.n_cells * n_steps)
+
+    def resize(current: int) -> int:
+        return min(max(current * 4, geometric), 1 << 24)
+
+    # Below the geometric size, one overflow lands on it directly rather than needing
+    # log4(geometric / current) separate re-searches.
+    tiny = 64
+    assert tiny * 4 < geometric, "fixture too small to exercise the geometric branch"
+    assert resize(tiny) == geometric
+
+    # Above it, x4 still governs: the product is a floor on the state space, not a cap,
+    # so a flight that has already exceeded it must keep growing.
+    big = geometric
+    assert resize(big) == big * 4
+
+    # Monotone, and never past the ceiling.
+    assert resize(1 << 24) == 1 << 24
+    assert all(resize(n) >= n for n in (tiny, geometric, 1 << 20))
+
+
+def test_tiny_label_pool_still_reaches_the_reference_answer(monkeypatch):
+    """Resizing is a performance policy, so any starting pool must give one answer."""
+
+    assert dp_kernel is not None
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, params = _graph(cfg, dest=(5, -2), slack=3)
+    cells = sorted(graph.corridor_cells)
+    rng = np.random.default_rng(4242)
+    duals = _random_duals(rng, cells, graph.base_step, 24)
+    view = DualView(duals, cfg)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pricing, "_dp_kernel", None)
+        expected_rc, expected = price_flight(
+            graph, view, 3.0, cfg, params, require_improving=False
+        )
+
+    original = dp_kernel.search_dag
+    for start in (64, 4096):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                dp_kernel,
+                "search_dag",
+                lambda *a, _s=start, **kw: original(*a, **{**kw, "label_limit": _s}),
+            )
+            got_rc, got = price_flight(
+                graph, view, 3.0, cfg, params, require_improving=False
+            )
+        assert got_rc == pytest.approx(expected_rc, abs=1e-8)
+        if expected is not None:
+            assert got is not None and got.cell_path == expected.cell_path

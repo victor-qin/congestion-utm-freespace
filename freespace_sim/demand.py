@@ -224,15 +224,36 @@ def _uss_rng(base_seed: int, uss_id: str) -> np.random.Generator:
     )
 
 
-def _shift_request_clock(requests: list[FlightRequest]) -> float:
-    """Shift every request and desired departure so the earliest filing is exactly zero."""
+def _shift_request_clock(requests: list[FlightRequest], offset_s: float | None = None) -> float:
+    """Shift every request and desired departure forward onto a nonnegative clock.
+
+    ``offset_s=None`` (default) shifts by the REALIZED preroll, putting the earliest filing at exactly
+    zero. That amount is a max-order statistic over the departure-lead draws, so two otherwise-identical
+    runs whose leads differ end up translated relative to each other — every ``t_departure`` moves, and
+    the runs can only be compared in aggregate.
+
+    Passing a FIXED ``offset_s`` instead pins the translation, so a family of runs differing only in
+    ``departure_offset_s`` keeps byte-identical desired departures and differs solely in FCFS filing
+    order — the paired per-flight comparison the scheduling-lead arms rely on. The constant must cover
+    the realized preroll: a filing before t=0 would break the planner's monotonic-``t_request``
+    occupancy eviction (see ``planner/occupancy.py``), so an undersized offset raises rather than clips.
+    """
     if not requests:
         return 0.0
-    offset_s = -min(request.t_request for request in requests)
+    needed_s = -min(request.t_request for request in requests)
+    if offset_s is None:
+        shift_s = needed_s
+    else:
+        shift_s = float(offset_s)
+        if shift_s < needed_s:
+            raise ValueError(
+                f"request_clock_offset_s={shift_s:g} is smaller than the realized preroll "
+                f"{needed_s:.1f}s — raise it to at least that (a filing before t=0 breaks the "
+                f"monotonic-t_request occupancy eviction)")
     for request in requests:
-        request.t_request += offset_s
-        request.t_departure += offset_s
-    return offset_s
+        request.t_request += shift_s
+        request.t_departure += shift_s
+    return shift_s
 
 
 @dataclass
@@ -285,6 +306,11 @@ class HubRadiusDemand:
     # When true, the outbound and its return are filed together. The return requests departure after the
     # outbound's nominal arrival plus turnaround, with no second scheduling-lead draw.
     paired_return_request: bool = False
+    # timing_mode="departure" only: shift the whole clock by this FIXED constant instead of by the
+    # realized preroll. Holding it constant across a family of runs that differ only in
+    # departure_offset_s gives every arm byte-identical t_departure values, so delays can be compared
+    # flight-by-flight rather than only in aggregate. None → the legacy data-dependent shift.
+    request_clock_offset_s: "float | None" = None
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F
     min_hub_gap_m: float = 100.0                     # clearance between terminal-airspace EDGES (no overlap)
@@ -293,6 +319,16 @@ class HubRadiusDemand:
         if self.timing_mode not in {"request", "departure"}:
             raise ValueError(
                 f"unknown timing_mode {self.timing_mode!r} (want 'request' | 'departure')")
+        if self.request_clock_offset_s is not None:
+            # Only the departure-first path shifts the clock at all; silently ignoring the knob in
+            # request mode would let an arm family think it was pinned when it never was.
+            if self.timing_mode != "departure":
+                raise ValueError(
+                    "request_clock_offset_s applies only to timing_mode='departure' "
+                    f"(got {self.timing_mode!r}); request-first filings are already nonnegative")
+            if self.request_clock_offset_s < 0.0:
+                raise ValueError(
+                    f"request_clock_offset_s must be >= 0 (got {self.request_clock_offset_s})")
         # Fail fast on a mistyped USS key — an experiment silently generating zero flights for a hub is a
         # worse failure mode than a config error at construction.
         hubs = set(self.n_hubs_per_uss)
@@ -434,6 +470,7 @@ class HubRadiusDemand:
                 requests.append(FlightRequest(                        # delivery: hub → customer
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
                     t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal))
+            outbound_fid = fid
             fid += 1
             if self.return_flights:                                  # return: customer → same hub
                 trip_and_turnaround_s = (
@@ -451,7 +488,8 @@ class HubRadiusDemand:
                 if not drop:                                          # foreign-column filter drops both legs
                     requests.append(FlightRequest(
                         fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
-                        t_departure=t_ret_dep, uss_id=uss_id, dest_terminal=terminal))
+                        t_departure=t_ret_dep, uss_id=uss_id, dest_terminal=terminal,
+                        paired_outbound_id=outbound_fid))
                 fid += 1
 
         if self.lam_per_uss is None:
@@ -485,6 +523,6 @@ class HubRadiusDemand:
                     )
 
         if self.timing_mode == "departure":
-            _shift_request_clock(requests)
+            _shift_request_clock(requests, self.request_clock_offset_s)
         requests.sort(key=lambda r: (r.t_request, r.flight_id))
         return requests

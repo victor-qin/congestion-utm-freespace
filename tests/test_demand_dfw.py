@@ -40,6 +40,23 @@ def test_hubs_respect_separation_and_stay_in_region():
         assert ((pts[:, 0] >= 0) & (pts[:, 0] <= w) & (pts[:, 1] >= 0) & (pts[:, 1] <= h)).all(), uid
 
 
+def test_hubs_and_customers_avoid_the_airport_keepout():
+    """No hub may sit inside the DFW-airport no-fly zone — its flights could never leave the permanent
+    wall — and no census-density customer may land inside it (undeliverable). place_hubs seeds the zone
+    as a pre-placed obstacle (reusing the separation contract); the base draw rejects in-zone points, and
+    DfwGeoDemand inherits it. This is what keeps the real hazard (5 eligible retail POIs within 3.5 km of
+    the runway, the nearest 360 m) from being seated as a hub whose every flight is then denied."""
+    spec, cfg, dm, hubs = _placed("dfw_faa_wing_zipline_amazon")
+    (kx, ky, kr), = cfg.keepout_zones
+    ctr = np.array([kx, ky])
+    for uid, pts in hubs.items():
+        assert (np.linalg.norm(pts - ctr, axis=1) >= kr).all(), (uid, float(np.linalg.norm(pts - ctr, axis=1).min()))
+    small = with_overrides(spec, horizon_s=600.0, demand_duration_s=120.0)
+    reqs = dm.generate(small.config(), np.random.default_rng(0))    # hubs identical (same region+seed)
+    endpoints = np.array([p[:2] for r in reqs for p in (r.origin, r.dest)])
+    assert (np.linalg.norm(endpoints - ctr, axis=1) >= kr - 1e-6).all()
+
+
 def test_placement_is_deterministic_in_hub_seed():
     spec = get_scenario("dfw_faa_wing_zipline")
     dm = spec.demand_model()
@@ -145,3 +162,12 @@ def test_dfw_scenario_plans_end_to_end_and_verifies():
     res = run(spec.config(), demand=spec.demand_model())
     assert res.verified                                  # FCL replay finds no inter-flight conflict
     assert not res.denied and len(res.accepted) >= 250   # real geography stays flyable
+    # The airport no-fly zone actually diverts traffic: independently of verify, no committed volume's
+    # footprint reaches within the zone radius of its centre — flights route AROUND the field.
+    (kx, ky, kr), = spec.config().keepout_zones
+
+    def _gap(v):
+        xlo, ylo, _, xhi, yhi, _ = v.flat_aabb()
+        dx, dy = max(xlo - kx, 0.0, kx - xhi), max(ylo - ky, 0.0, ky - yhi)
+        return (dx * dx + dy * dy) ** 0.5
+    assert min(_gap(v) for _, v in res.ledger.iter_committed()) >= kr - 1e-6

@@ -26,7 +26,7 @@ from .mechanism import FCFSMechanism, Mechanism
 from .planner import get_planner
 from .scenario import Scenario, scenario_from_requests
 from .telemetry import TelemetryCollector, build_terminal_snapshot
-from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
+from .types import FlightRequest, IntentStatus, OperationalIntent, Terminal, as_terminal
 from .uss import USS
 
 log = logging.getLogger(__name__)
@@ -246,6 +246,20 @@ def _wall_aware(planner) -> bool:
     return False
 
 
+def _keepout_terminals(cfg: SimConfig) -> list:
+    """``cfg.keepout_zones`` → ``(center, Terminal)`` pairs on the always-active static-wall rail.
+
+    Each zone ``(cx, cy, radius)`` becomes a permanent no-fly cylinder — a ``Terminal`` with the zone's
+    radius and a UNIQUE, non-hub id ``("keepout", i)``. Registered exactly like an always-active hub wall
+    (:meth:`ReservationLedger.register_static_terminal`), so it is a permanent ledger volume the A*
+    occupancy derives a routing wall from (flights route AROUND it), and ``verify`` / the parallel workers
+    see it through the same ``static_terms`` list. The tuple id is shared by no flight, so the same-``tid``
+    column exemption (:func:`conflict.volumes_conflict`) never fires for it — unlike a hub wall it is opaque
+    to everyone, which is what makes it a no-fly zone rather than a per-hub column."""
+    return [((float(cx), float(cy)), Terminal(id=("keepout", i), capacity=1, radius=float(r)))
+            for i, (cx, cy, r) in enumerate(cfg.keepout_zones)]
+
+
 def _astar_planners(planner) -> list:
     """Every ``AStarPlanner`` reachable from ``planner`` via the inner/warm_planner chain — so telemetry
     attaches to the A* inside any shortcut refiner or a warm-start wrapper (astar_milp, …), not just
@@ -316,7 +330,7 @@ def run(
     usses = {uid: USS(uid, dss, cfg, get_planner(pname, planner_params)) for uid in scenario.uss_ids}
     default_uss = next(iter(usses.values()))
 
-    static_terms: list = []                              # (center, term) per walled hub; [] unless always-active
+    static_terms: list = []                              # (center, term) per static wall; [] unless walls/keepouts
     if cfg.terminal_airspace_always_active:
         # Wall EVERY placed hub's terminal off from foreign cruise traffic for the whole horizon. Prefer
         # the demand model's FULL placed-hub set (permanent infrastructure — a vertiport is walled even
@@ -333,13 +347,20 @@ def run(
                     if term is not None:
                         terms.setdefault(term.id, (pt, term))
             static_terms = list(terms.values())
-        # File each hub's terminal airspace as a PERMANENT ledger volume (whole horizon). any_conflict /
-        # verify / the ledger-only refiners now ALL see the walls, and the A* occupancy services derive their
-        # discrete routing walls from the ledger (subscribe_static).
+    # Permanent KEEP-OUT zones (cfg.keepout_zones): no-fly cylinders EVERY flight routes around — e.g. a
+    # major airport in the middle of the metro. Same static-wall rail as the hub walls above but with a
+    # unique non-hub id (opaque to all), and INDEPENDENT of always-active — a scenario can impose a no-fly
+    # zone without walling its own hubs (so this is outside the `if` above and appends unconditionally).
+    static_terms += _keepout_terminals(cfg)
+    if static_terms:
+        # File each wall as a PERMANENT ledger volume (whole horizon). any_conflict / verify / the
+        # ledger-only refiners now ALL see the walls, and the A* occupancy services derive their discrete
+        # routing walls from the ledger (subscribe_static).
         for center, term in static_terms:
             ledger.register_static_terminal(center, term)
-        # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its own hub's
-        # wall only if it too is tagged (conflict.volumes_conflict same-tid+cylinder). Wall-aware planners:
+        # The walls are TAGGED CylinderSpecs; a flight's own-hub column is exempt from its own hub's wall
+        # only if it too is tagged (conflict.volumes_conflict same-tid+cylinder) — a keep-out's unique id is
+        # shared by no flight, so it walls everyone. Wall-aware planners:
         #   • astar and all shortcut variants TAG their terminal columns
         #     (astar._build / shortcut pass the terminal id),
         #     so they refine fully under always-active.
@@ -350,14 +371,14 @@ def run(
         #   • refiners/warm-start wrappers qualify through their chain (they rebuild or fall back to a tagged
         #     intent).
         # A planner that is none of these (bare straight / decoupled) has no wall-respecting geometry, so it
-        # would commit untagged near-hub columns that collide with the wall (or ignore it) and deny / mis-plan
-        # every hub flight — refused LOUDLY below rather than allowed to silently mis-plan.
+        # would commit untagged paths that collide with the wall (or ignore it) and deny / mis-plan every
+        # affected flight — refused LOUDLY here rather than allowed to silently mis-plan.
         for u in usses.values():
             if not _wall_aware(u.planner):
                 raise ValueError(
-                    f"terminal_airspace_always_active=True needs a wall-aware planner (tagged terminal "
-                    f"columns — A*-reaching or terminal-aware MILP), but {pname!r} is neither and would "
-                    f"commit untagged near-hub columns that collide with the wall and deny every hub flight.")
+                    f"terminal_airspace_always_active / keepout_zones needs a wall-aware planner (tagged "
+                    f"terminal columns — A*-reaching or terminal-aware MILP), but {pname!r} is neither and "
+                    f"would commit untagged paths that collide with the wall and deny every affected flight.")
 
     collector: TelemetryCollector | None = None
     if telemetry:

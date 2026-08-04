@@ -113,11 +113,13 @@ if printf '%s\n' "${ARMS[@]}" | grep -qx azlead30m && \
 fi
 
 IFS=',' read -ra SEED_LIST <<< "$SEEDS"
-# Duplicate seeds give two tasks an IDENTICAL SimConfig -> the same _config_hash, and save_run's
-# folder is {stamp}_{tag}_{hash} with mkdir(exist_ok=True): same-second finishers would interleave
-# parquet into ONE folder. Refuse rather than corrupt.
+# Duplicate seeds are duplicate WORK: two tasks compute the same run twice. save_run keeps them apart
+# on disk (the folder is {stamp}_{tag}_s{seed}_{hash}, and a collision is suffixed __2 rather than
+# merged), but the second still lands in the index as a bogus replicate of the first, so any cross-run
+# mean silently double-counts it. Refuse up front.
 if [[ $(printf '%s\n' "${SEED_LIST[@]}" | sort | uniq -d | wc -l) -gt 0 ]]; then
-  echo "FATAL: --seeds has duplicates ($SEEDS) — identical configs collide in one run folder" >&2
+  echo "FATAL: --seeds has duplicates ($SEEDS) — that is the same run twice, and the index cannot" \
+       "tell the copy from a real replicate" >&2
   exit 1
 fi
 

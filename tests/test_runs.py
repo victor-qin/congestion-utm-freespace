@@ -301,3 +301,46 @@ def test_load_run_tolerates_runs_archived_before_the_pairing_column(tmp_path):
     sdf.to_parquet(folder / "scenario.parquet", index=False)
     loaded = runs.load_run(folder)                                # must NOT raise
     assert all(i.request.paired_outbound_id is None for i in loaded.intents)
+
+
+def test_run_folders_of_different_lead_arms_do_not_collide(tmp_path):
+    """Regression: the arms share a byte-identical SimConfig and differ only in DemandSpec, so
+    _config_hash(cfg) alone gave all five the SAME hash (a246cd5e). Under one --tag their folders then
+    differed only by a second-granularity timestamp, and same-second finishers merged into one."""
+    from freespace_sim.scenarios import SCENARIOS
+
+    base = "density_faa_wing_zipline_amazon"
+    arms = ["azlead08m", "azlead15m", "azlead30m", "wzlead15m", "wzlead30m"]
+    hashes = {a: runs._config_hash(SCENARIOS[f"{base}_{a}"].config(),
+                                   SCENARIOS[f"{base}_{a}"].to_json_dict()) for a in arms}
+    assert len(set(hashes.values())) == len(arms), hashes
+
+    # the same recipe under a different registry NAME still separates — two folders, not one merged
+    pivot = [f"{base}_azlead30m", f"{base}_wzlead08m"]
+    assert SCENARIOS[pivot[0]].demand == SCENARIOS[pivot[1]].demand      # genuinely the same world
+    assert (runs._config_hash(SCENARIOS[pivot[0]].config(), SCENARIOS[pivot[0]].to_json_dict())
+            != runs._config_hash(SCENARIOS[pivot[1]].config(), SCENARIOS[pivot[1]].to_json_dict()))
+
+
+def test_run_folder_name_carries_the_seed(tmp_path):
+    for seed in (0, 1, 2):
+        res = run(SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0),
+                            seed=seed),
+                  requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+        folder = runs.save_run(res, root=tmp_path, label="sweep", wall_seconds=0.1)
+        assert f"_s{seed}_" in folder.name, folder.name
+
+
+def test_colliding_run_folders_are_suffixed_not_merged(tmp_path, caplog):
+    # Identical config + label + second ⇒ the same base name. Merging would interleave two runs'
+    # parquet into one directory; losing a finished run to a raise would be worse. Suffix instead.
+    a = runs.save_run(_small(), root=tmp_path, label="dup", wall_seconds=0.1)
+    with caplog.at_level("WARNING"):
+        b = runs.save_run(_small(), root=tmp_path, label="dup", wall_seconds=0.1)
+    if a.name == b.name.rsplit("__", 1)[0]:            # same second ⇒ the collision path ran
+        assert b.name.endswith("__2")
+        assert any("already exists" in r.message for r in caplog.records)
+    assert a != b
+    for f in (a, b):                                   # both runs are complete and independent
+        assert (f / "summary.json").stat().st_size > 0
+        assert len(pd.read_parquet(f / "flights.parquet")) == len(_small().intents)

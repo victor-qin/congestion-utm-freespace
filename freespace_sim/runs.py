@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import platform
 import subprocess
@@ -51,9 +52,24 @@ INDEX_FILENAME = "index.parquet"
 # --- metadata captures -----------------------------------------------------
 
 
-def _config_hash(cfg: SimConfig) -> str:
-    payload = json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=str).encode()
-    return hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:8]
+log = logging.getLogger(__name__)
+
+
+def _config_hash(cfg: SimConfig, scenario_spec: dict | None = None) -> str:
+    """Short digest of everything that makes a run a DIFFERENT run.
+
+    ``SimConfig`` alone is not enough. Two scenarios can share a byte-identical SimConfig and still be
+    different worlds, because the whole demand recipe — operator mix, per-USS rates, service radii, and
+    the scheduling leads the lead arms vary — lives in ``DemandSpec``, which SimConfig never sees. The
+    five FAA lead arms all hashed to a246cd5e, so under one ``--tag`` their run folders differed only by
+    a second-granularity timestamp and same-second finishers merged into one directory. Fold the
+    archived scenario recipe in when there is one.
+    """
+    payload = {"config": dataclasses.asdict(cfg)}
+    if scenario_spec is not None:
+        payload["scenario_spec"] = scenario_spec
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha1(blob, usedforsecurity=False).hexdigest()[:8]
 
 
 def _git_info() -> dict:
@@ -237,8 +253,24 @@ def save_run(
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
-    folder = Path(root) / f"{stamp}_{label}_{_config_hash(cfg)}"
-    folder.mkdir(parents=True, exist_ok=True)
+    # Seed in the name as well as the hash: a sweep's folders are read by eye far more often than they
+    # are parsed, and `_s0/_s1/_s2` is the axis one actually scans for. The hash still carries it.
+    base_name = f"{stamp}_{label}_s{cfg.seed}_{_config_hash(cfg, scenario_spec)}"
+    # exist_ok=False in a claim loop, NOT exist_ok=True. Two runs landing on one name used to merge
+    # their parquet into a single directory — a silent corruption, and the likeliest way to hit it is a
+    # Slurm array whose tasks share a tag and finish inside the same second. Suffixing keeps both runs
+    # (losing a finished multi-hour run to a raise would be worse) and says so.
+    folder = Path(root) / base_name
+    for attempt in range(2, 1000):
+        try:
+            folder.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            folder = Path(root) / f"{base_name}__{attempt}"
+            log.warning("run folder %s already exists — writing to %s instead, so the two runs cannot "
+                        "interleave parquet into one directory", base_name, folder.name)
+    else:
+        raise RuntimeError(f"could not find a free run folder for {base_name} after 998 attempts")
 
     (folder / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2, default=str))
     (folder / "env.json").write_text(json.dumps(_env_info(), indent=2))

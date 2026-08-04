@@ -19,7 +19,14 @@ from freespace_sim.scenarios.demand_dfw import (
     DfwGeoDemand,
 )
 from freespace_sim.scenarios.density import AMAZON_USS, WING_ZIPLINE_USS
-from freespace_sim.scenarios.dfw import DFW_FRAME, DFW_REGION_CENTER_LATLON, DFW_REGION_M
+from freespace_sim.scenarios.dfw import (
+    DFW_AIRPORT_KEEPOUT_RADIUS_M,
+    DFW_AIRPORT_LONLAT,
+    DFW_FRAME,
+    DFW_KEEPOUT_ZONES,
+    DFW_REGION_CENTER_LATLON,
+    DFW_REGION_M,
+)
 
 
 def test_get_scenario_resolves_and_rejects():
@@ -341,8 +348,25 @@ def test_dfw_spec_pins_its_own_hub_siting_rules():
     assert tuple(payload["fixed_hub_types"]) == DEFAULT_FIXED_TYPES
 
 
-def test_dfw_spec_json_round_trips_under_schema_v2():
-    # the new dfw_geo tuple fields must survive to_json_dict/from_json_dict (they default () elsewhere,
-    # so a missed coercion would break EVERY scenario's round-trip — this pins it for a geo spec).
+def test_dfw_twins_impose_airport_keepout_and_density_does_not():
+    """Every dfw_* twin carries a permanent no-fly zone over DFW airport (its single keepout, projected
+    to where the airport lands in the frame at the configured radius); the density_* parents carry NONE.
+    The zone is what forces flights AROUND the field — and its absence from density is part of the guard
+    that a dfw twin differs from its synthetic parent only in geography, not in the airspace rules."""
+    (kx, ky, kr), = DFW_KEEPOUT_ZONES
+    assert kr == DFW_AIRPORT_KEEPOUT_RADIUS_M
+    apt = project_lonlat_to_enu(DFW_AIRPORT_LONLAT[0], DFW_AIRPORT_LONLAT[1],
+                                DFW_REGION_CENTER_LATLON[0], DFW_REGION_CENTER_LATLON[1], *DFW_REGION_M)
+    assert np.allclose([kx, ky], apt)                          # the zone is at the airport, not arbitrary
+    for dfw_name, den_name in _DFW_TWINS:
+        assert SCENARIOS[dfw_name].keepout_zones == DFW_KEEPOUT_ZONES
+        assert SCENARIOS[dfw_name].config().keepout_zones == DFW_KEEPOUT_ZONES   # survives the config build
+        assert SCENARIOS[den_name].keepout_zones == ()        # synthetic parent: open airspace
+
+
+def test_dfw_spec_json_round_trips_under_schema_v3():
+    # the dfw_geo tuple fields AND keepout_zones (float triples) must survive to_json_dict/from_json_dict
+    # (both default () elsewhere, so a missed coercion would break EVERY scenario's round-trip). Assert the
+    # spec actually SETS keepout_zones so this pins the triple coercion, not just the empty-tuple path.
     spec = SCENARIOS["dfw_future_wing_zipline_amazon"]
-    assert ScenarioSpec.from_json_dict(spec.to_json_dict()) == spec
+    assert spec.keepout_zones and ScenarioSpec.from_json_dict(spec.to_json_dict()) == spec

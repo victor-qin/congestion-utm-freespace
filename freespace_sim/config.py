@@ -104,6 +104,15 @@ class SimConfig:
     # inside a foreign column (unreachable).
     terminal_airspace_always_active: bool = False
 
+    # --- permanent keep-out (no-fly) zones; A*/wall-aware planners only ---
+    # Cylinders EVERY flight must route around for the whole horizon — e.g. a major airport sitting in
+    # the middle of the metro. Each entry is ``(cx, cy, radius_m)`` in the local ENU frame; the tube
+    # spans [ground, ceiling] at every flight level. Modelled as static walls with a unique, non-hub id
+    # so no flight is ever exempt (unlike a terminal wall, which is transparent to its own hub). Empty ⇒
+    # no zones and zero overhead. Independent of ``terminal_airspace_always_active`` (a scenario may
+    # impose a no-fly zone without walling its own hubs); both feed the same static-wall rail in ``sim``.
+    keepout_zones: tuple = ()
+
     # ----- DERIVED (kept inside SimConfig) -----
     @property
     def corridor_segment_len_m(self) -> float:

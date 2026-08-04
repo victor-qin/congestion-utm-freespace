@@ -142,8 +142,11 @@ sampled from Overture retail POIs weighted by Census tract population density, A
 facility coordinates, and customers drawn by tract population density. They run on the **full ~192×147 km
 metroplex frame** (lon −97.98→−95.92, lat 32.18→33.50) rather than the compact density 60×30 km window,
 so the real metro-wide geography — including all Amazon last-mile facilities — fits and the Amazon hub
-counts match density (7 / 14). They read small committed artifacts under
-[`freespace_sim/data/dfw/`](freespace_sim/data/dfw); regenerate them from source with:
+counts match density (7 / 14). DFW International Airport, near the centre of the frame, is a permanent
+**no-fly zone** (`SimConfig.keepout_zones`, a 4 km-radius cylinder over the runway complex): every flight
+routes *around* it, hubs are never sited inside it, and destinations never land in it. They read small
+committed artifacts under [`freespace_sim/data/dfw/`](freespace_sim/data/dfw); regenerate them from source
+with:
 
 ```bash
 uv run --extra geo python analysis/prep_dfw.py \

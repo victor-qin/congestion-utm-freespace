@@ -22,7 +22,9 @@ _DEFAULT_HUB_COUNTS = (6, 20)
 # ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
 # reinterpreted under a schema it was not written with. v2 adds the dfw_geo demand fields (geo_dataset,
 # sampled/fixed hub operators, category/type filters) — a pre-v2 reader would silently drop them.
-_SPEC_SCHEMA_VERSION = 2
+# v3 adds ScenarioSpec.keepout_zones (permanent no-fly cylinders) — a pre-v3 reader would silently drop the
+# zones, replaying a run that routed AROUND an airport as if the airspace were open.
+_SPEC_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,9 @@ class ScenarioSpec:
     # MORE than this apart (else the boxes overlap in z). Lower it below the level gap to stack levels
     # closer than 30 m — e.g. 14 m tubes let the (80, 95, 110) ladder sit 15 m apart and stay FCL-disjoint.
     corridor_height_m: "float | None" = None
+    # Permanent no-fly cylinders every flight routes around (SimConfig.keepout_zones): ``(cx, cy, radius_m)``
+    # ENU triples. () → none. The dfw_* twins set a zone over DFW airport; see scenarios/dfw.py.
+    keepout_zones: tuple = ()
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -167,6 +172,7 @@ class ScenarioSpec:
             **({"region_center_latlon": (float(self.region_center_latlon[0]),
                                          float(self.region_center_latlon[1]))}
                if self.region_center_latlon is not None else {}),
+            keepout_zones=self.keepout_zones,
         )
 
     def demand_model(self) -> DemandModel | None:
@@ -221,6 +227,9 @@ class ScenarioSpec:
                 float(kw["region_center_latlon"][0]), float(kw["region_center_latlon"][1]))
         if kw.get("flight_levels_m") is not None:
             kw["flight_levels_m"] = tuple(float(z) for z in kw["flight_levels_m"])
+        if kw.get("keepout_zones") is not None:          # JSON lists → tuple of (cx, cy, radius) float triples;
+            kw["keepout_zones"] = tuple(                  # `is not None` so an empty [] coerces back to () too —
+                (float(cx), float(cy), float(r)) for cx, cy, r in kw["keepout_zones"])  # else [] != () breaks EVERY scenario
         return cls(**kw, demand=DemandSpec(**demand_kw))
 
 

@@ -81,9 +81,15 @@ class DfwGeoDemand(HubRadiusDemand):
 
     def place_hubs(self, cfg, rng):
         """{uss_id: (n, 2)} hub centres in ENU metres — fixed Amazon anchors first, then density-
-        weighted wing/zipline reject-sampled against the shared placed set (stable in ``hub_seed``)."""
+        weighted wing/zipline reject-sampled against the shared placed set (stable in ``hub_seed``).
+
+        No-fly zones (``cfg.keepout_zones``) are seeded as pre-placed obstacles, so the same ``_separated``
+        contract that keeps hubs from overlapping each other also keeps every hub's column outside the
+        zone — you do not build a drone hub on airport property, and a hub inside a no-fly cylinder would
+        have all of its flights denied at commit (they cannot leave the wall)."""
         geo = self._geo(cfg)
-        placed: list = []                                      # (centre, radius) across ALL operators
+        # Each keep-out disk is an obstacle of its own radius; a hub then clears it by r_hub + r_zone + gap.
+        placed: list = [(np.asarray((cx, cy), float), float(r)) for cx, cy, r in cfg.keepout_zones]
         out: dict = {}
 
         for uid in self.fixed_hub_uss:                         # real facilities, densest tract first
@@ -180,6 +186,7 @@ class DfwGeoDemand(HubRadiusDemand):
                 else:
                     continue                                          # sliver tract — draw another
                 d2 = (cx - hx) ** 2 + (cy - hy) ** 2
-                if min_r2 <= d2 <= r2 and 0.0 <= cx <= w and 0.0 <= cy <= h:
+                if (min_r2 <= d2 <= r2 and 0.0 <= cx <= w and 0.0 <= cy <= h
+                        and self._outside_keepouts(cx, cy, cfg)):
                     return np.array([cx, cy], dtype=float)
         return super()._draw_customer(hub, radius, min_r, w, h, cfg, event_rng)

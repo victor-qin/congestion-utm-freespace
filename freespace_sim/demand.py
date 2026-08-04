@@ -367,6 +367,15 @@ class HubRadiusDemand:
         dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
         return dist / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
 
+    @staticmethod
+    def _outside_keepouts(x: float, y: float, cfg) -> bool:
+        """True iff ``(x, y)`` clears every ``cfg.keepout_zones`` no-fly disk — a customer inside one is an
+        undeliverable landing (its flight would hit the permanent static wall and be denied). ``()`` (the
+        default for every non-keepout scenario) makes this an ``all`` over nothing → ``True``, so the draw
+        above keeps its exact RNG sequence and stays byte-identical; only a scenario that sets
+        ``keepout_zones`` (the dfw_* twins) pays the per-accepted-point check. Usually one zone."""
+        return all((x - kx) ** 2 + (y - ky) ** 2 >= kr * kr for kx, ky, kr in cfg.keepout_zones)
+
     def _draw_customer(self, hub, radius, min_r, w, h, cfg, event_rng):
         """Draw one delivery customer near ``hub`` — area-uniform in the service disk of ``radius``,
         redrawn (≤20×) until it is in-region and ≥ ``min_r`` from the hub (clear of its wall footprint),
@@ -374,10 +383,10 @@ class HubRadiusDemand:
         draws the identical RNG sequence; :class:`~freespace_sim.scenarios.demand_dfw.DfwGeoDemand` overrides it to
         land the customer by census-tract population density instead."""
         customer = None
-        for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint
+        for _ in range(20):  # redraw until in-region, clear of the hub's wall footprint, and outside any no-fly zone
             c = _sample_in_disk(hub, radius, event_rng)
             if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
-                    np.linalg.norm(c - hub) >= min_r:
+                    np.linalg.norm(c - hub) >= min_r and self._outside_keepouts(c[0], c[1], cfg):
                 customer = c
                 break
         if customer is None:

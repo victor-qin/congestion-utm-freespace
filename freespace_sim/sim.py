@@ -466,16 +466,26 @@ def run(
         couple = return_anchor == "realized"
         turnaround_s = float(getattr(demand, "turnaround_s", 0.0) or 0.0) if couple else 0.0
         awaited = ({ev.request.paired_outbound_id for ev in scenario.events} - {None}) if couple else set()
+        # Only HubRadiusDemand links its legs, so asking for the realized anchor anywhere else is a
+        # no-op. Say so: silently doing nothing is exactly the failure this option exists to prevent.
+        if couple and not awaited:
+            log.warning("return_anchor='realized' but no request carries paired_outbound_id — nothing "
+                        "to re-anchor. Only the hub_radius demand model emits linked round-trip legs.")
         anchors: dict[int, float] = {}
         for done, ev in enumerate(scenario.events, 1):
             req = ev.request
             if couple and req.paired_outbound_id is not None:
                 landed = anchors.pop(req.paired_outbound_id, None)
                 if landed is not None:                 # None ⇒ outbound denied; keep the nominal anchor
-                    # max() defends t_departure >= t_request; neither shipped return mode can reach it
-                    # (both file no later than the outbound's nominal arrival), but a future model that
-                    # filed later would otherwise violate the invariant silently.
-                    req.t_departure = max(req.t_request, landed + cfg.hover_time_s + turnaround_s)
+                    # `replace`, NOT in-place assignment: `requests` may be caller-owned, and mutating it
+                    # would leak the coupled departures into any later run over the same list — silently
+                    # corrupting exactly the anchor A/B this option invites. It also re-runs
+                    # __post_init__, so the t_departure >= t_request invariant is re-validated rather
+                    # than bypassed. The max() defends it: neither shipped return mode can reach the
+                    # clamp (both file no later than the outbound's nominal arrival), but a future model
+                    # that filed later would otherwise violate it silently.
+                    req = replace(
+                        req, t_departure=max(req.t_request, landed + cfg.hover_time_s + turnaround_s))
             uss = usses.get(req.uss_id, default_uss)
             intent = uss.handle_request(req)
             if req.flight_id in awaited:

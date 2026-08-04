@@ -673,3 +673,40 @@ def test_nominal_anchor_is_byte_identical_to_no_flag():
     b = run(cfg, demand=model, return_anchor="nominal")
     assert ([(i.request.flight_id, i.request.t_departure, i.ground_delay_s) for i in a.intents]
             == [(i.request.flight_id, i.request.t_departure, i.ground_delay_s) for i in b.intents])
+
+
+def test_realized_anchor_does_not_mutate_caller_owned_requests():
+    """run() must not write the coupled departures back into the caller's list.
+
+    Regression: it used to assign req.t_departure in place, so a nominal run over the SAME list after
+    a realized one silently inherited the coupled schedule — 157 of 188 flights differed. That is
+    precisely the anchor A/B this option invites someone to write.
+    """
+    cfg, model = _roundtrip_world()
+    reqs = model.generate(cfg, np.random.default_rng(0))
+    before = [r.t_departure for r in reqs]
+
+    run(cfg, requests=reqs, demand=model, return_anchor="realized")
+    assert [r.t_departure for r in reqs] == before, "run() mutated the caller's requests"
+
+    clean = run(cfg, requests=model.generate(cfg, np.random.default_rng(0)), demand=model)
+    after = run(cfg, requests=reqs, demand=model, return_anchor="nominal")
+    assert ([i.ground_delay_s for i in after.intents]
+            == [i.ground_delay_s for i in clean.intents]), "a prior realized run leaked into nominal"
+
+    # the coupling still reaches the planner — it is the INTENT's request that carries it
+    coupled = run(cfg, requests=reqs, demand=model, return_anchor="realized")
+    moved = [i for i in coupled.intents
+             if i.request.paired_outbound_id is not None and i.request.t_departure != before[i.request.flight_id]]
+    assert moved, "no return was re-anchored at all"
+
+
+def test_realized_anchor_warns_when_nothing_is_linked(caplog):
+    # Only hub_radius links its legs. Asking for the realized anchor elsewhere must not pass silently.
+    from freespace_sim.demand import UniformPoissonDemand
+
+    cfg = SimConfig(region_size_m=(4000.0, 4000.0), lam_per_hour=120.0, horizon_s=600.0,
+                    planner="astar_shortcut")
+    with caplog.at_level("WARNING"):
+        run(cfg, demand=UniformPoissonDemand(), return_anchor="realized")
+    assert any("paired_outbound_id" in r.message for r in caplog.records)

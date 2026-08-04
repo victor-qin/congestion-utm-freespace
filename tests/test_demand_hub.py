@@ -388,6 +388,85 @@ def test_departure_mode_dynamic_preroll_keeps_filings_nonnegative():
     assert all(r.t_departure >= r.t_request for r in reqs)
 
 
+def _preroll_model(**kw):
+    """A departure-mode model whose realized preroll is a 1800 s-mean lead (so it is comfortably > 0)."""
+    return HubRadiusDemand(
+        n_hubs_per_uss={"a": 3},
+        lam_per_uss={"a": 600.0},
+        departure_offset_s={"a": (1800.0, 300.0)},
+        return_flights=False,
+        timing_mode="departure",
+        **kw,
+    )
+
+
+_PREROLL_CFG = SimConfig(
+    region_size_m=(20000.0, 20000.0), horizon_s=7200.0, demand_duration_s=600.0)
+
+
+def test_request_clock_offset_pins_the_shift():
+    # The legacy shift is data-dependent (earliest filing lands exactly at 0); a fixed offset shifts by
+    # that constant instead, so the earliest filing sits at offset - realized_preroll > 0.
+    floating = _preroll_model().generate(_PREROLL_CFG, np.random.default_rng(2))
+    pinned = _preroll_model(request_clock_offset_s=3600.0).generate(
+        _PREROLL_CFG, np.random.default_rng(2))
+
+    assert min(r.t_request for r in floating) == pytest.approx(0.0)
+    realized_preroll = 3600.0 - min(r.t_request for r in pinned)
+    assert 0.0 < realized_preroll < 3600.0
+    assert all(r.t_request >= 0.0 for r in pinned)
+    assert all(r.t_departure >= r.t_request for r in pinned)
+    # same world, rigidly translated: every flight moves by the SAME constant, none is reshuffled
+    pinned_dep = {r.flight_id: r.t_departure for r in pinned}
+    assert pinned_dep.keys() == {r.flight_id for r in floating}
+    offsets = {round(pinned_dep[r.flight_id] - r.t_departure, 6) for r in floating}
+    assert offsets == {round(3600.0 - realized_preroll, 6)}
+
+
+def test_request_clock_offset_makes_departures_lead_invariant():
+    """The property the scheduling-lead arms rest on: pin the clock and two runs differing ONLY in the
+    lead share every flight and every desired departure — solely the filing times (FCFS order) move."""
+    def gen(lead):
+        m = HubRadiusDemand(
+            n_hubs_per_uss={"a": 3},
+            lam_per_uss={"a": 600.0},
+            departure_offset_s={"a": lead},
+            return_flights=False,
+            timing_mode="departure",
+            request_clock_offset_s=3600.0,
+        )
+        return m.generate(_PREROLL_CFG, np.random.default_rng(2))
+
+    def world(reqs):
+        return {r.flight_id: (tuple(r.origin), tuple(r.dest), r.t_departure) for r in reqs}
+
+    short, long_ = gen((480.0, 90.0)), gen((1800.0, 300.0))
+    assert world(short) == world(long_)
+    short_lead = np.mean([r.t_departure - r.t_request for r in short])
+    long_lead = np.mean([r.t_departure - r.t_request for r in long_])
+    assert long_lead - short_lead == pytest.approx(1320.0, abs=60.0)
+
+
+def test_request_clock_offset_too_small_raises():
+    # Clipping to keep filings nonnegative would silently break the pinned-clock guarantee (and a
+    # negative t_request breaks the planner's monotonic-t_request eviction), so this is a hard error.
+    m = _preroll_model(request_clock_offset_s=10.0)
+    with pytest.raises(ValueError, match="realized preroll"):
+        m.generate(_PREROLL_CFG, np.random.default_rng(2))
+
+
+def test_request_clock_offset_rejected_outside_departure_mode():
+    with pytest.raises(ValueError, match="timing_mode='departure'"):
+        HubRadiusDemand(n_hubs_per_uss={"a": 3}, timing_mode="request",
+                        request_clock_offset_s=3600.0)
+
+
+def test_request_clock_offset_rejects_negative():
+    with pytest.raises(ValueError, match="must be >= 0"):
+        HubRadiusDemand(n_hubs_per_uss={"a": 3}, timing_mode="departure",
+                        request_clock_offset_s=-1.0)
+
+
 def test_departure_mode_preserves_gaussian_outbound_leads():
     cfg = SimConfig(
         region_size_m=(20000.0, 20000.0),
@@ -479,3 +558,118 @@ def test_departure_stream_is_stable_when_second_uss_is_added():
 def test_invalid_timing_mode_raises():
     with pytest.raises(ValueError, match="timing_mode"):
         HubRadiusDemand(timing_mode="filing-ish")
+
+
+# --- round-trip returns anchored to the REALIZED outbound arrival (two-pass) ----------------------
+
+def _roundtrip_world(**kw):
+    """A small congested round-trip world in the density scenarios' own timing mode: both legs filed
+    together, the return's departure anchored to the outbound's NOMINAL arrival."""
+    cfg = SimConfig(region_size_m=(12000.0, 12000.0), horizon_s=3600.0, demand_duration_s=300.0,
+                    planner="astar_shortcut")
+    kw = {"timing_mode": "departure", "paired_return_request": True,
+          "departure_offset_s": {"a": (480.0, 90.0)}, **kw}
+    model = HubRadiusDemand(
+        n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 900.0}, radius_m=2500.0,
+        pads_per_hub=2, terminal_radius_m=120.0, return_flights=True, **kw)
+    return cfg, model
+
+
+def test_return_leg_names_its_outbound():
+    # The link must be explicit: the old flight_id + 1 parity convention is invisible to any consumer
+    # and silently wrong for a model that emits legs in another order.
+    cfg, model = _roundtrip_world()
+    reqs = model.generate(cfg, np.random.default_rng(0))
+    by_id = {r.flight_id: r for r in reqs}
+    returns = [r for r in reqs if r.paired_outbound_id is not None]
+    assert returns
+    assert all(r.dest_terminal is not None for r in returns)      # a return lands at its hub
+    for r in returns:
+        out = by_id[r.paired_outbound_id]
+        assert out.origin_terminal is not None                    # ...and its outbound left from one
+        assert np.allclose(out.origin, r.dest)                    # same hub, reversed
+        assert np.allclose(out.dest, r.origin)
+    assert all(r.paired_outbound_id is None for r in reqs if r.origin_terminal is not None)
+
+
+
+
+def test_realized_anchor_departs_on_the_arrival_that_actually_happened():
+    """The property the coupling exists for: every return departs after its aircraft is down."""
+    from freespace_sim.sim import realized_arrival_s
+
+    cfg, model = _roundtrip_world()
+
+    def slips(res):
+        by = {i.request.flight_id: i for i in res.intents}
+        out = []
+        for i in res.intents:
+            o = by.get(i.request.paired_outbound_id) if i.request.paired_outbound_id else None
+            if o is None or not (i.accepted and o.accepted):
+                continue
+            out.append(realized_arrival_s(o) - i.request.t_departure)   # >0 ⇒ departs before landing
+        return np.array(out)
+
+    nominal = run(cfg, demand=model, return_anchor="nominal")
+    realized = run(cfg, demand=model, return_anchor="realized")
+    s_nom, s_real = slips(nominal), slips(realized)
+
+    assert len(s_nom) and len(s_nom) == len(s_real)
+    assert (s_nom > 0).mean() > 0.5                 # the artifact is severe under the nominal anchor
+    # ...and the coupling removes it OUTRIGHT — this is exact, not a fixed-point approximation
+    assert (s_real > 0).sum() == 0
+    # each return leaves exactly one pad dwell after its own outbound touched down
+    assert s_real.max() == pytest.approx(-cfg.hover_time_s, abs=cfg.dt_s)
+    assert len(realized.intents) == len(nominal.intents)   # same flight set; only departures moved
+
+
+def test_realized_anchor_keeps_filing_times_and_flight_set_intact():
+    # FCFS order (and the monotonic-t_request occupancy eviction that rides on it) must not move.
+    cfg, model = _roundtrip_world()
+    nominal = run(cfg, demand=model, return_anchor="nominal")
+    realized = run(cfg, demand=model, return_anchor="realized")
+    key = lambda res: [(i.request.flight_id, i.request.t_request) for i in res.intents]  # noqa: E731
+    assert key(nominal) == key(realized)
+    # outbound legs are upstream of the coupling, so their departures are untouched
+    assert ([i.request.t_departure for i in nominal.intents if i.request.paired_outbound_id is None]
+            == [i.request.t_departure for i in realized.intents if i.request.paired_outbound_id is None])
+
+
+def test_realized_anchor_keeps_nominal_when_the_outbound_is_denied():
+    # Dropping or denying the return instead would make the flight SET depend on congestion, which
+    # breaks any paired comparison across runs (e.g. the scheduling-lead arms).
+    from freespace_sim.sim import realized_arrival_s
+    from freespace_sim.types import DenialReason, IntentStatus, OperationalIntent
+
+    cfg, model = _roundtrip_world()
+    reqs = model.generate(cfg, np.random.default_rng(0))
+    outbound = next(r for r in reqs if r.paired_outbound_id is None)
+
+    # a denied outbound yields no arrival, so the loop leaves its return on the nominal anchor
+    denied = OperationalIntent(request=outbound, status=IntentStatus.REJECTED,
+                               denial_reason=DenialReason.BUDGET_EXCEEDED)
+    assert realized_arrival_s(denied) is None
+
+    # end-to-end the flight set is identical either way — congestion never removes a leg
+    realized = run(cfg, demand=model, return_anchor="realized")
+    assert len(realized.intents) == len(reqs)
+    assert any(r.paired_outbound_id is not None for r in reqs)   # the fixture really pairs legs
+    assert all(i.request.t_departure >= i.request.t_request for i in realized.intents)
+
+
+def test_realized_anchor_rejects_parallel_and_unknown_values():
+    from freespace_sim.parallel import ParallelConfig
+
+    cfg, model = _roundtrip_world()
+    with pytest.raises(ValueError, match="sequential loop"):
+        run(cfg, demand=model, return_anchor="realized", parallel=ParallelConfig(n_workers=2))
+    with pytest.raises(ValueError, match="unknown return_anchor"):
+        run(cfg, demand=model, return_anchor="whenever")
+
+
+def test_nominal_anchor_is_byte_identical_to_no_flag():
+    cfg, model = _roundtrip_world()
+    a = run(cfg, demand=model)
+    b = run(cfg, demand=model, return_anchor="nominal")
+    assert ([(i.request.flight_id, i.request.t_departure, i.ground_delay_s) for i in a.intents]
+            == [(i.request.flight_id, i.request.t_departure, i.ground_delay_s) for i in b.intents])

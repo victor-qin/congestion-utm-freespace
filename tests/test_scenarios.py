@@ -12,7 +12,14 @@ from freespace_sim.scenarios import (
     get_scenario,
     with_overrides,
 )
-from freespace_sim.scenarios.density import AMAZON_USS, WING_ZIPLINE_USS
+from freespace_sim.scenarios.density import (
+    AMAZON_USS,
+    LEAD_ARM_CLOCK_OFFSET_S,
+    LEAD_ARM_OPERATORS,
+    LEAD_ARMS,
+    WING_ZIPLINE_LEAD_S,
+    WING_ZIPLINE_USS,
+)
 
 
 def test_get_scenario_resolves_and_rejects():
@@ -210,6 +217,129 @@ def test_density_stacked_scenarios_are_three_levels(stacked_name, twin_name):
     assert twin_cfg.corridor_height_m == 30.0
 
 
+_MIXED_WORLDS = ["density_faa_wing_zipline_amazon", "density_future_wing_zipline_amazon"]
+
+
+def _world(reqs):
+    """The identity every arm of a world must agree on — flights and DESIRED departures."""
+    return {r.flight_id: (r.uss_id, tuple(r.origin), tuple(r.dest), r.t_departure) for r in reqs}
+
+
+def _filings(reqs, uss):
+    return {r.flight_id: r.t_request for r in reqs if r.uss_id == uss}
+
+
+def _generate(name):
+    spec = SCENARIOS[name]
+    cfg = spec.config()
+    return spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))
+
+
+@pytest.mark.parametrize("base", _MIXED_WORLDS)
+@pytest.mark.parametrize("token", sorted(LEAD_ARM_OPERATORS))
+@pytest.mark.parametrize("arm", sorted(LEAD_ARMS))
+def test_lead_arm_changes_one_operators_lead_and_pins_the_clock(base, token, arm):
+    """An arm is its base world with two edits: ONE operator's lead, and a pinned request clock.
+
+    Parametrized over both operators — the arm machinery is operator-agnostic, so Wing/Zipline gets the
+    same treatment Amazon does and the sweep can be run from either side.
+    """
+    _, varied_uss = LEAD_ARM_OPERATORS[token]
+    held_uss = AMAZON_USS if varied_uss == WING_ZIPLINE_USS else WING_ZIPLINE_USS
+    spec, base_spec = SCENARIOS[f"{base}_{token}lead{arm}"], SCENARIOS[base]
+    demand, base_demand = spec.demand_model(), base_spec.demand_model()
+
+    assert demand.departure_offset_s[varied_uss] == LEAD_ARMS[arm]
+    # the OTHER operator holds still — that is what makes the arm a contrast rather than a translation
+    assert demand.departure_offset_s[held_uss] == base_demand.departure_offset_s[held_uss]
+    assert demand.request_clock_offset_s == LEAD_ARM_CLOCK_OFFSET_S
+    assert base_demand.request_clock_offset_s is None   # base worlds keep the floating preroll
+    assert demand.timing_mode == "departure"            # the pinned clock only applies here
+
+    # everything else — geometry, capacity, rates, horizon — is the base world untouched
+    assert demand.n_hubs_per_uss == base_demand.n_hubs_per_uss
+    assert demand.lam_per_uss == base_demand.lam_per_uss
+    assert demand.radius_m == base_demand.radius_m
+    assert demand.pads_per_hub == base_demand.pads_per_hub
+    assert demand.terminal_radius_m == base_demand.terminal_radius_m
+    assert demand.paired_return_request == base_demand.paired_return_request
+    assert (spec.region_m, spec.horizon_s, spec.demand_duration_s, spec.lam_per_hour) == (
+        base_spec.region_m, base_spec.horizon_s, base_spec.demand_duration_s, base_spec.lam_per_hour)
+    assert spec.flight_levels_m == base_spec.flight_levels_m
+
+
+def test_lead_ladder_spans_both_operators_defaults():
+    # The ladder is operator-agnostic precisely because its ends ARE the two defaults: 8 minutes is
+    # Wing/Zipline's own lead, 30 minutes is Amazon's. So "08m" reads as "file like Wing/Zipline" and
+    # "30m" as "file like Amazon" whichever operator an arm varies.
+    assert LEAD_ARMS["08m"] == WING_ZIPLINE_LEAD_S
+    assert LEAD_ARMS["15m"] == (900.0, 150.0)
+    assert LEAD_ARMS["30m"] == (1800.0, 300.0)
+
+
+@pytest.mark.parametrize("base", _MIXED_WORLDS)
+def test_az_and_wz_sweeps_share_the_status_quo_pivot(base):
+    """``azlead30m`` and ``wzlead08m`` are both operators at their defaults — the SAME recipe under two
+    names, and the point both sweeps rotate about. Running both would just pay twice for one world."""
+    assert SCENARIOS[f"{base}_azlead30m"].demand == SCENARIOS[f"{base}_wzlead08m"].demand
+    # ...and it is the status quo: identical leads to the un-pinned base world
+    assert (SCENARIOS[f"{base}_azlead30m"].demand.departure_offset_s
+            == SCENARIOS[base].demand.departure_offset_s)
+
+
+def test_lead_arms_share_one_world_and_move_only_the_varied_operator():
+    """THE load-bearing invariant: within a seed, arms differ ONLY in one operator's FCFS position.
+
+    Every arm of a world — across BOTH operator sweeps — must yield the identical flight set: same ids,
+    operators, endpoints, and *desired departures*. That is what lets delays be differenced
+    flight-by-flight rather than only in aggregate. Two things could silently break it and void every
+    comparison built on it: a change to how ``rng.normal`` consumes entropy (which would desync the
+    varied operator's stream from arm to arm), and dropping the pinned clock offset (whose
+    data-dependent twin translates the whole world per arm). Only the FAA world is generated here — the
+    far-future one is ~27k flights and shares the same code path.
+    """
+    base = "density_faa_wing_zipline_amazon"
+    generated = {
+        f"{token}lead{arm}": _generate(f"{base}_{token}lead{arm}")
+        for token in LEAD_ARM_OPERATORS
+        for arm in LEAD_ARMS
+    }
+
+    reference = _world(generated["azlead30m"])
+    assert reference
+    for name, reqs in generated.items():
+        assert _world(reqs) == reference, f"{name} perturbed the flight set or desired departures"
+
+    for token, (_, varied_uss) in LEAD_ARM_OPERATORS.items():
+        held_uss = AMAZON_USS if varied_uss == WING_ZIPLINE_USS else WING_ZIPLINE_USS
+        arms = [generated[f"{token}lead{arm}"] for arm in LEAD_ARMS]
+
+        held = [_filings(reqs, held_uss) for reqs in arms]
+        assert all(h == held[0] for h in held), f"{token} sweep moved {held_uss}'s filings"
+
+        # the varied operator's filings DO move, by the difference in lead — that shift IS the treatment
+        mean_filing = [float(np.mean(list(_filings(reqs, varied_uss).values()))) for reqs in arms]
+        assert mean_filing[0] > mean_filing[1] > mean_filing[2]
+        assert mean_filing[0] - mean_filing[2] == pytest.approx(
+            LEAD_ARMS["30m"][0] - LEAD_ARMS["08m"][0], abs=60.0)
+
+
+@pytest.mark.parametrize("base", _MIXED_WORLDS)
+@pytest.mark.parametrize("arm", ["azlead30m", "wzlead30m"])
+def test_lead_arm_departures_stay_inside_the_horizon(base, arm):
+    """The pinned preroll must not push flights past ``horizon_s``, where the compiled A* box guard
+    dispatches to the ~5-7x slower reference. Checks the real margin rather than trusting the sizing
+    arithmetic in density.py. Both 30-minute arms are exercised because the preroll is a max-order
+    statistic over the varied operator's lead draws — ``wzlead30m`` is the binding case, drawing that
+    maximum from Wing/Zipline's far larger flight count.
+    """
+    spec = SCENARIOS[f"{base}_{arm}"]
+    cfg = spec.config()
+    reqs = spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))
+    assert min(r.t_request for r in reqs) > 0.0        # offset genuinely exceeded the realized preroll
+    assert max(r.t_departure for r in reqs) < cfg.horizon_s
+
+
 def test_density_mixed_scenarios_use_two_distinct_uss():
     for name in (
         "density_faa_wing_zipline_amazon",
@@ -261,6 +391,11 @@ def test_density_scenarios_have_descriptions_and_remove_density_test():
         "density_future_wing_zipline_3lvl",
         "density_faa_wing_zipline_amazon_3lvl",
         "density_future_wing_zipline_amazon_3lvl",
+    } | {
+        f"{base}_{token}lead{arm}"
+        for base in ("density_faa_wing_zipline_amazon", "density_future_wing_zipline_amazon")
+        for token in LEAD_ARM_OPERATORS
+        for arm in LEAD_ARMS
     }
     assert all(SCENARIOS[name].description for name in density_names)
     assert "density_test" not in SCENARIOS

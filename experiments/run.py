@@ -25,7 +25,7 @@ import time
 
 from freespace_sim import metrics, runs
 from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
-from freespace_sim.sim import run
+from freespace_sim.sim import RETURN_ANCHORS, run
 
 log = logging.getLogger("experiments.run")
 
@@ -142,6 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--return-flights", action=argparse.BooleanOptionalAction, default=None,
                    help="emit a return flight to the origin pad for each delivery")
     p.add_argument("--turnaround", type=float, default=None, help="return-flight turnaround (s)")
+    p.add_argument("--return-anchor", choices=RETURN_ANCHORS, default="nominal",
+                   dest="return_anchor",
+                   help="what a round-trip return's desired departure waits on. nominal (default): a "
+                        "straight-line undelayed estimate of the outbound's arrival, fixed when demand "
+                        "is generated — under congestion the return is scheduled before its aircraft "
+                        "lands. realized: plan the outbound, then anchor its return to the arrival that "
+                        "actually happened (+ turnaround). Same cost; sequential mode only")
     p.add_argument("--tag", default=None, help="run-folder label + index join key (default: scenario name)")
     p.add_argument("--window-frac", type=float, default=0.9,
                    help="steady-state plateau threshold: measure where airborne density ≥ frac×peak "
@@ -214,9 +221,26 @@ def main() -> None:
     else:
         log.info("mode=sequential: serial FCFS planning")
 
+    if args.return_anchor == "realized":
+        # The coupling keys off FlightRequest.paired_outbound_id, which only the return-emitting hub
+        # models set. Without one there is nothing to re-anchor, so the flag would be a silent no-op.
+        if demand is None or not getattr(spec.demand, "return_flights", False):
+            raise SystemExit(
+                "--return-anchor realized needs a demand model that emits round-trip returns "
+                f"(scenario {spec.name!r} has none); drop the flag or pick a hub_radius scenario")
+        if pcfg is not None:
+            # run() raises on this too; catching it here keeps the CLI failure a one-line message
+            # rather than a traceback, and does it before the world is built.
+            raise SystemExit(
+                f"--return-anchor realized is sequential-only (got --mode {args.mode}): a speculative "
+                "worker may plan a return before its outbound has committed, and the exact-mode "
+                "envelope check cannot detect that. Use --mode sequential or --return-anchor nominal.")
+        log.info("return anchor: realized — each return departs on its outbound's actual arrival "
+                 "+ %.0fs turnaround, not a nominal estimate", spec.demand.turnaround_s)
+
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
-              parallel=pcfg)
+              parallel=pcfg, return_anchor=args.return_anchor)
     wall = time.time() - t0
     sim_lo, sim_hi = metrics.simulation_window(res)
     log.info(

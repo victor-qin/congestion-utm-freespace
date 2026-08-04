@@ -49,7 +49,9 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     from freespace_sim.scenarios import SCENARIOS
     from freespace_sim.scenarios.spec import ScenarioSpec
 
-    spec = SCENARIOS["density_faa_wing_zipline_amazon"]        # tuples + a nested per-USS pair dict
+    # a lead arm: tuples + a nested per-USS pair dict + the pinned request clock, which an arm
+    # comparison silently loses its per-flight pairing without
+    spec = SCENARIOS["density_faa_wing_zipline_amazon_azlead08m"]
     folder = runs.save_run(_small(), root=tmp_path, label="t", experiment="unit",
                            scenario_spec=spec.to_json_dict(), wall_seconds=0.5)
 
@@ -58,8 +60,15 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     assert isinstance(back.region_m, tuple) and isinstance(back.flight_levels_m, tuple)
     assert isinstance(back.demand.uss, tuple) and isinstance(back.demand.hubs, tuple)
     assert all(isinstance(v, tuple) for v in back.demand.departure_offset_s.values())
+    assert back.demand.request_clock_offset_s == spec.demand.request_clock_offset_s
     back.demand_model()          # used to raise AttributeError
     back.config()
+
+    # and the floating-preroll base world still round-trips its absent offset as None
+    base = SCENARIOS["density_faa_wing_zipline_amazon"]
+    base_folder = runs.save_run(_small(), root=tmp_path, label="t2", experiment="unit",
+                                scenario_spec=base.to_json_dict(), wall_seconds=0.5)
+    assert runs.load_scenario_spec(base_folder).demand.request_clock_offset_s is None
 
     # every registry scenario must survive the trip, not just the richest one — a scenario-specific
     # tuple field the reconstructor forgets would come back a list and fail equality here.

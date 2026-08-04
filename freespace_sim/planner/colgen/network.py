@@ -764,6 +764,7 @@ class _FlightSearchCache:
         "seed_columns",
         "seed_delay_certified",
         "seed_search_complete",
+        "topology",
     )
 
     def __init__(self) -> None:
@@ -774,6 +775,10 @@ class _FlightSearchCache:
         self.seed_columns: tuple[Any, ...] | None = None
         self.seed_delay_certified = False
         self.seed_search_complete = False
+        # Flat-array mirror of the expanded arc topology, built on first compiled
+        # pricing use.  Answer-neutral like the rest of this cache: it only ever
+        # restates what ``outgoing``/``role_mask`` already computed.
+        self.topology: Any | None = None
 
     def __reduce__(self):
         # Search workers start with a cold cache; no lock or path payload is shipped.
@@ -875,6 +880,28 @@ class FlightGraph:
             and target in self.corridor_cells
             and (source, target) not in lazy
         )
+
+    def hop_role_mask(self, source: Cell, target: Cell) -> int:
+        """Return every path-position role in which one directed arc is admissible.
+
+        This is the bulk form of :meth:`hop_allowed_for_role`: the flat-array
+        packer needs all four verdicts for an arc at once, and asking four times
+        would repeat the same cached lookup.  ``0`` means the arc is unusable in
+        every role.
+        """
+
+        lazy = self.forbidden_hops
+        if isinstance(lazy, _LazyForbiddenHops):
+            return lazy.role_mask(source, target)
+        # The eager frozenset form predates role tagging: an arc it admits is
+        # admissible in every role, matching ``hop_allowed_for_role`` above.
+        if (
+            source in self.corridor_cells
+            and target in self.corridor_cells
+            and (source, target) not in lazy
+        ):
+            return _ALL_ARC_ROLES
+        return 0
 
     def __hash__(self) -> int:
         """Hash stable graph identity without materializing lazy set fields."""
@@ -1336,8 +1363,13 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
     def outgoing(self, source: Cell) -> tuple[Cell, ...]:
         cached = self._allowed.get(source)
         if cached is not None:
-            with self._lock:
-                self._cache_hits += 1
+            # Deliberately unlocked.  A pricing run logged ~16M hits against 40k
+            # misses, so taking the RLock here spent real wall time purely to make
+            # a diagnostic counter exact.  ``_cache_hits`` is reported by
+            # ``arc_cache_stats`` and asserted only for growth, never for an exact
+            # value, so a lost increment under concurrent search is acceptable;
+            # every counter that feeds a decision stays inside the lock below.
+            self._cache_hits += 1
             return cached
         with self._lock:
             cached = self._allowed.get(source)
@@ -1374,6 +1406,18 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
             self._allowed[source] = cached
             return cached
 
+    def role_mask(self, source: Cell, target: Cell) -> int:
+        """Return the cached role bitmask for one directed arc, expanding on demand.
+
+        A missing entry means the arc was never admissible in any role: the source
+        or target sits outside the corridor, the pair is not adjacent, or expansion
+        already found every role blocked.  All four cases share the ``0`` answer, so
+        callers need no separate adjacency test.
+        """
+
+        self.outgoing(source)
+        return self._roles.get((source, target), 0)
+
     def allows(
         self,
         source: Cell,
@@ -1382,8 +1426,6 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         first: bool,
         last: bool,
     ) -> bool:
-        if target not in self.outgoing(source):
-            return False
         role = (
             _ARC_FIRST_LAST
             if first and last
@@ -1393,7 +1435,10 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
             if last
             else _ARC_INTERNAL
         )
-        return bool(self._roles[(source, target)] & role)
+        # ``role_mask`` subsumes the old ``target not in self.outgoing(source)``
+        # membership test, which rescanned a <=6-tuple on every one of the two
+        # calls the pricing DP makes per arc.
+        return bool(self.role_mask(source, target) & role)
 
     def __contains__(self, raw_hop: object) -> bool:
         if not isinstance(raw_hop, tuple) or len(raw_hop) != 2:

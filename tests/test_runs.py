@@ -210,3 +210,36 @@ def test_denied_flight_captured_without_volumes(tmp_path):
     folder = runs.save_run(res, root=tmp_path, label="den")
     loaded = runs.load_run(folder)
     assert len(loaded.denied) == 1 and loaded.denied[0].volumes is None
+
+
+def test_scenario_parquet_round_trips_the_round_trip_link(tmp_path):
+    """The pairing is a RELATIONSHIP; the coupled t_departure is only its outcome. Without the link
+    persisted, a reloaded run cannot tell which legs were paired, so nothing downstream can re-derive
+    the schedule slip or re-anchor a return post-hoc."""
+    from freespace_sim.demand import HubRadiusDemand
+    from freespace_sim.sim import run as sim_run
+
+    cfg = SimConfig(region_size_m=(9000.0, 9000.0), horizon_s=1800.0, demand_duration_s=120.0,
+                    planner="astar_shortcut")
+    model = HubRadiusDemand(n_hubs_per_uss={"a": 3}, lam_per_uss={"a": 600.0}, radius_m=2000.0,
+                            pads_per_hub=2, terminal_radius_m=120.0, return_flights=True)
+    res = sim_run(cfg, demand=model)
+    folder = runs.save_run(res, root=tmp_path, label="pairing", experiment="unit", wall_seconds=0.1)
+
+    sdf = pd.read_parquet(folder / "scenario.parquet")
+    assert "paired_outbound_id" in sdf.columns
+    original = {i.request.flight_id: i.request.paired_outbound_id for i in res.intents}
+    assert any(v is not None for v in original.values())          # the fixture really pairs legs
+
+    back = {i.request.flight_id: i.request.paired_outbound_id for i in runs.load_run(folder).intents}
+    assert back == original
+    # unlinked legs come back as None, not NaN or 0 — a 0 would alias flight_id 0's outbound
+    assert all(v is None or isinstance(v, int) for v in back.values())
+
+
+def test_load_run_tolerates_runs_archived_before_the_pairing_column(tmp_path):
+    folder = runs.save_run(_small(), root=tmp_path, label="legacy_pairing", wall_seconds=0.1)
+    sdf = pd.read_parquet(folder / "scenario.parquet").drop(columns=["paired_outbound_id"])
+    sdf.to_parquet(folder / "scenario.parquet", index=False)
+    loaded = runs.load_run(folder)                                # must NOT raise
+    assert all(i.request.paired_outbound_id is None for i in loaded.intents)

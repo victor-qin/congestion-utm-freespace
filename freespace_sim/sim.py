@@ -427,7 +427,17 @@ def run(
         # outbound is planned first (see the return_anchor docs), so the entry is always in hand — and
         # popping keeps the dict at roughly one live entry, since a paired return is the very next event.
         couple = return_anchor == "realized"
-        turnaround_s = float(getattr(demand, "turnaround_s", 0.0) or 0.0) if couple else 0.0
+        turnaround_s = 0.0
+        if couple:
+            # The turnaround has to match the one the NOMINAL anchor budgeted for, and only the demand
+            # model knows it. Without a model there is no way to recover it, and defaulting to 0 would
+            # quietly shorten every turnaround — so name the assumption instead of absorbing it.
+            if demand is None:
+                log.warning("return_anchor='realized' without a demand model: assuming turnaround_s=0. "
+                            "Pass demand= (alongside requests=) so the realized anchor uses the same "
+                            "turnaround the requests were generated with.")
+            else:
+                turnaround_s = float(getattr(demand, "turnaround_s", 0.0) or 0.0)
         awaited = ({ev.request.paired_outbound_id for ev in scenario.events} - {None}) if couple else set()
         # Only HubRadiusDemand links its legs, so asking for the realized anchor anywhere else is a
         # no-op. Say so: silently doing nothing is exactly the failure this option exists to prevent.

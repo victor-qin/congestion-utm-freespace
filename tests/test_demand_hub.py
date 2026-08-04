@@ -710,3 +710,18 @@ def test_realized_anchor_warns_when_nothing_is_linked(caplog):
     with caplog.at_level("WARNING"):
         run(cfg, demand=UniformPoissonDemand(), return_anchor="realized")
     assert any("paired_outbound_id" in r.message for r in caplog.records)
+
+
+def test_realized_anchor_warns_when_turnaround_cannot_be_recovered(caplog):
+    # requests= without demand= leaves no way to know the turnaround the nominal anchor budgeted for.
+    # Defaulting to 0 quietly shortens every turnaround, so the assumption must be stated.
+    cfg, model = _roundtrip_world(turnaround_s=90.0)
+    reqs = model.generate(cfg, np.random.default_rng(0))
+    with caplog.at_level("WARNING"):
+        run(cfg, requests=reqs, return_anchor="realized")          # no demand=
+    assert any("turnaround_s=0" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        run(cfg, requests=reqs, demand=model, return_anchor="realized")
+    assert not any("turnaround_s=0" in r.message for r in caplog.records)

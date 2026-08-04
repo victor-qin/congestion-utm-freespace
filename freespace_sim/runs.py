@@ -100,6 +100,13 @@ def _term_from_json(s):
     return tuple(json.loads(s))
 
 
+def _opt_int(v) -> int | None:
+    """A parquet cell back to ``int | None`` — None for a missing column or a NaN (unlinked) row."""
+    if v is None or (isinstance(v, float) and v != v):
+        return None
+    return int(v)
+
+
 def scenario_frame(result: SimResult) -> pd.DataFrame:
     """Every generated flight request — the scenario, independent of what got accepted. Carries each
     endpoint's terminal (hub) membership so a saved run — including its denied flights — records which hub
@@ -116,6 +123,12 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
             "origin_terminal": _term_to_json(r.origin_terminal),
             "dest_terminal": _term_to_json(r.dest_terminal),
+            # Round-trip link (return leg → its outbound). Without it a reloaded run cannot tell which
+            # legs were paired, so nothing downstream could re-derive the schedule slip or re-anchor a
+            # return post-hoc — the coupled t_departure above is the OUTCOME, not the relationship.
+            # pandas has no nullable-int dtype by default, so an unlinked leg stores NaN and
+            # load_run reads it back as None.
+            "paired_outbound_id": r.paired_outbound_id,
         })
     return pd.DataFrame(rows)
 
@@ -434,7 +447,10 @@ def load_run(folder: Path | str) -> LoadedRun:
                             vec(s.dest_x, s.dest_y, s.dest_z), float(s.t_request),
                             t_departure=t_dep, uss_id=str(s.uss_id),
                             origin_terminal=_term_from_json(getattr(s, "origin_terminal", None)),
-                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)))
+                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)),
+                            # getattr + NaN check: runs archived before the column existed have neither
+                            # the attribute nor a value, and an unlinked leg stores NaN either way.
+                            paired_outbound_id=_opt_int(getattr(s, "paired_outbound_id", None)))
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(
             request=req,

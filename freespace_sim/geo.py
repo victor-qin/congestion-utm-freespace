@@ -89,12 +89,12 @@ class DfwGeo:
 
     def pois_of_categories(self, categories) -> tuple[np.ndarray, np.ndarray]:
         """``(xy, weight)`` for POIs whose category is in ``categories`` (the wing/zipline hub pool)."""
-        keep = np.isin(self.pois_cat, np.asarray(list(categories)))
+        keep = np.isin(self.pois_cat, list(categories))
         return self.pois_xy[keep], self.pois_w[keep]
 
     def amazon_of_types(self, types) -> tuple[np.ndarray, np.ndarray]:
         """``(xy, weight)`` for Amazon facilities whose type is in ``types`` (fixed hubs)."""
-        keep = np.isin(self.amazon_type, np.asarray(list(types)))
+        keep = np.isin(self.amazon_type, list(types))
         return self.amazon_xy[keep], self.amazon_w[keep]
 
 

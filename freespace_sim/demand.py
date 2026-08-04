@@ -304,23 +304,24 @@ class HubRadiusDemand:
                     f"{name} references USS(es) {sorted(unknown)} absent from "
                     f"n_hubs_per_uss {sorted(hubs)}")
 
+    def _wall_radius(self, uid: str, cfg: SimConfig) -> float:
+        """Reject-sampling radius for ``uid``'s hubs: the bare terminal column, or — under always-active
+        airspace — the WIDER walled extent (column + one boundary-hex ring), so neighbouring hubs' permanent
+        walls never overlap or foreign-block each other's exit lanes. A boundary-hex centre sits within one
+        hex pitch (SQRT3·circumradius) of the ``exit_radius`` edge, which rigorously upper-bounds the ring
+        for any gap ≥ 0. (Flag off ⇒ the bare column radius; transient dwell walls don't engulf.)"""
+        tr = self._terminal_radius_for(uid)
+        if cfg.terminal_airspace_always_active:
+            term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
+            return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
+        return cfg.terminal_radius_m if tr is None else float(tr)
+
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Return ``{uss_id: (n_hubs, 2)}`` single-point hub centres, reject-sampled so no two hubs'
-        terminal airspaces overlap (:func:`_scatter_hubs`; each USS's column radius is
-        ``terminal_radius_m`` or the ``cfg`` hover footprint). DESIGN KNOB for spatial structure (swap
-        the uniform scatter for a clustered process to mimic real retail geography)."""
-        def radius_of(uid: str) -> float:
-            tr = self._terminal_radius_for(uid)
-            # always-active terminals wall the WIDER terminal_cells (column + one boundary-hex ring), not
-            # just the column — reject-sample on that extent so neighbouring hubs' permanent walls never
-            # overlap and foreign-block each other's exit lanes. A boundary-hex centre sits within one hex
-            # pitch (SQRT3·circumradius) of the exit_radius edge, so that rigorously upper-bounds the ring
-            # for any gap ≥ 0. Flag off ⇒ the bare column radius (transient dwell walls don't engulf).
-            if cfg.terminal_airspace_always_active:
-                term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
-                return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
-            return cfg.terminal_radius_m if tr is None else float(tr)
-        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
+        terminal airspaces overlap (:func:`_scatter_hubs`, radius from :meth:`_wall_radius`). DESIGN KNOB
+        for spatial structure (swap the uniform scatter for a clustered process to mimic real geography)."""
+        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss,
+                             lambda uid: self._wall_radius(uid, cfg), self.min_hub_gap_m)
 
     def terminals(self, cfg: SimConfig) -> list:
         """All placed hubs as ``(center, Terminal)`` — permanent vertiport infrastructure, EVERY hub

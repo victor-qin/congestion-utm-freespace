@@ -23,9 +23,6 @@ import numpy as np
 
 from ..demand import HubRadiusDemand
 from ..geo import load_dfw_geo, point_in_polygon
-from ..planner.hexgrid import SQRT3, circumradius
-from ..types import Terminal
-from ..volumes import exit_radius
 
 # Retail categories eligible as wing/zipline hub sites. The FAA EAs approve "shopping centers, large
 # individual retailers, and shopping malls" — the large-format retailers (department/grocery/discount/
@@ -65,17 +62,12 @@ class DfwGeoDemand(HubRadiusDemand):
         cached = getattr(self, "_geo_cache", None)
         if cached is None or cached[0] != key:
             cached = (key, load_dfw_geo(self.dataset, cfg))
-            object.__setattr__(self, "_geo_cache", cached)
+            self._geo_cache = cached
         return cached[1]
 
     def _sep_radius(self, uid: str, cfg) -> float:
-        """The non-overlap radius for ``uid``'s hubs — REPLICATES HubRadiusDemand.place_hubs' radius_of
-        (walled extent = column + one boundary-hex ring under always-active airspace)."""
-        tr = self._terminal_radius_for(uid)
-        if cfg.terminal_airspace_always_active:
-            term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
-            return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
-        return cfg.terminal_radius_m if tr is None else float(tr)
+        """The non-overlap radius for ``uid``'s hubs — the shared base wall radius."""
+        return self._wall_radius(uid, cfg)
 
     def _separated(self, c, r: float, placed: list) -> bool:
         """True iff centre ``c`` (radius ``r``) clears every placed hub by ``r_i+r_j+min_hub_gap_m``."""
@@ -96,7 +88,7 @@ class DfwGeoDemand(HubRadiusDemand):
             r = self._sep_radius(uid, cfg)
             xy, w = geo.amazon_of_types(self.fixed_hub_types)
             order = np.argsort(-w, kind="stable")
-            cap = len(order) if self.use_all_fixed_hubs else int(self.n_hubs_per_uss.get(uid, len(order)))
+            cap = len(order) if self.use_all_fixed_hubs else int(self.n_hubs_per_uss[uid])
             picks = []
             for i in order:
                 if len(picks) >= cap:
@@ -131,7 +123,7 @@ class DfwGeoDemand(HubRadiusDemand):
         """Cached (tract_indices, populations) for tracts whose bbox meets the hub's service disk."""
         cache = getattr(self, "_cand_cache", None)
         if cache is None:
-            cache = {}; object.__setattr__(self, "_cand_cache", cache)
+            cache = self._cand_cache = {}
         key = (round(float(hub[0]), 2), round(float(hub[1]), 2), round(float(radius), 2))
         hit = cache.get(key)
         if hit is None:

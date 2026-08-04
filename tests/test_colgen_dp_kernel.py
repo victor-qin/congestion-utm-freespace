@@ -374,3 +374,118 @@ def test_variant_prefilter_never_drops_the_reference_answer(monkeypatch):
     got = price_flight(graph, view, 0.0, cfg, params, require_improving=False)
     assert got[0] == pytest.approx(expected[0], abs=1e-8)
     assert got[1] == expected[1]
+
+
+# ------------------------------------------------------- forbidden rows (repair path)
+
+
+def _price_both_forbidden(monkeypatch, graph, duals, pi_f, cfg, params, forbidden):
+    """Price with and without the kernel under an identical row-exclusion set."""
+
+    view = DualView(duals, cfg)
+    with monkeypatch.context() as patch:
+        patch.setattr(pricing, "_dp_kernel", None)
+        expected = price_flight(
+            graph, view, pi_f, cfg, params,
+            forbidden_rows=forbidden, require_improving=False,
+        )
+    got = price_flight(
+        graph, view, pi_f, cfg, params,
+        forbidden_rows=forbidden, require_improving=False,
+    )
+    return expected, got
+
+
+@pytest.mark.parametrize("time_buffer_s", [4.0, 0.0])
+def test_kernel_matches_reference_when_rows_are_forbidden(monkeypatch, time_buffer_s):
+    """The repair path used to be reference-only; it is now compiled, so pin parity.
+
+    Exclusions reach the kernel as a packed cell-row table
+    (``dp_prepare.prepare_forbidden``) while terminal and endpoint rows stay in Python.
+    The kernel therefore searches a superset of the feasible space and relies on
+    ``_canonical_candidate`` to reject anything its packed set could not see -- if that
+    division of labour were wrong, the two arms would disagree here.
+    """
+
+    assert dp_kernel is not None, "kernel inactive -- this parity guard would be vacuous"
+    rng = np.random.default_rng(20260804)
+    compared = 0
+    excluded_something = 0
+    for trial in range(14):
+        cfg = _cfg(
+            time_buffer_s=time_buffer_s,
+            max_ground_delay_s=float(rng.choice([0.0, 48.0, 120.0])),
+        )
+        graph, params = _graph(
+            cfg,
+            dest=(int(rng.integers(2, 6)), int(rng.integers(-3, 3))),
+            slack=int(rng.integers(0, 5)),
+            flight_id=trial + 1,
+        )
+        cells = sorted(graph.corridor_cells)
+        duals = _random_duals(rng, cells, graph.base_step, int(rng.integers(0, 30)))
+        pi_f = float(rng.normal(0.0, 50.0))
+
+        # Forbid a random scatter of real cell rows inside the flight's own clock
+        # window, so the exclusions actually bite rather than naming unreachable rows.
+        forbidden = frozenset(
+            RowKey.cell(
+                cells[int(rng.integers(0, len(cells)))][0],
+                cells[int(rng.integers(0, len(cells)))][1],
+                0,
+                int(rng.integers(graph.min_step, graph.max_step + 1)),
+            )
+            for _ in range(int(rng.integers(1, 25)))
+        )
+
+        (expected_rc, expected), (got_rc, got) = _price_both_forbidden(
+            monkeypatch, graph, duals, pi_f, cfg, params, forbidden
+        )
+        if expected is None:
+            assert got is None, "kernel returned a column where the reference found none"
+            excluded_something += 1
+            continue
+        compared += 1
+        assert got is not None
+        assert got_rc == pytest.approx(expected_rc, abs=1e-8)
+        assert got.cell_path == expected.cell_path
+        assert got.departure_step == expected.departure_step
+        assert got.origin_lane_idx == expected.origin_lane_idx
+        assert got.dest_lane_idx == expected.dest_lane_idx
+        # The whole point of the exclusion set: the answer must respect it.
+        assert got.claims.isdisjoint(forbidden)
+    assert compared >= 6, f"only {compared} graphs produced a column; sweep is too weak"
+
+
+def test_forbidden_pack_probe_matches_the_python_membership_oracle():
+    """The kernel probe and ``PreparedForbidden.contains`` must agree bit for bit.
+
+    They are separate implementations of the same open-addressed table -- one in numba
+    over int64 arrays, one in Python integers -- and a divergence would show up as
+    silently ignored exclusions rather than as an error.
+    """
+
+    assert dp_kernel is not None
+    rng = np.random.default_rng(7)
+    index = {(q, r): i for i, (q, r) in enumerate(
+        (q, r) for q in range(-6, 6) for r in range(-6, 6)
+    )}
+    inverse = {i: c for c, i in index.items()}
+    truth = {
+        (int(rng.integers(0, len(index))), int(rng.integers(-20, 200)))
+        for _ in range(400)
+    }
+    rows = frozenset(
+        RowKey.cell(inverse[c][0], inverse[c][1], 0, s) for c, s in truth
+    )
+    pack = dp_prepare.prepare_forbidden(rows, dp_prepare.PreparedTopology(), index)
+    assert pack.n_rows == len(truth)
+
+    window_lo, window_hi = -2, 1
+    for cell in range(0, 20):
+        for step in range(-25, 205):
+            want = any((cell, step + o) in truth for o in range(window_lo, window_hi + 1))
+            assert pack.contains(cell, step) == ((cell, step) in truth)
+            assert bool(dp_kernel._visit_forbidden(
+                cell, step, window_lo, window_hi, pack.slots, pack.log2cap, pack.n_rows
+            )) == want

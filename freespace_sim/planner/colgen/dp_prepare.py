@@ -103,6 +103,129 @@ class PreparedTopology:
         return int(found[0]) if found.size else -1
 
 
+# Composite key for one forbidden cell row.  colgen v1 pricing is single-level (the
+# topology refuses anything else), so a row is fully identified by (cell index, step);
+# the offset keeps negative steps positive so the key stays a plain non-negative int64.
+_FORBIDDEN_STEP_OFFSET = 1 << 20
+_FORBIDDEN_STEP_SPAN = 1 << 21
+
+
+# Fibonacci hashing in exact Python integers.  numba applies uint64 wraparound
+# silently; doing the same with np.uint64 here raises a RuntimeWarning on every
+# multiply, so the wrap is written out explicitly and the two agree bit for bit.
+_FIB_MAGIC = 0x9E3779B97F4A7C15
+_U64 = (1 << 64) - 1
+
+
+def _fib_slot(key: int, log2cap: int) -> int:
+    return ((key * _FIB_MAGIC) & _U64) >> (64 - log2cap)
+
+
+def forbidden_key(cell_index: int, step: int) -> int:
+    """The int64 a forbidden ``('cell', q, r, 0, step)`` row hashes to."""
+
+    return int(cell_index) * _FORBIDDEN_STEP_SPAN + int(step) + _FORBIDDEN_STEP_OFFSET
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedForbidden:
+    """Open-addressed set of excluded cell rows, readable from the kernel.
+
+    Only *cell* rows are packed.  Terminal rows also appear in an exclusion set, but the
+    search tests those solely at the endpoints -- origin claims before the sweep and
+    destination claims at each sink -- and both of those stay in Python, where the exact
+    ``RowKey`` set is still available.  Packing them would add a second key space for no
+    inner-loop benefit.
+
+    ``foreign_rows`` counts exclusions whose cell is outside this flight's corridor. They
+    are unreachable by construction, so dropping them is not an approximation; it is
+    counted only so a suspiciously empty pack is visible rather than silent.
+    """
+
+    slots: np.ndarray = field(repr=False, default_factory=lambda: np.full(1, -1, np.int64))
+    log2cap: int = 0
+    n_rows: int = 0
+    foreign_rows: int = 0
+
+    @property
+    def is_empty(self) -> bool:
+        return self.n_rows == 0
+
+    def contains(self, cell_index: int, step: int) -> bool:
+        """Python mirror of the kernel probe; the executable spec for the tests."""
+
+        if self.n_rows == 0:
+            return False
+        key = forbidden_key(cell_index, step)
+        cap = int(self.slots.shape[0])
+        mask = cap - 1
+        slot = _fib_slot(key, self.log2cap)
+        while True:
+            held = int(self.slots[slot])
+            if held == -1:
+                return False
+            if held == key:
+                return True
+            slot = (slot + 1) & mask
+
+
+def prepare_forbidden(
+    forbidden_rows, topology: PreparedTopology, cell_index: dict[Cell, int] | None = None
+) -> PreparedForbidden:
+    """Pack excluded cell rows into a power-of-two open-addressed int64 table.
+
+    Rebuilt per search, because the greedy heuristic mutates its saturated set as it
+    reassigns flights.  Measured on density_faa: ~48k rows per call, which is cheap
+    against the millions of arc relaxations the pack then serves.
+    """
+
+    if cell_index is None:
+        cell_index = {
+            (int(q), int(r)): i
+            for i, (q, r) in enumerate(zip(topology.cell_q, topology.cell_r, strict=True))
+        }
+    keys: list[int] = []
+    foreign = 0
+    for row in forbidden_rows:
+        if tuple.__getitem__(row, 0) != "cell":
+            continue
+        index = cell_index.get(
+            (tuple.__getitem__(row, 1), tuple.__getitem__(row, 2))
+        )
+        if index is None:
+            foreign += 1
+            continue
+        if tuple.__getitem__(row, 3) != 0:      # single-level invariant, see class docstring
+            continue
+        keys.append(forbidden_key(index, tuple.__getitem__(row, 4)))
+
+    if not keys:
+        return PreparedForbidden(n_rows=0, foreign_rows=foreign)
+
+    # Load factor <= 0.5 so linear probing stays short.
+    cap = 1
+    while cap < 2 * len(keys):
+        cap <<= 1
+    log2cap = cap.bit_length() - 1
+    slots = np.full(cap, -1, dtype=np.int64)
+    mask = cap - 1
+    stored = 0
+    for key in keys:
+        slot = _fib_slot(key, log2cap)
+        while True:
+            held = int(slots[slot])
+            if held == key:
+                break
+            if held == -1:
+                slots[slot] = key
+                stored += 1
+                break
+            slot = (slot + 1) & mask
+    return PreparedForbidden(
+        slots=slots, log2cap=log2cap, n_rows=stored, foreign_rows=foreign
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedDuals:
     """One iteration's cell-row prices as flat prefix sums, indexed by cell id.

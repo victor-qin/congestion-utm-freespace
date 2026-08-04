@@ -1146,6 +1146,13 @@ def _best_column_compiled(
         return incumbent, False
 
     cutoff = incumbent[0] if incumbent is not None else None
+    # The kernel filters only CELL rows.  Terminal and endpoint exclusions stay in
+    # Python: `_canonical_candidate` re-tests every proposal against the full
+    # `forbidden_rows` set below.  That is sound for the optimality proof because the
+    # kernel then searches a SUPERSET of the feasible space, so its residual bound
+    # dominates the true one -- it can propose an infeasible sink, never hide a
+    # feasible one.
+    forbidden_pack = dp_prepare.prepare_forbidden(forbidden_rows, topology)
     duals = dp_prepare.prepare_duals(dual_view, topology)
     variants = dp_prepare.prepare_variants(
         fg, cfg, dual_view, topology, seed=seed,
@@ -1178,7 +1185,7 @@ def _best_column_compiled(
             result = _dp_kernel.search_dag(
                 topology, duals, variants,
                 cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
-                seed=seed, cancel_flag=cancel_flag,
+                seed=seed, forbidden=forbidden_pack, cancel_flag=cancel_flag,
             )
             if result.status == _dp_kernel.FB_CANCELLED:
                 raise PricingTimeout("column pricing reached its wall-clock deadline")
@@ -1235,7 +1242,10 @@ def _best_column(
     deadline: float | None = None,
 ) -> tuple[float, Column | None]:
     _check_deadline(deadline)
-    if _dp_kernel is not None and not forbidden_rows and len(fg.levels) == 1:
+    # Row exclusions no longer force the reference: the kernel carries a packed set of
+    # forbidden cell rows (dp_prepare.prepare_forbidden), so the repair path
+    # (solver.py's re-pricing against saturated rows) is compiled too.
+    if _dp_kernel is not None and len(fg.levels) == 1:
         certified, proved = _best_column_compiled(
             fg, dual_view, pi_f, cfg, benefit, forbidden_rows,
             seed=seed, incumbent=incumbent, deadline=deadline,

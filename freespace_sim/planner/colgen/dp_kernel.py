@@ -71,6 +71,42 @@ def _mix(value, log2cap):
     return np.int64((np.uint64(value) * _MAGIC) >> np.uint64(64 - log2cap))
 
 
+# Must match dp_prepare._FORBIDDEN_STEP_OFFSET / _SPAN exactly -- the host packs the
+# table, the kernel probes it, and a mismatch would silently miss every exclusion.
+_FORBIDDEN_STEP_OFFSET = 1 << 20
+_FORBIDDEN_STEP_SPAN = 1 << 21
+
+
+@njit(cache=True, nogil=True)
+def _visit_forbidden(
+    cell, visit_step, window_lo, window_hi, forbidden_slots, forbidden_log2cap, forbidden_n
+):
+    """True if any row in this cell visit's window is excluded.
+
+    Mirrors ``pricing._visit_hits_forbidden``: same window as ``visit_rows`` -- the
+    inclusive ``[visit_step + lo, visit_step + hi]`` range -- and the same first-hit exit.
+    """
+
+    if forbidden_n == 0:
+        return False
+    mask = np.int64(forbidden_slots.shape[0] - 1)
+    for offset in range(window_lo, window_hi + 1):
+        key = (
+            np.int64(cell) * np.int64(_FORBIDDEN_STEP_SPAN)
+            + np.int64(visit_step + offset)
+            + np.int64(_FORBIDDEN_STEP_OFFSET)
+        )
+        slot = _mix(key, forbidden_log2cap)
+        while True:
+            held = forbidden_slots[slot]
+            if held == -1:
+                break
+            if held == key:
+                return True
+            slot = (slot + np.int64(1)) & mask
+    return False
+
+
 @njit(cache=True, nogil=True)
 def _window_cost(
     cell,
@@ -306,6 +342,10 @@ def _search_dag(
     cand_hops,
     cand_variant,
     cand_rc_ub,
+    # forbidden rows (empty table => forbidden_n == 0 and every probe short-circuits)
+    forbidden_slots,
+    forbidden_log2cap,
+    forbidden_n,
     cancel_flag,
 ):
     """Forward layer sweep over the time-expanded DAG.  See module docstring."""
@@ -465,6 +505,15 @@ def _search_dag(
                 if next_step + remain_nb > max_step:
                     continue
                 if is_seed and hops + 1 + remain_nb > seed_hop_limit:
+                    continue
+
+                # Row exclusions.  Placed exactly where the reference tests them --
+                # after the reachability guards, before the score is formed -- so an
+                # excluded arc is dropped at the same point in both.
+                if _visit_forbidden(
+                    nb, next_step, window_lo, window_hi,
+                    forbidden_slots, forbidden_log2cap, forbidden_n,
+                ):
                     continue
 
                 score = (
@@ -695,6 +744,7 @@ def search_dag(
     # therefore a STRAGGLER knob at least as much as a memory knob: it also lifts the
     # makespan floor for flight-parallel pricing from 125s to 34s.
     label_limit_max: int = 1 << 24,
+    forbidden=None,
     cancel_flag: np.ndarray | None = None,
 ) -> DagSearchResult:
     """Run the compiled DP, growing the workspace on overflow rather than failing.
@@ -708,6 +758,10 @@ def search_dag(
     if n_cells == 0 or n_variants == 0:
         return DagSearchResult(status=NO_PATH, remaining_rc_upper_bound=-float("inf"))
 
+    if forbidden is None:
+        from .dp_prepare import PreparedForbidden
+
+        forbidden = PreparedForbidden()
     if cancel_flag is None:
         cancel_flag = np.zeros(1, dtype=np.uint8)
     limit = label_limit if label_limit is not None else max(4096, 64 * n_cells)
@@ -763,6 +817,7 @@ def search_dag(
             state_key_step, state_key_cell, state_key_paid, state_key_first,
             state_recent, state_label, log2cap,
             cand_parent, cand_cell, cand_step, cand_hops, cand_variant, cand_rc_ub,
+            forbidden.slots, forbidden.log2cap, forbidden.n_rows,
             cancel_flag,
         )
 

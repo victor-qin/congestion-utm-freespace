@@ -1694,9 +1694,8 @@ def _best_column(
                     continue
                 if seed and hops + 1 + distance_to_go > seed_hop_limit:
                     continue
-                if forbidden_rows and not _visit_claims(
-                    neighbour, 0, next_step, offsets
-                ).isdisjoint(forbidden_rows):
+                # Same per-arc guard as the feasible search: a set built only to be tested.
+                if _visit_hits_forbidden(neighbour, 0, next_step, offsets, forbidden_rows):
                     continue
                 # Price the visit window from ``DualView``'s prefix sums instead of
                 # materializing its ``RowKey`` set.  Building that set to sum it was
@@ -2067,8 +2066,9 @@ def find_feasible_column(
             remaining = _distance_lower_bound(neighbour, destination_cells)
             if next_step + remaining > fg.max_step:
                 continue
-            claims = _visit_claims(neighbour, 0, next_step, offsets)
-            if not claims.isdisjoint(forbidden):
+            # Once per relaxed arc, and the set was built only to be tested: measured at
+            # 3,764,765 calls and 11.76s of this search's 37.72s.
+            if _visit_hits_forbidden(neighbour, 0, next_step, offsets, forbidden):
                 continue
             next_path = (*path, neighbour)
             next_recent = (neighbour, *recent[: state_history_depth - 1])

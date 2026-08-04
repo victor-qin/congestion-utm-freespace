@@ -360,6 +360,66 @@ def _visit_claims(
     )
 
 
+def _rows_hit_forbidden(
+    claims: Iterable[RowKey],
+    forbidden: AbstractSet[RowKey],
+    *,
+    delta_steps: int = 0,
+) -> bool:
+    """``not _shift_claims(claims, delta_steps).isdisjoint(forbidden)``, without the set.
+
+    The translated claim set is built purely to be asked a membership question, and building
+    it costs one ``RowKey.__new__`` per row -- four ``operator.index`` calls each -- plus a
+    frozenset.  ``RowKey`` is ``tuple.__new__(cls, ("cell", q, r, level, step))``, so the plain
+    tuple written here hashes and compares equal to the ``RowKey`` it mirrors and the lookup is
+    identical; and the walk stops at the first hit instead of translating every remaining row.
+
+    ``tuple.__getitem__`` rather than the ``.kind`` / ``.step`` / ``.level`` properties, because
+    each of those re-reads ``.kind`` to choose its index -- several attribute lookups per row on
+    the hottest path in the greedy heuristic.
+    """
+    if not forbidden:
+        return False
+    if delta_steps == 0:
+        return any(row in forbidden for row in claims)
+    for row in claims:
+        if tuple.__getitem__(row, 0) == "cell":
+            key: tuple[Any, ...] = (
+                "cell",
+                tuple.__getitem__(row, 1),
+                tuple.__getitem__(row, 2),
+                tuple.__getitem__(row, 3),
+                tuple.__getitem__(row, 4) + delta_steps,
+            )
+        else:
+            key = ("term", tuple.__getitem__(row, 1), tuple.__getitem__(row, 2) + delta_steps)
+        if key in forbidden:
+            return True
+    return False
+
+
+def _visit_hits_forbidden(
+    cell: Cell,
+    level: int,
+    visit_step: int,
+    offsets: tuple[int, int],
+    forbidden: AbstractSet[RowKey],
+) -> bool:
+    """``not _visit_claims(...).isdisjoint(forbidden)`` without materializing the window.
+
+    Same identity as :func:`_rows_hit_forbidden`, applied to the per-visit cell window: this
+    is called once per relaxed arc, so the frozenset it replaces was the single largest source
+    of ``RowKey`` construction in ``find_feasible_column``.
+    """
+    if not forbidden:
+        return False
+    q, r = cell
+    return any(
+        ("cell", q, r, level, row_step) in forbidden
+        for row_step in visit_rows(visit_step, offsets)
+    )
+
+
 def _endpoint_claims(
     fg: FlightGraph,
     cfg: SimConfig,
@@ -674,24 +734,23 @@ def _shifted_seed_incumbent(
     )
     latest_departure = min(fg.latest_departure_step, path_latest_departure)
     best = incumbent
-    # The scan asks each translation only for its dual cost, then throws the row set
-    # away; every translation that is not the winner was materialized for nothing.
-    # ``shift_terms`` resolves the seed's rows once so each step is a handful of dict
-    # lookups instead of rebuilding a frozenset of RowKey objects.  Row exclusions
-    # need the real set, so the repair path keeps the original form.
-    terms = None if forbidden_rows else duals.shift_terms(seed.claims)
+    # The scan asks each translation only for its dual cost and a disjointness verdict, then
+    # throws the row set away; every translation that is not the winner was materialized for
+    # nothing.  ``shift_terms`` resolves the seed's rows once so each step is a handful of
+    # dict lookups instead of rebuilding a frozenset of RowKey objects.
+    terms = duals.shift_terms(seed.claims)
     best_delta: int | None = None
     best_delay_s = 0.0
     for departure_step in range(seed.departure_step + 1, latest_departure + 1):
         _check_deadline(deadline)
         delta_steps = departure_step - seed.departure_step
-        if terms is None:
-            claims = _shift_claims(seed.claims, delta_steps)
-            if not claims.isdisjoint(forbidden_rows):
-                continue
-            dual_cost = duals.claim_cost(claims)
-        else:
-            dual_cost = duals.shifted_claim_cost(terms, delta_steps)
+        # Row exclusions used to force this scan back onto `_shift_claims` + `claim_cost`,
+        # rebuilding a frozenset of RowKeys per translation purely to answer a disjointness
+        # question.  That fallback was the dominant cost of the greedy heuristic, which always
+        # supplies `forbidden_rows` (its saturated set).  Both halves are now set-free.
+        if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
+            continue
+        dual_cost = duals.shifted_claim_cost(terms, delta_steps)
         delay_s = seed.delay_s + delta_steps * cfg.dt_s
         reduced_cost = benefit - delay_s - dual_cost - pi_f
         if best is None or reduced_cost > best[0] + _SCORE_EPS:
@@ -1906,8 +1965,11 @@ def find_feasible_column(
             remaining = _distance_lower_bound(cell, destination_cells)
             if start_step >= fg.max_step or start_step + remaining > fg.max_step:
                 continue
-            visit_claims = _visit_claims(cell, 0, start_step, offsets)
-            if not (origin_claims | visit_claims).isdisjoint(forbidden):
+            # `origin_claims` was proven disjoint from `forbidden` immediately above and is
+            # invariant across this loop, so the old `(origin_claims | visit_claims)` union
+            # re-tested it once per lane and allocated two sets to do it.  The union is
+            # equivalent to testing the visit window alone.
+            if _visit_hits_forbidden(cell, 0, start_step, offsets, forbidden):
                 continue
             path = (cell,)
             recent = path

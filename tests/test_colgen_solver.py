@@ -1030,6 +1030,67 @@ def test_swap_never_selected_and_head_on_files_cleanly():
     _assert_files_cleanly(requests, result.columns, cfg)
 
 
+def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
+    """The final IP was the last unattributed block in the solve.
+
+    It matters because the intuition is wrong by orders of magnitude: on a 1,138-column
+    100-flight pool the whole solve took 643s and the IP was under a second of it, the
+    rest being pricing.  Without a number, "the IP is slow" is an unfalsifiable
+    explanation for any slow run.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+
+    result = ColGenSolver().solve(requests, cfg, (), _params())
+
+    assert result.stats["ip_status"] != "skipped", "this fixture must reach the IP"
+    elapsed = result.stats["ip_elapsed_s"]
+    assert isinstance(elapsed, float)
+    assert 0.0 <= elapsed <= result.stats["elapsed_s"] + 1e-6, (
+        "the IP is one block inside the solve, so its time cannot exceed the whole"
+    )
+
+
+def test_iteration_payload_carries_both_gap_scales_and_the_master():
+    """Per-iteration telemetry has to answer questions the final stats cannot.
+
+    Both scales, because with an artificial big-M the revenue gap reads as converged
+    while the cost gap is still enormous.  The master itself, because the rounding
+    heuristic and the restricted IP over the same columns are different numbers --
+    measured 13,266.8 vs 13,099.3 on one pool -- so only holding the master lets an
+    analysis run ask what the IP would have said at that iteration.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+    seen: list[dict] = []
+
+    ColGenSolver().solve(
+        requests, cfg, (), _params(), on_iteration=seen.append
+    )
+
+    assert seen, "at least one iteration must report"
+    payload = seen[0]
+    for key in (
+        "lp_gap_cost", "lp_gap_revenue",
+        "heuristic_gap_cost", "heuristic_gap_revenue",
+        "cost_upper_bound", "cost_lower_bound", "rc_sum", "dual_l2",
+    ):
+        assert key in payload, key
+    assert payload["master"] is not None
+    assert hasattr(payload["master"], "solve_ip"), "analysis needs the live master"
+    # The two scales share a numerator and differ only by denominator, so neither is
+    # derivable from the other without also knowing M and the flight count.
+    assert payload["lp_gap_cost"] >= payload["lp_gap_revenue"]
+
+
 def test_bounds_are_monotone_and_solver_is_deterministic():
     cfg = _cfg(max_ground_delay_s=48.0, seed=29)
     requests = [
@@ -1052,6 +1113,7 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         "elapsed_s",
         "graph_build_elapsed_s",
         "initial_greedy_elapsed_s",
+        "ip_elapsed_s",
         "seed_elapsed_s",
         "time_to_master_s",
     }

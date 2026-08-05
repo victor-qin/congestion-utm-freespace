@@ -1050,8 +1050,17 @@ class ColGenSolver:
                     "lp_gap_revenue": lp_gap_revenue,
                     "lp_gap_cost": lp_gap_cost,
                     "heuristic_gap_revenue": heuristic_gap_revenue,
+                    "heuristic_gap_cost": heuristic_gap_cost,
                     "heuristic_cost": heuristic_cost,
                     "heuristic_gap": heuristic_gap,
+                    # The live master, for analysis that has to ask it something the
+                    # scalars above cannot answer -- solving the IP at THIS iteration
+                    # being the motivating case, since the difference between the
+                    # rounding heuristic and the true restricted IP is exactly what
+                    # `heuristic_cost` alone cannot show.  Callers that mutate it own the
+                    # consequences; the solver reads back only `last_ip_*`, which its own
+                    # final solve overwrites.
+                    "master": master,
                     "columns": len(master.columns),
                     "columns_added": len(priced_columns),
                     "rc_sum": math.fsum(positives),
@@ -1111,6 +1120,7 @@ class ColGenSolver:
         ip_gap: float | None = None
         ip_gap_revenue: float | None = None
         ip_gap_met: bool | None = None
+        ip_elapsed_s = 0.0
         ip_status = "skipped"
         ip_optimal: bool | None = None
         if not ip_skipped and time.monotonic() >= deadline:
@@ -1120,7 +1130,13 @@ class ColGenSolver:
         elif not ip_skipped:
             master.backend.time_limit_s = max(1e-6, deadline - time.monotonic())
             master.set_heuristic(incumbent)
+            # Timed because it was the one unattributed block left in the solve.  Worth
+            # knowing precisely: on a 1,138-column 100-flight pool the whole solve took
+            # 643s and the IP was under a second of it, so "the IP is slow" is a
+            # hypothesis that needs a number before anyone acts on it.
+            ip_started = time.monotonic()
             ip_selection = master.solve_ip(deadline=deadline)
+            ip_elapsed_s = time.monotonic() - ip_started
             ip_selection = {
                 flight_id: _canonical_column(column, graphs[flight_id], cfg)
                 for flight_id, column in ip_selection.items()
@@ -1286,6 +1302,7 @@ class ColGenSolver:
             "ip_status": ip_status,
             "ip_optimal": ip_optimal,
             "ip_skipped": ip_skipped,
+            "ip_elapsed_s": ip_elapsed_s,
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
             "objective": total_delay_s,

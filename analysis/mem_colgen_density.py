@@ -275,6 +275,15 @@ def main() -> int:
                     help="recycle each worker after this many flights, returning its arena to "
                          "the OS; 0 = never recycle")
     ap.add_argument("--start-method", default=None, choices=["spawn", "fork", "forkserver"])
+    ap.add_argument("--benefit-m", type=float, default=None,
+                    help="ColGenParams.M; must exceed the largest achievable column cost. "
+                         "Oversizing it inflates the Lagrangian bound by M per LP-uncovered flight")
+    ap.add_argument("--chunksize", type=int, default=1,
+                    help="flights handed to a worker per dispatch (imap_unordered chunksize)")
+    ap.add_argument("--objective", default="total_delay",
+                    choices=["total_delay", "total_cost"],
+                    help="total_delay sums ground and excess-air seconds unweighted; "
+                         "total_cost weights them by the config dials (1:3)")
     ap.add_argument("--label-limit-max", type=int, default=None,
                     help="override dp_kernel.search_dag's label ceiling (default 1<<23); "
                          "pricing.py calls search_dag positionally through the module, so the "
@@ -322,9 +331,14 @@ def main() -> int:
     static_terms = list(demand.terminals(cfg)) if cfg.terminal_airspace_always_active else []
     print(f"terminals : {len(static_terms)} static hub walls (all placed hubs)")
 
-    params = ColGenParams(max_iterations=args.max_iterations, time_limit_s=args.time_limit)
+    params = ColGenParams(
+        max_iterations=args.max_iterations,
+        time_limit_s=args.time_limit,
+        objective=args.objective,
+        **({} if args.benefit_m is None else {"M": args.benefit_m}),
+    )
     print(f"params    : max_iterations={params.max_iterations} time_limit_s={params.time_limit_s} "
-          f"detour_slack_hops={params.detour_slack_hops}")
+          f"detour_slack_hops={params.detour_slack_hops} objective={params.objective}")
     print()
 
     pool_cfg = None
@@ -342,11 +356,13 @@ def main() -> int:
             n_workers=args.workers,
             max_tasks_per_child=args.max_tasks_per_child or None,
             start_method=args.start_method,
+            chunksize=args.chunksize,
             on_progress=_progress,
         )
         print(f"parallel  : {pool_cfg.n_workers} workers  "
               f"max_tasks_per_child={pool_cfg.max_tasks_per_child}  "
               f"start_method={pool_cfg.start_method or 'platform default'}")
+        print(f"            chunksize={pool_cfg.chunksize}")
         print()
 
     # In parallel mode price_flight runs in the WORKERS, so these parent-side patches never
@@ -361,8 +377,48 @@ def main() -> int:
     try:
         with _RssSampler(args.sample_interval) as sampler:
             t0 = time.perf_counter()
+            def _iter_line(st):
+                # Streamed so a converging solve is legible while it runs -- the bound
+                # and the gap are what say whether more iterations are worth buying,
+                # and they were previously discarded if the run was killed.
+                print(
+                    f"  ITER {st['iteration']:>3}  elapsed={st['elapsed_s']:8.1f}s"
+                    f"  cost_ub={st['cost_upper_bound']:13.2f}"
+                    f"  cost_lb={st['cost_lower_bound']:13.2f}"
+                    f"  lp_gap={st['lp_gap']:.6f}"
+                    f"  cols={st['columns']:>6} (+{st['columns_added']})",
+                    flush=True,
+                )
+                print(
+                    f"           rc: n+={st['rc_n_positive']:>5} sum={st['rc_sum']:12.2f}"
+                    f" max={st['rc_max']:9.2f} p90={st['rc_p90']:8.2f} p50={st['rc_p50']:8.2f}"
+                    f"   duals: L2={st['dual_l2']:11.2f} Linf={st['dual_linf']:9.2f}"
+                    f" nnz={st['dual_nonzero']:>6}"
+                    f"   raw_ub={st['raw_upper_bound']:.2f}",
+                    flush=True,
+                )
+                stages = st.get("stage_s", {})
+                counts = st.get("stage_n", {})
+                if stages:
+                    parts = " ".join(
+                        f"{k}={v:.2f}s/{counts.get(k, 0)}"
+                        for k, v in sorted(stages.items(), key=lambda kv: -kv[1])
+                    )
+                    print(
+                        f"           master: {parts}"
+                        f"  lazy_rows={st['lazy_rows_added']}/{st['lazy_row_rounds']}r",
+                        flush=True,
+                    )
+                print(
+                    f"           coverage: uncovered={st['n_uncovered']:>4}"
+                    f" rc~M={st['n_rc_near_M']:>4} overlap={st['n_overlap']:>4}"
+                    f"   max_column_cost={st['max_column_cost']:.2f}",
+                    flush=True,
+                )
+
             result = ColGenSolver().solve(
-                requests, cfg, static_terms, params, parallel=pool_cfg
+                requests, cfg, static_terms, params,
+                parallel=pool_cfg, on_iteration=_iter_line,
             )
             wall = time.perf_counter() - t0
     finally:
@@ -375,6 +431,12 @@ def main() -> int:
     print("=" * 78)
     print(f"wall            : {wall:.2f}s")
     print(f"termination     : {stats.get('termination_reason')}  iterations={stats.get('iterations')}")
+    print(f"gap_metric      : {stats.get('gap_metric', '?')}"
+          f"   lp_gap={stats.get('lp_gap')}")
+    print(f"                  (revenue={stats.get('lp_gap_revenue')}"
+          f"  cost={stats.get('lp_gap_cost')})")
+    print(f"IP gap (eq 11)  : {stats.get('ip_gap_revenue')}"
+          f"   ip_objective={stats.get('ip_objective')}  ip_status={stats.get('ip_status')}")
     print(f"selected        : {stats.get('selected_flights')}/{len(requests)}")
     print(f"objective       : {stats.get('objective')}")
     print(f"columns         : {len(result.columns)}")

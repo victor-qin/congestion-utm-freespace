@@ -10,6 +10,7 @@ semantics as the LP/IP loop.
 
 from __future__ import annotations
 
+import collections
 import math
 import time
 from collections import Counter
@@ -69,6 +70,33 @@ def _fixed_loads(fixed_claims: Sequence[frozenset[RowKey]]) -> dict[RowKey, int]
             key = raw_key if isinstance(raw_key, RowKey) else RowKey(raw_key)
             loads[key] += 1
     return dict(loads)
+
+
+def _coverage_diagnostics(master, x, rc_by_flight, benefit) -> dict:
+    """Cross-reference LP coverage against the flights whose reduced cost is ~M.
+
+    A flight the LP leaves uncovered has a slack cover constraint, so complementary
+    slackness sets its dual to zero and pricing reports ``rc = M - cost - dual_cost``,
+    i.e. roughly the whole benefit.  Those terms then dominate the Lagrangian bound
+    ``LP + sum(max(0, rc))``.  This measures the overlap directly rather than inferring
+    it, and reports the largest column cost -- the quantity that actually bounds how
+    small ``M`` is allowed to be.
+    """
+
+    coverage: dict[int, float] = collections.defaultdict(float)
+    max_cost = 0.0
+    for value, column in zip(np.asarray(x, dtype=float), master.columns, strict=False):
+        coverage[column.flight_id] += float(value)
+        if column.delay_s > max_cost:
+            max_cost = float(column.delay_s)
+    uncovered = {f for f, v in coverage.items() if v < 1.0 - 1e-6}
+    contaminated = {f for f, rc in rc_by_flight.items() if rc > 0.5 * float(benefit)}
+    return {
+        "max_column_cost": max_cost,
+        "n_uncovered": len(uncovered),
+        "n_rc_near_M": len(contaminated),
+        "n_overlap": len(uncovered & contaminated),
+    }
 
 
 def _canonical_column(column: Column, graph: FlightGraph, cfg: SimConfig) -> Column:
@@ -524,6 +552,7 @@ class ColGenSolver:
         *,
         fixed_claims: Sequence[frozenset[RowKey]] = (),
         parallel: ParallelPricingConfig | None = None,
+        on_iteration=None,
     ) -> ColGenResult:
         """``parallel`` fans the per-iteration pricing sweep across processes.
 
@@ -531,6 +560,13 @@ class ColGenSolver:
         iteration's duals, and :func:`pricing_pool.price_sweep` reproduces the sequential
         loop's timeout prefix, so the accepted columns and the objective are unchanged.
         ``None`` (default) keeps the sequential sweep.
+
+        ``on_iteration`` is called once per column-generation iteration with a dict of
+        that iteration's master state (LP objective, global upper bound, gaps, column
+        counts).  Without it a long solve is opaque until it returns: the bound and the
+        gap are computed every iteration but only surface in the final stats, so a run
+        that is killed -- or one you simply want to watch -- discards them.  The pricing
+        sweep already streams per-flight progress for the same reason.
         """
         started = time.monotonic()
         parallel_sweeps: list = []
@@ -753,6 +789,11 @@ class ColGenSolver:
         cost_upper_bounds: list[float] = []
         cost_lower_bounds: list[float] = []
         lp_gaps: list[float] = []
+        # Previous iteration's capacity duals, kept only to measure dual movement.
+        # Tailing-off with a frozen bound has two very different causes -- duals
+        # converging slowly, or duals oscillating -- and they call for opposite fixes
+        # (more iterations vs. stabilization).  ||pi_k - pi_{k-1}|| separates them.
+        prev_capacity_duals: dict | None = None
         heuristic_objectives: list[float] = []
         heuristic_costs: list[float] = []
         lazy_rows_added = 0
@@ -767,6 +808,21 @@ class ColGenSolver:
         pricing_timeout_flight_id: int | None = None
 
         for iteration in range(params.max_iterations):
+            # Per-iteration stage timings.  The master block was one unattributed lump in
+            # the serial tail, and "the LP is slow" is only one of four candidates in it:
+            # the LP itself, the lazy-row re-solve loop around it, `_canonical_column`
+            # (run once per priced column, in the parent), and `add_column`.
+            stage_s: dict[str, float] = collections.defaultdict(float)
+            stage_n: dict[str, int] = collections.defaultdict(int)
+
+            def _timed(key, fn, *a, **kw):
+                t0 = time.perf_counter()
+                try:
+                    return fn(*a, **kw)
+                finally:
+                    stage_s[key] += time.perf_counter() - t0
+                    stage_n[key] += 1
+
             if time.monotonic() >= pricing_deadline:
                 termination_reason = "time_limit"
                 break
@@ -780,10 +836,12 @@ class ColGenSolver:
                     break
                 master.backend.time_limit_s = max(1e-6, remaining_s)
                 try:
-                    lp_objective, capacity_duals, x = master.solve_lp()
+                    lp_objective, capacity_duals, x = _timed("solve_lp", master.solve_lp)
                 except BackendTimeout:
                     break
-                added_rows = master.add_violated_rows(x, _FEASIBILITY_TOL)
+                added_rows = _timed(
+                    "add_violated_rows", master.add_violated_rows, x, _FEASIBILITY_TOL
+                )
                 if not added_rows:
                     lp_complete = True
                     break
@@ -798,15 +856,17 @@ class ColGenSolver:
             last_x = np.asarray(x, dtype=float)
             columns_at_lp = len(master.columns)
 
-            heuristic = master.round_heuristic(
-                last_x,
-                rng,
-                params.n_heuristic_tries,
+            heuristic = _timed(
+                "round_heuristic", master.round_heuristic, last_x, rng, params.n_heuristic_tries
             )
-            heuristic = {
-                flight_id: _canonical_column(column, graphs[flight_id], cfg)
-                for flight_id, column in heuristic.items()
-            }
+            heuristic = _timed(
+                "canonical_heuristic",
+                lambda h: {
+                    flight_id: _canonical_column(column, graphs[flight_id], cfg)
+                    for flight_id, column in h.items()
+                },
+                heuristic,
+            )
             _assert_claim_feasible(heuristic, committed_loads, row_index)
             if not best_heuristic or _better_selection(heuristic, best_heuristic, params.M):
                 best_heuristic = dict(heuristic)
@@ -831,7 +891,7 @@ class ColGenSolver:
                 )
                 greedy_elapsed_s = time.monotonic() - greedy_started
                 for column in greedy_heuristic.values():
-                    master.add_column(column)
+                    _timed("add_column", master.add_column, column)
                 if greedy_heuristic and _better_selection(
                     greedy_heuristic,
                     best_heuristic,
@@ -841,6 +901,7 @@ class ColGenSolver:
                     master.set_heuristic(best_heuristic)
 
             best_reduced_costs: list[float] = []
+            rc_by_flight: dict[int, float] = {}
             priced_columns: list[Column] = []
             pricing_order = sorted(
                 flight_ids,
@@ -876,8 +937,14 @@ class ColGenSolver:
                 for flight_id, reduced_cost, column in sweep.priced:
                     pricing_flights_completed += 1
                     best_reduced_costs.append(float(reduced_cost))
+                    rc_by_flight[flight_id] = float(reduced_cost)
                     if column is not None and reduced_cost > _REDUCED_COST_TOL:
-                        priced_columns.append(_canonical_column(column, graphs[flight_id], cfg))
+                        priced_columns.append(
+                            _timed(
+                                "canonical_priced", _canonical_column,
+                                column, graphs[flight_id], cfg,
+                            )
+                        )
                 if not sweep.complete:
                     pricing_complete = False
                     pricing_timeout_flight_id = sweep.timeout_flight_id
@@ -899,14 +966,20 @@ class ColGenSolver:
                         break
                     pricing_flights_completed += 1
                     best_reduced_costs.append(float(reduced_cost))
+                    rc_by_flight[flight_id] = float(reduced_cost)
                     if column is not None and reduced_cost > _REDUCED_COST_TOL:
-                        priced_columns.append(_canonical_column(column, graphs[flight_id], cfg))
+                        priced_columns.append(
+                            _timed(
+                                "canonical_priced", _canonical_column,
+                                column, graphs[flight_id], cfg,
+                            )
+                        )
 
             before_pricing = len(master.columns)
             for column in sorted(
                 priced_columns, key=lambda item: (item.flight_id, _column_key(item))
             ):
-                master.add_column(column)
+                _timed("add_column", master.add_column, column)
             if not pricing_complete:
                 termination_reason = "time_limit"
                 break
@@ -943,6 +1016,60 @@ class ColGenSolver:
             lp_gaps.append(lp_gap)
             heuristic_objectives.append(heuristic_objective)
             heuristic_costs.append(heuristic_cost)
+
+            if on_iteration is not None:
+                # Reduced-cost spread.  The bound is LP + sum(max(0, rc)), so whether the
+                # gap is a few pathological flights or all of them uniformly decides
+                # whether this is targetable or structural -- and the values are already
+                # computed here and otherwise discarded.
+                positives = sorted(v for v in best_reduced_costs if v > 0.0)
+                def _pct(frac: float) -> float:
+                    if not positives:
+                        return 0.0
+                    return positives[min(len(positives) - 1, int(frac * len(positives)))]
+
+                # Dual movement over the union of both iterations' support.
+                dual_l2 = dual_linf = float("nan")
+                if prev_capacity_duals is not None:
+                    keys = set(capacity_duals) | set(prev_capacity_duals)
+                    diffs = [
+                        capacity_duals.get(k, 0.0) - prev_capacity_duals.get(k, 0.0)
+                        for k in keys
+                    ]
+                    dual_l2 = math.sqrt(math.fsum(d * d for d in diffs))
+                    dual_linf = max((abs(d) for d in diffs), default=0.0)
+
+                on_iteration({
+                    "iteration": iterations,
+                    "lp_objective": last_lp_objective,
+                    "upper_bound": last_upper_bound,
+                    "raw_upper_bound": raw_upper_bound,
+                    "cost_upper_bound": cost_upper_bound,
+                    "cost_lower_bound": cost_lower_bound,
+                    "lp_gap": lp_gap,
+                    "lp_gap_revenue": lp_gap_revenue,
+                    "lp_gap_cost": lp_gap_cost,
+                    "heuristic_gap_revenue": heuristic_gap_revenue,
+                    "heuristic_cost": heuristic_cost,
+                    "heuristic_gap": heuristic_gap,
+                    "columns": len(master.columns),
+                    "columns_added": len(priced_columns),
+                    "rc_sum": math.fsum(positives),
+                    "rc_n_positive": len(positives),
+                    "rc_max": positives[-1] if positives else 0.0,
+                    "rc_p50": _pct(0.5),
+                    "rc_p90": _pct(0.9),
+                    "dual_l2": dual_l2,
+                    "dual_linf": dual_linf,
+                    "dual_nonzero": sum(1 for v in capacity_duals.values() if v != 0.0),
+                    "elapsed_s": time.monotonic() - started,
+                    **_coverage_diagnostics(master, last_x, rc_by_flight, params.M),
+                    "stage_s": dict(stage_s),
+                    "stage_n": dict(stage_n),
+                    "lazy_rows_added": lazy_rows_added,
+                    "lazy_row_rounds": lazy_row_rounds,
+                })
+            prev_capacity_duals = dict(capacity_duals)
 
             new_columns_since_lp = len(master.columns) > columns_at_lp
             # Section 4.2.3 stops as soon as the LP gap is under threshold, full stop --

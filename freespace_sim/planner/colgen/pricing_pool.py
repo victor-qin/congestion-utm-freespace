@@ -65,7 +65,17 @@ class ParallelPricingConfig:
     # and freed per flight.  `mp.Pool`'s own `maxtasksperchild` counts CHUNKS, so the two
     # knobs silently multiplied before `pool_maxtasksperchild` converted between them:
     # 4 here with chunksize=4 gave a worker a 16-flight life, 4x the documented bound.
-    max_tasks_per_child: int | None = 4
+    #
+    # 16 rather than the old 4 because once the conversion was correct, 4 flights meant
+    # "recycle after one chunk" at the shipped chunksize, and a 100-flight sweep spawned
+    # 25 processes instead of 7.  Measured cost of that: sweeps 20-42% slower across 2-12
+    # workers (e.g. 22.13s -> 17.48s at 4).  16 makes this default agree with
+    # `batch._default_pricing_pool`, which is the value the chunksize tuning was measured
+    # under, and removes a footgun for anyone building the config directly.  The trade is
+    # a 4x looser residue bound per worker, which is affordable now that the cost
+    # objective shrank peak labels ~29x; drop it again if worker RSS becomes the binding
+    # constraint.
+    max_tasks_per_child: int | None = 16
     # Flights handed to a worker per dispatch.  1 is maximum load balance and one IPC
     # round-trip per flight; k amortises that over k flights but lets one slow flight
     # hold k-1 others behind it.  1 was right when per-flight cost spanned 0.09-34s.

@@ -916,6 +916,12 @@ class ColGenSolver:
             pricing_complete = True
             dual_view = DualView(capacity_duals, cfg)
             flight_duals = master.flight_duals
+            # Per-iteration sweep cost.  The aggregate `parallel_sweep_wall_s` is a sum
+            # over the whole solve, which cannot answer "is pricing getting cheaper as
+            # the cutoffs tighten, or is iteration 80 as expensive as iteration 1" --
+            # and that question decides whether more iterations are affordable.
+            sweep_started = time.perf_counter()
+            iteration_sweep = None
             if parallel is not None and parallel.enabled:
                 # Same duals, same graphs, same order -- only the dispatch differs.  The pool
                 # hands back the longest completed prefix of pricing_order, so the accepted
@@ -934,6 +940,7 @@ class ColGenSolver:
                     pool_cfg=parallel,
                 )
                 parallel_sweeps.append(sweep)
+                iteration_sweep = sweep
                 for flight_id, reduced_cost, column in sweep.priced:
                     pricing_flights_completed += 1
                     best_reduced_costs.append(float(reduced_cost))
@@ -974,6 +981,8 @@ class ColGenSolver:
                                 column, graphs[flight_id], cfg,
                             )
                         )
+
+            iteration_sweep_s = time.perf_counter() - sweep_started
 
             before_pricing = len(master.columns)
             for column in sorted(
@@ -1061,6 +1070,21 @@ class ColGenSolver:
                     # consequences; the solver reads back only `last_ip_*`, which its own
                     # final solve overwrites.
                     "master": master,
+                    # This iteration's pricing cost.  `sweep_s` is the wall the solver
+                    # waited; `sweep_task_total_s` is the work the workers actually did.
+                    # The ratio against n_workers is the efficiency, and the shortfall
+                    # between them is pool overhead -- which is paid EVERY iteration,
+                    # because price_sweep builds and tears down its pool per call.
+                    "sweep_s": iteration_sweep_s,
+                    "sweep_task_total_s": (
+                        None if iteration_sweep is None else iteration_sweep.task_wall_total_s
+                    ),
+                    "sweep_task_max_s": (
+                        None if iteration_sweep is None else iteration_sweep.task_wall_max_s
+                    ),
+                    "sweep_worker_procs": (
+                        None if iteration_sweep is None else len(iteration_sweep.worker_pids)
+                    ),
                     "columns": len(master.columns),
                     "columns_added": len(priced_columns),
                     "rc_sum": math.fsum(positives),

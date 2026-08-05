@@ -15,6 +15,7 @@ from freespace_sim.planner import get_planner
 from freespace_sim.planner.colgen import batch
 from freespace_sim.planner.colgen.batch import ColumnGenerationPlanner, run_batch
 from freespace_sim.planner.colgen.params import ColGenParams
+from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig
 from freespace_sim.planner.colgen.solver import ColGenResult
 from freespace_sim.scenario import scenario_from_requests
 from freespace_sim.types import (
@@ -85,7 +86,7 @@ def test_run_batch_maps_missing_columns_and_fires_callbacks_in_event_order(
     captured = {}
     warnings = []
 
-    def fake_solve(self, requests, solve_cfg, static_terms, solve_params):
+    def fake_solve(self, requests, solve_cfg, static_terms, solve_params, parallel=None):
         captured.update(
             requests=requests,
             cfg=solve_cfg,
@@ -153,7 +154,7 @@ def test_run_batch_uses_precommit_acceptance_for_covering_bug_log(monkeypatch, c
     monkeypatch.setattr(
         batch.ColGenSolver,
         "solve",
-        lambda self, requests, solve_cfg, static_terms, params: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, parallel=None: ColGenResult(
             columns={request.flight_id: object()},
             stats={},
         ),
@@ -298,3 +299,62 @@ def test_sim_batch_branch_forwards_planner_params(monkeypatch):
     assert calls[0].report is None
     assert [intent.request.flight_id for intent in result.intents] == [1, 2]
     assert result.verified
+
+
+def test_run_batch_defaults_pricing_onto_the_process_pool(monkeypatch):
+    """The production route must be able to reach the pricing pool, and does by default.
+
+    ``sim.run`` -> ``run_batch`` is the only production entry point for whole-schedule
+    planning: ``sim.run(parallel=...)`` selects the A* speculative runner and rejects
+    batch planners outright.  Before this, ``run_batch`` called ``solve`` with no
+    ``parallel`` argument and had no parameter to pass one, so every measured speedup
+    from :mod:`~.pricing_pool` was unreachable in production.
+    """
+
+    from freespace_sim.planner.colgen.batch import (
+        _PARALLEL_MIN_FLIGHTS,
+        _default_pricing_pool,
+    )
+
+    assert _default_pricing_pool(_PARALLEL_MIN_FLIGHTS - 1) is None, "tiny batches stay serial"
+    pool = _default_pricing_pool(_PARALLEL_MIN_FLIGHTS)
+    assert pool is not None
+    assert pool.n_workers >= 2
+    assert pool.chunksize > 1, "chunked dispatch amortises per-task overhead"
+
+    cfg = SimConfig(planner="colgen")
+    seen: list = []
+
+    def _capture(self, requests, solve_cfg, static_terms, params, parallel=None):
+        seen.append(parallel)
+        return ColGenResult(columns={}, stats={})
+
+    monkeypatch.setattr(batch.ColGenSolver, "solve", _capture)
+
+    def _run(requests, **kwargs):
+        return run_batch(
+            scenario_from_requests(requests),
+            cfg,
+            ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (),
+            lambda *_args: None,
+            None,
+            None,
+            **kwargs,
+        )
+
+    small = [FlightRequest(i, vec(0, 0, 0), vec(1200, 0, 0), float(i)) for i in range(4)]
+    big = [
+        FlightRequest(i, vec(0, 0, 0), vec(1200, 0, 0), float(i))
+        for i in range(_PARALLEL_MIN_FLIGHTS + 1)
+    ]
+    explicit = ParallelPricingConfig(n_workers=3, chunksize=7)
+
+    _run(small)
+    _run(big)
+    _run(big, parallel=explicit)
+
+    assert seen[0] is None, "below the threshold the pool costs more than it saves"
+    assert seen[1] is not None and seen[1].n_workers >= 2, "a real batch fans out by default"
+    assert seen[2] is explicit, "an explicit config is forwarded verbatim"

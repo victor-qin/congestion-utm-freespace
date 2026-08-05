@@ -396,6 +396,8 @@ def main() -> int:
               f"= what the sequential sweep costs")
         print(f"efficiency      : {task_total / (sweep_wall * n_w) if sweep_wall else 0:8.2%} "
               f"of the {n_w} worker-slots kept busy")
+        for fid, wall_s, peak_b, kstats in stats_par.get("parallel_slowest_flights", ())[:6]:
+            print(f"    slow fid={fid:<7} {wall_s:8.2f}s  peak={peak_b / _MB:7.0f}MB  {kstats}")
         print(f"straggler       : {task_max:8.2f}s longest single task "
               f"= hard floor under the makespan "
               f"(max achievable sweep speedup {task_total / task_max if task_max else 0:.1f}x)")

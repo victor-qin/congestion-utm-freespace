@@ -40,7 +40,7 @@ import os
 import resource
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .params import ColGenParams
 
@@ -119,7 +119,15 @@ def _price_one(task):
     except pricing_mod.PricingTimeout:
         reduced_cost, column = None, None
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _MAXRSS_SCALE
-    return flight_id, reduced_cost, column, os.getpid(), peak, time.perf_counter() - started
+    # Read the kernel's own account of this flight before anything else overwrites it.
+    # This is the only route to straggler attribution: the time is spent in the worker,
+    # and a parent-side patch cannot reach it because the pool pickles `_price_one` by
+    # reference and the worker resolves the original.
+    stats = dict(pricing_mod._LAST_KERNEL_STATS)
+    return (
+        flight_id, reduced_cost, column, os.getpid(), peak,
+        time.perf_counter() - started, stats,
+    )
 
 
 # --------------------------------------------------------------------------------- parent side
@@ -138,6 +146,9 @@ class SweepResult:
     sweep_wall_s: float               # makespan: submit -> last task back
     task_wall_total_s: float          # sum of per-task work; ~= the sequential sweep cost
     task_wall_max_s: float            # the straggler; a hard floor under sweep_wall_s
+    # (flight_id, wall_s, worker_peak_rss_bytes, kernel_stats) per task, so the
+    # straggler can be named and explained rather than just counted.
+    per_flight: list = field(default_factory=list)
 
     @property
     def efficiency(self) -> float:
@@ -165,6 +176,7 @@ def price_sweep(
     worker_pids: set = set()
     peak_rss = 0
     task_walls: list[float] = []
+    per_flight: list[tuple] = []
     sweep_started = time.perf_counter()
     # multiprocessing.Pool rather than concurrent.futures.ProcessPoolExecutor, for one
     # specific reason: ProcessPoolExecutor's `max_tasks_per_child` DEADLOCKS on CPython
@@ -189,13 +201,14 @@ def price_sweep(
         initargs=(repo_root, cfg, params, dual_view),
         maxtasksperchild=pool_cfg.max_tasks_per_child,
     ) as pool:
-        for flight_id, reduced_cost, column, pid, peak, task_wall in pool.imap_unordered(
-            _price_one, tasks
-        ):
+        for (
+            flight_id, reduced_cost, column, pid, peak, task_wall, kstats
+        ) in pool.imap_unordered(_price_one, tasks):
             results[flight_id] = (reduced_cost, column)
             worker_pids.add(pid)
             peak_rss = max(peak_rss, peak)
             task_walls.append(task_wall)
+            per_flight.append((flight_id, task_wall, peak, kstats))
     sweep_wall = time.perf_counter() - sweep_started
 
     # Rebuild the sequential prefix: stop at the first flight that timed out, and drop
@@ -221,6 +234,7 @@ def price_sweep(
         sweep_wall_s=sweep_wall,
         task_wall_total_s=sum(task_walls),
         task_wall_max_s=max(task_walls, default=0.0),
+        per_flight=per_flight,
     )
 
 

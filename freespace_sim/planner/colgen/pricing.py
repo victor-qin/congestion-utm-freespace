@@ -57,6 +57,16 @@ except ImportError:  # pragma: no cover - exercised by installs without the extr
 _kernel_fallback_warned = False
 
 
+# Outcome of the most recent `_best_column` call in THIS process, overwritten each
+# time.  A module global rather than a return value because the compiled gate sits
+# several frames below the pricing entry point and threading a stats object through
+# would touch every signature on the way.  Read it immediately after `price_flight`
+# returns, in the same process -- `pricing_pool` does exactly that, which is the only
+# way to attribute a straggler in the parallel sweep (the workers are where the time
+# goes, and parent-side patches cannot reach them).
+_LAST_KERNEL_STATS: dict = {}
+
+
 def _warn_kernel_fallback() -> None:
     """One stderr line, once per process, when the compiled pricing DP is absent.
 
@@ -1141,9 +1151,14 @@ def _best_column_compiled(
 
     from . import dp_prepare
 
+    _LAST_KERNEL_STATS.clear()
+    _LAST_KERNEL_STATS["hops"] = fg.shortest_hops
+    _LAST_KERNEL_STATS["steps"] = fg.max_step - fg.min_step + 1
     topology = _topology_for(fg, cfg)
     if topology.unsupported_reason is not None:
+        _LAST_KERNEL_STATS["unsupported"] = topology.unsupported_reason
         return incumbent, False
+    _LAST_KERNEL_STATS["n_cells"] = topology.n_cells
 
     cutoff = incumbent[0] if incumbent is not None else None
     # The kernel filters only CELL rows.  Terminal and endpoint exclusions stay in
@@ -1187,6 +1202,15 @@ def _best_column_compiled(
                 cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
                 seed=seed, forbidden=forbidden_pack, cancel_flag=cancel_flag,
             )
+            _LAST_KERNEL_STATS["attempts"] = _LAST_KERNEL_STATS.get("attempts", 0) + 1
+            _LAST_KERNEL_STATS["status"] = result.status_name
+            _LAST_KERNEL_STATS["regrow"] = (
+                _LAST_KERNEL_STATS.get("regrow", 0) + result.regrow
+            )
+            _LAST_KERNEL_STATS["labels"] = max(
+                _LAST_KERNEL_STATS.get("labels", 0), result.n_labels
+            )
+            _LAST_KERNEL_STATS["candidates"] = len(result.candidates)
             if result.status == _dp_kernel.FB_CANCELLED:
                 raise PricingTimeout("column pricing reached its wall-clock deadline")
             if result.ok or not result.candidates:
@@ -1252,6 +1276,7 @@ def _best_column(
         )
         if proved:
             return certified if certified is not None else (-math.inf, None)
+        _LAST_KERNEL_STATS["reference_fallback"] = True
         # Not proved: fall through to the reference search, warm-started with
         # whatever the kernel did certify so its pruning starts tighter.
         incumbent = certified if certified is not None else incumbent

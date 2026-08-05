@@ -1135,6 +1135,14 @@ class ColGenSolver:
             "parallel_task_wall_max_s": max(
                 (sweep.task_wall_max_s for sweep in parallel_sweeps), default=0.0
             ),
+            # Slowest tasks, named and explained. A straggler sets the makespan floor,
+            # so "which flight and why" is the actionable form of that number.
+            "parallel_slowest_flights": tuple(
+                sorted(
+                    (row for sweep in parallel_sweeps for row in sweep.per_flight),
+                    key=lambda row: -row[1],
+                )[:8]
+            ),
             "n_columns": len(master.columns),
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,

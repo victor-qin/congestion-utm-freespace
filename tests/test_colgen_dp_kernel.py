@@ -559,3 +559,268 @@ def test_tiny_label_pool_still_reaches_the_reference_answer(monkeypatch):
         assert got_rc == pytest.approx(expected_rc, abs=1e-8)
         if expected is not None:
             assert got is not None and got.cell_path == expected.cell_path
+
+
+
+# ------------------------------------------------------ joint completion bound
+#
+# ``_completion_bound`` is the only place the kernel charges a label for work it has
+# not done yet, so an over-tight value here prunes the optimum and the search returns
+# a wrong answer that still looks certified.  Admissibility is therefore tested from
+# four independent directions: against a hand-written recursion, against the degenerate
+# case where it must reduce to the previous bound exactly, against what a real
+# certified column actually pays, and end to end against the reference DP.
+
+
+def _bounds_for(graph, cfg, view, *, benefit=100.0, pi_f=0.0):
+    """Run ``_completion_bound`` on a prepared graph; returns (g, topology, variants)."""
+
+    topology = pricing._topology_for(graph, cfg)
+    duals = dp_prepare.prepare_duals(view, topology)
+    variants = dp_prepare.prepare_variants(
+        graph, cfg, view, topology, seed=False, benefit=benefit, pi_f=pi_f
+    )
+    n_steps = topology.max_step - topology.min_step + 1
+    g = np.empty((topology.n_cells, n_steps), dtype=np.float64)
+    dp_kernel._completion_bound(
+        topology.arc_start, topology.arc_target, topology.rev_remaining,
+        topology.dest_mask, topology.min_step, topology.max_step,
+        duals.dual_first, duals.dual_start, duals.dual_prefix,
+        duals.window_lo, duals.window_hi,
+        variants.dest_slot_of_cell, variants.dest_positive, variants.dest_step_base,
+        float(cfg.dt_s), g,
+    )
+    return g, topology, variants
+
+
+def _completion_bound_oracle(topology, variants, view, dt_s):
+    """Independent pure-Python recursion, written from the definition.
+
+    Deliberately not a transcription of the kernel: least (positive-part payment +
+    destination endpoint price + dt per remaining hop) over every relaxed completion.
+    """
+
+    n_cells = topology.n_cells
+    min_step, max_step = topology.min_step, topology.max_step
+    n_steps = max_step - min_step + 1
+    cells = [
+        (int(q), int(r))
+        for q, r in zip(topology.cell_q.tolist(), topology.cell_r.tolist())
+    ]
+    inf = float("inf")
+    g = [[inf] * n_steps for _ in range(n_cells)]
+    n_dest_steps = variants.dest_positive.shape[1]
+
+    for step in range(max_step, min_step - 1, -1):
+        k = step - min_step
+        for c in range(n_cells):
+            if step + int(topology.rev_remaining[c]) > max_step or step >= max_step:
+                continue                                        # stays inf
+            best = inf
+            for a in range(int(topology.arc_start[c]), int(topology.arc_start[c + 1])):
+                nb = int(topology.arc_target[a])
+                w = max(0.0, view.visit_cost(cells[nb], 0, step + 1))
+                if topology.dest_mask[nb]:
+                    # max, not sum: the endpoint rows and this visit's window overlap.
+                    slot = int(variants.dest_slot_of_cell[nb])
+                    arrival = step + 1 - variants.dest_step_base
+                    endpoint = (
+                        float(variants.dest_positive[slot, arrival])
+                        if slot >= 0 and 0 <= arrival < n_dest_steps
+                        else 0.0
+                    )
+                    stop = max(w, endpoint)
+                    best = min(best, dt_s + stop)
+                if g[nb][k + 1] != inf:
+                    best = min(best, w + dt_s + g[nb][k + 1])
+            g[c][k] = best
+    return g
+
+
+def test_completion_bound_matches_an_independent_backward_recursion():
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, _params = _graph(cfg, dest=(5, -2), slack=4)
+    # DENSE duals, deliberately.  With sparse pricing the payment part is identically
+    # zero -- a free detour always exists -- so a random-dual sweep would compare 0
+    # against 0 over most states.  (Not a quirk of the test: measured on three captured
+    # density_faa subproblems, ZERO of 4.3M-7.6M reachable states had a positive
+    # payment bound.  The endpoint and per-hop terms are what make it bite there.)
+    dense = {
+        RowKey.cell(cell, 0, step): 1.5
+        for cell in sorted(graph.corridor_cells)
+        for step in range(graph.base_step, graph.base_step + 30)
+    }
+    view = DualView(dense, cfg)
+    g, topology, variants = _bounds_for(graph, cfg, view)
+    want_g = _completion_bound_oracle(topology, variants, view, float(cfg.dt_s))
+
+    finite = 0
+    for c in range(topology.n_cells):
+        for k in range(topology.max_step - topology.min_step + 1):
+            want = want_g[c][k]
+            if want == float("inf"):
+                assert g[c, k] == float("inf"), f"g[{c},{k}] finite"
+            else:
+                assert g[c, k] == pytest.approx(want, abs=1e-9), f"g[{c},{k}]"
+            if want_g[c][k] != float("inf"):
+                finite += 1
+    assert finite > 100, f"only {finite} reachable states; the comparison is too weak"
+    assert float(g[np.isfinite(g)].max()) > 0.0, "bound is vacuously zero"
+
+
+def test_completion_bound_reduces_to_the_previous_delay_bound_when_nothing_is_priced():
+    """With no duals and no endpoint price, ``g`` must be exactly ``rev_remaining * dt``.
+
+    That is the identity that makes this a strict tightening rather than a different
+    bound: the old expression charged ``_delay_lower_bound`` at ``hops + rev_remaining``
+    and nothing for payment, which is precisely this case.  If it fails, the joint bound
+    is not a superset of the old one and every parity result is suspect.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, _params = _graph(cfg, dest=(5, -2), slack=4)
+    g, topology, _variants = _bounds_for(graph, cfg, DualView({}, cfg))
+
+    checked = 0
+    for c in range(topology.n_cells):
+        for k in range(topology.max_step - topology.min_step + 1):
+            if not np.isfinite(g[c, k]):
+                continue
+            checked += 1
+            if topology.dest_mask[c]:
+                # A label already ON a destination has had its sink emitted; the bound
+                # governs only what happens if it CONTINUES, which costs at least one
+                # hop off the cell (and, here, one back).  Charging that is a genuine
+                # tightening over the old bound, which used rev_remaining == 0.
+                assert g[c, k] >= cfg.dt_s - 1e-9, f"g[{c},{k}] undercharges a dest cell"
+                continue
+            assert g[c, k] == pytest.approx(
+                float(topology.rev_remaining[c]) * cfg.dt_s, abs=1e-9
+            ), f"g[{c},{k}] is not rev_remaining * dt"
+    assert checked > 100, f"only {checked} reachable states"
+
+
+def test_completion_bound_dominates_its_own_components():
+    """Structural invariant: ``g >= rev_remaining * dt`` everywhere, and never negative.
+
+    Failure means the per-hop charge or the endpoint seed landed wrong, which is the
+    shape of error that silently over-tightens the bound and prunes the optimum.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, _params = _graph(cfg, dest=(5, -2), slack=4)
+    rng = np.random.default_rng(31)
+    view = DualView(_random_duals(rng, sorted(graph.corridor_cells), graph.base_step, 30), cfg)
+    g, topology, _variants = _bounds_for(graph, cfg, view)
+
+    finite = np.isfinite(g)
+    assert finite.any()
+    floor = np.broadcast_to(
+        np.asarray(topology.rev_remaining, dtype=np.float64)[:, None] * cfg.dt_s, g.shape
+    )
+    assert np.all(g[finite] >= floor[finite] - 1e-9), "g fell below rev_remaining * dt"
+    assert np.all(g[finite] >= -1e-12), "g went negative"
+
+
+@pytest.mark.parametrize("seed", [23, 41, 57])
+def test_completion_bound_never_exceeds_what_a_certified_column_pays(seed):
+    """Admissibility against reality: the bound must not exceed the real remainder.
+
+    Charge a label more than its best completion actually costs and the optimum is
+    pruned.  Checked against a genuine certified column, at every position along it,
+    for both accumulators.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, params = _graph(cfg, dest=(5, -2), slack=4)
+    rng = np.random.default_rng(seed)
+    view = DualView(_random_duals(rng, sorted(graph.corridor_cells), graph.base_step, 25), cfg)
+    _rc, column = price_flight(graph, view, 0.0, cfg, params, require_improving=False)
+    assert column is not None
+    g, topology, variants = _bounds_for(graph, cfg, view)
+
+    path = list(column.cell_path)
+    first_visit = column.departure_step + graph.takeoff_steps[0] + (
+        0 if column.origin_lane_idx is None
+        else graph.origin_lanes[column.origin_lane_idx].steps
+    )
+    steps = [first_visit + i for i in range(len(path))]
+    index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+    arrival = steps[-1] - variants.dest_step_base
+    dest_slot = int(variants.dest_slot_of_cell[index[path[-1]]])
+    endpoint = (
+        float(variants.dest_positive[dest_slot, arrival])
+        if dest_slot >= 0 and 0 <= arrival < variants.dest_positive.shape[1]
+        else 0.0
+    )
+
+    checked = 0
+    # The final position is excluded on purpose: the column ENDS there, its sink was
+    # already emitted when the arc into it was relaxed, and the bound at that label
+    # governs only continuations -- which necessarily cost at least one more hop.
+    for i, (cell, step) in enumerate(zip(path[:-1], steps[:-1])):
+        ci = index.get((int(cell[0]), int(cell[1])))
+        if ci is None or not (topology.min_step <= step <= topology.max_step):
+            continue
+        payment = sum(
+            max(0.0, view.visit_cost(path[j], 0, steps[j])) for j in range(i + 1, len(path))
+        )
+        remaining_hops = len(path) - 1 - i
+        checked += 1
+        assert g[ci, step - topology.min_step] <= (
+            payment + endpoint + remaining_hops * cfg.dt_s + 1e-9
+        ), f"g exceeds what this column really costs from hop {i}; the optimum prunes"
+    assert checked >= 3, f"only {checked} positions checked; the sweep is too weak"
+
+
+@pytest.mark.parametrize("time_buffer_s", [4.0, 0.0])
+def test_joint_bound_returns_the_same_column_as_the_unbounded_search(time_buffer_s):
+    """End-to-end admissibility: toggling the bound must not change the answer.
+
+    The strongest check available -- an inadmissible bound prunes the optimum, and the
+    two arms then disagree on the column even when the reduced cost happens to match.
+    Both arms run the compiled kernel, so this isolates the bound from every other
+    difference between kernel and reference.
+    """
+
+    original = dp_kernel.search_dag
+    rng = np.random.default_rng(20260805)
+    compared = 0
+    for trial in range(10):
+        cfg = _cfg(time_buffer_s=time_buffer_s, max_ground_delay_s=120.0)
+        graph, params = _graph(
+            cfg, dest=(int(rng.integers(3, 6)), int(rng.integers(-3, 3))),
+            slack=int(rng.integers(1, 5)), flight_id=trial + 1,
+        )
+        view = DualView(
+            _random_duals(rng, sorted(graph.corridor_cells), graph.base_step, 30), cfg
+        )
+        pi_f = float(rng.normal(0.0, 20.0))
+
+        arms = {}
+        for enabled in (False, True):
+            def patched(*args, _on=enabled, **kwargs):
+                kwargs["completion_bound"] = _on
+                return original(*args, **kwargs)
+
+            pricing._dp_kernel.search_dag = patched
+            try:
+                arms[enabled] = price_flight(
+                    graph, view, pi_f, cfg, params, require_improving=False
+                )
+            finally:
+                pricing._dp_kernel.search_dag = original
+
+        (off_rc, off), (on_rc, on) = arms[False], arms[True]
+        if off is None:
+            assert on is None, "the bound invented a column the unbounded search misses"
+            continue
+        compared += 1
+        assert on is not None, "the bound pruned the only column"
+        assert on_rc == pytest.approx(off_rc, abs=1e-8)
+        assert on.cell_path == off.cell_path, "the bound pruned the optimum"
+        assert on.departure_step == off.departure_step
+    assert compared >= 5, f"only {compared} graphs produced a column; sweep is too weak"

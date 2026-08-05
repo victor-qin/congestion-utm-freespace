@@ -127,6 +127,38 @@ def _visit_forbidden(
 
 
 @njit(cache=True, nogil=True)
+def _raw_window_cost(
+    cell, visit_step, dual_first, dual_start, dual_prefix, window_lo, window_hi
+):
+    """One cell visit's row window price, before any origin-paid deduction.
+
+    Split out of ``_window_cost`` because the completion bound below prices visits
+    without knowing which origin variant will reach them, so it cannot apply the
+    per-variant deduction.
+    """
+
+    lo_off = dual_start[cell]
+    length = dual_start[cell + 1] - lo_off
+    if length <= 1:
+        return 0.0
+    first = dual_first[cell]
+    series_stop = first + length - 1
+    a = visit_step + window_lo
+    if a < first:
+        a = first
+    if a > series_stop:
+        a = series_stop
+    b = visit_step + window_hi + 1
+    if b < first:
+        b = first
+    if b > series_stop:
+        b = series_stop
+    if b > a:
+        return dual_prefix[lo_off + b - first] - dual_prefix[lo_off + a - first]
+    return 0.0
+
+
+@njit(cache=True, nogil=True)
 def _window_cost(
     cell,
     visit_step,
@@ -148,26 +180,9 @@ def _window_cost(
     ``RowKey`` sum in pure Python.
     """
 
-    lo_off = dual_start[cell]
-    length = dual_start[cell + 1] - lo_off
-    total = 0.0
-    if length > 1:
-        first = dual_first[cell]
-        series_stop = first + length - 1
-        start = visit_step + window_lo
-        stop = visit_step + window_hi + 1
-        a = start
-        if a < first:
-            a = first
-        if a > series_stop:
-            a = series_stop
-        b = stop
-        if b < first:
-            b = first
-        if b > series_stop:
-            b = series_stop
-        if b > a:
-            total = dual_prefix[lo_off + b - first] - dual_prefix[lo_off + a - first]
+    total = _raw_window_cost(
+        cell, visit_step, dual_first, dual_start, dual_prefix, window_lo, window_hi
+    )
 
     # Subtract any window row already charged at the origin endpoint.  Entries are
     # sorted by (cell, step); the sets are tiny, so a bounded scan beats a search.
@@ -184,6 +199,107 @@ def _window_cost(
             elif paid_cell[p] > cell:
                 break
     return total
+
+
+@njit(cache=True, nogil=True)
+def _completion_bound(
+    arc_start,
+    arc_target,
+    rev_remaining,
+    dest_mask,
+    min_step,
+    max_step,
+    dual_first,
+    dual_start,
+    dual_prefix,
+    window_lo,
+    window_hi,
+    dest_slot_of_cell,
+    dest_positive,
+    dest_step_base,
+    dt_s,
+    g,
+):
+    """Least JOINT cost any completion must still incur, per (cell, step).
+
+    Filled by one backward sweep over time.  The sweep is exact for the relaxation
+    because every arc advances the step by exactly one, so the time-expanded graph is a
+    DAG whose layers are already in topological order.
+
+    ``g[c, k]`` = min over completions of ``sum(max(0, w)) + dest_positive(T) + dt*(T - t)``
+
+    Why this is the whole point.  Charging delay and payment separately -- a delay term
+    at the FEWEST possible hops plus a payment term along the CHEAPEST route -- bounds a
+    sum of minima, which no single completion can attain when those are different
+    routes.  That is exactly the case on a congested flight: the short route arrives in
+    a priced window and the free route is longer.  Minimising them jointly is what
+    makes the bound bite.
+
+    Positive parts rather than signed sums: the caller clamps the prefix payment at
+    zero and adds ``max_negative_credit`` back to cover every negative dual on the
+    path.  Summing signed costs here would let the same credit count twice and the
+    bound would stop being an upper bound.  With positive parts the composition is
+    immediate, since ``sum(w) >= sum(max(0, w)) - sum(max(0, -w))`` and the second term
+    is what ``max_negative_credit`` already bounds.
+
+    Three relaxations keep it admissible -- each minimises over a SUPERSET of the real
+    completions, so the values can only come out too small:
+      * arc roles are ignored (any-role superset, as ``rev_remaining``);
+      * the revisit ban is ignored, so a walk may reuse cells the search forbids;
+      * the per-variant origin-paid deduction is not applied here.  That one would cut
+        the *true* cost rather than widen the walk set, so the caller subtracts the
+        largest possible deduction separately -- see ``paid_correction``.
+
+    Unreachable states stay ``inf``; the caller prunes them, which is right because no
+    completion exists from there at all.
+    """
+
+    n_cells = arc_start.shape[0] - 1
+    n_dest_steps = dest_positive.shape[1]
+
+    for step in range(max_step, min_step - 1, -1):
+        k = step - min_step
+        for c in range(n_cells):
+            # A state that cannot reach a destination in the time left has no
+            # completion; leaving it at inf prunes it at the first probe.
+            if step + rev_remaining[c] > max_step or step >= max_step:
+                g[c, k] = np.inf
+                continue
+            best = np.inf
+            for a in range(arc_start[c], arc_start[c + 1]):
+                nb = arc_target[a]
+                w = _raw_window_cost(
+                    nb, step + 1, dual_first, dual_start, dual_prefix,
+                    window_lo, window_hi,
+                )
+                if w < 0.0:
+                    w = 0.0
+
+                # Stopping here.  Termination is priced on the ARC, not as a value at
+                # the destination node, because the endpoint claim set and the final
+                # visit's window overlap: the reference charges their de-duplicated
+                # UNION, whose positive price is at least the larger of the two but
+                # generally less than their sum.  Summing them over-charges, which
+                # over-tightens the bound and prunes the optimum -- caught by
+                # test_zero_buffer_pricing_keeps_predecessor_dependent_endpoint_duals.
+                if dest_mask[nb] != 0:
+                    stop = w
+                    slot = dest_slot_of_cell[nb]
+                    arrival = step + 1 - dest_step_base
+                    if slot >= 0 and 0 <= arrival < n_dest_steps:
+                        endpoint = dest_positive[slot, arrival]
+                        if endpoint > stop:
+                            stop = endpoint
+                    if dt_s + stop < best:
+                        best = dt_s + stop
+
+                # Carrying on past nb.
+                onward = g[nb, k + 1]
+                if onward != np.inf:
+                    total = w + dt_s + onward
+                    if total < best:
+                        best = total
+            g[c, k] = best
 
 
 @njit(cache=True, nogil=True)
@@ -336,6 +452,12 @@ def _search_dag(
     pi_f,
     cost_cutoff,
     have_cutoff,
+    # joint completion bound, indexed [cell, step - min_step], plus the largest
+    # origin-paid deduction any variant could apply (they are built without knowing
+    # which variant will arrive)
+    g,
+    paid_correction,
+    use_g,
     # workspace (label pool)
     label_cell,
     label_parent,
@@ -469,18 +591,18 @@ def _search_dag(
                 and v_origin_fold_exact[v] != 0
                 and destination_fold_exact
             )
-            # Bound pruning.  ``_delay_lower_bound`` is non-decreasing in total
-            # hops, so the loop the reference runs over hop counts is maximized at
-            # its first iteration -- one expression, no table.  Dropping the
-            # reference's destination-positive refinement only widens the bound,
-            # so this never prunes a label the reference would keep.
+            # Bound pruning.
             if have_cutoff:
                 paid = -label_score[li] - v_ground_delay[v] - v_origin_leg[v] - hops * dt_s
                 paid_positive = paid - RECOMPUTE_EPS
                 if paid_positive < 0.0:
                     paid_positive = 0.0
-                remain = rev_remaining[cell]
-                total_hops = hops + remain
+                # Bound 1, the long-standing one.  ``_delay_lower_bound`` is
+                # non-decreasing in total hops, so the loop the reference runs over hop
+                # counts is maximized at its first iteration -- one expression, no
+                # table.  Charges the prefix payment; charges nothing for the
+                # destination endpoint.
+                total_hops = hops + rev_remaining[cell]
                 if total_hops < 1:
                     total_hops = 1
                 bound = (
@@ -493,6 +615,39 @@ def _search_dag(
                     - paid_positive
                     + max_negative_credit
                 )
+
+                # Bound 2, the joint one: least (endpoint price + dt per remaining hop)
+                # any completion can reach, folded into the delay clamp together rather
+                # than minimised separately.  That coupling is the point -- on a
+                # congested flight the short route arrives in a priced window and the
+                # free route is longer, and charging each minimum on its own bounds a
+                # sum no single completion attains.
+                #
+                # It deliberately does NOT subtract paid_positive.  The prefix payment
+                # and the endpoint claim set OVERLAP, and the reference combines them
+                # with max for exactly that reason (`union_positive_lb`, and the same
+                # note on the sink path here).  Subtracting both would charge the
+                # overlap twice and prune the optimum -- caught by
+                # test_zero_buffer_pricing_keeps_predecessor_dependent_endpoint_duals.
+                #
+                # Both bounds are valid upper bounds on this label's reduced cost, so
+                # the smaller is the tighter admissible one.  `inf` (no completion
+                # reaches a destination in the time left) collapses bound 2 to -inf and
+                # prunes, which is correct.
+                if use_g and folding_exact:
+                    excess = (
+                        v_origin_fold[v] + hops * dt_s + destination_fold_s
+                        - reference_time_s
+                        + g[cell, step - min_step]
+                        - paid_correction
+                    )
+                    if excess < 0.0:
+                        excess = 0.0
+                    joint = (
+                        benefit - pi_f - v_ground_delay[v] - excess + max_negative_credit
+                    )
+                    if joint < bound:
+                        bound = joint
                 if bound <= cost_cutoff - RECOMPUTE_EPS:
                     li = label_next[li]
                     continue
@@ -763,6 +918,11 @@ def search_dag(
     # therefore a STRAGGLER knob at least as much as a memory knob: it also lifts the
     # makespan floor for flight-parallel pricing from 125s to 34s.
     label_limit_max: int = 1 << 25,
+    # Charge each label for the cheapest dual price its completion must still pay,
+    # instead of assuming the remainder is free.  Costs one backward sweep over
+    # n_cells * n_steps up front; exposed so the A/B harness can measure whether that
+    # sweep pays for itself on a given workload.
+    completion_bound: bool = True,
     forbidden=None,
     cancel_flag: np.ndarray | None = None,
 ) -> DagSearchResult:
@@ -787,6 +947,35 @@ def search_dag(
     n_steps = topology.max_step - topology.min_step + 1
     depth = topology.state_history_depth
     regrow = 0
+
+    # Completion bound, built once: it depends only on the topology and this
+    # iteration's duals, so a label-pool regrow reuses it.  One n_cells * n_steps
+    # float64 array -- 36 MB on the largest measured density flight, against a label
+    # pool of ~1.5 GB at the same size.
+    if completion_bound:
+        g = np.empty((n_cells, n_steps), dtype=np.float64)
+        _completion_bound(
+            topology.arc_start, topology.arc_target, topology.rev_remaining,
+            topology.dest_mask, topology.min_step, topology.max_step,
+            duals.dual_first, duals.dual_start, duals.dual_prefix,
+            duals.window_lo, duals.window_hi,
+            variants.dest_slot_of_cell, variants.dest_positive, variants.dest_step_base,
+            float(cfg.dt_s), g,
+        )
+        # The bound prices visits without the per-variant origin-paid deduction, so it
+        # can over-charge by at most the largest such deduction.  Subtracting that
+        # keeps it a lower bound for every variant at once.
+        paid_correction = 0.0
+        starts = variants.paid_start
+        for cls in range(starts.shape[0] - 1):
+            segment = variants.paid_value[starts[cls] : starts[cls + 1]]
+            if segment.size:
+                total = float(segment[segment > 0.0].sum())
+                if total > paid_correction:
+                    paid_correction = total
+    else:
+        g = np.zeros((1, 1), dtype=np.float64)
+        paid_correction = 0.0
 
     while True:
         state_cap = _next_pow2(2 * limit)
@@ -832,6 +1021,7 @@ def search_dag(
             float(cfg.dt_s), float(benefit), float(pi_f),
             float(cost_cutoff) if cost_cutoff is not None else 0.0,
             cost_cutoff is not None,
+            g, float(paid_correction), bool(completion_bound),
             label_cell, label_parent, label_hops, label_variant, label_first_arc,
             label_score, label_next, label_recent, layer_head,
             state_key_step, state_key_cell, state_key_paid, state_key_first,

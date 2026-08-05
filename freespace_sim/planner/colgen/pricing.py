@@ -1041,20 +1041,6 @@ def _topology_for(fg: FlightGraph, cfg: SimConfig):
         return topology
 
 
-# Departure variants searched per kernel invocation; 0 disables chunking.
-#
-# OFF by default because it measured a net loss.  It does bound the pool per search and
-# does cut the per-flight peak where it applies (fid=1796: 2,168 -> 989 MB), and it is
-# exact.  But on density_faa first-100 at 4 workers it cost wall 69.22 -> 84.04s and
-# useful work 107.92 -> 163.88s (+52%, the price of losing cross-batch dominance) while
-# TREE peak RSS went 7,966 -> 10,315 MB and per-worker peak did not move at all.
-#
-# Two reasons the guarantee does not reach the number that matters: flights with fewer
-# variants than the chunk are never chunked, so they still set the per-worker peak; and a
-# slower sweep overlaps more large allocations across workers, which is what the tree
-# peak actually measures.  Left in, tested, and available for a memory-bound machine
-# where trading 21% wall for a bounded per-search pool is the right way round.
-_VARIANT_CHUNK = 0
 
 _MAX_KERNEL_ATTEMPTS = 3
 
@@ -1226,7 +1212,7 @@ def _best_column_compiled(
         # Answer-neutral: the bootstrap only ever produces a *certified* incumbent, and
         # pruning against an attainable score cannot discard anything strictly better.
         # If it finds nothing, the cutoff is unchanged and only its own cost is lost.
-        if variants.n_variants > 1 and _VARIANT_CHUNK <= 0:
+        if variants.n_variants > 1:
             order = np.argsort(-np.asarray(variants.score), kind="stable")
             boot = _dp_kernel.search_dag(
                 topology, duals, dp_prepare.restrict_variants(variants, order[:1]),
@@ -1252,55 +1238,6 @@ def _best_column_compiled(
                     )
                     if variants.n_variants == 0:
                         return incumbent, True
-
-        # Chunked search: bound the label pool by searching departure variants in
-        # batches, tightening the cutoff after each.  The bootstrap above is the
-        # degenerate case (one batch of size 1 then everything); this generalises it and
-        # is what makes the memory bound a GUARANTEE rather than a hope -- peak pool is
-        # set by the largest batch, not by the whole problem.
-        #
-        # Exact, for two separate reasons.  (a) The cutoff only ever comes from a
-        # *certified* column, and pruning against an attainable score cannot discard
-        # anything strictly better.  (b) Dominance is applied only within a batch, so
-        # labels that the monolithic sweep would have dominated across variants survive
-        # here -- the chunked search explores a SUPERSET, never a subset.  It therefore
-        # costs more total work than one big sweep and buys a lower peak; that is the
-        # trade, and it is the right way round when memory is what bounds worker count.
-        #
-        # The residual is accumulated as a max over batches, because the optimality
-        # proof must cover what every batch left unexplored, not just the last.
-        chunk_residual: float | None = None
-        if _VARIANT_CHUNK > 0 and variants.n_variants > _VARIANT_CHUNK:
-            order = np.argsort(-np.asarray(variants.score), kind="stable")
-            chunk_residual = -math.inf
-            all_variants = variants
-            for start in range(0, order.shape[0], _VARIANT_CHUNK):
-                batch = dp_prepare.restrict_variants(
-                    all_variants, order[start : start + _VARIANT_CHUNK]
-                )
-                result = _dp_kernel.search_dag(
-                    topology, duals, batch,
-                    cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
-                    seed=seed, forbidden=forbidden_pack, cancel_flag=cancel_flag,
-                )
-                if result.status == _dp_kernel.FB_CANCELLED:
-                    raise PricingTimeout("column pricing reached its wall-clock deadline")
-                if not result.ok:
-                    # One batch could not be completed, so nothing can be proved. Hand
-                    # the reference whatever has been certified so far.
-                    return incumbent, False
-                improved, res = _certify_candidates(
-                    result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent,
-                    deadline=deadline, want_residual=True,
-                )
-                chunk_residual = max(chunk_residual, res)
-                if improved is not None and (
-                    cutoff is None or improved[0] > cutoff + _SCORE_EPS
-                ):
-                    incumbent = improved
-                    cutoff = improved[0]
-            proved = incumbent is not None and chunk_residual <= incumbent[0] + _RECOMPUTE_EPS
-            return incumbent, proved
 
         for _attempt in range(_MAX_KERNEL_ATTEMPTS):
             result = _dp_kernel.search_dag(
@@ -1333,17 +1270,6 @@ def _best_column_compiled(
             timer.cancel()
     if not result.ok:
         return incumbent, False
-
-    if chunk_residual is not None:
-        # Chunked: `result` holds only the LAST batch, so certify it and fold in the
-        # residual every earlier batch left behind.
-        best, residual = _certify_candidates(
-            result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent,
-            deadline=deadline, want_residual=True,
-        )
-        residual = max(residual, chunk_residual)
-        proved = best is not None and residual <= best[0] + _RECOMPUTE_EPS
-        return best, proved
 
     # Tier 1 -- rank by a PROVISIONAL reduced cost built from real path geometry,
     # not by the kernel's admissible bound.  The bound is deliberately loose (it

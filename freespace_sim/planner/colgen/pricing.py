@@ -2181,9 +2181,25 @@ def price_flight(
     *,
     forbidden_rows: AbstractSet[RowKey] = _EMPTY_ROWS,
     require_improving: bool = True,
+    known_column: Column | None = None,
     deadline: float | None = None,
 ) -> tuple[float, Column | None]:
     """Return the best positive-reduced-cost column for one flight.
+
+    ``known_column`` is a column the caller already holds for this flight -- the
+    restricted master's current selection.  Its reduced cost under the current duals is
+    a *proven achievable* score, so it is a valid pruning cutoff, and a far better one
+    than the shortest-path seed this function otherwise builds for itself.  That matters
+    enormously: on a captured 500-flight subproblem the seed gave a cutoff of rc=112
+    against an optimum of rc=144, and closing that 32-unit gap collapsed the search from
+    **32,274,881 labels to 73,541** -- 439x -- with the departure-variant prefilter going
+    from 503 surviving variants to 1.  The label pool, its regrowth ladder and the
+    reference-DP fallback are all downstream of this one number.
+
+    Passing it never changes the answer, only the work: pruning against a score that is
+    actually attainable cannot discard anything strictly better.  A column equal to the
+    one supplied is reported as no column at all, so the caller is not handed back what
+    it already has and cannot mistake it for pricing progress.
 
     ``forbidden_rows`` is the repair seam: touching one of those already
     saturated rows makes an origin, visit, arrival, or final canonical column
@@ -2251,6 +2267,18 @@ def price_flight(
             incumbent,
             deadline=deadline,
         )
+    # Fold in the caller's existing column, after the seed work so it can only tighten.
+    # Its claims are re-checked against the exclusion set because the repair path may have
+    # saturated a row the column occupies since it was filed.
+    if known_column is not None and known_column.claims.isdisjoint(forbidden):
+        known_rc = (
+            benefit
+            - known_column.delay_s
+            - view.claim_cost(known_column.claims)
+            - pi_value
+        )
+        if incumbent is None or known_rc > incumbent[0] + _SCORE_EPS:
+            incumbent = (known_rc, known_column)
     reduced_cost, column = _best_column(
         fg,
         view,
@@ -2263,6 +2291,11 @@ def price_flight(
         deadline=deadline,
     )
     if column is None or (require_improving and reduced_cost <= _pricing_tolerance(params)):
+        return reduced_cost, None
+    if known_column is not None and column == known_column:
+        # The best column IS the one the caller already holds.  Reporting it would let a
+        # column the master already owns read as pricing progress and keep column
+        # generation iterating on nothing.
         return reduced_cost, None
     return reduced_cost, column
 

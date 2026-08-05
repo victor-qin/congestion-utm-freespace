@@ -115,11 +115,12 @@ def _price_one(task):
     makespan is pinned by one long task).  Without it, a bad speedup is unattributable.
     """
     started = time.perf_counter()
-    flight_id, graph, pi_f, deadline = task
+    flight_id, graph, pi_f, deadline, known_column = task
     pricing_mod = _WORKER["pricing"]
     try:
         reduced_cost, column = pricing_mod.price_flight(
-            graph, _WORKER["duals"], pi_f, _WORKER["cfg"], _WORKER["params"], deadline=deadline
+            graph, _WORKER["duals"], pi_f, _WORKER["cfg"], _WORKER["params"],
+            known_column=known_column, deadline=deadline,
         )
     except pricing_mod.PricingTimeout:
         reduced_cost, column = None, None
@@ -170,6 +171,7 @@ def price_sweep(
     flight_duals,
     cfg,
     params: ColGenParams,
+    known_columns=None,
     deadline: float | None,
     pool_cfg: ParallelPricingConfig,
 ) -> SweepResult:
@@ -196,8 +198,10 @@ def price_sweep(
     # imap_unordered with the default chunksize=1 preserves the dynamic one-task-per-flight
     # dispatch that the skewed per-flight cost needs; it also pickles each graph lazily as a
     # worker becomes free rather than all of them up front.
+    known = known_columns or {}
     tasks = [
-        (flight_id, graphs[flight_id], flight_duals[flight_id], deadline)
+        (flight_id, graphs[flight_id], flight_duals[flight_id], deadline,
+         known.get(flight_id))
         for flight_id in pricing_order
     ]
     with ctx.Pool(

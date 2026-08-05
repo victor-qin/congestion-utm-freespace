@@ -823,6 +823,9 @@ class ColGenSolver:
                     flight_duals=flight_duals,
                     cfg=cfg,
                     params=params,
+                    # The incumbent selection is a proven-achievable cutoff per flight;
+                    # see price_flight's `known_column`.
+                    known_columns=best_heuristic,
                     deadline=pricing_deadline,
                     pool_cfg=parallel,
                 )
@@ -844,6 +847,7 @@ class ColGenSolver:
                             flight_duals[flight_id],
                             cfg,
                             params,
+                            known_column=best_heuristic.get(flight_id),
                             deadline=pricing_deadline,
                         )
                     except PricingTimeout:

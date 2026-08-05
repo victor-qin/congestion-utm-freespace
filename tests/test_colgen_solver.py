@@ -665,17 +665,23 @@ def test_hand_checked_detour_beats_hold():
     ]
     _assert_endpoint_cells_pairwise_disjoint(requests, cfg)
 
+    # Pinned to the cost-scale gap because the bound assertions below are cost-scale
+    # claims: that the LP itself *proves* 4.0, not merely that the IP happens to find it.
+    # Under the default revenue metric this instance stops after one iteration -- with
+    # M=1e6 and two flights the denominator is ~2e6, so the 12-unit slack reads as 6e-6
+    # and clears the 1e-4 threshold before the LP is re-solved with the detour column.
+    # The returned solution is optimal either way; only `cost_upper_bound` stays loose.
     no_detour = ColGenSolver().solve(
         requests,
         cfg,
         (),
-        _params(detour_slack_hops=0),
+        _params(detour_slack_hops=0, gap_metric="cost"),
     )
     with_detour = ColGenSolver().solve(
         requests,
         cfg,
         (),
-        _params(detour_slack_hops=1),
+        _params(detour_slack_hops=1, gap_metric="cost"),
     )
 
     assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
@@ -688,6 +694,41 @@ def test_hand_checked_detour_beats_hold():
         for column in with_detour.columns.values()
     )
     _assert_files_cleanly(requests, with_detour.columns, cfg)
+
+
+def test_revenue_gap_stops_early_but_still_returns_the_optimum():
+    """The paper's revenue-scale gap is loose here because ``M`` is an artificial big-M.
+
+    Equation (10) normalizes by the maximize objective, which the paper can do because
+    its ``M`` is real per-flight revenue.  Ours is a constant chosen only to make
+    cancellation unattractive, so the denominator is ~``n * M`` whatever the delays are
+    and the ratio mostly measures how large ``M`` was set.  On this two-flight instance
+    that means "converged" fires an iteration before the cost-scale gap has moved at all.
+
+    Pinned deliberately: the solution is still optimal, because pricing's columns are
+    banked in the master before the loop breaks and the final IP sees them.  What the
+    early stop costs is bound *tightness* in the reported stats, not solution quality --
+    and that distinction is the thing worth not rediscovering.
+    """
+
+    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=20.0)
+    requests = [
+        _request(1, (-2, -5), (-2, -11), cfg),
+        _request(2, (-8, -4), (0, -4), cfg),
+    ]
+
+    revenue = ColGenSolver().solve(
+        requests, cfg, (), _params(detour_slack_hops=1, gap_metric="revenue")
+    )
+
+    assert revenue.stats["termination_reason"] == "lp_gap"
+    assert revenue.stats["iterations"] == 1
+    # Optimal solution ...
+    assert revenue.stats["objective"] == pytest.approx(4.0, abs=1e-8)
+    assert revenue.stats["cost_lower_bound"] == pytest.approx(4.0, abs=1e-7)
+    # ... reached while the two scales disagree by five orders of magnitude.
+    assert revenue.stats["lp_gap_revenue"] < 1e-4
+    assert revenue.stats["lp_gap_cost"] > 0.5
 
 
 def test_colgen_beats_fcfs_on_constructed_congestion():

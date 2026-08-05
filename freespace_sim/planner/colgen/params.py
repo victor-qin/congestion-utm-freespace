@@ -30,6 +30,12 @@ class ColGenParams:
     epsilon: float = 1e-6
     n_heuristic_tries: int = 32
     objective: str = "total_delay"
+    # Which scale the lp_gap / ip_gap thresholds are measured on.
+    #   "revenue" -- the paper's equations (10) and (11): (UB - RMP)/RMP on the maximize
+    #                objective, whose scale includes n*M.
+    #   "cost"    -- the same absolute gap normalized by total cost instead, which is
+    #                what this repo used before and is far stricter when M >> cost.
+    gap_metric: str = "revenue"
     shortcut: bool = False
 
     def __post_init__(self) -> None:
@@ -58,6 +64,10 @@ class ColGenParams:
         # :mod:`freespace_sim.planner.colgen.objective`.
         if self.objective not in {"total_delay", "total_cost"}:
             raise ValueError("objective must be 'total_delay' or 'total_cost'")
+        if not isinstance(self.gap_metric, str):
+            raise TypeError("gap_metric must be a string")
+        if self.gap_metric not in {"revenue", "cost"}:
+            raise ValueError("gap_metric must be 'revenue' or 'cost'")
         if not isinstance(self.shortcut, bool):
             raise TypeError("shortcut must be a boolean")
 

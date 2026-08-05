@@ -328,6 +328,32 @@ def _better_selection(
     return _selection_key(candidate) < _selection_key(incumbent)
 
 
+def _relative_revenue_gap(upper_bound: float, rmp_value: float) -> float:
+    """The paper's gap, equations (10) and (11): ``(UB - RMP) / RMP``.
+
+    Measured on the maximize objective, whose scale includes ``n * M``.  That
+    normalization is the whole difference from :func:`_relative_cost_gap`: the same
+    absolute slack of ~90,000 units reads as 0.009% here (against a revenue of ~1e9) and
+    as 63% there (against a total cost of ~141,000).  Both describe the identical
+    solution; the paper's thresholds -- 0.01% for the LP, 0.1% for the heuristic -- are
+    calibrated against this one.
+    """
+
+    if not math.isfinite(upper_bound) or not math.isfinite(rmp_value):
+        return math.inf
+    # Test the numerator before the scale.  A bound that coincides with the RMP has
+    # closed, and that is true at any scale including zero -- which is reachable here,
+    # because a one-flight master whose only column exactly consumes its benefit prices
+    # out at objective 0.  Dividing first would report that tight bound as `inf`.
+    absolute = max(0.0, upper_bound - rmp_value)
+    if absolute <= 0.0:
+        return 0.0
+    denominator = abs(rmp_value)
+    if denominator <= 0.0:
+        return math.inf
+    return absolute / denominator
+
+
 def _relative_cost_gap(cost_upper_bound: float, cost_lower_bound: float) -> float:
     """Return a relative minimization gap in transformed delay currency.
 
@@ -895,10 +921,20 @@ class ColGenSolver:
             # incorrectly certify a trajectory that is tens of seconds worse.
             cost_upper_bound = total_benefit - last_lp_objective
             cost_lower_bound = total_benefit - last_upper_bound
-            lp_gap = _relative_cost_gap(cost_upper_bound, cost_lower_bound)
             heuristic_objective = _selection_objective(best_heuristic, params.M)
             heuristic_cost = total_benefit - heuristic_objective
-            heuristic_gap = _relative_cost_gap(heuristic_cost, cost_lower_bound)
+            # Both scales are computed every iteration so neither is lost; only which one
+            # the thresholds are applied to depends on params.gap_metric.
+            lp_gap_cost = _relative_cost_gap(cost_upper_bound, cost_lower_bound)
+            heuristic_gap_cost = _relative_cost_gap(heuristic_cost, cost_lower_bound)
+            lp_gap_revenue = _relative_revenue_gap(last_upper_bound, last_lp_objective)
+            heuristic_gap_revenue = _relative_revenue_gap(
+                last_upper_bound, heuristic_objective
+            )
+            if params.gap_metric == "revenue":
+                lp_gap, heuristic_gap = lp_gap_revenue, heuristic_gap_revenue
+            else:
+                lp_gap, heuristic_gap = lp_gap_cost, heuristic_gap_cost
 
             lp_objectives.append(last_lp_objective)
             upper_bounds.append(last_upper_bound)
@@ -909,14 +945,17 @@ class ColGenSolver:
             heuristic_costs.append(heuristic_cost)
 
             new_columns_since_lp = len(master.columns) > columns_at_lp
-            if lp_gap <= params.lp_gap and not new_columns_since_lp:
+            # Section 4.2.3 stops as soon as the LP gap is under threshold, full stop --
+            # the bound `RMP + sum(max(0, phi_max))` is valid however many columns were
+            # just banked, and further columns can only move the RMP toward it.  The
+            # `not new_columns_since_lp` guard is a stricter local rule that makes the
+            # criterion effectively unreachable while pricing is still productive, so it
+            # applies only to the cost-scale metric this repo used before.
+            gate = params.gap_metric == "revenue" or not new_columns_since_lp
+            if lp_gap <= params.lp_gap and gate:
                 termination_reason = "lp_gap"
                 break
-            if (
-                best_heuristic
-                and heuristic_gap <= params.ip_gap
-                and not new_columns_since_lp
-            ):
+            if best_heuristic and heuristic_gap <= params.ip_gap and gate:
                 termination_reason = "heuristic_gap"
                 break
             if not priced_columns and not new_columns_since_lp:
@@ -943,6 +982,7 @@ class ColGenSolver:
         ip_cost_lower_bound: float | None = None
         ip_cost_upper_bound: float | None = None
         ip_gap: float | None = None
+        ip_gap_revenue: float | None = None
         ip_gap_met: bool | None = None
         ip_status = "skipped"
         ip_optimal: bool | None = None
@@ -962,9 +1002,20 @@ class ColGenSolver:
             ip_objective = _selection_objective(ip_selection, params.M)
             ip_upper_bound = master.last_ip_bound
             ip_cost_upper_bound = total_benefit - ip_objective
+            # Equation (11): the IP gap is measured against the LP UPPER BOUND -- a bound
+            # on the full master problem -- not against the restricted IP's own bound,
+            # which only certifies the columns already in the pool.
+            ip_gap_revenue = _relative_revenue_gap(last_upper_bound, ip_objective)
             if ip_upper_bound is not None:
                 ip_cost_lower_bound = total_benefit - ip_upper_bound
-                ip_gap = _relative_cost_gap(ip_cost_upper_bound, ip_cost_lower_bound)
+                ip_gap_cost = _relative_cost_gap(ip_cost_upper_bound, ip_cost_lower_bound)
+            else:
+                ip_gap_cost = None
+            if params.gap_metric == "revenue":
+                ip_gap = ip_gap_revenue
+                ip_gap_met = ip_gap <= params.ip_gap
+            elif ip_gap_cost is not None:
+                ip_gap = ip_gap_cost
                 ip_gap_met = ip_gap <= params.ip_gap
             ip_status = master.last_ip_status or "unknown"
             ip_optimal = master.last_ip_optimal
@@ -1071,13 +1122,30 @@ class ColGenSolver:
             "cost_upper_bound": total_benefit - last_lp_objective,
             "cost_lower_bound": final_cost_lower_bound,
             "lp_gap": (
-                _relative_cost_gap(
-                    total_benefit - last_lp_objective,
-                    final_cost_lower_bound,
+                (
+                    _relative_revenue_gap(last_upper_bound, last_lp_objective)
+                    if params.gap_metric == "revenue"
+                    else _relative_cost_gap(
+                        total_benefit - last_lp_objective, final_cost_lower_bound
+                    )
                 )
                 if math.isfinite(last_lp_objective)
                 else math.inf
             ),
+            "lp_gap_revenue": (
+                _relative_revenue_gap(last_upper_bound, last_lp_objective)
+                if math.isfinite(last_lp_objective)
+                else math.inf
+            ),
+            "lp_gap_cost": (
+                _relative_cost_gap(
+                    total_benefit - last_lp_objective, final_cost_lower_bound
+                )
+                if math.isfinite(last_lp_objective)
+                else math.inf
+            ),
+            "ip_gap_revenue": ip_gap_revenue,
+            "gap_metric": params.gap_metric,
             "heuristic_objective": heuristic_objective,
             "heuristic_cost": heuristic_cost,
             # Native IP diagnostics describe the final restricted master.

@@ -61,6 +61,10 @@ class ParallelPricingConfig:
 
     n_workers: int = 0
     max_tasks_per_child: int | None = 4
+    # Flights handed to a worker per dispatch.  1 is maximum load balance and one IPC
+    # round-trip per flight; k amortises that over k flights but lets one slow flight
+    # hold k-1 others behind it.  1 was right when per-flight cost spanned 0.09-34s.
+    chunksize: int = 1
     start_method: str | None = None
     # Called in the PARENT as each task returns, with
     # (done, total, flight_id, wall_s, kernel_stats).  A long sweep is otherwise opaque
@@ -195,9 +199,9 @@ def price_sweep(
     # never triggers.  mp.Pool's `maxtasksperchild` is an independent implementation and
     # recycles correctly (40 tasks / k=4 -> exactly 10 distinct pids).
     #
-    # imap_unordered with the default chunksize=1 preserves the dynamic one-task-per-flight
-    # dispatch that the skewed per-flight cost needs; it also pickles each graph lazily as a
-    # worker becomes free rather than all of them up front.
+    # imap_unordered with chunksize=1 (the default) preserves the dynamic
+    # one-task-per-flight dispatch that the skewed per-flight cost needs; it also pickles
+    # each graph lazily as a worker becomes free rather than all of them up front.
     known = known_columns or {}
     tasks = [
         (flight_id, graphs[flight_id], flight_duals[flight_id], deadline,
@@ -212,7 +216,7 @@ def price_sweep(
     ) as pool:
         for (
             flight_id, reduced_cost, column, pid, peak, task_wall, kstats
-        ) in pool.imap_unordered(_price_one, tasks):
+        ) in pool.imap_unordered(_price_one, tasks, chunksize=pool_cfg.chunksize):
             results[flight_id] = (reduced_cost, column)
             worker_pids.add(pid)
             peak_rss = max(peak_rss, peak)

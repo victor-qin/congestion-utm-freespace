@@ -53,17 +53,24 @@ class ParallelPricingConfig:
     """Knobs for the parallel pricing sweep.  Pure performance -- results are unchanged.
 
     ``n_workers`` 0 (default) keeps the sequential sweep.  ``max_tasks_per_child`` bounds how
-    much allocator residue a worker can accumulate before it is replaced; ``None`` never
-    recycles.  ``start_method`` defaults to the platform default (``spawn`` on macOS,
-    ``fork`` on Linux) -- ``fork`` additionally gives workers the parent's graphs
-    copy-on-write, but is unsafe in a process that already has threads running.
+    much allocator residue a worker can accumulate before it is replaced, counted in
+    FLIGHTS; ``None`` never recycles.  ``start_method`` defaults to the platform default
+    (``spawn`` on macOS, ``fork`` on Linux) -- ``fork`` additionally gives workers the
+    parent's graphs copy-on-write, but is unsafe in a process that already has threads
+    running.
     """
 
     n_workers: int = 0
+    # In FLIGHTS, which is the unit residue accumulates in -- a label pool is allocated
+    # and freed per flight.  `mp.Pool`'s own `maxtasksperchild` counts CHUNKS, so the two
+    # knobs silently multiplied before `pool_maxtasksperchild` converted between them:
+    # 4 here with chunksize=4 gave a worker a 16-flight life, 4x the documented bound.
     max_tasks_per_child: int | None = 4
     # Flights handed to a worker per dispatch.  1 is maximum load balance and one IPC
     # round-trip per flight; k amortises that over k flights but lets one slow flight
     # hold k-1 others behind it.  1 was right when per-flight cost spanned 0.09-34s.
+    # Note k also divides the respawn count, so raising it buys fewer worker restarts
+    # (~0.36s of import + warm_kernel each) on top of the dispatch saving.
     chunksize: int = 1
     start_method: str | None = None
     # Called in the PARENT as each task returns, with
@@ -77,10 +84,31 @@ class ParallelPricingConfig:
             raise ValueError("n_workers must be non-negative (0 disables parallel pricing)")
         if self.max_tasks_per_child is not None and self.max_tasks_per_child < 1:
             raise ValueError("max_tasks_per_child must be >= 1 or None")
+        if self.chunksize < 1:
+            raise ValueError("chunksize must be >= 1")
 
     @property
     def enabled(self) -> bool:
         return self.n_workers > 0
+
+    @property
+    def pool_maxtasksperchild(self) -> int | None:
+        """``max_tasks_per_child`` expressed in the CHUNKS ``mp.Pool`` actually counts.
+
+        `Pool`'s worker loop increments its completion counter once per item pulled off
+        the inqueue, and with ``imap_unordered(chunksize=k)`` one such item is a chunk of
+        k flights.  Passing the flight budget through unconverted therefore recycles k
+        times too late.  Measured directly (64 items, 2 workers, maxtasksperchild=4):
+        chunksize=1 gives 16 distinct pids, chunksize=4 gives 4.
+
+        Rounded UP so a flight budget smaller than one chunk still yields a legal value;
+        the effective bound is then one chunk, which is the finest granularity the pool
+        can express at that chunksize.
+        """
+
+        if self.max_tasks_per_child is None:
+            return None
+        return max(1, -(-self.max_tasks_per_child // self.chunksize))
 
 
 # --------------------------------------------------------------------------------- worker side
@@ -212,7 +240,7 @@ def price_sweep(
         processes=pool_cfg.n_workers,
         initializer=_init_worker,
         initargs=(repo_root, cfg, params, dual_view),
-        maxtasksperchild=pool_cfg.max_tasks_per_child,
+        maxtasksperchild=pool_cfg.pool_maxtasksperchild,
     ) as pool:
         for (
             flight_id, reduced_cost, column, pid, peak, task_wall, kstats

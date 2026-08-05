@@ -63,12 +63,18 @@ def _default_pricing_pool(n_flights: int) -> ParallelPricingConfig | None:
     ``chunksize=4`` amortises per-task dispatch now that the cost objective made pricing
     ~29x cheaper: measured on density_faa first-500, worker efficiency 46.7% -> 80.3% and
     sweep makespan 72.3s -> 41.6s, at roughly 2x peak memory.
+
+    ``max_tasks_per_child=16`` is stated rather than inherited: the 4-flight default times
+    chunksize 4 is what these numbers were actually measured under, back when the two
+    knobs multiplied.  Now that they no longer do, the value has to be written down to
+    keep the tuning, and 16 flights per worker is a deliberate residue/respawn trade --
+    a restart costs ~0.36s of import + warm_kernel and returns the arena to the OS.
     """
 
     if n_flights < _PARALLEL_MIN_FLIGHTS:
         return None
     workers = max(2, min(8, (os.cpu_count() or 4) - 2))
-    return ParallelPricingConfig(n_workers=workers, chunksize=4)
+    return ParallelPricingConfig(n_workers=workers, chunksize=4, max_tasks_per_child=16)
 
 
 def run_batch(
@@ -83,6 +89,7 @@ def run_batch(
     *,
     params: ColGenParams | None = None,
     parallel=None,
+    on_iteration=None,
 ) -> list[OperationalIntent]:
     """Solve once, then file every result through the normal DSS in FCFS order.
 
@@ -96,6 +103,11 @@ def run_batch(
     keeps the sequential sweep.  Note ``sim.run``'s own ``parallel`` argument is a
     different mechanism entirely (the A* speculative runner) and rejects batch planners,
     so this is the only route by which whole-schedule planning reaches the pool.
+
+    ``on_iteration`` is forwarded to the solver, which calls it once per column-generation
+    iteration.  It is forwarded rather than dropped because ``run_batch`` is the production
+    entry point: without this the per-iteration telemetry existed but was reachable only by
+    calling :meth:`ColGenSolver.solve` directly, so every real run was blind to it.
     """
     if getattr(dss, "ledger", ledger) is not ledger:
         raise ValueError("colgen batch requires dss and run_batch to share one ledger")
@@ -124,7 +136,8 @@ def run_batch(
         parallel = _default_pricing_pool(len(requests))
     solve_started = time.monotonic()
     result = ColGenSolver().solve(
-        requests, cfg, static_terms, batch_params, parallel=parallel
+        requests, cfg, static_terms, batch_params,
+        parallel=parallel, on_iteration=on_iteration,
     )
     solve_elapsed = time.monotonic() - solve_started
     solve_share = solve_elapsed / len(events) if events else 0.0
@@ -158,6 +171,35 @@ def run_batch(
         stats.get("wall_index_queries", "unknown"),
         stats.get("wall_index_candidates", "unknown"),
         solve_elapsed,
+    )
+    # A second line rather than a longer first one: the line above is a stable format
+    # that callers grep, and these are answers to different questions -- "did the fan-out
+    # happen and did it pay" and "how converged is this really".  Both were unanswerable
+    # from a production log before, which is how a full-scenario run could be reported as
+    # parallel without any evidence in its own output that it was.
+    sweep_s = stats.get("parallel_sweep_wall_s") or 0.0
+    task_s = stats.get("parallel_task_wall_total_s") or 0.0
+    workers = stats.get("parallel_workers") or 0
+    log.info(
+        "colgen detail: gap_metric=%s lp_gap_revenue=%s lp_gap_cost=%s ip_gap_revenue=%s "
+        "greedy_s=%s workers=%s worker_procs=%s sweep_s=%.3f task_s=%.3f straggler_s=%.3f "
+        "worker_efficiency=%s worker_peak_rss_mb=%.1f tasks_discarded=%s",
+        stats.get("gap_metric", "unknown"),
+        stats.get("lp_gap_revenue", "unknown"),
+        # The cost-scale gap is logged beside the revenue one deliberately: with M an
+        # artificial big-M the revenue gap can read as converged while this one is still
+        # enormous, and only printing the first hides that entirely.
+        stats.get("lp_gap_cost", "unknown"),
+        stats.get("ip_gap_revenue", "unknown"),
+        stats.get("initial_greedy_elapsed_s", "unknown"),
+        workers,
+        stats.get("parallel_worker_processes", 0),
+        sweep_s,
+        task_s,
+        stats.get("parallel_task_wall_max_s") or 0.0,
+        f"{task_s / (sweep_s * workers):.1%}" if sweep_s and workers else "n/a",
+        (stats.get("parallel_worker_peak_rss_bytes") or 0) / 1e6,
+        stats.get("parallel_tasks_discarded", 0),
     )
 
     intents: list[OperationalIntent] = []

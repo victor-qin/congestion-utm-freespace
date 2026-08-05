@@ -86,7 +86,8 @@ def test_run_batch_maps_missing_columns_and_fires_callbacks_in_event_order(
     captured = {}
     warnings = []
 
-    def fake_solve(self, requests, solve_cfg, static_terms, solve_params, parallel=None):
+    def fake_solve(self, requests, solve_cfg, static_terms, solve_params, parallel=None,
+                   on_iteration=None):
         captured.update(
             requests=requests,
             cfg=solve_cfg,
@@ -154,7 +155,8 @@ def test_run_batch_uses_precommit_acceptance_for_covering_bug_log(monkeypatch, c
     monkeypatch.setattr(
         batch.ColGenSolver,
         "solve",
-        lambda self, requests, solve_cfg, static_terms, params, parallel=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, parallel=None,
+        on_iteration=None: ColGenResult(
             columns={request.flight_id: object()},
             stats={},
         ),
@@ -325,7 +327,8 @@ def test_run_batch_defaults_pricing_onto_the_process_pool(monkeypatch):
     cfg = SimConfig(planner="colgen")
     seen: list = []
 
-    def _capture(self, requests, solve_cfg, static_terms, params, parallel=None):
+    def _capture(self, requests, solve_cfg, static_terms, params, parallel=None,
+                 on_iteration=None):
         seen.append(parallel)
         return ColGenResult(columns={}, stats={})
 
@@ -358,3 +361,68 @@ def test_run_batch_defaults_pricing_onto_the_process_pool(monkeypatch):
     assert seen[0] is None, "below the threshold the pool costs more than it saves"
     assert seen[1] is not None and seen[1].n_workers >= 2, "a real batch fans out by default"
     assert seen[2] is explicit, "an explicit config is forwarded verbatim"
+
+
+def test_run_batch_forwards_the_per_iteration_callback(monkeypatch):
+    """``on_iteration`` has to survive the production entry point to be worth anything.
+
+    The solver grew per-iteration telemetry, but ``run_batch`` neither accepted nor
+    forwarded it, so it was reachable only by calling ``ColGenSolver.solve`` directly.
+    Every production run -- including a full 4,636-flight scenario solve -- was blind to
+    it while appearing to have it.
+    """
+
+    cfg = SimConfig(planner="colgen")
+    seen: list = []
+
+    def _capture(self, requests, solve_cfg, static_terms, params, parallel=None,
+                 on_iteration=None):
+        seen.append(on_iteration)
+        return ColGenResult(columns={}, stats={})
+
+    monkeypatch.setattr(batch.ColGenSolver, "solve", _capture)
+
+    def _sentinel(payload):  # never called; identity is the whole assertion
+        raise AssertionError("stub solver must not invoke the callback")
+
+    requests = [FlightRequest(1, vec(0, 0, 0), vec(1200, 0, 0), 0.0)]
+    for kwargs in ({}, {"on_iteration": _sentinel}):
+        run_batch(
+            scenario_from_requests(requests), cfg, ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (), lambda *_args: None, None, None, **kwargs,
+        )
+
+    assert seen[0] is None, "absent by default, so the solver skips the payload entirely"
+    assert seen[1] is _sentinel, "and forwarded by identity when supplied"
+
+
+def test_worker_recycle_budget_is_counted_in_flights_not_chunks():
+    """``max_tasks_per_child`` must not silently multiply by ``chunksize``.
+
+    ``mp.Pool`` increments its per-worker completion counter once per item pulled off the
+    inqueue, and under ``imap_unordered(chunksize=k)`` that item is a chunk of k flights.
+    Passing the flight budget straight through therefore recycles k times too late: the
+    shipped 4-flight budget at chunksize 4 gave workers a 16-flight life, four times the
+    documented residue bound.  Verified against real pools (64 items, 2 workers,
+    maxtasksperchild=4): chunksize=1 -> 16 distinct pids, chunksize=4 -> 4.
+    """
+
+    for chunksize, expected_chunks in ((1, 16), (2, 8), (4, 4), (16, 1), (32, 1)):
+        cfg = ParallelPricingConfig(
+            n_workers=2, max_tasks_per_child=16, chunksize=chunksize
+        )
+        assert cfg.pool_maxtasksperchild == expected_chunks
+        # The invariant that matters: flights per worker lifetime stays ~the budget,
+        # never a multiple of it.
+        assert cfg.pool_maxtasksperchild * chunksize >= 16
+        assert cfg.pool_maxtasksperchild * chunksize < 16 + chunksize
+
+    assert ParallelPricingConfig(n_workers=2, max_tasks_per_child=None).pool_maxtasksperchild is None
+    # A budget finer than one chunk cannot be expressed; round up rather than to zero,
+    # which mp.Pool would reject.
+    assert ParallelPricingConfig(
+        n_workers=2, max_tasks_per_child=1, chunksize=8
+    ).pool_maxtasksperchild == 1
+    with pytest.raises(ValueError, match="chunksize"):
+        ParallelPricingConfig(n_workers=2, chunksize=0)

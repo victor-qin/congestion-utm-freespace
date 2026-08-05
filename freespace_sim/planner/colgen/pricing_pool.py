@@ -62,6 +62,11 @@ class ParallelPricingConfig:
     n_workers: int = 0
     max_tasks_per_child: int | None = 4
     start_method: str | None = None
+    # Called in the PARENT as each task returns, with
+    # (done, total, flight_id, wall_s, kernel_stats).  A long sweep is otherwise opaque
+    # while it runs: the per-flight record below is only assembled once every task is
+    # back, so a 15-minute run shows nothing until it ends.
+    on_progress: object = None
 
     def __post_init__(self) -> None:
         if self.n_workers < 0:
@@ -209,6 +214,10 @@ def price_sweep(
             peak_rss = max(peak_rss, peak)
             task_walls.append(task_wall)
             per_flight.append((flight_id, task_wall, peak, kstats))
+            if pool_cfg.on_progress is not None:
+                pool_cfg.on_progress(
+                    len(per_flight), len(tasks), flight_id, task_wall, kstats
+                )
     sweep_wall = time.perf_counter() - sweep_started
 
     # Rebuild the sequential prefix: stop at the first flight that timed out, and drop

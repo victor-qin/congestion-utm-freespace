@@ -329,10 +329,20 @@ def main() -> int:
 
     pool_cfg = None
     if args.workers > 0:
+        def _progress(done, total, flight_id, wall_s, kstats):
+            # Streamed so a long sweep is legible while it runs, and so a run that is
+            # killed still leaves its per-flight record on disk.
+            print(f"  [{done:>4}/{total}] fid={flight_id:<7} {wall_s:8.2f}s "
+                  f"labels={kstats.get('labels', 0):>10,} "
+                  f"status={kstats.get('status', '-')} "
+                  f"attempts={kstats.get('attempts', 0)} "
+                  f"fallback={kstats.get('reference_fallback', False)}", flush=True)
+
         pool_cfg = ParallelPricingConfig(
             n_workers=args.workers,
             max_tasks_per_child=args.max_tasks_per_child or None,
             start_method=args.start_method,
+            on_progress=_progress,
         )
         print(f"parallel  : {pool_cfg.n_workers} workers  "
               f"max_tasks_per_child={pool_cfg.max_tasks_per_child}  "

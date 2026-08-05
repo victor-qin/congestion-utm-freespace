@@ -30,6 +30,8 @@ from types import MappingProxyType
 import numpy as np
 from numba import njit
 
+from . import objective as _objective
+
 # Status codes.  ``FB_`` values mean the host must finish the job itself; there is
 # deliberately no "numba unavailable" code, because the host guard short-circuits
 # before any kernel call and it would be unreachable.
@@ -925,6 +927,7 @@ def search_dag(
     completion_bound: bool = True,
     forbidden=None,
     cancel_flag: np.ndarray | None = None,
+    model=None,
 ) -> DagSearchResult:
     """Run the compiled DP, growing the workspace on overflow rather than failing.
 
@@ -948,6 +951,24 @@ def search_dag(
     depth = topology.state_history_depth
     regrow = 0
 
+    # The kernel holds no objective of its own: it charges `dt_s` per arc and multiplies
+    # hop counts by it, so scaling that one scalar -- together with the fold, leg and
+    # reference times `prepare_variants` pre-weights identically -- makes this untouched
+    # arithmetic compute the weighted cost.  See colgen.objective.
+    #
+    # `separable` is the loud failure the scheme needs.  A non-linear objective cannot be
+    # carried by two scalars, and the symptom would otherwise be silent: `label_score` IS
+    # the objective for dominance, so a mismatch discards the true optimum while still
+    # reporting proved=True.
+    if model is None:
+        model = _objective.DELAY_MODEL
+    if not model.separable:
+        raise NotImplementedError(
+            "the compiled pricing DP needs an objective expressible as one ground and "
+            "one air weight; this one is not separable, so run the reference search"
+        )
+    dt_air_s = _objective.scaled_dt_s(model, float(cfg.dt_s))
+
     # Completion bound, built once: it depends only on the topology and this
     # iteration's duals, so a label-pool regrow reuses it.  One n_cells * n_steps
     # float64 array -- 36 MB on the largest measured density flight, against a label
@@ -960,7 +981,7 @@ def search_dag(
             duals.dual_first, duals.dual_start, duals.dual_prefix,
             duals.window_lo, duals.window_hi,
             variants.dest_slot_of_cell, variants.dest_positive, variants.dest_step_base,
-            float(cfg.dt_s), g,
+            dt_air_s, g,
         )
         # The bound prices visits without the per-variant origin-paid deduction, so it
         # can over-charge by at most the largest such deduction.  Subtracting that
@@ -1018,7 +1039,7 @@ def search_dag(
             variants.destination_fold_s, variants.destination_fold_exact,
             variants.reference_time_s,
             variants.dest_slot_of_cell, variants.dest_positive, variants.dest_step_base,
-            float(cfg.dt_s), float(benefit), float(pi_f),
+            dt_air_s, float(benefit), float(pi_f),
             float(cost_cutoff) if cost_cutoff is not None else 0.0,
             cost_cutoff is not None,
             g, float(paid_correction), bool(completion_bound),

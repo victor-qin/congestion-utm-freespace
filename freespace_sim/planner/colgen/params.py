@@ -52,8 +52,12 @@ class ColGenParams:
 
         if not isinstance(self.objective, str):
             raise TypeError("objective must be a string")
-        if self.objective != "total_delay":
-            raise ValueError("objective must be 'total_delay'")
+        # ``total_delay`` sums ground and excess-air seconds unweighted, which is what
+        # colgen has always done.  ``total_cost`` weights them by the config's
+        # per-second dials (1:3), matching the cost model the A* planner uses -- see
+        # :mod:`freespace_sim.planner.colgen.objective`.
+        if self.objective not in {"total_delay", "total_cost"}:
+            raise ValueError("objective must be 'total_delay' or 'total_cost'")
         if not isinstance(self.shortcut, bool):
             raise TypeError("shortcut must be a boolean")
 

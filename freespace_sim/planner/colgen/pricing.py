@@ -33,6 +33,7 @@ from ...volumes import (
 )
 from .. import hexgrid as hg
 from .network import Cell, FlightGraph, RowKey, column_claims
+from .objective import DELAY_MODEL, CostModel, cost_model
 from .translate import Column, column_to_intent
 from .windows import (
     derive_cell_window,
@@ -585,7 +586,9 @@ def _path_claims(
     return frozenset(claims)
 
 
-def _path_delay_s(fg: FlightGraph, cfg: SimConfig, label: _Label) -> float:
+def _path_delay_s(
+    fg: FlightGraph, cfg: SimConfig, label: _Label, model: CostModel = DELAY_MODEL
+) -> float:
     """Compute the exact v1 delay ruler without building reservation volumes."""
 
     radius = hg.circumradius(cfg)
@@ -607,7 +610,10 @@ def _path_delay_s(fg: FlightGraph, cfg: SimConfig, label: _Label) -> float:
         cfg,
     )
     detour = enroute_detour_m(flown, reference)
-    return (label.departure_step - fg.base_step) * cfg.dt_s + detour / cfg.nominal_speed_mps
+    return model.evaluate(
+        ground_s=(label.departure_step - fg.base_step) * cfg.dt_s,
+        air_detour_s=detour / cfg.nominal_speed_mps,
+    )
 
 
 def _fold_leg_s(point, terminal: Terminal | None, lane_dist: float | None, cfg: SimConfig) -> float:
@@ -661,6 +667,7 @@ def _arc_delay_lower_bound_s(
     reference_time_s: float,
     dt_s: float,
     folding_exact: bool,
+    model: CostModel = DELAY_MODEL,
 ) -> float:
     """Lower-bound canonical delay for every completion of one prefix.
 
@@ -678,9 +685,11 @@ def _arc_delay_lower_bound_s(
     """
 
     if not folding_exact or reference_time_s <= 0.0:
-        return ground_delay_s
+        return model.evaluate(ground_s=ground_delay_s)
     flown_time_lb = origin_fold_s + (hops + remaining_hops) * dt_s + destination_fold_s
-    return ground_delay_s + max(0.0, flown_time_lb - reference_time_s)
+    return model.evaluate(
+        ground_s=ground_delay_s, air_detour_s=max(0.0, flown_time_lb - reference_time_s)
+    )
 
 
 def _pricing_tolerance(params: Any) -> float:
@@ -719,6 +728,7 @@ def _shifted_seed_incumbent(
     incumbent: tuple[float, Column] | None,
     *,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> tuple[float, Column] | None:
     """Strengthen an incumbent by scanning time-translations of its seed path.
 
@@ -761,8 +771,12 @@ def _shifted_seed_incumbent(
         if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
             continue
         dual_cost = duals.shifted_claim_cost(terms, delta_steps)
-        delay_s = seed.delay_s + delta_steps * cfg.dt_s
-        reduced_cost = benefit - delay_s - dual_cost - pi_f
+        # A pure clock translation adds GROUND delay only -- the spatial path, and hence
+        # the air term, is invariant -- so this is the one weight that applies.
+        delay_s = seed.delay_s + model.ground_weight * (delta_steps * cfg.dt_s)
+        reduced_cost = model.reduced_cost(
+            benefit=benefit, cost=delay_s, dual_cost=dual_cost, pi_f=pi_f
+        )
         if best is None or reduced_cost > best[0] + _SCORE_EPS:
             best = (reduced_cost, None)  # column built once, after the scan
             best_delta = delta_steps
@@ -804,6 +818,7 @@ def _canonical_candidate(
     cfg: SimConfig,
     benefit: float,
     forbidden_rows: AbstractSet[RowKey],
+    model: CostModel = DELAY_MODEL,
 ) -> tuple[float, Column] | None:
     label = candidate.label
     provisional = Column(
@@ -828,8 +843,10 @@ def _canonical_candidate(
     # ``column_claims`` already translated the path as its canonical budget
     # gate.  Translate once more to set the objective from precisely the same
     # metric fields exposed to callers; this is only done for top sink labels.
-    exact_delay = (
-        intent.ground_delay_s + intent.air_hold_s + intent.air_detour_m / cfg.nominal_speed_mps
+    exact_delay = model.evaluate(
+        ground_s=intent.ground_delay_s,
+        air_hold_s=intent.air_hold_s,
+        air_detour_s=intent.air_detour_m / cfg.nominal_speed_mps,
     )
     column = Column(
         flight_id=provisional.flight_id,
@@ -841,7 +858,9 @@ def _canonical_candidate(
         delay_s=exact_delay,
         claims=claims,
     )
-    reduced_cost = benefit - exact_delay - duals.claim_cost(claims) - pi_f
+    reduced_cost = model.reduced_cost(
+        benefit=benefit, cost=exact_delay, dual_cost=duals.claim_cost(claims), pi_f=pi_f
+    )
     return reduced_cost, column
 
 
@@ -850,12 +869,16 @@ def _shortest_seed_columns(
     cfg: SimConfig,
     *,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> tuple[Column, ...]:
     """Certify and cache one best deterministic shortest-delay seed column.
 
     Endpoint lane pairs are ordered by an admissible delay lower bound.  Once a
     canonical seed beats the remaining bounds, no further spatial path is
     generated.  Exact ties are still explored for deterministic tie-breaking.
+
+    The result is cached on the graph, so it assumes one ``model`` per graph -- which
+    holds because the objective is fixed for a solve and graphs are built per solve.
     """
 
     cache = fg._search_cache
@@ -928,6 +951,7 @@ def _shortest_seed_columns(
                         folding_exact=(
                             reference_time_s > 0.0 and origin_exact and destination_exact
                         ),
+                        model=model,
                     )
                     specs.append(
                         (
@@ -977,7 +1001,7 @@ def _shortest_seed_columns(
             if arrival_step > fg.max_step:
                 continue
             label = _Label(0.0, fg.base_step, origin_lane_idx, path, frozenset())
-            delay_s = _path_delay_s(fg, cfg, label)
+            delay_s = _path_delay_s(fg, cfg, label, model)
             candidate = _Candidate(-delay_s, delay_s, label, dest_lane_idx)
             canonical = _canonical_candidate(
                 candidate,
@@ -987,6 +1011,7 @@ def _shortest_seed_columns(
                 cfg,
                 0.0,
                 _EMPTY_ROWS,
+                model,
             )
             if canonical is None:
                 unresolved_shortest_path = True
@@ -1015,10 +1040,11 @@ def _shortest_seed(
     cfg: SimConfig,
     *,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> Column | None:
     """Certify the best deterministic BFS seed without expanding the time DAG."""
 
-    columns = _shortest_seed_columns(fg, cfg, deadline=deadline)
+    columns = _shortest_seed_columns(fg, cfg, deadline=deadline, model=model)
     return None if not columns else columns[0]
 
 
@@ -1057,6 +1083,7 @@ def _certify_candidates(
     *,
     deadline: float | None = None,
     want_residual: bool = False,
+    model: CostModel = DELAY_MODEL,
 ):
     """Turn kernel proposals into a certified column, in the reference's order.
 
@@ -1099,8 +1126,13 @@ def _certify_candidates(
             )
             if not claims.isdisjoint(forbidden_rows):
                 continue
-            delay_s = _path_delay_s(fg, cfg, label)
-            reduced_cost = benefit - delay_s - dual_view.claim_cost(claims) - pi_f
+            delay_s = _path_delay_s(fg, cfg, label, model)
+            reduced_cost = model.reduced_cost(
+                benefit=benefit,
+                cost=delay_s,
+                dual_cost=dual_view.claim_cost(claims),
+                pi_f=pi_f,
+            )
             if best_provisional is None or reduced_cost > best_provisional:
                 best_provisional = reduced_cost
             provisional.append(_Candidate(reduced_cost, delay_s, label, dest_lane_idx))
@@ -1114,7 +1146,7 @@ def _certify_candidates(
         if best is not None and candidate.reduced_cost < best[0] - _RECOMPUTE_EPS:
             break
         canonical = _canonical_candidate(
-            candidate, fg, dual_view, pi_f, cfg, benefit, forbidden_rows
+            candidate, fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model
         )
         if canonical is None:
             continue
@@ -1141,6 +1173,7 @@ def _best_column_compiled(
     seed: bool,
     incumbent: tuple[float, Column] | None,
     deadline: float | None,
+    model: CostModel = DELAY_MODEL,
 ) -> tuple[tuple[float, Column] | None, bool]:
     """Run the compiled DP and certify its proposals.
 
@@ -1172,7 +1205,7 @@ def _best_column_compiled(
     duals = dp_prepare.prepare_duals(dual_view, topology)
     variants = dp_prepare.prepare_variants(
         fg, cfg, dual_view, topology, seed=seed,
-        benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
+        benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff, model=model,
     )
     if variants.n_variants == 0:
         # Every start option was ruled out by ground delay alone.  With a cutoff
@@ -1218,12 +1251,14 @@ def _best_column_compiled(
                 topology, duals, dp_prepare.restrict_variants(variants, order[:1]),
                 cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
                 seed=seed, forbidden=forbidden_pack, cancel_flag=cancel_flag,
+                model=model,
             )
             if boot.status == _dp_kernel.FB_CANCELLED:
                 raise PricingTimeout("column pricing reached its wall-clock deadline")
             if boot.candidates:
                 improved = _certify_candidates(
-                    boot, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent
+                    boot, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent,
+                    model=model,
                 )
                 if improved is not None and (
                     cutoff is None or improved[0] > cutoff + _SCORE_EPS
@@ -1234,7 +1269,7 @@ def _best_column_compiled(
                     # which is most of the win (83 -> 4 on the captured flight).
                     variants = dp_prepare.prepare_variants(
                         fg, cfg, dual_view, topology, seed=seed,
-                        benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
+                        benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff, model=model,
                     )
                     if variants.n_variants == 0:
                         return incumbent, True
@@ -1244,6 +1279,7 @@ def _best_column_compiled(
                 topology, duals, variants,
                 cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
                 seed=seed, forbidden=forbidden_pack, cancel_flag=cancel_flag,
+                model=model,
             )
             _LAST_KERNEL_STATS["attempts"] = _LAST_KERNEL_STATS.get("attempts", 0) + 1
             _LAST_KERNEL_STATS["status"] = result.status_name
@@ -1259,7 +1295,8 @@ def _best_column_compiled(
             if result.ok or not result.candidates:
                 break
             improved = _certify_candidates(
-                result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent
+                result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent,
+                model=model,
             )
             if improved is None or (cutoff is not None and improved[0] <= cutoff + _SCORE_EPS):
                 break  # no tighter bound to retry with; let the reference finish
@@ -1278,7 +1315,7 @@ def _best_column_compiled(
     # certification into the bottleneck.  This mirrors ``consider_sink``.
     best, residual = _certify_candidates(
         result, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent,
-        deadline=deadline, want_residual=True,
+        deadline=deadline, want_residual=True, model=model,
     )
     proved = best is not None and residual <= best[0] + _RECOMPUTE_EPS
     return best, proved
@@ -1307,6 +1344,7 @@ def _best_column(
     seed: bool,
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> tuple[float, Column | None]:
     _check_deadline(deadline)
     # Row exclusions no longer force the reference: the kernel carries a packed set of
@@ -1315,7 +1353,7 @@ def _best_column(
     if _dp_kernel is not None and len(fg.levels) == 1:
         certified, proved = _best_column_compiled(
             fg, dual_view, pi_f, cfg, benefit, forbidden_rows,
-            seed=seed, incumbent=incumbent, deadline=deadline,
+            seed=seed, incumbent=incumbent, deadline=deadline, model=model,
         )
         if proved:
             return certified if certified is not None else (-math.inf, None)
@@ -1474,6 +1512,7 @@ def _best_column(
             reference_time_s=reference_time_s,
             dt_s=cfg.dt_s,
             folding_exact=detour_defined and origin_fold_exact and destination_fold_exact,
+            model=model,
         )
 
     # Every completion pays its destination endpoint union.  It may duplicate
@@ -1683,8 +1722,13 @@ def _best_column(
             claims = _path_claims(fg, cfg, label, dest_lane_idx)
             if not claims.isdisjoint(forbidden_rows):
                 continue
-            delay_s = _path_delay_s(fg, cfg, label)
-            reduced_cost = benefit - delay_s - dual_view.claim_cost(claims) - pi_f
+            delay_s = _path_delay_s(fg, cfg, label, model)
+            reduced_cost = model.reduced_cost(
+                benefit=benefit,
+                cost=delay_s,
+                dual_cost=dual_view.claim_cost(claims),
+                pi_f=pi_f,
+            )
             candidate = _Candidate(
                 reduced_cost,
                 delay_s,
@@ -1703,6 +1747,7 @@ def _best_column(
                     cfg,
                     benefit,
                     forbidden_rows,
+                    model,
                 )
                 if canonical is not None and (
                     incumbent is None or canonical[0] > incumbent[0] + _SCORE_EPS
@@ -1837,6 +1882,7 @@ def _best_column(
             cfg,
             benefit,
             forbidden_rows,
+            model,
         )
         if canonical is None:
             continue
@@ -1872,6 +1918,7 @@ def find_feasible_column(
     forbidden_rows: AbstractSet[RowKey] = _EMPTY_ROWS,
     improve_below_delay_s: float | None = None,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> Column | None:
     """Best-first incumbent search over the lazy space-time topology.
 
@@ -1972,6 +2019,7 @@ def find_feasible_column(
             destination_fold_s=destination_fold_lb,
             reference_time_s=reference_time_s,
             dt_s=cfg.dt_s,
+            model=model,
             folding_exact=(
                 reference_m > 1e-9 and origin_exact and destination_fold_exact
             ),
@@ -1979,7 +2027,7 @@ def find_feasible_column(
 
     best_column: Column | None = None
     try:
-        seed = seed_column(fg, cfg, deadline=deadline)
+        seed = seed_column(fg, cfg, deadline=deadline, model=model)
     except ValueError:
         seed = None
     if seed is not None:
@@ -2000,6 +2048,7 @@ def find_feasible_column(
             forbidden,
             None if best_column is None else (-best_column.delay_s, best_column),
             deadline=deadline,
+            model=model,
         )
         if shifted is not None and (
             best_column is None or shifted[1].delay_s < best_column.delay_s - _SCORE_EPS
@@ -2128,7 +2177,7 @@ def find_feasible_column(
                 claims = _path_claims(fg, cfg, label, dest_lane_idx)
                 if not claims.isdisjoint(forbidden):
                     continue
-                delay_s = _path_delay_s(fg, cfg, label)
+                delay_s = _path_delay_s(fg, cfg, label, model)
                 canonical = _canonical_candidate(
                     _Candidate(-delay_s, delay_s, label, dest_lane_idx),
                     fg,
@@ -2137,6 +2186,7 @@ def find_feasible_column(
                     cfg,
                     0.0,
                     forbidden,
+                    model,
                 )
                 if canonical is None:
                     continue
@@ -2268,9 +2318,12 @@ def price_flight(
     view = duals if isinstance(duals, DualView) else DualView(duals, cfg)
     forbidden = forbidden_rows
     benefit = _benefit(params)
+    # Resolved once per call and threaded down; every objective expression below and in
+    # dp_prepare/dp_kernel derives from it.  See colgen.objective.
+    model = cost_model(cfg, params)
     incumbent: tuple[float, Column] | None = None
     try:
-        seed = seed_column(fg, cfg, deadline=deadline)
+        seed = seed_column(fg, cfg, deadline=deadline, model=model)
     except ValueError:
         # A deterministic shortest-path seed is an acceleration, not a
         # feasibility precondition.  The full DAG may still find a usable
@@ -2280,7 +2333,9 @@ def price_flight(
     if seed is not None:
         if seed.claims.isdisjoint(forbidden):
             seed_dual_cost = view.claim_cost(seed.claims)
-            seed_rc = benefit - seed.delay_s - seed_dual_cost - pi_value
+            seed_rc = model.reduced_cost(
+                benefit=benefit, cost=seed.delay_s, dual_cost=seed_dual_cost, pi_f=pi_value
+            )
             incumbent = seed_rc, seed
             # The seed is the globally minimum-delay column.  If it remains
             # feasible and pays no row price, non-negative duals and additional
@@ -2309,16 +2364,17 @@ def price_flight(
             forbidden,
             incumbent,
             deadline=deadline,
+            model=model,
         )
     # Fold in the caller's existing column, after the seed work so it can only tighten.
     # Its claims are re-checked against the exclusion set because the repair path may have
     # saturated a row the column occupies since it was filed.
     if known_column is not None and known_column.claims.isdisjoint(forbidden):
-        known_rc = (
-            benefit
-            - known_column.delay_s
-            - view.claim_cost(known_column.claims)
-            - pi_value
+        known_rc = model.reduced_cost(
+            benefit=benefit,
+            cost=known_column.delay_s,
+            dual_cost=view.claim_cost(known_column.claims),
+            pi_f=pi_value,
         )
         if incumbent is None or known_rc > incumbent[0] + _SCORE_EPS:
             incumbent = (known_rc, known_column)
@@ -2332,6 +2388,7 @@ def price_flight(
         seed=False,
         incumbent=incumbent,
         deadline=deadline,
+        model=model,
     )
     if column is None or (require_improving and reduced_cost <= _pricing_tolerance(params)):
         return reduced_cost, None
@@ -2348,6 +2405,7 @@ def seed_column(
     cfg: SimConfig,
     *,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> Column:
     """Return a deterministic, dual-free shortest-delay feasible seed.
 
@@ -2372,7 +2430,7 @@ def seed_column(
                 return cached[0]
             raise ValueError(f"flight {fg.request.flight_id} has no feasible seed column")
 
-    direct = _shortest_seed(fg, cfg, deadline=deadline)
+    direct = _shortest_seed(fg, cfg, deadline=deadline, model=model)
     if direct is not None:
         with fg._search_cache.lock:
             fg._search_cache.seed_search_complete = True
@@ -2393,6 +2451,7 @@ def seed_column(
         seed=True,
         incumbent=None,
         deadline=deadline,
+        model=model,
     )
     if column is None:
         with fg._search_cache.lock:

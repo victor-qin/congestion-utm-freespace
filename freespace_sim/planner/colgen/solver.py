@@ -22,6 +22,7 @@ import numpy as np
 from ...config import SimConfig
 from ...types import FlightRequest, as_terminal
 from .master import BackendTimeout, RestrictedMaster
+from .objective import DELAY_MODEL, CostModel, cost_model
 from .network import (
     FlightGraph,
     RowIndex,
@@ -94,7 +95,9 @@ def _shift_claims(claims: Sequence[RowKey] | frozenset[RowKey], steps: int) -> f
     return frozenset(shifted)
 
 
-def _shift_column(column: Column, departure_step: int, cfg: SimConfig) -> Column:
+def _shift_column(
+    column: Column, departure_step: int, cfg: SimConfig, model: CostModel = DELAY_MODEL
+) -> Column:
     """Return the same certified spatial route at a later integer departure."""
 
     delta = departure_step - column.departure_step
@@ -103,7 +106,9 @@ def _shift_column(column: Column, departure_step: int, cfg: SimConfig) -> Column
     return replace(
         column,
         departure_step=departure_step,
-        delay_s=column.delay_s + delta * cfg.dt_s,
+        # A pure clock translation adds GROUND delay only; the route, and so the air
+        # term, is invariant.  See colgen.objective.
+        delay_s=column.delay_s + model.ground_weight * (delta * cfg.dt_s),
         claims=_shift_claims(column.claims, delta),
     )
 
@@ -116,6 +121,7 @@ def _initial_feasible_selection(
     cfg: SimConfig,
     *,
     deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
 ) -> dict[int, Column]:
     """Greedily ground-shift seed paths into a globally feasible RMP incumbent.
 
@@ -150,7 +156,7 @@ def _initial_feasible_selection(
         for departure_step in range(seed.departure_step, latest_departure + 1):
             if deadline is not None and time.monotonic() >= deadline:
                 return dict(sorted(selected.items()))
-            candidate = _shift_column(seed, departure_step, cfg)
+            candidate = _shift_column(seed, departure_step, cfg, model)
             if any(loads[row] + 1 > row_index.cap(row) for row in candidate.claims):
                 continue
             # Time translation is exact for this fixed path.  Re-run the
@@ -186,6 +192,7 @@ def _greedy_feasible_selection(
     an incumbent heuristic and never contributes to a global bound.
     """
 
+    model = cost_model(cfg, params)
     selected: dict[int, Column] = dict(initial or {})
     loads = _loads_for(selected, fixed_loads)
     saturated = {
@@ -252,6 +259,7 @@ def _greedy_feasible_selection(
                     None if incumbent is None else incumbent.delay_s
                 ),
                 deadline=flight_deadline,
+                model=model,
             )
         except PricingTimeout:
             completed = False
@@ -299,6 +307,8 @@ def _selection_key(selection: Mapping[int, Column]) -> tuple[Any, ...]:
 
 
 def _selection_objective(selection: Mapping[int, Column], benefit: float) -> float:
+    # ``delay_s`` already carries whatever the objective weights made it -- see
+    # colgen.objective -- so this stays a plain difference.
     return math.fsum(benefit - column.delay_s for column in selection.values())
 
 
@@ -620,6 +630,10 @@ class ColGenSolver:
                 graph_build_elapsed_s=graph_build_elapsed_s,
             )
 
+        # One objective for the whole solve, threaded into seeding, the greedy
+        # heuristic, pricing and the compiled DP.  See colgen.objective.
+        model = cost_model(cfg, params)
+
         row_index = RowIndex()
         for graph in graphs.values():
             for terminal_id, capacity in graph.terminal_capacities.items():
@@ -652,7 +666,9 @@ class ColGenSolver:
         seed_started = time.monotonic()
         for flight_id in flight_ids:
             try:
-                seed = seed_column(graphs[flight_id], cfg, deadline=pricing_deadline)
+                seed = seed_column(
+                    graphs[flight_id], cfg, deadline=pricing_deadline, model=model
+                )
             except PricingTimeout:
                 return _pre_master_timeout_result(
                     flight_ids,
@@ -687,6 +703,7 @@ class ColGenSolver:
             row_index,
             cfg,
             deadline=pricing_deadline,
+            model=model,
         )
         # Keep initialization deliberately small: one certified shortest seed
         # per flight plus at most one time-shifted seed selected by the cheap

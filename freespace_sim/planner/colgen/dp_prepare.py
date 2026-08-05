@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from .network import RowKey
+from .objective import DELAY_MODEL, CostModel
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...config import SimConfig
@@ -442,6 +443,7 @@ def prepare_variants(
     benefit: float = 0.0,
     pi_f: float = 0.0,
     cost_cutoff: float | None = None,
+    model: "CostModel | None" = None,
 ) -> PreparedVariants:
     """Price every root option once, exactly as ``_best_column`` initialization does.
 
@@ -453,6 +455,17 @@ def prepare_variants(
     search that consumes them.  A departure whose ground delay alone cannot beat
     the incumbent can never win, whatever route follows it.
     """
+
+    # Every air-time field below is emitted PRE-WEIGHTED, and ground delay likewise.
+    # That is what lets the njit kernel stay objective-agnostic: `_search_dag` charges
+    # `dt_s` per arc and `_delay_lower_bound` multiplies hop counts by it, so handing
+    # both the weighted values makes their untouched arithmetic compute
+    # `ground_weight*ground + air_weight*air`.  Dual prices (`paid_value`,
+    # `dest_positive`) are NOT weighted -- they already arrive in the master's currency.
+    if model is None:
+        model = DELAY_MODEL
+    w_ground = model.ground_weight
+    w_air = model.air_weight
 
     from ...volumes import enroute_reference_m
     from .pricing import (
@@ -513,7 +526,8 @@ def prepare_variants(
     rows: list[dict[str, Any]] = []
     _RECOMPUTE_EPS = 1e-8
     for departure_step in departure_steps:
-        ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
+        ground_delay_raw_s = (departure_step - fg.base_step) * cfg.dt_s
+        ground_delay_s = w_ground * ground_delay_raw_s
         if cost_cutoff is not None:
             # pricing.py's identical guard, and for the same reason: ground delay is
             # irrevocable, so it upper-bounds every completion from this departure.
@@ -547,7 +561,7 @@ def prepare_variants(
                 # keeps a bound above the cutoff and survives.
                 fold_s, fold_exact = origin_fold_by_lane[lane_idx]
                 delay_lb = _arc_delay_lower_bound_s(
-                    ground_delay_s=ground_delay_s,
+                    ground_delay_s=ground_delay_raw_s,
                     origin_fold_s=fold_s,
                     hops=0,
                     remaining_hops=distance_to_go,
@@ -557,6 +571,7 @@ def prepare_variants(
                     folding_exact=(
                         reference_m > 1e-9 and fold_exact and destination_fold_exact
                     ),
+                    model=model,
                 )
                 if benefit - delay_lb - pi_f + view.max_negative_credit < (
                     cost_cutoff - _RECOMPUTE_EPS
@@ -589,10 +604,14 @@ def prepare_variants(
                     "lane_idx": -1 if lane_idx is None else lane_idx,
                     "cell": index,
                     "start_step": start_step,
-                    "score": -ground_delay_s - origin_leg_by_lane[lane_idx] - start_dual_cost,
-                    "origin_leg_s": origin_leg_by_lane[lane_idx],
+                    "score": (
+                        -ground_delay_s
+                        - w_air * origin_leg_by_lane[lane_idx]
+                        - start_dual_cost
+                    ),
+                    "origin_leg_s": w_air * origin_leg_by_lane[lane_idx],
                     "ground_delay_s": ground_delay_s,
-                    "origin_fold_s": origin_fold_s,
+                    "origin_fold_s": w_air * origin_fold_s,
                     "origin_fold_exact": 1 if origin_fold_exact else 0,
                     "paid_class": paid_class,
                 }
@@ -657,9 +676,9 @@ def prepare_variants(
         dest_slot_of_cell=dest_slot_of_cell,
         dest_positive=dest_positive,
         dest_step_base=step_base,
-        destination_fold_s=destination_fold_s,
+        destination_fold_s=w_air * destination_fold_s,
         destination_fold_exact=destination_fold_exact,
-        reference_time_s=reference_m / cfg.nominal_speed_mps,
+        reference_time_s=w_air * (reference_m / cfg.nominal_speed_mps),
     )
 
 

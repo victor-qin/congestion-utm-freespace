@@ -60,8 +60,20 @@ _MAGIC = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci hashing multiplier, as astar
 # Headroom over ``n_cells * n_steps`` when resizing the label pool after an overflow.
 # The state key carries more than (cell, step) -- the revisit history, the origin's
 # paid-row class and the first arc -- so several labels can share a cell-step and the
-# product is a floor, not a bound.  Measured overshoot was 1.03-1.58x; 2.0 buys margin
-# on a pool that is only ever allocated for a flight which already proved it overflows.
+# product is a floor, not a bound.
+#
+# The multiplier grows with scenario size: 1.03-1.58x at 100 flights, 2.1-7.5x at 500,
+# because more flights means more priced rows -- more origin paid-row classes and weaker
+# duals -- and both widen the dominance key's effective span.  A captured 500-flight
+# failure (fid=3176) needed 32,274,881 labels against cells*steps = 8,156,869: 3.96x.
+#
+# 2.0 nonetheless stays, because the CEILING was the actual bug and raising it alone
+# suffices.  Measured on that flight at label_limit_max = 1<<25:
+#     safety 2.0 -> 32.5s (2 regrowths)   safety 4.0 -> 23.0s (1 regrowth)
+# Matching the observed ratio saves 9.5s on straggler flights but costs +59% peak RSS on
+# EVERY flight (100-flight run: 6,656 -> 10,566 MB tree peak), because it over-allocates
+# wherever the ratio is genuinely ~1.3.  Peak memory is what bounds worker count, so the
+# extra regrowth is the cheaper side of that trade.
 _LABEL_GEOMETRY_SAFETY = 2.0
 
 # Arc role bits, mirroring network.py.
@@ -732,10 +744,10 @@ def search_dag(
     # is ~4 MB against the label pool's ~1 GB.
     max_candidates: int = 1 << 17,
     label_limit: int | None = None,
-    # ~16.8M labels.  Sizing note, because this constant is load-bearing and easy to
+    # ~33.6M labels.  Sizing note, because this constant is load-bearing and easy to
     # pick blindly: a label costs ~44 B (6 int32 + float64 + recent[depth] int32) and
     # its state slot ~32 B, and the table is the next power of two above 2x the pool,
-    # so the ceiling is worth roughly 1.7 GB of transient workspace.  Flights that
+    # so the ceiling is worth roughly 3.5 GB of transient workspace.  Flights that
     # exceed it fall back to the reference DP -- correct, just slow.  Measured on
     # colgen_test: the label counts form a continuum (2.6M / 2.9M / 3.1M / 3.3M / 3.4M
     # all certify), so this bound is a memory budget, not a semantic limit.
@@ -750,7 +762,7 @@ def search_dag(
     # 3145.6 -> 3384.9 MB (+7.6%) because the pool is transient, not retained.  This is
     # therefore a STRAGGLER knob at least as much as a memory knob: it also lifts the
     # makespan floor for flight-parallel pricing from 125s to 34s.
-    label_limit_max: int = 1 << 24,
+    label_limit_max: int = 1 << 25,
     forbidden=None,
     cancel_flag: np.ndarray | None = None,
 ) -> DagSearchResult:

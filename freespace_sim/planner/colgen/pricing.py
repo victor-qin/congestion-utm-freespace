@@ -1196,6 +1196,48 @@ def _best_column_compiled(
         # that stronger cutoff.  Each retry starts from a strictly better bound, so
         # it explores strictly less.  Without this a hard flight burned the whole
         # kernel budget, returned nothing, and paid for the reference DP as well.
+        # Bootstrap the cutoff from ONE departure variant before searching them all.
+        #
+        # The sweep advances by step, so a sink only exists once some label has reached
+        # `start_step + hops`.  Spread across many variants the pool fills long before
+        # that, and the retry loop below is then useless -- it needs candidates to
+        # tighten with and there are none.  Measured on a captured 500-flight subproblem
+        # (fid=3176, 83 surviving variants): the full search burned 32,274,881 labels and
+        # returned ZERO candidates, while the single best-scoring variant reached 1,352
+        # sinks in 3,521,185 labels and lifted the cutoff from rc=112.0 to rc=140.8.
+        # The full pass then needed 294,693 labels and 0.12s. End to end 33.1s -> 4.5s
+        # for the identical rc=144.000 column, at a ninth of the peak labels.
+        #
+        # Answer-neutral: the bootstrap only ever produces a *certified* incumbent, and
+        # pruning against an attainable score cannot discard anything strictly better.
+        # If it finds nothing, the cutoff is unchanged and only its own cost is lost.
+        if variants.n_variants > 1:
+            order = np.argsort(-np.asarray(variants.score), kind="stable")
+            boot = _dp_kernel.search_dag(
+                topology, duals, dp_prepare.restrict_variants(variants, order[:1]),
+                cfg=cfg, benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
+                seed=seed, forbidden=forbidden_pack, cancel_flag=cancel_flag,
+            )
+            if boot.status == _dp_kernel.FB_CANCELLED:
+                raise PricingTimeout("column pricing reached its wall-clock deadline")
+            if boot.candidates:
+                improved = _certify_candidates(
+                    boot, fg, cfg, dual_view, pi_f, benefit, forbidden_rows, incumbent
+                )
+                if improved is not None and (
+                    cutoff is None or improved[0] > cutoff + _SCORE_EPS
+                ):
+                    incumbent = improved
+                    cutoff = improved[0]
+                    # Re-filter: a tighter cutoff prunes departure variants outright,
+                    # which is most of the win (83 -> 4 on the captured flight).
+                    variants = dp_prepare.prepare_variants(
+                        fg, cfg, dual_view, topology, seed=seed,
+                        benefit=benefit, pi_f=pi_f, cost_cutoff=cutoff,
+                    )
+                    if variants.n_variants == 0:
+                        return incumbent, True
+
         for _attempt in range(_MAX_KERNEL_ATTEMPTS):
             result = _dp_kernel.search_dag(
                 topology, duals, variants,

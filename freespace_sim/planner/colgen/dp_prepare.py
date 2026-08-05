@@ -226,6 +226,36 @@ def prepare_forbidden(
     )
 
 
+# Per-variant columns of PreparedVariants.  The paid_* arrays are deliberately absent:
+# paid_class values index into them and stay valid under any subset.
+_PER_VARIANT_FIELDS = (
+    "departure_step", "lane_idx", "cell", "start_step", "score",
+    "origin_leg_s", "ground_delay_s", "origin_fold_s", "origin_fold_exact",
+    "paid_class",
+)
+
+
+def restrict_variants(variants: "PreparedVariants", keep) -> "PreparedVariants":
+    """Return a copy holding only the departure variants at indices ``keep``.
+
+    The ``paid_*`` arrays are shared unchanged: ``paid_class`` values index into them
+    and stay valid under any subset, so only the per-variant columns are sliced.
+    ``n_variants`` is derived from ``departure_step``, not stored, so it follows.
+
+    Used to run a cheap bootstrap search over the most promising variant before the real
+    one -- see ``pricing._best_column_compiled``.
+    """
+
+    from dataclasses import replace
+
+    keep = np.ascontiguousarray(np.asarray(keep, dtype=np.intp))
+    sliced = {
+        name: np.ascontiguousarray(np.asarray(getattr(variants, name))[keep])
+        for name in _PER_VARIANT_FIELDS
+    }
+    return replace(variants, **sliced)
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedDuals:
     """One iteration's cell-row prices as flat prefix sums, indexed by cell id.

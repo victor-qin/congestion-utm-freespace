@@ -178,6 +178,26 @@ def run_batch(
             batch_params.time_limit_s,
             stats.get("iterations", "?"),
         )
+    # A different fact with a different remedy, which is why it is no longer folded into
+    # the message above: the generation loop finished, and only the final integer master
+    # failed to PROVE its selection optimal over the pool it was handed.  The schedule is
+    # feasible and may well be optimal; it is simply uncertified, so no absent flight can
+    # be reported as a physical denial.  Note the backend is asked for a much tighter gap
+    # than `ip_gap` names -- it is converted to the master's revenue scale by dividing by
+    # n*M -- so at a large M this is the expected outcome rather than a rare one.
+    elif stats.get("termination_reason") == "ip_not_proven":
+        log.warning(
+            "colgen's generation loop converged (%s iterations) but the final integer "
+            "master returned status=%s without proving optimality over its %s columns. "
+            "The schedule is feasible; its optimality is NOT certified, and every denial "
+            "is reported as search-exhausted rather than infeasible. Raising "
+            "--colgen-time-limit gives the IP more room; loosening ip_gap (currently %g, "
+            "handed to the backend divided by n*M) asks it to prove less.",
+            stats.get("iterations", "?"),
+            stats.get("ip_status", "unknown"),
+            stats.get("n_columns", "?"),
+            batch_params.ip_gap,
+        )
     # The two gap scales can disagree by orders of magnitude, and only one of them is the
     # gate.  Under `gap_metric="revenue"` the denominator carries n*M, so with M an
     # artificial big-M the gate can close on a pool that is barely past the greedy start --

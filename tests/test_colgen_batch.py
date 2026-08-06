@@ -482,3 +482,40 @@ def test_a_genuinely_converged_solve_is_not_flagged(monkeypatch, caplog):
         )
 
     assert not caplog.records, "a converged solve must not cry wolf"
+
+
+def test_an_uncertified_final_ip_is_not_reported_as_a_budget_timeout(monkeypatch, caplog):
+    """Two different facts had one name, and the name pointed at the wrong knob.
+
+    ``ip_optimal is False`` used to overwrite ``termination_reason`` with ``time_limit``,
+    because both mean an absent flight is unproven rather than impossible. But a run whose
+    generation loop converged on ``lp_gap`` and whose final MILP merely failed to certify
+    has not exhausted its wall clock, and telling its operator to raise the time limit
+    describes a cause that is not there.
+    """
+
+    cfg = _cfg()
+    monkeypatch.setattr(
+        batch.ColGenSolver, "solve",
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+            columns={},
+            stats={
+                "termination_reason": "ip_not_proven", "iterations": 12,
+                "ip_status": "iteration_limit", "n_columns": 431,
+            },
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=batch.__name__):
+        run_batch(
+            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (), lambda *_args: None, None, None,
+            params=ColGenParams(time_limit_s=45.0),
+        )
+
+    messages = [record.message for record in caplog.records]
+    assert any("without proving optimality over its 431 columns" in m for m in messages)
+    assert not any("stopped on its time limit" in m for m in messages), (
+        "the budget message names a cause this run does not have"
+    )

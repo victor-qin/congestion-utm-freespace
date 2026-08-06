@@ -1456,11 +1456,15 @@ def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
         _params(lp_gap=0.0, ip_gap=0.0),
     )
 
-    assert result.stats["termination_reason"] == "time_limit"
+    # The partition is the contract: an unproven IP cannot certify that a missing flight
+    # is physically impossible, so every denial here is a compute-cap artifact.
     assert result.stats["ip_status"] == "status_1"
     assert len(result.stats["denied_flight_ids"]) == 1
     assert result.stats["budget_denied_flight_ids"] == ()
     assert result.stats["search_exhausted_flight_ids"] == result.stats["denied_flight_ids"]
+    # ...but the REASON is its own fact. This run did not exhaust its wall clock, and
+    # reporting "time_limit" sent a reader to --colgen-time-limit, which cannot fix it.
+    assert result.stats["termination_reason"] == "ip_not_proven"
 
 
 def test_every_exit_reports_the_same_stats_keys():

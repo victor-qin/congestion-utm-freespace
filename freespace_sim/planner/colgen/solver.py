@@ -1183,8 +1183,17 @@ class ColGenSolver:
                 ip_gap_met = ip_gap <= params.ip_gap
             ip_status = master.last_ip_status or "unknown"
             ip_optimal = master.last_ip_optimal
-            if ip_optimal is False:
-                termination_reason = "time_limit"
+            if ip_optimal is False and termination_reason not in {
+                "time_limit", "iteration_limit"
+            }:
+                # The restricted IP could not PROVE its selection optimal over the pool it
+                # was given.  That is a different fact from the CG loop running out of
+                # budget: the loop may have converged on `lp_gap` with only the final MILP
+                # left uncertified, and only the second is fixed by raising the time limit.
+                # Both mean an absent flight is unproven rather than physically impossible,
+                # so the denial partition below treats them alike -- but the reason a run
+                # reports is read by a person, and "time_limit" sent them to the wrong knob.
+                termination_reason = "ip_not_proven"
             if not incumbent or _better_selection(ip_selection, incumbent, params.M):
                 incumbent = dict(ip_selection)
 
@@ -1249,7 +1258,9 @@ class ColGenSolver:
         incumbent = dict(sorted(incumbent.items()))
         _assert_claim_feasible(incumbent, committed_loads, row_index)
         denied = tuple(flight_id for flight_id in flight_ids if flight_id not in incumbent)
-        if termination_reason in {"time_limit", "iteration_limit"}:
+        # Every truncated exit, by whatever mechanism: a flight the solve did not place is
+        # then a compute-cap artifact, not the optimizer's verdict that no plan exists.
+        if termination_reason in {"time_limit", "iteration_limit", "ip_not_proven"}:
             search_exhausted_flights.update(denied)
         search_exhausted = tuple(
             flight_id for flight_id in denied if flight_id in search_exhausted_flights

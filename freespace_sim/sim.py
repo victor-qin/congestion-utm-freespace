@@ -265,6 +265,7 @@ def run(
     requests: list[FlightRequest] | None = None,
     demand: DemandModel | None = None,
     planner_name: str | None = None,
+    planner_params=None,
     mechanism: Mechanism | None = None,
     progress: bool | ProgressCallback | None = None,
     telemetry: bool | TelemetryCollector = False,
@@ -285,6 +286,11 @@ def run(
     (filed-but-rejected corridors, `conflict_filed` culprits, per-hub metadata) onto ``SimResult.telemetry``
     for `save_run` to persist. Pass ``True`` or a preexisting collector.
 
+    ``planner_params`` configures the selected planner where it takes a configuration object —
+    today only ``colgen`` (a :class:`~freespace_sim.planner.colgen.ColGenParams`, carrying the solver
+    backend, iteration cap, whole-solve time budget and objective). ``None`` keeps that planner's
+    own defaults.
+
     ``parallel`` (default off → the serial FCFS loop, byte-identical to today) runs the speculative
     worker-pool sim (issue #8 Track A): a :class:`~freespace_sim.parallel.ParallelConfig`, or an int
     as an ``n_workers`` shorthand. ``mode="exact"`` (default) is byte-identical to the serial run;
@@ -302,7 +308,7 @@ def run(
     ledger = ReservationLedger(cfg)
     dss = DSS(ledger=ledger, mechanism=mechanism or FCFSMechanism())
     pname = planner_name or cfg.planner
-    usses = {uid: USS(uid, dss, cfg, get_planner(pname)) for uid in scenario.uss_ids}
+    usses = {uid: USS(uid, dss, cfg, get_planner(pname, planner_params)) for uid in scenario.uss_ids}
     default_uss = next(iter(usses.values()))
 
     static_terms: list = []                              # (center, term) per walled hub; [] unless always-active
@@ -359,6 +365,9 @@ def run(
     total = len(scenario.events)
     report = _resolve_progress(progress, total)
     status = _MilestoneLog(total, cfg.horizon_s)        # INFO milestones; silent without a log handler
+    batch_planners = [
+        u.planner for u in usses.values() if getattr(u.planner, "plans_whole_schedule", False)
+    ]
     if parallel is not None:
         from .parallel import PARALLEL_PLANNERS, ParallelConfig, run_parallel
 
@@ -371,6 +380,28 @@ def run(
         # commit order into `collector`; serial replans write into it directly.
         intents = run_parallel(scenario, cfg, pcfg, ledger, dss, pname, static_terms, status, report,
                                collector=collector)
+    elif batch_planners:
+        from .planner.colgen import run_batch
+
+        # A whole-schedule planner solves for every flight at once, so it cannot share a
+        # run with per-flight planners: the FCFS loop below would file some flights against
+        # a ledger the batch solve already reserved against.
+        if len(batch_planners) != len(usses):
+            raise ValueError("whole-schedule and per-flight planners cannot share one simulation")
+        params = batch_planners[0].params
+        if any(planner.params != params for planner in batch_planners[1:]):
+            raise ValueError("all whole-schedule planners must use identical parameters")
+        intents = run_batch(
+            scenario,
+            cfg,
+            ledger,
+            dss,
+            static_terms,
+            status,
+            report,
+            collector,
+            params=params,
+        )
     else:
         intents = []
         for done, ev in enumerate(scenario.events, 1):

@@ -21,8 +21,15 @@ class Planner(Protocol):
     ) -> OperationalIntent: ...
 
 
-def get_planner(name: str) -> Planner:
-    """Resolve a planner by name."""
+def get_planner(name: str, params=None) -> Planner:
+    """Resolve a planner by name.
+
+    ``params`` is a planner-specific configuration object. Only ``colgen`` accepts one today
+    (a :class:`~.colgen.ColGenParams`), so passing one for any other planner raises rather than
+    being silently dropped — a dropped solver budget looks like a converged run, not an error.
+    """
+    if params is not None and name != "colgen":
+        raise ValueError(f"planner {name!r} takes no params object (got {type(params).__name__})")
     if name == "straight":
         from .straight import StraightLineTimeShift
 
@@ -81,6 +88,12 @@ def get_planner(name: str) -> Planner:
         milp = MILPOptPlanner(
             warm_planner=ShortcutRefiner(AStarPlanner()), optimize_delay=False, lock_homotopy=True)
         return ShortcutRefiner(milp, label="astar_milp_sc")
+    if name == "colgen":
+        from .colgen import ColumnGenerationPlanner
+
+        # Whole-schedule, not per-flight: `plan` refuses the FCFS protocol and `sim.run`
+        # routes this planner to `colgen.run_batch` instead. See `plans_whole_schedule`.
+        return ColumnGenerationPlanner(params)
     raise ValueError(f"unknown planner: {name!r}")
 
 

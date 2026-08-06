@@ -1,0 +1,211 @@
+"""Whole-schedule integration for the column-generation planner."""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from ...config import SimConfig
+from ...dss import DSS
+from ...ledger import ReservationLedger
+from ...scenario import Scenario
+from ...types import (
+    DenialReason,
+    FlightRequest,
+    IntentStatus,
+    OperationalIntent,
+    as_terminal,
+)
+from ...uss import _warn_if_terminal_dropped
+from .params import ColGenParams
+from .solver import ColGenSolver
+from .translate import column_to_intent
+
+log = logging.getLogger(__name__)
+
+
+class ColumnGenerationPlanner:
+    """Factory-facing marker for a planner that solves the whole schedule at once."""
+
+    plans_terminal_airspace = True
+    plans_whole_schedule = True
+
+    def __init__(self, params: ColGenParams | None = None) -> None:
+        self.params = params if params is not None else ColGenParams()
+
+    def plan(
+        self,
+        req: FlightRequest,
+        ledger: ReservationLedger,
+        cfg: SimConfig,
+    ) -> OperationalIntent:
+        """Refuse the per-flight protocol; :func:`run_batch` is the execution path."""
+        raise RuntimeError("colgen is a whole-schedule planner; run it through sim.run batch mode")
+
+
+def run_batch(
+    scenario: Scenario,
+    cfg: SimConfig,
+    ledger: ReservationLedger,
+    dss: DSS,
+    static_terms,
+    status,
+    report,
+    collector,
+    *,
+    params: ColGenParams | None = None,
+    on_iteration=None,
+) -> list[OperationalIntent]:
+    """Solve once, then file every result through the normal DSS in FCFS order.
+
+    ``collector`` is accepted for parity with the parallel runner.  Column generation
+    has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
+
+    Pricing runs sequentially.  ``sim.run``'s own ``parallel`` argument is a different
+    mechanism entirely -- the A* speculative runner -- and rejects whole-schedule
+    planners, so a colgen run is single-process by construction.
+
+    ``on_iteration`` is forwarded to the solver, which calls it once per column-generation
+    iteration.  It is forwarded rather than dropped because ``run_batch`` is the production
+    entry point: without this the per-iteration telemetry existed but was reachable only by
+    calling :meth:`ColGenSolver.solve` directly, so every real run was blind to it.
+    """
+    if cfg.n_levels != 1:
+        # Also guarded inside `build_flight_graph`, but that fires per flight from four frames
+        # down. Selecting a planner is a whole-run decision, so refuse it here where the message
+        # can name the knob -- the shipped default ladder is three levels, which makes this the
+        # first thing anyone pointing colgen at an existing scenario hits.
+        raise NotImplementedError(
+            f"colgen v1 plans on a single flight level, but this run has {cfg.n_levels} "
+            "(flight_levels_m). Pin the scenario to one level (e.g. flight_levels_m=(100.0,)) "
+            "or choose a multi-level planner"
+        )
+    if getattr(dss, "ledger", ledger) is not ledger:
+        raise ValueError("colgen batch requires dss and run_batch to share one ledger")
+    if ledger.n_volumes:
+        raise ValueError(
+            "colgen batch requires an empty dynamic ledger; pre-existing reservations "
+            "must first be represented as fixed row claims"
+        )
+    del collector
+
+    events = tuple(scenario.events)
+    requests = [event.request for event in events]
+    if not cfg.terminal_airspace_always_active and any(
+        as_terminal(request.origin_terminal) is not None
+        or as_terminal(request.dest_terminal) is not None
+        for request in requests
+    ):
+        raise NotImplementedError(
+            "colgen terminal endpoints require terminal_airspace_always_active=True; "
+            "without permanent walls, transient foreign terminal geometry is not represented "
+            "by the batch capacity rows"
+        )
+
+    batch_params = params if params is not None else ColGenParams()
+    solve_started = time.monotonic()
+    result = ColGenSolver().solve(
+        requests, cfg, static_terms, batch_params, on_iteration=on_iteration,
+    )
+    solve_elapsed = time.monotonic() - solve_started
+    solve_share = solve_elapsed / len(events) if events else 0.0
+    stats = result.stats
+    log.info(
+        "colgen solver: backend=%s termination=%s iterations=%s objective_delay_s=%s "
+        "lp_gap=%s ip_gap=%s selected=%s/%d search_exhausted=%s columns=%s rows=%s "
+        "stage=%s graphs=%s seeds=%s graph_s=%s seed_s=%s master_s=%s "
+        "arc_nodes=%s arc_checks=%s cache_hits=%s wall_queries=%s wall_candidates=%s "
+        "elapsed_s=%.3f",
+        stats.get("backend", "unknown"),
+        stats.get("termination_reason", "unknown"),
+        stats.get("iterations", "unknown"),
+        stats.get("objective", "unknown"),
+        stats.get("lp_gap", "unknown"),
+        stats.get("ip_gap", "unknown"),
+        stats.get("selected_flights", len(result.columns)),
+        len(requests),
+        len(stats.get("search_exhausted_flight_ids", ())),
+        stats.get("n_columns", "unknown"),
+        stats.get("n_materialized_rows", "unknown"),
+        stats.get("preprocessing_stage", "unknown"),
+        stats.get("graphs_built", "unknown"),
+        stats.get("seeds_completed", "unknown"),
+        stats.get("graph_build_elapsed_s", "unknown"),
+        stats.get("seed_elapsed_s", "unknown"),
+        stats.get("time_to_master_s", "unknown"),
+        stats.get("arc_expanded_nodes", "unknown"),
+        stats.get("arc_checks", "unknown"),
+        stats.get("arc_cache_hits", "unknown"),
+        stats.get("wall_index_queries", "unknown"),
+        stats.get("wall_index_candidates", "unknown"),
+        solve_elapsed,
+    )
+    # A second line rather than a longer first one: the line above is a stable format
+    # that callers grep, and these are answers to a different question -- "how converged
+    # is this really, and where did the wall go".  Both were unanswerable from a
+    # production log before.
+    log.info(
+        "colgen detail: gap_metric=%s lp_gap_revenue=%s lp_gap_cost=%s ip_gap_revenue=%s "
+        "greedy_s=%s pricing_wall_s=%s",
+        stats.get("gap_metric", "unknown"),
+        stats.get("lp_gap_revenue", "unknown"),
+        # The cost-scale gap is logged beside the revenue one deliberately: with M an
+        # artificial big-M the revenue gap can read as converged while this one is still
+        # enormous, and only printing the first hides that entirely.
+        stats.get("lp_gap_cost", "unknown"),
+        stats.get("ip_gap_revenue", "unknown"),
+        stats.get("initial_greedy_elapsed_s", "unknown"),
+        stats.get("pricing_wall_s", "unknown"),
+    )
+    # A budget-terminated solve still returns a full, feasible schedule -- so it looks
+    # exactly like a converged one in the results, and nothing downstream can tell them
+    # apart.  Say it once, loudly, at the point the run can still be re-launched with a
+    # bigger budget.  Pricing is the whole cost, so on the reference DP this is the
+    # ordinary outcome at scenario scale rather than an exotic failure.
+    if stats.get("termination_reason") == "time_limit":
+        log.warning(
+            "colgen stopped on its time limit (%.0fs) after %s iteration(s) -- this is the "
+            "best schedule found within the budget, NOT a converged column-generation "
+            "solution. Raise --colgen-time-limit to converge.",
+            batch_params.time_limit_s,
+            stats.get("iterations", "?"),
+        )
+
+    intents: list[OperationalIntent] = []
+    search_exhausted = frozenset(result.stats.get("search_exhausted_flight_ids", ()))
+    total = len(events)
+    for done, event in enumerate(events, 1):
+        request = event.request
+        filing_started = time.monotonic()
+        column = result.columns.get(request.flight_id)
+        if column is None:
+            intent = OperationalIntent(
+                request=request,
+                status=IntentStatus.REJECTED,
+                denial_reason=(
+                    DenialReason.SEARCH_EXHAUSTED
+                    if request.flight_id in search_exhausted
+                    else DenialReason.BUDGET_EXCEEDED
+                ),
+                planner="colgen",
+                solve_time_s=solve_share,
+            )
+        else:
+            intent = column_to_intent(column, request, cfg, solve_share_s=solve_share)
+
+        _warn_if_terminal_dropped(request, intent)
+        was_accepted = intent.accepted
+        committed = dss.commit(intent)
+        intent.solve_time_s += time.monotonic() - filing_started
+        if was_accepted and not committed:
+            log.error(
+                "colgen filing denial -- covering bug: flight_id=%s",
+                request.flight_id,
+            )
+
+        intents.append(intent)
+        status(done, request, intent)
+        if report:
+            report(done, total, intent)
+
+    return intents

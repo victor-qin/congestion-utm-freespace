@@ -2,7 +2,7 @@
 
 import pytest
 
-from experiments.run import parse_args, spec_from_args
+from experiments.run import colgen_params_from_args, parse_args, spec_from_args
 from freespace_sim.scenarios import SCENARIOS
 
 
@@ -85,3 +85,51 @@ def test_demand_duration_flag_shrinks_a_density_scenario_for_a_smoke_run():
         _args("density_faa_wing_zipline", "--horizon", "900", "--demand-duration", "60")
     ).config()
     assert (cfg.horizon_s, cfg.effective_demand_duration_s) == (900.0, 60.0)
+
+
+def test_colgen_flags_reach_the_planner_params():
+    """The solver budget has to survive the CLI, or a sweep silently runs at the default."""
+
+    args = _args(
+        "colgen_test", "--planner", "colgen",
+        "--colgen-time-limit", "900", "--colgen-max-iterations", "50",
+        "--colgen-objective", "total_cost", "--colgen-solver", "highs",
+    )
+    params = colgen_params_from_args(args)
+
+    assert params.time_limit_s == 900.0
+    assert params.max_iterations == 50
+    assert params.objective == "total_cost"
+    assert params.solver == "highs"
+
+
+def test_colgen_params_are_none_for_every_other_planner():
+    """``None`` keeps non-colgen planners on ``get_planner``'s no-params path."""
+
+    assert colgen_params_from_args(_args("metro_uniform", "--planner", "astar")) is None
+
+
+def test_unset_colgen_flags_leave_the_defaults_alone():
+    """An unset flag must not be forwarded as ``None`` and overwrite a real default."""
+
+    defaults = colgen_params_from_args(_args("colgen_test", "--planner", "colgen"))
+
+    assert defaults.time_limit_s == 120.0
+    assert defaults.objective == "total_delay"
+
+
+@pytest.mark.parametrize(
+    "colgen_flag",
+    [
+        ("--colgen-time-limit", "900"),
+        ("--colgen-max-iterations", "50"),
+        ("--colgen-objective", "total_cost"),
+        ("--colgen-solver", "highs"),
+    ],
+)
+def test_colgen_flags_require_the_colgen_planner(colgen_flag):
+    """Accepting them for another planner would drop the budget without saying so."""
+
+    with pytest.raises(SystemExit) as exc:
+        _args("metro_uniform", "--planner", "astar", *colgen_flag)
+    assert exc.value.code == 2

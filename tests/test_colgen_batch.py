@@ -118,7 +118,7 @@ def test_run_batch_maps_missing_columns_and_fires_callbacks_in_event_order(
     report_calls = []
     caplog.set_level(logging.INFO, logger="freespace_sim.planner.colgen.batch")
 
-    intents = run_batch(
+    intents, _stats = run_batch(
         scenario,
         cfg,
         ledger,
@@ -178,7 +178,7 @@ def test_run_batch_uses_precommit_acceptance_for_covering_bug_log(monkeypatch, c
     )
     caplog.set_level(logging.ERROR, logger="freespace_sim.planner.colgen.batch")
 
-    intents = run_batch(
+    intents, _stats = run_batch(
         scenario,
         cfg,
         ReservationLedger(cfg),
@@ -311,7 +311,7 @@ def test_sim_batch_branch_forwards_planner_params(monkeypatch):
                 planner="colgen",
             )
             for event in scenario.events
-        ]
+        ], {"termination_reason": "lp_gap", "iterations": 4}
 
     monkeypatch.setattr(batch, "run_batch", fake_run_batch)
     result = sim_module.run(cfg, requests=_requests())
@@ -322,6 +322,9 @@ def test_sim_batch_branch_forwards_planner_params(monkeypatch):
     assert calls[0].report is None
     assert [intent.request.flight_id for intent in result.intents] == [1, 2]
     assert result.verified
+    # The solve's diagnostics have to survive onto the result, or the run folder cannot
+    # say whether this schedule came from a converged solve or a truncated one.
+    assert result.planner_stats == {"termination_reason": "lp_gap", "iterations": 4}
 
 
 def test_run_batch_forwards_the_per_iteration_callback(monkeypatch):
@@ -386,11 +389,11 @@ def test_sim_run_forwards_planner_params_to_the_factory(monkeypatch):
     monkeypatch.setattr(sim_module, "get_planner", _capture)
     monkeypatch.setattr(
         batch, "run_batch",
-        lambda *args, **kwargs: [
+        lambda *args, **kwargs: ([
             OperationalIntent(event.request, IntentStatus.REJECTED,
                               denial_reason=DenialReason.BUDGET_EXCEEDED, planner="colgen")
             for event in args[0].events
-        ],
+        ], {}),
     )
     sim_module.run(_cfg(), requests=_requests(), planner_params=params)
 

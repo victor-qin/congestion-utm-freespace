@@ -44,7 +44,7 @@ def _run_direct_batch(
     for center, terminal in terms:
         ledger.register_static_terminal(center, terminal)
     dss = DSS(ledger, FCFSMechanism())
-    intents = run_batch(
+    intents, _stats = run_batch(
         scenario_from_requests(requests),
         cfg,
         ledger,

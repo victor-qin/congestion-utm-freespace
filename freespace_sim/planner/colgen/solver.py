@@ -502,7 +502,7 @@ def _pre_master_timeout_result(
             "ip_optimal": None,
             "ip_skipped": True,
             "objective": 0.0,
-            "total_delay_s": 0.0,
+            "objective_name": params.objective,
             "master_objective": 0.0,
             "selected_flights": 0,
             "denied_flight_ids": denied,
@@ -630,7 +630,7 @@ class ColGenSolver:
                     "ip_optimal": None,
                     "ip_skipped": True,
                     "objective": 0.0,
-                    "total_delay_s": 0.0,
+                    "objective_name": params.objective,
                     "master_objective": 0.0,
                     "selected_flights": 0,
                     "denied_flight_ids": (),
@@ -1257,7 +1257,11 @@ class ColGenSolver:
         budget_denied = tuple(
             flight_id for flight_id in denied if flight_id not in search_exhausted_flights
         )
-        total_delay_s = math.fsum(column.delay_s for column in incumbent.values())
+        # NOT seconds under every objective: `Column.delay_s` carries whatever currency the
+        # cost model priced in, so at objective="total_cost" this is weighted cost units
+        # (1*ground + 3*air).  Reported beside `objective_name` for that reason -- the run
+        # folder's own delay metrics, computed from the filed intents, are the seconds.
+        objective_value = math.fsum(column.delay_s for column in incumbent.values())
         master_objective = _selection_objective(incumbent, params.M)
         elapsed_s = time.monotonic() - started
         arc_stats: Counter[str] = Counter()
@@ -1326,8 +1330,8 @@ class ColGenSolver:
             "ip_elapsed_s": ip_elapsed_s,
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
-            "objective": total_delay_s,
-            "total_delay_s": total_delay_s,
+            "objective": objective_value,
+            "objective_name": params.objective,
             "master_objective": master_objective,
             "selected_flights": len(incumbent),
             "denied_flight_ids": denied,

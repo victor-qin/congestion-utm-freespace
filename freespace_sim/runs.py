@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -173,6 +174,24 @@ def _ledger_end_frame(result: SimResult) -> pd.DataFrame:
 # --- save / load -----------------------------------------------------------
 
 
+def _json_finite(value):
+    """Replace non-finite floats with ``None`` so the payload is real JSON.
+
+    ``json.dumps`` emits bare ``Infinity``/``NaN``, which RFC 8259 does not allow: strict
+    parsers reject the file outright, and ``jq`` silently clamps to 1.8e308 — turning "no
+    bound was ever computed" into a plausible-looking finite bound. ``null`` says the same
+    thing without inviting either failure.
+    """
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_finite(v) for v in value]
+    return value
+
+
 def save_run(
     result: SimResult, *,
     root: Path | str = DEFAULT_ROOT,
@@ -233,6 +252,14 @@ def save_run(
         "verified": result.verified,
     }, indent=2, default=str))
     (folder / "summary.json").write_text(json.dumps(agg, indent=2))
+    # Whole-schedule solver diagnostics, when the run had a solver (colgen). Without this a
+    # column-generation run is indistinguishable on disk from a converged one: it files a
+    # complete, feasible accepted set whether it ran to optimality or stopped at iteration 1.
+    # `default=str` because the stats carry tuples of ids and occasional non-JSON scalars.
+    if getattr(result, "planner_stats", None):
+        (folder / "planner_stats.json").write_text(
+            json.dumps(_json_finite(result.planner_stats), indent=2, default=str)
+        )
 
     scenario_frame(result).to_parquet(folder / "scenario.parquet", index=False)
     trajectory_frame(result).to_parquet(folder / "trajectories.parquet", index=False)
@@ -278,6 +305,7 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
     cfg = result.config
     if agg is None:
         agg = metrics.aggregate_with_steady(result)
+    planner_stats = getattr(result, "planner_stats", None) or {}
     steady = agg.get("steady_state", {})
     steady_cols = {f"steady_{k}": steady.get(k) for k in
                    ("mean_total_delay_s", "p50_total_delay_s", "p95_total_delay_s",
@@ -297,6 +325,11 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
            "simulation_end_s": agg["simulation_end_s"],
            "simulation_duration_s": agg["simulation_duration_s"],
            "region_w": cfg.region_size_m[0], "region_h": cfg.region_size_m[1],
+           # None for per-flight planners, which have neither. For a whole-schedule solver these
+           # are what separates "we have six colgen runs" from "we have six colgen runs, five of
+           # which stopped at iteration 1" -- without them that needs opening every folder.
+           "planner_termination": planner_stats.get("termination_reason"),
+           "planner_iterations": planner_stats.get("iterations"),
            "wall_seconds": wall_seconds,
            "has_telemetry": result.telemetry is not None,
            **{k: agg[k] for k in ("n_uss", "n_requests", "n_accepted", "n_denied", "denial_rate",

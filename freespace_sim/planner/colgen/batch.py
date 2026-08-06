@@ -55,8 +55,13 @@ def run_batch(
     *,
     params: ColGenParams | None = None,
     on_iteration=None,
-) -> list[OperationalIntent]:
+) -> tuple[list[OperationalIntent], dict]:
     """Solve once, then file every result through the normal DSS in FCFS order.
+
+    Returns ``(intents, stats)``.  The stats are returned rather than only logged because
+    the intents alone cannot answer "did this solve converge" -- a run that stopped at
+    iteration 1 files a complete, feasible, ordinary-looking accepted set.  ``sim.run``
+    carries them onto :class:`~freespace_sim.sim.SimResult` so they reach the run folder.
 
     ``collector`` is accepted for parity with the parallel runner.  Column generation
     has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
@@ -111,7 +116,7 @@ def run_batch(
     solve_share = solve_elapsed / len(events) if events else 0.0
     stats = result.stats
     log.info(
-        "colgen solver: backend=%s termination=%s iterations=%s objective_delay_s=%s "
+        "colgen solver: backend=%s termination=%s iterations=%s objective=%s:%s "
         "lp_gap=%s ip_gap=%s selected=%s/%d search_exhausted=%s columns=%s rows=%s "
         "stage=%s graphs=%s seeds=%s graph_s=%s seed_s=%s master_s=%s "
         "arc_nodes=%s arc_checks=%s cache_hits=%s wall_queries=%s wall_candidates=%s "
@@ -119,6 +124,9 @@ def run_batch(
         stats.get("backend", "unknown"),
         stats.get("termination_reason", "unknown"),
         stats.get("iterations", "unknown"),
+        # Named, because `objective` is in the cost model's currency: at
+        # objective="total_cost" it is weighted cost units, not seconds.
+        stats.get("objective_name", "unknown"),
         stats.get("objective", "unknown"),
         stats.get("lp_gap", "unknown"),
         stats.get("ip_gap", "unknown"),
@@ -235,4 +243,4 @@ def run_batch(
         if report:
             report(done, total, intent)
 
-    return intents
+    return intents, stats

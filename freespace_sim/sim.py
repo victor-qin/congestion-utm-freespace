@@ -188,6 +188,11 @@ class SimResult:
     ledger: ReservationLedger
     verified: bool
     telemetry: TelemetryCollector | None = None   # observer-only congestion capture (default off)
+    # Whole-schedule solver diagnostics (colgen), or None for per-flight planners. Carried on the
+    # result rather than only logged because the intents cannot answer "did this solve converge":
+    # a run that stopped at iteration 1 files a complete, feasible, ordinary-looking accepted set.
+    # `runs.save_run` persists this as planner_stats.json.
+    planner_stats: dict | None = None
 
     @property
     def accepted(self) -> list[OperationalIntent]:
@@ -363,6 +368,7 @@ def run(
                 p._tele = collector
 
     total = len(scenario.events)
+    planner_stats: dict | None = None
     report = _resolve_progress(progress, total)
     status = _MilestoneLog(total, cfg.horizon_s)        # INFO milestones; silent without a log handler
     batch_planners = [
@@ -391,7 +397,7 @@ def run(
         params = batch_planners[0].params
         if any(planner.params != params for planner in batch_planners[1:]):
             raise ValueError("all whole-schedule planners must use identical parameters")
-        intents = run_batch(
+        intents, planner_stats = run_batch(
             scenario,
             cfg,
             ledger,
@@ -418,4 +424,4 @@ def run(
     # and the reported planner label would describe cfg.planner, not the planner that ran.
     result_cfg = cfg if pname == cfg.planner else replace(cfg, planner=pname)
     return SimResult(config=result_cfg, intents=intents, ledger=ledger, verified=verified,
-                     telemetry=collector)
+                     telemetry=collector, planner_stats=planner_stats)

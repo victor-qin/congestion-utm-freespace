@@ -761,8 +761,11 @@ def test_colgen_beats_fcfs_on_constructed_congestion():
 
     assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 16.0]
     assert fcfs_delays == pytest.approx([0.0, 24.0, 24.0])
-    assert colgen.stats["total_delay_s"] == pytest.approx(16.0)
-    assert colgen.stats["total_delay_s"] < sum(fcfs_delays)
+    # `objective` is in the cost model's currency; this solve runs the default delay
+    # objective, so here it is seconds and comparable to the A* delays directly.
+    assert colgen.stats["objective_name"] == "total_delay"
+    assert colgen.stats["objective"] == pytest.approx(16.0)
+    assert colgen.stats["objective"] < sum(fcfs_delays)
     _assert_files_cleanly(requests, colgen.columns, cfg)
 
 
@@ -1482,3 +1485,35 @@ def test_every_exit_reports_the_same_stats_keys():
     assert timed_out.stats["termination_reason"] == "time_limit"
     assert set(empty.stats) == set(full.stats)
     assert set(timed_out.stats) == set(full.stats)
+
+
+def test_the_objective_stat_says_which_currency_it_is_in():
+    """``objective`` is NOT seconds under every objective, so it has to name itself.
+
+    ``Column.delay_s`` carries whatever the cost model priced in, so at
+    ``objective="total_cost"`` the reported value is weighted cost units. A sweep that
+    compared the two objectives on one un-named number would be comparing seconds against
+    3x-weighted cost and calling the difference a result.
+
+    The fixture is the detour instance, because it is the one whose optimum spends its
+    delay in the AIR -- and air is the term the two objectives disagree about (ground is
+    the numeraire at 1.0 in both).
+    """
+
+    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=20.0)
+    requests = [
+        _request(1, (-2, -5), (-2, -11), cfg),
+        _request(2, (-8, -4), (0, -4), cfg),
+    ]
+    shared = {"detour_slack_hops": 1, "gap_metric": "cost"}
+
+    delay = ColGenSolver().solve(requests, cfg, (), _params(objective="total_delay", **shared))
+    cost = ColGenSolver().solve(requests, cfg, (), _params(objective="total_cost", **shared))
+
+    assert delay.stats["objective_name"] == "total_delay"
+    assert cost.stats["objective_name"] == "total_cost"
+    # One extra hop of air: 4.0 s raw, and cost_air_lateral_per_s = 3.0 against a ground
+    # numeraire of 1.0, so the identical schedule is reported as 12.0 under the weighted
+    # objective. Same seconds flown, a number 3x larger -- which is exactly the trap.
+    assert delay.stats["objective"] == pytest.approx(4.0, abs=1e-8)
+    assert cost.stats["objective"] == pytest.approx(12.0, abs=1e-8)

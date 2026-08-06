@@ -877,13 +877,17 @@ def _shortest_seed_columns(
     canonical seed beats the remaining bounds, no further spatial path is
     generated.  Exact ties are still explored for deterministic tie-breaking.
 
-    The result is cached on the graph, so it assumes one ``model`` per graph -- which
-    holds because the objective is fixed for a solve and graphs are built per solve.
+    The result is cached on the graph, keyed on ``model``.  It used to assume one model
+    per graph -- true inside a solve, since the objective is fixed and graphs are built
+    per solve -- but the assumption was enforced only by convention, and violating it
+    returned the first model's seed with no error.  Anything comparing two objectives on
+    one graph, which is the natural way to write such a comparison, silently got the same
+    answer twice.
     """
 
     cache = fg._search_cache
     with cache.lock:
-        if cache.seed_columns is not None:
+        if cache.seed_columns is not None and cache.seed_model == model:
             return cache.seed_columns
 
         view = DualView({}, cfg)
@@ -1031,6 +1035,7 @@ def _shortest_seed_columns(
 
         result = () if best is None else (best,)
         cache.seed_columns = result
+        cache.seed_model = model
         cache.seed_delay_certified = best is not None and not unresolved_shortest_path
         return result
 
@@ -2424,7 +2429,13 @@ def seed_column(
             raise ValueError("seed deadline must be finite")
     _check_deadline(deadline)
     with fg._search_cache.lock:
-        if fg._search_cache.seed_search_complete:
+        # Keyed on the model for the same reason as `_shortest_seed_columns`: a seed's
+        # cost is the objective's verdict, so a cache hit under a different weighting
+        # would answer the wrong question without saying so.
+        if (
+            fg._search_cache.seed_search_complete
+            and fg._search_cache.seed_model == model
+        ):
             cached = fg._search_cache.seed_columns or ()
             if cached:
                 return cached[0]
@@ -2456,11 +2467,13 @@ def seed_column(
     if column is None:
         with fg._search_cache.lock:
             fg._search_cache.seed_columns = ()
+            fg._search_cache.seed_model = model
             fg._search_cache.seed_delay_certified = False
             fg._search_cache.seed_search_complete = True
         raise ValueError(f"flight {fg.request.flight_id} has no feasible seed column")
     with fg._search_cache.lock:
         fg._search_cache.seed_columns = (column,)
+        fg._search_cache.seed_model = model
         # The fallback is a bounded feasibility search.  It is a valid seed,
         # but path-dependent wall tagging may mean it is not a globally
         # minimum-delay column, so exact pricing must not take the zero-dual

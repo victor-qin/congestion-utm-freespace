@@ -763,6 +763,7 @@ class _FlightSearchCache:
         "certified_claims",
         "seed_columns",
         "seed_delay_certified",
+        "seed_model",
         "seed_search_complete",
         "topology",
     )
@@ -774,6 +775,14 @@ class _FlightSearchCache:
         ] = OrderedDict()
         self.seed_columns: tuple[Any, ...] | None = None
         self.seed_delay_certified = False
+        # The objective the cached seed was costed under.  Everything else in this cache
+        # is answer-neutral -- it restates what the graph already determines -- but a seed
+        # is NOT: its ``delay_s`` is the cost model's verdict, and the cheapest seed under
+        # one weighting is not the cheapest under another.  Keying on the model turns a
+        # documented "one model per graph" assumption into one that cannot be violated
+        # silently, which matters because the failure mode is a wrong number rather than
+        # an exception.
+        self.seed_model: Any | None = None
         self.seed_search_complete = False
         # Flat-array mirror of the expanded arc topology, built on first compiled
         # pricing use.  Answer-neutral like the rest of this cache: it only ever

@@ -29,7 +29,7 @@ from freespace_sim.planner.colgen.objective import (
     scaled_dt_s,
 )
 from freespace_sim.planner.colgen.params import ColGenParams
-from freespace_sim.planner.colgen.pricing import DualView, price_flight
+from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
 from freespace_sim.types import FlightRequest, vec
 
 dp_kernel = pytest.importorskip(
@@ -162,6 +162,44 @@ def test_kernel_refuses_a_non_separable_objective():
             seed=False,
             model=NonSeparable(1.0, 3.0),
         )
+
+
+def test_seed_cache_is_keyed_on_the_cost_model():
+    """A cached seed must not answer for an objective it was not costed under.
+
+    ``_shortest_seed_columns`` memoises on ``fg._search_cache``.  That cache used to be
+    consulted without regard to ``model``, so pricing one graph under two objectives --
+    the natural way to write a comparison -- returned the FIRST model's seed both times,
+    silently.  Nothing raised; the second answer was simply wrong.
+
+    This is the failure mode the rest of the objective refactor was built to eliminate:
+    a weight that fails to reach a computation and reports a plausible number anyway.
+    """
+
+    cfg = _cfg()
+    weighted = CostModel(ground_weight=1.0, air_weight=3.0)
+    assert weighted.air_weight != weighted.ground_weight, "fixture needs unequal weights"
+
+    # One graph, both models, delay-first -- the order that used to poison the cache.
+    graph, _params = _graph(cfg)
+    delay_seed = seed_column(graph, cfg)
+    cost_seed = seed_column(graph, cfg, model=weighted)
+
+    # Independently: a graph that has only ever seen the weighted model.
+    reference = seed_column(_graph(cfg)[0], cfg, model=weighted)
+
+    assert cost_seed.delay_s == pytest.approx(reference.delay_s, abs=1e-9), (
+        "the cached unweighted seed leaked into the weighted query"
+    )
+    assert cost_seed.delay_s != pytest.approx(delay_seed.delay_s, abs=1e-9), (
+        "this fixture must have air time, or the two models cannot differ"
+    )
+    # And the reverse order, so the fix is not an artifact of which model asked first.
+    graph2, _ = _graph(cfg)
+    assert seed_column(graph2, cfg, model=weighted).delay_s == pytest.approx(
+        cost_seed.delay_s, abs=1e-9
+    )
+    assert seed_column(graph2, cfg).delay_s == pytest.approx(delay_seed.delay_s, abs=1e-9)
 
 
 @pytest.mark.parametrize("weights", [(1.0, 1.0), (1.0, 3.0), (2.0, 5.0)])

@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
+import numpy as np
 import pytest
 
 from freespace_sim.config import SimConfig
@@ -18,7 +19,8 @@ from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen import pricing
 from freespace_sim.planner.colgen.network import RowKey, build_flight_graph, column_claims
 from freespace_sim.planner.colgen.params import ColGenParams
-from freespace_sim.planner.colgen.pricing import price_flight, seed_column
+from freespace_sim.planner.colgen.objective import CostModel
+from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import derive_cell_window, endpoint_claim_cells
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
@@ -501,3 +503,82 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
 
         assert reduced_cost == pytest.approx(oracle_rc, abs=1e-8)
         assert column == oracle_column
+
+
+def _weighted_cost(column, graph, cfg, model: CostModel) -> float:
+    """Cost one enumerated column WITHOUT reusing pricing's own arithmetic.
+
+    Built from the filed intent's ground/detour split, so the oracle and the thing it
+    checks share nothing but the geometry.
+    """
+
+    intent = column_to_intent(column, graph.request, cfg)
+    ground_s = intent.ground_delay_s
+    return model.evaluate(
+        ground_s=ground_s, air_detour_s=total_delay_s(intent, cfg) - ground_s
+    )
+
+
+@pytest.mark.parametrize(
+    "ground_weight,air_weight", [(1.0, 1.0), (1.0, 3.0), (3.0, 1.0)]
+)
+def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
+    ground_weight, air_weight
+):
+    """The search's answer must be the objective's argmin, whichever way it leans.
+
+    The label score is the dominance currency: score two labels in the wrong units and
+    the survivor is whichever the tie-break reached first, not the one the objective
+    prefers. This fixture has the substitution in it -- 567 columns over 2..9 hops and 7
+    departure steps, so ground and air genuinely trade -- and the oracle re-costs every
+    one of them from its filed intent, sharing nothing with pricing but the geometry.
+
+    The third case is the discriminating one, and the duals are the seed that exposes it:
+    scoring in raw seconds returns a column 8.0 short of the optimum here. With ground
+    dearer than air the objective wants an early departure and a longer route, which is
+    the opposite of what the ``(hops, departure_step)`` tie-break picks on a raw-seconds
+    tie -- so the two only agree while air is the expensive one.
+    """
+
+    cfg = replace(
+        _cfg(),
+        max_ground_delay_s=24.0,
+        cost_ground_delay_per_s=ground_weight,
+        cost_air_lateral_per_s=air_weight,
+        cost_air_hold_per_s=air_weight,
+    )
+    params = ColGenParams(
+        solver="highs", detour_slack_hops=1, objective="total_cost", time_limit_s=60.0
+    )
+    request = FlightRequest(7, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)
+    graph = build_flight_graph(request, cfg, (), params)
+    columns = _exhaustive_columns(graph, cfg)
+    assert len(columns) == 567, "a shrunken universe would hide a miss rather than fail"
+
+    cells = sorted(graph.corridor_cells)
+    rng = np.random.default_rng(17)
+    duals: dict[RowKey, float] = {}
+    for _ in range(int(rng.integers(3, 12))):
+        cell = cells[int(rng.integers(0, len(cells)))]
+        step = int(rng.integers(graph.min_step, graph.max_step + 1))
+        duals[RowKey.cell(cell, 0, step)] = float(rng.uniform(-15.0, 70.0))
+    view = DualView(duals, cfg)
+    pi_f = float(rng.uniform(0.0, 30.0))
+
+    model = CostModel(ground_weight, air_weight)
+    best = max(
+        model.reduced_cost(
+            benefit=params.M,
+            cost=_weighted_cost(column, graph, cfg, model),
+            dual_cost=view.claim_cost(column.claims),
+            pi_f=pi_f,
+        )
+        for column in columns
+    )
+
+    reduced_cost, priced = price_flight(
+        graph, view, pi_f, cfg, params, require_improving=False
+    )
+
+    assert priced is not None
+    assert reduced_cost == pytest.approx(best, abs=1e-9)

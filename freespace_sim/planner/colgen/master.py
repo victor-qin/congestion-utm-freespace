@@ -53,13 +53,6 @@ class BackendIpResult:
     status: str = "unknown"
     optimal: bool = False
 
-    @property
-    def bound(self) -> float:
-        """Compatibility alias for the explicitly oriented upper bound."""
-
-        return self.upper_bound
-
-
 @runtime_checkable
 class LpBackend(Protocol):
     """Small incremental seam used by :class:`RestrictedMaster`.
@@ -576,10 +569,6 @@ class RestrictedMaster:
     @property
     def materialized_rows(self) -> frozenset[RowKey]:
         return frozenset(self._materialized)
-
-    @property
-    def heuristic_selection(self) -> dict[int, Column]:
-        return dict(self._heuristic_selection)
 
     @property
     def flight_duals(self) -> dict[int, float]:

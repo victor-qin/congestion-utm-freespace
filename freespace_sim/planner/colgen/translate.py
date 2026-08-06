@@ -106,17 +106,6 @@ class Column:
         if len(self.cell_path) < 2:
             raise ValueError("a column path must contain at least two cells")
 
-    @property
-    def s(self) -> int:
-        """Short pricing-notation alias for :attr:`departure_step`."""
-        return self.departure_step
-
-    @property
-    def L(self) -> int:
-        """Short pricing-notation alias for :attr:`level`."""
-        return self.level
-
-
 def _selected_lane(
     cell: Cell, lane_idx: int | None, lanes: list[hg.Lane], endpoint: str
 ) -> hg.Lane:

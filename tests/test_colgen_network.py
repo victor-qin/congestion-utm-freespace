@@ -284,21 +284,11 @@ def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
         <= fg.shortest_hops + slack
         for cell in fg.corridor_cells
     )
-    assert fg.index_to_cell == tuple(sorted(fg.corridor_cells))
-    assert all(fg.cell_to_index[cell] == i for i, cell in enumerate(fg.index_to_cell))
     assert fg.base_step == math.ceil(req.t_departure / cfg.dt_s)
     assert fg.latest_departure_step == fg.base_step + math.floor(cfg.max_ground_delay_s / cfg.dt_s)
     rebuilt = pickle.loads(pickle.dumps(fg))
     assert rebuilt == fg
-    assert rebuilt.cell_to_index == fg.cell_to_index
-    assert not hasattr(fg.cell_to_index, "clear")
-    with pytest.raises(TypeError):
-        fg.cell_to_index[origin_cell] = 999
-    with pytest.raises(AttributeError, match="immutable"):
-        fg.cell_to_index._data = {origin_cell: 999}
-    with pytest.raises(AttributeError, match="reinitialized"):
-        fg.cell_to_index.__init__(((origin_cell, 999),))
-    assert fg.cell_to_index[origin_cell] == rebuilt.cell_to_index[origin_cell]
+    assert rebuilt.corridor_cells == fg.corridor_cells
 
     request_origin = fg.request.origin.copy()
     req.origin[0] += 1234.0

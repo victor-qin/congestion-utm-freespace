@@ -294,40 +294,6 @@ class _CombinedCellSet(AbstractSet[Cell]):
         return NotImplemented
 
 
-class _ImmutableCellIndex(Mapping[Cell, int]):
-    """Read-only, pickle-safe mapping from axial cells to dense node indices.
-
-    ``MappingProxyType`` provides the desired mutation guard but is not itself
-    picklable.  This wrapper keeps the live storage behind a proxy and teaches
-    pickle to reconstruct it from immutable item pairs.  Consequently both the
-    public mapping and its exposed backing view reject mutation while the graph
-    as a whole stays picklable.
-    """
-
-    __slots__ = ("_data",)
-
-    def __init__(self, items: Mapping[Cell, int] | tuple[tuple[Cell, int], ...]) -> None:
-        if hasattr(self, "_data"):
-            raise AttributeError("cell index is immutable and cannot be reinitialized")
-        data = dict(items.items()) if isinstance(items, Mapping) else dict(items)
-        object.__setattr__(self, "_data", MappingProxyType(data))
-
-    def __setattr__(self, _name, _value) -> None:
-        raise AttributeError("cell index is immutable")
-
-    def __getitem__(self, cell: Cell) -> int:
-        return self._data[cell]
-
-    def __iter__(self):
-        return iter(self._data)
-
-    def __len__(self) -> int:
-        return len(self._data)
-
-    def __reduce__(self):
-        return type(self), (tuple(self._data.items()),)
-
-
 class _ImmutableFlightRequest(FlightRequest):
     """A detached request whose geometry/terminal signature cannot drift."""
 
@@ -725,7 +691,6 @@ class _LazyCellCatalog:
     def __init__(self, corridor: AbstractSet[Cell]) -> None:
         self._corridor = corridor
         self._cells: tuple[Cell, ...] | None = None
-        self._index: _ImmutableCellIndex | None = None
         self._lock = threading.RLock()
 
     @property
@@ -738,17 +703,6 @@ class _LazyCellCatalog:
                     cells = tuple(sorted(self._corridor))
                     self._cells = cells
         return cells
-
-    @property
-    def index(self) -> _ImmutableCellIndex:
-        index = self._index
-        if index is None:
-            with self._lock:
-                index = self._index
-                if index is None:
-                    index = _ImmutableCellIndex(tuple((cell, i) for i, cell in enumerate(self.cells)))
-                    self._index = index
-        return index
 
     def __reduce__(self):
         # Rebuild lazy views after transport instead of copying dense caches.
@@ -830,22 +784,6 @@ class FlightGraph:
         compare=False,
     )
 
-    @property
-    def index_to_cell(self) -> tuple[Cell, ...]:
-        return self._cell_catalog.cells
-
-    @property
-    def cell_to_index(self) -> Mapping[Cell, int]:
-        return self._cell_catalog.index
-
-    @property
-    def cells(self) -> tuple[Cell, ...]:
-        return self.index_to_cell
-
-    @property
-    def cell_index(self) -> Mapping[Cell, int]:
-        return self.cell_to_index
-
     def outgoing_neighbors(self, source: Cell) -> tuple[Cell, ...]:
         """Generate/cache all admissible directed arcs leaving ``source``."""
 
@@ -916,34 +854,6 @@ class FlightGraph:
                 "blocked_arcs": len(lazy),
             }
         )
-
-    @property
-    def wall_index_stats(self) -> Mapping[str, int]:
-        return self._wall_index.stats
-
-    @property
-    def o_cell(self) -> Cell:
-        return self.origin_cell
-
-    @property
-    def d_cell(self) -> Cell:
-        return self.dest_cell
-
-    @property
-    def o_lanes(self) -> tuple[hg.Lane, ...]:
-        return self.origin_lanes
-
-    @property
-    def d_lanes(self) -> tuple[hg.Lane, ...]:
-        return self.dest_lanes
-
-    @property
-    def t_min(self) -> int:
-        return self.min_step
-
-    @property
-    def t_max(self) -> int:
-        return self.max_step
 
     @property
     def terminal_capacities(self) -> Mapping[Hashable, int]:
@@ -1258,32 +1168,6 @@ def _static_hop_allowed_roles(
         if not conflicts:
             allowed_roles |= role
     return allowed_roles
-
-
-def _static_hop_forbidden(
-    source: Cell,
-    target: Cell,
-    walls_with_bounds: tuple[WallBound, ...] | _WallSpatialIndex,
-    req: FlightRequest,
-    origin_terminal: Terminal | None,
-    dest_terminal: Terminal | None,
-    origin_lane_cells: frozenset[Cell],
-    dest_lane_cells: frozenset[Cell],
-    cfg: SimConfig,
-) -> bool:
-    """Compatibility predicate: forbid only when every possible role conflicts."""
-
-    return not _static_hop_allowed_roles(
-        source,
-        target,
-        walls_with_bounds,
-        req,
-        origin_terminal,
-        dest_terminal,
-        origin_lane_cells,
-        dest_lane_cells,
-        cfg,
-    )
 
 
 class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):

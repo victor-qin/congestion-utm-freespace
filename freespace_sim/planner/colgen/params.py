@@ -36,7 +36,6 @@ class ColGenParams:
     #   "cost"    -- the same absolute gap normalized by total cost instead, which is
     #                what this repo used before and is far stricter when M >> cost.
     gap_metric: str = "revenue"
-    shortcut: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.detour_slack_hops, bool):
@@ -68,8 +67,6 @@ class ColGenParams:
             raise TypeError("gap_metric must be a string")
         if self.gap_metric not in {"revenue", "cost"}:
             raise ValueError("gap_metric must be 'revenue' or 'cost'")
-        if not isinstance(self.shortcut, bool):
-            raise TypeError("shortcut must be a boolean")
 
         for name in ("max_iterations", "n_heuristic_tries"):
             value = getattr(self, name)

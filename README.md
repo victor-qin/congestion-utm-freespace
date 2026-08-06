@@ -83,7 +83,9 @@ You never edit `config.py` to run a different scenario.
 ## Planners
 
 All implement one `Planner` protocol and minimize the same cost model (distinct weights for ground
-delay vs air detour vs air hold vs altitude change), so they are directly comparable.
+delay vs air detour vs air hold vs altitude change), so they are directly comparable. All but the
+last plan one flight at a time, in FCFS order, against whatever the earlier flights already
+reserved; `colgen` instead solves the whole schedule at once.
 
 | name | strategy |
 |---|---|
@@ -95,6 +97,15 @@ delay vs air detour vs air hold vs altitude change), so they are directly compar
 | `astar_heading_shortcut` | `OperationalIntent`-equivalent legacy ordering; skips same-heading probes only when reservation sampling is exactly unchanged (the run config retains the distinct public planner name) |
 | `astar_batched_shortcut` | experimental A\* shortcut: seed at 3D turns, then batch maximal straight runs for A/B evaluation |
 | `astar_milp_shortcut` | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |
+| `colgen` | **whole-schedule** column generation (Balakrishnan–Chandran): a route is a column, the master is a set-partitioning LP over them, pricing is an exact label DP per flight. Single flight level; needs `terminal_airspace_always_active` for hub endpoints |
+
+`colgen` is not FCFS — it optimizes every flight jointly, so it answers a different question from the
+rest of the table ("what is the best schedule" rather than "what can this flight get, given the
+others"). Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-max-iterations`,
+`--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`; pricing dominates its cost, so the
+120 s default budget is a smoke-test budget rather than a converging one. A run that stops on that
+budget still files a complete, feasible schedule, so read the WARNING and `planner_stats.json` in the
+run folder rather than assuming the result converged.
 
 ## Experiments
 
@@ -103,7 +114,8 @@ and the demand pattern / USS count is a property of the **scenario** (reused by 
 
 **1. DEFINE** — a `ScenarioSpec` is a named *world* (region, horizon, λ, planner, demand pattern). The
 registry in [`scenarios/`](freespace_sim/scenarios) ships `metro_uniform` (1 USS), `metro_2uss`
-(2 USS, uniform), `dallas_hub_2uss` (2 USS, geographic hub-and-spoke), and the four explicit density
+(2 USS, uniform), `dallas_hub_2uss` (2 USS, geographic hub-and-spoke), `colgen_test` (a small
+congested eight-hub world sized for whole-schedule optimization), and the four explicit density
 worlds below. Any field is overridable.
 
 **2. EXECUTE** — `experiments.run` runs **one** scenario and persists it (no plots). Sweeps and

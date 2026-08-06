@@ -105,7 +105,6 @@ class DualView:
     __slots__ = (
         "_cell",
         "_duals",
-        "_has_active_duals",
         "_max_negative_credit",
         "_offsets",
         "_terminal",
@@ -135,7 +134,6 @@ class DualView:
             bucket[key.step] = bucket.get(key.step, 0.0) + value
 
         self._duals = normalized
-        self._has_active_duals = any(value != 0.0 for value in normalized.values())
         self._max_negative_credit = -math.fsum(min(0.0, value) for value in normalized.values())
         self._offsets = derive_cell_window(cfg)
         self._cell = {resource: _prefix_series(values) for resource, values in cell_values.items()}
@@ -216,12 +214,6 @@ class DualView:
         )
 
     @property
-    def has_active_duals(self) -> bool:
-        """Whether any capacity row has a nonzero price."""
-
-        return self._has_active_duals
-
-    @property
     def max_negative_credit(self) -> float:
         """Largest possible RC gain from tiny negative backend-tolerance duals."""
 
@@ -235,43 +227,6 @@ class DualView:
             return 0.0
         lo, hi = self._offsets
         return series.range_sum(visit_step + lo, visit_step + hi + 1)
-
-    def endpoint_cost(
-        self,
-        cells: Iterable[Cell],
-        levels: Iterable[int],
-        steps: range,
-    ) -> float:
-        """Return customer-cylinder cell-row duals in O(cells * levels)."""
-
-        start, stop = _range_bounds(steps)
-        total = 0.0
-        level_tuple = tuple(levels)
-        for cell in cells:
-            for level in level_tuple:
-                series = self._cell.get((cell, level))
-                if series is not None:
-                    total += series.range_sum(start, stop)
-        return total
-
-    def dwell_cost(self, terminal_id: Hashable, steps: int | range) -> float:
-        """Return one terminal-row dual or an interval sum in O(1)."""
-
-        series = self._terminal.get(terminal_id)
-        if series is None:
-            return 0.0
-        if isinstance(steps, range):
-            start, stop = _range_bounds(steps)
-            return series.range_sum(start, stop)
-        step = int(steps)
-        return series.range_sum(step, step + 1)
-
-
-def _range_bounds(steps: range) -> tuple[int, int]:
-    if steps.step != 1:
-        raise ValueError("capacity-row ranges must have unit stride")
-    return steps.start, steps.stop
-
 
 @dataclass(frozen=True, slots=True)
 class _Label:

@@ -53,17 +53,14 @@ class _RecordingDSS:
         return intent.accepted
 
 
-def test_phase3_params_validate_objective_and_shortcut():
-    params = ColGenParams(objective="total_delay", shortcut=True)
+def test_params_validate_the_objective():
+    params = ColGenParams(objective="total_delay")
     assert params.objective == "total_delay"
-    assert params.shortcut is True
 
     with pytest.raises(ValueError, match="objective"):
         ColGenParams(objective="throughput")
     with pytest.raises(TypeError, match="objective"):
         ColGenParams(objective=1)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="shortcut"):
-        ColGenParams(shortcut=1)  # type: ignore[arg-type]
 
 
 def test_factory_returns_batch_only_wall_aware_planner():
@@ -269,7 +266,7 @@ def test_run_batch_rejects_a_prepopulated_dynamic_ledger(monkeypatch):
 def test_sim_batch_branch_forwards_planner_params(monkeypatch):
     sim_module = importlib.import_module("freespace_sim.sim")
     cfg = _cfg()
-    params = ColGenParams(max_iterations=3, shortcut=True)
+    params = ColGenParams(max_iterations=3, n_heuristic_tries=8)
     calls = []
 
     monkeypatch.setattr(

@@ -683,32 +683,6 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         return type(self), self._signature()
 
 
-class _LazyCellCatalog:
-    """Lazy view over the dense cell tuple/index pair the graph exposes."""
-
-    __slots__ = ("_cells", "_corridor", "_index", "_lock")
-
-    def __init__(self, corridor: AbstractSet[Cell]) -> None:
-        self._corridor = corridor
-        self._cells: tuple[Cell, ...] | None = None
-        self._lock = threading.RLock()
-
-    @property
-    def cells(self) -> tuple[Cell, ...]:
-        cells = self._cells
-        if cells is None:
-            with self._lock:
-                cells = self._cells
-                if cells is None:
-                    cells = tuple(sorted(self._corridor))
-                    self._cells = cells
-        return cells
-
-    def __reduce__(self):
-        # Rebuild lazy views after transport instead of copying dense caches.
-        return type(self), (self._corridor,)
-
-
 class _FlightSearchCache:
     """Mutable, answer-neutral cache kept outside frozen graph semantics."""
 
@@ -776,7 +750,6 @@ class FlightGraph:
     static_walls: tuple[Volume4D, ...] = field(repr=False, compare=False)
     _wall_index: _WallSpatialIndex = field(repr=False, compare=False)
     forbidden_hops: frozenset[tuple[Cell, Cell]] | _LazyForbiddenHops
-    _cell_catalog: _LazyCellCatalog = field(repr=False, compare=False)
     _search_cache: _FlightSearchCache = field(
         default_factory=_FlightSearchCache,
         init=False,
@@ -1569,7 +1542,6 @@ def build_flight_graph(
         static_walls=frozen_static_walls,
         _wall_index=wall_index,
         forbidden_hops=forbidden_hops,
-        _cell_catalog=_LazyCellCatalog(corridor),
     )
 
 

@@ -1193,7 +1193,15 @@ class ColGenSolver:
                 # Both mean an absent flight is unproven rather than physically impossible,
                 # so the denial partition below treats them alike -- but the reason a run
                 # reports is read by a person, and "time_limit" sent them to the wrong knob.
-                termination_reason = "ip_not_proven"
+                #
+                # The IP can also fail to prove because it ran out of WALL CLOCK -- it gets
+                # only the small `ip_reserve_s` tail -- and that really is a budget
+                # exhaustion, whatever the loop did before it.  Distinguish the two here
+                # rather than calling both uncertified, or a sweep filtering runs on
+                # `planner_termination == "time_limit"` silently drops them.
+                termination_reason = (
+                    "time_limit" if time.monotonic() >= deadline else "ip_not_proven"
+                )
             if not incumbent or _better_selection(ip_selection, incumbent, params.M):
                 incumbent = dict(ip_selection)
 

@@ -353,8 +353,11 @@ def test_run_batch_forwards_the_per_iteration_callback(monkeypatch):
             (), lambda *_args: None, None, None, **kwargs,
         )
 
-    assert seen[0] is None, "absent by default, so the solver skips the payload entirely"
-    assert seen[1] is _sentinel, "and forwarded by identity when supplied"
+    assert seen[0] is batch._log_iteration, (
+        "a caller that supplies nothing still gets progress; the entry point must not go "
+        "silent for the length of a solve"
+    )
+    assert seen[1] is _sentinel, "and an explicit callback is forwarded by identity"
 
 
 def test_factory_carries_colgen_params_and_refuses_them_elsewhere():
@@ -516,3 +519,27 @@ def test_an_uncertified_final_ip_is_not_reported_as_a_budget_timeout(monkeypatch
     assert not any("stopped on its time limit" in m for m in messages), (
         "the budget message names a cause this run does not have"
     )
+
+
+def test_the_iteration_cap_is_announced_like_the_other_truncated_exits(monkeypatch, caplog):
+    """`solver` treats `iteration_limit` exactly like `time_limit`: every denial becomes
+    SEARCH_EXHAUSTED and the schedule is uncertified. It was the one truncated exit that
+    said nothing, which is the failure the other two warnings exist to prevent."""
+
+    cfg = _cfg()
+    monkeypatch.setattr(
+        batch.ColGenSolver, "solve",
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+            columns={}, stats={"termination_reason": "iteration_limit", "iterations": 30},
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=batch.__name__):
+        run_batch(
+            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (), lambda *_args: None, None, None,
+            params=ColGenParams(max_iterations=30),
+        )
+
+    assert any("iteration cap (30)" in record.message for record in caplog.records)

@@ -17,3 +17,9 @@ results/supercloud
 
 # browser-automation scratch (Playwright MCP page/console dumps)
 .playwright-mcp/
+
+# Gurobi writes this per solve; it carries the local LicenseID and path
+gurobi.log
+
+# editor-local debug configs
+.vscode/

@@ -1437,10 +1437,17 @@ def _best_column(
                 # already in reduced-cost currency and are never weighted, so inverting
                 # the same decomposition recovers them exactly -- which is why the two
                 # weights below must track the ones the score was built with.
+                # Term by term, NOT `air_weight * (origin_leg + hops * dt)`: the grouped
+                # form changes the association and so is not bit-identical to the
+                # unweighted expression it replaced (measured: 62,673 of 200,000 random
+                # draws differ by ~1e-13).  This function is the oracle any compiled
+                # pricing path gets certified against, so its arithmetic has to be
+                # reproducible exactly, not just to within a tolerance.
                 paid_duals = (
                     -label.score
                     - model.ground_weight * ground_delay
-                    - model.air_weight * (origin_leg + hops * cfg.dt_s)
+                    - model.air_weight * origin_leg
+                    - model.air_weight * (hops * cfg.dt_s)
                 )
                 distance_to_go = remaining_distance(cell)
                 # The endpoint-aware envelope lower-bounds the positive price

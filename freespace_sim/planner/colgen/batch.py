@@ -43,6 +43,29 @@ class ColumnGenerationPlanner:
         raise RuntimeError("colgen is a whole-schedule planner; run it through sim.run batch mode")
 
 
+def _log_iteration(state: dict) -> None:
+    """One INFO line per column-generation iteration.
+
+    Both gap scales, because which one is the gate is a parameter and the other is the
+    honest magnitude; `columns_added` because a sweep that stops adding columns is the
+    signal that the pool has converged, whatever the bound says.
+    """
+
+    log.info(
+        "colgen iter %s: lp=%.6g gap_revenue=%.3g gap_cost=%.3g columns=%s (+%s) "
+        "rc_sum=%.6g rc_n+=%s sweep_s=%.1f",
+        state.get("iteration", "?"),
+        state.get("lp_objective", float("nan")),
+        state.get("lp_gap_revenue", float("nan")),
+        state.get("lp_gap_cost", float("nan")),
+        state.get("columns", "?"),
+        state.get("columns_added", "?"),
+        state.get("rc_sum", float("nan")),
+        state.get("rc_n_positive", "?"),
+        state.get("sweep_s", float("nan")),
+    )
+
+
 def run_batch(
     scenario: Scenario,
     cfg: SimConfig,
@@ -71,9 +94,9 @@ def run_batch(
     planners, so a colgen run is single-process by construction.
 
     ``on_iteration`` is forwarded to the solver, which calls it once per column-generation
-    iteration.  It is forwarded rather than dropped because ``run_batch`` is the production
-    entry point: without this the per-iteration telemetry existed but was reachable only by
-    calling :meth:`ColGenSolver.solve` directly, so every real run was blind to it.
+    iteration.  A caller that supplies nothing gets :func:`_log_iteration`, because pricing
+    is minutes per sweep at scenario scale and the alternative is a production entry point
+    that prints its banner and then says nothing for the rest of the solve.
     """
     if cfg.n_levels != 1:
         # Also guarded inside `build_flight_graph`, but that fires per flight from four frames
@@ -110,7 +133,8 @@ def run_batch(
     batch_params = params if params is not None else ColGenParams()
     solve_started = time.monotonic()
     result = ColGenSolver().solve(
-        requests, cfg, static_terms, batch_params, on_iteration=on_iteration,
+        requests, cfg, static_terms, batch_params,
+        on_iteration=on_iteration if on_iteration is not None else _log_iteration,
     )
     solve_elapsed = time.monotonic() - solve_started
     solve_share = solve_elapsed / len(events) if events else 0.0
@@ -185,6 +209,17 @@ def run_batch(
     # be reported as a physical denial.  Note the backend is asked for a much tighter gap
     # than `ip_gap` names -- it is converted to the master's revenue scale by dividing by
     # n*M -- so at a large M this is the expected outcome rather than a rare one.
+    elif stats.get("termination_reason") == "iteration_limit":
+        # The third truncated exit, and until now the silent one.  `solver` treats it
+        # exactly like the other two -- every denial becomes SEARCH_EXHAUSTED and the
+        # schedule is uncertified -- and the shipped cap of 30 makes it reachable, so
+        # leaving it unannounced is the same failure the branch above exists to prevent.
+        log.warning(
+            "colgen stopped at its iteration cap (%s) -- this is the best schedule found "
+            "within that many column-generation rounds, NOT a converged solution. Raise "
+            "--colgen-max-iterations to continue.",
+            batch_params.max_iterations,
+        )
     elif stats.get("termination_reason") == "ip_not_proven":
         log.warning(
             "colgen's generation loop converged (%s iterations) but the final integer "

@@ -1345,7 +1345,15 @@ def _best_column(
 
     for departure_step in departure_steps:
         _check_deadline(deadline)
-        ground_score = -(departure_step - fg.base_step) * cfg.dt_s
+        # The label score is the search's ranking currency, and `_prefer` prunes on it, so
+        # it has to be denominated in the OBJECTIVE -- not in raw seconds.  Within one time
+        # layer `ground + flown` is invariant, so at unit weights the split between them
+        # cannot change a comparison and the two currencies coincide exactly.  Under
+        # `total_cost` it can: trading one step of ground for one hop of air is free in
+        # seconds and worth 2*dt in cost, so an unweighted score calls two labels tied
+        # where the objective strictly prefers one, and dominance then keeps whichever the
+        # tie-break happened to reach first.
+        ground_score = -model.ground_weight * (departure_step - fg.base_step) * cfg.dt_s
         if incumbent is not None:
             start_upper_bound = benefit + ground_score - pi_f + dual_view.max_negative_credit
             if start_upper_bound < incumbent[0] - _RECOMPUTE_EPS:
@@ -1382,7 +1390,11 @@ def _best_column(
                 paid_duals_exact=True,
             ):
                 continue
-            score = ground_score - origin_leg_by_lane[lane_idx] - start_dual_cost
+            score = (
+                ground_score
+                - model.air_weight * origin_leg_by_lane[lane_idx]
+                - start_dual_cost
+            )
             label = _Label(score, departure_step, lane_idx, (cell,), origin_paid_rows)
             recent = (cell,)
             key = (cell, recent, origin_paid_rows, None)
@@ -1465,9 +1477,16 @@ def _best_column(
             if incumbent is not None:
                 ground_delay = (label.departure_step - fg.base_step) * cfg.dt_s
                 origin_leg = origin_leg_by_lane[label.origin_lane_idx]
-                # ``label.score`` is the negative sum of ground delay, flown
-                # time so far, and the de-duplicated duals paid so far.
-                paid_duals = -label.score - ground_delay - origin_leg - hops * cfg.dt_s
+                # ``label.score`` is the negative sum of the WEIGHTED ground delay and
+                # flown time so far, plus the de-duplicated duals paid so far.  Duals are
+                # already in reduced-cost currency and are never weighted, so inverting
+                # the same decomposition recovers them exactly -- which is why the two
+                # weights below must track the ones the score was built with.
+                paid_duals = (
+                    -label.score
+                    - model.ground_weight * ground_delay
+                    - model.air_weight * (origin_leg + hops * cfg.dt_s)
+                )
                 distance_to_go = remaining_distance(cell)
                 # The endpoint-aware envelope lower-bounds the positive price
                 # of the eventual row union without double-counting overlaps.
@@ -1527,7 +1546,7 @@ def _best_column(
                     )
                 next_recent = (neighbour, *recent[: state_history_depth - 1])
                 next_label = _Label(
-                    label.score - cfg.dt_s - visit_cost,
+                    label.score - model.air_weight * cfg.dt_s - visit_cost,
                     label.departure_step,
                     label.origin_lane_idx,
                     (*label.path, neighbour),

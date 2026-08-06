@@ -330,7 +330,10 @@ def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
     def fail_if_checked(*_args, **_kwargs):
         pytest.fail("build_flight_graph eagerly classified a static hop")
 
-    monkeypatch.setattr(network_module, "_static_hop_forbidden", fail_if_checked)
+    # `_static_hop_allowed_roles`, NOT the `_static_hop_forbidden` wrapper: the lazy oracle
+    # calls the former directly, so a sentinel on the wrapper can never fire and the guard
+    # would pass no matter how eager construction became.
+    monkeypatch.setattr(network_module, "_static_hop_allowed_roles", fail_if_checked)
     graph = build_flight_graph(
         req,
         cfg,

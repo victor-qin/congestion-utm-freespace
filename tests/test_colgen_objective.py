@@ -156,29 +156,75 @@ def test_seed_cache_is_keyed_on_the_cost_model():
 # ------------------------------------------------------------------- the default is a no-op
 
 
-@pytest.mark.parametrize("time_buffer_s", [4.0, 0.0])
-def test_explicit_delay_model_prices_identically_to_the_default(time_buffer_s):
-    """Threading the model must not perturb the answer at unit weights."""
+def _weighted_probe(ground_weight: float, air_weight: float):
+    """Price one fixed congested instance under a given ground:air weighting.
 
-    cfg = _cfg(time_buffer_s=time_buffer_s)
-    rng = np.random.default_rng(99)
-    for flight_id in range(4):
-        graph, params = _graph(cfg, flight_id=flight_id)
-        duals = _random_duals(rng, sorted(graph.corridor_cells), graph.base_step, 10)
-        view = DualView(duals, cfg)
-        default_rc, default_col = price_flight(
-            graph, view, 0.0, cfg, params, require_improving=False
-        )
-        graph2, params2 = _graph(cfg, flight_id=flight_id)
-        explicit_rc, explicit_col = price_flight(
-            graph2, view, 0.0, cfg, params2, require_improving=False
-        )
-        assert default_rc == explicit_rc
-        assert (default_col is None) == (explicit_col is None)
-        if default_col is not None:
-            assert default_col.cell_path == explicit_col.cell_path
-            assert default_col.departure_step == explicit_col.departure_step
-            assert default_col.delay_s == explicit_col.delay_s
+    Identical in every respect except the weights, so the ground/air split of the answer
+    is attributable to the objective and nothing else.
+    """
+
+    cfg = _cfg(
+        cost_ground_delay_per_s=ground_weight,
+        cost_air_lateral_per_s=air_weight,
+        cost_air_hold_per_s=air_weight,
+    )
+    graph, params = _graph(cfg, dest=(3, 0), slack=1, objective="total_cost")
+    rng = np.random.default_rng(7)
+    cells = sorted(graph.corridor_cells)
+    duals: dict[RowKey, float] = {}
+    for _ in range(9):
+        cell = cells[int(rng.integers(0, len(cells)))]
+        step = int(rng.integers(graph.min_step, graph.max_step + 1))
+        duals[RowKey.cell(cell, 0, step)] = float(rng.uniform(-20.0, 60.0))
+    _rc, column = price_flight(
+        graph, DualView(duals, cfg), float(rng.uniform(0.0, 40.0)), cfg, params,
+        require_improving=False,
+    )
+    assert column is not None
+    return column
+
+
+def test_the_objective_steers_the_ground_air_trade_in_the_search_itself():
+    """The label score is the DOMINANCE currency, so it has to be the objective.
+
+    Within one time layer `ground + flown` is invariant -- a step of ground delay buys
+    exactly one hop of air -- so two labels reaching the same cell at the same step with
+    different splits are tied in raw seconds and NOT tied under any other weighting. The
+    search used to score them in raw seconds, which made dominance keep whichever the
+    `(hops, departure_step)` tie-break reached first: fewest hops. That coincides with the
+    objective whenever air costs at least as much as ground, which is why the shipped
+    1:3 config never showed it -- and inverts the moment it does not.
+
+    Measured on this fixture with ground priced above air, the raw-seconds score returned
+    a column costing 48.0 where 32.0 was available.
+    """
+
+    air_heavy = _weighted_probe(ground_weight=1.0, air_weight=3.0)
+    ground_heavy = _weighted_probe(ground_weight=3.0, air_weight=1.0)
+
+    # Air expensive: hold on the pad and fly the short route.
+    assert air_heavy.departure_step > 0
+    assert len(air_heavy.cell_path) - 1 == 3
+
+    # Ground expensive: leave immediately and absorb the same congestion in the air.
+    assert ground_heavy.departure_step == 0
+    assert len(ground_heavy.cell_path) - 1 > 3
+    assert ground_heavy.delay_s == pytest.approx(32.0, abs=1e-9)
+
+
+def test_the_shipped_weighting_is_unchanged_by_that_currency():
+    """...and the fix is a no-op where the tie-break already agreed.
+
+    The rest of this suite runs at unit weights, so bit-identity there is covered by it
+    passing. This pins the other regime the repo actually ships: 1:3, where the answer
+    must be the same one the raw-seconds score produced.
+    """
+
+    column = _weighted_probe(ground_weight=1.0, air_weight=3.0)
+
+    assert column.departure_step == 8
+    assert len(column.cell_path) - 1 == 3
+    assert column.delay_s == pytest.approx(32.0, abs=1e-9)
 
 
 def test_reduced_cost_is_the_same_arithmetic_it_replaced():

@@ -553,6 +553,7 @@ class ColGenSolver:
         fixed_claims: Sequence[frozenset[RowKey]] = (),
         parallel: ParallelPricingConfig | None = None,
         on_iteration=None,
+        seed_columns: Mapping[int, Sequence[Column]] | None = None,
     ) -> ColGenResult:
         """``parallel`` fans the per-iteration pricing sweep across processes.
 
@@ -779,6 +780,20 @@ class ColGenSolver:
         best_heuristic = dict(initial_heuristic)
         for column in initial_heuristic.values():
             master.add_column(column)
+        # Optional warm start.  The policy above is a deliberate bet -- that route
+        # alternatives are cheaper to discover by reduced-cost pricing than to enumerate
+        # up front -- and `seed_columns` is how that bet gets tested rather than assumed.
+        # It is a pool-contents knob only: every column still goes through the same
+        # canonical claim gate, so it cannot introduce a trajectory pricing could not
+        # have produced, and it changes which optimum is reached only by the same
+        # tie-breaking that column order already governs.
+        seeded_columns = 0
+        for flight_id, extras in (seed_columns or {}).items():
+            if flight_id not in graphs:
+                raise KeyError(f"seed_columns names flight {flight_id}, which is not in this batch")
+            for column in extras:
+                master.add_column(_canonical_column(column, graphs[flight_id], cfg))
+                seeded_columns += 1
         if best_heuristic:
             master.set_heuristic(best_heuristic)
 
@@ -1070,6 +1085,18 @@ class ColGenSolver:
                     # consequences; the solver reads back only `last_ip_*`, which its own
                     # final solve overwrites.
                     "master": master,
+                    # This iteration's LP solution, positionally aligned with
+                    # ``master.columns``.  Needed to tell a column that was ADDED from one
+                    # the LP actually USES: pricing's acceptance test is a reduced-cost
+                    # sign, which says a column improves the LP basis, not that it ends up
+                    # with x > 0.  Without x those two are indistinguishable from outside.
+                    "lp_x": last_x,
+                    # This iteration's capacity duals, by row.  `dual_nonzero` counts them
+                    # but cannot say WHICH rows are expensive, and that is the question
+                    # behind "why do the new columns conflict": pricing steers every
+                    # flight away from the same few hot rows at once, so their proposals
+                    # collide on the alternatives.
+                    "capacity_duals": capacity_duals,
                     # This iteration's pricing cost.  `sweep_s` is the wall the solver
                     # waited; `sweep_task_total_s` is the work the workers actually did.
                     # The ratio against n_workers is the efficiency, and the shortfall
@@ -1401,6 +1428,7 @@ class ColGenSolver:
                 )[:8]
             ),
             "n_columns": len(master.columns),
+            "seeded_columns": seeded_columns,
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,

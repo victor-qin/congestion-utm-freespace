@@ -1030,6 +1030,57 @@ def test_swap_never_selected_and_head_on_files_cleanly():
     _assert_files_cleanly(requests, result.columns, cfg)
 
 
+def test_seed_columns_warm_start_the_pool_without_changing_the_answer():
+    """Seeding is a knob on the PATH to the optimum, not on the optimum.
+
+    solver.py keeps initialization deliberately small on the bet that route alternatives
+    are cheaper to discover by reduced-cost pricing than to enumerate up front.  This
+    parameter exists so that bet can be measured instead of assumed -- forensics on a
+    100-flight solve found ~95% of early additions were time shifts of a route already
+    in the pool, which `_shift_column` produces arithmetically while a pricing sweep
+    costs 15-17s.
+
+    Whatever seeding does to iteration count, it must not move the objective: every
+    seeded column goes through the same canonical claim gate, so it cannot introduce a
+    trajectory pricing could not have produced.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+    params = _params()
+
+    plain = ColGenSolver().solve(requests, cfg, (), params)
+
+    # Time translations of each flight's own shortest seed -- the cheapest possible
+    # alternatives, and exactly what pricing spends its early iterations rediscovering.
+    graphs = {r.flight_id: build_flight_graph(r, cfg, (), params) for r in requests}
+    seeds = {}
+    for flight_id, graph in graphs.items():
+        seed = seed_column(graph, cfg)
+        seeds[flight_id] = [
+            solver_module._shift_column(seed, seed.departure_step + step, cfg)
+            for step in (1, 2)
+            if seed.departure_step + step <= graph.latest_departure_step
+        ]
+
+    seeded = ColGenSolver().solve(requests, cfg, (), params, seed_columns=seeds)
+
+    n_seeded = sum(len(v) for v in seeds.values())
+    assert n_seeded > 0, "the fixture must actually seed something"
+    assert seeded.stats["seeded_columns"] == n_seeded
+    assert seeded.stats["n_columns"] >= plain.stats["n_columns"]
+    # The answer is the contract; the route there is not.
+    assert seeded.stats["objective"] == pytest.approx(plain.stats["objective"], abs=1e-7)
+    _assert_claim_feasible(seeded.columns)
+    _assert_files_cleanly(requests, seeded.columns, cfg)
+
+    with pytest.raises(KeyError, match="not in this batch"):
+        ColGenSolver().solve(requests, cfg, (), params, seed_columns={999: []})
+
+
 def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
     """The final IP was the last unattributed block in the solve.
 

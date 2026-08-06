@@ -56,8 +56,10 @@ def _point(cell, cfg):
     return vec(x, y, cfg.ground_level_m)
 
 
-def _graph(cfg, origin=(0, 0), dest=(4, -1), slack=4, flight_id=1):
-    params = ColGenParams(solver="highs", detour_slack_hops=slack)
+def _graph(cfg, origin=(0, 0), dest=(4, -1), slack=4, flight_id=1, objective="total_delay"):
+    params = ColGenParams(
+        solver="highs", detour_slack_hops=slack, objective=objective
+    )
     request = FlightRequest(flight_id, _point(origin, cfg), _point(dest, cfg), 0.0, 0.0)
     return build_flight_graph(request, cfg, (), params), params
 
@@ -90,9 +92,21 @@ def _price_both(monkeypatch, graph, duals, pi_f, cfg, params):
 
 
 @pytest.mark.parametrize("time_buffer_s", [4.0, 0.0])
+@pytest.mark.parametrize("objective", ["total_delay", "total_cost"])
 def test_kernel_matches_reference_column_on_random_mixed_sign_duals(
-    monkeypatch, time_buffer_s
+    monkeypatch, time_buffer_s, objective
 ):
+    """Parity must hold under the WEIGHTED objective too, not just at unit weights.
+
+    Every parity guard in this file used to run at ``total_delay``, where ground and air
+    both cost 1 -- and that is exactly the regime in which a weighted/unweighted mixup is
+    invisible, because the two currencies coincide.  A kernel that charged air at 1x while
+    the model charged 3x would have passed the entire suite.
+
+    ``total_cost`` separates them, so the same fixtures now discriminate: the reference
+    and the kernel must agree on the reduced cost AND on which column wins, at 1:3.
+    """
+
     assert dp_kernel is not None, "kernel inactive -- this parity guard would be vacuous"
     rng = np.random.default_rng(20260803)
     compared = 0
@@ -106,6 +120,7 @@ def test_kernel_matches_reference_column_on_random_mixed_sign_duals(
             dest=(int(rng.integers(2, 6)), int(rng.integers(-3, 3))),
             slack=int(rng.integers(0, 5)),
             flight_id=trial + 1,
+            objective=objective,
         )
         cells = sorted(graph.corridor_cells)
         duals = _random_duals(rng, cells, graph.base_step, int(rng.integers(0, 40)))

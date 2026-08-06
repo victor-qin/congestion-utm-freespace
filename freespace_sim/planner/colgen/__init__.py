@@ -1,8 +1,7 @@
 """Whole-schedule column-generation planner.
 
-The batch planner lands in PR A Phase 3.  Keeping these exports lazy lets the
-Phase-1 geometry package be imported without prematurely depending on that
-integration module.
+The solver and batch exports stay lazy so that importing the geometry surface
+does not drag in SciPy or the simulator's filing path with it.
 """
 
 from __future__ import annotations

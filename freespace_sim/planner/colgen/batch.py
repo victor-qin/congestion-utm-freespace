@@ -170,6 +170,33 @@ def run_batch(
             batch_params.time_limit_s,
             stats.get("iterations", "?"),
         )
+    # The two gap scales can disagree by orders of magnitude, and only one of them is the
+    # gate.  Under `gap_metric="revenue"` the denominator carries n*M, so with M an
+    # artificial big-M the gate can close on a pool that is barely past the greedy start --
+    # measured on colgen_test: Gurobi's duals close it at ITERATION 1 where HiGHS's, on the
+    # identical problem, leave it at 0.194.  Both bounds are valid; they are different
+    # optimal dual vertices of a degenerate master, and the gate keys on how tight the one
+    # the backend happened to return is.  A converged LP also says nothing about the
+    # integrality gap over the pool it converged on.  So when the two scales disagree, say
+    # so rather than let "lp_gap" read as "solved".
+    lp_gap_cost = stats.get("lp_gap_cost")
+    if (
+        stats.get("termination_reason") in {"lp_gap", "heuristic_gap"}
+        and batch_params.gap_metric == "revenue"
+        and isinstance(lp_gap_cost, float)
+        and lp_gap_cost > batch_params.lp_gap
+    ):
+        log.warning(
+            "colgen stopped on the revenue-scale %s at iteration %s, but the cost-scale LP "
+            "gap is still %.3g (threshold %g) -- the revenue scale is normalised by an "
+            "objective containing n*M (M=%g), so it closes early on a degenerate master. "
+            "Re-run with --colgen-gap-metric cost to price against total cost instead.",
+            stats.get("termination_reason"),
+            stats.get("iterations", "?"),
+            lp_gap_cost,
+            batch_params.lp_gap,
+            batch_params.M,
+        )
 
     intents: list[OperationalIntent] = []
     search_exhausted = frozenset(result.stats.get("search_exhausted_flight_ids", ()))

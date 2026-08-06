@@ -768,7 +768,7 @@ def _benefit(params: Any) -> float:
     try:
         value = float(params.M)
     except AttributeError as exc:
-        raise AttributeError("Phase-2 pricing requires params.M") from exc
+        raise AttributeError("colgen pricing requires params.M") from exc
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("params.M must be finite and positive")
     return value
@@ -1965,8 +1965,8 @@ def price_flight(
     enormously: on a captured 500-flight subproblem the seed gave a cutoff of rc=112
     against an optimum of rc=144, and closing that 32-unit gap collapsed the search from
     **32,274,881 labels to 73,541** -- 439x -- with the departure-variant prefilter going
-    from 503 surviving variants to 1.  The label pool, its regrowth ladder and the
-    reference-DP fallback are all downstream of this one number.
+    from 503 surviving variants to 1.  Cutoff quality dominates every other lever in this
+    search, so this argument is the one to preserve when changing anything below.
 
     Passing it never changes the answer, only the work: pruning against a score that is
     actually attainable cannot discard anything strictly better.  A column equal to the

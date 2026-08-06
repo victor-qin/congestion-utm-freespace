@@ -53,7 +53,8 @@ class ColGenResult:
 
     A flight absent from :attr:`columns` is either an exhaustive optimizer
     denial or a compute-cap artifact.  ``budget_denied_flight_ids`` and
-    ``search_exhausted_flight_ids`` partition those cases for Phase 3 filing.
+    ``search_exhausted_flight_ids`` partition those cases for ``batch.run_batch``,
+    which turns the distinction into a :class:`DenialReason`.
     """
 
     columns: dict[int, Column]
@@ -481,6 +482,16 @@ def _pre_master_timeout_result(
             "lp_gap": math.inf,
             "heuristic_objective": 0.0,
             "heuristic_cost": heuristic_cost,
+            # The full path's gap and timing keys, at the values a pre-master timeout
+            # actually implies.  `batch.run_batch` reads five of these by name; a missing
+            # one logged as "unknown" on exactly the run whose cost you most want to see.
+            "gap_metric": params.gap_metric,
+            "lp_gap_revenue": math.inf,
+            "lp_gap_cost": math.inf,
+            "ip_gap_revenue": None,
+            "pricing_wall_s": 0.0,
+            "seeded_columns": 0,
+            "ip_elapsed_s": 0.0,
             "ip_objective": None,
             "ip_upper_bound": None,
             "ip_cost_lower_bound": None,
@@ -563,8 +574,9 @@ class ColGenSolver:
         that iteration's master state (LP objective, global upper bound, gaps, column
         counts).  Without it a long solve is opaque until it returns: the bound and the
         gap are computed every iteration but only surface in the final stats, so a run
-        that is killed -- or one you simply want to watch -- discards them.  The pricing
-        sweep already streams per-flight progress for the same reason.
+        that is killed -- or one you simply want to watch -- discards them.  Nothing else
+        in this package logs, so without a callback a solve is silent until `run_batch`
+        summarises it.
         """
         started = time.monotonic()
         pricing_wall_s = 0.0
@@ -601,6 +613,13 @@ class ColGenSolver:
                     "lp_gap": 0.0,
                     "heuristic_objective": 0.0,
                     "heuristic_cost": 0.0,
+                    "gap_metric": params.gap_metric,
+                    "lp_gap_revenue": 0.0,
+                    "lp_gap_cost": 0.0,
+                    "ip_gap_revenue": None,
+                    "pricing_wall_s": 0.0,
+                    "seeded_columns": 0,
+                    "ip_elapsed_s": 0.0,
                     "ip_objective": None,
                     "ip_upper_bound": None,
                     "ip_cost_lower_bound": None,

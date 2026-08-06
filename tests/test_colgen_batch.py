@@ -421,3 +421,61 @@ def test_a_budget_terminated_solve_says_so(monkeypatch, caplog):
         )
 
     assert any("stopped on its time limit (45s)" in record.message for record in caplog.records)
+
+
+def test_an_early_revenue_gap_close_is_flagged_against_the_cost_scale(monkeypatch, caplog):
+    """The gate is one scale; the honest magnitude is the other, and they disagree.
+
+    Measured on ``colgen_test``: Gurobi's duals close the revenue gap at iteration 1 where
+    HiGHS's, on the identical problem, leave it at 0.194. Both bounds are valid -- they are
+    different optimal dual vertices of a degenerate master -- so which backend is installed
+    decides whether the solve stops immediately, and nothing in the results says so.
+    """
+
+    cfg = _cfg()
+    monkeypatch.setattr(
+        batch.ColGenSolver, "solve",
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+            columns={},
+            stats={
+                "termination_reason": "lp_gap", "iterations": 1,
+                "lp_gap_revenue": 4.65e-05, "lp_gap_cost": 1.166,
+            },
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=batch.__name__):
+        run_batch(
+            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (), lambda *_args: None, None, None,
+            params=ColGenParams(gap_metric="revenue"),
+        )
+
+    assert any("cost-scale LP gap is still 1.17" in record.message for record in caplog.records)
+
+
+def test_a_genuinely_converged_solve_is_not_flagged(monkeypatch, caplog):
+    """Both scales agreeing is the case the warning must stay quiet for."""
+
+    cfg = _cfg()
+    monkeypatch.setattr(
+        batch.ColGenSolver, "solve",
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+            columns={},
+            stats={
+                "termination_reason": "lp_gap", "iterations": 40,
+                "lp_gap_revenue": 1e-06, "lp_gap_cost": 1e-05,
+            },
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=batch.__name__):
+        run_batch(
+            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (), lambda *_args: None, None, None,
+            params=ColGenParams(gap_metric="revenue"),
+        )
+
+    assert not caplog.records, "a converged solve must not cry wolf"

@@ -94,6 +94,7 @@ def test_colgen_flags_reach_the_planner_params():
         "colgen_test", "--planner", "colgen",
         "--colgen-time-limit", "900", "--colgen-max-iterations", "50",
         "--colgen-objective", "total_cost", "--colgen-solver", "highs",
+        "--colgen-gap-metric", "cost",
     )
     params = colgen_params_from_args(args)
 
@@ -101,6 +102,7 @@ def test_colgen_flags_reach_the_planner_params():
     assert params.max_iterations == 50
     assert params.objective == "total_cost"
     assert params.solver == "highs"
+    assert params.gap_metric == "cost"
 
 
 def test_colgen_params_are_none_for_every_other_planner():
@@ -125,6 +127,7 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
         ("--colgen-max-iterations", "50"),
         ("--colgen-objective", "total_cost"),
         ("--colgen-solver", "highs"),
+        ("--colgen-gap-metric", "cost"),
     ],
 )
 def test_colgen_flags_require_the_colgen_planner(colgen_flag):

@@ -1,4 +1,4 @@
-"""Phase-1 contracts for colgen's space-time network and ledger translation.
+"""Contracts for colgen's space-time network and ledger translation.
 
 These tests deliberately use the ledger's continuous FCL predicate as an independent
 referee.  The important implication is one-way: whenever two filed geometry templates

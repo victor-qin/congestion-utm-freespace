@@ -1,4 +1,4 @@
-"""Phase-2 contracts for pricing, the restricted master, and orchestration.
+"""Contracts for pricing, the restricted master, and the column-generation loop.
 
 The end-to-end fixtures use customer endpoints on exact hex centres.  That removes
 lane and snap constants from the arithmetic, so every asserted delay is simply an
@@ -1458,3 +1458,27 @@ def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
     assert len(result.stats["denied_flight_ids"]) == 1
     assert result.stats["budget_denied_flight_ids"] == ()
     assert result.stats["search_exhausted_flight_ids"] == result.stats["denied_flight_ids"]
+
+
+def test_every_exit_reports_the_same_stats_keys():
+    """A caller reads stats by name, so an exit that omits a key logs "unknown" instead.
+
+    ``run_batch`` reads five gap/timing keys for its summary lines, and the exits that
+    lack them are exactly the ones worth reading -- a pre-master timeout is where you most
+    want ``pricing_wall_s``. Pinning the key SET (not the values, which legitimately
+    differ) is what stops the three dicts drifting apart again.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    params = _params()
+
+    full = ColGenSolver().solve([_request(1, (-4, 0), (4, 0), cfg)], cfg, (), params)
+    empty = ColGenSolver().solve([], cfg, (), params)
+    # time_limit_s below the first stage boundary returns through _pre_master_timeout_result
+    timed_out = ColGenSolver().solve(
+        [_request(1, (-4, 0), (4, 0), cfg)], cfg, (), _params(time_limit_s=1e-6)
+    )
+
+    assert timed_out.stats["termination_reason"] == "time_limit"
+    assert set(empty.stats) == set(full.stats)
+    assert set(timed_out.stats) == set(full.stats)

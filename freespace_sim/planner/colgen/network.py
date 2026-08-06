@@ -300,8 +300,8 @@ class _ImmutableCellIndex(Mapping[Cell, int]):
     ``MappingProxyType`` provides the desired mutation guard but is not itself
     picklable.  This wrapper keeps the live storage behind a proxy and teaches
     pickle to reconstruct it from immutable item pairs.  Consequently both the
-    public mapping and its exposed backing view reject mutation while process-
-    pool graph serialization remains supported.
+    public mapping and its exposed backing view reject mutation while the graph
+    as a whole stays picklable.
     """
 
     __slots__ = ("_data",)
@@ -718,7 +718,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
 
 
 class _LazyCellCatalog:
-    """Compatibility view for the Phase-1 dense cell tuple/index API."""
+    """Lazy view over the dense cell tuple/index pair the graph exposes."""
 
     __slots__ = ("_cells", "_corridor", "_index", "_lock")
 
@@ -987,9 +987,9 @@ def _graph_max_step(
 ) -> int:
     """Budget-preserving final air-state bound.
 
-    The Phase-1 plan's abbreviated expression omitted the climb and origin-lane traverse even
+    The abbreviated expression this replaced omitted the climb and origin-lane traverse even
     though those advance the same integer clock before the first cell visit.  Include both so
-    neither consumes the ground-delay or route budget (user-approved Phase-1 clarification).
+    neither silently consumes the ground-delay or route budget.
     """
     return (
         latest_departure_step
@@ -1488,7 +1488,8 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         return NotImplemented
 
     def __reduce__(self):
-        # Geometry caches are deterministic and rebuilt cold in another process.
+        # Geometry caches are deterministic, so a transported copy rebuilds them cold
+        # rather than shipping them.
         return (
             type(self),
             (

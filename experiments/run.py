@@ -181,7 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "unweighted (default); total_cost weights them by the config's per-second "
                         "dials (1:3), matching the A* cost model")
     p.add_argument("--colgen-solver", choices=("auto", "gurobi", "highs"), default=None,
-                   help="colgen: LP/IP backend for the restricted master (default auto)")
+                   help="colgen: LP/IP backend for the restricted master (default auto: Gurobi when "
+                        "importable, HiGHS otherwise). Result-affecting on a degenerate master — the "
+                        "two backends return different optimal dual vertices, which changes both the "
+                        "pricing subproblems and how tight the reported LP bound is")
+    p.add_argument("--colgen-gap-metric", choices=("revenue", "cost"), default=None,
+                   help="colgen: which scale the lp_gap/ip_gap thresholds are measured on. revenue "
+                        "(default) is the paper's eq. (10)/(11), normalised by an objective whose "
+                        "scale includes n*M — with M an artificial big-M it can close at iteration 1. "
+                        "cost normalises by total cost instead: far stricter, and its termination gate "
+                        "additionally requires that no new columns arrived")
     return p
 
 
@@ -209,6 +218,7 @@ def _colgen_overrides(args) -> dict:
             ("max_iterations", args.colgen_max_iterations),
             ("objective", args.colgen_objective),
             ("solver", args.colgen_solver),
+            ("gap_metric", args.colgen_gap_metric),
         )
         if value is not None
     }

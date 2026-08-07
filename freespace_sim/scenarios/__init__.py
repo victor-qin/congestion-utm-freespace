@@ -8,13 +8,14 @@ dropping in a module with its own ``SCENARIOS`` dict and merging it below.
 
 from __future__ import annotations
 
-from . import dallas, density, metro
+from . import dallas, density, dfw, metro
 from .spec import DemandSpec, ScenarioSpec, with_overrides
 
 SCENARIOS: dict[str, ScenarioSpec] = {
     **metro.SCENARIOS,
     **dallas.SCENARIOS,
     **density.SCENARIOS,
+    **dfw.SCENARIOS,
 }
 
 

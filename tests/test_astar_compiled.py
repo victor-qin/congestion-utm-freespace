@@ -355,7 +355,7 @@ def test_always_active_refuses_untagged_planner():
     from freespace_sim.scenarios import get_scenario, with_overrides
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"), horizon_s=8.0)
     cfg = spec.config()
-    with pytest.raises(ValueError, match="untagged near-hub"):
+    with pytest.raises(ValueError, match="untagged paths that collide with the wall"):
         sim.run(cfg, demand=spec.demand_model(), planner_name="straight")
 
 

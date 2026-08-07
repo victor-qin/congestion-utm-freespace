@@ -304,23 +304,24 @@ class HubRadiusDemand:
                     f"{name} references USS(es) {sorted(unknown)} absent from "
                     f"n_hubs_per_uss {sorted(hubs)}")
 
+    def _wall_radius(self, uid: str, cfg: SimConfig) -> float:
+        """Reject-sampling radius for ``uid``'s hubs: the bare terminal column, or — under always-active
+        airspace — the WIDER walled extent (column + one boundary-hex ring), so neighbouring hubs' permanent
+        walls never overlap or foreign-block each other's exit lanes. A boundary-hex centre sits within one
+        hex pitch (SQRT3·circumradius) of the ``exit_radius`` edge, which rigorously upper-bounds the ring
+        for any gap ≥ 0. (Flag off ⇒ the bare column radius; transient dwell walls don't engulf.)"""
+        tr = self._terminal_radius_for(uid)
+        if cfg.terminal_airspace_always_active:
+            term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
+            return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
+        return cfg.terminal_radius_m if tr is None else float(tr)
+
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Return ``{uss_id: (n_hubs, 2)}`` single-point hub centres, reject-sampled so no two hubs'
-        terminal airspaces overlap (:func:`_scatter_hubs`; each USS's column radius is
-        ``terminal_radius_m`` or the ``cfg`` hover footprint). DESIGN KNOB for spatial structure (swap
-        the uniform scatter for a clustered process to mimic real retail geography)."""
-        def radius_of(uid: str) -> float:
-            tr = self._terminal_radius_for(uid)
-            # always-active terminals wall the WIDER terminal_cells (column + one boundary-hex ring), not
-            # just the column — reject-sample on that extent so neighbouring hubs' permanent walls never
-            # overlap and foreign-block each other's exit lanes. A boundary-hex centre sits within one hex
-            # pitch (SQRT3·circumradius) of the exit_radius edge, so that rigorously upper-bounds the ring
-            # for any gap ≥ 0. Flag off ⇒ the bare column radius (transient dwell walls don't engulf).
-            if cfg.terminal_airspace_always_active:
-                term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
-                return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
-            return cfg.terminal_radius_m if tr is None else float(tr)
-        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
+        terminal airspaces overlap (:func:`_scatter_hubs`, radius from :meth:`_wall_radius`). DESIGN KNOB
+        for spatial structure (swap the uniform scatter for a clustered process to mimic real geography)."""
+        return _scatter_hubs(cfg, rng, self.n_hubs_per_uss,
+                             lambda uid: self._wall_radius(uid, cfg), self.min_hub_gap_m)
 
     def terminals(self, cfg: SimConfig) -> list:
         """All placed hubs as ``(center, Terminal)`` — permanent vertiport infrastructure, EVERY hub
@@ -366,6 +367,32 @@ class HubRadiusDemand:
         dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
         return dist / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
 
+    @staticmethod
+    def _outside_keepouts(x: float, y: float, cfg) -> bool:
+        """True iff ``(x, y)`` clears every ``cfg.keepout_zones`` no-fly disk — a customer inside one is an
+        undeliverable landing (its flight would hit the permanent static wall and be denied). ``()`` (the
+        default for every non-keepout scenario) makes this an ``all`` over nothing → ``True``, so the draw
+        above keeps its exact RNG sequence and stays byte-identical; only a scenario that sets
+        ``keepout_zones`` (the dfw_* twins) pays the per-accepted-point check. Usually one zone."""
+        return all((x - kx) ** 2 + (y - ky) ** 2 >= kr * kr for kx, ky, kr in cfg.keepout_zones)
+
+    def _draw_customer(self, hub, radius, min_r, w, h, cfg, event_rng):
+        """Draw one delivery customer near ``hub`` — area-uniform in the service disk of ``radius``,
+        redrawn (≤20×) until it is in-region and ≥ ``min_r`` from the hub (clear of its wall footprint),
+        with a clipped fallback. Extracted from ``generate``'s ``emit`` VERBATIM so every non-geo scenario
+        draws the identical RNG sequence; :class:`~freespace_sim.scenarios.demand_dfw.DfwGeoDemand` overrides it to
+        land the customer by census-tract population density instead."""
+        customer = None
+        for _ in range(20):  # redraw until in-region, clear of the hub's wall footprint, and outside any no-fly zone
+            c = _sample_in_disk(hub, radius, event_rng)
+            if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
+                    np.linalg.norm(c - hub) >= min_r and self._outside_keepouts(c[0], c[1], cfg):
+                customer = c
+                break
+        if customer is None:
+            customer = np.clip(c, [0.0, 0.0], [w, h])
+        return customer
+
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
@@ -408,15 +435,7 @@ class HubRadiusDemand:
             # service ``radius`` exceeds ``min_r`` (true for every configured scenario: radius ≫ terminal_radius);
             # otherwise the redraw loop can't satisfy it and falls back to a clipped, possibly too-close point.
             min_r = max(self.min_od_separation_m, 1.5 * terminal_radius(terminal, cfg))
-            customer = None
-            for _ in range(20):  # redraw until in-region and clear of the hub's wall footprint
-                c = _sample_in_disk(hub, radius, event_rng)
-                if 0.0 <= c[0] <= w and 0.0 <= c[1] <= h and \
-                        np.linalg.norm(c - hub) >= min_r:
-                    customer = c
-                    break
-            if customer is None:
-                customer = np.clip(c, [0.0, 0.0], [w, h])
+            customer = self._draw_customer(hub, radius, min_r, w, h, cfg, event_rng)
             sampled_clock = float(event_rng.uniform(0, demand_duration_s))
             lead_s = self._lead_for(uss_id, event_rng)
             if self.timing_mode == "departure":

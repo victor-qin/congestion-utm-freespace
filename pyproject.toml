@@ -19,6 +19,11 @@ dependencies = [
 dev = ["pytest>=8.0", "ruff>=0.6"]
 cloud = ["huggingface_hub>=0.20"]   # optional: push/pull run folders to a HF Hub dataset repo
 compiled = ["numba>=0.59"]          # optional: numba JIT for the compiled A* air-search kernel (astar_kernel)
+# optional: ONE-TIME offline geodata prep (analysis/prep_dfw.py) — geopandas/GDAL stack that ingests the
+# Census ACS geodatabase, Overture retail CSV and Amazon facilities xlsx and bakes the small committed
+# artifacts under freespace_sim/data/dfw/. NOT a runtime dependency: the DfwGeoDemand model reads those
+# baked .csv/.npz with numpy only, so plain `uv run` / HPC jobs never install GDAL.
+geo = ["geopandas>=1.0", "pyogrio>=0.7", "openpyxl>=3.1", "pyproj>=3.6", "shapely>=2.0"]
 
 [dependency-groups]
 # Mirrors the `compiled` extra (keep the pin in sync). Listed in tool.uv.default-groups so EVERY

@@ -105,7 +105,9 @@ others"). Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-max-i
 `--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`; pricing dominates its cost, so the
 120 s default budget is a smoke-test budget rather than a converging one. A run that stops on that
 budget still files a complete, feasible schedule, so read the WARNING and `planner_stats.json` in the
-run folder rather than assuming the result converged.
+run folder rather than assuming the result converged. One reporting caveat: a whole-schedule planner
+has no per-flight solve, so `colgen` stamps every intent with the same amortized share (solve wall ÷
+flights) — its `*_solve_time_s` columns in `index.parquet` are not comparable with an FCFS run's.
 
 ## Experiments
 

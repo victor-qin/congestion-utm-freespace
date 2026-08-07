@@ -1,5 +1,22 @@
 # `colgen` — Balakrishnan–Chandran column generation planner over the hex lattice
 
+> **Historical design plan (2026-07-31), not a description of the current tree.** It is
+> committed because the *rationale* — why the rows are what they are, why the objective is
+> arc-priced, what was rejected and by which argument — is not recoverable from the code.
+> The inventory sections are not maintained. Superseded specifically:
+>
+> | plan says | what shipped |
+> |---|---|
+> | §19 / §23 / §180 / §405: `FlightGraph.cell_to_index` + `_ImmutableCellIndex` as an immutability-tested contract | **removed.** A dense cell↔index bijection exists so a flat-array kernel can address cells by integer; this PR has no such kernel, so it had no caller |
+> | §230: `DualView.endpoint_cost` / `dwell_cost` | **removed**, never called |
+> | §169: `ColGenParams.shortcut` | **removed.** PR B is not in this PR, so the field was declared, validated and never read |
+> | §75 / §194 / §210: `Column.delay_s == metrics.total_delay_s(...)` *exactly*, as the objective contract | holds under the default `objective="total_delay"` only. Under `total_cost`, `delay_s` carries weighted cost units (1·ground + 3·air) — see `colgen.objective` and the `objective_name` stat |
+> | §342-356 (PR B shortcut pass), §359-362 (PR C kernel, ProcessPool, `analysis/bench_colgen.py`) | not here. The compiled pricing DP and the process-parallel sweep live on the separate kernel PR, where the module is `dp_kernel.py`, not `pricing_kernel.py` |
+> | §15 / §162: three phases on one branch, pause for review between each | this PR is the reference method split back out of that branch, so the phase boundaries no longer match its commits |
+>
+> The paper path below is under `.context/`, which is git-excluded — it will not resolve in
+> a fresh clone.
+
 ## Context
 
 Add a planner named `colgen` that optimizes the **whole flight schedule at once** (vs. today's FCFS per-flight A*/MILP), implementing the deterministic column-generation method of Balakrishnan & Chandran, *Optimal Large-Scale Air Traffic Flow Management*, **Section 4 only** (no stochastic part). It plans over the same hex lattice A* uses, on a space-time network whose capacity rows are derived from the ledger's actual reservation geometry so that **any row-feasible integer solution files against the ledger with 0 denials** (priority 1). The column-generation loop follows the paper's algorithm and must be fast (priority 2). Shortcutting is a post-pass over the final solution in planned-departure order (priority 3). Rolling horizon is a follow-up (design leaves the seam open).

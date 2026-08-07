@@ -49,6 +49,12 @@ from .windows import (
 )
 
 _SCORE_EPS = 1e-12
+# A column has to beat zero reduced cost by this much to count as improving.  Mirrors
+# ``solver._REDUCED_COST_TOL``; the two are the same threshold read from opposite sides of
+# the call.  This used to be probed off ``params.reduced_cost_tol`` / ``params.pricing_tol``,
+# neither of which ``ColGenParams`` has -- so it was always this value behind a lookup that
+# read like a knob.
+_IMPROVING_RC_TOL = 1e-9
 _RECOMPUTE_EPS = 1e-8
 _EMPTY_ROWS: frozenset[RowKey] = frozenset()
 
@@ -611,16 +617,6 @@ def _arc_delay_lower_bound_s(
     )
 
 
-def _pricing_tolerance(params: Any) -> float:
-    for name in ("reduced_cost_tol", "pricing_tol"):
-        if hasattr(params, name):
-            value = float(getattr(params, name))
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"params.{name} must be finite and non-negative")
-            return value
-    return 1e-9
-
-
 def _shift_claims(claims: Iterable[RowKey], delta_steps: int) -> frozenset[RowKey]:
     """Translate a canonical claim set by an integer number of clock steps."""
 
@@ -1015,6 +1011,14 @@ def _best_column(
     if not math.isfinite(pi_f):
         raise ValueError(f"flight-row dual must be finite, got {pi_f!r}")
 
+    # Hoisted: the objective's weights are constant for the whole search, and `air_dt_s` in
+    # particular sits in the arc relaxation below -- the innermost loop of the innermost
+    # loop, run tens of millions of times per sweep.  Computing the product once is the
+    # same float, so this is bit-identical, not an approximation.
+    ground_weight = model.ground_weight
+    air_weight = model.air_weight
+    air_dt_s = air_weight * cfg.dt_s
+
     destination_options = _destination_options(fg)
     if not destination_options:
         return -math.inf, None
@@ -1308,7 +1312,7 @@ def _best_column(
         # seconds and worth 2*dt in cost, so an unweighted score calls two labels tied
         # where the objective strictly prefers one, and dominance then keeps whichever the
         # tie-break happened to reach first.
-        ground_score = -model.ground_weight * (departure_step - fg.base_step) * cfg.dt_s
+        ground_score = -ground_weight * (departure_step - fg.base_step) * cfg.dt_s
         if incumbent is not None:
             start_upper_bound = benefit + ground_score - pi_f + dual_view.max_negative_credit
             if start_upper_bound < incumbent[0] - _RECOMPUTE_EPS:
@@ -1347,7 +1351,7 @@ def _best_column(
                 continue
             score = (
                 ground_score
-                - model.air_weight * origin_leg_by_lane[lane_idx]
+                - air_weight * origin_leg_by_lane[lane_idx]
                 - start_dual_cost
             )
             label = _Label(score, departure_step, lane_idx, (cell,), origin_paid_rows)
@@ -1445,9 +1449,9 @@ def _best_column(
                 # reproducible exactly, not just to within a tolerance.
                 paid_duals = (
                     -label.score
-                    - model.ground_weight * ground_delay
-                    - model.air_weight * origin_leg
-                    - model.air_weight * (hops * cfg.dt_s)
+                    - ground_weight * ground_delay
+                    - air_weight * origin_leg
+                    - air_weight * (hops * cfg.dt_s)
                 )
                 distance_to_go = remaining_distance(cell)
                 # The endpoint-aware envelope lower-bounds the positive price
@@ -1508,7 +1512,7 @@ def _best_column(
                     )
                 next_recent = (neighbour, *recent[: state_history_depth - 1])
                 next_label = _Label(
-                    label.score - model.air_weight * cfg.dt_s - visit_cost,
+                    label.score - air_dt_s - visit_cost,
                     label.departure_step,
                     label.origin_lane_idx,
                     (*label.path, neighbour),
@@ -2011,7 +2015,7 @@ def price_flight(
                 and seed_dual_cost == 0.0
                 and view.max_negative_credit == 0.0
             ):
-                if require_improving and seed_rc <= _pricing_tolerance(params):
+                if require_improving and seed_rc <= _IMPROVING_RC_TOL:
                     return seed_rc, None
                 return seed_rc, seed
         incumbent = _shifted_seed_incumbent(
@@ -2050,7 +2054,7 @@ def price_flight(
         deadline=deadline,
         model=model,
     )
-    if column is None or (require_improving and reduced_cost <= _pricing_tolerance(params)):
+    if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
         return reduced_cost, None
     if known_column is not None and column == known_column:
         # The best column IS the one the caller already holds.  Reporting it would let a

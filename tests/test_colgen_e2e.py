@@ -242,11 +242,18 @@ def full_colgen_test_results():
     demand = spec.demand_model()
     requests = demand.generate(cfg, np.random.default_rng(cfg.seed))
 
+    # `solver="highs"` rather than the "auto" default: the two backends return different
+    # optimal dual vertices of a degenerate master, and on this world Gurobi's close the
+    # revenue gap at iteration 1 where HiGHS's run to the budget. Left on auto, this
+    # acceptance fixture measures a 1-iteration solve on a machine with Gurobi installed
+    # and a ~17-iteration one everywhere else. HiGHS is always available (SciPy), so
+    # pinning it is what makes the assertions below mean the same thing for everyone;
+    # `test_backend_parity` is where Gurobi is exercised.
     solver_time_limit_s = 100.0
     started = time.monotonic()
     colgen = run(
         cfg, requests=requests, demand=demand, progress=False,
-        planner_params=ColGenParams(time_limit_s=solver_time_limit_s),
+        planner_params=ColGenParams(solver="highs", time_limit_s=solver_time_limit_s),
     )
     colgen_wall_s = time.monotonic() - started
 
@@ -282,9 +289,17 @@ def test_colgen_runs_full_density_miniature_without_filing_denials(full_colgen_t
     assert result.verified
     assert len(result.accepted) == len(data.requests)
     assert not result.denied
-    assert data.colgen_wall_s < 120.0, (
-        f"colgen_test took {data.colgen_wall_s:.3f}s "
-        f"with a {data.solver_time_limit_s:.3f}s solver cap (wall budget 120.000s)"
+    # What is contractual is that the solver honours the budget it was given, which it
+    # reports itself. A wall-clock ceiling here would instead assert that the machine is
+    # fast -- flaky under load, and silent about the thing that could actually regress.
+    stats = data.colgen.planner_stats
+    assert stats["termination_reason"] in {"time_limit", "lp_gap", "heuristic_gap",
+                                           "no_improving_columns", "no_new_columns",
+                                           "iteration_limit", "ip_not_proven"}
+    assert stats["time_limit_overrun_s"] < 0.25 * data.solver_time_limit_s, (
+        f"solve ran {stats['elapsed_s']:.1f}s against a {data.solver_time_limit_s:.1f}s cap; "
+        "a single synchronous geometry/backend call cannot be preempted, so a small "
+        "overrun is expected and a large one means a stage stopped checking its deadline"
     )
     assert any(intent.ground_delay_s > 0.0 for intent in result.accepted)
     assert not {

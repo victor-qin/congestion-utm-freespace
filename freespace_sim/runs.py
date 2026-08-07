@@ -328,6 +328,13 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
            # None for per-flight planners, which have neither. For a whole-schedule solver these
            # are what separates "we have six colgen runs" from "we have six colgen runs, five of
            # which stopped at iteration 1" -- without them that needs opening every folder.
+           #
+           # They also mark the rows whose `*_solve_time_s` columns are not comparable with the
+           # rest: a whole-schedule planner has no per-flight solve, so `colgen` files the SAME
+           # amortized share (solve wall / n_flights) on every intent. Its mean is the amortized
+           # share, its p95 and max are that share again, and its total is the solve. Against an
+           # FCFS run those columns describe a different quantity, so filter on
+           # `planner_termination.isna()` before comparing them.
            "planner_termination": planner_stats.get("termination_reason"),
            "planner_iterations": planner_stats.get("iterations"),
            "wall_seconds": wall_seconds,

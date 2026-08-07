@@ -202,24 +202,24 @@ def run_batch(
             batch_params.time_limit_s,
             stats.get("iterations", "?"),
         )
-    # A different fact with a different remedy, which is why it is no longer folded into
-    # the message above: the generation loop finished, and only the final integer master
-    # failed to PROVE its selection optimal over the pool it was handed.  The schedule is
-    # feasible and may well be optimal; it is simply uncertified, so no absent flight can
-    # be reported as a physical denial.  Note the backend is asked for a much tighter gap
-    # than `ip_gap` names -- it is converted to the master's revenue scale by dividing by
-    # n*M -- so at a large M this is the expected outcome rather than a rare one.
+    # The third truncated exit, and until now the silent one.  `solver` treats it exactly
+    # like the branch above -- every denial becomes SEARCH_EXHAUSTED and the schedule is
+    # uncertified -- and the shipped cap of 30 makes it reachable, so leaving it
+    # unannounced is the same failure that branch exists to prevent.
     elif stats.get("termination_reason") == "iteration_limit":
-        # The third truncated exit, and until now the silent one.  `solver` treats it
-        # exactly like the other two -- every denial becomes SEARCH_EXHAUSTED and the
-        # schedule is uncertified -- and the shipped cap of 30 makes it reachable, so
-        # leaving it unannounced is the same failure the branch above exists to prevent.
         log.warning(
             "colgen stopped at its iteration cap (%s) -- this is the best schedule found "
             "within that many column-generation rounds, NOT a converged solution. Raise "
             "--colgen-max-iterations to continue.",
             batch_params.max_iterations,
         )
+    # A different fact with a different remedy, which is why it is not folded into either
+    # message above: the generation loop finished, and only the final integer master failed
+    # to PROVE its selection optimal over the pool it was handed.  The schedule is feasible
+    # and may well be optimal; it is simply uncertified, so no absent flight can be reported
+    # as a physical denial.  Note the backend is asked for a much tighter gap than `ip_gap`
+    # names -- it is converted to the master's revenue scale by dividing by n*M -- so at a
+    # large M this is the expected outcome rather than a rare one.
     elif stats.get("termination_reason") == "ip_not_proven":
         log.warning(
             "colgen's generation loop converged (%s iterations) but the final integer "

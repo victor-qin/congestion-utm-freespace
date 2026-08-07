@@ -152,14 +152,20 @@ def test_colgen_flags_follow_the_scenario_when_it_selects_the_planner(monkeypatc
     colgen_spec = with_overrides(SCENARIOS["colgen_test"], planner="colgen")
     monkeypatch.setattr(run_module, "get_scenario", lambda _name: colgen_spec)
 
+    # `spec_from_args(...).config().planner` is verbatim what `main` passes, so this
+    # exercises the real derivation rather than re-deriving the answer the test wants.
+    def _params_as_main_would(argv):
+        parsed = parse_args(argv)
+        return colgen_params_from_args(parsed, spec_from_args(parsed).config().planner)
+
     # No --planner anywhere: the budget must be accepted, not rejected...
-    args = parse_args(["--scenario", "colgen_test", "--colgen-time-limit", "600"])
-    assert colgen_params_from_args(args, colgen_spec.config().planner).time_limit_s == 600.0
+    assert _params_as_main_would(
+        ["--scenario", "colgen_test", "--colgen-time-limit", "600"]
+    ).time_limit_s == 600.0
 
     # ...and a run with no colgen flags at all must still be recognised as a colgen run,
     # rather than falling through to the shipped defaults by accident.
-    bare = parse_args(["--scenario", "colgen_test"])
-    assert colgen_params_from_args(bare, colgen_spec.config().planner) is not None
+    assert _params_as_main_would(["--scenario", "colgen_test"]) is not None
 
 
 def test_colgen_flags_are_still_refused_when_the_scenario_picks_another_planner(monkeypatch):

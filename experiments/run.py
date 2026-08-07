@@ -202,7 +202,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.workers is not None or args.parallel_window is not None
     ):
         parser.error("--workers and --parallel-window require --mode exact or --mode relaxed")
-    if _effective_planner(args) != "colgen" and _colgen_overrides(args):
+    # `_colgen_overrides` first: it is a namespace read, while `_effective_planner` resolves
+    # the registry and builds a `SimConfig`.  Ordering it this way keeps that work off every
+    # invocation that has nothing to do with colgen, and keeps any error it could raise out
+    # of runs that never mentioned the planner.
+    if _colgen_overrides(args) and _effective_planner(args) != "colgen":
         # Silently ignoring them is the bad outcome: a sweep that meant to raise the solver
         # budget would report a converged-looking run at the default one.
         parser.error(

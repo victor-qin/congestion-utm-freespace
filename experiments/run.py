@@ -202,11 +202,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.workers is not None or args.parallel_window is not None
     ):
         parser.error("--workers and --parallel-window require --mode exact or --mode relaxed")
-    if args.planner != "colgen" and _colgen_overrides(args):
+    if _effective_planner(args) != "colgen" and _colgen_overrides(args):
         # Silently ignoring them is the bad outcome: a sweep that meant to raise the solver
         # budget would report a converged-looking run at the default one.
-        parser.error("--colgen-* flags require --planner colgen")
+        parser.error(
+            "--colgen-* flags need a colgen run: pass --planner colgen, or use a scenario "
+            "whose spec selects it"
+        )
     return args
+
+
+def _effective_planner(args) -> str:
+    """The planner this invocation will actually run.
+
+    NOT ``args.planner``, which is an OVERRIDE defaulting to ``None``: a ``ScenarioSpec``
+    carries its own planner and falls back to ``SimConfig``'s. Keying the colgen flags on
+    the override alone means a scenario that selects colgen itself cannot be given a solver
+    budget -- ``--colgen-time-limit`` hard-errors asking for a flag the scenario already
+    implies -- and, worse, that run silently uses ``ColGenParams()`` defaults, which is a
+    smoke-test budget rather than a converging one.
+
+    Reads the REGISTRY spec, not ``spec_from_args``: the CLI's other overrides can make a
+    spec invalid (``--horizon`` below its demand window raises from ``SimConfig``), and that
+    belongs in ``main`` where the error is about the run, not here where it would surface as
+    a traceback out of argument parsing.
+    """
+
+    if args.planner is not None:
+        return args.planner
+    return get_scenario(args.scenario).config().planner
 
 
 def _colgen_overrides(args) -> dict:
@@ -224,13 +248,17 @@ def _colgen_overrides(args) -> dict:
     }
 
 
-def colgen_params_from_args(args):
+def colgen_params_from_args(args, planner: str):
     """Build the planner's params object, or ``None`` when this run is not a colgen run.
+
+    ``planner`` is passed in rather than re-derived so the decision is made from the config
+    that will actually run -- ``parse_args``'s own check is an early UX guard, and the two
+    must not be able to drift.
 
     ``None`` rather than a default-constructed ``ColGenParams`` so every other planner keeps
     taking the no-params path through :func:`~freespace_sim.planner.get_planner`.
     """
-    if args.planner != "colgen":
+    if planner != "colgen":
         return None
     from freespace_sim.planner.colgen import ColGenParams
 
@@ -275,7 +303,7 @@ def main() -> None:
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
-              parallel=pcfg, planner_params=colgen_params_from_args(args))
+              parallel=pcfg, planner_params=colgen_params_from_args(args, cfg.planner))
     wall = time.time() - t0
     sim_lo, sim_hi = metrics.simulation_window(res)
     log.info(

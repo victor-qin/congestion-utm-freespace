@@ -1882,6 +1882,14 @@ def find_feasible_column(
                     ):
                         return candidate
 
+        # A label at the ceiling cannot be extended, so stop before enumerating arcs at all.
+        # The per-arc test below already implies this one -- `remaining` is a hex distance and
+        # so non-negative, making `hops + 1 + remaining > max_air_hops` true for every
+        # neighbour once `hops == max_air_hops` -- but only after six `remaining_distance`
+        # calls that cannot change the outcome.  `_best_column` guards its extension loop the
+        # same way; these two searches share a domain and should agree on how they bound it.
+        if hops >= fg.max_air_hops:
+            continue
         if step + 1 > fg.max_step:
             continue
         for neighbour in fg.outgoing_neighbors(cell):

@@ -191,6 +191,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "scale includes n*M — with M an artificial big-M it can close at iteration 1. "
                         "cost normalises by total cost instead: far stricter, and its termination gate "
                         "additionally requires that no new columns arrived")
+    # The two knobs that size the pricing search itself. The budget flags above decide how long
+    # a solve may run; these decide how much work each iteration IS, and pricing is ~98% of the
+    # cost — so without them a run cannot be tuned, only given more time.
+    p.add_argument("--colgen-detour-slack", type=int, default=None, metavar="HOPS",
+                   help="colgen: half-width of the O-D ellipse each flight is priced over, in hops "
+                        "over the lattice geodesic (default 12). The dominant term in how much "
+                        "search a sweep does; suboptimal by construction, since a route needing a "
+                        "wider detour becomes unreachable")
+    p.add_argument("--colgen-max-air-overrun", type=int, default=None, metavar="HOPS",
+                   help="colgen: hop budget over the geodesic for a priced route (default 12). "
+                        "Bounds circling INSIDE the ellipse, which the ellipse itself does not. "
+                        "Pair it with --colgen-detour-slack: below that value it, not the ellipse, "
+                        "becomes what sizes the search; above it, it buys only backtracking room")
     return p
 
 
@@ -247,6 +260,8 @@ def _colgen_overrides(args) -> dict:
             ("objective", args.colgen_objective),
             ("solver", args.colgen_solver),
             ("gap_metric", args.colgen_gap_metric),
+            ("detour_slack_hops", args.colgen_detour_slack),
+            ("max_air_overrun_hops", args.colgen_max_air_overrun),
         )
         if value is not None
     }

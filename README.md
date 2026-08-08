@@ -102,8 +102,11 @@ reserved; `colgen` instead solves the whole schedule at once.
 `colgen` is not FCFS — it optimizes every flight jointly, so it answers a different question from the
 rest of the table ("what is the best schedule" rather than "what can this flight get, given the
 others"). Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-max-iterations`,
-`--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`; pricing dominates its cost, so the
-120 s default budget is a smoke-test budget rather than a converging one. A run that stops on that
+`--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`, and the two that size the pricing
+search itself as `--colgen-detour-slack` (the O-D ellipse a flight is priced over) and
+`--colgen-max-air-overrun` (the hop budget over the geodesic, which bounds circling *inside* that
+ellipse — pair the two, they bound the same routes from different directions); pricing dominates its
+cost, so the 120 s default budget is a smoke-test budget rather than a converging one. A run that stops on that
 budget still files a complete, feasible schedule, so read the WARNING and `planner_stats.json` in the
 run folder rather than assuming the result converged. One reporting caveat: a whole-schedule planner
 has no per-flight solve, so `colgen` stamps every intent with the same amortized share (solve wall ÷

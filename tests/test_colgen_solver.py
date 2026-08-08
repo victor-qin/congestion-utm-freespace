@@ -1563,12 +1563,18 @@ def test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows():
 
 
 def test_the_air_time_ceiling_is_a_flat_budget_not_a_fraction_of_the_flight():
-    """Every flight gets the same room, whatever its length.
+    """Every flight gets the same room, and the search honours it at every length.
 
     This is the point of an absolute budget over a fractional one. A fraction gives a short
     flight almost nothing -- 10% of 2 hops is one -- while a long flight gets several, so it
     is tightest exactly where the absolute room is smallest. A flat budget gives a 2-hop and
     a 16-hop flight the same six hops to route around a busy cell.
+
+    The arithmetic half of that is `build_flight_graph`'s to get right, and asserting it alone
+    would pass against a build that computes `max_air_hops` and never enforces it. So the
+    second half prices both a short and a longer flight against duals expensive enough to buy
+    a detour, and checks the budget is both SPENDABLE (the generous ceiling reaches routes the
+    tight one forbids, or the tight one proves nothing) and RESPECTED at either length.
     """
 
     cfg = _cfg()
@@ -1579,9 +1585,57 @@ def test_the_air_time_ceiling_is_a_flat_budget_not_a_fraction_of_the_flight():
                 _params(detour_slack_hops=4, max_air_overrun_hops=overrun),
             )
             assert graph.shortest_hops == shortest
-            assert graph.max_air_hops == shortest + overrun
+            # The room is this integer for both flights; a fraction would have scaled it.
+            assert graph.max_air_hops - graph.shortest_hops == overrun
 
     with pytest.raises(ValueError, match="max_air_overrun_hops"):
         ColGenParams(max_air_overrun_hops=-1)
     with pytest.raises(TypeError, match="max_air_overrun_hops"):
         ColGenParams(max_air_overrun_hops=1.5)
+
+    # The ceiling implies the ellipse, which is why the two knobs have to move together --
+    # `params.py` states the rule and this is the proof it rests on. A path through `c` costs
+    # at least d(o,c) + d(c,d) hops, so a route within `shortest + overrun` can only touch
+    # cells inside the ellipse of radius `overrun`, whatever `detour_slack_hops` allows. The
+    # corridor here is sized 3 and the budget 1, so the containment is strictly tighter than
+    # anything `build_flight_graph` enforces: it is a claim about the SEARCH, not the graph.
+    priced_cfg = _cfg(max_ground_delay_s=16.0)
+    rng = np.random.default_rng(5)
+    eccentric = False
+    for origin, dest in (((0, 0), (2, 0)), ((-2, 0), (3, 0))):
+        request = _request(2, origin, dest, priced_cfg)
+        for overrun in (1, 6):
+            params = _params(detour_slack_hops=3, max_air_overrun_hops=overrun)
+            graph = build_flight_graph(request, priced_cfg, (), params)
+            assert graph.shortest_hops == hg.hex_distance(origin, dest)
+            cells = sorted(graph.corridor_cells)
+            lo = graph.min_step
+            for _ in range(6):
+                # Duals only bite over the steps a route actually occupies, and the horizon is
+                # far wider than that (it has to cover the latest legal departure), so sampling
+                # across all of `max_step` would mostly wall cells no route ever meets.
+                duals = {
+                    RowKey.cell(
+                        cells[int(rng.integers(len(cells)))],
+                        0,
+                        int(rng.integers(lo, lo + 2 * graph.shortest_hops + 8)),
+                    ): float(rng.uniform(40.0, 150.0))
+                    for _ in range(6)
+                }
+                _, column = price_flight(graph, duals, 0.0, priced_cfg, params)
+                assert column is not None
+                assert len(column.cell_path) - 1 <= graph.max_air_hops
+                for cell in column.cell_path:
+                    off_line = (
+                        hg.hex_distance(origin, cell)
+                        + hg.hex_distance(cell, dest)
+                        - graph.shortest_hops
+                    )
+                    assert off_line <= overrun, (
+                        f"{cell} is outside the ellipse the hop budget implies"
+                    )
+                    eccentric |= off_line > 0
+    # Containment is trivially true of a geodesic, so a fixture that stopped producing detours
+    # would leave the loop above asserting nothing. At the seed above the `overrun=1` arm of
+    # the 5-hop flight binds exactly -- eccentricity 1 against a budget of 1, at the hop cap.
+    assert eccentric, "no priced column left the geodesic; the containment check is vacuous"

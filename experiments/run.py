@@ -126,7 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--terminal-airspace-always-active", action=argparse.BooleanOptionalAction,
                    default=None, dest="terminal_airspace_always_active",
                    help="permanently wall each hub's column+lanes off from foreign traffic (foreign "
-                        "transit → air detour instead of ground-block); A* only")
+                        "transit → air detour instead of ground-block); needs a wall-aware planner "
+                        "(A* family, terminal-aware MILP, or colgen)")
     p.add_argument("--demand", choices=("uniform", "hub", "hub_radius"), default=None,
                    help="demand pattern")
     p.add_argument("--uss", nargs="+", default=None, help="USS labels (multi-operator demand)")
@@ -164,6 +165,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parallel-window", type=int, default=None,
                    help="speculation window for explicit exact/relaxed mode only (default 4×workers); "
                         "result-affecting in relaxed mode")
+    # --- colgen (whole-schedule column generation; --planner colgen) ---
+    # Exposed because colgen's answer depends on its budget in a way per-flight planners' does not:
+    # it reports the best schedule found before the budget ran out, so a run that quietly stopped
+    # at iteration 1 still looks like a completed solve. The termination reason is logged for that
+    # reason, and these flags are what let a run be given enough budget to actually converge.
+    p.add_argument("--colgen-time-limit", type=float, default=None, metavar="S",
+                   help="colgen: whole-solve wall budget in seconds (default 120). Pricing dominates "
+                        "the cost, so the default is a smoke-test budget — a scenario-scale solve "
+                        "needs orders of magnitude more")
+    p.add_argument("--colgen-max-iterations", type=int, default=None, metavar="N",
+                   help="colgen: cap on column-generation iterations (default 30)")
+    p.add_argument("--colgen-objective", choices=("total_delay", "total_cost"), default=None,
+                   help="colgen: what to minimise — total_delay sums ground and excess-air seconds "
+                        "unweighted (default); total_cost weights them by the config's per-second "
+                        "dials (1:3), matching the A* cost model")
+    p.add_argument("--colgen-solver", choices=("auto", "gurobi", "highs"), default=None,
+                   help="colgen: LP/IP backend for the restricted master (default auto: Gurobi when "
+                        "importable, HiGHS otherwise). Result-affecting on a degenerate master — the "
+                        "two backends return different optimal dual vertices, which changes both the "
+                        "pricing subproblems and how tight the reported LP bound is")
+    p.add_argument("--colgen-gap-metric", choices=("revenue", "cost"), default=None,
+                   help="colgen: which scale the lp_gap/ip_gap thresholds are measured on. revenue "
+                        "(default) is the paper's eq. (10)/(11), normalised by an objective whose "
+                        "scale includes n*M — with M an artificial big-M it can close at iteration 1. "
+                        "cost normalises by total cost instead: far stricter, and its termination gate "
+                        "additionally requires that no new columns arrived")
+    # The two knobs that size the pricing search itself. The budget flags above decide how long
+    # a solve may run; these decide how much work each iteration IS, and pricing is ~98% of the
+    # cost — so without them a run cannot be tuned, only given more time.
+    p.add_argument("--colgen-detour-slack", type=int, default=None, metavar="HOPS",
+                   help="colgen: half-width of the O-D ellipse each flight is priced over, in hops "
+                        "over the lattice geodesic (default 3). The dominant term in how much "
+                        "search a sweep does; suboptimal by construction, since a route needing a "
+                        "wider detour becomes unreachable — widen it first if a congested scenario "
+                        "denies flights that ought to be placeable")
+    p.add_argument("--colgen-max-air-overrun", type=int, default=None, metavar="HOPS",
+                   help="colgen: hop budget over the geodesic for a priced route (default 3). "
+                        "Bounds circling INSIDE the ellipse, which the ellipse itself does not. "
+                        "Pair it with --colgen-detour-slack: below that value it, not the ellipse, "
+                        "becomes what sizes the search; above it, it buys only backtracking room")
     return p
 
 
@@ -175,7 +216,73 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.workers is not None or args.parallel_window is not None
     ):
         parser.error("--workers and --parallel-window require --mode exact or --mode relaxed")
+    # `_colgen_overrides` first: it is a namespace read, while `_effective_planner` resolves
+    # the registry and builds a `SimConfig`.  Ordering it this way keeps that work off every
+    # invocation that has nothing to do with colgen, and keeps any error it could raise out
+    # of runs that never mentioned the planner.
+    if _colgen_overrides(args) and _effective_planner(args) != "colgen":
+        # Silently ignoring them is the bad outcome: a sweep that meant to raise the solver
+        # budget would report a converged-looking run at the default one.
+        parser.error(
+            "--colgen-* flags need a colgen run: pass --planner colgen, or use a scenario "
+            "whose spec selects it"
+        )
     return args
+
+
+def _effective_planner(args) -> str:
+    """The planner this invocation will actually run.
+
+    NOT ``args.planner``, which is an OVERRIDE defaulting to ``None``: a ``ScenarioSpec``
+    carries its own planner and falls back to ``SimConfig``'s. Keying the colgen flags on
+    the override alone means a scenario that selects colgen itself cannot be given a solver
+    budget -- ``--colgen-time-limit`` hard-errors asking for a flag the scenario already
+    implies -- and, worse, that run silently uses ``ColGenParams()`` defaults, which is a
+    smoke-test budget rather than a converging one.
+
+    Reads the REGISTRY spec, not ``spec_from_args``: the CLI's other overrides can make a
+    spec invalid (``--horizon`` below its demand window raises from ``SimConfig``), and that
+    belongs in ``main`` where the error is about the run, not here where it would surface as
+    a traceback out of argument parsing.
+    """
+
+    if args.planner is not None:
+        return args.planner
+    return get_scenario(args.scenario).config().planner
+
+
+def _colgen_overrides(args) -> dict:
+    """The colgen knobs the CLI actually set, as ``ColGenParams`` keyword arguments."""
+    return {
+        name: value
+        for name, value in (
+            ("time_limit_s", args.colgen_time_limit),
+            ("max_iterations", args.colgen_max_iterations),
+            ("objective", args.colgen_objective),
+            ("solver", args.colgen_solver),
+            ("gap_metric", args.colgen_gap_metric),
+            ("detour_slack_hops", args.colgen_detour_slack),
+            ("max_air_overrun_hops", args.colgen_max_air_overrun),
+        )
+        if value is not None
+    }
+
+
+def colgen_params_from_args(args, planner: str):
+    """Build the planner's params object, or ``None`` when this run is not a colgen run.
+
+    ``planner`` is passed in rather than re-derived so the decision is made from the config
+    that will actually run -- ``parse_args``'s own check is an early UX guard, and the two
+    must not be able to drift.
+
+    ``None`` rather than a default-constructed ``ColGenParams`` so every other planner keeps
+    taking the no-params path through :func:`~freespace_sim.planner.get_planner`.
+    """
+    if planner != "colgen":
+        return None
+    from freespace_sim.planner.colgen import ColGenParams
+
+    return ColGenParams(**_colgen_overrides(args))
 
 
 def main() -> None:
@@ -216,7 +323,7 @@ def main() -> None:
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
-              parallel=pcfg)
+              parallel=pcfg, planner_params=colgen_params_from_args(args, cfg.planner))
     wall = time.time() - t0
     sim_lo, sim_hi = metrics.simulation_window(res)
     log.info(
@@ -232,7 +339,7 @@ def main() -> None:
     # dispatches to the ~5-7x slower pure-Python reference. On a cluster that is the difference between
     # a 6-hour job and a 30-hour one, so say it out loud rather than let the allocation absorb it.
     late = sum(1 for i in res.intents if i.request.t_departure > cfg.horizon_s)
-    if late:
+    if late and "astar" in cfg.planner:
         log.warning("%d/%d departures (%.0f%%) are past horizon_s=%.0fs — those flights fall back to "
                     "the slow reference A* (box guard). Raise --horizon or lower --demand-duration.",
                     late, len(res.intents), 100.0 * late / len(res.intents), cfg.horizon_s)

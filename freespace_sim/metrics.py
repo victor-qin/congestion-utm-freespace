@@ -268,7 +268,8 @@ def _straight_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
 
 def _unimpeded_cruise_z(cfg: SimConfig) -> float:
     """The altitude the run's planner cruises at when UNIMPEDED. The A* family deconflicts by altitude on
-    the discrete ladder, so its unimpeded cruise is the lowest flight level; the MILP cruises the
+    the discrete ladder, so its unimpeded cruise is the lowest flight level; colgen prices columns on
+    the same ladder (single-level in v1) and shares that baseline; the MILP cruises the
     continuous band [z_min_m, z_max_m], so its unimpeded cruise is the band floor; only the truly
     single-plane planners (straight / decoupled) are pinned to ``cruise_level_m`` (no altitude lever).
 
@@ -276,7 +277,7 @@ def _unimpeded_cruise_z(cfg: SimConfig) -> float:
     relabels to its own stage (``astar_milp`` stamps 'milp'), dropping the A* origin. So a
     single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced
     climb above the floor reads positive excess (real congestion)."""
-    if "astar" in cfg.planner:
+    if "astar" in cfg.planner or "colgen" in cfg.planner:
         return cfg.flight_levels_m[0]
     if "milp" in cfg.planner:
         return cfg.z_min_m           # MILP band floor (astar_milp takes the astar branch — same value)

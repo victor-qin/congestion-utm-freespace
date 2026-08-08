@@ -1066,6 +1066,14 @@ def _best_column(
     seed_hop_limit = fg.shortest_hops + fg.detour_slack_hops
     if seed_hop_limit < 1:
         return -math.inf, None
+    # The air-time ceiling (`params.max_air_overrun_frac`, resolved at graph build).  Unlike
+    # `seed_hop_limit` this applies to EVERY search, which is the point: the ellipse bounds
+    # how far off the straight line a route may stray, and nothing bounded how long it could
+    # circle inside that ellipse.  A label at the cap cannot be extended, and one that could
+    # not reach a destination within it is dead on creation.  Costs optimality -- a route
+    # needing more hops is now unreachable -- on the same terms `detour_slack_hops` already
+    # does, and buys the same thing: labels never created.
+    air_hop_limit = fg.max_air_hops
 
     offsets = dual_view.offsets
     revisit_depth = offsets[1] - offsets[0]
@@ -1333,6 +1341,8 @@ def _best_column(
                 continue
             if start_step + distance_to_go > fg.max_step:
                 continue
+            if distance_to_go > air_hop_limit:
+                continue
             if seed and distance_to_go > seed_hop_limit:
                 continue
             visit_claims = _visit_claims(cell, 0, start_step, offsets)
@@ -1430,6 +1440,8 @@ def _best_column(
             if label_index % 128 == 0:
                 _check_deadline(deadline)
             hops = label.hops
+            if hops >= air_hop_limit:
+                continue
             if (seed and hops >= seed_hop_limit) or step + 1 > fg.max_step:
                 continue
             paid_cells, paid_cell_rows = _paid_cell_rows(origin_paid_rows)
@@ -1490,6 +1502,8 @@ def _best_column(
                 distance_to_go = remaining_distance(neighbour)
                 next_step = step + 1
                 if next_step + distance_to_go > fg.max_step:
+                    continue
+                if hops + 1 + distance_to_go > air_hop_limit:
                     continue
                 if seed and hops + 1 + distance_to_go > seed_hop_limit:
                     continue
@@ -1769,6 +1783,11 @@ def find_feasible_column(
             remaining = remaining_distance(cell)
             if start_step >= fg.max_step or start_step + remaining > fg.max_step:
                 continue
+            # Same air-time ceiling the reduced-cost search applies.  Without it this
+            # incumbent heuristic could hand the master a column pricing is forbidden to
+            # reproduce, so the two would disagree about what the flight's domain is.
+            if remaining > fg.max_air_hops:
+                continue
             # `origin_claims` was proven disjoint from `forbidden` immediately above and is
             # invariant across this loop, so the old `(origin_claims | visit_claims)` union
             # re-tested it once per lane and allocated two sets to do it.  The union is
@@ -1871,6 +1890,8 @@ def find_feasible_column(
             next_step = step + 1
             remaining = remaining_distance(neighbour)
             if next_step + remaining > fg.max_step:
+                continue
+            if hops + 1 + remaining > fg.max_air_hops:
                 continue
             # Once per relaxed arc, and the set was built only to be tested: measured at
             # 3,764,765 calls and 11.76s of this search's 37.72s.

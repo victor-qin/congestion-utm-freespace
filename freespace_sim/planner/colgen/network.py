@@ -744,6 +744,10 @@ class FlightGraph:
     max_step: int
     shortest_hops: int
     detour_slack_hops: int
+    # Hard ceiling on a priced route's hop count, from `params.max_air_overrun_frac`.
+    # Resolved here rather than in pricing so both searches over this domain agree on it
+    # and so it participates in graph identity.
+    max_air_hops: int
     static_exclusions: AbstractSet[Cell]
     foreign_exclusions: AbstractSet[Cell]
     own_terminal_interiors: frozenset[Cell]
@@ -1518,6 +1522,13 @@ def build_flight_graph(
         slack,
     )
 
+    # `ceil`, so any positive fraction buys at least one hop of room: pinning a short
+    # flight to its exact geodesic would remove rerouting entirely for it.
+    overrun = float(getattr(params, "max_air_overrun_frac", 0.10))
+    if not math.isfinite(overrun) or overrun < 0.0:
+        raise ValueError(f"max_air_overrun_frac must be finite and non-negative, got {overrun!r}")
+    max_air_hops = shortest_hops + math.ceil(overrun * shortest_hops)
+
     return FlightGraph(
         request=frozen_request,
         _cfg=cfg,
@@ -1536,6 +1547,7 @@ def build_flight_graph(
         max_step=max_step,
         shortest_hops=shortest_hops,
         detour_slack_hops=slack,
+        max_air_hops=max_air_hops,
         static_exclusions=static_exclusions,
         foreign_exclusions=foreign_exclusions,
         own_terminal_interiors=frozen_own_interiors,

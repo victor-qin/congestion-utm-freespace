@@ -44,15 +44,17 @@ def _point(cell: tuple[int, int], cfg: SimConfig):
     return vec(x, y, cfg.ground_level_m)
 
 
-def _graph(cfg: SimConfig, *, slack: int = 4):
+def _graph(cfg: SimConfig, *, slack: int = 4, **overrides):
     request = FlightRequest(1, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)
-    params = ColGenParams(
-        solver="highs",
-        detour_slack_hops=slack,
-        max_iterations=3,
-        time_limit_s=30.0,
-        n_heuristic_tries=2,
-    )
+    values = {
+        "solver": "highs",
+        "detour_slack_hops": slack,
+        "max_iterations": 3,
+        "time_limit_s": 30.0,
+        "n_heuristic_tries": 2,
+    }
+    values.update(overrides)
+    params = ColGenParams(**values)
     return build_flight_graph(request, cfg, (), params), params
 
 
@@ -264,10 +266,17 @@ def test_unrelated_rows_keep_the_canonical_seed_fast_path(monkeypatch):
 
 
 def test_negative_dual_disables_the_seed_locality_shortcut():
-    """Even an off-seed negative row can make a longer route price best."""
+    """Even an off-seed negative row can make a longer route price best.
+
+    `max_air_overrun_frac` is lifted because this is precisely the lever it bounds: a
+    negative dual is the master paying a flight to use an under-used row, and collecting
+    that credit costs hops. At the shipped 10% a 2-hop flight may fly 3, which is not
+    enough to reach the credited cell -- so this contract is about what pricing does when
+    the air-time ceiling is not the binding constraint.
+    """
 
     cfg = _cfg()
-    graph, params = _graph(cfg)
+    graph, params = _graph(cfg, max_air_overrun_frac=10.0)
     credited = RowKey.cell((-2, 0), 0, 5)
     assert credited not in seed_column(graph, cfg).claims
 
@@ -552,8 +561,14 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
     )
     request = FlightRequest(7, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)
     graph = build_flight_graph(request, cfg, (), params)
-    columns = _exhaustive_columns(graph, cfg)
-    assert len(columns) == 567, "a shrunken universe would hide a miss rather than fail"
+    # The oracle enumerates every W-valid column; the search is bounded by
+    # `max_air_hops`, so compare over the domain the search is actually allowed to reach.
+    # Enumerating first and filtering second keeps the count assertion honest about what
+    # the cap removes: 567 columns exist, and the search may choose among those within it.
+    all_columns = _exhaustive_columns(graph, cfg)
+    assert len(all_columns) == 567, "a shrunken universe would hide a miss rather than fail"
+    columns = [c for c in all_columns if len(c.cell_path) - 1 <= graph.max_air_hops]
+    assert columns, "the air-time ceiling cannot rule out every column"
 
     cells = sorted(graph.corridor_cells)
     rng = np.random.default_rng(17)

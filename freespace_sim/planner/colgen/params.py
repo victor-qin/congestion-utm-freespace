@@ -46,6 +46,40 @@ class ColGenParams:
     # and exactly what this one cannot test. But anyone tuning for speed starts here: it is
     # the dominant term in how much search a sweep does.
     detour_slack_hops: int = 12
+    # How far over the LATTICE geodesic a priced route may fly, as a fraction of it: a
+    # flight whose shortest path is 17 hops may fly ceil(0.10 * 17) = 2 extra. This is an
+    # air-time cap, so ground delay is unaffected -- holding on the pad is a lever, wandering
+    # in the air to dodge a dual is the thing being bounded.
+    #
+    # Measured against the LATTICE geodesic and not `enroute_reference_m`, because hex
+    # quantization alone already puts 49 of colgen_test's first 50 flights over 1.10x the
+    # Euclidean straight line (median 1.26x, max 2.32x) -- a fractional cap on that base
+    # would deny almost every flight before congestion entered the picture.
+    #
+    # Deliberately suboptimal, in the same way `detour_slack_hops` is: a route needing more
+    # than this becomes unreachable even if it is the true optimum. `translate.py`'s
+    # `max_detour_factor` gate expresses a similar idea but fires at translation, after the
+    # label has been expanded and certified -- this one prunes during the search, which is
+    # where the work is. Set to 0 for the geodesic only; set high to disable.
+    #
+    # Measured on colgen_test's first 50 flights, no time limit:
+    #
+    #     slack  ceiling   wall   iters  objective     labels    arc nodes  denied
+    #        12      off   936 s     30      724.8  124,615,013     11,230       0
+    #        12      10%   628 s     30      724.8   35,878,413      5,751       0
+    #         3      off   739 s     29      724.8   60,178,713      4,909       0
+    #         3      10%   611 s     30      724.8   33,246,072      4,771       0
+    #
+    # At the shipped slack of 12 the ceiling cuts labels 3.47x and wall 1.49x for the same
+    # objective and no denials, and it also halves `arc nodes` -- cells unreachable within
+    # the hop budget are never expanded at all, so it shrinks the reachable corridor rather
+    # than only the label count. It is the stronger of the two levers here: slack 12 WITH
+    # the ceiling searches less than slack 3 without it, so the wide ellipse is affordable.
+    #
+    # Read the identical objective with care. This world is uncongested -- every arm places
+    # all 50 flights and reaches 724.8 -- so it cannot show what the ceiling costs. For a
+    # case where it does, see `test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows`.
+    max_air_overrun_frac: float = 0.10
     solver: str = "auto"
     max_iterations: int = 30
     time_limit_s: float = 120.0
@@ -125,7 +159,7 @@ class ColGenParams:
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, normalized)
 
-        for name in ("time_limit_s", "lp_gap", "ip_gap", "M", "epsilon"):
+        for name in ("time_limit_s", "lp_gap", "ip_gap", "M", "epsilon", "max_air_overrun_frac"):
             value = getattr(self, name)
             if isinstance(value, bool):
                 raise TypeError(f"{name} must be a real number")
@@ -137,6 +171,8 @@ class ColGenParams:
                 raise ValueError(f"{name} must be finite")
             object.__setattr__(self, name, normalized)
 
+        if self.max_air_overrun_frac < 0.0:
+            raise ValueError("max_air_overrun_frac must be non-negative")
         if self.time_limit_s <= 0.0:
             raise ValueError("time_limit_s must be positive")
         if not 0.0 <= self.lp_gap < 1.0:

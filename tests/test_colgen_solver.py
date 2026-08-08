@@ -253,7 +253,10 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
         origin_terminal=origin_terminal,
         dest_terminal=destination_terminal,
     )
-    params = _params(detour_slack_hops=2)
+    # `max_air_overrun_frac` lifted: replacing terminal fold distance with an extra hop is
+    # itself an air-time overrun, and this test is about the delay accounting rather than
+    # the ceiling -- at the shipped 10% the ceiling would pick the lane, not the arithmetic.
+    params = _params(detour_slack_hops=2, max_air_overrun_frac=10.0)
     graph = build_flight_graph(
         request,
         cfg,
@@ -375,10 +378,16 @@ def test_zero_buffer_pricing_keeps_predecessor_dependent_endpoint_duals():
 
 
 def test_pricing_allows_wide_loops_but_no_tight_revisits():
-    """Slack sizes the ellipse, not path length; a dual-optimal loop may revisit at W."""
+    """Slack sizes the ellipse, not path length; a dual-optimal loop may revisit at W.
+
+    That contract is about the ELLIPSE and the revisit window, so `max_air_overrun_frac` is
+    lifted out of the way: at the shipped 10% this 2-hop flight may fly 3 hops and the loop
+    below is 6, so the air-time ceiling -- not the geometry under test -- would decide the
+    answer. `test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows` pins that.
+    """
 
     cfg = _cfg(max_ground_delay_s=16.0)
-    params = _params(detour_slack_hops=2)
+    params = _params(detour_slack_hops=2, max_air_overrun_frac=10.0)
     request = _request(3, (0, 0), (2, 0), cfg)
     graph = build_flight_graph(request, cfg, (), params)
     duals = {
@@ -1521,3 +1530,60 @@ def test_the_objective_stat_says_which_currency_it_is_in():
     # objective. Same seconds flown, a number 3x larger -- which is exactly the trap.
     assert delay.stats["objective"] == pytest.approx(4.0, abs=1e-8)
     assert cost.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+
+
+def test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows():
+    """The cap's whole purpose: bound circling inside an ellipse that permits it.
+
+    Same instance as `test_pricing_allows_wide_loops_but_no_tight_revisits`, which lifts the
+    ceiling and gets a 6-hop loop for a 2-hop flight. At the shipped 10% that flight may fly
+    ceil(0.10 * 2) = 1 extra hop, so the loop is unreachable and pricing returns the direct
+    route -- paying the duals it would otherwise have detoured around. Suboptimal by
+    construction, in the same way `detour_slack_hops` is.
+    """
+
+    cfg = _cfg(max_ground_delay_s=16.0)
+    duals = {RowKey.cell((3, 0), 0, 9): 100.0, RowKey.cell((-1, 0), 0, 12): 100.0}
+    request = _request(3, (0, 0), (2, 0), cfg)
+
+    capped_params = _params(detour_slack_hops=2, max_air_overrun_frac=0.10)
+    capped_graph = build_flight_graph(request, cfg, (), capped_params)
+    assert capped_graph.shortest_hops == 2
+    assert capped_graph.max_air_hops == 3, "ceil(0.10 * 2) buys exactly one hop"
+    capped_rc, capped = price_flight(capped_graph, duals, 0.0, cfg, capped_params)
+
+    free_params = _params(detour_slack_hops=2, max_air_overrun_frac=10.0)
+    free_graph = build_flight_graph(request, cfg, (), free_params)
+    free_rc, free = price_flight(free_graph, duals, 0.0, cfg, free_params)
+
+    assert capped is not None and free is not None
+    assert len(capped.cell_path) - 1 <= capped_graph.max_air_hops
+    assert len(free.cell_path) - 1 > capped_graph.max_air_hops, "the fixture must need a loop"
+    # The ceiling costs reduced cost -- it rules out the column the duals made best.
+    assert capped_rc < free_rc
+
+
+def test_the_air_time_ceiling_scales_with_the_flight_and_never_pins_the_geodesic():
+    """`ceil` rather than `floor`: any positive fraction buys at least one hop.
+
+    Flooring would pin a short flight to its exact geodesic, removing rerouting entirely
+    for it -- and short flights are where a fractional cap is already harshest.
+    """
+
+    cfg = _cfg()
+    for origin, dest, shortest in (((0, 0), (2, 0), 2), ((-8, 0), (8, 0), 16)):
+        graph = build_flight_graph(
+            _request(1, origin, dest, cfg), cfg, (), _params(detour_slack_hops=4)
+        )
+        assert graph.shortest_hops == shortest
+        assert graph.max_air_hops == shortest + math.ceil(0.10 * shortest)
+        assert graph.max_air_hops > shortest
+
+    # Zero means the geodesic only, and is still expressible.
+    pinned = build_flight_graph(
+        _request(1, (0, 0), (2, 0), cfg), cfg, (), _params(max_air_overrun_frac=0.0)
+    )
+    assert pinned.max_air_hops == pinned.shortest_hops
+
+    with pytest.raises(ValueError, match="max_air_overrun_frac"):
+        ColGenParams(max_air_overrun_frac=-0.1)

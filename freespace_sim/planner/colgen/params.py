@@ -20,6 +20,21 @@ class ColGenParams:
     synchronous geometry/backend call cannot be preempted and may overrun slightly.
     """
 
+    # Sizes the spatial ellipse each flight is priced over, so it is the dominant term in
+    # how much search a sweep does -- and it is NOT a route-length budget (see
+    # `_best_column`: ordinary pricing may spend the clock slack on wide loops).
+    #
+    # Measured on colgen_test's first 50 flights, no time limit, everything else equal:
+    #
+    #     slack   wall    iters  termination       objective   labels expanded
+    #         3   762 s      29  lp_gap                 724.8    60,166,158
+    #        12   971 s      30  iteration_limit        724.8   124,599,822
+    #
+    # The wider ellipse expands 2.07x the labels (2.00x per iteration), derives 2.29x the
+    # arc nodes, reaches the SAME objective, and runs out of iterations where slack 3
+    # converges. That is one 50-flight world and not grounds to change the default on its
+    # own -- the slack exists so pricing can route around congestion, which is exactly what
+    # a denser instance has more of -- but anyone tuning for speed should start here.
     detour_slack_hops: int = 12
     solver: str = "auto"
     max_iterations: int = 30
@@ -31,24 +46,24 @@ class ColGenParams:
     # Two consumers, and they scale differently.
     #
     # `master.round_heuristic` runs this many randomized-rounding restarts per iteration:
-    # measured at ~4.7 ms per try on a 425-column colgen_test master, so 32 -> 64 costs
-    # +147 ms per iteration against pricing sweeps of ~100 s. That is what the
-    # `heuristic_gap` termination and the `ip_skipped` decision key on, so the restarts buy
-    # a tighter incumbent for ~0.1% of a sweep.
+    # ~4.7 ms per try on a 425-column colgen_test master, against pricing sweeps of ~100 s.
+    # Measured on 98 flights, 16 / 32 / 64 restarts all returned the IDENTICAL incumbent
+    # (heuristic 3260.4, IP 3152.4 after one iteration), so the extra restarts bought
+    # nothing on that world and the low value is the honest default; their value is on a
+    # more fractional LP than this one produces.
     #
     # `_greedy_feasible_selection` ALSO derives its candidate cap from this (x16), which has
     # nothing to do with rounding and is worth knowing about before changing the field. That
     # stage runs once, after the first LP, and walks flights in order asking pricing for a
-    # better column for each; the cap truncates how many it reaches. Inert below 512 flights.
+    # better column for each; the cap truncates how many it reaches. At 16 the cap is 256.
     #
-    # Above it the effect is not a simple cost, because the stage is bounded by
-    # `min(60 s, 0.55 * time_limit_s)` and splits what remains evenly across the flights
-    # still to try -- so a longer list means a SMALLER slice each, and hard flights hit
-    # their local timeout instead of eating the stage. Measured on 780 flights at the 60 s
-    # production budget, 32 -> 64 ran 32.2 s -> 19.6 s and improved 265 flights instead of
-    # 217, for an incumbent 21.53% below the shifted-seed start instead of 21.51%. Reaching
-    # every flight shallowly beat reaching two thirds of them deeply, on that instance.
-    n_heuristic_tries: int = 64
+    # The stage is bounded by `min(60 s, 0.55 * time_limit_s)` and splits what remains
+    # evenly across the flights still to try, so a longer list means a SMALLER slice each
+    # and hard flights hit their local timeout instead of eating the stage. Measured on 780
+    # flights at the 60 s budget, a cap of 512 ran 32.2 s and improved 217 flights where
+    # 1024 ran 19.6 s and improved 265 -- reaching every flight shallowly beat reaching two
+    # thirds of them deeply. Below the cap none of this applies.
+    n_heuristic_tries: int = 16
     objective: str = "total_delay"
     # Which scale the lp_gap / ip_gap thresholds are measured on.
     #   "revenue" -- the paper's equations (10) and (11): (UB - RMP)/RMP on the maximize

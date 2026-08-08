@@ -196,11 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     # cost — so without them a run cannot be tuned, only given more time.
     p.add_argument("--colgen-detour-slack", type=int, default=None, metavar="HOPS",
                    help="colgen: half-width of the O-D ellipse each flight is priced over, in hops "
-                        "over the lattice geodesic (default 12). The dominant term in how much "
+                        "over the lattice geodesic (default 3). The dominant term in how much "
                         "search a sweep does; suboptimal by construction, since a route needing a "
-                        "wider detour becomes unreachable")
+                        "wider detour becomes unreachable — widen it first if a congested scenario "
+                        "denies flights that ought to be placeable")
     p.add_argument("--colgen-max-air-overrun", type=int, default=None, metavar="HOPS",
-                   help="colgen: hop budget over the geodesic for a priced route (default 12). "
+                   help="colgen: hop budget over the geodesic for a priced route (default 3). "
                         "Bounds circling INSIDE the ellipse, which the ellipse itself does not. "
                         "Pair it with --colgen-detour-slack: below that value it, not the ellipse, "
                         "becomes what sizes the search; above it, it buys only backtracking room")

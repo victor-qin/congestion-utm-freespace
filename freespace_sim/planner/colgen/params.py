@@ -41,11 +41,18 @@ class ColGenParams:
     # every arm sat at or one below the 30-iteration cap, so which side of it they landed
     # on is a threshold artifact, not a property of the slack.
     #
-    # Left at 12 deliberately. This is one uncongested 50-flight world, and the slack exists
-    # so pricing can route AROUND congestion -- exactly what a denser instance has more of,
-    # and exactly what this one cannot test. But anyone tuning for speed starts here: it is
-    # the dominant term in how much search a sweep does.
-    detour_slack_hops: int = 12
+    # Set to 3, paired with `max_air_overrun_hops` below -- see the rule stated there, and note
+    # that 3/3 is the configuration the ceiling table was actually measured at rather than an
+    # interpolation. Against the old 12 (with no ceiling) it is 36.7M labels where that was
+    # 124.6M: 3.4x less search for the same objective and the same 50 placements.
+    #
+    # THE CAVEAT THAT COMES WITH IT: both tables are one UNCONGESTED 50-flight world, and the
+    # slack exists so pricing can route AROUND congestion -- exactly what a denser instance has
+    # more of, and exactly what this one cannot test. If a congested scenario starts denying
+    # flights pricing ought to be able to place, this is the first knob to widen, and
+    # `--colgen-detour-slack` widens it without a code change. Symmetrically, it remains the
+    # dominant term in how much search a sweep does, so it is also where speed tuning starts.
+    detour_slack_hops: int = 3
     # How far over the LATTICE geodesic a priced route may fly, in hops. One hop advances
     # the clock by `dt_s`, so this is equally "how many steps of air time over nominal": a
     # flight whose shortest path is 17 hops may fly 17 + this. Ground delay is unaffected --
@@ -101,10 +108,10 @@ class ColGenParams:
     # 26.3 vs 26.1 at ceiling 6, i.e. nothing. Which side of the cap an arm landed on is a
     # threshold artifact, as it was for `detour_slack_hops` above.
     #
-    # Left at 12 to match the shipped `detour_slack_hops`, which is where the pairing rule
-    # puts it. The rule is geometric and holds for any slack; the 1.64x is measured only at
-    # slack=3, and 12/12 is untested.
-    max_air_overrun_hops: int = 12
+    # Set to 3, matching the shipped `detour_slack_hops` as the pairing rule requires. This is
+    # the top row of the table above rather than an extrapolation from it: the shipped default
+    # IS the measured configuration, which the earlier 12/12 pairing could not claim.
+    max_air_overrun_hops: int = 3
     solver: str = "auto"
     max_iterations: int = 30
     time_limit_s: float = 120.0

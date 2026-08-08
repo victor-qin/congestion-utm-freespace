@@ -26,15 +26,25 @@ class ColGenParams:
     #
     # Measured on colgen_test's first 50 flights, no time limit, everything else equal:
     #
-    #     slack   wall    iters  termination       objective   labels expanded
-    #         3   762 s      29  lp_gap                 724.8    60,166,158
-    #        12   971 s      30  iteration_limit        724.8   124,599,822
+    #     slack   wall    iters  termination       objective   labels expanded   arc nodes
+    #         1   645 s      30  iteration_limit        724.8    35,017,481         3,554
+    #         2   734 s      30  iteration_limit        724.8    47,583,416         4,269
+    #         3   762 s      29  lp_gap                 724.8    60,166,158         4,909
+    #        12   971 s      30  iteration_limit        724.8   124,599,822        11,230
     #
-    # The wider ellipse expands 2.07x the labels (2.00x per iteration), derives 2.29x the
-    # arc nodes, reaches the SAME objective, and runs out of iterations where slack 3
-    # converges. That is one 50-flight world and not grounds to change the default on its
-    # own -- the slack exists so pricing can route around congestion, which is exactly what
-    # a denser instance has more of -- but anyone tuning for speed should start here.
+    # Labels grow 3.56x from slack 1 to 12 and every setting reaches the SAME objective;
+    # slack 1 and 2 placed all 50 flights with zero denials. Wall grows only 1.51x across
+    # that range, because much of a solve is per-iteration overhead -- LP solves,
+    # canonicalization, the greedy stage -- that the ellipse does not touch.
+    #
+    # Do not read the termination column as "slack 3 converges and the others do not":
+    # every arm sat at or one below the 30-iteration cap, so which side of it they landed
+    # on is a threshold artifact, not a property of the slack.
+    #
+    # Left at 12 deliberately. This is one uncongested 50-flight world, and the slack exists
+    # so pricing can route AROUND congestion -- exactly what a denser instance has more of,
+    # and exactly what this one cannot test. But anyone tuning for speed starts here: it is
+    # the dominant term in how much search a sweep does.
     detour_slack_hops: int = 12
     solver: str = "auto"
     max_iterations: int = 30

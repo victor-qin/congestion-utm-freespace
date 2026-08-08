@@ -36,14 +36,18 @@ class ColGenParams:
     # `heuristic_gap` termination and the `ip_skipped` decision key on, so the restarts buy
     # a tighter incumbent for ~0.1% of a sweep.
     #
-    # `_greedy_feasible_selection` also derives its candidate cap from this (x16), which is
-    # inert below 512 flights and NOT a simple cost above it: the stage splits its remaining
-    # budget evenly across the candidates, so a longer list gives each flight a SMALLER
-    # slice. Measured on 780 flights with a 1800 s deadline, 32 -> 64 took the stage from
-    # 650 s to 351 s -- reproducible with the arms in either order -- because more flights
-    # hit their local timeout and keep their existing column instead of searching for a
-    # better one. Faster, but by doing less per flight; the quality of that trade is not
-    # measured here.
+    # `_greedy_feasible_selection` ALSO derives its candidate cap from this (x16), which has
+    # nothing to do with rounding and is worth knowing about before changing the field. That
+    # stage runs once, after the first LP, and walks flights in order asking pricing for a
+    # better column for each; the cap truncates how many it reaches. Inert below 512 flights.
+    #
+    # Above it the effect is not a simple cost, because the stage is bounded by
+    # `min(60 s, 0.55 * time_limit_s)` and splits what remains evenly across the flights
+    # still to try -- so a longer list means a SMALLER slice each, and hard flights hit
+    # their local timeout instead of eating the stage. Measured on 780 flights at the 60 s
+    # production budget, 32 -> 64 ran 32.2 s -> 19.6 s and improved 265 flights instead of
+    # 217, for an incumbent 21.53% below the shifted-seed start instead of 21.51%. Reaching
+    # every flight shallowly beat reaching two thirds of them deeply, on that instance.
     n_heuristic_tries: int = 64
     objective: str = "total_delay"
     # Which scale the lp_gap / ip_gap thresholds are measured on.

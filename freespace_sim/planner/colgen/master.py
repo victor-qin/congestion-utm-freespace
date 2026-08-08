@@ -721,9 +721,19 @@ class RestrictedMaster:
         self,
         selection: Mapping[int, Column] | Iterable[Column],
     ) -> bool:
+        """Whether every row this selection claims stays within its capacity.
+
+        Only `ValueError` is answered with ``False``: `claim_loads` raises it for a selection
+        naming one flight twice, which is a malformed selection rather than an over-capacity
+        one, and the caller wants a verdict either way.  `KeyError` deliberately propagates --
+        `RowIndex.cap` raises it for an unregistered terminal, a configuration error whose own
+        message names the fix.  Swallowing it reported that as "violates a capacity claim",
+        sending the reader to the schedule when the terminal registry is what is wrong.
+        """
+
         try:
             return not self.violated_claim_rows(selection)
-        except (KeyError, ValueError):
+        except ValueError:
             return False
 
     def _can_add(self, column: Column, loads: Mapping[RowKey, int]) -> bool:

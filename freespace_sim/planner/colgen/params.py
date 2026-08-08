@@ -21,8 +21,10 @@ class ColGenParams:
     """
 
     # Sizes the spatial ellipse each flight is priced over, so it is the dominant term in
-    # how much search a sweep does -- and it is NOT a route-length budget (see
-    # `_best_column`: ordinary pricing may spend the clock slack on wide loops).
+    # how much search a sweep does. It bounds WHERE a route may go, not how long it may take:
+    # the ellipse alone permits circling inside itself indefinitely, which is what
+    # `max_air_overrun_hops` below exists to stop. Set the two together -- the rule is stated
+    # there, and neither knob describes the search's actual bounds on its own.
     #
     # Measured on colgen_test's FIRST 50 FLIGHTS via `ColGenSolver().solve` directly: HiGHS,
     # objective=total_delay, gap_metric=cost, n_heuristic_tries=16, time_limit_s=86400 (so the
@@ -38,10 +40,11 @@ class ColGenParams:
     #         3   762 s      29  lp_gap                 724.8    60,166,158         4,909
     #        12   971 s      30  iteration_limit        724.8   124,599,822        11,230
     #
-    # Labels grow 3.56x from slack 1 to 12 and every setting reaches the SAME objective;
-    # slack 1 and 2 placed all 50 flights with zero denials. Wall grows only 1.51x across
-    # that range, because much of a solve is per-iteration overhead -- LP solves,
-    # canonicalization, the greedy stage -- that the ellipse does not touch.
+    # Labels grow 3.56x from slack 1 to 12 and every setting reaches the SAME objective, each
+    # placing all 50 flights with zero denials -- including the shipped 3, re-confirmed by
+    # every arm of the ceiling table below. Wall grows only 1.51x across that range, because
+    # much of a solve is per-iteration overhead -- LP solves, canonicalization, the greedy
+    # stage -- that the ellipse does not touch.
     #
     # Do not read the termination column as "slack 3 converges and the others do not":
     # every arm sat at or one below the 30-iteration cap, so which side of it they landed

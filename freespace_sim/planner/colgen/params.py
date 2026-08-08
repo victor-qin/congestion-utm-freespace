@@ -24,7 +24,13 @@ class ColGenParams:
     # how much search a sweep does -- and it is NOT a route-length budget (see
     # `_best_column`: ordinary pricing may spend the clock slack on wide loops).
     #
-    # Measured on colgen_test's first 50 flights, no time limit, everything else equal:
+    # Measured on colgen_test's FIRST 50 FLIGHTS via `ColGenSolver().solve` directly: HiGHS,
+    # objective=total_delay, gap_metric=cost, n_heuristic_tries=16, time_limit_s=86400 (so the
+    # 30-iteration cap is what stops these, not the clock). Both tables in this file share that
+    # harness, so they compare to each other and to nothing else -- in particular NOT to the
+    # end-to-end figures in the PR/README, which are 98 flights of weighted total_cost under
+    # Gurobi on a 600 s budget. Those objectives are different quantities, not the same one
+    # measured twice.
     #
     #     slack   wall    iters  termination       objective   labels expanded   arc nodes
     #         1   645 s      30  iteration_limit        724.8    35,017,481         3,554
@@ -89,8 +95,9 @@ class ColGenParams:
     #                        it; loops and second excursions are what get cut
     #     overrun >  slack   buys backtracking room inside a container already fixed
     #
-    # Measured on colgen_test's first 50 flights at slack=3, no time limit, everything else
-    # equal (geodesics: min 4 hops, median 17, max 23):
+    # Measured at slack=3 on the same harness as the table above -- 50 flights, HiGHS,
+    # total_delay, no clock -- and comparable only to it (geodesics: min 4 hops, median 17,
+    # max 23):
     #
     #     ceiling   wall    iters  termination       objective   labels expanded   arc nodes
     #           3   685 s      30  iteration_limit        724.8    36,702,755          4,982

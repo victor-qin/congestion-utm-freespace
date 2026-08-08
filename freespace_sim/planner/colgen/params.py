@@ -46,40 +46,65 @@ class ColGenParams:
     # and exactly what this one cannot test. But anyone tuning for speed starts here: it is
     # the dominant term in how much search a sweep does.
     detour_slack_hops: int = 12
-    # How far over the LATTICE geodesic a priced route may fly, as a fraction of it: a
-    # flight whose shortest path is 17 hops may fly ceil(0.10 * 17) = 2 extra. This is an
-    # air-time cap, so ground delay is unaffected -- holding on the pad is a lever, wandering
-    # in the air to dodge a dual is the thing being bounded.
+    # How far over the LATTICE geodesic a priced route may fly, in hops. One hop advances
+    # the clock by `dt_s`, so this is equally "how many steps of air time over nominal": a
+    # flight whose shortest path is 17 hops may fly 17 + this. Ground delay is unaffected --
+    # holding on the pad is a lever, wandering in the air to dodge a dual is what is bounded.
     #
-    # Measured against the LATTICE geodesic and not `enroute_reference_m`, because hex
-    # quantization alone already puts 49 of colgen_test's first 50 flights over 1.10x the
-    # Euclidean straight line (median 1.26x, max 2.32x) -- a fractional cap on that base
-    # would deny almost every flight before congestion entered the picture.
+    # ABSOLUTE rather than a fraction of the flight, which is a deliberate choice about who
+    # pays. A fractional cap gives a 2-hop flight one extra hop and a 23-hop flight three,
+    # so it is harshest exactly where the absolute room is smallest; a fixed budget gives
+    # every flight the same room to route around a busy cell regardless of how far it is
+    # going. Neither is obviously right, but the fixed one is easier to reason about and
+    # does not silently pin short flights to their geodesic.
+    #
+    # Measured against the LATTICE geodesic and not `enroute_reference_m`: hex quantization
+    # alone already puts 49 of colgen_test's first 50 flights over 1.10x the Euclidean
+    # straight line (median 1.26x, max 2.32x), so a budget measured on that base would be
+    # spent before congestion entered the picture.
     #
     # Deliberately suboptimal, in the same way `detour_slack_hops` is: a route needing more
     # than this becomes unreachable even if it is the true optimum. `translate.py`'s
     # `max_detour_factor` gate expresses a similar idea but fires at translation, after the
     # label has been expanded and certified -- this one prunes during the search, which is
-    # where the work is. Set to 0 for the geodesic only; set high to disable.
+    # where the work is. 0 pins the geodesic; a large value disables it.
     #
-    # Measured on colgen_test's first 50 flights, no time limit:
+    # THIS KNOB IS PAIRED WITH `detour_slack_hops` AND SHOULD NOT BE SET BELOW IT. The two
+    # bound the same routes from different directions, and the crossover is exact rather
+    # than a rule of thumb. A path through cell c costs at least hex_distance(o,c) +
+    # hex_distance(c,d) hops, and the ellipse admits c precisely when that sum is within
+    # `shortest + slack` -- so reaching a cell on the ellipse BOUNDARY takes `shortest +
+    # slack` hops, with none to spare. Hence:
     #
-    #     slack  ceiling   wall   iters  objective     labels    arc nodes  denied
-    #        12      off   936 s     30      724.8  124,615,013     11,230       0
-    #        12      10%   628 s     30      724.8   35,878,413      5,751       0
-    #         3      off   739 s     29      724.8   60,178,713      4,909       0
-    #         3      10%   611 s     30      724.8   33,246,072      4,771       0
+    #     overrun <  slack   the outer ellipse is unreachable; this knob, not the ellipse,
+    #                        is now what sizes the search, and `detour_slack_hops` is dead
+    #     overrun == slack   every ellipse cell stays reachable, by a shortest route through
+    #                        it; loops and second excursions are what get cut
+    #     overrun >  slack   buys backtracking room inside a container already fixed
     #
-    # At the shipped slack of 12 the ceiling cuts labels 3.47x and wall 1.49x for the same
-    # objective and no denials, and it also halves `arc nodes` -- cells unreachable within
-    # the hop budget are never expanded at all, so it shrinks the reachable corridor rather
-    # than only the label count. It is the stronger of the two levers here: slack 12 WITH
-    # the ceiling searches less than slack 3 without it, so the wide ellipse is affordable.
+    # Measured on colgen_test's first 50 flights at slack=3, no time limit, everything else
+    # equal (geodesics: min 4 hops, median 17, max 23):
     #
-    # Read the identical objective with care. This world is uncongested -- every arm places
-    # all 50 flights and reaches 724.8 -- so it cannot show what the ceiling costs. For a
-    # case where it does, see `test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows`.
-    max_air_overrun_frac: float = 0.10
+    #     ceiling   wall    iters  termination       objective   labels expanded   arc nodes
+    #           3   685 s      30  iteration_limit        724.8    36,702,755          4,982
+    #           6   788 s      30  iteration_limit        724.8    57,745,819          4,907
+    #           9   756 s      29  lp_gap                 724.8    59,448,491          4,907
+    #         off   757 s      29  lp_gap                 724.8    60,169,941          4,909
+    #
+    # All four place all 50 flights with zero denials at the SAME objective, so the ceiling
+    # is free here. What it buys falls off a cliff: at the pairing (3 == slack) it is 1.64x
+    # fewer labels, and one hop of slop above it recovers 96% of the unbounded label count.
+    # Loops are the whole prize, and they are all within one hop of the boundary.
+    #
+    # Read wall time per iteration, not raw -- the arms ran 29 or 30 iterations against the
+    # 30 cap. That is 22.8 s/iter at the pairing against 26.1 s/iter unbounded (1.15x), and
+    # 26.3 vs 26.1 at ceiling 6, i.e. nothing. Which side of the cap an arm landed on is a
+    # threshold artifact, as it was for `detour_slack_hops` above.
+    #
+    # Left at 12 to match the shipped `detour_slack_hops`, which is where the pairing rule
+    # puts it. The rule is geometric and holds for any slack; the 1.64x is measured only at
+    # slack=3, and 12/12 is untested.
+    max_air_overrun_hops: int = 12
     solver: str = "auto"
     max_iterations: int = 30
     time_limit_s: float = 120.0
@@ -147,6 +172,16 @@ class ColGenParams:
         if self.gap_metric not in {"revenue", "cost"}:
             raise ValueError("gap_metric must be 'revenue' or 'cost'")
 
+        if isinstance(self.max_air_overrun_hops, bool):
+            raise TypeError("max_air_overrun_hops must be an integer")
+        try:
+            overrun = operator.index(self.max_air_overrun_hops)
+        except TypeError as exc:
+            raise TypeError("max_air_overrun_hops must be an integer") from exc
+        if overrun < 0:
+            raise ValueError("max_air_overrun_hops must be non-negative")
+        object.__setattr__(self, "max_air_overrun_hops", overrun)
+
         for name in ("max_iterations", "n_heuristic_tries"):
             value = getattr(self, name)
             if isinstance(value, bool):
@@ -159,7 +194,7 @@ class ColGenParams:
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, normalized)
 
-        for name in ("time_limit_s", "lp_gap", "ip_gap", "M", "epsilon", "max_air_overrun_frac"):
+        for name in ("time_limit_s", "lp_gap", "ip_gap", "M", "epsilon"):
             value = getattr(self, name)
             if isinstance(value, bool):
                 raise TypeError(f"{name} must be a real number")
@@ -171,8 +206,6 @@ class ColGenParams:
                 raise ValueError(f"{name} must be finite")
             object.__setattr__(self, name, normalized)
 
-        if self.max_air_overrun_frac < 0.0:
-            raise ValueError("max_air_overrun_frac must be non-negative")
         if self.time_limit_s <= 0.0:
             raise ValueError("time_limit_s must be positive")
         if not 0.0 <= self.lp_gap < 1.0:

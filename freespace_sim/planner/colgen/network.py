@@ -744,7 +744,7 @@ class FlightGraph:
     max_step: int
     shortest_hops: int
     detour_slack_hops: int
-    # Hard ceiling on a priced route's hop count, from `params.max_air_overrun_frac`.
+    # Hard ceiling on a priced route's hop count, from `params.max_air_overrun_hops`.
     # Resolved here rather than in pricing so both searches over this domain agree on it
     # and so it participates in graph identity.
     max_air_hops: int
@@ -1522,12 +1522,17 @@ def build_flight_graph(
         slack,
     )
 
-    # `ceil`, so any positive fraction buys at least one hop of room: pinning a short
-    # flight to its exact geodesic would remove rerouting entirely for it.
-    overrun = float(getattr(params, "max_air_overrun_frac", 0.10))
-    if not math.isfinite(overrun) or overrun < 0.0:
-        raise ValueError(f"max_air_overrun_frac must be finite and non-negative, got {overrun!r}")
-    max_air_hops = shortest_hops + math.ceil(overrun * shortest_hops)
+    # A flat hop budget over the geodesic, identical for every flight (see ColGenParams,
+    # which owns the default and the rule pairing it with `detour_slack_hops`).  Read the
+    # same way as the slack above rather than through a `getattr` default, so there is one
+    # copy of that number: a second one here silently disagrees the moment either moves.
+    try:
+        overrun = operator.index(params.max_air_overrun_hops)
+    except (AttributeError, TypeError) as exc:
+        raise TypeError("params.max_air_overrun_hops must be an integer") from exc
+    if overrun < 0:
+        raise ValueError(f"max_air_overrun_hops must be non-negative, got {overrun}")
+    max_air_hops = shortest_hops + overrun
 
     return FlightGraph(
         request=frozen_request,

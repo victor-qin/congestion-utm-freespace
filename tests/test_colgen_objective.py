@@ -168,12 +168,12 @@ def _weighted_probe(ground_weight: float, air_weight: float):
         cost_air_lateral_per_s=air_weight,
         cost_air_hold_per_s=air_weight,
     )
-    # `max_air_overrun_frac` lifted: the ground-heavy arm's whole point is absorbing delay
-    # in the AIR by flying further, which is exactly what the air-time ceiling bounds. At
-    # the shipped 10% a 3-hop flight may fly 4, so the ceiling would decide this, not the
-    # objective -- and the objective is what is under test.
+    # The air-time ceiling is lifted: the ground-heavy arm's whole point is absorbing delay
+    # in the AIR by flying further, which is exactly what that ceiling bounds. At the
+    # shipped budget it would decide this test, not the objective -- and the objective is
+    # what is under test.
     graph, params = _graph(
-        cfg, dest=(3, 0), slack=1, objective="total_cost", max_air_overrun_frac=10.0
+        cfg, dest=(3, 0), slack=1, objective="total_cost", max_air_overrun_hops=64
     )
     rng = np.random.default_rng(7)
     cells = sorted(graph.corridor_cells)

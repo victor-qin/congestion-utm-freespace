@@ -1066,7 +1066,7 @@ def _best_column(
     seed_hop_limit = fg.shortest_hops + fg.detour_slack_hops
     if seed_hop_limit < 1:
         return -math.inf, None
-    # The air-time ceiling (`params.max_air_overrun_frac`, resolved at graph build).  Unlike
+    # The air-time ceiling (`params.max_air_overrun_hops`, resolved at graph build).  Unlike
     # `seed_hop_limit` this applies to EVERY search, which is the point: the ellipse bounds
     # how far off the straight line a route may stray, and nothing bounded how long it could
     # circle inside that ellipse.  A label at the cap cannot be extended, and one that could

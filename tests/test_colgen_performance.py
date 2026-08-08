@@ -268,15 +268,15 @@ def test_unrelated_rows_keep_the_canonical_seed_fast_path(monkeypatch):
 def test_negative_dual_disables_the_seed_locality_shortcut():
     """Even an off-seed negative row can make a longer route price best.
 
-    `max_air_overrun_frac` is lifted because this is precisely the lever it bounds: a
+    The air-time ceiling is lifted because this is precisely the lever it bounds: a
     negative dual is the master paying a flight to use an under-used row, and collecting
-    that credit costs hops. At the shipped 10% a 2-hop flight may fly 3, which is not
-    enough to reach the credited cell -- so this contract is about what pricing does when
-    the air-time ceiling is not the binding constraint.
+    that credit costs hops. With a small hop budget the credited cell is out of reach, so
+    this contract is about what pricing does when the ceiling is not the binding
+    constraint.
     """
 
     cfg = _cfg()
-    graph, params = _graph(cfg, max_air_overrun_frac=10.0)
+    graph, params = _graph(cfg, max_air_overrun_hops=64)
     credited = RowKey.cell((-2, 0), 0, 5)
     assert credited not in seed_column(graph, cfg).claims
 

@@ -488,6 +488,8 @@ def _pre_master_timeout_result(
             "gap_metric": params.gap_metric,
             "lp_gap_revenue": math.inf,
             "lp_gap_cost": math.inf,
+            "heuristic_gap_revenue": math.inf,
+            "heuristic_gap_cost": math.inf,
             "ip_gap_revenue": None,
             "pricing_wall_s": 0.0,
             "seeded_columns": 0,
@@ -616,6 +618,8 @@ class ColGenSolver:
                     "gap_metric": params.gap_metric,
                     "lp_gap_revenue": 0.0,
                     "lp_gap_cost": 0.0,
+                    "heuristic_gap_revenue": 0.0,
+                    "heuristic_gap_cost": 0.0,
                     "ip_gap_revenue": None,
                     "pricing_wall_s": 0.0,
                     "seeded_columns": 0,
@@ -1330,6 +1334,17 @@ class ColGenSolver:
                 )
                 if math.isfinite(last_lp_objective)
                 else math.inf
+            ),
+            # The heuristic gap on both scales, for the same reason the LP's is reported on
+            # both: `gap_metric` decides which one gates, and a run that stopped on
+            # `heuristic_gap` cannot otherwise be asked how converged it really was -- these
+            # were computed every iteration and then discarded with the loop frame.
+            # `heuristic_gap_cost` is also the quantity the `ip_skipped` decision uses.
+            "heuristic_gap_revenue": _relative_revenue_gap(
+                last_upper_bound, heuristic_objective
+            ),
+            "heuristic_gap_cost": _relative_cost_gap(
+                heuristic_cost, final_cost_lower_bound
             ),
             "ip_gap_revenue": ip_gap_revenue,
             "gap_metric": params.gap_metric,

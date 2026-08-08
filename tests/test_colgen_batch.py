@@ -455,7 +455,11 @@ def test_an_early_revenue_gap_close_is_flagged_against_the_cost_scale(monkeypatc
             params=ColGenParams(gap_metric="revenue"),
         )
 
-    assert any("cost-scale LP gap is still 1.17" in record.message for record in caplog.records)
+    assert any(
+        "stopped on the revenue-scale lp_gap" in record.message
+        and "still 1.17" in record.message
+        for record in caplog.records
+    )
 
 
 def test_a_genuinely_converged_solve_is_not_flagged(monkeypatch, caplog):
@@ -543,3 +547,42 @@ def test_the_iteration_cap_is_announced_like_the_other_truncated_exits(monkeypat
         )
 
     assert any("iteration cap (30)" in record.message for record in caplog.records)
+
+
+def test_a_heuristic_gap_stop_is_measured_against_the_heuristic_threshold(monkeypatch, caplog):
+    """`lp_gap` and `heuristic_gap` are different quantities against different thresholds.
+
+    The LP bound is gated by `lp_gap`; the incumbent by `ip_gap`. Quoting the LP's numbers
+    at a run that stopped on the heuristic's describes something that did not happen -- and
+    the honest value was not even in the stats to quote, having been computed per iteration
+    and discarded with the loop frame.
+    """
+
+    cfg = _cfg()
+    monkeypatch.setattr(
+        batch.ColGenSolver, "solve",
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+            columns={},
+            stats={
+                "termination_reason": "heuristic_gap", "iterations": 3,
+                # The LP's cost gap has closed; the HEURISTIC's has not. Keying on the
+                # former would stay silent on exactly the run worth warning about.
+                "lp_gap_cost": 1e-9, "heuristic_gap_cost": 0.42,
+            },
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=batch.__name__):
+        run_batch(
+            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
+            _RecordingDSS(),  # type: ignore[arg-type]
+            (), lambda *_args: None, None, None,
+            params=ColGenParams(gap_metric="revenue", ip_gap=1e-3),
+        )
+
+    assert any(
+        "stopped on the revenue-scale heuristic_gap" in record.message
+        and "still 0.42" in record.message
+        and "threshold 0.001" in record.message
+        for record in caplog.records
+    )

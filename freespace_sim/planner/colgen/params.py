@@ -28,7 +28,23 @@ class ColGenParams:
     ip_gap: float = 1e-3
     M: float = 1_000_000.0
     epsilon: float = 1e-6
-    n_heuristic_tries: int = 32
+    # Two consumers, and they scale differently.
+    #
+    # `master.round_heuristic` runs this many randomized-rounding restarts per iteration:
+    # measured at ~4.7 ms per try on a 425-column colgen_test master, so 32 -> 64 costs
+    # +147 ms per iteration against pricing sweeps of ~100 s. That is what the
+    # `heuristic_gap` termination and the `ip_skipped` decision key on, so the restarts buy
+    # a tighter incumbent for ~0.1% of a sweep.
+    #
+    # `_greedy_feasible_selection` also derives its candidate cap from this (x16), which is
+    # inert below 512 flights and NOT a simple cost above it: the stage splits its remaining
+    # budget evenly across the candidates, so a longer list gives each flight a SMALLER
+    # slice. Measured on 780 flights with a 1800 s deadline, 32 -> 64 took the stage from
+    # 650 s to 351 s -- reproducible with the arms in either order -- because more flights
+    # hit their local timeout and keep their existing column instead of searching for a
+    # better one. Faster, but by doing less per flight; the quality of that trade is not
+    # measured here.
+    n_heuristic_tries: int = 64
     objective: str = "total_delay"
     # Which scale the lp_gap / ip_gap thresholds are measured on.
     #   "revenue" -- the paper's equations (10) and (11): (UB - RMP)/RMP on the maximize

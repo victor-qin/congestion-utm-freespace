@@ -242,22 +242,32 @@ def run_batch(
     # the backend happened to return is.  A converged LP also says nothing about the
     # integrality gap over the pool it converged on.  So when the two scales disagree, say
     # so rather than let "lp_gap" read as "solved".
-    lp_gap_cost = stats.get("lp_gap_cost")
+    # Report the criterion that actually stopped the solve.  `lp_gap` and `heuristic_gap`
+    # are different quantities against different thresholds -- the LP bound against
+    # `lp_gap`, the incumbent against `ip_gap` -- and quoting the LP's numbers at a run
+    # that stopped on the heuristic's describes something that did not happen.
+    reason = stats.get("termination_reason")
+    cost_gap, threshold = (
+        (stats.get("heuristic_gap_cost"), batch_params.ip_gap)
+        if reason == "heuristic_gap"
+        else (stats.get("lp_gap_cost"), batch_params.lp_gap)
+    )
     if (
-        stats.get("termination_reason") in {"lp_gap", "heuristic_gap"}
+        reason in {"lp_gap", "heuristic_gap"}
         and batch_params.gap_metric == "revenue"
-        and isinstance(lp_gap_cost, float)
-        and lp_gap_cost > batch_params.lp_gap
+        and isinstance(cost_gap, float)
+        and cost_gap > threshold
     ):
         log.warning(
-            "colgen stopped on the revenue-scale %s at iteration %s, but the cost-scale LP "
-            "gap is still %.3g (threshold %g) -- the revenue scale is normalised by an "
-            "objective containing n*M (M=%g), so it closes early on a degenerate master. "
-            "Re-run with --colgen-gap-metric cost to price against total cost instead.",
-            stats.get("termination_reason"),
+            "colgen stopped on the revenue-scale %s at iteration %s, but the same gap on "
+            "the cost scale is still %.3g (threshold %g) -- the revenue scale is "
+            "normalised by an objective containing n*M (M=%g), so it closes early on a "
+            "degenerate master. Re-run with --colgen-gap-metric cost to price against "
+            "total cost instead.",
+            reason,
             stats.get("iterations", "?"),
-            lp_gap_cost,
-            batch_params.lp_gap,
+            cost_gap,
+            threshold,
             batch_params.M,
         )
 

@@ -19,8 +19,9 @@ from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen import dp_prepare, pricing
 from freespace_sim.planner.colgen.network import RowKey, build_flight_graph
 from freespace_sim.planner.colgen.params import ColGenParams
+from freespace_sim.planner.colgen.objective import DELAY_MODEL, cost_model
 from freespace_sim.planner.colgen.pricing import DualView
-from freespace_sim.types import FlightRequest, vec
+from freespace_sim.types import FlightRequest, Terminal, vec
 
 njit = pytest.importorskip("numba", reason="the compiled kernel needs numba").njit
 dp_kernel = pytest.importorskip("freespace_sim.planner.colgen.dp_kernel")
@@ -438,6 +439,177 @@ def test_kernel_mix_stays_inside_the_table():
 
 def test_warm_kernel_compiles_every_primitive():
     assert dp_kernel.warm_kernel() is True
+
+
+# ------------------------------------------------------------------------ the whole search
+
+
+def _reference_candidates(graph, cfg, view, params, monkeypatch, **kwargs):
+    """Every sink proposal `_best_column` registers, in the order it registers them.
+
+    Spies on `_Candidate` rather than re-deriving the set: that constructor runs exactly
+    once per accepted `(sink label, destination lane)` inside `consider_sink`, so this is
+    the reference's candidate list by construction rather than by reimplementation.
+    """
+
+    recorded = []
+    real = pricing._Candidate
+
+    def spy(reduced_cost, delay_s, label, dest_lane_idx):
+        candidate = real(reduced_cost, delay_s, label, dest_lane_idx)
+        recorded.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(pricing, "_Candidate", spy)
+    pricing._best_column(
+        graph, view, 0.0, cfg, kwargs.pop("benefit", 100.0), frozenset(),
+        seed=False, incumbent=None, model=kwargs.pop("model", None) or DELAY_MODEL,
+    )
+    return recorded
+
+
+def _kernel_candidates(graph, cfg, view, model, forbidden=frozenset()):
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+    duals = dp_prepare.prepare_duals(view, graph, topology, rows)
+    variants = dp_prepare.prepare_variants(
+        graph, cfg, view, topology, rows, benefit=100.0, pi_f=0.0,
+        cost_cutoff=None, model=model, forbidden_rows=forbidden,
+    )
+    pack = dp_prepare.prepare_forbidden(forbidden, graph, rows, topology)
+    result = dp_kernel.price_dag(
+        topology, rows, duals, variants, pack,
+        air_dt_s=model.air_weight * cfg.dt_s,
+    )
+    cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    out = []
+    for departure, lane, dest_lane, _step, label in result.candidates:
+        out.append((
+            departure,
+            None if lane < 0 else lane,
+            None if dest_lane < 0 else dest_lane,
+            tuple(cells[c] for c in result.paths[label]),
+        ))
+    return result, out
+
+
+def _terminal_graph(cfg, *, overrun: int = 4):
+    origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
+    o_term, d_term = Terminal("kern-A", 1, radius=90.0), Terminal("kern-B", 1, radius=90.0)
+    request = FlightRequest(
+        12, origin, dest, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term
+    )
+    params = ColGenParams(solver="highs", max_air_overrun_hops=overrun)
+    graph = build_flight_graph(request, cfg, [(origin, o_term), (dest, d_term)], params)
+    return graph, params
+
+
+GRAPH_SHAPES = {"plain": _graph, "terminal": _terminal_graph}
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "plain",
+        pytest.param(
+            "terminal",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "KNOWN BUG, not a tolerance: on a terminal graph the kernel misses 12 of "
+                    "the reference's sinks, all at (departure=8, origin_lane=2). Missing "
+                    "means the kernel over-merges somewhere -- its dominance is stricter than "
+                    "the reference's -- which is the one direction that costs an answer. "
+                    "Ruled out so far: the CSR arcs, the role masks and the destination-lane "
+                    "table all match the graph exactly (0 mismatches over 856 role checks), "
+                    "and `paid_class` interns the full `active_claims` set including term "
+                    "rows, so it is not collapsing states there. Prime remaining suspect is "
+                    "`first_hop`, which is inert on the plain fixture and live here: "
+                    "`_state_find` mixes it into the hash but never verifies it on a probe, "
+                    "so a hash collision merges two states that differ only in that field. "
+                    "strict=True so this flips to a failure the moment it is fixed."
+                ),
+            ),
+        ),
+    ],
+)
+def test_kernel_never_misses_a_sink_the_reference_finds_by_shape(shape, monkeypatch):
+    """The same inclusion on a terminal graph, where two more code paths come alive.
+
+    A terminal origin turns on `track_first_hop`, so the dominance key grows a field that is
+    inert on the plain fixture, and both endpoints claim *term* rows under the unpadded span
+    rule instead of *cell* rows. Neither is exercised by `colgen_test`-shaped graphs, and
+    both are the density shape.
+    """
+
+    cfg = _cfg()
+    graph, params = GRAPH_SHAPES[shape](cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model)
+    assert result.ok, result.status
+    if shape == "terminal":
+        topology = dp_prepare.prepare_topology(graph, cfg)
+        assert topology.track_first_hop, "fixture no longer exercises the first-hop field"
+
+    reference = _reference_candidates(graph, cfg, view, params, monkeypatch, model=model)
+    reference_side = {
+        (
+            candidate.label.departure_step,
+            candidate.label.origin_lane_idx,
+            candidate.dest_lane_idx,
+            tuple((q, r) for q, r in candidate.label.path),
+        )
+        for candidate in reference
+    }
+    assert reference_side, "the reference proposed nothing, so this proves nothing"
+    missing = reference_side - set(kernel_side)
+    assert not missing, f"{shape}: kernel missed {len(missing)}, e.g. {sorted(missing)[0]}"
+
+
+def test_kernel_never_misses_a_sink_the_reference_finds(monkeypatch):
+    """Every reference sink is proposed by the kernel; the kernel may propose more.
+
+    This is the load-bearing test of the whole search, and the direction of the inclusion is
+    the whole point. **Missing** a sink is a correctness failure -- the reference found a
+    column the kernel cannot certify. **Extra** sinks are the documented, deliberate cost of
+    `_price_dag` not applying `completion_can_compete`: `consider_sink` assigns to a
+    `nonlocal incumbent`, so the reference acquires a cutoff DURING its sweep even when
+    called with `incumbent=None`, and prunes against it from then on. The kernel holds one
+    cutoff per round and cannot. Tier 2 then certifies the extras away.
+
+    Measured on this fixture: the kernel proposes ~1.6x the reference's sinks and misses
+    none. That ratio is the cost of the omitted gate, and it is the number to re-read once
+    the gate lands -- it should collapse toward 1.0.
+    """
+
+    cfg = _cfg()
+    graph, params = _graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 31337), cfg)
+
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model)
+    assert result.ok, result.status
+    assert kernel_side, "the kernel proposed nothing, so this test proves nothing"
+
+    reference = _reference_candidates(graph, cfg, view, params, monkeypatch, model=model)
+    reference_side = [
+        (
+            candidate.label.departure_step,
+            candidate.label.origin_lane_idx,
+            candidate.dest_lane_idx,
+            tuple((q, r) for q, r in candidate.label.path),
+        )
+        for candidate in reference
+    ]
+
+    missing = set(reference_side) - set(kernel_side)
+    assert not missing, f"kernel missed {len(missing)} reference sinks, e.g. {sorted(missing)[0]}"
+    assert len(set(reference_side)) > 200, "the fixture is too small to be a real check"
+    # Pinned so the omitted gate's cost stays visible rather than drifting silently.
+    ratio = len(set(kernel_side)) / len(set(reference_side))
+    assert 1.0 <= ratio < 2.5, f"kernel/reference sink ratio {ratio:.2f} moved unexpectedly"
 
 
 # ------------------------------------------------------------------- label state helpers

@@ -33,6 +33,13 @@ def with_air_hops(fg: FlightGraph, max_air_hops: int) -> FlightGraph:
     ``init=False`` search cache cold.
     """
 
+    if max_air_hops < fg.shortest_hops:
+        # Below the geodesic nothing can complete, `price_flight` returns None, and a caller
+        # asserting on the column gets a confusing failure several frames away from the typo.
+        raise ValueError(
+            f"max_air_hops={max_air_hops} is below the graph's shortest path "
+            f"({fg.shortest_hops}); no route could complete"
+        )
     return replace(
         fg,
         max_air_hops=max_air_hops,

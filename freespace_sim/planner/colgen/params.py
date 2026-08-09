@@ -103,11 +103,18 @@ class ColGenParams:
     # BYTE-IDENTICAL schedule: all 50 columns agree on flight_id, departure_step, both lane
     # indices and full cell path. The 2.17x is `completion_envelope`'s ceiling cap, which stops
     # `completion_can_compete` keeping labels alive on completions the ceiling forbids -- see
-    # the comment on `max_total_hops` in pricing.py. The 36.3M reproduces table 2's 36.7M to
-    # within 1.2%, so its `labels` column and this one are the same quantity.
+    # the comment on `max_total_hops` in pricing.py.
     #
-    # (Wall was taken under uneven load and the counter itself is instrumentation, so read the
-    # label column, not the seconds. Both arms carried the same instrumentation.)
+    # The 2.17x is like-for-like WITHIN this pair -- one machine, one counter
+    # (`analysis/colgen_bounds_digest.py --label-counts`, which wraps `_prefer`), both arms
+    # instrumented identically. Do NOT read it against table 2's 36,702,755. That is the same
+    # order of magnitude as the 36,269,194 here, which is reassuring, but a deterministic solve
+    # under one counter would reproduce EXACTLY, and 1.2% apart does not: the two differ in
+    # counter definition, in the build the table was taken on, or both. Cross-table label
+    # comparisons are not supported; comparisons within a pair are.
+    #
+    # Wall was taken under uneven load and with the counter attached, so read the label column
+    # rather than the seconds.
     #
     # Every arm of both tables placed all 50 flights with zero denials at the SAME objective,
     # so neither bound cost anything on this world. Do not read the termination column as

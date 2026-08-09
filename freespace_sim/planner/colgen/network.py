@@ -745,8 +745,13 @@ class FlightGraph:
     shortest_hops: int
     # Hard ceiling on a priced route's hop count, from `params.max_air_overrun_hops`.
     # Resolved here rather than in pricing so both searches over this domain agree on it
-    # and so it participates in graph identity.  `max_air_hops - shortest_hops` is also the
-    # radius of `corridor_cells`: one knob sizes both (see `ColGenParams`).
+    # and so it participates in graph identity.
+    #
+    # AS BUILT BY `build_flight_graph`, `max_air_hops - shortest_hops` is also the radius of
+    # `corridor_cells` -- one knob sizes both (see `ColGenParams`).  That is a property of the
+    # builder, not of this type: a graph assembled by hand can carry a ceiling unrelated to its
+    # corridor, and `tests/_colgen_support.with_air_hops` does exactly that on purpose.  Nothing
+    # in pricing depends on the two agreeing; the ceiling is the operative bound either way.
     max_air_hops: int
     static_exclusions: AbstractSet[Cell]
     foreign_exclusions: AbstractSet[Cell]

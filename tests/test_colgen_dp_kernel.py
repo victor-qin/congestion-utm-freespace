@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 
 import numpy as np
 import pytest
@@ -19,7 +20,7 @@ from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen import dp_prepare, pricing
 from freespace_sim.planner.colgen.network import RowKey, build_flight_graph
 from freespace_sim.planner.colgen.params import ColGenParams
-from freespace_sim.planner.colgen.objective import DELAY_MODEL, cost_model
+from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel, cost_model
 from freespace_sim.planner.colgen.pricing import DualView
 from freespace_sim.types import FlightRequest, Terminal, vec
 
@@ -1018,3 +1019,268 @@ def test_kernel_paid_correction_matches_the_references_fsum_expression():
         paid_start, paid_cell, paid_step, paid_value, 1, 5, 11, 0, 1, partials
     )
     assert ok and value == 0.0
+
+
+# -------------------------------------------------------------- the production entry point
+
+
+def test_price_flight_takes_the_compiled_path_and_returns_the_reference_column():
+    """`price_flight` proves the compiled search and returns exactly what the oracle does.
+
+    The end-to-end shape of Phase 2c, and the one that would otherwise ship silently wrong:
+    every earlier test drives `price_dag` directly, so none of them notices if
+    `_best_column_compiled` falls back on every flight -- which reads as a correct, slow
+    solve rather than as a failure. Hence the assertion on `proved` as well as on the
+    column.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    seed = pricing.seed_column(graph, cfg, model=model)
+    incumbent = (
+        model.reduced_cost(
+            benefit=100.0, cost=seed.delay_s, dual_cost=view.claim_cost(seed.claims), pi_f=0.0
+        ),
+        seed,
+    )
+
+    (rc, column), proved = pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model
+    )
+    assert proved, "the compiled path refused a graph it is supposed to handle"
+    assert column is not None
+
+    ref_rc, ref_column = pricing._best_column(
+        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False,
+        incumbent=incumbent, model=model,
+    )
+    assert column == ref_column
+    assert rc == ref_rc
+
+
+def test_compiled_path_honours_forbidden_rows_without_falling_back():
+    """Repair runs INSIDE the kernel; a non-empty exclusion set is not a fallback trigger.
+
+    Required rather than optional: the sweep always passes `_EMPTY_ROWS` (solver.py), so
+    without this the whole repair path ships untested, and routing repair to Python was
+    rejected because it is O(flights) inside the greedy.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    rng = random.Random(4242)
+    forbidden = frozenset(
+        RowKey.cell(cell[0], cell[1], 0, step)
+        for cell in sorted(graph.corridor_cells)[:12]
+        for step in range(graph.min_step + 4, graph.min_step + 16)
+        if rng.random() < 0.25
+    )
+    assert len(forbidden) > 10
+
+    (rc, column), proved = pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, forbidden, incumbent=None, model=model
+    )
+    assert proved, "a non-empty forbidden set must not force the reference"
+    ref_rc, ref_column = pricing._best_column(
+        graph, view, 0.0, cfg, 100.0, forbidden, seed=False, incumbent=None, model=model
+    )
+    assert column == ref_column
+    assert rc == ref_rc
+    if column is not None:
+        assert column.claims.isdisjoint(forbidden)
+
+
+def test_compiled_path_respects_the_pricing_deadline():
+    """An expired deadline raises `PricingTimeout` rather than running to completion.
+
+    An `@njit(nogil=True)` function cannot read a clock, and with geometric budget growth
+    one call can run for minutes -- so the deadline is carried by a watchdog that sets the
+    kernel's `cancel` flag, polled per time layer. `solver.py` turns the exception into
+    `termination_reason = "time_limit"`, so swallowing it here would report a converged
+    solve that was actually cut off.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    with pytest.raises(pricing.PricingTimeout):
+        pricing._best_column_compiled(
+            graph, view, 0.0, cfg, 100.0, frozenset(),
+            incumbent=None, deadline=time.monotonic() - 1.0, model=model,
+        )
+
+
+def test_compiled_path_weights_the_label_score_in_the_objective_currency():
+    """A ground-heavy `CostModel` must still return the reference's column.
+
+    `[[colgen-label-score-currency]]`: at unit weights `ground + flown` is invariant within
+    a time layer, so the objective and raw seconds coincide and a mis-weighted score is
+    dormant. Under `total_cost` they diverge -- trading one step of ground for one hop of
+    air is free in seconds and worth `2*dt` in cost -- so only an asymmetric model can tell
+    the two apart.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = CostModel(ground_weight=9.0, air_weight=1.0)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    (rc, column), proved = pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
+    )
+    assert proved
+    ref_rc, ref_column = pricing._best_column(
+        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
+    )
+    assert column == ref_column
+    assert rc == ref_rc
+
+
+@pytest.mark.parametrize("overrun", [0, 1, 3, 9])
+def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
+    """The route-length bound is the only knob shaping the corridor, so sweep it.
+
+    `max_air_overrun_hops` sizes `max_air_hops`, which is simultaneously the ceiling, the
+    per-arc lookahead that truncates weaving, and (post-#78) the corridor. A kernel that
+    read the ceiling correctly but reconstructed the lookahead would pass at the shipped
+    value and fail everywhere else, which is what `[[colgen-ceiling-pairs-with-slack]]`
+    describes from the other direction.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg, overrun=overrun)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    (rc, column), proved = pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
+    )
+    ref_rc, ref_column = pricing._best_column(
+        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
+    )
+    assert proved
+    assert column == ref_column
+    assert rc == ref_rc
+
+
+def test_prepared_topology_is_built_once_per_graph():
+    """The packing is cached on the graph, because it is rebuilt every colgen iteration.
+
+    Measured at up to 80% of the compiled search's own time on a cheap density flight --
+    enough to make the compiled path a regression on the majority of a real sweep. The
+    assertion is on the CALL COUNT rather than on wall time so it cannot pass by accident
+    on a fast machine.
+    """
+
+    cfg = _cfg()
+    graph, _ = _terminal_graph(cfg)
+    calls = []
+    real = dp_prepare.prepare_topology
+
+    def counted(fg, config):
+        calls.append(fg.request.flight_id)
+        return real(fg, config)
+
+    dp_prepare.prepare_topology = counted
+    try:
+        first = dp_prepare.prepared_for(graph, cfg)
+        second = dp_prepare.prepared_for(graph, cfg)
+    finally:
+        dp_prepare.prepare_topology = real
+
+    assert len(calls) == 1, f"prepare_topology ran {len(calls)} times for one graph"
+    assert first[0] is second[0] and first[1] is second[1]
+    # A transported graph starts cold: the lock cannot be pickled and the payload is a
+    # memo, so `__reduce__` deliberately drops it.
+    assert type(graph._search_cache)().prepared is None
+
+
+def _random_case(rng, index):
+    """One randomized pricing subproblem: geometry, hop ceiling, endpoints and duals."""
+
+    cfg = _cfg(max_ground_delay_s=rng.choice((16.0, 48.0, 96.0)))
+    origin = (0, 0)
+    dest = (rng.randint(2, 5), rng.randint(-3, 1))
+    if dest == origin:
+        dest = (3, -1)
+    overrun = rng.choice((0, 1, 3, 9))
+    terminal = bool(index % 2)
+    o, d = _point(origin, cfg), _point(dest, cfg)
+    params = ColGenParams(solver="highs", max_air_overrun_hops=overrun)
+    if terminal:
+        o_term = Terminal(f"rnd-A{index}", 1, radius=90.0)
+        d_term = Terminal(f"rnd-B{index}", 1, radius=90.0)
+        request = FlightRequest(
+            index, o, d, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term
+        )
+        statics = [(o, o_term), (d, d_term)]
+    else:
+        request = FlightRequest(index, o, d, 0.0, 0.0)
+        statics = ()
+    graph = build_flight_graph(request, cfg, statics, params)
+    model = rng.choice(
+        (cost_model(params, cfg), CostModel(ground_weight=9.0, air_weight=1.0))
+    )
+    return cfg, graph, model, DualView(_random_duals(graph, cfg, rng.randrange(1 << 30)), cfg)
+
+
+def test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs():
+    """The load-bearing sweep: the same COLUMN, not merely the same reduced cost.
+
+    Reduced-cost equality is the weak claim and the one that hides the real failure. Two
+    equally optimal columns score identically, so a search that broke a dominance tie the
+    other way passes an RC check and still returns a different trajectory -- which changes
+    the next iteration's duals and compounds across the solve. Hence `column == ref_column`.
+
+    Randomized over the axes that reshape the search rather than merely rescale it:
+    geometry (so `shortest_hops` and the corridor move), the hop ceiling (the only
+    route-length bound post-#78, which is simultaneously ceiling, per-arc lookahead and
+    corridor), the endpoint shape (terminal turns on `track_first_hop` and the unpadded
+    `term`-row span rule), the objective weights (`[[colgen-label-score-currency]]`), and
+    the duals.
+    """
+
+    rng = random.Random(20260810)
+    compared = nontrivial = 0
+    for index in range(40):
+        cfg, graph, model, view = _random_case(rng, index)
+        incumbent = None
+        if index % 3 == 0:
+            try:
+                seed = pricing.seed_column(graph, cfg, model=model)
+            except ValueError:
+                seed = None
+            if seed is not None:
+                incumbent = (
+                    model.reduced_cost(
+                        benefit=100.0,
+                        cost=seed.delay_s,
+                        dual_cost=view.claim_cost(seed.claims),
+                        pi_f=0.0,
+                    ),
+                    seed,
+                )
+
+        (rc, column), proved = pricing._best_column_compiled(
+            graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model
+        )
+        if not proved:
+            continue
+        ref_rc, ref_column = pricing._best_column(
+            graph, view, 0.0, cfg, 100.0, frozenset(), seed=False,
+            incumbent=incumbent, model=model,
+        )
+        compared += 1
+        nontrivial += column is not None
+        assert column == ref_column, f"case {index}: different column"
+        assert rc == ref_rc, f"case {index}: {rc!r} != {ref_rc!r}"
+
+    assert compared >= 30, f"only {compared} cases were proved; the sweep proves little"
+    assert nontrivial >= 20, f"only {nontrivial} cases found a column at all"

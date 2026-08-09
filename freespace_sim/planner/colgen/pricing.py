@@ -18,6 +18,8 @@ point and the module-level constants for the pruning envelopes.
 from __future__ import annotations
 
 import math
+import sys
+import threading
 import time
 import heapq
 import itertools
@@ -37,6 +39,7 @@ from ...volumes import (
     exit_radius,
 )
 from .. import hexgrid as hg
+from . import dp_prepare
 from .network import (
     _MAX_ENDPOINT_CLAIMS,
     Cell,
@@ -1121,6 +1124,72 @@ def _column_sort_key(column: Column) -> tuple[Any, ...]:
     )
 
 
+def _certify_candidates(
+    candidates: list[_Candidate],
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel = DELAY_MODEL,
+    *,
+    incumbent: tuple[float, Column] | None = None,
+    deadline: float | None = None,
+) -> tuple[float, Column] | None:
+    """Tier 2: rank sink proposals and return the best certified column, or ``None``.
+
+    This is ``_best_column``'s own post-loop block, and it lives here rather than inside it
+    because the compiled Tier 1 produces the same proposals and must be ranked by the same
+    rule. Two copies of a tie-break is how the two searches quietly start preferring
+    different -- equally optimal -- columns, which is precisely what the parity gate
+    measures and precisely the failure that does not raise.
+
+    ``incumbent`` is the score already certified before ranking started: ``_best_column``
+    passes the one ``consider_sink`` improved during its sweep, and the compiled host
+    passes the one its pause-and-resume protocol arrived at. It is what the early
+    ``_RECOMPUTE_EPS`` break is measured against, so passing ``None`` is not a neutral
+    default -- it certifies far more candidates than the reference would.
+    """
+
+    if not candidates:
+        return incumbent
+    candidates.sort(key=lambda candidate: (-candidate.reduced_cost, candidate.tie_key))
+
+    best: tuple[float, Column] | None = incumbent
+    for candidate_index, candidate in enumerate(candidates):
+        if candidate_index % 128 == 0:
+            _check_deadline(deadline)
+        # Provisional and canonical RC differ only at floating resampling ulps.
+        # Once below the best by a generous numerical envelope, no later label
+        # can win; exact ties are still certified and broken deterministically.
+        if best is not None and candidate.reduced_cost < best[0] - _RECOMPUTE_EPS:
+            break
+        canonical = _canonical_candidate(
+            candidate,
+            fg,
+            dual_view,
+            pi_f,
+            cfg,
+            benefit,
+            forbidden_rows,
+            model,
+        )
+        if canonical is None:
+            continue
+        if best is None:
+            best = canonical
+            continue
+        rc, column = canonical
+        best_rc, best_column = best
+        column_key = _column_sort_key(column)
+        best_key = _column_sort_key(best_column)
+        if rc > best_rc + _SCORE_EPS or (abs(rc - best_rc) <= _SCORE_EPS and column_key < best_key):
+            best = canonical
+
+    return best
+
+
 def _best_column(
     fg: FlightGraph,
     dual_view: DualView,
@@ -1715,42 +1784,295 @@ def _best_column(
                 if _prefer(next_label, next_layer.get(key)):
                     next_layer[key] = next_label
 
-    if not candidates:
-        return (-math.inf, None) if incumbent is None else incumbent
-    candidates.sort(key=lambda candidate: (-candidate.reduced_cost, candidate.tie_key))
-
-    best: tuple[float, Column] | None = incumbent
-    for candidate_index, candidate in enumerate(candidates):
-        if candidate_index % 128 == 0:
-            _check_deadline(deadline)
-        # Provisional and canonical RC differ only at floating resampling ulps.
-        # Once below the best by a generous numerical envelope, no later label
-        # can win; exact ties are still certified and broken deterministically.
-        if best is not None and candidate.reduced_cost < best[0] - _RECOMPUTE_EPS:
-            break
-        canonical = _canonical_candidate(
-            candidate,
-            fg,
-            dual_view,
-            pi_f,
-            cfg,
-            benefit,
-            forbidden_rows,
-            model,
-        )
-        if canonical is None:
-            continue
-        if best is None:
-            best = canonical
-            continue
-        rc, column = canonical
-        best_rc, best_column = best
-        column_key = _column_sort_key(column)
-        best_key = _column_sort_key(best_column)
-        if rc > best_rc + _SCORE_EPS or (abs(rc - best_rc) <= _SCORE_EPS and column_key < best_key):
-            best = canonical
-
+    best = _certify_candidates(
+        candidates,
+        fg,
+        dual_view,
+        pi_f,
+        cfg,
+        benefit,
+        forbidden_rows,
+        model,
+        incumbent=incumbent,
+        deadline=deadline,
+    )
     return (-math.inf, None) if best is None else best
+
+
+_kernel_fallback_warned = False
+
+
+def _dp_kernel():
+    """The compiled kernel module, or ``None`` when numba is unavailable.
+
+    Warns once per process rather than per flight. The warning exists because the failure
+    is silent and expensive: a sweep that quietly ran the reference everywhere looks
+    exactly like a slow sweep, and ``[[run-astar-with-compiled-extra]]`` records the same
+    lesson from the A* side, where a 5-7x regression stayed invisible for a whole issue.
+    """
+
+    global _kernel_fallback_warned
+    try:
+        from . import dp_kernel
+    except ImportError:
+        if not _kernel_fallback_warned:
+            _kernel_fallback_warned = True
+            print(
+                "WARNING: compiled colgen pricing kernel unavailable (numba import "
+                "failed) -- using the pure-Python reference search",
+                file=sys.stderr,
+            )
+        return None
+    return dp_kernel
+
+
+def _dag_candidates(
+    result,
+    topology,
+    fg: FlightGraph,
+    cfg: SimConfig,
+    dual_view: DualView,
+    pi_f: float,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel,
+    *,
+    deadline: float | None = None,
+) -> list[_Candidate]:
+    """Price the compiled search's sinks into the ``_Candidate`` list Tier 2 ranks.
+
+    This is ``consider_sink``'s pricing half -- the part the kernel cannot do, because
+    ``_path_delay_s`` reaches ``fold_corners_to_columns`` and a ``np.linalg.norm(...).sum()``
+    whose pairwise summation numba does not reproduce.
+
+    Two memos that the reference declines and this is entitled to, both answer-identical:
+
+    * ``_path_claims``' own ``endpoint_cache``/``visit_cache`` parameters, which exist for
+      exactly this caller. Sink proposals share path prefixes and corridor start steps;
+      measured 90% redundant (1106 calls, 114 distinct) on one ranking pass.
+    * the provisional reduced cost itself, per LABEL rather than per lane. Neither
+      ``_path_claims`` (which opens with ``del dest_lane_idx``) nor ``_path_delay_s`` takes
+      the destination lane, so the reference recomputes an identical number once per lane
+      on every multi-lane arrival.
+
+    The two ``forbidden_rows`` gates are applied here rather than in the kernel, which is
+    why the kernel is allowed to register a sink the reference rejects: reproducing the two
+    endpoint span rules in numba to save work Tier 2 redoes anyway would be a second place
+    for them to drift.
+    """
+
+    cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    endpoint_cache: dict[tuple[bool, int, int], frozenset[RowKey]] = {}
+    visit_cache: dict[tuple[Cell, int], frozenset[RowKey]] = {}
+    priced: dict[int, tuple[frozenset[RowKey], float, float] | None] = {}
+    labels: dict[int, _Label] = {}
+    candidates: list[_Candidate] = []
+
+    for index, entry in enumerate(result.candidates):
+        if index % 128 == 0:
+            _check_deadline(deadline)
+        departure_step, origin_lane, dest_lane, arrival_step, label_index = entry
+        label = labels.get(label_index)
+        if label is None:
+            label = _Label(
+                0.0,
+                departure_step,
+                None if origin_lane < 0 else origin_lane,
+                tuple(cells[cell] for cell in result.paths[label_index]),
+                _EMPTY_ROWS,
+            )
+            labels[label_index] = label
+        entry_priced = priced.get(label_index, ...)
+        if entry_priced is ...:
+            destination_claims = _endpoint_claims(
+                fg, cfg, origin=False, step=arrival_step, timing_steps=label.hops
+            )
+            claims = _path_claims(fg, cfg, label, None, endpoint_cache, visit_cache)
+            if not destination_claims.isdisjoint(forbidden_rows) or not claims.isdisjoint(
+                forbidden_rows
+            ):
+                entry_priced = None
+            else:
+                delay_s = _path_delay_s(fg, cfg, label, model)
+                entry_priced = (
+                    claims,
+                    delay_s,
+                    model.reduced_cost(
+                        benefit=benefit,
+                        cost=delay_s,
+                        dual_cost=dual_view.claim_cost(claims),
+                        pi_f=pi_f,
+                    ),
+                )
+            priced[label_index] = entry_priced
+        if entry_priced is None:
+            continue
+        _claims, delay_s, reduced_cost = entry_priced
+        candidates.append(
+            _Candidate(
+                reduced_cost, delay_s, label, None if dest_lane < 0 else dest_lane
+            )
+        )
+    return candidates
+
+
+def _best_column_compiled(
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    *,
+    incumbent: tuple[float, Column] | None = None,
+    deadline: float | None = None,
+    model: CostModel = DELAY_MODEL,
+) -> tuple[tuple[float, Column | None], bool]:
+    """``_best_column`` over the compiled search: ``((reduced_cost, column), proved)``.
+
+    ``proved`` is the whole contract. ``True`` means the compiled search ran to completion,
+    and because it reproduces the reference's explored set exactly -- same roots, same
+    completion gate, same mid-sweep incumbent, same dominance ties -- its sink set is the
+    reference's, so ranking it gives the reference's column. ``False`` means the caller
+    must run ``_best_column``: numba missing, a graph the packer refuses (multi-level, no
+    reachable destination), or a budget the kernel could not grow into.
+
+    Note what ``proved`` is NOT: a residual-bound argument over a superset search. PR #76
+    needed one because its kernel searched more than the reference and certified
+    separately. This one does not, which is why there is no bootstrap round and no
+    ``label_limit`` ladder here -- ``price_dag`` grows its own budgets and either finishes
+    or says it did not.
+
+    A deadline is enforced two ways, because neither alone is enough: ``_check_deadline``
+    between the Python stages, and a watchdog that sets the kernel's ``cancel`` flag, which
+    it polls per time layer. An ``@njit(nogil=True)`` function cannot read a clock, and
+    with geometric budget growth one call can run for minutes.
+    """
+
+    kernel = _dp_kernel()
+    if kernel is None or len(fg.levels) != 1:
+        return (-math.inf, None), False
+
+    _check_deadline(deadline)
+    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if not (topology.ok and rows.ok):
+        return (-math.inf, None), False
+
+    duals = dp_prepare.prepare_duals(dual_view, fg, topology, rows)
+    envelopes = dp_prepare.CompletionEnvelopes(
+        fg,
+        cfg,
+        dual_view,
+        benefit=benefit,
+        pi_f=pi_f,
+        model=model,
+        forbidden_rows=forbidden_rows,
+        incumbent=incumbent,
+        deadline=deadline,
+    )
+    variants = dp_prepare.prepare_variants(
+        fg,
+        cfg,
+        dual_view,
+        topology,
+        rows,
+        benefit=benefit,
+        pi_f=pi_f,
+        cost_cutoff=None if incumbent is None else incumbent[0],
+        model=model,
+        forbidden_rows=forbidden_rows,
+        envelopes=envelopes,
+    )
+    if not variants.ok:
+        return (-math.inf, None), False
+    pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
+
+    with fg._search_cache.lock:
+        budget = fg._search_cache.dag_budget
+    sizes = {}
+    if budget is not None:
+        # What the last completed search on this graph needed.  The duals move every
+        # iteration but the geometry does not, so this is a good estimate and never more
+        # than an estimate -- `price_dag` still grows from it if this iteration explores
+        # further.  A budget bounds work, never the search, so it cannot move an answer.
+        sizes = dict(
+            label_capacity=budget[0], log2cap=budget[1], candidate_capacity=budget[2]
+        )
+
+    cancel = np.zeros(1, dtype=np.uint8)
+    watchdog = None
+    if deadline is not None:
+        _check_deadline(deadline)
+        watchdog = threading.Timer(
+            max(0.0, deadline - time.monotonic()), _cancel_search, args=(cancel,)
+        )
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        result = kernel.price_dag(
+            topology,
+            rows,
+            duals,
+            variants,
+            pack,
+            air_weight=model.air_weight,
+            dt_s=cfg.dt_s,
+            benefit=benefit,
+            pi_f=pi_f,
+            envelopes=envelopes,
+            certify=_sink_certifier(
+                fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model, deadline=deadline
+            ),
+            cancel=cancel,
+            **sizes,
+        )
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+
+    if result.status == kernel.STATUS_CANCELLED:
+        # The watchdog fired, so the deadline has passed.  Falling back to the reference
+        # here would spend the caller's whole remaining budget re-running what was just
+        # abandoned; `solver.py` turns this into `termination_reason = "time_limit"`.
+        _check_deadline(deadline)
+        return (-math.inf, None), False
+    if result.status != kernel.STATUS_OK:
+        return (-math.inf, None), False
+
+    with fg._search_cache.lock:
+        fg._search_cache.dag_budget = result.budget
+
+    candidates = _dag_candidates(
+        result,
+        topology,
+        fg,
+        cfg,
+        dual_view,
+        pi_f,
+        benefit,
+        forbidden_rows,
+        model,
+        deadline=deadline,
+    )
+    best = _certify_candidates(
+        candidates,
+        fg,
+        dual_view,
+        pi_f,
+        cfg,
+        benefit,
+        forbidden_rows,
+        model,
+        incumbent=result.incumbent,
+        deadline=deadline,
+    )
+    return ((-math.inf, None) if best is None else best), True
+
+
+def _cancel_search(flag) -> None:
+    """Watchdog body: ask the kernel to stop at its next time layer."""
+
+    flag[0] = 1
 
 
 def find_feasible_column(
@@ -2235,18 +2557,40 @@ def price_flight(
         )
         if incumbent is None or known_rc > incumbent[0] + _SCORE_EPS:
             incumbent = (known_rc, known_column)
-    reduced_cost, column = _best_column(
+    # The compiled search first, the reference when it cannot prove it ran to completion.
+    # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
+    # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of
+    # flights, and the exclusion set is a bitset over dense row ids inside the kernel.
+    (reduced_cost, column), proved = _best_column_compiled(
         fg,
         view,
         pi_value,
         cfg,
         benefit,
         forbidden,
-        seed=False,
         incumbent=incumbent,
         deadline=deadline,
         model=model,
     )
+    if not proved:
+        # The ORIGINAL incumbent, deliberately, not whatever the abandoned compiled attempt
+        # managed to certify first.  Warm-starting the fallback would be optimality-safe --
+        # pruning against an achievable score never discards anything strictly better -- but
+        # it is not parity-safe: a stronger cutoff explores less than the reference did and
+        # can return a different, equally optimal column.  The fallback exists to reproduce
+        # the oracle, and it is rare enough that its speed is not the thing to optimize.
+        reduced_cost, column = _best_column(
+            fg,
+            view,
+            pi_value,
+            cfg,
+            benefit,
+            forbidden,
+            seed=False,
+            incumbent=incumbent,
+            deadline=deadline,
+            model=model,
+        )
     if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
         return reduced_cost, None
     if known_column is not None and column == known_column:

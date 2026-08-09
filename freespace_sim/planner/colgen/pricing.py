@@ -1058,11 +1058,12 @@ def _best_column(
         return entry
 
     origin_options = _origin_options(fg)
-    # ``detour_slack_hops`` sizes the spatial ellipse; it is not a route-length
-    # budget.  Ordinary pricing may spend the clock slack on W-separated wide
-    # loops (the network's en-route-waiting lever), subject to the canonical
-    # detour gate at the sink.  A zero-dual seed has no reason to loop, so its
-    # tighter hop limit avoids exploring value-tied cyclic walks.
+    # ``detour_slack_hops`` sizes the spatial ellipse, so this is a route-length bound
+    # denominated in a knob that does not measure route length -- deliberately, and only for
+    # SEEDS.  A zero-dual seed has no reason to loop at all, so bounding it by the container's
+    # own radius keeps it off the value-tied cyclic walks a wider budget would let it explore.
+    # Every other search is bounded by ``air_hop_limit`` below, which is the honest budget;
+    # when the two knobs are paired these coincide and this line does nothing extra.
     seed_hop_limit = fg.shortest_hops + fg.detour_slack_hops
     if seed_hop_limit < 1:
         return -math.inf, None

@@ -311,11 +311,13 @@ def test_completion_envelope_never_costs_a_hop_count_the_ceiling_forbids(monkeyp
     break fires at `total_hops == 1` or never.
 
     `timing_steps` on a destination-endpoint claim IS the hop count, so watching that argument
-    states the invariant directly and without reaching into a closure. Measured against the
-    pre-#78 build this fails by exactly one call per key -- the break evaluates `ceiling + 1`
-    before it fires -- which is also the honest size of the saving on this scenario. The point
-    is the bound, not the hop: it now holds by construction rather than by an argument about a
-    break two functions away.
+    states the invariant directly and without reaching into a closure.
+
+    Do not read the small number of over-ceiling calls this catches as the size of what the cap
+    buys. Construction is the cheap half; the envelope's LENGTH is the expensive half, because
+    it bounds `completion_can_compete`'s scan and an entry past the ceiling keeps a label alive
+    on a completion the ceiling forbids. That is worth 2.17x the labels on the 50-flight
+    harness. This test guards the invariant those savings rest on, not the savings.
     """
 
     # A wide ground-delay budget is what opens the gap this guards: `max_step` has to cover the

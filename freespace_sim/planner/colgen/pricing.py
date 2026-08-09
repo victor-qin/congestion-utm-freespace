@@ -1203,23 +1203,30 @@ def _best_column(
         # The horizon term is ~920 hops for an early colgen_test departure against a ceiling of
         # ~20, and every entry past the ceiling describes a completion the search cannot make.
         #
-        # NOT a large saving, and the comment is here to stop the next reader assuming it is.
-        # The `break` below already contains the loop whenever it CAN fire, and measured on
-        # colgen_test it fires at exactly `max_air_hops + 1` -- one wasted `_endpoint_claims`
-        # per (departure, lane), not nine hundred.  What this buys is that the containment stops
-        # depending on the break, which needs `delay_lb` monotone in hops: true in the arc form,
-        # false in the ground-only fallback where it is CONSTANT and the break fires at
-        # `total_hops == 1` or never.  "Never" means the full horizon range.  Reaching that
-        # fallback needs `reference_time_s <= 0` or an inexact fold, and lanes are the boundary
-        # ring of the same `exit_radius` the fold measures against, so no colgen_test flight
-        # does (checked: 0 of 50).  A cheap guard on an awkward path, not a hot-path win.
+        # THE COST OF THOSE ENTRIES IS NOT THE POINT, and measuring it is how you talk yourself
+        # out of this line.  Building one costs an `_endpoint_claims` call, and the `break`
+        # below already contains THAT to `max_air_hops + 1`, so construction waste is one call
+        # per (departure, lane).  The length of the result is what matters: it bounds
+        # `completion_can_compete`'s scan (`range(first_hops, len(delay_lbs))`), which keeps a
+        # label alive as soon as SOME hop count in range could beat the incumbent.  Entries past
+        # the ceiling let a label survive on the strength of a completion the ceiling forbids.
+        # Measured on the 50-flight harness in `ColGenParams`: 36.3M labels -> 16.7M, 2.17x, at
+        # a byte-identical schedule and objective.
         #
-        # Exact, not a heuristic: `completion_can_compete` reads a short envelope as "cannot
-        # compete", which is the right verdict for an unreachable hop count, and no caller can
-        # ask about one -- every label satisfies `hops + remaining_distance <= max_air_hops` by
-        # the guards in the two loops below.  Keep the `min()` rather than the ceiling alone:
-        # the two are provably equal today (single level, so `takeoff_steps[0]` is the max), but
-        # the horizon is a real bound and should stay visible if `_graph_max_step` changes.
+        # Exact, not a heuristic.  A completion above `max_air_hops` cannot occur, so a label
+        # that only competes there could never have won; `completion_can_compete` reading a
+        # short envelope as "cannot compete" is the right verdict.  And no caller is cut off
+        # early: every label satisfies `hops + remaining_distance <= max_air_hops` by the guards
+        # in the two loops below, so `first_hops` is always inside the capped range.
+        #
+        # The `break` also cannot be relied on to do this.  It needs `delay_lb` monotone in
+        # hops, which holds in the arc form and NOT in the ground-only fallback, where
+        # `delay_lb` is constant and the break fires at `total_hops == 1` or never -- "never"
+        # meaning the full horizon range.
+        #
+        # Keep the `min()` rather than the ceiling alone: the two are provably equal today
+        # (single level, so `takeoff_steps[0]` is the max), but the horizon is a real bound and
+        # should stay visible if `_graph_max_step` changes.
         max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
         delay_lbs = [math.inf]
         destination_positive_costs = [math.inf]

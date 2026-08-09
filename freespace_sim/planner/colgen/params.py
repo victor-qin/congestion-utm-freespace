@@ -92,16 +92,27 @@ class ColGenParams:
     #           9   756 s      29  lp_gap                 724.8    59,448,491          4,907
     #         off   757 s      29  lp_gap                 724.8    60,169,941          4,909
     #
-    # THE ONE LIVE ROW IS TABLE 2'S FIRST: 3 == 3 was the shipped pairing, so it is the only
-    # measurement that still describes a configuration this code can produce, and it is the
-    # default set below. Against table 1's corridor-12-no-ceiling arm it is 36.7M labels where
-    # that was 124.6M -- 3.4x less search for the same objective and the same 50 placements.
+    # Table 2's first row is the shipped 3 == 3 pairing, so it is the closest either table comes
+    # to the configuration below -- but it too was taken on pre-#78 code and has been superseded.
+    # Re-measured on the same harness, `main` at `31891be` against this build, at the default:
+    #
+    #     build           wall    iters  termination       objective   labels        arc nodes
+    #     31891be        686 s      30  iteration_limit   724.840287   36,269,194        4,983
+    #     this (issue78) 454 s      30  iteration_limit   724.840287   16,680,454        4,983
+    #
+    # BYTE-IDENTICAL schedule: all 50 columns agree on flight_id, departure_step, both lane
+    # indices and full cell path. The 2.17x is `completion_envelope`'s ceiling cap, which stops
+    # `completion_can_compete` keeping labels alive on completions the ceiling forbids -- see
+    # the comment on `max_total_hops` in pricing.py. The 36.3M reproduces table 2's 36.7M to
+    # within 1.2%, so its `labels` column and this one are the same quantity.
+    #
+    # (Wall was taken under uneven load and the counter itself is instrumentation, so read the
+    # label column, not the seconds. Both arms carried the same instrumentation.)
     #
     # Every arm of both tables placed all 50 flights with zero denials at the SAME objective,
     # so neither bound cost anything on this world. Do not read the termination column as
     # "3 converges and the others do not": every arm sat at or one below the 30-iteration cap,
-    # so which side of it they landed on is a threshold artifact. Read wall per iteration, not
-    # raw -- 22.8 s/iter at 3/3 against 26.1 s/iter unbounded (1.15x).
+    # so which side of it they landed on is a threshold artifact.
     #
     # THE CAVEAT THAT COMES WITH ALL OF IT: both tables are one UNCONGESTED 50-flight world,
     # and this knob exists so pricing can route AROUND congestion -- exactly what a denser

@@ -30,6 +30,7 @@ from freespace_sim.planner.colgen.network import (
     RowIndex,
     RowKey,
     StaticTerminalCatalog,
+    _graph_max_step,
     build_flight_graph,
     column_claims,
 )
@@ -152,11 +153,11 @@ def _column_for(
     cfg: SimConfig,
     *,
     departure_step: int | None = None,
-    slack: int = 12,
+    overrun: int = 12,
 ) -> tuple[Column, object]:
     """Build a graph-valid column and populate claims through the production owner."""
 
-    fg = build_flight_graph(req, cfg, [], ColGenParams(detour_slack_hops=slack))
+    fg = build_flight_graph(req, cfg, [], ColGenParams(max_air_overrun_hops=overrun))
     departure_step = fg.base_step if departure_step is None else departure_step
     origin_lane_idx = None
     dest_lane_idx = None
@@ -256,8 +257,9 @@ def test_row_index_interns_stably_and_uses_terminal_pad_capacity():
         rows.cap(-1)
 
 
-def test_params_validate_integral_nonnegative_slack():
-    assert ColGenParams(np.int64(3)).detour_slack_hops == 3
+def test_params_validate_integral_nonnegative_overrun():
+    # `max_air_overrun_hops` is the first field, so these positional forms reach it.
+    assert ColGenParams(np.int64(3)).max_air_overrun_hops == 3
     with pytest.raises(TypeError, match="must be an integer"):
         ColGenParams(1.5)
     with pytest.raises(ValueError, match="non-negative"):
@@ -274,16 +276,19 @@ def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
         4.1,
         9.2,
     )
-    slack = 4
-    fg = build_flight_graph(req, cfg, [], ColGenParams(detour_slack_hops=slack))
+    overrun = 4
+    fg = build_flight_graph(req, cfg, [], ColGenParams(max_air_overrun_hops=overrun))
 
     assert fg.origin_cell == origin_cell and fg.dest_cell == dest_cell
     assert set(_shortest_path(origin_cell, dest_cell)) <= fg.corridor_cells
     assert all(
         hg.hex_distance(origin_cell, cell) + hg.hex_distance(cell, dest_cell)
-        <= fg.shortest_hops + slack
+        <= fg.shortest_hops + overrun
         for cell in fg.corridor_cells
     )
+    # One knob sizes both, so the corridor radius is recoverable from the graph: there is no
+    # separate field that could disagree with it.
+    assert fg.max_air_hops - fg.shortest_hops == overrun
     assert fg.base_step == math.ceil(req.t_departure / cfg.dt_s)
     assert fg.latest_departure_step == fg.base_step + math.floor(cfg.max_ground_delay_s / cfg.dt_s)
     rebuilt = pickle.loads(pickle.dumps(fg))
@@ -328,7 +333,7 @@ def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
         req,
         cfg,
         [(_ground_point((0, 20), cfg), wall)],
-        ColGenParams(detour_slack_hops=12),
+        ColGenParams(max_air_overrun_hops=12),
     )
 
     assert not graph.corridor_cells.is_materialized
@@ -363,7 +368,7 @@ def test_static_catalog_is_shared_without_rebuilding_terminal_cells(monkeypatch)
         FlightRequest(121, _ground_point((-5, 5), cfg), _ground_point((5, 5), cfg), 0.0),
     )
     graphs = tuple(
-        build_flight_graph(request, cfg, catalog, ColGenParams(detour_slack_hops=2))
+        build_flight_graph(request, cfg, catalog, ColGenParams(max_air_overrun_hops=2))
         for request in requests
     )
 
@@ -394,7 +399,7 @@ def test_many_far_walls_never_reach_narrow_phase(monkeypatch):
         request,
         cfg,
         catalog,
-        ColGenParams(detour_slack_hops=2),
+        ColGenParams(max_air_overrun_hops=2),
     )
     calls = 0
     original_conflict = network_module.volumes_conflict
@@ -422,7 +427,7 @@ def test_lazy_outgoing_arcs_expand_each_source_once():
         _ground_point((4, 0), cfg),
         0.0,
     )
-    graph = build_flight_graph(req, cfg, (), ColGenParams(detour_slack_hops=2))
+    graph = build_flight_graph(req, cfg, (), ColGenParams(max_air_overrun_hops=2))
 
     first = graph.outgoing_neighbors(graph.origin_cell)
     after_first = dict(graph.arc_cache_stats)
@@ -455,7 +460,7 @@ def test_lazy_static_arc_verdicts_match_eager_reference():
         req,
         cfg,
         ((wall_center, wall),),
-        ColGenParams(detour_slack_hops=2),
+        ColGenParams(max_air_overrun_hops=2),
     )
     cells = frozenset(graph.corridor_cells)
     eager = network_module._forbidden_static_hops(
@@ -483,7 +488,7 @@ def test_warmed_lazy_graph_pickles_with_cold_answer_equivalent_cache():
         _ground_point((4, 0), cfg),
         0.0,
     )
-    graph = build_flight_graph(req, cfg, (), ColGenParams(detour_slack_hops=2))
+    graph = build_flight_graph(req, cfg, (), ColGenParams(max_air_overrun_hops=2))
     expected = graph.outgoing_neighbors(graph.origin_cell)
     assert graph.arc_cache_stats["expanded_nodes"] == 1
 
@@ -508,7 +513,7 @@ def test_corridor_prune_removes_foreign_terminal_cells():
         req,
         cfg,
         [(foreign_center, foreign)],
-        ColGenParams(detour_slack_hops=6),
+        ColGenParams(max_air_overrun_hops=6),
     )
     wall = hg.terminal_cells(foreign_center, foreign, cfg)
 
@@ -646,7 +651,7 @@ def test_exact_static_hops_cover_empty_terminal_cell_projection():
         req,
         cfg,
         [(wall_center, wall)],
-        ColGenParams(detour_slack_hops=2),
+        ColGenParams(max_air_overrun_hops=2),
     )
     raw = Column(req.flight_id, fg.base_step, 0, None, None, path, 0.0)
 
@@ -667,14 +672,13 @@ def test_exact_static_hops_cover_empty_terminal_cell_projection():
 
 @pytest.mark.parametrize("overrun", [1, 4, 9])
 def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget(overrun):
-    """The clock must reach the ceiling from the LAST legal departure, at any pairing.
+    """The clock must reach the ceiling from the LAST legal departure.
 
     `max_step` is a single scalar serving every departure, so it is sized for the latest one
     and an earlier departure inherits the surplus. That makes the term it carries for route
-    length load-bearing: denominated in `detour_slack_hops` rather than the ceiling, an
-    overrun above the slack left the horizon short of `max_air_hops`, so the last departures
-    were capped by the clock and earlier ones by the ceiling -- the departure-dependent cap
-    the ceiling exists to remove. `overrun=9` against `slack=4` is that case.
+    length load-bearing: anything smaller than `max_air_hops` in that slot caps the last
+    departures by the clock and earlier ones by the ceiling -- the departure-dependent cap the
+    ceiling exists to remove.
     """
 
     cfg = replace(_cfg(), max_ground_delay_s=20.0)
@@ -686,7 +690,7 @@ def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget(overrun):
         0.0,
         origin_terminal=terminal,
     )
-    params = ColGenParams(detour_slack_hops=4, max_air_overrun_hops=overrun)
+    params = ColGenParams(max_air_overrun_hops=overrun)
     fg = build_flight_graph(req, cfg, [], params)
     preamble = max(fg.takeoff_steps) + max(lane.steps for lane in fg.origin_lanes)
     assert fg.max_step == fg.latest_departure_step + preamble + fg.max_air_hops
@@ -694,6 +698,25 @@ def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget(overrun):
     assert fg.max_step - (fg.latest_departure_step + preamble) >= fg.max_air_hops, (
         "the clock binds before the ceiling at the last departure"
     )
+
+
+def test_graph_max_step_route_term_is_the_ceiling_not_a_re_derivation():
+    """`9816f61`, pinned where one knob cannot express it any more.
+
+    The bug was `_graph_max_step` carrying `shortest_hops + detour_slack_hops` where it needed
+    `max_air_hops`: at slack=3/overrun=9 the horizon advertised 26 hops and only 20 were
+    reachable at the last departure. With the corridor knob deleted (issue #78) the two can no
+    longer disagree through `ColGenParams`, so the regression has to be pinned on the function
+    itself -- with a budget deliberately unrelated to any ellipse radius, so a future
+    re-derivation from `shortest_hops` plus anything cannot pass.
+    """
+
+    lanes = (hg.Lane(cell=(1, 0), bearing=0.0, dist=0.0, steps=5),)
+    assert _graph_max_step(100, (7,), lanes, 26) == 100 + 7 + 5 + 26
+    # The whole route budget survives the preamble, whatever it is.
+    for max_air_hops in (0, 1, 26, 1000):
+        horizon = _graph_max_step(100, (7,), lanes, max_air_hops)
+        assert horizon - (100 + 7 + 5) == max_air_hops
 
 
 def test_flight_graph_one_hop_and_same_cell_degenerate_guard():
@@ -704,7 +727,7 @@ def test_flight_graph_one_hop_and_same_cell_degenerate_guard():
         _ground_point((1, 0), cfg),
         0.0,
     )
-    fg = build_flight_graph(one_hop, cfg, [], ColGenParams(detour_slack_hops=0))
+    fg = build_flight_graph(one_hop, cfg, [], ColGenParams(max_air_overrun_hops=0))
     assert fg.shortest_hops == 1
     assert fg.corridor_cells == frozenset({(0, 0), (1, 0)})
 
@@ -868,7 +891,7 @@ def test_column_requires_integral_network_clock_and_coordinates():
     )
     assert valid.departure_step == 0 and valid.cell_path == ((0, 0), (1, 0))
 
-    fg = build_flight_graph(req, cfg, [], ColGenParams(detour_slack_hops=0))
+    fg = build_flight_graph(req, cfg, [], ColGenParams(max_air_overrun_hops=0))
     object.__setattr__(valid, "departure_step", 0.5)
     with pytest.raises(TypeError, match="departure_step must be an integer"):
         column_to_intent(valid, req, cfg)
@@ -1019,14 +1042,14 @@ def test_translated_hops_stay_on_integer_clock_and_preserve_row_coverage(
         first_path,
         cfg,
         departure_step=0,
-        slack=0,
+        overrun=0,
     )
     second, _second_fg = _column_for(
         second_req,
         second_path,
         cfg,
         departure_step=second_departure_step,
-        slack=0,
+        overrun=0,
     )
 
     assert first.claims.isdisjoint(second.claims)
@@ -1091,7 +1114,7 @@ def test_column_delay_equals_metrics_total_delay(endpoint_kinds):
         path,
         cfg,
         departure_step=departure_step,
-        slack=12,
+        overrun=12,
     )
     intent = column_to_intent(col, req, cfg)
 
@@ -1107,7 +1130,7 @@ def test_reported_cost_and_lattice_overhead_exclude_empty_world_deconfliction():
     req = FlightRequest(300, origin, dest, 0.0)
     start = hg.enu_to_axial(float(origin[0]), float(origin[1]), hg.circumradius(cfg))
     end = hg.enu_to_axial(float(dest[0]), float(dest[1]), hg.circumradius(cfg))
-    col, _fg = _column_for(req, _shortest_path(start, end), cfg, slack=0)
+    col, _fg = _column_for(req, _shortest_path(start, end), cfg, overrun=0)
     intent = column_to_intent(col, req, cfg)
     row = flight_row(intent, cfg)
 
@@ -1126,7 +1149,7 @@ def test_max_detour_factor_rejects_graph_valid_column():
         _ground_point(path[-1], cfg),
         0.0,
     )
-    fg = build_flight_graph(req, cfg, [], ColGenParams(detour_slack_hops=2))
+    fg = build_flight_graph(req, cfg, [], ColGenParams(max_air_overrun_hops=2))
     raw = Column(req.flight_id, fg.base_step, 0, None, None, path, 0.0)
 
     with pytest.raises(ValueError, match="max_detour_factor"):
@@ -1201,7 +1224,7 @@ def test_claims_use_translated_detour_gate_at_ulp_boundary():
         _ground_point(path[-1], cfg),
         0.0,
     )
-    fg = build_flight_graph(req, cfg, [], ColGenParams(detour_slack_hops=100))
+    fg = build_flight_graph(req, cfg, [], ColGenParams(max_air_overrun_hops=100))
     raw = Column(req.flight_id, fg.base_step, 0, None, None, path, 0.0)
 
     denied = column_to_intent(raw, req, cfg)
@@ -1462,7 +1485,7 @@ def test_hub_terminal_rows_cover_dwell_overlap(time_buffer_s, hub_endpoint):
             path,
             cfg,
             departure_step=math.ceil(req.t_departure / cfg.dt_s) + hold_steps,
-            slack=12,
+            overrun=12,
         )
         intent = column_to_intent(col, req, cfg)
         cylinder = intent.volumes[0 if hub_endpoint == "origin" else -1]
@@ -1558,7 +1581,7 @@ def test_customer_endpoint_rows_are_owned_by_column_claims():
     req = FlightRequest(500, origin, dest, 0.0)
     start = hg.enu_to_axial(float(origin[0]), float(origin[1]), hg.circumradius(cfg))
     end = hg.enu_to_axial(float(dest[0]), float(dest[1]), hg.circumradius(cfg))
-    col, fg = _column_for(req, _shortest_path(start, end), cfg, slack=0)
+    col, fg = _column_for(req, _shortest_path(start, end), cfg, overrun=0)
     corridor_start = col.departure_step + fg.takeoff_steps[col.level]
     arrival_step = corridor_start + len(col.cell_path) - 1
 
@@ -1587,7 +1610,7 @@ def test_claims_deduped_constructed():
         _ground_point(path[-1], cfg),
         0.0,
     )
-    col, fg = _column_for(req, path, cfg, slack=4)
+    col, fg = _column_for(req, path, cfg, overrun=4)
     corridor_start = col.departure_step + fg.takeoff_steps[col.level]
     offsets = derive_cell_window(cfg)
     raw_visit_rows = [

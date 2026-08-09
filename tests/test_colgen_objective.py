@@ -21,6 +21,7 @@ from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel, cost_
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
 from freespace_sim.types import FlightRequest, vec
+from tests._colgen_support import with_air_hops
 
 
 def _cfg(**overrides) -> SimConfig:
@@ -42,10 +43,8 @@ def _point(cell, cfg):
     return vec(x, y, cfg.ground_level_m)
 
 
-def _graph(cfg, origin=(0, 0), dest=(4, -1), slack=4, flight_id=1, **kw):
-    # Ceiling paired with the ellipse unless a caller says otherwise; see ColGenParams.
-    kw.setdefault("max_air_overrun_hops", slack)
-    params = ColGenParams(solver="highs", detour_slack_hops=slack, **kw)
+def _graph(cfg, origin=(0, 0), dest=(4, -1), overrun=4, flight_id=1, **kw):
+    params = ColGenParams(solver="highs", max_air_overrun_hops=overrun, **kw)
     request = FlightRequest(flight_id, _point(origin, cfg), _point(dest, cfg), 0.0, 0.0)
     return build_flight_graph(request, cfg, (), params), params
 
@@ -173,10 +172,12 @@ def _weighted_probe(ground_weight: float, air_weight: float):
     # The air-time ceiling is lifted: the ground-heavy arm's whole point is absorbing delay
     # in the AIR by flying further, which is exactly what that ceiling bounds. At the
     # shipped budget it would decide this test, not the objective -- and the objective is
-    # what is under test.
-    graph, params = _graph(
-        cfg, dest=(3, 0), slack=1, objective="total_cost", max_air_overrun_hops=64
-    )
+    # what is under test. Lifted at the GRAPH, not through `ColGenParams`: one knob sizes the
+    # corridor and the budget together (issue #78), so lifting it there would widen the
+    # corridor with it and this fixture would stop being the one below is derived from.
+    corridor = 1
+    graph, params = _graph(cfg, dest=(3, 0), overrun=corridor, objective="total_cost")
+    graph = with_air_hops(graph, graph.shortest_hops + 64)
     rng = np.random.default_rng(7)
     cells = sorted(graph.corridor_cells)
     # Duals have to land on steps a route actually occupies. Drawing them across `max_step`
@@ -190,7 +191,7 @@ def _weighted_probe(ground_weight: float, air_weight: float):
     dual_span = (
         (graph.latest_departure_step - graph.base_step)
         + graph.shortest_hops
-        + graph.detour_slack_hops
+        + corridor
         + 4
     )
     duals: dict[RowKey, float] = {}

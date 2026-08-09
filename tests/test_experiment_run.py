@@ -96,7 +96,7 @@ def test_colgen_flags_reach_the_planner_params():
         "--colgen-time-limit", "900", "--colgen-max-iterations", "50",
         "--colgen-objective", "total_cost", "--colgen-solver", "highs",
         "--colgen-gap-metric", "cost",
-        "--colgen-detour-slack", "3", "--colgen-max-air-overrun", "3",
+        "--colgen-max-air-overrun", "3",
     )
     params = colgen_params_from_args(args, "colgen")
 
@@ -105,7 +105,6 @@ def test_colgen_flags_reach_the_planner_params():
     assert params.objective == "total_cost"
     assert params.solver == "highs"
     assert params.gap_metric == "cost"
-    assert params.detour_slack_hops == 3
     assert params.max_air_overrun_hops == 3
 
 
@@ -132,7 +131,6 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
         ("--colgen-objective", "total_cost"),
         ("--colgen-solver", "highs"),
         ("--colgen-gap-metric", "cost"),
-        ("--colgen-detour-slack", "3"),
         ("--colgen-max-air-overrun", "3"),
     ],
 )

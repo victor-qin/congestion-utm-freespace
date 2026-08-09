@@ -77,13 +77,20 @@ def test_seed_astar_expands_only_a_small_lazy_subset():
     assert stats["expanded_nodes"] < len(graph.corridor_cells) // 10
 
 
-def test_repeated_pricing_reuses_lazy_arcs_and_cached_seed():
-    """A second pricing call must not re-derive any arc geometry.
+def test_repeated_pricing_stops_touching_the_arc_oracle_entirely():
+    """A second pricing call must not re-derive any arc geometry -- nor re-read it.
 
-    ``arc_checks``/``expanded_nodes`` holding still is the invariant: no wall geometry is
-    recomputed and no new source cell is expanded.  The search walks the lazy oracle again,
-    so ``cache_hits`` is what grows -- that split is the evidence the reuse is real rather
-    than the second call quietly skipping work.
+    ``arc_checks``/``expanded_nodes`` holding still was always the invariant: no wall
+    geometry recomputed, no new source cell expanded.  What changed with the compiled
+    pricing path is the third counter.  The reference search walks the lazy oracle again on
+    every call, so ``cache_hits`` used to GROW, and that growth was the evidence the reuse
+    was real rather than the second call quietly skipping work.
+
+    ``dp_prepare.prepared_for`` drains the oracle once and keeps the result on the graph, so
+    the second call now asks it **nothing at all** and every counter holds still. The
+    evidence moves accordingly: the answer is identical and the packing is the same object,
+    which is a stronger statement than "it hit the cache more times" and the reason the
+    compiled path is not a regression on the cheap flights that dominate a real sweep.
     """
 
     cfg = _cfg()
@@ -92,13 +99,15 @@ def test_repeated_pricing_reuses_lazy_arcs_and_cached_seed():
 
     first = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
     first_stats = dict(graph.arc_cache_stats)
+    prepared = graph._search_cache.prepared
     second = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
     second_stats = dict(graph.arc_cache_stats)
 
     assert second == first
-    assert second_stats["arc_checks"] == first_stats["arc_checks"]
-    assert second_stats["expanded_nodes"] == first_stats["expanded_nodes"]
-    assert second_stats["cache_hits"] > first_stats["cache_hits"]
+    assert second_stats == first_stats
+    assert first_stats["cache_hits"] > 0, "the first call never consulted the oracle"
+    assert prepared is not None, "the compiled path did not run, so this proves nothing"
+    assert graph._search_cache.prepared is prepared
 
 
 def test_canonical_claim_cache_is_strictly_bounded():
@@ -117,6 +126,32 @@ def test_canonical_claim_cache_is_strictly_bounded():
     assert len(graph._search_cache.certified_claims) == 2
 
 
+def _count_exact_pricing(monkeypatch) -> dict[str, int]:
+    """Count entries into the exact DAG search, whichever implementation serves one.
+
+    ``price_flight`` enters exact pricing through ``_best_column_compiled`` and reaches
+    ``_best_column`` only when that cannot prove it ran to completion. Counting just one of
+    the two would make these tests assert "the compiled path was taken" rather than the
+    seeding property they exist for -- and would go quiet, rather than fail, the next time
+    the entry point moves.
+    """
+
+    counts = {"entered": 0, "fallback": 0}
+    compiled, reference = pricing._best_column_compiled, pricing._best_column
+
+    def entry(*args, **kwargs):
+        counts["entered"] += 1
+        return compiled(*args, **kwargs)
+
+    def fallback(*args, **kwargs):
+        counts["fallback"] += 1
+        return reference(*args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_best_column_compiled", entry)
+    monkeypatch.setattr(pricing, "_best_column", fallback)
+    return counts
+
+
 def test_uncertified_wall_seed_cannot_skip_exact_pricing(monkeypatch):
     """A valid fallback seed is an incumbent, not a global zero-dual proof."""
 
@@ -124,19 +159,11 @@ def test_uncertified_wall_seed_cannot_skip_exact_pricing(monkeypatch):
     graph, params = _graph(cfg, overrun=1)
     seed_column(graph, cfg)
     graph._search_cache.seed_delay_certified = False
-    original = pricing._best_column
-    calls = 0
-
-    def capture_exact_search(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(pricing, "_best_column", capture_exact_search)
+    counts = _count_exact_pricing(monkeypatch)
 
     _reduced_cost, column = price_flight(graph, {}, 0.0, cfg, params)
 
-    assert calls == 1
+    assert counts["entered"] == 1
     assert column is not None
 
 
@@ -392,9 +419,11 @@ def test_shifted_seed_is_only_an_incumbent_for_exact_pricing(monkeypatch):
 
     def capture_exact_search(*args, **kwargs):
         captured["incumbent"] = kwargs["incumbent"]
-        return kwargs["incumbent"]
+        # Stand in for the search by returning the incumbent unchanged.  `proved=True` so
+        # `price_flight` does not then fall through to the reference and undo the stub.
+        return kwargs["incumbent"], True
 
-    monkeypatch.setattr(pricing, "_best_column", capture_exact_search)
+    monkeypatch.setattr(pricing, "_best_column_compiled", capture_exact_search)
     reduced_cost, column = price_flight(
         graph,
         {priced_at_nominal: 100.0},

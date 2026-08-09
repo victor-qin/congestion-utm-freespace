@@ -1347,11 +1347,19 @@ def _price_dag(
 class DagResult:
     """One compiled search's proposals, in the host's terms."""
 
-    __slots__ = ("status", "n_labels", "candidates", "paths", "incumbent", "attempts")
+    __slots__ = (
+        "status", "n_labels", "candidates", "paths", "incumbent", "attempts", "budget",
+    )
 
-    def __init__(self, status, n_labels, candidates, paths, incumbent=None, attempts=1):
+    def __init__(
+        self, status, n_labels, candidates, paths, incumbent=None, attempts=1, budget=None
+    ):
         self.status = status
         self.n_labels = n_labels
+        # `(label_capacity, log2cap, candidate_capacity)` this run settled on.  Handing it
+        # back to the next call for the same graph is what stops every colgen iteration
+        # from re-discovering the same 13.3M-label pool by restarting into it.
+        self.budget = budget
         # How many times the search ran from its first layer.  More than one means a budget
         # was exhausted and everything before it was thrown away -- including the
         # certifications that had already been paid for -- so this is the number to read
@@ -1655,7 +1663,8 @@ def price_dag(
 
     _drain()
     return DagResult(
-        status, int(out_counts[0]), candidates, paths, incumbent, attempt + 1
+        status, int(out_counts[0]), candidates, paths, incumbent, attempt + 1,
+        (label_capacity, log2cap, candidate_capacity),
     )
 
 

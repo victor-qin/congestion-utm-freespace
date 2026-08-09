@@ -695,7 +695,9 @@ class _FlightSearchCache:
     __slots__ = (
         "lock",
         "certified_claims",
+        "dag_budget",
         "endpoint_claims",
+        "prepared",
         "seed_columns",
         "seed_delay_certified",
         "seed_model",
@@ -704,6 +706,17 @@ class _FlightSearchCache:
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        # `(PreparedTopology, PreparedRows)` for the compiled pricing path, built on first
+        # use.  Both are pure functions of the graph and its `SimConfig`, so this is a
+        # memo rather than state -- but it is not an optional one: the same flight is
+        # priced on EVERY colgen iteration, and rebuilding was measured at up to 80% of the
+        # compiled search's own time on a cheap density flight.  See `dp_prepare.prepared_for`.
+        self.prepared: Any | None = None
+        # `(label_capacity, log2cap, candidate_capacity)` the last completed compiled search
+        # actually needed.  A density flight builds 13.3M labels against a 65,536 default,
+        # and re-discovering that by restarting costs ~1.7x on every iteration after the
+        # first.  Answer-neutral: a budget only bounds work, never the search.
+        self.dag_budget: tuple[int, int, int] | None = None
         self.certified_claims: OrderedDict[
             tuple[Any, ...], frozenset[RowKey]
         ] = OrderedDict()

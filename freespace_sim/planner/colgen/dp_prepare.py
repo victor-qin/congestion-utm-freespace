@@ -528,6 +528,37 @@ def prepare_rows(fg: FlightGraph, cfg: SimConfig, topology: PreparedTopology) ->
     )
 
 
+def prepared_for(fg: FlightGraph, cfg: SimConfig) -> tuple[PreparedTopology, PreparedRows]:
+    """The graph's dual-independent packing, built once and kept on the graph.
+
+    ``prepare_topology`` and ``prepare_rows`` depend only on the graph and its config, both
+    fixed for the solve, so this is a memo and not state. It is not an optional one: the
+    same flight is priced on **every** colgen iteration, and rebuilding was measured at up
+    to 80% of the compiled search's own time on a cheap density flight -- enough to make
+    the compiled path a *regression* on the majority of a real sweep's flights.
+
+    Built outside the lock and stored under it, the same shape as
+    ``pricing._endpoint_claims``: it is a pure function, so two threads racing to fill it
+    compute equal answers and either may win. Holding the lock across the build instead
+    would serialize the one part of pricing that is still entirely Python.
+
+    An unsupported flight is cached too, so a graph the kernel cannot handle is diagnosed
+    once rather than on every iteration.
+    """
+
+    cache = fg._search_cache
+    with cache.lock:
+        hit = cache.prepared
+    if hit is not None:
+        return hit
+    topology = prepare_topology(fg, cfg)
+    rows = prepare_rows(fg, cfg, topology)
+    value = (topology, rows)
+    with cache.lock:
+        cache.prepared = value
+    return value
+
+
 def endpoint_row_ids(
     rows: PreparedRows,
     cfg: SimConfig,

@@ -713,6 +713,58 @@ def test_kernel_matches_the_reference_when_warm_started_with_an_incumbent(monkey
     assert set(kernel_side) == reference_side
 
 
+def test_kernel_survives_a_budget_restart_with_the_same_answer(monkeypatch):
+    """A pool too small to finish is re-run from scratch, and must re-run identically.
+
+    The restart is where the envelope memo can betray parity: envelopes frozen against a
+    mid-sweep incumbent are a strictly stronger prune, so a second attempt starting from
+    the cutoff the first one *reached* would explore less than the first -- and the
+    reference's column is defined by a search that never restarted. `rewind` is what puts
+    the cutoff and the memo back, and this is the test that it does.
+
+    The capacity is deliberately far too small, so several restarts happen rather than one.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model, label_capacity=1024)
+    assert result.ok, result.status
+    assert result.attempts > 1, "the fixture no longer forces a restart"
+
+    reference_side = _reference_sink_set(graph, cfg, view, params, monkeypatch, model)
+    assert set(kernel_side) == reference_side
+
+
+@pytest.mark.parametrize(
+    "capacity, step_reached, expected",
+    [
+        # No layer was relaxed at all, so there is nothing to extrapolate from: double.
+        (1000, -1, 2000),
+        # Filled a tenth of the way in; 1.25 * 10x wants 12.5x, and the ceiling caps it.
+        (1000, 9, 8000),
+        # Filled a third of the way; 1.25 * 3x = 3.75x, inside both bounds.
+        (1000, 32, 3787),
+        # Nearly finished; 1.25 * 1.02x is below the doubling floor, which wins.
+        (1000, 97, 2000),
+    ],
+)
+def test_kernel_retry_capacity_is_bounded_in_both_directions(
+    capacity, step_reached, expected
+):
+    """Extrapolating beats doubling, but only between a floor and a ceiling.
+
+    The floor matters because labels per step are not uniform -- the frontier widens before
+    it plateaus, so an estimate taken early reads low and would ask for less than doubling.
+    The ceiling matters because a pathological early fill would otherwise ask for gigabytes:
+    at ~44 bytes a label, 8x of a 13.3M pool is already 4.7 GB.
+    """
+
+    assert dp_kernel._next_label_capacity(capacity, step_reached, 0, 99) == expected
+
+
 def test_kernel_honours_forbidden_rows(monkeypatch):
     """Repair's exclusion set, applied inside the kernel rather than by a Python fallback.
 

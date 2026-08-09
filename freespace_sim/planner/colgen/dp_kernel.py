@@ -1039,6 +1039,7 @@ def _price_dag(
             scratch_a, scratch_b,
         )
         if n_labels == -1:
+            out_counts[2] = min_step - 1  # no layer was relaxed; the host cannot extrapolate
             return STATUS_LABEL_LIMIT
         if n_labels == -2:
             return STATUS_STATE_LIMIT
@@ -1088,6 +1089,7 @@ def _price_dag(
             )
             if n_labels == -1:
                 out_counts[1] = n_cand
+                out_counts[2] = step
                 return STATUS_LABEL_LIMIT
             if n_labels == -2:
                 out_counts[1] = n_cand
@@ -1245,6 +1247,11 @@ def _price_dag(
                 if n_labels >= pool_cap:
                     out_counts[0] = n_labels
                     out_counts[1] = n_cand
+                    # How far the search got before the pool filled.  The host needs this to
+                    # size the retry: doubling from a default that is 200x too small costs
+                    # eight restarts, and every one of them throws away the certifications
+                    # the previous attempt already paid for.
+                    out_counts[2] = step
                     return STATUS_LABEL_LIMIT
                 nxt = n_labels
                 n_labels += 1
@@ -1386,6 +1393,31 @@ def _root_buckets(variants, topology, rows_unused=None):
     )
     bucket_start[1:] = np.cumsum(counts[:span])
     return order, bucket_start
+
+
+def _next_label_capacity(capacity, step_reached, min_step, max_step):
+    """Size the retry pool from how far the filled one got, not from doubling alone.
+
+    Doubling is the safe policy and a slow one: a density flight builds 13.3M labels
+    against a 65,536 default, which is eight restarts, and every restart discards the sink
+    certifications the previous attempt already paid for.  The kernel reports the step it
+    reached, so the host can extrapolate instead.
+
+    Deliberately crude, and hedged in both directions.  Labels per step are far from
+    uniform -- the frontier widens for a while and then plateaus -- so an estimate taken
+    early reads low; the 1.25 margin and the doubling FLOOR cover that, and a second
+    attempt extrapolates from a later step and lands closer.  The 8x ceiling is what stops
+    a pathological early fill from asking for gigabytes: at 44 bytes a label, 8x of a
+    13.3M pool is already 4.7 GB.
+    """
+
+    span = max_step - min_step + 1
+    progress = step_reached - min_step + 1
+    doubled = capacity * 2
+    if progress <= 0 or span <= 0:
+        return doubled
+    estimate = int(capacity * 1.25 * span / progress)
+    return max(doubled, min(estimate, capacity * 8))
 
 
 def price_dag(
@@ -1612,7 +1644,9 @@ def price_dag(
             break
 
         if status == STATUS_LABEL_LIMIT:
-            label_capacity *= 2
+            label_capacity = _next_label_capacity(
+                label_capacity, int(out_counts[2]), topology.min_step, topology.max_step
+            )
             continue
         if status == STATUS_STATE_LIMIT:
             log2cap += 1

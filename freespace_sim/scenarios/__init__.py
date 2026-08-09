@@ -2,14 +2,14 @@
 
 A :class:`ScenarioSpec` builds the ``(SimConfig, DemandModel)`` pair the simulator needs; ``SCENARIOS``
 names canonical worlds, assembled from one module per family (``metro``, ``dallas``, ``density``,
-``colgen``). ``get_scenario``
+``colgen``, ``dfw``). ``get_scenario``
 resolves a name to its spec — the scenario analogue of ``planner.get_planner``. Add a new family by
 dropping in a module with its own ``SCENARIOS`` dict and merging it below.
 """
 
 from __future__ import annotations
 
-from . import colgen, dallas, density, metro
+from . import colgen, dallas, density, dfw, metro
 from .spec import DemandSpec, ScenarioSpec, with_overrides
 
 SCENARIOS: dict[str, ScenarioSpec] = {
@@ -17,6 +17,7 @@ SCENARIOS: dict[str, ScenarioSpec] = {
     **dallas.SCENARIOS,
     **density.SCENARIOS,
     **colgen.SCENARIOS,
+    **dfw.SCENARIOS,
 }
 
 

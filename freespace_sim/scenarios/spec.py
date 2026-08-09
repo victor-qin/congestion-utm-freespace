@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field, replace
 
 from ..config import SimConfig
 from ..demand import DemandModel, HubRadiusDemand, HubVoronoiDemand, UniformPoissonDemand
+from .demand_dfw import DfwGeoDemand
 
 # default Walmart/strip-mall split for the hub patterns when counts aren't given explicitly
 _DEFAULT_HUB_LABELS = ("walmart_uss", "stripmall_uss")
@@ -19,8 +20,11 @@ _DEFAULT_HUB_COUNTS = (6, 20)
 
 # Bumped when the persisted scenario_spec.json layout changes incompatibly. Stamped by
 # ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
-# reinterpreted under a schema it was not written with.
-_SPEC_SCHEMA_VERSION = 1
+# reinterpreted under a schema it was not written with. v2 adds the dfw_geo demand fields (geo_dataset,
+# sampled/fixed hub operators, category/type filters) — a pre-v2 reader would silently drop them.
+# v3 adds ScenarioSpec.keepout_zones (permanent no-fly cylinders) — a pre-v3 reader would silently drop the
+# zones, replaying a run that routed AROUND an airport as if the airspace were open.
+_SPEC_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,14 @@ class DemandSpec:
     # the outbound's nominal arrival. False preserves the legacy independently-filed return behavior.
     paired_return_request: bool = False
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
+    # --- dfw_geo extras: real-geography hub placement + census-density destinations. () / None keep the
+    # DfwGeoDemand model defaults; the dfw_* scenarios set sampled/fixed operators explicitly. ---
+    geo_dataset: "str | None" = None       # artifact dir under freespace_sim/data/ (None → "dfw")
+    sampled_hub_uss: tuple[str, ...] = ()  # operators whose hubs are density-sampled from retail POIs
+    fixed_hub_uss: tuple[str, ...] = ()    # operators whose hubs are fixed real facilities
+    fixed_hub_types: tuple[str, ...] = ()  # facility types eligible as fixed hubs ((): model default)
+    hub_categories: tuple[str, ...] = ()   # retail categories eligible as sampled hubs ((): model default)
+    use_all_fixed_hubs: bool = False       # True → use every listed fixed facility (ignore the hub count)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
         labels = self.uss or _DEFAULT_HUB_LABELS
@@ -69,23 +81,29 @@ class DemandSpec:
             labels, counts = self._hub_labels_counts()
             return HubVoronoiDemand(n_hubs_per_uss=dict(zip(labels, counts)), direction=self.direction,
                                     uss_share=self.uss_share)
-        if self.pattern == "hub_radius":
+        if self.pattern in ("hub_radius", "dfw_geo"):
             labels, counts = self._hub_labels_counts()
-            return HubRadiusDemand(
+            hub_kw = dict(
                 n_hubs_per_uss=dict(zip(labels, counts)),
                 radius_m=self.radius_m, pads_per_hub=self.pads_per_hub,
                 terminal_radius_m=self.terminal_radius_m, corridor_overlap_m=self.corridor_overlap_m,
-                return_flights=self.return_flights, turnaround_s=self.turnaround_s,
-                uss_share=self.uss_share,
-                lam_per_uss=self.lam_per_uss,
-                departure_offset_s=self.departure_offset_s,
-                timing_mode=self.timing_mode,
-                paired_return_request=self.paired_return_request,
+                return_flights=self.return_flights, turnaround_s=self.turnaround_s, uss_share=self.uss_share,
+                lam_per_uss=self.lam_per_uss, departure_offset_s=self.departure_offset_s,
+                timing_mode=self.timing_mode, paired_return_request=self.paired_return_request,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
+            if self.pattern == "hub_radius":
+                return HubRadiusDemand(**hub_kw)
+            # dfw_geo: same hub_radius knobs + real-geography placement ((): keep DfwGeoDemand defaults)
+            geo_kw = {k: v for k, v in (("fixed_hub_types", self.fixed_hub_types),
+                                        ("hub_categories", self.hub_categories)) if v}
+            return DfwGeoDemand(**hub_kw, dataset=self.geo_dataset or "dfw",
+                                sampled_hub_uss=self.sampled_hub_uss, fixed_hub_uss=self.fixed_hub_uss,
+                                use_all_fixed_hubs=self.use_all_fixed_hubs, **geo_kw)
         if self.pattern != "uniform":
             raise ValueError(
-                f"unknown demand pattern {self.pattern!r} (want 'uniform' | 'hub' | 'hub_radius')")
+                f"unknown demand pattern {self.pattern!r} "
+                "(want 'uniform' | 'hub' | 'hub_radius' | 'dfw_geo')")
         if self.uss:
             return UniformPoissonDemand(uss_ids=tuple(self.uss))
         return None   # bare default: single "default" USS, uniform O/D
@@ -103,6 +121,9 @@ class ScenarioSpec:
     name: str
     description: str = ""
     region_m: tuple[float, float] = (8000.0, 8000.0)
+    # ENU projection anchor (lat, lon) → region centre. None keeps SimConfig's DFW default; the real-
+    # geography dfw_* scenarios set it to their frame centre so hubs/tracts project into the region box.
+    region_center_latlon: "tuple[float, float] | None" = None
     horizon_s: float = 3600.0
     demand_duration_s: float | None = None
     lam_per_hour: float = 600.0
@@ -120,6 +141,9 @@ class ScenarioSpec:
     # MORE than this apart (else the boxes overlap in z). Lower it below the level gap to stack levels
     # closer than 30 m — e.g. 14 m tubes let the (80, 95, 110) ladder sit 15 m apart and stay FCL-disjoint.
     corridor_height_m: "float | None" = None
+    # Permanent no-fly cylinders every flight routes around (SimConfig.keepout_zones): ``(cx, cy, radius_m)``
+    # ENU triples. () → none. The dfw_* twins set a zone over DFW airport; see scenarios/dfw.py.
+    keepout_zones: tuple = ()
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -145,6 +169,10 @@ class ScenarioSpec:
                if self.terminal_airspace_always_active is not None else {}),
             **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
             **({"corridor_height_m": self.corridor_height_m} if self.corridor_height_m is not None else {}),
+            **({"region_center_latlon": (float(self.region_center_latlon[0]),
+                                         float(self.region_center_latlon[1]))}
+               if self.region_center_latlon is not None else {}),
+            keepout_zones=self.keepout_zones,
         )
 
     def demand_model(self) -> DemandModel | None:
@@ -182,7 +210,8 @@ class ScenarioSpec:
         demand_payload = dict(payload.pop("demand", None) or {})
         demand_fields = DemandSpec.__dataclass_fields__
         demand_kw = {k: v for k, v in demand_payload.items() if k in demand_fields}
-        for name in ("uss", "hubs"):
+        for name in ("uss", "hubs", "sampled_hub_uss", "fixed_hub_uss",
+                     "fixed_hub_types", "hub_categories"):
             if demand_kw.get(name) is not None:
                 demand_kw[name] = tuple(demand_kw[name])
         if demand_kw.get("departure_offset_s"):
@@ -193,8 +222,14 @@ class ScenarioSpec:
         kw = {k: v for k, v in payload.items() if k in spec_fields}
         if kw.get("region_m") is not None:
             kw["region_m"] = (float(kw["region_m"][0]), float(kw["region_m"][1]))
+        if kw.get("region_center_latlon") is not None:
+            kw["region_center_latlon"] = (
+                float(kw["region_center_latlon"][0]), float(kw["region_center_latlon"][1]))
         if kw.get("flight_levels_m") is not None:
             kw["flight_levels_m"] = tuple(float(z) for z in kw["flight_levels_m"])
+        if kw.get("keepout_zones") is not None:          # JSON lists → tuple of (cx, cy, radius) float triples;
+            kw["keepout_zones"] = tuple(                  # `is not None` so an empty [] coerces back to () too —
+                (float(cx), float(cy), float(r)) for cx, cy, r in kw["keepout_zones"])  # else [] != () breaks EVERY scenario
         return cls(**kw, demand=DemandSpec(**demand_kw))
 
 

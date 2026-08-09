@@ -525,7 +525,8 @@ def _sort_layer(
 def _state_find(
     slot_label, slot_hash, log2cap, key_hash, depth,
     cell, recent, n_recent, paid_class, first_a, first_b,
-    label_cell, label_parent, label_variant, var_paid_class, probe_recent,
+    label_cell, label_parent, label_variant, var_paid_class,
+    label_first_a, label_first_b, probe_recent,
 ):
     """Locate the slot for one dominance key: its occupant, or the first free slot.
 
@@ -545,11 +546,19 @@ def _state_find(
         occupant = slot_label[slot]
         if occupant < 0:
             return slot, False
-        if slot_hash[slot] == key_hash and label_cell[occupant] == cell:
-            if var_paid_class[label_variant[occupant]] == paid_class:
-                n_occ = _fill_recent(occupant, depth, label_parent, label_cell, probe_recent)
-                if n_occ == n_recent and _recent_cmp(probe_recent, n_occ, recent, n_recent) == 0:
-                    return slot, True
+        # Every field of the key is verified, `first_hop` included.  Hashing a field but not
+        # checking it makes the table correct only until two keys collide, which is a bug
+        # that shows up rarely, on one graph shape, as a merged state and a missing column.
+        if (
+            slot_hash[slot] == key_hash
+            and label_cell[occupant] == cell
+            and label_first_a[occupant] == first_a
+            and label_first_b[occupant] == first_b
+            and var_paid_class[label_variant[occupant]] == paid_class
+        ):
+            n_occ = _fill_recent(occupant, depth, label_parent, label_cell, probe_recent)
+            if n_occ == n_recent and _recent_cmp(probe_recent, n_occ, recent, n_recent) == 0:
+                return slot, True
         slot += 1
         if slot >= cap:
             slot = 0
@@ -654,7 +663,8 @@ def _seed_layer(
         slot, found = _state_find(
             tbl_label, tbl_hash, log2cap, key_hash, depth,
             cell, recent_a, 1, paid_class, -1, -1,
-            label_cell, label_parent, label_variant, var_paid_class, probe_recent,
+            label_cell, label_parent, label_variant, var_paid_class,
+            label_first_a, label_first_b, probe_recent,
         )
         if slot < 0:
             return -2
@@ -892,7 +902,8 @@ def _price_dag(
                     nxt_label, nxt_hash, log2cap, key_hash, depth,
                     neighbour, recent_b, n_next, paid_class,
                     label_first_a[nxt], label_first_b[nxt],
-                    label_cell, label_parent, label_variant, var_paid_class, probe_recent,
+                    label_cell, label_parent, label_variant, var_paid_class,
+                    label_first_a, label_first_b, probe_recent,
                 )
                 if slot < 0:
                     out_counts[0] = n_labels
@@ -1125,7 +1136,8 @@ def warm_kernel() -> bool:
     )
     _state_find(
         np.full(2, -1, np.int32), np.zeros(2, np.uint64), 1, key_hash, 2,
-        0, recent_a, 1, 0, -1, -1, cell, parent, zeros_i, zeros_i, recent_b,
+        0, recent_a, 1, 0, -1, -1, cell, parent, zeros_i, zeros_i,
+        parent, parent, recent_b,
     )
     _paid_visit_correction(
         np.zeros(2, np.int32), zeros_i, zeros_i, np.zeros(1, np.float64),

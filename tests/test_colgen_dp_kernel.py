@@ -518,16 +518,21 @@ GRAPH_SHAPES = {"plain": _graph, "terminal": _terminal_graph}
                 reason=(
                     "KNOWN BUG, not a tolerance: on a terminal graph the kernel misses 12 of "
                     "the reference's sinks, all at (departure=8, origin_lane=2). Missing "
-                    "means the kernel over-merges somewhere -- its dominance is stricter than "
-                    "the reference's -- which is the one direction that costs an answer. "
-                    "Ruled out so far: the CSR arcs, the role masks and the destination-lane "
-                    "table all match the graph exactly (0 mismatches over 856 role checks), "
-                    "and `paid_class` interns the full `active_claims` set including term "
-                    "rows, so it is not collapsing states there. Prime remaining suspect is "
-                    "`first_hop`, which is inert on the plain fixture and live here: "
-                    "`_state_find` mixes it into the hash but never verifies it on a probe, "
-                    "so a hash collision merges two states that differ only in that field. "
-                    "strict=True so this flips to a failure the moment it is fixed."
+                    "means the kernel is stricter than the reference somewhere, which is the "
+                    "one direction that costs an answer. NOTE these graphs are the only shape "
+                    "that occurs in any registered scenario -- every colgen_test and density "
+                    "flight has terminals -- so this is the production case, not an edge one. "
+                    "RULED OUT, each by direct comparison against the graph or the reference: "
+                    "(1) the CSR arcs, role masks and destination-lane table all match exactly "
+                    "-- 0 mismatches over 856 role checks; (2) `paid_class` interns the full "
+                    "`active_claims` set including term rows, so states are not collapsing "
+                    "there; (3) `prepare_variants` emits exactly the reference's 78 roots, "
+                    "(8, 2) among them, so the root is created and dies during the search; "
+                    "(4) `first_hop` -- `_state_find` hashed it without verifying it on a "
+                    "probe, which was a genuine latent bug and is now fixed, but it was NOT "
+                    "this one. Remaining suspects are the layer-swap discipline and the "
+                    "`recent` history under multi-lane origins, neither yet tested in "
+                    "isolation. strict=True so this flips the moment it is fixed."
                 ),
             ),
         ),
@@ -731,6 +736,7 @@ def test_kernel_state_table_finds_what_it_inserted_and_separates_keys():
     var_paid_class = np.asarray([i % 3 for i in range(len(pool.labels))], np.int32)
     probe = np.zeros(depth, np.int32)
     recent = np.zeros(depth, np.int32)
+    no_first = np.full(len(pool.labels), -1, np.int32)
 
     placed = {}
     for label in range(len(pool.labels)):
@@ -740,7 +746,7 @@ def test_kernel_state_table_finds_what_it_inserted_and_separates_keys():
         slot, found = dp_kernel._state_find(
             slot_label, slot_hash, log2cap, key_hash, depth,
             int(cell[label]), recent, n, paid_class, -1, -1,
-            cell, parent, variant, var_paid_class, probe,
+            cell, parent, variant, var_paid_class, no_first, no_first, probe,
         )
         assert slot >= 0
         key = (int(cell[label]), tuple(recent[:n].tolist()), paid_class)

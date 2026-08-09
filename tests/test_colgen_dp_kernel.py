@@ -438,3 +438,208 @@ def test_kernel_mix_stays_inside_the_table():
 
 def test_warm_kernel_compiles_every_primitive():
     assert dp_kernel.warm_kernel() is True
+
+
+# ------------------------------------------------------------------- label state helpers
+
+
+def test_kernel_arc_role_bits_match_dp_prepare():
+    """Restated for numba as compile-time constants; they must not drift from the packer."""
+
+    assert dp_kernel._ARC_INTERNAL == dp_prepare.ARC_INTERNAL
+    assert dp_kernel._ARC_FIRST == dp_prepare.ARC_FIRST
+    assert dp_kernel._ARC_LAST == dp_prepare.ARC_LAST
+    assert dp_kernel._ARC_FIRST_LAST == dp_prepare.ARC_FIRST_LAST
+
+
+def test_kernel_role_gate_matches_the_graphs_own_verdict():
+    """`_role_allows` reads a packed mask the way `fg.hop_allowed_for_role` answers."""
+
+    cfg = _cfg()
+    graph, _ = _graph(cfg)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+
+    checked = 0
+    for source_index, source in enumerate(cells):
+        for arc in range(int(topology.arc_start[source_index]),
+                         int(topology.arc_start[source_index + 1])):
+            target = cells[int(topology.arc_target[arc])]
+            roles = int(topology.arc_roles[arc])
+            for first in (False, True):
+                for last in (False, True):
+                    assert dp_kernel._role_allows(roles, first, last) == (
+                        graph.hop_allowed_for_role(source, target, first=first, last=last)
+                    )
+                    checked += 1
+    assert checked > 200, "the fixture had too few arcs to be a real check"
+
+
+def test_kernel_recent_matches_the_references_tuple():
+    """`_fill_recent` reproduces `(neighbour, *recent[:depth - 1])`, length included."""
+
+    rng = random.Random(3)
+    pool = _random_pool(rng, n_labels=90, depth=7)
+    _score, _hops, _dep, _lane, parent, cell = pool.arrays()
+
+    for depth in (2, 3, 4):
+        out = np.zeros(depth, np.int32)
+        for label in range(len(pool.labels)):
+            path = [pool.cell[i] for i in _chain(pool.parent, label)]
+            expected = tuple(reversed(path))[:depth]
+            n = dp_kernel._fill_recent(label, depth, parent, cell, out)
+            assert tuple(out[:n].tolist()) == expected
+            assert n == min(len(path), depth)
+
+
+def test_kernel_recent_compare_matches_python_tuple_ordering():
+    """Including the prefix rule -- a shorter history sorts before a longer one."""
+
+    rng = random.Random(5)
+    for _ in range(2000):
+        a = [rng.randint(0, 3) for _ in range(rng.randint(1, 4))]
+        b = [rng.randint(0, 3) for _ in range(rng.randint(1, 4))]
+        buf_a = np.asarray(a + [0] * 4, np.int32)
+        buf_b = np.asarray(b + [0] * 4, np.int32)
+        expected = int(tuple(a) > tuple(b)) - int(tuple(a) < tuple(b))
+        assert dp_kernel._recent_cmp(buf_a, len(a), buf_b, len(b)) == expected
+
+
+def test_kernel_layer_sort_matches_the_references_sorted_call():
+    """`_sort_layer` orders a layer exactly as `sorted(..., key=(cell, recent, tie_key))`.
+
+    Load-bearing rather than cosmetic: relaxation order decides which label reaches the
+    next layer's slot first, and `_prefer` is non-transitive inside its epsilon band.
+    """
+
+    rng = random.Random(13)
+    pool = _random_pool(rng, n_labels=300, depth=6)
+    score, hops, departure, lane, parent, cell = pool.arrays()
+    depth = 3
+
+    for n in (0, 1, 2, 17, 300):
+        items = np.asarray(rng.sample(range(len(pool.labels)), n), np.int32)
+        buffer = np.zeros(max(n, 1), np.int32)
+        recent_a, recent_b = np.zeros(depth, np.int32), np.zeros(depth, np.int32)
+        scratch_a, scratch_b = np.zeros(64, np.int32), np.zeros(64, np.int32)
+        expected = sorted(
+            items.tolist(),
+            key=lambda label: (
+                pool.cell[label],
+                tuple(reversed([pool.cell[i] for i in _chain(pool.parent, label)]))[:depth],
+                (
+                    pool.hops[label],
+                    pool.departure[label],
+                    pool.lane[label],
+                    tuple(pool.cell[i] for i in _chain(pool.parent, label)),
+                ),
+            ),
+        )
+        dp_kernel._sort_layer(
+            items, buffer, n, depth, score, cell, parent, hops, departure, lane,
+            recent_a, recent_b, scratch_a, scratch_b,
+        )
+        assert items.tolist() == expected, n
+
+
+def test_kernel_state_table_finds_what_it_inserted_and_separates_keys():
+    """Insert/lookup round trip, and two labels differing in one key field never merge."""
+
+    rng = random.Random(17)
+    pool = _random_pool(rng, n_labels=200, depth=5)
+    _score, _hops, _dep, _lane, parent, cell = pool.arrays()
+    depth = 3
+    log2cap = 10
+    slot_label = np.full(1 << log2cap, -1, np.int32)
+    # uint64, matching `_state_hash`'s return: an int64 slot would overflow on any key whose
+    # Fibonacci mix lands above 2**63, which is half of them.
+    slot_hash = np.zeros(1 << log2cap, np.uint64)
+    # One paid class per label id parity, so the field genuinely varies.
+    variant = np.arange(len(pool.labels), dtype=np.int32)
+    var_paid_class = np.asarray([i % 3 for i in range(len(pool.labels))], np.int32)
+    probe = np.zeros(depth, np.int32)
+    recent = np.zeros(depth, np.int32)
+
+    placed = {}
+    for label in range(len(pool.labels)):
+        n = dp_kernel._fill_recent(label, depth, parent, cell, recent)
+        paid_class = int(var_paid_class[label])
+        key_hash = np.uint64(dp_kernel._state_hash(int(cell[label]), recent, n, paid_class, -1, -1))
+        slot, found = dp_kernel._state_find(
+            slot_label, slot_hash, log2cap, key_hash, depth,
+            int(cell[label]), recent, n, paid_class, -1, -1,
+            cell, parent, variant, var_paid_class, probe,
+        )
+        assert slot >= 0
+        key = (int(cell[label]), tuple(recent[:n].tolist()), paid_class)
+        if key in placed:
+            assert found and slot_label[slot] == placed[key]
+        else:
+            assert not found
+            slot_label[slot] = label
+            slot_hash[slot] = key_hash
+            placed[key] = label
+
+    # Every distinct key got its own slot -- no two merged.
+    assert len(placed) == len({int(slot_label[s]) for s in range(1 << log2cap)
+                               if slot_label[s] >= 0})
+    assert len(placed) > 30, "the fixture produced too few distinct states"
+
+
+def test_kernel_visit_forbidden_matches_the_reference_window_test():
+    """`_visit_hits_forbidden` over row ids answers as `pricing._visit_hits_forbidden` does."""
+
+    cfg = _cfg()
+    graph, _ = _graph(cfg)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+    offsets = DualView({}, cfg).offsets
+
+    rng = random.Random(23)
+    cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    forbidden = set()
+    for cell in cells[:20]:
+        for step in range(graph.min_step, min(graph.min_step + 30, graph.max_step + 1)):
+            if rng.random() < 0.25:
+                forbidden.add(RowKey.cell(cell[0], cell[1], 0, step))
+    pack = dp_prepare.prepare_forbidden(forbidden, graph, rows, topology)
+
+    hits = 0
+    for cell_index, cell in enumerate(cells):
+        for visit_step in range(rows.step0, rows.step0 + min(rows.n_steps, 50)):
+            expected = pricing._visit_hits_forbidden(cell, 0, visit_step, offsets, forbidden)
+            actual = dp_kernel._visit_hits_forbidden(
+                pack.bits, rows.n_steps, rows.step0, cell_index, visit_step,
+                offsets[0], offsets[1],
+            )
+            assert actual == expected, (cell, visit_step)
+            hits += int(expected)
+    assert hits > 50, "the fixture forbade too little to exercise the positive branch"
+
+
+def test_kernel_paid_correction_matches_the_references_fsum_expression():
+    """The double-charge correction, term for term and in the same summation order."""
+
+    partials = np.zeros(dp_kernel.FSUM_MAX_PARTIALS, np.float64)
+    # Two classes: class 0 has rows on cells 5 and 9, class 1 is empty.
+    paid_start = np.asarray([0, 4, 4], np.int32)
+    paid_cell = np.asarray([5, 5, 5, 9], np.int32)
+    paid_step = np.asarray([10, 11, 12, 11], np.int32)
+    paid_value = np.asarray([1e16, 1.0, -1e16, 7.5], np.float64)
+
+    # Window [11, 12] on cell 5 picks rows 1 and 2 -- magnitudes chosen so `+=` would lose
+    # the 1.0 entirely and only an exact sum recovers it.
+    value, ok = dp_kernel._paid_visit_correction(
+        paid_start, paid_cell, paid_step, paid_value, 0, 5, 11, 0, 1, partials
+    )
+    assert ok and value == math.fsum([1.0, -1e16])
+
+    # A cell with no paid rows in range answers zero, which is the reference's `in` guard.
+    value, ok = dp_kernel._paid_visit_correction(
+        paid_start, paid_cell, paid_step, paid_value, 0, 7, 11, 0, 1, partials
+    )
+    assert ok and value == 0.0
+    value, ok = dp_kernel._paid_visit_correction(
+        paid_start, paid_cell, paid_step, paid_value, 1, 5, 11, 0, 1, partials
+    )
+    assert ok and value == 0.0

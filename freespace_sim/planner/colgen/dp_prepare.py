@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ...volumes import column_dwell_s
+from .. import hexgrid as hg
 from .network import RowKey
 from .windows import (
     derive_cell_window,
@@ -97,6 +98,12 @@ class PreparedTopology:
     # Admissible hop count from each cell to the nearest destination over the any-role arc
     # superset.  A lower bound on every role-specific completion.
     rev_remaining: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    # The reference's own `_distance_lower_bound` -- plain hex distance to the nearest
+    # destination, ignoring walls and corridor shape.  LOOSER than `rev_remaining`, and the
+    # priced search must use this one: substituting the tighter value would prune labels the
+    # oracle keeps, which is safe for optimality but changes the explored set and so can
+    # return a different, equally optimal column.
+    hex_remaining: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
 
     dest_mask: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.uint8))
     dest_lane_start: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(1, np.int32))
@@ -210,6 +217,22 @@ def _reverse_remaining(
     return remaining
 
 
+def _hex_remaining(cells: list[Cell], destinations: list[Cell]) -> np.ndarray:
+    """``pricing._distance_lower_bound`` for every cell: hex distance to the nearest goal.
+
+    Deliberately the *looser* of the two remaining-distance bounds this module computes.
+    ``_reverse_remaining`` follows real arcs and is tighter wherever the corridor is
+    non-convex, but the reference prices against plain hex distance, and the priced search
+    consults this value at four decision points -- three hop-ceiling guards and the arc
+    delay lower bound. Tightening any of them prunes labels the oracle explores.
+    """
+
+    remaining = np.empty(len(cells), dtype=np.int32)
+    for i, cell in enumerate(cells):
+        remaining[i] = min(hg.hex_distance(cell, destination) for destination in destinations)
+    return remaining
+
+
 def _role_mask(fg: FlightGraph, source: Cell, target: Cell) -> int:
     """Pack one arc's four path-position verdicts into a bitmask.
 
@@ -313,6 +336,7 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
 
     destinations = [index[cell] for cell in destination_options if cell in index]
     rev_remaining = _reverse_remaining(n, arc_start, arc_target, destinations)
+    hex_remaining = _hex_remaining(cells, list(destination_options))
 
     offsets = derive_cell_window(cfg)
     revisit_depth = offsets[1] - offsets[0]
@@ -328,6 +352,7 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
         arc_target=arc_target,
         arc_roles=arc_roles,
         rev_remaining=rev_remaining,
+        hex_remaining=hex_remaining,
         dest_mask=dest_mask,
         dest_lane_start=dest_lane_start,
         dest_lane_idx=np.asarray(dest_lane_list, dtype=np.int32),
@@ -351,7 +376,7 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
     # the guarantee that nobody mutates them is the entire basis for doing so.
     for array in (
         prepared.cell_q, prepared.cell_r, prepared.arc_start, prepared.arc_target,
-        prepared.arc_roles, prepared.rev_remaining, prepared.dest_mask,
+        prepared.arc_roles, prepared.rev_remaining, prepared.hex_remaining, prepared.dest_mask,
         prepared.dest_lane_start, prepared.dest_lane_idx, prepared.origin_lane_idx,
         prepared.origin_cell, prepared.origin_lane_steps,
     ):

@@ -157,6 +157,41 @@ def test_reverse_remaining_is_admissible_and_no_looser_than_hex_distance(shape):
 
 
 @pytest.mark.parametrize("shape", sorted(GRAPHS))
+def test_hex_remaining_is_the_references_own_distance_bound(shape):
+    """``hex_remaining`` IS ``pricing._distance_lower_bound``, cell for cell.
+
+    The priced search must read this and not ``rev_remaining``. Both are admissible, but
+    the reverse BFS is *tighter*, and substituting it would prune labels the reference
+    explores -- optimality survives, the explored set does not, and the search can then
+    certify a different equally optimal column. The reference says as much in
+    ``_arc_delay_lower_bound_s``: hex distance is chosen deliberately because it ignores
+    walls and corridor shape.
+    """
+
+    cfg = _cfg()
+    fg = GRAPHS[shape](cfg)
+    topo = prepare_topology(fg, cfg)
+    assert topo.ok
+    cells = list(zip(topo.cell_q.tolist(), topo.cell_r.tolist()))
+    destinations = frozenset(pricing._destination_options(fg))
+
+    for i, cell in enumerate(cells):
+        assert int(topo.hex_remaining[i]) == pricing._distance_lower_bound(cell, destinations)
+    # Looser everywhere, by construction: hex distance ignores the arcs the BFS follows.
+    reachable = topo.rev_remaining < dp_prepare.UNREACHABLE
+    assert np.all(topo.hex_remaining[reachable] <= topo.rev_remaining[reachable])
+
+    # Recorded because it bounds what this file can prove: on these small corridors the two
+    # arrays are IDENTICAL -- convex enough that following arcs costs nothing over straight
+    # hex distance -- so no unit fixture here can detect the kernel reading the wrong one.
+    # The guard against that is `analysis/ab_colgen_parity.py`'s density arms, where the
+    # corridors are ~105 hops long and bend around real walls.
+    assert np.array_equal(topo.hex_remaining, topo.rev_remaining), (
+        "a fixture corridor became non-convex; that is fine, but the note above is now stale"
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPHS))
 def test_claim_only_cells_are_interned_but_unenterable(shape):
     """Endpoint-disc cells outside the reachable set get row ids and nothing else.
 

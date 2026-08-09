@@ -45,6 +45,21 @@ RECOMPUTE_EPS = 1e-8
 
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci hashing multiplier, as in `astar_kernel`
 
+# Arc role bits.  Restated from `dp_prepare` rather than imported so numba can treat them as
+# compile-time constants; `test_kernel_arc_roles_match_dp_prepare` fails if the two drift.
+_ARC_INTERNAL = 1 << 0
+_ARC_FIRST = 1 << 1
+_ARC_LAST = 1 << 2
+_ARC_FIRST_LAST = 1 << 3
+
+# Search outcomes.  Only `STATUS_OK` licenses an optimality claim; everything else means the
+# host must widen a budget and retry, or fall back to the reference.
+STATUS_OK = 0
+STATUS_LABEL_LIMIT = 1      # label pool full -- host doubles it and re-runs
+STATUS_STATE_LIMIT = 2      # dominance table saturated -- host doubles it and re-runs
+STATUS_CANDIDATE_LIMIT = 3  # candidate buffer full; the search itself completed
+STATUS_CANCELLED = 4        # deadline fired mid-search
+
 # The longest exactly-representable partial expansion `_fsum_add` will hold.  Shewchuk's
 # algorithm needs one partial per distinct exponent range in play; 64 covers a full
 # float64 exponent sweep with room to spare, and the arc-loop sums this backs are a
@@ -376,6 +391,224 @@ def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
     return h
 
 
+# ------------------------------------------------------------------- label state helpers
+
+
+@njit(cache=True, nogil=True)
+def _fill_recent(label, depth, label_parent, label_cell, out):
+    """Write the reference's ``recent`` tuple for one label; return its length.
+
+    ``recent`` is the last ``min(hops + 1, depth)`` cells of the path, most-recent first --
+    the reference builds it as ``(neighbour, *recent[:depth - 1])``.  Its LENGTH is part of
+    the identity: a label two hops out has a two-cell history, and Python tuples of
+    different lengths never compare equal, so a fixed-width buffer would merge states the
+    reference keeps apart if the length were dropped.
+    """
+
+    n = 0
+    node = label
+    while node >= 0 and n < depth:
+        out[n] = label_cell[node]
+        n += 1
+        node = label_parent[node]
+    return n
+
+
+@njit(cache=True, nogil=True)
+def _recent_cmp(a, n_a, b, n_b):
+    """Compare two ``recent`` buffers as Python would compare the tuples: -1, 0 or 1."""
+
+    n = min(n_a, n_b)
+    for i in range(n):
+        if a[i] < b[i]:
+            return -1
+        if a[i] > b[i]:
+            return 1
+    if n_a < n_b:
+        return -1
+    if n_a > n_b:
+        return 1
+    return 0
+
+
+@njit(cache=True, nogil=True)
+def _role_allows(roles, first, last):
+    """Whether an arc may be traversed in the requested role -- ``hop_allowed_for_role``."""
+
+    if first:
+        bit = _ARC_FIRST_LAST if last else _ARC_FIRST
+    else:
+        bit = _ARC_LAST if last else _ARC_INTERNAL
+    return (roles & bit) != 0
+
+
+@njit(cache=True, nogil=True)
+def _layer_lt(
+    a, b, depth,
+    label_score, label_cell, label_parent, label_hops, label_departure, label_lane,
+    recent_a, recent_b, scratch_a, scratch_b,
+):
+    """The reference's layer iteration order: ``(cell, recent, tie_key)``.
+
+    ``sorted(layer.items(), key=lambda item: (item[0][0], item[0][1], item[1].tie_key))``
+    at pricing.py:1522.  This is not cosmetic: relaxation order decides which label lands
+    first in the next layer, and ``_prefer`` is non-transitive inside its epsilon band, so
+    the surviving label depends on arrival order.
+    """
+
+    if label_cell[a] != label_cell[b]:
+        return label_cell[a] < label_cell[b]
+    n_a = _fill_recent(a, depth, label_parent, label_cell, recent_a)
+    n_b = _fill_recent(b, depth, label_parent, label_cell, recent_b)
+    order = _recent_cmp(recent_a, n_a, recent_b, n_b)
+    if order != 0:
+        return order < 0
+    return _tie_lt(
+        a, b, label_hops, label_departure, label_lane, label_parent, label_cell,
+        scratch_a, scratch_b,
+    )
+
+
+@njit(cache=True, nogil=True)
+def _sort_layer(
+    items, buffer, n, depth,
+    label_score, label_cell, label_parent, label_hops, label_departure, label_lane,
+    recent_a, recent_b, scratch_a, scratch_b,
+):
+    """Bottom-up merge sort of a layer's label ids under :func:`_layer_lt`.
+
+    Merge sort rather than the obvious insertion sort because a congested density layer
+    holds thousands of labels and O(n^2) there is not survivable; and rather than
+    ``np.argsort`` because the ordering key ends in a whole path, which no numeric key can
+    encode.  Stability is irrelevant to the result -- ``_layer_lt`` is a strict total order
+    on distinct labels, since two labels in one layer cannot share the full key.
+    """
+
+    width = 1
+    while width < n:
+        i = 0
+        while i < n:
+            mid = min(i + width, n)
+            end = min(i + 2 * width, n)
+            left = i
+            right = mid
+            out = i
+            while left < mid and right < end:
+                if _layer_lt(
+                    items[right], items[left], depth,
+                    label_score, label_cell, label_parent, label_hops, label_departure,
+                    label_lane, recent_a, recent_b, scratch_a, scratch_b,
+                ):
+                    buffer[out] = items[right]
+                    right += 1
+                else:
+                    buffer[out] = items[left]
+                    left += 1
+                out += 1
+            while left < mid:
+                buffer[out] = items[left]
+                left += 1
+                out += 1
+            while right < end:
+                buffer[out] = items[right]
+                right += 1
+                out += 1
+            i += 2 * width
+        for k in range(n):
+            items[k] = buffer[k]
+        width *= 2
+    return n
+
+
+@njit(cache=True, nogil=True)
+def _state_find(
+    slot_label, slot_hash, log2cap, key_hash, depth,
+    cell, recent, n_recent, paid_class, first_a, first_b,
+    label_cell, label_parent, label_variant, var_paid_class, probe_recent,
+):
+    """Locate the slot for one dominance key: its occupant, or the first free slot.
+
+    Returns ``(slot, found)``.  ``found`` means the slot holds a label with this exact key;
+    otherwise ``slot`` is where an insertion belongs.  ``-1`` means the table is full.
+
+    The slot stores only a label id and a hash -- the key is re-derived from the label on
+    each probe rather than stored alongside.  That is what keeps the table to two words per
+    slot instead of ``depth + 4``, which matters because the table is per-thread and sized
+    to the largest layer of the largest flight.  Re-deriving costs a walk of ``depth``
+    parent pointers, and ``depth`` is 2-4.
+    """
+
+    cap = 1 << log2cap
+    slot = _mix(key_hash, log2cap)
+    for _probe in range(cap):
+        occupant = slot_label[slot]
+        if occupant < 0:
+            return slot, False
+        if slot_hash[slot] == key_hash and label_cell[occupant] == cell:
+            if var_paid_class[label_variant[occupant]] == paid_class:
+                n_occ = _fill_recent(occupant, depth, label_parent, label_cell, probe_recent)
+                if n_occ == n_recent and _recent_cmp(probe_recent, n_occ, recent, n_recent) == 0:
+                    return slot, True
+        slot += 1
+        if slot >= cap:
+            slot = 0
+    return -1, False
+
+
+@njit(cache=True, nogil=True)
+def _paid_visit_correction(
+    paid_start, paid_cell, paid_step, paid_value, paid_class, cell, visit_step, lo, hi,
+    partials,
+):
+    """Duals this label's origin endpoint already paid inside a later visit window.
+
+    The reference subtracts exactly these (pricing.py:1606) so a row the start option
+    already bought is not charged twice.  The CSR slice is sorted by ``(cell, step)`` --
+    ``sorted(paid)`` over ``RowKey`` tuples, and cell interning is sorted axial order -- so
+    ascending ``step`` here is the same order ``visit_rows`` yields, and the ``fsum`` sees
+    the same terms in the same sequence as ``math.fsum`` does.
+    """
+
+    start = paid_start[paid_class]
+    stop = paid_start[paid_class + 1]
+    n = 0
+    found = False
+    for i in range(start, stop):
+        if paid_cell[i] != cell:
+            continue
+        step = paid_step[i]
+        if step < visit_step + lo or step > visit_step + hi:
+            continue
+        found = True
+        n = _fsum_add(partials, n, paid_value[i])
+        if n < 0:
+            return 0.0, False
+    if not found:
+        return 0.0, True
+    return _fsum_finalize(partials, n), True
+
+
+@njit(cache=True, nogil=True)
+def _visit_hits_forbidden(bits, rows_n_steps, rows_step0, cell, visit_step, lo, hi):
+    """``_visit_hits_forbidden``: does any row of this visit window carry an exclusion?
+
+    Row ids are arithmetic (``cell * n_steps + (step - step0)``), so the whole window is a
+    contiguous run and no ``RowKey`` is built -- which is the allocation the reference
+    removed from its own hot path for the same reason.
+    """
+
+    if bits.shape[0] == 0:
+        return False
+    base = cell * rows_n_steps - rows_step0
+    for step in range(visit_step + lo, visit_step + hi + 1):
+        offset = step - rows_step0
+        if offset < 0 or offset >= rows_n_steps:
+            continue
+        if _row_forbidden(bits, base + step):
+            return True
+    return False
+
+
 def warm_kernel() -> bool:
     """Force compilation of every primitive, so a later timing run measures the search.
 
@@ -420,6 +653,26 @@ def warm_kernel() -> bool:
         scratch_a,
         scratch_b,
     )
-    _state_hash(0, np.zeros(1, np.int32), 0, 0, -1, -1)
-    _mix(0, 8)
+    recent_a = np.zeros(2, np.int32)
+    recent_b = np.zeros(2, np.int32)
+    key_hash = np.uint64(_state_hash(0, recent_a, 1, 0, -1, -1))
+    _mix(key_hash, 8)
+    _fill_recent(0, 2, parent, cell, recent_a)
+    _recent_cmp(recent_a, 1, recent_b, 1)
+    _role_allows(_ARC_INTERNAL, False, False)
+    items = np.zeros(1, np.int32)
+    _sort_layer(
+        items, np.zeros(1, np.int32), 1, 2,
+        np.zeros(1, np.float64), cell, parent, zeros_i, zeros_i, zeros_i,
+        recent_a, recent_b, scratch_a, scratch_b,
+    )
+    _state_find(
+        np.full(2, -1, np.int32), np.zeros(2, np.uint64), 1, key_hash, 2,
+        0, recent_a, 1, 0, -1, -1, cell, parent, zeros_i, zeros_i, recent_b,
+    )
+    _paid_visit_correction(
+        np.zeros(2, np.int32), zeros_i, zeros_i, np.zeros(1, np.float64),
+        0, 0, 0, 0, 0, partials,
+    )
+    _visit_hits_forbidden(np.zeros(1, np.uint64), 1, 0, 0, 0, 0, 0)
     return True

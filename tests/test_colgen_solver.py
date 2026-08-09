@@ -52,6 +52,7 @@ from freespace_sim.planner.colgen.windows import (
     visit_rows,
 )
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
+from tests._colgen_support import with_air_hops
 
 
 def _cfg(**overrides) -> SimConfig:
@@ -92,17 +93,12 @@ def _request(
 def _params(**overrides) -> ColGenParams:
     values = {
         "solver": "highs",
-        "detour_slack_hops": 0,
+        "max_air_overrun_hops": 0,
         "max_iterations": 30,
         "time_limit_s": 30.0,
         "n_heuristic_tries": 16,
     }
     values.update(overrides)
-    # Pair the ceiling with the ellipse unless a test overrides it deliberately -- the rule in
-    # `ColGenParams`. Left unpaired, a fixture naming `detour_slack_hops=0` still gets the
-    # shipped 3-hop ceiling and a graph three steps deeper than the knob it names, so its
-    # column universe tracks the default rather than the fixture.
-    values.setdefault("max_air_overrun_hops", values["detour_slack_hops"])
     return ColGenParams(**values)
 
 
@@ -223,7 +219,7 @@ def test_hub_fold_legs_and_terminal_rows_are_priced_exactly():
         origin_terminal=origin_terminal,
         dest_terminal=destination_terminal,
     )
-    params = _params(detour_slack_hops=4)
+    params = _params(max_air_overrun_hops=4)
     graph = build_flight_graph(
         request,
         cfg,
@@ -260,14 +256,16 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
     )
     # The air-time ceiling is lifted: replacing terminal fold distance with an extra hop is
     # itself an air-time overrun, and this test is about the delay accounting rather than
-    # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic.
-    params = _params(detour_slack_hops=2, max_air_overrun_hops=64)
+    # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic. Lifted at
+    # the graph so the corridor stays where the fixture put it (issue #78: one knob sizes both).
+    params = _params(max_air_overrun_hops=2)
     graph = build_flight_graph(
         request,
         cfg,
         ((origin, origin_terminal), (destination, destination_terminal)),
         params,
     )
+    graph = with_air_hops(graph, graph.shortest_hops + 64)
     duals = {
         RowKey.cell((1, 38), 0, 9): 1.0,
         RowKey.cell((1, 40), 0, 10): 1.0,
@@ -383,18 +381,24 @@ def test_zero_buffer_pricing_keeps_predecessor_dependent_endpoint_duals():
 
 
 def test_pricing_allows_wide_loops_but_no_tight_revisits():
-    """Slack sizes the ellipse, not path length; a dual-optimal loop may revisit at W.
+    """The corridor bounds WHERE a route goes, not how long it takes; a loop may revisit at W.
 
     That contract is about the ELLIPSE and the revisit window, so the air-time ceiling is
-    lifted out of the way: the loop below is 6 hops for a 2-hop flight, so a small hop
-    budget -- not the geometry under test -- would decide the answer.
+    lifted out of the way with `with_air_hops`: the loop below is 6 hops for a 2-hop flight,
+    so a small hop budget -- not the geometry under test -- would decide the answer. Since
+    issue #78 one knob sizes both, so lifting the ceiling through `ColGenParams` would widen
+    the corridor with it and change the instance; the graph-level override holds the corridor
+    at 2 and moves only the budget.
     `test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows` pins that side.
     """
 
+    corridor = 2
     cfg = _cfg(max_ground_delay_s=16.0)
-    params = _params(detour_slack_hops=2, max_air_overrun_hops=64)
+    params = _params(max_air_overrun_hops=corridor)
     request = _request(3, (0, 0), (2, 0), cfg)
-    graph = build_flight_graph(request, cfg, (), params)
+    corridor_graph = build_flight_graph(request, cfg, (), params)
+    assert corridor_graph.shortest_hops == 2
+    graph = with_air_hops(corridor_graph, corridor_graph.shortest_hops + 64)
     duals = {
         RowKey.cell((3, 0), 0, 9): 100.0,
         RowKey.cell((-1, 0), 0, 12): 100.0,
@@ -412,7 +416,7 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
         (1, 0),
         (2, 0),
     )
-    assert len(column.cell_path) - 1 > graph.shortest_hops + graph.detour_slack_hops
+    assert len(column.cell_path) - 1 > graph.shortest_hops + corridor
     assert column.delay_s == pytest.approx(16.0)
     assert reduced_cost == pytest.approx(params.M - 16.0)
     assert column.claims.isdisjoint(duals)
@@ -689,13 +693,13 @@ def test_hand_checked_detour_beats_hold():
         requests,
         cfg,
         (),
-        _params(detour_slack_hops=0, gap_metric="cost"),
+        _params(max_air_overrun_hops=0, gap_metric="cost"),
     )
     with_detour = ColGenSolver().solve(
         requests,
         cfg,
         (),
-        _params(detour_slack_hops=1, gap_metric="cost"),
+        _params(max_air_overrun_hops=1, gap_metric="cost"),
     )
 
     assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
@@ -732,7 +736,7 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     ]
 
     revenue = ColGenSolver().solve(
-        requests, cfg, (), _params(detour_slack_hops=1, gap_metric="revenue")
+        requests, cfg, (), _params(max_air_overrun_hops=1, gap_metric="revenue")
     )
 
     assert revenue.stats["termination_reason"] == "lp_gap"
@@ -935,7 +939,13 @@ def test_greedy_timeout_is_local_to_one_flight(monkeypatch):
 
 
 def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
-    """A detoured seed can be longer than the graph's nominal hop allowance."""
+    """A detoured seed can be longer than the graph's nominal hop allowance.
+
+    Longer than `max_air_hops`, in fact: `seed_column` walks the corridor and is not bounded by
+    the ceiling the exact search enforces, so the incumbent it hands `price_flight` can be a
+    column pricing is forbidden to reproduce. Safe -- an incumbent only tightens pruning -- and
+    pre-existing, but it is what this assertion now says out loud.
+    """
 
     cfg = _cfg(max_ground_delay_s=48.0)
     request = _request(1, (-10, 0), (10, 0), cfg)
@@ -943,10 +953,10 @@ def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
         (_point(cell, cfg), Terminal(f"X{index}", 1, radius=0.0))
         for index, cell in enumerate(((3, 1), (1, -1)))
     )
-    params = _params(detour_slack_hops=1)
+    params = _params(max_air_overrun_hops=1)
     graph = build_flight_graph(request, cfg, static_terms, params)
     seed = seed_column(graph, cfg)
-    assert len(seed.cell_path) - 1 > graph.shortest_hops + graph.detour_slack_hops
+    assert len(seed.cell_path) - 1 > graph.max_air_hops
 
     invalid_latest_claims = _shift_claims(
         seed.claims,
@@ -1523,7 +1533,7 @@ def test_the_objective_stat_says_which_currency_it_is_in():
         _request(1, (-2, -5), (-2, -11), cfg),
         _request(2, (-8, -4), (0, -4), cfg),
     ]
-    shared = {"detour_slack_hops": 1, "gap_metric": "cost"}
+    shared = {"max_air_overrun_hops": 1, "gap_metric": "cost"}
 
     delay = ColGenSolver().solve(requests, cfg, (), _params(objective="total_delay", **shared))
     cost = ColGenSolver().solve(requests, cfg, (), _params(objective="total_cost", **shared))
@@ -1543,22 +1553,29 @@ def test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows():
     Same instance as `test_pricing_allows_wide_loops_but_no_tight_revisits`, which lifts the
     ceiling and gets a 6-hop loop for a 2-hop flight. Given one hop of room the loop is
     unreachable and pricing returns the direct route -- paying the duals it would otherwise
-    have detoured around. Suboptimal by construction, like `detour_slack_hops`.
+    have detoured around. Suboptimal by construction.
+
+    Both arms share ONE graph, so the corridor is identical by reference and only the budget
+    moves. That is stronger than the two-graph form this replaced: with the corridor knob
+    deleted (issue #78) two `build_flight_graph` calls at different budgets would differ in
+    corridor too, and the comparison would no longer isolate the ceiling.
     """
 
     cfg = _cfg(max_ground_delay_s=16.0)
     duals = {RowKey.cell((3, 0), 0, 9): 100.0, RowKey.cell((-1, 0), 0, 12): 100.0}
     request = _request(3, (0, 0), (2, 0), cfg)
 
-    capped_params = _params(detour_slack_hops=2, max_air_overrun_hops=1)
-    capped_graph = build_flight_graph(request, cfg, (), capped_params)
-    assert capped_graph.shortest_hops == 2
-    assert capped_graph.max_air_hops == 3
-    capped_rc, capped = price_flight(capped_graph, duals, 0.0, cfg, capped_params)
+    params = _params(max_air_overrun_hops=2)
+    base_graph = build_flight_graph(request, cfg, (), params)
+    assert base_graph.shortest_hops == 2
 
-    free_params = _params(detour_slack_hops=2, max_air_overrun_hops=64)
-    free_graph = build_flight_graph(request, cfg, (), free_params)
-    free_rc, free = price_flight(free_graph, duals, 0.0, cfg, free_params)
+    capped_graph = with_air_hops(base_graph, 3)
+    assert capped_graph.max_air_hops == 3
+    capped_rc, capped = price_flight(capped_graph, duals, 0.0, cfg, params)
+
+    free_graph = with_air_hops(base_graph, base_graph.shortest_hops + 64)
+    assert free_graph.corridor_cells is capped_graph.corridor_cells
+    free_rc, free = price_flight(free_graph, duals, 0.0, cfg, params)
 
     assert capped is not None and free is not None
     assert len(capped.cell_path) - 1 <= capped_graph.max_air_hops
@@ -1587,7 +1604,7 @@ def test_the_air_time_ceiling_is_a_flat_budget_not_a_fraction_of_the_flight():
         for overrun in (0, 3, 6, 9):
             graph = build_flight_graph(
                 _request(1, origin, dest, cfg), cfg, (),
-                _params(detour_slack_hops=4, max_air_overrun_hops=overrun),
+                _params(max_air_overrun_hops=overrun),
             )
             assert graph.shortest_hops == shortest
             # The room is this integer for both flights; a fraction would have scaled it.
@@ -1598,21 +1615,28 @@ def test_the_air_time_ceiling_is_a_flat_budget_not_a_fraction_of_the_flight():
     with pytest.raises(TypeError, match="max_air_overrun_hops"):
         ColGenParams(max_air_overrun_hops=1.5)
 
-    # The ceiling implies the ellipse, which is why the two knobs have to move together --
-    # `params.py` states the rule and this is the proof it rests on. A path through `c` costs
-    # at least d(o,c) + d(c,d) hops, so a route within `shortest + overrun` can only touch
-    # cells inside the ellipse of radius `overrun`, whatever `detour_slack_hops` allows. The
-    # corridor here is sized 3 and the budget 1, so the containment is strictly tighter than
-    # anything `build_flight_graph` enforces: it is a claim about the SEARCH, not the graph.
+    # The ceiling implies the ellipse -- this is the proof the single knob rests on, and the
+    # reason `params.py` can say the corridor follows from the budget. A path through `c` costs
+    # at least d(o,c) + d(c,d) hops, so a route within `shortest + budget` can only touch cells
+    # inside the ellipse of radius `budget`, however wide the corridor is.
+    #
+    # The corridor is deliberately held at 3 while the budget moves to 1, so the containment is
+    # strictly TIGHTER than anything `build_flight_graph` enforces: it is a claim about the
+    # SEARCH, not the graph. Sizing both from one knob would make it vacuous -- the graph would
+    # already forbid every cell the assertion checks for -- so the budget is overridden at the
+    # graph level, which is the only place the two are still separate.
     priced_cfg = _cfg(max_ground_delay_s=16.0)
+    corridor = 3
     rng = np.random.default_rng(5)
     eccentric = False
     for origin, dest in (((0, 0), (2, 0)), ((-2, 0), (3, 0))):
         request = _request(2, origin, dest, priced_cfg)
+        params = _params(max_air_overrun_hops=corridor)
+        wide = build_flight_graph(request, priced_cfg, (), params)
         for overrun in (1, 6):
-            params = _params(detour_slack_hops=3, max_air_overrun_hops=overrun)
-            graph = build_flight_graph(request, priced_cfg, (), params)
+            graph = with_air_hops(wide, wide.shortest_hops + overrun)
             assert graph.shortest_hops == hg.hex_distance(origin, dest)
+            assert graph.corridor_cells is wide.corridor_cells, "the corridor must stay wide"
             cells = sorted(graph.corridor_cells)
             lo = graph.min_step
             for _ in range(6):

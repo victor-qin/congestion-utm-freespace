@@ -598,9 +598,15 @@ def _arc_delay_lower_bound_s(
 
     When both terminal folds retain their selected boundary cells, the raw
     centreline consists of the origin fold, one equal-length lattice arc per
-    hop, and the destination fold.  Reverse-BFS distance lower-bounds the
-    unflown arcs, while independently minimizing the destination fold can only
-    weaken that bound.  Customer snap legs have the same additive form.
+    hop, and the destination fold.  ``remaining_hops`` lower-bounds the unflown
+    arcs, while independently minimizing the destination fold can only weaken
+    that bound.  Customer snap legs have the same additive form.
+
+    That remaining-hop count is plain hex distance (:func:`_distance_lower_bound`),
+    NOT a reverse traversal of the corridor: it ignores walls and corridor shape,
+    so it is a relaxation of the true remaining distance and the bound stays
+    admissible.  A real reverse BFS would be tighter wherever the corridor is
+    non-convex, at the cost of one traversal per graph.
 
     A terminal lane inside its fold radius invalidates that decomposition: a
     later hop can be dropped by folding without increasing canonical flown
@@ -1058,23 +1064,17 @@ def _best_column(
         return entry
 
     origin_options = _origin_options(fg)
-    # ``detour_slack_hops`` sizes the spatial ellipse, so this is a route-length bound
-    # denominated in a knob that does not measure route length -- deliberately, and only for
-    # SEEDS.  A zero-dual seed has no reason to loop at all, so bounding it by the container's
-    # own radius keeps it off the value-tied cyclic walks a wider budget would let it explore.
-    # Every other search is bounded by ``air_hop_limit`` below, which is the honest budget;
-    # when the two knobs are paired these coincide and this line does nothing extra.
-    seed_hop_limit = fg.shortest_hops + fg.detour_slack_hops
-    if seed_hop_limit < 1:
-        return -math.inf, None
-    # The air-time ceiling (`params.max_air_overrun_hops`, resolved at graph build).  Unlike
-    # `seed_hop_limit` this applies to EVERY search, which is the point: the ellipse bounds
-    # how far off the straight line a route may stray, and nothing bounded how long it could
-    # circle inside that ellipse.  A label at the cap cannot be extended, and one that could
-    # not reach a destination within it is dead on creation.  Costs optimality -- a route
-    # needing more hops is now unreachable -- on the same terms `detour_slack_hops` already
-    # does, and buys the same thing: labels never created.
+    # The air-time ceiling (`params.max_air_overrun_hops`, resolved at graph build), and the
+    # ONLY route-length bound this search has.  A label at the cap cannot be extended, and one
+    # that could not reach a destination within it is dead on creation.  It also implies the
+    # corridor -- a route within `max_air_hops` cannot touch a cell outside the ellipse of
+    # radius `max_air_hops - shortest_hops`, which is why the two are one knob and why the
+    # per-arc form below is a stronger test than corridor membership, not a redundant one.
+    # Costs optimality -- a route needing more hops is unreachable even if it is the true
+    # optimum -- and buys the thing that matters: labels never created.
     air_hop_limit = fg.max_air_hops
+    if air_hop_limit < 1:
+        return -math.inf, None
 
     offsets = dual_view.offsets
     revisit_depth = offsets[1] - offsets[0]
@@ -1200,7 +1200,27 @@ def _best_column(
 
         lane_steps = 0 if lane_idx is None else fg.origin_lanes[lane_idx].steps
         corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
-        max_total_hops = fg.max_step - corridor_start
+        # The horizon term is ~920 hops for an early colgen_test departure against a ceiling of
+        # ~20, and every entry past the ceiling describes a completion the search cannot make.
+        #
+        # NOT a large saving, and the comment is here to stop the next reader assuming it is.
+        # The `break` below already contains the loop whenever it CAN fire, and measured on
+        # colgen_test it fires at exactly `max_air_hops + 1` -- one wasted `_endpoint_claims`
+        # per (departure, lane), not nine hundred.  What this buys is that the containment stops
+        # depending on the break, which needs `delay_lb` monotone in hops: true in the arc form,
+        # false in the ground-only fallback where it is CONSTANT and the break fires at
+        # `total_hops == 1` or never.  "Never" means the full horizon range.  Reaching that
+        # fallback needs `reference_time_s <= 0` or an inexact fold, and lanes are the boundary
+        # ring of the same `exit_radius` the fold measures against, so no colgen_test flight
+        # does (checked: 0 of 50).  A cheap guard on an awkward path, not a hot-path win.
+        #
+        # Exact, not a heuristic: `completion_can_compete` reads a short envelope as "cannot
+        # compete", which is the right verdict for an unreachable hop count, and no caller can
+        # ask about one -- every label satisfies `hops + remaining_distance <= max_air_hops` by
+        # the guards in the two loops below.  Keep the `min()` rather than the ceiling alone:
+        # the two are provably equal today (single level, so `takeoff_steps[0]` is the max), but
+        # the horizon is a real bound and should stay visible if `_graph_max_step` changes.
+        max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
         delay_lbs = [math.inf]
         destination_positive_costs = [math.inf]
         for total_hops in range(1, max_total_hops + 1):
@@ -1344,8 +1364,6 @@ def _best_column(
                 continue
             if distance_to_go > air_hop_limit:
                 continue
-            if seed and distance_to_go > seed_hop_limit:
-                continue
             visit_claims = _visit_claims(cell, 0, start_step, offsets)
             start_claims = origin_claims | visit_claims
             if not start_claims.isdisjoint(forbidden_rows):
@@ -1443,7 +1461,7 @@ def _best_column(
             hops = label.hops
             if hops >= air_hop_limit:
                 continue
-            if (seed and hops >= seed_hop_limit) or step + 1 > fg.max_step:
+            if step + 1 > fg.max_step:
                 continue
             paid_cells, paid_cell_rows = _paid_cell_rows(origin_paid_rows)
             if incumbent is not None:
@@ -1505,8 +1523,6 @@ def _best_column(
                 if next_step + distance_to_go > fg.max_step:
                     continue
                 if hops + 1 + distance_to_go > air_hop_limit:
-                    continue
-                if seed and hops + 1 + distance_to_go > seed_hop_limit:
                     continue
                 # Same per-arc guard as the feasible search: a set built only to be tested.
                 if _visit_hits_forbidden(neighbour, 0, next_step, offsets, forbidden_rows):

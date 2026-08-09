@@ -586,23 +586,23 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         "_lock",
         "_materialized",
         "_origin",
+        "_overrun",
         "_own_interiors",
         "_shortest",
-        "_slack",
     )
 
     def __init__(
         self,
         origin: Cell,
         dest: Cell,
-        slack: int,
+        overrun: int,
         foreign_exclusions: AbstractSet[Cell],
         own_interiors: frozenset[Cell],
         explicit_lanes: frozenset[Cell],
     ) -> None:
         self._origin = origin
         self._dest = dest
-        self._slack = slack
+        self._overrun = overrun
         self._shortest = hg.hex_distance(origin, dest)
         self._foreign_exclusions = foreign_exclusions
         self._own_interiors = own_interiors
@@ -625,7 +625,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
             return False
         return (
             hg.hex_distance(self._origin, cell) + hg.hex_distance(cell, self._dest)
-            <= self._shortest + self._slack
+            <= self._shortest + self._overrun
         )
 
     def _cells(self) -> frozenset[Cell]:
@@ -635,7 +635,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         with self._lock:
             materialized = self._materialized
             if materialized is None:
-                cells = _ellipse_cells(self._origin, self._dest, self._slack)
+                cells = _ellipse_cells(self._origin, self._dest, self._overrun)
                 cells.difference_update(self._foreign_exclusions)
                 cells.difference_update(self._own_interiors)
                 cells.update(
@@ -663,7 +663,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         return (
             self._origin,
             self._dest,
-            self._slack,
+            self._overrun,
             self._foreign_exclusions,
             self._own_interiors,
             self._explicit_lanes,
@@ -743,10 +743,10 @@ class FlightGraph:
     min_step: int
     max_step: int
     shortest_hops: int
-    detour_slack_hops: int
     # Hard ceiling on a priced route's hop count, from `params.max_air_overrun_hops`.
     # Resolved here rather than in pricing so both searches over this domain agree on it
-    # and so it participates in graph identity.
+    # and so it participates in graph identity.  `max_air_hops - shortest_hops` is also the
+    # radius of `corridor_cells`: one knob sizes both (see `ColGenParams`).
     max_air_hops: int
     static_exclusions: AbstractSet[Cell]
     foreign_exclusions: AbstractSet[Cell]
@@ -813,7 +813,7 @@ class FlightGraph:
                 self.latest_departure_step,
                 self.max_step,
                 self.shortest_hops,
-                self.detour_slack_hops,
+                self.max_air_hops,
             )
         )
 
@@ -848,10 +848,15 @@ class FlightGraph:
         return MappingProxyType(capacities)
 
 
-def _ellipse_cells(origin: Cell, dest: Cell, slack: int) -> set[Cell]:
-    """Enumerate the finite axial O-D ellipse used by the pricing network."""
+def _ellipse_cells(origin: Cell, dest: Cell, overrun: int) -> set[Cell]:
+    """Enumerate the finite axial O-D ellipse used by the pricing network.
+
+    ``overrun`` is ``params.max_air_overrun_hops``: the hop budget IS the corridor radius,
+    because a route within ``shortest + overrun`` hops cannot touch a cell outside the
+    ellipse of that radius.  See :class:`ColGenParams`.
+    """
     shortest = hg.hex_distance(origin, dest)
-    radius = shortest + slack
+    radius = shortest + overrun
     oq, orr = origin
     cells: set[Cell] = set()
     # Enumerate the exact axial disk around the origin, then retain the O-D ellipse.
@@ -860,7 +865,7 @@ def _ellipse_cells(origin: Cell, dest: Cell, slack: int) -> set[Cell]:
         dr_hi = min(radius, -dq + radius)
         for dr in range(dr_lo, dr_hi + 1):
             cell = (oq + dq, orr + dr)
-            if hg.hex_distance(origin, cell) + hg.hex_distance(cell, dest) <= shortest + slack:
+            if hg.hex_distance(origin, cell) + hg.hex_distance(cell, dest) <= radius:
                 cells.add(cell)
     return cells
 
@@ -877,15 +882,17 @@ def _graph_max_step(
     though those advance the same integer clock before the first cell visit.  Include both so
     neither silently consumes the ground-delay or route budget.
 
-    The route term is ``max_air_hops`` -- the ceiling itself -- and not
-    ``shortest_hops + detour_slack_hops``.  The two agree at the shipped pairing, so this
-    reads like a rename, but they part whenever the two knobs do, and the slack is the wrong
-    one of the pair to ask.  The clock has to reach the LATEST legal departure plus that
-    departure's longest legal route; with the slack in this slot and an overrun above it, the
-    horizon fell short of the ceiling and became the binding constraint for late departures
-    only -- reinstating exactly the departure-dependent cap the ceiling exists to remove
-    (measured at slack=3/overrun=9: 26 hops advertised, 20 reachable at the last departure).
-    Below the slack it errs the other way and simply leaves dead clock.
+    The route term is ``max_air_hops`` -- the ceiling itself.  The clock has to reach the LATEST
+    legal departure plus that departure's longest legal route, so anything smaller in this slot
+    becomes the binding constraint for late departures only, reinstating exactly the
+    departure-dependent cap the ceiling exists to remove.
+
+    Historically this slot held ``shortest_hops + detour_slack_hops``, from a separate corridor
+    knob since removed (issue #78).  The two agreed at the shipped pairing and parted whenever
+    the knobs did: measured at slack=3/overrun=9, 26 hops were advertised and 20 reachable at
+    the last departure (``9816f61``).  With one knob they cannot part, but the term still has to
+    be ``max_air_hops`` rather than any re-derivation of it -- that is what this docstring
+    exists to say.
     """
     return (
         latest_departure_step
@@ -1392,12 +1399,16 @@ def build_flight_graph(
             "colgen v1 supports a single flight level; multi-level level choice is a planned extension"
         )
     validate_edge_locality(cfg)
+    # A flat hop budget over the geodesic, identical for every flight (see ColGenParams, which
+    # owns the default).  Read once and threaded down: it sizes the corridor below AND caps
+    # route length AND denominates the horizon, and a second copy of that number would silently
+    # disagree with this one the moment either moved.
     try:
-        slack = operator.index(params.detour_slack_hops)
+        overrun = operator.index(params.max_air_overrun_hops)
     except (AttributeError, TypeError) as exc:
-        raise TypeError("params.detour_slack_hops must be an integer") from exc
-    if slack < 0:
-        raise ValueError(f"detour_slack_hops must be non-negative, got {slack}")
+        raise TypeError("params.max_air_overrun_hops must be an integer") from exc
+    if overrun < 0:
+        raise ValueError(f"max_air_overrun_hops must be non-negative, got {overrun}")
 
     dt = cfg.dt_s
     radius = hg.circumradius(cfg)
@@ -1472,13 +1483,17 @@ def build_flight_graph(
         own_interiors.update(hg.terminal_cells(center, terminal, cfg) - lane_cells)
 
     shortest_hops = hg.hex_distance(origin_cell, dest_cell)
+    max_air_hops = shortest_hops + overrun
     frozen_own_interiors = frozenset(own_interiors)
     static_exclusions = _CombinedCellSet(foreign_exclusions, frozen_own_interiors)
     explicit_lanes = frozenset(lane.cell for lane in (*origin_lanes, *dest_lanes))
+    # The corridor radius IS the hop budget: a route within `max_air_hops` cannot touch a cell
+    # outside the ellipse of radius `overrun`, so sizing it by anything else would be either a
+    # band no route can reach or a second, hidden cap.
     corridor = _LazyCorridorCells(
         origin_cell,
         dest_cell,
-        slack,
+        overrun,
         foreign_exclusions,
         frozen_own_interiors,
         explicit_lanes,
@@ -1522,18 +1537,6 @@ def build_flight_graph(
     latest_departure_step = base_step + max_ground_steps
     levels = tuple(cfg.flight_levels_m)
     takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)
-    # A flat hop budget over the geodesic, identical for every flight (see ColGenParams,
-    # which owns the default and the rule pairing it with `detour_slack_hops`).  Read the
-    # same way as the slack above rather than through a `getattr` default, so there is one
-    # copy of that number: a second one here silently disagrees the moment either moves.
-    # Resolved before the horizon below, which is denominated in it.
-    try:
-        overrun = operator.index(params.max_air_overrun_hops)
-    except (AttributeError, TypeError) as exc:
-        raise TypeError("params.max_air_overrun_hops must be an integer") from exc
-    if overrun < 0:
-        raise ValueError(f"max_air_overrun_hops must be non-negative, got {overrun}")
-    max_air_hops = shortest_hops + overrun
     max_step = _graph_max_step(
         latest_departure_step,
         takeoff_steps,
@@ -1558,7 +1561,6 @@ def build_flight_graph(
         min_step=base_step,
         max_step=max_step,
         shortest_hops=shortest_hops,
-        detour_slack_hops=slack,
         max_air_hops=max_air_hops,
         static_exclusions=static_exclusions,
         foreign_exclusions=foreign_exclusions,

@@ -25,6 +25,7 @@ from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import derive_cell_window, endpoint_claim_cells
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import exit_radius
+from tests._colgen_support import with_air_hops
 
 
 def _cfg() -> SimConfig:
@@ -44,18 +45,16 @@ def _point(cell: tuple[int, int], cfg: SimConfig):
     return vec(x, y, cfg.ground_level_m)
 
 
-def _graph(cfg: SimConfig, *, slack: int = 4, **overrides):
+def _graph(cfg: SimConfig, *, overrun: int = 4, **overrides):
     request = FlightRequest(1, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)
     values = {
         "solver": "highs",
-        "detour_slack_hops": slack,
+        "max_air_overrun_hops": overrun,
         "max_iterations": 3,
         "time_limit_s": 30.0,
         "n_heuristic_tries": 2,
     }
     values.update(overrides)
-    # Ceiling paired with the ellipse unless a caller says otherwise; see ColGenParams.
-    values.setdefault("max_air_overrun_hops", values["detour_slack_hops"])
     params = ColGenParams(**values)
     return build_flight_graph(request, cfg, (), params), params
 
@@ -65,7 +64,7 @@ def test_seed_astar_expands_only_a_small_lazy_subset():
 
     cfg = _cfg()
     request = FlightRequest(101, _point((0, 0), cfg), _point((80, 0), cfg), 0.0, 0.0)
-    params = ColGenParams(solver="highs", detour_slack_hops=12)
+    params = ColGenParams(solver="highs", max_air_overrun_hops=12)
     graph = build_flight_graph(request, cfg, (), params)
 
     assert not graph.corridor_cells.is_materialized
@@ -88,7 +87,7 @@ def test_repeated_pricing_reuses_lazy_arcs_and_cached_seed():
     """
 
     cfg = _cfg()
-    graph, params = _graph(cfg, slack=2)
+    graph, params = _graph(cfg, overrun=2)
     credited = RowKey.cell((-2, 0), 0, 5)
 
     first = price_flight(graph, {credited: -100.0}, 0.0, cfg, params)
@@ -104,7 +103,7 @@ def test_repeated_pricing_reuses_lazy_arcs_and_cached_seed():
 
 def test_canonical_claim_cache_is_strictly_bounded():
     cfg = _cfg()
-    graph, _params = _graph(cfg, slack=2)
+    graph, _params = _graph(cfg, overrun=2)
     seed = seed_column(graph, cfg)
 
     for delta in range(6):
@@ -122,7 +121,7 @@ def test_uncertified_wall_seed_cannot_skip_exact_pricing(monkeypatch):
     """A valid fallback seed is an incumbent, not a global zero-dual proof."""
 
     cfg = _cfg()
-    graph, params = _graph(cfg, slack=1)
+    graph, params = _graph(cfg, overrun=1)
     seed_column(graph, cfg)
     graph._search_cache.seed_delay_certified = False
     original = pricing._best_column
@@ -155,7 +154,7 @@ def test_role_specific_wall_arcs_survive_pricing_dominance():
     )
     params = ColGenParams(
         solver="highs",
-        detour_slack_hops=6,
+        max_air_overrun_hops=6,
         M=1_000_000.0,
     )
     origin = vec(34.27069337311164, -48.529334145873435, 0.0)
@@ -274,11 +273,13 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
     negative dual is the master paying a flight to use an under-used row, and collecting
     that credit costs hops. With a small hop budget the credited cell is out of reach, so
     this contract is about what pricing does when the ceiling is not the binding
-    constraint.
+    constraint. Lifted at the graph so the corridor stays at the fixture's 4 -- one knob sizes
+    both since issue #78, and widening the corridor to 64 would change the instance.
     """
 
     cfg = _cfg()
-    graph, params = _graph(cfg, max_air_overrun_hops=64)
+    graph, params = _graph(cfg)
+    graph = with_air_hops(graph, graph.shortest_hops + 64)
     credited = RowKey.cell((-2, 0), 0, 5)
     assert credited not in seed_column(graph, cfg).claims
 
@@ -299,12 +300,60 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
     )
 
 
+def test_completion_envelope_never_costs_a_hop_count_the_ceiling_forbids(monkeypatch):
+    """The envelope builds no entry for a hop count the ceiling makes unreachable.
+
+    `completion_envelope` sizes its range from the HORIZON (`max_step - corridor_start`, ~920
+    hops for an early departure) while the ceiling is ~20, and every entry costs an
+    `_endpoint_claims` call plus a sweep over destination options. Its `break` contains that,
+    but only conditionally: the break needs `delay_lb` monotone in hops, which holds in the arc
+    form and NOT in the conservative ground-only fallback, where `delay_lb` is constant and the
+    break fires at `total_hops == 1` or never.
+
+    `timing_steps` on a destination-endpoint claim IS the hop count, so watching that argument
+    states the invariant directly and without reaching into a closure. Measured against the
+    pre-#78 build this fails by exactly one call per key -- the break evaluates `ceiling + 1`
+    before it fires -- which is also the honest size of the saving on this scenario. The point
+    is the bound, not the hop: it now holds by construction rather than by an argument about a
+    break two functions away.
+    """
+
+    # A wide ground-delay budget is what opens the gap this guards: `max_step` has to cover the
+    # latest legal departure, so the horizon runs far past any one route's length. The shipped
+    # colgen_test budget is 3600 s, which is where the ~920-against-20 figure comes from.
+    cfg = replace(_cfg(), max_ground_delay_s=400.0)
+    graph, params = _graph(cfg, overrun=1)
+    # Duals ON the seed's own claims: with none, `price_flight` takes the zero-dual locality
+    # shortcut and `_best_column` -- so `completion_envelope` -- never runs at all.
+    seed = seed_column(graph, cfg)
+    duals = {row: 50.0 for row in sorted(seed.claims)[:6]}
+
+    original = pricing._endpoint_claims
+    arrival_hops: list[int] = []
+
+    def spy(fg, cfg_, *, origin, step, timing_steps):
+        if not origin:
+            arrival_hops.append(timing_steps)
+        return original(fg, cfg_, origin=origin, step=step, timing_steps=timing_steps)
+
+    monkeypatch.setattr(pricing, "_endpoint_claims", spy)
+    price_flight(graph, duals, 0.0, cfg, params)
+
+    assert arrival_hops, "the fixture must reach the exact search, not the seed shortcut"
+    assert max(arrival_hops) <= graph.max_air_hops, (
+        f"asked about {max(arrival_hops)} hops against a ceiling of {graph.max_air_hops}"
+    )
+    # The horizon is what the range used to be denominated in; keep the gap visible so a
+    # regression that reinstates it is obviously a regression.
+    assert graph.max_step - graph.min_step > 10 * graph.max_air_hops
+
+
 @pytest.mark.parametrize("terminal_origin", [False, True])
 def test_shifted_seed_claims_are_canonical_time_translations(terminal_origin):
     """Every canonical row moves by exactly the integer departure shift."""
 
     cfg = _cfg()
-    params = ColGenParams(solver="highs", detour_slack_hops=4)
+    params = ColGenParams(solver="highs", max_air_overrun_hops=4)
     origin = _point((0, 0), cfg)
     destination = _point((4, 0), cfg)
     terminal = Terminal("hub", 2, radius=180.0) if terminal_origin else None
@@ -365,7 +414,7 @@ def test_arc_bound_matches_ground_only_pricing_sweep(monkeypatch):
     """The guarded arc lower bound preserves the exact DP optimum across row signs."""
 
     cfg = _cfg()
-    graph, params = _graph(cfg, slack=2)
+    graph, params = _graph(cfg, overrun=2)
     seed = seed_column(graph, cfg)
     dual_sweep = (
         {min(seed.claims, key=lambda row: row.step): 100.0},
@@ -465,10 +514,10 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
     """Positive, negative, and exact-tie endpoint prices preserve the global optimum."""
 
     cfg = replace(_cfg(), max_ground_delay_s=8.0)
-    # Ceiling paired with the ellipse: `max_step` is denominated in `max_air_hops`, so leaving
-    # the shipped 3-hop ceiling against slack=0 would deepen the graph past the knob this
-    # fixture names and grow the enumerated universe below from 10 columns to 16.
-    params = ColGenParams(solver="highs", detour_slack_hops=0, max_air_overrun_hops=0)
+    # `max_step` is denominated in `max_air_hops`, so the shipped 3-hop budget would deepen the
+    # graph past the knob this fixture names and grow the enumerated universe below from 10
+    # columns to 16.
+    params = ColGenParams(solver="highs", max_air_overrun_hops=0)
     request = FlightRequest(7, _point((0, 0), cfg), _point((1, 1), cfg), 0.0, 0.0)
     graph = build_flight_graph(request, cfg, (), params)
     columns = _exhaustive_columns(graph, cfg)
@@ -563,8 +612,7 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
     )
     params = ColGenParams(
         solver="highs",
-        detour_slack_hops=1,
-        max_air_overrun_hops=1,   # paired with the ellipse; see ColGenParams
+        max_air_overrun_hops=1,
         objective="total_cost",
         time_limit_s=60.0,
     )

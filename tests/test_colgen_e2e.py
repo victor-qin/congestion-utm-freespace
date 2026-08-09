@@ -105,7 +105,7 @@ def test_real_crossing_batch_files_every_selected_column():
         FlightRequest(1, _point((-4, 0), cfg), _point((4, 0), cfg), 0.0, 0.0),
         FlightRequest(2, _point((0, -4), cfg), _point((0, 4), cfg), 0.0, 0.0),
     ]
-    params = ColGenParams(solver="highs", detour_slack_hops=0, time_limit_s=30.0)
+    params = ColGenParams(solver="highs", max_air_overrun_hops=0, time_limit_s=30.0)
 
     intents, _ledger = _run_direct_batch(requests, cfg, params)
 
@@ -128,7 +128,7 @@ def test_colgen_terminal_rows_enforce_pad_capacity():
     hub = (3_000.0, 3_000.0)
     terminal = Terminal("H", capacity=2, radius=180.0)
     requests = _radial_deliveries(hub, terminal, 3)
-    params = ColGenParams(solver="highs", detour_slack_hops=0, time_limit_s=30.0)
+    params = ColGenParams(solver="highs", max_air_overrun_hops=0, time_limit_s=30.0)
 
     intents, _ledger = _run_direct_batch(
         requests,
@@ -167,7 +167,7 @@ def test_budget_denial_is_not_logged_as_a_covering_bug(caplog):
     hub = (3_000.0, 3_000.0)
     terminal = Terminal("H", capacity=1, radius=180.0)
     requests = _radial_deliveries(hub, terminal, 2)
-    params = ColGenParams(solver="highs", detour_slack_hops=0, time_limit_s=30.0)
+    params = ColGenParams(solver="highs", max_air_overrun_hops=0, time_limit_s=30.0)
     caplog.set_level(logging.ERROR, logger="freespace_sim.planner.colgen.batch")
 
     intents, _ledger = _run_direct_batch(
@@ -197,7 +197,7 @@ def test_colgen_is_wall_aware_and_customer_batch_needs_no_terminal_walls():
     intents, _ledger = _run_direct_batch(
         [request],
         cfg,
-        ColGenParams(solver="highs", detour_slack_hops=0),
+        ColGenParams(solver="highs", max_air_overrun_hops=0),
     )
 
     assert len(intents) == 1 and intents[0].accepted
@@ -216,7 +216,7 @@ def test_colgen_test_fast_real_batch_smoke():
     assert 0 < len(requests) <= 20
     params = ColGenParams(
         solver="highs",
-        detour_slack_hops=0,
+        max_air_overrun_hops=0,
         max_iterations=10,
         time_limit_s=30.0,
     )
@@ -353,7 +353,7 @@ def test_colgen_small_hub_seed_sweep_has_no_filing_denials(seed):
     assert requests
     params = ColGenParams(
         solver="highs",
-        detour_slack_hops=0,
+        max_air_overrun_hops=0,
         max_iterations=10,
         time_limit_s=30.0,
     )

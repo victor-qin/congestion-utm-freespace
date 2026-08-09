@@ -840,6 +840,86 @@ def _canonical_candidate(
     return reduced_cost, column
 
 
+def _sink_certifier(
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel = DELAY_MODEL,
+    *,
+    deadline: float | None = None,
+):
+    """``consider_sink``'s certification half, for a caller that found the sink elsewhere.
+
+    Lifted out of :func:`_best_column` rather than reimplemented, because it is the thing
+    that makes the reference's pruning *safe*: ``consider_sink`` assigns to a ``nonlocal
+    incumbent``, so the cutoff improves mid-sweep and every later time layer prunes against
+    a score that is **certified achievable** rather than merely proposed.  A cutoff taken
+    from a provisional reduced cost can sit above the true optimum and discard it.
+
+    The compiled search cannot do any of this in flight -- ``_path_delay_s`` reaches
+    ``fold_corners_to_columns`` and ``column_to_intent`` reaches the whole geometry stack --
+    so it pauses and calls this instead.  Returning the reference's own verdict is the
+    point: the two forbidden-row gates, the provisional improvement test and the canonical
+    improvement test are all here, in the same order, so the incumbent trajectory is the
+    reference's whatever found the sink.
+
+    ``label.score`` and ``label.origin_paid_rows`` are not read by anything downstream, so
+    the reconstructed :class:`_Label` carries placeholders rather than pretending to a
+    provenance it does not have.
+
+    Returns the new ``(reduced_cost, Column)`` incumbent, or ``None`` when this sink does
+    not improve on the one passed in.
+    """
+
+    def certify(
+        incumbent: tuple[float, Column] | None,
+        departure_step: int,
+        origin_lane_idx: int | None,
+        dest_lane_idx: int | None,
+        arrival_step: int,
+        path: tuple[Cell, ...],
+    ) -> tuple[float, Column] | None:
+        _check_deadline(deadline)
+        label = _Label(0.0, departure_step, origin_lane_idx, tuple(path), _EMPTY_ROWS)
+        destination_claims = _endpoint_claims(
+            fg, cfg, origin=False, step=arrival_step, timing_steps=label.hops
+        )
+        if not destination_claims.isdisjoint(forbidden_rows):
+            return None
+        claims = _path_claims(fg, cfg, label, dest_lane_idx)
+        if not claims.isdisjoint(forbidden_rows):
+            return None
+        delay_s = _path_delay_s(fg, cfg, label, model)
+        reduced_cost = model.reduced_cost(
+            benefit=benefit,
+            cost=delay_s,
+            dual_cost=dual_view.claim_cost(claims),
+            pi_f=pi_f,
+        )
+        if incumbent is not None and reduced_cost <= incumbent[0] + _SCORE_EPS:
+            return None
+        canonical = _canonical_candidate(
+            _Candidate(reduced_cost, delay_s, label, dest_lane_idx),
+            fg,
+            dual_view,
+            pi_f,
+            cfg,
+            benefit,
+            forbidden_rows,
+            model,
+        )
+        if canonical is not None and (
+            incumbent is None or canonical[0] > incumbent[0] + _SCORE_EPS
+        ):
+            return canonical
+        return None
+
+    return certify
+
+
 def _shortest_seed_columns(
     fg: FlightGraph,
     cfg: SimConfig,

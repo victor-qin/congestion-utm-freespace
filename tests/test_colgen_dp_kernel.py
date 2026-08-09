@@ -444,12 +444,18 @@ def test_warm_kernel_compiles_every_primitive():
 # ------------------------------------------------------------------------ the whole search
 
 
-def _reference_candidates(graph, cfg, view, params, monkeypatch, **kwargs):
+def _reference_candidates(
+    graph, cfg, view, params, monkeypatch, *, forbidden=frozenset(), incumbent=None, **kwargs
+):
     """Every sink proposal `_best_column` registers, in the order it registers them.
 
     Spies on `_Candidate` rather than re-deriving the set: that constructor runs exactly
     once per accepted `(sink label, destination lane)` inside `consider_sink`, so this is
     the reference's candidate list by construction rather than by reimplementation.
+
+    Call this AFTER `_kernel_candidates`, never before: `pricing._sink_certifier` builds a
+    `_Candidate` too, so a spy left installed would record the kernel's certifications as
+    if they were the reference's proposals.
     """
 
     recorded = []
@@ -462,24 +468,46 @@ def _reference_candidates(graph, cfg, view, params, monkeypatch, **kwargs):
 
     monkeypatch.setattr(pricing, "_Candidate", spy)
     pricing._best_column(
-        graph, view, 0.0, cfg, kwargs.pop("benefit", 100.0), frozenset(),
-        seed=False, incumbent=None, model=kwargs.pop("model", None) or DELAY_MODEL,
+        graph, view, 0.0, cfg, kwargs.pop("benefit", 100.0), forbidden,
+        seed=False, incumbent=incumbent, model=kwargs.pop("model", None) or DELAY_MODEL,
     )
     return recorded
 
 
-def _kernel_candidates(graph, cfg, view, model, forbidden=frozenset()):
+def _kernel_candidates(
+    graph, cfg, view, model, forbidden=frozenset(), *, incumbent=None, benefit=100.0,
+    **kwargs,
+):
+    """The compiled search's sink proposals, driven through the full host protocol.
+
+    Deliberately wires up `envelopes` and `certify` rather than running the kernel bare:
+    the completion gate and the mid-sweep incumbent are the two things that make the
+    kernel's explored set the reference's, and a helper that omitted them would be
+    comparing a looser search against the oracle and calling the difference acceptable.
+    """
+
     topology = dp_prepare.prepare_topology(graph, cfg)
     rows = dp_prepare.prepare_rows(graph, cfg, topology)
     duals = dp_prepare.prepare_duals(view, graph, topology, rows)
+    envelopes = dp_prepare.CompletionEnvelopes(
+        graph, cfg, view, benefit=benefit, pi_f=0.0, model=model,
+        forbidden_rows=forbidden, incumbent=incumbent,
+    )
     variants = dp_prepare.prepare_variants(
-        graph, cfg, view, topology, rows, benefit=100.0, pi_f=0.0,
-        cost_cutoff=None, model=model, forbidden_rows=forbidden,
+        graph, cfg, view, topology, rows, benefit=benefit, pi_f=0.0,
+        cost_cutoff=None if incumbent is None else incumbent[0],
+        model=model, forbidden_rows=forbidden, envelopes=envelopes,
     )
     pack = dp_prepare.prepare_forbidden(forbidden, graph, rows, topology)
     result = dp_kernel.price_dag(
         topology, rows, duals, variants, pack,
-        air_dt_s=model.air_weight * cfg.dt_s,
+        air_weight=model.air_weight, dt_s=cfg.dt_s,
+        benefit=benefit, pi_f=0.0,
+        envelopes=envelopes,
+        certify=pricing._sink_certifier(
+            graph, view, 0.0, cfg, benefit, forbidden, model
+        ),
+        **kwargs,
     )
     cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
     out = []
@@ -507,43 +535,64 @@ def _terminal_graph(cfg, *, overrun: int = 4):
 GRAPH_SHAPES = {"plain": _graph, "terminal": _terminal_graph}
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        "plain",
-        pytest.param(
-            "terminal",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "DIAGNOSED, and not a coding bug: the kernel misses 12 of the "
-                    "reference's sinks because it does not apply `completion_can_compete`. "
-                    "Traced to the label: the losing path's hop-7 label IS built, with a "
-                    "score bit-identical to the reference's at every prefix, and every guard "
-                    "passes -- but three labels share its dominance key at step 21 and the "
-                    "slot is won by one the reference NEVER BUILT, whose ancestor that gate "
-                    "had pruned, scoring -2271.395 against -2309.408. It evicts the "
-                    "reference's survivor and those sinks are never generated. So omitting "
-                    "the gate does not merely explore a superset -- pruned labels have "
-                    "descendants, and descendants win slots. The answer stays optimal (the "
-                    "evicting label dominates at an identical state) but the COLUMN differs, "
-                    "which is exactly what parity measures. Fix is to implement the gate, "
-                    "needing `destination_positive_costs` prepare-side plus two per-variant "
-                    "fields. Terminal graphs are the only shape in any registered scenario, "
-                    "so this is the production case. strict=True flips it when the gate "
-                    "lands."
-                ),
-            ),
-        ),
-    ],
-)
-def test_kernel_never_misses_a_sink_the_reference_finds_by_shape(shape, monkeypatch):
-    """The same inclusion on a terminal graph, where two more code paths come alive.
+def _reference_sink_set(graph, cfg, view, params, monkeypatch, model, **kwargs):
+    return {
+        (
+            candidate.label.departure_step,
+            candidate.label.origin_lane_idx,
+            candidate.dest_lane_idx,
+            tuple((q, r) for q, r in candidate.label.path),
+        )
+        for candidate in _reference_candidates(
+            graph, cfg, view, params, monkeypatch, model=model, **kwargs
+        )
+    }
 
-    A terminal origin turns on `track_first_hop`, so the dominance key grows a field that is
-    inert on the plain fixture, and both endpoints claim *term* rows under the unpadded span
-    rule instead of *cell* rows. Neither is exercised by `colgen_test`-shaped graphs, and
-    both are the density shape.
+
+def _certification_trace(monkeypatch):
+    """Record what `_canonical_candidate` is asked to certify, in order.
+
+    The reference calls it from two places -- ``consider_sink``, throughout the sweep, and
+    Tier 2, once the sweep is over -- so a run's trace is its mid-sweep incumbent
+    trajectory followed by its ranking. The kernel host calls it only from
+    ``_sink_certifier``, so its trace IS the incumbent trajectory alone.
+    """
+
+    seen = []
+    real = pricing._canonical_candidate
+
+    def spy(candidate, *args, **kwargs):
+        seen.append(
+            (
+                candidate.label.departure_step,
+                candidate.label.origin_lane_idx,
+                candidate.dest_lane_idx,
+                tuple((q, r) for q, r in candidate.label.path),
+            )
+        )
+        return real(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_canonical_candidate", spy)
+    return seen
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPH_SHAPES))
+def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch):
+    """The kernel's sink set EQUALS the reference's, on both endpoint shapes.
+
+    Equality, not inclusion, and the difference is the whole of Phase 2d. Missing a sink
+    was always a correctness failure. **Extra** sinks used to be the accepted cost of not
+    applying `completion_can_compete` -- and they are not free: a looser search does not
+    merely explore a superset, because its extra labels win dominance slots and evict the
+    reference's survivors, whose sinks are then never generated at all. This fixture used
+    to lose 12 that way, with every guard correct and every label score bit-identical to
+    the reference's at every prefix. `[[pruning-not-neutral-under-dominance]]`.
+
+    The terminal shape is the one that matters: a terminal origin turns on
+    `track_first_hop`, so the dominance key grows a field that is inert on the plain
+    fixture, and both endpoints claim *term* rows under the unpadded span rule instead of
+    *cell* rows. Neither is exercised by `colgen_test`-shaped graphs, and both are the
+    density shape -- which is to say, the only shape any registered scenario produces.
     """
 
     cfg = _cfg()
@@ -557,35 +606,20 @@ def test_kernel_never_misses_a_sink_the_reference_finds_by_shape(shape, monkeypa
         topology = dp_prepare.prepare_topology(graph, cfg)
         assert topology.track_first_hop, "fixture no longer exercises the first-hop field"
 
-    reference = _reference_candidates(graph, cfg, view, params, monkeypatch, model=model)
-    reference_side = {
-        (
-            candidate.label.departure_step,
-            candidate.label.origin_lane_idx,
-            candidate.dest_lane_idx,
-            tuple((q, r) for q, r in candidate.label.path),
-        )
-        for candidate in reference
-    }
+    reference_side = _reference_sink_set(graph, cfg, view, params, monkeypatch, model)
     assert reference_side, "the reference proposed nothing, so this proves nothing"
     missing = reference_side - set(kernel_side)
+    extra = set(kernel_side) - reference_side
     assert not missing, f"{shape}: kernel missed {len(missing)}, e.g. {sorted(missing)[0]}"
+    assert not extra, f"{shape}: kernel invented {len(extra)}, e.g. {sorted(extra)[0]}"
 
 
-def test_kernel_never_misses_a_sink_the_reference_finds(monkeypatch):
-    """Every reference sink is proposed by the kernel; the kernel may propose more.
+def test_kernel_proposes_exactly_the_reference_sinks(monkeypatch):
+    """The same equality on a larger plain graph, with a different dual draw.
 
-    This is the load-bearing test of the whole search, and the direction of the inclusion is
-    the whole point. **Missing** a sink is a correctness failure -- the reference found a
-    column the kernel cannot certify. **Extra** sinks are the documented, deliberate cost of
-    `_price_dag` not applying `completion_can_compete`: `consider_sink` assigns to a
-    `nonlocal incumbent`, so the reference acquires a cutoff DURING its sweep even when
-    called with `incumbent=None`, and prunes against it from then on. The kernel holds one
-    cutoff per round and cannot. Tier 2 then certifies the extras away.
-
-    Measured on this fixture: the kernel proposes ~1.6x the reference's sinks and misses
-    none. That ratio is the cost of the omitted gate, and it is the number to re-read once
-    the gate lands -- it should collapse toward 1.0.
+    Kept separate from the shape sweep because it is the size check: a fixture small
+    enough to agree by luck proves nothing about a search whose whole difficulty is which
+    of several thousand labels wins a dominance slot.
     """
 
     cfg = _cfg()
@@ -597,23 +631,135 @@ def test_kernel_never_misses_a_sink_the_reference_finds(monkeypatch):
     assert result.ok, result.status
     assert kernel_side, "the kernel proposed nothing, so this test proves nothing"
 
-    reference = _reference_candidates(graph, cfg, view, params, monkeypatch, model=model)
-    reference_side = [
-        (
-            candidate.label.departure_step,
-            candidate.label.origin_lane_idx,
-            candidate.dest_lane_idx,
-            tuple((q, r) for q, r in candidate.label.path),
-        )
-        for candidate in reference
-    ]
+    reference_side = _reference_sink_set(graph, cfg, view, params, monkeypatch, model)
+    assert len(reference_side) > 200, "the fixture is too small to be a real check"
+    assert set(kernel_side) == reference_side
 
-    missing = set(reference_side) - set(kernel_side)
-    assert not missing, f"kernel missed {len(missing)} reference sinks, e.g. {sorted(missing)[0]}"
-    assert len(set(reference_side)) > 200, "the fixture is too small to be a real check"
-    # Pinned so the omitted gate's cost stays visible rather than drifting silently.
-    ratio = len(set(kernel_side)) / len(set(reference_side))
-    assert 1.0 <= ratio < 2.5, f"kernel/reference sink ratio {ratio:.2f} moved unexpectedly"
+
+def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monkeypatch):
+    """The pause protocol reproduces the reference's mid-sweep incumbent, step for step.
+
+    This is the direct test of pause-and-resume, and it is sharper than comparing final
+    answers. ``consider_sink`` canonicalizes a sink exactly when its provisional reduced
+    cost beats the live incumbent, so the *sequence* of canonicalizations IS the cutoff
+    trajectory -- and the cutoff is what every later layer prunes against. Two searches
+    that agree on that sequence agree on every prune between them.
+
+    The kernel's trace must be a strict PREFIX of the reference's, not merely a subset:
+    the reference appends its Tier 2 ranking to the same trace once the sweep is over,
+    and the kernel host's certifier stops at the end of the sweep.
+
+    The label pool is sized generously on purpose. A budget restart re-runs the search
+    from its first layer and re-certifies everything, so the trace would then be one run's
+    certifications concatenated with another's -- a real property of the host, but not the
+    one under test here, and `attempts` is asserted so a silent restart cannot hide.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    kernel_trace = _certification_trace(monkeypatch)
+    result, _ = _kernel_candidates(graph, cfg, view, model, label_capacity=1 << 18)
+    assert result.ok, result.status
+    assert result.attempts == 1, "the search restarted, so the trace spans two runs"
+    kernel_trace = list(kernel_trace)
+    monkeypatch.undo()
+
+    reference_trace = _certification_trace(monkeypatch)
+    pricing._best_column(
+        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
+    )
+
+    assert kernel_trace, "no sink was ever certified, so the pause protocol never ran"
+    assert reference_trace[: len(kernel_trace)] == kernel_trace
+    # The certifications are a vanishing fraction of the sinks; that ratio is what makes
+    # pausing per improvement a different proposition from pausing per sink.
+    assert len(kernel_trace) < 0.01 * len(result.candidates)
+
+
+def test_kernel_matches_the_reference_when_warm_started_with_an_incumbent(monkeypatch):
+    """The production path: `price_flight` always hands `_best_column` a seed incumbent.
+
+    A live incumbent from the very first root changes the search qualitatively rather than
+    quantitatively. ``prepare_variants``' root gate now prunes departures outright, and
+    every surviving variant's completion envelope is frozen against this one cutoff --
+    which is what the reference's memo does too, since it builds them all inside its root
+    loop before any arc is relaxed. Without an incumbent that whole code path is dead, so
+    the un-warmed tests above do not cover it.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    seed = pricing.seed_column(graph, cfg, model=model)
+    incumbent = (
+        model.reduced_cost(
+            benefit=100.0, cost=seed.delay_s, dual_cost=view.claim_cost(seed.claims), pi_f=0.0
+        ),
+        seed,
+    )
+
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model, incumbent=incumbent)
+    assert result.ok, result.status
+
+    reference_side = _reference_sink_set(
+        graph, cfg, view, params, monkeypatch, model, incumbent=incumbent
+    )
+    assert reference_side, "the warm start pruned everything, so this proves nothing"
+    assert set(kernel_side) == reference_side
+
+
+def test_kernel_honours_forbidden_rows(monkeypatch):
+    """Repair's exclusion set, applied inside the kernel rather than by a Python fallback.
+
+    Required coverage rather than a nice-to-have: the sweep always passes ``_EMPTY_ROWS``
+    (solver.py), so without a test that constructs one explicitly the whole bitset path
+    ships unexercised.
+
+    The inclusion is one-directional here, deliberately. ``consider_sink`` drops a sink
+    whose destination-endpoint or path claims touch an excluded row, and doing that in the
+    kernel would mean reproducing both endpoint span rules in numba -- a second place for
+    them to drift, to save work that Tier 2 redoes anyway. So the kernel proposes those
+    sinks and the assertion below pins exactly that: every extra it proposes is one the
+    reference rejected on a forbidden gate, and none of them can survive certification.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    rng = random.Random(2718)
+    forbidden = frozenset(
+        RowKey.cell(cell[0], cell[1], 0, step)
+        for cell in sorted(graph.corridor_cells)[:12]
+        for step in range(graph.min_step + 4, graph.min_step + 16)
+        if rng.random() < 0.25
+    )
+    assert len(forbidden) > 10, "the fixture forbade too few rows to be a real check"
+
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model, forbidden)
+    assert result.ok, result.status
+
+    reference_side = _reference_sink_set(
+        graph, cfg, view, params, monkeypatch, model, forbidden=forbidden
+    )
+    assert reference_side, "the exclusion set killed every sink, so this proves nothing"
+    missing = reference_side - set(kernel_side)
+    assert not missing, f"kernel missed {len(missing)}, e.g. {sorted(missing)[0]}"
+
+    extra = set(kernel_side) - reference_side
+    for departure_step, origin_lane, dest_lane, path in extra:
+        label = pricing._Label(0.0, departure_step, origin_lane, path, frozenset())
+        claims = pricing._path_claims(graph, cfg, label, dest_lane)
+        assert not claims.isdisjoint(forbidden), (
+            "the kernel proposed a sink the reference did not, and it is not one the "
+            "forbidden-row gates explain"
+        )
 
 
 # ------------------------------------------------------------------- label state helpers

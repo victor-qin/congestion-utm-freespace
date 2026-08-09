@@ -39,6 +39,7 @@ Both are O(1) and require no lookup structure, which is the whole point.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -813,6 +814,401 @@ def visit_row_ids(rows: PreparedRows, cell_index: int, visit_step: int, offsets)
     return [rows.row_of_cell(cell_index, visit_step + o) for o in range(lo, hi + 1)]
 
 
+# ------------------------------------------------------------------- completion envelope
+
+
+class CompletionEnvelopes:
+    """``_best_column``'s completion bound, lifted out of the search that owns it.
+
+    This is ``pricing._best_column``'s ``completion_envelope`` and
+    ``completion_can_compete`` (pricing.py:1247-1394) with their captured state made
+    explicit, so the compiled search can consult the same numbers the reference does.
+    The arithmetic is copied term for term rather than re-derived: it is a *pruning*
+    bound, and a bound that is a hair too tight discards the true optimum while the
+    search still reports that it proved optimality.
+
+    **Why this stays in Python.** The delay half is scalar arithmetic a kernel could do,
+    but the destination half needs endpoint claim *sets* — the disc-times-steps rectangle
+    for a bare point, the unpadded dwell span for a terminal — unioned with a visit window
+    and summed with :func:`math.fsum`. Reimplementing those two span rules in a kernel is
+    a second place for them to drift, and ``[[pruning-not-neutral-under-dominance]]`` is
+    the reminder that drift here does not merely cost time.
+
+    **Why the incumbent is mutable.** ``completion_envelope`` memoizes, and its early
+    ``break`` reads the incumbent live, so each envelope's LENGTH is frozen by whatever
+    incumbent existed at its first use — and the length is load-bearing, since
+    ``first_hops >= len(delay_lbs)`` is itself a prune. ``consider_sink`` improves that
+    incumbent mid-sweep. Reproducing the reference therefore means building each envelope
+    at the same moment, against the same cutoff, which is what :meth:`set_incumbent` and
+    the kernel's pause-and-resume protocol exist to arrange.
+
+    The destination half is additionally memoized on ``(arrival_step, total_hops)``,
+    which the reference does not do because it has no reason to: that pair is what the
+    endpoint claims and the arrival visit window actually depend on, and many
+    ``(departure_step, lane)`` keys share a corridor start. Measured on a density flight,
+    13,515 variants collapse to ~901 distinct corridor starts. It is a cache over a pure
+    function of already-fixed state, so it cannot move an answer.
+    """
+
+    __slots__ = (
+        "_cfg",
+        "_deadline",
+        "_destination_costs",
+        "_initial_incumbent",
+        "_destination_fold_exact",
+        "_destination_fold_lb",
+        "_destination_options",
+        "_detour_defined",
+        "_envelopes",
+        "_fg",
+        "_forbidden",
+        "_incumbent",
+        "_model",
+        "_offsets",
+        "_origin_fold_lb_by_lane",
+        "_pi_f",
+        "_reference_time_s",
+        "_view",
+        "benefit",
+        "destination_lane_tie",
+    )
+
+    def __init__(
+        self,
+        fg: FlightGraph,
+        cfg: SimConfig,
+        view,
+        *,
+        benefit: float,
+        pi_f: float,
+        model=None,
+        forbidden_rows=frozenset(),
+        incumbent=None,
+        deadline: float | None = None,
+    ) -> None:
+        from ...volumes import enroute_reference_m
+        from .objective import DELAY_MODEL
+        from .pricing import (
+            _destination_options,
+            _fold_leg_s,
+            _origin_options,
+            _terminal_fold_leg_s,
+        )
+
+        self._fg = fg
+        self._cfg = cfg
+        self._view = view
+        self.benefit = float(benefit)
+        self._pi_f = float(pi_f)
+        self._model = DELAY_MODEL if model is None else model
+        self._forbidden = forbidden_rows
+        self._deadline = deadline
+        self._incumbent = incumbent
+        self._initial_incumbent = incumbent
+        self._offsets = view.offsets
+        self._envelopes: dict[tuple[int, int | None], tuple[tuple[float, ...], ...]] = {}
+        self._destination_costs: dict[tuple[int, int], float] = {}
+
+        destination_options = _destination_options(fg)
+        self._destination_options = destination_options
+
+        # Endpoint fold legs, per lane and for the destination.  Copied from
+        # pricing.py:1164-1210; ``_terminal_fold_leg_s`` returns a "was the lane cell
+        # retained by folding" flag as well as the leg, and that flag is what enables the
+        # arc form of the delay bound at all.
+        self._origin_fold_lb_by_lane: dict[int | None, tuple[float, bool]] = {}
+        for lane_idx, cell, _lane_steps in _origin_options(fg):
+            lane_dist = None if lane_idx is None else fg.origin_lanes[lane_idx].dist
+            if fg.origin_terminal is None:
+                leg = _fold_leg_s(fg.request.origin, None, lane_dist, cfg)
+                self._origin_fold_lb_by_lane[lane_idx] = leg, True
+            else:
+                self._origin_fold_lb_by_lane[lane_idx] = _terminal_fold_leg_s(
+                    fg.request.origin, fg.origin_terminal, cell, cfg
+                )
+
+        destination_fold_exact = True
+        if fg.dest_terminal is None:
+            destination_fold_lb = _fold_leg_s(fg.request.dest, None, None, cfg)
+        else:
+            destination_folds: list[float] = []
+            for destination, lane_indices in destination_options.items():
+                for lane_idx in lane_indices:
+                    assert lane_idx is not None
+                    fold_s, retained = _terminal_fold_leg_s(
+                        fg.request.dest, fg.dest_terminal, destination, cfg
+                    )
+                    destination_folds.append(fold_s)
+                    destination_fold_exact &= retained
+            destination_fold_lb = min(destination_folds)
+        self._destination_fold_lb = destination_fold_lb
+        self._destination_fold_exact = destination_fold_exact
+
+        reference_m = enroute_reference_m(
+            fg.request.origin, fg.request.dest, fg.origin_terminal, fg.dest_terminal, cfg
+        )
+        self._reference_time_s = reference_m / cfg.nominal_speed_mps
+        self._detour_defined = reference_m > 1e-9
+
+        self.destination_lane_tie = min(
+            -1 if lane_idx is None else lane_idx
+            for lane_indices in destination_options.values()
+            for lane_idx in lane_indices
+        )
+
+    # -- incumbent ---------------------------------------------------------------------
+
+    @property
+    def incumbent(self):
+        return self._incumbent
+
+    def set_incumbent(self, incumbent) -> None:
+        """Adopt a newly certified incumbent, exactly as ``consider_sink`` reassigns it.
+
+        Envelopes already built keep the length they were frozen with; the reference's
+        memo does the same, and that asymmetry is a property of the algorithm rather than
+        an artefact of caching it.
+        """
+
+        self._incumbent = incumbent
+
+    @property
+    def incumbent_prefix(self) -> tuple[int, int, int, int]:
+        """``completion_can_compete``'s four-field incumbent prefix (pricing.py:1351)."""
+
+        assert self._incumbent is not None
+        column = self._incumbent[1]
+        return (
+            len(column.cell_path) - 1,
+            column.departure_step,
+            -1 if column.origin_lane_idx is None else column.origin_lane_idx,
+            -1 if column.dest_lane_idx is None else column.dest_lane_idx,
+        )
+
+    # -- the bound ---------------------------------------------------------------------
+
+    def delay_lower_bound(
+        self, departure_step: int, lane_idx: int | None, hops: int, remaining_hops: int
+    ) -> float:
+        """``_best_column``'s ``delay_lower_bound`` closure (pricing.py:1212)."""
+
+        from .pricing import _arc_delay_lower_bound_s
+
+        cfg = self._cfg
+        origin_fold_s, origin_fold_exact = self._origin_fold_lb_by_lane[lane_idx]
+        return _arc_delay_lower_bound_s(
+            ground_delay_s=(departure_step - self._fg.base_step) * cfg.dt_s,
+            origin_fold_s=origin_fold_s,
+            hops=hops,
+            remaining_hops=remaining_hops,
+            destination_fold_s=self._destination_fold_lb,
+            reference_time_s=self._reference_time_s,
+            dt_s=cfg.dt_s,
+            folding_exact=(
+                self._detour_defined and origin_fold_exact and self._destination_fold_exact
+            ),
+            model=self._model,
+        )
+
+    def _destination_cost(self, arrival_step: int, total_hops: int) -> float:
+        """Cheapest positive endpoint-plus-arrival price over the destination options.
+
+        pricing.py:1302-1318.  ``math.fsum`` is order-independent, so the memo cannot
+        perturb it even though the sets it sums are iterated in hash order.
+        """
+
+        from .pricing import _endpoint_claims, _visit_claims
+
+        key = arrival_step, total_hops
+        cached = self._destination_costs.get(key)
+        if cached is not None:
+            return cached
+        endpoint_claims = _endpoint_claims(
+            self._fg, self._cfg, origin=False, step=arrival_step, timing_steps=total_hops
+        )
+        destination_cost = math.inf
+        for destination in self._destination_options:
+            final_visit_claims = _visit_claims(destination, 0, arrival_step, self._offsets)
+            unavoidable_claims = endpoint_claims | final_visit_claims
+            if not unavoidable_claims.isdisjoint(self._forbidden):
+                continue
+            destination_cost = min(
+                destination_cost,
+                math.fsum(max(0.0, self._view.row_cost(row)) for row in unavoidable_claims),
+            )
+        self._destination_costs[key] = destination_cost
+        return destination_cost
+
+    def envelope(
+        self, departure_step: int, lane_idx: int | None
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """``completion_envelope`` — memoized, and frozen at its first length."""
+
+        from .pricing import _RECOMPUTE_EPS, _check_deadline
+
+        key = departure_step, lane_idx
+        cached = self._envelopes.get(key)
+        if cached is not None:
+            return cached
+
+        fg = self._fg
+        lane_steps = 0 if lane_idx is None else fg.origin_lanes[lane_idx].steps
+        corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
+        # `min()` rather than the ceiling alone, and the reasoning is pricing.py:1258-1284:
+        # the horizon is a real bound even though the two are provably equal today, and the
+        # LENGTH of this result is what bounds `can_compete`'s scan.
+        max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
+        delay_lbs = [math.inf]
+        destination_positive_costs = [math.inf]
+        incumbent = self._incumbent
+        for total_hops in range(1, max_total_hops + 1):
+            _check_deadline(self._deadline)
+            delay_lb = self.delay_lower_bound(departure_step, lane_idx, total_hops, 0)
+            if incumbent is not None and (
+                self.benefit - self._pi_f - delay_lb + self._view.max_negative_credit
+                < incumbent[0] - _RECOMPUTE_EPS
+            ):
+                break
+            destination_cost = self._destination_cost(corridor_start + total_hops, total_hops)
+            if not math.isfinite(destination_cost):
+                delay_lbs.append(math.inf)
+                destination_positive_costs.append(math.inf)
+                continue
+            delay_lbs.append(delay_lb)
+            destination_positive_costs.append(destination_cost)
+
+        result = tuple(delay_lbs), tuple(destination_positive_costs)
+        self._envelopes[key] = result
+        return result
+
+    def built(self, departure_step: int, lane_idx: int | None) -> bool:
+        """Whether this key's envelope has been frozen already."""
+
+        return (departure_step, lane_idx) in self._envelopes
+
+    def built_keys(self) -> tuple[tuple[int, int | None], ...]:
+        """The keys frozen so far, in the order they were frozen."""
+
+        return tuple(self._envelopes)
+
+    def rewind(self, keys) -> None:
+        """Return to the pre-search state, then re-freeze exactly ``keys``.
+
+        A compiled search that exhausts a budget re-runs from its first layer, and it has
+        to re-run against the cutoff it *started* with: an envelope frozen against a
+        mid-sweep incumbent is a strictly stronger prune, so a second attempt would
+        explore less than the first, and the reference's column is defined by a search
+        that never restarts.
+
+        The destination-cost memo deliberately survives. It is a pure function of the
+        duals, the graph and the exclusion set, none of which move when the incumbent
+        does, so keeping it makes the restart cheaper without making it different.
+        """
+
+        self._envelopes = {}
+        self._incumbent = self._initial_incumbent
+        for departure_step, lane_idx in keys:
+            self.envelope(departure_step, lane_idx)
+
+    def can_compete(
+        self,
+        departure_step: int,
+        lane_idx: int | None,
+        minimum_total_hops: int,
+        paid_duals: float,
+        *,
+        paid_duals_exact: bool,
+    ) -> bool:
+        """``completion_can_compete`` — pricing.py:1330, arm for arm."""
+
+        from .pricing import _RECOMPUTE_EPS, _SCORE_EPS
+
+        incumbent = self._incumbent
+        if incumbent is None:
+            return True
+        delay_lbs, destination_positive_costs = self.envelope(departure_step, lane_idx)
+        first_hops = max(1, minimum_total_hops)
+        if first_hops >= len(delay_lbs):
+            return False
+
+        incumbent_prefix = self.incumbent_prefix
+        origin_lane_tie = -1 if lane_idx is None else lane_idx
+        paid_positive_lb = max(
+            0.0, paid_duals - (0.0 if paid_duals_exact else _RECOMPUTE_EPS)
+        )
+        for total_hops in range(first_hops, len(delay_lbs)):
+            union_positive_lb = max(
+                paid_positive_lb, destination_positive_costs[total_hops]
+            )
+            hop_rc_bound = (
+                self.benefit
+                - self._pi_f
+                - delay_lbs[total_hops]
+                - union_positive_lb
+                + self._view.max_negative_credit
+            )
+            if hop_rc_bound > incumbent[0] + _SCORE_EPS:
+                return True
+            if not paid_duals_exact and (hop_rc_bound >= incumbent[0] - _RECOMPUTE_EPS):
+                return True
+            if abs(hop_rc_bound - incumbent[0]) <= _SCORE_EPS:
+                possible_prefix = (
+                    total_hops,
+                    departure_step,
+                    origin_lane_tie,
+                    self.destination_lane_tie,
+                )
+                if possible_prefix <= incumbent_prefix:
+                    return True
+        return False
+
+
+class EnvelopeArena:
+    """The built envelopes as three flat arrays the kernel can index by variant id.
+
+    Growable rather than sized up front: with a seed incumbent the reference builds every
+    envelope in its root loop, so one pass fills this exactly; without one it acquires the
+    incumbent mid-sweep and envelopes arrive one pause at a time. A dense
+    ``n_variants x (max_air_hops + 2)`` allocation would be ~28 MB on a density flight
+    whose surviving variant count is usually in the single digits, so the arena doubles
+    instead — the same geometric policy ``PricingWorkspace`` uses, for the same reason.
+
+    ``start[v] < 0`` means "not built", and the kernel treats that as a hard stop
+    (``STATUS_NEED_ENVELOPE``) rather than as "no bound": guessing would be pruning
+    against a bound the reference never computed.
+    """
+
+    __slots__ = ("delay", "dest", "length", "start", "_used")
+
+    def __init__(self, n_variants: int) -> None:
+        self.start = np.full(max(n_variants, 1), -1, dtype=np.int32)
+        self.length = np.zeros(max(n_variants, 1), dtype=np.int32)
+        self.delay = np.zeros(64, dtype=np.float64)
+        self.dest = np.zeros(64, dtype=np.float64)
+        self._used = 0
+
+    def add(self, variant: int, delay_lbs, destination_positive_costs) -> None:
+        """Append one variant's frozen envelope; idempotent per variant."""
+
+        if self.start[variant] >= 0:
+            return
+        n = len(delay_lbs)
+        needed = self._used + n
+        if needed > self.delay.shape[0]:
+            size = self.delay.shape[0]
+            while size < needed:
+                size <<= 1
+            for name in ("delay", "dest"):
+                grown = np.zeros(size, dtype=np.float64)
+                grown[: self._used] = getattr(self, name)[: self._used]
+                setattr(self, name, grown)
+        self.delay[self._used : self._used + n] = delay_lbs
+        self.dest[self._used : self._used + n] = destination_positive_costs
+        self.start[variant] = self._used
+        self.length[variant] = n
+        self._used += n
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedVariants:
     """Root labels: every ``(departure_step, origin lane)`` the reference would create.
@@ -841,6 +1237,11 @@ class PreparedVariants:
     start_step: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
     score: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
     ground_delay_s: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+    # ``air_weight * origin_leg``, the second term of the score.  Stored because the kernel
+    # recovers the duals a label has paid by inverting the score's decomposition
+    # (pricing.py:1548), and that inversion has to subtract the very same products the
+    # score was built from -- term by term, in the same order, or it is not exact.
+    origin_leg_w_s: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
     start_dual_cost: np.ndarray = field(
         repr=False, default_factory=lambda: np.empty(0, np.float64)
     )
@@ -879,6 +1280,7 @@ def prepare_variants(
     cost_cutoff: float | None = None,
     model=None,
     forbidden_rows=frozenset(),
+    envelopes: CompletionEnvelopes | None = None,
 ) -> PreparedVariants:
     """Price every root option once, exactly as ``_best_column``'s initialization does.
 
@@ -889,14 +1291,19 @@ def prepare_variants(
     whose ground delay alone cannot beat the incumbent can never win, whatever route
     follows.
 
-    **Omits** ``completion_can_compete``, which is a parity defect and not a free choice.
-    The claim this docstring used to make -- that omitting a prune costs work and never an
-    answer -- holds for pure enumeration and fails under dominance: a pruned label's
+    ``envelopes`` supplies the second, sharper root gate: ``completion_can_compete``
+    (pricing.py:1435). Passing it is what makes the compiled search reproduce the
+    reference's *column* rather than merely its optimum. Omitting a prune costs work and
+    never an answer under pure enumeration, and that is false here — a pruned label's
     DESCENDANTS still compete for dominance slots, and a better-scoring one evicts the
-    survivor the reference kept, losing its sinks. Measured on a terminal graph in
-    ``dp_kernel._price_dag``'s docstring. The answer stays optimal; the column returned does
-    not stay the same. Applying a prune the reference would NOT have remains the worse
-    error, so the asymmetry is real -- it is just far from free in this direction.
+    survivor the reference kept, losing its sinks. See
+    ``[[pruning-not-neutral-under-dominance]]``.
+
+    The gate runs **here**, over every root, before any arc is relaxed, because that is
+    where the reference runs it — and running it here is also what freezes every
+    envelope's length against the *initial* incumbent, which is what the reference's memo
+    does. Deferring it into the search would freeze some of them against a mid-sweep
+    incumbent instead, and the length of an envelope is itself a prune.
     """
 
     from .objective import DELAY_MODEL
@@ -944,6 +1351,7 @@ def prepare_variants(
     starts: list[int] = []
     scores: list[float] = []
     grounds: list[float] = []
+    origin_legs: list[float] = []
     dual_costs: list[float] = []
     classes: list[int] = []
     considered = prefiltered = 0
@@ -977,6 +1385,14 @@ def prepare_variants(
                 continue
             start_dual_cost = view.claim_cost(start_claims)
             origin_paid_rows = view.active_claims(start_claims)
+            if envelopes is not None and not envelopes.can_compete(
+                departure_step,
+                lane_idx,
+                distance_to_go,
+                start_dual_cost,
+                paid_duals_exact=True,
+            ):
+                continue
             paid_class = paid_ids.get(origin_paid_rows)
             if paid_class is None:
                 paid_class = len(paid_rows_by_class)
@@ -989,6 +1405,7 @@ def prepare_variants(
             starts.append(start_step)
             scores.append(ground_score - w_air * origin_leg_by_lane[lane_idx] - start_dual_cost)
             grounds.append(w_ground * ground_delay_s)
+            origin_legs.append(w_air * origin_leg_by_lane[lane_idx])
             dual_costs.append(start_dual_cost)
             classes.append(paid_class)
 
@@ -1018,6 +1435,7 @@ def prepare_variants(
         start_step=np.asarray(starts, dtype=np.int32),
         score=np.asarray(scores, dtype=np.float64),
         ground_delay_s=np.asarray(grounds, dtype=np.float64),
+        origin_leg_w_s=np.asarray(origin_legs, dtype=np.float64),
         start_dual_cost=np.asarray(dual_costs, dtype=np.float64),
         paid_class=np.asarray(classes, dtype=np.int32),
         paid_start=np.asarray(paid_start, dtype=np.int32),

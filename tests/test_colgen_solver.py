@@ -98,6 +98,11 @@ def _params(**overrides) -> ColGenParams:
         "n_heuristic_tries": 16,
     }
     values.update(overrides)
+    # Pair the ceiling with the ellipse unless a test overrides it deliberately -- the rule in
+    # `ColGenParams`. Left unpaired, a fixture naming `detour_slack_hops=0` still gets the
+    # shipped 3-hop ceiling and a graph three steps deeper than the knob it names, so its
+    # column universe tracks the default rather than the fixture.
+    values.setdefault("max_air_overrun_hops", values["detour_slack_hops"])
     return ColGenParams(**values)
 
 

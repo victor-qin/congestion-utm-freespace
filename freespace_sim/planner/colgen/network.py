@@ -869,21 +869,29 @@ def _graph_max_step(
     latest_departure_step: int,
     takeoff_steps: tuple[int, ...],
     origin_lanes: tuple[hg.Lane, ...],
-    shortest_hops: int,
-    detour_slack_hops: int,
+    max_air_hops: int,
 ) -> int:
     """Budget-preserving final air-state bound.
 
     The abbreviated expression this replaced omitted the climb and origin-lane traverse even
     though those advance the same integer clock before the first cell visit.  Include both so
     neither silently consumes the ground-delay or route budget.
+
+    The route term is ``max_air_hops`` -- the ceiling itself -- and not
+    ``shortest_hops + detour_slack_hops``.  The two agree at the shipped pairing, so this
+    reads like a rename, but they part whenever the two knobs do, and the slack is the wrong
+    one of the pair to ask.  The clock has to reach the LATEST legal departure plus that
+    departure's longest legal route; with the slack in this slot and an overrun above it, the
+    horizon fell short of the ceiling and became the binding constraint for late departures
+    only -- reinstating exactly the departure-dependent cap the ceiling exists to remove
+    (measured at slack=3/overrun=9: 26 hops advertised, 20 reachable at the last departure).
+    Below the slack it errs the other way and simply leaves dead clock.
     """
     return (
         latest_departure_step
         + max(takeoff_steps)
         + max((lane.steps for lane in origin_lanes), default=0)
-        + shortest_hops
-        + detour_slack_hops
+        + max_air_hops
     )
 
 
@@ -1514,18 +1522,11 @@ def build_flight_graph(
     latest_departure_step = base_step + max_ground_steps
     levels = tuple(cfg.flight_levels_m)
     takeoff_steps = tuple(cfg.climb_steps_to(z) for z in levels)
-    max_step = _graph_max_step(
-        latest_departure_step,
-        takeoff_steps,
-        origin_lanes,
-        shortest_hops,
-        slack,
-    )
-
     # A flat hop budget over the geodesic, identical for every flight (see ColGenParams,
     # which owns the default and the rule pairing it with `detour_slack_hops`).  Read the
     # same way as the slack above rather than through a `getattr` default, so there is one
     # copy of that number: a second one here silently disagrees the moment either moves.
+    # Resolved before the horizon below, which is denominated in it.
     try:
         overrun = operator.index(params.max_air_overrun_hops)
     except (AttributeError, TypeError) as exc:
@@ -1533,6 +1534,12 @@ def build_flight_graph(
     if overrun < 0:
         raise ValueError(f"max_air_overrun_hops must be non-negative, got {overrun}")
     max_air_hops = shortest_hops + overrun
+    max_step = _graph_max_step(
+        latest_departure_step,
+        takeoff_steps,
+        origin_lanes,
+        max_air_hops,
+    )
 
     return FlightGraph(
         request=frozen_request,

@@ -43,6 +43,8 @@ def _point(cell, cfg):
 
 
 def _graph(cfg, origin=(0, 0), dest=(4, -1), slack=4, flight_id=1, **kw):
+    # Ceiling paired with the ellipse unless a caller says otherwise; see ColGenParams.
+    kw.setdefault("max_air_overrun_hops", slack)
     params = ColGenParams(solver="highs", detour_slack_hops=slack, **kw)
     request = FlightRequest(flight_id, _point(origin, cfg), _point(dest, cfg), 0.0, 0.0)
     return build_flight_graph(request, cfg, (), params), params
@@ -177,10 +179,24 @@ def _weighted_probe(ground_weight: float, air_weight: float):
     )
     rng = np.random.default_rng(7)
     cells = sorted(graph.corridor_cells)
+    # Duals have to land on steps a route actually occupies. Drawing them across `max_step`
+    # made this fixture a function of the air-time ceiling: `max_step` is denominated in
+    # `max_air_hops`, so lifting the ceiling widens the horizon, the same nine draws scatter
+    # over a longer axis, and the instance stops being the one these assertions were derived
+    # from -- at overrun=64 both arms collapsed to the same answer and the test measured
+    # nothing. The departure window plus a geodesic route is what the search reaches whatever
+    # ceiling is left over, so anchoring there makes the instance depend on the weighting
+    # alone, which is the variable under test.
+    dual_span = (
+        (graph.latest_departure_step - graph.base_step)
+        + graph.shortest_hops
+        + graph.detour_slack_hops
+        + 4
+    )
     duals: dict[RowKey, float] = {}
     for _ in range(9):
         cell = cells[int(rng.integers(0, len(cells)))]
-        step = int(rng.integers(graph.min_step, graph.max_step + 1))
+        step = int(rng.integers(graph.min_step, graph.min_step + dual_span + 1))
         duals[RowKey.cell(cell, 0, step)] = float(rng.uniform(-20.0, 60.0))
     _rc, column = price_flight(
         graph, DualView(duals, cfg), float(rng.uniform(0.0, 40.0)), cfg, params,

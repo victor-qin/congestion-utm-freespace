@@ -54,6 +54,8 @@ def _graph(cfg: SimConfig, *, slack: int = 4, **overrides):
         "n_heuristic_tries": 2,
     }
     values.update(overrides)
+    # Ceiling paired with the ellipse unless a caller says otherwise; see ColGenParams.
+    values.setdefault("max_air_overrun_hops", values["detour_slack_hops"])
     params = ColGenParams(**values)
     return build_flight_graph(request, cfg, (), params), params
 
@@ -463,7 +465,10 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
     """Positive, negative, and exact-tie endpoint prices preserve the global optimum."""
 
     cfg = replace(_cfg(), max_ground_delay_s=8.0)
-    params = ColGenParams(solver="highs", detour_slack_hops=0)
+    # Ceiling paired with the ellipse: `max_step` is denominated in `max_air_hops`, so leaving
+    # the shipped 3-hop ceiling against slack=0 would deepen the graph past the knob this
+    # fixture names and grow the enumerated universe below from 10 columns to 16.
+    params = ColGenParams(solver="highs", detour_slack_hops=0, max_air_overrun_hops=0)
     request = FlightRequest(7, _point((0, 0), cfg), _point((1, 1), cfg), 0.0, 0.0)
     graph = build_flight_graph(request, cfg, (), params)
     columns = _exhaustive_columns(graph, cfg)
@@ -557,7 +562,11 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
         cost_air_hold_per_s=air_weight,
     )
     params = ColGenParams(
-        solver="highs", detour_slack_hops=1, objective="total_cost", time_limit_s=60.0
+        solver="highs",
+        detour_slack_hops=1,
+        max_air_overrun_hops=1,   # paired with the ellipse; see ColGenParams
+        objective="total_cost",
+        time_limit_s=60.0,
     )
     request = FlightRequest(7, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)
     graph = build_flight_graph(request, cfg, (), params)

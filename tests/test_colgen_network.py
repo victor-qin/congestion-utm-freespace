@@ -665,7 +665,18 @@ def test_exact_static_hops_cover_empty_terminal_cell_projection():
     assert not ledger.any_conflict(safe_intent.volumes)
 
 
-def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget():
+@pytest.mark.parametrize("overrun", [1, 4, 9])
+def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget(overrun):
+    """The clock must reach the ceiling from the LAST legal departure, at any pairing.
+
+    `max_step` is a single scalar serving every departure, so it is sized for the latest one
+    and an earlier departure inherits the surplus. That makes the term it carries for route
+    length load-bearing: denominated in `detour_slack_hops` rather than the ceiling, an
+    overrun above the slack left the horizon short of `max_air_hops`, so the last departures
+    were capped by the clock and earlier ones by the ceiling -- the departure-dependent cap
+    the ceiling exists to remove. `overrun=9` against `slack=4` is that case.
+    """
+
     cfg = replace(_cfg(), max_ground_delay_s=20.0)
     terminal = Terminal("origin", 2, radius=180.0)
     req = FlightRequest(
@@ -675,14 +686,13 @@ def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget():
         0.0,
         origin_terminal=terminal,
     )
-    params = ColGenParams(detour_slack_hops=4)
+    params = ColGenParams(detour_slack_hops=4, max_air_overrun_hops=overrun)
     fg = build_flight_graph(req, cfg, [], params)
-    assert fg.max_step == (
-        fg.latest_departure_step
-        + max(fg.takeoff_steps)
-        + max(lane.steps for lane in fg.origin_lanes)
-        + fg.shortest_hops
-        + params.detour_slack_hops
+    preamble = max(fg.takeoff_steps) + max(lane.steps for lane in fg.origin_lanes)
+    assert fg.max_step == fg.latest_departure_step + preamble + fg.max_air_hops
+    # The invariant the formula exists to serve, stated independently of it.
+    assert fg.max_step - (fg.latest_departure_step + preamble) >= fg.max_air_hops, (
+        "the clock binds before the ceiling at the last departure"
     )
 
 

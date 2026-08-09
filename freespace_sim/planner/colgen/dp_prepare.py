@@ -889,10 +889,14 @@ def prepare_variants(
     whose ground delay alone cannot beat the incumbent can never win, whatever route
     follows.
 
-    Deliberately **omits** ``completion_can_compete``. That gate is a prune, not a
-    correctness condition, and it needs the completion envelope that lives in the kernel;
-    omitting a prune costs work and never an answer, whereas applying one the reference
-    would not have is how a compiled search loses the optimum.
+    **Omits** ``completion_can_compete``, which is a parity defect and not a free choice.
+    The claim this docstring used to make -- that omitting a prune costs work and never an
+    answer -- holds for pure enumeration and fails under dominance: a pruned label's
+    DESCENDANTS still compete for dominance slots, and a better-scoring one evicts the
+    survivor the reference kept, losing its sinks. Measured on a terminal graph in
+    ``dp_kernel._price_dag``'s docstring. The answer stays optimal; the column returned does
+    not stay the same. Applying a prune the reference would NOT have remains the worse
+    error, so the asymmetry is real -- it is just far from free in this direction.
     """
 
     from .objective import DELAY_MODEL

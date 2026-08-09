@@ -722,13 +722,22 @@ def _price_dag(
     any arc runs, and ``_prefer`` is non-transitive inside its epsilon band, so
     roots-before-arcs is part of the answer rather than an implementation detail.
 
-    **``completion_can_compete`` is deliberately not applied.**  Its ``destination_positive
-    _costs`` half is a row-set computation the kernel cannot do, and its ``delay_lbs`` half
-    needs two per-variant fields ``prepare_variants`` does not yet emit.  Omitting a prune
-    costs work and never an answer -- the search stays exact and simply explores more than
-    the reference -- whereas applying one the reference would not have is how a compiled
-    search loses the optimum.  Adding it is the first thing to do once this is measured, and
-    the label counts are what say how much it is worth.
+    **``completion_can_compete`` is not applied yet, and that is a PARITY DEFECT, not a
+    missing optimization.**  An earlier draft of this docstring claimed omitting a prune
+    "costs work and never an answer".  That is true of pure enumeration and false here,
+    demonstrated at the label level: on a terminal graph, three labels share one dominance
+    key at step 21, and the slot is won by a label the reference never built -- its ancestor
+    was pruned by this very gate -- with a better score (-2271.395 against -2309.408).  It
+    evicts the reference's survivor, whose sinks are then never generated.
+
+    Pruned labels have DESCENDANTS, and those descendants compete for dominance slots.  So a
+    looser search does not merely explore a superset; it changes which labels win.
+
+    The answer stays optimal -- the evicting label dominates at an identical state, so no
+    completion is lost -- but a different, equally optimal column comes back.  Column parity
+    with the reference therefore REQUIRES this gate.  It needs
+    ``destination_positive_costs`` (a row-set computation, so prepare-side) and two
+    per-variant fields ``prepare_variants`` does not yet emit.
     """
 
     cap = 1 << log2cap

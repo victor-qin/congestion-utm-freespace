@@ -15,12 +15,13 @@ import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.planner import hexgrid as hg
+from freespace_sim.planner.colgen import network as network_mod
 from freespace_sim.planner.colgen import pricing
 from freespace_sim.planner.colgen.network import RowKey, build_flight_graph
 from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel, cost_model
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
-from freespace_sim.types import FlightRequest, vec
+from freespace_sim.types import FlightRequest, Terminal, vec
 from tests._colgen_support import with_air_hops
 
 
@@ -310,3 +311,85 @@ def test_shifting_a_column_later_charges_ground_weight_only():
     )
     assert scaled.delay_s == pytest.approx(seed.delay_s + 2.0 * (3 * dt))
     assert math.isfinite(scaled.delay_s)
+
+
+# ------------------------------------------------- the endpoint claim cache
+
+
+def _terminal_graph(cfg):
+    """A graph whose endpoints are both terminals, so the *term* row branch is reached."""
+
+    origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
+    origin_terminal = Terminal("cache-A", 1, radius=90.0)
+    dest_terminal = Terminal("cache-B", 1, radius=90.0)
+    request = FlightRequest(
+        7, origin, dest, 0.0, 0.0,
+        origin_terminal=origin_terminal,
+        dest_terminal=dest_terminal,
+    )
+    params = ColGenParams(solver="highs", max_air_overrun_hops=4)
+    static = [(origin, origin_terminal), (dest, dest_terminal)]
+    return build_flight_graph(request, cfg, static, params), params
+
+
+@pytest.mark.parametrize("terminals", [False, True])
+def test_endpoint_claims_cache_matches_the_uncached_oracle(terminals):
+    """The memoized endpoint rows are the uncached ones, over the whole reachable key space.
+
+    Both endpoint shapes are exercised because they do not share a step rule: a terminal
+    endpoint claims *term* rows over an unpadded interval that ignores ``timing_steps``,
+    while a bare point claims *cell* rows over a range rounded outward by a drift that
+    scales WITH ``timing_steps``.  A cache that collapsed the two would still pass on
+    ``colgen_test``-shaped graphs and fail on every terminal one.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg) if terminals else _graph(cfg)
+    assert (graph.origin_terminal is not None) is terminals
+
+    # Drive a real pricing call first, so the keys under test are the ones the search
+    # actually reaches rather than a hand-picked range.  Price the SEED's own rows rather
+    # than sampling the corridor: a seed that pays nothing is provably optimal, and
+    # `price_flight` then returns it without ever running the DAG search that fills this
+    # cache.  On the terminal graph the seed touches 3 of 46 corridor cells, so random
+    # duals miss it almost every time.
+    seed = seed_column(graph, cfg)
+    duals = {row: 4.0 for row in seed.claims if row.kind == "cell"}
+    assert duals, "seed claims no cell rows, so it cannot be priced off its shortcut"
+    price_flight(graph, DualView(duals, cfg), 0.0, cfg, params, require_improving=False)
+    reached = dict(graph._search_cache.endpoint_claims)
+    assert reached, "pricing reached no endpoint claim sets"
+
+    for (origin, step, timing_steps), cached in reached.items():
+        expected = pricing._endpoint_claims_uncached(
+            graph, cfg, origin=origin, step=step, timing_steps=timing_steps
+        )
+        assert cached == expected, (origin, step, timing_steps)
+        # A terminal endpoint claims `term` rows; a bare point claims `cell` rows.  Pinned
+        # so a future unification of the two span rules cannot pass this test silently.
+        assert all(row.kind == ("term" if terminals else "cell") for row in cached)
+
+    # Sweep beyond what pricing happened to reach, including keys it never asked for.
+    for origin in (True, False):
+        for step in range(graph.min_step, min(graph.min_step + 12, graph.max_step + 1)):
+            for timing_steps in (0, 1, 5, 17):
+                assert pricing._endpoint_claims(
+                    graph, cfg, origin=origin, step=step, timing_steps=timing_steps
+                ) == pricing._endpoint_claims_uncached(
+                    graph, cfg, origin=origin, step=step, timing_steps=timing_steps
+                )
+
+
+def test_endpoint_claims_cache_is_bounded():
+    """The LRU cap holds under more distinct keys than it can store."""
+
+    cfg = _cfg()
+    graph, _ = _graph(cfg)
+    for step in range(network_mod._MAX_ENDPOINT_CLAIMS + 64):
+        pricing._endpoint_claims(graph, cfg, origin=True, step=step, timing_steps=0)
+        assert len(graph._search_cache.endpoint_claims) <= network_mod._MAX_ENDPOINT_CLAIMS
+
+    # Evicting is answer-neutral: the coldest keys are simply recomputed on demand.
+    assert pricing._endpoint_claims(
+        graph, cfg, origin=True, step=0, timing_steps=0
+    ) == pricing._endpoint_claims_uncached(graph, cfg, origin=True, step=0, timing_steps=0)

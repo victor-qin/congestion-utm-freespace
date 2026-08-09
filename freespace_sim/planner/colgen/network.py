@@ -54,6 +54,12 @@ _ARC_LAST = 1 << 2
 _ARC_FIRST_LAST = 1 << 3
 _ALL_ARC_ROLES = _ARC_INTERNAL | _ARC_FIRST | _ARC_LAST | _ARC_FIRST_LAST
 _MAX_CERTIFIED_COLUMNS = 2
+# Distinct `(origin, step, timing_steps)` endpoint claim sets kept per graph.  The
+# reachable key space is bounded by `2 * n_steps * (max_air_hops + 1)`, which is small on
+# `colgen_test` (1,511 measured over three iterations) but grows with the horizon, and each
+# entry is a frozenset of freshly built `RowKey`s.  So this is a memory bound, not a
+# correctness one: an eviction only costs the recompute it was avoiding.
+_MAX_ENDPOINT_CLAIMS = 2048
 
 
 def _aabbs_overlap(first: FlatAabb, second: FlatAabb) -> bool:
@@ -689,6 +695,7 @@ class _FlightSearchCache:
     __slots__ = (
         "lock",
         "certified_claims",
+        "endpoint_claims",
         "seed_columns",
         "seed_delay_certified",
         "seed_model",
@@ -699,6 +706,12 @@ class _FlightSearchCache:
         self.lock = threading.RLock()
         self.certified_claims: OrderedDict[
             tuple[Any, ...], frozenset[RowKey]
+        ] = OrderedDict()
+        # Endpoint dwell rows, keyed `(origin, step, timing_steps)`.  See
+        # `pricing._endpoint_claims`, which owns the purity argument that makes this
+        # answer-neutral, and `_MAX_ENDPOINT_CLAIMS` for why it is bounded.
+        self.endpoint_claims: OrderedDict[
+            tuple[bool, int, int], frozenset[RowKey]
         ] = OrderedDict()
         self.seed_columns: tuple[Any, ...] | None = None
         self.seed_delay_certified = False

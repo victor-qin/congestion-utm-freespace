@@ -37,7 +37,13 @@ from ...volumes import (
     exit_radius,
 )
 from .. import hexgrid as hg
-from .network import Cell, FlightGraph, RowKey, column_claims
+from .network import (
+    _MAX_ENDPOINT_CLAIMS,
+    Cell,
+    FlightGraph,
+    RowKey,
+    column_claims,
+)
 from .objective import DELAY_MODEL, CostModel, cost_model
 from .translate import Column, column_to_intent
 from .windows import (
@@ -364,6 +370,55 @@ def _endpoint_claims(
     step: int,
     timing_steps: int,
 ) -> frozenset[RowKey]:
+    """Dwell rows one endpoint occupies, memoized on the graph.
+
+    A pure function of ``(fg, origin, step, timing_steps)``, which is what makes the cache
+    answer-neutral rather than a heuristic: the body below reads only the request's two
+    endpoints, the two terminals, ``fg.levels`` and ``cfg`` scalars, all fixed for the
+    graph's life -- and every caller reaches this through :func:`price_flight` or
+    :func:`find_feasible_column`, which refuse a ``cfg`` that is not ``fg._cfg``.
+
+    Worth the machinery because the redundancy is extreme rather than marginal: one sink
+    proposal per ``(arrival step, hop count)`` pair means the reachable key space is far
+    smaller than the number of sinks reaching it.  Measured on ``colgen_test``'s first 12
+    flights over three iterations -- 286,705 calls, **1,511 distinct**, 99.5% redundant,
+    and the solve went 38.85 s to 12.28 s with a bit-identical objective and column set.
+    """
+
+    key = (origin, step, timing_steps)
+    cache = fg._search_cache
+    with cache.lock:
+        hit = cache.endpoint_claims.get(key)
+        if hit is not None:
+            cache.endpoint_claims.move_to_end(key)
+            return hit
+    # Built outside the lock: it is a pure function, so two threads racing to fill the same
+    # key compute equal sets and either may win.
+    value = _endpoint_claims_uncached(
+        fg, cfg, origin=origin, step=step, timing_steps=timing_steps
+    )
+    with cache.lock:
+        cache.endpoint_claims[key] = value
+        cache.endpoint_claims.move_to_end(key)
+        while len(cache.endpoint_claims) > _MAX_ENDPOINT_CLAIMS:
+            cache.endpoint_claims.popitem(last=False)
+    return value
+
+
+def _endpoint_claims_uncached(
+    fg: FlightGraph,
+    cfg: SimConfig,
+    *,
+    origin: bool,
+    step: int,
+    timing_steps: int,
+) -> frozenset[RowKey]:
+    """Compute one endpoint's dwell rows.  The oracle :func:`_endpoint_claims` memoizes.
+
+    Kept separate rather than inlined so a test can assert the cache reproduces it exactly
+    over the whole reachable key space, instead of trusting the purity argument above.
+    """
+
     point = fg.request.origin if origin else fg.request.dest
     terminal = fg.origin_terminal if origin else fg.dest_terminal
     z = fg.levels[0]
@@ -1404,19 +1459,24 @@ def _best_column(
 
         nonlocal incumbent
         hops = label.hops
+        # Hoisted out of the lane loop below: the arrival dwell is a property of when the
+        # flight lands, not of which lane it lands on, and `destination_options` groups
+        # every lane sharing a cell -- so inside the loop this recomputed one answer per
+        # lane.  Its `forbidden_rows` verdict is likewise lane-independent, hence `return`.
+        destination_claims = _endpoint_claims(
+            fg,
+            cfg,
+            origin=False,
+            step=step,
+            timing_steps=hops,
+        )
+        if not destination_claims.isdisjoint(forbidden_rows):
+            return
         for dest_lane_idx in destination_options[cell]:
-            destination_claims = _endpoint_claims(
-                fg,
-                cfg,
-                origin=False,
-                step=step,
-                timing_steps=hops,
-            )
-            if not destination_claims.isdisjoint(forbidden_rows):
-                continue
-            # Deliberately left uncached: this is the verbatim oracle any later
-            # acceleration is measured and certified against, and a cache here would
-            # be one more thing to keep honest.
+            # `_path_claims` is deliberately left uncached: this is the verbatim oracle any
+            # later acceleration is measured and certified against, and a cache here would
+            # be one more thing to keep honest.  (Its own `endpoint_cache`/`visit_cache`
+            # parameters exist for callers that have made that argument; this one has not.)
             claims = _path_claims(fg, cfg, label, dest_lane_idx)
             if not claims.isdisjoint(forbidden_rows):
                 continue

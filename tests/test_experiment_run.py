@@ -2,8 +2,9 @@
 
 import pytest
 
-from experiments.run import parse_args, spec_from_args
-from freespace_sim.scenarios import SCENARIOS
+import experiments.run as run_module
+from experiments.run import colgen_params_from_args, parse_args, spec_from_args
+from freespace_sim.scenarios import SCENARIOS, with_overrides
 
 
 def _args(scenario: str, *extra: str):
@@ -85,3 +86,99 @@ def test_demand_duration_flag_shrinks_a_density_scenario_for_a_smoke_run():
         _args("density_faa_wing_zipline", "--horizon", "900", "--demand-duration", "60")
     ).config()
     assert (cfg.horizon_s, cfg.effective_demand_duration_s) == (900.0, 60.0)
+
+
+def test_colgen_flags_reach_the_planner_params():
+    """The solver budget has to survive the CLI, or a sweep silently runs at the default."""
+
+    args = _args(
+        "colgen_test", "--planner", "colgen",
+        "--colgen-time-limit", "900", "--colgen-max-iterations", "50",
+        "--colgen-objective", "total_cost", "--colgen-solver", "highs",
+        "--colgen-gap-metric", "cost",
+        "--colgen-detour-slack", "3", "--colgen-max-air-overrun", "3",
+    )
+    params = colgen_params_from_args(args, "colgen")
+
+    assert params.time_limit_s == 900.0
+    assert params.max_iterations == 50
+    assert params.objective == "total_cost"
+    assert params.solver == "highs"
+    assert params.gap_metric == "cost"
+    assert params.detour_slack_hops == 3
+    assert params.max_air_overrun_hops == 3
+
+
+def test_colgen_params_are_none_for_every_other_planner():
+    """``None`` keeps non-colgen planners on ``get_planner``'s no-params path."""
+
+    assert colgen_params_from_args(_args("metro_uniform", "--planner", "astar"), "astar") is None
+
+
+def test_unset_colgen_flags_leave_the_defaults_alone():
+    """An unset flag must not be forwarded as ``None`` and overwrite a real default."""
+
+    defaults = colgen_params_from_args(_args("colgen_test", "--planner", "colgen"), "colgen")
+
+    assert defaults.time_limit_s == 120.0
+    assert defaults.objective == "total_delay"
+
+
+@pytest.mark.parametrize(
+    "colgen_flag",
+    [
+        ("--colgen-time-limit", "900"),
+        ("--colgen-max-iterations", "50"),
+        ("--colgen-objective", "total_cost"),
+        ("--colgen-solver", "highs"),
+        ("--colgen-gap-metric", "cost"),
+        ("--colgen-detour-slack", "3"),
+        ("--colgen-max-air-overrun", "3"),
+    ],
+)
+def test_colgen_flags_require_the_colgen_planner(colgen_flag):
+    """Accepting them for another planner would drop the budget without saying so."""
+
+    with pytest.raises(SystemExit) as exc:
+        _args("metro_uniform", "--planner", "astar", *colgen_flag)
+    assert exc.value.code == 2
+
+
+def test_colgen_flags_follow_the_scenario_when_it_selects_the_planner(monkeypatch):
+    """``--planner`` is an override, not the question "which planner runs".
+
+    A ``ScenarioSpec`` carries its own planner. Gating the colgen flags on the override
+    alone meant such a scenario could not be given a solver budget at all -- and, worse,
+    that a run of it silently used ``ColGenParams()`` defaults, which buys one iteration
+    on a real world. ``colgen_test`` does not set ``planner`` today, so this pins the
+    behaviour against a spec that does, which is one scenario edit away.
+    """
+
+    colgen_spec = with_overrides(SCENARIOS["colgen_test"], planner="colgen")
+    monkeypatch.setattr(run_module, "get_scenario", lambda _name: colgen_spec)
+
+    # `spec_from_args(...).config().planner` is verbatim what `main` passes, so this
+    # exercises the real derivation rather than re-deriving the answer the test wants.
+    def _params_as_main_would(argv):
+        parsed = parse_args(argv)
+        return colgen_params_from_args(parsed, spec_from_args(parsed).config().planner)
+
+    # No --planner anywhere: the budget must be accepted, not rejected...
+    assert _params_as_main_would(
+        ["--scenario", "colgen_test", "--colgen-time-limit", "600"]
+    ).time_limit_s == 600.0
+
+    # ...and a run with no colgen flags at all must still be recognised as a colgen run,
+    # rather than falling through to the shipped defaults by accident.
+    assert _params_as_main_would(["--scenario", "colgen_test"]) is not None
+
+
+def test_colgen_flags_are_still_refused_when_the_scenario_picks_another_planner(monkeypatch):
+    """The guard has to survive the fix, or it stops catching the typo it exists for."""
+
+    astar_spec = with_overrides(SCENARIOS["metro_uniform"], planner="astar")
+    monkeypatch.setattr(run_module, "get_scenario", lambda _name: astar_spec)
+
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--scenario", "metro_uniform", "--colgen-time-limit", "600"])
+    assert exc.value.code == 2

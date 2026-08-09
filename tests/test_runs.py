@@ -201,3 +201,62 @@ def test_denied_flight_captured_without_volumes(tmp_path):
     folder = runs.save_run(res, root=tmp_path, label="den")
     loaded = runs.load_run(folder)
     assert len(loaded.denied) == 1 and loaded.denied[0].volumes is None
+
+
+def test_solver_diagnostics_reach_the_run_folder_and_the_index(tmp_path):
+    """A truncated whole-schedule solve is indistinguishable from a converged one on disk.
+
+    Both file a complete, feasible accepted set, so `intents` cannot tell them apart and
+    neither can any metric derived from them. `planner_stats.json` is the only record of
+    which one happened, and the two index columns are what let a sweep ask the question
+    without opening every folder.
+    """
+
+    import json
+
+    from freespace_sim.sim import SimResult
+
+    led = ReservationLedger(SimConfig())
+    accepted = get_planner("straight").plan(
+        FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0), led, SimConfig())
+    stats = {
+        "termination_reason": "time_limit", "iterations": 1,
+        "lp_gap_cost": 0.965, "search_exhausted_flight_ids": (7, 9),
+        # A solve that never reached the master reports infinite bounds, and json.dumps
+        # would write a bare `Infinity` -- which jq reads back as 1.8e308, i.e. a
+        # plausible finite bound where there was none.
+        "lp_gap": float("inf"), "cost_lower_bound": float("-inf"),
+    }
+    res = SimResult(config=SimConfig(region_size_m=(2200.0, 2200.0)), intents=[accepted],
+                    ledger=led, verified=True, planner_stats=stats)
+
+    folder = runs.save_run(res, root=tmp_path, label="cg", write_replay=False)
+
+    persisted = json.loads((folder / "planner_stats.json").read_text())
+    assert persisted["termination_reason"] == "time_limit"
+    assert persisted["iterations"] == 1
+    assert persisted["lp_gap_cost"] == 0.965
+    assert persisted["lp_gap"] is None and persisted["cost_lower_bound"] is None
+    assert "Infinity" not in (folder / "planner_stats.json").read_text()
+
+    index = pd.read_parquet(tmp_path / "index.parquet")
+    assert index["planner_termination"].tolist() == ["time_limit"]
+    assert index["planner_iterations"].tolist() == [1]
+
+
+def test_a_per_flight_run_writes_no_planner_stats(tmp_path):
+    """Per-flight planners have no solve to describe; the file must simply be absent."""
+
+    from freespace_sim.sim import SimResult
+
+    led = ReservationLedger(SimConfig())
+    accepted = get_planner("straight").plan(
+        FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0), led, SimConfig())
+    res = SimResult(config=SimConfig(region_size_m=(2200.0, 2200.0)), intents=[accepted],
+                    ledger=led, verified=True)
+
+    folder = runs.save_run(res, root=tmp_path, label="astar", write_replay=False)
+
+    assert not (folder / "planner_stats.json").exists()
+    index = pd.read_parquet(tmp_path / "index.parquet")
+    assert index["planner_termination"].isna().all()

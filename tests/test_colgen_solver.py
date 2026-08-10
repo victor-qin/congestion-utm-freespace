@@ -1208,6 +1208,11 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         "initial_greedy_elapsed_s",
         "ip_elapsed_s",
         "pricing_wall_s",
+        # A wall measurement like the rest.  `kernel_priced` / `kernel_fell_back` are
+        # deliberately NOT excluded: they are counts, and a run that falls back a different
+        # number of times took a different path through the code, which is exactly the kind
+        # of difference this contract exists to catch.
+        "pricing_task_total_s",
         "seed_elapsed_s",
         "time_to_master_s",
     }

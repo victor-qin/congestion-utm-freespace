@@ -1801,6 +1801,25 @@ def _best_column(
 
 _kernel_fallback_warned = False
 
+# Per-process tally of exact-pricing calls and how many could not be proved in the kernel.
+#
+# A fallback is a 3-4.5x slowdown that produces the RIGHT answer, so nothing downstream can
+# notice it: the objective, the columns and the tests are all identical, only the clock
+# moves.  `[[run-astar-with-compiled-extra]]` records the same failure mode costing a whole
+# issue on the A* side.  Counting it is the only way a production run can report "the
+# compiled path served 100% of pricing" rather than assume it.
+#
+# Per PROCESS, deliberately: under a worker pool each worker keeps its own tally and
+# `pricing_pool` returns the delta per task, because a parent-side counter would report zero
+# forever while every fallback happened somewhere else.
+_KERNEL_STATS = {"priced": 0, "fell_back": 0}
+
+
+def kernel_stats() -> dict[str, int]:
+    """Snapshot this process's compiled-pricing tally."""
+
+    return dict(_KERNEL_STATS)
+
 
 def _dp_kernel():
     """The compiled kernel module, or ``None`` when numba is unavailable.
@@ -2765,7 +2784,9 @@ def price_flight(
         deadline=deadline,
         model=model,
     )
+    _KERNEL_STATS["priced"] += 1
     if not proved:
+        _KERNEL_STATS["fell_back"] += 1
         # The ORIGINAL incumbent, deliberately, not whatever the abandoned compiled attempt
         # managed to certify first.  Warm-starting the fallback would be optimality-safe --
         # pruning against an achievable score never discards anything strictly better -- but

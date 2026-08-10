@@ -18,6 +18,7 @@ from ...types import (
 )
 from ...uss import _warn_if_terminal_dropped
 from .params import ColGenParams
+from .pricing_pool import ParallelPricingConfig
 from .solver import ColGenSolver
 from .translate import column_to_intent
 
@@ -89,9 +90,12 @@ def run_batch(
     ``collector`` is accepted for parity with the parallel runner.  Column generation
     has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
 
-    Pricing runs sequentially.  ``sim.run``'s own ``parallel`` argument is a different
-    mechanism entirely -- the A* speculative runner -- and rejects whole-schedule
-    planners, so a colgen run is single-process by construction.
+    Pricing fans across worker processes when ``params.n_pricing_workers`` is nonzero, and
+    runs in this process otherwise (the default).  That is a pure performance knob:
+    :func:`pricing_pool.price_sweep` reproduces the sequential loop's accepted prefix and
+    hands the reduced costs back in index order, so the columns and the objective do not
+    move.  ``sim.run``'s own ``parallel`` argument is a different mechanism entirely -- the
+    A* speculative runner -- and rejects whole-schedule planners, so the two never interact.
 
     ``on_iteration`` is forwarded to the solver, which calls it once per column-generation
     iteration.  A caller that supplies nothing gets :func:`_log_iteration`, because pricing
@@ -135,6 +139,11 @@ def run_batch(
     result = ColGenSolver().solve(
         requests, cfg, static_terms, batch_params,
         on_iteration=on_iteration if on_iteration is not None else _log_iteration,
+        parallel=(
+            ParallelPricingConfig(n_workers=batch_params.n_pricing_workers)
+            if batch_params.n_pricing_workers
+            else None
+        ),
     )
     solve_elapsed = time.monotonic() - solve_started
     solve_share = solve_elapsed / len(events) if events else 0.0

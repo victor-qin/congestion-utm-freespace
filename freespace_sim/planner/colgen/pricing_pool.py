@@ -37,6 +37,7 @@ in ``_check_not_importing_main``. Every shipped entry point already guards its m
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -45,7 +46,7 @@ from ...config import SimConfig
 from ...types import FlightRequest
 from .network import StaticTerminalCatalog, build_flight_graph
 from .params import ColGenParams
-from .pricing import DualView, PricingTimeout, price_flight
+from .pricing import DualView, PricingTimeout, kernel_stats, price_flight
 from .translate import Column
 
 __all__ = [
@@ -71,6 +72,18 @@ class ParallelPricingConfig:
             raise ValueError("n_workers must be non-negative")
         if self.chunksize < 1:
             raise ValueError("chunksize must be positive")
+        # An upper bound, because the failure past it is not an error message.  Each worker
+        # rebuilds every graph and carries its own label pool -- roughly 1.5 GB on density
+        # -- so an over-large count from a config file OOMs the host rather than running
+        # slowly.  Measured, more lanes stop paying long before here anyway: 8 and 12
+        # workers were within noise of each other, because added lanes add memory-system
+        # contention as fast as they add throughput.
+        ceiling = 4 * (os.cpu_count() or 1)
+        if self.n_workers > ceiling:
+            raise ValueError(
+                f"n_workers={self.n_workers} exceeds {ceiling} (4x this host's "
+                f"{os.cpu_count()} cores); each worker holds its own label pool"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,13 +109,25 @@ class SweepResult:
     # Wall the caller waited for the sweep, measured inside `price_sweep` so it covers pool
     # construction and teardown -- the costs a per-sweep pool actually pays.
     wall_s: float = 0.0
+    # Exact-pricing calls this sweep, and how many fell back to the Python reference.  A
+    # fallback is invisible downstream -- same column, same objective, 3-4.5x the time -- so
+    # a nonzero count here is the only signal a production run gets.  Summed ACROSS workers,
+    # since each keeps its own per-process tally.
+    kernel_priced: int = 0
+    kernel_fell_back: int = 0
 
     @property
     def complete(self) -> bool:
         return self.timeout_flight_id is None
 
     def efficiency(self, n_workers: int) -> float:
-        """Fraction of the pool's worker-seconds that did real work."""
+        """Fraction of the pool's worker-seconds that did real work.
+
+        UNDERSTATES after a timeout, and unavoidably so: the sweep stops reading results at
+        the first gap, so tasks that completed but land past it are never observed, while
+        the wall clock already includes the time spent producing them.  On a sweep that
+        completed (``timeout_flight_id is None``) the figure is exact.
+        """
 
         if n_workers <= 0 or self.wall_s <= 0.0:
             return 1.0
@@ -164,6 +189,9 @@ def _price_one(flight_id: int):
     an ordinary outcome, not a failure.
     """
 
+    # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
+    # so shipping the absolute would double-count on the second task and beyond.
+    before = kernel_stats()
     started = time.perf_counter()
     try:
         reduced_cost, column = price_flight(
@@ -176,8 +204,17 @@ def _price_one(flight_id: int):
             deadline=_WORKER["deadline"],
         )
     except PricingTimeout:
-        return flight_id, False, 0.0, None, time.perf_counter() - started
-    return flight_id, True, float(reduced_cost), column, time.perf_counter() - started
+        return flight_id, False, 0.0, None, time.perf_counter() - started, 0, 0
+    after = kernel_stats()
+    return (
+        flight_id,
+        True,
+        float(reduced_cost),
+        column,
+        time.perf_counter() - started,
+        after["priced"] - before["priced"],
+        after["fell_back"] - before["fell_back"],
+    )
 
 
 # --------------------------------------------------------------------------- parent side
@@ -225,6 +262,7 @@ def _sweep_sequential(
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
     task_total_s = 0.0
+    before = kernel_stats()
     sweep_started = time.perf_counter()
     for flight_id in pricing_order:
         task_started = time.perf_counter()
@@ -239,19 +277,25 @@ def _sweep_sequential(
                 deadline=deadline,
             )
         except PricingTimeout:
+            after = kernel_stats()
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
+                after["priced"] - before["priced"],
+                after["fell_back"] - before["fell_back"],
             )
         task_total_s += time.perf_counter() - task_started
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+    after = kernel_stats()
     # One worker's worth of work, by definition -- which is what makes it the denominator
     # the parallel arm is compared against.
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
+        after["priced"] - before["priced"],
+        after["fell_back"] - before["fell_back"],
     )
 
 
@@ -264,6 +308,13 @@ def _sweep_parallel(
     The pool is per-sweep because the duals change every iteration and they reach the
     workers through the initializer -- once per worker rather than once per task, which is
     the difference between pickling them ~n_workers times and ~n_flights times.
+
+    The initializer's largest payload is NOT the duals, though: it is `known_columns`, one
+    `Column` per flight at ~13.7 KB with 619 claims, so ~13.7 MB per worker at 1,000
+    flights and linear in both flights and workers.  Invisible against a sweep of hundreds
+    of seconds, and the first term that would bite at several thousand flights -- at which
+    point the fix is to send only the columns each worker's own flights need, which
+    requires a static rather than dynamic assignment.
     """
 
     # `spawn` explicitly rather than by platform default: `fork` would inherit the parent's
@@ -278,6 +329,8 @@ def _sweep_parallel(
     columns: list[Column | None] = []
     timeout_flight_id: int | None = None
     task_total_s = 0.0
+    kernel_priced = 0
+    kernel_fell_back = 0
     # Started before the pool exists on purpose: spawning workers, re-importing numba and
     # rebuilding graphs are real costs of a per-sweep pool, and excluding them would report
     # an efficiency the caller never experiences.
@@ -289,8 +342,8 @@ def _sweep_parallel(
         # order so the accepted prefix is the one the sequential loop would have produced,
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
-        for flight_id, priced, reduced_cost, column, task_s in pool.imap(
-            _price_one, pricing_order, config.chunksize
+        for flight_id, priced, reduced_cost, column, task_s, n_priced, n_fell_back in (
+            pool.imap(_price_one, pricing_order, config.chunksize)
         ):
             if not priced:
                 # Past the first gap nothing is accepted, so breaking here abandons the
@@ -298,10 +351,13 @@ def _sweep_parallel(
                 timeout_flight_id = flight_id
                 break
             task_total_s += task_s
+            kernel_priced += n_priced
+            kernel_fell_back += n_fell_back
             flight_ids.append(flight_id)
             reduced_costs.append(float(reduced_cost))
             columns.append(column)
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), timeout_flight_id,
         task_total_s, time.perf_counter() - sweep_started,
+        kernel_priced, kernel_fell_back,
     )

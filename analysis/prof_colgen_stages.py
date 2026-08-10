@@ -15,9 +15,14 @@ A time-limited solve prices as many flights as it can afford, so instrumentation
 which subproblems are reached and the profile describes a different computation than the
 one you meant to measure.
 
-Note ``solver`` binds ``price_flight`` / ``seed_column`` / ``find_feasible_column`` at
-import, so patching only ``pricing`` instruments nothing the solver actually calls. Both
-module objects are patched below.
+Note ``solver`` binds ``seed_column`` / ``find_feasible_column`` at import, and
+``pricing_pool`` binds ``price_flight``, so patching only ``pricing`` instruments nothing
+the solve actually calls. Every module object holding such a binding is patched below.
+
+**Profile sequentially.** Neither these timers nor cProfile cross a process boundary, so
+under ``parallel=`` everything inside the sweep happens in workers and is invisible here --
+the parent would show only the greedy, the LP and canonicalization. A sequential sweep is
+exactly one worker's workload, which is the thing worth ranking anyway.
 
 Examples:
 
@@ -47,6 +52,7 @@ if REPO_ROOT not in _loaded.parents:
 from freespace_sim.planner.colgen import dp_prepare as dp_prepare_mod  # noqa: E402
 from freespace_sim.planner.colgen import master as master_mod  # noqa: E402
 from freespace_sim.planner.colgen import pricing as pricing_mod  # noqa: E402
+from freespace_sim.planner.colgen import pricing_pool as pricing_pool_mod  # noqa: E402
 from freespace_sim.planner.colgen import solver as solver_mod  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
@@ -57,6 +63,15 @@ CALLS: collections.Counter = collections.Counter()
 
 # (label, [(module, attribute), ...]) -- a stage may be bound in more than one module.
 STAGES: list[tuple[str, list[tuple[object, str]]]] = [
+    # The top of the sweep, and the one binding that MOVED: `pricing_pool` imports
+    # `price_flight` directly, so patching only `pricing` would instrument nothing the
+    # sweep calls.  Both are wrapped, and only one of them fires per run -- the pool's
+    # when `parallel=` is set (and then only in the parent, since cProfile and these
+    # timers do not cross a process boundary), `pricing`'s otherwise.
+    (
+        "price_flight (sweep entry)",
+        [(pricing_mod, "price_flight"), (pricing_pool_mod, "price_flight")],
+    ),
     # `_best_column_compiled` is the entry to exact pricing since Phase 2c; `_best_column`
     # runs only when it cannot prove it completed, so a nonzero row there is a FALLBACK
     # count and worth reading as one.

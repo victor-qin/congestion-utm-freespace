@@ -180,6 +180,17 @@ class ColGenParams:
     # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
     # 0 disables.
     seed_ladder_steps: int = 20
+    # Wall clock for the post-first-LP greedy, PER FLIGHT.  That stage splits its budget
+    # across up to `max(64, n_heuristic_tries * 16)` candidates, so a fixed total starves as
+    # the batch grows: the previous `min(60.0, 0.55 * time_limit_s)` gave each candidate
+    # ~0.23 s at 500 flights, and 168 of 202 searches were cut off mid-kernel.  Scaling with
+    # the batch keeps the per-candidate slice roughly constant.  0 disables the stage.
+    greedy_budget_s_per_flight: float = 0.7
+    # Worker processes for the per-iteration pricing sweep; 0 keeps it in-process.  A pure
+    # performance knob -- `pricing_pool.price_sweep` reproduces the sequential loop's
+    # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
+    # graph and carries its own label pool, so memory is linear in this number.
+    n_pricing_workers: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):
@@ -221,6 +232,26 @@ class ColGenParams:
         if ladder < 0:
             raise ValueError("seed_ladder_steps must be non-negative")
         object.__setattr__(self, "seed_ladder_steps", ladder)
+
+        if isinstance(self.n_pricing_workers, bool):
+            raise TypeError("n_pricing_workers must be an integer")
+        try:
+            workers = operator.index(self.n_pricing_workers)
+        except TypeError as exc:
+            raise TypeError("n_pricing_workers must be an integer") from exc
+        if workers < 0:
+            raise ValueError("n_pricing_workers must be non-negative")
+        object.__setattr__(self, "n_pricing_workers", workers)
+
+        if isinstance(self.greedy_budget_s_per_flight, bool):
+            raise TypeError("greedy_budget_s_per_flight must be a real number")
+        try:
+            per_flight = float(self.greedy_budget_s_per_flight)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("greedy_budget_s_per_flight must be a real number") from exc
+        if not math.isfinite(per_flight) or per_flight < 0.0:
+            raise ValueError("greedy_budget_s_per_flight must be finite and non-negative")
+        object.__setattr__(self, "greedy_budget_s_per_flight", per_flight)
 
         for name in ("max_iterations", "n_heuristic_tries"):
             value = getattr(self, name)

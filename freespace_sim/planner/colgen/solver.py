@@ -163,15 +163,27 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
 
     if steps <= 0:
         return 0
+    # BOTH bounds, stated.  `latest_departure_step` alone is not the limit: this path must
+    # also arrive by `max_step`, which is the bound `_initial_feasible_selection` computes
+    # explicitly for the same reason.  Leaving it to be caught as a `ValueError` from
+    # `column_claims` works -- the horizon is the only shift-dependent failure, since a
+    # clock translation leaves the wall verdict and the detour budget invariant, and it is
+    # monotone in `step` so `break` is right -- but `column_claims` raises `ValueError` for
+    # eight other reasons too, and every one of them would be silently read as "the ladder
+    # ended here" rather than as the regression it would be.
+    origin_lane_steps = (
+        0 if seed.origin_lane_idx is None else graph.origin_lanes[seed.origin_lane_idx].steps
+    )
+    path_latest_departure = (
+        graph.max_step
+        - graph.takeoff_steps[seed.level]
+        - origin_lane_steps
+        - (len(seed.cell_path) - 1)
+    )
+    latest = min(graph.latest_departure_step, path_latest_departure)
     added = 0
-    for step in range(seed.departure_step + 1, seed.departure_step + 1 + steps):
-        if step > graph.latest_departure_step:
-            break
-        try:
-            shifted = _canonical_column(_shift_column(seed, step, cfg, model), graph, cfg)
-        except ValueError:
-            break
-        master.add_column(shifted)
+    for step in range(seed.departure_step + 1, min(seed.departure_step + steps, latest) + 1):
+        master.add_column(_canonical_column(_shift_column(seed, step, cfg, model), graph, cfg))
         added += 1
     return added
 
@@ -527,6 +539,10 @@ def _pre_master_timeout_result(
             "heuristic_gap_cost": math.inf,
             "ip_gap_revenue": None,
             "pricing_wall_s": 0.0,
+            "pricing_task_total_s": 0.0,
+            "n_pricing_workers": 0,
+            "kernel_priced": 0,
+            "kernel_fell_back": 0,
             "seeded_columns": 0,
             "ladder_columns": 0,
             "ip_elapsed_s": 0.0,
@@ -624,6 +640,9 @@ class ColGenSolver:
         """
         started = time.monotonic()
         pricing_wall_s = 0.0
+        pricing_task_total_s = 0.0
+        kernel_priced = 0
+        kernel_fell_back = 0
         deadline = started + params.time_limit_s
         # Leave a small tail for the final restricted-master IP.  An incomplete
         # pricing sweep cannot certify a global bound, but every completed
@@ -664,6 +683,10 @@ class ColGenSolver:
                     "heuristic_gap_cost": 0.0,
                     "ip_gap_revenue": None,
                     "pricing_wall_s": 0.0,
+                    "pricing_task_total_s": 0.0,
+                    "n_pricing_workers": 0,
+                    "kernel_priced": 0,
+                    "kernel_fell_back": 0,
                     "seeded_columns": 0,
                     "ladder_columns": 0,
                     "ip_elapsed_s": 0.0,
@@ -960,7 +983,16 @@ class ColGenSolver:
                 # flight using the same lazy topology, bounded independently so
                 # formal reduced-cost pricing retains most of the solve budget.
                 greedy_started = time.monotonic()
-                greedy_budget_s = min(60.0, 0.55 * params.time_limit_s)
+                # PER FLIGHT, because the stage divides its budget across candidates and a
+                # fixed total therefore starves as the batch grows.  The old
+                # `min(60.0, 0.55 * time_limit_s)` split 60 s across up to
+                # `candidate_limit` = 256 candidates, giving each ~0.23 s at 500 flights --
+                # far under one density search.  Measured there: 170 of 202 searches
+                # entered the compiled kernel and 168 were cut off inside it, so the stage
+                # spent its whole budget to improve about two flights.  It was also the
+                # reason a solve stopped being reproducible above ~300 flights: when nearly
+                # every candidate is decided by a stopwatch, machine load picks the winners.
+                greedy_budget_s = params.greedy_budget_s_per_flight * len(flight_ids)
                 greedy_deadline = min(pricing_deadline, greedy_started + greedy_budget_s)
                 greedy_heuristic, greedy_completed = _greedy_feasible_selection(
                     graphs,
@@ -1040,6 +1072,14 @@ class ColGenSolver:
 
             iteration_sweep_s = time.perf_counter() - sweep_started
             pricing_wall_s += iteration_sweep_s
+            # Production telemetry, summed across the solve.  A compiled-path fallback is
+            # the one regression nothing else can see: same column, same objective, 3-4.5x
+            # the time.  `sweep_task_total_s` against `pricing_wall_s * n_workers` is the
+            # pool's occupancy, which is the difference between "parallelism is not paying"
+            # and "parallelism is paying and the machine is saturated".
+            pricing_task_total_s += sweep.task_total_s
+            kernel_priced += sweep.kernel_priced
+            kernel_fell_back += sweep.kernel_fell_back
 
             before_pricing = len(master.columns)
             for column in sorted(
@@ -1468,6 +1508,18 @@ class ColGenSolver:
             # its time, so this against `elapsed_s` says how much of the run was the
             # subproblem and how much was the master.
             "pricing_wall_s": pricing_wall_s,
+            # What the sweep's workers COMPUTED, against the wall above.  Divided by
+            # `pricing_wall_s * n_pricing_workers` this is the pool's occupancy; equal to
+            # `pricing_wall_s` when the sweep ran sequentially.  Without it a slow run
+            # cannot be told apart from a badly-scheduled one after the fact.
+            "pricing_task_total_s": pricing_task_total_s,
+            "n_pricing_workers": 0 if parallel is None else parallel.n_workers,
+            # Exact-pricing calls and how many could not be proved in the compiled kernel.
+            # A fallback returns the SAME column 3-4.5x slower, so it moves no other number
+            # in this dict; a nonzero count is the only way a run reports that its compiled
+            # path was not actually serving it.
+            "kernel_priced": kernel_priced,
+            "kernel_fell_back": kernel_fell_back,
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,

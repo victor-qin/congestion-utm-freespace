@@ -203,6 +203,39 @@ def build_parser() -> argparse.ArgumentParser:
                         "search a sweep does; suboptimal by construction, since a route needing "
                         "more hops becomes unreachable — widen it first if a congested scenario "
                         "denies flights that ought to be placeable")
+    # The three knobs `ColGenParams` grew for the compiled/parallel pricing path. Without
+    # them the params object is reachable only from Python: `n_pricing_workers` defaults to
+    # 0, so no invocation of this CLI could ever run the pool, and the other two default to
+    # ON and could not be turned down. "Off by default" and "unreachable" look identical
+    # from the params object and are not the same thing.
+    p.add_argument("--colgen-workers", type=int, default=None, metavar="N",
+                   help="colgen: fan each pricing sweep across N worker processes (default 0, "
+                        "in-process). Note this is NOT --workers, which sizes the simulation's "
+                        "speculative pool. Answer-identical to sequential by construction — the "
+                        "accepted prefix and the reduced-cost order both reproduce the sequential "
+                        "loop — but only reproducible in practice below ~300 flights, above which "
+                        "the greedy's wall-clock budget makes the run non-deterministic anyway. "
+                        "Measured 2.6x at 100 flights and 4.4x at 200. Sizing is bound by MEMORY "
+                        "before cores: each worker rebuilds every graph and holds its own label "
+                        "pool, ~1.75 GB apiece at 100 flights")
+    p.add_argument("--colgen-seed-ladder", type=int, default=None, metavar="STEPS",
+                   help="colgen: seed each flight's column with STEPS retimed copies of itself "
+                        "before the first LP (default 20; 0 disables). Pure clock translation, so "
+                        "a rung adds ground delay and nothing else, and LP duality then PROVES "
+                        "those retimes non-improving rather than making pricing rediscover them "
+                        "one iteration at a time. Buys objective and costs pricing time: measured "
+                        # `%%` because argparse %-formats help strings -- a bare `%` here is a
+                        # ValueError at parser construction, i.e. every invocation.
+                        "-6%% to -19%% objective for 1.6-13.7x the pricing. At 100 flights the "
+                        "ladder is 2000 of the final 2186 columns")
+    p.add_argument("--colgen-greedy-budget-rate", type=float, default=None, metavar="S",
+                   help="colgen: seconds PER FLIGHT for the initial greedy feasible-selection "
+                        "stage (default 0.7, so 350 s at 500 flights; 0 disables the stage). A "
+                        "rate rather than a total "
+                        "because the stage splits its budget across the flights still to try, so a "
+                        "flat budget starves large batches — at 500 flights the old flat 60 s gave "
+                        "each search ~0.23 s and 200 of 202 were cut off mid-flight. Inert at 100 "
+                        "flights or fewer, where the stage exits before spending it")
     return p
 
 
@@ -260,6 +293,9 @@ def _colgen_overrides(args) -> dict:
             ("solver", args.colgen_solver),
             ("gap_metric", args.colgen_gap_metric),
             ("max_air_overrun_hops", args.colgen_max_air_overrun),
+            ("n_pricing_workers", args.colgen_workers),
+            ("seed_ladder_steps", args.colgen_seed_ladder),
+            ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
         )
         if value is not None
     }

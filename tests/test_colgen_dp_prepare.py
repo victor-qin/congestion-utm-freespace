@@ -66,6 +66,24 @@ def _terminal_graph(cfg, origin=(0, 0), dest=(4, -1), overrun=4):
 GRAPHS = {"plain": _plain_graph, "terminal": _terminal_graph}
 
 
+def _origin_lanes(fg):
+    """The lane ids `_origin_options` offers, `None` for a laneless origin."""
+
+    return [lane for lane, _cell, _steps in pricing._origin_options(fg)]
+
+
+def _duals(fg, cfg, seed):
+    import random
+
+    rng = random.Random(seed)
+    return {
+        RowKey.cell(cell[0], cell[1], 0, step): rng.uniform(-2.0, 40.0)
+        for cell in list(fg.corridor_cells)[:40]
+        for step in range(fg.min_step, min(fg.min_step + 25, fg.max_step + 1))
+        if rng.random() < 0.55
+    }
+
+
 # --------------------------------------------------------------------- topology
 
 
@@ -730,3 +748,138 @@ def test_workspace_generation_stamp_never_reads_stale():
     assert ws.stamp_gen == 0
     assert ws.next_generation() == 1
     assert int(ws.stamp[3]) == 0, "regrown arena must not carry a live stamp"
+
+
+# ------------------------------------------------------- the completion gate, split lazily
+
+
+def _eager_envelope(envelopes, departure_step, lane_idx):
+    """Rebuild `completion_envelope` the way it was before the lazy split.
+
+    Deliberately NOT a call to `envelope()`: this is the independent re-derivation the split
+    has to agree with, so it recomputes both halves in one pass exactly as the reference's
+    closure does.
+    """
+
+    import math
+
+    fg = envelopes._fg
+    lane_steps = 0 if lane_idx is None else fg.origin_lanes[lane_idx].steps
+    corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
+    max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
+    delay_lbs = [math.inf]
+    dest_costs = [math.inf]
+    incumbent = envelopes.incumbent
+    for total_hops in range(1, max_total_hops + 1):
+        delay_lb = envelopes.delay_lower_bound(departure_step, lane_idx, total_hops, 0)
+        if incumbent is not None and (
+            envelopes.benefit - envelopes._pi_f - delay_lb
+            + envelopes._view.max_negative_credit
+            < incumbent[0] - pricing._RECOMPUTE_EPS
+        ):
+            break
+        cost = envelopes._destination_cost(corridor_start + total_hops, total_hops)
+        if not math.isfinite(cost):
+            delay_lbs.append(math.inf)
+            dest_costs.append(math.inf)
+            continue
+        delay_lbs.append(delay_lb)
+        dest_costs.append(cost)
+    return tuple(delay_lbs), tuple(dest_costs)
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPHS))
+def test_completion_envelope_split_reproduces_the_eager_form(shape):
+    """Deferring the destination half must not move the envelope, in value or in LENGTH.
+
+    The length is the part that would fail silently. It is decided by a `break` that reads
+    `delay_lb` alone -- which is why the halves can be split at all -- and it is itself a
+    prune, since `can_compete` returns False outright on `first_hops >= len(delay_lbs)`.
+    An envelope that came back one entry shorter would prune labels the reference keeps and
+    return a different, equally optimal column.
+    """
+
+    cfg = _cfg()
+    fg = GRAPHS[shape](cfg)
+    view = pricing.DualView(_duals(fg, cfg, 606), cfg)
+    seed = pricing.seed_column(fg, cfg)
+    incumbent = (
+        100.0 - seed.delay_s - view.claim_cost(seed.claims),
+        seed,
+    )
+    envelopes = dp_prepare.CompletionEnvelopes(
+        fg, cfg, view, benefit=100.0, pi_f=0.0, incumbent=incumbent
+    )
+
+    checked = 0
+    for departure_step in range(fg.base_step, min(fg.base_step + 6, fg.latest_departure_step + 1)):
+        for lane_idx in _origin_lanes(fg):
+            expected = _eager_envelope(envelopes, departure_step, lane_idx)
+            assert envelopes.envelope(departure_step, lane_idx) == expected
+            checked += 1
+    assert checked >= 3, "the fixture swept too few keys to be a real check"
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPHS))
+def test_can_compete_agrees_with_the_eager_envelope_everywhere(shape):
+    """The gate's verdict, swept over the arguments the search actually supplies.
+
+    `minimum_total_hops` is swept across the envelope's length because the 69.2% of real
+    calls that are answered by `first_hops >= len(delay_lbs)` never touch the destination
+    half at all -- so a split that got the length right and the values wrong would pass on
+    the common case and fail only where it decides the answer.
+    """
+
+    import math
+
+    cfg = _cfg()
+    fg = GRAPHS[shape](cfg)
+    view = pricing.DualView(_duals(fg, cfg, 606), cfg)
+    seed = pricing.seed_column(fg, cfg)
+    incumbent = (100.0 - seed.delay_s - view.claim_cost(seed.claims), seed)
+
+    def expected(envelopes, departure_step, lane_idx, minimum_total_hops, paid, exact):
+        delay_lbs, dest_costs = _eager_envelope(envelopes, departure_step, lane_idx)
+        first_hops = max(1, minimum_total_hops)
+        if first_hops >= len(delay_lbs):
+            return False
+        prefix = envelopes.incumbent_prefix
+        origin_lane_tie = -1 if lane_idx is None else lane_idx
+        paid_lb = max(0.0, paid - (0.0 if exact else pricing._RECOMPUTE_EPS))
+        for total_hops in range(first_hops, len(delay_lbs)):
+            union = max(paid_lb, dest_costs[total_hops])
+            bound = (
+                envelopes.benefit - envelopes._pi_f - delay_lbs[total_hops] - union
+                + envelopes._view.max_negative_credit
+            )
+            if bound > incumbent[0] + pricing._SCORE_EPS:
+                return True
+            if not exact and bound >= incumbent[0] - pricing._RECOMPUTE_EPS:
+                return True
+            if abs(bound - incumbent[0]) <= pricing._SCORE_EPS:
+                if (total_hops, departure_step, origin_lane_tie,
+                        envelopes.destination_lane_tie) <= prefix:
+                    return True
+        return False
+
+    checked = agreed_true = 0
+    for departure_step in range(fg.base_step, min(fg.base_step + 4, fg.latest_departure_step + 1)):
+        for lane_idx in _origin_lanes(fg):
+            fresh = dp_prepare.CompletionEnvelopes(
+                fg, cfg, view, benefit=100.0, pi_f=0.0, incumbent=incumbent
+            )
+            length = len(_eager_envelope(fresh, departure_step, lane_idx)[0])
+            for hops in (0, 1, max(1, length // 2), length - 1, length, length + 5):
+                for paid, exact in ((0.0, True), (5.0, False), (math.inf, False)):
+                    lazy = dp_prepare.CompletionEnvelopes(
+                        fg, cfg, view, benefit=100.0, pi_f=0.0, incumbent=incumbent
+                    )
+                    got = lazy.can_compete(
+                        departure_step, lane_idx, hops, paid, paid_duals_exact=exact
+                    )
+                    want = expected(fresh, departure_step, lane_idx, hops, paid, exact)
+                    assert got is want, (departure_step, lane_idx, hops, paid, exact)
+                    checked += 1
+                    agreed_true += int(got)
+    assert checked >= 50, f"only {checked} verdicts compared"
+    assert 0 < agreed_true < checked, "the sweep never exercised both verdicts"

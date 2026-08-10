@@ -1959,11 +1959,14 @@ def price_dag(
         """Mirror whatever the root gate already froze into arrays the kernel indexes."""
 
         arena = EnvelopeArena(n_variants)
-        if envelopes is not None:
+        # Every variant that SURVIVED `prepare_variants` had `can_compete` answer True
+        # against this incumbent, and the reference builds the full envelope in that call --
+        # so building them here is reproducing the reference, not anticipating the kernel.
+        # With no incumbent the reference builds nothing at root time, and neither does this.
+        if envelopes is not None and envelopes.incumbent is not None:
             for variant in range(n_variants):
                 key = departures[variant], lane_of[variant]
-                if envelopes.built(*key):
-                    arena.add(variant, *envelopes.envelope(*key))
+                arena.add(variant, *envelopes.envelope(*key))
         return arena
 
     def _publish(incumbent):

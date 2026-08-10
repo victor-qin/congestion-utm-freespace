@@ -119,7 +119,7 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
 
     defaults = colgen_params_from_args(_args("colgen_test", "--planner", "colgen"), "colgen")
 
-    assert defaults.time_limit_s == 120.0
+    assert defaults.time_limit_s == 1200.0
     assert defaults.objective == "total_delay"
 
 

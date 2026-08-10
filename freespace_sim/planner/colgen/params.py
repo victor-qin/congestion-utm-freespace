@@ -131,7 +131,16 @@ class ColGenParams:
     max_air_overrun_hops: int = 3
     solver: str = "auto"
     max_iterations: int = 30
-    time_limit_s: float = 120.0
+    # 20 minutes, raised from 120 s. The old default could not finish a single pricing
+    # sweep on a real instance: measured on `density_faa_wing_zipline` x100, iteration 1
+    # alone is 147 s and the sweeps LENGTHEN as the pool grows -- 147, 213, 222, 234, 235,
+    # 397, 521, 555 s -- so a 120 s budget terminated inside the first sweep and reported
+    # `time_limit` with a schedule built entirely by the rounding heuristic. 1200 s buys
+    # roughly three iterations at that size and ten or more at 50 flights.
+    #
+    # Nothing derived from it moves: `ip_reserve_s = min(5, 0.05 * t)` and
+    # `greedy_budget_s = min(60, 0.55 * t)` are both already at their caps by 1200 s.
+    time_limit_s: float = 1200.0
     lp_gap: float = 1e-4
     ip_gap: float = 1e-3
     M: float = 1_000_000.0

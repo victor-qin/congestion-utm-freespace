@@ -884,6 +884,7 @@ class CompletionEnvelopes:
     __slots__ = (
         "_cfg",
         "_deadline",
+        "_delay_envelopes",
         "_destination_costs",
         "_initial_incumbent",
         "_destination_fold_exact",
@@ -938,6 +939,7 @@ class CompletionEnvelopes:
         self._initial_incumbent = incumbent
         self._offsets = view.offsets
         self._envelopes: dict[tuple[int, int | None], tuple[tuple[float, ...], ...]] = {}
+        self._delay_envelopes: dict[tuple[int, int | None], tuple[Any, int]] = {}
         self._destination_costs: dict[tuple[int, int], float] = {}
 
         destination_options = _destination_options(fg)
@@ -1070,27 +1072,43 @@ class CompletionEnvelopes:
         self._destination_costs[key] = destination_cost
         return destination_cost
 
-    def envelope(
+    def _delay_envelope(
         self, departure_step: int, lane_idx: int | None
-    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-        """``completion_envelope`` — memoized, and frozen at its first length."""
+    ) -> tuple[tuple[float, ...], int]:
+        """The envelope's LENGTH and delay terms — scalar arithmetic, no claim sets at all.
+
+        Split out of :meth:`envelope` because the reference's early ``break`` consults
+        ``delay_lb`` alone and never the destination cost. The length is therefore settled
+        before a single row set is built, and the length is what most of the gate's callers
+        actually need: measured on ``density_faa``, **69.2% of ``can_compete`` calls are
+        answered by ``first_hops >= len(delay_lbs)``**, and building the other half of the
+        envelope for them cost 135,449 of 193,852 destination-cost entries. The 30.8% that
+        do scan read a mean of 3.2 entries and never more than 7, against a mean envelope
+        length of 81.7.
+
+        **The incumbent is captured here, at first use, and reused for every later
+        consultation.** That is what makes the split answer-identical rather than merely
+        faster: the reference builds the whole list in one go against one incumbent and
+        caches it, so a length re-derived later against an improved incumbent would be a
+        strictly stronger prune -- which is the failure ``[[pruning-not-neutral-under-
+        dominance]]`` describes.
+
+        ``min()`` rather than the ceiling alone, and the reasoning is pricing.py:1258-1284:
+        the horizon is a real bound even though the two are provably equal today.
+        """
 
         from .pricing import _RECOMPUTE_EPS, _check_deadline
 
         key = departure_step, lane_idx
-        cached = self._envelopes.get(key)
+        cached = self._delay_envelopes.get(key)
         if cached is not None:
             return cached
 
         fg = self._fg
         lane_steps = 0 if lane_idx is None else fg.origin_lanes[lane_idx].steps
         corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
-        # `min()` rather than the ceiling alone, and the reasoning is pricing.py:1258-1284:
-        # the horizon is a real bound even though the two are provably equal today, and the
-        # LENGTH of this result is what bounds `can_compete`'s scan.
         max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
         delay_lbs = [math.inf]
-        destination_positive_costs = [math.inf]
         incumbent = self._incumbent
         for total_hops in range(1, max_total_hops + 1):
             _check_deadline(self._deadline)
@@ -1100,15 +1118,41 @@ class CompletionEnvelopes:
                 < incumbent[0] - _RECOMPUTE_EPS
             ):
                 break
+            delay_lbs.append(delay_lb)
+
+        value = tuple(delay_lbs), corridor_start
+        self._delay_envelopes[key] = value
+        return value
+
+    def envelope(
+        self, departure_step: int, lane_idx: int | None
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """``completion_envelope`` in full — both halves, frozen at its first length.
+
+        Still the reference's own shape, because the compiled search needs the whole array:
+        the kernel evaluates the gate per LABEL, not just per root, and cannot pause into
+        Python for one entry at a time. Only the roots that survive
+        ``prepare_variants`` ever reach here -- 69 of 2,402 on a density flight.
+        """
+
+        key = departure_step, lane_idx
+        cached = self._envelopes.get(key)
+        if cached is not None:
+            return cached
+
+        delay_lbs, corridor_start = self._delay_envelope(departure_step, lane_idx)
+        delays = [math.inf]
+        destination_positive_costs = [math.inf]
+        for total_hops in range(1, len(delay_lbs)):
             destination_cost = self._destination_cost(corridor_start + total_hops, total_hops)
             if not math.isfinite(destination_cost):
-                delay_lbs.append(math.inf)
+                delays.append(math.inf)
                 destination_positive_costs.append(math.inf)
                 continue
-            delay_lbs.append(delay_lb)
+            delays.append(delay_lbs[total_hops])
             destination_positive_costs.append(destination_cost)
 
-        result = tuple(delay_lbs), tuple(destination_positive_costs)
+        result = tuple(delays), tuple(destination_positive_costs)
         self._envelopes[key] = result
         return result
 
@@ -1137,6 +1181,9 @@ class CompletionEnvelopes:
         """
 
         self._envelopes = {}
+        # The DELAY envelopes go too: their length is frozen by the incumbent live at their
+        # first use, so keeping them would carry a mid-sweep truncation into the restart.
+        self._delay_envelopes = {}
         self._incumbent = self._initial_incumbent
         for departure_step, lane_idx in keys:
             self.envelope(departure_step, lane_idx)
@@ -1157,7 +1204,8 @@ class CompletionEnvelopes:
         incumbent = self._incumbent
         if incumbent is None:
             return True
-        delay_lbs, destination_positive_costs = self.envelope(departure_step, lane_idx)
+        # Only the LENGTH is needed to answer most calls, and the length is free.
+        delay_lbs, corridor_start = self._delay_envelope(departure_step, lane_idx)
         first_hops = max(1, minimum_total_hops)
         if first_hops >= len(delay_lbs):
             return False
@@ -1168,9 +1216,15 @@ class CompletionEnvelopes:
             0.0, paid_duals - (0.0 if paid_duals_exact else _RECOMPUTE_EPS)
         )
         for total_hops in range(first_hops, len(delay_lbs)):
-            union_positive_lb = max(
-                paid_positive_lb, destination_positive_costs[total_hops]
+            destination_positive = self._destination_cost(
+                corridor_start + total_hops, total_hops
             )
+            if not math.isfinite(destination_positive):
+                # The eager form stored `(inf, inf)` at this hop.  Either way the bound is
+                # -inf -- `finite - inf` then `+ credit` -- and all three arms below reject
+                # it, so skipping is the same verdict reached without the arithmetic.
+                continue
+            union_positive_lb = max(paid_positive_lb, destination_positive)
             hop_rc_bound = (
                 self.benefit
                 - self._pi_f

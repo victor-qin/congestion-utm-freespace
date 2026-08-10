@@ -1,0 +1,203 @@
+"""One colgen solve, timed and broken down by stage.
+
+The parity harness answers "did the answer move"; this answers "where did the time go".
+Those became different questions once the pricing sweep was parallelised: at 8 workers the
+sweep stops dominating, and whatever is still SERIAL -- graph build, seeding and the
+departure ladder, the greedy's fixed wall-clock block, the master LP, the final IP --
+becomes the thing worth attacking next.  A total wall figure cannot rank them.
+
+Every number here already existed in `ColGenResult.stats` or in the `on_iteration`
+payload's `stage_s`; nothing is re-instrumented for this script.
+
+    uv run python analysis/run_colgen_timed.py --flights 500 --workers 8 --chunksize 8
+    uv run python analysis/run_colgen_timed.py --flights 1000 --workers 8 --chunksize 8
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import resource
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+import freespace_sim
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_loaded = Path(freespace_sim.__file__).resolve()
+if REPO_ROOT not in _loaded.parents:
+    raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
+
+from freespace_sim.planner.colgen import pricing as _pricing  # noqa: E402
+from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
+from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
+from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
+from freespace_sim.scenarios import get_scenario  # noqa: E402
+
+_RSS_SCALE = 2**20 if sys.platform == "darwin" else 1024
+
+# How often the GREEDY's search actually reaches the compiled kernel.  It runs in the
+# parent process, so counting here catches all of it -- and the count matters: if these
+# searches mostly fall back to the pure-Python frontier, "the greedy is already compiled"
+# is false and compiling it properly becomes a real lever rather than a dead end.  A
+# fallback is silent by construction, which is exactly how a 5-7x regression hid for a
+# whole issue once before.
+_FEASIBLE = {"proved": 0, "fell_back": 0}
+_REAL_FEASIBLE_COMPILED = _pricing._feasible_compiled
+
+
+def _counting_feasible_compiled(*args, **kwargs):
+    out = _REAL_FEASIBLE_COMPILED(*args, **kwargs)
+    _FEASIBLE["fell_back" if out is _pricing._UNPROVED else "proved"] += 1
+    return out
+
+
+_pricing._feasible_compiled = _counting_feasible_compiled
+
+
+def _rss_mb(who) -> float:
+    return resource.getrusage(who).ru_maxrss / _RSS_SCALE
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--flights", type=int, default=500)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--chunksize", type=int, default=1)
+    ap.add_argument("--iterations", type=int, default=2)
+    ap.add_argument("--scenario", default="density_faa_wing_zipline")
+    ap.add_argument("--solver", default="highs")
+    ap.add_argument("--gap-metric", default="cost")
+    ap.add_argument("--ladder", type=int, default=0)
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    spec = get_scenario(args.scenario)
+    cfg = spec.config()
+    demand = spec.demand_model()
+    requests = sorted(
+        demand.generate(cfg, np.random.default_rng(cfg.seed)), key=lambda r: r.flight_id
+    )[: args.flights]
+    static_terms = list(demand.terminals(cfg))
+    params = ColGenParams(
+        solver=args.solver,
+        max_iterations=args.iterations,
+        time_limit_s=86400.0,
+        gap_metric=args.gap_metric,
+        seed_ladder_steps=args.ladder,
+    )
+    parallel = (
+        ParallelPricingConfig(n_workers=args.workers, chunksize=args.chunksize)
+        if args.workers
+        else None
+    )
+
+    header = {
+        "scenario": args.scenario, "flights": len(requests),
+        "iterations": args.iterations, "workers": args.workers,
+        "chunksize": args.chunksize, "ladder": args.ladder, "solver": args.solver,
+    }
+    print(json.dumps(header), flush=True)
+
+    per_iteration: list[dict] = []
+    stages: dict[str, float] = collections.defaultdict(float)
+
+    def on_iteration(state: dict) -> None:
+        for key, value in (state.get("stage_s") or {}).items():
+            stages[key] += float(value)
+        per_iteration.append(
+            {
+                "iteration": state["iteration"],
+                "sweep_s": round(float(state["sweep_s"]), 2),
+                "columns": state["columns"],
+                "rc_n_positive": state["rc_n_positive"],
+                "dual_nonzero": state["dual_nonzero"],
+            }
+        )
+        print(
+            f"  it {state['iteration']:>3}  sweep={float(state['sweep_s']):8.1f}s  "
+            f"cols={state['columns']:>6}  rc_n+={state['rc_n_positive']:>5}",
+            flush=True,
+        )
+
+    started = time.perf_counter()
+    result = ColGenSolver().solve(
+        requests, cfg, static_terms, params, on_iteration=on_iteration, parallel=parallel
+    )
+    wall = time.perf_counter() - started
+    stats = dict(result.stats)
+
+    rows = [
+        (
+            int(c.flight_id), int(c.departure_step), repr(c.delay_s),
+            tuple(tuple(cell) for cell in c.cell_path),
+            tuple(sorted(tuple(r) for r in c.claims)),
+        )
+        for _, c in sorted(result.columns.items())
+    ]
+    sha = hashlib.sha256(repr(rows).encode()).hexdigest()[:16]
+
+    graph_s = float(stats.get("graph_build_elapsed_s") or 0.0)
+    seed_s = float(stats.get("seed_elapsed_s") or 0.0)
+    greedy_s = float(stats.get("initial_greedy_elapsed_s") or 0.0)
+    pricing_s = float(stats.get("pricing_wall_s") or 0.0)
+    ip_s = float(stats.get("ip_elapsed_s") or 0.0)
+    named = graph_s + seed_s + greedy_s + pricing_s + ip_s
+
+    print(f"\n{'stage':32} {'seconds':>10} {'share':>8}")
+    breakdown = [
+        ("build_flight_graph", graph_s),
+        ("seed + departure ladder", seed_s),
+        ("greedy_feasible_selection", greedy_s),
+        ("pricing sweeps (parallel)", pricing_s),
+        ("final IP", ip_s),
+        ("unattributed (LP, add_column, ...)", wall - named),
+    ]
+    for name, value in breakdown:
+        print(f"{name:32} {value:10.2f} {value / wall * 100:7.1f}%")
+    print(f"{'TOTAL':32} {wall:10.2f} {100.0:7.1f}%")
+    total_feasible = _FEASIBLE["proved"] + _FEASIBLE["fell_back"]
+    if total_feasible:
+        print(
+            f"\ngreedy feasible search: {_FEASIBLE['proved']}/{total_feasible} reached the "
+            f"kernel, {_FEASIBLE['fell_back']} fell back to Python "
+            f"({_FEASIBLE['fell_back'] / total_feasible * 100:.1f}%)"
+        )
+
+    if stages:
+        print(f"\n{'master-side stage (summed)':32} {'seconds':>10} {'share':>8}")
+        for name, value in sorted(stages.items(), key=lambda kv: -kv[1]):
+            print(f"{name:32} {value:10.2f} {value / wall * 100:7.1f}%")
+
+    summary = {
+        **header,
+        "wall_s": round(wall, 2),
+        "column_sha": sha,
+        "objective": repr(stats.get("objective")),
+        "selected_flights": stats.get("selected_flights"),
+        "n_columns": stats.get("n_columns"),
+        "termination_reason": stats.get("termination_reason"),
+        "iterations_run": stats.get("iterations"),
+        "greedy_completed": stats.get("initial_greedy_completed"),
+        "feasible_search_proved": _FEASIBLE["proved"],
+        "feasible_search_fell_back": _FEASIBLE["fell_back"],
+        "ip_status": stats.get("ip_status"),
+        "ip_skipped": stats.get("ip_skipped"),
+        "rss_self_mb": round(_rss_mb(resource.RUSAGE_SELF), 1),
+        "rss_children_mb": round(_rss_mb(resource.RUSAGE_CHILDREN), 1),
+        "stage_s": {name: round(value, 2) for name, value in breakdown},
+        "master_stage_s": {k: round(v, 2) for k, v in stages.items()},
+        "per_iteration": per_iteration,
+    }
+    print("\n" + json.dumps(summary, indent=2, default=str), flush=True)
+    if args.out:
+        Path(args.out).write_text(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

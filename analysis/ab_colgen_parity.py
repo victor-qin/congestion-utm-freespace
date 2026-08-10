@@ -96,8 +96,11 @@ ARMS: dict[str, dict] = {
 
 # Runs in a child interpreter, against whichever tree `cwd` selects.
 _CHILD = r'''
-import dataclasses, hashlib, json, sys, time
+import dataclasses, hashlib, json, resource as _rusage, sys, time
 from pathlib import Path
+
+# ru_maxrss is bytes on macOS, kilobytes on Linux.
+_RSS_SCALE = 2**20 if sys.platform == "darwin" else 1024
 
 import numpy as np
 
@@ -114,7 +117,7 @@ from freespace_sim.scenarios import get_scenario
 
 spec_name, n_flights, iterations = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 backend, gap_metric = sys.argv[5], sys.argv[6]
-ladder, kernel = int(sys.argv[7]), sys.argv[8]
+ladder, kernel, workers = int(sys.argv[7]), sys.argv[8], int(sys.argv[9])
 spec = get_scenario(spec_name)
 cfg = spec.config()
 demand = spec.demand_model()
@@ -149,8 +152,21 @@ if kernel == "off":
     from freespace_sim.planner.colgen import pricing
     pricing._dp_kernel = lambda: None
 
+# Same feature test as the ladder, for the same reason: older refs have no `parallel`
+# kwarg.  Unlike the ladder this one is NOT required to match across arms -- worker count
+# is forbidden to change the answer, so an arm at 0 and an arm at 8 SHOULD agree, and that
+# disagreement-is-a-bug property is exactly what the comparison is for.
+import inspect
+_solve_params = inspect.signature(ColGenSolver.solve).parameters
+_pool_kwargs = {}
+effective_workers = 0
+if workers and "parallel" in _solve_params:
+    from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig
+    _pool_kwargs["parallel"] = ParallelPricingConfig(n_workers=workers)
+    effective_workers = workers
+
 started = time.perf_counter()
-result = ColGenSolver().solve(requests, cfg, static_terms, params)
+result = ColGenSolver().solve(requests, cfg, static_terms, params, **_pool_kwargs)
 wall = time.perf_counter() - started
 
 rows = []
@@ -179,19 +195,35 @@ print("@@FINGERPRINT@@" + json.dumps({
     "seed_ladder_steps": effective_ladder,
     "ladder_columns": stats.get("ladder_columns", 0),
     "kernel": kernel,
+    "workers": effective_workers,
+    # `_greedy_feasible_selection` is bounded by a 60 s WALL CLOCK, not by a flight count,
+    # so at scale it stops wherever the clock caught it -- and it produces `best_heuristic`,
+    # which is the `known_column` cutoff handed to every pricing call.  If this is False the
+    # arms did not start from the same incumbent and no fingerprint comparison is valid,
+    # whatever else differs.
+    "greedy_completed": stats.get("initial_greedy_completed"),
+    "greedy_elapsed_s": round(float(stats.get("initial_greedy_elapsed_s", 0.0) or 0.0), 1),
+    "heuristic_strategy": stats.get("initial_heuristic_strategy"),
+    # Label pools are per-process, so a parallel arm's memory is the thing most likely to
+    # scale badly and the thing a wall-clock number hides.  SELF is the parent; CHILDREN is
+    # the high-water mark of the pool's workers, which is where that risk actually lands.
+    "rss_self_mb": round(_rusage.getrusage(_rusage.RUSAGE_SELF).ru_maxrss / _RSS_SCALE, 1),
+    "rss_children_mb": round(
+        _rusage.getrusage(_rusage.RUSAGE_CHILDREN).ru_maxrss / _RSS_SCALE, 1
+    ),
     "tree": str(loaded.parent.parent),
 }))
 '''
 
 
-def _run_arm(root: Path, arm: dict, ladder: int, kernel: str) -> dict:
+def _run_arm(root: Path, arm: dict, ladder: int, kernel: str, workers: int) -> dict:
     """Fingerprint one arm in a child interpreter rooted at ``root``."""
 
     proc = subprocess.run(
         [
             sys.executable, "-c", _CHILD, str(root),
             arm["scenario"], str(arm["flights"]), str(arm["iterations"]),
-            arm["solver"], arm["gap_metric"], str(ladder), kernel,
+            arm["solver"], arm["gap_metric"], str(ladder), kernel, str(workers),
         ],
         cwd=root,
         capture_output=True,
@@ -239,6 +271,18 @@ def main() -> int:
              "anything that changes the master's pool rather than the search.",
     )
     parser.add_argument(
+        "--sequential-baseline", action="store_true",
+        help="compare an N-worker sweep against the SEQUENTIAL sweep in this same tree. "
+             "The speedup arm: worker count is forbidden to change the answer, so this "
+             "reports a speedup and proves the fingerprint held at the same time.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=0, metavar="N",
+        help="n_workers for the tree arm (default 0 = sequential). With "
+             "--sequential-baseline the baseline arm is pinned to 0; otherwise both arms "
+             "get N.",
+    )
+    parser.add_argument(
         "--ladder", type=int, default=0, metavar="N",
         help="pin seed_ladder_steps on BOTH arms (default 0). See the module docstring: a "
              "ladder changes the duals, so a laddered tree vs an unladdered ref diverges "
@@ -248,11 +292,31 @@ def main() -> int:
         "--arm", action="append", choices=sorted(ARMS),
         help="restrict to one arm; repeatable. Default: all three.",
     )
+    parser.add_argument(
+        "--flights", type=int, default=None, metavar="N",
+        help="override every selected arm's flight count. Both arms still get the same "
+             "number, so the comparison stays fixed-work.",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=None, metavar="N",
+        help="override every selected arm's iteration count.",
+    )
     args = parser.parse_args()
-    if args.ref and args.reference_baseline:
-        parser.error("--ref and --reference-baseline are alternative baselines; pick one")
+    chosen = [
+        name for name, on in (
+            ("--ref", bool(args.ref)),
+            ("--reference-baseline", args.reference_baseline),
+            ("--sequential-baseline", args.sequential_baseline),
+        ) if on
+    ]
+    if len(chosen) > 1:
+        parser.error(f"{', '.join(chosen)} are alternative baselines; pick one")
     if args.ladder < 0:
         parser.error("--ladder must be non-negative")
+    if args.workers < 0:
+        parser.error("--workers must be non-negative")
+    if args.sequential_baseline and args.workers == 0:
+        parser.error("--sequential-baseline compares against 0 workers; set --workers > 0")
     names = args.arm or sorted(ARMS)
 
     def say(text: str) -> None:
@@ -263,6 +327,7 @@ def main() -> int:
 
     baseline_root = None
     baseline_kernel = "on"
+    baseline_workers = args.workers
     baseline_label = args.ref or ""
     tmp = None
     if args.ref:
@@ -274,27 +339,41 @@ def main() -> int:
         baseline_kernel = "off"
         baseline_label = "reference"
         say("baseline: this tree with the compiled kernel disabled")
+    elif args.sequential_baseline:
+        baseline_root = REPO_ROOT
+        baseline_workers = 0
+        baseline_label = "seq"
+        say("baseline: this tree with the sequential (0-worker) sweep")
     say(f"seed_ladder_steps pinned to {args.ladder} on every arm")
+    say(f"workers: tree={args.workers} baseline={baseline_workers}")
 
     failures = 0
     for name in names:
-        arm = ARMS[name]
+        arm = dict(ARMS[name])
+        if args.flights is not None:
+            arm["flights"] = args.flights
+        if args.iterations is not None:
+            arm["iterations"] = args.iterations
         say(f"\n=== {name}: {arm['scenario']} x{arm['flights']} "
             f"iters={arm['iterations']} {arm['solver']} gap={arm['gap_metric']} "
             f"ladder={args.ladder} ===")
-        current = _run_arm(REPO_ROOT, arm, args.ladder, "on")
+        current = _run_arm(REPO_ROOT, arm, args.ladder, "on", args.workers)
         say(f"  tree     {current['wall_s']:8.2f}s pricing={current['pricing_wall_s']:8.2f}s "
             f"obj={current['objective']} sel={current['selected_flights']} "
             f"cols={current['n_columns']} sha={current['column_sha']} "
-            f"ladder_cols={current['ladder_columns']}")
+            f"w={current['workers']} rss={current['rss_self_mb']:.0f}"
+            f"+{current['rss_children_mb']:.0f}MB "
+            f"greedy_done={current['greedy_completed']}/{current['greedy_elapsed_s']}s")
         if baseline_root is None:
             continue
-        base = _run_arm(baseline_root, arm, args.ladder, baseline_kernel)
+        base = _run_arm(baseline_root, arm, args.ladder, baseline_kernel, baseline_workers)
         say(f"  {baseline_label:<8.8} {base['wall_s']:8.2f}s "
             f"pricing={base['pricing_wall_s']:8.2f}s "
             f"obj={base['objective']} sel={base['selected_flights']} "
             f"cols={base['n_columns']} sha={base['column_sha']} "
-            f"ladder_cols={base['ladder_columns']}")
+            f"w={base['workers']} rss={base['rss_self_mb']:.0f}"
+            f"+{base['rss_children_mb']:.0f}MB "
+            f"greedy_done={base['greedy_completed']}/{base['greedy_elapsed_s']}s")
         # A ref predating `seed_ladder_steps` accepts no such kwarg and runs unladdered.
         # Every column would then differ, which looks exactly like a kernel divergence --
         # so refuse the comparison outright rather than report a mismatch it cannot explain.

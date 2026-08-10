@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import freespace_sim.planner.colgen.master as master_module
+import freespace_sim.planner.colgen.pricing_pool as pricing_pool_module
 import freespace_sim.planner.colgen.solver as solver_module
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
@@ -1331,7 +1332,11 @@ def test_incomplete_pricing_sweep_never_publishes_a_global_bound(monkeypatch):
         column = seed_column(graph, solve_cfg)
         return params.M - column.delay_s, column
 
-    monkeypatch.setattr(solver_module, "price_flight", timeout_on_second)
+    # The sweep moved into `pricing_pool`, so that is where the seam is now.  Patching
+    # `solver_module.price_flight` would silently do nothing -- the solve would run to
+    # completion and the test would assert against a sweep that never timed out.  The
+    # contract under test is unchanged: an incomplete sweep publishes no global bound.
+    monkeypatch.setattr(pricing_pool_module, "price_flight", timeout_on_second)
     monkeypatch.setattr(
         solver_module,
         "_greedy_feasible_selection",
@@ -1474,11 +1479,13 @@ def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
         "_greedy_feasible_selection",
         lambda *args, **kwargs: ({}, True),
     )
-    monkeypatch.setattr(
-        solver_module,
-        "price_flight",
-        lambda *args, **kwargs: (1.0, None),
-    )
+    # BOTH seams, because there are now two.  The sweep calls
+    # `pricing_pool.price_flight`; the final repair pass still calls the solver's own
+    # binding (solver.py:1293).  This test needs pricing to yield no column ANYWHERE --
+    # stub only the sweep and repair quietly recovers the flight, erasing the denial the
+    # assertions are about.
+    for module in (pricing_pool_module, solver_module):
+        monkeypatch.setattr(module, "price_flight", lambda *args, **kwargs: (1.0, None))
 
     def partial_ip(master, *args, **kwargs):
         del args, kwargs

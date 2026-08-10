@@ -40,6 +40,7 @@ from .pricing import (
     price_flight,
     seed_column,
 )
+from .pricing_pool import ParallelPricingConfig, price_sweep
 from .translate import Column
 
 _FEASIBILITY_TOL = 1e-7
@@ -600,12 +601,18 @@ class ColGenSolver:
         fixed_claims: Sequence[frozenset[RowKey]] = (),
         on_iteration=None,
         seed_columns: Mapping[int, Sequence[Column]] | None = None,
+        parallel: ParallelPricingConfig | None = None,
     ) -> ColGenResult:
         """Run the column-generation loop to convergence, a bound, or a time limit.
 
-        Pricing is a sequential sweep over the flights: each subproblem is independent
-        given the iteration's duals, so the loop order affects only which columns a
-        timed-out sweep managed to reach, never their value.
+        Pricing is a sweep over the flights: each subproblem is independent given the
+        iteration's duals, so the loop order affects only which columns a timed-out sweep
+        managed to reach, never their value.
+
+        ``parallel`` fans that sweep across worker processes.  It is a pure performance
+        knob: :func:`pricing_pool.price_sweep` reproduces the sequential loop's accepted
+        prefix and hands the reduced costs back in index order, so the columns and the
+        objective are unchanged.  ``None`` (the default) keeps the sweep in-process.
 
         ``on_iteration`` is called once per column-generation iteration with a dict of
         that iteration's master state (LP objective, global upper bound, gaps, column
@@ -996,24 +1003,30 @@ class ColGenSolver:
             # iteration 80 as expensive as iteration 1" -- and that question decides
             # whether more iterations are affordable.
             sweep_started = time.perf_counter()
-            for flight_id in pricing_order:
-                try:
-                    reduced_cost, column = price_flight(
-                        graphs[flight_id],
-                        dual_view,
-                        flight_duals[flight_id],
-                        cfg,
-                        params,
-                        known_column=best_heuristic.get(flight_id),
-                        deadline=pricing_deadline,
-                    )
-                except PricingTimeout:
-                    pricing_complete = False
-                    pricing_timeout_flight_id = flight_id
-                    break
+            sweep = price_sweep(
+                pricing_order,
+                ordered_requests,
+                graphs,
+                cfg,
+                params,
+                static_catalog,
+                capacity_duals,
+                dual_view,
+                flight_duals,
+                best_heuristic,
+                deadline=pricing_deadline,
+                config=parallel,
+            )
+            # Consumed in index order, which is what keeps a parallel sweep's answer equal
+            # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
+            # float addition is not associative.  `SweepResult` has already discarded
+            # everything at or past the first timeout, reproducing the loop's `break`.
+            for flight_id, reduced_cost, column in zip(
+                sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
+            ):
                 pricing_flights_completed += 1
-                best_reduced_costs.append(float(reduced_cost))
-                rc_by_flight[flight_id] = float(reduced_cost)
+                best_reduced_costs.append(reduced_cost)
+                rc_by_flight[flight_id] = reduced_cost
                 if column is not None and reduced_cost > _REDUCED_COST_TOL:
                     priced_columns.append(
                         _timed(
@@ -1021,6 +1034,9 @@ class ColGenSolver:
                             column, graphs[flight_id], cfg,
                         )
                     )
+            if not sweep.complete:
+                pricing_complete = False
+                pricing_timeout_flight_id = sweep.timeout_flight_id
 
             iteration_sweep_s = time.perf_counter() - sweep_started
             pricing_wall_s += iteration_sweep_s

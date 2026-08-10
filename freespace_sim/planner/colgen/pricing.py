@@ -2075,6 +2075,172 @@ def _cancel_search(flag) -> None:
     flag[0] = 1
 
 
+#: "The compiled feasible search declined."  A distinct sentinel because ``None`` is a real
+#: answer from ``find_feasible_column`` -- a flight with no feasible column -- and returning
+#: it for "numba is missing" would report an infeasible flight instead of falling back.
+_UNPROVED = object()
+
+
+def _feasible_compiled(
+    fg: FlightGraph,
+    cfg: SimConfig,
+    *,
+    forbidden: AbstractSet[RowKey],
+    best_column: Column | None,
+    improve_below_delay_s: float | None,
+    origin_options,
+    offsets,
+    origin_fold_lb,
+    destination_fold_lb: float,
+    destination_fold_exact: bool,
+    reference_time_s: float,
+    reference_m: float,
+    remaining_distance,
+    delay_bound,
+    column_key,
+    view: DualView,
+    deadline: float | None,
+    model: CostModel,
+):
+    """``find_feasible_column``'s search, compiled; ``_UNPROVED`` when it cannot run.
+
+    The **start loop stays in Python** and the kernel gets its result. That is not laziness:
+    the guards need ``_endpoint_claims`` sets and the reference's own ``break`` on the
+    incumbent's delay, and the loop runs a few hundred times against the search's hundreds
+    of thousands of arc relaxations. Measured on a density flight: 141,553 arcs against 491
+    endpoint-claim calls.
+
+    Every sink still goes back to Python, because ``_canonical_candidate`` is the exact gate
+    that judges them and it reaches the whole geometry stack. 115 of those against the same
+    141,553 arcs is what makes pausing per sink affordable.
+    """
+
+    kernel = _dp_kernel()
+    if kernel is None or len(fg.levels) != 1:
+        return _UNPROVED
+    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if not (topology.ok and rows.ok):
+        return _UNPROVED
+    if topology.dest_lane_idx.size == 0:
+        return _UNPROVED
+    cell_index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+
+    # Fold legs by lane, indexed `lane + 1` so the laneless origin (-1) lands at 0.
+    n_lanes = 1 + max((idx for idx, _c, _s in origin_options if idx is not None), default=-1)
+    lane_fold_s = [0.0] * (n_lanes + 1)
+    lane_fold_exact = [0] * (n_lanes + 1)
+    for lane_idx, _cell, _steps in origin_options:
+        fold_s, exact = origin_fold_lb[lane_idx]
+        slot = 0 if lane_idx is None else lane_idx + 1
+        lane_fold_s[slot] = fold_s
+        lane_fold_exact[slot] = 1 if (reference_m > 1e-9 and exact and destination_fold_exact) else 0
+
+    # --- the reference's start loop, verbatim, emitting roots instead of heap entries ----
+    roots: list[tuple[int, int, int, int, float, int]] = []
+    for departure_step in range(fg.base_step, fg.latest_departure_step + 1):
+        _check_deadline(deadline)
+        ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
+        if best_column is not None and ground_delay_s > best_column.delay_s + _RECOMPUTE_EPS:
+            break
+        origin_claims = _endpoint_claims(
+            fg, cfg, origin=True, step=departure_step, timing_steps=0
+        )
+        if not origin_claims.isdisjoint(forbidden):
+            continue
+        for lane_idx, cell, lane_steps in origin_options:
+            index = cell_index.get(cell)
+            if index is None:
+                return _UNPROVED
+            start_step = departure_step + fg.takeoff_steps[0] + lane_steps
+            remaining = remaining_distance(cell)
+            if start_step >= fg.max_step or start_step + remaining > fg.max_step:
+                continue
+            if remaining > fg.max_air_hops:
+                continue
+            if _visit_hits_forbidden(cell, 0, start_step, offsets, forbidden):
+                continue
+            bound = delay_bound(departure_step, lane_idx, 0, remaining)
+            if best_column is not None and bound > best_column.delay_s + _RECOMPUTE_EPS:
+                continue
+            roots.append(
+                (
+                    index,
+                    start_step,
+                    departure_step,
+                    -1 if lane_idx is None else lane_idx,
+                    bound,
+                    remaining,
+                )
+            )
+    if not roots:
+        return best_column
+
+    pack = dp_prepare.prepare_forbidden(forbidden, fg, rows, topology)
+    state: dict[str, Any] = {"best": best_column}
+
+    def certify(departure_step, origin_lane, dest_lane, step, hops, path):
+        """``find_feasible_column``'s per-sink block, arm for arm (pricing.py:2337-2369)."""
+
+        _check_deadline(deadline)
+        label = _Label(0.0, departure_step, origin_lane, path, _EMPTY_ROWS)
+        destination_claims = _endpoint_claims(
+            fg, cfg, origin=False, step=step, timing_steps=hops
+        )
+        if not destination_claims.isdisjoint(forbidden):
+            return None, False
+        claims = _path_claims(fg, cfg, label, dest_lane)
+        if not claims.isdisjoint(forbidden):
+            return None, False
+        delay_s = _path_delay_s(fg, cfg, label, model)
+        canonical = _canonical_candidate(
+            _Candidate(-delay_s, delay_s, label, dest_lane),
+            fg,
+            view,
+            0.0,
+            cfg,
+            0.0,
+            forbidden,
+            model,
+        )
+        if canonical is None:
+            return None, False
+        candidate = canonical[1]
+        current = state["best"]
+        if current is not None and not (column_key(candidate) < column_key(current)):
+            return None, False
+        state["best"] = candidate
+        stop = (
+            improve_below_delay_s is not None
+            and candidate.delay_s < improve_below_delay_s - _SCORE_EPS
+        )
+        return candidate.delay_s, stop
+
+    status, stopped_early = kernel.feasible_dag(
+        topology,
+        rows,
+        pack,
+        roots,
+        lane_fold_s=lane_fold_s,
+        lane_fold_exact=lane_fold_exact,
+        destination_fold_lb=destination_fold_lb,
+        reference_time_s=reference_time_s,
+        dt_s=cfg.dt_s,
+        ground_weight=model.ground_weight,
+        air_weight=model.air_weight,
+        base_step=fg.base_step,
+        offsets=offsets,
+        incumbent_delay=None if best_column is None else best_column.delay_s,
+        certify=certify,
+    )
+    del stopped_early  # the early exit already put its column in `state`
+    if status != kernel.STATUS_OK:
+        return _UNPROVED
+    return state["best"]
+
+
 def find_feasible_column(
     fg: FlightGraph,
     cfg: SimConfig,
@@ -2233,6 +2399,33 @@ def find_feasible_column(
             -1 if column.dest_lane_idx is None else column.dest_lane_idx,
             column.cell_path,
         )
+
+    # The compiled best-first search, when the graph has a packing and numba is present.
+    # `_UNPROVED` -- not `None` -- because `None` is a legitimate answer here: a flight with
+    # no feasible column at all. Conflating the two would silently turn "the kernel declined"
+    # into "this flight cannot fly".
+    compiled = _feasible_compiled(
+        fg,
+        cfg,
+        forbidden=forbidden,
+        best_column=best_column,
+        improve_below_delay_s=improve_below_delay_s,
+        origin_options=origin_options,
+        offsets=offsets,
+        origin_fold_lb=origin_fold_lb,
+        destination_fold_lb=destination_fold_lb,
+        destination_fold_exact=destination_fold_exact,
+        reference_time_s=reference_time_s,
+        reference_m=reference_m,
+        remaining_distance=remaining_distance,
+        delay_bound=delay_bound,
+        column_key=column_key,
+        view=view,
+        deadline=deadline,
+        model=model,
+    )
+    if compiled is not _UNPROVED:
+        return compiled
 
     counter = itertools.count()
     frontier: list[

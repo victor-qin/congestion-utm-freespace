@@ -1284,3 +1284,112 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
 
     assert compared >= 30, f"only {compared} cases were proved; the sweep proves little"
     assert nontrivial >= 20, f"only {nontrivial} cases found a column at all"
+
+
+# ------------------------------------------------------ the compiled feasible search
+
+
+def _feasible_both(graph, cfg, model, **kwargs):
+    """Run `find_feasible_column` compiled and again with the compiled path refused.
+
+    The graph is prepared and seeded first, deliberately. In production pricing has already
+    done both, and timing or comparing a COLD `prepare_topology` against a reference that
+    never pays it measures the cache rather than the search -- which is exactly the mistake
+    that made this search first read as a 1.03x regression.
+    """
+
+    dp_prepare.prepared_for(graph, cfg)
+    pricing.seed_column(graph, cfg, model=model)
+    compiled = pricing.find_feasible_column(graph, cfg, model=model, **kwargs)
+    real = pricing._feasible_compiled
+    pricing._feasible_compiled = lambda *a, **k: pricing._UNPROVED
+    try:
+        reference = pricing.find_feasible_column(graph, cfg, model=model, **kwargs)
+    finally:
+        pricing._feasible_compiled = real
+    return compiled, reference
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPH_SHAPES))
+def test_compiled_feasible_search_returns_the_reference_column(shape):
+    """The greedy's incumbent search, compiled, returns the same column.
+
+    A best-first search rather than the priced DP's layered one, so almost none of
+    `_price_dag` applies: the frontier is a heap ordered by an admissible delay bound, the
+    dominance table is global with `step` inside the key, and what it keeps per state is the
+    lexicographically smallest PATH rather than the best score. Getting that last rule wrong
+    yields a search that is still optimal and still returns a different column.
+    """
+
+    cfg = _cfg()
+    graph, params = GRAPH_SHAPES[shape](cfg)
+    model = cost_model(params, cfg)
+    compiled, reference = _feasible_both(graph, cfg, model)
+    assert compiled == reference
+    assert compiled is not None, "the fixture has no feasible column, so this proves nothing"
+
+
+def test_compiled_feasible_search_honours_the_early_improvement_exit():
+    """`improve_below_delay_s` returns the FIRST certified strict improvement.
+
+    That early exit is what makes this an incumbent heuristic rather than an oracle, and it
+    is order-sensitive: it returns whichever improving column the frontier reaches first, so
+    a kernel that expanded in a different order would return a different -- also valid --
+    column and quietly change the greedy's selection.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    dp_prepare.prepared_for(graph, cfg)
+    baseline = pricing.find_feasible_column(graph, cfg, model=model)
+    assert baseline is not None
+
+    threshold = baseline.delay_s + 10.0 * cfg.dt_s
+    compiled, reference = _feasible_both(
+        graph, cfg, model, improve_below_delay_s=threshold
+    )
+    assert compiled == reference
+    assert compiled is not None and compiled.delay_s < threshold
+
+
+def test_compiled_feasible_search_honours_forbidden_rows():
+    """Repair's exclusion set, in the search that the greedy actually calls for repair."""
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    rng = random.Random(97531)
+    forbidden = frozenset(
+        RowKey.cell(cell[0], cell[1], 0, step)
+        for cell in sorted(graph.corridor_cells)[:10]
+        for step in range(graph.min_step + 3, graph.min_step + 14)
+        if rng.random() < 0.3
+    )
+    assert len(forbidden) > 8
+
+    compiled, reference = _feasible_both(graph, cfg, model, forbidden_rows=forbidden)
+    assert compiled == reference
+    if compiled is not None:
+        assert compiled.claims.isdisjoint(forbidden)
+
+
+def test_compiled_feasible_search_declines_rather_than_reporting_infeasible():
+    """`_UNPROVED` is not `None`, and the difference is a flight that cannot fly.
+
+    `find_feasible_column` returns `None` for a genuinely infeasible flight. If the compiled
+    path signalled "I declined" with the same value, a missing numba would read as an
+    infeasible flight and the greedy would drop it instead of falling back.
+    """
+
+    assert pricing._UNPROVED is not None
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    real = pricing._dp_kernel
+    pricing._dp_kernel = lambda: None
+    try:
+        column = pricing.find_feasible_column(graph, cfg, model=model)
+    finally:
+        pricing._dp_kernel = real
+    assert column is not None, "the reference fallback did not run"

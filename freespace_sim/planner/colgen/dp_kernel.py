@@ -1344,6 +1344,463 @@ def _price_dag(
     return STATUS_OK
 
 
+# ------------------------------------------------------- the feasible (min-delay) search
+
+# `find_feasible_column`'s outcomes.  It shares the budget codes above so a host can treat
+# "widen and retry" identically for both searches.
+STATUS_SINK = 9        # a sink reached a destination -- host certifies, then resumes
+
+
+@njit(cache=True, nogil=True)
+def _delay_lower_bound(
+    ground_delay_s, origin_fold_s, hops, remaining_hops, destination_fold_s,
+    reference_time_s, dt_s, folding_exact, ground_weight, air_weight,
+):
+    """``pricing._arc_delay_lower_bound_s`` composed with ``CostModel.evaluate``.
+
+    Written as the three-term sum ``w_g*ground + w_a*hold + w_a*detour`` with ``hold`` zero,
+    rather than the two terms that survive, because ``evaluate`` sums in that order and this
+    value is compared against an incumbent delay inside a ``_RECOMPUTE_EPS`` band.  The
+    grouped form is a different association and so is not bit-identical.
+
+    A terminal lane inside its fold radius invalidates the arc decomposition -- folding can
+    then drop a hop without increasing canonical flown distance -- and the safe fallback is
+    the irrevocable ground delay.  The same fallback covers a zero reference, because
+    ``enroute_detour_m`` deliberately defines its detour as zero there.
+    """
+
+    if (not folding_exact) or reference_time_s <= 0.0:
+        return ground_weight * ground_delay_s + air_weight * 0.0 + air_weight * 0.0
+    flown_time_lb = origin_fold_s + (hops + remaining_hops) * dt_s + destination_fold_s
+    detour = flown_time_lb - reference_time_s
+    if not (detour > 0.0):
+        detour = 0.0
+    return ground_weight * ground_delay_s + air_weight * 0.0 + air_weight * detour
+
+
+@njit(cache=True, nogil=True)
+def _frontier_lt(
+    a, b, lab_bound, lab_estimate, lab_departure, lab_lane, lab_serial,
+    label_parent, label_cell, scratch_a, scratch_b,
+):
+    """The reference's frontier order: ``(bound, hops+remaining, departure, lane, path, serial)``.
+
+    Every field matters and the last two are not decoration.  ``path`` is compared
+    lexicographically because two labels can tie on all four numeric fields, and ``serial``
+    -- the push counter -- is what makes the order total, so a heap cannot reorder equal
+    keys and change which path is expanded first.
+    """
+
+    if lab_bound[a] != lab_bound[b]:
+        return lab_bound[a] < lab_bound[b]
+    if lab_estimate[a] != lab_estimate[b]:
+        return lab_estimate[a] < lab_estimate[b]
+    if lab_departure[a] != lab_departure[b]:
+        return lab_departure[a] < lab_departure[b]
+    if lab_lane[a] != lab_lane[b]:
+        return lab_lane[a] < lab_lane[b]
+    order = _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b)
+    if order != 0:
+        return order < 0
+    return lab_serial[a] < lab_serial[b]
+
+
+@njit(cache=True, nogil=True)
+def _heap_push(
+    heap, n, item, lab_bound, lab_estimate, lab_departure, lab_lane, lab_serial,
+    label_parent, label_cell, scratch_a, scratch_b,
+):
+    """Sift up.  Returns the new size, or -1 when the frontier array is full."""
+
+    if n >= heap.shape[0]:
+        return -1
+    heap[n] = item
+    child = n
+    while child > 0:
+        parent = (child - 1) >> 1
+        if _frontier_lt(
+            heap[child], heap[parent], lab_bound, lab_estimate, lab_departure, lab_lane,
+            lab_serial, label_parent, label_cell, scratch_a, scratch_b,
+        ):
+            tmp = heap[parent]
+            heap[parent] = heap[child]
+            heap[child] = tmp
+            child = parent
+        else:
+            break
+    return n + 1
+
+
+@njit(cache=True, nogil=True)
+def _heap_pop(
+    heap, n, lab_bound, lab_estimate, lab_departure, lab_lane, lab_serial,
+    label_parent, label_cell, scratch_a, scratch_b,
+):
+    """Sift down.  Returns ``(item, new_size)``."""
+
+    top = heap[0]
+    n -= 1
+    heap[0] = heap[n]
+    parent = 0
+    while True:
+        left = 2 * parent + 1
+        if left >= n:
+            break
+        smallest = left
+        right = left + 1
+        if right < n and _frontier_lt(
+            heap[right], heap[left], lab_bound, lab_estimate, lab_departure, lab_lane,
+            lab_serial, label_parent, label_cell, scratch_a, scratch_b,
+        ):
+            smallest = right
+        if _frontier_lt(
+            heap[smallest], heap[parent], lab_bound, lab_estimate, lab_departure, lab_lane,
+            lab_serial, label_parent, label_cell, scratch_a, scratch_b,
+        ):
+            tmp = heap[parent]
+            heap[parent] = heap[smallest]
+            heap[smallest] = tmp
+            parent = smallest
+        else:
+            break
+    return top, n
+
+
+@njit(cache=True, nogil=True)
+def _feasible_state_hash(step, cell, recent, n_recent, departure_step, lane, first_a, first_b):
+    """Hash ``(step, cell, recent, departure_step, lane, first_hop)``.
+
+    A DIFFERENT key from the priced search's, and deliberately so.  That one is layer-local
+    and carries ``origin_paid_rows``; this one is global -- best-first jumps between steps,
+    so ``step`` has to be inside the key rather than implied by the table.
+    """
+
+    h = np.uint64(step + 1) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(cell + 1)) * np.uint64(0x100000001B3)
+    for i in range(n_recent):
+        h = (h ^ np.uint64(recent[i] + 1)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(n_recent + 1)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(departure_step + 1)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(lane + 2)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(first_a + 1)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(first_b + 1)) * np.uint64(0x100000001B3)
+    return h
+
+
+@njit(cache=True, nogil=True)
+def _feasible_state_find(
+    slot_label, slot_hash, log2cap, key_hash, depth,
+    step, cell, recent, n_recent, departure_step, lane, first_a, first_b,
+    lab_step, label_cell, label_parent, label_departure, label_lane,
+    label_first_a, label_first_b, probe_recent,
+):
+    """Locate the slot for one feasible-search state: ``(slot, found)``, ``-1`` when full.
+
+    Every field of the key is verified on probe, not merely hashed.  Hashing a field and
+    then trusting the hash makes the table correct only until two keys collide, which shows
+    up rarely, on one graph shape, as a path silently dropped.
+    """
+
+    cap = 1 << log2cap
+    slot = _mix(key_hash, log2cap)
+    for _probe in range(cap):
+        occupant = slot_label[slot]
+        if occupant < 0:
+            return slot, False
+        if (
+            slot_hash[slot] == key_hash
+            and lab_step[occupant] == step
+            and label_cell[occupant] == cell
+            and label_departure[occupant] == departure_step
+            and label_lane[occupant] == lane
+            and label_first_a[occupant] == first_a
+            and label_first_b[occupant] == first_b
+        ):
+            n_occ = _fill_recent(occupant, depth, label_parent, label_cell, probe_recent)
+            if n_occ == n_recent and _recent_cmp(probe_recent, n_occ, recent, n_recent) == 0:
+                return slot, True
+        slot += 1
+        if slot >= cap:
+            slot = 0
+    return -1, False
+
+
+@njit(cache=True, nogil=True)
+def _feasible_dag(
+    # --- topology
+    arc_start, arc_target, hex_remaining,
+    dest_mask, dest_lane_start,
+    air_hop_limit, revisit_depth, state_history_depth, track_first_hop,
+    max_step,
+    # --- roots, already filtered by the host in the reference's own order
+    root_cell, root_step, root_departure, root_lane, root_bound, root_remaining,
+    # --- delay bound
+    lane_fold_s, lane_fold_exact, destination_fold_lb, reference_time_s, dt_s,
+    ground_weight, air_weight, base_step,
+    # --- exclusions
+    forbidden_bits, rows_n_steps, rows_step0, offsets_lo, offsets_hi,
+    # --- incumbent (value, valid-flag); the early exit is the host's call
+    incumbent,
+    # --- workspace: label pool
+    label_cell, label_parent, label_hops, label_departure, label_lane,
+    label_first_a, label_first_b,
+    lab_step, lab_bound, lab_estimate, lab_serial,
+    # --- workspace: frontier and state table
+    heap, tbl_label, tbl_hash, log2cap,
+    recent_a, recent_b, probe_recent, scratch_a, scratch_b,
+    # --- control
+    cancel, out_counts, resume, out_sink,
+):
+    """``pricing.find_feasible_column``'s search over flat arrays.
+
+    A **best-first** search, not the layered DP of :func:`_price_dag`, and the difference is
+    structural rather than cosmetic: the frontier is a priority queue ordered by an
+    admissible delay bound, so it jumps between time layers and its dominance table has to
+    be global with ``step`` inside the key.  Sharing ``_price_dag``'s outer loop was
+    considered and is not possible; the arc guards are what the two have in common.
+
+    **What it keeps per state is a PATH, not a score.**  ``best_state_path`` stores the
+    lexicographically smallest path seen for each state and refuses anything not strictly
+    smaller.  That is a different rule from ``_prefer``, and mixing the two up produces a
+    search that is still optimal and still returns a different column.
+
+    **Why it pauses.**  Every sink is judged by ``_canonical_candidate``, which reaches
+    ``column_to_intent`` and the whole geometry stack -- so the kernel returns
+    ``STATUS_SINK``, the host certifies exactly as the reference does, updates ``incumbent``
+    and resumes.  Measured on a density flight: 141,553 arcs relaxed against 115
+    certifications, which is the ratio that makes this worth doing at all.
+
+    ``improve_below`` is the greedy's early exit: the FIRST certified strict improvement may
+    be returned, which is what makes this an incumbent heuristic rather than an oracle. The
+    host signals it with ``STATUS_IMPROVED``; the kernel never decides it, because deciding
+    it needs the certified delay.
+
+    The resume record is ``resume[0]`` mode (0 fresh, 1 continue the lane loop), ``[1]`` the
+    popped label, ``[2]`` the lane slot, ``[3]`` the frontier size, ``[4]`` the label count,
+    ``[5]`` the serial counter.
+    """
+
+    depth = state_history_depth
+    pool_cap = label_cell.shape[0]
+    cap = 1 << log2cap
+
+    if resume[0] == 0:
+        n_labels = 0
+        n_heap = 0
+        serial = 0
+        for slot in range(cap):
+            tbl_label[slot] = -1
+        # Seed the frontier.  The host already applied every start guard the reference
+        # applies, in its order, so this loop only has to preserve that order.
+        for r in range(root_cell.shape[0]):
+            if n_labels >= pool_cap:
+                return STATUS_LABEL_LIMIT
+            label = n_labels
+            n_labels += 1
+            cell = root_cell[r]
+            label_cell[label] = cell
+            label_parent[label] = -1
+            label_hops[label] = 0
+            label_departure[label] = root_departure[r]
+            label_lane[label] = root_lane[r]
+            label_first_a[label] = -1
+            label_first_b[label] = -1
+            lab_step[label] = root_step[r]
+            lab_bound[label] = root_bound[r]
+            lab_estimate[label] = root_remaining[r]
+            lab_serial[label] = serial
+            serial += 1
+            recent_a[0] = cell
+            key_hash = _feasible_state_hash(
+                root_step[r], cell, recent_a, 1, root_departure[r], root_lane[r], -1, -1
+            )
+            slot, found = _feasible_state_find(
+                tbl_label, tbl_hash, log2cap, key_hash, depth,
+                root_step[r], cell, recent_a, 1, root_departure[r], root_lane[r], -1, -1,
+                lab_step, label_cell, label_parent, label_departure, label_lane,
+                label_first_a, label_first_b, probe_recent,
+            )
+            if slot < 0:
+                return STATUS_STATE_LIMIT
+            tbl_label[slot] = label
+            tbl_hash[slot] = key_hash
+            n_heap = _heap_push(
+                heap, n_heap, label, lab_bound, lab_estimate, label_departure, label_lane,
+                lab_serial, label_parent, label_cell, scratch_a, scratch_b,
+            )
+            if n_heap < 0:
+                return STATUS_CANDIDATE_LIMIT
+        popped = -1
+        lane_from = 0
+    else:
+        n_heap = resume[3]
+        n_labels = resume[4]
+        serial = resume[5]
+        popped = resume[1]
+        lane_from = resume[2]
+    pending = resume[0]
+    resume[0] = 0
+
+    while True:
+        if pending == 0:
+            if cancel[0] != 0:
+                out_counts[0] = n_labels
+                return STATUS_CANCELLED
+            if n_heap == 0:
+                break
+            popped, n_heap = _heap_pop(
+                heap, n_heap, lab_bound, lab_estimate, label_departure, label_lane,
+                lab_serial, label_parent, label_cell, scratch_a, scratch_b,
+            )
+            if incumbent[1] != 0.0 and lab_bound[popped] > incumbent[0] + RECOMPUTE_EPS:
+                break
+            step = lab_step[popped]
+            cell = label_cell[popped]
+            n_recent = _fill_recent(popped, depth, label_parent, label_cell, recent_a)
+            key_hash = _feasible_state_hash(
+                step, cell, recent_a, n_recent, label_departure[popped],
+                label_lane[popped], label_first_a[popped], label_first_b[popped],
+            )
+            slot, found = _feasible_state_find(
+                tbl_label, tbl_hash, log2cap, key_hash, depth,
+                step, cell, recent_a, n_recent, label_departure[popped],
+                label_lane[popped], label_first_a[popped], label_first_b[popped],
+                lab_step, label_cell, label_parent, label_departure, label_lane,
+                label_first_a, label_first_b, probe_recent,
+            )
+            if slot < 0:
+                out_counts[0] = n_labels
+                return STATUS_STATE_LIMIT
+            # `best_state_path.get(state_key) != path`.  Two labels sharing this key AND a
+            # path are the same label, since the key already carries departure and lane --
+            # so comparing ids is comparing paths.
+            if (not found) or tbl_label[slot] != popped:
+                continue
+            lane_from = dest_lane_start[cell]
+        else:
+            step = lab_step[popped]
+            cell = label_cell[popped]
+            n_recent = _fill_recent(popped, depth, label_parent, label_cell, recent_a)
+            pending = 0
+
+        hops = label_hops[popped]
+
+        # --- sinks: every destination lane is judged by the host ------------------------
+        if hops >= 1 and dest_mask[cell] != 0:
+            if lane_from < dest_lane_start[cell + 1]:
+                out_counts[0] = n_labels
+                resume[0] = 1
+                resume[1] = popped
+                resume[2] = lane_from + 1
+                resume[3] = n_heap
+                resume[4] = n_labels
+                resume[5] = serial
+                out_sink[0] = popped
+                out_sink[1] = lane_from
+                out_sink[2] = step
+                out_sink[3] = hops
+                return STATUS_SINK
+
+        if hops >= air_hop_limit:
+            continue
+        if step + 1 > max_step:
+            continue
+
+        # --- relax --------------------------------------------------------------------
+        departure_step = label_departure[popped]
+        lane = label_lane[popped]
+        ground_delay_s = (departure_step - base_step) * dt_s
+        fold_s = lane_fold_s[lane + 1]
+        exact = lane_fold_exact[lane + 1] != 0
+        ban = min(n_recent, revisit_depth)
+        next_step = step + 1
+        for a in range(arc_start[cell], arc_start[cell + 1]):
+            neighbour = arc_target[a]
+            banned = False
+            for j in range(ban):
+                if recent_a[j] == neighbour:
+                    banned = True
+                    break
+            if banned:
+                continue
+            remaining = hex_remaining[neighbour]
+            if next_step + remaining > max_step:
+                continue
+            if hops + 1 + remaining > air_hop_limit:
+                continue
+            if _visit_hits_forbidden(
+                forbidden_bits, rows_n_steps, rows_step0, neighbour, next_step,
+                offsets_lo, offsets_hi,
+            ):
+                continue
+            next_bound = _delay_lower_bound(
+                ground_delay_s, fold_s, hops + 1, remaining, destination_fold_lb,
+                reference_time_s, dt_s, exact, ground_weight, air_weight,
+            )
+            if incumbent[1] != 0.0 and next_bound > incumbent[0] + RECOMPUTE_EPS:
+                continue
+
+            if n_labels >= pool_cap:
+                out_counts[0] = n_labels
+                return STATUS_LABEL_LIMIT
+            nxt = n_labels
+            label_cell[nxt] = neighbour
+            label_parent[nxt] = popped
+            label_hops[nxt] = hops + 1
+            label_departure[nxt] = departure_step
+            label_lane[nxt] = lane
+            if track_first_hop and label_first_a[popped] < 0:
+                label_first_a[nxt] = cell
+                label_first_b[nxt] = neighbour
+            else:
+                label_first_a[nxt] = label_first_a[popped]
+                label_first_b[nxt] = label_first_b[popped]
+            lab_step[nxt] = next_step
+
+            recent_b[0] = neighbour
+            n_next = 1
+            while n_next < depth and n_next - 1 < n_recent:
+                recent_b[n_next] = recent_a[n_next - 1]
+                n_next += 1
+            key_hash = _feasible_state_hash(
+                next_step, neighbour, recent_b, n_next, departure_step, lane,
+                label_first_a[nxt], label_first_b[nxt],
+            )
+            slot, found = _feasible_state_find(
+                tbl_label, tbl_hash, log2cap, key_hash, depth,
+                next_step, neighbour, recent_b, n_next, departure_step, lane,
+                label_first_a[nxt], label_first_b[nxt],
+                lab_step, label_cell, label_parent, label_departure, label_lane,
+                label_first_a, label_first_b, probe_recent,
+            )
+            if slot < 0:
+                out_counts[0] = n_labels
+                return STATUS_STATE_LIMIT
+            if found:
+                # `previous_path is not None and previous_path <= next_path: continue`
+                if _path_cmp(
+                    tbl_label[slot], nxt, label_parent, label_cell, scratch_a, scratch_b
+                ) <= 0:
+                    continue
+            n_labels += 1
+            lab_bound[nxt] = next_bound
+            lab_estimate[nxt] = hops + 1 + remaining
+            lab_serial[nxt] = serial
+            serial += 1
+            tbl_label[slot] = nxt
+            tbl_hash[slot] = key_hash
+            n_heap = _heap_push(
+                heap, n_heap, nxt, lab_bound, lab_estimate, label_departure, label_lane,
+                lab_serial, label_parent, label_cell, scratch_a, scratch_b,
+            )
+            if n_heap < 0:
+                out_counts[0] = n_labels
+                return STATUS_CANDIDATE_LIMIT
+
+    out_counts[0] = n_labels
+    return STATUS_OK
+
+
 class DagResult:
     """One compiled search's proposals, in the host's terms."""
 
@@ -1666,6 +2123,161 @@ def price_dag(
         status, int(out_counts[0]), candidates, paths, incumbent, attempt + 1,
         (label_capacity, log2cap, candidate_capacity),
     )
+
+
+def feasible_dag(
+    topology,
+    rows,
+    forbidden,
+    roots,
+    *,
+    lane_fold_s,
+    lane_fold_exact,
+    destination_fold_lb: float,
+    reference_time_s: float,
+    dt_s: float,
+    ground_weight: float,
+    air_weight: float,
+    base_step: int,
+    offsets,
+    incumbent_delay: float | None = None,
+    certify=None,
+    label_capacity: int = 1 << 16,
+    log2cap: int = 15,
+    heap_capacity: int = 1 << 15,
+    cancel=None,
+    max_attempts: int = 12,
+):
+    """Run :func:`_feasible_dag`, servicing its sink pauses and growing its budgets.
+
+    ``roots`` is the reference's start loop already evaluated, in its order: the kernel
+    reproduces the search, not the guards, because those need endpoint claim SETS and the
+    reference's own early ``break`` on the incumbent's delay.
+
+    ``certify(departure_step, origin_lane, dest_lane, step, hops, path)`` is
+    ``find_feasible_column``'s per-sink block -- canonicalize, compare on ``column_key``,
+    adopt -- and returns ``(new_incumbent_delay_or_None, stop)``. All of that stays in
+    :mod:`.pricing` because it is the reference's semantics; the kernel only decides *when*
+    to ask.
+
+    Returns ``(status, stopped_early)``. ``status == STATUS_OK`` means the frontier drained
+    or the bound cut it off, which is what licenses using the result.
+    """
+
+    root_cell = np.asarray([r[0] for r in roots], np.int32)
+    root_step = np.asarray([r[1] for r in roots], np.int32)
+    root_departure = np.asarray([r[2] for r in roots], np.int32)
+    root_lane = np.asarray([r[3] for r in roots], np.int32)
+    root_bound = np.asarray([r[4] for r in roots], np.float64)
+    root_remaining = np.asarray([r[5] for r in roots], np.int32)
+
+    if cancel is None:
+        cancel = np.zeros(1, dtype=np.uint8)
+    out_counts = np.zeros(3, dtype=np.int64)
+    resume = np.zeros(8, dtype=np.int64)
+    out_sink = np.zeros(8, dtype=np.int64)
+    incumbent = np.zeros(2, dtype=np.float64)
+    depth = max(1, topology.state_history_depth)
+    hop_scratch = max(2, topology.air_hop_limit + 2)
+    cell_q = topology.cell_q.tolist()
+    cell_r = topology.cell_r.tolist()
+    lane_fold_s = np.asarray(lane_fold_s, np.float64)
+    lane_fold_exact = np.asarray(lane_fold_exact, np.uint8)
+    initial_delay = incumbent_delay
+    stopped_early = False
+    status = STATUS_OK
+
+    for _attempt in range(max_attempts):
+        label_cell = np.zeros(label_capacity, np.int32)
+        label_parent = np.full(label_capacity, -1, np.int32)
+        label_hops = np.zeros(label_capacity, np.int32)
+        label_departure = np.zeros(label_capacity, np.int32)
+        label_lane = np.zeros(label_capacity, np.int32)
+        label_first_a = np.full(label_capacity, -1, np.int32)
+        label_first_b = np.full(label_capacity, -1, np.int32)
+        lab_step = np.zeros(label_capacity, np.int32)
+        lab_bound = np.zeros(label_capacity, np.float64)
+        lab_estimate = np.zeros(label_capacity, np.int32)
+        lab_serial = np.zeros(label_capacity, np.int64)
+        cap = 1 << log2cap
+        heap = np.zeros(heap_capacity, np.int32)
+        tbl_label = np.full(cap, -1, np.int32)
+        tbl_hash = np.zeros(cap, np.uint64)
+
+        resume[0] = 0
+        stopped_early = False
+        # A restart re-runs from the first root, so it must re-run against the incumbent the
+        # first attempt began with.  A delay the abandoned attempt certified is a tighter
+        # bound, and the reference's answer is defined by a search that never restarted.
+        if initial_delay is None:
+            incumbent[0] = 0.0
+            incumbent[1] = 0.0
+        else:
+            incumbent[0] = initial_delay
+            incumbent[1] = 1.0
+
+        while True:
+            status = _feasible_dag(
+                topology.arc_start, topology.arc_target, topology.hex_remaining,
+                topology.dest_mask, topology.dest_lane_start,
+                topology.air_hop_limit, topology.revisit_depth, depth,
+                bool(topology.track_first_hop), topology.max_step,
+                root_cell, root_step, root_departure, root_lane, root_bound, root_remaining,
+                lane_fold_s, lane_fold_exact, float(destination_fold_lb),
+                float(reference_time_s), float(dt_s), float(ground_weight),
+                float(air_weight), int(base_step),
+                forbidden.bits, rows.n_steps, rows.step0,
+                int(offsets[0]), int(offsets[1]),
+                incumbent,
+                label_cell, label_parent, label_hops, label_departure, label_lane,
+                label_first_a, label_first_b,
+                lab_step, lab_bound, lab_estimate, lab_serial,
+                heap, tbl_label, tbl_hash, log2cap,
+                np.zeros(depth, np.int32), np.zeros(depth, np.int32),
+                np.zeros(depth, np.int32),
+                np.zeros(hop_scratch, np.int32), np.zeros(hop_scratch, np.int32),
+                cancel, out_counts, resume, out_sink,
+            )
+            if status != STATUS_SINK:
+                break
+            label = int(out_sink[0])
+            path = []
+            node = label
+            while node >= 0:
+                path.append(int(label_cell[node]))
+                node = int(label_parent[node])
+            path.reverse()
+            dest_lane = int(topology.dest_lane_idx[int(out_sink[1])])
+            new_delay, stop = certify(
+                int(label_departure[label]),
+                None if label_lane[label] < 0 else int(label_lane[label]),
+                # `-1` is how the packing spells "no destination lane"; the geometry refuses
+                # anything but `None` for a non-terminal endpoint.
+                None if dest_lane < 0 else dest_lane,
+                int(out_sink[2]),
+                int(out_sink[3]),
+                tuple((cell_q[c], cell_r[c]) for c in path),
+            )
+            if new_delay is not None:
+                incumbent[0] = new_delay
+                incumbent[1] = 1.0
+            if stop:
+                stopped_early = True
+                status = STATUS_OK
+                break
+
+        if status == STATUS_LABEL_LIMIT:
+            label_capacity *= 2
+            continue
+        if status == STATUS_STATE_LIMIT:
+            log2cap += 1
+            continue
+        if status == STATUS_CANDIDATE_LIMIT:
+            heap_capacity *= 2
+            continue
+        break
+
+    return status, stopped_early
 
 
 def warm_kernel() -> bool:

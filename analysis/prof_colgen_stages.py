@@ -44,6 +44,7 @@ _loaded = Path(freespace_sim.__file__).resolve()
 if REPO_ROOT not in _loaded.parents:
     raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
 
+from freespace_sim.planner.colgen import dp_prepare as dp_prepare_mod  # noqa: E402
 from freespace_sim.planner.colgen import master as master_mod  # noqa: E402
 from freespace_sim.planner.colgen import pricing as pricing_mod  # noqa: E402
 from freespace_sim.planner.colgen import solver as solver_mod  # noqa: E402
@@ -56,9 +57,19 @@ CALLS: collections.Counter = collections.Counter()
 
 # (label, [(module, attribute), ...]) -- a stage may be bound in more than one module.
 STAGES: list[tuple[str, list[tuple[object, str]]]] = [
-    ("_best_column (Tier 1: labels + sinks)", [(pricing_mod, "_best_column")]),
+    # `_best_column_compiled` is the entry to exact pricing since Phase 2c; `_best_column`
+    # runs only when it cannot prove it completed, so a nonzero row there is a FALLBACK
+    # count and worth reading as one.
+    ("_best_column_compiled (Tier 1+2, entry)", [(pricing_mod, "_best_column_compiled")]),
+    ("_best_column (reference FALLBACK)", [(pricing_mod, "_best_column")]),
+    ("  _dag_candidates (per-sink pricing)", [(pricing_mod, "_dag_candidates")]),
+    ("  _certify_candidates (Tier 2 rank)", [(pricing_mod, "_certify_candidates")]),
+    ("  prepared_for (cached packing)", [(dp_prepare_mod, "prepared_for")]),
+    ("  prepare_duals (per sweep)", [(dp_prepare_mod, "prepare_duals")]),
+    ("  prepare_variants (roots + gate)", [(dp_prepare_mod, "prepare_variants")]),
     ("_canonical_candidate (Tier 2 + incumbent)", [(pricing_mod, "_canonical_candidate")]),
     ("_path_claims", [(pricing_mod, "_path_claims")]),
+    ("_path_delay_s", [(pricing_mod, "_path_delay_s")]),
     ("_endpoint_claims", [(pricing_mod, "_endpoint_claims")]),
     ("_endpoint_claims_uncached", [(pricing_mod, "_endpoint_claims_uncached")]),
     ("_canonical_column", [(solver_mod, "_canonical_column")]),

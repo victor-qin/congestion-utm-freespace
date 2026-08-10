@@ -33,13 +33,22 @@ reason no worker-recycling budget is set here.
 **macOS spawn hazard, deliberately accepted.** Under the ``spawn`` start method a caller
 script that does work at module level rather than under ``if __name__ == "__main__":`` dies
 in ``_check_not_importing_main``. Every shipped entry point already guards its main.
+
+**A worker KILLED mid-task hangs the sweep, and that is accepted too.** ``mp.Pool`` does
+not fail a task whose worker died: ``_repopulate_pool_static`` starts a replacement and the
+task's result is simply never produced, so ``imap`` waits for it forever. The realistic
+trigger is the OOM killer, which is what the ``n_workers`` ceiling below exists to keep out
+of reach, and the alternative pool implementation that would detect it is the one that
+deadlocks. A worker that fails in its *initializer* is NOT accepted -- that failure is
+reachable rather than hypothetical, so :func:`_init_worker` reports it instead of raising.
 """
 from __future__ import annotations
 
 import multiprocessing as mp
 import os
 import time
-from dataclasses import dataclass
+import traceback
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ...config import SimConfig
@@ -156,26 +165,45 @@ def _init_worker(
     The catalog is shipped rather than rebuilt from raw terminals: every graph in a solve
     must see the identical wall catalogue, and re-deriving it here would be a second source
     of truth for something the parent already snapshotted.  It pickles to 12.2 KB.
+
+    A failure here is RECORDED, never raised, and that is a hang the parent would otherwise
+    have no way out of.  ``mp.Pool`` calls the initializer outside the try/except that wraps
+    a task, so an exception kills the worker before it reads its first one,
+    ``_repopulate_pool_static`` immediately starts a replacement, and the replacement dies
+    on the same argument -- forever, at full CPU, while the parent's ``imap`` waits for a
+    result no worker will ever produce and nothing is printed.  Rebuilding every graph is
+    also the largest allocation a worker makes, so ``MemoryError`` -- the failure the
+    ``n_workers`` ceiling is about -- lands exactly here.  :func:`_price_one` re-raises it
+    from the first task instead, which reaches the caller as an ordinary traceback.
     """
 
     _WORKER.clear()
-    _WORKER["graphs"] = {
-        request.flight_id: build_flight_graph(request, cfg, catalog, params)
-        for request in requests
-    }
-    _WORKER["cfg"] = cfg
-    _WORKER["params"] = params
-    # `DualView` is rebuilt here rather than pickled so the worker owns its own caches.
-    _WORKER["dual_view"] = DualView(duals, cfg)
-    _WORKER["flight_duals"] = flight_duals
-    _WORKER["known_columns"] = known_columns
-    # `time.monotonic` is a system-wide clock on both Linux and macOS, so a deadline taken
-    # in the parent is directly comparable here. It would NOT be across hosts.
-    _WORKER["deadline"] = deadline
+    try:
+        _WORKER["graphs"] = {
+            request.flight_id: build_flight_graph(request, cfg, catalog, params)
+            for request in requests
+        }
+        _WORKER["cfg"] = cfg
+        _WORKER["params"] = params
+        # `DualView` is rebuilt here rather than pickled so the worker owns its own caches.
+        _WORKER["dual_view"] = DualView(duals, cfg)
+        _WORKER["flight_duals"] = flight_duals
+        _WORKER["known_columns"] = known_columns
+        # `time.monotonic` is a system-wide clock on both Linux and macOS, so a deadline
+        # taken in the parent is directly comparable here. It would NOT be across hosts.
+        _WORKER["deadline"] = deadline
+    except Exception:
+        # The traceback as TEXT, because the exception object itself may not survive the
+        # trip back: it is re-raised below as a `RuntimeError`, which always pickles.
+        _WORKER["init_error"] = traceback.format_exc()
 
 
 def _price_one(flight_id: int):
-    """Price one flight in a worker, returning ``(flight_id, priced, rc, column)``.
+    """Price one flight in a worker.
+
+    Returns ``(flight_id, priced, rc, column, task_s, n_priced, n_fell_back)`` -- the shape
+    :func:`_accepted_prefix` reduces, and the reason that function takes a sequence of these
+    rather than a pool.
 
     ``priced`` is an explicit BOOLEAN and not an identity sentinel, which is a correctness
     requirement rather than a style choice: a module-level ``object()`` pickles happily and
@@ -189,6 +217,11 @@ def _price_one(flight_id: int):
     an ordinary outcome, not a failure.
     """
 
+    init_error = _WORKER.get("init_error")
+    if init_error is not None:
+        # This worker never built its batch view.  Raising from here rather than from the
+        # initializer is the whole point -- see `_init_worker`.
+        raise RuntimeError(f"pricing worker failed to initialise:\n{init_error}")
     # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
     # so shipping the absolute would double-count on the second task and beyond.
     before = kernel_stats()
@@ -324,13 +357,6 @@ def _sweep_parallel(
         list(requests), cfg, params, catalog, duals, flight_duals,
         dict(known_columns), deadline,
     )
-    flight_ids: list[int] = []
-    reduced_costs: list[float] = []
-    columns: list[Column | None] = []
-    timeout_flight_id: int | None = None
-    task_total_s = 0.0
-    kernel_priced = 0
-    kernel_fell_back = 0
     # Started before the pool exists on purpose: spawning workers, re-importing numba and
     # rebuilding graphs are real costs of a per-sweep pool, and excluding them would report
     # an efficiency the caller never experiences.
@@ -342,22 +368,51 @@ def _sweep_parallel(
         # order so the accepted prefix is the one the sequential loop would have produced,
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
-        for flight_id, priced, reduced_cost, column, task_s, n_priced, n_fell_back in (
+        accepted = _accepted_prefix(
             pool.imap(_price_one, pricing_order, config.chunksize)
-        ):
-            if not priced:
-                # Past the first gap nothing is accepted, so breaking here abandons the
-                # outstanding tasks; leaving the `with` block terminates the pool.
-                timeout_flight_id = flight_id
-                break
-            task_total_s += task_s
-            kernel_priced += n_priced
-            kernel_fell_back += n_fell_back
-            flight_ids.append(flight_id)
-            reduced_costs.append(float(reduced_cost))
-            columns.append(column)
+        )
+    return replace(accepted, wall_s=time.perf_counter() - sweep_started)
+
+
+def _accepted_prefix(results) -> SweepResult:
+    """Reduce worker results, IN THE ORDER GIVEN, to the prefix the sequential loop keeps.
+
+    Split out from :func:`_sweep_parallel` because this, and not the pool, is the rule the
+    module exists to enforce -- and a live pool cannot demonstrate it.  ``deadline`` is a
+    wall clock, so a sweep is either past it (every flight times out and the prefix is
+    empty for reasons that would survive the rule being deleted) or comfortably inside it
+    (nothing times out at all).  The shape the rule is FOR -- a flight that timed out with
+    COMPLETED flights on both sides of it, which is what a pool produces and a sequential
+    loop never sees -- has no reproducible wall-clock recipe, but as a sequence of results
+    it is three lines of test.
+
+    ``wall_s`` is left at zero: the caller owns the clock, because it has to start before
+    the pool exists.
+    """
+
+    flight_ids: list[int] = []
+    reduced_costs: list[float] = []
+    columns: list[Column | None] = []
+    task_total_s = 0.0
+    kernel_priced = 0
+    kernel_fell_back = 0
+    for flight_id, priced, reduced_cost, column, task_s, n_priced, n_fell_back in results:
+        if not priced:
+            # Past the first gap nothing is accepted, so returning here stops consuming --
+            # which abandons the outstanding tasks, and leaving the caller's `with` block
+            # terminates the pool.  The timed-out task's own seconds are deliberately not
+            # added: they are not work the sweep kept.
+            return SweepResult(
+                tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
+                task_total_s, 0.0, kernel_priced, kernel_fell_back,
+            )
+        task_total_s += task_s
+        kernel_priced += n_priced
+        kernel_fell_back += n_fell_back
+        flight_ids.append(flight_id)
+        reduced_costs.append(float(reduced_cost))
+        columns.append(column)
     return SweepResult(
-        tuple(flight_ids), tuple(reduced_costs), tuple(columns), timeout_flight_id,
-        task_total_s, time.perf_counter() - sweep_started,
-        kernel_priced, kernel_fell_back,
+        tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
+        task_total_s, 0.0, kernel_priced, kernel_fell_back,
     )

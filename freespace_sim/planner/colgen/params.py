@@ -138,8 +138,11 @@ class ColGenParams:
     # `time_limit` with a schedule built entirely by the rounding heuristic. 1200 s buys
     # roughly three iterations at that size and ten or more at 50 flights.
     #
-    # Nothing derived from it moves: `ip_reserve_s = min(5, 0.05 * t)` and
-    # `greedy_budget_s = min(60, 0.55 * t)` are both already at their caps by 1200 s.
+    # `ip_reserve_s = min(5, 0.05 * t)` is already at its cap by 1200 s, so the tail left
+    # for the final IP does not move.  The greedy's budget is no longer derived from this
+    # at all -- see `greedy_budget_s_per_flight` -- but it is still CLAMPED by
+    # `pricing_deadline`, so raising this does lift the greedy's effective ceiling on a
+    # batch large enough for `0.7 * n_flights` to reach it (about 1,700 flights).
     time_limit_s: float = 1200.0
     lp_gap: float = 1e-4
     ip_gap: float = 1e-3
@@ -159,10 +162,10 @@ class ColGenParams:
     # stage runs once, after the first LP, and walks flights in order asking pricing for a
     # better column for each; the cap truncates how many it reaches. At 16 the cap is 256.
     #
-    # The stage is bounded by `min(60 s, 0.55 * time_limit_s)` and splits what remains
-    # evenly across the flights still to try, so a longer list means a SMALLER slice each
-    # and hard flights hit their local timeout instead of eating the stage. Measured on 780
-    # flights at the 60 s budget, a cap of 512 ran 32.2 s and improved 217 flights where
+    # The stage is bounded by `greedy_budget_s_per_flight * n_flights` and splits what
+    # remains evenly across the flights still to try, so a longer list means a SMALLER slice
+    # each and hard flights hit their local timeout instead of eating the stage. Measured on
+    # 780 flights at the old flat 60 s budget, a cap of 512 ran 32.2 s and improved 217 where
     # 1024 ran 19.6 s and improved 265 -- reaching every flight shallowly beat reaching two
     # thirds of them deeply. Below the cap none of this applies.
     n_heuristic_tries: int = 16

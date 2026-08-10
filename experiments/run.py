@@ -171,9 +171,10 @@ def build_parser() -> argparse.ArgumentParser:
     # at iteration 1 still looks like a completed solve. The termination reason is logged for that
     # reason, and these flags are what let a run be given enough budget to actually converge.
     p.add_argument("--colgen-time-limit", type=float, default=None, metavar="S",
-                   help="colgen: whole-solve wall budget in seconds (default 120). Pricing dominates "
-                        "the cost, so the default is a smoke-test budget — a scenario-scale solve "
-                        "needs orders of magnitude more")
+                   help="colgen: whole-solve wall budget in seconds (default 1200). Pricing "
+                        "dominates the cost and one sweep at 100 flights is already 147 s, so the "
+                        "default buys roughly three iterations there — a scenario-scale solve needs "
+                        "more, and a solve that stops early says so in its termination reason")
     p.add_argument("--colgen-max-iterations", type=int, default=None, metavar="N",
                    help="colgen: cap on column-generation iterations (default 30)")
     p.add_argument("--colgen-objective", choices=("total_delay", "total_cost"), default=None,

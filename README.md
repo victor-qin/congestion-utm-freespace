@@ -106,7 +106,8 @@ others"). Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-max-i
 search itself as `--colgen-max-air-overrun` (the hop budget over the lattice geodesic, which is also
 the half-width of the O-D ellipse a flight is priced over — the budget implies the ellipse, since a
 route within it cannot reach a cell outside); pricing dominates its
-cost, so the 120 s default budget is a smoke-test budget rather than a converging one. A run that stops on that
+cost, and one sweep at 100 flights is already ~147 s, so the 1200 s default budget buys roughly three
+iterations there rather than a converged solve. A run that stops on that
 budget still files a complete, feasible schedule, so read the WARNING and `planner_stats.json` in the
 run folder rather than assuming the result converged. One reporting caveat: a whole-schedule planner
 has no per-flight solve, so `colgen` stamps every intent with the same amortized share (solve wall ÷

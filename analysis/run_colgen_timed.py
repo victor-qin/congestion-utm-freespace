@@ -71,10 +71,12 @@ _pricing._feasible_compiled = _counting_feasible_compiled
 def _budgeted_greedy(budget_s: float):
     """Replace the greedy's deadline, the one thing its wall-clock budget controls.
 
-    ``greedy_budget_s = min(60.0, 0.55 * time_limit_s)`` is a literal in ``solver.py``, so
-    no parameter can lift it -- and at 500 flights that 60 s is split across up to 256
-    candidates, giving each ~0.23 s, well under one density search.  Measuring what the
-    greedy finds when it is not starved needs this seam.
+    The budget itself is now a parameter -- ``greedy_budget_s_per_flight``, which replaced
+    the ``min(60.0, 0.55 * time_limit_s)`` literal that no parameter could lift -- but it is
+    a RATE, and the question this seam answers is about a TOTAL: what the greedy finds when
+    it is not starved, at a fixed number of seconds, independent of how many flights are in
+    the batch.  Expressing that through the rate would mean dividing by the flight count at
+    every call site that quotes a budget.
     """
 
     real = _solver._greedy_feasible_selection
@@ -102,7 +104,8 @@ def main() -> int:
     ap.add_argument("--ladder", type=int, default=0)
     ap.add_argument(
         "--greedy-budget-s", type=float, default=None,
-        help="Override the greedy's hardcoded min(60, 0.55*time_limit_s) wall clock.",
+        help="Pin the greedy's wall clock to this many seconds TOTAL, in place of "
+             "greedy_budget_s_per_flight * n_flights.",
     )
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

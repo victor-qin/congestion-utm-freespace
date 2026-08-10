@@ -1120,6 +1120,81 @@ def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
     )
 
 
+def test_pricing_cap_defaults_off_and_costs_no_certification():
+    """The shipped configuration must be exactly today's, and provably so.
+
+    ``pricing_slack_hops`` restricts the pricing subproblem, which invalidates the
+    Dantzig-Wolfe bound, so it defaulting to anything but ``None`` would silently change
+    what ``cost_lower_bound`` means.  ``certify_pricing_cap`` costs an extra sweep, so it
+    defaulting on would silently change what a solve costs.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+
+    result = ColGenSolver().solve(requests, cfg, (), _params())
+
+    assert result.stats["pricing_slack_hops"] is None
+    assert result.stats["certify_sweeps"] == 0
+    assert result.stats["certify_columns"] == 0
+
+
+def test_a_pricing_cap_alone_never_certifies():
+    """The cap is opt-in speed; paying for a certificate must be a separate opt-in.
+
+    Setting the cap without the flag has to leave the extra sweep unrun -- otherwise the
+    knob gives back the time it exists to buy.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+
+    result = ColGenSolver().solve(requests, cfg, (), _params(pricing_slack_hops=0))
+
+    assert result.stats["pricing_slack_hops"] == 0
+    assert result.stats["certify_sweeps"] == 0
+    assert result.columns, "a cap of 0 still admits the geodesic; this must stay solvable"
+
+
+def test_certification_runs_an_uncapped_sweep_before_believing_termination():
+    """Every termination reason but the iteration limit claims nothing better exists.
+
+    A capped search cannot support that claim -- it may simply not have looked.  With
+    the flag on, at least one uncapped sweep must run before the solve stops, and the
+    counters must record it so the certificate's cost is visible rather than folded
+    into the pricing total.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+
+    result = ColGenSolver().solve(
+        requests, cfg, (),
+        _params(pricing_slack_hops=0, certify_pricing_cap=True),
+    )
+
+    assert result.stats["termination_reason"] != "iteration_limit", (
+        "this fixture must terminate on a claim, or certification is never reached"
+    )
+    assert result.stats["certify_sweeps"] >= 1
+    assert result.stats["certify_columns"] >= 0
+    assert result.stats["certify_elapsed_s"] > 0.0
+    assert result.stats["certify_elapsed_s"] <= result.stats["elapsed_s"] + 1e-6
+
+
+def test_certification_is_skipped_when_nothing_is_capped():
+    """The flag is a no-op without a cap, and must not buy a sweep for nothing."""
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(certify_pricing_cap=True, pricing_slack_hops=None)
+    )
+
+    assert result.stats["certify_sweeps"] == 0
+
+
 def test_iteration_payload_carries_both_gap_scales_and_the_master():
     """Per-iteration telemetry has to answer questions the final stats cannot.
 

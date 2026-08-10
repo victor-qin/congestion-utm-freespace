@@ -833,6 +833,11 @@ class FlightGraph:
         repr=False,
         compare=False,
     )
+    # Pricing-time air-time budget, in hops beyond ``shortest_hops``; see
+    # ``ColGenParams.pricing_slack_hops``.  ``None`` leaves pricing bounded only by
+    # ``max_step``.  It rides on the graph rather than being read from params because
+    # ``prepare_topology`` and ``_best_column`` both need it and neither takes params.
+    pricing_slack_hops: int | None = None
 
     @property
     def index_to_cell(self) -> tuple[Cell, ...]:
@@ -925,6 +930,10 @@ class FlightGraph:
                 self.max_step,
                 self.shortest_hops,
                 self.detour_slack_hops,
+                # Two graphs that differ only in the pricing cap search differently, so
+                # they must not collide -- the same class of bug as the seed cache that
+                # ignored the cost model and returned the first one's answer.
+                self.pricing_slack_hops,
             )
         )
 
@@ -1554,6 +1563,16 @@ def build_flight_graph(
         raise TypeError("params.detour_slack_hops must be an integer") from exc
     if slack < 0:
         raise ValueError(f"detour_slack_hops must be non-negative, got {slack}")
+    pricing_slack = getattr(params, "pricing_slack_hops", None)
+    if pricing_slack is not None:
+        try:
+            pricing_slack = operator.index(pricing_slack)
+        except TypeError as exc:
+            raise TypeError("params.pricing_slack_hops must be an integer or None") from exc
+        if pricing_slack < 0:
+            raise ValueError(
+                f"pricing_slack_hops must be non-negative, got {pricing_slack}"
+            )
 
     dt = cfg.dt_s
     radius = hg.circumradius(cfg)
@@ -1704,6 +1723,7 @@ def build_flight_graph(
         max_step=max_step,
         shortest_hops=shortest_hops,
         detour_slack_hops=slack,
+        pricing_slack_hops=pricing_slack,
         static_exclusions=static_exclusions,
         foreign_exclusions=foreign_exclusions,
         own_terminal_interiors=frozen_own_interiors,

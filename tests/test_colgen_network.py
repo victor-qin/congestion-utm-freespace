@@ -264,6 +264,48 @@ def test_params_validate_integral_nonnegative_slack():
         ColGenParams(-1)
 
 
+def test_params_validate_optional_pricing_slack():
+    assert ColGenParams().pricing_slack_hops is None
+    assert ColGenParams(pricing_slack_hops=np.int64(3)).pricing_slack_hops == 3
+    assert ColGenParams(pricing_slack_hops=0).pricing_slack_hops == 0
+    with pytest.raises(TypeError, match="integer or None"):
+        ColGenParams(pricing_slack_hops=1.5)
+    with pytest.raises(TypeError, match="integer or None"):
+        ColGenParams(pricing_slack_hops=True)
+    with pytest.raises(ValueError, match="non-negative"):
+        ColGenParams(pricing_slack_hops=-1)
+    assert ColGenParams().certify_pricing_cap is False
+    with pytest.raises(TypeError, match="certify_pricing_cap must be a boolean"):
+        ColGenParams(certify_pricing_cap=1)
+
+
+def test_graphs_differing_only_in_the_pricing_cap_are_distinct():
+    """The cap changes what the search explores, so it must change graph identity.
+
+    ``_search_cache`` memoises per graph, and a capped and an uncapped graph that hash
+    and compare equal would let one answer the other's question.  That is exactly the
+    seed-cache defect: a memo keyed on something that cannot distinguish the two inputs,
+    returning the first one's result with no error.
+    """
+
+    cfg = _cfg()
+    req = FlightRequest(
+        11, _ground_point((-4, 1), cfg, 0.0, 0.0), _ground_point((5, -2), cfg, 0.0, 0.0),
+        0.0, 0.0,
+    )
+    uncapped = build_flight_graph(req, cfg, [], ColGenParams(detour_slack_hops=4))
+    capped = build_flight_graph(
+        req, cfg, [], ColGenParams(detour_slack_hops=4, pricing_slack_hops=2)
+    )
+
+    assert uncapped.pricing_slack_hops is None
+    assert capped.pricing_slack_hops == 2
+    # Same corridor -- the cap is a search bound, not a domain change.
+    assert uncapped.corridor_cells == capped.corridor_cells
+    assert hash(uncapped) != hash(capped)
+    assert uncapped != capped
+
+
 def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
     cfg = _cfg()
     origin_cell, dest_cell = (-5, 2), (6, -3)

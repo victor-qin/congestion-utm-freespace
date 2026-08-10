@@ -175,6 +175,83 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     return added
 
 
+def _certify_uncapped(
+    *,
+    graphs,
+    pricing_order,
+    dual_view,
+    flight_duals,
+    cfg,
+    params,
+    known_columns,
+    deadline,
+    parallel,
+) -> list[Column]:
+    """Re-price every flight with ``pricing_slack_hops`` lifted; return what improves.
+
+    A capped pricing search can only report "nothing improves" about the columns it was
+    permitted to look at, and every termination reason except ``iteration_limit`` is a
+    claim that nothing better exists.  So each such claim needs one uncapped sweep
+    before it can be believed, and the Dantzig-Wolfe bound with it -- ``LP + sum(max(0,
+    rc))`` is only an upper bound when the ``rc`` are the true subproblem optima.
+
+    Finding nothing here IS the certificate: if no uncapped column improves, then no
+    column improves, so the capped sweep's reduced costs are a valid witness and the
+    bound computed from them stands.
+
+    The cap rides on the graph, not on params, so lifting it is a ``replace`` rather
+    than a rebuild.  ``replace`` re-initializes ``_search_cache`` instead of copying it,
+    which is what we want: one cache shared between a capped and an uncapped graph would
+    be the seed-cache bug again -- memoised on a key that cannot tell the two apart.
+    """
+
+    uncapped = {
+        flight_id: (
+            graph
+            if graph.pricing_slack_hops is None
+            else replace(graph, pricing_slack_hops=None)
+        )
+        for flight_id, graph in graphs.items()
+    }
+    found: list[Column] = []
+    # Certify against the ORIGINAL graph: the corridor is identical, so the verdict is
+    # the same, and it keeps the certification cache the rest of the solve is warming.
+    if parallel is not None and parallel.enabled:
+        sweep = price_sweep(
+            graphs=uncapped,
+            pricing_order=pricing_order,
+            dual_view=dual_view,
+            flight_duals=flight_duals,
+            cfg=cfg,
+            params=params,
+            known_columns=known_columns,
+            deadline=deadline,
+            pool_cfg=parallel,
+        )
+        for flight_id, reduced_cost, column in sweep.priced:
+            if column is not None and reduced_cost > _REDUCED_COST_TOL:
+                found.append(_canonical_column(column, graphs[flight_id], cfg))
+        return found
+    for flight_id in pricing_order:
+        try:
+            reduced_cost, column = price_flight(
+                uncapped[flight_id],
+                dual_view,
+                flight_duals[flight_id],
+                cfg,
+                params,
+                known_column=known_columns.get(flight_id),
+                deadline=deadline,
+            )
+        except PricingTimeout:
+            # A timed-out certification proves nothing, so report nothing and let the
+            # caller terminate on the capped evidence it already has.
+            break
+        if column is not None and reduced_cost > _REDUCED_COST_TOL:
+            found.append(_canonical_column(column, graphs[flight_id], cfg))
+    return found
+
+
 def _initial_feasible_selection(
     seeds: Mapping[int, Column],
     graphs: Mapping[int, FlightGraph],
@@ -761,6 +838,12 @@ class ColGenSolver:
         seedless_flights: set[int] = set()
         seeds: dict[int, Column] = {}
         ladder_columns = 0
+        # Uncapped re-prices run to certify a termination claim, and the columns they
+        # recovered.  Both stay 0 unless `certify_pricing_cap` is on; `certify_columns`
+        # above 0 is the direct measure of what `pricing_slack_hops` cost in optimality.
+        certify_sweeps = 0
+        certify_columns = 0
+        certify_elapsed_s = 0.0
         seed_started = time.monotonic()
         for flight_id in flight_ids:
             try:
@@ -1177,19 +1260,49 @@ class ColGenSolver:
             # criterion effectively unreachable while pricing is still productive, so it
             # applies only to the cost-scale metric this repo used before.
             gate = params.gap_metric == "revenue" or not new_columns_since_lp
+            # One chain rather than four independent breaks, because each of these is a
+            # claim that nothing better exists and they now share a certification step.
+            reason: str | None = None
             if lp_gap <= params.lp_gap and gate:
-                termination_reason = "lp_gap"
-                break
-            if best_heuristic and heuristic_gap <= params.ip_gap and gate:
-                termination_reason = "heuristic_gap"
-                break
-            if not priced_columns and not new_columns_since_lp:
-                termination_reason = "no_improving_columns"
-                break
+                reason = "lp_gap"
+            elif best_heuristic and heuristic_gap <= params.ip_gap and gate:
+                reason = "heuristic_gap"
+            elif not priced_columns and not new_columns_since_lp:
+                reason = "no_improving_columns"
+            elif len(master.columns) == before_pricing and not new_columns_since_lp:
+                reason = "no_new_columns"
 
-            if len(master.columns) == before_pricing and not new_columns_since_lp:
-                termination_reason = "no_new_columns"
-                break
+            if reason is not None:
+                certified = None
+                if params.certify_pricing_cap and params.pricing_slack_hops is not None:
+                    certify_sweeps += 1
+                    # Timed here rather than through `_timed`: `stage_s` resets every
+                    # iteration, and the cost that matters is the solve-level total,
+                    # which is what makes the certificate's price comparable to the
+                    # speed the cap bought.
+                    certify_started = time.perf_counter()
+                    certified = _certify_uncapped(
+                        graphs=graphs,
+                        pricing_order=pricing_order,
+                        dual_view=dual_view,
+                        flight_duals=flight_duals,
+                        cfg=cfg,
+                        params=params,
+                        known_columns=best_heuristic,
+                        deadline=pricing_deadline,
+                        parallel=parallel,
+                    )
+                    certify_elapsed_s += time.perf_counter() - certify_started
+                if certified:
+                    # The cap hid an improving column, so the claim was wrong.  Bank
+                    # what it hid and let the next iteration re-solve; the bound is
+                    # recomputed there from the new reduced costs.
+                    certify_columns += len(certified)
+                    for column in certified:
+                        master.add_column(column)
+                else:
+                    termination_reason = reason
+                    break
         else:
             termination_reason = "iteration_limit"
 
@@ -1468,6 +1581,10 @@ class ColGenSolver:
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,
+            "pricing_slack_hops": params.pricing_slack_hops,
+            "certify_sweeps": certify_sweeps,
+            "certify_columns": certify_columns,
+            "certify_elapsed_s": certify_elapsed_s,
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,

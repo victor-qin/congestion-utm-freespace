@@ -43,6 +43,29 @@ class ColGenParams:
     # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
     # 0 disables.
     seed_ladder_steps: int = 20
+    # En-route air time the PRICING search may spend, as hops beyond the geodesic.
+    # There is no hold-in-place arc -- `AXIAL_NEIGHBORS` has six entries, none of them
+    # (0, 0), and every arc does `next_step = step + 1` -- so a hop IS one step of air
+    # time and this is an air-delay budget in `dt_s` units.
+    #
+    # This is NOT `detour_slack_hops`, which sizes the corridor ellipse and whose hop
+    # limit is `is_seed`-gated, so it never reaches pricing.  With this at `None`,
+    # pricing is bounded only by `max_step`: measured on density_faa/100, an early
+    # departure may weave 906 hops, ~60 minutes.  `None` is the shipped behaviour and
+    # every result to date assumes it.
+    #
+    # Setting it RESTRICTS the pricing subproblem.  "No improving column" then stops
+    # being a proof, so `cost_lower_bound` and the Dantzig-Wolfe bound become bounds
+    # for the capped problem rather than the true one -- see `certify_pricing_cap`.
+    # `cfg.max_detour_factor` is the only other detour budget, and it is enforced at
+    # certification (network.py), after the search has already paid for the column.
+    pricing_slack_hops: int | None = None
+    # Run one UNCAPPED sweep before terminating on the LP gap, which restores the
+    # bound's meaning for the cost of a single extra sweep per solve (not per
+    # iteration -- only the final "nothing improves" claim needs certifying).  Off by
+    # default: the cap exists to buy time, and a certificate every solve gives some of
+    # it back.  A no-op when `pricing_slack_hops` is None, since nothing is capped.
+    certify_pricing_cap: bool = False
     shortcut: bool = False
 
     def __post_init__(self) -> None:
@@ -77,6 +100,19 @@ class ColGenParams:
             raise ValueError("gap_metric must be 'revenue' or 'cost'")
         if not isinstance(self.shortcut, bool):
             raise TypeError("shortcut must be a boolean")
+
+        if self.pricing_slack_hops is not None:
+            if isinstance(self.pricing_slack_hops, bool):
+                raise TypeError("pricing_slack_hops must be an integer or None")
+            try:
+                cap = operator.index(self.pricing_slack_hops)
+            except TypeError as exc:
+                raise TypeError("pricing_slack_hops must be an integer or None") from exc
+            if cap < 0:
+                raise ValueError("pricing_slack_hops must be non-negative")
+            object.__setattr__(self, "pricing_slack_hops", cap)
+        if not isinstance(self.certify_pricing_cap, bool):
+            raise TypeError("certify_pricing_cap must be a boolean")
 
         if isinstance(self.seed_ladder_steps, bool):
             raise TypeError("seed_ladder_steps must be an integer")

@@ -417,9 +417,11 @@ def _search_dag(
     max_step,
     revisit_depth,
     state_history_depth,
-    seed_hop_limit,
+    # Seed and pricing budgets differ, so the CALLER picks which one applies and passes
+    # it here.  That keeps one comparison in the hot loop instead of a conjunction, and
+    # removes the need for the kernel to know which mode it is in.
+    hop_limit,
     track_first_hop,
-    is_seed,
     # duals
     dual_first,
     dual_start,
@@ -584,7 +586,7 @@ def _search_dag(
             cell = label_cell[li]
             v = label_variant[li]
             paid_class = v_paid_class[v]
-            if (is_seed and hops >= seed_hop_limit) or step + 1 > max_step:
+            if hops >= hop_limit or step + 1 > max_step:
                 li = label_next[li]
                 continue
 
@@ -680,7 +682,7 @@ def _search_dag(
                 remain_nb = rev_remaining[nb]
                 if next_step + remain_nb > max_step:
                     continue
-                if is_seed and hops + 1 + remain_nb > seed_hop_limit:
+                if hops + 1 + remain_nb > hop_limit:
                     continue
 
                 # Row exclusions.  Placed exactly where the reference tests them --
@@ -1027,8 +1029,9 @@ def search_dag(
             topology.arc_start, topology.arc_target, topology.arc_roles,
             topology.rev_remaining, topology.dest_mask,
             topology.min_step, topology.max_step,
-            topology.revisit_depth, depth, topology.seed_hop_limit,
-            topology.track_first_hop, seed,
+            topology.revisit_depth, depth,
+            topology.seed_hop_limit if seed else topology.pricing_hop_limit,
+            topology.track_first_hop,
             duals.dual_first, duals.dual_start, duals.dual_prefix,
             duals.window_lo, duals.window_hi, duals.max_negative_credit,
             variants.cell, variants.start_step, variants.score, variants.paid_class,

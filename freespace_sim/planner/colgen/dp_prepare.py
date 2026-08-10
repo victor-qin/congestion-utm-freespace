@@ -78,6 +78,11 @@ class PreparedTopology:
     max_step: int = 0
     takeoff_steps0: int = 0
     seed_hop_limit: int = 0
+    # The same budget for ordinary pricing.  When the cap is off this is
+    # ``max_step - min_step + 1``, which no label can reach: every arc advances the
+    # clock exactly one step, so ``hops <= step - min_step <= max_step - min_step``.
+    # That makes the disabled path a provable no-op without a magic sentinel.
+    pricing_hop_limit: int = 0
     revisit_depth: int = 0
     state_history_depth: int = 0
     track_first_hop: bool = False
@@ -525,6 +530,7 @@ def prepare_variants(
     paid_rows_by_class: list[list[tuple[int, int, float]]] = []
     rows: list[dict[str, Any]] = []
     _RECOMPUTE_EPS = 1e-8
+    hop_limit = topology.seed_hop_limit if seed else topology.pricing_hop_limit
     for departure_step in departure_steps:
         ground_delay_raw_s = (departure_step - fg.base_step) * cfg.dt_s
         ground_delay_s = w_ground * ground_delay_raw_s
@@ -547,7 +553,7 @@ def prepare_variants(
             distance_to_go = int(topology.rev_remaining[index])
             if start_step + distance_to_go > fg.max_step:
                 continue
-            if seed and distance_to_go > topology.seed_hop_limit:
+            if distance_to_go > hop_limit:
                 continue
             if cost_cutoff is not None:
                 # Per-LANE bound, strictly tighter than the departure-level one above.
@@ -831,6 +837,11 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
         max_step=int(fg.max_step),
         takeoff_steps0=int(fg.takeoff_steps[0]),
         seed_hop_limit=int(fg.shortest_hops + fg.detour_slack_hops),
+        pricing_hop_limit=(
+            int(fg.max_step - fg.min_step + 1)
+            if fg.pricing_slack_hops is None
+            else int(fg.shortest_hops + fg.pricing_slack_hops)
+        ),
         revisit_depth=revisit_depth,
         # Two different widths, deliberately.  ``revisit_depth`` bans re-entering a
         # recently-held cell; the STATE key must keep at least the predecessor even

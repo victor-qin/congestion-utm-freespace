@@ -1419,8 +1419,19 @@ def _best_column(
     # loops (the network's en-route-waiting lever), subject to the canonical
     # detour gate at the sink.  A zero-dual seed has no reason to loop, so its
     # tighter hop limit avoids exploring value-tied cyclic walks.
-    seed_hop_limit = fg.shortest_hops + fg.detour_slack_hops
-    if seed_hop_limit < 1:
+    #
+    # ``pricing_slack_hops`` is the optional budget on exactly that looping, and it is
+    # None by default -- in which case the limit is ``max_step - min_step + 1``, which
+    # no label can reach, because every arc advances the clock exactly one step.  The
+    # uncapped path is therefore a provable no-op, not a behaviour change.  Mirrors the
+    # kernel's ``pricing_hop_limit``; the two must agree or parity breaks.
+    if seed:
+        hop_limit = fg.shortest_hops + fg.detour_slack_hops
+    elif fg.pricing_slack_hops is None:
+        hop_limit = fg.max_step - fg.min_step + 1
+    else:
+        hop_limit = fg.shortest_hops + fg.pricing_slack_hops
+    if hop_limit < 1:
         return -math.inf, None
 
     offsets = dual_view.offsets
@@ -1681,7 +1692,7 @@ def _best_column(
                 continue
             if start_step + distance_to_go > fg.max_step:
                 continue
-            if seed and distance_to_go > seed_hop_limit:
+            if distance_to_go > hop_limit:
                 continue
             visit_claims = _visit_claims(cell, 0, start_step, offsets)
             start_claims = origin_claims | visit_claims
@@ -1773,7 +1784,7 @@ def _best_column(
             if label_index % 128 == 0:
                 _check_deadline(deadline)
             hops = label.hops
-            if (seed and hops >= seed_hop_limit) or step + 1 > fg.max_step:
+            if hops >= hop_limit or step + 1 > fg.max_step:
                 continue
             paid_cells, paid_cell_rows = _paid_cell_rows(origin_paid_rows)
             if incumbent is not None:
@@ -1820,7 +1831,7 @@ def _best_column(
                 next_step = step + 1
                 if next_step + distance_to_go > fg.max_step:
                     continue
-                if seed and hops + 1 + distance_to_go > seed_hop_limit:
+                if hops + 1 + distance_to_go > hop_limit:
                     continue
                 # Same per-arc guard as the feasible search: a set built only to be tested.
                 if _visit_hits_forbidden(neighbour, 0, next_step, offsets, forbidden_rows):

@@ -56,9 +56,18 @@ def _point(cell, cfg):
     return vec(x, y, cfg.ground_level_m)
 
 
-def _graph(cfg, origin=(0, 0), dest=(4, -1), slack=4, flight_id=1, objective="total_delay"):
+def _graph(
+    cfg,
+    origin=(0, 0),
+    dest=(4, -1),
+    slack=4,
+    flight_id=1,
+    objective="total_delay",
+    pricing_slack=None,
+):
     params = ColGenParams(
-        solver="highs", detour_slack_hops=slack, objective=objective
+        solver="highs", detour_slack_hops=slack, objective=objective,
+        pricing_slack_hops=pricing_slack,
     )
     request = FlightRequest(flight_id, _point(origin, cfg), _point(dest, cfg), 0.0, 0.0)
     return build_flight_graph(request, cfg, (), params), params
@@ -141,6 +150,74 @@ def test_kernel_matches_reference_column_on_random_mixed_sign_duals(
         assert got.origin_lane_idx == expected.origin_lane_idx
         assert got.dest_lane_idx == expected.dest_lane_idx
     assert compared >= 6, f"only {compared} graphs produced a column; sweep is too weak"
+
+
+@pytest.mark.parametrize("pricing_slack", [0, 2])
+def test_kernel_matches_reference_under_a_pricing_hop_cap(monkeypatch, pricing_slack):
+    """``pricing_slack_hops`` must bind identically in the kernel and the reference.
+
+    The cap is applied at three sites per implementation -- variant admission, the layer
+    sweep, and arc expansion -- and the two implementations are separate code.  A cap
+    that fired in one and not the other would not raise; it would silently make the
+    kernel and the fallback oracle disagree about which column wins, which is the exact
+    failure mode the rest of this file exists to prevent.
+
+    Also asserts the cap's contract directly: no returned column may exceed
+    ``shortest_hops + pricing_slack_hops`` lateral hops.  Every arc advances the clock
+    one step, so that IS the air-time budget it is meant to express.
+    """
+
+    assert dp_kernel is not None, "kernel inactive -- this parity guard would be vacuous"
+    rng = np.random.default_rng(20260807)
+    compared = 0
+    for trial in range(10):
+        cfg = _cfg(max_ground_delay_s=float(rng.choice([0.0, 48.0, 120.0])))
+        graph, params = _graph(
+            cfg,
+            dest=(int(rng.integers(2, 6)), int(rng.integers(-3, 3))),
+            slack=int(rng.integers(0, 5)),
+            flight_id=trial + 1,
+            pricing_slack=pricing_slack,
+        )
+        cells = sorted(graph.corridor_cells)
+        duals = _random_duals(rng, cells, graph.base_step, int(rng.integers(0, 40)))
+        pi_f = float(rng.normal(0.0, 50.0))
+
+        (expected_rc, expected), (got_rc, got) = _price_both(
+            monkeypatch, graph, duals, pi_f, cfg, params
+        )
+        if expected is None:
+            assert got is None
+            continue
+        compared += 1
+        assert got is not None
+        assert got_rc == pytest.approx(expected_rc, abs=1e-8)
+        assert got.cell_path == expected.cell_path
+        assert got.departure_step == expected.departure_step
+        limit = graph.shortest_hops + pricing_slack
+        assert len(got.cell_path) - 1 <= limit, (
+            f"capped pricing returned {len(got.cell_path) - 1} hops over a limit of {limit}"
+        )
+    assert compared >= 5, f"only {compared} graphs produced a column; sweep is too weak"
+
+
+def test_pricing_cap_off_leaves_a_hop_limit_no_label_can_reach():
+    """The disabled path must be a no-op by construction, not by luck.
+
+    ``pricing_hop_limit`` is compared against a live hop count rather than being skipped,
+    so "off" is expressed as a limit nothing can reach.  Every arc advances the clock
+    exactly one step, which makes ``max_step - min_step`` a hard ceiling on hops -- so a
+    limit one above it can never fire.  If that identity ever stops holding, the default
+    silently becomes a restriction.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0)
+    graph, _params = _graph(cfg, dest=(5, -2), slack=4, pricing_slack=None)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+
+    assert graph.pricing_slack_hops is None
+    assert topology.pricing_hop_limit == graph.max_step - graph.min_step + 1
+    assert topology.pricing_hop_limit > graph.max_step - graph.min_step
 
 
 def test_kernel_column_is_claim_feasible(monkeypatch):

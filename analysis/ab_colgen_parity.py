@@ -19,10 +19,26 @@ The fingerprint covers the objective, the selected-flight count, the denial set,
 over every column's ``(flight_id, departure_step, delay_s, cell_path, sorted claims)``. It
 deliberately excludes wall time and anything else a legitimate acceleration may move.
 
+**``--ladder`` defaults to 0, and that is the contract, not a convenience.** A departure
+ladder changes the master's *pool*, hence its duals, hence the subproblems pricing is handed
+-- so a laddered tree compared against an unladdered ref diverges for a reason that has
+nothing to do with the kernel, and the mismatch would read as a kernel regression. This
+harness exists to say "the compiled search reproduces the reference search", which is a
+statement about ``price_flight``'s internals; ``seed_ladder_steps`` is upstream of that fork
+and is pinned off so the claim stays the one being tested.
+
+To test the ladder itself, compare the two searches *inside one tree* with
+``--reference-baseline``, which reruns the same arm with the compiled kernel disabled.
+That is the comparison that answers "does the kernel still reproduce the reference once
+the ladder moves the duals", and it needs no git ref at all.
+
 Examples:
 
-    # compare the working tree against origin/main on all three default arms
+    # the kernel-identity gate: working tree vs origin/main, ladder pinned off
     uv run python analysis/ab_colgen_parity.py --ref origin/main
+
+    # the ladder gate: compiled vs reference within this tree, ladder on
+    uv run python analysis/ab_colgen_parity.py --reference-baseline --ladder 20
 
     # one arm, more iterations
     uv run python analysis/ab_colgen_parity.py --ref origin/main --arm colgen_test
@@ -80,7 +96,7 @@ ARMS: dict[str, dict] = {
 
 # Runs in a child interpreter, against whichever tree `cwd` selects.
 _CHILD = r'''
-import hashlib, json, sys, time
+import dataclasses, hashlib, json, sys, time
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +114,7 @@ from freespace_sim.scenarios import get_scenario
 
 spec_name, n_flights, iterations = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 backend, gap_metric = sys.argv[5], sys.argv[6]
+ladder, kernel = int(sys.argv[7]), sys.argv[8]
 spec = get_scenario(spec_name)
 cfg = spec.config()
 demand = spec.demand_model()
@@ -105,9 +122,33 @@ requests = demand.generate(cfg, np.random.default_rng(cfg.seed))
 requests = sorted(requests, key=lambda r: r.flight_id)[:n_flights]
 static_terms = list(demand.terminals(cfg))
 
+# `seed_ladder_steps` does not exist on every ref this harness compares against, so it is
+# applied by feature test rather than assumed -- passing it as a kwarg to an older
+# `ColGenParams` is a TypeError, and defaulting it silently would be worse: a baseline that
+# quietly ran with no ladder diverges on every column and reads as a kernel regression.
+# The EFFECTIVE value goes into the fingerprint and the parent refuses to compare two arms
+# that did not get the same one.
+_fields = {f.name for f in dataclasses.fields(ColGenParams)}
+_ladder_kwargs = {"seed_ladder_steps": ladder} if "seed_ladder_steps" in _fields else {}
 params = ColGenParams(
-    solver=backend, max_iterations=iterations, time_limit_s=86400.0, gap_metric=gap_metric
+    solver=backend, max_iterations=iterations, time_limit_s=86400.0, gap_metric=gap_metric,
+    **_ladder_kwargs,
 )
+effective_ladder = getattr(params, "seed_ladder_steps", 0)
+
+if kernel == "off":
+    # Force the pure-Python reference search.  Same seam the kernel tests use
+    # (`tests/test_colgen_dp_kernel.py`), and the same one a numba-less install takes on its
+    # own, so this exercises a shipped path rather than a test-only one.
+    #
+    # This is a COMPLETE disable only because both compiled entry points consult
+    # `_dp_kernel()` and fall back when it returns None: `_best_column_compiled` (exact
+    # pricing) and `_feasible_compiled` (the greedy's feasible search).  A third entry point
+    # that skipped that check would leave this arm silently half-compiled, which would look
+    # like the reference agreeing with itself.
+    from freespace_sim.planner.colgen import pricing
+    pricing._dp_kernel = lambda: None
+
 started = time.perf_counter()
 result = ColGenSolver().solve(requests, cfg, static_terms, params)
 wall = time.perf_counter() - started
@@ -135,19 +176,22 @@ print("@@FINGERPRINT@@" + json.dumps({
     "column_sha": hashlib.sha256(repr(rows).encode()).hexdigest()[:16],
     "wall_s": round(wall, 3),
     "pricing_wall_s": round(float(stats.get("pricing_wall_s", 0.0)), 3),
+    "seed_ladder_steps": effective_ladder,
+    "ladder_columns": stats.get("ladder_columns", 0),
+    "kernel": kernel,
     "tree": str(loaded.parent.parent),
 }))
 '''
 
 
-def _run_arm(root: Path, arm: dict) -> dict:
+def _run_arm(root: Path, arm: dict, ladder: int, kernel: str) -> dict:
     """Fingerprint one arm in a child interpreter rooted at ``root``."""
 
     proc = subprocess.run(
         [
             sys.executable, "-c", _CHILD, str(root),
             arm["scenario"], str(arm["flights"]), str(arm["iterations"]),
-            arm["solver"], arm["gap_metric"],
+            arm["solver"], arm["gap_metric"], str(ladder), kernel,
         ],
         cwd=root,
         capture_output=True,
@@ -189,10 +233,26 @@ def main() -> int:
              "Omit to fingerprint the working tree only.",
     )
     parser.add_argument(
+        "--reference-baseline", action="store_true",
+        help="compare the compiled search against the pure-Python reference INSIDE this "
+             "tree, instead of against a git ref. Needs no ref and is the right gate for "
+             "anything that changes the master's pool rather than the search.",
+    )
+    parser.add_argument(
+        "--ladder", type=int, default=0, metavar="N",
+        help="pin seed_ladder_steps on BOTH arms (default 0). See the module docstring: a "
+             "ladder changes the duals, so a laddered tree vs an unladdered ref diverges "
+             "for reasons unrelated to the kernel.",
+    )
+    parser.add_argument(
         "--arm", action="append", choices=sorted(ARMS),
         help="restrict to one arm; repeatable. Default: all three.",
     )
     args = parser.parse_args()
+    if args.ref and args.reference_baseline:
+        parser.error("--ref and --reference-baseline are alternative baselines; pick one")
+    if args.ladder < 0:
+        parser.error("--ladder must be non-negative")
     names = args.arm or sorted(ARMS)
 
     def say(text: str) -> None:
@@ -202,33 +262,55 @@ def main() -> int:
         print(text, flush=True)
 
     baseline_root = None
+    baseline_kernel = "on"
+    baseline_label = args.ref or ""
     tmp = None
     if args.ref:
         tmp = tempfile.TemporaryDirectory(prefix="colgen_parity_")
         baseline_root = _extract(args.ref, Path(tmp.name) / "tree")
         say(f"baseline: {args.ref} -> {baseline_root}")
+    elif args.reference_baseline:
+        baseline_root = REPO_ROOT
+        baseline_kernel = "off"
+        baseline_label = "reference"
+        say("baseline: this tree with the compiled kernel disabled")
+    say(f"seed_ladder_steps pinned to {args.ladder} on every arm")
 
     failures = 0
     for name in names:
         arm = ARMS[name]
         say(f"\n=== {name}: {arm['scenario']} x{arm['flights']} "
-            f"iters={arm['iterations']} {arm['solver']} gap={arm['gap_metric']} ===")
-        current = _run_arm(REPO_ROOT, arm)
+            f"iters={arm['iterations']} {arm['solver']} gap={arm['gap_metric']} "
+            f"ladder={args.ladder} ===")
+        current = _run_arm(REPO_ROOT, arm, args.ladder, "on")
         say(f"  tree     {current['wall_s']:8.2f}s pricing={current['pricing_wall_s']:8.2f}s "
             f"obj={current['objective']} sel={current['selected_flights']} "
-            f"cols={current['n_columns']} sha={current['column_sha']}")
+            f"cols={current['n_columns']} sha={current['column_sha']} "
+            f"ladder_cols={current['ladder_columns']}")
         if baseline_root is None:
             continue
-        base = _run_arm(baseline_root, arm)
-        say(f"  {args.ref:<8.8} {base['wall_s']:8.2f}s pricing={base['pricing_wall_s']:8.2f}s "
+        base = _run_arm(baseline_root, arm, args.ladder, baseline_kernel)
+        say(f"  {baseline_label:<8.8} {base['wall_s']:8.2f}s "
+            f"pricing={base['pricing_wall_s']:8.2f}s "
             f"obj={base['objective']} sel={base['selected_flights']} "
-            f"cols={base['n_columns']} sha={base['column_sha']}")
+            f"cols={base['n_columns']} sha={base['column_sha']} "
+            f"ladder_cols={base['ladder_columns']}")
+        # A ref predating `seed_ladder_steps` accepts no such kwarg and runs unladdered.
+        # Every column would then differ, which looks exactly like a kernel divergence --
+        # so refuse the comparison outright rather than report a mismatch it cannot explain.
+        if current["seed_ladder_steps"] != base["seed_ladder_steps"]:
+            failures += 1
+            say(f"  UNCOMPARABLE: tree ran seed_ladder_steps="
+                f"{current['seed_ladder_steps']} but {baseline_label} ran "
+                f"{base['seed_ladder_steps']} -- the baseline predates the parameter, so "
+                f"rerun with --ladder 0 or pick a newer ref")
+            continue
         diffs = [f for f in _COMPARED if current[f] != base[f]]
         if diffs:
             failures += 1
             say(f"  MISMATCH on {', '.join(diffs)}")
             for field in diffs:
-                say(f"    {field}: tree={current[field]!r} {args.ref}={base[field]!r}")
+                say(f"    {field}: tree={current[field]!r} {baseline_label}={base[field]!r}")
         else:
             speedup = base["wall_s"] / current["wall_s"] if current["wall_s"] else float("nan")
             say(f"  IDENTICAL on all {len(_COMPARED)} fields -- {speedup:.2f}x")
@@ -238,7 +320,11 @@ def main() -> int:
     if failures:
         say(f"\n{failures} arm(s) DIVERGED")
         return 1
-    say("\nall arms identical" if args.ref else "\nfingerprinted (no baseline requested)")
+    say(
+        f"\nall arms identical vs {baseline_label}"
+        if baseline_root is not None
+        else "\nfingerprinted (no baseline requested)"
+    )
     return 0
 
 

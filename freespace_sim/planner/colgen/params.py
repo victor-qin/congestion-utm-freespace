@@ -173,6 +173,13 @@ class ColGenParams:
     #   "cost"    -- the same absolute gap normalized by total cost instead, which is
     #                what this repo used before and is far stricter when M >> cost.
     gap_metric: str = "revenue"
+    # Pure clock translations of each flight's seed, offered to the master before the
+    # first LP.  A shift is arithmetic, not a search, and pricing otherwise spends its
+    # early iterations rediscovering exactly these -- 91% of the columns added in
+    # iterations 2-11 of a converged 100-flight solve were time shifts of a route already
+    # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
+    # 0 disables.
+    seed_ladder_steps: int = 20
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):
@@ -204,6 +211,16 @@ class ColGenParams:
             raise TypeError("gap_metric must be a string")
         if self.gap_metric not in {"revenue", "cost"}:
             raise ValueError("gap_metric must be 'revenue' or 'cost'")
+
+        if isinstance(self.seed_ladder_steps, bool):
+            raise TypeError("seed_ladder_steps must be an integer")
+        try:
+            ladder = operator.index(self.seed_ladder_steps)
+        except TypeError as exc:
+            raise TypeError("seed_ladder_steps must be an integer") from exc
+        if ladder < 0:
+            raise ValueError("seed_ladder_steps must be non-negative")
+        object.__setattr__(self, "seed_ladder_steps", ladder)
 
         for name in ("max_iterations", "n_heuristic_tries"):
             value = getattr(self, name)

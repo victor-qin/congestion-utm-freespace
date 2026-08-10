@@ -870,12 +870,17 @@ def test_first_master_has_only_bounded_shortest_path_initialization(monkeypatch)
     ]
     events: list[str] = []
     first_lp_counts: Counter[int] = Counter()
+    first_lp_routes: dict[int, set] = {}
     original_solve_lp = RestrictedMaster.solve_lp
 
     def capture_first_lp(master):
         events.append("lp")
         if not first_lp_counts:
             first_lp_counts.update(column.flight_id for column in master.columns)
+            for column in master.columns:
+                first_lp_routes.setdefault(column.flight_id, set()).add(
+                    tuple(column.cell_path)
+                )
         return original_solve_lp(master)
 
     def capture_greedy(*_args, **kwargs):
@@ -890,7 +895,15 @@ def test_first_master_has_only_bounded_shortest_path_initialization(monkeypatch)
     assert result.columns
     assert first_lp_counts
     assert set(first_lp_counts) == {1, 2}
-    assert max(first_lp_counts.values()) <= 2
+    # The contract is "no ROUTE alternatives before the first LP", and a departure
+    # ladder is not one: every pre-LP column for a flight is the same cell path at a
+    # different clock.  Asserting that directly is stronger than the old <=2 column
+    # count, which was a proxy that the ladder (seed_ladder_steps) invalidated without
+    # touching the invariant.
+    assert max(first_lp_counts.values()) <= 1 + _params().seed_ladder_steps
+    assert all(len(routes) == 1 for routes in first_lp_routes.values()), (
+        f"pre-LP pool holds route alternatives: {first_lp_routes}"
+    )
     assert events.index("lp") < events.index("greedy")
 
 
@@ -1123,7 +1136,8 @@ def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
         _request(2, (0, -4), (0, 4), cfg),
     ]
 
-    result = ColGenSolver().solve(requests, cfg, (), _params())
+    # ladder off so the heuristic cannot prove the gap and skip the MILP outright.
+    result = ColGenSolver().solve(requests, cfg, (), _params(seed_ladder_steps=0))
 
     assert result.stats["ip_status"] != "skipped", "this fixture must reach the IP"
     elapsed = result.stats["ip_elapsed_s"]
@@ -1246,6 +1260,8 @@ def test_backend_parity_when_final_integer_master_runs():
         "ip_gap": 0.0,
     }
 
+    # See note on the ladder below: this test must reach the final integer master.
+    controls = {**controls, "seed_ladder_steps": 0}
     highs = ColGenSolver().solve(requests, cfg, (), _params(solver="highs", **controls))
     gurobi = ColGenSolver().solve(requests, cfg, (), _params(solver="gurobi", **controls))
 
@@ -1427,7 +1443,9 @@ def test_seeding_timeout_reports_partial_master_progress(monkeypatch):
 
     monkeypatch.setattr(solver_module, "seed_column", timeout_on_second)
 
-    result = ColGenSolver().solve(requests, cfg, (), _params())
+    # ladder off: this test counts the partial seed prefix a timeout leaves behind,
+    # and the ladder would add seed_ladder_steps columns per seeded flight on top.
+    result = ColGenSolver().solve(requests, cfg, (), _params(seed_ladder_steps=0))
 
     assert result.columns == {}
     assert result.stats["backend"] == "highs"
@@ -1477,7 +1495,8 @@ def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
         requests,
         cfg,
         (),
-        _params(lp_gap=0.0, ip_gap=0.0),
+        # ladder off: this test needs the final MILP to actually run.
+        _params(lp_gap=0.0, ip_gap=0.0, seed_ladder_steps=0),
     )
 
     # The partition is the contract: an unproven IP cannot certify that a missing flight

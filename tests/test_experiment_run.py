@@ -97,6 +97,9 @@ def test_colgen_flags_reach_the_planner_params():
         "--colgen-objective", "total_cost", "--colgen-solver", "highs",
         "--colgen-gap-metric", "cost",
         "--colgen-max-air-overrun", "3",
+        "--colgen-workers", "4",
+        "--colgen-seed-ladder", "30",
+        "--colgen-greedy-budget-rate", "1.5",
     )
     params = colgen_params_from_args(args, "colgen")
 
@@ -106,6 +109,9 @@ def test_colgen_flags_reach_the_planner_params():
     assert params.solver == "highs"
     assert params.gap_metric == "cost"
     assert params.max_air_overrun_hops == 3
+    assert params.n_pricing_workers == 4
+    assert params.seed_ladder_steps == 30
+    assert params.greedy_budget_s_per_flight == 1.5
 
 
 def test_colgen_params_are_none_for_every_other_planner():
@@ -121,6 +127,30 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
 
     assert defaults.time_limit_s == 1200.0
     assert defaults.objective == "total_delay"
+    # The pricing-path knobs specifically: `n_pricing_workers` defaulting to 0 is what
+    # keeps an existing command line byte-identical after the flags were added, and the
+    # other two default to ON, so a `None` leaking through would silently disable the
+    # ladder or the greedy stage rather than merely resetting a budget.
+    assert defaults.n_pricing_workers == 0
+    assert defaults.seed_ladder_steps == 20
+    assert defaults.greedy_budget_s_per_flight == 0.7
+
+
+def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():
+    """``0`` is the documented disable path for both, so it must not be rejected.
+
+    Neither is a plain budget: ``seed_ladder_steps=0`` means seed no retimes at all and
+    ``greedy_budget_s_per_flight=0`` means skip the stage.  A validator that treated them
+    like ``n_pricing_workers`` and demanded positivity would make the documented way to
+    turn either off an argparse error instead.
+    """
+
+    off = colgen_params_from_args(
+        _args("colgen_test", "--planner", "colgen",
+              "--colgen-seed-ladder", "0", "--colgen-greedy-budget-rate", "0"),
+        "colgen",
+    )
+    assert (off.seed_ladder_steps, off.greedy_budget_s_per_flight) == (0, 0.0)
 
 
 @pytest.mark.parametrize(
@@ -132,6 +162,9 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
         ("--colgen-solver", "highs"),
         ("--colgen-gap-metric", "cost"),
         ("--colgen-max-air-overrun", "3"),
+        ("--colgen-workers", "4"),
+        ("--colgen-seed-ladder", "30"),
+        ("--colgen-greedy-budget-rate", "1.5"),
     ],
 )
 def test_colgen_flags_require_the_colgen_planner(colgen_flag):

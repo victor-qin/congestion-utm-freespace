@@ -1142,6 +1142,12 @@ class ColGenSolver:
                     # This iteration's pricing cost -- the wall the solver spent in the
                     # sweep, which is very nearly the wall of the whole iteration.
                     "sweep_s": iteration_sweep_s,
+                    # The work the sweep actually did, against the wall above.  With a
+                    # pool, `sweep_task_total_s / (sweep_s * n_workers)` is the fraction of
+                    # worker-seconds spent computing; the rest is workers idle behind a
+                    # straggler.  That distinguishes scheduling loss from dispatch overhead,
+                    # and only the latter is something `chunksize` can address.
+                    "sweep_task_total_s": sweep.task_total_s,
                     "columns": len(master.columns),
                     "columns_added": len(priced_columns),
                     "rc_sum": math.fsum(positives),

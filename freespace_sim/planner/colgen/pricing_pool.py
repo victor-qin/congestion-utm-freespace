@@ -37,6 +37,7 @@ in ``_check_not_importing_main``. Every shipped entry point already guards its m
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -85,10 +86,27 @@ class SweepResult:
     reduced_costs: tuple[float, ...]
     columns: tuple[Column | None, ...]
     timeout_flight_id: int | None
+    # Seconds of WORK the accepted tasks actually did, against the wall the caller waited.
+    # The two separate the only losses a pool can suffer: `wall * n_workers - task_total`
+    # is idle worker time, which is scheduling loss (a straggler nobody can fill in behind),
+    # while the gap between `task_total` and the sequential sweep's total is dispatch
+    # overhead.  Only the second is what `chunksize` can attack, and telling them apart
+    # from wall clock alone is impossible.
+    task_total_s: float = 0.0
+    # Wall the caller waited for the sweep, measured inside `price_sweep` so it covers pool
+    # construction and teardown -- the costs a per-sweep pool actually pays.
+    wall_s: float = 0.0
 
     @property
     def complete(self) -> bool:
         return self.timeout_flight_id is None
+
+    def efficiency(self, n_workers: int) -> float:
+        """Fraction of the pool's worker-seconds that did real work."""
+
+        if n_workers <= 0 or self.wall_s <= 0.0:
+            return 1.0
+        return self.task_total_s / (self.wall_s * n_workers)
 
 
 # --------------------------------------------------------------------------- worker side
@@ -146,6 +164,7 @@ def _price_one(flight_id: int):
     an ordinary outcome, not a failure.
     """
 
+    started = time.perf_counter()
     try:
         reduced_cost, column = price_flight(
             _WORKER["graphs"][flight_id],
@@ -157,8 +176,8 @@ def _price_one(flight_id: int):
             deadline=_WORKER["deadline"],
         )
     except PricingTimeout:
-        return flight_id, False, 0.0, None
-    return flight_id, True, float(reduced_cost), column
+        return flight_id, False, 0.0, None, time.perf_counter() - started
+    return flight_id, True, float(reduced_cost), column, time.perf_counter() - started
 
 
 # --------------------------------------------------------------------------- parent side
@@ -205,7 +224,10 @@ def _sweep_sequential(
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    task_total_s = 0.0
+    sweep_started = time.perf_counter()
     for flight_id in pricing_order:
+        task_started = time.perf_counter()
         try:
             reduced_cost, column = price_flight(
                 graphs[flight_id],
@@ -218,12 +240,19 @@ def _sweep_sequential(
             )
         except PricingTimeout:
             return SweepResult(
-                tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id
+                tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
+                task_total_s, time.perf_counter() - sweep_started,
             )
+        task_total_s += time.perf_counter() - task_started
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
-    return SweepResult(tuple(flight_ids), tuple(reduced_costs), tuple(columns), None)
+    # One worker's worth of work, by definition -- which is what makes it the denominator
+    # the parallel arm is compared against.
+    return SweepResult(
+        tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
+        task_total_s, time.perf_counter() - sweep_started,
+    )
 
 
 def _sweep_parallel(
@@ -248,6 +277,11 @@ def _sweep_parallel(
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
     timeout_flight_id: int | None = None
+    task_total_s = 0.0
+    # Started before the pool exists on purpose: spawning workers, re-importing numba and
+    # rebuilding graphs are real costs of a per-sweep pool, and excluding them would report
+    # an efficiency the caller never experiences.
+    sweep_started = time.perf_counter()
     with ctx.Pool(
         processes=config.n_workers, initializer=_init_worker, initargs=init_args
     ) as pool:
@@ -255,7 +289,7 @@ def _sweep_parallel(
         # order so the accepted prefix is the one the sequential loop would have produced,
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
-        for flight_id, priced, reduced_cost, column in pool.imap(
+        for flight_id, priced, reduced_cost, column, task_s in pool.imap(
             _price_one, pricing_order, config.chunksize
         ):
             if not priced:
@@ -263,9 +297,11 @@ def _sweep_parallel(
                 # outstanding tasks; leaving the `with` block terminates the pool.
                 timeout_flight_id = flight_id
                 break
+            task_total_s += task_s
             flight_ids.append(flight_id)
             reduced_costs.append(float(reduced_cost))
             columns.append(column)
     return SweepResult(
-        tuple(flight_ids), tuple(reduced_costs), tuple(columns), timeout_flight_id
+        tuple(flight_ids), tuple(reduced_costs), tuple(columns), timeout_flight_id,
+        task_total_s, time.perf_counter() - sweep_started,
     )

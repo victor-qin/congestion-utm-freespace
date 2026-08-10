@@ -32,8 +32,9 @@ _loaded = Path(freespace_sim.__file__).resolve()
 if REPO_ROOT not in _loaded.parents:
     raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
 
-from freespace_sim.planner.colgen import pricing as _pricing  # noqa: E402
+from freespace_sim.planner.colgen import pricing as _pricing, solver as _solver  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
+from freespace_sim.planner.colgen.pricing import PricingTimeout  # noqa: E402
 from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
@@ -46,17 +47,43 @@ _RSS_SCALE = 2**20 if sys.platform == "darwin" else 1024
 # is false and compiling it properly becomes a real lever rather than a dead end.  A
 # fallback is silent by construction, which is exactly how a 5-7x regression hid for a
 # whole issue once before.
-_FEASIBLE = {"proved": 0, "fell_back": 0}
+_FEASIBLE = {"proved": 0, "fell_back": 0, "timed_out": 0}
 _REAL_FEASIBLE_COMPILED = _pricing._feasible_compiled
 
 
 def _counting_feasible_compiled(*args, **kwargs):
-    out = _REAL_FEASIBLE_COMPILED(*args, **kwargs)
+    try:
+        out = _REAL_FEASIBLE_COMPILED(*args, **kwargs)
+    except PricingTimeout:
+        # A search cut off inside the kernel still REACHED the kernel.  Counting only
+        # returns reported "2/2 reached the kernel" at 500 flights and "0/0" at 1000,
+        # when in truth 170 of 202 greedy searches had entered it and 168 were cut off
+        # by their per-flight slice -- i.e. the exact opposite of what it appeared to say.
+        _FEASIBLE["timed_out"] += 1
+        raise
     _FEASIBLE["fell_back" if out is _pricing._UNPROVED else "proved"] += 1
     return out
 
 
 _pricing._feasible_compiled = _counting_feasible_compiled
+
+
+def _budgeted_greedy(budget_s: float):
+    """Replace the greedy's deadline, the one thing its wall-clock budget controls.
+
+    ``greedy_budget_s = min(60.0, 0.55 * time_limit_s)`` is a literal in ``solver.py``, so
+    no parameter can lift it -- and at 500 flights that 60 s is split across up to 256
+    candidates, giving each ~0.23 s, well under one density search.  Measuring what the
+    greedy finds when it is not starved needs this seam.
+    """
+
+    real = _solver._greedy_feasible_selection
+
+    def _wrapped(*args, **kwargs):
+        kwargs["deadline"] = time.monotonic() + budget_s
+        return real(*args, **kwargs)
+
+    _solver._greedy_feasible_selection = _wrapped
 
 
 def _rss_mb(who) -> float:
@@ -73,8 +100,14 @@ def main() -> int:
     ap.add_argument("--solver", default="highs")
     ap.add_argument("--gap-metric", default="cost")
     ap.add_argument("--ladder", type=int, default=0)
+    ap.add_argument(
+        "--greedy-budget-s", type=float, default=None,
+        help="Override the greedy's hardcoded min(60, 0.55*time_limit_s) wall clock.",
+    )
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if args.greedy_budget_s is not None:
+        _budgeted_greedy(args.greedy_budget_s)
 
     spec = get_scenario(args.scenario)
     cfg = spec.config()
@@ -109,17 +142,28 @@ def main() -> int:
     def on_iteration(state: dict) -> None:
         for key, value in (state.get("stage_s") or {}).items():
             stages[key] += float(value)
+        sweep_s = float(state["sweep_s"])
+        task_s = float(state.get("sweep_task_total_s") or 0.0)
+        # Against ONE worker when sequential, so the sequential arm reads 100% rather than
+        # 1/n -- it is the denominator, not a degenerate pool.
+        lanes = max(1, args.workers)
+        efficiency = task_s / (sweep_s * lanes) if sweep_s > 0 else 0.0
         per_iteration.append(
             {
                 "iteration": state["iteration"],
-                "sweep_s": round(float(state["sweep_s"]), 2),
+                "sweep_s": round(sweep_s, 2),
+                "sweep_task_total_s": round(task_s, 2),
+                "worker_efficiency": round(efficiency, 4),
+                "idle_worker_s": round(sweep_s * lanes - task_s, 2),
                 "columns": state["columns"],
                 "rc_n_positive": state["rc_n_positive"],
                 "dual_nonzero": state["dual_nonzero"],
             }
         )
         print(
-            f"  it {state['iteration']:>3}  sweep={float(state['sweep_s']):8.1f}s  "
+            f"  it {state['iteration']:>3}  sweep={sweep_s:8.1f}s  "
+            f"work={task_s:9.1f}s  eff={efficiency * 100:5.1f}%  "
+            f"idle={sweep_s * lanes - task_s:8.1f}s  "
             f"cols={state['columns']:>6}  rc_n+={state['rc_n_positive']:>5}",
             flush=True,
         )
@@ -160,12 +204,16 @@ def main() -> int:
     for name, value in breakdown:
         print(f"{name:32} {value:10.2f} {value / wall * 100:7.1f}%")
     print(f"{'TOTAL':32} {wall:10.2f} {100.0:7.1f}%")
-    total_feasible = _FEASIBLE["proved"] + _FEASIBLE["fell_back"]
+    total_feasible = (
+        _FEASIBLE["proved"] + _FEASIBLE["fell_back"] + _FEASIBLE["timed_out"]
+    )
     if total_feasible:
         print(
-            f"\ngreedy feasible search: {_FEASIBLE['proved']}/{total_feasible} reached the "
-            f"kernel, {_FEASIBLE['fell_back']} fell back to Python "
-            f"({_FEASIBLE['fell_back'] / total_feasible * 100:.1f}%)"
+            f"\ngreedy feasible search: {total_feasible} reached the kernel -- "
+            f"{_FEASIBLE['proved']} proved, {_FEASIBLE['fell_back']} fell back to Python "
+            f"({_FEASIBLE['fell_back'] / total_feasible * 100:.1f}%), "
+            f"{_FEASIBLE['timed_out']} cut off by their per-flight slice "
+            f"({_FEASIBLE['timed_out'] / total_feasible * 100:.1f}%)"
         )
 
     if stages:
@@ -185,6 +233,8 @@ def main() -> int:
         "greedy_completed": stats.get("initial_greedy_completed"),
         "feasible_search_proved": _FEASIBLE["proved"],
         "feasible_search_fell_back": _FEASIBLE["fell_back"],
+        "feasible_search_timed_out": _FEASIBLE["timed_out"],
+        "greedy_budget_s": args.greedy_budget_s,
         "ip_status": stats.get("ip_status"),
         "ip_skipped": stats.get("ip_skipped"),
         "rss_self_mb": round(_rss_mb(resource.RUSAGE_SELF), 1),

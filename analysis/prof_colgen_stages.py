@@ -55,6 +55,7 @@ from freespace_sim.planner.colgen import pricing as pricing_mod  # noqa: E402
 from freespace_sim.planner.colgen import pricing_pool as pricing_pool_mod  # noqa: E402
 from freespace_sim.planner.colgen import solver as solver_mod  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
+from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -151,6 +152,15 @@ def main() -> int:
         help="skip the cProfile pass. Halves the run and loses only the function ranking; "
              "the stage table is unaffected either way.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="fan the pricing sweep across N worker processes (0 = in-process). READ THE "
+             "WARNING THIS PRINTS: neither the stage timers nor cProfile cross a process "
+             "boundary, so above 0 the whole sweep becomes invisible to both and what is "
+             "left is a profile of the SERIAL side only. Useful for exactly that -- what "
+             "the parent still does while the pool works -- and misleading for anything "
+             "else.",
+    )
     parser.add_argument("--top", type=int, default=25)
     args = parser.parse_args()
 
@@ -173,14 +183,68 @@ def main() -> int:
         gap_metric=args.gap_metric,
     )
 
+    parallel = (
+        ParallelPricingConfig(n_workers=args.workers) if args.workers else None
+    )
+
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
-          f"{args.solver} gap={args.gap_metric} (fixed work, no clock)")
+          f"{args.solver} gap={args.gap_metric} workers={args.workers} "
+          f"(fixed work, no clock)")
+    if args.workers:
+        print(
+            "WARNING   the stage timers and cProfile below cover THIS PROCESS ONLY. With a\n"
+            "          worker pool the entire pricing sweep runs elsewhere, so it will not\n"
+            "          appear -- read the stage table as the serial tail, not as the solve.\n"
+            "          The per-iteration table is unaffected and is the point of this mode."
+        )
+
+    # Per-iteration record.  The stage table says where time went; this says what each
+    # iteration BOUGHT, which is a different question and the one a stage total cannot
+    # answer -- an iteration that costs 300 s and closes the gap is not the same as one
+    # that costs 300 s and does not.
+    iteration_rows: list[dict] = []
+
+    def _record(state: dict) -> None:
+        sweep_s = float(state.get("sweep_s") or 0.0)
+        task_s = float(state.get("sweep_task_total_s") or 0.0)
+        lanes = max(1, args.workers)
+        iteration_rows.append({
+            "iteration": state.get("iteration"),
+            "lp_objective": state.get("lp_objective"),
+            "lp_gap_revenue": state.get("lp_gap_revenue"),
+            "lp_gap_cost": state.get("lp_gap_cost"),
+            "heuristic_gap_cost": state.get("heuristic_gap_cost"),
+            "columns": state.get("columns"),
+            "columns_added": state.get("columns_added"),
+            "rc_n_positive": state.get("rc_n_positive"),
+            "dual_nonzero": state.get("dual_nonzero"),
+            "sweep_s": sweep_s,
+            "sweep_task_total_s": task_s,
+            "efficiency": task_s / (sweep_s * lanes) if sweep_s > 0 else None,
+        })
 
     install_timers()
     started = time.perf_counter()
-    result = ColGenSolver().solve(requests, cfg, static_terms, params)
+    result = ColGenSolver().solve(
+        requests, cfg, static_terms, params, on_iteration=_record, parallel=parallel
+    )
     wall = time.perf_counter() - started
+
+    if iteration_rows:
+        print("\n--- PER ITERATION ---")
+        print(f"{'it':>3} {'lp_objective':>16} {'gap_revenue':>12} {'gap_cost':>12} "
+              f"{'cols':>7} {'+add':>6} {'rc_n+':>6} {'duals':>7} {'sweep_s':>9} {'eff':>6}")
+        for row in iteration_rows:
+            efficiency = row["efficiency"]
+            print(
+                f"{row['iteration']:>3} {row['lp_objective']:>16.10g} "
+                f"{row['lp_gap_revenue']:>12.4g} {row['lp_gap_cost']:>12.4g} "
+                f"{row['columns']:>7} {row['columns_added']:>6} "
+                f"{row['rc_n_positive']:>6} {row['dual_nonzero']:>7} "
+                f"{row['sweep_s']:>9.1f} "
+                f"{'n/a' if efficiency is None else format(efficiency * 100, '5.1f')}"
+            )
 
     print(f"\nWALL {wall:.2f}s   pricing {result.stats['pricing_wall_s']:.2f}s "
           f"({100 * result.stats['pricing_wall_s'] / wall:.1f}%)   "

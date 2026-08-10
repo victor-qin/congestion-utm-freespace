@@ -117,6 +117,13 @@ def main() -> int:
              "reserve from this, so it must be a finite number.",
     )
     parser.add_argument("--gap-metric", default="cost", choices=("cost", "revenue"))
+    parser.add_argument(
+        "--ip-gap", type=float, default=None,
+        help="`ColGenParams.ip_gap` (default 1e-3). Pass 0 to FORCE the final MILP: the "
+             "solver skips it entirely when the rounding heuristic is already provably "
+             "within this gap of the LP bound, which is correct but leaves a trace with "
+             "`ip_status='skipped'` and no MILP to study.",
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -144,6 +151,7 @@ def main() -> int:
         max_iterations=args.max_iterations,
         time_limit_s=args.time_limit_s,
         gap_metric=args.gap_metric,
+        **({} if args.ip_gap is None else {"ip_gap": args.ip_gap}),
     )
 
     header = {

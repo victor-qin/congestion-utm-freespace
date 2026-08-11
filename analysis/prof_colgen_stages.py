@@ -204,6 +204,17 @@ def main() -> int:
              "the parent still does while the pool works -- and misleading for anything "
              "else.",
     )
+    parser.add_argument(
+        "--chunksize", type=int, default=1,
+        help="tasks handed to a worker at a time (`pool.imap`'s third argument). The "
+             "default of 1 is almost certainly right here and raising it is a trap: "
+             "chunking amortizes DISPATCH, and a pricing task ships one int in and ~14 KB "
+             "out against tens of seconds of compute, so there is nothing to amortize. "
+             "What it costs instead is load balance -- `mp.Pool` pre-partitions the "
+             "iterable, per-flight cost varies several-fold, and n/chunksize chunks across "
+             "n_workers lanes leaves nothing to rebalance a straggler against. Exposed so "
+             "that claim can be MEASURED rather than asserted.",
+    )
     parser.add_argument("--top", type=int, default=25)
     args = parser.parse_args()
 
@@ -227,13 +238,15 @@ def main() -> int:
     )
 
     parallel = (
-        ParallelPricingConfig(n_workers=args.workers) if args.workers else None
+        ParallelPricingConfig(n_workers=args.workers, chunksize=args.chunksize)
+        if args.workers
+        else None
     )
 
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
           f"{args.solver} gap={args.gap_metric} workers={args.workers} "
-          f"(fixed work, no clock)")
+          f"chunksize={args.chunksize} (fixed work, no clock)")
     if args.workers:
         print(
             "WARNING   the stage timers and cProfile below cover THIS PROCESS ONLY. With a\n"

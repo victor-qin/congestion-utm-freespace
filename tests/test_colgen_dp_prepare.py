@@ -444,6 +444,34 @@ def test_forbidden_counts_an_in_universe_row_it_cannot_number():
     assert packed.n_unmapped == 1 and packed.n_set == 0
 
 
+def test_forbidden_bits_are_read_only_on_every_path_including_the_empty_one():
+    """Mutability is part of the numba TYPE, so an inconsistent flag costs a compile.
+
+    `array(uint64, 1d, C)` and `readonly array(uint64, 1d, C)` are two different signatures
+    of `_price_dag`. A solve sees both shapes -- the sweep passes an empty exclusion set and
+    repair passes a populated one -- so if the empty fast path returned a writable array the
+    kernel would compile a SECOND specialization, against the solve's own deadline.
+    Reproduced before the fix by handing the empty path a writable copy: `_price_dag`
+    signatures went 1 -> 2.
+
+    The flag, not the contents, is the contract here: an empty bitset forbids nothing on
+    either path, so this can never be caught by asserting on behaviour.
+    """
+
+    cfg = _cfg()
+    fg = _plain_graph(cfg)
+    topo = prepare_topology(fg, cfg)
+    rows = prepare_rows(fg, cfg, topo)
+
+    empty = prepare_forbidden(frozenset(), fg, rows, topo)
+    cell = (int(topo.cell_q[0]), int(topo.cell_r[0]))
+    populated = prepare_forbidden(frozenset({RowKey.cell(cell, 0, topo.min_step)}), fg, rows, topo)
+
+    assert empty.n_set == 0 and populated.n_set == 1, "the fixture stopped covering both paths"
+    assert not empty.bits.flags.writeable, "empty path returns a writable bitset"
+    assert not populated.bits.flags.writeable
+
+
 # ------------------------------------------------------------------------ duals
 
 

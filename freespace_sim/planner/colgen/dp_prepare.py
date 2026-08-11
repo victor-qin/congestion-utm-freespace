@@ -623,6 +623,12 @@ def prepare_forbidden(
     n_words = (rows.n_rows + 63) // 64
     bits = np.zeros(max(1, n_words), dtype=np.uint64)
     if not forbidden_rows:
+        # Read-only on THIS path too, and it is not tidiness: numba encodes mutability in
+        # the type, so `array(uint64, 1d, C)` and `readonly array(uint64, 1d, C)` are two
+        # different signatures of `_price_dag`.  A solve sees both -- the sweep passes an
+        # empty set, repair passes a populated one -- so leaving this writable makes the
+        # kernel compile a SECOND time, against the solve's own deadline.
+        bits.setflags(write=False)
         return PreparedForbidden(bits=bits)
 
     cell_index = {

@@ -20,8 +20,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import select
+import shutil
 import sys
+import tempfile
+import threading
 import time
+from pathlib import Path
 
 from freespace_sim import metrics, runs
 from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
@@ -56,6 +62,84 @@ def _kernel_status(planner_name: str) -> str:
     except ImportError:
         return ("REFERENCE FALLBACK — numba unavailable, ~5-7x slower search. "
                 "Run via plain `uv run` (numba is in tool.uv default-groups) or `uv sync`.")
+
+
+class _StderrTee:
+    """Copy everything written to fd 2 into a file, without taking it off the terminal.
+
+    Exists because the compiled pricing path's diagnosis lives only on stderr. A run can
+    report ``kernel_fell_back: 37`` and not say whether the answer is to install numba,
+    raise ``MAX_LABEL_CAPACITY``, or widen the time limit — and those call for opposite
+    responses, which is the whole reason ``pricing._warn_budget_growth`` distinguishes
+    them. Cluster runs are the case with no terminal to read, and ``[[run-archive-workflow]]``
+    syncs the run FOLDER, so a file inside it is archived while a ``slurm-*.out`` in the
+    submit directory is not.
+
+    **fd-level, and not a ``sys.stderr`` swap.** The pricing sweep runs in *spawned*
+    workers, which inherit file descriptors but not Python objects — and a worker never
+    runs ``basicConfig``, which is exactly why those warnings are ``print(file=sys.stderr)``
+    rather than ``logging`` in the first place. Replacing ``sys.stderr`` would capture the
+    parent and silently miss every worker, i.e. the half that matters.
+
+    **The pump stops on a flag, never on EOF.** ``multiprocessing`` launches its resource
+    tracker with ``sys.stderr.fileno()`` in ``fds_to_pass`` and that child outlives the
+    parent (``resource_tracker._launch``), so from the first pool onward a process we do
+    not control holds a duplicate of this pipe's write end for the rest of the run.
+    Draining until ``read()`` returns ``b''`` would block forever *after the solve
+    finished*, on precisely the parallel runs this exists to instrument. Restoring fd 2
+    first is necessary and nowhere near sufficient.
+    """
+
+    __slots__ = ("path", "_read_fd", "_saved_fd", "_stop", "_thread")
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._read_fd, write_fd = os.pipe()
+        self._saved_fd = os.dup(2)
+        os.dup2(write_fd, 2)
+        os.close(write_fd)
+        self._stop = threading.Event()
+        # Daemon on purpose: the stop flag is what ends this thread, so if it ever wedges
+        # the failure should be a lost tail rather than an interpreter that will not exit.
+        self._thread = threading.Thread(target=self._pump, name="stderr-tee", daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        with open(self.path, "wb") as sink:
+            while True:
+                # Polled rather than blocking, because this thread must never be the reason
+                # a writer stalls: a full 64 KB pipe blocks everyone writing to fd 2,
+                # workers included, and a worker that blocks in a warning hangs the sweep.
+                ready, _, _ = select.select([self._read_fd], [], [], 0.2)
+                if ready:
+                    chunk = os.read(self._read_fd, 65536)
+                    if chunk:
+                        os.write(self._saved_fd, chunk)
+                        sink.write(chunk)
+                        sink.flush()
+                        continue
+                # Only once the pipe has nothing left AND shutdown was asked for, so the
+                # last warnings before teardown are not dropped.
+                if self._stop.is_set():
+                    return
+
+    def close(self) -> None:
+        """Restore fd 2, let the pump drain, and release both descriptors.
+
+        The order is the whole of it. Restoring *before* signalling means anything written
+        during teardown reaches the real stderr instead of a pipe nobody is reading; and
+        the descriptors are released only once the pump has actually stopped, because
+        closing one it is still selecting on would hand its number to the next ``open()``.
+        """
+
+        os.dup2(self._saved_fd, 2)
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            sys.stderr.write(f"stderr tee did not stop; {self.path} may be truncated\n")
+            return
+        os.close(self._read_fd)
+        os.close(self._saved_fd)
 
 
 def spec_from_args(args):
@@ -151,6 +235,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="capture observer-only congestion telemetry (filed-but-rejected corridors, "
                         "conflict_filed culprits, per-hub metadata, end-of-run walls) into extra parquets")
     p.add_argument("--no-progress", action="store_true", help="silence the live progress line")
+    p.add_argument("--no-run-log", action="store_true",
+                   help="skip capturing stderr into the run folder as run.log. The capture is an "
+                        "fd-level tee so that SPAWNED pricing workers are covered too, which is where "
+                        "the compiled-path fallback warnings come from; turn it off for a debugger or "
+                        "anything else that dislikes having fd 2 redirected under it")
     p.add_argument("--mode", choices=("sequential", "exact", "relaxed"), default="sequential",
                    help="execution strategy for the whole simulation (issue #8 Track A). "
                         "sequential (default): the classic serial FCFS loop. exact: speculative "
@@ -320,7 +409,34 @@ def colgen_params_from_args(args, planner: str):
 
 def main() -> None:
     args = parse_args()
+    # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
+    # Installed before any work, so the invocation banner is inside the capture, and torn down
+    # in a `finally` so a run that DIES still leaves its log somewhere findable -- which is the
+    # case with the most to say.
+    tee = None if args.no_run_log else _StderrTee(Path(tempfile.mkdtemp()) / "run.log")
+    folder = None
+    try:
+        folder = _execute(args)
+    finally:
+        if tee is not None:
+            _archive_log(tee, folder)
 
+
+def _archive_log(tee: _StderrTee, folder: Path | None) -> None:
+    """Move the captured stderr into the run folder, or say where it was left."""
+
+    tee.close()
+    if folder is None:
+        # No folder to put it in: the run never reached `save_run`.  Keep the file and name
+        # it, rather than deleting the only record of why.
+        sys.stderr.write(f"run failed before save_run; stderr log kept at {tee.path}\n")
+        return
+    shutil.move(tee.path, folder / "run.log")
+    os.rmdir(tee.path.parent)
+
+
+def _execute(args) -> Path:
     spec = spec_from_args(args)
     # to_json_dict, not asdict: the latter loses every tuple to a JSON list and leaves `demand` a
     # plain dict, so the archived recipe could not be rebuilt. See ScenarioSpec.from_json_dict.
@@ -328,8 +444,6 @@ def main() -> None:
     cfg = spec.config()
     demand = spec.demand_model()
     tag = args.tag or spec.name
-    # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
     log.info("invocation: python -m experiments.run %s", " ".join(sys.argv[1:]) or "(no arguments)")
     log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h planner-envelope=%ss seed=%s",
              spec.name, tag, cfg.planner, spec.demand.pattern, cfg.region_size_m,
@@ -398,6 +512,7 @@ def main() -> None:
              st.get("window_lo", 0), st.get("window_hi", 0),
              st.get("mean_total_delay_s", 0), summ.get("mean_total_delay_s", 0))
     print(folder)   # LAST stdout line: the run folder, for `FOLDER=$(... | tail -1)`
+    return folder
 
 
 if __name__ == "__main__":

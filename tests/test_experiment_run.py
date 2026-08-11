@@ -1,10 +1,21 @@
-"""Pure CLI-to-ScenarioSpec override tests for the execute entry point."""
+"""CLI-to-ScenarioSpec override tests for the execute entry point, plus its stderr capture."""
+
+import multiprocessing as mp
+import os
+import sys
+import time
 
 import pytest
 
 import experiments.run as run_module
 from experiments.run import colgen_params_from_args, parse_args, spec_from_args
 from freespace_sim.scenarios import SCENARIOS, with_overrides
+
+
+def _shout(message: str) -> None:
+    """Module level, because a `spawn` child has to import the target rather than inherit it."""
+
+    print(message, file=sys.stderr)
 
 
 def _args(scenario: str, *extra: str):
@@ -213,3 +224,78 @@ def test_colgen_flags_are_still_refused_when_the_scenario_picks_another_planner(
     with pytest.raises(SystemExit) as exc:
         parse_args(["--scenario", "metro_uniform", "--colgen-time-limit", "600"])
     assert exc.value.code == 2
+
+
+# --------------------------------------------------------------------------- run.log capture
+
+
+def test_the_stderr_tee_copies_to_both_the_terminal_and_the_file(tmp_path, capfd):
+    """Copies, not moves: losing the terminal would break every interactive run.
+
+    Writes to the DESCRIPTOR rather than through ``sys.stderr``, because pytest replaces the
+    latter with an object of its own and the message would then never reach fd 2 — which
+    would test pytest's capture instead of this one. Under the real entry point the two are
+    the same file.
+    """
+
+    tee = run_module._StderrTee(tmp_path / "run.log")
+    try:
+        os.write(2, b"visible and captured\n")
+    finally:
+        tee.close()
+
+    assert "visible and captured" in (tmp_path / "run.log").read_text()
+    assert "visible and captured" in capfd.readouterr().err
+
+
+def test_the_stderr_tee_captures_a_spawned_child(tmp_path):
+    """The half that matters: pricing warnings come from SPAWNED workers, not the parent.
+
+    A `sys.stderr` swap would pass the parent test above and fail this one, which is why the
+    capture is at the descriptor level.
+    """
+
+    tee = run_module._StderrTee(tmp_path / "run.log")
+    try:
+        ctx = mp.get_context("spawn")
+        process = ctx.Process(target=_shout, args=("from a spawned child",))
+        process.start()
+        process.join(timeout=60)
+    finally:
+        tee.close()
+
+    assert "from a spawned child" in (tmp_path / "run.log").read_text()
+
+
+def test_the_stderr_tee_closes_after_a_spawn_pool_has_run(tmp_path):
+    """`close()` must not wait for EOF on the pipe, because EOF never comes.
+
+    `multiprocessing` launches its resource tracker with `sys.stderr.fileno()` in
+    `fds_to_pass`, and that child outlives the parent — so from the first pool onward,
+    something we do not control holds a duplicate of the tee's write end for the rest of the
+    run. A pump that drained until `read()` returned `b''` would block here forever, *after*
+    the solve finished, on exactly the `--colgen-workers N` runs the capture exists for.
+    Verified directly: after this teardown a `select` on the read end still reports nothing
+    ready and no EOF.
+
+    A plain child-process test cannot reach this — an ordinary child exits and releases the
+    descriptor — which is why it is a separate case from the one above.
+
+    No external timeout marker: ``close()`` joins with a 5 s cap and the pump is a daemon, so
+    the regression is a five-second stall rather than a hang. The elapsed assertion below is
+    what distinguishes "stopped because it was told to" from "stopped because it gave up".
+    """
+
+    tee = run_module._StderrTee(tmp_path / "run.log")
+    try:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(1) as pool:
+            assert pool.map(int, ["7"]) == [7]
+    finally:
+        started = time.monotonic()
+        tee.close()
+        elapsed = time.monotonic() - started
+
+    # The pump polls at 0.2 s and `close()` joins with a 5 s timeout, so anything near the
+    # timeout means it stopped because it gave up rather than because it was told to.
+    assert elapsed < 3.0, f"close() took {elapsed:.1f}s — the pump is waiting on EOF"

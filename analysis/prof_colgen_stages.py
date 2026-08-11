@@ -24,11 +24,21 @@ under ``parallel=`` everything inside the sweep happens in workers and is invisi
 the parent would show only the greedy, the LP and canonicalization. A sequential sweep is
 exactly one worker's workload, which is the thing worth ranking anyway.
 
+**Read fallbacks off ``--- KERNEL ---``, never off the stderr warnings.**
+``pricing._warn_budget`` guards on module globals, so it fires once per PROCESS per kind,
+and the pool is rebuilt per sweep -- the warning count is therefore roughly
+``n_workers x kinds x iterations`` and carries no information about how many flights
+declined. ``kernel_fell_back`` is the only figure valid in both modes.
+
 Examples:
 
     uv run python analysis/prof_colgen_stages.py --flights 12 --iterations 3
     uv run python analysis/prof_colgen_stages.py --scenario density_faa_wing_zipline \
         --flights 20 --iterations 2 --no-cprofile
+
+    # how far past the shipped label ceiling does a workload actually reach?
+    uv run python analysis/prof_colgen_stages.py --scenario density_faa_wing_zipline \
+        --flights 12 --iterations 2 --no-cprofile --max-label-log2 26
 """
 from __future__ import annotations
 
@@ -215,8 +225,32 @@ def main() -> int:
              "n_workers lanes leaves nothing to rebalance a straggler against. Exposed so "
              "that claim can be MEASURED rather than asserted.",
     )
+    parser.add_argument(
+        "--max-label-log2", type=int, default=None,
+        help="override `dp_kernel.MAX_LABEL_CAPACITY` to 2**N for this run (default: leave "
+             "the shipped 1<<25 alone). Answer-neutral by the same argument the constant "
+             "carries -- a budget bounds work, never the search -- so this changes how many "
+             "flights DECLINE and fall back to the Python reference, not what any of them "
+             "returns. Read as a knob for measuring how far past the shipped ceiling a "
+             "workload actually reaches. Labels cost ~40 B each across the nine arrays, so "
+             "N=26 is ~2.7 GB per worker and N=27 is ~5.4 GB.",
+    )
+    parser.add_argument(
+        "--max-log2cap", type=int, default=None,
+        help="override `dp_kernel.MAX_LOG2CAP` (dominance table ceiling, shipped 26). "
+             "Same answer-neutrality argument; ~32 B per slot.",
+    )
     parser.add_argument("--top", type=int, default=25)
     args = parser.parse_args()
+
+    # Patched on the MODULE, which works because both ceilings are read as module globals
+    # inside the host `price_dag`/`find_feasible_dag` retry loops -- not inside the `@njit`
+    # kernels, which could not see a rebound global anyway.
+    if dp_kernel_mod is not None:
+        if args.max_label_log2 is not None:
+            dp_kernel_mod.MAX_LABEL_CAPACITY = 1 << args.max_label_log2
+        if args.max_log2cap is not None:
+            dp_kernel_mod.MAX_LOG2CAP = args.max_log2cap
 
     spec = get_scenario(args.scenario)
     cfg = spec.config()
@@ -247,6 +281,11 @@ def main() -> int:
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
           f"{args.solver} gap={args.gap_metric} workers={args.workers} "
           f"chunksize={args.chunksize} (fixed work, no clock)")
+    if dp_kernel_mod is not None:
+        # Printed unconditionally, not only when overridden: an arm that declines is only
+        # interpretable against the ceiling it was run at, and these are now runtime values.
+        print(f"ceilings  MAX_LABEL_CAPACITY={dp_kernel_mod.MAX_LABEL_CAPACITY:,} "
+              f"MAX_LOG2CAP={dp_kernel_mod.MAX_LOG2CAP}")
     if args.workers:
         print(
             "WARNING   the stage timers and cProfile below cover THIS PROCESS ONLY. With a\n"
@@ -306,6 +345,31 @@ def main() -> int:
           f"({100 * result.stats['pricing_wall_s'] / wall:.1f}%)   "
           f"iters={result.stats['iterations']} cols={result.stats['n_columns']} "
           f"obj={result.stats.get('objective')!r}")
+
+    # THE FALLBACK LINE.  `kernel_fell_back` is the only number here that is authoritative in
+    # BOTH modes: `_price_one` ships each task's delta, so a pooled sweep's declines are
+    # summed back into the parent.  Do not read fallbacks off the stderr warnings instead --
+    # `pricing._warn_budget` guards on module globals (`_kernel_restart_warned`,
+    # `_kernel_budget_warned`), so it warns ONCE PER PROCESS PER KIND, and the pool is rebuilt
+    # per sweep, so the warning COUNT is ~n_workers x kinds x iterations and says nothing
+    # about how many flights were affected.
+    #
+    # `label_restarts` / `budget_declined` come from this PROCESS's `_KERNEL_STATS` and are
+    # therefore parent-only: meaningful sequentially, structurally zero under a pool because
+    # `SweepResult` does not carry them yet (issue #86's plumbing). Labelled as such rather
+    # than printed as a flat zero that reads like good news.
+    kernel_priced = result.stats.get("kernel_priced", 0)
+    kernel_fell_back = result.stats.get("kernel_fell_back", 0)
+    parent_stats = pricing_mod.kernel_stats()
+    scope = "parent-only, N/A under a pool" if args.workers else "this process"
+    print(
+        f"\n--- KERNEL ---\n"
+        f"priced {kernel_priced}  fell_back {kernel_fell_back} "
+        f"({100.0 * kernel_fell_back / kernel_priced if kernel_priced else 0.0:.1f}%)"
+        f"   [aggregated across workers]\n"
+        f"label_restarts {parent_stats.get('label_restarts', 0)}  "
+        f"budget_declined {parent_stats.get('budget_declined', 0)}   [{scope}]"
+    )
 
     print("\n--- STAGE TIMERS (authoritative for magnitude) ---")
     print(f"{'stage':44s} {'calls':>9s} {'s':>9s} {'%wall':>7s}")

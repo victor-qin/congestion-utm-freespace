@@ -55,10 +55,16 @@ _ARC_FIRST_LAST = 1 << 3
 _ALL_ARC_ROLES = _ARC_INTERNAL | _ARC_FIRST | _ARC_LAST | _ARC_FIRST_LAST
 _MAX_CERTIFIED_COLUMNS = 2
 # Distinct `(origin, step, timing_steps)` endpoint claim sets kept per graph.  The
-# reachable key space is bounded by `2 * n_steps * (max_air_hops + 1)`, which is small on
-# `colgen_test` (1,511 measured over three iterations) but grows with the horizon, and each
-# entry is a frozenset of freshly built `RowKey`s.  So this is a memory bound, not a
-# correctness one: an eviction only costs the recompute it was avoiding.
+# reachable key space is bounded by `2 * n_steps * (max_air_hops + 1)`, which grows with the
+# horizon, and each entry is a frozenset of freshly built `RowKey`s.  So this is a memory
+# bound, not a correctness one: an eviction only costs the recompute it was avoiding.
+#
+# The 1,511 distinct keys `pricing._endpoint_claims` quotes are NOT the figure to size this
+# against: that count is over `colgen_test`'s first twelve flights, so it spans twelve
+# graphs, while this cap is enforced on one graph's `_search_cache`.  The per-graph number
+# is far smaller there and larger on density, i.e. this constant is not yet calibrated
+# against the quantity it actually bounds.  Answer-neutral, so tuning it is free -- see
+# issue #87.
 _MAX_ENDPOINT_CLAIMS = 2048
 
 

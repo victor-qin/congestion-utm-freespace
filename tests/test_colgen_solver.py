@@ -39,12 +39,15 @@ from freespace_sim.planner.colgen.pricing import (
     price_flight,
     seed_column,
 )
+from freespace_sim.planner.colgen.objective import DELAY_MODEL
 from freespace_sim.planner.colgen.solver import (
     ColGenSolver,
+    _add_departure_ladder,
     _fixed_loads,
     _greedy_feasible_selection,
     _initial_feasible_selection,
     _shift_claims,
+    _shift_column,
 )
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import (
@@ -1005,6 +1008,82 @@ def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
     )
     if priced is not None:
         assert column_claims(priced, graph, cfg) == priced.claims
+
+
+class _ColumnRecorder:
+    """Everything `_add_departure_ladder` needs from a master, and nothing else."""
+
+    def __init__(self) -> None:
+        self.columns: list[Column] = []
+
+    def add_column(self, column: Column) -> None:
+        self.columns.append(column)
+
+
+def test_the_departure_ladder_offers_clock_translations_up_to_the_ground_budget():
+    """Every rung is the same route later, and the ground budget bounds how many there are.
+
+    `max_ground_delay_s=48` at `dt_s=4` is twelve steps, so a seed departing at `base_step`
+    has exactly twelve legal retimes however many are asked for.  The delay assertion is
+    what makes these *translations* rather than columns: `_shift_column` may only move the
+    ground term, so the air term has to survive `_canonical_column` untouched.
+    """
+
+    cfg = _cfg(max_ground_delay_s=48.0)
+    request = _request(1, (-4, 0), (4, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = seed_column(graph, cfg)
+    assert seed.departure_step == graph.base_step
+
+    master = _ColumnRecorder()
+    added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, 20)
+
+    assert added == len(master.columns) == 12
+    assert [c.departure_step for c in master.columns] == list(range(1, 13))
+    for column in master.columns:
+        delta = column.departure_step - seed.departure_step
+        assert column.cell_path == seed.cell_path
+        assert column.delay_s == pytest.approx(seed.delay_s + delta * cfg.dt_s, abs=1e-9)
+        # The ladder feeds `master.add_column` directly, so an illegal rung is not caught
+        # anywhere downstream -- it is simply in the LP.
+        assert column_claims(column, graph, cfg) == column.claims
+
+    assert _add_departure_ladder(_ColumnRecorder(), seed, graph, cfg, DELAY_MODEL, 0) == 0
+
+
+def test_the_departure_ladder_stops_at_the_arrival_horizon_not_the_ground_budget():
+    """The second bound is load-bearing, and only a longer-than-nominal seed shows it.
+
+    `seed_column` walks the corridor and is not bounded by `max_air_hops`, so a detoured
+    seed arrives later than the graph sized itself for -- the same fixture as
+    `test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon`, where the seed is
+    22 hops against a 21-hop ceiling.  That pulls the last legal departure to 11 while the
+    ground budget still says 12, and a ladder that trusted `latest_departure_step` alone
+    would hand the master a column whose `_canonical_column` raises `ValueError: column
+    arrives at step 39, beyond graph maximum 38` -- during seeding, so the solve dies before
+    its first LP.
+    """
+
+    cfg = _cfg(max_ground_delay_s=48.0)
+    request = _request(1, (-10, 0), (10, 0), cfg)
+    static_terms = tuple(
+        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=0.0))
+        for index, cell in enumerate(((3, 1), (1, -1)))
+    )
+    graph = build_flight_graph(request, cfg, static_terms, _params(max_air_overrun_hops=1))
+    seed = seed_column(graph, cfg)
+    assert len(seed.cell_path) - 1 > graph.max_air_hops
+
+    master = _ColumnRecorder()
+    added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, 20)
+
+    assert added == 11 < graph.latest_departure_step
+    assert [c.departure_step for c in master.columns] == list(range(1, 12))
+    for column in master.columns:
+        assert column_claims(column, graph, cfg) == column.claims
+    # The step the ground budget would have allowed, and the arrival horizon does not.
+    with pytest.raises(ValueError, match="beyond graph maximum"):
+        column_claims(_shift_column(seed, graph.latest_departure_step, cfg), graph, cfg)
 
 
 def test_repair_finds_feasible_column_even_when_delay_exceeds_m():

@@ -781,6 +781,92 @@ def _shifted_seed_incumbent(
     return best
 
 
+def _bootstrap_incumbent(
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel,
+    *,
+    incumbent: tuple[float, Column] | None,
+    departures: int,
+    deadline: float | None = None,
+) -> tuple[float, Column] | None:
+    """Buy a real cutoff cheaply, by searching a prefix of the departure window.
+
+    The cutoff ``price_flight`` can assemble for free is not merely weak, it is
+    **structurally zero**, and that is a property of column generation rather than a defect
+    here.  ``seed_column``, ``_shifted_seed_incumbent`` and the master's ``known_column``
+    are all columns the master's pool already holds, and LP optimality over that pool forces
+    every pool column's reduced cost ``<= 0`` -- complementary slackness pins the basic one
+    at exactly ``0``.  Measured on ``density_faa_wing_zipline`` x12: the incumbent handed to
+    the search scores ``0.0000`` for all twelve flights in both sweeps, against optima of
+    8.5-20.5, and a flight's own previous priced column re-scored under the next duals gives
+    ``0.0`` or negative.  **So no reuse of anything already known can produce a positive
+    cutoff; the only source is a search.**
+
+    Cutoff quality is then the dominant lever on this search, which the tree measures from
+    several sides: 439x on one captured subproblem (:func:`price_flight`), 2.17x from
+    capping the completion envelope's length alone (:func:`_best_column`), and 98x on a
+    whole sweep under a perfect cutoff (``analysis/ab_colgen_oracle_cutoff.py``).
+
+    **Only the incumbent escapes.**  What comes back is fed to the real search as a cutoff
+    and nothing else; no bootstrap candidate reaches ``_certify_candidates``.  That
+    separation is load-bearing rather than tidy: a restricted search's labels compete for
+    dominance slots, and one of them evicting a survivor the unrestricted search would have
+    kept is how a prune stops being answer-neutral (``[[pruning-not-neutral-under-dominance]]``).
+
+    **It re-uses the two real searches rather than writing a third**, which is where its
+    safety comes from.  Every column either returns has already passed
+    ``_canonical_candidate``, so the score is certified achievable and pruning against it
+    cannot discard anything strictly better.  A bootstrap that invented its own scoring
+    could sit above the true optimum and discard it -- silently, with no crash and no
+    fallback, which is the one failure mode here that does not raise.
+
+    Returns the incumbent unchanged when it finds nothing better, so a bootstrap that
+    declines outright leaves the caller exactly where it was.
+    """
+
+    limit = fg.base_step + departures - 1
+    outcome = _best_column_compiled(
+        fg,
+        dual_view,
+        pi_f,
+        cfg,
+        benefit,
+        forbidden_rows,
+        incumbent=incumbent,
+        deadline=deadline,
+        model=model,
+        max_departure_step=limit,
+        record_budget=False,
+    )
+    if isinstance(outcome, Declined):
+        # Bounded by `departures` roots rather than the whole window, so the reference is
+        # affordable here in a way it is not for the main search.
+        outcome = _best_column(
+            fg,
+            dual_view,
+            pi_f,
+            cfg,
+            benefit,
+            forbidden_rows,
+            seed=False,
+            incumbent=incumbent,
+            deadline=deadline,
+            model=model,
+            max_departure_step=limit,
+        )
+    score, column = outcome
+    if column is None:
+        return incumbent
+    if incumbent is not None and score <= incumbent[0] + _SCORE_EPS:
+        return incumbent
+    return score, column
+
+
 def _benefit(params: Any) -> float:
     try:
         value = float(params.M)
@@ -1204,6 +1290,7 @@ def _best_column(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
+    max_departure_step: int | None = None,
 ) -> tuple[float, Column | None]:
     """Return the most negative-reduced-cost column, or ``(-inf, None)`` when none exists.
 
@@ -1213,6 +1300,12 @@ def _best_column(
     speed, and every pruning rule below is an argument that the discarded label cannot
     lead to a strictly better column.  ``incumbent`` warm-starts that pruning with an
     already-certified ``(reduced_cost, column)`` pair.
+
+    ``max_departure_step`` truncates the departure window.  This is the axis ``seed=True``
+    already restricts in its most degenerate form -- one departure -- so it generalizes a
+    bound this search has always had rather than adding one, and the compiled search takes
+    the same argument straight through to ``prepare_variants``.  Used by
+    :func:`_bootstrap_incumbent`.
     """
 
     _check_deadline(deadline)
@@ -1310,7 +1403,10 @@ def _best_column(
     if seed:
         departure_steps = (fg.base_step,)
     else:
-        departure_steps = range(fg.base_step, fg.latest_departure_step + 1)
+        last_departure_step = fg.latest_departure_step
+        if max_departure_step is not None:
+            last_departure_step = min(last_departure_step, max_departure_step)
+        departure_steps = range(fg.base_step, last_departure_step + 1)
 
     origin_leg_by_lane: dict[int | None, float] = {}
     origin_fold_lb_by_lane: dict[int | None, tuple[float, bool]] = {}
@@ -2087,6 +2183,8 @@ def _best_column_compiled(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
+    max_departure_step: int | None = None,
+    record_budget: bool = True,
 ) -> tuple[float, Column | None] | Declined:
     """``_best_column`` over the compiled search: ``(reduced_cost, column)``, or a reason.
 
@@ -2146,6 +2244,7 @@ def _best_column_compiled(
         model=model,
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
+        max_departure_step=max_departure_step,
     )
     if not variants.ok:
         # Unreachable today, and kept anyway.  `prepare_variants` has exactly two returns and
@@ -2157,8 +2256,18 @@ def _best_column_compiled(
         return Declined.TOPOLOGY if not topology.ok else Declined.ROWS
     pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
 
-    with fg._search_cache.lock:
-        budget = fg._search_cache.dag_budget
+    # `record_budget=False` skips BOTH halves of the graph's budget memo, and it has to be
+    # both.  A restricted search shares this cache with the unrestricted one that follows it,
+    # and would corrupt it in each direction: reading, a 4-departure bootstrap would allocate
+    # the FULL search's pool (up to `MAX_LABEL_CAPACITY`, ~1.34 GB) for a search that needs a
+    # sliver of it; writing, the memo would end up holding the bootstrap's tiny budget, and
+    # since the write below sits past the `status != OK` guard, a declining flight -- the one
+    # this is all for -- would keep that number and make every later iteration re-climb the
+    # ladder from it.  Answer-neutral either way; the cost is entirely in wasted work.
+    budget = None
+    if record_budget:
+        with fg._search_cache.lock:
+            budget = fg._search_cache.dag_budget
     sizes = {}
     if budget is not None:
         # What the last completed search on this graph needed.  The duals move every
@@ -2213,8 +2322,9 @@ def _best_column_compiled(
     if result.status != kernel.STATUS_OK:
         return _status_reason(kernel, result.status)
 
-    with fg._search_cache.lock:
-        fg._search_cache.dag_budget = result.budget
+    if record_budget:
+        with fg._search_cache.lock:
+            fg._search_cache.dag_budget = result.budget
 
     candidates = _dag_candidates(
         result,
@@ -2922,6 +3032,29 @@ def price_flight(
         )
         if incumbent is None or known_rc > incumbent[0] + _SCORE_EPS:
             incumbent = (known_rc, known_column)
+    # Everything folded in above is a column the master already holds, so LP optimality caps
+    # its reduced cost at 0 and the search would enter with no usable cutoff at all.  The
+    # bootstrap is the only way to a positive one -- see `_bootstrap_incumbent`.
+    #
+    # HERE, in the shared caller, and deliberately not inside the two searches.  `incumbent`
+    # is computed once and handed to `_best_column_compiled` and to the `_best_column`
+    # fallback below as the same object, so a bootstrap at this seam reaches BOTH by
+    # construction: whichever one runs explores the space the other would have.  Putting it
+    # in two bodies is how they drift, and the `Declined` contract -- that the compiled
+    # search explored exactly what the reference would -- is what would drift first.
+    if params.bootstrap_departures:
+        incumbent = _bootstrap_incumbent(
+            fg,
+            view,
+            pi_value,
+            cfg,
+            benefit,
+            forbidden,
+            model,
+            incumbent=incumbent,
+            departures=params.bootstrap_departures,
+            deadline=deadline,
+        )
     # The compiled search first, the reference when it cannot prove it ran to completion.
     # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
     # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of

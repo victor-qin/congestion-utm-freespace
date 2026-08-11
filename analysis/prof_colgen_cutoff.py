@@ -33,6 +33,9 @@ Every number here is per ``(sweep, flight)``:
 ``att``         ``DagResult.attempts``; >1 means a budget filled and the search restarted
                 from its first layer, discarding every certification it had paid for.
 ``status``      the kernel's verdict.  ``LABEL_LIMIT`` is the decline this issue is about.
+``boot_s``      time in the bootstrap (``--bootstrap-departures``), kept apart from the
+                search it informs; ``labels``/``roots``/``status`` describe the REAL search
+                only, since a shared row would let the second call overwrite the first.
 ``fallback_s``  time in ``_best_column``, the pure-Python reference, after a decline.
 
 Sequential only, for the same reason ``prof_colgen_stages`` is: none of this crosses a
@@ -140,6 +143,8 @@ def install_probes(carry_forward: bool = False) -> None:
             mid_rc=None,
             final_rc=None,
             roots=None,
+            bootstrap_s=0.0,
+            bootstrap_labels=0,
             labels=None,
             attempts=None,
             status=None,
@@ -169,31 +174,49 @@ def install_probes(carry_forward: bool = False) -> None:
     best_compiled = pricing_mod._best_column_compiled
 
     def timed_best_compiled(*args, incumbent=None, **kwargs):
-        CURRENT["entry_rc"] = -math.inf if incumbent is None else float(incumbent[0])
+        # Two compiled searches per flight once the bootstrap is on, and they must not share
+        # a row: these were plain assignments, so the main search's numbers silently
+        # overwrote the bootstrap's and the overhead being tuned for was invisible.
+        # `max_departure_step` is what tells them apart -- only the bootstrap restricts.
+        bootstrap = kwargs.get("max_departure_step") is not None
+        if not bootstrap:
+            CURRENT["entry_rc"] = -math.inf if incumbent is None else float(incumbent[0])
+        CURRENT["in_bootstrap"] = bootstrap
         started = time.perf_counter()
         try:
             return best_compiled(*args, incumbent=incumbent, **kwargs)
         finally:
-            CURRENT["search_s"] = time.perf_counter() - started
+            elapsed = time.perf_counter() - started
+            if bootstrap:
+                CURRENT["bootstrap_s"] += elapsed
+            else:
+                CURRENT["search_s"] = elapsed
+            CURRENT["in_bootstrap"] = False
 
     best_reference = pricing_mod._best_column
 
     def timed_best_reference(*args, **kwargs):
-        # `seed=True` is `seed_column`'s rare last-resort geodesic, not the decline
-        # fallback; charging it to `fallback_s` would report a fallback that never happened.
-        fallback = not kwargs.get("seed", False)
+        # `seed=True` is `seed_column`'s rare last-resort geodesic and `max_departure_step`
+        # is the bootstrap's own restricted reference; neither is the decline fallback, and
+        # charging either would report a fallback that never happened.
+        restricted = kwargs.get("max_departure_step") is not None
+        fallback = not kwargs.get("seed", False) and not restricted
         started = time.perf_counter()
         try:
             return best_reference(*args, **kwargs)
         finally:
-            if fallback and CURRENT:
-                CURRENT["fallback_s"] += time.perf_counter() - started
+            elapsed = time.perf_counter() - started
+            if CURRENT:
+                if fallback:
+                    CURRENT["fallback_s"] += elapsed
+                elif restricted:
+                    CURRENT["bootstrap_s"] += elapsed
 
     prepare_variants = dp_prepare_mod.prepare_variants
 
     def counted_prepare_variants(*args, **kwargs):
         variants = prepare_variants(*args, **kwargs)
-        if CURRENT:
+        if CURRENT and kwargs.get("max_departure_step") is None:
             CURRENT["roots"] = int(variants.departure_step.size)
         return variants
 
@@ -209,7 +232,9 @@ def install_probes(carry_forward: bool = False) -> None:
 
         def probed_price_dag(*args, **kwargs):
             result = price_dag(*args, **kwargs)
-            if CURRENT:
+            if CURRENT and CURRENT.get("in_bootstrap"):
+                CURRENT["bootstrap_labels"] += int(result.n_labels)
+            elif CURRENT:
                 CURRENT["labels"] = int(result.n_labels)
                 CURRENT["attempts"] = int(result.attempts)
                 CURRENT["status"] = dp_kernel_mod.STATUS_NAMES.get(
@@ -252,6 +277,13 @@ def main() -> int:
              "reporting the override.",
     )
     parser.add_argument(
+        "--bootstrap-departures", type=int, default=0, metavar="N",
+        help="run the pricing bootstrap over the first N departure steps before the real "
+             "search (0 = off). Answer-affecting but optimality-safe, so the OBJECTIVE must "
+             "not move across a sweep of this -- if it does, the bootstrap is not producing "
+             "certified incumbents and the premise is wrong.",
+    )
+    parser.add_argument(
         "--carry-forward", action="store_true",
         help="prototype: reuse each flight's own previous priced column as its incumbent "
              "when it beats the solver's heuristic column under the current duals. "
@@ -276,6 +308,7 @@ def main() -> int:
         max_iterations=args.iterations,
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
+        bootstrap_departures=args.bootstrap_departures,
     )
 
     if args.max_label_log2 is not None:
@@ -286,6 +319,7 @@ def main() -> int:
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
           f"{args.solver} gap={args.gap_metric} sequential (fixed work, no clock)"
+          f" bootstrap={args.bootstrap_departures}"
           f"{' carry-forward' if args.carry_forward else ''}")
     if dp_kernel_mod is not None:
         print(f"ceilings  MAX_LABEL_CAPACITY={dp_kernel_mod.MAX_LABEL_CAPACITY:,} "
@@ -308,7 +342,7 @@ def main() -> int:
     print("\n--- PER FLIGHT (pricing sweep, slowest first) ---")
     header = (f"{'sw':>3} {'flight':>7} {'entry_rc':>13} {'mid_rc':>13} {'final_rc':>13} "
               f"{'gap':>11} {'roots':>7} {'labels':>12} {'att':>4} {'status':>12} "
-              f"{'search_s':>9} {'fallb_s':>9} {'total_s':>9}")
+              f"{'boot_s':>8} {'search_s':>9} {'fallb_s':>9} {'total_s':>9}")
     print(header)
     for row in sorted(sweep_rows, key=lambda r: (r["sweep"], -r["total_s"])):
         entry = row["entry_rc"]
@@ -329,6 +363,7 @@ def main() -> int:
             f"{'n/a' if row['labels'] is None else format(row['labels'], ',d'):>12} "
             f"{'n/a' if row['attempts'] is None else row['attempts']:>4} "
             f"{str(row['status']):>12} "
+            f"{row['bootstrap_s']:>8.2f} "
             f"{row['search_s']:>9.2f} {row['fallback_s']:>9.2f} {row['total_s']:>9.2f}"
         )
 

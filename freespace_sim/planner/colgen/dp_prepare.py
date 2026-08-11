@@ -1372,6 +1372,7 @@ def prepare_variants(
     model=None,
     forbidden_rows=frozenset(),
     envelopes: CompletionEnvelopes | None = None,
+    max_departure_step: int | None = None,
 ) -> PreparedVariants:
     """Price every root option once, exactly as ``_best_column``'s initialization does.
 
@@ -1389,6 +1390,11 @@ def prepare_variants(
     DESCENDANTS still compete for dominance slots, and a better-scoring one evicts the
     survivor the reference kept, losing its sinks. See
     ``[[pruning-not-neutral-under-dominance]]``.
+
+    ``max_departure_step`` truncates the departure window, which is what the pricing
+    BOOTSTRAP restricts on (``pricing._bootstrap_incumbent``). The reference honours the
+    same bound through ``_best_column``'s own ``max_departure_step``, so the two searches
+    still explore the same space and ``Declined``'s contract is unaffected.
 
     The gate runs **here**, over every root, before any arc is relaxed, because that is
     where the reference runs it — and running it here is also what freezes every
@@ -1447,7 +1453,10 @@ def prepare_variants(
     classes: list[int] = []
     considered = prefiltered = 0
 
-    for departure_step in range(fg.base_step, fg.latest_departure_step + 1):
+    last_departure_step = fg.latest_departure_step
+    if max_departure_step is not None:
+        last_departure_step = min(last_departure_step, max_departure_step)
+    for departure_step in range(fg.base_step, last_departure_step + 1):
         considered += 1
         ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
         ground_score = -w_ground * ground_delay_s

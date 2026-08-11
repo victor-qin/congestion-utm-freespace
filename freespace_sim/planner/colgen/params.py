@@ -194,6 +194,38 @@ class ColGenParams:
     # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
     # graph and carries its own label pool, so memory is linear in this number.
     n_pricing_workers: int = 0
+    # Departure steps, counted from `base_step`, that the pricing BOOTSTRAP searches before
+    # the real search starts.  0 disables it.
+    #
+    # It exists because the cutoff pricing enters with is not merely weak, it is
+    # structurally ZERO -- and that is a property of column generation, not a bug.  Every
+    # column `price_flight` can reach for free (the geodesic seed, its time translations,
+    # the master's `known_column`) is already in the master's pool, and LP optimality over
+    # that pool forces every pool column's reduced cost <= 0; complementary slackness pins
+    # the basic one at exactly 0.  Measured on `density_faa_wing_zipline` x12: `entry_rc` is
+    # 0.0000 for all twelve flights in both sweeps, against optima of 8.5-20.5.  Re-scoring
+    # a flight's own previous PRICED column under the next iteration's duals gives 0.0 or
+    # negative (-5.9211 observed), so mining the pool cannot help either.  The only way to a
+    # positive cutoff before the search is to SEARCH for one.
+    #
+    # What that cutoff is worth, measured by handing each flight its own optimum (the oracle
+    # bound, `analysis/ab_colgen_oracle_cutoff.py`): sweep-1 task total 519.7 s -> 5.3 s,
+    # 98x.  The flight that exhausts the label pool goes from 33.5M labels plus a 418 s
+    # Python fallback to 4.1M labels in 4.53 s, i.e. it then fits under the SHIPPED ceiling
+    # with 8x headroom.  Two flights are pruned to zero labels at the root gate.
+    #
+    # DEPARTURES is the only restriction axis, and that is a choice.  The other candidate --
+    # a tighter hop budget -- sizes the corridor at `build_flight_graph`, so varying it means
+    # rebuilding the graph per bootstrap, which costs more than the search it saves.
+    # Departures are a slice of an array that already exists, and they are where the leverage
+    # is: 157 of ~901 possible departures survive the root gate on the straggler, and the
+    # oracle collapses that to between 0 and 16.
+    #
+    # Answer-affecting, and optimality-safe.  Pruning against a certified achievable score
+    # never discards anything strictly better, so the optimum is unchanged -- but under
+    # dominance a tighter cutoff can return a DIFFERENT equally-optimal column, so this moves
+    # the `ab_colgen_parity.py` sha and has to be re-baselined deliberately.
+    bootstrap_departures: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):
@@ -245,6 +277,16 @@ class ColGenParams:
         if workers < 0:
             raise ValueError("n_pricing_workers must be non-negative")
         object.__setattr__(self, "n_pricing_workers", workers)
+
+        if isinstance(self.bootstrap_departures, bool):
+            raise TypeError("bootstrap_departures must be an integer")
+        try:
+            bootstrap = operator.index(self.bootstrap_departures)
+        except TypeError as exc:
+            raise TypeError("bootstrap_departures must be an integer") from exc
+        if bootstrap < 0:
+            raise ValueError("bootstrap_departures must be non-negative")
+        object.__setattr__(self, "bootstrap_departures", bootstrap)
 
         if isinstance(self.greedy_budget_s_per_flight, bool):
             raise TypeError("greedy_budget_s_per_flight must be a real number")

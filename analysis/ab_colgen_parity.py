@@ -425,13 +425,20 @@ def main() -> int:
                 f"{base['seed_ladder_steps']} -- the baseline predates the parameter, so "
                 f"rerun with --ladder 0 or pick a newer ref")
             continue
-        # Same argument for the greedy's budget, which a ref predating the field ignores.
-        if current["greedy_budget_s_per_flight"] != base["greedy_budget_s_per_flight"]:
+        # The greedy's budget, which a ref predating the field ignores.  Unlike the ladder
+        # this is NOT refused on inequality alone: the budget is a clock, and a clock that
+        # never bound changed nothing.  `greedy_completed` on both arms is exactly that
+        # evidence, so the guard is on the budget differing AND one of them having stopped
+        # early -- which is the only case where the two started from different incumbents.
+        budgets_differ = (
+            current["greedy_budget_s_per_flight"] != base["greedy_budget_s_per_flight"]
+        )
+        if budgets_differ and not (current["greedy_completed"] and base["greedy_completed"]):
             failures += 1
             say(f"  UNCOMPARABLE: tree ran greedy_budget_s_per_flight="
                 f"{current['greedy_budget_s_per_flight']} but {baseline_label} ran "
-                f"{base['greedy_budget_s_per_flight']} -- the baseline predates the "
-                f"parameter, so its greedy stopped on a different clock")
+                f"{base['greedy_budget_s_per_flight']}, and at least one greedy stopped "
+                f"early -- so the two started from different incumbents")
             continue
         # The greedy's stop reason, not merely whether it stopped.  A stage capped by its
         # CANDIDATE limit stops at the same place in both arms and is fine; one stopped by

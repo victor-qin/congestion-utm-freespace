@@ -449,7 +449,8 @@ def test_warm_kernel_compiles_every_primitive():
 
 
 def _reference_candidates(
-    graph, cfg, view, params, monkeypatch, *, forbidden=frozenset(), incumbent=None, **kwargs
+    graph, cfg, view, params, monkeypatch, *, forbidden=frozenset(), incumbent=None,
+    max_departure_step=None, **kwargs
 ):
     """Every sink proposal `_best_column` registers, in the order it registers them.
 
@@ -474,13 +475,14 @@ def _reference_candidates(
     pricing._best_column(
         graph, view, 0.0, cfg, kwargs.pop("benefit", 100.0), forbidden,
         seed=False, incumbent=incumbent, model=kwargs.pop("model", None) or DELAY_MODEL,
+        max_departure_step=max_departure_step,
     )
     return recorded
 
 
 def _kernel_candidates(
     graph, cfg, view, model, forbidden=frozenset(), *, incumbent=None, benefit=100.0,
-    **kwargs,
+    max_departure_step=None, **kwargs,
 ):
     """The compiled search's sink proposals, driven through the full host protocol.
 
@@ -501,6 +503,7 @@ def _kernel_candidates(
         graph, cfg, view, topology, rows, benefit=benefit, pi_f=0.0,
         cost_cutoff=None if incumbent is None else incumbent[0],
         model=model, forbidden_rows=forbidden, envelopes=envelopes,
+        max_departure_step=max_departure_step,
     )
     pack = dp_prepare.prepare_forbidden(forbidden, graph, rows, topology)
     result = dp_kernel.price_dag(
@@ -640,6 +643,53 @@ def test_kernel_proposes_exactly_the_reference_sinks(monkeypatch):
     assert set(kernel_side) == reference_side
 
 
+def test_kernel_and_reference_restrict_departures_identically(monkeypatch):
+    """The bootstrap's restriction axis, held to the same equality as the full search.
+
+    `_bootstrap_incumbent` runs whichever of the two searches is available over a prefix of
+    the departure window, so if they truncated it differently the bootstrap would hand the
+    main search a cutoff that depends on which path ran -- and `Declined`'s contract, that
+    the compiled search explored exactly what the reference would, would be false for the
+    search that consumed it.
+
+    Equality, not inclusion, for the reason the unrestricted case documents: a looser search
+    does not merely explore a superset, because its extra labels win dominance slots and
+    evict survivors whose sinks are then never generated at all.
+    """
+
+    cfg = _cfg()
+    graph, params = _graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 31337), cfg)
+    limit = graph.base_step + 3
+
+    result, kernel_side = _kernel_candidates(
+        graph, cfg, view, model, max_departure_step=limit
+    )
+    assert result.ok, result.status
+    assert kernel_side, "the restricted kernel proposed nothing, so this proves nothing"
+
+    reference_side = _reference_sink_set(
+        graph, cfg, view, params, monkeypatch, model, max_departure_step=limit
+    )
+    assert set(kernel_side) == reference_side
+    assert all(departure <= limit for departure, *_rest in kernel_side)
+
+    # The restriction has to actually bite, or the equality above is the unrestricted test
+    # wearing a disguise.
+    unrestricted = _reference_sink_set(graph, cfg, view, params, monkeypatch, model)
+    assert any(departure > limit for departure, *_rest in unrestricted)
+
+    # NOT a subset, and that is the finding rather than a wrinkle: the restricted search
+    # emits sinks the unrestricted one never does.  Labels from the surviving departures win
+    # dominance slots that later departures would otherwise have taken, so their descendants
+    # reach sinks that are evicted in the full search.  Restricting is not "the same search
+    # with rows deleted" (`[[pruning-not-neutral-under-dominance]]`), which is exactly why
+    # `_bootstrap_incumbent` may only ever return an INCUMBENT: a bootstrap candidate
+    # flowing into `_certify_candidates` would let one of these into the real ranking.
+    assert reference_side - unrestricted, "restriction merely deleted sinks; check the fixture"
+
+
 def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monkeypatch):
     """The pause protocol reproduces the reference's mid-sweep incumbent, step for step.
 
@@ -715,6 +765,117 @@ def test_kernel_matches_the_reference_when_warm_started_with_an_incumbent(monkey
     )
     assert reference_side, "the warm start pruned everything, so this proves nothing"
     assert set(kernel_side) == reference_side
+
+
+# ------------------------------------------------------------------------ the bootstrap
+
+
+def _bootstrap_fixture(seed=606, overrun=4):
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg, overrun=overrun)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, seed), cfg)
+    return cfg, graph, params, model, view
+
+
+def test_a_restricted_search_leaves_the_graphs_budget_memo_alone():
+    """The bootstrap shares `dag_budget` with the search it only means to inform.
+
+    Both directions are wrong and both are silent. Reading it, a 4-departure bootstrap would
+    allocate the FULL search's pool for a search that needs a sliver. Writing it, the memo
+    would end up holding the bootstrap's tiny budget -- and since the write sits past the
+    `status != OK` guard, a DECLINING flight (the one the bootstrap exists for) would keep
+    that number and re-climb the ladder from it on every later iteration, which is the 20%
+    cost that made raising the ceiling a regression in the first place.
+    """
+
+    cfg, graph, _params, model, view = _bootstrap_fixture()
+
+    pricing._best_column_compiled(graph, view, 0.0, cfg, 100.0, frozenset(), model=model)
+    with graph._search_cache.lock:
+        full_budget = graph._search_cache.dag_budget
+    assert full_budget is not None, "the unrestricted search recorded nothing to protect"
+
+    pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), model=model,
+        max_departure_step=graph.base_step, record_budget=False,
+    )
+    with graph._search_cache.lock:
+        assert graph._search_cache.dag_budget == full_budget
+
+
+def test_the_bootstrap_only_ever_returns_a_certified_improvement():
+    """Uncertified is the one failure here that does not raise.
+
+    A cutoff above the true optimum discards it, and the search then returns a worse column
+    with no crash, no fallback and no signal. The defence is that `_bootstrap_incumbent`
+    never scores anything itself -- it returns what one of the two real searches returned,
+    and both have already been through `_canonical_candidate`. This checks the property that
+    guarantees: the score it hands back is achievable by the column it hands back.
+    """
+
+    cfg, graph, params, model, view = _bootstrap_fixture()
+    benefit = 100.0
+
+    for departures in (1, 2, 4, 64):
+        out = pricing._bootstrap_incumbent(
+            graph, view, 0.0, cfg, benefit, frozenset(), model,
+            incumbent=None, departures=departures,
+        )
+        if out is None:
+            continue
+        score, column = out
+        achievable = model.reduced_cost(
+            benefit=benefit, cost=column.delay_s,
+            dual_cost=view.claim_cost(column.claims), pi_f=0.0,
+        )
+        assert score == achievable, f"{departures}: score is not the column's own"
+
+    # Given an incumbent it cannot beat, it returns that incumbent UNCHANGED -- so a
+    # bootstrap that finds nothing leaves the caller exactly where it was.
+    unbeatable = (1e9, pricing.seed_column(graph, cfg, model=model))
+    assert pricing._bootstrap_incumbent(
+        graph, view, 0.0, cfg, benefit, frozenset(), model,
+        incumbent=unbeatable, departures=4,
+    ) is unbeatable
+
+
+def test_the_bootstrap_reaches_the_real_search_only_as_an_incumbent(monkeypatch):
+    """Its column may be a cutoff and must never be a candidate.
+
+    A restricted search's labels win dominance slots, so it emits sinks the unrestricted
+    search never does (see `test_kernel_and_reference_restrict_departures_identically`). One
+    of those entering the real ranking would be a column the reference could not have
+    returned -- optimal or not, that is a different answer. The separation is what keeps the
+    bootstrap a pruning aid rather than a second source of columns.
+    """
+
+    cfg, graph, params, model, view = _bootstrap_fixture()
+    seen = []
+    real = pricing._certify_candidates
+
+    def spy(candidates, *args, **kwargs):
+        seen.append((len(candidates), kwargs.get("incumbent")))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_certify_candidates", spy)
+    boot = pricing._bootstrap_incumbent(
+        graph, view, 0.0, cfg, 100.0, frozenset(), model,
+        incumbent=None, departures=2,
+    )
+    assert seen, "the bootstrap never reached the ranking, so this proves nothing"
+    assert boot is not None, "the bootstrap found nothing, so this proves nothing"
+
+    seen.clear()
+    pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=boot, model=model
+    )
+    assert len(seen) == 1
+    _n_candidates, ranked_incumbent = seen[0]
+    # The real search's ranking starts from the kernel's own mid-sweep incumbent, which the
+    # bootstrap's cutoff can only have improved -- never from a bootstrap CANDIDATE.
+    assert ranked_incumbent is not None
+    assert ranked_incumbent[0] >= boot[0]
 
 
 def test_kernel_survives_a_budget_restart_with_the_same_answer(monkeypatch):
@@ -1522,7 +1683,8 @@ def _random_case(rng, index):
     return cfg, graph, model, DualView(_random_duals(graph, cfg, rng.randrange(1 << 30)), cfg)
 
 
-def test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs():
+@pytest.mark.parametrize("bootstrap", [0, 3])
+def test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs(bootstrap):
     """The load-bearing sweep: the same COLUMN, not merely the same reduced cost.
 
     Reduced-cost equality is the weak claim and the one that hides the real failure. Two
@@ -1536,6 +1698,11 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
     corridor), the endpoint shape (terminal turns on `track_first_hop` and the unpadded
     `term`-row span rule), the objective weights (`[[colgen-label-score-currency]]`), and
     the duals.
+
+    Run with the bootstrap off and on. On, BOTH searches receive its cutoff -- the same
+    object, from `price_flight`'s single call -- so the equality claim is unchanged and the
+    space each explores is merely smaller. That is the whole reason the bootstrap lives in
+    the shared caller: applied to one search only, this sweep is what would fail.
     """
 
     rng = random.Random(20260810)
@@ -1558,6 +1725,12 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
                     ),
                     seed,
                 )
+
+        if bootstrap:
+            incumbent = pricing._bootstrap_incumbent(
+                graph, view, 0.0, cfg, 100.0, frozenset(), model,
+                incumbent=incumbent, departures=bootstrap,
+            )
 
         outcome = pricing._best_column_compiled(
             graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model

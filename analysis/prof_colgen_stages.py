@@ -246,6 +246,25 @@ def main() -> int:
     # Patched on the MODULE, which works because both ceilings are read as module globals
     # inside the host `price_dag`/`find_feasible_dag` retry loops -- not inside the `@njit`
     # kernels, which could not see a rebound global anyway.
+    #
+    # PARENT ONLY, AND THAT IS WHY THE COMBINATION IS REFUSED.  `_sweep_parallel` uses the
+    # `spawn` context and its initargs carry no ceilings (`pricing_pool.py:355-366`), so a
+    # worker imports `dp_kernel` fresh and gets the SHIPPED constant. Under `--workers N`
+    # the override would reach only the parent -- which prices nothing -- so the arm would
+    # silently run at `1 << 25` while its header claimed otherwise. Refuse rather than
+    # measure the wrong thing quietly; overriding for a pooled sweep needs the value
+    # threaded through the initializer, which is a change to shipped code, not to this
+    # script.
+    if args.workers and (args.max_label_log2 is not None or args.max_log2cap is not None):
+        raise SystemExit(
+            "--max-label-log2/--max-log2cap only reach the parent process, and a pooled "
+            "sweep prices in spawned workers that re-import dp_kernel with the shipped "
+            f"ceilings ({dp_kernel_mod.MAX_LABEL_CAPACITY:,} / "
+            f"{dp_kernel_mod.MAX_LOG2CAP}). Drop --workers, or thread the override through "
+            "pricing_pool's initializer first."
+            if dp_kernel_mod is not None else
+            "--max-label-log2/--max-log2cap require the compiled kernel"
+        )
     if dp_kernel_mod is not None:
         if args.max_label_log2 is not None:
             dp_kernel_mod.MAX_LABEL_CAPACITY = 1 << args.max_label_log2

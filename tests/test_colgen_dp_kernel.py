@@ -840,6 +840,71 @@ def test_a_search_that_hits_the_capacity_ceiling_says_so_before_falling_back(
     assert "pure-Python reference" in warning
 
 
+def test_destination_lane_tie_comes_from_the_envelopes_not_the_packed_lanes(monkeypatch):
+    """The kernel must tie-break on the REFERENCE's destination lane, not the packed one.
+
+    Two different mins. `CompletionEnvelopes` takes it over every lane of every
+    `_destination_options(fg)` entry, verbatim as `pricing.py` does.
+    `topology.dest_lane_idx` holds only the lanes of destination cells that survived
+    interning (`cells = set(reachable) | claim_only`), a filter `prepare_topology` spells
+    out itself as `[index[cell] for cell in destination_options if cell in index]`.
+
+    They coincide until a destination cell is not forward-reachable from any origin. If
+    that cell held the lowest lane, the packed min is HIGHER, and the value reaches
+    `_prefix_le`'s four-field comparison -- so the compiled search could certify a
+    different, equally optimal column while still reporting `proved=True`.
+
+    Measured: the filter drops nothing across 260 flights on `colgen_test` and the four
+    density arms, so no natural fixture exhibits it. Rather than wait for one, this pins
+    the SOURCE: the envelope's value is what reaches the kernel even when the packed array
+    disagrees, which is what makes the divergence unreachable instead of merely unobserved.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+    duals = dp_prepare.prepare_duals(view, graph, topology, rows)
+    envelopes = dp_prepare.CompletionEnvelopes(
+        graph, cfg, view, benefit=100.0, pi_f=0.0, model=model, forbidden_rows=frozenset(),
+    )
+    variants = dp_prepare.prepare_variants(
+        graph, cfg, view, topology, rows, benefit=100.0, pi_f=0.0, cost_cutoff=None,
+        model=model, forbidden_rows=frozenset(), envelopes=envelopes,
+    )
+    pack = dp_prepare.prepare_forbidden(frozenset(), graph, rows, topology)
+
+    packed_min = int(topology.dest_lane_idx.min())
+    sentinel = packed_min - 7  # a value the packed array cannot produce
+    envelopes.destination_lane_tie = sentinel
+
+    seen = []
+    real = dp_kernel._price_dag
+
+    def spy(*args):
+        seen.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(dp_kernel, "_price_dag", spy)
+    dp_kernel.price_dag(
+        topology, rows, duals, variants, pack,
+        air_weight=model.air_weight, dt_s=cfg.dt_s, benefit=100.0, pi_f=0.0,
+        envelopes=envelopes,
+    )
+
+    assert seen, "the kernel never ran, so this asserts nothing"
+    # Scalars only: most of the argument list is numpy arrays, and `in` on those compares
+    # elementwise and raises rather than answering.
+    scalars = [
+        int(arg) for arg in seen[0]
+        if isinstance(arg, (int, np.integer)) and not isinstance(arg, bool)
+    ]
+    assert sentinel in scalars, "the kernel took the packed min, not the envelope's tie"
+
+
 def test_a_correctness_stop_is_not_offered_the_budget_remedy(monkeypatch, capsys):
     """`FSUM_OVERFLOW` reaches the same branch as a full pool and means the opposite.
 
@@ -891,7 +956,7 @@ def test_kernel_retry_capacity_is_bounded_in_both_directions(
     The floor matters because labels per step are not uniform -- the frontier widens before
     it plateaus, so an estimate taken early reads low and would ask for less than doubling.
     The ceiling matters because a pathological early fill would otherwise ask for gigabytes:
-    at ~44 bytes a label, 8x of a 13.3M pool is already 4.7 GB.
+    at 40 bytes a label, 8x of a 13.3M pool is already 4.3 GB.
     """
 
     assert dp_kernel._next_label_capacity(capacity, step_reached, 0, 99) == expected

@@ -60,7 +60,7 @@ RECOMPUTE_EPS = 1e-8
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci hashing multiplier, as in `astar_kernel`
 
 # Arc role bits.  Restated from `dp_prepare` rather than imported so numba can treat them as
-# compile-time constants; `test_kernel_arc_roles_match_dp_prepare` fails if the two drift.
+# compile-time constants; `test_kernel_arc_role_bits_match_dp_prepare` fails if they drift.
 _ARC_INTERNAL = 1 << 0
 _ARC_FIRST = 1 << 1
 _ARC_LAST = 1 << 2
@@ -120,10 +120,12 @@ FSUM_MAX_PARTIALS = 64
 # Answer-neutral, because a budget bounds work and never the search: hitting either ceiling
 # returns the same STATUS_LABEL_LIMIT / STATUS_STATE_LIMIT the caller already handles.
 # Sized from measurement rather than a round number.  Labels cost 40 bytes each across the
-# nine parallel arrays, and the largest real pool observed on this work is 13.3M, so 1<<25
-# is ~2.5x the worst measured need at ~1.34 GB -- which is what the `n_workers` ceiling in
-# `pricing_pool` already assumes each worker holds.  A dominance slot costs 32 bytes across
-# the four tables plus the two layer buffers, so 1<<26 slots is ~2.1 GB on the same budget.
+# nine parallel arrays (one float64 plus eight int32), and the largest real pool observed on
+# this work is 13.3M, so 1<<25 is ~2.5x the worst measured need at ~1.34 GB.  That sits just
+# under -- NOT equal to -- the "roughly 1.5 GB on density" `pricing_pool` quotes per worker,
+# which is the whole worker including its rebuilt graphs rather than the label pool alone.
+# A dominance slot costs 32 bytes across the four tables plus the two layer buffers, so
+# 1<<26 slots is ~2.1 GB on the same budget.
 MAX_LABEL_CAPACITY = 1 << 25
 MAX_LOG2CAP = 26
 
@@ -707,8 +709,15 @@ def _paid_duals(
 
     Term by term, and in this order, NOT ``air_weight * (origin_leg + hops * dt)``: the
     grouped form changes the association and stops being bit-identical.  The reference
-    measured 62,673 of 200,000 random draws differing by ~1e-13 between the two, which is
-    three orders of magnitude wider than the ``_SCORE_EPS`` band the result is compared in.
+    measured 62,673 of 200,000 random draws differing by ~1e-13 between the two.
+
+    That figure is an order of magnitude BELOW ``SCORE_EPS`` (1e-12), which is exactly why
+    the argument for this ordering cannot be an epsilon argument -- a one-ulp story would
+    conclude the grouped form is fine.  The requirement here is the stricter one
+    ``pricing.py`` states for the same expression: this is the oracle a compiled path is
+    certified against, so its arithmetic has to be reproducible EXACTLY, not to within a
+    tolerance.  A sub-epsilon perturbation still propagates into later sums, where it can
+    cross the band and flip a dominance tie.
     """
 
     return (
@@ -1606,8 +1615,12 @@ def _feasible_dag(
 
     ``improve_below`` is the greedy's early exit: the FIRST certified strict improvement may
     be returned, which is what makes this an incumbent heuristic rather than an oracle. The
-    host signals it with ``STATUS_IMPROVED``; the kernel never decides it, because deciding
-    it needs the certified delay.
+    kernel never decides it, because deciding it needs the certified delay -- the host does,
+    by returning ``stop=True`` as the second element of ``certify``'s result, which ends the
+    search and surfaces as the ``stopped_early`` flag beside an ordinary ``STATUS_OK``.
+    There is deliberately no distinct status code for it: stopping early on an improvement
+    is a successful search, not a budget or correctness outcome, and giving it its own code
+    would put it in the same space as the ones that mean the result cannot be used.
 
     The resume record is ``resume[0]`` mode (0 fresh, 1 continue the lane loop), ``[1]`` the
     popped label, ``[2]`` the lane slot, ``[3]`` the frontier size, ``[4]`` the label count,
@@ -1906,8 +1919,8 @@ def _next_label_capacity(capacity, step_reached, min_step, max_step):
     uniform -- the frontier widens for a while and then plateaus -- so an estimate taken
     early reads low; the 1.25 margin and the doubling FLOOR cover that, and a second
     attempt extrapolates from a later step and lands closer.  The 8x ceiling is what stops
-    a pathological early fill from asking for gigabytes: at 44 bytes a label, 8x of a
-    13.3M pool is already 4.7 GB.
+    a pathological early fill from asking for gigabytes: at 40 bytes a label -- the figure
+    `MAX_LABEL_CAPACITY` is sized against -- 8x of a 13.3M pool is already 4.3 GB.
     """
 
     span = max_step - min_step + 1
@@ -1976,8 +1989,28 @@ def price_dag(
     air_dt_s = air_weight * dt_s
     n_variants = variants.n_variants
     sink_probe = 1 if certify is not None else 0
+    # Taken from `envelopes` rather than recomputed, because the two are NOT the same min.
+    # `CompletionEnvelopes` mins over every lane of every `_destination_options(fg)` entry,
+    # which is verbatim what the reference does (`pricing.py`'s `destination_lane_tie`).
+    # `topology.dest_lane_idx` holds only the lanes of destination cells that survived
+    # interning -- `cells = set(reachable) | claim_only` -- and `prepare_topology` spells
+    # that filter out itself as `[index[cell] for cell in destination_options
+    # if cell in index]`.  So a destination cell that is not forward-reachable from any
+    # origin is absent here and present there, and if it held the lowest lane index the two
+    # tie-break on different values.  That reaches `_prefix_le`'s four-field comparison, so
+    # the compiled search could certify a different -- equally optimal -- column while still
+    # reporting `proved=True`, which is the one failure this path is not allowed to have.
+    #
+    # Measured: the filter drops nothing across 260 flights on five scenarios
+    # (`colgen_test` and the four density arms), so this is latent rather than live -- but
+    # "not reproduced" is not the same as "cannot happen", and taking the reference's own
+    # number costs nothing and removes the question.  The packed min stays as the fallback
+    # for the envelope-less call, where there is no incumbent and `_can_compete`
+    # short-circuits on `inc_state[0] == 0` before the tie is ever read.
     destination_lane_tie = (
-        int(topology.dest_lane_idx.min()) if topology.dest_lane_idx.size else -1
+        int(envelopes.destination_lane_tie)
+        if envelopes is not None
+        else (int(topology.dest_lane_idx.min()) if topology.dest_lane_idx.size else -1)
     )
     # `-1` is how `PreparedVariants` spells "no origin lane"; `CompletionEnvelopes` keys on
     # the reference's `None`, so the two are translated once here rather than at every use.
@@ -2345,9 +2378,14 @@ def feasible_dag(
 def warm_kernel() -> bool:
     """Force compilation of every primitive, so a later timing run measures the search.
 
-    Returns ``True`` once all of them are resident.  Called by the host before a timed
-    sweep and by the test suite, since numba's per-process compile would otherwise be
-    attributed to the first flight priced.
+    Returns ``True`` once all of them are resident, since numba's per-process compile would
+    otherwise be attributed to the first flight priced.
+
+    Called by the test suite and by measurement scripts.  NOT by the production sweep: a
+    real solve wants the compile counted, because it is a cost that solve genuinely pays,
+    and warming it in `pricing_pool._init_worker` would hide it once per worker per sweep.
+    Reach for this when a timing run needs the search isolated from the compile, not to make
+    a production run look faster.
     """
 
     partials = np.zeros(FSUM_MAX_PARTIALS, np.float64)

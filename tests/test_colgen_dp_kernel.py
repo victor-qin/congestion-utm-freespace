@@ -739,6 +739,137 @@ def test_kernel_survives_a_budget_restart_with_the_same_answer(monkeypatch):
     assert set(kernel_side) == reference_side
 
 
+def test_kernel_declines_at_the_capacity_ceiling_rather_than_allocating_past_it(monkeypatch):
+    """Budget growth stops somewhere, and the stop is a decline rather than a `MemoryError`.
+
+    `_best_column_compiled` documents "a budget the kernel could not grow into" as one of
+    its `proved=False` cases, and without a ceiling that case is unreachable: the retry
+    loop grows geometrically and `np.zeros` raises long before `max_attempts` runs out.
+    `MemoryError` is caught nowhere on the pricing path, so it would take the solve down --
+    and under a worker pool an OOM-killed worker hangs the sweep forever
+    (`pricing_pool`'s module docstring).
+
+    The fixture is the one `test_kernel_survives_a_budget_restart_with_the_same_answer`
+    uses, which needs several restarts at this capacity.  Pinning the ceiling AT the
+    starting capacity is therefore the sharpest form of the contract: the same search that
+    completes when it may grow now returns `STATUS_LABEL_LIMIT` without ever reallocating.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    monkeypatch.setattr(dp_kernel, "MAX_LABEL_CAPACITY", 1024)
+    result, _ = _kernel_candidates(graph, cfg, view, model, label_capacity=1024)
+
+    assert not result.ok
+    assert result.status == dp_kernel.STATUS_LABEL_LIMIT
+    assert result.attempts == 1, "the ceiling was reached, so nothing should have regrown"
+
+
+def _quiet_kernel_telemetry(monkeypatch):
+    """Reset the per-process warn flags and tally, so a test sees only its own run.
+
+    All three are module globals by design -- warn ONCE per process, tally per process --
+    which makes them order-dependent across tests unless each one starts clean.
+    """
+
+    monkeypatch.setattr(pricing, "_kernel_restart_warned", False)
+    monkeypatch.setattr(pricing, "_kernel_budget_warned", False)
+    monkeypatch.setattr(
+        pricing, "_KERNEL_STATS",
+        {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0},
+    )
+
+
+def test_a_restarted_label_pool_is_counted_and_announced_once(monkeypatch, capsys):
+    """A restart is invisible except as a slow flight, so it says so on the way past.
+
+    `DagResult.attempts` has always carried this -- "the number to read when a flight is
+    unexpectedly expensive" -- and nothing read it.  The graph-cached `dag_budget` is the
+    documented way in: seeding it small is exactly what a first iteration on a big flight
+    does to itself.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    _quiet_kernel_telemetry(monkeypatch)
+    graph._search_cache.dag_budget = (1024, 14, 4096)
+
+    (_rc, column), proved = pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), model=model
+    )
+
+    assert proved and column is not None, "a restart must not change the outcome"
+    assert pricing.kernel_stats()["label_restarts"] >= 1
+    assert pricing.kernel_stats()["budget_declined"] == 0
+    warning = capsys.readouterr().err
+    assert "restarted its label pool" in warning
+    assert f"flight {graph.request.flight_id}" in warning
+
+
+def test_a_search_that_hits_the_capacity_ceiling_says_so_before_falling_back(
+    monkeypatch, capsys
+):
+    """The decline names the constant, because it is a knob and not a wall.
+
+    This is the one cause of `fell_back` that gets WORSE as the instance grows, so it is
+    also the one worth telling apart from "numba is missing" -- which has carried its own
+    warn-once for the same reason since the compiled path shipped.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    _quiet_kernel_telemetry(monkeypatch)
+    monkeypatch.setattr(dp_kernel, "MAX_LABEL_CAPACITY", 1024)
+    graph._search_cache.dag_budget = (1024, 14, 4096)
+
+    _result, proved = pricing._best_column_compiled(
+        graph, view, 0.0, cfg, 100.0, frozenset(), model=model
+    )
+
+    assert not proved, "the ceiling should decline rather than grow into it"
+    assert pricing.kernel_stats()["budget_declined"] == 1
+    warning = capsys.readouterr().err
+    assert "MAX_LABEL_CAPACITY" in warning
+    assert "pure-Python reference" in warning
+
+
+def test_a_correctness_stop_is_not_offered_the_budget_remedy(monkeypatch, capsys):
+    """`FSUM_OVERFLOW` reaches the same branch as a full pool and means the opposite.
+
+    Both are "the compiled search declined", so both land in `_warn_budget_growth` -- but
+    one is a knob and the other is the kernel refusing to report a score it cannot stand
+    behind.  Telling someone to raise a capacity ceiling for the second would be worse than
+    printing nothing, which is why the remedy is chosen from the status rather than shared.
+
+    Driven through `_warn_budget_growth` directly: the condition is unreachable on a real
+    graph (this kernel's arc sums are a handful of terms), and a test that could only reach
+    it by faking the search would be asserting the fake.
+    """
+
+    _quiet_kernel_telemetry(monkeypatch)
+
+    class _Declined:
+        status = dp_kernel.STATUS_FSUM_OVERFLOW
+        attempts = 1
+        budget = (65536, 14, 4096)
+
+    graph, _params = _terminal_graph(_cfg())
+    pricing._warn_budget_growth(dp_kernel, graph, _Declined())
+
+    assert pricing.kernel_stats()["budget_declined"] == 1
+    warning = capsys.readouterr().err
+    assert "FSUM_OVERFLOW" in warning
+    assert "CORRECTNESS stop" in warning
+    assert "MAX_LABEL_CAPACITY" not in warning, "budget advice on a correctness stop"
+
+
 @pytest.mark.parametrize(
     "capacity, step_reached, expected",
     [

@@ -1800,6 +1800,12 @@ def _best_column(
 
 
 _kernel_fallback_warned = False
+# Same warn-once-per-process discipline as `_kernel_fallback_warned`, and for the same
+# reason: a budget the pool could not grow into is silent, and per-flight it would be a
+# thousand identical lines rather than a signal.  Two flags rather than one because the two
+# conditions want different responses -- see `_warn_budget_growth`.
+_kernel_restart_warned = False
+_kernel_budget_warned = False
 
 # Per-process tally of exact-pricing calls and how many could not be proved in the kernel.
 #
@@ -1812,13 +1818,87 @@ _kernel_fallback_warned = False
 # Per PROCESS, deliberately: under a worker pool each worker keeps its own tally and
 # `pricing_pool` returns the delta per task, because a parent-side counter would report zero
 # forever while every fallback happened somewhere else.
-_KERNEL_STATS = {"priced": 0, "fell_back": 0}
+#
+# `fell_back` alone cannot be acted on, because it conflates causes that call for opposite
+# responses: numba missing (install it), a graph the packer refuses (a modelling limit), a
+# deadline (raise the budget) and a label pool that could not grow far enough (a SCALE
+# problem, and the only one that gets worse as the instance does).  The last two counters
+# split that one out, and they are a pair on purpose -- `label_restarts` is the precursor
+# and `budget_declined` is the failure, so a run whose restarts climb while declines stay 0
+# is one that is paying for the pool it needs without losing the compiled path yet.
+_KERNEL_STATS = {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0}
 
 
 def kernel_stats() -> dict[str, int]:
     """Snapshot this process's compiled-pricing tally."""
 
     return dict(_KERNEL_STATS)
+
+
+def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
+    """Record and announce what the compiled search's label budget cost this flight.
+
+    Two conditions, warned once per process each, because they call for different responses
+    and reporting them as one number would hide the cheaper one behind the louder one:
+
+    * **Restarts.** ``result.attempts > 1`` means a budget filled and the search re-ran from
+      its first layer, throwing away every sink certification the previous attempt had
+      already paid for.  The answer is unchanged -- a budget bounds work, never the search --
+      so this is invisible except as a slow flight, which is exactly the shape
+      ``[[run-astar-with-compiled-extra]]`` records costing a whole issue on the A* side.
+      ``DagResult.attempts`` has always carried this ("the number to read when a flight is
+      unexpectedly expensive"); nothing read it.
+    * **Declines.** The search stopped without finishing, so this flight fell back to the
+      Python reference -- same column, 3-4.5x the time.  The advice is split by cause,
+      because the two that land here are opposites: a budget status means the pool hit
+      :data:`~.dp_kernel.MAX_LABEL_CAPACITY`, which is a knob and not a wall, while
+      ``FSUM_OVERFLOW`` means a partial expansion saturated and a SCORE would have been
+      wrong -- telling someone to raise a ceiling in that case would be worse than saying
+      nothing.
+
+    Per process, so under a worker pool each worker warns for itself.  The counters are
+    per process too, which means a parallel sweep's totals live in the workers -- the
+    aggregate a parent already sees is ``kernel_fell_back``, which every decline here also
+    increments one level up in :func:`price_flight`.
+    """
+
+    global _kernel_restart_warned, _kernel_budget_warned
+
+    if result.attempts > 1:
+        _KERNEL_STATS["label_restarts"] += result.attempts - 1
+        if not _kernel_restart_warned:
+            _kernel_restart_warned = True
+            print(
+                f"WARNING: compiled colgen pricing restarted its label pool "
+                f"{result.attempts - 1}x on flight {fg.request.flight_id} (now "
+                f"{result.budget[0]:,} labels) -- the answer is unchanged, the search is "
+                f"not; a graph-cached budget means later iterations should not repeat this",
+                file=sys.stderr,
+            )
+    if result.status in (kernel.STATUS_OK, kernel.STATUS_CANCELLED):
+        return
+    _KERNEL_STATS["budget_declined"] += 1
+    if _kernel_budget_warned:
+        return
+    _kernel_budget_warned = True
+    name = kernel.STATUS_NAMES.get(result.status, str(result.status))
+    if result.status == kernel.STATUS_FSUM_OVERFLOW:
+        remedy = (
+            "this is a CORRECTNESS stop, not a budget one -- an exact-sum expansion "
+            "saturated, so the kernel refused to report a score it could not stand behind"
+        )
+    else:
+        remedy = (
+            "raise dp_kernel.MAX_LABEL_CAPACITY / MAX_LOG2CAP if this instance is simply "
+            "larger than they assume"
+        )
+    print(
+        f"WARNING: compiled colgen pricing gave up on flight {fg.request.flight_id} with "
+        f"{name} after {result.attempts} attempts ({result.budget[0]:,} labels, 2^"
+        f"{result.budget[1]} states) -- falling back to the pure-Python reference search, "
+        f"3-4.5x slower for the same column. {remedy}",
+        file=sys.stderr,
+    )
 
 
 def _dp_kernel():
@@ -2048,6 +2128,10 @@ def _best_column_compiled(
     finally:
         if watchdog is not None:
             watchdog.cancel()
+
+    # Before the status checks, so a search that restarted and THEN ran out of clock is
+    # still recorded as having restarted -- `_check_deadline` below raises out of here.
+    _warn_budget_growth(kernel, fg, result)
 
     if result.status == kernel.STATUS_CANCELLED:
         # The watchdog fired, so the deadline has passed.  Falling back to the reference

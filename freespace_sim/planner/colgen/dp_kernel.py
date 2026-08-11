@@ -87,11 +87,45 @@ STATUS_NEED_ENVELOPE = 7    # the gate needs a variant's envelope -- host builds
 # throwing away every certification the previous one had paid for.
 STATUS_CANDIDATE_FULL = 8
 
+# For diagnostics only -- nothing branches on this, and the kernel never sees it (numba has
+# no dict of str).  It exists because a status reaches a human exactly once, in the warning
+# `pricing._warn_budget_growth` prints, and "status 5" there would send the reader to a
+# grep when the difference between 1 and 5 is the difference between "the pool was too
+# small" and "a score is wrong".
+STATUS_NAMES = {
+    STATUS_OK: "OK",
+    STATUS_LABEL_LIMIT: "LABEL_LIMIT",
+    STATUS_STATE_LIMIT: "STATE_LIMIT",
+    STATUS_CANDIDATE_LIMIT: "CANDIDATE_LIMIT",
+    STATUS_CANCELLED: "CANCELLED",
+    STATUS_FSUM_OVERFLOW: "FSUM_OVERFLOW",
+    STATUS_IMPROVING_SINK: "IMPROVING_SINK",
+    STATUS_NEED_ENVELOPE: "NEED_ENVELOPE",
+    STATUS_CANDIDATE_FULL: "CANDIDATE_FULL",
+}
+
 # The longest exactly-representable partial expansion `_fsum_add` will hold.  Shewchuk's
 # algorithm needs one partial per distinct exponent range in play; 64 covers a full
 # float64 exponent sweep with room to spare, and the arc-loop sums this backs are a
 # handful of terms from one visit window.
 FSUM_MAX_PARTIALS = 64
+
+# Where budget growth STOPS.  `_best_column_compiled` documents "a budget the kernel could
+# not grow into" as a `proved=False` case, but without these that case is unreachable: the
+# retry loop grows geometrically and `np.zeros` raises `MemoryError` long before
+# `max_attempts` runs out, and `MemoryError` is caught nowhere on the path -- so instead of
+# falling back to the reference the solve dies, and under a worker pool an OOM-killed worker
+# hangs the sweep forever (see `pricing_pool`'s module docstring).
+#
+# Answer-neutral, because a budget bounds work and never the search: hitting either ceiling
+# returns the same STATUS_LABEL_LIMIT / STATUS_STATE_LIMIT the caller already handles.
+# Sized from measurement rather than a round number.  Labels cost 40 bytes each across the
+# nine parallel arrays, and the largest real pool observed on this work is 13.3M, so 1<<25
+# is ~2.5x the worst measured need at ~1.34 GB -- which is what the `n_workers` ceiling in
+# `pricing_pool` already assumes each worker holds.  A dominance slot costs 32 bytes across
+# the four tables plus the two layer buffers, so 1<<26 slots is ~2.1 GB on the same budget.
+MAX_LABEL_CAPACITY = 1 << 25
+MAX_LOG2CAP = 26
 
 
 # --------------------------------------------------------------------------- exact sums
@@ -2112,11 +2146,21 @@ def price_dag(
             break
 
         if status == STATUS_LABEL_LIMIT:
-            label_capacity = _next_label_capacity(
-                label_capacity, int(out_counts[2]), topology.min_step, topology.max_step
+            # Already at the ceiling: stop rather than ask for an allocation that would
+            # raise instead of degrading.  The status survives, so the caller reads this
+            # as the `proved=False` its docstring already promises.
+            if label_capacity >= MAX_LABEL_CAPACITY:
+                break
+            label_capacity = min(
+                MAX_LABEL_CAPACITY,
+                _next_label_capacity(
+                    label_capacity, int(out_counts[2]), topology.min_step, topology.max_step
+                ),
             )
             continue
         if status == STATUS_STATE_LIMIT:
+            if log2cap >= MAX_LOG2CAP:
+                break
             log2cap += 1
             continue
         break
@@ -2269,14 +2313,29 @@ def feasible_dag(
                 status = STATUS_OK
                 break
 
+        # Ceilings for the same reason as `price_dag`'s -- see `MAX_LABEL_CAPACITY`.  A
+        # label costs 52 bytes here rather than 40 (this search carries a bound, an
+        # estimate and a serial per label), so the same ceiling is ~1.74 GB.  The status
+        # survives the break, and `_feasible_compiled` already treats anything but
+        # `STATUS_OK` as "the compiled feasible search declined".
+        #
+        # The heap shares the label ceiling rather than getting its own, and that is the
+        # right bound rather than a convenient one: the heap holds label INDICES, so it can
+        # never usefully outgrow the pool those indices point into.
         if status == STATUS_LABEL_LIMIT:
-            label_capacity *= 2
+            if label_capacity >= MAX_LABEL_CAPACITY:
+                break
+            label_capacity = min(MAX_LABEL_CAPACITY, label_capacity * 2)
             continue
         if status == STATUS_STATE_LIMIT:
+            if log2cap >= MAX_LOG2CAP:
+                break
             log2cap += 1
             continue
         if status == STATUS_CANDIDATE_LIMIT:
-            heap_capacity *= 2
+            if heap_capacity >= MAX_LABEL_CAPACITY:
+                break
+            heap_capacity = min(MAX_LABEL_CAPACITY, heap_capacity * 2)
             continue
         break
 

@@ -58,7 +58,8 @@ import multiprocessing as mp
 import os
 import time
 import traceback
-from dataclasses import dataclass, replace
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ...config import SimConfig
@@ -128,12 +129,25 @@ class SweepResult:
     # Wall the caller waited for the sweep, measured inside `price_sweep` so it covers pool
     # construction and teardown -- the costs a per-sweep pool actually pays.
     wall_s: float = 0.0
-    # Exact-pricing calls this sweep, and how many fell back to the Python reference.  A
-    # fallback is invisible downstream -- same column, same objective, 3-4.5x the time -- so
-    # a nonzero count here is the only signal a production run gets.  Summed ACROSS workers,
-    # since each keeps its own per-process tally.
-    kernel_priced: int = 0
-    kernel_fell_back: int = 0
+    # `pricing.kernel_stats()` summed ACROSS workers, since each keeps its own per-process
+    # tally: exact-pricing calls, how many fell back, the label-pool restarts and declines,
+    # and one `declined_<reason>` key per `pricing.Declined` member that fired.  A fallback
+    # is invisible downstream -- same column, same objective, 3-4.5x the time -- so these are
+    # the only signal a production run gets.
+    #
+    # ONE DICT rather than a field per counter, deliberately.  The two that used to be
+    # fields grew to four and then to a reason histogram whose keys depend on the instance;
+    # as positional fields that is a constructor argument per counter, in a dataclass built
+    # positionally at four sites and hand-built in the tests.
+    kernel_counters: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def kernel_priced(self) -> int:
+        return self.kernel_counters.get("priced", 0)
+
+    @property
+    def kernel_fell_back(self) -> int:
+        return self.kernel_counters.get("fell_back", 0)
 
     @property
     def complete(self) -> bool:
@@ -211,9 +225,13 @@ def _init_worker(
 def _price_one(flight_id: int):
     """Price one flight in a worker.
 
-    Returns ``(flight_id, priced, rc, column, task_s, n_priced, n_fell_back)`` -- the shape
+    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas)`` -- the shape
     :func:`_accepted_prefix` reduces, and the reason that function takes a sequence of these
     rather than a pool.
+
+    The counters travel as ONE dict rather than a trailing int each, because there are now
+    four of them plus a `declined_<reason>` key per cause, and the reachable set of those
+    depends on the instance.
 
     ``priced`` is an explicit BOOLEAN and not an identity sentinel, which is a correctness
     requirement rather than a style choice: a module-level ``object()`` pickles happily and
@@ -247,16 +265,17 @@ def _price_one(flight_id: int):
             deadline=_WORKER["deadline"],
         )
     except PricingTimeout:
-        return flight_id, False, 0.0, None, time.perf_counter() - started, 0, 0
+        return flight_id, False, 0.0, None, time.perf_counter() - started, {}
     after = kernel_stats()
+    # Subtraction over the UNION of keys, not over `before`'s: a `declined_<reason>` key
+    # appears the first time that cause fires, so it exists in `after` and not in `before`.
     return (
         flight_id,
         True,
         float(reduced_cost),
         column,
         time.perf_counter() - started,
-        after["priced"] - before["priced"],
-        after["fell_back"] - before["fell_back"],
+        {key: value - before.get(key, 0) for key, value in after.items()},
     )
 
 
@@ -305,7 +324,7 @@ def _sweep_sequential(
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
     task_total_s = 0.0
-    before = kernel_stats()
+    before = Counter(kernel_stats())
     sweep_started = time.perf_counter()
     for flight_id in pricing_order:
         task_started = time.perf_counter()
@@ -320,25 +339,21 @@ def _sweep_sequential(
                 deadline=deadline,
             )
         except PricingTimeout:
-            after = kernel_stats()
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
-                after["priced"] - before["priced"],
-                after["fell_back"] - before["fell_back"],
+                Counter(kernel_stats()) - before,
             )
         task_total_s += time.perf_counter() - task_started
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
-    after = kernel_stats()
     # One worker's worth of work, by definition -- which is what makes it the denominator
     # the parallel arm is compared against.
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
-        after["priced"] - before["priced"],
-        after["fell_back"] - before["fell_back"],
+        Counter(kernel_stats()) - before,
     )
 
 
@@ -404,9 +419,10 @@ def _accepted_prefix(results) -> SweepResult:
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
     task_total_s = 0.0
-    kernel_priced = 0
-    kernel_fell_back = 0
-    for flight_id, priced, reduced_cost, column, task_s, n_priced, n_fell_back in results:
+    # `Counter.update` ADDS where `dict.update` would REPLACE, which is the whole reason
+    # this is a Counter: a plain dict here would silently report only the last task's tally.
+    counters: Counter[str] = Counter()
+    for flight_id, priced, reduced_cost, column, task_s, deltas in results:
         if not priced:
             # Past the first gap nothing is accepted, so returning here stops consuming --
             # which abandons the outstanding tasks, and leaving the caller's `with` block
@@ -414,15 +430,14 @@ def _accepted_prefix(results) -> SweepResult:
             # added: they are not work the sweep kept.
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
-                task_total_s, 0.0, kernel_priced, kernel_fell_back,
+                task_total_s, 0.0, counters,
             )
         task_total_s += task_s
-        kernel_priced += n_priced
-        kernel_fell_back += n_fell_back
+        counters.update(deltas)
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
-        task_total_s, 0.0, kernel_priced, kernel_fell_back,
+        task_total_s, 0.0, counters,
     )

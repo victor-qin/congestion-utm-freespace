@@ -61,7 +61,10 @@ def _counting_feasible_compiled(*args, **kwargs):
         # by their per-flight slice -- i.e. the exact opposite of what it appeared to say.
         _FEASIBLE["timed_out"] += 1
         raise
-    _FEASIBLE["fell_back" if out is _pricing._UNPROVED else "proved"] += 1
+    declined = isinstance(out, _pricing.Declined)
+    _FEASIBLE["fell_back" if declined else "proved"] += 1
+    if declined:
+        _FEASIBLE[f"declined_{out.value}"] = _FEASIBLE.get(f"declined_{out.value}", 0) + 1
     return out
 
 

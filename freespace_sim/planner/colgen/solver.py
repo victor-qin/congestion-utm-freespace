@@ -543,6 +543,9 @@ def _pre_master_timeout_result(
             "n_pricing_workers": 0,
             "kernel_priced": 0,
             "kernel_fell_back": 0,
+            "kernel_label_restarts": 0,
+            "kernel_budget_declined": 0,
+            "kernel_declined_by_reason": {},
             "seeded_columns": 0,
             "ladder_columns": 0,
             "ip_elapsed_s": 0.0,
@@ -646,8 +649,10 @@ class ColGenSolver:
         started = time.monotonic()
         pricing_wall_s = 0.0
         pricing_task_total_s = 0.0
-        kernel_priced = 0
-        kernel_fell_back = 0
+        # Every compiled-pricing counter each sweep reported, summed: `priced`, `fell_back`,
+        # the label-pool `label_restarts` / `budget_declined` pair, and one
+        # `declined_<reason>` key per `pricing.Declined` cause that fired.
+        kernel_counters: Counter[str] = Counter()
         deadline = started + params.time_limit_s
         # Leave a small tail for the final restricted-master IP.  An incomplete
         # pricing sweep cannot certify a global bound, but every completed
@@ -692,6 +697,9 @@ class ColGenSolver:
                     "n_pricing_workers": 0,
                     "kernel_priced": 0,
                     "kernel_fell_back": 0,
+                    "kernel_label_restarts": 0,
+                    "kernel_budget_declined": 0,
+                    "kernel_declined_by_reason": {},
                     "seeded_columns": 0,
                     "ladder_columns": 0,
                     "ip_elapsed_s": 0.0,
@@ -1094,8 +1102,7 @@ class ColGenSolver:
             # pool's occupancy, which is the difference between "parallelism is not paying"
             # and "parallelism is paying and the machine is saturated".
             pricing_task_total_s += sweep.task_total_s
-            kernel_priced += sweep.kernel_priced
-            kernel_fell_back += sweep.kernel_fell_back
+            kernel_counters.update(sweep.kernel_counters)
 
             before_pricing = len(master.columns)
             for column in sorted(
@@ -1530,12 +1537,25 @@ class ColGenSolver:
             # cannot be told apart from a badly-scheduled one after the fact.
             "pricing_task_total_s": pricing_task_total_s,
             "n_pricing_workers": 0 if parallel is None else parallel.n_workers,
-            # Exact-pricing calls and how many could not be proved in the compiled kernel.
+            # Exact-pricing calls and how many fell back to the pure-Python reference.
             # A fallback returns the SAME column 3-4.5x slower, so it moves no other number
             # in this dict; a nonzero count is the only way a run reports that its compiled
             # path was not actually serving it.
-            "kernel_priced": kernel_priced,
-            "kernel_fell_back": kernel_fell_back,
+            "kernel_priced": kernel_counters.get("priced", 0),
+            "kernel_fell_back": kernel_counters.get("fell_back", 0),
+            # WHY it fell back, which the count alone cannot say: "numba is missing" and "a
+            # partial expansion saturated on real data" call for opposite responses, and the
+            # warning that distinguishes them goes to stderr and dies with the process.  The
+            # pair below is the label pool's precursor and its failure -- restarts climbing
+            # while declines stay 0 is a run paying for the pool it needs without having lost
+            # the compiled path yet.
+            "kernel_label_restarts": kernel_counters.get("label_restarts", 0),
+            "kernel_budget_declined": kernel_counters.get("budget_declined", 0),
+            "kernel_declined_by_reason": {
+                key.removeprefix("declined_"): value
+                for key, value in sorted(kernel_counters.items())
+                if key.startswith("declined_")
+            },
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,

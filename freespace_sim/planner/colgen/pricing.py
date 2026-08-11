@@ -17,12 +17,14 @@ point and the module-level constants for the pruning envelopes.
 
 from __future__ import annotations
 
+import enum
 import math
 import sys
 import threading
 import time
 import heapq
 import itertools
+from collections import Counter
 from collections.abc import Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Hashable
@@ -1807,7 +1809,7 @@ _kernel_fallback_warned = False
 _kernel_restart_warned = False
 _kernel_budget_warned = False
 
-# Per-process tally of exact-pricing calls and how many could not be proved in the kernel.
+# Per-process tally of exact-pricing calls and how many fell back out of the kernel.
 #
 # A fallback is a 3-4.5x slowdown that produces the RIGHT answer, so nothing downstream can
 # notice it: the objective, the columns and the tests are all identical, only the clock
@@ -1826,13 +1828,72 @@ _kernel_budget_warned = False
 # split that one out, and they are a pair on purpose -- `label_restarts` is the precursor
 # and `budget_declined` is the failure, so a run whose restarts climb while declines stay 0
 # is one that is paying for the pool it needs without losing the compiled path yet.
-_KERNEL_STATS = {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0}
+#
+# A `Counter` rather than a fixed dict because `price_flight` also tallies one key per
+# `Declined` member, and the reachable set of those depends on the instance.
+_KERNEL_STATS: Counter[str] = Counter(
+    {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0}
+)
 
 
 def kernel_stats() -> dict[str, int]:
     """Snapshot this process's compiled-pricing tally."""
 
     return dict(_KERNEL_STATS)
+
+
+class Declined(enum.Enum):
+    """Why the compiled search did not run. Members are the reasons the reference is used.
+
+    This replaces a boolean named ``proved``, which was a **capability** flag with the name
+    of a **safety** one -- and the name caused real misreadings. ``proved=True`` could never
+    detect divergence: if the kernel explored a different set than ``_best_column``, it
+    returned ``True`` beside a plausible wrong column and nothing raised. The inference from
+    "ran to completion" to "therefore this is the reference's column" is carried entirely by
+    the test suite at build time; there is no runtime cross-check anywhere, by design.
+
+    It was also lossy in a way that cost debugging time. "numba isn't installed" and "a
+    Shewchuk partial expansion saturated on real data" were the same value, and they warrant
+    opposite responses: one is a shrug, the other means the numeric machinery the whole
+    parity argument rests on hit a wall. Only the budget members vary at runtime with the
+    instance and that iteration's duals, which is why this cannot be a startup check and why
+    the reason has to ride on the return value.
+
+    **An ``Enum`` because it pickles by name.** The ``object()`` sentinel this also replaces
+    (``_UNPROVED``) pickles happily and arrives in a pool worker as a *different instance*,
+    so ``result is _UNPROVED`` is always False across a process boundary. The sequential path
+    could never have caught that -- nothing is pickled there -- so it would have surfaced
+    first on a production timeout under a pool.
+    """
+
+    NO_NUMBA = "numba_unavailable"
+    MULTI_LEVEL = "multi_level_graph"
+    TOPOLOGY = "topology_refused"
+    ROWS = "rows_refused"
+    NO_DESTINATION = "no_reachable_destination"
+    MISSING_CELL = "origin_cell_not_packed"
+    LABEL_BUDGET = "label_pool_exhausted"
+    STATE_BUDGET = "dominance_table_exhausted"
+    HEAP_BUDGET = "heap_exhausted"
+    FSUM_OVERFLOW = "fsum_partials_overflowed"
+    DEADLINE = "cancelled"
+    #: A kernel status with no member of its own.  Unreachable today; it exists so that
+    #: adding a status to `dp_kernel` degrades to a fallback rather than to a `KeyError`
+    #: raised from the function whose entire job is to decline gracefully.
+    KERNEL_STATUS = "unmapped_kernel_status"
+
+
+def _status_reason(kernel, status) -> Declined:
+    """Map a kernel stop status onto its reason. Built per call: `kernel` is imported lazily."""
+
+    return {
+        kernel.STATUS_LABEL_LIMIT: Declined.LABEL_BUDGET,
+        kernel.STATUS_STATE_LIMIT: Declined.STATE_BUDGET,
+        # `feasible_dag`'s heap, which `price_dag` never raises: the two searches share the
+        # status code, and only the feasible one grows a heap (`dp_kernel.py:2334-2338`).
+        kernel.STATUS_CANDIDATE_LIMIT: Declined.HEAP_BUDGET,
+        kernel.STATUS_FSUM_OVERFLOW: Declined.FSUM_OVERFLOW,
+    }.get(status, Declined.KERNEL_STATUS)
 
 
 def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
@@ -2026,21 +2087,21 @@ def _best_column_compiled(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
-) -> tuple[tuple[float, Column | None], bool]:
-    """``_best_column`` over the compiled search: ``((reduced_cost, column), proved)``.
+) -> tuple[float, Column | None] | Declined:
+    """``_best_column`` over the compiled search: ``(reduced_cost, column)``, or a reason.
 
-    ``proved`` is the whole contract. ``True`` means the compiled search ran to completion,
-    and because it reproduces the reference's explored set exactly -- same roots, same
-    completion gate, same mid-sweep incumbent, same dominance ties -- its sink set is the
-    reference's, so ranking it gives the reference's column. ``False`` means the caller
-    must run ``_best_column``: numba missing, a graph the packer refuses (multi-level, no
-    reachable destination), or a budget the kernel could not grow into.
+    A 2-tuple means the compiled search ran to completion, and because it reproduces the
+    reference's explored set exactly -- same roots, same completion gate, same mid-sweep
+    incumbent, same dominance ties -- its sink set is the reference's, so ranking it gives
+    the reference's column. A :class:`Declined` means the caller must run ``_best_column``,
+    and says which of the eight reachable causes applied.
 
-    Note what ``proved`` is NOT: a residual-bound argument over a superset search. PR #76
+    Note what completing is NOT: a residual-bound argument over a superset search. PR #76
     needed one because its kernel searched more than the reference and certified
-    separately. This one does not, which is why there is no bootstrap round and no
-    ``label_limit`` ladder here -- ``price_dag`` grows its own budgets and either finishes
-    or says it did not.
+    separately. This one does not, which is why there is no ``label_limit`` ladder here --
+    ``price_dag`` grows its own budgets and either finishes or says it did not. (A
+    *bootstrap* round is a different thing and does exist, in ``price_flight``, where both
+    searches receive its result; see :func:`_bootstrap_incumbent`.)
 
     A deadline is enforced two ways, because neither alone is enough: ``_check_deadline``
     between the Python stages, and a watchdog that sets the kernel's ``cancel`` flag, which
@@ -2049,13 +2110,17 @@ def _best_column_compiled(
     """
 
     kernel = _dp_kernel()
-    if kernel is None or len(fg.levels) != 1:
-        return (-math.inf, None), False
+    if kernel is None:
+        return Declined.NO_NUMBA
+    if len(fg.levels) != 1:
+        return Declined.MULTI_LEVEL
 
     _check_deadline(deadline)
     topology, rows = dp_prepare.prepared_for(fg, cfg)
-    if not (topology.ok and rows.ok):
-        return (-math.inf, None), False
+    if not topology.ok:
+        return Declined.TOPOLOGY
+    if not rows.ok:
+        return Declined.ROWS
 
     duals = dp_prepare.prepare_duals(dual_view, fg, topology, rows)
     envelopes = dp_prepare.CompletionEnvelopes(
@@ -2083,7 +2148,13 @@ def _best_column_compiled(
         envelopes=envelopes,
     )
     if not variants.ok:
-        return (-math.inf, None), False
+        # Unreachable today, and kept anyway.  `prepare_variants` has exactly two returns and
+        # the failing one only ever propagates `topology.unsupported_reason or
+        # rows.unsupported_reason`, both of which the guard above already caught -- so this
+        # cannot fire without one of those two first.  A root set that the gate pruned to
+        # nothing is a different thing entirely: it comes back `ok` with empty arrays and
+        # correctly PROVES that no improving column exists.
+        return Declined.TOPOLOGY if not topology.ok else Declined.ROWS
     pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
 
     with fg._search_cache.lock:
@@ -2138,9 +2209,9 @@ def _best_column_compiled(
         # here would spend the caller's whole remaining budget re-running what was just
         # abandoned; `solver.py` turns this into `termination_reason = "time_limit"`.
         _check_deadline(deadline)
-        return (-math.inf, None), False
+        return Declined.DEADLINE
     if result.status != kernel.STATUS_OK:
-        return (-math.inf, None), False
+        return _status_reason(kernel, result.status)
 
     with fg._search_cache.lock:
         fg._search_cache.dag_budget = result.budget
@@ -2169,19 +2240,13 @@ def _best_column_compiled(
         incumbent=result.incumbent,
         deadline=deadline,
     )
-    return ((-math.inf, None) if best is None else best), True
+    return (-math.inf, None) if best is None else best
 
 
 def _cancel_search(flag) -> None:
     """Watchdog body: ask the kernel to stop at its next time layer."""
 
     flag[0] = 1
-
-
-#: "The compiled feasible search declined."  A distinct sentinel because ``None`` is a real
-#: answer from ``find_feasible_column`` -- a flight with no feasible column -- and returning
-#: it for "numba is missing" would report an infeasible flight instead of falling back.
-_UNPROVED = object()
 
 
 def _feasible_compiled(
@@ -2205,7 +2270,7 @@ def _feasible_compiled(
     deadline: float | None,
     model: CostModel,
 ):
-    """``find_feasible_column``'s search, compiled; ``_UNPROVED`` when it cannot run.
+    """``find_feasible_column``'s search, compiled; a :class:`Declined` when it cannot run.
 
     The **start loop stays in Python** and the kernel gets its result. That is not laziness:
     the guards need ``_endpoint_claims`` sets and the reference's own ``break`` on the
@@ -2219,13 +2284,17 @@ def _feasible_compiled(
     """
 
     kernel = _dp_kernel()
-    if kernel is None or len(fg.levels) != 1:
-        return _UNPROVED
+    if kernel is None:
+        return Declined.NO_NUMBA
+    if len(fg.levels) != 1:
+        return Declined.MULTI_LEVEL
     topology, rows = dp_prepare.prepared_for(fg, cfg)
-    if not (topology.ok and rows.ok):
-        return _UNPROVED
+    if not topology.ok:
+        return Declined.TOPOLOGY
+    if not rows.ok:
+        return Declined.ROWS
     if topology.dest_lane_idx.size == 0:
-        return _UNPROVED
+        return Declined.NO_DESTINATION
     cell_index = {
         (int(q), int(r)): i
         for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
@@ -2256,7 +2325,7 @@ def _feasible_compiled(
         for lane_idx, cell, lane_steps in origin_options:
             index = cell_index.get(cell)
             if index is None:
-                return _UNPROVED
+                return Declined.MISSING_CELL
             start_step = departure_step + fg.takeoff_steps[0] + lane_steps
             remaining = remaining_distance(cell)
             if start_step >= fg.max_step or start_step + remaining > fg.max_step:
@@ -2340,7 +2409,7 @@ def _feasible_compiled(
     )
     del stopped_early  # the early exit already put its column in `state`
     if status != kernel.STATUS_OK:
-        return _UNPROVED
+        return _status_reason(kernel, status)
     return state["best"]
 
 
@@ -2504,7 +2573,7 @@ def find_feasible_column(
         )
 
     # The compiled best-first search, when the graph has a packing and numba is present.
-    # `_UNPROVED` -- not `None` -- because `None` is a legitimate answer here: a flight with
+    # A `Declined` -- not `None` -- because `None` is a legitimate answer here: a flight with
     # no feasible column at all. Conflating the two would silently turn "the kernel declined"
     # into "this flight cannot fly".
     compiled = _feasible_compiled(
@@ -2527,7 +2596,7 @@ def find_feasible_column(
         deadline=deadline,
         model=model,
     )
-    if compiled is not _UNPROVED:
+    if not isinstance(compiled, Declined):
         return compiled
 
     counter = itertools.count()
@@ -2857,7 +2926,7 @@ def price_flight(
     # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
     # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of
     # flights, and the exclusion set is a bitset over dense row ids inside the kernel.
-    (reduced_cost, column), proved = _best_column_compiled(
+    outcome = _best_column_compiled(
         fg,
         view,
         pi_value,
@@ -2869,8 +2938,13 @@ def price_flight(
         model=model,
     )
     _KERNEL_STATS["priced"] += 1
-    if not proved:
+    if isinstance(outcome, Declined):
         _KERNEL_STATS["fell_back"] += 1
+        # The reason, not just the count.  `fell_back` alone cannot be acted on -- "install
+        # numba" and "a partial expansion saturated on real data" are opposite responses --
+        # and this is the only place both are in scope.  `solver.py` sums these into
+        # `planner_stats.json`, so an archived run can say WHICH.
+        _KERNEL_STATS[f"declined_{outcome.value}"] += 1
         # The ORIGINAL incumbent, deliberately, not whatever the abandoned compiled attempt
         # managed to certify first.  Warm-starting the fallback would be optimality-safe --
         # pruning against an achievable score never discards anything strictly better -- but
@@ -2889,6 +2963,8 @@ def price_flight(
             deadline=deadline,
             model=model,
         )
+    else:
+        reduced_cost, column = outcome
     if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
         return reduced_cost, None
     if known_column is not None and column == known_column:

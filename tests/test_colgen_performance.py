@@ -419,9 +419,10 @@ def test_shifted_seed_is_only_an_incumbent_for_exact_pricing(monkeypatch):
 
     def capture_exact_search(*args, **kwargs):
         captured["incumbent"] = kwargs["incumbent"]
-        # Stand in for the search by returning the incumbent unchanged.  `proved=True` so
-        # `price_flight` does not then fall through to the reference and undo the stub.
-        return kwargs["incumbent"], True
+        # Stand in for the search by returning the incumbent unchanged.  A plain 2-tuple
+        # rather than a `Declined`, so `price_flight` does not then fall through to the
+        # reference and undo the stub.
+        return kwargs["incumbent"]
 
     monkeypatch.setattr(pricing, "_best_column_compiled", capture_exact_search)
     reduced_cost, column = price_flight(

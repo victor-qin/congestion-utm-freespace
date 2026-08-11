@@ -181,9 +181,9 @@ def test_a_timeout_discards_later_results_that_completed():
     """
 
     accepted = _accepted_prefix(iter([
-        (7, True, 0.5, None, 1.0, 1, 0),
-        (3, False, 0.0, None, 0.25, 0, 0),
-        (9, True, 4.0, None, 8.0, 1, 1),
+        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (3, False, 0.0, None, 0.25, {}),
+        (9, True, 4.0, None, 8.0, {"priced": 1, "fell_back": 1}),
     ]))
 
     assert accepted.flight_ids == (7,)
@@ -202,8 +202,9 @@ def test_a_complete_sweep_keeps_index_order_and_sums_the_worker_tallies():
     downstream by a plain non-associative `sum`, so the sequence itself is the contract."""
 
     accepted = _accepted_prefix(iter([
-        (7, True, 0.5, None, 1.0, 1, 0),
-        (3, True, 0.25, None, 0.5, 1, 1),
+        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (3, True, 0.25, None, 0.5,
+         {"priced": 1, "fell_back": 1, "declined_label_pool_exhausted": 1}),
     ]))
 
     assert accepted.complete
@@ -212,6 +213,12 @@ def test_a_complete_sweep_keeps_index_order_and_sums_the_worker_tallies():
     assert accepted.reduced_costs == (0.5, 0.25)
     assert accepted.task_total_s == 1.5
     assert (accepted.kernel_priced, accepted.kernel_fell_back) == (2, 1)
+    # `Counter.update` ADDS; a plain `dict.update` here would report only the last task's
+    # tally, silently, and every count would read as 1.
+    assert accepted.kernel_counters["priced"] == 2
+    # The reason rides along with the count, which is the whole point of the dict: a run
+    # can say WHICH cause sent a flight back to Python, not merely that one did.
+    assert accepted.kernel_counters["declined_label_pool_exhausted"] == 1
 
 
 def test_a_worker_that_cannot_initialise_reports_from_its_first_task(monkeypatch):

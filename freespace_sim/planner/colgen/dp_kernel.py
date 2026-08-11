@@ -111,7 +111,7 @@ STATUS_NAMES = {
 FSUM_MAX_PARTIALS = 64
 
 # Where budget growth STOPS.  `_best_column_compiled` documents "a budget the kernel could
-# not grow into" as a `proved=False` case, but without these that case is unreachable: the
+# not grow into" as a `Declined` case, but without these that case is unreachable: the
 # retry loop grows geometrically and `np.zeros` raises `MemoryError` long before
 # `max_attempts` runs out, and `MemoryError` is caught nowhere on the path -- so instead of
 # falling back to the reference the solve dies, and under a worker pool an OOM-killed worker
@@ -2181,7 +2181,7 @@ def price_dag(
         if status == STATUS_LABEL_LIMIT:
             # Already at the ceiling: stop rather than ask for an allocation that would
             # raise instead of degrading.  The status survives, so the caller reads this
-            # as the `proved=False` its docstring already promises.
+            # as the `Declined` its docstring already promises.
             if label_capacity >= MAX_LABEL_CAPACITY:
                 break
             label_capacity = min(

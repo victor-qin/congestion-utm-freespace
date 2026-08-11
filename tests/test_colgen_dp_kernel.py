@@ -9,8 +9,11 @@ which is why it has to be caught one function at a time.
 from __future__ import annotations
 
 import math
+import pickle           # round-tripping this test's OWN enum members; nothing external is read
 import random
 import time
+import types
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -743,7 +746,7 @@ def test_kernel_declines_at_the_capacity_ceiling_rather_than_allocating_past_it(
     """Budget growth stops somewhere, and the stop is a decline rather than a `MemoryError`.
 
     `_best_column_compiled` documents "a budget the kernel could not grow into" as one of
-    its `proved=False` cases, and without a ceiling that case is unreachable: the retry
+    its `Declined` cases, and without a ceiling that case is unreachable: the retry
     loop grows geometrically and `np.zeros` raises long before `max_attempts` runs out.
     `MemoryError` is caught nowhere on the pricing path, so it would take the solve down --
     and under a worker pool an OOM-killed worker hangs the sweep forever
@@ -779,8 +782,22 @@ def _quiet_kernel_telemetry(monkeypatch):
     monkeypatch.setattr(pricing, "_kernel_budget_warned", False)
     monkeypatch.setattr(
         pricing, "_KERNEL_STATS",
-        {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0},
+        Counter({"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0}),
     )
+
+
+def _compiled_or_fail(*args, **kwargs):
+    """``_best_column_compiled``'s answer, failing the test if it declined instead.
+
+    Every caller here is asserting that the compiled path SERVED this graph, so a
+    ``Declined`` is a test failure and the reason is the useful part of the message.
+    Collected in one place rather than repeated per call site, the way ``_feasible_both``
+    already is for the other search.
+    """
+
+    outcome = pricing._best_column_compiled(*args, **kwargs)
+    assert not isinstance(outcome, pricing.Declined), f"compiled search declined: {outcome}"
+    return outcome
 
 
 def test_a_restarted_label_pool_is_counted_and_announced_once(monkeypatch, capsys):
@@ -799,11 +816,11 @@ def test_a_restarted_label_pool_is_counted_and_announced_once(monkeypatch, capsy
     _quiet_kernel_telemetry(monkeypatch)
     graph._search_cache.dag_budget = (1024, 14, 4096)
 
-    (_rc, column), proved = pricing._best_column_compiled(
+    _rc, column = _compiled_or_fail(
         graph, view, 0.0, cfg, 100.0, frozenset(), model=model
     )
 
-    assert proved and column is not None, "a restart must not change the outcome"
+    assert column is not None, "a restart must not change the outcome"
     assert pricing.kernel_stats()["label_restarts"] >= 1
     assert pricing.kernel_stats()["budget_declined"] == 0
     warning = capsys.readouterr().err
@@ -829,11 +846,13 @@ def test_a_search_that_hits_the_capacity_ceiling_says_so_before_falling_back(
     monkeypatch.setattr(dp_kernel, "MAX_LABEL_CAPACITY", 1024)
     graph._search_cache.dag_budget = (1024, 14, 4096)
 
-    _result, proved = pricing._best_column_compiled(
+    outcome = pricing._best_column_compiled(
         graph, view, 0.0, cfg, 100.0, frozenset(), model=model
     )
 
-    assert not proved, "the ceiling should decline rather than grow into it"
+    # The REASON, not just "it declined": this is the one cause that gets worse as the
+    # instance grows, and the one whose remedy is a constant rather than an install.
+    assert outcome is pricing.Declined.LABEL_BUDGET
     assert pricing.kernel_stats()["budget_declined"] == 1
     warning = capsys.readouterr().err
     assert "MAX_LABEL_CAPACITY" in warning
@@ -933,6 +952,86 @@ def test_a_correctness_stop_is_not_offered_the_budget_remedy(monkeypatch, capsys
     assert "FSUM_OVERFLOW" in warning
     assert "CORRECTNESS stop" in warning
     assert "MAX_LABEL_CAPACITY" not in warning, "budget advice on a correctness stop"
+
+
+def test_declined_survives_a_process_boundary():
+    """The bug the `object()` sentinel it replaces actually had.
+
+    A module-level `object()` pickles happily and arrives in a worker as a DIFFERENT
+    instance, so `result is _UNPROVED` was always False across a process boundary. Nothing
+    sequential could catch that -- nothing is pickled there -- so it would have surfaced
+    first on a production timeout under a pool. An `Enum` pickles by name and round-trips
+    to the same object.
+
+    Narrow to the round trip on purpose: that a decline is distinguishable from `None` is
+    already tested THROUGH `find_feasible_column`, which is the better test of it.
+    """
+
+    for member in pricing.Declined:
+        assert pickle.loads(pickle.dumps(member)) is member
+
+
+def test_every_kernel_stop_status_maps_to_its_own_reason():
+    """Distinct reasons, and an unmapped status degrades to a fallback rather than a crash.
+
+    "numba isn't installed" and "a Shewchuk partial expansion saturated on real data" used
+    to be the same value, and they warrant opposite responses. The catch-all matters for a
+    different reason: a closed `[...]` lookup would turn a future kernel status into a
+    `KeyError` raised out of the function whose entire job is to decline gracefully.
+    """
+
+    mapped = {
+        dp_kernel.STATUS_LABEL_LIMIT: pricing.Declined.LABEL_BUDGET,
+        dp_kernel.STATUS_STATE_LIMIT: pricing.Declined.STATE_BUDGET,
+        dp_kernel.STATUS_CANDIDATE_LIMIT: pricing.Declined.HEAP_BUDGET,
+        dp_kernel.STATUS_FSUM_OVERFLOW: pricing.Declined.FSUM_OVERFLOW,
+    }
+    for status, expected in mapped.items():
+        assert pricing._status_reason(dp_kernel, status) is expected
+    assert len(set(mapped.values())) == len(mapped), "two statuses share a reason"
+
+    unmapped = max(dp_kernel.STATUS_NAMES) + 100
+    assert pricing._status_reason(dp_kernel, unmapped) is pricing.Declined.KERNEL_STATUS
+
+
+def test_each_structural_decline_names_its_own_cause(monkeypatch):
+    """The four guards that fire before the kernel runs, each with its own reason.
+
+    These are the ones a `proved=False` boolean flattened into a single value: "fix your
+    install", "this scope is unimplemented", and "the packer refused this graph" want
+    different responses from whoever reads the run.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    call = (graph, view, 0.0, cfg, 100.0, frozenset())
+
+    monkeypatch.setattr(pricing, "_dp_kernel", lambda: None)
+    assert pricing._best_column_compiled(*call, model=model) is pricing.Declined.NO_NUMBA
+    monkeypatch.undo()
+
+    # Only `len(fg.levels)` is read before this guard returns, so a stand-in is honest here
+    # and building a genuinely multi-level graph would be testing the builder instead.
+    two_level = types.SimpleNamespace(levels=(0, 1))
+    assert pricing._best_column_compiled(
+        two_level, view, 0.0, cfg, 100.0, frozenset(), model=model
+    ) is pricing.Declined.MULTI_LEVEL
+
+    for refused, expected in (
+        ("topology", pricing.Declined.TOPOLOGY),
+        ("rows", pricing.Declined.ROWS),
+    ):
+        topology, rows = dp_prepare.prepared_for(graph, cfg)
+        stubs = {"topology": topology, "rows": rows}
+        stubs[refused] = types.SimpleNamespace(ok=False, unsupported_reason="stubbed")
+        monkeypatch.setattr(
+            dp_prepare, "prepared_for",
+            lambda *a, **k: (stubs["topology"], stubs["rows"]),
+        )
+        assert pricing._best_column_compiled(*call, model=model) is expected
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize(
@@ -1226,8 +1325,8 @@ def test_price_flight_takes_the_compiled_path_and_returns_the_reference_column()
     The end-to-end shape of Phase 2c, and the one that would otherwise ship silently wrong:
     every earlier test drives `price_dag` directly, so none of them notices if
     `_best_column_compiled` falls back on every flight -- which reads as a correct, slow
-    solve rather than as a failure. Hence the assertion on `proved` as well as on the
-    column.
+    solve rather than as a failure. Hence `_compiled_or_fail`, which fails on a `Declined`,
+    as well as the assertion on the column.
     """
 
     cfg = _cfg()
@@ -1242,10 +1341,9 @@ def test_price_flight_takes_the_compiled_path_and_returns_the_reference_column()
         seed,
     )
 
-    (rc, column), proved = pricing._best_column_compiled(
+    rc, column = _compiled_or_fail(
         graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model
     )
-    assert proved, "the compiled path refused a graph it is supposed to handle"
     assert column is not None
 
     ref_rc, ref_column = pricing._best_column(
@@ -1278,10 +1376,9 @@ def test_compiled_path_honours_forbidden_rows_without_falling_back():
     )
     assert len(forbidden) > 10
 
-    (rc, column), proved = pricing._best_column_compiled(
+    rc, column = _compiled_or_fail(
         graph, view, 0.0, cfg, 100.0, forbidden, incumbent=None, model=model
     )
-    assert proved, "a non-empty forbidden set must not force the reference"
     ref_rc, ref_column = pricing._best_column(
         graph, view, 0.0, cfg, 100.0, forbidden, seed=False, incumbent=None, model=model
     )
@@ -1328,10 +1425,9 @@ def test_compiled_path_weights_the_label_score_in_the_objective_currency():
     model = CostModel(ground_weight=9.0, air_weight=1.0)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
-    (rc, column), proved = pricing._best_column_compiled(
+    rc, column = _compiled_or_fail(
         graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
     )
-    assert proved
     ref_rc, ref_column = pricing._best_column(
         graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
     )
@@ -1355,13 +1451,12 @@ def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
     model = cost_model(params, cfg)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
-    (rc, column), proved = pricing._best_column_compiled(
+    rc, column = _compiled_or_fail(
         graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
     )
     ref_rc, ref_column = pricing._best_column(
         graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
     )
-    assert proved
     assert column == ref_column
     assert rc == ref_rc
 
@@ -1464,11 +1559,12 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
                     seed,
                 )
 
-        (rc, column), proved = pricing._best_column_compiled(
+        outcome = pricing._best_column_compiled(
             graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model
         )
-        if not proved:
+        if isinstance(outcome, pricing.Declined):
             continue
+        rc, column = outcome
         ref_rc, ref_column = pricing._best_column(
             graph, view, 0.0, cfg, 100.0, frozenset(), seed=False,
             incumbent=incumbent, model=model,
@@ -1478,7 +1574,7 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
         assert column == ref_column, f"case {index}: different column"
         assert rc == ref_rc, f"case {index}: {rc!r} != {ref_rc!r}"
 
-    assert compared >= 30, f"only {compared} cases were proved; the sweep proves little"
+    assert compared >= 30, f"only {compared} cases ran compiled; the sweep proves little"
     assert nontrivial >= 20, f"only {nontrivial} cases found a column at all"
 
 
@@ -1498,7 +1594,7 @@ def _feasible_both(graph, cfg, model, **kwargs):
     pricing.seed_column(graph, cfg, model=model)
     compiled = pricing.find_feasible_column(graph, cfg, model=model, **kwargs)
     real = pricing._feasible_compiled
-    pricing._feasible_compiled = lambda *a, **k: pricing._UNPROVED
+    pricing._feasible_compiled = lambda *a, **k: pricing.Declined.NO_NUMBA
     try:
         reference = pricing.find_feasible_column(graph, cfg, model=model, **kwargs)
     finally:
@@ -1571,14 +1667,14 @@ def test_compiled_feasible_search_honours_forbidden_rows():
 
 
 def test_compiled_feasible_search_declines_rather_than_reporting_infeasible():
-    """`_UNPROVED` is not `None`, and the difference is a flight that cannot fly.
+    """A `Declined` is not `None`, and the difference is a flight that cannot fly.
 
     `find_feasible_column` returns `None` for a genuinely infeasible flight. If the compiled
     path signalled "I declined" with the same value, a missing numba would read as an
     infeasible flight and the greedy would drop it instead of falling back.
     """
 
-    assert pricing._UNPROVED is not None
+    assert pricing.Declined.NO_NUMBA is not None
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
     model = cost_model(params, cfg)

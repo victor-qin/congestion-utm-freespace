@@ -118,6 +118,7 @@ from freespace_sim.scenarios import get_scenario
 spec_name, n_flights, iterations = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 backend, gap_metric = sys.argv[5], sys.argv[6]
 ladder, kernel, workers = int(sys.argv[7]), sys.argv[8], int(sys.argv[9])
+greedy_budget = float(sys.argv[10])
 spec = get_scenario(spec_name)
 cfg = spec.config()
 demand = spec.demand_model()
@@ -131,13 +132,26 @@ static_terms = list(demand.terminals(cfg))
 # quietly ran with no ladder diverges on every column and reads as a kernel regression.
 # The EFFECTIVE value goes into the fingerprint and the parent refuses to compare two arms
 # that did not get the same one.
+#
+# `greedy_budget_s_per_flight` is the same shape of problem and a sharper one: the greedy
+# stage is bounded by a WALL CLOCK (`solver.py`'s `greedy_budget_s_per_flight * n_flights`),
+# so a faster tree reaches more candidates, `best_heuristic` differs, the duals differ, and
+# every column diverges for a reason that has nothing to do with what is under test. Pinning
+# it high enough that the stage always finishes is what makes this harness able to gate a
+# change that legitimately makes pricing faster. `origin/main` has no such field at all, so
+# the same feature test applies.
 _fields = {f.name for f in dataclasses.fields(ColGenParams)}
 _ladder_kwargs = {"seed_ladder_steps": ladder} if "seed_ladder_steps" in _fields else {}
+_greedy_kwargs = (
+    {"greedy_budget_s_per_flight": greedy_budget}
+    if "greedy_budget_s_per_flight" in _fields else {}
+)
 params = ColGenParams(
     solver=backend, max_iterations=iterations, time_limit_s=86400.0, gap_metric=gap_metric,
-    **_ladder_kwargs,
+    **_ladder_kwargs, **_greedy_kwargs,
 )
 effective_ladder = getattr(params, "seed_ladder_steps", 0)
+effective_greedy_budget = getattr(params, "greedy_budget_s_per_flight", None)
 
 if kernel == "off":
     # Force the pure-Python reference search.  Same seam the kernel tests use
@@ -196,12 +210,21 @@ print("@@FINGERPRINT@@" + json.dumps({
     "ladder_columns": stats.get("ladder_columns", 0),
     "kernel": kernel,
     "workers": effective_workers,
-    # `_greedy_feasible_selection` is bounded by a 60 s WALL CLOCK, not by a flight count,
-    # so at scale it stops wherever the clock caught it -- and it produces `best_heuristic`,
-    # which is the `known_column` cutoff handed to every pricing call.  If this is False the
-    # arms did not start from the same incumbent and no fingerprint comparison is valid,
-    # whatever else differs.
+    # `_greedy_feasible_selection` is bounded by a WALL CLOCK, not by a flight count, so at
+    # scale it stops wherever the clock caught it -- and it produces `best_heuristic`, which
+    # is the `known_column` cutoff handed to every pricing call.  If this is False for the
+    # CLOCK's sake the arms did not start from the same incumbent and no fingerprint
+    # comparison is valid, whatever else differs.  `--greedy-budget` exists to lift it, and
+    # the effective value is fingerprinted so two arms that got different ones cannot be
+    # compared.
+    #
+    # It is ALSO False for a structural reason no budget can fix: the stage caps itself at
+    # `max(64, n_heuristic_tries * 16)` candidates before consulting any deadline, so above
+    # that flight count it never "completes".  `greedy_candidate_capped` tells the two apart,
+    # and only the clock case invalidates a comparison.
     "greedy_completed": stats.get("initial_greedy_completed"),
+    "greedy_budget_s_per_flight": effective_greedy_budget,
+    "greedy_candidate_capped": n_flights > max(64, params.n_heuristic_tries * 16),
     "greedy_elapsed_s": round(float(stats.get("initial_greedy_elapsed_s", 0.0) or 0.0), 1),
     "heuristic_strategy": stats.get("initial_heuristic_strategy"),
     # Label pools are per-process, so a parallel arm's memory is the thing most likely to
@@ -216,7 +239,9 @@ print("@@FINGERPRINT@@" + json.dumps({
 '''
 
 
-def _run_arm(root: Path, arm: dict, ladder: int, kernel: str, workers: int) -> dict:
+def _run_arm(
+    root: Path, arm: dict, ladder: int, kernel: str, workers: int, greedy_budget: float
+) -> dict:
     """Fingerprint one arm in a child interpreter rooted at ``root``."""
 
     proc = subprocess.run(
@@ -224,6 +249,7 @@ def _run_arm(root: Path, arm: dict, ladder: int, kernel: str, workers: int) -> d
             sys.executable, "-c", _CHILD, str(root),
             arm["scenario"], str(arm["flights"]), str(arm["iterations"]),
             arm["solver"], arm["gap_metric"], str(ladder), kernel, str(workers),
+            str(greedy_budget),
         ],
         cwd=root,
         capture_output=True,
@@ -287,6 +313,16 @@ def main() -> int:
         help="pin seed_ladder_steps on BOTH arms (default 0). See the module docstring: a "
              "ladder changes the duals, so a laddered tree vs an unladdered ref diverges "
              "for reasons unrelated to the kernel.",
+    )
+    parser.add_argument(
+        "--greedy-budget", type=float, default=1e6, metavar="S",
+        help="pin greedy_budget_s_per_flight on BOTH arms (default 1e6, i.e. effectively "
+             "unbounded). The greedy stage is bounded by a WALL CLOCK, so at the shipped "
+             "default a faster tree reaches more candidates, gets a different "
+             "best_heuristic, and therefore different duals -- every column then diverges "
+             "for a reason that is not the change under test. Lifting the clock is what "
+             "makes this harness able to gate an acceleration at all. Ignored on refs whose "
+             "ColGenParams has no such field.",
     )
     parser.add_argument(
         "--arm", action="append", choices=sorted(ARMS),
@@ -357,7 +393,9 @@ def main() -> int:
         say(f"\n=== {name}: {arm['scenario']} x{arm['flights']} "
             f"iters={arm['iterations']} {arm['solver']} gap={arm['gap_metric']} "
             f"ladder={args.ladder} ===")
-        current = _run_arm(REPO_ROOT, arm, args.ladder, "on", args.workers)
+        current = _run_arm(
+            REPO_ROOT, arm, args.ladder, "on", args.workers, args.greedy_budget
+        )
         say(f"  tree     {current['wall_s']:8.2f}s pricing={current['pricing_wall_s']:8.2f}s "
             f"obj={current['objective']} sel={current['selected_flights']} "
             f"cols={current['n_columns']} sha={current['column_sha']} "
@@ -366,7 +404,10 @@ def main() -> int:
             f"greedy_done={current['greedy_completed']}/{current['greedy_elapsed_s']}s")
         if baseline_root is None:
             continue
-        base = _run_arm(baseline_root, arm, args.ladder, baseline_kernel, baseline_workers)
+        base = _run_arm(
+            baseline_root, arm, args.ladder, baseline_kernel, baseline_workers,
+            args.greedy_budget,
+        )
         say(f"  {baseline_label:<8.8} {base['wall_s']:8.2f}s "
             f"pricing={base['pricing_wall_s']:8.2f}s "
             f"obj={base['objective']} sel={base['selected_flights']} "
@@ -383,6 +424,27 @@ def main() -> int:
                 f"{current['seed_ladder_steps']} but {baseline_label} ran "
                 f"{base['seed_ladder_steps']} -- the baseline predates the parameter, so "
                 f"rerun with --ladder 0 or pick a newer ref")
+            continue
+        # Same argument for the greedy's budget, which a ref predating the field ignores.
+        if current["greedy_budget_s_per_flight"] != base["greedy_budget_s_per_flight"]:
+            failures += 1
+            say(f"  UNCOMPARABLE: tree ran greedy_budget_s_per_flight="
+                f"{current['greedy_budget_s_per_flight']} but {baseline_label} ran "
+                f"{base['greedy_budget_s_per_flight']} -- the baseline predates the "
+                f"parameter, so its greedy stopped on a different clock")
+            continue
+        # The greedy's stop reason, not merely whether it stopped.  A stage capped by its
+        # CANDIDATE limit stops at the same place in both arms and is fine; one stopped by
+        # the CLOCK stops wherever the machine happened to be, so the two arms started from
+        # different `best_heuristic` incumbents and nothing downstream is comparable.
+        clock_stopped = [
+            label for label, arm_fp in ((baseline_label, base), ("tree", current))
+            if not arm_fp["greedy_completed"] and not arm_fp["greedy_candidate_capped"]
+        ]
+        if clock_stopped:
+            failures += 1
+            say(f"  UNCOMPARABLE: the greedy ran out of CLOCK in {', '.join(clock_stopped)}"
+                f" -- raise --greedy-budget (currently {args.greedy_budget:g} s/flight)")
             continue
         diffs = [f for f in _COMPARED if current[f] != base[f]]
         if diffs:

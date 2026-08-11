@@ -10,7 +10,17 @@ change is *when* results arrive. This module exists to make sure that is all it 
    :class:`PricingTimeout`, so flights after it are never priced. A pool has no such
    ordering: a worker can finish flight 40 while flight 5 times out. Results are collected
    by ``pricing_order`` index and everything at or past the first timeout is DISCARDED, so
-   the accepted set is exactly the prefix the sequential loop would have produced.
+   the accepted set has the same SHAPE the sequential loop would have produced -- a prefix
+   of ``pricing_order``, never a set with holes in it.
+
+   Same shape, not the same prefix. ``PricingTimeout`` fires off a wall clock, and
+   ``solver`` fixes one absolute ``pricing_deadline`` per iteration, so sequentially flight
+   *k* is reached only after the cumulative single-core time of the flights before it while
+   a pool runs them concurrently. More of them therefore finish before that same instant,
+   and the prefix a pool keeps is generally LONGER. That is strictly more pricing done
+   inside the budget rather than a defect, but it is a different column set, so it is only
+   correct to call a pool answer-identical on a sweep that never times out. Parity runs
+   accordingly pin ``n_workers=0``.
 2. *Index order, not completion order.* ``master.upper_bound`` sums the reduced costs with
    plain ``sum`` (master.py), not ``math.fsum``, and float addition is not associative --
    so appending them as workers finish perturbs the global bound at ulp level and the

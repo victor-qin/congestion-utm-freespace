@@ -91,10 +91,19 @@ def run_batch(
     has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
 
     Pricing fans across worker processes when ``params.n_pricing_workers`` is nonzero, and
-    runs in this process otherwise (the default).  That is a pure performance knob:
-    :func:`pricing_pool.price_sweep` reproduces the sequential loop's accepted prefix and
-    hands the reduced costs back in index order, so the columns and the objective do not
-    move.  ``sim.run``'s own ``parallel`` argument is a different mechanism entirely -- the
+    runs in this process otherwise (the default).  :func:`pricing_pool.price_sweep`
+    reproduces the sequential loop's prefix RULE and hands the reduced costs back in index
+    order, so on any sweep that finishes the columns and the objective do not move.
+
+    It is NOT answer-identical on a sweep that hits the deadline, and that limit is worth
+    stating because a run at scenario scale usually does.  ``PricingTimeout`` fires off a
+    wall clock, not a work budget: sequentially, flight *k* is reached only after the
+    cumulative time of the flights before it, whereas a pool runs them concurrently, so
+    more of them finish before the SAME absolute deadline and the accepted prefix is
+    generally longer.  Longer is not worse -- it is strictly more pricing done inside the
+    budget -- but it is a different column set, so a parity run must leave this at 0.
+
+    ``sim.run``'s own ``parallel`` argument is a different mechanism entirely -- the
     A* speculative runner -- and rejects whole-schedule planners, so the two never interact.
 
     ``on_iteration`` is forwarded to the solver, which calls it once per column-generation

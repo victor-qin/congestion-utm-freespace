@@ -625,10 +625,15 @@ class ColGenSolver:
         iteration's duals, so the loop order affects only which columns a timed-out sweep
         managed to reach, never their value.
 
-        ``parallel`` fans that sweep across worker processes.  It is a pure performance
-        knob: :func:`pricing_pool.price_sweep` reproduces the sequential loop's accepted
-        prefix and hands the reduced costs back in index order, so the columns and the
-        objective are unchanged.  ``None`` (the default) keeps the sweep in-process.
+        ``parallel`` fans that sweep across worker processes.
+        :func:`pricing_pool.price_sweep` reproduces the sequential loop's prefix RULE and
+        hands the reduced costs back in index order, so on a sweep that FINISHES the columns
+        and the objective are unchanged.  A sweep that hits ``pricing_deadline`` is a
+        different matter: the timeout is a wall clock rather than a work budget, and a pool
+        gets further through ``pricing_order`` before the same absolute deadline than one
+        core does, so it keeps a longer prefix.  More pricing inside the same budget, but
+        not the same answer -- see :mod:`.pricing_pool`.  ``None`` (the default) keeps the
+        sweep in-process.
 
         ``on_iteration`` is called once per column-generation iteration with a dict of
         that iteration's master state (LP objective, global upper bound, gaps, column
@@ -980,8 +985,19 @@ class ColGenSolver:
             if iteration == 0:
                 # The first LP has now established the real column-generation
                 # cycle.  Build at most one route-aware incumbent column per
-                # flight using the same lazy topology, bounded independently so
-                # formal reduced-cost pricing retains most of the solve budget.
+                # flight using the same lazy topology, bounded independently of
+                # the pricing loop.
+                #
+                # "Independently" no longer means "as a share of the solve".  The
+                # budget below is per FLIGHT and the old `0.55 * time_limit_s`
+                # factor is gone, so the only thing keeping this stage away from
+                # the whole budget is the absolute `pricing_deadline` clamp: at
+                # the 0.7 s default and a 1200 s limit, ~850 flights makes the
+                # greedy half of pricing's budget and ~1700 makes it all of it.
+                # That is a deliberate trade -- see `greedy_budget_s_per_flight`
+                # -- but it is a ceiling on batch size, not a guarantee, and it
+                # is why a very large batch wants an explicit rate rather than
+                # the default.
                 greedy_started = time.monotonic()
                 # PER FLIGHT, because the stage divides its budget across candidates and a
                 # fixed total therefore starves as the batch grows.  The old

@@ -49,15 +49,25 @@ _loaded = Path(freespace_sim.__file__).resolve()
 if REPO_ROOT not in _loaded.parents:
     raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
 
+from freespace_sim import volumes as volumes_mod  # noqa: E402
 from freespace_sim.planner.colgen import dp_prepare as dp_prepare_mod  # noqa: E402
 from freespace_sim.planner.colgen import master as master_mod  # noqa: E402
+from freespace_sim.planner.colgen import network as network_mod  # noqa: E402
 from freespace_sim.planner.colgen import pricing as pricing_mod  # noqa: E402
 from freespace_sim.planner.colgen import pricing_pool as pricing_pool_mod  # noqa: E402
 from freespace_sim.planner.colgen import solver as solver_mod  # noqa: E402
+from freespace_sim.planner.colgen import translate as translate_mod  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
 from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
+
+# Optional: absent on a numba-less install, which is exactly the run where every pricing
+# call falls back and the `price_dag` row would read 0 anyway.
+try:
+    from freespace_sim.planner.colgen import dp_kernel as dp_kernel_mod  # noqa: E402
+except ImportError:  # pragma: no cover - depends on the install
+    dp_kernel_mod = None
 
 TOTAL_S: collections.Counter = collections.Counter()
 CALLS: collections.Counter = collections.Counter()
@@ -78,11 +88,18 @@ STAGES: list[tuple[str, list[tuple[object, str]]]] = [
     # count and worth reading as one.
     ("_best_column_compiled (Tier 1+2, entry)", [(pricing_mod, "_best_column_compiled")]),
     ("_best_column (reference FALLBACK)", [(pricing_mod, "_best_column")]),
+    # THE COMPILED BORDER.  `price_dag` is the host wrapper, not the `@njit` function, so
+    # this row spans the kernel PLUS every pause it makes -- `certify`, `envelopes.envelope`,
+    # candidate-buffer drains -- all of which run in Python inside its resume loop.
+    # Compiled time is therefore this row MINUS the `_canonical_candidate` and envelope time
+    # attributed below; without it the whole kernel side landed in an unattributed remainder.
+    ("  price_dag (COMPILED BORDER, incl. pauses)", [(dp_kernel_mod, "price_dag")]),
     ("  _dag_candidates (per-sink pricing)", [(pricing_mod, "_dag_candidates")]),
     ("  _certify_candidates (Tier 2 rank)", [(pricing_mod, "_certify_candidates")]),
     ("  prepared_for (cached packing)", [(dp_prepare_mod, "prepared_for")]),
     ("  prepare_duals (per sweep)", [(dp_prepare_mod, "prepare_duals")]),
     ("  prepare_variants (roots + gate)", [(dp_prepare_mod, "prepare_variants")]),
+    ("  prepare_forbidden (per repair call)", [(dp_prepare_mod, "prepare_forbidden")]),
     ("_canonical_candidate (Tier 2 + incumbent)", [(pricing_mod, "_canonical_candidate")]),
     ("_path_claims", [(pricing_mod, "_path_claims")]),
     ("_path_delay_s", [(pricing_mod, "_path_delay_s")]),
@@ -98,6 +115,32 @@ STAGES: list[tuple[str, list[tuple[object, str]]]] = [
     ("_greedy_feasible_selection", [(solver_mod, "_greedy_feasible_selection")]),
     ("column_claims", [(pricing_mod, "column_claims")]),
     ("column_to_intent", [(pricing_mod, "column_to_intent")]),
+    # The `volumes.py` geometry both rulers bottom out in, and the answer to "would
+    # compiling the ledger side help".  These are LEAVES of the rows above -- `_path_delay_s`
+    # is essentially `enroute_flown_m`, and `column_to_intent` is essentially
+    # `build_reservation_from_corners` -- so their sum is the ceiling on that idea, not an
+    # addition to it.  Every module ON THE COLGEN PATH holding a direct-name binding is
+    # patched, per the note in the module docstring -- `metrics`, `milp` and `shortcut` bind
+    # these names too but no colgen solve reaches them, so a row here is this planner's cost
+    # and not the ledger's in general.  `fold_corners_to_columns` is only ever reached as a
+    # `volumes` module global, hence the single site.
+    (
+        "  enroute_flown_m (volumes)",
+        [(volumes_mod, "enroute_flown_m"), (pricing_mod, "enroute_flown_m"),
+         (translate_mod, "enroute_flown_m")],
+    ),
+    ("    fold_corners_to_columns (volumes)", [(volumes_mod, "fold_corners_to_columns")]),
+    (
+        "  build_reservation_from_corners (volumes)",
+        [(volumes_mod, "build_reservation_from_corners"),
+         (translate_mod, "build_reservation_from_corners")],
+    ),
+    (
+        "  column_dwell_s (volumes)",
+        [(volumes_mod, "column_dwell_s"), (pricing_mod, "column_dwell_s"),
+         (translate_mod, "column_dwell_s"), (network_mod, "column_dwell_s"),
+         (dp_prepare_mod, "column_dwell_s")],
+    ),
 ]
 
 # Bound methods, timed by wrapping the class attribute.

@@ -137,7 +137,7 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     defaults = colgen_params_from_args(_args("colgen_test", "--planner", "colgen"), "colgen")
 
     assert defaults.time_limit_s == 1200.0
-    assert defaults.objective == "total_delay"
+    assert defaults.objective == "total_cost"
     # The pricing-path knobs specifically: `n_pricing_workers` defaulting to 0 is what
     # keeps an existing command line byte-identical after the flags were added, and the
     # other two default to ON, so a `None` leaking through would silently disable the

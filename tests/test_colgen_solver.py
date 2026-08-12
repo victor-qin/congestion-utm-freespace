@@ -12,6 +12,7 @@ import math
 import time
 from collections import Counter
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -39,7 +40,7 @@ from freespace_sim.planner.colgen.pricing import (
     price_flight,
     seed_column,
 )
-from freespace_sim.planner.colgen.objective import DELAY_MODEL
+from freespace_sim.planner.colgen.objective import DELAY_MODEL, cost_model
 from freespace_sim.planner.colgen.solver import (
     ColGenSolver,
     _add_departure_ladder,
@@ -131,15 +132,40 @@ def _assert_claim_feasible(columns: dict[int, Column], rows: RowIndex | None = N
     assert all(load <= rows.cap(row) for row, load in loads.items())
 
 
+# The SHIPPED default, spelled out.  `cost_model(cfg, None)` returns `DELAY_MODEL` -- a
+# caller with no params object has no config opinion to read -- so `None` is the wrong
+# default for a helper whose callers DID solve with real params.
+_SHIPPED_PARAMS = ColGenParams()
+
+
 def _assert_files_cleanly(
-    requests: list[FlightRequest], columns: dict[int, Column], cfg: SimConfig
+    requests: list[FlightRequest],
+    columns: dict[int, Column],
+    cfg: SimConfig,
+    params: Any = _SHIPPED_PARAMS,
 ) -> None:
+    """Every column files as an accepted, conflict-free intent priced in the right currency.
+
+    ``params`` selects the currency and defaults to the shipped one.  It has to be a
+    parameter at all because ``Column.delay_s`` is the OBJECTIVE's verdict, not a duration:
+    under the config's 1:3 weighting it is `w_ground*ground + w_air*air`, which equals
+    ``total_delay_s`` only when the two weights are 1 -- or when the column happens to fly
+    the geodesic, so the air term is zero.  Asserting the unweighted metric here used to
+    hold by accident and would now silently pass for every ground-only column while failing
+    on exactly the detour columns these tests exist to construct.
+    """
+
+    model = cost_model(cfg, params)
     by_id = {request.flight_id: request for request in requests}
     ledger = ReservationLedger(cfg)
     for flight_id, column in sorted(columns.items()):
         intent = column_to_intent(column, by_id[flight_id], cfg)
         assert intent.status is IntentStatus.ACCEPTED
-        assert column.delay_s == pytest.approx(total_delay_s(intent, cfg), abs=1e-9)
+        ground_s = intent.ground_delay_s
+        expected_cost = model.evaluate(
+            ground_s=ground_s, air_detour_s=total_delay_s(intent, cfg) - ground_s
+        )
+        assert column.delay_s == pytest.approx(expected_cost, abs=1e-9)
         assert not ledger.any_conflict(intent.volumes)
         ledger.commit(flight_id, intent.volumes)
 
@@ -262,7 +288,17 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
     # itself an air-time overrun, and this test is about the delay accounting rather than
     # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic. Lifted at
     # the graph so the corridor stays where the fixture put it (issue #78: one knob sizes both).
-    params = _params(max_air_overrun_hops=2)
+    #
+    # `objective` is pinned to `total_delay` rather than left at the shipped `total_cost`,
+    # and this is the one test in the file where that is the right call rather than a dodge.
+    # The property under test is in the name: fold replacement is not "unavoidable delay".
+    # It is a claim about the DELAY ACCOUNTING -- that an extra hop which buys back terminal
+    # folding distance is correctly credited -- and the fixture is hand-built so the two
+    # exactly cancel, which is a statement in unit seconds. Under 1:3 the hop is repriced at
+    # 3x while the fold it replaces is a continuous distance, so they no longer cancel and
+    # the optimum moves to a shorter path on a different lane (observed: lane 4, one hop).
+    # That is the objective working correctly; it is simply no longer this test's question.
+    params = _params(max_air_overrun_hops=2, objective="total_delay")
     graph = build_flight_graph(
         request,
         cfg,
@@ -421,8 +457,11 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
         (2, 0),
     )
     assert len(column.cell_path) - 1 > graph.shortest_hops + corridor
-    assert column.delay_s == pytest.approx(16.0)
-    assert reduced_cost == pytest.approx(params.M - 16.0)
+    # 4 excess hops x dt(4 s) x w_air(3) under the config's 1:3 weighting.  The COLUMN is
+    # the same one this test has always asserted -- the path equality above is unchanged --
+    # and only the currency it is priced in moved, from 16 s to 48 cost.
+    assert column.delay_s == pytest.approx(48.0)
+    assert reduced_cost == pytest.approx(params.M - 48.0)
     assert column.claims.isdisjoint(duals)
 
     _lo, hi = derive_cell_window(cfg)
@@ -706,11 +745,17 @@ def test_hand_checked_detour_beats_hold():
         _params(max_air_overrun_hops=1, gap_metric="cost"),
     )
 
+    # The claim is unchanged and is the name of the test: a one-hop detour still beats a
+    # four-step hold.  Only the margin moved.  Under the config's 1:3 weighting the hold
+    # costs 16 (16 ground seconds, w_ground = 1, the numeraire) and the detour costs 12
+    # (1 hop x dt(4 s) x w_air(3)) -- so the detour wins by 4 where it used to win by 12.
+    # That narrowing is the point of the weighting, and a ratio above 4:1 would flip it.
     assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
-    assert with_detour.stats["objective"] == pytest.approx(4.0, abs=1e-8)
-    assert with_detour.stats["cost_lower_bound"] == pytest.approx(4.0, abs=1e-7)
-    assert with_detour.stats["cost_upper_bound"] == pytest.approx(4.0, abs=1e-7)
-    assert sorted(column.delay_s for column in with_detour.columns.values()) == [0.0, 4.0]
+    assert with_detour.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert with_detour.stats["objective"] < no_detour.stats["objective"]
+    assert with_detour.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
+    assert with_detour.stats["cost_upper_bound"] == pytest.approx(12.0, abs=1e-7)
+    assert sorted(column.delay_s for column in with_detour.columns.values()) == [0.0, 12.0]
     assert any(
         len(column.cell_path) - 1 == hg.hex_distance(column.cell_path[0], column.cell_path[-1]) + 1
         for column in with_detour.columns.values()
@@ -745,12 +790,18 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
 
     assert revenue.stats["termination_reason"] == "lp_gap"
     assert revenue.stats["iterations"] == 1
-    # Optimal solution ...
-    assert revenue.stats["objective"] == pytest.approx(4.0, abs=1e-8)
-    assert revenue.stats["cost_lower_bound"] == pytest.approx(4.0, abs=1e-7)
-    # ... reached while the two scales disagree by five orders of magnitude.
+    # Optimal solution ... (12 = 1 detour hop x dt(4 s) x w_air(3); the same column as
+    # before the objective default moved to the config's 1:3 weighting, repriced)
+    assert revenue.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert revenue.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
+    # ... reached while the two scales disagree by orders of magnitude.  Asserted as the
+    # RATIO between them rather than as a floor on the cost gap: `lp_gap_cost` normalises
+    # the same absolute gap by total cost, so repricing the optimum from 4 to 12 divides it
+    # by three (0.75 -> 0.25) without changing anything this test is about.  The ratio is
+    # the claim -- the revenue scale closes while the cost scale is nowhere near closing.
     assert revenue.stats["lp_gap_revenue"] < 1e-4
-    assert revenue.stats["lp_gap_cost"] > 0.5
+    assert revenue.stats["lp_gap_cost"] > 0.2
+    assert revenue.stats["lp_gap_cost"] > 1e3 * revenue.stats["lp_gap_revenue"]
 
 
 def test_colgen_beats_fcfs_on_constructed_congestion():
@@ -783,10 +834,22 @@ def test_colgen_beats_fcfs_on_constructed_congestion():
 
     assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 16.0]
     assert fcfs_delays == pytest.approx([0.0, 24.0, 24.0])
-    # `objective` is in the cost model's currency; this solve runs the default delay
-    # objective, so here it is seconds and comparable to the A* delays directly.
-    assert colgen.stats["objective_name"] == "total_delay"
+    # `objective` is in the cost model's currency, which is now the config's 1:3 weighting
+    # and NOT seconds in general.  It is comparable to the A* delays here for a reason
+    # specific to this instance: colgen resolves the congestion entirely with GROUND delay
+    # (the columns above are 0/0/16 s of hold and no detour), and `cost_ground_delay_per_s`
+    # is the numeraire at 1.0, so ground seconds and cost coincide exactly.  An instance
+    # that resolved it with a detour would scale that term by 3 and the comparison below
+    # would be between two different units.
+    assert colgen.stats["objective_name"] == "total_cost"
     assert colgen.stats["objective"] == pytest.approx(16.0)
+    # The premise of that paragraph, asserted rather than assumed: every column flies the
+    # geodesic, so the air term is zero and only the ground term is left.
+    assert all(
+        len(column.cell_path) - 1
+        == hg.hex_distance(column.cell_path[0], column.cell_path[-1])
+        for column in colgen.columns.values()
+    )
     assert colgen.stats["objective"] < sum(fcfs_delays)
     _assert_files_cleanly(requests, colgen.columns, cfg)
 

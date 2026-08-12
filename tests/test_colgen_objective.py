@@ -85,10 +85,29 @@ def test_evaluate_applies_ground_and_air_weights_separately():
     assert model.evaluate(ground_s=10.0, air_hold_s=10.0, air_detour_s=10.0) == 70.0
 
 
-def test_cost_model_defaults_to_the_delay_objective():
+def test_cost_model_defaults_to_the_configs_weights_not_to_equal_ones():
+    """A default-constructed ``ColGenParams`` prices what the config says, 1:3.
+
+    This is the assertion that changed when the default moved off ``total_delay``, and it
+    is worth stating as a ratio rather than as an identity: equal weights make
+    ``ground + flown`` invariant under a ground-for-air swap, so whole families of columns
+    tie EXACTLY and dominance keeps whichever the tie-break reached first.  A default that
+    silently returned ``DELAY_MODEL`` would put every un-flagged run in that regime.
+    """
+
     cfg = _cfg()
-    assert cost_model(cfg, ColGenParams()) is DELAY_MODEL
+    model = cost_model(cfg, ColGenParams())
+    assert model is not DELAY_MODEL
+    assert model.ground_weight == cfg.cost_ground_delay_per_s
+    assert model.air_weight == cfg.cost_air_lateral_per_s
+    assert model.air_weight == 3.0 * model.ground_weight
+
+    # No params at all still means the historical model: `cost_model` reads
+    # `getattr(params, "objective", "total_delay")`, and a caller with no params object is
+    # not a caller who opted out of the config's weights -- it is one that has no config
+    # opinion to read.  Kept explicit so the two paths cannot drift silently.
     assert cost_model(cfg, None) is DELAY_MODEL
+    assert cost_model(cfg, ColGenParams(objective="total_delay")) is DELAY_MODEL
 
 
 def test_total_cost_objective_picks_up_the_config_weights():

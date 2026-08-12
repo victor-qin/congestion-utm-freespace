@@ -169,7 +169,27 @@ class ColGenParams:
     # 1024 ran 19.6 s and improved 265 -- reaching every flight shallowly beat reaching two
     # thirds of them deeply. Below the cap none of this applies.
     n_heuristic_tries: int = 16
-    objective: str = "total_delay"
+    # What the master minimises.  ``total_cost`` weights the two currencies the way the
+    # config does -- `cost_ground_delay_per_s = 1`, `cost_air_lateral_per_s = 3`
+    # (config.py:64-66) -- so one step of ground costs `dt` and one hop of air costs `3*dt`.
+    # ``total_delay`` weights them EQUALLY, and that is not merely a different answer, it is
+    # a degenerate one: `ground + flown` is invariant under a ground-for-air swap, so an
+    # enormous set of columns are EXACTLY tied and the label DP's dominance cannot separate
+    # labels the real objective strictly orders (pricing.py:1705-1712 spells this out).
+    #
+    # It is also the reason this default moved.  The tie plateau, plus a `delay_lbs[hops]`
+    # that rises `w_air*dt` per hop -- 4 under `total_delay`, 12 here -- makes the
+    # completion envelope roughly 3x longer and prunes far less.  Measured on
+    # `density_faa_wing_zipline` x12, 2 iterations, sequential, bootstrap off:
+    #
+    #     objective      WALL       fell_back   peak labels   straggler
+    #     total_delay    975.42 s   2 of 24     33.5M         456.9 s (87.6% of sweep 1)
+    #     total_cost      32.11 s   0 of 24      3.4M          20.6 s
+    #
+    # 30x, and issue #90's label-ceiling straggler does not occur at all.  Benchmarking the
+    # pricing search under `total_delay` was measuring the weakest pruning regime the code
+    # has, which is not the one that ships.
+    objective: str = "total_cost"
     # Which scale the lp_gap / ip_gap thresholds are measured on.
     #   "revenue" -- the paper's equations (10) and (11): (UB - RMP)/RMP on the maximize
     #                objective, whose scale includes n*M.

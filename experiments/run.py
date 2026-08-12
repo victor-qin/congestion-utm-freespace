@@ -267,9 +267,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colgen-max-iterations", type=int, default=None, metavar="N",
                    help="colgen: cap on column-generation iterations (default 30)")
     p.add_argument("--colgen-objective", choices=("total_delay", "total_cost"), default=None,
-                   help="colgen: what to minimise — total_delay sums ground and excess-air seconds "
-                        "unweighted (default); total_cost weights them by the config's per-second "
-                        "dials (1:3), matching the A* cost model")
+                   help="colgen: what to minimise — total_cost (default) weights ground and "
+                        "excess-air seconds by the config's per-second dials (1:3), matching the "
+                        "A* cost model; total_delay sums them unweighted, which makes a "
+                        "ground-for-air swap exactly free and leaves the pricing search with "
+                        "large families of tied columns it cannot order")
     p.add_argument("--colgen-solver", choices=("auto", "gurobi", "highs"), default=None,
                    help="colgen: LP/IP backend for the restricted master (default auto: Gurobi when "
                         "importable, HiGHS otherwise). Result-affecting on a degenerate master — the "

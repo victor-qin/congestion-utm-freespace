@@ -32,10 +32,21 @@ To test the ladder itself, compare the two searches *inside one tree* with
 That is the comparison that answers "does the kernel still reproduce the reference once
 the ladder moves the duals", and it needs no git ref at all.
 
+**``--objective`` is pinned for the same reason, and it is the one whose DEFAULT MOVED.**
+``ColGenParams.objective`` shipped ``total_delay`` (ground and air weighted 1:1) and now
+ships ``total_cost`` (the config's 1:3). Those are different cost currencies, so a ref from
+before the flip prices a different problem and every column diverges -- which would read as
+a catastrophic kernel regression. To compare against such a ref, pass
+``--objective total_delay`` and get the currency the ref speaks; the effective value is
+fingerprinted and the parent refuses to compare two arms that disagree on it.
+
 Examples:
 
     # the kernel-identity gate: working tree vs origin/main, ladder pinned off
     uv run python analysis/ab_colgen_parity.py --ref origin/main
+
+    # ...against a ref predating the objective flip, in the currency that ref speaks
+    uv run python analysis/ab_colgen_parity.py --ref <old-sha> --objective total_delay
 
     # the ladder gate: compiled vs reference within this tree, ladder on
     uv run python analysis/ab_colgen_parity.py --reference-baseline --ladder 20
@@ -120,6 +131,7 @@ backend, gap_metric = sys.argv[5], sys.argv[6]
 ladder, kernel, workers = int(sys.argv[7]), sys.argv[8], int(sys.argv[9])
 greedy_budget = float(sys.argv[10])
 bootstrap_roots = int(sys.argv[11])
+objective = sys.argv[12]
 spec = get_scenario(spec_name)
 cfg = spec.config()
 demand = spec.demand_model()
@@ -155,13 +167,21 @@ _greedy_kwargs = (
 _bootstrap_kwargs = (
     {"bootstrap_roots": bootstrap_roots} if "bootstrap_roots" in _fields else {}
 )
+# `objective` decides the WEIGHTS, and it is the sharpest pin of the lot because its default
+# MOVED: `total_delay` -> `total_cost`. An unpinned arm takes its own tree's default, so
+# comparing this tree against a ref from before the flip would price 1:1 on one side and 1:3
+# on the other and report a total regression that is really a change of currency. The field
+# has existed since the cost model landed, so no feature test is needed -- but the EFFECTIVE
+# value is fingerprinted, and the parent refuses to compare two arms that disagree.
+_objective_kwargs = {"objective": objective}
 params = ColGenParams(
     solver=backend, max_iterations=iterations, time_limit_s=86400.0, gap_metric=gap_metric,
-    **_ladder_kwargs, **_greedy_kwargs, **_bootstrap_kwargs,
+    **_ladder_kwargs, **_greedy_kwargs, **_bootstrap_kwargs, **_objective_kwargs,
 )
 effective_ladder = getattr(params, "seed_ladder_steps", 0)
 effective_greedy_budget = getattr(params, "greedy_budget_s_per_flight", None)
 effective_bootstrap = getattr(params, "bootstrap_roots", None)
+effective_objective = getattr(params, "objective", None)
 
 if kernel == "off":
     # Force the pure-Python reference search.  Same seam the kernel tests use
@@ -235,6 +255,7 @@ print("@@FINGERPRINT@@" + json.dumps({
     "greedy_completed": stats.get("initial_greedy_completed"),
     "greedy_budget_s_per_flight": effective_greedy_budget,
     "bootstrap_roots": effective_bootstrap,
+    "objective_mode": effective_objective,
     "greedy_candidate_capped": n_flights > max(64, params.n_heuristic_tries * 16),
     "greedy_elapsed_s": round(float(stats.get("initial_greedy_elapsed_s", 0.0) or 0.0), 1),
     "heuristic_strategy": stats.get("initial_heuristic_strategy"),
@@ -253,6 +274,7 @@ print("@@FINGERPRINT@@" + json.dumps({
 def _run_arm(
     root: Path, arm: dict, ladder: int, kernel: str, workers: int, greedy_budget: float,
     bootstrap_roots: int,
+    objective: str,
 ) -> dict:
     """Fingerprint one arm in a child interpreter rooted at ``root``."""
 
@@ -261,7 +283,7 @@ def _run_arm(
             sys.executable, "-c", _CHILD, str(root),
             arm["scenario"], str(arm["flights"]), str(arm["iterations"]),
             arm["solver"], arm["gap_metric"], str(ladder), kernel, str(workers),
-            str(greedy_budget), str(bootstrap_roots),
+            str(greedy_budget), str(bootstrap_roots), objective,
         ],
         cwd=root,
         capture_output=True,
@@ -335,6 +357,14 @@ def main() -> int:
              "for a reason that is not the change under test. Lifting the clock is what "
              "makes this harness able to gate an acceleration at all. Ignored on refs whose "
              "ColGenParams has no such field.",
+    )
+    parser.add_argument(
+        "--objective", default="total_cost", choices=("total_delay", "total_cost"),
+        help="pin the objective on BOTH arms (default total_cost, the shipped value). This "
+             "default MOVED off total_delay, so a ref from before the flip would otherwise "
+             "price 1:1 while this tree prices 1:3 and every column would diverge for a "
+             "reason that is not an acceleration. Pass --objective total_delay to compare "
+             "against such a ref.",
     )
     parser.add_argument(
         "--bootstrap-roots", type=int, default=0, metavar="K",
@@ -415,7 +445,7 @@ def main() -> int:
             f"ladder={args.ladder} ===")
         current = _run_arm(
             REPO_ROOT, arm, args.ladder, "on", args.workers, args.greedy_budget,
-            args.bootstrap_roots,
+            args.bootstrap_roots, args.objective,
         )
         say(f"  tree     {current['wall_s']:8.2f}s pricing={current['pricing_wall_s']:8.2f}s "
             f"obj={current['objective']} sel={current['selected_flights']} "
@@ -427,7 +457,7 @@ def main() -> int:
             continue
         base = _run_arm(
             baseline_root, arm, args.ladder, baseline_kernel, baseline_workers,
-            args.greedy_budget, args.bootstrap_roots,
+            args.greedy_budget, args.bootstrap_roots, args.objective,
         )
         say(f"  {baseline_label:<8.8} {base['wall_s']:8.2f}s "
             f"pricing={base['pricing_wall_s']:8.2f}s "
@@ -463,6 +493,13 @@ def main() -> int:
             continue
         # A ref predating `bootstrap_roots` runs unbootstrapped, which moves every column --
         # the same trap as the ladder, refused rather than reported as a divergence.
+        if current.get("objective_mode") != base.get("objective_mode"):
+            failures += 1
+            say(f"  UNCOMPARABLE: tree ran objective={current.get('objective_mode')} but "
+                f"{baseline_label} ran {base.get('objective_mode')} -- these are different "
+                f"cost currencies (1:3 vs 1:1), not a faster search. Rerun both with "
+                f"--objective {base.get('objective_mode')}")
+            continue
         if current["bootstrap_roots"] != base["bootstrap_roots"]:
             failures += 1
             say(f"  UNCOMPARABLE: tree ran bootstrap_roots={current['bootstrap_roots']} but "

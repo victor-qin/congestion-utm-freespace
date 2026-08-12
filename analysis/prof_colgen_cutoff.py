@@ -53,6 +53,7 @@ process boundary.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 import time
 from pathlib import Path
@@ -279,6 +280,28 @@ def main() -> int:
     parser.add_argument("--solver", default="highs", choices=("highs", "gurobi"))
     parser.add_argument("--gap-metric", default="cost", choices=("cost", "revenue"))
     parser.add_argument(
+        "--air-weight", type=float, default=None, metavar="W",
+        help="override cost_air_lateral_per_s AND cost_air_hold_per_s (config ships 3.0 "
+             "against a ground weight of 1.0). Only meaningful with objective=total_cost. "
+             "This is the knob that decides how DEGENERATE the objective is: at W=1.0 a "
+             "ground-for-air swap is exactly free, so whole families of columns tie and "
+             "dominance cannot order them; above 1.0 the ties break, but delay_lbs[hops] "
+             "still only rises W*dt per hop, so the completion envelope stays long. "
+             "Sweeping W separates those two effects -- if the explosion is the tie "
+             "plateau, W=1.1 is nearly as good as W=3; if it is the flat bound, W=1.1 is "
+             "nearly as bad as W=1.",
+    )
+    parser.add_argument(
+        "--objective", default="total_cost", choices=("total_delay", "total_cost"),
+        help="PRODUCTION is total_cost: w_ground=1, w_air=3 (config.py:64-66), so one "
+             "ground step costs dt=4 and one air hop costs 3*dt=12. total_delay weights "
+             "them equally, which makes every ground-for-air swap EXACTLY tied -- a "
+             "degenerate plateau that dominance cannot break and that makes "
+             "delay_lbs[hops] rise 3x more slowly, so the completion envelope is longer "
+             "and prunes less. Defaulted to total_cost here because every earlier #90 "
+             "measurement was taken in the other regime.",
+    )
+    parser.add_argument(
         "--max-label-log2", type=int, default=None,
         help="override dp_kernel.MAX_LABEL_CAPACITY with 2**N, to find where a declining "
              "flight's label demand actually tops out. Answer-neutral by construction "
@@ -310,6 +333,14 @@ def main() -> int:
 
     spec = get_scenario(args.scenario)
     cfg = spec.config()
+    if args.air_weight is not None:
+        # BOTH, because `cost_model` refuses to run when hold and lateral disagree -- it
+        # carries one air weight per step and will not guess which of the two it means.
+        cfg = dataclasses.replace(
+            cfg,
+            cost_air_lateral_per_s=args.air_weight,
+            cost_air_hold_per_s=args.air_weight,
+        )
     if len(cfg.flight_levels_m) != 1:
         raise SystemExit(f"{args.scenario} has {len(cfg.flight_levels_m)} flight levels")
     demand = spec.demand_model()
@@ -323,6 +354,7 @@ def main() -> int:
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
         bootstrap_roots=args.bootstrap_roots,
+        objective=args.objective,
     )
 
     if args.max_label_log2 is not None:
@@ -333,7 +365,8 @@ def main() -> int:
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
           f"{args.solver} gap={args.gap_metric} sequential (fixed work, no clock)"
-          f" bootstrap_roots={args.bootstrap_roots}"
+          f" objective={args.objective} bootstrap_roots={args.bootstrap_roots}"
+          f" w_air={cfg.cost_air_lateral_per_s}/w_ground={cfg.cost_ground_delay_per_s}"
           f"{' carry-forward' if args.carry_forward else ''}")
     if dp_kernel_mod is not None:
         print(f"ceilings  MAX_LABEL_CAPACITY={dp_kernel_mod.MAX_LABEL_CAPACITY:,} "

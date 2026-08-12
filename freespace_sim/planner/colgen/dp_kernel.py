@@ -120,14 +120,76 @@ FSUM_MAX_PARTIALS = 64
 # Answer-neutral, because a budget bounds work and never the search: hitting either ceiling
 # returns the same STATUS_LABEL_LIMIT / STATUS_STATE_LIMIT the caller already handles.
 # Sized from measurement rather than a round number.  Labels cost 40 bytes each across the
-# nine parallel arrays (one float64 plus eight int32), and the largest real pool observed on
-# this work is 13.3M, so 1<<25 is ~2.5x the worst measured need at ~1.34 GB.  That sits just
-# under -- NOT equal to -- the "roughly 1.5 GB on density" `pricing_pool` quotes per worker,
-# which is the whole worker including its rebuilt graphs rather than the label pool alone.
-# A dominance slot costs 32 bytes across the four tables plus the two layer buffers, so
-# 1<<26 slots is ~2.1 GB on the same budget.
-MAX_LABEL_CAPACITY = 1 << 25
+# nine parallel arrays (one float64 plus eight int32); a dominance slot costs 32 bytes
+# across the four tables plus the two layer buffers, so `1 << MAX_LOG2CAP` slots is ~2.1 GB.
+#
+# RAISED 1<<25 -> 1<<26.  The old value was sized against a 13.3M worst case; the shipped
+# `objective=total_cost` regime puts `density_faa_wing_zipline` x50 flight 14 at **30.78M
+# labels, 91.7% of 1<<25**, one doubling from a fallback.  1<<26 is 67.1M labels at
+# **2.68 GB**, and the pair (arena + state table) peaks near 4.83 GB per search.
+#
+# THAT IS PER PROCESS, and `pricing_pool` gives every worker its own -- so a 4-worker pool
+# is ~19 GB worst case and this ceiling is the thing that forecloses it on a 4 GB/core node.
+# It is a ceiling, not an allocation: nothing reaches it unless a flight genuinely needs it,
+# and `LABEL_HIGH_WATER_WARN` below exists so you learn which flights are approaching it
+# while they still SUCCEED, rather than from the decline after they stop.
+#
+# The 1<<25 this replaced was justified as "~2.5x the worst measured need", and the note
+# that it sat just under -- not equal to -- the "roughly 1.5 GB on density" `pricing_pool`
+# quotes per worker (that figure is the whole worker including its rebuilt graphs, not the
+# label pool alone) is still the right way to read those two numbers against each other.
+MAX_LABEL_CAPACITY = 1 << 26
 MAX_LOG2CAP = 26
+
+# Warn once per search whose final pool reaches this.  Deliberately the OLD ceiling: a
+# search past 1<<25 is one that would have declined to the pure-Python reference before this
+# module was retuned, so the warning marks exactly the flights whose headroom is gone.
+# Diagnostic only -- it reads a count and emits to stderr, and cannot move an answer.
+LABEL_HIGH_WATER_WARN = 1 << 25
+
+# Labels that coexist at one `(root, cell, hop)` point of the space-time ellipsoid.
+#
+# The DP keeps one label per DOMINANCE KEY, not one per cell-hop, and the key carries
+# `recent[0..state_history_depth-1]` plus `first_hop` (`_state_hash`).  So a point is split
+# by which neighbour the label arrived from, which one before that, and which arc it left
+# the origin by.
+#
+# A strictly ADMISSIBLE bound is computable -- the distinct `recent` triples ending at a
+# cell are at most the length-2 paths into it, `sum over p in in(c) of indeg(p)`, times
+# `outdeg(origin)` -- but in a hex interior that is 6*6*6 = 216, against ~34 measured.  It
+# would predict ~194M for one real flight, clamp every flight to `MAX_LABEL_CAPACITY`, and
+# turn this function into "always allocate the maximum".  So this is a CALIBRATED predictor
+# and 216 is the ceiling it must never be raised to.
+#
+# Being wrong is bounded in both directions and is not a correctness question: the retry
+# ladder doubles when this reads low, and reading high only costs arena.  `1.25` margin at
+# the call site, mirroring `_next_label_capacity`, which hedges the same way.
+LABEL_MULTIPLICITY = 34.0
+
+# Hand every cold search the full ceiling instead of predicting its need.  Viable only
+# because the arena is lazily mapped; flip to False to fall back on the calibrated estimate.
+FLAT_LABEL_ARENA = True
+
+# First rung of the STATE table's ladder, which is separate from the label arena's: this
+# table holds one slot per live dominance key in a LAYER (the frontier), not one per label,
+# and is double-buffered across two layers.
+#
+# 14, and the ladder is KEPT here even though the label arena's was removed.  Oversizing
+# this table is not free and that is measured twice, both on `colgen_test` x4 against a
+# 0.52 s baseline:
+#
+#     log2cap  with the scalar clear   without it
+#        25            56.29 s              --
+#        26              --              104.85 s
+#
+# Removing `_price_dag`'s redundant scalar clear (the host already `np.full(-1)`s these
+# inside its attempt loop) was necessary and NOT sufficient, so something else in the kernel
+# is still O(cap) per search -- `layer_items` / `layer_buffer` are also sized `cap` and are
+# the obvious suspects.  Until that is found and fixed, the state dimension pays for what it
+# ASKS for, not what it uses, and climbing a ladder is strictly better than starting high.
+# The label arena is the opposite case: lazily mapped, so a flat ceiling costs nothing.
+INITIAL_LOG2CAP = 14
+INITIAL_LOG2CAP = 14
 
 
 # --------------------------------------------------------------------------- exact sums
@@ -1063,9 +1125,17 @@ def _price_dag(
         arc_from = 0
         d_from = 0
         nxt_from = -1
-        for slot in range(cap):
-            tbl_label_a[slot] = -1
-            tbl_label_b[slot] = -1
+        # The two dominance tables arrive already -1-filled: `price_dag` allocates them
+        # with `np.full(cap, -1)` INSIDE its attempt loop, so every entry into mode 0 is
+        # entry onto a freshly allocated pair.  Clearing them again here was a SCALAR numba
+        # loop over `cap`, which made the state table's cost O(cap) per search whether or
+        # not the slots were used -- measured at ~12 s per flight at `log2cap = 25`, taking
+        # `colgen_test` x4 from 0.40 s to 56.29 s.  The host's `np.full` is a vectorised
+        # memset doing the identical job at memory bandwidth.
+        #
+        # Mode 0 is the only path that would need it, and it cannot be reached on a reused
+        # table: a pause sets `resume[0]` to 1, 2 or 3, and only a fresh allocation leaves
+        # it at 0.
         out_counts[0] = 0
         out_counts[1] = 0
         # The first layer is seeded before the loop; every later one is seeded by the
@@ -1932,6 +2002,80 @@ def _next_label_capacity(capacity, step_reached, min_step, max_step):
     return max(doubled, min(estimate, capacity * 8))
 
 
+def ellipsoid_volume(topology, variants) -> int:
+    """``(root, cell, hop)`` points the search can legally occupy.  Exact, no constants.
+
+    A label sits at cell ``c`` after ``h`` hops only if it could get there,
+    ``d_origin(c) <= h``, and can still finish inside the budget,
+    ``h + d_dest(c) <= air_hop_limit``.  Summing the admissible ``h`` per cell collapses to
+    a closed form, so the whole space-time volume is one vectorised expression per distinct
+    origin cell::
+
+        volume = SUM_c max(0, air_hop_limit - d_dest(c) - d_origin(c) + 1)
+
+    This is where CORRIDOR TIGHTNESS enters.  A cell contributes ``overrun + 1 - excess``,
+    where ``excess = d_origin + d_dest - shortest_hops`` is how far off-geodesic it lies, so
+    shrinking ``max_air_overrun_hops`` shrinks the count linearly per cell and cells outside
+    the ellipse contribute exactly zero.  ``d_dest`` is ``hex_remaining``, already on the
+    topology; ``d_origin`` is axial hex distance in the same metric.
+
+    Per DISTINCT origin cell rather than per root: roots sharing a lane share an origin, and
+    ~64 roots collapse to a handful of cells.
+    """
+
+    if variants is None or int(variants.departure_step.size) <= 0:
+        return 0
+    hops = int(topology.air_hop_limit)
+    if hops <= 0 or topology.n_cells <= 0:
+        return 0
+
+    d_dest = topology.hex_remaining.astype(np.int64)
+    q = topology.cell_q.astype(np.int64)
+    r = topology.cell_r.astype(np.int64)
+    origin_cells, counts = np.unique(variants.cell.astype(np.int64), return_counts=True)
+    volume = 0
+    for origin, n_roots in zip(origin_cells.tolist(), counts.tolist()):
+        dq = q - q[origin]
+        dr = r - r[origin]
+        d_origin = (np.abs(dq) + np.abs(dq + dr) + np.abs(dr)) // 2
+        span = hops - d_dest - d_origin + 1
+        volume += int(np.maximum(span, 0).sum()) * int(n_roots)
+    return volume
+
+
+def estimate_label_capacity(topology, variants) -> int:
+    """Size the FIRST rung from the DAG's shape, instead of climbing to it from 1<<16.
+
+    A cold search climbs 2^16, 2^17, ... and RE-RUNS FROM LAYER 0 at every rung, discarding
+    everything the previous attempt computed.  Measured on ``density_faa_wing_zipline`` x50
+    flight 14, that was **8 attempts**, so roughly half of its 39.5 s was re-derivation.
+    Sweep 2 shows what the right first rung is worth: every flight is ``att = 1`` there,
+    because ``_search_cache.dag_budget`` remembered.  This is that memo computed rather than
+    learned, so the FIRST sweep gets it too.
+
+    ``ellipsoid_volume`` supplies the geometry exactly; ``LABEL_MULTIPLICITY`` supplies the
+    one factor that cannot be derived from geometry, and is calibrated rather than reasoned.
+
+    Answer-neutral, like every budget on this path: it changes how much is allocated, never
+    which labels are explored or which column comes back.  Being wrong is bounded both ways
+    -- the ladder doubles when it reads low, arena is the only cost when it reads high.
+    """
+
+    if FLAT_LABEL_ARENA:
+        # The arena is lazily mapped (see the `np.empty` note in `price_dag`), so asking for
+        # the ceiling costs virtual address space and nothing physical -- only the pages a
+        # search actually fills are ever backed.  That removes the LABEL ladder outright,
+        # which is strictly better than predicting its final rung: no restart discards work,
+        # and no calibration constant has to be right.  `ellipsoid_volume` stays exported
+        # because it is still the honest way to REPORT how big a flight's DAG is.
+        return MAX_LABEL_CAPACITY
+    volume = ellipsoid_volume(topology, variants)
+    if volume <= 0:
+        return 1 << 16
+    estimate = int(volume * LABEL_MULTIPLICITY * 1.25)
+    return max(1 << 16, min(MAX_LABEL_CAPACITY, estimate))
+
+
 def price_dag(
     topology,
     rows,
@@ -1945,8 +2089,8 @@ def price_dag(
     pi_f: float = 0.0,
     envelopes=None,
     certify=None,
-    label_capacity: int = 1 << 16,
-    log2cap: int = 14,
+    label_capacity: int | None = None,
+    log2cap: int = INITIAL_LOG2CAP,
     candidate_capacity: int = 1 << 12,
     cancel=None,
     max_attempts: int = 12,
@@ -2019,6 +2163,12 @@ def price_dag(
     cell_q = topology.cell_q.tolist()
     cell_r = topology.cell_r.tolist()
 
+    # `None` means "no caller opinion", which is NOT the same as "start small": a warm
+    # `_search_cache.dag_budget` passes an explicit size and must win, while a cold one
+    # gets the shape estimate rather than the old 1<<16 floor.
+    if label_capacity is None:
+        label_capacity = estimate_label_capacity(topology, variants)
+
     initial_incumbent = None if envelopes is None else envelopes.incumbent
     initial_keys = () if envelopes is None else envelopes.built_keys()
 
@@ -2057,15 +2207,26 @@ def price_dag(
 
     for attempt in range(max_attempts):
         cap = 1 << log2cap
+        # `np.empty`, not `np.full(-1)`, for the three that used to be -1-filled.  This is
+        # what makes over-allocating the arena FREE: `np.zeros` is calloc and `np.empty` is
+        # malloc, so both hand back lazily-mapped pages that cost no physical RAM until
+        # touched, whereas `np.full(-1)` writes every page up front -- 12 bytes x capacity,
+        # which at the 1<<26 ceiling is 805 MB paid on EVERY search including a trivial one,
+        # and paid again per pricing worker.
+        #
+        # Safe because every allocated slot is fully written before it can be read: root
+        # labels set all three explicitly (the `-1` sentinels below), children set all three
+        # at creation, and every read is indexed by a label id that has already been handed
+        # out.  `np.empty` would be a real hazard if any field were left implicit.
         label_score = np.zeros(label_capacity, np.float64)
         label_cell = np.zeros(label_capacity, np.int32)
-        label_parent = np.full(label_capacity, -1, np.int32)
+        label_parent = np.empty(label_capacity, np.int32)
         label_hops = np.zeros(label_capacity, np.int32)
         label_variant = np.zeros(label_capacity, np.int32)
         label_departure = np.zeros(label_capacity, np.int32)
         label_lane = np.zeros(label_capacity, np.int32)
-        label_first_a = np.full(label_capacity, -1, np.int32)
-        label_first_b = np.full(label_capacity, -1, np.int32)
+        label_first_a = np.empty(label_capacity, np.int32)
+        label_first_b = np.empty(label_capacity, np.int32)
         cand_label = np.zeros(candidate_capacity, np.int32)
         cand_lane = np.zeros(candidate_capacity, np.int32)
         cand_step = np.zeros(candidate_capacity, np.int32)
@@ -2269,12 +2430,12 @@ def feasible_dag(
 
     for _attempt in range(max_attempts):
         label_cell = np.zeros(label_capacity, np.int32)
-        label_parent = np.full(label_capacity, -1, np.int32)
+        label_parent = np.empty(label_capacity, np.int32)
         label_hops = np.zeros(label_capacity, np.int32)
         label_departure = np.zeros(label_capacity, np.int32)
         label_lane = np.zeros(label_capacity, np.int32)
-        label_first_a = np.full(label_capacity, -1, np.int32)
-        label_first_b = np.full(label_capacity, -1, np.int32)
+        label_first_a = np.empty(label_capacity, np.int32)
+        label_first_b = np.empty(label_capacity, np.int32)
         lab_step = np.zeros(label_capacity, np.int32)
         lab_bound = np.zeros(label_capacity, np.float64)
         lab_estimate = np.zeros(label_capacity, np.int32)

@@ -781,6 +781,41 @@ def _shifted_seed_incumbent(
     return best
 
 
+def _root_bounds(topology, variants, envelopes, benefit: float, pi_f: float, dual_view):
+    """``completion_can_compete``'s ``hop_rc_bound`` per root, for ranking.
+
+    The gate (``dp_prepare.py:1228``) already evaluates this expression for every surviving
+    root; this reads out the NUMBER where ``can_compete`` returns only the verdict.  Nothing
+    here is a new bound and nothing prunes: the value orders the bootstrap's root allowlist
+    and has no effect on what any search explores, so it cannot discard a column.
+
+    ``-inf`` for a root the envelope's own LENGTH rejects, which sorts it last.
+    """
+
+    n = int(variants.departure_step.size)
+    out = np.full(n, -math.inf, dtype=np.float64)
+    for i in range(n):
+        lane_raw = int(variants.lane_idx[i])
+        first_hops = max(1, int(topology.hex_remaining[int(variants.cell[i])]))
+        delay_lbs, corridor_start = envelopes._delay_envelope(
+            int(variants.departure_step[i]), None if lane_raw < 0 else lane_raw
+        )
+        if first_hops >= len(delay_lbs):
+            continue
+        destination_positive = envelopes._destination_cost(
+            corridor_start + first_hops, first_hops
+        )
+        if not math.isfinite(destination_positive):
+            continue
+        paid_positive = max(0.0, float(variants.start_dual_cost[i]))
+        out[i] = (
+            benefit - pi_f - delay_lbs[first_hops]
+            - max(paid_positive, destination_positive)
+            + dual_view.max_negative_credit
+        )
+    return out
+
+
 def _bootstrap_incumbent(
     fg: FlightGraph,
     dual_view: DualView,
@@ -792,6 +827,7 @@ def _bootstrap_incumbent(
     *,
     incumbent: tuple[float, Column] | None,
     roots: int,
+    ranking: str = "score",
     deadline: float | None = None,
 ) -> tuple[float, Column] | None:
     """Buy a real cutoff cheaply, by searching the few most promising start options.
@@ -883,11 +919,35 @@ def _bootstrap_incumbent(
     if variants.departure_step.size <= 1:
         # Nothing to bootstrap FROM: with one root the bootstrap IS the search.
         return incumbent
-    # Descending score, STABLE, so ties resolve by `prepare_variants`' insertion order --
+    # Descending, STABLE, so ties resolve by `prepare_variants`' insertion order --
     # `(departure, lane)` ascending -- and the selection is a pure function of the graph,
     # the duals and the incumbent.  It has to be, or the two searches could be handed
     # different allowlists and the whole symmetry argument goes with it.
-    order = np.argsort(-variants.score, kind="stable")[:roots]
+    #
+    # `ranking` picks WHAT to sort on, and the two options are `g` versus `g + h`:
+    #
+    #   "score"  `variants.score` = -w_ground*ground_delay - w_air*origin_leg
+    #                               - start_dual_cost.  Cost already incurred at the root,
+    #            with the whole-route air term truncated to the origin fold leg and the
+    #            whole-column dual sum truncated to the origin claims.  No lookahead.
+    #   "bound"  `_root_bound` below: `completion_can_compete`'s own `hop_rc_bound` at the
+    #            root's minimum feasible hop count -- an UPPER bound on what the root can
+    #            ACHIEVE, already computed for every surviving root by the gate above.
+    #
+    # They rank identically whenever every root shares one lane geometry, because then the
+    # only thing separating roots is departure time and both collapse to "depart earlier"
+    # (measured: correlation exactly 1.000 on 7 of 8 density flights).  They diverge on
+    # multi-lane flights, and there the difference is not marginal -- on `density_faa` x50
+    # flight 16, `score` finds NO positive cutoff at any K (-48.56 at K=1, -9.60 at K=4,
+    # both worse than no incumbent) while `bound` finds +24.00 at K=1.  `score` charges
+    # `-w_air*origin_leg`, so it demotes long lanes outright; `bound` charges
+    # `-delay_lbs[h0]` with `h0 = hex_remaining[root cell]`, so it accounts for where the
+    # lane LEAVES you relative to the destination.
+    if ranking == "bound":
+        key = _root_bounds(topology, variants, envelopes, benefit, pi_f, dual_view)
+    else:
+        key = variants.score
+    order = np.argsort(-key, kind="stable")[:roots]
     keep = frozenset(
         (int(variants.departure_step[i]), int(variants.lane_idx[i])) for i in order
     )
@@ -1968,6 +2028,11 @@ _kernel_fallback_warned = False
 # conditions want different responses -- see `_warn_budget_growth`.
 _kernel_restart_warned = False
 _kernel_budget_warned = False
+# Flights already reported as near the label ceiling.  Per FLIGHT rather than once per
+# process, because "which flights have no headroom left" is the diagnostic -- and per
+# flight rather than per (flight, sweep), because a flight that is big in one sweep is big
+# in all of them and repeating it every iteration would bury the next distinct one.
+_kernel_high_water_warned: set = set()
 
 # Per-process tally of exact-pricing calls and how many fell back out of the kernel.
 #
@@ -2084,6 +2149,31 @@ def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
     """
 
     global _kernel_restart_warned, _kernel_budget_warned
+
+    # A search that FILLED past the old ceiling is one that would have declined to the
+    # pure-Python reference before `MAX_LABEL_CAPACITY` was raised to 1<<26.  It succeeded,
+    # so nothing here is wrong -- but its headroom is gone, and the decline warning below
+    # only fires once it is too late.  This is the one that fires while there is still time
+    # to act (a bootstrap cutoff, a narrower objective, fewer flights per batch).
+    #
+    # Gated on STATUS_OK, and not merely to be tidy: a search that DECLINED already gets a
+    # more specific warning below, and saying "no headroom left" about a search that
+    # already ran out of it is noise on top of the real message.  The status test also
+    # short-circuits before `n_labels`, which is what lets a caller hand this function a
+    # decline that never filled a pool.
+    if result.status == kernel.STATUS_OK and result.n_labels >= kernel.LABEL_HIGH_WATER_WARN:
+        flight_id = fg.request.flight_id
+        if flight_id not in _kernel_high_water_warned:
+            _kernel_high_water_warned.add(flight_id)
+            print(
+                f"WARNING: compiled colgen pricing filled {result.n_labels:,} labels on "
+                f"flight {flight_id} -- at or past {kernel.LABEL_HIGH_WATER_WARN:,}, which "
+                f"was the ceiling before it was raised to "
+                f"{kernel.MAX_LABEL_CAPACITY:,} ({result.n_labels * 40 / 1e9:.2f} GB of "
+                f"label arena, PER pricing worker). The answer is correct; the headroom is "
+                f"not. This flight declines to the reference search if its demand grows",
+                file=sys.stderr,
+            )
 
     if result.attempts > 1:
         _KERNEL_STATS["label_restarts"] += result.attempts - 1
@@ -3117,6 +3207,7 @@ def price_flight(
             model,
             incumbent=incumbent,
             roots=params.bootstrap_roots,
+            ranking=getattr(params, "bootstrap_ranking", "score"),
             deadline=deadline,
         )
     # The compiled search first, the reference when it cannot prove it ran to completion.

@@ -132,6 +132,7 @@ ladder, kernel, workers = int(sys.argv[7]), sys.argv[8], int(sys.argv[9])
 greedy_budget = float(sys.argv[10])
 bootstrap_roots = int(sys.argv[11])
 objective = sys.argv[12]
+bootstrap_ranking = sys.argv[13]
 spec = get_scenario(spec_name)
 cfg = spec.config()
 demand = spec.demand_model()
@@ -174,14 +175,21 @@ _bootstrap_kwargs = (
 # has existed since the cost model landed, so no feature test is needed -- but the EFFECTIVE
 # value is fingerprinted, and the parent refuses to compare two arms that disagree.
 _objective_kwargs = {"objective": objective}
+# Ordering-only, but answer-AFFECTING through the cutoff it produces, so pinned like the
+# rest.  Feature-tested: a ref predating the field would TypeError on the kwarg.
+_ranking_kwargs = (
+    {"bootstrap_ranking": bootstrap_ranking}
+    if "bootstrap_ranking" in _fields else {}
+)
 params = ColGenParams(
     solver=backend, max_iterations=iterations, time_limit_s=86400.0, gap_metric=gap_metric,
-    **_ladder_kwargs, **_greedy_kwargs, **_bootstrap_kwargs, **_objective_kwargs,
+    **_ladder_kwargs, **_greedy_kwargs, **_bootstrap_kwargs, **_objective_kwargs, **_ranking_kwargs,
 )
 effective_ladder = getattr(params, "seed_ladder_steps", 0)
 effective_greedy_budget = getattr(params, "greedy_budget_s_per_flight", None)
 effective_bootstrap = getattr(params, "bootstrap_roots", None)
 effective_objective = getattr(params, "objective", None)
+effective_ranking = getattr(params, "bootstrap_ranking", None)
 
 if kernel == "off":
     # Force the pure-Python reference search.  Same seam the kernel tests use
@@ -256,6 +264,7 @@ print("@@FINGERPRINT@@" + json.dumps({
     "greedy_budget_s_per_flight": effective_greedy_budget,
     "bootstrap_roots": effective_bootstrap,
     "objective_mode": effective_objective,
+    "bootstrap_ranking": effective_ranking,
     "greedy_candidate_capped": n_flights > max(64, params.n_heuristic_tries * 16),
     "greedy_elapsed_s": round(float(stats.get("initial_greedy_elapsed_s", 0.0) or 0.0), 1),
     "heuristic_strategy": stats.get("initial_heuristic_strategy"),
@@ -275,6 +284,7 @@ def _run_arm(
     root: Path, arm: dict, ladder: int, kernel: str, workers: int, greedy_budget: float,
     bootstrap_roots: int,
     objective: str,
+    bootstrap_ranking: str,
 ) -> dict:
     """Fingerprint one arm in a child interpreter rooted at ``root``."""
 
@@ -283,7 +293,7 @@ def _run_arm(
             sys.executable, "-c", _CHILD, str(root),
             arm["scenario"], str(arm["flights"]), str(arm["iterations"]),
             arm["solver"], arm["gap_metric"], str(ladder), kernel, str(workers),
-            str(greedy_budget), str(bootstrap_roots), objective,
+            str(greedy_budget), str(bootstrap_roots), objective, bootstrap_ranking,
         ],
         cwd=root,
         capture_output=True,
@@ -367,6 +377,11 @@ def main() -> int:
              "against such a ref.",
     )
     parser.add_argument(
+        "--bootstrap-ranking", default="score", choices=("score", "bound"),
+        help="pin the bootstrap's root ordering on BOTH arms. Ordering only, but it "
+             "changes the cutoff and hence which equally-optimal column returns.",
+    )
+    parser.add_argument(
         "--bootstrap-roots", type=int, default=0, metavar="K",
         help="pin bootstrap_roots on BOTH arms (default 0). Answer-affecting, so a tree with "
              "it on compared against a ref without it diverges for a reason that is not the "
@@ -445,7 +460,7 @@ def main() -> int:
             f"ladder={args.ladder} ===")
         current = _run_arm(
             REPO_ROOT, arm, args.ladder, "on", args.workers, args.greedy_budget,
-            args.bootstrap_roots, args.objective,
+            args.bootstrap_roots, args.objective, args.bootstrap_ranking,
         )
         say(f"  tree     {current['wall_s']:8.2f}s pricing={current['pricing_wall_s']:8.2f}s "
             f"obj={current['objective']} sel={current['selected_flights']} "
@@ -457,7 +472,7 @@ def main() -> int:
             continue
         base = _run_arm(
             baseline_root, arm, args.ladder, baseline_kernel, baseline_workers,
-            args.greedy_budget, args.bootstrap_roots, args.objective,
+            args.greedy_budget, args.bootstrap_roots, args.objective, args.bootstrap_ranking,
         )
         say(f"  {baseline_label:<8.8} {base['wall_s']:8.2f}s "
             f"pricing={base['pricing_wall_s']:8.2f}s "

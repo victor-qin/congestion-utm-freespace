@@ -257,6 +257,14 @@ class ColGenParams:
     # dominance a tighter cutoff can return a DIFFERENT equally-optimal column, so this moves
     # the `ab_colgen_parity.py` sha and has to be re-baselined deliberately.
     bootstrap_roots: int = 0
+    # WHAT the bootstrap sorts its roots on.  "score" is `PreparedVariants.score`, pure
+    # cost-so-far; "bound" is `completion_can_compete`'s own `hop_rc_bound` at the root's
+    # minimum feasible hop count -- `g + h` instead of `g`, already computed by the root
+    # gate, so it costs nothing to read.  Inert on single-lane flights (the two rank
+    # identically, correlation 1.000) and decisive on multi-lane ones.  Ordering only: it
+    # cannot prune, because the bootstrap returns an INCUMBENT and the main search still
+    # fans out over every root.
+    bootstrap_ranking: str = "score"
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):
@@ -315,6 +323,13 @@ class ColGenParams:
             bootstrap = operator.index(self.bootstrap_roots)
         except TypeError as exc:
             raise TypeError("bootstrap_roots must be an integer") from exc
+        if not isinstance(self.bootstrap_ranking, str):
+            raise TypeError("bootstrap_ranking must be a string")
+        _ranking = self.bootstrap_ranking.lower()
+        if _ranking not in {"score", "bound"}:
+            raise ValueError("bootstrap_ranking must be 'score' or 'bound'")
+        object.__setattr__(self, "bootstrap_ranking", _ranking)
+
         if bootstrap < 0:
             raise ValueError("bootstrap_roots must be non-negative")
         object.__setattr__(self, "bootstrap_roots", bootstrap)

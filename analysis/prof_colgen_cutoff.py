@@ -280,6 +280,27 @@ def main() -> int:
     parser.add_argument("--solver", default="highs", choices=("highs", "gurobi"))
     parser.add_argument("--gap-metric", default="cost", choices=("cost", "revenue"))
     parser.add_argument(
+        "--bootstrap-ranking", default="score", choices=("score", "bound"),
+        help="what the bootstrap sorts roots on: 'score' (cost-so-far) or 'bound' "
+             "(the completion gate's own hop_rc_bound, g+h). Ordering only -- it cannot "
+             "prune, so the OBJECTIVE must not move across it.",
+    )
+    parser.add_argument(
+        "--log2cap", type=int, default=None, metavar="N",
+        help="pin the STATE table's first rung to 2**N instead of letting it climb from "
+             "dp_kernel.INITIAL_LOG2CAP. Injected per call rather than by rebinding the "
+             "module constant, because `price_dag` binds its default at definition time -- "
+             "and because editing the constant would change every OTHER run sharing this "
+             "tree. Answer-neutral: a budget bounds work, never the search.",
+    )
+    parser.add_argument(
+        "--no-arena-estimate", action="store_true",
+        help="force the label ladder to start at 1<<16 instead of the shape estimate, so "
+             "the two can be compared. Answer-neutral -- a budget bounds work, never the "
+             "search -- so the OBJECTIVE must not move across this flag, and only `att`, "
+             "`labels` and the clock should.",
+    )
+    parser.add_argument(
         "--air-weight", type=float, default=None, metavar="W",
         help="override cost_air_lateral_per_s AND cost_air_hold_per_s (config ships 3.0 "
              "against a ground weight of 1.0). Only meaningful with objective=total_cost. "
@@ -354,8 +375,25 @@ def main() -> int:
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
         bootstrap_roots=args.bootstrap_roots,
+        bootstrap_ranking=args.bootstrap_ranking,
         objective=args.objective,
     )
+
+    if args.log2cap is not None:
+        if dp_kernel_mod is None:
+            raise SystemExit("--log2cap needs the compiled kernel")
+        _price_dag_real = dp_kernel_mod.price_dag
+
+        def _pinned_price_dag(*a, **kw):
+            kw.setdefault("log2cap", args.log2cap)
+            return _price_dag_real(*a, **kw)
+
+        dp_kernel_mod.price_dag = _pinned_price_dag
+
+    if args.no_arena_estimate:
+        if dp_kernel_mod is None:
+            raise SystemExit("--no-arena-estimate needs the compiled kernel")
+        dp_kernel_mod.estimate_label_capacity = lambda topology, variants: 1 << 16
 
     if args.max_label_log2 is not None:
         if dp_kernel_mod is None:
@@ -389,7 +427,7 @@ def main() -> int:
     print("\n--- PER FLIGHT (pricing sweep, slowest first) ---")
     header = (f"{'sw':>3} {'flight':>7} {'entry_rc':>13} {'mid_rc':>13} {'final_rc':>13} "
               f"{'gap':>11} {'roots':>7} {'labels':>12} {'att':>4} {'status':>12} "
-              f"{'boot_s':>8} {'bt_lab':>11} {'bt_att':>7} "
+              f"{'l2cap':>6} {'boot_s':>8} {'bt_lab':>11} {'bt_att':>7} "
               f"{'search_s':>9} {'fallb_s':>9} {'total_s':>9}")
     print(header)
     for row in sorted(sweep_rows, key=lambda r: (r["sweep"], -r["total_s"])):
@@ -411,6 +449,7 @@ def main() -> int:
             f"{'n/a' if row['labels'] is None else format(row['labels'], ',d'):>12} "
             f"{'n/a' if row['attempts'] is None else row['attempts']:>4} "
             f"{str(row['status']):>12} "
+            f"{('n/a' if not row.get('budget') else row['budget'][1]):>6} "
             f"{row['bootstrap_s']:>8.2f} "
             f"{format(row['bootstrap_labels'], ',d'):>11} "
             f"{row['bootstrap_attempts']:>7} "

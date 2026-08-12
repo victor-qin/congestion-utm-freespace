@@ -59,6 +59,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--workers", nargs="+", type=int, default=[0, 2, 4])
     parser.add_argument("--bootstrap-roots", type=int, default=2)
+    parser.add_argument("--bootstrap-ranking", default="score", choices=("score", "bound"))
     parser.add_argument("--objective", default="total_cost")
     # MUST be pinned, and "cost" not the ColGenParams default of "revenue": every
     # `prof_colgen_cutoff` arm in this investigation used "cost", and the two metrics
@@ -66,13 +67,22 @@ def main() -> None:
     # DIFFERENT solve (objective 5703.06 against 5663.06) that was not comparable to
     # anything else measured.
     parser.add_argument("--gap-metric", default="cost", choices=("cost", "revenue"))
+    # The post-first-LP greedy is bounded by a WALL CLOCK -- `greedy_budget_s_per_flight *
+    # n_flights` -- and it produces `best_heuristic`, the `known_column` cutoff every
+    # pricing call is handed.  So a machine that is busier or hotter reaches fewer
+    # candidates, the duals move, and every column changes for a reason that has NOTHING to
+    # do with the worker count under test.  `[[greedy-clock-defeats-parity]]`.  Pin it high
+    # enough that the stage always finishes, exactly as `ab_colgen_parity --greedy-budget`
+    # does, or the comparison measures the clock.
+    parser.add_argument("--greedy-budget", type=float, default=None, metavar="S")
     args = parser.parse_args()
 
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  x{args.flights} iters={args.iterations} "
-          f"objective={args.objective} bootstrap_roots={args.bootstrap_roots}")
+          f"objective={args.objective} bootstrap_roots={args.bootstrap_roots} "
+          f"ranking={args.bootstrap_ranking}")
     print(f"{'scenario':<30} {'w':>2} {'WALL':>9} {'pricing':>9} {'speedup':>8} "
-          f"{'rss_self':>9} {'rss_kids':>9} {'objective':>20} {'sel':>4} {'cols':>6}")
+          f"{'rss_self':>9} {'rss_kids':>9} {'objective':>20} {'sel':>4} {'cols':>6} {'greedy':>7} {'g_done':>7}")
 
     for scenario in args.scenarios:
         spec = get_scenario(scenario)
@@ -93,6 +103,9 @@ def main() -> None:
                 objective=args.objective,
                 gap_metric=args.gap_metric,
                 bootstrap_roots=args.bootstrap_roots,
+                bootstrap_ranking=args.bootstrap_ranking,
+                **({} if args.greedy_budget is None
+                   else {'greedy_budget_s_per_flight': args.greedy_budget}),
             )
             # The worker count is NOT a `ColGenParams` field: `solve` takes a separate
             # `parallel=ParallelPricingConfig(...)` keyword, and `stats["n_pricing_workers"]`
@@ -121,6 +134,10 @@ def main() -> None:
             flag = "" if key == baseline_key else "  <-- ANSWER MOVED, speedup is void"
             # The stat is derived from what the solver ACTUALLY used, so a mismatch here
             # means the knob did not take effect and the row is not a parallel measurement.
+            if not stats.get("initial_greedy_completed", True):
+                flag += ("  <-- GREEDY DID NOT COMPLETE ("
+                         f"{stats.get('initial_greedy_elapsed_s', 0.0):.1f}s); its cutoff "
+                         "differs, so this row is not comparable")
             got = stats.get("n_pricing_workers")
             if got != workers:
                 flag += f"  <-- ASKED {workers} WORKERS, SOLVER USED {got}"
@@ -130,7 +147,9 @@ def main() -> None:
                 f"{base_wall / wall:>7.2f}x "
                 f"{rss_self:>8.0f}M {rss_kids:>8.0f}M "
                 f"{stats.get('objective'):>20} {stats.get('selected_flights'):>4} "
-                f"{stats.get('n_columns'):>6}{flag}"
+                f"{stats.get('n_columns'):>6} "
+                f"{float(stats.get('initial_greedy_elapsed_s', 0.0)):>7.1f} "
+                f"{str(stats.get('initial_greedy_completed')):>7}{flag}"
             )
     print("WORKER SWEEP DONE")
 

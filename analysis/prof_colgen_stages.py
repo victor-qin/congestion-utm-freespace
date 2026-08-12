@@ -228,7 +228,7 @@ def main() -> int:
     parser.add_argument(
         "--max-label-log2", type=int, default=None,
         help="override `dp_kernel.MAX_LABEL_CAPACITY` to 2**N for this run (default: leave "
-             "the shipped 1<<25 alone). Answer-neutral by the same argument the constant "
+             "the shipped 1<<26 alone). Answer-neutral by the same argument the constant "
              "carries -- a budget bounds work, never the search -- so this changes how many "
              "flights DECLINE and fall back to the Python reference, not what any of them "
              "returns. Read as a knob for measuring how far past the shipped ceiling a "
@@ -236,9 +236,26 @@ def main() -> int:
              "N=26 is ~2.7 GB per worker and N=27 is ~5.4 GB.",
     )
     parser.add_argument(
+        # CEILING, not the ladder's first rung.  `prof_colgen_cutoff.py --log2cap` is the
+        # other end of the same ladder (it sets the STARTING rung, `INITIAL_LOG2CAP`), and
+        # the two names are one letter apart -- check which tool you are in.
         "--max-log2cap", type=int, default=None,
         help="override `dp_kernel.MAX_LOG2CAP` (dominance table ceiling, shipped 26). "
              "Same answer-neutrality argument; ~32 B per slot.",
+    )
+    parser.add_argument(
+        "--objective", default="total_cost", choices=("total_delay", "total_cost"),
+        help="the shipped default. `total_delay` weights ground and air equally, which is "
+             "a ~40x slower regime for pricing (issue #91) and profiles a different solve.",
+    )
+    # The bootstrap and its ranking change the SHAPE of what is profiled, not just the
+    # clock: they cut pricing without touching the greedy or the LP, so a profile taken
+    # without them over-states pricing's share and under-states everything serial. The
+    # serial remainder is exactly what this tool is usually pointed at, so defaulting these
+    # off made every such reading wrong by that ratio.
+    parser.add_argument("--bootstrap-roots", type=int, default=0, metavar="K")
+    parser.add_argument(
+        "--bootstrap-ranking", default="score", choices=("score", "bound"),
     )
     parser.add_argument("--top", type=int, default=25)
     args = parser.parse_args()
@@ -288,6 +305,9 @@ def main() -> int:
         max_iterations=args.iterations,
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
+        objective=args.objective,
+        bootstrap_roots=args.bootstrap_roots,
+        bootstrap_ranking=args.bootstrap_ranking,
     )
 
     parallel = (
@@ -298,6 +318,7 @@ def main() -> int:
 
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
+          f"obj={args.objective} K={args.bootstrap_roots}/{args.bootstrap_ranking} "
           f"{args.solver} gap={args.gap_metric} workers={args.workers} "
           f"chunksize={args.chunksize} (fixed work, no clock)")
     if dp_kernel_mod is not None:

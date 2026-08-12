@@ -791,10 +791,10 @@ def _bootstrap_incumbent(
     model: CostModel,
     *,
     incumbent: tuple[float, Column] | None,
-    departures: int,
+    roots: int,
     deadline: float | None = None,
 ) -> tuple[float, Column] | None:
-    """Buy a real cutoff cheaply, by searching a prefix of the departure window.
+    """Buy a real cutoff cheaply, by searching the few most promising start options.
 
     The cutoff ``price_flight`` can assemble for free is not merely weak, it is
     **structurally zero**, and that is a property of column generation rather than a defect
@@ -818,6 +818,15 @@ def _bootstrap_incumbent(
     dominance slots, and one of them evicting a survivor the unrestricted search would have
     kept is how a prune stops being answer-neutral (``[[pruning-not-neutral-under-dominance]]``).
 
+    **Ranked, not truncated.**  Taking the earliest N departures misses an optimum that
+    departs late: measured, a 4- and an 8-step prefix both returned rc 4.4590 against an
+    8.4590 optimum on the second sweep and the main search declined anyway.
+    ``PreparedVariants.score`` is the root's own upper bound, so it puts the promising start
+    option first whenever it is, and it costs ``roots`` roots instead of
+    ``N * n_origin_lanes`` (240 at N=16 on the density straggler).  This is PR #76's rule
+    (``pr76:pricing.py:1253``); the score expressions agree term for term except that ours
+    weights the ground term into the objective's currency, which #76's predates.
+
     **It re-uses the two real searches rather than writing a third**, which is where its
     safety comes from.  Every column either returns has already passed
     ``_canonical_candidate``, so the score is certified achievable and pruning against it
@@ -829,7 +838,59 @@ def _bootstrap_incumbent(
     declines outright leaves the caller exactly where it was.
     """
 
-    limit = fg.base_step + departures - 1
+    # Rank ONCE, here, and hand the result to whichever search runs.  `prepare_variants` is
+    # pure Python -- `dp_prepare` has no numba anywhere -- so this works identically on a
+    # numba-less install, which is what keeps `--reference-baseline` a real gate rather than
+    # a second code path.  `prepared_for` is memoized per graph, so the packing is not
+    # rebuilt for this.
+    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if not (topology.ok and rows.ok):
+        # Both searches decline this graph too, so skipping here keeps them symmetric.
+        return incumbent
+    # WITH `envelopes`, which is not optional and was the first thing this got wrong.  The
+    # ranking has to happen over the same gated set the restricted search will see, or the
+    # top-scoring root can be one `completion_can_compete` rejects -- the allowlist then
+    # names a root the search immediately discards, `prepare_variants` returns EMPTY, and the
+    # bootstrap silently does nothing while still costing its own setup.  Measured on
+    # `colgen_test` flight 0: the gate takes 13,515 roots to 97, and the highest-scoring root
+    # of the ungated 13,515 is not among them.  The failure is invisible -- no crash, a
+    # successful `(-inf, None)`, the incumbent handed straight back -- which is why
+    # `prof_colgen_cutoff`'s `bt_lab` column exists to show it as zero labels.
+    envelopes = dp_prepare.CompletionEnvelopes(
+        fg,
+        cfg,
+        dual_view,
+        benefit=benefit,
+        pi_f=pi_f,
+        model=model,
+        forbidden_rows=forbidden_rows,
+        incumbent=incumbent,
+        deadline=deadline,
+    )
+    variants = dp_prepare.prepare_variants(
+        fg,
+        cfg,
+        dual_view,
+        topology,
+        rows,
+        benefit=benefit,
+        pi_f=pi_f,
+        cost_cutoff=None if incumbent is None else incumbent[0],
+        model=model,
+        forbidden_rows=forbidden_rows,
+        envelopes=envelopes,
+    )
+    if variants.departure_step.size <= 1:
+        # Nothing to bootstrap FROM: with one root the bootstrap IS the search.
+        return incumbent
+    # Descending score, STABLE, so ties resolve by `prepare_variants`' insertion order --
+    # `(departure, lane)` ascending -- and the selection is a pure function of the graph,
+    # the duals and the incumbent.  It has to be, or the two searches could be handed
+    # different allowlists and the whole symmetry argument goes with it.
+    order = np.argsort(-variants.score, kind="stable")[:roots]
+    keep = frozenset(
+        (int(variants.departure_step[i]), int(variants.lane_idx[i])) for i in order
+    )
     outcome = _best_column_compiled(
         fg,
         dual_view,
@@ -840,12 +901,12 @@ def _bootstrap_incumbent(
         incumbent=incumbent,
         deadline=deadline,
         model=model,
-        max_departure_step=limit,
+        keep_roots=keep,
         record_budget=False,
     )
     if isinstance(outcome, Declined):
-        # Bounded by `departures` roots rather than the whole window, so the reference is
-        # affordable here in a way it is not for the main search.
+        # `roots` roots rather than the whole window, so the reference is affordable here in
+        # a way it is not for the main search.
         outcome = _best_column(
             fg,
             dual_view,
@@ -857,7 +918,7 @@ def _bootstrap_incumbent(
             incumbent=incumbent,
             deadline=deadline,
             model=model,
-            max_departure_step=limit,
+            keep_roots=keep,
         )
     score, column = outcome
     if column is None:
@@ -1290,7 +1351,7 @@ def _best_column(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
-    max_departure_step: int | None = None,
+    keep_roots: frozenset[tuple[int, int]] | None = None,
 ) -> tuple[float, Column | None]:
     """Return the most negative-reduced-cost column, or ``(-inf, None)`` when none exists.
 
@@ -1301,11 +1362,13 @@ def _best_column(
     lead to a strictly better column.  ``incumbent`` warm-starts that pruning with an
     already-certified ``(reduced_cost, column)`` pair.
 
-    ``max_departure_step`` truncates the departure window.  This is the axis ``seed=True``
-    already restricts in its most degenerate form -- one departure -- so it generalizes a
-    bound this search has always had rather than adding one, and the compiled search takes
-    the same argument straight through to ``prepare_variants``.  Used by
-    :func:`_bootstrap_incumbent`.
+    ``keep_roots`` restricts the search to an explicit allowlist of
+    ``(departure_step, lane_idx)`` pairs, ``-1`` for a bare origin.  This is the axis
+    ``seed=True`` already restricts in its most degenerate form -- one departure, every lane
+    -- so it generalizes a bound this search has always had rather than adding one.  The
+    compiled search takes the same argument straight through to ``prepare_variants``, and
+    the allowlist is built ONCE by :func:`_bootstrap_incumbent`, so neither search ranks
+    roots for itself and the two cannot disagree about which ones they kept.
     """
 
     _check_deadline(deadline)
@@ -1403,10 +1466,7 @@ def _best_column(
     if seed:
         departure_steps = (fg.base_step,)
     else:
-        last_departure_step = fg.latest_departure_step
-        if max_departure_step is not None:
-            last_departure_step = min(last_departure_step, max_departure_step)
-        departure_steps = range(fg.base_step, last_departure_step + 1)
+        departure_steps = range(fg.base_step, fg.latest_departure_step + 1)
 
     origin_leg_by_lane: dict[int | None, float] = {}
     origin_fold_lb_by_lane: dict[int | None, tuple[float, bool]] = {}
@@ -1665,6 +1725,10 @@ def _best_column(
         if not origin_claims.isdisjoint(forbidden_rows):
             continue
         for lane_idx, cell, lane_steps in origin_options:
+            if keep_roots is not None and (
+                departure_step, -1 if lane_idx is None else int(lane_idx)
+            ) not in keep_roots:
+                continue
             distance_to_go = remaining_distance(cell)
             start_step = departure_step + fg.takeoff_steps[0] + lane_steps
             if start_step >= fg.max_step:
@@ -2183,7 +2247,7 @@ def _best_column_compiled(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
-    max_departure_step: int | None = None,
+    keep_roots: frozenset[tuple[int, int]] | None = None,
     record_budget: bool = True,
 ) -> tuple[float, Column | None] | Declined:
     """``_best_column`` over the compiled search: ``(reduced_cost, column)``, or a reason.
@@ -2244,7 +2308,7 @@ def _best_column_compiled(
         model=model,
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
-        max_departure_step=max_departure_step,
+        keep_roots=keep_roots,
     )
     if not variants.ok:
         # Unreachable today, and kept anyway.  `prepare_variants` has exactly two returns and
@@ -3042,7 +3106,7 @@ def price_flight(
     # construction: whichever one runs explores the space the other would have.  Putting it
     # in two bodies is how they drift, and the `Declined` contract -- that the compiled
     # search explored exactly what the reference would -- is what would drift first.
-    if params.bootstrap_departures:
+    if params.bootstrap_roots:
         incumbent = _bootstrap_incumbent(
             fg,
             view,
@@ -3052,7 +3116,7 @@ def price_flight(
             forbidden,
             model,
             incumbent=incumbent,
-            departures=params.bootstrap_departures,
+            roots=params.bootstrap_roots,
             deadline=deadline,
         )
     # The compiled search first, the reference when it cannot prove it ran to completion.

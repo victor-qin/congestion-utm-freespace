@@ -450,7 +450,7 @@ def test_warm_kernel_compiles_every_primitive():
 
 def _reference_candidates(
     graph, cfg, view, params, monkeypatch, *, forbidden=frozenset(), incumbent=None,
-    max_departure_step=None, **kwargs
+    keep_roots=None, **kwargs
 ):
     """Every sink proposal `_best_column` registers, in the order it registers them.
 
@@ -475,14 +475,14 @@ def _reference_candidates(
     pricing._best_column(
         graph, view, 0.0, cfg, kwargs.pop("benefit", 100.0), forbidden,
         seed=False, incumbent=incumbent, model=kwargs.pop("model", None) or DELAY_MODEL,
-        max_departure_step=max_departure_step,
+        keep_roots=keep_roots,
     )
     return recorded
 
 
 def _kernel_candidates(
     graph, cfg, view, model, forbidden=frozenset(), *, incumbent=None, benefit=100.0,
-    max_departure_step=None, **kwargs,
+    keep_roots=None, **kwargs,
 ):
     """The compiled search's sink proposals, driven through the full host protocol.
 
@@ -503,7 +503,7 @@ def _kernel_candidates(
         graph, cfg, view, topology, rows, benefit=benefit, pi_f=0.0,
         cost_cutoff=None if incumbent is None else incumbent[0],
         model=model, forbidden_rows=forbidden, envelopes=envelopes,
-        max_departure_step=max_departure_step,
+        keep_roots=keep_roots,
     )
     pack = dp_prepare.prepare_forbidden(forbidden, graph, rows, topology)
     result = dp_kernel.price_dag(
@@ -643,14 +643,105 @@ def test_kernel_proposes_exactly_the_reference_sinks(monkeypatch):
     assert set(kernel_side) == reference_side
 
 
-def test_kernel_and_reference_restrict_departures_identically(monkeypatch):
+def _gated_variants(graph, cfg, view, model, incumbent=None, benefit=100.0, keep_roots=None):
+    """`prepare_variants` exactly as `_bootstrap_incumbent` and `_best_column_compiled` call
+    it -- WITH the completion gate, which is the part that has to match."""
+
+    topology, rows = dp_prepare.prepared_for(graph, cfg)
+    envelopes = dp_prepare.CompletionEnvelopes(
+        graph, cfg, view, benefit=benefit, pi_f=0.0, model=model, incumbent=incumbent
+    )
+    return dp_prepare.prepare_variants(
+        graph, cfg, view, topology, rows, benefit=benefit, pi_f=0.0,
+        cost_cutoff=None if incumbent is None else incumbent[0],
+        model=model, envelopes=envelopes, keep_roots=keep_roots,
+    )
+
+
+def _rank_roots(graph, cfg, view, model, k, incumbent=None, benefit=100.0):
+    """The allowlist `_bootstrap_incumbent` builds: top-k GATED roots by variant score."""
+
+    variants = _gated_variants(graph, cfg, view, model, incumbent=incumbent, benefit=benefit)
+    order = np.argsort(-variants.score, kind="stable")[:k]
+    keep = frozenset(
+        (int(variants.departure_step[i]), int(variants.lane_idx[i])) for i in order
+    )
+    return variants, keep
+
+
+def test_the_bootstrap_selects_only_roots_that_survive_the_full_gate():
+    """The invariant behind the one failure on this path that does not raise.
+
+    If the ranking is taken over a root set the restricted search will not see -- which is
+    what happens if the ranking call omits `envelopes` -- the top-scoring root can be one
+    `completion_can_compete` rejects. `prepare_variants` then returns EMPTY for the
+    bootstrap, the search reports `(-inf, None)` successfully, `_bootstrap_incumbent` hands
+    its incumbent straight back, and nothing anywhere raises: the bootstrap silently becomes
+    a no-op that merely reads as "not worth much". Also covers the `-1`-for-a-bare-origin
+    key encoding, whose failure mode is identical.
+
+    HONEST LIMIT: neither fixture here gates hard enough to reproduce that on its own -- the
+    top ungated root survives on both, checked. The real reproduction is `colgen_test`'s
+    flight 0, where the gate takes 13,515 roots to 97 and the ungated winner is not among
+    them. So this pins the property, and `prof_colgen_cutoff`'s `bt_lab` column (zero labels
+    against a nonzero `boot_s`) is what catches it in the field.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    seed = pricing.seed_column(graph, cfg, model=model)
+    incumbent = (
+        model.reduced_cost(
+            benefit=100.0, cost=seed.delay_s, dual_cost=view.claim_cost(seed.claims), pi_f=0.0
+        ),
+        seed,
+    )
+
+    _variants, keep = _rank_roots(graph, cfg, view, model, 3, incumbent=incumbent)
+    assert len(keep) == 3, "the fixture has too few roots to select from"
+
+    restricted = _gated_variants(
+        graph, cfg, view, model, incumbent=incumbent, keep_roots=keep
+    )
+    survivors = {
+        (int(d), int(lane))
+        for d, lane in zip(restricted.departure_step.tolist(), restricted.lane_idx.tolist())
+    }
+    assert survivors == keep, "a selected root did not survive the gate the search applies"
+
+
+def test_the_bootstrap_picks_the_highest_scoring_root():
+    """Ranked, not truncated -- the difference between this and the prefix it replaces.
+
+    A prefix takes the earliest departures and misses an optimum that departs late; `score`
+    is the root's own upper bound and orders by promise instead. The tie-break must be
+    stable, because the allowlist has to be a pure function of the graph, the duals and the
+    incumbent -- if it were not, the two searches could be handed different sets.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = cost_model(params, cfg)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+
+    variants, keep = _rank_roots(graph, cfg, view, model, 1)
+    best = int(np.argmax(variants.score))
+    assert keep == {(int(variants.departure_step[best]), int(variants.lane_idx[best]))}
+
+    _variants_again, keep_again = _rank_roots(graph, cfg, view, model, 1)
+    assert keep_again == keep, "the ranking is not deterministic"
+
+
+def test_kernel_and_reference_restrict_roots_identically(monkeypatch):
     """The bootstrap's restriction axis, held to the same equality as the full search.
 
-    `_bootstrap_incumbent` runs whichever of the two searches is available over a prefix of
-    the departure window, so if they truncated it differently the bootstrap would hand the
-    main search a cutoff that depends on which path ran -- and `Declined`'s contract, that
-    the compiled search explored exactly what the reference would, would be false for the
-    search that consumed it.
+    `_bootstrap_incumbent` runs whichever of the two searches is available over the same
+    allowlist, so if they honoured it differently the bootstrap would hand the main search a
+    cutoff that depends on which path ran -- and `Declined`'s contract, that the compiled
+    search explored exactly what the reference would, would be false for the search that
+    consumed it.
 
     Equality, not inclusion, for the reason the unrestricted case documents: a looser search
     does not merely explore a superset, because its extra labels win dominance slots and
@@ -661,33 +752,34 @@ def test_kernel_and_reference_restrict_departures_identically(monkeypatch):
     graph, params = _graph(cfg)
     model = cost_model(params, cfg)
     view = DualView(_random_duals(graph, cfg, 31337), cfg)
-    limit = graph.base_step + 3
+    _variants, keep = _rank_roots(graph, cfg, view, model, 4)
 
-    result, kernel_side = _kernel_candidates(
-        graph, cfg, view, model, max_departure_step=limit
-    )
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model, keep_roots=keep)
     assert result.ok, result.status
     assert kernel_side, "the restricted kernel proposed nothing, so this proves nothing"
 
     reference_side = _reference_sink_set(
-        graph, cfg, view, params, monkeypatch, model, max_departure_step=limit
+        graph, cfg, view, params, monkeypatch, model, keep_roots=keep
     )
     assert set(kernel_side) == reference_side
-    assert all(departure <= limit for departure, *_rest in kernel_side)
 
     # The restriction has to actually bite, or the equality above is the unrestricted test
     # wearing a disguise.
     unrestricted = _reference_sink_set(graph, cfg, view, params, monkeypatch, model)
-    assert any(departure > limit for departure, *_rest in unrestricted)
+    assert len(unrestricted) > len(reference_side)
 
-    # NOT a subset, and that is the finding rather than a wrinkle: the restricted search
-    # emits sinks the unrestricted one never does.  Labels from the surviving departures win
-    # dominance slots that later departures would otherwise have taken, so their descendants
-    # reach sinks that are evicted in the full search.  Restricting is not "the same search
-    # with rows deleted" (`[[pruning-not-neutral-under-dominance]]`), which is exactly why
-    # `_bootstrap_incumbent` may only ever return an INCUMBENT: a bootstrap candidate
-    # flowing into `_certify_candidates` would let one of these into the real ranking.
-    assert reference_side - unrestricted, "restriction merely deleted sinks; check the fixture"
+    # Deliberately NOT asserting how the two sets nest, in either direction.
+    #
+    # A departure PREFIX produced sinks the unrestricted search never did: it keeps the
+    # earliest roots, which are exactly the ones later better-scoring roots dominate away in
+    # the full search, so their descendants survive only under the restriction.  Ranking by
+    # `score` keeps the roots that win anyway, and on this fixture the restricted set comes
+    # out a clean subset -- i.e. it perturbs the search less, which is a point in its favour.
+    # But that is an observation about one fixture and not a property anyone has proved, so
+    # `_bootstrap_incumbent` may still only ever return an INCUMBENT: a bootstrap candidate
+    # flowing into `_certify_candidates` could otherwise put a sink into the real ranking
+    # that the reference would never have generated
+    # (`[[pruning-not-neutral-under-dominance]]`).
 
 
 def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monkeypatch):
@@ -798,7 +890,7 @@ def test_a_restricted_search_leaves_the_graphs_budget_memo_alone():
 
     pricing._best_column_compiled(
         graph, view, 0.0, cfg, 100.0, frozenset(), model=model,
-        max_departure_step=graph.base_step, record_budget=False,
+        keep_roots=_rank_roots(graph, cfg, view, model, 1)[1], record_budget=False,
     )
     with graph._search_cache.lock:
         assert graph._search_cache.dag_budget == full_budget
@@ -817,10 +909,10 @@ def test_the_bootstrap_only_ever_returns_a_certified_improvement():
     cfg, graph, params, model, view = _bootstrap_fixture()
     benefit = 100.0
 
-    for departures in (1, 2, 4, 64):
+    for roots in (1, 2, 4, 64):
         out = pricing._bootstrap_incumbent(
             graph, view, 0.0, cfg, benefit, frozenset(), model,
-            incumbent=None, departures=departures,
+            incumbent=None, roots=roots,
         )
         if out is None:
             continue
@@ -829,14 +921,14 @@ def test_the_bootstrap_only_ever_returns_a_certified_improvement():
             benefit=benefit, cost=column.delay_s,
             dual_cost=view.claim_cost(column.claims), pi_f=0.0,
         )
-        assert score == achievable, f"{departures}: score is not the column's own"
+        assert score == achievable, f"{roots}: score is not the column's own"
 
     # Given an incumbent it cannot beat, it returns that incumbent UNCHANGED -- so a
     # bootstrap that finds nothing leaves the caller exactly where it was.
     unbeatable = (1e9, pricing.seed_column(graph, cfg, model=model))
     assert pricing._bootstrap_incumbent(
         graph, view, 0.0, cfg, benefit, frozenset(), model,
-        incumbent=unbeatable, departures=4,
+        incumbent=unbeatable, roots=4,
     ) is unbeatable
 
 
@@ -861,7 +953,7 @@ def test_the_bootstrap_reaches_the_real_search_only_as_an_incumbent(monkeypatch)
     monkeypatch.setattr(pricing, "_certify_candidates", spy)
     boot = pricing._bootstrap_incumbent(
         graph, view, 0.0, cfg, 100.0, frozenset(), model,
-        incumbent=None, departures=2,
+        incumbent=None, roots=2,
     )
     assert seen, "the bootstrap never reached the ranking, so this proves nothing"
     assert boot is not None, "the bootstrap found nothing, so this proves nothing"
@@ -1683,7 +1775,7 @@ def _random_case(rng, index):
     return cfg, graph, model, DualView(_random_duals(graph, cfg, rng.randrange(1 << 30)), cfg)
 
 
-@pytest.mark.parametrize("bootstrap", [0, 3])
+@pytest.mark.parametrize("bootstrap", [0, 1])
 def test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs(bootstrap):
     """The load-bearing sweep: the same COLUMN, not merely the same reduced cost.
 
@@ -1729,7 +1821,7 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
         if bootstrap:
             incumbent = pricing._bootstrap_incumbent(
                 graph, view, 0.0, cfg, 100.0, frozenset(), model,
-                incumbent=incumbent, departures=bootstrap,
+                incumbent=incumbent, roots=bootstrap,
             )
 
         outcome = pricing._best_column_compiled(

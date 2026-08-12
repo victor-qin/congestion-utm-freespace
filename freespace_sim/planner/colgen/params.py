@@ -194,8 +194,19 @@ class ColGenParams:
     # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
     # graph and carries its own label pool, so memory is linear in this number.
     n_pricing_workers: int = 0
-    # Departure steps, counted from `base_step`, that the pricing BOOTSTRAP searches before
-    # the real search starts.  0 disables it.
+    # How many ROOTS the pricing BOOTSTRAP searches before the real search starts, taken in
+    # descending order of `PreparedVariants.score`.  0 disables it; PR #76 uses 1.  A root is
+    # one `(departure_step, origin lane)` pair, so this is a count of start options and not
+    # of departure times.
+    #
+    # Ranked rather than truncated, which is the whole difference between this and the
+    # departure PREFIX it replaces.  A prefix takes the earliest N departures and so misses
+    # an optimum that departs late -- measured: at a 4- and 8-step prefix the bootstrap
+    # returned rc 4.4590 against an 8.4590 optimum on the second sweep and the main search
+    # declined anyway, while `score` is the root's own upper bound and ranks the promising
+    # departure first whenever it is.  It is also far cheaper: a prefix of N covers
+    # `N * n_origin_lanes` roots (240 at N=16 on the density straggler) where this covers
+    # exactly `bootstrap_roots`.
     #
     # It exists because the cutoff pricing enters with is not merely weak, it is
     # structurally ZERO -- and that is a property of column generation, not a bug.  Every
@@ -225,7 +236,7 @@ class ColGenParams:
     # never discards anything strictly better, so the optimum is unchanged -- but under
     # dominance a tighter cutoff can return a DIFFERENT equally-optimal column, so this moves
     # the `ab_colgen_parity.py` sha and has to be re-baselined deliberately.
-    bootstrap_departures: int = 0
+    bootstrap_roots: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):
@@ -278,15 +289,15 @@ class ColGenParams:
             raise ValueError("n_pricing_workers must be non-negative")
         object.__setattr__(self, "n_pricing_workers", workers)
 
-        if isinstance(self.bootstrap_departures, bool):
-            raise TypeError("bootstrap_departures must be an integer")
+        if isinstance(self.bootstrap_roots, bool):
+            raise TypeError("bootstrap_roots must be an integer")
         try:
-            bootstrap = operator.index(self.bootstrap_departures)
+            bootstrap = operator.index(self.bootstrap_roots)
         except TypeError as exc:
-            raise TypeError("bootstrap_departures must be an integer") from exc
+            raise TypeError("bootstrap_roots must be an integer") from exc
         if bootstrap < 0:
-            raise ValueError("bootstrap_departures must be non-negative")
-        object.__setattr__(self, "bootstrap_departures", bootstrap)
+            raise ValueError("bootstrap_roots must be non-negative")
+        object.__setattr__(self, "bootstrap_roots", bootstrap)
 
         if isinstance(self.greedy_budget_s_per_flight, bool):
             raise TypeError("greedy_budget_s_per_flight must be a real number")

@@ -1372,7 +1372,7 @@ def prepare_variants(
     model=None,
     forbidden_rows=frozenset(),
     envelopes: CompletionEnvelopes | None = None,
-    max_departure_step: int | None = None,
+    keep_roots: frozenset[tuple[int, int]] | None = None,
 ) -> PreparedVariants:
     """Price every root option once, exactly as ``_best_column``'s initialization does.
 
@@ -1391,10 +1391,13 @@ def prepare_variants(
     survivor the reference kept, losing its sinks. See
     ``[[pruning-not-neutral-under-dominance]]``.
 
-    ``max_departure_step`` truncates the departure window, which is what the pricing
-    BOOTSTRAP restricts on (``pricing._bootstrap_incumbent``). The reference honours the
-    same bound through ``_best_column``'s own ``max_departure_step``, so the two searches
-    still explore the same space and ``Declined``'s contract is unaffected.
+    ``keep_roots`` restricts the root set to an explicit allowlist of
+    ``(departure_step, lane_idx)`` pairs, with ``-1`` for a bare origin. This is what the
+    pricing BOOTSTRAP restricts on (``pricing._bootstrap_incumbent``), and it is an
+    allowlist rather than a rule so that the *host* can rank once and hand the same set to
+    both searches -- ``_best_column`` takes the identical argument. Neither reimplements the
+    ranking, so the two still explore the same space and ``Declined``'s contract is
+    unaffected.
 
     The gate runs **here**, over every root, before any arc is relaxed, because that is
     where the reference runs it — and running it here is also what freezes every
@@ -1453,10 +1456,7 @@ def prepare_variants(
     classes: list[int] = []
     considered = prefiltered = 0
 
-    last_departure_step = fg.latest_departure_step
-    if max_departure_step is not None:
-        last_departure_step = min(last_departure_step, max_departure_step)
-    for departure_step in range(fg.base_step, last_departure_step + 1):
+    for departure_step in range(fg.base_step, fg.latest_departure_step + 1):
         considered += 1
         ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
         ground_score = -w_ground * ground_delay_s
@@ -1469,6 +1469,10 @@ def prepare_variants(
         if not origin_claims.isdisjoint(forbidden_rows):
             continue
         for lane_idx, cell, lane_steps in origin_options:
+            if keep_roots is not None and (
+                departure_step, -1 if lane_idx is None else int(lane_idx)
+            ) not in keep_roots:
+                continue
             index = cell_index.get(cell)
             if index is None:
                 continue

@@ -515,11 +515,18 @@ def main() -> int:
                 f"cost currencies (1:3 vs 1:1), not a faster search. Rerun both with "
                 f"--objective {base.get('objective_mode')}")
             continue
-        if current["bootstrap_roots"] != base["bootstrap_roots"]:
+        # `None` means the ref PREDATES the field, which is the same behaviour as 0 --
+        # no bootstrap either way -- so normalise before comparing.  Comparing raw made a
+        # ref older than `bootstrap_roots` UNCOMPARABLE against an unbootstrapped tree,
+        # while telling the caller to "rerun with --bootstrap-roots 0", which is what they
+        # had already done.  Only a tree that actually bootstraps against a ref that cannot
+        # is a real mismatch.
+        if (current["bootstrap_roots"] or 0) != (base["bootstrap_roots"] or 0):
             failures += 1
             say(f"  UNCOMPARABLE: tree ran bootstrap_roots={current['bootstrap_roots']} but "
-                f"{baseline_label} ran {base['bootstrap_roots']} -- the baseline predates the "
-                f"parameter, so rerun with --bootstrap-roots 0 or pick a newer ref")
+                f"{baseline_label} ran {base['bootstrap_roots']} -- a ref predating the "
+                f"parameter cannot bootstrap, so compare at --bootstrap-roots 0 or pick a "
+                f"newer ref")
             continue
         # The greedy's stop reason, not merely whether it stopped.  A stage capped by its
         # CANDIDATE limit stops at the same place in both arms and is fine; one stopped by

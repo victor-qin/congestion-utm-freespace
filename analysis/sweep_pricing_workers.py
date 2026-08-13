@@ -82,7 +82,7 @@ def main() -> None:
           f"objective={args.objective} bootstrap_roots={args.bootstrap_roots} "
           f"ranking={args.bootstrap_ranking}")
     print(f"{'scenario':<30} {'w':>2} {'WALL':>9} {'pricing':>9} {'speedup':>8} "
-          f"{'rss_self':>9} {'rss_kids':>9} {'objective':>20} {'sel':>4} {'cols':>6} {'greedy':>7} {'g_done':>7}")
+          f"{'rss_self':>9} {'rss_kids':>9} {'objective':>20} {'sel':>4} {'cols':>6} {'it':>3} {'termination':>18} {'greedy':>7} {'g_done':>7}")
 
     for scenario in args.scenarios:
         spec = get_scenario(scenario)
@@ -114,9 +114,28 @@ def main() -> None:
             # script did exactly that and measured six sequential runs, which `rss_kids = 0`
             # is the tell for.
             parallel = ParallelPricingConfig(n_workers=workers)
+            # One line per column-generation iteration, flushed, so a long gap-terminated
+            # run is legible WHILE it runs rather than only in its final row.  `lp_gap_cost`
+            # against `params.lp_gap` is the thing actually deciding when this stops.
+            t_iter = [time.perf_counter()]
+
+            def _on_iteration(state, _t=t_iter):
+                now = time.perf_counter()
+                print(
+                    f"    iter {state.get('iteration'):>3}  "
+                    f"{now - _t[0]:>7.1f}s  "
+                    f"lp_obj={state.get('lp_objective'):>18.4f}  "
+                    f"gap_cost={state.get('lp_gap_cost'):>10.3e}  "
+                    f"gap_rev={state.get('lp_gap_revenue'):>10.3e}  "
+                    f"cost_ub={state.get('cost_upper_bound'):>14.4f}",
+                    flush=True,
+                )
+                _t[0] = now
+
             started = time.perf_counter()
             result = ColGenSolver().solve(
-                requests, cfg, static_terms, params, parallel=parallel
+                requests, cfg, static_terms, params, parallel=parallel,
+                on_iteration=_on_iteration,
             )
             wall = time.perf_counter() - started
             stats = result.stats
@@ -134,10 +153,20 @@ def main() -> None:
             flag = "" if key == baseline_key else "  <-- ANSWER MOVED, speedup is void"
             # The stat is derived from what the solver ACTUALLY used, so a mismatch here
             # means the knob did not take effect and the row is not a parallel measurement.
-            if not stats.get("initial_greedy_completed", True):
+            # Only when the stage actually RAN.  At `greedy_budget_s_per_flight == 0` it is
+            # disabled, and `initial_greedy_completed` is False for the structural reason
+            # rather than the clock -- flagging that reads as a warning about a stage that
+            # did not happen.  Note the flag is imprecise even when it does fire: above
+            # ~256 flights `solver.py` sets `completed = len(order) <= candidate_limit`
+            # BEFORE consulting any deadline, so a large batch is marked incomplete by the
+            # candidate cap, which lands identically in both arms and is fine.
+            greedy_ran = (params.greedy_budget_s_per_flight > 0.0
+                          and not stats.get("initial_greedy_completed", True))
+            if greedy_ran:
                 flag += ("  <-- GREEDY DID NOT COMPLETE ("
-                         f"{stats.get('initial_greedy_elapsed_s', 0.0):.1f}s); its cutoff "
-                         "differs, so this row is not comparable")
+                         f"{stats.get('initial_greedy_elapsed_s', 0.0):.1f}s); if that was "
+                         "the CLOCK rather than the 256-candidate cap, its cutoff differs "
+                         "and this row is not comparable")
             got = stats.get("n_pricing_workers")
             if got != workers:
                 flag += f"  <-- ASKED {workers} WORKERS, SOLVER USED {got}"
@@ -148,6 +177,8 @@ def main() -> None:
                 f"{rss_self:>8.0f}M {rss_kids:>8.0f}M "
                 f"{stats.get('objective'):>20} {stats.get('selected_flights'):>4} "
                 f"{stats.get('n_columns'):>6} "
+                f"{stats.get('iterations'):>3} "
+                f"{str(stats.get('termination_reason')):>18} "
                 f"{float(stats.get('initial_greedy_elapsed_s', 0.0)):>7.1f} "
                 f"{str(stats.get('initial_greedy_completed')):>7}{flag}"
             )

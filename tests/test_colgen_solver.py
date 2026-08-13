@@ -102,6 +102,18 @@ def _params(**overrides) -> ColGenParams:
         "max_iterations": 30,
         "time_limit_s": 30.0,
         "n_heuristic_tries": 16,
+        # SEQUENTIAL, deliberately not the shipped default of 4 -- and this is a
+        # correctness pin, not a speed one.  Most tests in this file stub a pricing seam
+        # with `monkeypatch.setattr(pricing_pool, "price_flight", ...)`, and the pool uses
+        # the `spawn` context: a worker re-imports the module and gets the REAL function,
+        # so the stub reaches only the parent, which prices nothing.  Two tests caught this
+        # by failing outright when the default moved; the rest would have gone on passing
+        # against unstubbed pricing, which is worse.  The same spawn-boundary rule is why
+        # `prof_colgen_stages` refuses `--max-label-log2` under `--workers`.
+        #
+        # The SHIPPED default is pinned in `test_experiment_run.py`, and the pool's own
+        # behaviour in `test_colgen_pricing_pool.py`, which asks for workers by name.
+        "n_pricing_workers": 0,
     }
     values.update(overrides)
     return ColGenParams(**values)

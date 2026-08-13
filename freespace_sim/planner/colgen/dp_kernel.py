@@ -189,7 +189,6 @@ FLAT_LABEL_ARENA = True
 # ASKS for, not what it uses, and climbing a ladder is strictly better than starting high.
 # The label arena is the opposite case: lazily mapped, so a flat ceiling costs nothing.
 INITIAL_LOG2CAP = 14
-INITIAL_LOG2CAP = 14
 
 
 # --------------------------------------------------------------------------- exact sums

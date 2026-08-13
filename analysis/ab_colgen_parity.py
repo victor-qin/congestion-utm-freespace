@@ -212,21 +212,28 @@ import inspect
 _solve_params = inspect.signature(ColGenSolver.solve).parameters
 _param_fields = {f.name for f in dataclasses.fields(ColGenParams)}
 _pool_kwargs = {}
-effective_workers = 0
-if workers:
-    # TWO MECHANISMS, because this harness compares across a change that replaced one with
-    # the other.  Newer trees read `params.n_pricing_workers`; older ones ignore that field
-    # entirely and take a `parallel=ParallelPricingConfig(...)` keyword instead.  Test for
-    # the keyword FIRST: a ref can have both -- `origin/main` carries the params field but
-    # its `solve` does not consult it -- so preferring the field would silently run that
-    # arm sequentially while the header claimed workers.
-    if "parallel" in _solve_params:
+effective_workers = workers
+# TWO MECHANISMS, because this harness compares across a change that replaced one with the
+# other.  Newer trees read `params.n_pricing_workers`; older ones ignore that field entirely
+# and take a `parallel=ParallelPricingConfig(...)` keyword instead.  Test for the keyword
+# FIRST: a ref can have both -- `origin/main` carries the params field but its `solve` does
+# not consult it -- so preferring the field would silently run that arm sequentially while
+# the header claimed workers.
+if "parallel" in _solve_params:
+    # Old tree.  Omitting the keyword IS the sequential request there, because that tree's
+    # `ParallelPricingConfig` still defaults to 0.
+    if workers:
         from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig
         _pool_kwargs["parallel"] = ParallelPricingConfig(n_workers=workers)
-        effective_workers = workers
-    elif "n_pricing_workers" in _param_fields:
-        params = dataclasses.replace(params, n_pricing_workers=workers)
-        effective_workers = workers
+elif "n_pricing_workers" in _param_fields:
+    # New tree, and this MUST run for `workers == 0` too -- which is why it is not inside a
+    # `if workers:` guard.  The shipped default is now 4, so leaving `params` alone no
+    # longer means "sequential", it means "four".  Guarded, the 0-worker baseline arm of
+    # `--sequential-baseline` silently ran four workers and compared a pool against itself.
+    # The assertion below caught exactly that, on the first run after the default moved.
+    params = dataclasses.replace(params, n_pricing_workers=workers)
+else:
+    effective_workers = 0
 
 started = time.perf_counter()
 result = ColGenSolver().solve(requests, cfg, static_terms, params, **_pool_kwargs)

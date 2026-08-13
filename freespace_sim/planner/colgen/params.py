@@ -141,9 +141,10 @@ class ColGenParams:
     #
     # `ip_reserve_s = min(5, 0.05 * t)` is already at its cap by 1200 s, so the tail left
     # for the final IP does not move.  The greedy's budget is no longer derived from this
-    # at all -- see `greedy_budget_s_per_flight` -- but it is still CLAMPED by
-    # `pricing_deadline`, so raising this does lift the greedy's effective ceiling on a
-    # batch large enough for `0.7 * n_flights` to reach it (about 1,700 flights).
+    # at all -- see `greedy_budget_s_per_flight`, which now ships at 0 and therefore skips
+    # the stage entirely -- but an ENABLED rate is still CLAMPED by `pricing_deadline`, so
+    # raising this lifts that stage's effective ceiling on a batch large enough for
+    # `rate * n_flights` to reach it (about 1,700 flights at the old 0.7 rate).
     time_limit_s: float = 1200.0
     lp_gap: float = 1e-4
     ip_gap: float = 1e-3

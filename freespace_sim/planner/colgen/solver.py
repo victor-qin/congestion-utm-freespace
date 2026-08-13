@@ -1001,13 +1001,16 @@ class ColGenSolver:
                 # "Independently" no longer means "as a share of the solve".  The
                 # budget below is per FLIGHT and the old `0.55 * time_limit_s`
                 # factor is gone, so the only thing keeping this stage away from
-                # the whole budget is the absolute `pricing_deadline` clamp: at
-                # the 0.7 s default and a 1200 s limit, ~850 flights makes the
-                # greedy half of pricing's budget and ~1700 makes it all of it.
-                # That is a deliberate trade -- see `greedy_budget_s_per_flight`
-                # -- but it is a ceiling on batch size, not a guarantee, and it
-                # is why a very large batch wants an explicit rate rather than
-                # the default.
+                # the whole budget is the absolute `pricing_deadline` clamp.
+                #
+                # The shipped rate is now 0, which disables the stage outright,
+                # so none of that arithmetic runs by default -- see
+                # `greedy_budget_s_per_flight` for why.  It still describes what
+                # an ENABLED rate costs: at 0.7 s (the old default) against a
+                # 1200 s limit, ~850 flights makes the greedy half of pricing's
+                # budget and ~1700 makes it all of it.  A ceiling on batch size
+                # rather than a guarantee, and the reason a very large batch
+                # wants its rate chosen rather than copied.
                 greedy_started = time.monotonic()
                 # PER FLIGHT, because the stage divides its budget across candidates and a
                 # fixed total therefore starves as the batch grows.  The old

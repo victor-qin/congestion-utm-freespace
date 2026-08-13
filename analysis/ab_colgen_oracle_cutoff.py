@@ -153,6 +153,12 @@ def main() -> int:
     params = ColGenParams(
         solver="highs", max_iterations=args.iterations, time_limit_s=86400.0,
         gap_metric="cost",
+        # SEQUENTIAL, and not optional here.  This probe monkeypatches module-level
+        # functions in THIS process, and `n_pricing_workers` now DEFAULTS TO 4.  The pool
+        # uses the `spawn` context, so a worker re-imports the module and binds the REAL
+        # function: the patch would reach only the parent, which prices nothing, and the
+        # report would come back empty with no error saying why.
+        n_pricing_workers=0,
     )
     if args.max_label_log2 is not None and dp_kernel_mod is not None:
         dp_kernel_mod.MAX_LABEL_CAPACITY = 1 << args.max_label_log2

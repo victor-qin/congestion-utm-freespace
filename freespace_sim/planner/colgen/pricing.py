@@ -2413,7 +2413,7 @@ def _best_column_compiled(
     # `record_budget=False` skips BOTH halves of the graph's budget memo, and it has to be
     # both.  A restricted search shares this cache with the unrestricted one that follows it,
     # and would corrupt it in each direction: reading, a 4-departure bootstrap would allocate
-    # the FULL search's pool (up to `MAX_LABEL_CAPACITY`, ~1.34 GB) for a search that needs a
+    # the FULL search's pool (up to `MAX_LABEL_CAPACITY`, ~2.68 GB) for a search that needs a
     # sliver of it; writing, the memo would end up holding the bootstrap's tiny budget, and
     # since the write below sits past the `status != OK` guard, a declining flight -- the one
     # this is all for -- would keep that number and make every later iteration re-climb the

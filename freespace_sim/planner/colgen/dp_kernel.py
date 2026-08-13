@@ -2142,7 +2142,10 @@ def price_dag(
     # origin is absent here and present there, and if it held the lowest lane index the two
     # tie-break on different values.  That reaches `_prefix_le`'s four-field comparison, so
     # the compiled search could certify a different -- equally optimal -- column while still
-    # reporting `proved=True`, which is the one failure this path is not allowed to have.
+    # returning normally rather than a `Declined`, which is the one failure this path is not
+    # allowed to have.  (Written when that signal was a `proved=True` boolean; the boolean
+    # is gone because it conflated "ran to completion" with "was checked", but the hazard it
+    # named is unchanged -- nothing downstream can tell the substituted column apart.)
     #
     # Measured: the filter drops nothing across 260 flights on five scenarios
     # (`colgen_test` and the four density arms), so this is latent rather than live -- but

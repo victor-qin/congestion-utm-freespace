@@ -209,8 +209,13 @@ def main() -> None:
         demand.generate(cfg, np.random.default_rng(cfg.seed)), key=lambda r: r.flight_id
     )[: args.flights]
     static_terms = list(demand.terminals(cfg))
+    # `n_pricing_workers=0` is load-bearing: this probe patches module-level functions
+    # in THIS process and the shipped default is now 4.  A `spawn` worker re-imports the
+    # module and binds the REAL function, so the patch would reach only the parent, which
+    # prices nothing -- an empty report with no error saying why.
     params = ColGenParams(max_iterations=args.iterations, time_limit_s=86400.0,
-                          gap_metric="cost", objective=args.objective, bootstrap_roots=0)
+                          gap_metric="cost", objective=args.objective, bootstrap_roots=0,
+                          n_pricing_workers=0)
     ColGenSolver().solve(requests, cfg, static_terms, params)
 
     print(f"\n{'fl':>4} {'roots':>6} {'fin':>5} {'corr':>7} {'top1=':>6} {'top2=':>6} "

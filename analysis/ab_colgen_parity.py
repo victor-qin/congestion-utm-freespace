@@ -535,8 +535,10 @@ def main() -> int:
                 f"{base['greedy_budget_s_per_flight']}, and at least one greedy stopped "
                 f"early -- so the two started from different incumbents")
             continue
-        # A ref predating `bootstrap_roots` runs unbootstrapped, which moves every column --
-        # the same trap as the ladder, refused rather than reported as a divergence.
+        # Two arms in different cost CURRENCIES price different problems, so every column
+        # diverges -- the same trap as the ladder, refused rather than reported as a
+        # regression.  Compared by value, not feature-tested: unlike `bootstrap_roots`
+        # below, `objective` exists on every ref this harness can reach.
         if current.get("objective_mode") != base.get("objective_mode"):
             failures += 1
             say(f"  UNCOMPARABLE: tree ran objective={current.get('objective_mode')} but "

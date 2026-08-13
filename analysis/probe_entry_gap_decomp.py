@@ -168,6 +168,12 @@ def main() -> None:
         time_limit_s=86400.0,
         bootstrap_roots=args.bootstrap_roots,
         objective=args.objective,
+        # SEQUENTIAL, and not optional here.  This probe monkeypatches module-level
+        # functions in THIS process, and `n_pricing_workers` now DEFAULTS TO 4.  The pool
+        # uses the `spawn` context, so a worker re-imports the module and binds the REAL
+        # function: the patch would reach only the parent, which prices nothing, and the
+        # report would come back empty with no error saying why.
+        n_pricing_workers=0,
     )
 
     def _record(state: dict) -> None:

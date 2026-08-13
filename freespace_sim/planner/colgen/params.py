@@ -173,11 +173,11 @@ class ColGenParams:
     n_heuristic_tries: int = 16
     # What the master minimises.  ``total_cost`` weights the two currencies the way the
     # config does -- `cost_ground_delay_per_s = 1`, `cost_air_lateral_per_s = 3`
-    # (config.py:64-66) -- so one step of ground costs `dt` and one hop of air costs `3*dt`.
+    # (config.py:83-85) -- so one step of ground costs `dt` and one hop of air costs `3*dt`.
     # ``total_delay`` weights them EQUALLY, and that is not merely a different answer, it is
     # a degenerate one: `ground + flown` is invariant under a ground-for-air swap, so an
     # enormous set of columns are EXACTLY tied and the label DP's dominance cannot separate
-    # labels the real objective strictly orders (pricing.py:1705-1712 spells this out).
+    # labels the real objective strictly orders (pricing.py:1765-1772 spells this out).
     #
     # It is also the reason this default moved.  The tie plateau, plus a `delay_lbs[hops]`
     # that rises `w_air*dt` per hop -- 4 under `total_delay`, 12 here -- makes the
@@ -262,8 +262,9 @@ class ColGenParams:
     #
     # TURNING IT OFF DOES NOT REMOVE THE FALLBACK SCHEDULE, which was the real objection.
     # `best_heuristic` is set from `master.round_heuristic` BEFORE this stage runs
-    # (`solver.py:983`), and the greedy only replaces it when `_better_selection` says it
-    # improved (`solver.py:1019`).  So a timed-out solve still has a feasible answer; it is
+    # (`solver.py:991-993`), and the greedy only replaces it when `_better_selection` says
+    # it improved (`solver.py:1038-1044`).  So a timed-out solve still has a feasible
+    # answer; it is
     # simply the LP-rounding one rather than a refined one.
     #
     # WHERE THIS DEFAULT IS MOST LIKELY WRONG: a solve whose `time_limit_s` genuinely binds,

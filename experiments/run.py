@@ -427,12 +427,19 @@ def main() -> None:
     # in a `finally` so a run that DIES still leaves its log somewhere findable -- which is the
     # case with the most to say.
     tee = None if args.no_run_log else _StderrTee(Path(tempfile.mkdtemp()) / "run.log")
-    folder = None
+    # A LIST rather than `_execute`'s return value, because `_execute` does real work AFTER
+    # `save_run` returns: it reads `summary.json` back off disk and logs the steady-state
+    # twin.  An exception anywhere in that tail leaves the return value unassigned even
+    # though the run folder exists and is complete, and the log would then be stranded in a
+    # temp directory under a message claiming the run "failed before save_run" -- the
+    # opposite of what happened, and pointing at the wrong thing to debug.  `_execute`
+    # appends the moment the folder exists.
+    saved: list[Path] = []
     try:
-        folder = _execute(args)
+        _execute(args, saved)
     finally:
         if tee is not None:
-            _archive_log(tee, folder)
+            _archive_log(tee, saved[0] if saved else None)
 
 
 def _archive_log(tee: _StderrTee, folder: Path | None) -> None:
@@ -448,7 +455,7 @@ def _archive_log(tee: _StderrTee, folder: Path | None) -> None:
     os.rmdir(tee.path.parent)
 
 
-def _execute(args) -> Path:
+def _execute(args, saved: list[Path] | None = None) -> Path:
     spec = spec_from_args(args)
     # to_json_dict, not asdict: the latter loses every tuple to a JSON list and leaves `demand` a
     # plain dict, so the archived recipe could not be rebuilt. See ScenarioSpec.from_json_dict.
@@ -512,6 +519,10 @@ def _execute(args) -> Path:
         wall_seconds=wall, write_replay=False,   # execute persists data only; replay is a readout
         window_frac=args.window_frac,
     )
+    # Published to the caller HERE, not via the return value: everything below this line can
+    # raise, and the folder is already complete and on disk.  See `main`.
+    if saved is not None:
+        saved.append(folder)
     s = res.summary()
     log.info("n=%s acc=%s den=%s verified=%s (%.1fs) → %s",
              s["n_requests"], s["n_accepted"], s["n_denied"], res.verified, wall, folder)

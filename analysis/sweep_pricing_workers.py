@@ -1,15 +1,21 @@
 """Is the pricing pool worth using again, now that the straggler is gone?
 
-``[[parallel-loses-on-density-scenarios]]`` measured the pool LOSING to sequential on
-exactly these two scenarios -- 0.66-0.74x -- and the reason was Amdahl, not overhead: one
-flight was 87.6% of the sweep, which caps ANY worker pool at 1.14x however many cores it
-gets.  Two things have moved since:
+The pool's problem was never that it lost -- ``[[colgen-parallel-pricing-pool]]`` measured
+4 workers at 2.62x back on 2026-08-04.  It was that ONE FLIGHT was 87.6% of the sweep,
+which caps any worker pool at 1.14x however many cores it gets, and that peak RSS went
+3.5 GB sequential to 7.9 GB at 4 workers.  Two things have moved since:
 
-* ``objective=total_cost`` took the straggler's share to 20.6-28.3%, so the cap is now
-  **3.5-4.9x**;
+* ``objective=total_cost`` took the straggler's share to 20.6-28.3%, so the Amdahl cap is
+  now **3.5-4.9x**;
 * the label arena is flat and lazily mapped, so a worker no longer climbs the label ladder
   from 2^16 on a cold ``dag_budget`` -- though the STATE ladder still does, and that is
   per worker per sweep because ``_init_worker`` rebuilds every graph.
+
+Do NOT reach for ``[[parallel-loses-on-density-scenarios]]`` here, as an earlier draft of
+this docstring did: its 0.66-0.74x is the A* SPECULATIVE PARALLEL RUNNER, where the serial
+commit floor dominates a compiled per-flight plan.  Different mechanism, different
+bottleneck, and citing it made the pricing pool look like a reopened question when the
+open question was only ever memory.
 
 Against those, the pool got more expensive in one way: ``MAX_LABEL_CAPACITY`` is now 2^26,
 so each worker maps 2.68 GB of arena.  Lazily backed, so virtual rather than resident, but

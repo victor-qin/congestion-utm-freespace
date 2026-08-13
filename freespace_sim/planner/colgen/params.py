@@ -280,16 +280,23 @@ class ColGenParams:
     # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
     # graph and carries its own label pool, so memory is linear in this number.
     #
-    # NOW 4, WAS 0, AND THE MEASUREMENT THAT SAID 0 HAS BEEN OVERTURNED.  The pool used to
-    # LOSE to sequential on exactly these scenarios (0.66-0.74x), and the reason was Amdahl
-    # rather than overhead: one flight was 87.6% of the sweep, which caps any pool at 1.14x
-    # however many cores it gets.  `objective=total_cost` took that flight's share to
-    # 20.6-28.3%, and at 4 workers x50 now measures `density_faa` 2.36x and `density_future`
-    # 2.15x.  4 is the knee, not a round number.
+    # NOW 4, WAS 0, AND MEMORY IS WHAT CHANGED -- NOT SPEED.  The pool was never slower than
+    # sequential here: 4 workers measured 2.62x on `density_faa` x100 as far back as
+    # 2026-08-04, and 2.36x / 2.15x on the two density scenarios at x50 today.  What kept
+    # the default at 0 is the second sentence above -- memory is linear in workers, and that
+    # table also showed tree peak RSS going 3.5 GB sequential to 7.9 GB at 4 workers, which
+    # is what forecloses a 4 GB/core cluster node.
     #
-    # The memory objection is also gone: `rss_children` is flat from 2 to 16 workers
+    # THAT objection is the one that lifted: `rss_children` is now flat from 2 to 16 workers
     # (~3.9 GB) because the label arena is lazily mapped, so a worker's 2.68 GB ceiling is
-    # address space rather than resident pages.
+    # address space rather than resident pages.  4 is the knee of the speedup curve
+    # (efficiency 85.9% at 2, 80.5% at 4, 64.1% at 8, 37.6% at 16), not a round number.
+    #
+    # DO NOT cite the 0.66-0.74x "parallel loses on density" figures here, as an earlier
+    # draft of this comment did.  Those measure the A* SPECULATIVE PARALLEL RUNNER
+    # (`analysis/bench_parallel.py`, `--mode exact`, where the serial commit floor dominates
+    # a compiled per-flight plan) -- a different mechanism with a different bottleneck.  The
+    # colgen pricing pool has no such result.
     #
     # ONE CAVEAT THAT SURVIVES.  A pool is answer-identical to the sequential loop only on a
     # sweep that FINISHES.  `pricing_deadline` is a wall clock, so a pool gets further

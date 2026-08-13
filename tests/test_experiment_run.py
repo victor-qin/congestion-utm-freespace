@@ -142,10 +142,11 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     # one has to be deliberate -- which is the whole point of the test, and both of the
     # values below moved for measured reasons rather than drifting:
     #
-    #   `n_pricing_workers` 0 -> 4.  The pool used to LOSE to sequential on the density
-    #   scenarios because one flight was 87.6% of the sweep and capped any pool at 1.14x;
-    #   `objective=total_cost` took that share to 20.6-28.3% and 4 workers now measures
-    #   2.15-2.36x.  4 is the knee.
+    #   `n_pricing_workers` 0 -> 4.  The pool was never the slower option (2.62x at 4
+    #   workers as far back as 2026-08-04); what held the default at 0 was MEMORY, peak RSS
+    #   going 3.5 GB sequential to 7.9 GB at 4 workers.  The lazily-mapped label arena
+    #   lifted that, and 4 is the knee of the efficiency curve.  4 workers measures
+    #   2.15-2.36x on the two density scenarios today.
     #
     #   `greedy_budget_s_per_flight` 0.7 -> 0.0, which DISABLES the stage.  At convergence
     #   it buys 0.129% of objective for +57% of wall, and iteration 1 is bit-identical

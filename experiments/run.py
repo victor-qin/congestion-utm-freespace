@@ -488,7 +488,18 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
             log.info("planner %r has no parallel kernel — running sequential (--mode %s ignored)",
                      cfg.planner, args.mode)
     else:
-        log.info("mode=sequential: serial FCFS planning")
+        # `--mode` names the FCFS COMMIT loop and nothing else.  Spelled out for planners
+        # that could never use it, because the bare line reads as a claim about the whole
+        # run: a colgen solve fanning its pricing sweep across eight processes still prints
+        # `mode=sequential`, correctly -- the simulation loop IS serial -- and every reader
+        # so far has taken that to mean the run is single-process.
+        from freespace_sim.parallel import PARALLEL_PLANNERS
+        log.info(
+            "mode=sequential: serial FCFS planning%s",
+            "" if cfg.planner in PARALLEL_PLANNERS else
+            f" — {cfg.planner!r} has no speculative parallel kernel, so --mode/--workers "
+            "never apply to it; a planner with its own internal pool reports that separately"
+        )
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,

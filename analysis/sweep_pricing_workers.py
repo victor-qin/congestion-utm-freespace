@@ -18,22 +18,33 @@ bottleneck, and citing it made the pricing pool look like a reopened question wh
 open question was only ever memory.
 
 Against those, the pool got more expensive in one way: ``MAX_LABEL_CAPACITY`` is now 2^26,
-so each worker maps 2.68 GB of arena.  Lazily backed, so virtual rather than resident, but
-``rss_children`` is the number that says whether that is true in practice, and it is the
-one that decides whether this is usable on a 4 GB/core cluster node.
+so each worker maps 2.68 GB of arena.  Lazily backed, so virtual rather than resident --
+and whether that holds in practice is the number that decides if this is usable on a
+4 GB/core node, because an OOM-killed worker does not fail the sweep, it HANGS it.
+
+**That number is ``rss_peak``, sampled across the process TREE, and it is not the one this
+script used to print.**  ``getrusage(RUSAGE_CHILDREN).ru_maxrss`` is the largest SINGLE
+child by definition, never the sum, so it reads flat however many workers run and cannot
+distinguish "the arena costs nothing" from "aggregate memory is linear in workers".  It
+reported flat here and the conclusion drawn from it -- that the memory objection to
+defaulting the pool on had lifted -- was an artifact.  See ``_tree_rss_mib``.
 
 Not `prof_colgen_cutoff`: its probes hook module-level functions and would instrument only
 the parent, silently reporting the workers' searches as missing.  This measures the solve
-from outside instead, and checks the one invariant that makes a worker count safe to
-change -- the OBJECTIVE and the selected-flight set must not move.
+from outside instead, and checks the invariant that makes a worker count safe to change --
+the SCHEDULE must not move, fingerprinted the way the parity harness does rather than by
+objective and a flight COUNT, which a different flight set passes unchanged.
 
     uv run python analysis/sweep_pricing_workers.py --flights 50
 """
 from __future__ import annotations
 
 import argparse
-import resource
+import hashlib
+import os
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -50,8 +61,91 @@ from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
-# macOS reports ru_maxrss in bytes, Linux in kibibytes.
-_RSS_SCALE = 1024 * 1024 if sys.platform == "darwin" else 1024
+def _tree_rss_mib() -> float:
+    """Summed RSS of this process and every descendant, right now, in MiB.
+
+    NOT `getrusage(RUSAGE_CHILDREN).ru_maxrss`, which this script used to report and which
+    cannot answer the question the pool poses.  POSIX defines that field as the largest
+    SINGLE child, never the sum across the tree, so it reads FLAT however many workers run
+    -- measured directly: 1, 2 and 4 concurrent children each touching 150 MiB all report
+    172 MiB.  Reporting it as "rss_kids" made a pool whose aggregate scales linearly look
+    like one that costs nothing, which is exactly backwards for the decision it informed.
+
+    `ps` rather than a dependency, and a full descendant walk rather than direct children,
+    because `mp.Pool` workers are direct children but anything they spawn is not.
+    """
+
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,ppid=,rss="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return float("nan")
+    children: dict[int, list[int]] = {}
+    rss_kib: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        rss_kib[pid] = rss
+    total, stack = 0, [os.getpid()]
+    while stack:
+        pid = stack.pop()
+        total += rss_kib.get(pid, 0)
+        stack.extend(children.get(pid, ()))
+    return total / 1024.0          # `ps` reports KiB on both macOS and Linux
+
+
+class _RssSampler:
+    """Poll the process tree's summed RSS and keep the high-water mark."""
+
+    def __init__(self, period_s: float = 0.25) -> None:
+        self.peak_mib = 0.0
+        self._period = period_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            now = _tree_rss_mib()
+            if now == now and now > self.peak_mib:   # NaN-safe
+                self.peak_mib = now
+            self._stop.wait(self._period)
+
+    def __enter__(self) -> "_RssSampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+
+def _schedule_sha(result) -> str:
+    """A fingerprint of the SCHEDULE, not merely of its price.
+
+    `objective` plus a selected-flight COUNT is not an identity check: a different set of
+    flights, or a different equally-priced column for the same flight, passes it unchanged.
+    Same fields the parity harness hashes, so a divergence here means the same thing there.
+    """
+
+    h = hashlib.sha1()
+    for flight_id, column in sorted(result.columns.items()):
+        h.update(repr((
+            int(flight_id),
+            int(column.departure_step),
+            int(column.level),
+            column.origin_lane_idx,
+            column.dest_lane_idx,
+            repr(column.delay_s),
+            tuple(column.cell_path),
+            tuple(sorted(repr(row) for row in column.claims)),
+        )).encode())
+    return h.hexdigest()[:16]
 
 
 def main() -> None:
@@ -85,7 +179,8 @@ def main() -> None:
           f"objective={args.objective} bootstrap_roots={args.bootstrap_roots} "
           f"ranking={args.bootstrap_ranking}")
     print(f"{'scenario':<30} {'w':>2} {'WALL':>9} {'pricing':>9} {'speedup':>8} "
-          f"{'rss_self':>9} {'rss_kids':>9} {'objective':>20} {'sel':>4} {'cols':>6} {'it':>3} {'termination':>18} {'greedy':>7} {'g_done':>7}")
+          f"{'rss_peak':>9} {'per_wkr':>8} {'sha':>16} {'objective':>20} {'sel':>4} "
+          f"{'cols':>6} {'it':>3} {'termination':>18} {'greedy':>7} {'g_done':>7}")
 
     for scenario in args.scenarios:
         spec = get_scenario(scenario)
@@ -98,6 +193,7 @@ def main() -> None:
         static_terms = list(demand.terminals(cfg))
 
         base_wall = None
+        base_rss = None
         baseline_key = None
         for workers in args.workers:
             params = ColGenParams(
@@ -140,21 +236,28 @@ def main() -> None:
                 _t[0] = now
 
             started = time.perf_counter()
-            result = ColGenSolver().solve(
-                requests, cfg, static_terms, params,
-                on_iteration=_on_iteration,
-            )
+            with _RssSampler() as sampler:
+                result = ColGenSolver().solve(
+                    requests, cfg, static_terms, params,
+                    on_iteration=_on_iteration,
+                )
             wall = time.perf_counter() - started
             stats = result.stats
-            rss_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / _RSS_SCALE
-            rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / _RSS_SCALE
+            rss_peak = sampler.peak_mib
+            # Charged against the SEQUENTIAL arm, so the column answers the question the
+            # default flip actually turns on: what does adding a worker cost in resident
+            # memory.  Linear here means the pool is bounded by RAM, not by cores.
+            if base_rss is None:
+                base_rss = rss_peak
+            per_worker = ((rss_peak - base_rss) / workers) if workers else 0.0
             if base_wall is None:
                 base_wall = wall
             # The invariant that makes a worker count safe to change at all.  `price_sweep`
             # reproduces the sequential loop's ACCEPTED PREFIX and index order, so these two
             # must be identical -- if they are not, the speedup is measuring a different
             # answer and is meaningless.
-            key = (repr(stats.get("objective")), stats.get("selected_flights"))
+            sha = _schedule_sha(result)
+            key = (repr(stats.get("objective")), stats.get("selected_flights"), sha)
             if baseline_key is None:
                 baseline_key = key
             flag = "" if key == baseline_key else "  <-- ANSWER MOVED, speedup is void"
@@ -181,7 +284,7 @@ def main() -> None:
                 f"{scenario:<30} {workers:>2} {wall:>9.2f} "
                 f"{float(stats.get('pricing_wall_s', 0.0)):>9.2f} "
                 f"{base_wall / wall:>7.2f}x "
-                f"{rss_self:>8.0f}M {rss_kids:>8.0f}M "
+                f"{rss_peak:>8.0f}M {per_worker:>7.0f}M {sha:>16} "
                 f"{stats.get('objective'):>20} {stats.get('selected_flights'):>4} "
                 f"{stats.get('n_columns'):>6} "
                 f"{stats.get('iterations'):>3} "

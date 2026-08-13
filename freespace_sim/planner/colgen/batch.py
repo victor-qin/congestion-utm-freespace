@@ -89,8 +89,9 @@ def run_batch(
     ``collector`` is accepted for parity with the parallel runner.  Column generation
     has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
 
-    Pricing fans across worker processes when ``params.n_pricing_workers`` is nonzero, which
-    is the DEFAULT (4); pass 0 to run the sweep in this process.  :func:`pricing_pool.price_sweep`
+    Pricing fans across worker processes when ``params.n_pricing_workers`` is nonzero, and
+    runs in this process otherwise (the default -- the pool is opt-in because its memory is
+    linear in workers).  :func:`pricing_pool.price_sweep`
     reproduces the sequential loop's prefix RULE and hands the reduced costs back in index
     order, so on any sweep that finishes the columns and the objective do not move.
 

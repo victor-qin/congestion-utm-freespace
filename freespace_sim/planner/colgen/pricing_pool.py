@@ -27,10 +27,10 @@ change is *when* results arrive. This module exists to make sure that is all it 
    solve can terminate an iteration earlier or later. They are appended by index.
 
 ``n_workers=0`` runs the sequential loop in-process and is byte-identical to no pool at
-all. It is the PARITY BASELINE but no longer the default -- ``ColGenParams`` ships
-``n_pricing_workers = 4``, so a caller that sets nothing gets a pool. Parity runs have to
-pin 0 explicitly; leaving the field alone stopped meaning "sequential" when that default
-moved.
+all; it is both the default and the parity baseline. The pool is OPT-IN because its memory
+is linear in workers -- 3.9 GB in-process against 12.5 GB at 4 workers and 22.7 GB at 8, on
+a 50-flight density instance -- and an OOM-killed worker hangs this sweep rather than
+failing it (see the deadlock note below). Speed is not the constraint: 3.5x at 4 workers.
 
 **Processes, not threads.** Pricing is ~90% Python outside the numba kernel, so threads
 would contend on the GIL for the part that is not compiled. The costs processes bring are

@@ -282,17 +282,40 @@ class ColGenParams:
     # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
     # graph and carries its own label pool, so memory is linear in this number.
     #
-    # NOW 4, WAS 0, AND MEMORY IS WHAT CHANGED -- NOT SPEED.  The pool was never slower than
-    # sequential here: 4 workers measured 2.62x on `density_faa` x100 as far back as
-    # 2026-08-04, and 2.36x / 2.15x on the two density scenarios at x50 today.  What kept
-    # the default at 0 is the second sentence above -- memory is linear in workers, and that
-    # table also showed tree peak RSS going 3.5 GB sequential to 7.9 GB at 4 workers, which
-    # is what forecloses a 4 GB/core cluster node.
+    # STAYS 0 -- OPT-IN -- AND THE ATTEMPT TO DEFAULT IT TO 4 IS RECORDED HERE BECAUSE THE
+    # EVIDENCE FOR IT WAS AN ARTIFACT.  Speed was never the question: the pool measures 2.62x
+    # at 4 workers on `density_faa` x100 (2026-08-04) and 2.36x / 2.15x on the two density
+    # scenarios at x50.  Memory is, per the paragraph above, and the 2026-08-04 table put
+    # tree peak RSS at 3,501 MB sequential against 7,888 MB at 4 workers and 22,592 MB at 16
+    # -- roughly linear, and what forecloses a 4 GB/core cluster node.
     #
-    # THAT objection is the one that lifted: `rss_children` is now flat from 2 to 16 workers
-    # (~3.9 GB) because the label arena is lazily mapped, so a worker's 2.68 GB ceiling is
-    # address space rather than resident pages.  4 is the knee of the speedup curve
-    # (efficiency 85.9% at 2, 80.5% at 4, 64.1% at 8, 37.6% at 16), not a round number.
+    # The claim that the lazily-mapped arena had lifted that rested on `rss_children` reading
+    # FLAT from 2 to 16 workers.  It does, and it means nothing: `getrusage(RUSAGE_CHILDREN)`
+    # defines `ru_maxrss` as the largest SINGLE child, never the sum across the tree, so flat
+    # is the only answer that metric can give however many workers run.  Demonstrated
+    # directly -- 1, 2 and 4 concurrent children each touching 150 MiB all report 172 MiB.
+    #
+    # Measured properly since, by sampling summed RSS across the process TREE
+    # (`sweep_pricing_workers.py`), `density_faa_wing_zipline` x50, 2 iterations, greedy off:
+    #
+    #     workers   peak tree RSS   marginal/worker   speedup   schedule sha
+    #           0        3,953 MB              --       1.00x   b6ddd8d9af579126
+    #           2        7,100 MB        1,573 MB       2.27x   b6ddd8d9af579126
+    #           4       12,536 MB        2,146 MB       3.50x   b6ddd8d9af579126
+    #           8       22,688 MB        2,342 MB       3.89x   b6ddd8d9af579126
+    #
+    # LINEAR, and slightly worse than linear per worker.  Nothing about the lazy arena made
+    # the pool cheap; it made one METRIC stop reporting the cost.  4 workers is 12.5 GB at
+    # FIFTY flights, so on the 4 GB/core node this has to run on, the default cannot be 4 --
+    # and an OOM-killed worker does not fail the sweep, it HANGS it (see `pricing_pool`), so
+    # the failure mode is silence rather than a traceback.
+    #
+    # Speed is not the obstacle and never was: 3.50x at 4 workers here, better than the 2.36x
+    # measured while the greedy still ran, because turning that serial stage off lifted the
+    # Amdahl cap.  The schedule sha is identical across all four arms, so the pool is
+    # answer-identical on a sweep that finishes, exactly as claimed.  This is purely a memory
+    # budget, and raising the default needs a cap on aggregate live RSS -- not another
+    # speedup table.
     #
     # DO NOT cite the 0.66-0.74x "parallel loses on density" figures here, as an earlier
     # draft of this comment did.  Those measure the A* SPECULATIVE PARALLEL RUNNER
@@ -313,7 +336,7 @@ class ColGenParams:
     # 0 into `None`, which `price_sweep` resolved as "whatever the dataclass defaults to"
     # rather than "sequential".  `price_sweep` already receives this params object, so the
     # second one carried no information.
-    n_pricing_workers: int = 4
+    n_pricing_workers: int = 0
     # `mp.Pool.imap`'s third argument.  1 is almost certainly right and raising it is a
     # trap: chunking amortizes DISPATCH, and a pricing task ships one int in and ~14 KB out
     # against tens of seconds of compute, so there is nothing to amortize.  What it costs

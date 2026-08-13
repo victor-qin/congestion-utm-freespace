@@ -113,8 +113,14 @@ def test_the_pool_width_has_exactly_one_home():
     that the setting lives on the params object and that no second home has come back.
     """
 
-    assert ColGenParams().n_pricing_workers == 4
-    assert ColGenParams(n_pricing_workers=0).n_pricing_workers == 0
+    # 0, i.e. OPT-IN.  It was briefly defaulted to 4 on the strength of `rss_children`
+    # reading flat across worker counts -- which it always does, because
+    # `getrusage(RUSAGE_CHILDREN).ru_maxrss` is the largest single child and never the
+    # sum.  Sampling the process TREE instead put x50 density at 3.9 GB sequential,
+    # 12.5 GB at 4 workers and 22.7 GB at 8: linear, and unaffordable by default on a
+    # 4 GB/core node.
+    assert ColGenParams().n_pricing_workers == 0
+    assert ColGenParams(n_pricing_workers=4).n_pricing_workers == 4
     assert "parallel" not in inspect.signature(ColGenSolver.solve).parameters
     assert not hasattr(pricing_pool, "ParallelPricingConfig")
 

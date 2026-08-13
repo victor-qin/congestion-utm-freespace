@@ -240,7 +240,11 @@ def main() -> int:
         "ip_status": stats.get("ip_status"),
         "ip_skipped": stats.get("ip_skipped"),
         "rss_self_mb": round(_rss_mb(resource.RUSAGE_SELF), 1),
-        "rss_children_mb": round(_rss_mb(resource.RUSAGE_CHILDREN), 1),
+        # LARGEST SINGLE CHILD, not the sum across the tree -- `getrusage` defines
+        # `ru_maxrss` that way for RUSAGE_CHILDREN, so this reads flat however many
+        # workers ran and says NOTHING about aggregate pool memory.  For that use
+        # `analysis/sweep_pricing_workers.py`'s tree sampler.
+        "rss_largest_child_mb": round(_rss_mb(resource.RUSAGE_CHILDREN), 1),
         "stage_s": {name: round(value, 2) for name, value in breakdown},
         "master_stage_s": {k: round(v, 2) for k, v in stages.items()},
         "per_iteration": per_iteration,

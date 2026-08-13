@@ -307,7 +307,11 @@ def main() -> int:
         "initial_greedy_completed": stats.get("initial_greedy_completed"),
         "initial_greedy_elapsed_s": stats.get("initial_greedy_elapsed_s"),
         "rss_self_mb": round(_rss(resource.RUSAGE_SELF), 1),
-        "rss_children_mb": round(_rss(resource.RUSAGE_CHILDREN), 1),
+        # LARGEST SINGLE CHILD, not the sum across the tree -- `getrusage` defines
+        # `ru_maxrss` that way for RUSAGE_CHILDREN, so this reads flat however many
+        # workers ran and says NOTHING about aggregate pool memory.  For that use
+        # `analysis/sweep_pricing_workers.py`'s tree sampler.
+        "rss_largest_child_mb": round(_rss(resource.RUSAGE_CHILDREN), 1),
     }
     print("\n" + json.dumps(summary, indent=2, default=str), flush=True)
     if args.out:

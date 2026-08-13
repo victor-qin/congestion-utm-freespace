@@ -142,11 +142,12 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     # one has to be deliberate -- which is the whole point of the test, and both of the
     # values below moved for measured reasons rather than drifting:
     #
-    #   `n_pricing_workers` 0 -> 4.  The pool was never the slower option (2.62x at 4
-    #   workers as far back as 2026-08-04); what held the default at 0 was MEMORY, peak RSS
-    #   going 3.5 GB sequential to 7.9 GB at 4 workers.  The lazily-mapped label arena
-    #   lifted that, and 4 is the knee of the efficiency curve.  4 workers measures
-    #   2.15-2.36x on the two density scenarios today.
+    #   `n_pricing_workers` STAYS 0, and the attempt to default it to 4 is worth knowing
+    #   about: the pool is fast (3.50x at 4 workers on density x50) but its memory is
+    #   LINEAR -- 3.9 GB sequential, 12.5 GB at 4 workers, 22.7 GB at 8, sampled across the
+    #   process tree.  The evidence that briefly said otherwise was `rss_children`, which
+    #   is the largest single child rather than the sum and therefore reads flat no matter
+    #   how many workers run.
     #
     #   `greedy_budget_s_per_flight` 0.7 -> 0.0, which DISABLES the stage.  At convergence
     #   it buys 0.129% of objective for +57% of wall, and iteration 1 is bit-identical
@@ -154,7 +155,7 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     #
     # `seed_ladder_steps` still defaults ON, so a `None` leaking through would silently
     # disable the ladder rather than merely resetting a budget -- the original point here.
-    assert defaults.n_pricing_workers == 4
+    assert defaults.n_pricing_workers == 0
     assert defaults.seed_ladder_steps == 20
     assert defaults.greedy_budget_s_per_flight == 0.0
 

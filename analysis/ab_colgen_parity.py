@@ -301,7 +301,10 @@ print("@@FINGERPRINT@@" + json.dumps({
     # scale badly and the thing a wall-clock number hides.  SELF is the parent; CHILDREN is
     # the high-water mark of the pool's workers, which is where that risk actually lands.
     "rss_self_mb": round(_rusage.getrusage(_rusage.RUSAGE_SELF).ru_maxrss / _RSS_SCALE, 1),
-    "rss_children_mb": round(
+    # LARGEST SINGLE CHILD, not the sum across the tree: `ru_maxrss` is defined that way
+    # for RUSAGE_CHILDREN, so it reads flat however many workers ran and cannot speak to
+    # aggregate pool memory.  Named for what it is, since it is not what a reader assumes.
+    "rss_largest_child_mb": round(
         _rusage.getrusage(_rusage.RUSAGE_CHILDREN).ru_maxrss / _RSS_SCALE, 1
     ),
     "tree": str(loaded.parent.parent),
@@ -495,7 +498,7 @@ def main() -> int:
             f"obj={current['objective']} sel={current['selected_flights']} "
             f"cols={current['n_columns']} sha={current['column_sha']} "
             f"w={current['workers']} rss={current['rss_self_mb']:.0f}"
-            f"+{current['rss_children_mb']:.0f}MB "
+            f"+{current['rss_largest_child_mb']:.0f}MB "
             f"greedy_done={current['greedy_completed']}/{current['greedy_elapsed_s']}s")
         if baseline_root is None:
             continue
@@ -508,7 +511,7 @@ def main() -> int:
             f"obj={base['objective']} sel={base['selected_flights']} "
             f"cols={base['n_columns']} sha={base['column_sha']} "
             f"w={base['workers']} rss={base['rss_self_mb']:.0f}"
-            f"+{base['rss_children_mb']:.0f}MB "
+            f"+{base['rss_largest_child_mb']:.0f}MB "
             f"greedy_done={base['greedy_completed']}/{base['greedy_elapsed_s']}s")
         # A ref predating `seed_ladder_steps` accepts no such kwarg and runs unladdered.
         # Every column would then differ, which looks exactly like a kernel divergence --

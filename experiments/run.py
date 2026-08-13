@@ -295,25 +295,28 @@ def build_parser() -> argparse.ArgumentParser:
                         "more hops becomes unreachable — widen it first if a congested scenario "
                         "denies flights that ought to be placeable")
     # The three knobs `ColGenParams` grew for the compiled/parallel pricing path. Without
-    # them the params object is reachable only from Python, and the direction each one needs
-    # to be reachable in has now MOVED: `n_pricing_workers` defaults to 4, so the flag's job
-    # is to turn the pool DOWN rather than on, and `greedy_budget_s_per_flight` defaults to
-    # 0, so its flag turns a stage ON that used to need turning off. Only the ladder still
-    # reads the way it originally did. "Off by default" and "unreachable" look identical
-    # from the params object and are not the same thing -- and so do "on by default" and
-    # "cannot be disabled", which is what these two would now be without their flags.
+    # them the params object is reachable only from Python: `n_pricing_workers` defaults to
+    # 0, so no invocation of this CLI could ever run the pool, and the ladder defaults ON and
+    # could not be turned down. "Off by default" and "unreachable" look identical from the
+    # params object and are not the same thing.
+    #
+    # `--colgen-greedy-budget-rate` is now the mirror image -- its stage defaults OFF, so its
+    # flag turns something ON. Worth stating because the flip means an unset flag no longer
+    # implies "the documented behaviour happens", and the help strings below are the only
+    # place a caller sees which way each one points.
     p.add_argument("--colgen-workers", type=int, default=None, metavar="N",
-                   help="colgen: fan each pricing sweep across N worker processes (default 4; "
-                        "0 runs the sweep in-process). Note this is NOT --workers, which sizes "
-                        "the simulation's speculative pool. Answer-identical to sequential ONLY "
-                        "ON A SWEEP THAT FINISHES: the accepted prefix and the reduced-cost order "
-                        "both reproduce the sequential loop, but the pricing deadline is a wall "
-                        "clock, so a pool gets further through the flights before the same instant "
-                        "and keeps a LONGER prefix. More pricing inside the budget, and a "
-                        "different column set -- so pass 0 for a run that must reproduce a "
-                        "sequential answer under a binding --colgen-time-limit. Measured 2.4x on "
-                        "density at 50 flights. Sizing is bound by MEMORY before cores: each "
-                        "worker rebuilds every graph and holds its own label pool")
+                   help="colgen: fan each pricing sweep across N worker processes (default 0, "
+                        "in-process). Note this is NOT --workers, which sizes the simulation's "
+                        "speculative pool. Answer-identical to sequential ONLY ON A SWEEP THAT "
+                        "FINISHES: the accepted prefix and the reduced-cost order both reproduce "
+                        "the sequential loop, but the pricing deadline is a wall clock, so a pool "
+                        "gets further through the flights before the same instant and keeps a "
+                        "LONGER prefix -- more pricing inside the budget, and a different column "
+                        "set. Fast (3.5x at 4 workers on density x50) but MEMORY is the binding "
+                        "constraint and it is linear: 3.9 GB in-process, 12.5 GB at 4 workers, "
+                        "22.7 GB at 8, sampled across the process tree at only 50 flights. Size "
+                        "this against the RAM you have, not the cores; an OOM-killed worker hangs "
+                        "the sweep rather than failing it")
     p.add_argument("--colgen-seed-ladder", type=int, default=None, metavar="STEPS",
                    help="colgen: seed each flight's column with STEPS retimed copies of itself "
                         "before the first LP (default 20; 0 disables). Pure clock translation, so "

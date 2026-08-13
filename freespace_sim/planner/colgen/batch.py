@@ -18,7 +18,6 @@ from ...types import (
 )
 from ...uss import _warn_if_terminal_dropped
 from .params import ColGenParams
-from .pricing_pool import ParallelPricingConfig
 from .solver import ColGenSolver
 from .translate import column_to_intent
 
@@ -148,11 +147,11 @@ def run_batch(
     result = ColGenSolver().solve(
         requests, cfg, static_terms, batch_params,
         on_iteration=on_iteration if on_iteration is not None else _log_iteration,
-        parallel=(
-            ParallelPricingConfig(n_workers=batch_params.n_pricing_workers)
-            if batch_params.n_pricing_workers
-            else None
-        ),
+        # Worker count is NOT plumbed here: it rides on `batch_params.n_pricing_workers`,
+        # which `price_sweep` reads directly.  This used to build a `ParallelPricingConfig`
+        # and pass it as `parallel=`, mapping an explicit 0 to `None` -- which `price_sweep`
+        # resolved as "the dataclass default" rather than "sequential", so raising that
+        # default would have turned `--colgen-workers 0` into a pool.
     )
     solve_elapsed = time.monotonic() - solve_started
     solve_share = solve_elapsed / len(events) if events else 0.0

@@ -40,7 +40,7 @@ from .pricing import (
     price_flight,
     seed_column,
 )
-from .pricing_pool import ParallelPricingConfig, price_sweep
+from .pricing_pool import price_sweep
 from .translate import Column
 
 _FEASIBILITY_TOL = 1e-7
@@ -620,7 +620,6 @@ class ColGenSolver:
         fixed_claims: Sequence[frozenset[RowKey]] = (),
         on_iteration=None,
         seed_columns: Mapping[int, Sequence[Column]] | None = None,
-        parallel: ParallelPricingConfig | None = None,
     ) -> ColGenResult:
         """Run the column-generation loop to convergence, a bound, or a time limit.
 
@@ -628,15 +627,18 @@ class ColGenSolver:
         iteration's duals, so the loop order affects only which columns a timed-out sweep
         managed to reach, never their value.
 
-        ``parallel`` fans that sweep across worker processes.
-        :func:`pricing_pool.price_sweep` reproduces the sequential loop's prefix RULE and
-        hands the reduced costs back in index order, so on a sweep that FINISHES the columns
-        and the objective are unchanged.  A sweep that hits ``pricing_deadline`` is a
-        different matter: the timeout is a wall clock rather than a work budget, and a pool
-        gets further through ``pricing_order`` before the same absolute deadline than one
-        core does, so it keeps a longer prefix.  More pricing inside the same budget, but
-        not the same answer -- see :mod:`.pricing_pool`.  ``None`` (the default) keeps the
-        sweep in-process.
+        ``params.n_pricing_workers`` fans that sweep across worker processes; 0 keeps it
+        in-process.  :func:`pricing_pool.price_sweep` reproduces the sequential loop's
+        prefix RULE and hands the reduced costs back in index order, so on a sweep that
+        FINISHES the columns and the objective are unchanged.  A sweep that hits
+        ``pricing_deadline`` is a different matter: the timeout is a wall clock rather than
+        a work budget, and a pool gets further through ``pricing_order`` before the same
+        absolute deadline than one core does, so it keeps a longer prefix.  More pricing
+        inside the same budget, but not the same answer -- see :mod:`.pricing_pool`.
+
+        There is no ``parallel=`` keyword.  It used to take a separate
+        ``ParallelPricingConfig``, which duplicated a count ``params`` already carried and
+        let the two defaults disagree; the sweep reads ``params`` directly now.
 
         ``on_iteration`` is called once per column-generation iteration with a dict of
         that iteration's master state (LP objective, global upper bound, gaps, column
@@ -1071,7 +1073,6 @@ class ColGenSolver:
                 flight_duals,
                 best_heuristic,
                 deadline=pricing_deadline,
-                config=parallel,
             )
             # Consumed in index order, which is what keeps a parallel sweep's answer equal
             # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
@@ -1536,7 +1537,7 @@ class ColGenSolver:
             # `pricing_wall_s` when the sweep ran sequentially.  Without it a slow run
             # cannot be told apart from a badly-scheduled one after the fact.
             "pricing_task_total_s": pricing_task_total_s,
-            "n_pricing_workers": 0 if parallel is None else parallel.n_workers,
+            "n_pricing_workers": params.n_pricing_workers,
             # Exact-pricing calls and how many fell back to the pure-Python reference.
             # A fallback returns the SAME column 3-4.5x slower, so it moves no other number
             # in this dict; a nonzero count is the only way a run reports that its compiled

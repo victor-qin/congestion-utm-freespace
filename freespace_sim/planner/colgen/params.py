@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 from dataclasses import dataclass
 
 
@@ -278,7 +279,40 @@ class ColGenParams:
     # performance knob -- `pricing_pool.price_sweep` reproduces the sequential loop's
     # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
     # graph and carries its own label pool, so memory is linear in this number.
-    n_pricing_workers: int = 0
+    #
+    # NOW 4, WAS 0, AND THE MEASUREMENT THAT SAID 0 HAS BEEN OVERTURNED.  The pool used to
+    # LOSE to sequential on exactly these scenarios (0.66-0.74x), and the reason was Amdahl
+    # rather than overhead: one flight was 87.6% of the sweep, which caps any pool at 1.14x
+    # however many cores it gets.  `objective=total_cost` took that flight's share to
+    # 20.6-28.3%, and at 4 workers x50 now measures `density_faa` 2.36x and `density_future`
+    # 2.15x.  4 is the knee, not a round number.
+    #
+    # The memory objection is also gone: `rss_children` is flat from 2 to 16 workers
+    # (~3.9 GB) because the label arena is lazily mapped, so a worker's 2.68 GB ceiling is
+    # address space rather than resident pages.
+    #
+    # ONE CAVEAT THAT SURVIVES.  A pool is answer-identical to the sequential loop only on a
+    # sweep that FINISHES.  `pricing_deadline` is a wall clock, so a pool gets further
+    # through `pricing_order` before the same absolute instant and keeps a LONGER accepted
+    # prefix -- more pricing inside the same budget, but a different column set.  With
+    # `time_limit_s = 1200.0` shipped and a 500-flight solve at ~509 s, there is margin, but
+    # a parity comparison must still pin this to 0 on both arms.  See `pricing_pool`.
+    #
+    # THIS IS THE ONLY HOME FOR THE SETTING.  It used to be mirrored by a separate
+    # `ParallelPricingConfig` dataclass that `solve` took as a `parallel=` keyword, so the
+    # count had two defaults that could disagree -- and did: `batch.py` turned an explicit
+    # 0 into `None`, which `price_sweep` resolved as "whatever the dataclass defaults to"
+    # rather than "sequential".  `price_sweep` already receives this params object, so the
+    # second one carried no information.
+    n_pricing_workers: int = 4
+    # `mp.Pool.imap`'s third argument.  1 is almost certainly right and raising it is a
+    # trap: chunking amortizes DISPATCH, and a pricing task ships one int in and ~14 KB out
+    # against tens of seconds of compute, so there is nothing to amortize.  What it costs
+    # instead is load balance -- `mp.Pool` pre-partitions the iterable, per-flight cost
+    # varies several-fold, and n/chunksize chunks across n_pricing_workers lanes leaves
+    # nothing to rebalance a straggler against.  Kept configurable so that claim stays
+    # measurable rather than merely asserted.
+    pricing_chunksize: int = 1
     # How many ROOTS the pricing BOOTSTRAP searches before the real search starts, taken in
     # descending order of `PreparedVariants.score`.  0 disables it; PR #76 uses 1.  A root is
     # one `(departure_step, origin lane)` pair, so this is a count of start options and not
@@ -380,7 +414,29 @@ class ColGenParams:
             raise TypeError("n_pricing_workers must be an integer") from exc
         if workers < 0:
             raise ValueError("n_pricing_workers must be non-negative")
+        # An upper bound, because the failure past it is not an error message.  Each worker
+        # rebuilds every graph and carries its own label pool -- roughly 1.5 GB on density
+        # -- so an over-large count from a config file OOMs the host rather than running
+        # slowly.  Measured, more lanes stop paying long before here anyway: 8 and 12
+        # workers were within noise of each other, because added lanes add memory-system
+        # contention as fast as they add throughput.
+        ceiling = 4 * (os.cpu_count() or 1)
+        if workers > ceiling:
+            raise ValueError(
+                f"n_pricing_workers={workers} exceeds {ceiling} (4x this host's "
+                f"{os.cpu_count()} cores); each worker holds its own label pool"
+            )
         object.__setattr__(self, "n_pricing_workers", workers)
+
+        if isinstance(self.pricing_chunksize, bool):
+            raise TypeError("pricing_chunksize must be an integer")
+        try:
+            chunksize = operator.index(self.pricing_chunksize)
+        except TypeError as exc:
+            raise TypeError("pricing_chunksize must be an integer") from exc
+        if chunksize < 1:
+            raise ValueError("pricing_chunksize must be positive")
+        object.__setattr__(self, "pricing_chunksize", chunksize)
 
         if isinstance(self.bootstrap_roots, bool):
             raise TypeError("bootstrap_roots must be an integer")

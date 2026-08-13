@@ -41,9 +41,6 @@ if REPO_ROOT not in _loaded.parents:
     raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
 
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import (  # noqa: E402
-    ParallelPricingConfig,
-)
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -104,16 +101,20 @@ def main() -> None:
                 gap_metric=args.gap_metric,
                 bootstrap_roots=args.bootstrap_roots,
                 bootstrap_ranking=args.bootstrap_ranking,
+                # The worker count IS a `ColGenParams` field, and setting it here is the
+                # whole mechanism -- `price_sweep` reads `params.n_pricing_workers`
+                # directly.  This used to be the opposite: `solve` took a separate
+                # `parallel=ParallelPricingConfig(...)` keyword and `n_pricing_workers=`
+                # on the params object was accepted and SILENTLY IGNORED, which is how the
+                # first version of this script measured six sequential runs and reported
+                # them as a worker sweep (`rss_kids = 0` was the tell).  The assertion
+                # below survives that history deliberately: it is cheap, and it is what
+                # turns "the knob did not take effect" into a failed row instead of a
+                # plausible number.
+                n_pricing_workers=workers,
                 **({} if args.greedy_budget is None
                    else {'greedy_budget_s_per_flight': args.greedy_budget}),
             )
-            # The worker count is NOT a `ColGenParams` field: `solve` takes a separate
-            # `parallel=ParallelPricingConfig(...)` keyword, and `stats["n_pricing_workers"]`
-            # is DERIVED from it (`solver.py:1523`).  Passing `n_pricing_workers=` to
-            # ColGenParams is accepted and silently ignored -- the first version of this
-            # script did exactly that and measured six sequential runs, which `rss_kids = 0`
-            # is the tell for.
-            parallel = ParallelPricingConfig(n_workers=workers)
             # One line per column-generation iteration, flushed, so a long gap-terminated
             # run is legible WHILE it runs rather than only in its final row.  `lp_gap_cost`
             # against `params.lp_gap` is the thing actually deciding when this stops.
@@ -134,7 +135,7 @@ def main() -> None:
 
             started = time.perf_counter()
             result = ColGenSolver().solve(
-                requests, cfg, static_terms, params, parallel=parallel,
+                requests, cfg, static_terms, params,
                 on_iteration=_on_iteration,
             )
             wall = time.perf_counter() - started

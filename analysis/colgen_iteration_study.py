@@ -68,7 +68,6 @@ if REPO_ROOT not in _loaded.parents:
     raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
 
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.planner.colgen.translate import Column  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
@@ -254,7 +253,6 @@ def main() -> int:
     result = ColGenSolver().solve(
         requests, cfg, static_terms, params,
         on_iteration=on_iteration,
-        parallel=ParallelPricingConfig(n_workers=args.workers) if args.workers else None,
         **({} if seed_columns is None else {"seed_columns": seed_columns}),
     )
     wall = time.perf_counter() - started

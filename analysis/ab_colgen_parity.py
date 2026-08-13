@@ -210,16 +210,38 @@ if kernel == "off":
 # disagreement-is-a-bug property is exactly what the comparison is for.
 import inspect
 _solve_params = inspect.signature(ColGenSolver.solve).parameters
+_param_fields = {f.name for f in dataclasses.fields(ColGenParams)}
 _pool_kwargs = {}
 effective_workers = 0
-if workers and "parallel" in _solve_params:
-    from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig
-    _pool_kwargs["parallel"] = ParallelPricingConfig(n_workers=workers)
-    effective_workers = workers
+if workers:
+    # TWO MECHANISMS, because this harness compares across a change that replaced one with
+    # the other.  Newer trees read `params.n_pricing_workers`; older ones ignore that field
+    # entirely and take a `parallel=ParallelPricingConfig(...)` keyword instead.  Test for
+    # the keyword FIRST: a ref can have both -- `origin/main` carries the params field but
+    # its `solve` does not consult it -- so preferring the field would silently run that
+    # arm sequentially while the header claimed workers.
+    if "parallel" in _solve_params:
+        from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig
+        _pool_kwargs["parallel"] = ParallelPricingConfig(n_workers=workers)
+        effective_workers = workers
+    elif "n_pricing_workers" in _param_fields:
+        params = dataclasses.replace(params, n_pricing_workers=workers)
+        effective_workers = workers
 
 started = time.perf_counter()
 result = ColGenSolver().solve(requests, cfg, static_terms, params, **_pool_kwargs)
 wall = time.perf_counter() - started
+
+# The knob is only useful if it took effect.  `n_pricing_workers` was accepted-and-ignored
+# on the params object for the whole life of the `parallel=` keyword, and an arm that
+# silently ran sequential does not fail -- it AGREES, which reads as a passing parity run
+# that tested nothing.  The stat is derived from what the solver actually used.
+_got_workers = result.stats.get("n_pricing_workers")
+if _got_workers != effective_workers:
+    raise SystemExit(
+        f"asked for {effective_workers} pricing workers but the solver used "
+        f"{_got_workers}; this arm did not test what it claims"
+    )
 
 rows = []
 for flight_id, column in sorted(result.columns.items()):

@@ -138,13 +138,24 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
 
     assert defaults.time_limit_s == 1200.0
     assert defaults.objective == "total_cost"
-    # The pricing-path knobs specifically: `n_pricing_workers` defaulting to 0 is what
-    # keeps an existing command line byte-identical after the flags were added, and the
-    # other two default to ON, so a `None` leaking through would silently disable the
-    # ladder or the greedy stage rather than merely resetting a budget.
-    assert defaults.n_pricing_workers == 0
+    # The pricing-path knobs specifically.  These pin the SHIPPED defaults so that changing
+    # one has to be deliberate -- which is the whole point of the test, and both of the
+    # values below moved for measured reasons rather than drifting:
+    #
+    #   `n_pricing_workers` 0 -> 4.  The pool used to LOSE to sequential on the density
+    #   scenarios because one flight was 87.6% of the sweep and capped any pool at 1.14x;
+    #   `objective=total_cost` took that share to 20.6-28.3% and 4 workers now measures
+    #   2.15-2.36x.  4 is the knee.
+    #
+    #   `greedy_budget_s_per_flight` 0.7 -> 0.0, which DISABLES the stage.  At convergence
+    #   it buys 0.129% of objective for +57% of wall, and iteration 1 is bit-identical
+    #   without it because `round_heuristic` sets `best_heuristic` anyway.
+    #
+    # `seed_ladder_steps` still defaults ON, so a `None` leaking through would silently
+    # disable the ladder rather than merely resetting a budget -- the original point here.
+    assert defaults.n_pricing_workers == 4
     assert defaults.seed_ladder_steps == 20
-    assert defaults.greedy_budget_s_per_flight == 0.7
+    assert defaults.greedy_budget_s_per_flight == 0.0
 
 
 def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():

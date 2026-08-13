@@ -70,40 +70,20 @@ from .pricing import DualView, PricingTimeout, kernel_stats, price_flight
 from .translate import Column
 
 __all__ = [
-    "ParallelPricingConfig",
     "SweepResult",
     "price_sweep",
 ]
 
 
-@dataclass(frozen=True, slots=True)
-class ParallelPricingConfig:
-    """How wide to fan the sweep. ``n_workers=0`` is the sequential loop."""
-
-    n_workers: int = 0
-    chunksize: int = 1
-
-    def __post_init__(self) -> None:
-        for name in ("n_workers", "chunksize"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{name} must be an integer")
-        if self.n_workers < 0:
-            raise ValueError("n_workers must be non-negative")
-        if self.chunksize < 1:
-            raise ValueError("chunksize must be positive")
-        # An upper bound, because the failure past it is not an error message.  Each worker
-        # rebuilds every graph and carries its own label pool -- roughly 1.5 GB on density
-        # -- so an over-large count from a config file OOMs the host rather than running
-        # slowly.  Measured, more lanes stop paying long before here anyway: 8 and 12
-        # workers were within noise of each other, because added lanes add memory-system
-        # contention as fast as they add throughput.
-        ceiling = 4 * (os.cpu_count() or 1)
-        if self.n_workers > ceiling:
-            raise ValueError(
-                f"n_workers={self.n_workers} exceeds {ceiling} (4x this host's "
-                f"{os.cpu_count()} cores); each worker holds its own label pool"
-            )
+# HOW WIDE TO FAN THE SWEEP LIVES ON `ColGenParams`, as `n_pricing_workers` (0 is the
+# sequential loop) and `pricing_chunksize`.  There used to be a `ParallelPricingConfig`
+# dataclass here that `solve` took as a separate `parallel=` keyword, and it was pure
+# duplication: `price_sweep` already receives the params object, so the second one carried
+# no information the first did not.  It also cost a real bug -- two defaults that could
+# disagree, with `batch.py` mapping an explicit 0 to `None` and `price_sweep` resolving
+# `None` as "whatever the dataclass defaults to" rather than "sequential", so raising that
+# default would have silently turned `--colgen-workers 0` into a pool.  Both the worker
+# ceiling and the chunksize validation moved to `ColGenParams.__post_init__` with it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,23 +275,23 @@ def price_sweep(
     known_columns: dict[int, Column],
     *,
     deadline: float | None = None,
-    config: ParallelPricingConfig | None = None,
 ) -> SweepResult:
     """Price every flight in ``pricing_order``, sequentially or across processes.
 
-    ``graphs`` is used only by the sequential path; workers build their own from
-    ``requests`` (cheaper than pickling, see the module docstring).
+    Width comes from ``params.n_pricing_workers``; 0 is the sequential loop and is
+    byte-identical to no pool at all.  ``graphs`` is used only by the sequential path;
+    workers build their own from ``requests`` (cheaper than pickling, see the module
+    docstring).
     """
 
-    config = config or ParallelPricingConfig()
-    if config.n_workers == 0:
+    if params.n_pricing_workers == 0:
         return _sweep_sequential(
             pricing_order, graphs, cfg, params, dual_view, flight_duals,
             known_columns, deadline,
         )
     return _sweep_parallel(
         pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-        known_columns, deadline, config,
+        known_columns, deadline,
     )
 
 
@@ -359,7 +339,7 @@ def _sweep_sequential(
 
 def _sweep_parallel(
     pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-    known_columns, deadline, config
+    known_columns, deadline
 ) -> SweepResult:
     """Fan the sweep across a pool built and torn down for this sweep alone.
 
@@ -387,14 +367,14 @@ def _sweep_parallel(
     # an efficiency the caller never experiences.
     sweep_started = time.perf_counter()
     with ctx.Pool(
-        processes=config.n_workers, initializer=_init_worker, initargs=init_args
+        processes=params.n_pricing_workers, initializer=_init_worker, initargs=init_args
     ) as pool:
         # `imap` and not `imap_unordered`: results must arrive in `pricing_order` index
         # order so the accepted prefix is the one the sequential loop would have produced,
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
         accepted = _accepted_prefix(
-            pool.imap(_price_one, pricing_order, config.chunksize)
+            pool.imap(_price_one, pricing_order, params.pricing_chunksize)
         )
     return replace(accepted, wall_s=time.perf_counter() - sweep_started)
 

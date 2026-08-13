@@ -35,7 +35,6 @@ if REPO_ROOT not in _loaded.parents:
 from freespace_sim.planner.colgen import pricing as _pricing, solver as _solver  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
 from freespace_sim.planner.colgen.pricing import PricingTimeout  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -128,11 +127,8 @@ def main() -> int:
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
         seed_ladder_steps=args.ladder,
-    )
-    parallel = (
-        ParallelPricingConfig(n_workers=args.workers, chunksize=args.chunksize)
-        if args.workers
-        else None
+        n_pricing_workers=args.workers,
+        pricing_chunksize=args.chunksize,
     )
 
     header = {
@@ -176,7 +172,7 @@ def main() -> int:
 
     started = time.perf_counter()
     result = ColGenSolver().solve(
-        requests, cfg, static_terms, params, on_iteration=on_iteration, parallel=parallel
+        requests, cfg, static_terms, params, on_iteration=on_iteration
     )
     wall = time.perf_counter() - started
     stats = dict(result.stats)

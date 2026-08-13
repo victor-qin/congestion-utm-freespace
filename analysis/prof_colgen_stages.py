@@ -20,7 +20,8 @@ Note ``solver`` binds ``seed_column`` / ``find_feasible_column`` at import, and
 the solve actually calls. Every module object holding such a binding is patched below.
 
 **Profile sequentially.** Neither these timers nor cProfile cross a process boundary, so
-under ``parallel=`` everything inside the sweep happens in workers and is invisible here --
+with ``n_pricing_workers`` set, everything inside the sweep happens in workers and is
+invisible here --
 the parent would show only the greedy, the LP and canonicalization. A sequential sweep is
 exactly one worker's workload, which is the thing worth ranking anyway.
 
@@ -68,7 +69,6 @@ from freespace_sim.planner.colgen import pricing_pool as pricing_pool_mod  # noq
 from freespace_sim.planner.colgen import solver as solver_mod  # noqa: E402
 from freespace_sim.planner.colgen import translate as translate_mod  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -87,7 +87,7 @@ STAGES: list[tuple[str, list[tuple[object, str]]]] = [
     # The top of the sweep, and the one binding that MOVED: `pricing_pool` imports
     # `price_flight` directly, so patching only `pricing` would instrument nothing the
     # sweep calls.  Both are wrapped, and only one of them fires per run -- the pool's
-    # when `parallel=` is set (and then only in the parent, since cProfile and these
+    # when `n_pricing_workers` is set (and then only in the parent, since cProfile and these
     # timers do not cross a process boundary), `pricing`'s otherwise.
     (
         "price_flight (sweep entry)",
@@ -308,12 +308,8 @@ def main() -> int:
         objective=args.objective,
         bootstrap_roots=args.bootstrap_roots,
         bootstrap_ranking=args.bootstrap_ranking,
-    )
-
-    parallel = (
-        ParallelPricingConfig(n_workers=args.workers, chunksize=args.chunksize)
-        if args.workers
-        else None
+        n_pricing_workers=args.workers,
+        pricing_chunksize=args.chunksize,
     )
 
     print(f"tree      {_loaded.parent.parent}")
@@ -362,7 +358,7 @@ def main() -> int:
     install_timers()
     started = time.perf_counter()
     result = ColGenSolver().solve(
-        requests, cfg, static_terms, params, on_iteration=_record, parallel=parallel
+        requests, cfg, static_terms, params, on_iteration=_record
     )
     wall = time.perf_counter() - started
 

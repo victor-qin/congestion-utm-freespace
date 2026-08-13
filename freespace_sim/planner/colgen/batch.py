@@ -144,6 +144,27 @@ def run_batch(
         )
 
     batch_params = params if params is not None else ColGenParams()
+    # BEFORE the solve, because both existing colgen banners fire after it returns and the
+    # thing most likely to end a run badly is decided here.  The only pre-solve line that
+    # mentions parallelism is `sim.run`'s "mode=sequential", which describes the A*
+    # speculative runner and says "sequential" whatever this is set to -- so without this a
+    # run fanning across eight processes announces itself as serial and then, if it is
+    # OOM-killed, HANGS rather than failing (`pricing_pool`).  The memory figure is on the
+    # line because it is linear in workers and that is the whole hazard: measured across the
+    # process tree, `density_faa` x50 goes 3.9 GB in-process to 12.5 GB at 4 workers.
+    workers = batch_params.n_pricing_workers
+    log.info(
+        "colgen pricing: %s | %d flights | objective=%s greedy=%s ladder=%s",
+        (f"{workers} worker processes, memory LINEAR in that count "
+         f"(~2.1 GB each above a 3.9 GB in-process baseline at 50 flights); "
+         f"an OOM-killed worker hangs the sweep"
+         if workers else "in-process (sequential sweep)"),
+        len(requests),
+        batch_params.objective,
+        (f"{batch_params.greedy_budget_s_per_flight} s/flight"
+         if batch_params.greedy_budget_s_per_flight else "off"),
+        batch_params.seed_ladder_steps or "off",
+    )
     solve_started = time.monotonic()
     result = ColGenSolver().solve(
         requests, cfg, static_terms, batch_params,

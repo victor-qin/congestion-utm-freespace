@@ -387,7 +387,37 @@ class ColGenParams:
     # never discards anything strictly better, so the optimum is unchanged -- but under
     # dominance a tighter cutoff can return a DIFFERENT equally-optimal column, so this moves
     # the `ab_colgen_parity.py` sha and has to be re-baselined deliberately.
-    bootstrap_roots: int = 0
+    #
+    # NOW 1, RE-BASELINED 2026-08-13.  Measured x50, 2 iterations, sequential, `total_cost`,
+    # greedy OFF -- i.e. at the shipped configuration:
+    #
+    #     instance            off       K=2/score      K=1/bound
+    #     density_faa      263.40 s      197.87 s       80.79 s     3.26x over off
+    #     density_future   231.25 s      179.49 s      103.32 s     2.24x over off
+    #
+    # K=1 is enough ONLY with `bootstrap_ranking="bound"`; at `"score"` it provably fails
+    # (`entry_rc` stays at exactly 0.0000) and 2 is the floor, which is why the two defaults
+    # move together.  PR #76's literal K=1 is too weak on a 157-root instance ranked by
+    # score -- the ranking is what makes one root sufficient.
+    #
+    # THE BOOTSTRAP AND THE GREEDY ARE SUBSTITUTES, and that is why this is worth having.
+    # Both exist to hand pricing a `known_column` cutoff.  The greedy costs ~57% of wall for
+    # 0.129% of objective and is off by default; the pool cannot supply one at all
+    # (`entry_rc` is structurally 0, forced by LP duality).  With the greedy off the
+    # bootstrap is the ONLY cutoff source, which is where the 3.26x comes from -- and it is
+    # why a harness that pins the greedy on measures this change at roughly zero.
+    # `ab_colgen_parity.py` does exactly that (`--greedy-budget` defaults to 1e6), so its
+    # timings are not the ones to read for this knob.
+    #
+    # ANSWER-AFFECTING IN PRINCIPLE, ANSWER-NEUTRAL IN MEASUREMENT.  Pruning against a
+    # certified achievable score cannot discard anything strictly better, so the optimum is
+    # safe by construction; what a tighter cutoff CAN do under dominance is return a
+    # different equally-optimal column.  On every arm measured it does not: objective and
+    # full schedule sha are identical across the whole grid above, and the parity shas are
+    # unchanged from the pre-bootstrap baseline (`1cb183616dceb2a4` / `cb1e9afa2f31bdf1` /
+    # `45b35d203b1b8d47`).  Treat it as answer-affecting anyway -- the guarantee is about
+    # optimality, not about column identity.
+    bootstrap_roots: int = 1
     # WHAT the bootstrap sorts its roots on.  "score" is `PreparedVariants.score`, pure
     # cost-so-far; "bound" is `completion_can_compete`'s own `hop_rc_bound` at the root's
     # minimum feasible hop count -- `g + h` instead of `g`, already computed by the root
@@ -395,7 +425,14 @@ class ColGenParams:
     # identically, correlation 1.000) and decisive on multi-lane ones.  Ordering only: it
     # cannot prune, because the bootstrap returns an INCUMBENT and the main search still
     # fans out over every root.
-    bootstrap_ranking: str = "score"
+    #
+    # NOW "bound", and it is what makes `bootstrap_roots=1` viable: `score` carries one live
+    # bit, "depart earlier" -- its other two terms are inert, `start_dual_cost` constant
+    # across roots and `origin_leg` correlating ~0 with quality -- so it cannot tell a short
+    # remaining route from a long one.  `hop_rc_bound` can, because it is `g + h`.  Decisive
+    # exactly where roots sit on lanes of differing length; on a single-lane flight the two
+    # orderings are identical and this costs nothing.
+    bootstrap_ranking: str = "bound"
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):

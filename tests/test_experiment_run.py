@@ -158,6 +158,13 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     assert defaults.n_pricing_workers == 0
     assert defaults.seed_ladder_steps == 20
     assert defaults.greedy_budget_s_per_flight == 0.0
+    #   The bootstrap is ON at K=1, and the two fields move together: `bootstrap_roots=1`
+    #   works only because `bootstrap_ranking="bound"` orders roots by `g+h`.  At "score"
+    #   K=1 provably fails (`entry_rc` stays exactly 0.0000) and 2 is the floor.  Both are
+    #   ANSWER-AFFECTING -- they change which equally-optimal column returns -- so a change
+    #   here needs an `ab_colgen_parity.py` re-baseline, not just a green suite.
+    assert defaults.bootstrap_roots == 1
+    assert defaults.bootstrap_ranking == "bound"
 
 
 def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():

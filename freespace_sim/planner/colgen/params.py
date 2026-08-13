@@ -203,12 +203,77 @@ class ColGenParams:
     # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
     # 0 disables.
     seed_ladder_steps: int = 20
-    # Wall clock for the post-first-LP greedy, PER FLIGHT.  That stage splits its budget
-    # across up to `max(64, n_heuristic_tries * 16)` candidates, so a fixed total starves as
-    # the batch grows: the previous `min(60.0, 0.55 * time_limit_s)` gave each candidate
-    # ~0.23 s at 500 flights, and 168 of 202 searches were cut off mid-kernel.  Scaling with
-    # the batch keeps the per-candidate slice roughly constant.  0 disables the stage.
-    greedy_budget_s_per_flight: float = 0.7
+    # Wall clock for the post-first-LP greedy, PER FLIGHT.  **NOW 0, WHICH DISABLES THE
+    # STAGE.**  It was 0.7, and the history matters: the value scales with the batch because
+    # the stage splits its budget across up to `max(64, n_heuristic_tries * 16)` candidates,
+    # so the previous `min(60.0, 0.55 * time_limit_s)` gave each candidate ~0.23 s at 500
+    # flights and 168 of 202 searches were cut off mid-kernel.  Scaling fixed the starvation;
+    # it did not make the stage worth running.
+    #
+    # THE STAGE'S STATED JOB IS MEASURABLY WORTHLESS.  It produces `best_heuristic`, which
+    # `solver.py` hands pricing as `known_column` -- the cutoff each subproblem prunes
+    # against.  That cutoff's reduced cost is `entry_rc` and it is **exactly 0.0000 on every
+    # flight of every sweep measured**, because LP duality forces it: every column already in
+    # the master's pool has rc <= 0 by optimality, and complementary slackness pins the basic
+    # one at 0.  Removing the stage leaves pricing's time UNCHANGED on three instances --
+    # 28.98 -> 29.02 s, 40.40 -> 42.54 s, 99.23 -> 99.89 s -- which is the direct measurement
+    # of that argument.  (The bootstrap, `bootstrap_roots`, exists precisely because a real
+    # cutoff has to be SEARCHED for; nothing free can supply one.)
+    #
+    # What it costs, at 4 workers, objective=total_cost, K=1/bound:
+    #
+    #     instance             greedy on    greedy off   saved   pricing (on -> off)
+    #     density_faa   x100     60.73 s      37.80 s    1.61x   28.98 -> 29.02 s
+    #     density_future x100    87.89 s      54.98 s    1.60x   40.40 -> 42.54 s
+    #     density_future x200   221.04 s     129.00 s    1.71x   99.23 -> 99.89 s
+    #
+    # ~40% of the solve, and RSS roughly halves.  What it buys at these sizes is a COIN FLIP
+    # of +/-0.16% on the objective, with no consistent sign -- `density_faa` x100 is
+    # BIT-IDENTICAL without it (same objective, same 2178 columns), `density_future` x100 is
+    # 0.155% worse without, and `density_future` x200 is 0.013% BETTER without.  That is path
+    # dependence: the stage perturbs the master's column pool, which moves the duals, which
+    # lands the search in a different local outcome.  No arm lost a flight --
+    # `selected_flights` is unchanged in every one.
+    #
+    # AT SCALE, RUN TO CONVERGENCE, IT IS A HEAD START THAT COLUMN GENERATION CLOSES.  Twin
+    # run, `density_future_wing_zipline` x500, 16 workers, K=1/bound, `gap_metric=revenue`,
+    # both arms terminating on `lp_gap` at iteration 6, one harness invocation:
+    #
+    #     arm          WALL       pricing    objective            cols     parent RSS
+    #     greedy 0.0   508.75 s   372.67 s   64373.6808602346     11,917   1936 M
+    #     greedy 0.7   799.63 s   432.64 s   64290.3680883999     11,970   3201 M
+    #
+    # 0.129% of objective for +57.2% of wall.  The `cost_upper_bound` gap by iteration is
+    # 0, -93.77, -63.43, -1.98, -2.74, -39.77: **iteration 1 is bit-identical** across the
+    # arms -- same `lp_objective`, same `gap_cost`, same `gap_revenue`, same `cost_ub` --
+    # because `round_heuristic` sets `best_heuristic` regardless, and the lead peaks at
+    # iteration 2 and is gone by iteration 4.
+    #
+    # Pricing was 16% SLOWER with the stage on (372.67 -> 432.64 s), so it does not pay for
+    # itself even in the stage its cutoff exists to accelerate.  Some of that is the
+    # 1.9 -> 3.2 GB parent RSS under 16 workers, but the sign is the point.
+    #
+    # BEWARE THE TRUNCATED-ITERATION A/B, which got this call wrong twice.  The same pair at
+    # **2 iterations** reads greedy-on 2.03% BETTER -- squarely inside the head start.  A
+    # truncated comparison on a column-generation solve measures CONVERGENCE RATE, not
+    # solution quality; both arms must run to the same TERMINATION CONDITION.
+    #
+    # TURNING IT OFF DOES NOT REMOVE THE FALLBACK SCHEDULE, which was the real objection.
+    # `best_heuristic` is set from `master.round_heuristic` BEFORE this stage runs
+    # (`solver.py:983`), and the greedy only replaces it when `_better_selection` says it
+    # improved (`solver.py:1019`).  So a timed-out solve still has a feasible answer; it is
+    # simply the LP-rounding one rather than a refined one.
+    #
+    # WHERE THIS DEFAULT IS MOST LIKELY WRONG: a solve whose `time_limit_s` genuinely binds,
+    # where a better heuristic is the answer rather than a starting point.  Every measurement
+    # above pinned `time_limit_s=86400`, so that regime is UNTESTED -- and the head-start
+    # finding is precisely what makes it the risk.  A binding limit stops the solve INSIDE
+    # the head start, at the iteration where the twin above reads 2.03% rather than 0.129%;
+    # the shipped `time_limit_s = 1200.0` is 2.4x the x500 wall, which is margin but not
+    # much.  If it matters, the right shape is budget-conditional -- skip the stage when the
+    # projected solve fits inside the limit, run it when it might not -- rather than a fixed
+    # number here.
+    greedy_budget_s_per_flight: float = 0.0
     # Worker processes for the per-iteration pricing sweep; 0 keeps it in-process.  A pure
     # performance knob -- `pricing_pool.price_sweep` reproduces the sequential loop's
     # accepted prefix and index order -- but NOT a free one: each worker rebuilds every

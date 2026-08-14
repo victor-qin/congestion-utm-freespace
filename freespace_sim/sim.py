@@ -266,20 +266,29 @@ def _astar_planners(planner) -> list:
 RETURN_ANCHORS = ("nominal", "realized")
 
 
-def realized_arrival_s(intent: OperationalIntent) -> float | None:
-    """When an accepted flight actually touches down — its last centerline waypoint.
+def realized_release_s(intent: OperationalIntent) -> float | None:
+    """When an accepted flight's landing column CLEARS — touchdown plus the pad dwell, i.e. the
+    earliest the same aircraft can lift off again (turnaround still to be added by the caller).
 
-    Deliberately NOT the reservation envelope (``max(v.t_end)``): that runs past touchdown by the
-    landing column's dwell + climb + ASTM buffer, so a caller that then adds a pad dwell would
-    double-count it. ``None`` for a denied flight (nothing arrived) or one with no geometry.
+    This is the destination hover cylinder's ``t_end``, and so the largest ``t_end`` the intent
+    holds: the last corridor box ends where the flight meets the destination column, and the column
+    is booked from there for :func:`volumes.column_dwell_s` (ingress traverse + descent) plus
+    ``hover_time_s`` on the pad.
+
+    Deliberately NOT ``centerline[-1]``. The corridor stops at the destination column's EDGE at
+    CRUISE altitude — the descent inside the column is flown but unreserved (see ``astar._build``) —
+    so the last waypoint precedes touchdown by ``cfg.climb_time_to(z_land)``. Anchoring a return
+    there launched it while its own aircraft was still descending: 5 s at a 30 m cruise level,
+    16.7 s at the density scenarios' 100 m. Because the two legs share one pad cylinder, the planner
+    then charged that overlap straight back as ground delay — 94/94 returns in the round-trip
+    fixture, which is exactly the artifact the realized anchor exists to remove.
+
+    ``None`` when nothing landed: a denied flight, or an intent that reserved no volumes (such a leg
+    keeps its nominal anchor).
     """
-    if not intent.accepted:
+    if not intent.accepted or not intent.volumes:
         return None
-    if intent.centerline:
-        return float(intent.centerline[-1][1])
-    if intent.volumes:
-        return float(max(v.t_end for v in intent.volumes))
-    return None
+    return float(max(v.t_end for v in intent.volumes))
 
 
 def run(
@@ -331,13 +340,17 @@ def run(
       estimate of when the outbound lands — under congestion it schedules the return before its
       aircraft is back.
     - ``"realized"`` plans the outbound, then re-anchors its return to the arrival that ACTUALLY
-      happened: ``t_departure = touchdown + hover dwell + turnaround``. Exact, not an approximation,
+      happened: ``t_departure = (when the landing column clears) + turnaround``, the column being
+      released one pad dwell after touchdown (:func:`realized_release_s`). Exact, not an approximation,
       and it costs nothing extra — FCFS already guarantees the outbound is planned first (a paired
       return shares its outbound's filing time and takes the next flight_id, so it sorts immediately
       behind; a legacy return files strictly later still). Filing times never move, so FCFS order and
       the monotonic-``t_request`` eviction invariant are untouched, and the flight set is unchanged: a
       return whose outbound was DENIED keeps its nominal anchor, since dropping it instead would make
-      the flight set depend on congestion and break any paired comparison across runs.
+      the flight set depend on congestion and break any paired comparison across runs. On top of this
+      the return still pays the ordinary pad-reuse separation — the ASTM time buffer plus the
+      occupancy grid's ``dt`` quantisation, ~8 s at the defaults — exactly as any other flight taking
+      over that pad would; the anchor decides when the aircraft is ready, not who gets the pad.
 
     ``turnaround_s`` comes from the demand model, so the realized anchor uses exactly the turnaround
     the nominal one budgeted for.
@@ -438,6 +451,16 @@ def run(
     elif batch_planners:
         from .planner.colgen import run_batch
 
+        if return_anchor == "realized":
+            # The coupling lives in the FCFS loop below, which a batch solve never enters — so the
+            # flag would be accepted and do NOTHING, leaving every return on the nominal anchor it
+            # was asked to replace. Refuse instead: a silently-ignored anchor is indistinguishable
+            # on disk from a coupled run (return_anchor is not in index.parquet either).
+            raise ValueError(
+                f"return_anchor='realized' is not implemented for whole-schedule planners: {pname!r} "
+                "solves every flight at once, so there is no moment at which an outbound has "
+                "committed and its return has not, and the per-flight coupling loop never runs. Use "
+                "a per-flight planner (astar*/milp), or return_anchor='nominal'.")
         # A whole-schedule planner solves for every flight at once, so it cannot share a
         # run with per-flight planners: the FCFS loop below would file some flights against
         # a ledger the batch solve already reserved against.
@@ -459,9 +482,9 @@ def run(
         )
     else:
         intents = []
-        # Round-trip coupling. `anchors` holds, for each outbound that some return waits on, the arrival
-        # it actually achieved; the return pops it just before being planned. FCFS guarantees the
-        # outbound is planned first (see the return_anchor docs), so the entry is always in hand — and
+        # Round-trip coupling. `anchors` holds, for each outbound that some return waits on, the moment
+        # its landing column actually cleared; the return pops it just before being planned. FCFS
+        # guarantees the outbound is planned first (see the return_anchor docs), so it is in hand — and
         # popping keeps the dict at roughly one live entry, since a paired return is the very next event.
         couple = return_anchor == "realized"
         turnaround_s = 0.0
@@ -501,8 +524,8 @@ def run(
         for done, ev in enumerate(scenario.events, 1):
             req = ev.request
             if couple and req.paired_outbound_id is not None:
-                landed = anchors.pop(req.paired_outbound_id, None)
-                if landed is not None:                 # None ⇒ outbound denied; keep the nominal anchor
+                released = anchors.pop(req.paired_outbound_id, None)
+                if released is not None:               # None ⇒ outbound denied; keep the nominal anchor
                     # `replace`, NOT in-place assignment: `requests` may be caller-owned, and mutating it
                     # would leak the coupled departures into any later run over the same list — silently
                     # corrupting exactly the anchor A/B this option invites. It also re-runs
@@ -510,14 +533,17 @@ def run(
                     # than bypassed. The max() defends it: neither shipped return mode can reach the
                     # clamp (both file no later than the outbound's nominal arrival), but a future model
                     # that filed later would otherwise violate it silently.
-                    req = replace(
-                        req, t_departure=max(req.t_request, landed + cfg.hover_time_s + turnaround_s))
+                    #
+                    # Only the turnaround is added here: the pad dwell is already inside `released`
+                    # (it is the landing COLUMN's release, not touchdown), so adding hover_time_s
+                    # again would double-count it.
+                    req = replace(req, t_departure=max(req.t_request, released + turnaround_s))
             uss = usses.get(req.uss_id, default_uss)
             intent = uss.handle_request(req)
             if req.flight_id in awaited:
-                arrived = realized_arrival_s(intent)
-                if arrived is not None:
-                    anchors[req.flight_id] = arrived
+                free_at = realized_release_s(intent)
+                if free_at is not None:
+                    anchors[req.flight_id] = free_at
             intents.append(intent)
             status(done, req, intent)
             if report:

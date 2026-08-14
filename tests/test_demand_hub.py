@@ -5,6 +5,8 @@ nearest hub of its USS to the customer, and the hub layout is fixed by ``hub_see
 demand seed. Distribution-shape checks (lengths, shares, counts) use fixed seeds + loose tolerances.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -596,9 +598,9 @@ def test_return_leg_names_its_outbound():
 
 def test_realized_anchor_departs_on_the_arrival_that_actually_happened():
     """The property the coupling exists for: every return departs after its aircraft is down."""
-    from freespace_sim.sim import realized_arrival_s
+    from freespace_sim.sim import realized_release_s
 
-    cfg, model = _roundtrip_world()
+    cfg, model = _roundtrip_world(turnaround_s=120.0)
 
     def slips(res):
         by = {i.request.flight_id: i for i in res.intents}
@@ -607,7 +609,7 @@ def test_realized_anchor_departs_on_the_arrival_that_actually_happened():
             o = by.get(i.request.paired_outbound_id) if i.request.paired_outbound_id else None
             if o is None or not (i.accepted and o.accepted):
                 continue
-            out.append(realized_arrival_s(o) - i.request.t_departure)   # >0 ⇒ departs before landing
+            out.append(realized_release_s(o) - i.request.t_departure)   # >0 ⇒ departs before landing
         return np.array(out)
 
     nominal = run(cfg, demand=model, return_anchor="nominal")
@@ -618,9 +620,62 @@ def test_realized_anchor_departs_on_the_arrival_that_actually_happened():
     assert (s_nom > 0).mean() > 0.5                 # the artifact is severe under the nominal anchor
     # ...and the coupling removes it OUTRIGHT — this is exact, not a fixed-point approximation
     assert (s_real > 0).sum() == 0
-    # each return leaves exactly one pad dwell after its own outbound touched down
-    assert s_real.max() == pytest.approx(-cfg.hover_time_s, abs=cfg.dt_s)
+    # each return leaves exactly one turnaround after its own outbound's pad cleared — EXACTLY, not
+    # within a dt: the anchor is the committed column window, not an estimate of it
+    assert s_real.max() == pytest.approx(-model.turnaround_s)
     assert len(realized.intents) == len(nominal.intents)   # same flight set; only departures moved
+
+
+def test_realized_anchor_waits_out_the_descent_inside_the_landing_column():
+    """Regression: the anchor used to be ``centerline[-1]`` — the last CRUISE waypoint.
+
+    The corridor stops at the destination column's edge and the descent inside it is flown but
+    unreserved, so anchoring there launched every return ``climb_time_to(z_land)`` before its own
+    aircraft was down. The two legs share one pad cylinder, so the planner handed that overlap
+    straight back as ground delay: 94/94 returns in this fixture, 5 s each at a 30 m cruise level
+    (16.7 s at the density scenarios' 100 m).
+    """
+    from freespace_sim.sim import realized_release_s
+
+    cfg, model = _roundtrip_world()
+    res = run(cfg, demand=model, return_anchor="realized")
+    by = {i.request.flight_id: i for i in res.intents}
+
+    pairs = [(by[i.request.paired_outbound_id], i) for i in res.intents
+             if i.request.paired_outbound_id is not None
+             and by.get(i.request.paired_outbound_id) is not None
+             and i.accepted and by[i.request.paired_outbound_id].accepted]
+    assert pairs
+
+    for out, ret in pairs:
+        # an outbound lands at a CUSTOMER, which has no exit lanes, so its column dwell is pure descent
+        touchdown = out.centerline[-1][1] + cfg.climb_time_to(float(out.centerline[-1][0][2]))
+        # the whole point: airborne until touchdown, then a pad dwell, and only then may it leave
+        assert ret.request.t_departure >= touchdown + cfg.hover_time_s
+        # and that is precisely the landing column's window — nothing padded, nothing double-counted
+        assert realized_release_s(out) == pytest.approx(touchdown + cfg.hover_time_s)
+
+
+def test_realized_release_is_the_destination_column_window():
+    """``realized_release_s`` takes the largest ``t_end`` — assert that really is the landing column.
+
+    The corridor's last box ends where the flight MEETS the column, and the column is booked from
+    there for the ingress + descent + pad dwell, so it is always the last volume to clear. Taking a
+    max is only correct while that holds.
+    """
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.sim import realized_release_s
+
+    cfg, model = _roundtrip_world()
+    res = run(cfg, demand=model)
+    flown = [i for i in res.intents if i.accepted]
+    assert flown
+
+    for i in flown:
+        dest_col = i.volumes[-1]                       # astar._build orders [origin col, *edges, dest col]
+        assert isinstance(dest_col.shape, CylinderSpec)
+        assert (dest_col.shape.cx, dest_col.shape.cy) == pytest.approx(tuple(i.request.dest[:2]))
+        assert realized_release_s(i) == dest_col.t_end
 
 
 def test_realized_anchor_keeps_filing_times_and_flight_set_intact():
@@ -638,7 +693,7 @@ def test_realized_anchor_keeps_filing_times_and_flight_set_intact():
 def test_realized_anchor_keeps_nominal_when_the_outbound_is_denied():
     # Dropping or denying the return instead would make the flight SET depend on congestion, which
     # breaks any paired comparison across runs (e.g. the scheduling-lead arms).
-    from freespace_sim.sim import realized_arrival_s
+    from freespace_sim.sim import realized_release_s
     from freespace_sim.types import DenialReason, IntentStatus, OperationalIntent
 
     cfg, model = _roundtrip_world()
@@ -648,7 +703,7 @@ def test_realized_anchor_keeps_nominal_when_the_outbound_is_denied():
     # a denied outbound yields no arrival, so the loop leaves its return on the nominal anchor
     denied = OperationalIntent(request=outbound, status=IntentStatus.REJECTED,
                                denial_reason=DenialReason.BUDGET_EXCEEDED)
-    assert realized_arrival_s(denied) is None
+    assert realized_release_s(denied) is None
 
     # end-to-end the flight set is identical either way — congestion never removes a leg
     realized = run(cfg, demand=model, return_anchor="realized")
@@ -665,6 +720,19 @@ def test_realized_anchor_rejects_parallel_and_unknown_values():
         run(cfg, demand=model, return_anchor="realized", parallel=ParallelConfig(n_workers=2))
     with pytest.raises(ValueError, match="unknown return_anchor"):
         run(cfg, demand=model, return_anchor="whenever")
+
+
+def test_realized_anchor_rejects_whole_schedule_planners():
+    """A batch solve never enters the coupling loop, so the flag would be a silent no-op there —
+    and `return_anchor` is not in index.parquet, so the run would be indistinguishable from a
+    coupled one on disk. Refuse before solving."""
+    from freespace_sim.planner import WHOLE_SCHEDULE_PLANNERS, get_planner
+
+    cfg, model = _roundtrip_world()
+    for name in WHOLE_SCHEDULE_PLANNERS:                 # the CLI's name list must match the marker
+        assert getattr(get_planner(name), "plans_whole_schedule", False)
+        with pytest.raises(ValueError, match="whole-schedule"):
+            run(dataclasses.replace(cfg, planner=name), demand=model, return_anchor="realized")
 
 
 def test_nominal_anchor_is_byte_identical_to_no_flag():

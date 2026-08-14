@@ -512,6 +512,8 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
         )
 
     if args.return_anchor == "realized":
+        from freespace_sim.planner import WHOLE_SCHEDULE_PLANNERS
+
         # The coupling keys off FlightRequest.paired_outbound_id, which ONLY hub_radius sets. Testing
         # `return_flights` alone is not enough: it defaults True on DemandSpec but the uniform and hub
         # patterns ignore it entirely, so metro_2uss/dallas_hub_2uss would sail past the guard and the
@@ -529,8 +531,16 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
                 f"--return-anchor realized is sequential-only (got --mode {args.mode}): a speculative "
                 "worker may plan a return before its outbound has committed, and the exact-mode "
                 "envelope check cannot detect that. Use --mode sequential or --return-anchor nominal.")
-        log.info("return anchor: realized — each return departs on its outbound's actual arrival "
-                 "+ %.0fs turnaround, not a nominal estimate", spec.demand.turnaround_s)
+        if cfg.planner in WHOLE_SCHEDULE_PLANNERS:
+            # Also raised by run(); same reason as above for catching it here.
+            raise SystemExit(
+                f"--return-anchor realized is not implemented for --planner {cfg.planner}: a "
+                "whole-schedule solver plans every flight at once, so no outbound commits before its "
+                "return and the coupling loop never runs — the flag would silently leave every return "
+                "on the nominal anchor. Use a per-flight planner, or --return-anchor nominal.")
+        log.info("return anchor: realized — each return departs when its outbound's landing column "
+                 "actually cleared (touchdown + pad dwell) + %.0fs turnaround, not a nominal estimate",
+                 spec.demand.turnaround_s)
 
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,

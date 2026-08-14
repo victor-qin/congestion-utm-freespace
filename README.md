@@ -197,11 +197,17 @@ untouched — the contrast is only meaningful when a second operator holds still
 can only anchor a return's desired departure to a *nominal* estimate of its outbound's arrival —
 straight-line distance at cruise speed, ignoring the outbound's ground delay, air hold, and detour
 (including unavoidable hex-lattice overhead). Under congestion that schedules the return before its
-aircraft has landed: measured on `density_faa_wing_zipline_amazon`, 42% of returns, and the slip
-correlates 0.998 with the outbound's total delay, so it worsens exactly where congestion does.
+aircraft is back — measured on `density_faa_wing_zipline_amazon`, **80%** of returns are filed to
+depart before their outbound has even touched down, and **every one** of the 2551 before its pad
+clears (median 57 s early, worst 471 s). The slip correlates 0.999 with the outbound's total delay,
+so it worsens exactly where congestion does.
 
 `--return-anchor realized` couples the legs inside the one run: plan the outbound, then anchor its
-return to the arrival that actually happened — `touchdown + hover dwell + turnaround`.
+return to the arrival that actually happened — the moment its **landing column clears** (`touchdown +
+pad dwell`), plus `turnaround`. That column is the authority rather than the last centerline waypoint,
+because the corridor stops at the column's *edge* at cruise altitude and the descent inside is flown
+but unreserved: anchoring on the waypoint launches the return `climb_time_to(z_land)` before its own
+aircraft is down (16.7 s at the density scenarios' 100 m level).
 
 ```bash
 uv run python -m experiments.run --scenario density_faa_wing_zipline_amazon --return-anchor realized
@@ -216,11 +222,13 @@ Filing times never move, so FCFS order and the monotonic-`t_request` eviction in
 the flight set is identical, and a return whose outbound was *denied* keeps its nominal anchor
 (dropping it would make the flight set depend on congestion).
 
-**Sequential mode only.** A speculative worker could plan a return before its outbound has committed,
-and exact mode would not catch it — the envelope check tracks *ledger reads*, and a stale
-`t_departure` is request data, so the speculation would be accepted and silently diverge. `run()`
-raises on the combination rather than letting it slide (and parallel loses to sequential on the
-density scenarios anyway).
+**Sequential mode only, per-flight planners only.** A speculative worker could plan a return before
+its outbound has committed, and exact mode would not catch it — the envelope check tracks *ledger
+reads*, and a stale `t_departure` is request data, so the speculation would be accepted and silently
+diverge. A whole-schedule planner (`colgen`) is refused for the opposite reason: it solves every
+flight at once and never enters the per-flight loop the coupling lives in, so the flag would do
+nothing at all. `run()` raises on both rather than letting either slide (and parallel loses to
+sequential on the density scenarios anyway).
 
 ⚠️ **This interacts with the lead arms.** Re-anchored return departures depend on realized outbound
 delay, which is precisely what differs between arms — so returns are no longer byte-identical across

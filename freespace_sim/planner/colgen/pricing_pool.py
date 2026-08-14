@@ -32,12 +32,41 @@ is linear in workers -- 3.9 GB in-process against 12.5 GB at 4 workers and 22.7 
 a 50-flight density instance -- and an OOM-killed worker hangs this sweep rather than
 failing it (see the deadlock note below). Speed is not the constraint: 3.5x at 4 workers.
 
+**The pool is SOLVE-scoped, and the lane assignment is why that is worth anything.**
+:class:`PricingPool` holds one single-worker ``mp.Pool`` per lane and each flight is pinned
+to a lane for the whole solve (:func:`_lane_assignment`), so a worker keeps the state it
+derived for its own flights instead of deriving it again every iteration. Per-sweep duals
+arrive as a task rather than through the initializer, stamped with an epoch that
+:func:`_price_one` refuses to price against if it does not match -- because ``mp.Pool``
+replaces a dead worker by re-running the ORIGINAL initargs, and the replacement would
+otherwise price with no duals at all and return a plausible wrong number.
+
+**Two costs this removes, and the second is the one that was invisible.**
+
+* A flight's compiled packing (``dp_prepare.prepared_for``) is a pure function of its graph
+  and config, built lazily on first pricing touch and kept on ``_search_cache``. A worker
+  that dies at end of sweep takes it with it: 989 rebuilds a sweep at 1000 flights, ~184 ms
+  each, ~180 s of worker CPU per iteration to reconstruct something already computed.
+* Worker launch is parent-SERIAL. ``_repopulate_pool_static`` starts workers in a plain
+  loop and ``spawn`` re-pickles the initargs for each, measured at ~4.2-4.8 s per worker,
+  so idle worker-seconds grew as ``W(W-1)/2`` and not with W. That is why 8 workers ran at
+  79% efficiency where 16 ran at 49%, and why the second half of a 16-core machine bought
+  almost nothing. Paid once per solve, it stops being the binding term.
+
 **Processes, not threads.** Pricing is ~90% Python outside the numba kernel, so threads
 would contend on the GIL for the part that is not compiled. The costs processes bring are
 measured rather than assumed: a ``FlightGraph`` pickles to 38.6 KB but REBUILDS in 0.11 ms
 against 0.40 ms to pickle, so workers are handed the flight *requests* and build their own
-graphs. The caches (`_search_cache`) do not survive pickling either way, so nothing is lost
-by rebuilding that would have been kept by shipping.
+graphs.
+
+That last argument used to end "the caches (``_search_cache``) do not survive pickling
+either way, so nothing is lost by rebuilding that would have been kept by shipping", and
+that was the premise this module got wrong. It is true of everything the comparison covered
+and false of the expensive thing, because the packing is not on the graph when the graph is
+weighed: it is built lazily, on first pricing touch, long after transport. What the graph
+costs to rebuild (0.11 ms) and what its cache costs to rebuild (~184 ms) are three orders
+of magnitude apart, and only the first was ever measured. Keeping the WORKER is what keeps
+the cache; shipping the graph never could.
 
 **``mp.Pool``, never ``ProcessPoolExecutor``.** The latter deadlocks on CPython 3.14.2 when
 ``max_tasks_per_child`` fires -- see ``[[colgen-parallel-pricing-pool]]``. For the same
@@ -54,11 +83,12 @@ own time limit never fires, because the parent is blocked inside the sweep rathe
 checking a clock. The realistic trigger is the OOM killer, which is reachable rather than
 hypothetical: memory is linear in workers.
 
-:func:`_results_before_deadline` bounds the wait by the caller's own ``pricing_deadline``
-and reports a lost result as that flight timing out, so the sweep degrades to a short
-prefix instead of blocking. Bounding it by a deadline the caller already owns is what makes
-this safe to add without inventing a grace period, and without reaching for the pool
-implementation that deadlocks on this interpreter.
+:func:`_sweep_results` bounds the wait by the caller's own ``pricing_deadline`` and reports
+a lost result as that flight timing out, so the sweep degrades to a short prefix instead of
+blocking. Bounding it by a deadline the caller already owns is what makes this safe to add
+without inventing a grace period, and without reaching for the pool implementation that
+deadlocks on this interpreter. It also merges the lanes back into ``pricing_order`` order,
+which rule 2 requires and which a per-lane queue no longer gives for free.
 
 A worker that fails in its *initializer* is a different failure with the same symptom, and
 is handled separately: ``mp.Pool`` calls the initializer outside the try/except that wraps
@@ -66,9 +96,15 @@ a task, so :func:`_init_worker` records the traceback and :func:`_price_one` re-
 """
 from __future__ import annotations
 
+import collections
+import itertools
 import multiprocessing as mp
+import os
+import pickle
 import time
 import traceback
+import uuid
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -88,9 +124,46 @@ from .pricing import (
 from .translate import Column
 
 __all__ = [
+    "PricingPool",
+    "StalePricingWorker",
     "SweepResult",
     "price_sweep",
 ]
+
+
+class StalePricingWorker(RuntimeError):
+    """A worker was handed a task from a sweep whose state it does not hold.
+
+    Carries a single string so it survives the trip back through ``imap`` intact.
+
+    There is exactly one way to reach this, and it is why the class exists: ``mp.Pool``
+    silently replaces a worker that DIED, and ``_repopulate_pool_static`` re-runs the
+    ORIGINAL ``initargs``.  Under a solve-scoped pool those initargs carry solve constants
+    only -- the duals arrive per sweep, as a task -- so the replacement comes back with no
+    sweep state at all.  Without this check it would price against whatever it happened to
+    hold and return a reduced cost that ``master.upper_bound`` would treat as a valid
+    bound: a wrong number, with no exception and no log line.  The OOM killer makes that
+    reachable rather than hypothetical (see the memory note in the module docstring).
+    """
+
+
+def _lane_assignment(flight_ids, n_lanes: int) -> dict[int, int]:
+    """Fix each flight to one lane for the whole solve: ``{flight_id -> lane}``.
+
+    Keyed on the FLIGHT, not on its position in ``pricing_order`` -- that order is re-sorted
+    every sweep (``solver`` ranks by the heuristic's delay), so a positional rule would send
+    a flight to a different worker each iteration and the retained packing would never be
+    hit.  That is not a small effect: on ``mp.Pool``'s single shared queue a flight visits
+    ``W(1 - (1 - 1/W)^I)`` distinct workers, which is 5.14 of 6 at 16 workers and 6
+    iterations, so a solve-scoped pool WITHOUT this recovers about 14% of the rebuild.
+
+    Round-robin over SORTED ids rather than ``flight_id % n_lanes`` so sparse or
+    non-contiguous ids still split evenly; the modulus balances only when ids happen to be
+    dense.  Cost is not modelled -- see ``PricingPool`` for why that is deliberate, and for
+    the counter that will say whether it needs to be.
+    """
+
+    return {flight_id: i % n_lanes for i, flight_id in enumerate(sorted(flight_ids))}
 
 
 # HOW WIDE TO FAN THE SWEEP LIVES ON `ColGenParams`, as `n_pricing_workers` (0 is the
@@ -149,6 +222,13 @@ class SweepResult:
     #: Measured at 500 flights, the largest task is >=26x the mean, so this is the
     #: difference between attacking the binding term and a non-binding one.
     flight_records: tuple[dict[str, Any], ...] = ()
+    #: Seconds THIS sweep spent starting worker processes.  Nonzero on the sweep that
+    #: brought the pool up and 0.0 on every later one, which is the whole point of a
+    #: solve-scoped pool: worker launch is parent-SERIAL (`Pool._repopulate_pool_static`
+    #: starts them in a plain loop and `spawn` re-pickles the initargs per worker), so it
+    #: cost ~4.2-4.8 s per worker per sweep, measured. Kept as its own field rather than
+    #: folded into `wall_s` so a run can still SEE that cost after it stops recurring.
+    pool_setup_s: float = 0.0
 
     @property
     def kernel_priced(self) -> int:
@@ -178,22 +258,31 @@ class SweepResult:
 
 # --------------------------------------------------------------------------- worker side
 
-# Populated once per worker per sweep by `_init_worker`. A plain module global because that
-# is the only state a spawned worker can carry between tasks without re-pickling it.
+# Populated once per worker per SOLVE by `_init_worker`, and once per sweep by
+# `_load_sweep_state`. A plain module global because that is the only state a spawned worker
+# can carry between tasks without re-pickling it.
+#
+# The split is the point.  Everything `_init_worker` stores is fixed for the solve, so a
+# worker that outlives the sweep keeps it -- including, transitively, each graph's
+# `_search_cache.prepared`, the compiled packing that used to be rebuilt from scratch every
+# iteration at ~184 ms a flight.  Everything that moves per iteration lives under "sweep",
+# as ONE tuple, so there is no reachable state where new duals sit beside old flight duals.
 _WORKER: dict[str, Any] = {}
 
 
 def _init_worker(
-    requests: list[FlightRequest],
+    lane: int,
+    lane_requests: list[FlightRequest],
     cfg: SimConfig,
     params: ColGenParams,
     catalog: StaticTerminalCatalog,
-    duals: dict,
-    flight_duals: dict[int, float],
-    known_columns: dict[int, Column],
-    deadline: float | None,
 ) -> None:
-    """Rebuild this worker's view of the batch. Runs once per worker per sweep.
+    """Build this worker's view of ITS OWN flights. Runs once per worker per solve.
+
+    Takes only the lane's requests, not the batch's: under a fixed lane assignment a worker
+    can never be asked for a flight outside its slice, so building the rest was ~n/W useful
+    work and the remainder waste -- at 1000 flights and 16 workers, 16x more graphs than any
+    worker could use, in every worker.
 
     The catalog is shipped rather than rebuilt from raw terminals: every graph in a solve
     must see the identical wall catalogue, and re-deriving it here would be a second source
@@ -207,36 +296,102 @@ def _init_worker(
     result no worker will ever produce and nothing is printed.  Rebuilding every graph is
     also the largest allocation a worker makes, so ``MemoryError`` -- the failure the
     ``n_workers`` ceiling is about -- lands exactly here.  :func:`_price_one` re-raises it
-    from the first task instead, which reaches the caller as an ordinary traceback.
+    from the first task instead, which reaches the caller as an ordinary traceback.  That
+    contract matters MORE under a solve-scoped pool, not less: the respawn loop it prevents
+    would now last the whole solve rather than one sweep.
     """
 
     _WORKER.clear()
+    _WORKER["sweep"] = None
     try:
+        _WORKER["lane"] = int(lane)
         _WORKER["graphs"] = {
             request.flight_id: build_flight_graph(request, cfg, catalog, params)
-            for request in requests
+            for request in lane_requests
         }
+        _WORKER["lane_flights"] = frozenset(_WORKER["graphs"])
         _WORKER["cfg"] = cfg
         _WORKER["params"] = params
-        # `DualView` is rebuilt here rather than pickled so the worker owns its own caches.
-        _WORKER["dual_view"] = DualView(duals, cfg)
-        _WORKER["flight_duals"] = flight_duals
-        _WORKER["known_columns"] = known_columns
-        # `time.monotonic` is a system-wide clock on both Linux and macOS, so a deadline
-        # taken in the parent is directly comparable here. It would NOT be across hosts.
-        _WORKER["deadline"] = deadline
     except Exception:
         # The traceback as TEXT, because the exception object itself may not survive the
         # trip back: it is re-raised below as a `RuntimeError`, which always pickles.
         _WORKER["init_error"] = traceback.format_exc()
 
 
-def _price_one(flight_id: int):
+def _load_sweep_state(
+    epoch: tuple,
+    duals_blob: bytes,
+    flight_duals: dict[int, float],
+    known_columns: dict[int, Column],
+    deadline: float | None,
+) -> None:
+    """Install one sweep's duals in this worker. Runs once per lane per sweep.
+
+    ``duals_blob`` is BYTES, already pickled: the mapping is global to the iteration and
+    cannot be sliced per lane (``DualView._max_negative_credit`` is an ``fsum`` over EVERY
+    row and is consumed as a pricing bound, so a restricted view would move answers), but
+    the parent can serialize it ONCE and hand every lane the same buffer.  The outer pickle
+    is then a memcpy instead of W traversals of a mapping whose keys are ``RowKey`` -- a
+    tuple subclass with a validating ``__new__``, so each key costs its own function call in
+    each direction.  ``parallel.py`` ships its committed reservations the same way.
+
+    ``flight_duals`` and ``known_columns`` ARE sliced to the lane; the latter is ~13.7 KB a
+    flight, so broadcasting all of them cost ~13.7 MB per worker at 1000 flights for the
+    ~1/W of it each could use.
+
+    ``_WORKER["sweep"] = None`` happens BEFORE the try, and that ordering is the whole
+    safety argument: if building the ``DualView`` raises -- ``MemoryError`` is the realistic
+    one -- the worker must be left holding NOTHING, so the next task raises. Leaving the
+    previous sweep's tuple in place would let it price iteration k against iteration k-1's
+    duals and return a plausible wrong number.
+    """
+
+    if _WORKER.get("init_error") is not None:
+        # `_price_one` re-raises the initializer's traceback, which is the more useful
+        # error; overwriting it with a failure caused BY it would bury the cause.
+        return
+    _WORKER["sweep"] = None
+    _WORKER.pop("sweep_error", None)
+    try:
+        # Not untrusted input: this buffer was produced by `PricingPool.run_sweep` in the
+        # parent of this very process and handed over `mp.Pool`'s own task queue, which
+        # pickles every argument anyway. Pre-pickling changes WHEN the mapping is
+        # serialized (once, not once per lane), not whether.
+        duals = pickle.loads(duals_blob)
+        # `DualView` is rebuilt here rather than pickled so the worker owns its own caches.
+        # `time.monotonic` is a system-wide clock on both Linux and macOS, so a deadline
+        # taken in the parent is directly comparable here. It would NOT be across hosts.
+        _WORKER["sweep"] = (
+            epoch, DualView(duals, _WORKER["cfg"]), flight_duals, known_columns, deadline,
+        )
+    except Exception:
+        _WORKER["sweep_error"] = traceback.format_exc()
+
+
+def _worker_identity(_ignored=None) -> tuple:
+    """``(lane, pid)`` -- the only way a caller can prove a worker was REUSED.
+
+    Re-raises an initializer failure for the same reason :func:`_price_one` does: this runs
+    as :meth:`PricingPool.start`'s readiness probe, and a probe that ignored `init_error`
+    would block forever against a worker whose replacement dies the same way.
+    """
+
+    init_error = _WORKER.get("init_error")
+    if init_error is not None:
+        raise RuntimeError(f"pricing worker failed to initialise:\n{init_error}")
+    return (_WORKER.get("lane"), os.getpid())
+
+
+def _price_one(epoch: tuple, flight_id: int):
     """Price one flight in a worker.
 
-    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas)`` -- the shape
-    :func:`_accepted_prefix` reduces, and the reason that function takes a sequence of these
-    rather than a pool.
+    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas, search_record)`` --
+    the shape :func:`_accepted_prefix` reduces, and the reason that function takes a
+    sequence of these rather than a pool.
+
+    ``epoch`` names the sweep whose duals the caller believes this worker holds, and is
+    checked rather than trusted; see :class:`StalePricingWorker` for the failure it is
+    there to convert from a wrong number into an exception.
 
     The counters travel as ONE dict rather than a trailing int each, because there are now
     four of them plus a `declined_<reason>` key per cause, and the reachable set of those
@@ -259,6 +414,25 @@ def _price_one(flight_id: int):
         # This worker never built its batch view.  Raising from here rather than from the
         # initializer is the whole point -- see `_init_worker`.
         raise RuntimeError(f"pricing worker failed to initialise:\n{init_error}")
+    sweep_error = _WORKER.get("sweep_error")
+    if sweep_error is not None:
+        raise RuntimeError(f"pricing worker failed to load sweep state:\n{sweep_error}")
+    state = _WORKER.get("sweep")
+    if state is None or state[0] != epoch:
+        held = None if state is None else state[0]
+        raise StalePricingWorker(
+            f"lane {_WORKER.get('lane')!r} (pid {os.getpid()}) holds sweep state {held!r} "
+            f"but was asked to price flight {flight_id} for sweep {epoch!r}; it was almost "
+            f"certainly respawned after dying -- see mp.Pool._repopulate_pool_static"
+        )
+    if flight_id not in _WORKER["lane_flights"]:
+        # A named error rather than a bare KeyError three frames down, and a real
+        # possibility: the lane split and the result merge are two expressions of one
+        # assignment, and this is the cheap place to catch them disagreeing.
+        raise StalePricingWorker(
+            f"flight {flight_id} is not in lane {_WORKER.get('lane')!r}"
+        )
+    _, dual_view, flight_duals, known_columns, deadline = state
     # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
     # so shipping the absolute would double-count on the second task and beyond.
     before = kernel_stats()
@@ -270,12 +444,12 @@ def _price_one(flight_id: int):
     try:
         reduced_cost, column = price_flight(
             _WORKER["graphs"][flight_id],
-            _WORKER["dual_view"],
-            _WORKER["flight_duals"][flight_id],
+            dual_view,
+            flight_duals[flight_id],
             _WORKER["cfg"],
             _WORKER["params"],
-            known_column=_WORKER["known_columns"].get(flight_id),
-            deadline=_WORKER["deadline"],
+            known_column=known_columns.get(flight_id),
+            deadline=deadline,
         )
     except PricingTimeout:
         # The record still ships: a flight that timed out mid-search is the most
@@ -315,6 +489,7 @@ def price_sweep(
     known_columns: dict[int, Column],
     *,
     deadline: float | None = None,
+    pool: "PricingPool | None" = None,
 ) -> SweepResult:
     """Price every flight in ``pricing_order``, sequentially or across processes.
 
@@ -322,6 +497,11 @@ def price_sweep(
     byte-identical to no pool at all.  ``graphs`` is used only by the sequential path;
     workers build their own from ``requests`` (cheaper than pickling, see the module
     docstring).
+
+    ``pool`` is a caller-owned :class:`PricingPool` that outlives the sweep. Passing one is
+    what makes each flight's compiled packing survive to the next iteration; omitting it
+    keeps the old shape -- a pool built and torn down here -- so a caller that prices a
+    single sweep needs to know nothing about lifetimes.
     """
 
     if params.n_pricing_workers == 0:
@@ -331,7 +511,7 @@ def price_sweep(
         )
     return _sweep_parallel(
         pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-        known_columns, deadline,
+        known_columns, deadline, pool,
     )
 
 
@@ -396,7 +576,14 @@ def _flight_record(flight_id: int, task_s: float, *, priced: bool, search=None) 
     one cheap".
     """
 
-    record = {"flight_id": int(flight_id), "task_s": float(task_s), "priced": bool(priced)}
+    # `lane`/`pid` describe the SEQUENTIAL arm as written -- one lane, this process. The
+    # pool overwrites both in `PricingPool._annotate`, where the true values are known.
+    # Setting them here rather than only there is what keeps the two arms' rows the same
+    # SHAPE, which is the property `test_both_arms_report_the_same_per_flight_rows` pins.
+    record = {
+        "flight_id": int(flight_id), "task_s": float(task_s), "priced": bool(priced),
+        "lane": 0, "pid": os.getpid(),
+    }
     record.update(last_search_record() if search is None else search)
     # After the update, so a stale `flight_id` in the search record can never rename the
     # flight this row is about.
@@ -404,86 +591,271 @@ def _flight_record(flight_id: int, task_s: float, *, priced: bool, search=None) 
     return record
 
 
+class PricingPool:
+    """Worker processes that outlive the sweep, one lane each.
+
+    **Why W single-worker pools and not one W-worker pool.** ``mp.Pool`` has a single shared
+    task queue, so it can express neither "keep this worker" nor "send this flight to THAT
+    worker" -- and the second is what makes the first worth having (see
+    :func:`_lane_assignment`). A pool per lane gives both for free, and keeps everything
+    ``mp.Pool`` was chosen for: ``imap(..., 1)`` still returns the ``IMapIterator`` whose
+    ``.next(timeout)`` the deadline guard needs, :func:`_init_worker`'s record-don't-raise
+    contract is untouched, and the feeder thread means the parent never blocks pushing a
+    multi-megabyte dual payload into a worker that is still returning results -- the
+    deadlock class ``parallel.py`` had to invent an idle-only outbox flush to avoid.
+
+    **What this actually buys.** Two things, and the second was the larger one when measured:
+
+    1. Each flight's compiled packing (``dp_prepare.prepared_for``, ~184 ms) is built once
+       per SOLVE instead of once per sweep. It lives on the graph's ``_search_cache``, which
+       a spawned worker starts cold, so a per-sweep pool threw away every one of them --
+       989 rebuilds a sweep at 1000 flights, ~180 s of worker CPU.
+    2. Worker launch is parent-SERIAL: ``_repopulate_pool_static`` starts workers in a plain
+       loop and ``spawn`` re-pickles the initargs for each one. Measured at ~4.2-4.8 s per
+       worker, three ways, so at 16 workers the last one started ~60 s into a ~63 s sweep.
+       That is why idle worker-seconds scaled as ``W(W-1)/2`` rather than with W, and why 8
+       workers ran at 79% efficiency where 16 ran at 49%. A solve-scoped pool pays it once.
+
+    **Memory.** Retained packings do NOT raise the peak: a worker already held its whole
+    sweep's worth at end-of-sweep, so pinning converts "the same peak, discarded and rebuilt"
+    into "the same peak, kept". It is *dynamic* dispatch on a persistent pool that would
+    regress -- every worker would converge toward holding all n flights' packings and drained
+    hop tables -- which is a second reason the lane split is not optional.
+    """
+
+    def __init__(self, requests, cfg: SimConfig, params: ColGenParams, catalog) -> None:
+        self._requests = list(requests)
+        self._cfg = cfg
+        self._params = params
+        self._catalog = catalog
+        self._n_lanes = int(params.n_pricing_workers)
+        if self._n_lanes <= 0:
+            raise ValueError("PricingPool needs at least one worker")
+        self._lane_of = _lane_assignment(
+            [request.flight_id for request in self._requests], self._n_lanes
+        )
+        self._lane_requests: list[list] = [[] for _ in range(self._n_lanes)]
+        for request in self._requests:
+            self._lane_requests[self._lane_of[request.flight_id]].append(request)
+        self._pools: list | None = None
+        self._lane_pid: dict[int, int] = {}
+        # A pool instance's own id, so an epoch from a DIFFERENT pool can never compare
+        # equal to one of ours -- belt and braces against a future caller that builds two.
+        self._uid = uuid.uuid4().hex
+        self._counter = itertools.count(1)
+        self._poisoned: str | None = None
+
+    @property
+    def lane_of(self) -> dict[int, int]:
+        return dict(self._lane_of)
+
+    def start(self) -> float:
+        """Bring the workers up. Idempotent; returns seconds spent, 0.0 if already running."""
+
+        if self._pools is not None:
+            return 0.0
+        started = time.perf_counter()
+        # `spawn` explicitly rather than by platform default: `fork` would inherit the
+        # parent's numba runtime and thread state, which is exactly the combination that is
+        # unsafe.
+        ctx = mp.get_context("spawn")
+        # Appended one at a time, and `self._pools` bound BEFORE the loop, so a failure
+        # partway through leaves the pools that were created reachable by `close()` rather
+        # than orphaned with live worker processes.  `MemoryError` here is the realistic
+        # case and is exactly when leaking 15 of 16 workers would hurt most.
+        self._pools = []
+        try:
+            for lane in range(self._n_lanes):
+                self._pools.append(ctx.Pool(
+                    processes=1,
+                    initializer=_init_worker,
+                    initargs=(
+                        lane, self._lane_requests[lane], self._cfg, self._params,
+                        self._catalog,
+                    ),
+                ))
+            # Block until every lane has finished its initializer. Two reasons:
+            # `pool_setup_s` is then honest rather than half-charged to the first sweep's
+            # tasks, and an initializer `MemoryError` surfaces HERE, named, instead of on
+            # some later flight.
+            for lane, pool in enumerate(self._pools):
+                _, pid = pool.apply(_worker_identity, (None,))
+                self._lane_pid[lane] = pid
+        except BaseException:
+            self.close()
+            raise
+        return time.perf_counter() - started
+
+    def run_sweep(
+        self, pricing_order, duals, flight_duals, known_columns, deadline
+    ) -> SweepResult:
+        """Price one sweep across the lanes, in ``pricing_order`` order."""
+
+        if self._poisoned is not None:
+            raise RuntimeError(f"pricing pool is no longer usable: {self._poisoned}")
+        setup_s = self.start()
+        epoch = (self._uid, next(self._counter))
+        # Pickled ONCE for all lanes -- see `_load_sweep_state` for why the mapping cannot
+        # be sliced and why one buffer beats W traversals.
+        duals_blob = pickle.dumps(duals, protocol=pickle.HIGHEST_PROTOCOL)
+
+        lane_order: list[list[int]] = [[] for _ in range(self._n_lanes)]
+        for flight_id in pricing_order:
+            lane_order[self._lane_of[flight_id]].append(flight_id)
+
+        # Started before any work is dispatched, and after `start()`, so `wall_s` measures
+        # the sweep and `pool_setup_s` measures the launch. The predecessor folded the two
+        # together because it had no way to separate them.
+        sweep_started = time.perf_counter()
+        lane_iters = []
+        for lane, pool in enumerate(self._pools):
+            own = set(lane_order[lane])
+            # FIFO on this lane's queue, so it is guaranteed to run before the tasks below
+            # it -- which is the entire delivery mechanism for per-sweep duals, and works
+            # only because the lane has exactly one worker.
+            pool.apply_async(
+                _load_sweep_state,
+                (
+                    epoch,
+                    duals_blob,
+                    {f: flight_duals[f] for f in own if f in flight_duals},
+                    {f: c for f, c in known_columns.items() if f in own},
+                    deadline,
+                ),
+            )
+            # Chunked HERE rather than by `imap`, and that is a correctness requirement.
+            # `Pool.imap` only returns an `IMapIterator` when `chunksize == 1`; above 1 it
+            # returns `(item for chunk in result for item in chunk)` -- a plain generator,
+            # which has no `.next(timeout)`, so the deadline guard would raise
+            # `AttributeError` before yielding a single result.
+            chunks = [
+                (epoch, lane_order[lane][i:i + self._params.pricing_chunksize])
+                for i in range(0, len(lane_order[lane]), self._params.pricing_chunksize)
+            ]
+            lane_iters.append(pool.imap(_price_batch, chunks, 1))
+
+        try:
+            accepted = _accepted_prefix(
+                _sweep_results(lane_iters, pricing_order, self._lane_of, deadline)
+            )
+        except BaseException as exc:
+            # Same reasoning as the incomplete-sweep case below: the lanes' iterators are
+            # half consumed and their tasks are still running, so this pool cannot be
+            # trusted for another sweep.  Reached when the merge catches the lane split and
+            # itself disagreeing, and when a task raises `StalePricingWorker` outside the
+            # merge's own handler.
+            self._poisoned = f"sweep raised {type(exc).__name__}: {exc}"
+            raise
+        accepted = replace(
+            accepted,
+            wall_s=time.perf_counter() - sweep_started,
+            pool_setup_s=setup_s,
+            flight_records=self._annotate(accepted.flight_records),
+        )
+        if not accepted.complete:
+            # The prefix stopped early, so this lane's `imap` is half-consumed and tasks are
+            # still running behind it. Rather than reason about how those interleave with a
+            # next sweep, refuse one: an incomplete sweep ALWAYS ends the solve (`solver`
+            # sets `pricing_complete = False` and breaks), so there is no reachable caller
+            # that wants another. A future refactor that changes that gets this exception
+            # instead of a silently interleaved sweep.
+            self._poisoned = (
+                f"sweep ended early at flight {accepted.timeout_flight_id}; "
+                f"outstanding tasks were abandoned"
+            )
+        return accepted
+
+    def _annotate(self, records):
+        """Add ``lane`` and ``pid`` to each diagnostic row.
+
+        Done in the PARENT rather than returned by the worker, which is possible only
+        because the assignment is static: the lane follows from the flight id alone, and the
+        pid from the lane. That keeps `_price_one`'s result tuple, `_accepted_prefix` and
+        `_flight_record` untouched -- the reduction rule this module exists to enforce reads
+        as unchanged in the diff, which is worth more than saving a dict copy.
+
+        These two keys are what make lane skew observable in every future run: the risk the
+        lane split takes is that `mp.Pool`'s rebalancing is gone, and `max` over `min` of
+        per-lane `task_s` is the number that will say whether it needs a cost-aware split.
+        """
+
+        annotated = []
+        for record in records:
+            lane = self._lane_of.get(record["flight_id"])
+            annotated.append({
+                **record, "lane": lane, "pid": self._lane_pid.get(lane, -1),
+            })
+        return tuple(annotated)
+
+    def close(self) -> None:
+        """Terminate the workers. Idempotent, and safe after any failure."""
+
+        self._poisoned = self._poisoned or "closed"
+        for pool in self._pools or ():
+            try:
+                pool.terminate()
+            except Exception:
+                pass
+            try:
+                pool.join()
+            except Exception:
+                pass
+        self._pools = None
+
+    def __enter__(self) -> "PricingPool":
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.close()
+        return False
+
+
 def _sweep_parallel(
     pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-    known_columns, deadline
+    known_columns, deadline, pool: "PricingPool | None" = None,
 ) -> SweepResult:
-    """Fan the sweep across a pool built and torn down for this sweep alone.
+    """Fan the sweep across the lanes, on a caller-owned pool when there is one.
 
-    The pool is per-sweep because the duals change every iteration and they reach the
-    workers through the initializer -- once per worker rather than once per task, which is
-    the difference between pickling them ~n_workers times and ~n_flights times.
-
-    The initializer's largest payload is NOT the duals, though: it is `known_columns`, one
-    `Column` per flight at ~13.7 KB with 619 claims, so ~13.7 MB per worker at 1,000
-    flights and linear in both flights and workers.  Invisible against a sweep of hundreds
-    of seconds, and the first term that would bite at several thousand flights -- at which
-    point the fix is to send only the columns each worker's own flights need, which
-    requires a static rather than dynamic assignment.
+    With no pool the sweep builds one for itself and tears it down, which is what
+    `price_sweep` does when called outside a solve. That path is now a special case of the
+    solve-scoped one rather than a second implementation, so there is exactly one route
+    through the lanes and the tests that drive `price_sweep` directly still exercise it.
     """
 
-    # `spawn` explicitly rather than by platform default: `fork` would inherit the parent's
-    # numba runtime and thread state, which is exactly the combination that is unsafe.
-    ctx = mp.get_context("spawn")
-    init_args = (
-        list(requests), cfg, params, catalog, duals, flight_duals,
-        dict(known_columns), deadline,
-    )
-    # Started before the pool exists on purpose: spawning workers, re-importing numba and
-    # rebuilding graphs are real costs of a per-sweep pool, and excluding them would report
-    # an efficiency the caller never experiences.
-    sweep_started = time.perf_counter()
-    with ctx.Pool(
-        processes=params.n_pricing_workers, initializer=_init_worker, initargs=init_args
-    ) as pool:
-        # `imap` and not `imap_unordered`: results must arrive in `pricing_order` index
-        # order so the accepted prefix is the one the sequential loop would have produced,
-        # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
-        # fixed order. See the module docstring.
-        # Chunked HERE rather than by `imap`, and that is a correctness requirement.
-        # `Pool.imap` only returns an `IMapIterator` when `chunksize == 1`; above 1 it
-        # returns `(item for chunk in result for item in chunk)` -- a plain generator, which
-        # has no `.next(timeout)`, so the deadline guard below would raise `AttributeError`
-        # before yielding a single result. Batching the work ourselves and asking `imap` for
-        # chunks of one keeps the iterator type fixed while giving the identical work
-        # distribution `Pool._get_tasks` would have produced.
-        chunks = [
-            pricing_order[i:i + params.pricing_chunksize]
-            for i in range(0, len(pricing_order), params.pricing_chunksize)
-        ]
-        accepted = _accepted_prefix(
-            _results_before_deadline(
-                pool.imap(_price_batch, chunks, 1), chunks, deadline
-            )
-        )
-    return replace(accepted, wall_s=time.perf_counter() - sweep_started)
+    if pool is not None:
+        return pool.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline)
+    with PricingPool(requests, cfg, params, catalog) as own:
+        return own.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline)
 
 
-def _price_batch(flight_ids):
+def _price_batch(task):
     """Price one chunk of flights in a worker, in order.
 
-    Module level because `spawn` pickles by qualified name. Exists so `_sweep_parallel` can
-    hand `imap` a chunksize of one whatever `pricing_chunksize` is -- see the note there.
+    Module level because `spawn` pickles by qualified name. Exists so the sweep can hand
+    `imap` a chunksize of one whatever `pricing_chunksize` is -- see the note in
+    :meth:`PricingPool.run_sweep`.
+
+    Takes ONE argument, still, so `imap`'s return type stays `IMapIterator`; the epoch rides
+    inside it rather than as a second parameter.
     """
 
-    return [_price_one(flight_id) for flight_id in flight_ids]
+    epoch, flight_ids = task
+    return [_price_one(epoch, flight_id) for flight_id in flight_ids]
 
 
-def _results_before_deadline(results, chunks, deadline):
-    """Yield ``imap`` results, giving up on the one the parent is still waiting for at
-    ``deadline``.
+def _sweep_results(lane_iters, pricing_order, lane_of, deadline):
+    """Merge the lanes back into ``pricing_order`` order, bounded by ``deadline``.
 
-    Without this the sweep can wait forever, and the solver's own time limit never gets a
-    chance to fire. ``mp.Pool`` does not fail a task whose worker DIED: the sentinel thread
-    starts a replacement and the lost task's result is simply never produced, so the
+    Without the deadline the sweep can wait forever, and the solver's own time limit never
+    gets a chance to fire. ``mp.Pool`` does not fail a task whose worker DIED: the sentinel
+    thread starts a replacement and the lost task's result is simply never produced, so the
     ordered iterator blocks on a value nobody will send. The realistic trigger is the OOM
     killer, which is reachable rather than hypothetical here -- memory is linear in workers
     (22.7 GB at 8 on density x100) and that is what the ``n_workers`` ceiling exists for.
 
     The bound is the caller's OWN absolute deadline, not a grace period invented here.
-    That distinction is the reason this is safe to add: past ``deadline`` the sweep was
-    going to stop regardless, so nothing is abandoned that would otherwise have been kept,
-    and no new number needs justifying.
+    That distinction is the reason this is safe: past ``deadline`` the sweep was going to
+    stop regardless, so nothing is abandoned that would otherwise have been kept.
 
     A give-up is reported as **that flight timing out**, which is deliberate: it re-enters
     the discard rule the sequential loop already defines, so the caller gets a short prefix
@@ -491,30 +863,61 @@ def _results_before_deadline(results, chunks, deadline):
     merely *looked* complete would be far worse than the hang -- `master.upper_bound` would
     take a bound over flights that were never priced.
 
-    ``results`` yields CHUNKS, because `imap` only hands back an ``IMapIterator`` -- the one
-    type with ``.next(timeout)`` -- when its own chunksize is 1. `_sweep_parallel` therefore
-    batches the work itself and asks for chunks of one, so this stays ordered and the k-th
-    chunk is ``chunks[k]``, which is what lets a lost result be named at all.
+    **Why there is no reorder buffer.** The predecessor of this function leaned on one
+    global FIFO -- "the k-th chunk is ``chunks[k]``" -- and that is gone, because each lane
+    is now its own queue. It is not needed: a lane's results are FIFO in the order that
+    lane's flights appear in ``pricing_order``, so the j-th result out of lane *w* IS the
+    j-th ``pricing_order`` entry assigned to *w*. Walking ``pricing_order`` and blocking on
+    the one lane that owns the next index therefore yields exactly index order, with a
+    deque per lane holding whatever arrived early.
 
-    With ``deadline=None`` this blocks exactly as before, which is the documented behaviour
-    for a sweep that was given no time limit -- `solve` always passes one.
+    Blocking on that single lane costs nothing, and this is the subtle part: index order
+    means the next result is REQUIRED before any other can be emitted, so time spent
+    waiting for it is not time another lane's result could have used. That is what keeps
+    ``master.upper_bound``'s non-associative ``sum`` fed in a fixed order -- rule 2.
     """
 
-    for index in range(len(chunks)):
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        try:
-            chunk = results.next(remaining)
-        except StopIteration:
-            return
-        except mp.TimeoutError:
-            # Exactly the shape `_price_one` returns for a `PricingTimeout`, so the reducer
-            # needs no special case: no seconds, no counters, `priced` False -- and an
-            # EMPTY search record, because the worker that would have filled it is the one
-            # that never reported back.  Named with the chunk's FIRST flight: nothing in it
-            # reported, and the accepted prefix ends at the earliest of them either way.
-            yield chunks[index][0], False, 0.0, None, 0.0, {}, {}
-            return
-        yield from chunk
+    pending = [collections.deque() for _ in lane_iters]
+    for flight_id in pricing_order:
+        lane = lane_of[flight_id]
+        while not pending[lane]:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                pending[lane].extend(lane_iters[lane].next(remaining))
+            except StopIteration:
+                raise RuntimeError(
+                    f"pricing lane {lane} is exhausted but pricing_order still expects "
+                    f"flight {flight_id}: the lane split and this merge disagree"
+                ) from None
+            except mp.TimeoutError:
+                # Exactly the shape `_price_one` returns for a `PricingTimeout`, so the
+                # reducer needs no special case: no seconds, no counters, `priced` False --
+                # and an EMPTY search record, because the worker that would have filled it
+                # is the one that never reported back.  Names the flight the parent is
+                # actually blocked on, which the chunk-indexed predecessor could only
+                # approximate with its chunk's first flight.
+                yield flight_id, False, 0.0, None, 0.0, {}, {}
+                return
+            except StalePricingWorker as exc:
+                # A worker died and `mp.Pool` quietly replaced it with one holding no sweep
+                # state.  End the sweep the way a lost result does -- the prefix so far is
+                # still valid -- but count it, so `solve` can report why rather than
+                # blaming the clock.
+                warnings.warn(
+                    f"pricing lane {lane} lost its worker: {exc}", RuntimeWarning,
+                    stacklevel=2,
+                )
+                yield flight_id, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}
+                return
+        result = pending[lane].popleft()
+        if result[0] != flight_id:
+            # One comparison per flight, and it turns a merge bug from a WRONG NUMBER --
+            # reduced costs silently transposed between two flights -- into a crash.
+            raise RuntimeError(
+                f"pricing lane {lane} returned flight {result[0]} where pricing_order "
+                f"expects {flight_id}"
+            )
+        yield result
 
 
 def _accepted_prefix(results) -> SweepResult:

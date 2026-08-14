@@ -12,14 +12,13 @@
 ##
 ## TO ADJUST, edit the four lines below (and --array above to match the length of ARMS):
 ##
-##   ARMS   azlead08m / azlead15m / azlead30m = Amazon at 8 / 15 / 30 min, Wing/Zipline at 8.
-##          The mirrored sweep is wzlead15m / wzlead30m (Wing/Zipline files further ahead instead).
-##          Note azlead30m and wzlead08m are both operators at their defaults — the SAME world under
-##          two names — so run one of them, not both.
+##   ARMS   azlead08m / 15m / 30m = Amazon at 8 / 15 / 30 min, Wing/Zipline held at 8; wzlead15m /
+##          wzlead30m mirror it (Wing/Zipline files ahead instead). azlead30m and wzlead08m are the
+##          same world under two names — run one, not both.
 ##   WORLD  faa (~5k flights) or future (~27k flights, several times longer).
-##   SEED   the arms are paired per flight — within a seed every arm has an identical flight set and
-##          identical desired departures — so one seed already gives a clean contrast. Add seeds for
-##          error bars by submitting again with a different SEED and the same TAG.
+##   SEED   arms are paired per flight — within a seed every arm gets an identical flight set and
+##          identical desired departures — so one seed already gives a clean contrast. Resubmit with
+##          another SEED and the same TAG for error bars.
 ##   TAG    the join key the cross-run readouts filter on.
 
 ARMS=(azlead08m azlead15m azlead30m)
@@ -38,10 +37,9 @@ mkdir -p "$NUMBA_CACHE_DIR"
 cd $HOME/congestion-utm-freespace
 
 TASK=${SLURM_ARRAY_TASK_ID:-0}
-## --array and ARMS are edited separately, so they drift. Check the array's SIZE, not just this task's
-## index: a too-LONG array shows up as a task with no arm, but a too-SHORT one has no task left over
-## to notice the missing tail — it would just quietly run a partial sweep. Unset outside Slurm, where
-## there is no array to disagree with.
+## --array and ARMS drift because they are edited separately. Checking the array's SIZE — not just this
+## task's index — is what catches a too-SHORT array: it leaves no task to notice the missing tail, so it
+## would quietly run a partial sweep. Unset outside Slurm, where there is no array to disagree with.
 COUNT=${SLURM_ARRAY_TASK_COUNT:-${#ARMS[@]}}
 if [ "$COUNT" -ne "${#ARMS[@]}" ] || [ "$TASK" -ge "${#ARMS[@]}" ]; then
   echo "FATAL: --array covers $COUNT task(s) and ARMS has ${#ARMS[@]} entries (this is task $TASK) —" \
@@ -50,9 +48,9 @@ if [ "$COUNT" -ne "${#ARMS[@]}" ] || [ "$TASK" -ge "${#ARMS[@]}" ]; then
 fi
 ARM=${ARMS[$TASK]}
 
-## Array tasks start together and take about the same time, so they finish together too, and every
-## one of them ends by appending a row to the shared index. The append holds a lock now, but staggering
-## the starts keeps them from queueing on it at all (and spreads the numba cache warm-up).
+## Tasks start together and take about the same time, so they finish together and all append to the
+## shared index at once. That append is locked now, but staggering keeps them off the lock entirely
+## (and spreads the numba cache warm-up).
 sleep $((TASK * 30))
 
 ## --mode sequential: exact parallel LOSES to sequential on the density scenarios, and relaxed mode
@@ -64,9 +62,9 @@ python -m experiments.run \
   --seed $SEED --mode sequential --return-anchor nominal \
   --tag $TAG --no-progress
 
-## A lost index row is silent — the readout below just reports one arm fewer. Each run keeps its own
-## copy of its row, so rebuilding here means whichever task finishes LAST leaves a complete index
-## whatever the shared filesystem did with the lock. Idempotent; never removes anyone else's runs.
+## A lost index row is silent — the readout below would just report one arm fewer. Rebuilding from each
+## run's own copy means whichever task finishes LAST leaves a complete index, whatever the shared
+## filesystem did with the lock. Idempotent; never removes anyone else's runs.
 python -c "from freespace_sim import runs; print(len(runs.rebuild_index()), 'runs in index.parquet')"
 
 ## Read out per operator once the array finishes. compare.py is run-wide only; the per-USS split this

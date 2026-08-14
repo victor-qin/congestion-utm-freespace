@@ -21,11 +21,10 @@ class Planner(Protocol):
     ) -> OperationalIntent: ...
 
 
-#: Planners that solve every flight at once instead of one-at-a-time under FCFS, so `sim.run` routes
-#: them to `colgen.run_batch` and they never enter the per-flight loop (nor its round-trip coupling).
-#: A NAME list for callers that only hold `cfg.planner` and want to fail early with a readable
-#: message; `sim.run` itself tests the authoritative `plans_whole_schedule` marker on the built
-#: instance, so a new batch planner missing from here still gets refused — just less prettily.
+#: Planners that solve every flight at once, so `sim.run` routes them to `colgen.run_batch` and they
+#: never enter the per-flight FCFS loop (nor its round-trip coupling). Names, for callers holding only
+#: `cfg.planner` that want to fail early with a readable message; `sim.run` tests the authoritative
+#: `plans_whole_schedule` marker, so a batch planner missing here is still refused, just less prettily.
 WHOLE_SCHEDULE_PLANNERS = ("colgen",)
 
 

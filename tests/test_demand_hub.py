@@ -627,13 +627,12 @@ def test_realized_anchor_departs_on_the_arrival_that_actually_happened():
 
 
 def test_realized_anchor_waits_out_the_descent_inside_the_landing_column():
-    """Regression: the anchor used to be ``centerline[-1]`` — the last CRUISE waypoint.
+    """Regression: the anchor used to be ``centerline[-1]``, the last CRUISE waypoint.
 
-    The corridor stops at the destination column's edge and the descent inside it is flown but
-    unreserved, so anchoring there launched every return ``climb_time_to(z_land)`` before its own
-    aircraft was down. The two legs share one pad cylinder, so the planner handed that overlap
-    straight back as ground delay: 94/94 returns in this fixture, 5 s each at a 30 m cruise level
-    (16.7 s at the density scenarios' 100 m).
+    The corridor ends at the destination column's edge and the descent inside is unreserved, so that
+    launched every return ``climb_time_to(z_land)`` before its aircraft was down — and since the legs
+    share one pad cylinder, the planner billed the overlap back as ground delay (94/94 here, 5 s each
+    at 30 m; 16.7 s at the density scenarios' 100 m).
     """
     from freespace_sim.sim import realized_release_s
 
@@ -657,11 +656,10 @@ def test_realized_anchor_waits_out_the_descent_inside_the_landing_column():
 
 
 def test_realized_release_is_the_destination_column_window():
-    """``realized_release_s`` takes the largest ``t_end`` — assert that really is the landing column.
+    """``realized_release_s`` takes the largest ``t_end``; assert that really is the landing column.
 
-    The corridor's last box ends where the flight MEETS the column, and the column is booked from
-    there for the ingress + descent + pad dwell, so it is always the last volume to clear. Taking a
-    max is only correct while that holds.
+    The last corridor box ends where the flight meets the column, and the column runs from there
+    through ingress + descent + pad dwell — so it clears last. The max is only correct while that holds.
     """
     from freespace_sim.geometry import CylinderSpec
     from freespace_sim.sim import realized_release_s
@@ -723,9 +721,8 @@ def test_realized_anchor_rejects_parallel_and_unknown_values():
 
 
 def test_realized_anchor_rejects_whole_schedule_planners():
-    """A batch solve never enters the coupling loop, so the flag would be a silent no-op there —
-    and `return_anchor` is not in index.parquet, so the run would be indistinguishable from a
-    coupled one on disk. Refuse before solving."""
+    """A batch solve never enters the coupling loop, so the flag would be a silent no-op — and with
+    `return_anchor` absent from index.parquet, the run would look coupled on disk. Refuse instead."""
     from freespace_sim.planner import WHOLE_SCHEDULE_PLANNERS, get_planner
 
     cfg, model = _roundtrip_world()

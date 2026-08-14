@@ -267,24 +267,14 @@ RETURN_ANCHORS = ("nominal", "realized")
 
 
 def realized_release_s(intent: OperationalIntent) -> float | None:
-    """When an accepted flight's landing column CLEARS — touchdown plus the pad dwell, i.e. the
-    earliest the same aircraft can lift off again (turnaround still to be added by the caller).
+    """When an accepted flight's landing column clears (touchdown + pad dwell) — the earliest its
+    aircraft can leave again, before turnaround. That is the destination cylinder's ``t_end``, hence
+    the largest the intent holds. ``None`` if nothing landed: denied, or no volumes reserved.
 
-    This is the destination hover cylinder's ``t_end``, and so the largest ``t_end`` the intent
-    holds: the last corridor box ends where the flight meets the destination column, and the column
-    is booked from there for :func:`volumes.column_dwell_s` (ingress traverse + descent) plus
-    ``hover_time_s`` on the pad.
-
-    Deliberately NOT ``centerline[-1]``. The corridor stops at the destination column's EDGE at
-    CRUISE altitude — the descent inside the column is flown but unreserved (see ``astar._build``) —
-    so the last waypoint precedes touchdown by ``cfg.climb_time_to(z_land)``. Anchoring a return
-    there launched it while its own aircraft was still descending: 5 s at a 30 m cruise level,
-    16.7 s at the density scenarios' 100 m. Because the two legs share one pad cylinder, the planner
-    then charged that overlap straight back as ground delay — 94/94 returns in the round-trip
-    fixture, which is exactly the artifact the realized anchor exists to remove.
-
-    ``None`` when nothing landed: a denied flight, or an intent that reserved no volumes (such a leg
-    keeps its nominal anchor).
+    NOT ``centerline[-1]``: the corridor stops at the column's EDGE at cruise altitude because the
+    descent inside is flown but unreserved (``astar._build``), so the last waypoint precedes touchdown
+    by ``climb_time_to(z_land)`` — 16.7 s at the density scenarios' 100 m. Anchoring returns there
+    launched them mid-descent, and the shared pad cylinder billed the overlap back as ground delay.
     """
     if not intent.accepted or not intent.volumes:
         return None
@@ -339,18 +329,14 @@ def run(
       materialized before anything is planned, so that can only ever be a straight-line, undelayed
       estimate of when the outbound lands — under congestion it schedules the return before its
       aircraft is back.
-    - ``"realized"`` plans the outbound, then re-anchors its return to the arrival that ACTUALLY
-      happened: ``t_departure = (when the landing column clears) + turnaround``, the column being
-      released one pad dwell after touchdown (:func:`realized_release_s`). Exact, not an approximation,
-      and it costs nothing extra — FCFS already guarantees the outbound is planned first (a paired
-      return shares its outbound's filing time and takes the next flight_id, so it sorts immediately
-      behind; a legacy return files strictly later still). Filing times never move, so FCFS order and
-      the monotonic-``t_request`` eviction invariant are untouched, and the flight set is unchanged: a
-      return whose outbound was DENIED keeps its nominal anchor, since dropping it instead would make
-      the flight set depend on congestion and break any paired comparison across runs. On top of this
-      the return still pays the ordinary pad-reuse separation — the ASTM time buffer plus the
-      occupancy grid's ``dt`` quantisation, ~8 s at the defaults — exactly as any other flight taking
-      over that pad would; the anchor decides when the aircraft is ready, not who gets the pad.
+    - ``"realized"`` re-anchors each return to ``realized_release_s(outbound) + turnaround`` — the
+      arrival that actually happened. Exact and free: FCFS already plans the outbound first (a paired
+      return shares its filing time and takes the next flight_id), so the arrival is always in hand.
+      Filing times never move, so FCFS order and the monotonic-``t_request`` eviction are untouched.
+      A return whose outbound was DENIED keeps its nominal anchor — dropping it would make the flight
+      set depend on congestion and break paired comparisons across runs. The return still pays the
+      ordinary pad-reuse separation on top (~8 s: ASTM buffer + ``dt`` rounding), as any flight taking
+      over that pad would; the anchor says when the aircraft is ready, not who gets the pad.
 
     ``turnaround_s`` comes from the demand model, so the realized anchor uses exactly the turnaround
     the nominal one budgeted for.
@@ -452,10 +438,9 @@ def run(
         from .planner.colgen import run_batch
 
         if return_anchor == "realized":
-            # The coupling lives in the FCFS loop below, which a batch solve never enters — so the
-            # flag would be accepted and do NOTHING, leaving every return on the nominal anchor it
-            # was asked to replace. Refuse instead: a silently-ignored anchor is indistinguishable
-            # on disk from a coupled run (return_anchor is not in index.parquet either).
+            # A batch solve never enters the FCFS loop the coupling lives in, so the flag would do
+            # NOTHING — and since return_anchor is absent from index.parquet, the run would look
+            # coupled on disk. Refuse rather than no-op.
             raise ValueError(
                 f"return_anchor='realized' is not implemented for whole-schedule planners: {pname!r} "
                 "solves every flight at once, so there is no moment at which an outbound has "
@@ -482,10 +467,9 @@ def run(
         )
     else:
         intents = []
-        # Round-trip coupling. `anchors` holds, for each outbound that some return waits on, the moment
-        # its landing column actually cleared; the return pops it just before being planned. FCFS
-        # guarantees the outbound is planned first (see the return_anchor docs), so it is in hand — and
-        # popping keeps the dict at roughly one live entry, since a paired return is the very next event.
+        # Round-trip coupling. `anchors[outbound_id]` = when that outbound's landing column cleared;
+        # its return pops it just before being planned. FCFS plans the outbound first, so the entry is
+        # always in hand, and popping keeps the dict near one entry (a paired return is the next event).
         couple = return_anchor == "realized"
         turnaround_s = 0.0
         if couple:
@@ -526,17 +510,12 @@ def run(
             if couple and req.paired_outbound_id is not None:
                 released = anchors.pop(req.paired_outbound_id, None)
                 if released is not None:               # None ⇒ outbound denied; keep the nominal anchor
-                    # `replace`, NOT in-place assignment: `requests` may be caller-owned, and mutating it
-                    # would leak the coupled departures into any later run over the same list — silently
-                    # corrupting exactly the anchor A/B this option invites. It also re-runs
-                    # __post_init__, so the t_departure >= t_request invariant is re-validated rather
-                    # than bypassed. The max() defends it: neither shipped return mode can reach the
-                    # clamp (both file no later than the outbound's nominal arrival), but a future model
-                    # that filed later would otherwise violate it silently.
-                    #
-                    # Only the turnaround is added here: the pad dwell is already inside `released`
-                    # (it is the landing COLUMN's release, not touchdown), so adding hover_time_s
-                    # again would double-count it.
+                    # `replace`, NOT in-place: `requests` may be caller-owned, and mutating it leaks the
+                    # coupled departures into any later run over the same list — corrupting exactly the
+                    # anchor A/B this option invites. It also re-validates t_departure >= t_request via
+                    # __post_init__, which the max() keeps satisfied (unreachable for both shipped return
+                    # modes, but a future one that filed later would otherwise violate it silently).
+                    # Only turnaround is added: `released` already includes the pad dwell.
                     req = replace(req, t_departure=max(req.t_request, released + turnaround_s))
             uss = usses.get(req.uss_id, default_uss)
             intent = uss.handle_request(req)

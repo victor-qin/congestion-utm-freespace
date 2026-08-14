@@ -50,9 +50,8 @@ from .volumes import Volume4D
 
 DEFAULT_ROOT = Path("results")
 INDEX_FILENAME = "index.parquet"
-#: Each run's own copy of its index row, kept beside its artifacts. The shared index is appended by
-#: read-modify-write, so a concurrent writer can drop a row; this is what :func:`rebuild_index`
-#: restores it from.
+#: Each run's own copy of its index row. The shared index is appended by read-modify-write, so a
+#: concurrent writer can drop a row; :func:`rebuild_index` restores it from these.
 INDEX_ROW_FILENAME = "index_row.parquet"
 
 
@@ -401,8 +400,7 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
                                   "max_solve_time_s", "total_solve_time_s", "verified")},
            **steady_cols}
     row_df = pd.DataFrame([row])
-    # The run's own copy, before touching the shared file: if the append below loses the race (or the
-    # process dies mid-rewrite), `rebuild_index` can still put this row back.
+    # Own copy first: if the append below loses the race, `rebuild_index` can put this row back.
     row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
     path = root / INDEX_FILENAME
     with _index_lock(root):
@@ -412,17 +410,14 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
 
 @contextlib.contextmanager
 def _index_lock(root: Path):
-    """Serialise the index's read-modify-write against other processes.
+    """Serialise the index's read-modify-write (read whole file → concat → rewrite) across processes.
 
-    Appending is read-whole-file → concat → rewrite, so two runs finishing together can read the same
-    base and the second rewrite silently drops the first's row. That is the normal case for a Slurm
-    array, whose tasks start together and take about the same time — the sweep would then be one arm
-    short in every cross-run readout, with nothing to indicate it. An advisory ``flock`` on a sidecar
-    file makes the sequence atomic between cooperating writers.
+    Without it, two runs finishing together read the same base and the second rewrite drops the
+    first's row — the normal case for a Slurm array, whose tasks start together and take about the
+    same time, leaving the sweep silently one arm short.
 
-    Best-effort by design: ``flock`` is absent on Windows and unreliable on some network filesystems,
-    and neither should abort a run that has already finished computing. The per-run
-    ``index_row.parquet`` (see :func:`rebuild_index`) is what makes that safe to accept.
+    Best-effort: ``flock`` is absent on Windows and unreliable on some network filesystems, and
+    neither should abort a finished run. :func:`rebuild_index` is what makes that safe to accept.
     """
     try:
         import fcntl
@@ -445,16 +440,14 @@ def _index_lock(root: Path):
 
 
 def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
-    """Reconstitute ``index.parquet`` from the per-run rows in each run folder, and return it.
+    """Reconstitute ``index.parquet`` from each run folder's own ``index_row.parquet``, and return it.
 
-    A dropped index row is invisible in the worst way: a cross-run readout simply reports one run
-    fewer, with no error and no gap to notice. Every run writes its own row to
-    ``<run folder>/index_row.parquet`` as well, so the shared file is always recoverable — call this
-    after a batch array (each task calling it makes whichever finishes last leave a complete index).
+    A dropped index row is invisible — a cross-run readout just reports one run fewer, with no error
+    and no gap to notice. Call this after a batch array (having every task call it means whichever
+    finishes last leaves a complete index, whatever the shared filesystem did with the lock).
 
-    Non-destructive and idempotent: index rows whose folder has no ``index_row.parquet`` — runs saved
-    before this file existed, or folders since deleted — are KEPT. Where both exist the folder's copy
-    wins, being the one the run itself wrote.
+    Non-destructive and idempotent: index rows whose folder has no copy (runs archived before this
+    file existed, or folders since deleted) are KEPT; where both exist the folder's copy wins.
     """
     root = Path(root)
     rows = []

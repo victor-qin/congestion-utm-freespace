@@ -358,9 +358,9 @@ def test_every_run_keeps_its_own_copy_of_its_index_row(tmp_path):
 
 
 def test_rebuild_index_restores_a_row_a_concurrent_writer_dropped(tmp_path):
-    """Simulates the lost update exactly: two array tasks read the same base and the second rewrite
-    wins. Nothing raises and nothing is missing from disk — the sweep is just silently one run short
-    in every cross-run readout, which is why this is recoverable rather than detectable."""
+    """The lost update exactly: two array tasks read the same base and the second rewrite wins.
+    Nothing raises and no artifact is missing — the sweep is just silently one run short in every
+    readout, which is why this has to be recoverable rather than merely detected."""
     a = runs.save_run(_small(), root=tmp_path, label="arm_a", scenario="s")
     stale = pd.read_parquet(tmp_path / "index.parquet")          # a's row, as a racing task saw it
     b = runs.save_run(_small(), root=tmp_path, label="arm_b", scenario="s")

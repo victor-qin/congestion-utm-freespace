@@ -121,10 +121,12 @@ class DualView:
 
     __slots__ = (
         "_cell",
+        "_cell_steps",
         "_duals",
         "_max_negative_credit",
         "_offsets",
         "_terminal",
+        "_terminal_steps",
     )
 
     def __init__(
@@ -156,6 +158,23 @@ class DualView:
         self._cell = {resource: _prefix_series(values) for resource, values in cell_values.items()}
         self._terminal = {
             terminal_id: _prefix_series(values) for terminal_id, values in terminal_values.items()
+        }
+        # The same buckets, kept rather than discarded, so a per-flight consumer can
+        # enumerate the resources IT owns instead of scanning every global row.  See
+        # `dp_prepare.prepare_duals`, which is called once per flight and whose old loop was
+        # therefore O(flights x rows) -- a cost that grows with the master's materialized
+        # row count while the flight stays the same size.
+        #
+        # These are the accumulated values, not a recomputation: `prefix[k+1] - prefix[k]`
+        # would recover a DIFFERENT float, which is the thing `prepare_duals`' docstring
+        # forbids.  Tuples rather than the dicts because they are smaller and immutable, and
+        # pricing reads one view from several flights concurrently.
+        self._cell_steps = {
+            resource: tuple(sorted(values.items())) for resource, values in cell_values.items()
+        }
+        self._terminal_steps = {
+            terminal_id: tuple(sorted(values.items()))
+            for terminal_id, values in terminal_values.items()
         }
 
     @property

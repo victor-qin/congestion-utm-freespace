@@ -196,6 +196,193 @@ def test_kernel_dual_queries_are_bit_identical_to_the_prepared_view():
         assert dp_kernel._row_cost(duals.row_id, duals.row_value, row) == duals.row_cost(row)
 
 
+# --------------------------------------------------- prepare_duals scans its OWN resources
+
+
+def _terminal_graph(cfg: SimConfig, *, overrun: int = 4):
+    """A graph with both endpoints in terminal airspace, so terminal rows exist to price."""
+
+    origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
+    o_term, d_term = Terminal("dual-A", 1, radius=90.0), Terminal("dual-B", 1, radius=90.0)
+    request = FlightRequest(
+        12, origin, dest, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term
+    )
+    params = ColGenParams(solver="highs", max_air_overrun_hops=overrun)
+    graph = build_flight_graph(request, cfg, [(origin, o_term), (dest, d_term)], params)
+    return graph, params
+
+
+def _mixed_duals(graph, cfg, seed):
+    """This flight's rows, plus every category of row it does NOT own.
+
+    The foreign rows are the whole point. The old loop walked the global mapping and
+    filtered them out one at a time; a rewrite that walks this flight's resources instead
+    has to reach the identical verdict *without ever looking at them*, so a fixture with
+    only own-rows would pass while proving nothing.
+    """
+
+    rng = random.Random(seed)
+    duals: dict[RowKey, float] = dict(_random_duals(graph, cfg, seed))
+    own = list(graph.corridor_cells)[:8]
+    # Cells no corridor of this flight reaches.
+    for q in range(60, 90):
+        for step in range(graph.min_step, graph.min_step + 6):
+            duals[RowKey.cell(q, -q, 0, step)] = rng.uniform(0.5, 9.0)
+    # A level this single-level flight cannot fly -- the `key.level != 0` skip.
+    for cell in own:
+        duals[RowKey.cell(cell[0], cell[1], 1, graph.min_step)] = rng.uniform(0.5, 9.0)
+    # Own cells at steps outside the row numbering -- the `row < 0` / n_out_of_range path.
+    for cell in own:
+        duals[RowKey.cell(cell[0], cell[1], 0, graph.min_step - 500)] = rng.uniform(0.5, 9.0)
+    # Its own two terminals, and one it never touches.
+    for term_id in (graph.origin_terminal.id, graph.dest_terminal.id, "dual-foreign"):
+        for step in range(graph.min_step, graph.min_step + 10):
+            duals[RowKey.term(term_id, step)] = rng.uniform(0.5, 9.0)
+    return duals
+
+
+def _reference_pairs(view, cell_index, term_slot, rows):
+    """`prepare_duals`' pre-change loop, kept verbatim so the rewrite has an oracle.
+
+    Inlined rather than imported on purpose: this is the definition of the old behaviour,
+    and it has to survive the source change that deletes it.
+    """
+
+    pairs: list[tuple[int, float]] = []
+    n_out_of_range = 0
+    for key, value in view._duals.items():
+        if key.kind == "cell":
+            if key.level != 0:
+                continue
+            index = cell_index.get(key.cell_coord)
+            if index is None:
+                continue
+            row = rows.row_of_cell(index, key.step)
+        else:
+            slot = term_slot.get(key.terminal_id)
+            if slot is None:
+                continue
+            row = rows.row_of_term(slot, key.step)
+        if row < 0:
+            n_out_of_range += 1
+            continue
+        pairs.append((row, float(value)))
+    pairs.sort()
+    return pairs, n_out_of_range
+
+
+def _term_slot(graph, rows) -> dict:
+    slot: dict = {}
+    if rows.origin_is_terminal:
+        slot[graph.origin_terminal.id] = rows.origin_term_slot
+    if rows.dest_is_terminal:
+        slot[graph.dest_terminal.id] = rows.dest_term_slot
+    return slot
+
+
+def test_prepare_duals_matches_a_full_scan_of_the_dual_mapping():
+    """Walking this flight's resources must equal walking every global row and filtering.
+
+    Compared with `==` on the values rather than `allclose`: the point of keeping
+    `DualView`'s step buckets instead of differencing them back out of the prefix sums is
+    that they are the SAME floats, and an approximate check would not notice if they
+    stopped being.
+    """
+
+    cfg = _cfg()
+    graph, _ = _terminal_graph(cfg)
+    assert graph.origin_terminal is not None and graph.dest_terminal is not None
+    view = DualView(_mixed_duals(graph, cfg, 90210), cfg)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+
+    expected, expected_out_of_range = _reference_pairs(
+        view, _cell_index(topology), _term_slot(graph, rows), rows
+    )
+    assert expected, "the fixture priced no rows this flight owns"
+    assert expected_out_of_range > 0, "the fixture never exercised the out-of-range path"
+
+    prepared = dp_prepare.prepare_duals(view, graph, topology, rows)
+    assert prepared.row_id.tolist() == [row for row, _ in expected]
+    assert prepared.row_value.tolist() == [value for _, value in expected]
+    assert prepared.n_out_of_range == expected_out_of_range
+    # And the fixture has to reject a lot, or "equal" is trivially true: the rows this
+    # flight does not own are the only ones whose handling the rewrite actually changes.
+    rejected = len(view._duals) - len(expected)
+    assert rejected > 150, f"the fixture barely filtered: {rejected} of {len(view._duals)}"
+
+
+def test_prepare_duals_never_scans_the_global_dual_mapping():
+    """The cost claim, pinned as a behaviour rather than a benchmark.
+
+    A wall-clock assertion would be worthless on a shared machine; "it did not iterate the
+    global mapping even once" is exact and machine-independent. The old loop's cost was
+    O(all rows) *per flight*, so it grows with the master's materialized row count while
+    the flight stays the same size -- which is why this is the property worth freezing.
+    """
+
+    cfg = _cfg()
+    graph, _ = _terminal_graph(cfg)
+    view = DualView(_mixed_duals(graph, cfg, 4711), cfg)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+    reference = dp_prepare.prepare_duals(view, graph, topology, rows)
+
+    class _RefusesToBeScanned(dict):
+        def items(self):
+            raise AssertionError("prepare_duals scanned the global dual mapping")
+
+        def __iter__(self):
+            raise AssertionError("prepare_duals iterated the global dual mapping")
+
+    view._duals = _RefusesToBeScanned(view._duals)
+    prepared = dp_prepare.prepare_duals(view, graph, topology, rows)
+    assert prepared.row_id.tolist() == reference.row_id.tolist()
+    assert prepared.row_value.tolist() == reference.row_value.tolist()
+
+
+def test_dual_view_step_buckets_hold_the_same_floats_as_the_flat_mapping():
+    """The retained buckets must be the accumulated value, bit for bit -- not a recompute."""
+
+    cfg = _cfg()
+    graph, _ = _terminal_graph(cfg)
+    view = DualView(_mixed_duals(graph, cfg, 1337), cfg)
+
+    for key, value in view._duals.items():
+        if key.kind == "cell":
+            bucket = dict(view._cell_steps[(key.cell_coord, key.level)])
+        else:
+            bucket = dict(view._terminal_steps[key.terminal_id])
+        assert bucket[key.step] == value, key
+
+
+def test_cell_and_terminal_row_ids_never_collide():
+    """Two pairs sharing a row id would make `pairs.sort()` depend on insertion order.
+
+    `prepare_duals` sorts `(row, value)` tuples, so a duplicate row would be tie-broken by
+    VALUE and the result would depend on the order rows were appended -- exactly what the
+    rewrite changes. Injectivity is what makes the sort a total order and the change safe.
+    """
+
+    cfg = _cfg()
+    graph, _ = _terminal_graph(cfg)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+
+    seen: dict[int, tuple] = {}
+    steps = range(rows.step0, rows.step0 + rows.n_steps)
+    for index in range(rows.n_cells):
+        for step in steps:
+            row = rows.row_of_cell(index, step)
+            assert row not in seen, (row, seen.get(row), ("cell", index, step))
+            seen[row] = ("cell", index, step)
+    for slot in range(rows.n_terminals):
+        for step in steps:
+            row = rows.row_of_term(slot, step)
+            assert row not in seen, (row, seen.get(row), ("term", slot, step))
+            seen[row] = ("term", slot, step)
+
+
 # ------------------------------------------------------------------- forbidden-row test
 
 

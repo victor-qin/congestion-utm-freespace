@@ -13,15 +13,18 @@ analyse, or replay it without re-running the sim**:
     trajectories.parquet what was actually flown — timed centerline waypoints per flight
     reservations.parquet what was reserved in 4D — every corridor box + hover cylinder + window
     flights.parquet      per-flight metrics rows
+    index_row.parquet    this run's row of the cross-run index (its own copy — see rebuild_index)
     replay.html          the standalone scrubbable replay (the "video")
 
 ``load_run(folder)`` is the exact reverse: it rebuilds a `SimResult`-shaped object (config + intents
 with their volumes and centerlines) so a replay or analysis can start from disk. An append-only
-``results/index.parquet`` indexes every run for cross-run queries.
+``results/index.parquet`` indexes every run for cross-run queries; concurrent writers serialise on a
+lock and `rebuild_index` restores it from the per-run rows if one is ever lost anyway.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -47,6 +50,10 @@ from .volumes import Volume4D
 
 DEFAULT_ROOT = Path("results")
 INDEX_FILENAME = "index.parquet"
+#: Each run's own copy of its index row, kept beside its artifacts. The shared index is appended by
+#: read-modify-write, so a concurrent writer can drop a row; this is what :func:`rebuild_index`
+#: restores it from.
+INDEX_ROW_FILENAME = "index_row.parquet"
 
 
 # --- metadata captures -----------------------------------------------------
@@ -393,11 +400,81 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
                                   "mean_solve_time_s", "p95_solve_time_s",
                                   "max_solve_time_s", "total_solve_time_s", "verified")},
            **steady_cols}
+    row_df = pd.DataFrame([row])
+    # The run's own copy, before touching the shared file: if the append below loses the race (or the
+    # process dies mid-rewrite), `rebuild_index` can still put this row back.
+    row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
     path = root / INDEX_FILENAME
-    df = pd.DataFrame([row])
-    if path.exists():
-        df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
-    df.to_parquet(path, index=False)
+    with _index_lock(root):
+        out = pd.concat([pd.read_parquet(path), row_df], ignore_index=True) if path.exists() else row_df
+        out.to_parquet(path, index=False)
+
+
+@contextlib.contextmanager
+def _index_lock(root: Path):
+    """Serialise the index's read-modify-write against other processes.
+
+    Appending is read-whole-file → concat → rewrite, so two runs finishing together can read the same
+    base and the second rewrite silently drops the first's row. That is the normal case for a Slurm
+    array, whose tasks start together and take about the same time — the sweep would then be one arm
+    short in every cross-run readout, with nothing to indicate it. An advisory ``flock`` on a sidecar
+    file makes the sequence atomic between cooperating writers.
+
+    Best-effort by design: ``flock`` is absent on Windows and unreliable on some network filesystems,
+    and neither should abort a run that has already finished computing. The per-run
+    ``index_row.parquet`` (see :func:`rebuild_index`) is what makes that safe to accept.
+    """
+    try:
+        import fcntl
+    except ImportError:                                  # non-POSIX: no lock; folder rows still land
+        yield
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    with open(root / (INDEX_FILENAME + ".lock"), "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except OSError as exc:                           # filesystem without working flock
+            log.warning("could not lock the run index (%s) — concurrent writers may drop rows; "
+                        "run freespace_sim.runs.rebuild_index() afterwards to restore them", exc)
+            yield
+            return
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
+    """Reconstitute ``index.parquet`` from the per-run rows in each run folder, and return it.
+
+    A dropped index row is invisible in the worst way: a cross-run readout simply reports one run
+    fewer, with no error and no gap to notice. Every run writes its own row to
+    ``<run folder>/index_row.parquet`` as well, so the shared file is always recoverable — call this
+    after a batch array (each task calling it makes whichever finishes last leave a complete index).
+
+    Non-destructive and idempotent: index rows whose folder has no ``index_row.parquet`` — runs saved
+    before this file existed, or folders since deleted — are KEPT. Where both exist the folder's copy
+    wins, being the one the run itself wrote.
+    """
+    root = Path(root)
+    rows = []
+    for row_path in sorted(root.glob(f"*/{INDEX_ROW_FILENAME}")):
+        try:
+            rows.append(pd.read_parquet(row_path))
+        except Exception as exc:                         # one half-written row must not sink the rest
+            log.warning("skipping unreadable %s: %s", row_path, exc)
+    folder_rows = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    with _index_lock(root):
+        existing = load_index(root)
+        if len(existing) and len(folder_rows):
+            orphans = existing[~existing["path"].isin(set(folder_rows["path"]))]
+            out = pd.concat([orphans, folder_rows], ignore_index=True)
+        else:
+            out = folder_rows if len(folder_rows) else existing
+        if len(out):
+            out = out.sort_values("path", kind="stable", ignore_index=True)   # folder name is an ISO stamp
+            out.to_parquet(root / INDEX_FILENAME, index=False)
+    return out
 
 
 def load_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:

@@ -38,15 +38,21 @@ mkdir -p "$NUMBA_CACHE_DIR"
 cd $HOME/congestion-utm-freespace
 
 TASK=${SLURM_ARRAY_TASK_ID:-0}
-## A short --array silently drops the tail of ARMS, so say so rather than run a partial sweep.
-if [ "$TASK" -ge "${#ARMS[@]}" ]; then
-  echo "FATAL: array task $TASK but ARMS has ${#ARMS[@]} entries — use --array=0-$((${#ARMS[@]} - 1))" >&2
+## --array and ARMS are edited separately, so they drift. Check the array's SIZE, not just this task's
+## index: a too-LONG array shows up as a task with no arm, but a too-SHORT one has no task left over
+## to notice the missing tail — it would just quietly run a partial sweep. Unset outside Slurm, where
+## there is no array to disagree with.
+COUNT=${SLURM_ARRAY_TASK_COUNT:-${#ARMS[@]}}
+if [ "$COUNT" -ne "${#ARMS[@]}" ] || [ "$TASK" -ge "${#ARMS[@]}" ]; then
+  echo "FATAL: --array covers $COUNT task(s) and ARMS has ${#ARMS[@]} entries (this is task $TASK) —" \
+       "use --array=0-$((${#ARMS[@]} - 1))" >&2
   exit 1
 fi
 ARM=${ARMS[$TASK]}
 
-## Array tasks start together and take about the same time, so they finish together too — and
-## save_run's index append is an unlocked read-modify-write that can lose rows when they do.
+## Array tasks start together and take about the same time, so they finish together too, and every
+## one of them ends by appending a row to the shared index. The append holds a lock now, but staggering
+## the starts keeps them from queueing on it at all (and spreads the numba cache warm-up).
 sleep $((TASK * 30))
 
 ## --mode sequential: exact parallel LOSES to sequential on the density scenarios, and relaxed mode
@@ -57,6 +63,11 @@ python -m experiments.run \
   --scenario density_${WORLD}_wing_zipline_amazon_${ARM} \
   --seed $SEED --mode sequential --return-anchor nominal \
   --tag $TAG --no-progress
+
+## A lost index row is silent — the readout below just reports one arm fewer. Each run keeps its own
+## copy of its row, so rebuilding here means whichever task finishes LAST leaves a complete index
+## whatever the shared filesystem did with the lock. Idempotent; never removes anyone else's runs.
+python -c "from freespace_sim import runs; print(len(runs.rebuild_index()), 'runs in index.parquet')"
 
 ## Read out per operator once the array finishes. compare.py is run-wide only; the per-USS split this
 ## experiment is about lives in each run folder's per_uss.parquet:

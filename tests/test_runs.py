@@ -344,3 +344,45 @@ def test_colliding_run_folders_are_suffixed_not_merged(tmp_path, caplog):
     for f in (a, b):                                   # both runs are complete and independent
         assert (f / "summary.json").stat().st_size > 0
         assert len(pd.read_parquet(f / "flights.parquet")) == len(_small().intents)
+
+
+# --- index durability: the append is a read-modify-write, so a row can be lost ------------------
+
+def test_every_run_keeps_its_own_copy_of_its_index_row(tmp_path):
+    folder = runs.save_run(_small(), root=tmp_path, label="solo", scenario="metro_2uss")
+    row = pd.read_parquet(folder / runs.INDEX_ROW_FILENAME)
+    idx = runs.load_index(tmp_path)
+    assert len(row) == 1
+    # identical to what landed in the shared index — this is what makes a rebuild lossless
+    pd.testing.assert_frame_equal(row, idx.reset_index(drop=True))
+
+
+def test_rebuild_index_restores_a_row_a_concurrent_writer_dropped(tmp_path):
+    """Simulates the lost update exactly: two array tasks read the same base and the second rewrite
+    wins. Nothing raises and nothing is missing from disk — the sweep is just silently one run short
+    in every cross-run readout, which is why this is recoverable rather than detectable."""
+    a = runs.save_run(_small(), root=tmp_path, label="arm_a", scenario="s")
+    stale = pd.read_parquet(tmp_path / "index.parquet")          # a's row, as a racing task saw it
+    b = runs.save_run(_small(), root=tmp_path, label="arm_b", scenario="s")
+    lost = pd.concat([stale.iloc[0:0], pd.read_parquet(b / runs.INDEX_ROW_FILENAME)], ignore_index=True)
+    lost.to_parquet(tmp_path / "index.parquet", index=False)     # ...b's rewrite clobbers a's row
+    assert len(runs.load_index(tmp_path)) == 1
+
+    out = runs.rebuild_index(tmp_path)
+    assert set(out["path"]) == {str(a), str(b)}
+    assert len(runs.load_index(tmp_path)) == 2
+    assert runs.rebuild_index(tmp_path).equals(out)              # idempotent
+
+
+def test_rebuild_index_keeps_rows_it_cannot_find_a_folder_for(tmp_path):
+    # Runs archived before index_row.parquet existed (or whose folder has since been moved away) are
+    # only in the shared file. A rebuild must not quietly delete them to "restore" the index.
+    runs.save_run(_small(), root=tmp_path, label="current", scenario="s")
+    idx = runs.load_index(tmp_path)
+    legacy = idx.copy()
+    legacy["path"] = str(tmp_path / "2020-01-01T00-00-00_archived_s0_deadbeef")
+    pd.concat([legacy, idx], ignore_index=True).to_parquet(tmp_path / "index.parquet", index=False)
+
+    out = runs.rebuild_index(tmp_path)
+    assert len(out) == 2
+    assert any("archived" in p for p in out["path"])

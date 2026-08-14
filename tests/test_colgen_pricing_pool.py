@@ -327,8 +327,11 @@ def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
         (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
+    chunks = [[f] for f in order]
     accepted = _accepted_prefix(
-        _results_before_deadline(_LostResult(priced, lose_at=2), order, deadline=0.0)
+        _results_before_deadline(
+            _LostResult([[r] for r in priced], lose_at=2), chunks, deadline=0.0
+        )
     )
 
     assert accepted.flight_ids == (7, 3)
@@ -348,7 +351,10 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
     accepted = _accepted_prefix(
-        _results_before_deadline(_LostResult(priced, lose_at=None), order, deadline=None)
+        _results_before_deadline(
+            _LostResult([[r] for r in priced], lose_at=None), [[f] for f in order],
+            deadline=None,
+        )
     )
 
     assert accepted.complete
@@ -413,3 +419,56 @@ def test_a_flight_that_never_reached_the_kernel_reports_no_stale_labels():
 
     record = pricing_pool._flight_record(4, 1.5, priced=True)
     assert record == {"flight_id": 4, "task_s": 1.5, "priced": True}
+
+
+@pytest.mark.parametrize("chunksize", [1, 3])
+def test_a_real_pool_sweep_survives_every_supported_chunksize(chunksize):
+    """The gap that let a P1 ship: the fakes above all expose `.next(timeout)`.
+
+    A real `Pool.imap` only returns an `IMapIterator` -- the one type with that method --
+    when its OWN chunksize is 1; above 1 CPython returns
+    `(item for chunk in result for item in chunk)`, a plain generator. So the deadline
+    guard raised `AttributeError` before yielding anything, and every sweep at the
+    documented `--chunksize 8` died. Only a REAL pool has the right return type, which is
+    why this test pays for one.
+    """
+
+    cfg = _cfg()
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+        _request(3, (-4, 4), (4, -4), cfg),
+    ]
+    params = _params(n_pricing_workers=2, pricing_chunksize=chunksize)
+    catalog = StaticTerminalCatalog((), cfg)
+    graphs = {
+        r.flight_id: build_flight_graph(r, cfg, catalog, params) for r in requests
+    }
+    order = [1, 2, 3]
+    result = price_sweep(
+        order, requests, graphs, cfg, params, catalog, {}, DualView({}, cfg),
+        dict.fromkeys(order, 0.0), {}, deadline=None,
+    )
+
+    assert result.complete
+    assert result.flight_ids == tuple(order)
+    assert [r["flight_id"] for r in result.flight_records] == order
+
+
+def test_chunked_and_unchunked_pools_agree_exactly():
+    """`chunksize` is a dispatch knob, so it must not move a single number."""
+
+    cfg = _cfg()
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+        _request(3, (-4, 4), (4, -4), cfg),
+        _request(4, (4, -4), (-4, 4), cfg),
+    ]
+    one = ColGenSolver().solve(
+        requests, cfg, (), _params(n_pricing_workers=2, pricing_chunksize=1)
+    )
+    many = ColGenSolver().solve(
+        requests, cfg, (), _params(n_pricing_workers=2, pricing_chunksize=3)
+    )
+    assert _fingerprint(many) == _fingerprint(one)

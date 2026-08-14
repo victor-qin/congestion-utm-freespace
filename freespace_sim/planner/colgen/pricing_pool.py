@@ -440,17 +440,36 @@ def _sweep_parallel(
         # order so the accepted prefix is the one the sequential loop would have produced,
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
+        # Chunked HERE rather than by `imap`, and that is a correctness requirement.
+        # `Pool.imap` only returns an `IMapIterator` when `chunksize == 1`; above 1 it
+        # returns `(item for chunk in result for item in chunk)` -- a plain generator, which
+        # has no `.next(timeout)`, so the deadline guard below would raise `AttributeError`
+        # before yielding a single result. Batching the work ourselves and asking `imap` for
+        # chunks of one keeps the iterator type fixed while giving the identical work
+        # distribution `Pool._get_tasks` would have produced.
+        chunks = [
+            pricing_order[i:i + params.pricing_chunksize]
+            for i in range(0, len(pricing_order), params.pricing_chunksize)
+        ]
         accepted = _accepted_prefix(
             _results_before_deadline(
-                pool.imap(_price_one, pricing_order, params.pricing_chunksize),
-                pricing_order,
-                deadline,
+                pool.imap(_price_batch, chunks, 1), chunks, deadline
             )
         )
     return replace(accepted, wall_s=time.perf_counter() - sweep_started)
 
 
-def _results_before_deadline(results, pricing_order, deadline):
+def _price_batch(flight_ids):
+    """Price one chunk of flights in a worker, in order.
+
+    Module level because `spawn` pickles by qualified name. Exists so `_sweep_parallel` can
+    hand `imap` a chunksize of one whatever `pricing_chunksize` is -- see the note there.
+    """
+
+    return [_price_one(flight_id) for flight_id in flight_ids]
+
+
+def _results_before_deadline(results, chunks, deadline):
     """Yield ``imap`` results, giving up on the one the parent is still waiting for at
     ``deadline``.
 
@@ -472,25 +491,30 @@ def _results_before_deadline(results, pricing_order, deadline):
     merely *looked* complete would be far worse than the hang -- `master.upper_bound` would
     take a bound over flights that were never priced.
 
-    ``imap`` is ordered, so the k-th result is ``pricing_order[k]``; that is what lets a
-    lost result be named at all. With ``deadline=None`` this blocks exactly as before,
-    which is the documented behaviour for a sweep that was given no time limit -- `solve`
-    always passes one.
+    ``results`` yields CHUNKS, because `imap` only hands back an ``IMapIterator`` -- the one
+    type with ``.next(timeout)`` -- when its own chunksize is 1. `_sweep_parallel` therefore
+    batches the work itself and asks for chunks of one, so this stays ordered and the k-th
+    chunk is ``chunks[k]``, which is what lets a lost result be named at all.
+
+    With ``deadline=None`` this blocks exactly as before, which is the documented behaviour
+    for a sweep that was given no time limit -- `solve` always passes one.
     """
 
-    for index in range(len(pricing_order)):
+    for index in range(len(chunks)):
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         try:
-            yield results.next(remaining)
+            chunk = results.next(remaining)
         except StopIteration:
             return
         except mp.TimeoutError:
             # Exactly the shape `_price_one` returns for a `PricingTimeout`, so the reducer
             # needs no special case: no seconds, no counters, `priced` False -- and an
             # EMPTY search record, because the worker that would have filled it is the one
-            # that never reported back.
-            yield pricing_order[index], False, 0.0, None, 0.0, {}, {}
+            # that never reported back.  Named with the chunk's FIRST flight: nothing in it
+            # reported, and the accepted prefix ends at the earliest of them either way.
+            yield chunks[index][0], False, 0.0, None, 0.0, {}, {}
             return
+        yield from chunk
 
 
 def _accepted_prefix(results) -> SweepResult:

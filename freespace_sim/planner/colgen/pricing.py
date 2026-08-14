@@ -3333,19 +3333,27 @@ def price_flight(
         # can return a different, equally optimal column.  The fallback exists to reproduce
         # the oracle, and it is rare enough that its speed is not the thing to optimize.
         _fallback_started = time.perf_counter()
-        reduced_cost, column = _best_column(
-            fg,
-            view,
-            pi_value,
-            cfg,
-            benefit,
-            forbidden,
-            seed=False,
-            incumbent=incumbent,
-            deadline=deadline,
-            model=model,
-        )
-        _LAST_SEARCH["fallback_s"] = time.perf_counter() - _fallback_started
+        # `finally`, because `_best_column` RAISES `PricingTimeout` when it reaches the
+        # deadline -- and `_price_one` deliberately still ships the record for a timed-out
+        # flight, since that is the most interesting row in a straggler hunt. Recording only
+        # on the success path leaves `fallback_s = 0.0` on exactly the flights where the
+        # fallback consumed the rest of the task, which is the misattribution this split
+        # exists to prevent.
+        try:
+            reduced_cost, column = _best_column(
+                fg,
+                view,
+                pi_value,
+                cfg,
+                benefit,
+                forbidden,
+                seed=False,
+                incumbent=incumbent,
+                deadline=deadline,
+                model=model,
+            )
+        finally:
+            _LAST_SEARCH["fallback_s"] = time.perf_counter() - _fallback_started
     else:
         reduced_cost, column = outcome
     # Paired with `entry_rc` above, and the pair is the point: `final_rc - entry_rc` is how

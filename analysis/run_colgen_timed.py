@@ -104,6 +104,17 @@ def main() -> int:
     ap.add_argument("--solver", default="highs")
     ap.add_argument("--gap-metric", default="cost")
     ap.add_argument("--ladder", type=int, default=0)
+    # ANSWER-AFFECTING, unlike every other knob on this harness. Both change which of two
+    # equally-optimal columns comes back, so a run that moves either is not a clean speed
+    # A/B against one that does not -- the objective may differ without anything being
+    # wrong. Defaults track the shipped `ColGenParams` so the harness measures production
+    # unless asked otherwise.
+    ap.add_argument("--bootstrap-roots", type=int, default=ColGenParams().bootstrap_roots)
+    ap.add_argument(
+        "--bootstrap-ranking", default=ColGenParams().bootstrap_ranking,
+        help="how the bootstrap orders roots before taking the top K; `bound` (g+h) is "
+             "what makes K=1 viable at all.",
+    )
     ap.add_argument(
         "--greedy-budget-s", type=float, default=None,
         help="Pin the greedy's wall clock to this many seconds TOTAL, in place of "
@@ -129,12 +140,16 @@ def main() -> int:
         seed_ladder_steps=args.ladder,
         n_pricing_workers=args.workers,
         pricing_chunksize=args.chunksize,
+        bootstrap_roots=args.bootstrap_roots,
+        bootstrap_ranking=args.bootstrap_ranking,
     )
 
     header = {
         "scenario": args.scenario, "flights": len(requests),
         "iterations": args.iterations, "workers": args.workers,
         "chunksize": args.chunksize, "ladder": args.ladder, "solver": args.solver,
+        "bootstrap_roots": args.bootstrap_roots,
+        "bootstrap_ranking": args.bootstrap_ranking,
     }
     print(json.dumps(header), flush=True)
 

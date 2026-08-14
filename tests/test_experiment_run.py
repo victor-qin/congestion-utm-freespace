@@ -1,10 +1,21 @@
-"""Pure CLI-to-ScenarioSpec override tests for the execute entry point."""
+"""CLI-to-ScenarioSpec override tests for the execute entry point, plus its stderr capture."""
+
+import multiprocessing as mp
+import os
+import sys
+import time
 
 import pytest
 
 import experiments.run as run_module
 from experiments.run import colgen_params_from_args, parse_args, spec_from_args
 from freespace_sim.scenarios import SCENARIOS, with_overrides
+
+
+def _shout(message: str) -> None:
+    """Module level, because a `spawn` child has to import the target rather than inherit it."""
+
+    print(message, file=sys.stderr)
 
 
 def _args(scenario: str, *extra: str):
@@ -97,6 +108,9 @@ def test_colgen_flags_reach_the_planner_params():
         "--colgen-objective", "total_cost", "--colgen-solver", "highs",
         "--colgen-gap-metric", "cost",
         "--colgen-max-air-overrun", "3",
+        "--colgen-workers", "4",
+        "--colgen-seed-ladder", "30",
+        "--colgen-greedy-budget-rate", "1.5",
     )
     params = colgen_params_from_args(args, "colgen")
 
@@ -106,6 +120,9 @@ def test_colgen_flags_reach_the_planner_params():
     assert params.solver == "highs"
     assert params.gap_metric == "cost"
     assert params.max_air_overrun_hops == 3
+    assert params.n_pricing_workers == 4
+    assert params.seed_ladder_steps == 30
+    assert params.greedy_budget_s_per_flight == 1.5
 
 
 def test_colgen_params_are_none_for_every_other_planner():
@@ -119,8 +136,52 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
 
     defaults = colgen_params_from_args(_args("colgen_test", "--planner", "colgen"), "colgen")
 
-    assert defaults.time_limit_s == 120.0
-    assert defaults.objective == "total_delay"
+    assert defaults.time_limit_s == 1200.0
+    assert defaults.objective == "total_cost"
+    # The pricing-path knobs specifically.  These pin the SHIPPED defaults so that changing
+    # one has to be deliberate -- which is the whole point of the test, and both of the
+    # values below moved for measured reasons rather than drifting:
+    #
+    #   `n_pricing_workers` STAYS 0, and the attempt to default it to 4 is worth knowing
+    #   about: the pool is fast (3.50x at 4 workers on density x50) but its memory is
+    #   LINEAR -- 3.9 GB sequential, 12.5 GB at 4 workers, 22.7 GB at 8, sampled across the
+    #   process tree.  The evidence that briefly said otherwise was `rss_children`, which
+    #   is the largest single child rather than the sum and therefore reads flat no matter
+    #   how many workers run.
+    #
+    #   `greedy_budget_s_per_flight` 0.7 -> 0.0, which DISABLES the stage.  At convergence
+    #   it buys 0.129% of objective for +57% of wall, and iteration 1 is bit-identical
+    #   without it because `round_heuristic` sets `best_heuristic` anyway.
+    #
+    # `seed_ladder_steps` still defaults ON, so a `None` leaking through would silently
+    # disable the ladder rather than merely resetting a budget -- the original point here.
+    assert defaults.n_pricing_workers == 0
+    assert defaults.seed_ladder_steps == 20
+    assert defaults.greedy_budget_s_per_flight == 0.0
+    #   The bootstrap is ON at K=1, and the two fields move together: `bootstrap_roots=1`
+    #   works only because `bootstrap_ranking="bound"` orders roots by `g+h`.  At "score"
+    #   K=1 provably fails (`entry_rc` stays exactly 0.0000) and 2 is the floor.  Both are
+    #   ANSWER-AFFECTING -- they change which equally-optimal column returns -- so a change
+    #   here needs an `ab_colgen_parity.py` re-baseline, not just a green suite.
+    assert defaults.bootstrap_roots == 1
+    assert defaults.bootstrap_ranking == "bound"
+
+
+def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():
+    """``0`` is the documented disable path for both, so it must not be rejected.
+
+    Neither is a plain budget: ``seed_ladder_steps=0`` means seed no retimes at all and
+    ``greedy_budget_s_per_flight=0`` means skip the stage.  A validator that treated them
+    like ``n_pricing_workers`` and demanded positivity would make the documented way to
+    turn either off an argparse error instead.
+    """
+
+    off = colgen_params_from_args(
+        _args("colgen_test", "--planner", "colgen",
+              "--colgen-seed-ladder", "0", "--colgen-greedy-budget-rate", "0"),
+        "colgen",
+    )
+    assert (off.seed_ladder_steps, off.greedy_budget_s_per_flight) == (0, 0.0)
 
 
 @pytest.mark.parametrize(
@@ -132,6 +193,9 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
         ("--colgen-solver", "highs"),
         ("--colgen-gap-metric", "cost"),
         ("--colgen-max-air-overrun", "3"),
+        ("--colgen-workers", "4"),
+        ("--colgen-seed-ladder", "30"),
+        ("--colgen-greedy-budget-rate", "1.5"),
     ],
 )
 def test_colgen_flags_require_the_colgen_planner(colgen_flag):
@@ -180,3 +244,78 @@ def test_colgen_flags_are_still_refused_when_the_scenario_picks_another_planner(
     with pytest.raises(SystemExit) as exc:
         parse_args(["--scenario", "metro_uniform", "--colgen-time-limit", "600"])
     assert exc.value.code == 2
+
+
+# --------------------------------------------------------------------------- run.log capture
+
+
+def test_the_stderr_tee_copies_to_both_the_terminal_and_the_file(tmp_path, capfd):
+    """Copies, not moves: losing the terminal would break every interactive run.
+
+    Writes to the DESCRIPTOR rather than through ``sys.stderr``, because pytest replaces the
+    latter with an object of its own and the message would then never reach fd 2 — which
+    would test pytest's capture instead of this one. Under the real entry point the two are
+    the same file.
+    """
+
+    tee = run_module._StderrTee(tmp_path / "run.log")
+    try:
+        os.write(2, b"visible and captured\n")
+    finally:
+        tee.close()
+
+    assert "visible and captured" in (tmp_path / "run.log").read_text()
+    assert "visible and captured" in capfd.readouterr().err
+
+
+def test_the_stderr_tee_captures_a_spawned_child(tmp_path):
+    """The half that matters: pricing warnings come from SPAWNED workers, not the parent.
+
+    A `sys.stderr` swap would pass the parent test above and fail this one, which is why the
+    capture is at the descriptor level.
+    """
+
+    tee = run_module._StderrTee(tmp_path / "run.log")
+    try:
+        ctx = mp.get_context("spawn")
+        process = ctx.Process(target=_shout, args=("from a spawned child",))
+        process.start()
+        process.join(timeout=60)
+    finally:
+        tee.close()
+
+    assert "from a spawned child" in (tmp_path / "run.log").read_text()
+
+
+def test_the_stderr_tee_closes_after_a_spawn_pool_has_run(tmp_path):
+    """`close()` must not wait for EOF on the pipe, because EOF never comes.
+
+    `multiprocessing` launches its resource tracker with `sys.stderr.fileno()` in
+    `fds_to_pass`, and that child outlives the parent — so from the first pool onward,
+    something we do not control holds a duplicate of the tee's write end for the rest of the
+    run. A pump that drained until `read()` returned `b''` would block here forever, *after*
+    the solve finished, on exactly the `--colgen-workers N` runs the capture exists for.
+    Verified directly: after this teardown a `select` on the read end still reports nothing
+    ready and no EOF.
+
+    A plain child-process test cannot reach this — an ordinary child exits and releases the
+    descriptor — which is why it is a separate case from the one above.
+
+    No external timeout marker: ``close()`` joins with a 5 s cap and the pump is a daemon, so
+    the regression is a five-second stall rather than a hang. The elapsed assertion below is
+    what distinguishes "stopped because it was told to" from "stopped because it gave up".
+    """
+
+    tee = run_module._StderrTee(tmp_path / "run.log")
+    try:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(1) as pool:
+            assert pool.map(int, ["7"]) == [7]
+    finally:
+        started = time.monotonic()
+        tee.close()
+        elapsed = time.monotonic() - started
+
+    # The pump polls at 0.2 s and `close()` joins with a 5 s timeout, so anything near the
+    # timeout means it stopped because it gave up rather than because it was told to.
+    assert elapsed < 3.0, f"close() took {elapsed:.1f}s — the pump is waiting on EOF"

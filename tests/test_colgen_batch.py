@@ -88,7 +88,7 @@ def test_run_batch_maps_missing_columns_and_fires_callbacks_in_event_order(
     warnings = []
 
     def fake_solve(self, requests, solve_cfg, static_terms, solve_params,
-                   on_iteration=None):
+                   on_iteration=None, **_kw):
         captured.update(
             requests=requests,
             cfg=solve_cfg,
@@ -157,7 +157,7 @@ def test_run_batch_uses_precommit_acceptance_for_covering_bug_log(monkeypatch, c
         batch.ColGenSolver,
         "solve",
         lambda self, requests, solve_cfg, static_terms, params,
-        on_iteration=None: ColGenResult(
+        on_iteration=None, **_kw: ColGenResult(
             columns={request.flight_id: object()},
             stats={},
         ),
@@ -336,7 +336,7 @@ def test_run_batch_forwards_the_per_iteration_callback(monkeypatch):
     cfg = _cfg()
     seen: list = []
 
-    def _capture(self, requests, solve_cfg, static_terms, params, on_iteration=None):
+    def _capture(self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw):
         seen.append(on_iteration)
         return ColGenResult(columns={}, stats={})
 
@@ -410,7 +410,7 @@ def test_a_budget_terminated_solve_says_so(monkeypatch, caplog):
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
             columns={}, stats={"termination_reason": "time_limit", "iterations": 1},
         ),
     )
@@ -438,7 +438,7 @@ def test_an_early_revenue_gap_close_is_flagged_against_the_cost_scale(monkeypatc
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
             columns={},
             stats={
                 "termination_reason": "lp_gap", "iterations": 1,
@@ -468,7 +468,7 @@ def test_a_genuinely_converged_solve_is_not_flagged(monkeypatch, caplog):
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
             columns={},
             stats={
                 "termination_reason": "lp_gap", "iterations": 40,
@@ -501,7 +501,7 @@ def test_an_uncertified_final_ip_is_not_reported_as_a_budget_timeout(monkeypatch
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
             columns={},
             stats={
                 "termination_reason": "ip_not_proven", "iterations": 12,
@@ -533,7 +533,7 @@ def test_the_iteration_cap_is_announced_like_the_other_truncated_exits(monkeypat
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
             columns={}, stats={"termination_reason": "iteration_limit", "iterations": 30},
         ),
     )
@@ -561,7 +561,7 @@ def test_a_heuristic_gap_stop_is_measured_against_the_heuristic_threshold(monkey
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None: ColGenResult(
+        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
             columns={},
             stats={
                 "termination_reason": "heuristic_gap", "iterations": 3,

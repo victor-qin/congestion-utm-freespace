@@ -40,6 +40,7 @@ from .pricing import (
     price_flight,
     seed_column,
 )
+from .pricing_pool import price_sweep
 from .translate import Column
 
 _FEASIBILITY_TOL = 1e-7
@@ -139,6 +140,52 @@ def _shift_column(
         delay_s=column.delay_s + model.ground_weight * (delta * cfg.dt_s),
         claims=_shift_claims(column.claims, delta),
     )
+
+
+def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
+    """Offer the master `steps` pure clock translations of one flight's seed.
+
+    Pricing spends its early iterations rediscovering exactly these: measured over a
+    converged 100-flight solve, 91% of the columns added in iterations 2-11 were time
+    shifts of a route already in the pool.  A shift is a `_shift_column` translation --
+    arithmetic, no DP -- so handing them over up front converts search into addition.
+
+    Depth is a real dial with a knee, not "more is better".  Measured at 20 iterations on
+    density_faa/100, cost-scale LP gap: k=4 5.1e-3, k=10 4.2e-3, k=20 3.8e-4, k=50 4.3e-3.
+    k=20 is 13x tighter than k=4 for 18% more wall; k=50 REGRESSES to k=10's quality while
+    carrying 2.3x the columns.  The reason is that the optimum here never delays a flight
+    more than 14 steps, so a ladder past that adds departures no schedule wants, and tied
+    columns feed the master's degeneracy instead of resolving it.  The useful depth is set
+    by the solution's slip, not by `max_ground_delay_s` -- which allows 900 steps here.
+
+    Denser traffic slips further and moves the knee, so 20 is calibrated, not universal.
+    """
+
+    if steps <= 0:
+        return 0
+    # BOTH bounds, stated.  `latest_departure_step` alone is not the limit: this path must
+    # also arrive by `max_step`, which is the bound `_initial_feasible_selection` computes
+    # explicitly for the same reason.  Leaving it to be caught as a `ValueError` from
+    # `column_claims` works -- the horizon is the only shift-dependent failure, since a
+    # clock translation leaves the wall verdict and the detour budget invariant, and it is
+    # monotone in `step` so `break` is right -- but `column_claims` raises `ValueError` for
+    # eight other reasons too, and every one of them would be silently read as "the ladder
+    # ended here" rather than as the regression it would be.
+    origin_lane_steps = (
+        0 if seed.origin_lane_idx is None else graph.origin_lanes[seed.origin_lane_idx].steps
+    )
+    path_latest_departure = (
+        graph.max_step
+        - graph.takeoff_steps[seed.level]
+        - origin_lane_steps
+        - (len(seed.cell_path) - 1)
+    )
+    latest = min(graph.latest_departure_step, path_latest_departure)
+    added = 0
+    for step in range(seed.departure_step + 1, min(seed.departure_step + steps, latest) + 1):
+        master.add_column(_canonical_column(_shift_column(seed, step, cfg, model), graph, cfg))
+        added += 1
+    return added
 
 
 def _initial_feasible_selection(
@@ -492,7 +539,15 @@ def _pre_master_timeout_result(
             "heuristic_gap_cost": math.inf,
             "ip_gap_revenue": None,
             "pricing_wall_s": 0.0,
+            "pricing_task_total_s": 0.0,
+            "n_pricing_workers": 0,
+            "kernel_priced": 0,
+            "kernel_fell_back": 0,
+            "kernel_label_restarts": 0,
+            "kernel_budget_declined": 0,
+            "kernel_declined_by_reason": {},
             "seeded_columns": 0,
+            "ladder_columns": 0,
             "ip_elapsed_s": 0.0,
             "ip_objective": None,
             "ip_upper_bound": None,
@@ -568,9 +623,22 @@ class ColGenSolver:
     ) -> ColGenResult:
         """Run the column-generation loop to convergence, a bound, or a time limit.
 
-        Pricing is a sequential sweep over the flights: each subproblem is independent
-        given the iteration's duals, so the loop order affects only which columns a
-        timed-out sweep managed to reach, never their value.
+        Pricing is a sweep over the flights: each subproblem is independent given the
+        iteration's duals, so the loop order affects only which columns a timed-out sweep
+        managed to reach, never their value.
+
+        ``params.n_pricing_workers`` fans that sweep across worker processes; 0 keeps it
+        in-process.  :func:`pricing_pool.price_sweep` reproduces the sequential loop's
+        prefix RULE and hands the reduced costs back in index order, so on a sweep that
+        FINISHES the columns and the objective are unchanged.  A sweep that hits
+        ``pricing_deadline`` is a different matter: the timeout is a wall clock rather than
+        a work budget, and a pool gets further through ``pricing_order`` before the same
+        absolute deadline than one core does, so it keeps a longer prefix.  More pricing
+        inside the same budget, but not the same answer -- see :mod:`.pricing_pool`.
+
+        There is no ``parallel=`` keyword.  It used to take a separate
+        ``ParallelPricingConfig``, which duplicated a count ``params`` already carried and
+        let the two defaults disagree; the sweep reads ``params`` directly now.
 
         ``on_iteration`` is called once per column-generation iteration with a dict of
         that iteration's master state (LP objective, global upper bound, gaps, column
@@ -582,6 +650,11 @@ class ColGenSolver:
         """
         started = time.monotonic()
         pricing_wall_s = 0.0
+        pricing_task_total_s = 0.0
+        # Every compiled-pricing counter each sweep reported, summed: `priced`, `fell_back`,
+        # the label-pool `label_restarts` / `budget_declined` pair, and one
+        # `declined_<reason>` key per `pricing.Declined` cause that fired.
+        kernel_counters: Counter[str] = Counter()
         deadline = started + params.time_limit_s
         # Leave a small tail for the final restricted-master IP.  An incomplete
         # pricing sweep cannot certify a global bound, but every completed
@@ -622,7 +695,15 @@ class ColGenSolver:
                     "heuristic_gap_cost": 0.0,
                     "ip_gap_revenue": None,
                     "pricing_wall_s": 0.0,
+                    "pricing_task_total_s": 0.0,
+                    "n_pricing_workers": 0,
+                    "kernel_priced": 0,
+                    "kernel_fell_back": 0,
+                    "kernel_label_restarts": 0,
+                    "kernel_budget_declined": 0,
+                    "kernel_declined_by_reason": {},
                     "seeded_columns": 0,
+                    "ladder_columns": 0,
                     "ip_elapsed_s": 0.0,
                     "ip_objective": None,
                     "ip_upper_bound": None,
@@ -746,6 +827,7 @@ class ColGenSolver:
         time_to_master_s = time.monotonic() - started
         seedless_flights: set[int] = set()
         seeds: dict[int, Column] = {}
+        ladder_columns = 0
         seed_started = time.monotonic()
         for flight_id in flight_ids:
             try:
@@ -777,6 +859,9 @@ class ColGenSolver:
             seed = _canonical_column(seed, graphs[flight_id], cfg)
             seeds[flight_id] = seed
             master.add_column(seed)
+            ladder_columns += _add_departure_ladder(
+                master, seed, graphs[flight_id], cfg, model, params.seed_ladder_steps
+            )
         seed_elapsed_s = time.monotonic() - seed_started
 
         shifted_seed_heuristic = _initial_feasible_selection(
@@ -910,10 +995,33 @@ class ColGenSolver:
             if iteration == 0:
                 # The first LP has now established the real column-generation
                 # cycle.  Build at most one route-aware incumbent column per
-                # flight using the same lazy topology, bounded independently so
-                # formal reduced-cost pricing retains most of the solve budget.
+                # flight using the same lazy topology, bounded independently of
+                # the pricing loop.
+                #
+                # "Independently" no longer means "as a share of the solve".  The
+                # budget below is per FLIGHT and the old `0.55 * time_limit_s`
+                # factor is gone, so the only thing keeping this stage away from
+                # the whole budget is the absolute `pricing_deadline` clamp.
+                #
+                # The shipped rate is now 0, which disables the stage outright,
+                # so none of that arithmetic runs by default -- see
+                # `greedy_budget_s_per_flight` for why.  It still describes what
+                # an ENABLED rate costs: at 0.7 s (the old default) against a
+                # 1200 s limit, ~850 flights makes the greedy half of pricing's
+                # budget and ~1700 makes it all of it.  A ceiling on batch size
+                # rather than a guarantee, and the reason a very large batch
+                # wants its rate chosen rather than copied.
                 greedy_started = time.monotonic()
-                greedy_budget_s = min(60.0, 0.55 * params.time_limit_s)
+                # PER FLIGHT, because the stage divides its budget across candidates and a
+                # fixed total therefore starves as the batch grows.  The old
+                # `min(60.0, 0.55 * time_limit_s)` split 60 s across up to
+                # `candidate_limit` = 256 candidates, giving each ~0.23 s at 500 flights --
+                # far under one density search.  Measured there: 170 of 202 searches
+                # entered the compiled kernel and 168 were cut off inside it, so the stage
+                # spent its whole budget to improve about two flights.  It was also the
+                # reason a solve stopped being reproducible above ~300 flights: when nearly
+                # every candidate is decided by a stopwatch, machine load picks the winners.
+                greedy_budget_s = params.greedy_budget_s_per_flight * len(flight_ids)
                 greedy_deadline = min(pricing_deadline, greedy_started + greedy_budget_s)
                 greedy_heuristic, greedy_completed = _greedy_feasible_selection(
                     graphs,
@@ -956,24 +1064,29 @@ class ColGenSolver:
             # iteration 80 as expensive as iteration 1" -- and that question decides
             # whether more iterations are affordable.
             sweep_started = time.perf_counter()
-            for flight_id in pricing_order:
-                try:
-                    reduced_cost, column = price_flight(
-                        graphs[flight_id],
-                        dual_view,
-                        flight_duals[flight_id],
-                        cfg,
-                        params,
-                        known_column=best_heuristic.get(flight_id),
-                        deadline=pricing_deadline,
-                    )
-                except PricingTimeout:
-                    pricing_complete = False
-                    pricing_timeout_flight_id = flight_id
-                    break
+            sweep = price_sweep(
+                pricing_order,
+                ordered_requests,
+                graphs,
+                cfg,
+                params,
+                static_catalog,
+                capacity_duals,
+                dual_view,
+                flight_duals,
+                best_heuristic,
+                deadline=pricing_deadline,
+            )
+            # Consumed in index order, which is what keeps a parallel sweep's answer equal
+            # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
+            # float addition is not associative.  `SweepResult` has already discarded
+            # everything at or past the first timeout, reproducing the loop's `break`.
+            for flight_id, reduced_cost, column in zip(
+                sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
+            ):
                 pricing_flights_completed += 1
-                best_reduced_costs.append(float(reduced_cost))
-                rc_by_flight[flight_id] = float(reduced_cost)
+                best_reduced_costs.append(reduced_cost)
+                rc_by_flight[flight_id] = reduced_cost
                 if column is not None and reduced_cost > _REDUCED_COST_TOL:
                     priced_columns.append(
                         _timed(
@@ -981,9 +1094,19 @@ class ColGenSolver:
                             column, graphs[flight_id], cfg,
                         )
                     )
+            if not sweep.complete:
+                pricing_complete = False
+                pricing_timeout_flight_id = sweep.timeout_flight_id
 
             iteration_sweep_s = time.perf_counter() - sweep_started
             pricing_wall_s += iteration_sweep_s
+            # Production telemetry, summed across the solve.  A compiled-path fallback is
+            # the one regression nothing else can see: same column, same objective, 3-4.5x
+            # the time.  `sweep_task_total_s` against `pricing_wall_s * n_workers` is the
+            # pool's occupancy, which is the difference between "parallelism is not paying"
+            # and "parallelism is paying and the machine is saturated".
+            pricing_task_total_s += sweep.task_total_s
+            kernel_counters.update(sweep.kernel_counters)
 
             before_pricing = len(master.columns)
             for column in sorted(
@@ -1086,6 +1209,19 @@ class ColGenSolver:
                     # This iteration's pricing cost -- the wall the solver spent in the
                     # sweep, which is very nearly the wall of the whole iteration.
                     "sweep_s": iteration_sweep_s,
+                    # The work the sweep actually did, against the wall above.  With a
+                    # pool, `sweep_task_total_s / (sweep_s * n_workers)` is the fraction of
+                    # worker-seconds spent computing; the rest is workers idle behind a
+                    # straggler.  That distinguishes scheduling loss from dispatch overhead,
+                    # and only the latter is something `chunksize` can address.
+                    "sweep_task_total_s": sweep.task_total_s,
+                    # Per-flight rows behind that sum, in `pricing_order` index order.  The
+                    # sum says how much work the sweep did; only these say WHERE it went,
+                    # and a pool's wall clock is set by its slowest single task rather than
+                    # by the total.  Available under a pool as well as sequentially, which
+                    # `prof_colgen_cutoff.py` cannot be: its instrumentation rebinds a
+                    # module global in this process and a spawned worker imports its own.
+                    "sweep_flight_records": sweep.flight_records,
                     "columns": len(master.columns),
                     "columns_added": len(priced_columns),
                     "rc_sum": math.fsum(positives),
@@ -1406,8 +1542,34 @@ class ColGenSolver:
             # its time, so this against `elapsed_s` says how much of the run was the
             # subproblem and how much was the master.
             "pricing_wall_s": pricing_wall_s,
+            # What the sweep's workers COMPUTED, against the wall above.  Divided by
+            # `pricing_wall_s * n_pricing_workers` this is the pool's occupancy; equal to
+            # `pricing_wall_s` when the sweep ran sequentially.  Without it a slow run
+            # cannot be told apart from a badly-scheduled one after the fact.
+            "pricing_task_total_s": pricing_task_total_s,
+            "n_pricing_workers": params.n_pricing_workers,
+            # Exact-pricing calls and how many fell back to the pure-Python reference.
+            # A fallback returns the SAME column 3-4.5x slower, so it moves no other number
+            # in this dict; a nonzero count is the only way a run reports that its compiled
+            # path was not actually serving it.
+            "kernel_priced": kernel_counters.get("priced", 0),
+            "kernel_fell_back": kernel_counters.get("fell_back", 0),
+            # WHY it fell back, which the count alone cannot say: "numba is missing" and "a
+            # partial expansion saturated on real data" call for opposite responses, and the
+            # warning that distinguishes them goes to stderr and dies with the process.  The
+            # pair below is the label pool's precursor and its failure -- restarts climbing
+            # while declines stay 0 is a run paying for the pool it needs without having lost
+            # the compiled path yet.
+            "kernel_label_restarts": kernel_counters.get("label_restarts", 0),
+            "kernel_budget_declined": kernel_counters.get("budget_declined", 0),
+            "kernel_declined_by_reason": {
+                key.removeprefix("declined_"): value
+                for key, value in sorted(kernel_counters.items())
+                if key.startswith("declined_")
+            },
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
+            "ladder_columns": ladder_columns,
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,

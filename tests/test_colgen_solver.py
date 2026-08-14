@@ -12,11 +12,13 @@ import math
 import time
 from collections import Counter
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 import pytest
 
 import freespace_sim.planner.colgen.master as master_module
+import freespace_sim.planner.colgen.pricing_pool as pricing_pool_module
 import freespace_sim.planner.colgen.solver as solver_module
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
@@ -38,12 +40,15 @@ from freespace_sim.planner.colgen.pricing import (
     price_flight,
     seed_column,
 )
+from freespace_sim.planner.colgen.objective import DELAY_MODEL, cost_model
 from freespace_sim.planner.colgen.solver import (
     ColGenSolver,
+    _add_departure_ladder,
     _fixed_loads,
     _greedy_feasible_selection,
     _initial_feasible_selection,
     _shift_claims,
+    _shift_column,
 )
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import (
@@ -97,6 +102,18 @@ def _params(**overrides) -> ColGenParams:
         "max_iterations": 30,
         "time_limit_s": 30.0,
         "n_heuristic_tries": 16,
+        # SEQUENTIAL, deliberately not the shipped default of 4 -- and this is a
+        # correctness pin, not a speed one.  Most tests in this file stub a pricing seam
+        # with `monkeypatch.setattr(pricing_pool, "price_flight", ...)`, and the pool uses
+        # the `spawn` context: a worker re-imports the module and gets the REAL function,
+        # so the stub reaches only the parent, which prices nothing.  Two tests caught this
+        # by failing outright when the default moved; the rest would have gone on passing
+        # against unstubbed pricing, which is worse.  The same spawn-boundary rule is why
+        # `prof_colgen_stages` refuses `--max-label-log2` under `--workers`.
+        #
+        # The SHIPPED default is pinned in `test_experiment_run.py`, and the pool's own
+        # behaviour in `test_colgen_pricing_pool.py`, which asks for workers by name.
+        "n_pricing_workers": 0,
     }
     values.update(overrides)
     return ColGenParams(**values)
@@ -127,15 +144,40 @@ def _assert_claim_feasible(columns: dict[int, Column], rows: RowIndex | None = N
     assert all(load <= rows.cap(row) for row, load in loads.items())
 
 
+# The SHIPPED default, spelled out.  `cost_model(cfg, None)` returns `DELAY_MODEL` -- a
+# caller with no params object has no config opinion to read -- so `None` is the wrong
+# default for a helper whose callers DID solve with real params.
+_SHIPPED_PARAMS = ColGenParams()
+
+
 def _assert_files_cleanly(
-    requests: list[FlightRequest], columns: dict[int, Column], cfg: SimConfig
+    requests: list[FlightRequest],
+    columns: dict[int, Column],
+    cfg: SimConfig,
+    params: Any = _SHIPPED_PARAMS,
 ) -> None:
+    """Every column files as an accepted, conflict-free intent priced in the right currency.
+
+    ``params`` selects the currency and defaults to the shipped one.  It has to be a
+    parameter at all because ``Column.delay_s`` is the OBJECTIVE's verdict, not a duration:
+    under the config's 1:3 weighting it is `w_ground*ground + w_air*air`, which equals
+    ``total_delay_s`` only when the two weights are 1 -- or when the column happens to fly
+    the geodesic, so the air term is zero.  Asserting the unweighted metric here used to
+    hold by accident and would now silently pass for every ground-only column while failing
+    on exactly the detour columns these tests exist to construct.
+    """
+
+    model = cost_model(cfg, params)
     by_id = {request.flight_id: request for request in requests}
     ledger = ReservationLedger(cfg)
     for flight_id, column in sorted(columns.items()):
         intent = column_to_intent(column, by_id[flight_id], cfg)
         assert intent.status is IntentStatus.ACCEPTED
-        assert column.delay_s == pytest.approx(total_delay_s(intent, cfg), abs=1e-9)
+        ground_s = intent.ground_delay_s
+        expected_cost = model.evaluate(
+            ground_s=ground_s, air_detour_s=total_delay_s(intent, cfg) - ground_s
+        )
+        assert column.delay_s == pytest.approx(expected_cost, abs=1e-9)
         assert not ledger.any_conflict(intent.volumes)
         ledger.commit(flight_id, intent.volumes)
 
@@ -258,7 +300,17 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
     # itself an air-time overrun, and this test is about the delay accounting rather than
     # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic. Lifted at
     # the graph so the corridor stays where the fixture put it (issue #78: one knob sizes both).
-    params = _params(max_air_overrun_hops=2)
+    #
+    # `objective` is pinned to `total_delay` rather than left at the shipped `total_cost`,
+    # and this is the one test in the file where that is the right call rather than a dodge.
+    # The property under test is in the name: fold replacement is not "unavoidable delay".
+    # It is a claim about the DELAY ACCOUNTING -- that an extra hop which buys back terminal
+    # folding distance is correctly credited -- and the fixture is hand-built so the two
+    # exactly cancel, which is a statement in unit seconds. Under 1:3 the hop is repriced at
+    # 3x while the fold it replaces is a continuous distance, so they no longer cancel and
+    # the optimum moves to a shorter path on a different lane (observed: lane 4, one hop).
+    # That is the objective working correctly; it is simply no longer this test's question.
+    params = _params(max_air_overrun_hops=2, objective="total_delay")
     graph = build_flight_graph(
         request,
         cfg,
@@ -417,8 +469,11 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
         (2, 0),
     )
     assert len(column.cell_path) - 1 > graph.shortest_hops + corridor
-    assert column.delay_s == pytest.approx(16.0)
-    assert reduced_cost == pytest.approx(params.M - 16.0)
+    # 4 excess hops x dt(4 s) x w_air(3) under the config's 1:3 weighting.  The COLUMN is
+    # the same one this test has always asserted -- the path equality above is unchanged --
+    # and only the currency it is priced in moved, from 16 s to 48 cost.
+    assert column.delay_s == pytest.approx(48.0)
+    assert reduced_cost == pytest.approx(params.M - 48.0)
     assert column.claims.isdisjoint(duals)
 
     _lo, hi = derive_cell_window(cfg)
@@ -702,11 +757,17 @@ def test_hand_checked_detour_beats_hold():
         _params(max_air_overrun_hops=1, gap_metric="cost"),
     )
 
+    # The claim is unchanged and is the name of the test: a one-hop detour still beats a
+    # four-step hold.  Only the margin moved.  Under the config's 1:3 weighting the hold
+    # costs 16 (16 ground seconds, w_ground = 1, the numeraire) and the detour costs 12
+    # (1 hop x dt(4 s) x w_air(3)) -- so the detour wins by 4 where it used to win by 12.
+    # That narrowing is the point of the weighting, and a ratio above 4:1 would flip it.
     assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
-    assert with_detour.stats["objective"] == pytest.approx(4.0, abs=1e-8)
-    assert with_detour.stats["cost_lower_bound"] == pytest.approx(4.0, abs=1e-7)
-    assert with_detour.stats["cost_upper_bound"] == pytest.approx(4.0, abs=1e-7)
-    assert sorted(column.delay_s for column in with_detour.columns.values()) == [0.0, 4.0]
+    assert with_detour.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert with_detour.stats["objective"] < no_detour.stats["objective"]
+    assert with_detour.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
+    assert with_detour.stats["cost_upper_bound"] == pytest.approx(12.0, abs=1e-7)
+    assert sorted(column.delay_s for column in with_detour.columns.values()) == [0.0, 12.0]
     assert any(
         len(column.cell_path) - 1 == hg.hex_distance(column.cell_path[0], column.cell_path[-1]) + 1
         for column in with_detour.columns.values()
@@ -741,12 +802,18 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
 
     assert revenue.stats["termination_reason"] == "lp_gap"
     assert revenue.stats["iterations"] == 1
-    # Optimal solution ...
-    assert revenue.stats["objective"] == pytest.approx(4.0, abs=1e-8)
-    assert revenue.stats["cost_lower_bound"] == pytest.approx(4.0, abs=1e-7)
-    # ... reached while the two scales disagree by five orders of magnitude.
+    # Optimal solution ... (12 = 1 detour hop x dt(4 s) x w_air(3); the same column as
+    # before the objective default moved to the config's 1:3 weighting, repriced)
+    assert revenue.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert revenue.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
+    # ... reached while the two scales disagree by orders of magnitude.  Asserted as the
+    # RATIO between them rather than as a floor on the cost gap: `lp_gap_cost` normalises
+    # the same absolute gap by total cost, so repricing the optimum from 4 to 12 divides it
+    # by three (0.75 -> 0.25) without changing anything this test is about.  The ratio is
+    # the claim -- the revenue scale closes while the cost scale is nowhere near closing.
     assert revenue.stats["lp_gap_revenue"] < 1e-4
-    assert revenue.stats["lp_gap_cost"] > 0.5
+    assert revenue.stats["lp_gap_cost"] > 0.2
+    assert revenue.stats["lp_gap_cost"] > 1e3 * revenue.stats["lp_gap_revenue"]
 
 
 def test_colgen_beats_fcfs_on_constructed_congestion():
@@ -779,10 +846,22 @@ def test_colgen_beats_fcfs_on_constructed_congestion():
 
     assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 16.0]
     assert fcfs_delays == pytest.approx([0.0, 24.0, 24.0])
-    # `objective` is in the cost model's currency; this solve runs the default delay
-    # objective, so here it is seconds and comparable to the A* delays directly.
-    assert colgen.stats["objective_name"] == "total_delay"
+    # `objective` is in the cost model's currency, which is now the config's 1:3 weighting
+    # and NOT seconds in general.  It is comparable to the A* delays here for a reason
+    # specific to this instance: colgen resolves the congestion entirely with GROUND delay
+    # (the columns above are 0/0/16 s of hold and no detour), and `cost_ground_delay_per_s`
+    # is the numeraire at 1.0, so ground seconds and cost coincide exactly.  An instance
+    # that resolved it with a detour would scale that term by 3 and the comparison below
+    # would be between two different units.
+    assert colgen.stats["objective_name"] == "total_cost"
     assert colgen.stats["objective"] == pytest.approx(16.0)
+    # The premise of that paragraph, asserted rather than assumed: every column flies the
+    # geodesic, so the air term is zero and only the ground term is left.
+    assert all(
+        len(column.cell_path) - 1
+        == hg.hex_distance(column.cell_path[0], column.cell_path[-1])
+        for column in colgen.columns.values()
+    )
     assert colgen.stats["objective"] < sum(fcfs_delays)
     _assert_files_cleanly(requests, colgen.columns, cfg)
 
@@ -870,12 +949,17 @@ def test_first_master_has_only_bounded_shortest_path_initialization(monkeypatch)
     ]
     events: list[str] = []
     first_lp_counts: Counter[int] = Counter()
+    first_lp_routes: dict[int, set] = {}
     original_solve_lp = RestrictedMaster.solve_lp
 
     def capture_first_lp(master):
         events.append("lp")
         if not first_lp_counts:
             first_lp_counts.update(column.flight_id for column in master.columns)
+            for column in master.columns:
+                first_lp_routes.setdefault(column.flight_id, set()).add(
+                    tuple(column.cell_path)
+                )
         return original_solve_lp(master)
 
     def capture_greedy(*_args, **kwargs):
@@ -890,7 +974,15 @@ def test_first_master_has_only_bounded_shortest_path_initialization(monkeypatch)
     assert result.columns
     assert first_lp_counts
     assert set(first_lp_counts) == {1, 2}
-    assert max(first_lp_counts.values()) <= 2
+    # The contract is "no ROUTE alternatives before the first LP", and a departure
+    # ladder is not one: every pre-LP column for a flight is the same cell path at a
+    # different clock.  Asserting that directly is stronger than the old <=2 column
+    # count, which was a proxy that the ladder (seed_ladder_steps) invalidated without
+    # touching the invariant.
+    assert max(first_lp_counts.values()) <= 1 + _params().seed_ladder_steps
+    assert all(len(routes) == 1 for routes in first_lp_routes.values()), (
+        f"pre-LP pool holds route alternatives: {first_lp_routes}"
+    )
     assert events.index("lp") < events.index("greedy")
 
 
@@ -991,6 +1083,82 @@ def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
     )
     if priced is not None:
         assert column_claims(priced, graph, cfg) == priced.claims
+
+
+class _ColumnRecorder:
+    """Everything `_add_departure_ladder` needs from a master, and nothing else."""
+
+    def __init__(self) -> None:
+        self.columns: list[Column] = []
+
+    def add_column(self, column: Column) -> None:
+        self.columns.append(column)
+
+
+def test_the_departure_ladder_offers_clock_translations_up_to_the_ground_budget():
+    """Every rung is the same route later, and the ground budget bounds how many there are.
+
+    `max_ground_delay_s=48` at `dt_s=4` is twelve steps, so a seed departing at `base_step`
+    has exactly twelve legal retimes however many are asked for.  The delay assertion is
+    what makes these *translations* rather than columns: `_shift_column` may only move the
+    ground term, so the air term has to survive `_canonical_column` untouched.
+    """
+
+    cfg = _cfg(max_ground_delay_s=48.0)
+    request = _request(1, (-4, 0), (4, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = seed_column(graph, cfg)
+    assert seed.departure_step == graph.base_step
+
+    master = _ColumnRecorder()
+    added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, 20)
+
+    assert added == len(master.columns) == 12
+    assert [c.departure_step for c in master.columns] == list(range(1, 13))
+    for column in master.columns:
+        delta = column.departure_step - seed.departure_step
+        assert column.cell_path == seed.cell_path
+        assert column.delay_s == pytest.approx(seed.delay_s + delta * cfg.dt_s, abs=1e-9)
+        # The ladder feeds `master.add_column` directly, so an illegal rung is not caught
+        # anywhere downstream -- it is simply in the LP.
+        assert column_claims(column, graph, cfg) == column.claims
+
+    assert _add_departure_ladder(_ColumnRecorder(), seed, graph, cfg, DELAY_MODEL, 0) == 0
+
+
+def test_the_departure_ladder_stops_at_the_arrival_horizon_not_the_ground_budget():
+    """The second bound is load-bearing, and only a longer-than-nominal seed shows it.
+
+    `seed_column` walks the corridor and is not bounded by `max_air_hops`, so a detoured
+    seed arrives later than the graph sized itself for -- the same fixture as
+    `test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon`, where the seed is
+    22 hops against a 21-hop ceiling.  That pulls the last legal departure to 11 while the
+    ground budget still says 12, and a ladder that trusted `latest_departure_step` alone
+    would hand the master a column whose `_canonical_column` raises `ValueError: column
+    arrives at step 39, beyond graph maximum 38` -- during seeding, so the solve dies before
+    its first LP.
+    """
+
+    cfg = _cfg(max_ground_delay_s=48.0)
+    request = _request(1, (-10, 0), (10, 0), cfg)
+    static_terms = tuple(
+        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=0.0))
+        for index, cell in enumerate(((3, 1), (1, -1)))
+    )
+    graph = build_flight_graph(request, cfg, static_terms, _params(max_air_overrun_hops=1))
+    seed = seed_column(graph, cfg)
+    assert len(seed.cell_path) - 1 > graph.max_air_hops
+
+    master = _ColumnRecorder()
+    added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, 20)
+
+    assert added == 11 < graph.latest_departure_step
+    assert [c.departure_step for c in master.columns] == list(range(1, 12))
+    for column in master.columns:
+        assert column_claims(column, graph, cfg) == column.claims
+    # The step the ground budget would have allowed, and the arrival horizon does not.
+    with pytest.raises(ValueError, match="beyond graph maximum"):
+        column_claims(_shift_column(seed, graph.latest_departure_step, cfg), graph, cfg)
 
 
 def test_repair_finds_feasible_column_even_when_delay_exceeds_m():
@@ -1123,7 +1291,8 @@ def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
         _request(2, (0, -4), (0, 4), cfg),
     ]
 
-    result = ColGenSolver().solve(requests, cfg, (), _params())
+    # ladder off so the heuristic cannot prove the gap and skip the MILP outright.
+    result = ColGenSolver().solve(requests, cfg, (), _params(seed_ladder_steps=0))
 
     assert result.stats["ip_status"] != "skipped", "this fixture must reach the IP"
     elapsed = result.stats["ip_elapsed_s"]
@@ -1193,6 +1362,11 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         "initial_greedy_elapsed_s",
         "ip_elapsed_s",
         "pricing_wall_s",
+        # A wall measurement like the rest.  `kernel_priced` / `kernel_fell_back` are
+        # deliberately NOT excluded: they are counts, and a run that falls back a different
+        # number of times took a different path through the code, which is exactly the kind
+        # of difference this contract exists to catch.
+        "pricing_task_total_s",
         "seed_elapsed_s",
         "time_to_master_s",
     }
@@ -1246,6 +1420,8 @@ def test_backend_parity_when_final_integer_master_runs():
         "ip_gap": 0.0,
     }
 
+    # See note on the ladder below: this test must reach the final integer master.
+    controls = {**controls, "seed_ladder_steps": 0}
     highs = ColGenSolver().solve(requests, cfg, (), _params(solver="highs", **controls))
     gurobi = ColGenSolver().solve(requests, cfg, (), _params(solver="gurobi", **controls))
 
@@ -1315,7 +1491,11 @@ def test_incomplete_pricing_sweep_never_publishes_a_global_bound(monkeypatch):
         column = seed_column(graph, solve_cfg)
         return params.M - column.delay_s, column
 
-    monkeypatch.setattr(solver_module, "price_flight", timeout_on_second)
+    # The sweep moved into `pricing_pool`, so that is where the seam is now.  Patching
+    # `solver_module.price_flight` would silently do nothing -- the solve would run to
+    # completion and the test would assert against a sweep that never timed out.  The
+    # contract under test is unchanged: an incomplete sweep publishes no global bound.
+    monkeypatch.setattr(pricing_pool_module, "price_flight", timeout_on_second)
     monkeypatch.setattr(
         solver_module,
         "_greedy_feasible_selection",
@@ -1427,7 +1607,9 @@ def test_seeding_timeout_reports_partial_master_progress(monkeypatch):
 
     monkeypatch.setattr(solver_module, "seed_column", timeout_on_second)
 
-    result = ColGenSolver().solve(requests, cfg, (), _params())
+    # ladder off: this test counts the partial seed prefix a timeout leaves behind,
+    # and the ladder would add seed_ladder_steps columns per seeded flight on top.
+    result = ColGenSolver().solve(requests, cfg, (), _params(seed_ladder_steps=0))
 
     assert result.columns == {}
     assert result.stats["backend"] == "highs"
@@ -1456,11 +1638,13 @@ def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
         "_greedy_feasible_selection",
         lambda *args, **kwargs: ({}, True),
     )
-    monkeypatch.setattr(
-        solver_module,
-        "price_flight",
-        lambda *args, **kwargs: (1.0, None),
-    )
+    # BOTH seams, because there are now two.  The sweep calls
+    # `pricing_pool.price_flight`; the final repair pass still calls the solver's own
+    # binding (solver.py:1293).  This test needs pricing to yield no column ANYWHERE --
+    # stub only the sweep and repair quietly recovers the flight, erasing the denial the
+    # assertions are about.
+    for module in (pricing_pool_module, solver_module):
+        monkeypatch.setattr(module, "price_flight", lambda *args, **kwargs: (1.0, None))
 
     def partial_ip(master, *args, **kwargs):
         del args, kwargs
@@ -1477,7 +1661,8 @@ def test_nonoptimal_final_ip_cannot_certify_a_budget_denial(monkeypatch):
         requests,
         cfg,
         (),
-        _params(lp_gap=0.0, ip_gap=0.0),
+        # ladder off: this test needs the final MILP to actually run.
+        _params(lp_gap=0.0, ip_gap=0.0, seed_ladder_steps=0),
     )
 
     # The partition is the contract: an unproven IP cannot certify that a missing flight

@@ -89,9 +89,22 @@ def run_batch(
     ``collector`` is accepted for parity with the parallel runner.  Column generation
     has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
 
-    Pricing runs sequentially.  ``sim.run``'s own ``parallel`` argument is a different
-    mechanism entirely -- the A* speculative runner -- and rejects whole-schedule
-    planners, so a colgen run is single-process by construction.
+    Pricing fans across worker processes when ``params.n_pricing_workers`` is nonzero, and
+    runs in this process otherwise (the default -- the pool is opt-in because its memory is
+    linear in workers).  :func:`pricing_pool.price_sweep`
+    reproduces the sequential loop's prefix RULE and hands the reduced costs back in index
+    order, so on any sweep that finishes the columns and the objective do not move.
+
+    It is NOT answer-identical on a sweep that hits the deadline, and that limit is worth
+    stating because a run at scenario scale usually does.  ``PricingTimeout`` fires off a
+    wall clock, not a work budget: sequentially, flight *k* is reached only after the
+    cumulative time of the flights before it, whereas a pool runs them concurrently, so
+    more of them finish before the SAME absolute deadline and the accepted prefix is
+    generally longer.  Longer is not worse -- it is strictly more pricing done inside the
+    budget -- but it is a different column set, so a parity run must leave this at 0.
+
+    ``sim.run``'s own ``parallel`` argument is a different mechanism entirely -- the
+    A* speculative runner -- and rejects whole-schedule planners, so the two never interact.
 
     ``on_iteration`` is forwarded to the solver, which calls it once per column-generation
     iteration.  A caller that supplies nothing gets :func:`_log_iteration`, because pricing
@@ -131,10 +144,36 @@ def run_batch(
         )
 
     batch_params = params if params is not None else ColGenParams()
+    # BEFORE the solve, because both existing colgen banners fire after it returns and the
+    # thing most likely to end a run badly is decided here.  The only pre-solve line that
+    # mentions parallelism is `sim.run`'s "mode=sequential", which describes the A*
+    # speculative runner and says "sequential" whatever this is set to -- so without this a
+    # run fanning across eight processes announces itself as serial and then, if it is
+    # OOM-killed, HANGS rather than failing (`pricing_pool`).  The memory figure is on the
+    # line because it is linear in workers and that is the whole hazard: measured across the
+    # process tree, `density_faa` x50 goes 3.9 GB in-process to 12.5 GB at 4 workers.
+    workers = batch_params.n_pricing_workers
+    log.info(
+        "colgen pricing: %s | %d flights | objective=%s greedy=%s ladder=%s",
+        (f"{workers} worker processes, memory LINEAR in that count "
+         f"(~2.1 GB each above a 3.9 GB in-process baseline at 50 flights); "
+         f"an OOM-killed worker hangs the sweep"
+         if workers else "in-process (sequential sweep)"),
+        len(requests),
+        batch_params.objective,
+        (f"{batch_params.greedy_budget_s_per_flight} s/flight"
+         if batch_params.greedy_budget_s_per_flight else "off"),
+        batch_params.seed_ladder_steps or "off",
+    )
     solve_started = time.monotonic()
     result = ColGenSolver().solve(
         requests, cfg, static_terms, batch_params,
         on_iteration=on_iteration if on_iteration is not None else _log_iteration,
+        # Worker count is NOT plumbed here: it rides on `batch_params.n_pricing_workers`,
+        # which `price_sweep` reads directly.  This used to build a `ParallelPricingConfig`
+        # and pass it as `parallel=`, mapping an explicit 0 to `None` -- which `price_sweep`
+        # resolved as "the dataclass default" rather than "sequential", so raising that
+        # default would have turned `--colgen-workers 0` into a pool.
     )
     solve_elapsed = time.monotonic() - solve_started
     solve_share = solve_elapsed / len(events) if events else 0.0

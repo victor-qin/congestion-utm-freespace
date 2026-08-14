@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 from dataclasses import dataclass
 
 
@@ -131,7 +132,20 @@ class ColGenParams:
     max_air_overrun_hops: int = 3
     solver: str = "auto"
     max_iterations: int = 30
-    time_limit_s: float = 120.0
+    # 20 minutes, raised from 120 s. The old default could not finish a single pricing
+    # sweep on a real instance: measured on `density_faa_wing_zipline` x100, iteration 1
+    # alone is 147 s and the sweeps LENGTHEN as the pool grows -- 147, 213, 222, 234, 235,
+    # 397, 521, 555 s -- so a 120 s budget terminated inside the first sweep and reported
+    # `time_limit` with a schedule built entirely by the rounding heuristic. 1200 s buys
+    # roughly three iterations at that size and ten or more at 50 flights.
+    #
+    # `ip_reserve_s = min(5, 0.05 * t)` is already at its cap by 1200 s, so the tail left
+    # for the final IP does not move.  The greedy's budget is no longer derived from this
+    # at all -- see `greedy_budget_s_per_flight`, which now ships at 0 and therefore skips
+    # the stage entirely -- but an ENABLED rate is still CLAMPED by `pricing_deadline`, so
+    # raising this lifts that stage's effective ceiling on a batch large enough for
+    # `rate * n_flights` to reach it (about 1,700 flights at the old 0.7 rate).
+    time_limit_s: float = 1200.0
     lp_gap: float = 1e-4
     ip_gap: float = 1e-3
     M: float = 1_000_000.0
@@ -150,20 +164,275 @@ class ColGenParams:
     # stage runs once, after the first LP, and walks flights in order asking pricing for a
     # better column for each; the cap truncates how many it reaches. At 16 the cap is 256.
     #
-    # The stage is bounded by `min(60 s, 0.55 * time_limit_s)` and splits what remains
-    # evenly across the flights still to try, so a longer list means a SMALLER slice each
-    # and hard flights hit their local timeout instead of eating the stage. Measured on 780
-    # flights at the 60 s budget, a cap of 512 ran 32.2 s and improved 217 flights where
+    # The stage is bounded by `greedy_budget_s_per_flight * n_flights` and splits what
+    # remains evenly across the flights still to try, so a longer list means a SMALLER slice
+    # each and hard flights hit their local timeout instead of eating the stage. Measured on
+    # 780 flights at the old flat 60 s budget, a cap of 512 ran 32.2 s and improved 217 where
     # 1024 ran 19.6 s and improved 265 -- reaching every flight shallowly beat reaching two
     # thirds of them deeply. Below the cap none of this applies.
     n_heuristic_tries: int = 16
-    objective: str = "total_delay"
+    # What the master minimises.  ``total_cost`` weights the two currencies the way the
+    # config does -- `cost_ground_delay_per_s = 1`, `cost_air_lateral_per_s = 3`
+    # (config.py:83-85) -- so one step of ground costs `dt` and one hop of air costs `3*dt`.
+    # ``total_delay`` weights them EQUALLY, and that is not merely a different answer, it is
+    # a degenerate one: `ground + flown` is invariant under a ground-for-air swap, so an
+    # enormous set of columns are EXACTLY tied and the label DP's dominance cannot separate
+    # labels the real objective strictly orders (pricing.py:1765-1772 spells this out).
+    #
+    # It is also the reason this default moved.  The tie plateau, plus a `delay_lbs[hops]`
+    # that rises `w_air*dt` per hop -- 4 under `total_delay`, 12 here -- makes the
+    # completion envelope roughly 3x longer and prunes far less.  Measured on
+    # `density_faa_wing_zipline` x12, 2 iterations, sequential, bootstrap off:
+    #
+    #     objective      WALL       fell_back   peak labels   straggler
+    #     total_delay    975.42 s   2 of 24     33.5M         456.9 s (87.6% of sweep 1)
+    #     total_cost      32.11 s   0 of 24      3.4M          20.6 s
+    #
+    # 30x, and issue #90's label-ceiling straggler does not occur at all.  Benchmarking the
+    # pricing search under `total_delay` was measuring the weakest pruning regime the code
+    # has, which is not the one that ships.
+    objective: str = "total_cost"
     # Which scale the lp_gap / ip_gap thresholds are measured on.
     #   "revenue" -- the paper's equations (10) and (11): (UB - RMP)/RMP on the maximize
     #                objective, whose scale includes n*M.
     #   "cost"    -- the same absolute gap normalized by total cost instead, which is
     #                what this repo used before and is far stricter when M >> cost.
     gap_metric: str = "revenue"
+    # Pure clock translations of each flight's seed, offered to the master before the
+    # first LP.  A shift is arithmetic, not a search, and pricing otherwise spends its
+    # early iterations rediscovering exactly these -- 91% of the columns added in
+    # iterations 2-11 of a converged 100-flight solve were time shifts of a route already
+    # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
+    # 0 disables.
+    seed_ladder_steps: int = 20
+    # Wall clock for the post-first-LP greedy, PER FLIGHT.  **NOW 0, WHICH DISABLES THE
+    # STAGE.**  It was 0.7, and the history matters: the value scales with the batch because
+    # the stage splits its budget across up to `max(64, n_heuristic_tries * 16)` candidates,
+    # so the previous `min(60.0, 0.55 * time_limit_s)` gave each candidate ~0.23 s at 500
+    # flights and 168 of 202 searches were cut off mid-kernel.  Scaling fixed the starvation;
+    # it did not make the stage worth running.
+    #
+    # THE STAGE'S STATED JOB IS MEASURABLY WORTHLESS.  It produces `best_heuristic`, which
+    # `solver.py` hands pricing as `known_column` -- the cutoff each subproblem prunes
+    # against.  That cutoff's reduced cost is `entry_rc` and it is **exactly 0.0000 on every
+    # flight of every sweep measured**, because LP duality forces it: every column already in
+    # the master's pool has rc <= 0 by optimality, and complementary slackness pins the basic
+    # one at 0.  Removing the stage leaves pricing's time UNCHANGED on three instances --
+    # 28.98 -> 29.02 s, 40.40 -> 42.54 s, 99.23 -> 99.89 s -- which is the direct measurement
+    # of that argument.  (The bootstrap, `bootstrap_roots`, exists precisely because a real
+    # cutoff has to be SEARCHED for; nothing free can supply one.)
+    #
+    # What it costs, at 4 workers, objective=total_cost, K=1/bound:
+    #
+    #     instance             greedy on    greedy off   saved   pricing (on -> off)
+    #     density_faa   x100     60.73 s      37.80 s    1.61x   28.98 -> 29.02 s
+    #     density_future x100    87.89 s      54.98 s    1.60x   40.40 -> 42.54 s
+    #     density_future x200   221.04 s     129.00 s    1.71x   99.23 -> 99.89 s
+    #
+    # ~40% of the solve, and RSS roughly halves.  What it buys at these sizes is a COIN FLIP
+    # of +/-0.16% on the objective, with no consistent sign -- `density_faa` x100 is
+    # BIT-IDENTICAL without it (same objective, same 2178 columns), `density_future` x100 is
+    # 0.155% worse without, and `density_future` x200 is 0.013% BETTER without.  That is path
+    # dependence: the stage perturbs the master's column pool, which moves the duals, which
+    # lands the search in a different local outcome.  No arm lost a flight --
+    # `selected_flights` is unchanged in every one.
+    #
+    # AT SCALE, RUN TO CONVERGENCE, IT IS A HEAD START THAT COLUMN GENERATION CLOSES.  Twin
+    # run, `density_future_wing_zipline` x500, 16 workers, K=1/bound, `gap_metric=revenue`,
+    # both arms terminating on `lp_gap` at iteration 6, one harness invocation:
+    #
+    #     arm          WALL       pricing    objective            cols     parent RSS
+    #     greedy 0.0   508.75 s   372.67 s   64373.6808602346     11,917   1936 M
+    #     greedy 0.7   799.63 s   432.64 s   64290.3680883999     11,970   3201 M
+    #
+    # 0.129% of objective for +57.2% of wall.  The `cost_upper_bound` gap by iteration is
+    # 0, -93.77, -63.43, -1.98, -2.74, -39.77: **iteration 1 is bit-identical** across the
+    # arms -- same `lp_objective`, same `gap_cost`, same `gap_revenue`, same `cost_ub` --
+    # because `round_heuristic` sets `best_heuristic` regardless, and the lead peaks at
+    # iteration 2 and is gone by iteration 4.
+    #
+    # Pricing was 16% SLOWER with the stage on (372.67 -> 432.64 s), so it does not pay for
+    # itself even in the stage its cutoff exists to accelerate.  Some of that is the
+    # 1.9 -> 3.2 GB parent RSS under 16 workers, but the sign is the point.
+    #
+    # BEWARE THE TRUNCATED-ITERATION A/B, which got this call wrong twice.  The same pair at
+    # **2 iterations** reads greedy-on 2.03% BETTER -- squarely inside the head start.  A
+    # truncated comparison on a column-generation solve measures CONVERGENCE RATE, not
+    # solution quality; both arms must run to the same TERMINATION CONDITION.
+    #
+    # TURNING IT OFF DOES NOT REMOVE THE FALLBACK SCHEDULE, which was the real objection.
+    # `best_heuristic` is set from `master.round_heuristic` BEFORE this stage runs
+    # (`solver.py:991-993`), and the greedy only replaces it when `_better_selection` says
+    # it improved (`solver.py:1038-1044`).  So a timed-out solve still has a feasible
+    # answer; it is
+    # simply the LP-rounding one rather than a refined one.
+    #
+    # WHERE THIS DEFAULT IS MOST LIKELY WRONG: a solve whose `time_limit_s` genuinely binds,
+    # where a better heuristic is the answer rather than a starting point.  Every measurement
+    # above pinned `time_limit_s=86400`, so that regime is UNTESTED -- and the head-start
+    # finding is precisely what makes it the risk.  A binding limit stops the solve INSIDE
+    # the head start, at the iteration where the twin above reads 2.03% rather than 0.129%;
+    # the shipped `time_limit_s = 1200.0` is 2.4x the x500 wall, which is margin but not
+    # much.  If it matters, the right shape is budget-conditional -- skip the stage when the
+    # projected solve fits inside the limit, run it when it might not -- rather than a fixed
+    # number here.
+    greedy_budget_s_per_flight: float = 0.0
+    # Worker processes for the per-iteration pricing sweep; 0 keeps it in-process.  A pure
+    # performance knob -- `pricing_pool.price_sweep` reproduces the sequential loop's
+    # accepted prefix and index order -- but NOT a free one: each worker rebuilds every
+    # graph and carries its own label pool, so memory is linear in this number.
+    #
+    # STAYS 0 -- OPT-IN -- AND THE ATTEMPT TO DEFAULT IT TO 4 IS RECORDED HERE BECAUSE THE
+    # EVIDENCE FOR IT WAS AN ARTIFACT.  Speed was never the question: the pool measures 2.62x
+    # at 4 workers on `density_faa` x100 (2026-08-04) and 2.36x / 2.15x on the two density
+    # scenarios at x50.  Memory is, per the paragraph above, and the 2026-08-04 table put
+    # tree peak RSS at 3,501 MB sequential against 7,888 MB at 4 workers and 22,592 MB at 16
+    # -- roughly linear, and what forecloses a 4 GB/core cluster node.
+    #
+    # The claim that the lazily-mapped arena had lifted that rested on `rss_children` reading
+    # FLAT from 2 to 16 workers.  It does, and it means nothing: `getrusage(RUSAGE_CHILDREN)`
+    # defines `ru_maxrss` as the largest SINGLE child, never the sum across the tree, so flat
+    # is the only answer that metric can give however many workers run.  Demonstrated
+    # directly -- 1, 2 and 4 concurrent children each touching 150 MiB all report 172 MiB.
+    #
+    # Measured properly since, by sampling summed RSS across the process TREE
+    # (`sweep_pricing_workers.py`), `density_faa_wing_zipline` x50, 2 iterations, greedy off:
+    #
+    #     workers   peak tree RSS   marginal/worker   speedup   schedule sha
+    #           0        3,953 MB              --       1.00x   b6ddd8d9af579126
+    #           2        7,100 MB        1,573 MB       2.27x   b6ddd8d9af579126
+    #           4       12,536 MB        2,146 MB       3.50x   b6ddd8d9af579126
+    #           8       22,688 MB        2,342 MB       3.89x   b6ddd8d9af579126
+    #
+    # LINEAR, and slightly worse than linear per worker.  Nothing about the lazy arena made
+    # the pool cheap; it made one METRIC stop reporting the cost.  4 workers is 12.5 GB at
+    # FIFTY flights, so on the 4 GB/core node this has to run on, the default cannot be 4 --
+    # and an OOM-killed worker does not fail the sweep, it HANGS it (see `pricing_pool`), so
+    # the failure mode is silence rather than a traceback.
+    #
+    # Speed is not the obstacle and never was: 3.50x at 4 workers here, better than the 2.36x
+    # measured while the greedy still ran, because turning that serial stage off lifted the
+    # Amdahl cap.  The schedule sha is identical across all four arms, so the pool is
+    # answer-identical on a sweep that finishes, exactly as claimed.  This is purely a memory
+    # budget, and raising the default needs a cap on aggregate live RSS -- not another
+    # speedup table.
+    #
+    # DO NOT cite the 0.66-0.74x "parallel loses on density" figures here, as an earlier
+    # draft of this comment did.  Those measure the A* SPECULATIVE PARALLEL RUNNER
+    # (`analysis/bench_parallel.py`, `--mode exact`, where the serial commit floor dominates
+    # a compiled per-flight plan) -- a different mechanism with a different bottleneck.  The
+    # colgen pricing pool has no such result.
+    #
+    # ONE CAVEAT THAT SURVIVES.  A pool is answer-identical to the sequential loop only on a
+    # sweep that FINISHES.  `pricing_deadline` is a wall clock, so a pool gets further
+    # through `pricing_order` before the same absolute instant and keeps a LONGER accepted
+    # prefix -- more pricing inside the same budget, but a different column set.  With
+    # `time_limit_s = 1200.0` shipped and a 500-flight solve at ~509 s, there is margin, but
+    # a parity comparison must still pin this to 0 on both arms.  See `pricing_pool`.
+    #
+    # THIS IS THE ONLY HOME FOR THE SETTING.  It used to be mirrored by a separate
+    # `ParallelPricingConfig` dataclass that `solve` took as a `parallel=` keyword, so the
+    # count had two defaults that could disagree -- and did: `batch.py` turned an explicit
+    # 0 into `None`, which `price_sweep` resolved as "whatever the dataclass defaults to"
+    # rather than "sequential".  `price_sweep` already receives this params object, so the
+    # second one carried no information.
+    n_pricing_workers: int = 0
+    # `mp.Pool.imap`'s third argument.  1 is almost certainly right and raising it is a
+    # trap: chunking amortizes DISPATCH, and a pricing task ships one int in and ~14 KB out
+    # against tens of seconds of compute, so there is nothing to amortize.  What it costs
+    # instead is load balance -- `mp.Pool` pre-partitions the iterable, per-flight cost
+    # varies several-fold, and n/chunksize chunks across n_pricing_workers lanes leaves
+    # nothing to rebalance a straggler against.  Kept configurable so that claim stays
+    # measurable rather than merely asserted.
+    pricing_chunksize: int = 1
+    # How many ROOTS the pricing BOOTSTRAP searches before the real search starts, taken in
+    # descending order of `PreparedVariants.score`.  0 disables it; PR #76 uses 1.  A root is
+    # one `(departure_step, origin lane)` pair, so this is a count of start options and not
+    # of departure times.
+    #
+    # Ranked rather than truncated, which is the whole difference between this and the
+    # departure PREFIX it replaces.  A prefix takes the earliest N departures and so misses
+    # an optimum that departs late -- measured: at a 4- and 8-step prefix the bootstrap
+    # returned rc 4.4590 against an 8.4590 optimum on the second sweep and the main search
+    # declined anyway, while `score` is the root's own upper bound and ranks the promising
+    # departure first whenever it is.  It is also far cheaper: a prefix of N covers
+    # `N * n_origin_lanes` roots (240 at N=16 on the density straggler) where this covers
+    # exactly `bootstrap_roots`.
+    #
+    # It exists because the cutoff pricing enters with is not merely weak, it is
+    # structurally ZERO -- and that is a property of column generation, not a bug.  Every
+    # column `price_flight` can reach for free (the geodesic seed, its time translations,
+    # the master's `known_column`) is already in the master's pool, and LP optimality over
+    # that pool forces every pool column's reduced cost <= 0; complementary slackness pins
+    # the basic one at exactly 0.  Measured on `density_faa_wing_zipline` x12: `entry_rc` is
+    # 0.0000 for all twelve flights in both sweeps, against optima of 8.5-20.5.  Re-scoring
+    # a flight's own previous PRICED column under the next iteration's duals gives 0.0 or
+    # negative (-5.9211 observed), so mining the pool cannot help either.  The only way to a
+    # positive cutoff before the search is to SEARCH for one.
+    #
+    # What that cutoff is worth, measured by handing each flight its own optimum (the oracle
+    # bound, `analysis/ab_colgen_oracle_cutoff.py`): sweep-1 task total 519.7 s -> 5.3 s,
+    # 98x.  The flight that exhausts the label pool goes from 33.5M labels plus a 418 s
+    # Python fallback to 4.1M labels in 4.53 s, i.e. it then fits under the SHIPPED ceiling
+    # with 8x headroom.  Two flights are pruned to zero labels at the root gate.
+    #
+    # DEPARTURES is the only restriction axis, and that is a choice.  The other candidate --
+    # a tighter hop budget -- sizes the corridor at `build_flight_graph`, so varying it means
+    # rebuilding the graph per bootstrap, which costs more than the search it saves.
+    # Departures are a slice of an array that already exists, and they are where the leverage
+    # is: 157 of ~901 possible departures survive the root gate on the straggler, and the
+    # oracle collapses that to between 0 and 16.
+    #
+    # Answer-affecting, and optimality-safe.  Pruning against a certified achievable score
+    # never discards anything strictly better, so the optimum is unchanged -- but under
+    # dominance a tighter cutoff can return a DIFFERENT equally-optimal column, so this moves
+    # the `ab_colgen_parity.py` sha and has to be re-baselined deliberately.
+    #
+    # NOW 1, RE-BASELINED 2026-08-13.  Measured x50, 2 iterations, sequential, `total_cost`,
+    # greedy OFF -- i.e. at the shipped configuration:
+    #
+    #     instance            off       K=2/score      K=1/bound
+    #     density_faa      263.40 s      197.87 s       80.79 s     3.26x over off
+    #     density_future   231.25 s      179.49 s      103.32 s     2.24x over off
+    #
+    # K=1 is enough ONLY with `bootstrap_ranking="bound"`; at `"score"` it provably fails
+    # (`entry_rc` stays at exactly 0.0000) and 2 is the floor, which is why the two defaults
+    # move together.  PR #76's literal K=1 is too weak on a 157-root instance ranked by
+    # score -- the ranking is what makes one root sufficient.
+    #
+    # THE BOOTSTRAP AND THE GREEDY ARE SUBSTITUTES, and that is why this is worth having.
+    # Both exist to hand pricing a `known_column` cutoff.  The greedy costs ~57% of wall for
+    # 0.129% of objective and is off by default; the pool cannot supply one at all
+    # (`entry_rc` is structurally 0, forced by LP duality).  With the greedy off the
+    # bootstrap is the ONLY cutoff source, which is where the 3.26x comes from -- and it is
+    # why a harness that pins the greedy on measures this change at roughly zero.
+    # `ab_colgen_parity.py` does exactly that (`--greedy-budget` defaults to 1e6), so its
+    # timings are not the ones to read for this knob.
+    #
+    # ANSWER-AFFECTING IN PRINCIPLE, ANSWER-NEUTRAL IN MEASUREMENT.  Pruning against a
+    # certified achievable score cannot discard anything strictly better, so the optimum is
+    # safe by construction; what a tighter cutoff CAN do under dominance is return a
+    # different equally-optimal column.  On every arm measured it does not: objective and
+    # full schedule sha are identical across the whole grid above, and the parity shas are
+    # unchanged from the pre-bootstrap baseline (`1cb183616dceb2a4` / `cb1e9afa2f31bdf1` /
+    # `45b35d203b1b8d47`).  Treat it as answer-affecting anyway -- the guarantee is about
+    # optimality, not about column identity.
+    bootstrap_roots: int = 1
+    # WHAT the bootstrap sorts its roots on.  "score" is `PreparedVariants.score`, pure
+    # cost-so-far; "bound" is `completion_can_compete`'s own `hop_rc_bound` at the root's
+    # minimum feasible hop count -- `g + h` instead of `g`, already computed by the root
+    # gate, so it costs nothing to read.  Inert on single-lane flights (the two rank
+    # identically, correlation 1.000) and decisive on multi-lane ones.  Ordering only: it
+    # cannot prune, because the bootstrap returns an INCUMBENT and the main search still
+    # fans out over every root.
+    #
+    # NOW "bound", and it is what makes `bootstrap_roots=1` viable: `score` carries one live
+    # bit, "depart earlier" -- its other two terms are inert, `start_dual_cost` constant
+    # across roots and `origin_leg` correlating ~0 with quality -- so it cannot tell a short
+    # remaining route from a long one.  `hop_rc_bound` can, because it is `g + h`.  Decisive
+    # exactly where roots sit on lanes of differing length; on a single-lane flight the two
+    # orderings are identical and this costs nothing.
+    bootstrap_ranking: str = "bound"
 
     def __post_init__(self) -> None:
         if isinstance(self.max_air_overrun_hops, bool):
@@ -195,6 +464,75 @@ class ColGenParams:
             raise TypeError("gap_metric must be a string")
         if self.gap_metric not in {"revenue", "cost"}:
             raise ValueError("gap_metric must be 'revenue' or 'cost'")
+
+        if isinstance(self.seed_ladder_steps, bool):
+            raise TypeError("seed_ladder_steps must be an integer")
+        try:
+            ladder = operator.index(self.seed_ladder_steps)
+        except TypeError as exc:
+            raise TypeError("seed_ladder_steps must be an integer") from exc
+        if ladder < 0:
+            raise ValueError("seed_ladder_steps must be non-negative")
+        object.__setattr__(self, "seed_ladder_steps", ladder)
+
+        if isinstance(self.n_pricing_workers, bool):
+            raise TypeError("n_pricing_workers must be an integer")
+        try:
+            workers = operator.index(self.n_pricing_workers)
+        except TypeError as exc:
+            raise TypeError("n_pricing_workers must be an integer") from exc
+        if workers < 0:
+            raise ValueError("n_pricing_workers must be non-negative")
+        # An upper bound, because the failure past it is not an error message.  Each worker
+        # rebuilds every graph and carries its own label pool -- roughly 1.5 GB on density
+        # -- so an over-large count from a config file OOMs the host rather than running
+        # slowly.  Measured, more lanes stop paying long before here anyway: 8 and 12
+        # workers were within noise of each other, because added lanes add memory-system
+        # contention as fast as they add throughput.
+        ceiling = 4 * (os.cpu_count() or 1)
+        if workers > ceiling:
+            raise ValueError(
+                f"n_pricing_workers={workers} exceeds {ceiling} (4x this host's "
+                f"{os.cpu_count()} cores); each worker holds its own label pool"
+            )
+        object.__setattr__(self, "n_pricing_workers", workers)
+
+        if isinstance(self.pricing_chunksize, bool):
+            raise TypeError("pricing_chunksize must be an integer")
+        try:
+            chunksize = operator.index(self.pricing_chunksize)
+        except TypeError as exc:
+            raise TypeError("pricing_chunksize must be an integer") from exc
+        if chunksize < 1:
+            raise ValueError("pricing_chunksize must be positive")
+        object.__setattr__(self, "pricing_chunksize", chunksize)
+
+        if isinstance(self.bootstrap_roots, bool):
+            raise TypeError("bootstrap_roots must be an integer")
+        try:
+            bootstrap = operator.index(self.bootstrap_roots)
+        except TypeError as exc:
+            raise TypeError("bootstrap_roots must be an integer") from exc
+        if not isinstance(self.bootstrap_ranking, str):
+            raise TypeError("bootstrap_ranking must be a string")
+        _ranking = self.bootstrap_ranking.lower()
+        if _ranking not in {"score", "bound"}:
+            raise ValueError("bootstrap_ranking must be 'score' or 'bound'")
+        object.__setattr__(self, "bootstrap_ranking", _ranking)
+
+        if bootstrap < 0:
+            raise ValueError("bootstrap_roots must be non-negative")
+        object.__setattr__(self, "bootstrap_roots", bootstrap)
+
+        if isinstance(self.greedy_budget_s_per_flight, bool):
+            raise TypeError("greedy_budget_s_per_flight must be a real number")
+        try:
+            per_flight = float(self.greedy_budget_s_per_flight)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("greedy_budget_s_per_flight must be a real number") from exc
+        if not math.isfinite(per_flight) or per_flight < 0.0:
+            raise ValueError("greedy_budget_s_per_flight must be finite and non-negative")
+        object.__setattr__(self, "greedy_budget_s_per_flight", per_flight)
 
         for name in ("max_iterations", "n_heuristic_tries"):
             value = getattr(self, name)

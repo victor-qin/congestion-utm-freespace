@@ -54,6 +54,18 @@ _ARC_LAST = 1 << 2
 _ARC_FIRST_LAST = 1 << 3
 _ALL_ARC_ROLES = _ARC_INTERNAL | _ARC_FIRST | _ARC_LAST | _ARC_FIRST_LAST
 _MAX_CERTIFIED_COLUMNS = 2
+# Distinct `(origin, step, timing_steps)` endpoint claim sets kept per graph.  The
+# reachable key space is bounded by `2 * n_steps * (max_air_hops + 1)`, which grows with the
+# horizon, and each entry is a frozenset of freshly built `RowKey`s.  So this is a memory
+# bound, not a correctness one: an eviction only costs the recompute it was avoiding.
+#
+# The 1,511 distinct keys `pricing._endpoint_claims` quotes are NOT the figure to size this
+# against: that count is over `colgen_test`'s first twelve flights, so it spans twelve
+# graphs, while this cap is enforced on one graph's `_search_cache`.  The per-graph number
+# is far smaller there and larger on density, i.e. this constant is not yet calibrated
+# against the quantity it actually bounds.  Answer-neutral, so tuning it is free -- see
+# issue #87.
+_MAX_ENDPOINT_CLAIMS = 2048
 
 
 def _aabbs_overlap(first: FlatAabb, second: FlatAabb) -> bool:
@@ -689,6 +701,9 @@ class _FlightSearchCache:
     __slots__ = (
         "lock",
         "certified_claims",
+        "dag_budget",
+        "endpoint_claims",
+        "prepared",
         "seed_columns",
         "seed_delay_certified",
         "seed_model",
@@ -697,8 +712,25 @@ class _FlightSearchCache:
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        # `(PreparedTopology, PreparedRows)` for the compiled pricing path, built on first
+        # use.  Both are pure functions of the graph and its `SimConfig`, so this is a
+        # memo rather than state -- but it is not an optional one: the same flight is
+        # priced on EVERY colgen iteration, and rebuilding was measured at up to 80% of the
+        # compiled search's own time on a cheap density flight.  See `dp_prepare.prepared_for`.
+        self.prepared: Any | None = None
+        # `(label_capacity, log2cap, candidate_capacity)` the last completed compiled search
+        # actually needed.  A density flight builds 13.3M labels against a 65,536 default,
+        # and re-discovering that by restarting costs ~1.7x on every iteration after the
+        # first.  Answer-neutral: a budget only bounds work, never the search.
+        self.dag_budget: tuple[int, int, int] | None = None
         self.certified_claims: OrderedDict[
             tuple[Any, ...], frozenset[RowKey]
+        ] = OrderedDict()
+        # Endpoint dwell rows, keyed `(origin, step, timing_steps)`.  See
+        # `pricing._endpoint_claims`, which owns the purity argument that makes this
+        # answer-neutral, and `_MAX_ENDPOINT_CLAIMS` for why it is bounded.
+        self.endpoint_claims: OrderedDict[
+            tuple[bool, int, int], frozenset[RowKey]
         ] = OrderedDict()
         self.seed_columns: tuple[Any, ...] | None = None
         self.seed_delay_certified = False

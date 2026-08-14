@@ -19,6 +19,21 @@ dependencies = [
 dev = ["pytest>=8.0", "ruff>=0.6"]
 cloud = ["huggingface_hub>=0.20"]   # optional: push/pull run folders to a HF Hub dataset repo
 compiled = ["numba>=0.59"]          # optional: numba JIT for the compiled A* air-search kernel (astar_kernel)
+# optional: Gurobi backend for the colgen restricted master (`ColGenParams(solver="gurobi")`,
+# imported directly in `master.py`, NOT through pulp). Install with `uv sync --extra gurobi`.
+#
+# DELIBERATELY NOT a dependency-group, which is where `compiled` lives. numba is free and
+# byte-exact, so there is no reason not to have it and it installs on every plain `uv run`.
+# Gurobi is licensed: the PyPI wheel ships a size-limited trial that silently caps model
+# size, so installing it by default would hand every user a backend that works on the test
+# fixtures and fails at scenario scale. Opt in, and bring a licence.
+#
+# Two tests skip without it (`test_backend_parity` and the HiGHS/Gurobi IP comparison in
+# tests/test_colgen_solver.py, both `pytest.importorskip`). They are the only coverage that
+# the two backends agree, which matters because the backend choice is answer-affecting in
+# practice -- Gurobi's duals close the default revenue gap at iteration 1 where HiGHS runs
+# 17 iterations.
+gurobi = ["gurobipy>=11.0"]
 
 [dependency-groups]
 # Mirrors the `compiled` extra (keep the pin in sync). Listed in tool.uv.default-groups so EVERY

@@ -1,0 +1,1635 @@
+"""Flat-array packing of one flight's pricing subproblem, for the compiled DP.
+
+Pure Python and NumPy; this module deliberately does **not** import Numba, so colgen
+still runs without the compiled extra. The reference search in :mod:`.pricing` remains the
+oracle — nothing here may change an answer, and the tests assert arc-for-arc and
+value-for-value identity against the object API.
+
+The split is by **what changes when**, and it is what makes both flight-parallel pricing
+and thousands-of-flights scale possible rather than merely convenient:
+
+===================== ========================= ===================== ==================
+structure             rebuilt                   shared by             dense?
+===================== ========================= ===================== ==================
+`PreparedTopology`    once per **graph**        all threads, readonly CSR, ~100 KB/flight
+`PreparedRows`        once per **graph**        all threads, readonly **no tables**
+`PreparedForbidden`   once per **repair call**  that call             bitset over row ids
+`PricingWorkspace`    once per **thread**       nobody -- caller-owned dense, largest flight
+===================== ========================= ===================== ==================
+
+Two consequences worth stating outright, because they are the reason for the shape:
+
+* **Nothing per-graph is O(cells x steps).** A density flight reaches ~3k cells over ~1.2k
+  steps, so a dense per-graph row table would be ~14 MB and 4,636 of them would be ~65 GB.
+  :class:`PreparedRows` therefore *numbers* rows arithmetically and stores no table at all;
+  the only dense array is the de-duplication stamp, which lives in the per-**thread**
+  workspace and is sized to the largest single flight.
+* **The kernel allocates nothing.** Every mutable buffer is owned by the caller and passed
+  in, so threads reuse arenas instead of churning them -- the allocator residue that forced
+  PR #76's process pool to recycle workers is a property of allocating per flight, not of
+  the search.
+
+Row numbering, which the kernel and :func:`prepare_forbidden` both depend on::
+
+    cell row  (cell_index, step) -> cell_index * n_steps + (step - row_step0)
+    term row  (term_index, step) -> n_cells * n_steps + term_index * n_steps + (step - row_step0)
+
+Both are O(1) and require no lookup structure, which is the whole point.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from ...volumes import column_dwell_s
+from .. import hexgrid as hg
+from .network import RowKey
+from .windows import (
+    derive_cell_window,
+    endpoint_claim_cells,
+    endpoint_claim_steps,
+    terminal_claim_steps,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ...config import SimConfig
+    from .network import FlightGraph
+
+Cell = tuple[int, int]
+
+# Sentinel for "no path to any destination".  Deliberately not INT32_MAX: the kernel
+# evaluates ``step + 1 + rev_remaining[cell] > max_step`` and INT32_MAX would overflow that
+# addition.  2**24 dwarfs any realistic step count while leaving ~127x headroom in int32.
+UNREACHABLE = 1 << 24
+
+# Arc role bits, mirroring network.py's private constants.  Restated rather than imported
+# so a change there fails a test here instead of silently re-tagging every arc.
+ARC_INTERNAL = 1 << 0     # not first, not last
+ARC_FIRST = 1 << 1        # first, not last
+ARC_LAST = 1 << 2         # not first, last
+ARC_FIRST_LAST = 1 << 3   # first and last
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTopology:
+    """Dense, dual-independent mirror of one flight's spatial search domain.
+
+    ``unsupported_reason`` is set instead of raising when the flight has no compiled
+    representation (multi-level, no reachable destination). The caller then uses the
+    reference search, which is the fallback for every other failure too.
+    """
+
+    # Cell interning.  Index order is sorted axial order, so it is a function of the cell
+    # SET alone -- stable across processes and independent of BFS discovery order.
+    cell_q: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    cell_r: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+
+    # CSR adjacency.  Arc order within a cell matches ``outgoing_neighbors`` (that is,
+    # ``hexgrid.AXIAL_NEIGHBORS`` order), which is the order the reference DP iterates;
+    # reordering would silently change which label wins an insertion-order tie.
+    arc_start: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(1, np.int32))
+    arc_target: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    arc_roles: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.uint8))
+
+    # Admissible hop count from each cell to the nearest destination over the any-role arc
+    # superset.  A lower bound on every role-specific completion.
+    rev_remaining: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    # The reference's own `_distance_lower_bound` -- plain hex distance to the nearest
+    # destination, ignoring walls and corridor shape.  LOOSER than `rev_remaining`, and the
+    # priced search must use this one: substituting the tighter value would prune labels the
+    # oracle keeps, which is safe for optimality but changes the explored set and so can
+    # return a different, equally optimal column.
+    hex_remaining: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+
+    dest_mask: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.uint8))
+    dest_lane_start: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(1, np.int32))
+    dest_lane_idx: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+
+    # Origin start options, parallel arrays over ``_origin_options`` order.
+    origin_lane_idx: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    origin_cell: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    origin_lane_steps: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+
+    # Clock and search-shape scalars lifted off the graph.
+    base_step: int = 0
+    latest_departure_step: int = 0
+    min_step: int = 0
+    max_step: int = 0
+    takeoff_steps0: int = 0
+    shortest_hops: int = 0
+    # The ONLY route-length bound the search has, post-#78.  Read from ``fg.max_air_hops``
+    # rather than rebuilt from ``shortest_hops + overrun``: the graph resolves the ceiling
+    # at build time so both searches over the domain agree on it, and reconstructing it
+    # here would reintroduce exactly the second, drifting copy #78 removed.
+    air_hop_limit: int = 0
+    revisit_depth: int = 0
+    # Two different widths, deliberately.  ``revisit_depth`` bans re-entering a recently
+    # held cell; the STATE key must keep at least the predecessor even when that ban is
+    # narrower, because two equal-score labels reaching one cell from different
+    # predecessors can de-duplicate the destination endpoint union differently.  See the
+    # identical pair of constants in ``pricing._best_column``.
+    state_history_depth: int = 0
+    track_first_hop: bool = False
+
+    unsupported_reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.unsupported_reason is None
+
+    @property
+    def n_cells(self) -> int:
+        return int(self.cell_q.shape[0])
+
+
+def _reachable_cells(fg: FlightGraph, seeds: list[Cell]) -> list[Cell]:
+    """Forward-reachable cells, expanding arcs lazily and never materializing.
+
+    Walks ``outgoing_neighbors``, which both expands-and-caches the arc oracle and already
+    filters to arcs admissible in at least one role.  Iterating ``fg.corridor_cells``
+    instead would materialize the lazy ellipse, which is what lazy expansion exists to
+    avoid.
+    """
+
+    seen: set[Cell] = set()
+    queue: deque[Cell] = deque()
+    for seed in seeds:
+        if seed not in seen and seed in fg.corridor_cells:
+            seen.add(seed)
+            queue.append(seed)
+    while queue:
+        for target in fg.outgoing_neighbors(queue.popleft()):
+            if target not in seen:
+                seen.add(target)
+                queue.append(target)
+    # Sorted, so the dense index is a function of the cell set alone.
+    return sorted(seen)
+
+
+def _reverse_remaining(
+    n_cells: int,
+    arc_start: np.ndarray,
+    arc_target: np.ndarray,
+    destinations: list[int],
+) -> np.ndarray:
+    """Multi-source reverse BFS giving admissible hops-to-destination per cell.
+
+    Strictly tighter than the reference's ``_distance_lower_bound`` (plain hex distance),
+    because it follows real arcs rather than assuming the corridor is convex -- but only
+    ever *smaller or equal*, so substituting it cannot make an inadmissible bound.  The
+    kernel must therefore not use it where the reference's looser value decides a tie; see
+    the parity tests.
+    """
+
+    remaining = np.full(n_cells, UNREACHABLE, dtype=np.int32)
+
+    # Reverse the CSR once; the DP only ever needs distances, not the reverse adjacency
+    # itself, so it stays local.
+    in_degree = np.zeros(n_cells + 1, dtype=np.int64)
+    for target in arc_target:
+        in_degree[int(target) + 1] += 1
+    rev_start = np.cumsum(in_degree, dtype=np.int64)
+    rev_source = np.empty(arc_target.shape[0], dtype=np.int32)
+    cursor = rev_start.copy()
+    for source in range(n_cells):
+        for a in range(int(arc_start[source]), int(arc_start[source + 1])):
+            target = int(arc_target[a])
+            rev_source[cursor[target]] = source
+            cursor[target] += 1
+
+    queue: deque[int] = deque()
+    for destination in destinations:
+        if remaining[destination] != 0:
+            remaining[destination] = 0
+            queue.append(destination)
+    while queue:
+        cell = queue.popleft()
+        next_hops = remaining[cell] + 1
+        for a in range(int(rev_start[cell]), int(rev_start[cell + 1])):
+            source = int(rev_source[a])
+            if next_hops < remaining[source]:
+                remaining[source] = next_hops
+                queue.append(source)
+    return remaining
+
+
+def _hex_remaining(cells: list[Cell], destinations: list[Cell]) -> np.ndarray:
+    """``pricing._distance_lower_bound`` for every cell: hex distance to the nearest goal.
+
+    Deliberately the *looser* of the two remaining-distance bounds this module computes.
+    ``_reverse_remaining`` follows real arcs and is tighter wherever the corridor is
+    non-convex, but the reference prices against plain hex distance, and the priced search
+    consults this value at four decision points -- three hop-ceiling guards and the arc
+    delay lower bound. Tightening any of them prunes labels the oracle explores.
+    """
+
+    remaining = np.empty(len(cells), dtype=np.int32)
+    for i, cell in enumerate(cells):
+        remaining[i] = min(hg.hex_distance(cell, destination) for destination in destinations)
+    return remaining
+
+
+def _role_mask(fg: FlightGraph, source: Cell, target: Cell) -> int:
+    """Pack one arc's four path-position verdicts into a bitmask.
+
+    The lazy oracle already stores exactly this mask, so ask it for the packed value when
+    it is present and fall back to four ``hop_allowed_for_role`` calls otherwise --
+    ``forbidden_hops`` is a plain frozenset on a transported graph, where only the public
+    path works. The two agree by construction: ``_LazyForbiddenHops.allows`` is itself a
+    bit test against the same mask, which the parity test asserts arc for arc.
+    """
+
+    lazy = fg.forbidden_hops
+    role_mask = getattr(lazy, "role_mask", None)
+    if role_mask is not None:
+        return int(role_mask(source, target))
+
+    mask = 0
+    if fg.hop_allowed_for_role(source, target, first=False, last=False):
+        mask |= ARC_INTERNAL
+    if fg.hop_allowed_for_role(source, target, first=True, last=False):
+        mask |= ARC_FIRST
+    if fg.hop_allowed_for_role(source, target, first=False, last=True):
+        mask |= ARC_LAST
+    if fg.hop_allowed_for_role(source, target, first=True, last=True):
+        mask |= ARC_FIRST_LAST
+    return mask
+
+
+def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
+    """Drain the lazy arc oracle for one flight into dense arrays, once.
+
+    Answer-neutral: every arc and role recorded here is exactly what
+    ``fg.outgoing_neighbors`` / ``fg.hop_allowed_for_role`` would return on demand.
+
+    Draining is also what makes the graph **read-only for the rest of the solve**, which
+    is the precondition for pricing flights on threads: after this call the search touches
+    only arrays, so no lock is contended and no lazy cache is mutated concurrently.
+    """
+
+    # Imported here, not at module scope: pricing imports this module.
+    from .pricing import _destination_options, _origin_options
+
+    if len(fg.levels) != 1:
+        return PreparedTopology(unsupported_reason="colgen v1 pricing is single-level")
+
+    origin_options = _origin_options(fg)
+    destination_options = _destination_options(fg)
+    if not origin_options or not destination_options:
+        return PreparedTopology(unsupported_reason="no origin or destination option")
+
+    reachable = _reachable_cells(fg, [cell for _lane, cell, _steps in origin_options])
+    if not reachable:
+        return PreparedTopology(unsupported_reason="no reachable corridor cell")
+
+    # An endpoint's hover cylinder CLAIMS cells that no route can ever VISIT -- the disc
+    # spreads around the origin/destination point, and its rim regularly falls outside the
+    # forward-reachable set.  Measured on `density_faa_wing_zipline`: 4 of the first 12
+    # flights have exactly one such cell.  Those cells still need row ids, or the endpoint
+    # dwell would go partly unpriced, so they are interned here as claim-only: no arcs, and
+    # `rev_remaining` leaves them UNREACHABLE, so the search cannot enter them.
+    claim_only: set[Cell] = set()
+    for is_origin in (True, False):
+        if (fg.origin_terminal if is_origin else fg.dest_terminal) is not None:
+            continue  # a terminal endpoint claims `term` rows, not cell rows
+        point = fg.request.origin if is_origin else fg.request.dest
+        claim_only.update(endpoint_claim_cells(point, cfg.effective_hover_radius_m, cfg))
+    cells = sorted(set(reachable) | claim_only)
+    index = {cell: i for i, cell in enumerate(cells)}
+    n = len(cells)
+
+    reachable_set = set(reachable)
+    arc_start = np.zeros(n + 1, dtype=np.int32)
+    arc_target_list: list[int] = []
+    arc_roles_list: list[int] = []
+    for i, cell in enumerate(cells):
+        # Claim-only cells get no arcs, so the CSR is exactly what interning the reachable
+        # set alone would have produced.  Sound as well as tidy: a claim-only cell has no
+        # incoming arc from a reachable one -- the BFS follows the same arcs, so it would
+        # have been reached -- and therefore cannot shorten any reachable cell's
+        # `rev_remaining` either.
+        for target in (fg.outgoing_neighbors(cell) if cell in reachable_set else ()):
+            target_index = index.get(target)
+            if target_index is None:
+                # Unreachable-from-origin targets cannot appear: the BFS above followed
+                # the same arcs.  Guard anyway rather than emit a dangling index.
+                continue
+            arc_target_list.append(target_index)
+            arc_roles_list.append(_role_mask(fg, cell, target))
+        arc_start[i + 1] = len(arc_target_list)
+    arc_target = np.asarray(arc_target_list, dtype=np.int32)
+    arc_roles = np.asarray(arc_roles_list, dtype=np.uint8)
+
+    dest_mask = np.zeros(n, dtype=np.uint8)
+    dest_lane_start = np.zeros(n + 1, dtype=np.int32)
+    dest_lane_list: list[int] = []
+    for i, cell in enumerate(cells):
+        lanes = destination_options.get(cell)
+        if lanes is not None:
+            dest_mask[i] = 1
+            dest_lane_list.extend(-1 if lane is None else int(lane) for lane in lanes)
+        dest_lane_start[i + 1] = len(dest_lane_list)
+
+    destinations = [index[cell] for cell in destination_options if cell in index]
+    rev_remaining = _reverse_remaining(n, arc_start, arc_target, destinations)
+    hex_remaining = _hex_remaining(cells, list(destination_options))
+
+    offsets = derive_cell_window(cfg)
+    revisit_depth = offsets[1] - offsets[0]
+
+    origin_kept = [(lane, cell, steps) for lane, cell, steps in origin_options if cell in index]
+    if not origin_kept:
+        return PreparedTopology(unsupported_reason="no origin option inside the corridor")
+
+    prepared = PreparedTopology(
+        cell_q=np.asarray([q for q, _r in cells], dtype=np.int32),
+        cell_r=np.asarray([r for _q, r in cells], dtype=np.int32),
+        arc_start=arc_start,
+        arc_target=arc_target,
+        arc_roles=arc_roles,
+        rev_remaining=rev_remaining,
+        hex_remaining=hex_remaining,
+        dest_mask=dest_mask,
+        dest_lane_start=dest_lane_start,
+        dest_lane_idx=np.asarray(dest_lane_list, dtype=np.int32),
+        origin_lane_idx=np.asarray(
+            [-1 if lane is None else lane for lane, _c, _s in origin_kept], dtype=np.int32
+        ),
+        origin_cell=np.asarray([index[cell] for _l, cell, _s in origin_kept], dtype=np.int32),
+        origin_lane_steps=np.asarray([steps for _l, _c, steps in origin_kept], dtype=np.int32),
+        base_step=int(fg.base_step),
+        latest_departure_step=int(fg.latest_departure_step),
+        min_step=int(fg.min_step),
+        max_step=int(fg.max_step),
+        takeoff_steps0=int(fg.takeoff_steps[0]),
+        shortest_hops=int(fg.shortest_hops),
+        air_hop_limit=int(fg.max_air_hops),
+        revisit_depth=revisit_depth,
+        state_history_depth=max(2, revisit_depth),
+        track_first_hop=bool(fg.static_walls and fg.origin_terminal is not None),
+    )
+    # Read-only after construction: these are shared across threads without a lock, and
+    # the guarantee that nobody mutates them is the entire basis for doing so.
+    for array in (
+        prepared.cell_q, prepared.cell_r, prepared.arc_start, prepared.arc_target,
+        prepared.arc_roles, prepared.rev_remaining, prepared.hex_remaining, prepared.dest_mask,
+        prepared.dest_lane_start, prepared.dest_lane_idx, prepared.origin_lane_idx,
+        prepared.origin_cell, prepared.origin_lane_steps,
+    ):
+        array.setflags(write=False)
+    return prepared
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRows:
+    """Arithmetic numbering of every capacity row this flight can claim.
+
+    Deliberately holds **no table**. ``row_of_cell``/``row_of_term`` are closed-form, so
+    the whole structure is a handful of scalars plus the endpoint discs -- which is what
+    lets thousands of graphs stay resident while the only dense array (the kernel's
+    de-duplication stamp, sized ``n_rows``) lives once per thread.
+
+    ``step0``/``n_steps`` bound the clock generously rather than exactly: a row id must
+    exist for every step any endpoint window can reach, including the padding
+    ``endpoint_claim_steps`` adds outside ``[min_step, max_step]``.
+    """
+
+    n_cells: int = 0
+    n_terminals: int = 0
+    step0: int = 0
+    n_steps: int = 0
+
+    # Endpoint discs, resolved once per graph.  ``endpoint_claim_cells`` was measured at
+    # 202,044 calls per 12-flight solve before this.
+    origin_disc: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    dest_disc: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    origin_is_terminal: bool = False
+    dest_is_terminal: bool = False
+    # Terminal slots, -1 when that endpoint is not a terminal.
+    origin_term_slot: int = -1
+    dest_term_slot: int = -1
+
+    # Dwell duration per endpoint, in seconds.  ``t1 - t0`` is constant for a given
+    # endpoint, so the span is a pure translation of a fixed pattern by ``step``.
+    origin_dwell_s: float = 0.0
+    dest_dwell_s: float = 0.0
+
+    unsupported_reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.unsupported_reason is None
+
+    @property
+    def n_rows(self) -> int:
+        return (self.n_cells + self.n_terminals) * self.n_steps
+
+    def row_of_cell(self, cell_index: int, step: int) -> int:
+        """Row id for a cell visit, or -1 when the step is outside the numbering."""
+
+        offset = step - self.step0
+        if offset < 0 or offset >= self.n_steps or not 0 <= cell_index < self.n_cells:
+            return -1
+        return cell_index * self.n_steps + offset
+
+    def row_of_term(self, term_slot: int, step: int) -> int:
+        """Row id for a terminal dwell period, or -1 when outside the numbering."""
+
+        offset = step - self.step0
+        if offset < 0 or offset >= self.n_steps or not 0 <= term_slot < self.n_terminals:
+            return -1
+        return (self.n_cells + term_slot) * self.n_steps + offset
+
+
+def prepare_rows(fg: FlightGraph, cfg: SimConfig, topology: PreparedTopology) -> PreparedRows:
+    """Number this flight's row universe and resolve its two endpoint discs.
+
+    The two endpoint shapes are kept **separate on purpose**, and unifying them is the
+    mistake this docstring exists to prevent. ``windows.py`` states the divergence is
+    deliberate:
+
+    * a **terminal** endpoint claims ``term`` rows over ``terminal_claim_steps``, which
+      applies no floating padding and ignores ``timing_steps`` entirely;
+    * a **bare point** claims ``cell`` rows over ``endpoint_claim_steps``, whose outward
+      rounding carries a drift bound that scales *with* ``timing_steps``.
+
+    Origin and destination choose independently, so all four combinations occur --
+    and terminal endpoints are the density-scenario shape, not an edge case.
+    """
+
+    if not topology.ok:
+        return PreparedRows(unsupported_reason=topology.unsupported_reason)
+    if len(fg.levels) != 1:
+        return PreparedRows(unsupported_reason="colgen v1 pricing is single-level")
+
+    cell_index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+    z = fg.levels[0]
+
+    discs: dict[bool, np.ndarray] = {}
+    dwell: dict[bool, float] = {}
+    term_slot: dict[bool, int] = {}
+    terminals: list[Any] = []
+    for is_origin in (True, False):
+        point = fg.request.origin if is_origin else fg.request.dest
+        terminal = fg.origin_terminal if is_origin else fg.dest_terminal
+        dwell[is_origin] = cfg.hover_time_s + column_dwell_s(point, terminal, cfg, z)
+        if terminal is not None:
+            if terminal.id not in [t.id for t in terminals]:
+                terminals.append(terminal)
+            term_slot[is_origin] = [t.id for t in terminals].index(terminal.id)
+            discs[is_origin] = np.empty(0, np.int32)
+            continue
+        term_slot[is_origin] = -1
+        # Every disc cell has an index: `prepare_topology` interns the union of the
+        # reachable set and both discs precisely so this cannot miss one.  A missing cell
+        # would silently under-price the endpoint dwell -- a cheaper wrong answer rather
+        # than a slower right one -- so it stays a hard refusal rather than a drop.
+        cells = endpoint_claim_cells(point, cfg.effective_hover_radius_m, cfg)
+        missing = [c for c in cells if c not in cell_index]
+        if missing:
+            return PreparedRows(
+                unsupported_reason=(
+                    f"{len(missing)} endpoint disc cell(s) were not interned; "
+                    "prepare_topology and prepare_rows disagree about the cell set"
+                )
+            )
+        discs[is_origin] = np.asarray(
+            sorted(cell_index[c] for c in cells), dtype=np.int32
+        )
+
+    # Bound the clock generously: claims pad outside [min_step, max_step], and a row id that
+    # does not exist would silently drop one.
+    #
+    # TWO independent sources widen it, and counting only the first was a real bug. The
+    # endpoint dwell is one. The other is the intermediate-cell window, which every visit
+    # claims through and which `derive_cell_window` grows with `time_buffer_s`: the default
+    # 4.0 s yields (-2, 1), but 100 s yields (-26, 25). At the default the `+8` slack
+    # happened to cover it, which is exactly why no shipped scenario exhibited this and why
+    # raising the buffer would have started dropping forbidden rows instead of failing.
+    #
+    # `max` rather than a sum because these are alternative furthest-out claims from one
+    # visit, not a stack: the clock has to reach past whichever is larger.
+    lo_offset, hi_offset = derive_cell_window(cfg)
+    pad = max(
+        int(max(dwell.values()) / cfg.dt_s), abs(lo_offset), abs(hi_offset)
+    ) + 8
+    step0 = topology.min_step - pad
+    n_steps = (topology.max_step + pad) - step0 + 1
+
+    return PreparedRows(
+        n_cells=topology.n_cells,
+        n_terminals=len(terminals),
+        step0=step0,
+        n_steps=n_steps,
+        origin_disc=discs[True],
+        dest_disc=discs[False],
+        origin_is_terminal=fg.origin_terminal is not None,
+        dest_is_terminal=fg.dest_terminal is not None,
+        origin_term_slot=term_slot[True],
+        dest_term_slot=term_slot[False],
+        origin_dwell_s=dwell[True],
+        dest_dwell_s=dwell[False],
+    )
+
+
+def prepared_for(fg: FlightGraph, cfg: SimConfig) -> tuple[PreparedTopology, PreparedRows]:
+    """The graph's dual-independent packing, built once and kept on the graph.
+
+    ``prepare_topology`` and ``prepare_rows`` depend only on the graph and its config, both
+    fixed for the solve, so this is a memo and not state. It is not an optional one: the
+    same flight is priced on **every** colgen iteration, and rebuilding was measured at up
+    to 80% of the compiled search's own time on a cheap density flight -- enough to make
+    the compiled path a *regression* on the majority of a real sweep's flights.
+
+    Built outside the lock and stored under it, the same shape as
+    ``pricing._endpoint_claims``: it is a pure function, so two threads racing to fill it
+    compute equal answers and either may win. Holding the lock across the build instead
+    would serialize the one part of pricing that is still entirely Python.
+
+    An unsupported flight is cached too, so a graph the kernel cannot handle is diagnosed
+    once rather than on every iteration.
+    """
+
+    cache = fg._search_cache
+    with cache.lock:
+        hit = cache.prepared
+    if hit is not None:
+        return hit
+    topology = prepare_topology(fg, cfg)
+    rows = prepare_rows(fg, cfg, topology)
+    value = (topology, rows)
+    with cache.lock:
+        cache.prepared = value
+    return value
+
+
+def endpoint_row_ids(
+    rows: PreparedRows,
+    cfg: SimConfig,
+    *,
+    origin: bool,
+    step: int,
+    timing_steps: int,
+) -> list[int]:
+    """Row ids one endpoint dwell claims — the row-id image of ``_endpoint_claims``.
+
+    Kept in Python beside the packing rather than inlined into the kernel so a test can
+    compare it against :func:`pricing._endpoint_claims_uncached` directly, key for key.
+    The kernel reimplements this arithmetic; this is what pins it.
+    """
+
+    t0 = step * cfg.dt_s
+    is_terminal = rows.origin_is_terminal if origin else rows.dest_is_terminal
+    t1 = t0 + (rows.origin_dwell_s if origin else rows.dest_dwell_s)
+    if is_terminal:
+        slot = rows.origin_term_slot if origin else rows.dest_term_slot
+        return [rows.row_of_term(slot, s) for s in terminal_claim_steps(t0, t1, cfg)]
+    disc = rows.origin_disc if origin else rows.dest_disc
+    steps = endpoint_claim_steps(t0, t1, cfg, timing_steps=timing_steps)
+    return [
+        rows.row_of_cell(int(cell_index), s) for cell_index in disc for s in steps
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedForbidden:
+    """Saturated rows, as a bitset over row ids.
+
+    A bitset rather than PR #76's Fibonacci hash because rows are already interned to a
+    dense range here: ``n_rows / 8`` bytes, O(1) membership, no collisions and no probe
+    loop in the innermost test. Rows outside this flight's universe simply do not map,
+    which is correct -- the flight cannot claim them.
+
+    This is a first-class input rather than a fallback trigger: repair runs once per
+    flight in the greedy, so routing it to the Python reference would be a scaling cliff
+    exactly where thousands of flights are felt.
+    """
+
+    bits: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.uint64))
+    n_set: int = 0
+    # Forbidden rows this flight could claim but that could not be mapped.  Must be zero
+    # for the compiled path to be trusted; non-zero means a claim would go unchecked.
+    n_unmapped: int = 0
+
+    @property
+    def any(self) -> bool:
+        return self.n_set > 0
+
+
+def prepare_forbidden(
+    forbidden_rows,
+    fg: FlightGraph,
+    rows: PreparedRows,
+    topology: PreparedTopology,
+) -> PreparedForbidden:
+    """Map an exclusion set into this flight's row numbering."""
+
+    n_words = (rows.n_rows + 63) // 64
+    bits = np.zeros(max(1, n_words), dtype=np.uint64)
+    if not forbidden_rows:
+        # Read-only on THIS path too, and it is not tidiness: numba encodes mutability in
+        # the type, so `array(uint64, 1d, C)` and `readonly array(uint64, 1d, C)` are two
+        # different signatures of `_price_dag`.  A solve sees both -- the sweep passes an
+        # empty set, repair passes a populated one -- so leaving this writable makes the
+        # kernel compile a SECOND time, against the solve's own deadline.
+        bits.setflags(write=False)
+        return PreparedForbidden(bits=bits)
+
+    cell_index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+    term_slot: dict[Any, int] = {}
+    if rows.origin_is_terminal:
+        term_slot[fg.origin_terminal.id] = rows.origin_term_slot
+    if rows.dest_is_terminal:
+        term_slot[fg.dest_terminal.id] = rows.dest_term_slot
+
+    n_set = 0
+    n_unmapped = 0
+    for row in forbidden_rows:
+        key = row if isinstance(row, RowKey) else RowKey(row)
+        if key.kind == "cell":
+            # A different level cannot be claimed by a single-level flight, so it is out
+            # of universe rather than unmapped.
+            if key.level != 0:
+                continue
+            index = cell_index.get(key.cell_coord)
+            if index is None:
+                continue
+            row_id = rows.row_of_cell(index, key.step)
+        else:
+            slot = term_slot.get(key.terminal_id)
+            if slot is None:
+                continue
+            row_id = rows.row_of_term(slot, key.step)
+        if row_id < 0:
+            # In-universe by resource but outside the numbered clock: the flight COULD
+            # touch this resource, so silently dropping it would let a forbidden claim
+            # through.  Counted, and the caller must refuse the compiled path.
+            n_unmapped += 1
+            continue
+        bits[row_id >> 6] |= np.uint64(1) << np.uint64(row_id & 63)
+        n_set += 1
+    bits.setflags(write=False)
+    return PreparedForbidden(bits=bits, n_set=n_set, n_unmapped=n_unmapped)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDuals:
+    """One iteration's row prices, in this flight's row numbering.
+
+    Mirrors :class:`pricing.DualView`'s **two** structures, and it has to be two rather
+    than one for a reason that is easy to get wrong: a window query and an exact claim cost
+    are not the same arithmetic.
+
+    * ``series_*`` are the dense per-resource prefix sums a visit-window query subtracts,
+      exactly as ``DualView.visit_cost`` does. O(1), and bit-identical because it is the
+      same two floats subtracted.
+    * ``row_id``/``row_value`` are the **exact per-row prices**, sorted for binary search,
+      mirroring ``DualView._duals``. Deriving a single row's price from the prefix sums
+      instead -- ``prefix[k+1] - prefix[k]`` -- would *not* be bit-identical, because
+      ``(a + v) - a != v`` in floating point, and ``claim_cost`` sums precisely these
+      values. A dense array is not an option: 5M rows would be 40 MB per flight.
+
+    Rebuilt once per **sweep**, not per flight: duals are global to an iteration.
+    """
+
+    row_id: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int64))
+    row_value: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+
+    # Series table, shared by cells and terminals.  -1 means "no dual anywhere on this
+    # resource", which the reference spells as a missing dict entry.
+    cell_series: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    term_series: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    series_first: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    series_start: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(1, np.int64))
+    series_prefix: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+
+    offsets_lo: int = 0
+    offsets_hi: int = 0
+    max_negative_credit: float = 0.0
+    # Duals on a resource this flight owns but at a step outside its numbering.  Expected
+    # to be zero: every row this flight can claim lies within `[min_step - pad, max_step +
+    # pad]` by construction, so an out-of-range dual is on a row it cannot claim and
+    # dropping it is a no-op.  Counted anyway, because "expected zero" and "checked zero"
+    # differ exactly when it matters.
+    n_out_of_range: int = 0
+
+    def range_sum(self, series: int, start: int, stop: int) -> float:
+        """Sum over ``[start, stop)`` — the literal arithmetic of ``_PrefixSeries``."""
+
+        if series < 0:
+            return 0.0
+        lo_index = int(self.series_start[series])
+        hi_index = int(self.series_start[series + 1])
+        length = hi_index - lo_index
+        if stop <= start or length <= 1:
+            return 0.0
+        first = int(self.series_first[series])
+        series_stop = first + length - 1
+        lo = min(max(start, first), series_stop)
+        hi = min(max(stop, first), series_stop)
+        if hi <= lo:
+            return 0.0
+        return float(
+            self.series_prefix[lo_index + hi - first] - self.series_prefix[lo_index + lo - first]
+        )
+
+    def visit_cost(self, cell_index: int, visit_step: int) -> float:
+        """All cell-row duals charged by one centre visit, in O(1)."""
+
+        if not 0 <= cell_index < self.cell_series.shape[0]:
+            return 0.0
+        return self.range_sum(
+            int(self.cell_series[cell_index]),
+            visit_step + self.offsets_lo,
+            visit_step + self.offsets_hi + 1,
+        )
+
+    def row_cost(self, row: int) -> float:
+        """Exact price of one row id, or zero when unpriced."""
+
+        if row < 0 or self.row_id.shape[0] == 0:
+            return 0.0
+        position = int(np.searchsorted(self.row_id, row))
+        if position < self.row_id.shape[0] and int(self.row_id[position]) == row:
+            return float(self.row_value[position])
+        return 0.0
+
+
+def prepare_duals(
+    view,
+    fg: FlightGraph,
+    topology: PreparedTopology,
+    rows: PreparedRows,
+) -> PreparedDuals:
+    """Restate one iteration's duals in this flight's row numbering.
+
+    Reads ``DualView``'s private structures deliberately: they are the values the reference
+    search actually consults, so copying them is what makes the compiled path bit-identical
+    rather than merely close. Recomputing prefix sums here from the raw dual mapping would
+    reintroduce the possibility of a different summation order.
+    """
+
+    cell_index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+    term_slot: dict[Any, int] = {}
+    if rows.origin_is_terminal:
+        term_slot[fg.origin_terminal.id] = rows.origin_term_slot
+    if rows.dest_is_terminal:
+        term_slot[fg.dest_terminal.id] = rows.dest_term_slot
+
+    series_first: list[int] = []
+    series_prefix: list[float] = []
+    series_start: list[int] = [0]
+    cell_series = np.full(topology.n_cells, -1, dtype=np.int32)
+    term_series = np.full(max(rows.n_terminals, 0), -1, dtype=np.int32)
+
+    def add_series(prefix_series) -> int:
+        slot = len(series_first)
+        series_first.append(int(prefix_series.first_step))
+        series_prefix.extend(float(v) for v in prefix_series.prefix)
+        series_start.append(len(series_prefix))
+        return slot
+
+    for (cell, level), prefix_series in view._cell.items():
+        if level != 0:
+            continue
+        index = cell_index.get(cell)
+        if index is not None:
+            cell_series[index] = add_series(prefix_series)
+    for terminal_id, prefix_series in view._terminal.items():
+        slot = term_slot.get(terminal_id)
+        if slot is not None:
+            term_series[slot] = add_series(prefix_series)
+
+    pairs: list[tuple[int, float]] = []
+    n_out_of_range = 0
+    for key, value in view._duals.items():
+        if key.kind == "cell":
+            if key.level != 0:
+                continue
+            index = cell_index.get(key.cell_coord)
+            if index is None:
+                continue
+            row = rows.row_of_cell(index, key.step)
+        else:
+            slot = term_slot.get(key.terminal_id)
+            if slot is None:
+                continue
+            row = rows.row_of_term(slot, key.step)
+        if row < 0:
+            n_out_of_range += 1
+            continue
+        pairs.append((row, float(value)))
+    pairs.sort()
+
+    prepared = PreparedDuals(
+        row_id=np.asarray([r for r, _v in pairs], dtype=np.int64),
+        row_value=np.asarray([v for _r, v in pairs], dtype=np.float64),
+        cell_series=cell_series,
+        term_series=term_series,
+        series_first=np.asarray(series_first, dtype=np.int32),
+        series_start=np.asarray(series_start, dtype=np.int64),
+        series_prefix=np.asarray(series_prefix, dtype=np.float64),
+        offsets_lo=int(view.offsets[0]),
+        offsets_hi=int(view.offsets[1]),
+        max_negative_credit=float(view.max_negative_credit),
+        n_out_of_range=n_out_of_range,
+    )
+    for array in (
+        prepared.row_id, prepared.row_value, prepared.cell_series, prepared.term_series,
+        prepared.series_first, prepared.series_start, prepared.series_prefix,
+    ):
+        array.setflags(write=False)
+    return prepared
+
+
+def visit_row_ids(rows: PreparedRows, cell_index: int, visit_step: int, offsets) -> list[int]:
+    """Row ids one centre visit claims — the row-id image of ``pricing._visit_claims``."""
+
+    lo, hi = offsets
+    return [rows.row_of_cell(cell_index, visit_step + o) for o in range(lo, hi + 1)]
+
+
+# ------------------------------------------------------------------- completion envelope
+
+
+class CompletionEnvelopes:
+    """``_best_column``'s completion bound, lifted out of the search that owns it.
+
+    This is ``pricing._best_column``'s ``completion_envelope`` and
+    ``completion_can_compete`` (pricing.py:1247-1394) with their captured state made
+    explicit, so the compiled search can consult the same numbers the reference does.
+    The arithmetic is copied term for term rather than re-derived: it is a *pruning*
+    bound, and a bound that is a hair too tight discards the true optimum while the
+    search still reports that it proved optimality.
+
+    **Why this stays in Python.** The delay half is scalar arithmetic a kernel could do,
+    but the destination half needs endpoint claim *sets* — the disc-times-steps rectangle
+    for a bare point, the unpadded dwell span for a terminal — unioned with a visit window
+    and summed with :func:`math.fsum`. Reimplementing those two span rules in a kernel is
+    a second place for them to drift, and ``[[pruning-not-neutral-under-dominance]]`` is
+    the reminder that drift here does not merely cost time.
+
+    **Why the incumbent is mutable.** ``completion_envelope`` memoizes, and its early
+    ``break`` reads the incumbent live, so each envelope's LENGTH is frozen by whatever
+    incumbent existed at its first use — and the length is load-bearing, since
+    ``first_hops >= len(delay_lbs)`` is itself a prune. ``consider_sink`` improves that
+    incumbent mid-sweep. Reproducing the reference therefore means building each envelope
+    at the same moment, against the same cutoff, which is what :meth:`set_incumbent` and
+    the kernel's pause-and-resume protocol exist to arrange.
+
+    The destination half is additionally memoized on ``(arrival_step, total_hops)``,
+    which the reference does not do because it has no reason to: that pair is what the
+    endpoint claims and the arrival visit window actually depend on, and many
+    ``(departure_step, lane)`` keys share a corridor start. Measured on a density flight,
+    13,515 variants collapse to ~901 distinct corridor starts. It is a cache over a pure
+    function of already-fixed state, so it cannot move an answer.
+    """
+
+    __slots__ = (
+        "_cfg",
+        "_deadline",
+        "_delay_envelopes",
+        "_destination_costs",
+        "_initial_incumbent",
+        "_destination_fold_exact",
+        "_destination_fold_lb",
+        "_destination_options",
+        "_detour_defined",
+        "_envelopes",
+        "_fg",
+        "_forbidden",
+        "_incumbent",
+        "_model",
+        "_offsets",
+        "_origin_fold_lb_by_lane",
+        "_pi_f",
+        "_reference_time_s",
+        "_view",
+        "benefit",
+        "destination_lane_tie",
+    )
+
+    def __init__(
+        self,
+        fg: FlightGraph,
+        cfg: SimConfig,
+        view,
+        *,
+        benefit: float,
+        pi_f: float,
+        model=None,
+        forbidden_rows=frozenset(),
+        incumbent=None,
+        deadline: float | None = None,
+    ) -> None:
+        from ...volumes import enroute_reference_m
+        from .objective import DELAY_MODEL
+        from .pricing import (
+            _destination_options,
+            _fold_leg_s,
+            _origin_options,
+            _terminal_fold_leg_s,
+        )
+
+        self._fg = fg
+        self._cfg = cfg
+        self._view = view
+        self.benefit = float(benefit)
+        self._pi_f = float(pi_f)
+        self._model = DELAY_MODEL if model is None else model
+        self._forbidden = forbidden_rows
+        self._deadline = deadline
+        self._incumbent = incumbent
+        self._initial_incumbent = incumbent
+        self._offsets = view.offsets
+        self._envelopes: dict[tuple[int, int | None], tuple[tuple[float, ...], ...]] = {}
+        self._delay_envelopes: dict[tuple[int, int | None], tuple[Any, int]] = {}
+        self._destination_costs: dict[tuple[int, int], float] = {}
+
+        destination_options = _destination_options(fg)
+        self._destination_options = destination_options
+
+        # Endpoint fold legs, per lane and for the destination.  Copied from
+        # pricing.py:1164-1210; ``_terminal_fold_leg_s`` returns a "was the lane cell
+        # retained by folding" flag as well as the leg, and that flag is what enables the
+        # arc form of the delay bound at all.
+        self._origin_fold_lb_by_lane: dict[int | None, tuple[float, bool]] = {}
+        for lane_idx, cell, _lane_steps in _origin_options(fg):
+            lane_dist = None if lane_idx is None else fg.origin_lanes[lane_idx].dist
+            if fg.origin_terminal is None:
+                leg = _fold_leg_s(fg.request.origin, None, lane_dist, cfg)
+                self._origin_fold_lb_by_lane[lane_idx] = leg, True
+            else:
+                self._origin_fold_lb_by_lane[lane_idx] = _terminal_fold_leg_s(
+                    fg.request.origin, fg.origin_terminal, cell, cfg
+                )
+
+        destination_fold_exact = True
+        if fg.dest_terminal is None:
+            destination_fold_lb = _fold_leg_s(fg.request.dest, None, None, cfg)
+        else:
+            destination_folds: list[float] = []
+            for destination, lane_indices in destination_options.items():
+                for lane_idx in lane_indices:
+                    assert lane_idx is not None
+                    fold_s, retained = _terminal_fold_leg_s(
+                        fg.request.dest, fg.dest_terminal, destination, cfg
+                    )
+                    destination_folds.append(fold_s)
+                    destination_fold_exact &= retained
+            destination_fold_lb = min(destination_folds)
+        self._destination_fold_lb = destination_fold_lb
+        self._destination_fold_exact = destination_fold_exact
+
+        reference_m = enroute_reference_m(
+            fg.request.origin, fg.request.dest, fg.origin_terminal, fg.dest_terminal, cfg
+        )
+        self._reference_time_s = reference_m / cfg.nominal_speed_mps
+        self._detour_defined = reference_m > 1e-9
+
+        self.destination_lane_tie = min(
+            -1 if lane_idx is None else lane_idx
+            for lane_indices in destination_options.values()
+            for lane_idx in lane_indices
+        )
+
+    # -- incumbent ---------------------------------------------------------------------
+
+    @property
+    def incumbent(self):
+        return self._incumbent
+
+    def set_incumbent(self, incumbent) -> None:
+        """Adopt a newly certified incumbent, exactly as ``consider_sink`` reassigns it.
+
+        Envelopes already built keep the length they were frozen with; the reference's
+        memo does the same, and that asymmetry is a property of the algorithm rather than
+        an artefact of caching it.
+        """
+
+        self._incumbent = incumbent
+
+    @property
+    def incumbent_prefix(self) -> tuple[int, int, int, int]:
+        """``completion_can_compete``'s four-field incumbent prefix (pricing.py:1351)."""
+
+        assert self._incumbent is not None
+        column = self._incumbent[1]
+        return (
+            len(column.cell_path) - 1,
+            column.departure_step,
+            -1 if column.origin_lane_idx is None else column.origin_lane_idx,
+            -1 if column.dest_lane_idx is None else column.dest_lane_idx,
+        )
+
+    # -- the bound ---------------------------------------------------------------------
+
+    def delay_lower_bound(
+        self, departure_step: int, lane_idx: int | None, hops: int, remaining_hops: int
+    ) -> float:
+        """``_best_column``'s ``delay_lower_bound`` closure (pricing.py:1212)."""
+
+        from .pricing import _arc_delay_lower_bound_s
+
+        cfg = self._cfg
+        origin_fold_s, origin_fold_exact = self._origin_fold_lb_by_lane[lane_idx]
+        return _arc_delay_lower_bound_s(
+            ground_delay_s=(departure_step - self._fg.base_step) * cfg.dt_s,
+            origin_fold_s=origin_fold_s,
+            hops=hops,
+            remaining_hops=remaining_hops,
+            destination_fold_s=self._destination_fold_lb,
+            reference_time_s=self._reference_time_s,
+            dt_s=cfg.dt_s,
+            folding_exact=(
+                self._detour_defined and origin_fold_exact and self._destination_fold_exact
+            ),
+            model=self._model,
+        )
+
+    def _destination_cost(self, arrival_step: int, total_hops: int) -> float:
+        """Cheapest positive endpoint-plus-arrival price over the destination options.
+
+        pricing.py:1302-1318.  ``math.fsum`` is order-independent, so the memo cannot
+        perturb it even though the sets it sums are iterated in hash order.
+        """
+
+        from .pricing import _endpoint_claims, _visit_claims
+
+        key = arrival_step, total_hops
+        cached = self._destination_costs.get(key)
+        if cached is not None:
+            return cached
+        endpoint_claims = _endpoint_claims(
+            self._fg, self._cfg, origin=False, step=arrival_step, timing_steps=total_hops
+        )
+        destination_cost = math.inf
+        for destination in self._destination_options:
+            final_visit_claims = _visit_claims(destination, 0, arrival_step, self._offsets)
+            unavoidable_claims = endpoint_claims | final_visit_claims
+            if not unavoidable_claims.isdisjoint(self._forbidden):
+                continue
+            destination_cost = min(
+                destination_cost,
+                math.fsum(max(0.0, self._view.row_cost(row)) for row in unavoidable_claims),
+            )
+        self._destination_costs[key] = destination_cost
+        return destination_cost
+
+    def _delay_envelope(
+        self, departure_step: int, lane_idx: int | None
+    ) -> tuple[tuple[float, ...], int]:
+        """The envelope's LENGTH and delay terms — scalar arithmetic, no claim sets at all.
+
+        Split out of :meth:`envelope` because the reference's early ``break`` consults
+        ``delay_lb`` alone and never the destination cost. The length is therefore settled
+        before a single row set is built, and the length is what most of the gate's callers
+        actually need: measured on ``density_faa``, **69.2% of ``can_compete`` calls are
+        answered by ``first_hops >= len(delay_lbs)``**, and building the other half of the
+        envelope for them cost 135,449 of 193,852 destination-cost entries. The 30.8% that
+        do scan read a mean of 3.2 entries and never more than 7, against a mean envelope
+        length of 81.7.
+
+        **The incumbent is captured here, at first use, and reused for every later
+        consultation.** That is what makes the split answer-identical rather than merely
+        faster: the reference builds the whole list in one go against one incumbent and
+        caches it, so a length re-derived later against an improved incumbent would be a
+        strictly stronger prune -- which is the failure ``[[pruning-not-neutral-under-
+        dominance]]`` describes.
+
+        ``min()`` rather than the ceiling alone, and the reasoning is pricing.py:1258-1284:
+        the horizon is a real bound even though the two are provably equal today.
+        """
+
+        from .pricing import _RECOMPUTE_EPS, _check_deadline
+
+        key = departure_step, lane_idx
+        cached = self._delay_envelopes.get(key)
+        if cached is not None:
+            return cached
+
+        fg = self._fg
+        lane_steps = 0 if lane_idx is None else fg.origin_lanes[lane_idx].steps
+        corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
+        max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
+        delay_lbs = [math.inf]
+        incumbent = self._incumbent
+        for total_hops in range(1, max_total_hops + 1):
+            _check_deadline(self._deadline)
+            delay_lb = self.delay_lower_bound(departure_step, lane_idx, total_hops, 0)
+            if incumbent is not None and (
+                self.benefit - self._pi_f - delay_lb + self._view.max_negative_credit
+                < incumbent[0] - _RECOMPUTE_EPS
+            ):
+                break
+            delay_lbs.append(delay_lb)
+
+        value = tuple(delay_lbs), corridor_start
+        self._delay_envelopes[key] = value
+        return value
+
+    def envelope(
+        self, departure_step: int, lane_idx: int | None
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """``completion_envelope`` in full — both halves, frozen at its first length.
+
+        Still the reference's own shape, because the compiled search needs the whole array:
+        the kernel evaluates the gate per LABEL, not just per root, and cannot pause into
+        Python for one entry at a time. Only the roots that survive
+        ``prepare_variants`` ever reach here -- 69 of 2,402 on a density flight.
+        """
+
+        key = departure_step, lane_idx
+        cached = self._envelopes.get(key)
+        if cached is not None:
+            return cached
+
+        delay_lbs, corridor_start = self._delay_envelope(departure_step, lane_idx)
+        delays = [math.inf]
+        destination_positive_costs = [math.inf]
+        for total_hops in range(1, len(delay_lbs)):
+            destination_cost = self._destination_cost(corridor_start + total_hops, total_hops)
+            if not math.isfinite(destination_cost):
+                delays.append(math.inf)
+                destination_positive_costs.append(math.inf)
+                continue
+            delays.append(delay_lbs[total_hops])
+            destination_positive_costs.append(destination_cost)
+
+        result = tuple(delays), tuple(destination_positive_costs)
+        self._envelopes[key] = result
+        return result
+
+    def built(self, departure_step: int, lane_idx: int | None) -> bool:
+        """Whether this key's envelope has been frozen already."""
+
+        return (departure_step, lane_idx) in self._envelopes
+
+    def built_keys(self) -> tuple[tuple[int, int | None], ...]:
+        """The keys frozen so far, in the order they were frozen."""
+
+        return tuple(self._envelopes)
+
+    def rewind(self, keys) -> None:
+        """Return to the pre-search state, then re-freeze exactly ``keys``.
+
+        A compiled search that exhausts a budget re-runs from its first layer, and it has
+        to re-run against the cutoff it *started* with: an envelope frozen against a
+        mid-sweep incumbent is a strictly stronger prune, so a second attempt would
+        explore less than the first, and the reference's column is defined by a search
+        that never restarts.
+
+        The destination-cost memo deliberately survives. It is a pure function of the
+        duals, the graph and the exclusion set, none of which move when the incumbent
+        does, so keeping it makes the restart cheaper without making it different.
+        """
+
+        self._envelopes = {}
+        # The DELAY envelopes go too: their length is frozen by the incumbent live at their
+        # first use, so keeping them would carry a mid-sweep truncation into the restart.
+        self._delay_envelopes = {}
+        self._incumbent = self._initial_incumbent
+        for departure_step, lane_idx in keys:
+            self.envelope(departure_step, lane_idx)
+
+    def can_compete(
+        self,
+        departure_step: int,
+        lane_idx: int | None,
+        minimum_total_hops: int,
+        paid_duals: float,
+        *,
+        paid_duals_exact: bool,
+    ) -> bool:
+        """``completion_can_compete`` — pricing.py:1330, arm for arm."""
+
+        from .pricing import _RECOMPUTE_EPS, _SCORE_EPS
+
+        incumbent = self._incumbent
+        if incumbent is None:
+            return True
+        # Only the LENGTH is needed to answer most calls, and the length is free.
+        delay_lbs, corridor_start = self._delay_envelope(departure_step, lane_idx)
+        first_hops = max(1, minimum_total_hops)
+        if first_hops >= len(delay_lbs):
+            return False
+
+        incumbent_prefix = self.incumbent_prefix
+        origin_lane_tie = -1 if lane_idx is None else lane_idx
+        paid_positive_lb = max(
+            0.0, paid_duals - (0.0 if paid_duals_exact else _RECOMPUTE_EPS)
+        )
+        for total_hops in range(first_hops, len(delay_lbs)):
+            destination_positive = self._destination_cost(
+                corridor_start + total_hops, total_hops
+            )
+            if not math.isfinite(destination_positive):
+                # The eager form stored `(inf, inf)` at this hop.  Either way the bound is
+                # -inf -- `finite - inf` then `+ credit` -- and all three arms below reject
+                # it, so skipping is the same verdict reached without the arithmetic.
+                continue
+            union_positive_lb = max(paid_positive_lb, destination_positive)
+            hop_rc_bound = (
+                self.benefit
+                - self._pi_f
+                - delay_lbs[total_hops]
+                - union_positive_lb
+                + self._view.max_negative_credit
+            )
+            if hop_rc_bound > incumbent[0] + _SCORE_EPS:
+                return True
+            if not paid_duals_exact and (hop_rc_bound >= incumbent[0] - _RECOMPUTE_EPS):
+                return True
+            if abs(hop_rc_bound - incumbent[0]) <= _SCORE_EPS:
+                possible_prefix = (
+                    total_hops,
+                    departure_step,
+                    origin_lane_tie,
+                    self.destination_lane_tie,
+                )
+                if possible_prefix <= incumbent_prefix:
+                    return True
+        return False
+
+
+class EnvelopeArena:
+    """The built envelopes as three flat arrays the kernel can index by variant id.
+
+    Growable rather than sized up front: with a seed incumbent the reference builds every
+    envelope in its root loop, so one pass fills this exactly; without one it acquires the
+    incumbent mid-sweep and envelopes arrive one pause at a time. A dense
+    ``n_variants x (max_air_hops + 2)`` allocation would be ~28 MB on a density flight
+    whose surviving variant count is usually in the single digits, so the arena doubles
+    instead — the same geometric policy ``PricingWorkspace`` uses, for the same reason.
+
+    ``start[v] < 0`` means "not built", and the kernel treats that as a hard stop
+    (``STATUS_NEED_ENVELOPE``) rather than as "no bound": guessing would be pruning
+    against a bound the reference never computed.
+    """
+
+    __slots__ = ("delay", "dest", "length", "start", "_used")
+
+    def __init__(self, n_variants: int) -> None:
+        self.start = np.full(max(n_variants, 1), -1, dtype=np.int32)
+        self.length = np.zeros(max(n_variants, 1), dtype=np.int32)
+        self.delay = np.zeros(64, dtype=np.float64)
+        self.dest = np.zeros(64, dtype=np.float64)
+        self._used = 0
+
+    def add(self, variant: int, delay_lbs, destination_positive_costs) -> None:
+        """Append one variant's frozen envelope; idempotent per variant."""
+
+        if self.start[variant] >= 0:
+            return
+        n = len(delay_lbs)
+        needed = self._used + n
+        if needed > self.delay.shape[0]:
+            size = self.delay.shape[0]
+            while size < needed:
+                size <<= 1
+            for name in ("delay", "dest"):
+                grown = np.zeros(size, dtype=np.float64)
+                grown[: self._used] = getattr(self, name)[: self._used]
+                setattr(self, name, grown)
+        self.delay[self._used : self._used + n] = delay_lbs
+        self.dest[self._used : self._used + n] = destination_positive_costs
+        self.start[variant] = self._used
+        self.length[variant] = n
+        self._used += n
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedVariants:
+    """Root labels: every ``(departure_step, origin lane)`` the reference would create.
+
+    Mirrors the initialization loop of ``pricing._best_column``. One variant is one root
+    label, so the kernel creates exactly the labels the reference does.
+
+    ``paid_class`` is the subtle field. The reference's dominance key holds the *set*
+    ``origin_paid_rows``, **not** the departure step, so two roots from different
+    departures that happened to pay the same rows are allowed to merge downstream. Keying
+    on variant id instead would keep them apart -- still optimal, since a finer state never
+    loses a completion, but it explores more labels and, worse, can break a tie the
+    reference breaks the other way. Distinct paid-row sets are therefore interned to a
+    dense class id and the kernel keys on that.
+
+    **Every time field here is already multiplied by the objective's weights**, which is
+    what lets the kernel stay objective-agnostic: it charges ``air_weight * dt_s`` per arc
+    and never sees a weight of its own. Dual prices are NOT weighted -- they already arrive
+    in the master's currency. Getting this backwards is a silent wrong answer rather than a
+    crash, and is the reason the label score must be denominated in the objective.
+    """
+
+    departure_step: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    lane_idx: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    cell: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    start_step: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    score: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+    ground_delay_s: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+    # ``air_weight * origin_leg``, the second term of the score.  Stored because the kernel
+    # recovers the duals a label has paid by inverting the score's decomposition
+    # (pricing.py:1548), and that inversion has to subtract the very same products the
+    # score was built from -- term by term, in the same order, or it is not exact.
+    origin_leg_w_s: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+    start_dual_cost: np.ndarray = field(
+        repr=False, default_factory=lambda: np.empty(0, np.float64)
+    )
+    paid_class: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+
+    # Rows a root already paid, CSR over paid CLASS (not variant).  The arc loop consults
+    # these to avoid charging a cell row twice when a later visit window overlaps the
+    # origin endpoint's own cells -- the reference's ``_paid_cell_rows``.
+    paid_start: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(1, np.int32))
+    paid_cell: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    paid_step: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
+    paid_value: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
+
+    n_departures_considered: int = 0
+    n_departures_prefiltered: int = 0
+    unsupported_reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.unsupported_reason is None
+
+    @property
+    def n_variants(self) -> int:
+        return int(self.departure_step.shape[0])
+
+
+def prepare_variants(
+    fg: FlightGraph,
+    cfg: SimConfig,
+    view,
+    topology: PreparedTopology,
+    rows: PreparedRows,
+    *,
+    benefit: float = 0.0,
+    pi_f: float = 0.0,
+    cost_cutoff: float | None = None,
+    model=None,
+    forbidden_rows=frozenset(),
+    envelopes: CompletionEnvelopes | None = None,
+    keep_roots: frozenset[tuple[int, int]] | None = None,
+) -> PreparedVariants:
+    """Price every root option once, exactly as ``_best_column``'s initialization does.
+
+    ``cost_cutoff`` enables the same cheap ground-delay prefilter the reference applies at
+    the top of its loop, *before* building any endpoint claim set. It matters more here
+    than there: ``max_ground_delay_s=3600`` gives 901 departure steps, and building origin
+    rows for every one of them costs more than the search that consumes them. A departure
+    whose ground delay alone cannot beat the incumbent can never win, whatever route
+    follows.
+
+    ``envelopes`` supplies the second, sharper root gate: ``completion_can_compete``
+    (pricing.py:1435). Passing it is what makes the compiled search reproduce the
+    reference's *column* rather than merely its optimum. Omitting a prune costs work and
+    never an answer under pure enumeration, and that is false here — a pruned label's
+    DESCENDANTS still compete for dominance slots, and a better-scoring one evicts the
+    survivor the reference kept, losing its sinks. See
+    ``[[pruning-not-neutral-under-dominance]]``.
+
+    ``keep_roots`` restricts the root set to an explicit allowlist of
+    ``(departure_step, lane_idx)`` pairs, with ``-1`` for a bare origin. This is what the
+    pricing BOOTSTRAP restricts on (``pricing._bootstrap_incumbent``), and it is an
+    allowlist rather than a rule so that the *host* can rank once and hand the same set to
+    both searches -- ``_best_column`` takes the identical argument. Neither reimplements the
+    ranking, so the two still explore the same space and ``Declined``'s contract is
+    unaffected.
+
+    The gate runs **here**, over every root, before any arc is relaxed, because that is
+    where the reference runs it — and running it here is also what freezes every
+    envelope's length against the *initial* incumbent, which is what the reference's memo
+    does. Deferring it into the search would freeze some of them against a mid-sweep
+    incumbent instead, and the length of an envelope is itself a prune.
+    """
+
+    from .objective import DELAY_MODEL
+    from .pricing import _RECOMPUTE_EPS, _fold_leg_s, _origin_options, _visit_claims
+
+    if not (topology.ok and rows.ok):
+        return PreparedVariants(
+            unsupported_reason=topology.unsupported_reason or rows.unsupported_reason
+        )
+    if model is None:
+        model = DELAY_MODEL
+    w_ground, w_air = model.ground_weight, model.air_weight
+    offsets = view.offsets
+
+    cell_index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+    origin_options = _origin_options(fg)
+    # Endpoint legs, computed once per lane exactly as the reference does.
+    origin_leg_by_lane: dict[int | None, float] = {}
+    for lane_idx, _cell, _steps in origin_options:
+        lane_dist = None if lane_idx is None else fg.origin_lanes[lane_idx].dist
+        origin_leg_by_lane[lane_idx] = _fold_leg_s(
+            fg.request.origin, fg.origin_terminal, lane_dist, cfg
+        )
+
+    from .pricing import _destination_options, _distance_lower_bound
+    destination_cells = frozenset(_destination_options(fg))
+    distance_cache: dict[Cell, int] = {}
+
+    def remaining_distance(cell: Cell) -> int:
+        cached = distance_cache.get(cell)
+        if cached is None:
+            cached = _distance_lower_bound(cell, destination_cells)
+            distance_cache[cell] = cached
+        return cached
+
+    paid_ids: dict[frozenset, int] = {}
+    paid_rows_by_class: list[frozenset] = []
+
+    dep: list[int] = []
+    lanes: list[int] = []
+    cells: list[int] = []
+    starts: list[int] = []
+    scores: list[float] = []
+    grounds: list[float] = []
+    origin_legs: list[float] = []
+    dual_costs: list[float] = []
+    classes: list[int] = []
+    considered = prefiltered = 0
+
+    for departure_step in range(fg.base_step, fg.latest_departure_step + 1):
+        considered += 1
+        ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
+        ground_score = -w_ground * ground_delay_s
+        if cost_cutoff is not None:
+            start_upper_bound = benefit + ground_score - pi_f + view.max_negative_credit
+            if start_upper_bound < cost_cutoff - _RECOMPUTE_EPS:
+                prefiltered += 1
+                continue
+        origin_claims = pricing_endpoint_claims(fg, cfg, origin=True, step=departure_step)
+        if not origin_claims.isdisjoint(forbidden_rows):
+            continue
+        for lane_idx, cell, lane_steps in origin_options:
+            if keep_roots is not None and (
+                departure_step, -1 if lane_idx is None else int(lane_idx)
+            ) not in keep_roots:
+                continue
+            index = cell_index.get(cell)
+            if index is None:
+                continue
+            distance_to_go = remaining_distance(cell)
+            start_step = departure_step + fg.takeoff_steps[0] + lane_steps
+            if start_step >= fg.max_step:
+                continue
+            if start_step + distance_to_go > fg.max_step:
+                continue
+            if distance_to_go > topology.air_hop_limit:
+                continue
+            start_claims = origin_claims | _visit_claims(cell, 0, start_step, offsets)
+            if not start_claims.isdisjoint(forbidden_rows):
+                continue
+            start_dual_cost = view.claim_cost(start_claims)
+            origin_paid_rows = view.active_claims(start_claims)
+            if envelopes is not None and not envelopes.can_compete(
+                departure_step,
+                lane_idx,
+                distance_to_go,
+                start_dual_cost,
+                paid_duals_exact=True,
+            ):
+                continue
+            paid_class = paid_ids.get(origin_paid_rows)
+            if paid_class is None:
+                paid_class = len(paid_rows_by_class)
+                paid_ids[origin_paid_rows] = paid_class
+                paid_rows_by_class.append(origin_paid_rows)
+
+            dep.append(departure_step)
+            lanes.append(-1 if lane_idx is None else int(lane_idx))
+            cells.append(index)
+            starts.append(start_step)
+            scores.append(ground_score - w_air * origin_leg_by_lane[lane_idx] - start_dual_cost)
+            grounds.append(w_ground * ground_delay_s)
+            origin_legs.append(w_air * origin_leg_by_lane[lane_idx])
+            dual_costs.append(start_dual_cost)
+            classes.append(paid_class)
+
+    # Paid-row corrections, CSR over class.  Only single-level CELL rows can recur in a
+    # later visit window; terminal rows never can, so they are dropped rather than searched
+    # -- exactly what ``_paid_cell_rows`` does.
+    paid_start = [0]
+    paid_cell: list[int] = []
+    paid_step: list[int] = []
+    paid_value: list[float] = []
+    for paid in paid_rows_by_class:
+        for row in sorted(paid):
+            if row.kind != "cell" or row.level != 0:
+                continue
+            index = cell_index.get(row.cell_coord)
+            if index is None:
+                continue
+            paid_cell.append(index)
+            paid_step.append(int(row.step))
+            paid_value.append(float(view.row_cost(row)))
+        paid_start.append(len(paid_cell))
+
+    return PreparedVariants(
+        departure_step=np.asarray(dep, dtype=np.int32),
+        lane_idx=np.asarray(lanes, dtype=np.int32),
+        cell=np.asarray(cells, dtype=np.int32),
+        start_step=np.asarray(starts, dtype=np.int32),
+        score=np.asarray(scores, dtype=np.float64),
+        ground_delay_s=np.asarray(grounds, dtype=np.float64),
+        origin_leg_w_s=np.asarray(origin_legs, dtype=np.float64),
+        start_dual_cost=np.asarray(dual_costs, dtype=np.float64),
+        paid_class=np.asarray(classes, dtype=np.int32),
+        paid_start=np.asarray(paid_start, dtype=np.int32),
+        paid_cell=np.asarray(paid_cell, dtype=np.int32),
+        paid_step=np.asarray(paid_step, dtype=np.int32),
+        paid_value=np.asarray(paid_value, dtype=np.float64),
+        n_departures_considered=considered,
+        n_departures_prefiltered=prefiltered,
+    )
+
+
+def pricing_endpoint_claims(fg, cfg, *, origin: bool, step: int):
+    """``pricing._endpoint_claims`` with ``timing_steps=0``, imported lazily.
+
+    Wrapped rather than imported at module scope because ``pricing`` imports this module;
+    named so the call site reads as the reference function it is.
+    """
+
+    from .pricing import _endpoint_claims
+
+    return _endpoint_claims(fg, cfg, origin=origin, step=step, timing_steps=0)
+
+
+class PricingWorkspace:
+    """Caller-owned scratch for one compiled pricing call.
+
+    **Owned by the caller, never allocated inside the kernel.** That is the single
+    decision that makes flight-parallel pricing cheap: one workspace per thread, reused
+    across every flight it prices, so the per-flight allocate-and-free churn that leaves
+    a large allocator residue never happens. PR #76 measured 2.5 GB surviving
+    ``gc.collect()`` with every graph unreachable, and answered it by recycling worker
+    *processes*; not allocating is the cheaper answer.
+
+    Growth is **geometric**, never exact-fit: a ladder of powers of two was measured to
+    remove 82% of resize waste, and an exact-fit policy re-allocates on nearly every
+    flight because label counts vary by orders of magnitude between them.
+    """
+
+    __slots__ = ("stamp", "stamp_gen", "claim_scratch", "_n_rows", "_n_claims")
+
+    def __init__(self) -> None:
+        self.stamp = np.zeros(0, dtype=np.int32)
+        # Generation stamping instead of clearing: a claim set is a few hundred rows out
+        # of millions, so zeroing the array per sink would dominate the sink itself.
+        self.stamp_gen = 0
+        self.claim_scratch = np.zeros(0, dtype=np.int32)
+        self._n_rows = 0
+        self._n_claims = 0
+
+    @staticmethod
+    def _grow(current: int, needed: int) -> int:
+        size = max(current, 1024)
+        while size < needed:
+            size <<= 1
+        return size
+
+    def ensure(self, n_rows: int, n_claims: int) -> None:
+        """Size the buffers for one flight, keeping whatever is already large enough."""
+
+        if n_rows > self._n_rows:
+            self._n_rows = self._grow(self._n_rows, n_rows)
+            self.stamp = np.zeros(self._n_rows, dtype=np.int32)
+            # A fresh array is all zeros, so restart stamping rather than carrying a
+            # generation that would read as "already seen" on every row.
+            self.stamp_gen = 0
+        if n_claims > self._n_claims:
+            self._n_claims = self._grow(self._n_claims, n_claims)
+            self.claim_scratch = np.zeros(self._n_claims, dtype=np.int32)
+
+    def next_generation(self) -> int:
+        """Advance the stamp, clearing only when int32 would wrap."""
+
+        self.stamp_gen += 1
+        if self.stamp_gen >= (1 << 31) - 1:
+            self.stamp.fill(0)
+            self.stamp_gen = 1
+        return self.stamp_gen
+
+    @property
+    def n_rows_capacity(self) -> int:
+        return self._n_rows

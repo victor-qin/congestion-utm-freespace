@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import multiprocessing as mp
 import os
 import time
 
@@ -16,6 +17,7 @@ from freespace_sim.planner.colgen.pricing import DualView
 from freespace_sim.planner.colgen.pricing_pool import (
     SweepResult,
     _accepted_prefix,
+    _results_before_deadline,
     price_sweep,
 )
 from freespace_sim.planner.colgen.solver import ColGenSolver
@@ -288,3 +290,67 @@ def test_explicit_zero_workers_matches_no_config_at_all():
     default = ColGenSolver().solve(requests, cfg, (), _params())
     pinned = ColGenSolver().solve(requests, cfg, (), _params(n_pricing_workers=0))
     assert _fingerprint(pinned) == _fingerprint(default)
+
+
+class _LostResult:
+    """An ``imap`` iterator whose k-th result never arrives, like a task whose worker died.
+
+    `mp.Pool` does not fail that task -- it starts a replacement process and the lost
+    result is simply never produced -- so the real object blocks in `next(timeout)` until
+    the timeout and then raises. A fake is the only way to state that contract: killing a
+    worker for real is a race, and the hang it produces has no natural end.
+    """
+
+    def __init__(self, results, lose_at):
+        self._results, self._lose_at, self._i = results, lose_at, 0
+
+    def next(self, timeout=None):
+        if self._i == self._lose_at:
+            raise mp.TimeoutError("worker died; this result will never arrive")
+        if self._i >= len(self._results):
+            raise StopIteration
+        value = self._results[self._i]
+        self._i += 1
+        return value
+
+
+def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
+    """The hang this guards is silent and unbounded, and the wrong fix is worse than it.
+
+    A truncated prefix that reported itself COMPLETE would let `master.upper_bound` take a
+    bound over flights that were never priced -- a wrong answer rather than a slow one. So
+    the lost flight has to come back named, with `complete` False.
+    """
+
+    order = [7, 3, 9]
+    priced = [
+        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}),
+    ]
+    accepted = _accepted_prefix(
+        _results_before_deadline(_LostResult(priced, lose_at=2), order, deadline=0.0)
+    )
+
+    assert accepted.flight_ids == (7, 3)
+    assert accepted.timeout_flight_id == 9
+    assert not accepted.complete
+    # The lost task contributes no seconds and no kernel tally: it is not work that landed.
+    assert accepted.task_total_s == 1.5
+    assert (accepted.kernel_priced, accepted.kernel_fell_back) == (2, 1)
+
+
+def test_every_result_arriving_in_time_is_still_a_complete_sweep():
+    """The guard must not turn an ordinary finished sweep into a phantom timeout."""
+
+    order = [7, 3]
+    priced = [
+        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}),
+    ]
+    accepted = _accepted_prefix(
+        _results_before_deadline(_LostResult(priced, lose_at=None), order, deadline=None)
+    )
+
+    assert accepted.complete
+    assert accepted.timeout_flight_id is None
+    assert accepted.flight_ids == (7, 3)

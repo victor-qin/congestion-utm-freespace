@@ -47,18 +47,26 @@ reason no worker-recycling budget is set here.
 script that does work at module level rather than under ``if __name__ == "__main__":`` dies
 in ``_check_not_importing_main``. Every shipped entry point already guards its main.
 
-**A worker KILLED mid-task hangs the sweep, and that is accepted too.** ``mp.Pool`` does
-not fail a task whose worker died: ``_repopulate_pool_static`` starts a replacement and the
-task's result is simply never produced, so ``imap`` waits for it forever. The realistic
-trigger is the OOM killer, which is what the ``n_workers`` ceiling below exists to keep out
-of reach, and the alternative pool implementation that would detect it is the one that
-deadlocks. A worker that fails in its *initializer* is NOT accepted -- that failure is
-reachable rather than hypothetical, so :func:`_init_worker` reports it instead of raising.
+**A worker KILLED mid-task no longer hangs the sweep.** ``mp.Pool`` does not fail a task
+whose worker died: ``_repopulate_pool_static`` starts a replacement and the task's result
+is simply never produced, so an unguarded ``imap`` waits for it forever -- and the solver's
+own time limit never fires, because the parent is blocked inside the sweep rather than
+checking a clock. The realistic trigger is the OOM killer, which is reachable rather than
+hypothetical: memory is linear in workers.
+
+:func:`_results_before_deadline` bounds the wait by the caller's own ``pricing_deadline``
+and reports a lost result as that flight timing out, so the sweep degrades to a short
+prefix instead of blocking. Bounding it by a deadline the caller already owns is what makes
+this safe to add without inventing a grace period, and without reaching for the pool
+implementation that deadlocks on this interpreter.
+
+A worker that fails in its *initializer* is a different failure with the same symptom, and
+is handled separately: ``mp.Pool`` calls the initializer outside the try/except that wraps
+a task, so :func:`_init_worker` records the traceback and :func:`_price_one` re-raises it.
 """
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 import time
 import traceback
 from collections import Counter
@@ -377,9 +385,54 @@ def _sweep_parallel(
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
         accepted = _accepted_prefix(
-            pool.imap(_price_one, pricing_order, params.pricing_chunksize)
+            _results_before_deadline(
+                pool.imap(_price_one, pricing_order, params.pricing_chunksize),
+                pricing_order,
+                deadline,
+            )
         )
     return replace(accepted, wall_s=time.perf_counter() - sweep_started)
+
+
+def _results_before_deadline(results, pricing_order, deadline):
+    """Yield ``imap`` results, giving up on the one the parent is still waiting for at
+    ``deadline``.
+
+    Without this the sweep can wait forever, and the solver's own time limit never gets a
+    chance to fire. ``mp.Pool`` does not fail a task whose worker DIED: the sentinel thread
+    starts a replacement and the lost task's result is simply never produced, so the
+    ordered iterator blocks on a value nobody will send. The realistic trigger is the OOM
+    killer, which is reachable rather than hypothetical here -- memory is linear in workers
+    (22.7 GB at 8 on density x100) and that is what the ``n_workers`` ceiling exists for.
+
+    The bound is the caller's OWN absolute deadline, not a grace period invented here.
+    That distinction is the reason this is safe to add: past ``deadline`` the sweep was
+    going to stop regardless, so nothing is abandoned that would otherwise have been kept,
+    and no new number needs justifying.
+
+    A give-up is reported as **that flight timing out**, which is deliberate: it re-enters
+    the discard rule the sequential loop already defines, so the caller gets a short prefix
+    with ``timeout_flight_id`` set and ``complete`` False. Returning a truncated prefix that
+    merely *looked* complete would be far worse than the hang -- `master.upper_bound` would
+    take a bound over flights that were never priced.
+
+    ``imap`` is ordered, so the k-th result is ``pricing_order[k]``; that is what lets a
+    lost result be named at all. With ``deadline=None`` this blocks exactly as before,
+    which is the documented behaviour for a sweep that was given no time limit -- `solve`
+    always passes one.
+    """
+
+    for index in range(len(pricing_order)):
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        try:
+            yield results.next(remaining)
+        except StopIteration:
+            return
+        except mp.TimeoutError:
+            # Exactly the shape `_price_one` returns for a `PricingTimeout`, so the reducer
+            # needs no special case: no seconds, no counters, `priced` False.
+            yield pricing_order[index], False, 0.0, None, 0.0, {}
+            return
 
 
 def _accepted_prefix(results) -> SweepResult:

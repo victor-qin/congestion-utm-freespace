@@ -668,7 +668,15 @@ class RestrictedMaster:
             # comprehension built -- ascending and unique, because `index` strictly
             # increases across commits and `add_column` commits each distinct column once.
             # The default covers a `fixed_loads` row that no column claims.
-            indices = self._columns_by_row.get(row, ())
+            #
+            # SNAPSHOT, because the bucket is live and `add_column` keeps appending to it.
+            # `LpBackend` is a public exported seam and `RestrictedMaster` takes an injected
+            # backend, so a backend that retains the sequence it is handed would observe the
+            # row gain coefficients afterwards -- duplicating any column it also processed
+            # through its own `add_column`.  The comprehension this replaced yielded a fresh
+            # list every call, so isolation was a property callers already had.  Both shipped
+            # backends copy immediately and neither needs this; the contract does.
+            indices = tuple(self._columns_by_row.get(row, ()))
             self._backend.add_row(row, rhs, indices)
             self.row_index.intern(row)
             self._materialized[row] = rhs

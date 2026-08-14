@@ -568,6 +568,59 @@ def test_columns_by_row_is_the_enumerate_scan_it_replaced():
     assert master._columns_by_row[shared] == [0, 1, 2, len(columns)]
 
 
+class _RetainingBackend:
+    """Minimal `LpBackend` that KEEPS the sequence it is handed, to catch aliasing.
+
+    Both shipped backends copy `column_indices` immediately, so neither would notice the
+    master handing out a live list. `LpBackend` is exported and `RestrictedMaster` accepts an
+    injected backend, so "copies immediately" is a coincidence of the two in-tree
+    implementations rather than something the seam promises.
+    """
+
+    name = "retaining"
+
+    def __init__(self, flight_ids):
+        self.flight_ids = tuple(flight_ids)
+        self.time_limit_s = 1.0
+        self.rows: dict[RowKey, object] = {}
+
+    def add_column(self, objective, flight_id, column_rows):
+        return None
+
+    def add_row(self, row, rhs, column_indices):
+        self.rows[row] = column_indices  # deliberately NOT copied
+
+    def solve_lp(self):  # pragma: no cover - not exercised by this test
+        raise NotImplementedError
+
+    def solve_ip(self, warm_start=None):  # pragma: no cover - not exercised by this test
+        raise NotImplementedError
+
+
+def test_materialize_rows_hands_the_backend_an_isolated_sequence():
+    """Columns added later must not mutate a row the backend already received.
+
+    `materialize_rows` reads its indices out of the master's live `_columns_by_row` bucket,
+    which `add_column` keeps appending to. Handing that bucket over directly would let a
+    retaining backend see the row silently gain coefficients -- duplicating any column it also
+    processed through its own `add_column`. The scan this replaced built a fresh list per call,
+    so isolation is a property callers already had.
+    """
+
+    shared = RowKey.cell((4, -2), 0, 9)
+    backend = _RetainingBackend((1, 2))
+    master = RestrictedMaster((1, 2), RowIndex(), _params(M=1000.0), backend=backend)
+    master.add_column(_synthetic_column(1, 0.0, frozenset({shared})))
+
+    assert master.materialize_rows([shared]) == 1
+    retained = backend.rows[shared]
+    assert list(retained) == [0]
+
+    master.add_column(_synthetic_column(2, 0.0, frozenset({shared})))
+    assert master._columns_by_row[shared] == [0, 1]  # the master's own bucket does grow
+    assert list(retained) == [0]  # what the backend holds must not
+
+
 def test_highs_flight_row_owns_its_maximize_dual():
     """A redundant variable upper bound must not absorb the pricing dual pi_f."""
 

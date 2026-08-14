@@ -68,7 +68,6 @@ if REPO_ROOT not in _loaded.parents:
     raise SystemExit(f"loaded the wrong tree: {_loaded} is not under {REPO_ROOT}")
 
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.planner.colgen.translate import Column  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
@@ -254,7 +253,6 @@ def main() -> int:
     result = ColGenSolver().solve(
         requests, cfg, static_terms, params,
         on_iteration=on_iteration,
-        parallel=ParallelPricingConfig(n_workers=args.workers) if args.workers else None,
         **({} if seed_columns is None else {"seed_columns": seed_columns}),
     )
     wall = time.perf_counter() - started
@@ -309,7 +307,11 @@ def main() -> int:
         "initial_greedy_completed": stats.get("initial_greedy_completed"),
         "initial_greedy_elapsed_s": stats.get("initial_greedy_elapsed_s"),
         "rss_self_mb": round(_rss(resource.RUSAGE_SELF), 1),
-        "rss_children_mb": round(_rss(resource.RUSAGE_CHILDREN), 1),
+        # LARGEST SINGLE CHILD, not the sum across the tree -- `getrusage` defines
+        # `ru_maxrss` that way for RUSAGE_CHILDREN, so this reads flat however many
+        # workers ran and says NOTHING about aggregate pool memory.  For that use
+        # `analysis/sweep_pricing_workers.py`'s tree sampler.
+        "rss_largest_child_mb": round(_rss(resource.RUSAGE_CHILDREN), 1),
     }
     print("\n" + json.dumps(summary, indent=2, default=str), flush=True)
     if args.out:

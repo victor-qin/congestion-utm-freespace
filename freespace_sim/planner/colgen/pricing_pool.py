@@ -27,7 +27,10 @@ change is *when* results arrive. This module exists to make sure that is all it 
    solve can terminate an iteration earlier or later. They are appended by index.
 
 ``n_workers=0`` runs the sequential loop in-process and is byte-identical to no pool at
-all; it is the default and the parity baseline.
+all; it is both the default and the parity baseline. The pool is OPT-IN because its memory
+is linear in workers -- 3.9 GB in-process against 12.5 GB at 4 workers and 22.7 GB at 8, on
+a 50-flight density instance -- and an OOM-killed worker hangs this sweep rather than
+failing it (see the deadlock note below). Speed is not the constraint: 3.5x at 4 workers.
 
 **Processes, not threads.** Pricing is ~90% Python outside the numba kernel, so threads
 would contend on the GIL for the part that is not compiled. The costs processes bring are
@@ -58,7 +61,8 @@ import multiprocessing as mp
 import os
 import time
 import traceback
-from dataclasses import dataclass, replace
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ...config import SimConfig
@@ -69,40 +73,20 @@ from .pricing import DualView, PricingTimeout, kernel_stats, price_flight
 from .translate import Column
 
 __all__ = [
-    "ParallelPricingConfig",
     "SweepResult",
     "price_sweep",
 ]
 
 
-@dataclass(frozen=True, slots=True)
-class ParallelPricingConfig:
-    """How wide to fan the sweep. ``n_workers=0`` is the sequential loop."""
-
-    n_workers: int = 0
-    chunksize: int = 1
-
-    def __post_init__(self) -> None:
-        for name in ("n_workers", "chunksize"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{name} must be an integer")
-        if self.n_workers < 0:
-            raise ValueError("n_workers must be non-negative")
-        if self.chunksize < 1:
-            raise ValueError("chunksize must be positive")
-        # An upper bound, because the failure past it is not an error message.  Each worker
-        # rebuilds every graph and carries its own label pool -- roughly 1.5 GB on density
-        # -- so an over-large count from a config file OOMs the host rather than running
-        # slowly.  Measured, more lanes stop paying long before here anyway: 8 and 12
-        # workers were within noise of each other, because added lanes add memory-system
-        # contention as fast as they add throughput.
-        ceiling = 4 * (os.cpu_count() or 1)
-        if self.n_workers > ceiling:
-            raise ValueError(
-                f"n_workers={self.n_workers} exceeds {ceiling} (4x this host's "
-                f"{os.cpu_count()} cores); each worker holds its own label pool"
-            )
+# HOW WIDE TO FAN THE SWEEP LIVES ON `ColGenParams`, as `n_pricing_workers` (0 is the
+# sequential loop) and `pricing_chunksize`.  There used to be a `ParallelPricingConfig`
+# dataclass here that `solve` took as a separate `parallel=` keyword, and it was pure
+# duplication: `price_sweep` already receives the params object, so the second one carried
+# no information the first did not.  It also cost a real bug -- two defaults that could
+# disagree, with `batch.py` mapping an explicit 0 to `None` and `price_sweep` resolving
+# `None` as "whatever the dataclass defaults to" rather than "sequential", so raising that
+# default would have silently turned `--colgen-workers 0` into a pool.  Both the worker
+# ceiling and the chunksize validation moved to `ColGenParams.__post_init__` with it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,12 +112,25 @@ class SweepResult:
     # Wall the caller waited for the sweep, measured inside `price_sweep` so it covers pool
     # construction and teardown -- the costs a per-sweep pool actually pays.
     wall_s: float = 0.0
-    # Exact-pricing calls this sweep, and how many fell back to the Python reference.  A
-    # fallback is invisible downstream -- same column, same objective, 3-4.5x the time -- so
-    # a nonzero count here is the only signal a production run gets.  Summed ACROSS workers,
-    # since each keeps its own per-process tally.
-    kernel_priced: int = 0
-    kernel_fell_back: int = 0
+    # `pricing.kernel_stats()` summed ACROSS workers, since each keeps its own per-process
+    # tally: exact-pricing calls, how many fell back, the label-pool restarts and declines,
+    # and one `declined_<reason>` key per `pricing.Declined` member that fired.  A fallback
+    # is invisible downstream -- same column, same objective, 3-4.5x the time -- so these are
+    # the only signal a production run gets.
+    #
+    # ONE DICT rather than a field per counter, deliberately.  The two that used to be
+    # fields grew to four and then to a reason histogram whose keys depend on the instance;
+    # as positional fields that is a constructor argument per counter, in a dataclass built
+    # positionally at four sites and hand-built in the tests.
+    kernel_counters: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def kernel_priced(self) -> int:
+        return self.kernel_counters.get("priced", 0)
+
+    @property
+    def kernel_fell_back(self) -> int:
+        return self.kernel_counters.get("fell_back", 0)
 
     @property
     def complete(self) -> bool:
@@ -211,9 +208,13 @@ def _init_worker(
 def _price_one(flight_id: int):
     """Price one flight in a worker.
 
-    Returns ``(flight_id, priced, rc, column, task_s, n_priced, n_fell_back)`` -- the shape
+    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas)`` -- the shape
     :func:`_accepted_prefix` reduces, and the reason that function takes a sequence of these
     rather than a pool.
+
+    The counters travel as ONE dict rather than a trailing int each, because there are now
+    four of them plus a `declined_<reason>` key per cause, and the reachable set of those
+    depends on the instance.
 
     ``priced`` is an explicit BOOLEAN and not an identity sentinel, which is a correctness
     requirement rather than a style choice: a module-level ``object()`` pickles happily and
@@ -247,16 +248,17 @@ def _price_one(flight_id: int):
             deadline=_WORKER["deadline"],
         )
     except PricingTimeout:
-        return flight_id, False, 0.0, None, time.perf_counter() - started, 0, 0
+        return flight_id, False, 0.0, None, time.perf_counter() - started, {}
     after = kernel_stats()
+    # Subtraction over the UNION of keys, not over `before`'s: a `declined_<reason>` key
+    # appears the first time that cause fires, so it exists in `after` and not in `before`.
     return (
         flight_id,
         True,
         float(reduced_cost),
         column,
         time.perf_counter() - started,
-        after["priced"] - before["priced"],
-        after["fell_back"] - before["fell_back"],
+        {key: value - before.get(key, 0) for key, value in after.items()},
     )
 
 
@@ -276,23 +278,23 @@ def price_sweep(
     known_columns: dict[int, Column],
     *,
     deadline: float | None = None,
-    config: ParallelPricingConfig | None = None,
 ) -> SweepResult:
     """Price every flight in ``pricing_order``, sequentially or across processes.
 
-    ``graphs`` is used only by the sequential path; workers build their own from
-    ``requests`` (cheaper than pickling, see the module docstring).
+    Width comes from ``params.n_pricing_workers``; 0 is the sequential loop and is
+    byte-identical to no pool at all.  ``graphs`` is used only by the sequential path;
+    workers build their own from ``requests`` (cheaper than pickling, see the module
+    docstring).
     """
 
-    config = config or ParallelPricingConfig()
-    if config.n_workers == 0:
+    if params.n_pricing_workers == 0:
         return _sweep_sequential(
             pricing_order, graphs, cfg, params, dual_view, flight_duals,
             known_columns, deadline,
         )
     return _sweep_parallel(
         pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-        known_columns, deadline, config,
+        known_columns, deadline,
     )
 
 
@@ -305,7 +307,7 @@ def _sweep_sequential(
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
     task_total_s = 0.0
-    before = kernel_stats()
+    before = Counter(kernel_stats())
     sweep_started = time.perf_counter()
     for flight_id in pricing_order:
         task_started = time.perf_counter()
@@ -320,31 +322,27 @@ def _sweep_sequential(
                 deadline=deadline,
             )
         except PricingTimeout:
-            after = kernel_stats()
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
-                after["priced"] - before["priced"],
-                after["fell_back"] - before["fell_back"],
+                Counter(kernel_stats()) - before,
             )
         task_total_s += time.perf_counter() - task_started
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
-    after = kernel_stats()
     # One worker's worth of work, by definition -- which is what makes it the denominator
     # the parallel arm is compared against.
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
-        after["priced"] - before["priced"],
-        after["fell_back"] - before["fell_back"],
+        Counter(kernel_stats()) - before,
     )
 
 
 def _sweep_parallel(
     pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-    known_columns, deadline, config
+    known_columns, deadline
 ) -> SweepResult:
     """Fan the sweep across a pool built and torn down for this sweep alone.
 
@@ -372,14 +370,14 @@ def _sweep_parallel(
     # an efficiency the caller never experiences.
     sweep_started = time.perf_counter()
     with ctx.Pool(
-        processes=config.n_workers, initializer=_init_worker, initargs=init_args
+        processes=params.n_pricing_workers, initializer=_init_worker, initargs=init_args
     ) as pool:
         # `imap` and not `imap_unordered`: results must arrive in `pricing_order` index
         # order so the accepted prefix is the one the sequential loop would have produced,
         # and so the reduced costs reach `master.upper_bound`'s non-associative `sum` in a
         # fixed order. See the module docstring.
         accepted = _accepted_prefix(
-            pool.imap(_price_one, pricing_order, config.chunksize)
+            pool.imap(_price_one, pricing_order, params.pricing_chunksize)
         )
     return replace(accepted, wall_s=time.perf_counter() - sweep_started)
 
@@ -404,9 +402,10 @@ def _accepted_prefix(results) -> SweepResult:
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
     task_total_s = 0.0
-    kernel_priced = 0
-    kernel_fell_back = 0
-    for flight_id, priced, reduced_cost, column, task_s, n_priced, n_fell_back in results:
+    # `Counter.update` ADDS where `dict.update` would REPLACE, which is the whole reason
+    # this is a Counter: a plain dict here would silently report only the last task's tally.
+    counters: Counter[str] = Counter()
+    for flight_id, priced, reduced_cost, column, task_s, deltas in results:
         if not priced:
             # Past the first gap nothing is accepted, so returning here stops consuming --
             # which abandons the outstanding tasks, and leaving the caller's `with` block
@@ -414,15 +413,14 @@ def _accepted_prefix(results) -> SweepResult:
             # added: they are not work the sweep kept.
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
-                task_total_s, 0.0, kernel_priced, kernel_fell_back,
+                task_total_s, 0.0, counters,
             )
         task_total_s += task_s
-        kernel_priced += n_priced
-        kernel_fell_back += n_fell_back
+        counters.update(deltas)
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
-        task_total_s, 0.0, kernel_priced, kernel_fell_back,
+        task_total_s, 0.0, counters,
     )

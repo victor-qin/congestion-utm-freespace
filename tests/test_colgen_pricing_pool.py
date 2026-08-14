@@ -1,6 +1,8 @@
 """The parallel pricing sweep must change work, never answers."""
 from __future__ import annotations
 
+import inspect
+import os
 import time
 
 import pytest
@@ -12,7 +14,6 @@ from freespace_sim.planner.colgen.network import StaticTerminalCatalog, build_fl
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView
 from freespace_sim.planner.colgen.pricing_pool import (
-    ParallelPricingConfig,
     SweepResult,
     _accepted_prefix,
     price_sweep,
@@ -49,6 +50,12 @@ def _params(**overrides) -> ColGenParams:
         "max_iterations": 3,
         "time_limit_s": 120.0,
         "n_heuristic_tries": 16,
+        # PINNED to the sequential loop, deliberately not the shipped default of 4.  These
+        # are unit tests on five-flight problems: a pool would spawn four processes that
+        # each re-import numba and rebuild every graph, which costs seconds per test and
+        # buys nothing.  The tests that mean to exercise the pool ask for it by name.  The
+        # SHIPPED default is pinned separately, in `test_experiment_run.py`.
+        "n_pricing_workers": 0,
     }
     values.update(overrides)
     return ColGenParams(**values)
@@ -77,23 +84,45 @@ def _fingerprint(result):
     )
 
 
-@pytest.mark.parametrize("field", ["n_workers", "chunksize"])
-def test_config_rejects_non_integers(field):
+@pytest.mark.parametrize("field", ["n_pricing_workers", "pricing_chunksize"])
+def test_pool_knobs_reject_non_integers(field):
     with pytest.raises(TypeError):
-        ParallelPricingConfig(**{field: 1.5})
+        ColGenParams(**{field: 1.5})
     with pytest.raises(TypeError):
-        ParallelPricingConfig(**{field: True})
+        ColGenParams(**{field: True})
 
 
-def test_config_rejects_out_of_range_values():
+def test_pool_knobs_reject_out_of_range_values():
     with pytest.raises(ValueError):
-        ParallelPricingConfig(n_workers=-1)
+        ColGenParams(n_pricing_workers=-1)
     with pytest.raises(ValueError):
-        ParallelPricingConfig(chunksize=0)
+        ColGenParams(pricing_chunksize=0)
+    # The ceiling exists because the failure past it is an OOM rather than a message: each
+    # worker rebuilds every graph and holds its own label pool.
+    with pytest.raises(ValueError):
+        ColGenParams(n_pricing_workers=4 * (os.cpu_count() or 1) + 1)
 
 
-def test_zero_workers_is_the_default_and_means_sequential():
-    assert ParallelPricingConfig().n_workers == 0
+def test_the_pool_width_has_exactly_one_home():
+    """It had two, and they could disagree.
+
+    ``solve`` used to take a separate ``ParallelPricingConfig`` whose own ``n_workers``
+    default competed with this one, and ``batch`` mapped an explicit 0 to ``None`` -- which
+    ``price_sweep`` resolved as *the dataclass default*, not *sequential*.  Raising that
+    default would therefore have turned ``--colgen-workers 0`` into a pool.  Assert both
+    that the setting lives on the params object and that no second home has come back.
+    """
+
+    # 0, i.e. OPT-IN.  It was briefly defaulted to 4 on the strength of `rss_children`
+    # reading flat across worker counts -- which it always does, because
+    # `getrusage(RUSAGE_CHILDREN).ru_maxrss` is the largest single child and never the
+    # sum.  Sampling the process TREE instead put x50 density at 3.9 GB sequential,
+    # 12.5 GB at 4 workers and 22.7 GB at 8: linear, and unaffordable by default on a
+    # 4 GB/core node.
+    assert ColGenParams().n_pricing_workers == 0
+    assert ColGenParams(n_pricing_workers=4).n_pricing_workers == 4
+    assert "parallel" not in inspect.signature(ColGenSolver.solve).parameters
+    assert not hasattr(pricing_pool, "ParallelPricingConfig")
 
 
 def test_sweep_result_reports_completeness_from_the_timeout_field():
@@ -119,9 +148,7 @@ def test_parallel_sweep_returns_exactly_the_sequential_answer():
         _request(4, (4, -4), (-4, 4), cfg),
     ]
     sequential = ColGenSolver().solve(requests, cfg, (), _params())
-    parallel = ColGenSolver().solve(
-        requests, cfg, (), _params(), parallel=ParallelPricingConfig(n_workers=2)
-    )
+    parallel = ColGenSolver().solve(requests, cfg, (), _params(n_pricing_workers=2))
     assert _fingerprint(parallel) == _fingerprint(sequential)
 
 
@@ -140,7 +167,7 @@ def test_an_expired_deadline_yields_an_empty_prefix_in_both_paths(n_workers):
         _request(1, (-4, 0), (4, 0), cfg),
         _request(2, (0, -4), (0, 4), cfg),
     ]
-    params = _params()
+    params = _params(n_pricing_workers=n_workers)
     catalog = StaticTerminalCatalog((), cfg)
     graphs = {
         request.flight_id: build_flight_graph(request, cfg, catalog, params)
@@ -159,7 +186,6 @@ def test_an_expired_deadline_yields_an_empty_prefix_in_both_paths(n_workers):
         dict.fromkeys(order, 0.0),
         {},
         deadline=time.monotonic() - 1.0,
-        config=ParallelPricingConfig(n_workers=n_workers),
     )
     assert not result.complete
     assert result.timeout_flight_id == order[0]
@@ -181,9 +207,9 @@ def test_a_timeout_discards_later_results_that_completed():
     """
 
     accepted = _accepted_prefix(iter([
-        (7, True, 0.5, None, 1.0, 1, 0),
-        (3, False, 0.0, None, 0.25, 0, 0),
-        (9, True, 4.0, None, 8.0, 1, 1),
+        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (3, False, 0.0, None, 0.25, {}),
+        (9, True, 4.0, None, 8.0, {"priced": 1, "fell_back": 1}),
     ]))
 
     assert accepted.flight_ids == (7,)
@@ -202,8 +228,9 @@ def test_a_complete_sweep_keeps_index_order_and_sums_the_worker_tallies():
     downstream by a plain non-associative `sum`, so the sequence itself is the contract."""
 
     accepted = _accepted_prefix(iter([
-        (7, True, 0.5, None, 1.0, 1, 0),
-        (3, True, 0.25, None, 0.5, 1, 1),
+        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (3, True, 0.25, None, 0.5,
+         {"priced": 1, "fell_back": 1, "declined_label_pool_exhausted": 1}),
     ]))
 
     assert accepted.complete
@@ -212,6 +239,12 @@ def test_a_complete_sweep_keeps_index_order_and_sums_the_worker_tallies():
     assert accepted.reduced_costs == (0.5, 0.25)
     assert accepted.task_total_s == 1.5
     assert (accepted.kernel_priced, accepted.kernel_fell_back) == (2, 1)
+    # `Counter.update` ADDS; a plain `dict.update` here would report only the last task's
+    # tally, silently, and every count would read as 1.
+    assert accepted.kernel_counters["priced"] == 2
+    # The reason rides along with the count, which is the whole point of the dict: a run
+    # can say WHICH cause sent a flight back to Python, not merely that one did.
+    assert accepted.kernel_counters["declined_label_pool_exhausted"] == 1
 
 
 def test_a_worker_that_cannot_initialise_reports_from_its_first_task(monkeypatch):
@@ -253,7 +286,5 @@ def test_explicit_zero_workers_matches_no_config_at_all():
         _request(2, (0, -4), (0, 4), cfg),
     ]
     default = ColGenSolver().solve(requests, cfg, (), _params())
-    pinned = ColGenSolver().solve(
-        requests, cfg, (), _params(), parallel=ParallelPricingConfig(n_workers=0)
-    )
+    pinned = ColGenSolver().solve(requests, cfg, (), _params(n_pricing_workers=0))
     assert _fingerprint(pinned) == _fingerprint(default)

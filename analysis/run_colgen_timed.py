@@ -35,7 +35,6 @@ if REPO_ROOT not in _loaded.parents:
 from freespace_sim.planner.colgen import pricing as _pricing, solver as _solver  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
 from freespace_sim.planner.colgen.pricing import PricingTimeout  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -61,7 +60,10 @@ def _counting_feasible_compiled(*args, **kwargs):
         # by their per-flight slice -- i.e. the exact opposite of what it appeared to say.
         _FEASIBLE["timed_out"] += 1
         raise
-    _FEASIBLE["fell_back" if out is _pricing._UNPROVED else "proved"] += 1
+    declined = isinstance(out, _pricing.Declined)
+    _FEASIBLE["fell_back" if declined else "proved"] += 1
+    if declined:
+        _FEASIBLE[f"declined_{out.value}"] = _FEASIBLE.get(f"declined_{out.value}", 0) + 1
     return out
 
 
@@ -125,11 +127,8 @@ def main() -> int:
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
         seed_ladder_steps=args.ladder,
-    )
-    parallel = (
-        ParallelPricingConfig(n_workers=args.workers, chunksize=args.chunksize)
-        if args.workers
-        else None
+        n_pricing_workers=args.workers,
+        pricing_chunksize=args.chunksize,
     )
 
     header = {
@@ -173,7 +172,7 @@ def main() -> int:
 
     started = time.perf_counter()
     result = ColGenSolver().solve(
-        requests, cfg, static_terms, params, on_iteration=on_iteration, parallel=parallel
+        requests, cfg, static_terms, params, on_iteration=on_iteration
     )
     wall = time.perf_counter() - started
     stats = dict(result.stats)
@@ -241,7 +240,11 @@ def main() -> int:
         "ip_status": stats.get("ip_status"),
         "ip_skipped": stats.get("ip_skipped"),
         "rss_self_mb": round(_rss_mb(resource.RUSAGE_SELF), 1),
-        "rss_children_mb": round(_rss_mb(resource.RUSAGE_CHILDREN), 1),
+        # LARGEST SINGLE CHILD, not the sum across the tree -- `getrusage` defines
+        # `ru_maxrss` that way for RUSAGE_CHILDREN, so this reads flat however many
+        # workers ran and says NOTHING about aggregate pool memory.  For that use
+        # `analysis/sweep_pricing_workers.py`'s tree sampler.
+        "rss_largest_child_mb": round(_rss_mb(resource.RUSAGE_CHILDREN), 1),
         "stage_s": {name: round(value, 2) for name, value in breakdown},
         "master_stage_s": {k: round(v, 2) for k, v in stages.items()},
         "per_iteration": per_iteration,

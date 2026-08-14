@@ -67,8 +67,14 @@ class CostModel:
 
 #: The historical objective: one second of ground delay costs the same as one second of
 #: excess flight.  Note this is *not* the cost model the A* planner uses (config's
-#: 1:3:3:4 per-second weights); colgen has always summed unweighted seconds, and keeping
-#: that as the default is what makes this refactor a no-op until someone opts in.
+#: 1:3:3:4 per-second weights), and it is **no longer the colgen default** either --
+#: ``ColGenParams.objective`` now ships ``"total_cost"``.  Kept as the module default so
+#: every function that takes ``model: CostModel = DELAY_MODEL`` behaves as it always did
+#: when called without one, which is what the kernel-parity tests rely on.
+#:
+#: Reach for it deliberately, not by omission.  Equal weights make ``ground + flown``
+#: invariant under a ground-for-air swap, so large sets of columns tie EXACTLY -- see
+#: ``ColGenParams.objective`` for what that costs the pricing search.
 DELAY_MODEL = CostModel(ground_weight=1.0, air_weight=1.0)
 
 

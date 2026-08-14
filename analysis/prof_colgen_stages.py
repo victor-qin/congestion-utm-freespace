@@ -20,7 +20,8 @@ Note ``solver`` binds ``seed_column`` / ``find_feasible_column`` at import, and
 the solve actually calls. Every module object holding such a binding is patched below.
 
 **Profile sequentially.** Neither these timers nor cProfile cross a process boundary, so
-under ``parallel=`` everything inside the sweep happens in workers and is invisible here --
+with ``n_pricing_workers`` set, everything inside the sweep happens in workers and is
+invisible here --
 the parent would show only the greedy, the LP and canonicalization. A sequential sweep is
 exactly one worker's workload, which is the thing worth ranking anyway.
 
@@ -68,7 +69,6 @@ from freespace_sim.planner.colgen import pricing_pool as pricing_pool_mod  # noq
 from freespace_sim.planner.colgen import solver as solver_mod  # noqa: E402
 from freespace_sim.planner.colgen import translate as translate_mod  # noqa: E402
 from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
-from freespace_sim.planner.colgen.pricing_pool import ParallelPricingConfig  # noqa: E402
 from freespace_sim.planner.colgen.solver import ColGenSolver  # noqa: E402
 from freespace_sim.scenarios import get_scenario  # noqa: E402
 
@@ -87,7 +87,7 @@ STAGES: list[tuple[str, list[tuple[object, str]]]] = [
     # The top of the sweep, and the one binding that MOVED: `pricing_pool` imports
     # `price_flight` directly, so patching only `pricing` would instrument nothing the
     # sweep calls.  Both are wrapped, and only one of them fires per run -- the pool's
-    # when `parallel=` is set (and then only in the parent, since cProfile and these
+    # when `n_pricing_workers` is set (and then only in the parent, since cProfile and these
     # timers do not cross a process boundary), `pricing`'s otherwise.
     (
         "price_flight (sweep entry)",
@@ -228,7 +228,7 @@ def main() -> int:
     parser.add_argument(
         "--max-label-log2", type=int, default=None,
         help="override `dp_kernel.MAX_LABEL_CAPACITY` to 2**N for this run (default: leave "
-             "the shipped 1<<25 alone). Answer-neutral by the same argument the constant "
+             "the shipped 1<<26 alone). Answer-neutral by the same argument the constant "
              "carries -- a budget bounds work, never the search -- so this changes how many "
              "flights DECLINE and fall back to the Python reference, not what any of them "
              "returns. Read as a knob for measuring how far past the shipped ceiling a "
@@ -236,9 +236,26 @@ def main() -> int:
              "N=26 is ~2.7 GB per worker and N=27 is ~5.4 GB.",
     )
     parser.add_argument(
+        # CEILING, not the ladder's first rung.  `prof_colgen_cutoff.py --log2cap` is the
+        # other end of the same ladder (it sets the STARTING rung, `INITIAL_LOG2CAP`), and
+        # the two names are one letter apart -- check which tool you are in.
         "--max-log2cap", type=int, default=None,
         help="override `dp_kernel.MAX_LOG2CAP` (dominance table ceiling, shipped 26). "
              "Same answer-neutrality argument; ~32 B per slot.",
+    )
+    parser.add_argument(
+        "--objective", default="total_cost", choices=("total_delay", "total_cost"),
+        help="the shipped default. `total_delay` weights ground and air equally, which is "
+             "a ~40x slower regime for pricing (issue #91) and profiles a different solve.",
+    )
+    # The bootstrap and its ranking change the SHAPE of what is profiled, not just the
+    # clock: they cut pricing without touching the greedy or the LP, so a profile taken
+    # without them over-states pricing's share and under-states everything serial. The
+    # serial remainder is exactly what this tool is usually pointed at, so defaulting these
+    # off made every such reading wrong by that ratio.
+    parser.add_argument("--bootstrap-roots", type=int, default=0, metavar="K")
+    parser.add_argument(
+        "--bootstrap-ranking", default="score", choices=("score", "bound"),
     )
     parser.add_argument("--top", type=int, default=25)
     args = parser.parse_args()
@@ -288,16 +305,16 @@ def main() -> int:
         max_iterations=args.iterations,
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
-    )
-
-    parallel = (
-        ParallelPricingConfig(n_workers=args.workers, chunksize=args.chunksize)
-        if args.workers
-        else None
+        objective=args.objective,
+        bootstrap_roots=args.bootstrap_roots,
+        bootstrap_ranking=args.bootstrap_ranking,
+        n_pricing_workers=args.workers,
+        pricing_chunksize=args.chunksize,
     )
 
     print(f"tree      {_loaded.parent.parent}")
     print(f"workload  {args.scenario} x{len(requests)} iters={args.iterations} "
+          f"obj={args.objective} K={args.bootstrap_roots}/{args.bootstrap_ranking} "
           f"{args.solver} gap={args.gap_metric} workers={args.workers} "
           f"chunksize={args.chunksize} (fixed work, no clock)")
     if dp_kernel_mod is not None:
@@ -341,7 +358,7 @@ def main() -> int:
     install_timers()
     started = time.perf_counter()
     result = ColGenSolver().solve(
-        requests, cfg, static_terms, params, on_iteration=_record, parallel=parallel
+        requests, cfg, static_terms, params, on_iteration=_record
     )
     wall = time.perf_counter() - started
 

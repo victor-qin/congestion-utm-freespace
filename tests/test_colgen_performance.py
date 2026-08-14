@@ -19,7 +19,7 @@ from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen import pricing
 from freespace_sim.planner.colgen.network import RowKey, build_flight_graph, column_claims
 from freespace_sim.planner.colgen.params import ColGenParams
-from freespace_sim.planner.colgen.objective import CostModel
+from freespace_sim.planner.colgen.objective import CostModel, cost_model
 from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import derive_cell_window, endpoint_claim_cells
@@ -157,7 +157,13 @@ def test_uncertified_wall_seed_cannot_skip_exact_pricing(monkeypatch):
 
     cfg = _cfg()
     graph, params = _graph(cfg, overrun=1)
-    seed_column(graph, cfg)
+    # WITH THE MODEL `price_flight` WILL RESOLVE, not the default one. `seed_column` is
+    # keyed on the model (`_search_cache.seed_model`), so warming the cache under
+    # `DELAY_MODEL` and then pricing under the config's 1:3 weighting is a cache MISS --
+    # the seed is recomputed and `seed_delay_certified` is reset to True underneath the
+    # line below, re-arming the very shortcut this test exists to disarm.  It then passes
+    # vacuously, asserting nothing.
+    seed_column(graph, cfg, model=cost_model(cfg, params))
     graph._search_cache.seed_delay_certified = False
     counts = _count_exact_pricing(monkeypatch)
 
@@ -227,9 +233,13 @@ def test_role_specific_wall_arcs_survive_pricing_dominance():
         ),
         0.0,
     )
+    # `_weighted_cost`, not `total_delay_s`: `Column.delay_s` is the OBJECTIVE's verdict,
+    # and under the config's shipped 1:3 weighting that is not the unweighted duration.
+    # `column == expected` below compares `delay_s` field-for-field, so building it in the
+    # wrong currency fails there as well as in the reduced cost.
     expected = replace(
         expected,
-        delay_s=total_delay_s(column_to_intent(expected, request, cfg), cfg),
+        delay_s=_weighted_cost(expected, graph, cfg, cost_model(cfg, params)),
         claims=column_claims(expected, graph, cfg),
     )
 
@@ -261,8 +271,10 @@ def test_role_specific_wall_arcs_survive_pricing_dominance():
         duals.get(row, 0.0) for row in expected.claims
     )
 
-    assert expected.delay_s == pytest.approx(21.45534857624976)
-    assert expected_reduced_cost == pytest.approx(1_004_977.5446514237)
+    # 3x the unweighted 21.45534857624976: this cfg pins `max_ground_delay_s=0.0`, so the
+    # whole cost is air and `w_air` scales all of it.
+    assert expected.delay_s == pytest.approx(64.36604572874928)
+    assert expected_reduced_cost == pytest.approx(1_004_934.6339542712)
     assert reduced_cost == pytest.approx(expected_reduced_cost)
     assert column == expected
 
@@ -308,7 +320,7 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
     graph, params = _graph(cfg)
     graph = with_air_hops(graph, graph.shortest_hops + 64)
     credited = RowKey.cell((-2, 0), 0, 5)
-    assert credited not in seed_column(graph, cfg).claims
+    assert credited not in seed_column(graph, cfg, model=cost_model(cfg, params)).claims
 
     reduced_cost, column = price_flight(
         graph,
@@ -320,7 +332,10 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
 
     assert column is not None
     assert credited in column.claims
-    assert column.delay_s == pytest.approx(20.0)
+    # 5 hops x dt(4 s) x w_air(3) under the config's 1:3 weighting.  Same column as before
+    # the objective default moved -- the `credited in column.claims` assertion above is what
+    # this test is really about, and it is unchanged.
+    assert column.delay_s == pytest.approx(60.0)
     assert reduced_cost == pytest.approx(
         params.M - column.delay_s + 100.0,
         abs=1e-7,
@@ -419,9 +434,10 @@ def test_shifted_seed_is_only_an_incumbent_for_exact_pricing(monkeypatch):
 
     def capture_exact_search(*args, **kwargs):
         captured["incumbent"] = kwargs["incumbent"]
-        # Stand in for the search by returning the incumbent unchanged.  `proved=True` so
-        # `price_flight` does not then fall through to the reference and undo the stub.
-        return kwargs["incumbent"], True
+        # Stand in for the search by returning the incumbent unchanged.  A plain 2-tuple
+        # rather than a `Declined`, so `price_flight` does not then fall through to the
+        # reference and undo the stub.
+        return kwargs["incumbent"]
 
     monkeypatch.setattr(pricing, "_best_column_compiled", capture_exact_search)
     reduced_cost, column = price_flight(
@@ -585,10 +601,14 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
         ranked = sorted(
             (
                 (
-                    params.M - column.delay_s - sum(duals.get(row, 0.0) for row in column.claims),
-                    column,
+                    params.M - weighted - sum(duals.get(row, 0.0) for row in column.claims),
+                    # Repriced, so the oracle's column carries the same currency as the one
+                    # pricing returns -- `Column.__eq__` compares `delay_s` field-for-field,
+                    # and `_exhaustive_columns` builds them with the unweighted duration.
+                    replace(column, delay_s=weighted),
                 )
                 for column in columns
+                for weighted in (_weighted_cost(column, graph, cfg, cost_model(cfg, params)),)
             ),
             key=lambda item: (-item[0], tie_key(item[1])),
         )
@@ -596,7 +616,14 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
         reduced_cost, column = price_flight(graph, duals, 0.0, cfg, params)
 
         assert reduced_cost == pytest.approx(oracle_rc, abs=1e-8)
-        assert column == oracle_column
+        # Identity exactly, magnitude to tolerance.  `_weighted_cost` deliberately reaches
+        # the cost through `metrics.total_delay_s` -- sharing nothing with pricing but the
+        # geometry -- so it sums (ground, hold+detour) where pricing sums (ground, hold,
+        # detour).  Same value, different association, and under a non-unit `w_air` that is
+        # a 1-ULP disagreement rather than the exact tie it used to be.  The column IDENTITY
+        # is what this oracle is for, so that stays exact.
+        assert replace(column, delay_s=0.0) == replace(oracle_column, delay_s=0.0)
+        assert column.delay_s == pytest.approx(oracle_column.delay_s, rel=1e-12)
 
 
 def _weighted_cost(column, graph, cfg, model: CostModel) -> float:

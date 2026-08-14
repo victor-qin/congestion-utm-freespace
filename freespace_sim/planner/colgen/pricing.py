@@ -17,12 +17,14 @@ point and the module-level constants for the pruning envelopes.
 
 from __future__ import annotations
 
+import enum
 import math
 import sys
 import threading
 import time
 import heapq
 import itertools
+from collections import Counter
 from collections.abc import Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Hashable
@@ -779,6 +781,213 @@ def _shifted_seed_incumbent(
     return best
 
 
+def _root_bounds(topology, variants, envelopes, benefit: float, pi_f: float, dual_view):
+    """``completion_can_compete``'s ``hop_rc_bound`` per root, for ranking.
+
+    The gate (``dp_prepare.py:1228``) already evaluates this expression for every surviving
+    root; this reads out the NUMBER where ``can_compete`` returns only the verdict.  Nothing
+    here is a new bound and nothing prunes: the value orders the bootstrap's root allowlist
+    and has no effect on what any search explores, so it cannot discard a column.
+
+    ``-inf`` for a root the envelope's own LENGTH rejects, which sorts it last.
+    """
+
+    n = int(variants.departure_step.size)
+    out = np.full(n, -math.inf, dtype=np.float64)
+    for i in range(n):
+        lane_raw = int(variants.lane_idx[i])
+        first_hops = max(1, int(topology.hex_remaining[int(variants.cell[i])]))
+        delay_lbs, corridor_start = envelopes._delay_envelope(
+            int(variants.departure_step[i]), None if lane_raw < 0 else lane_raw
+        )
+        if first_hops >= len(delay_lbs):
+            continue
+        destination_positive = envelopes._destination_cost(
+            corridor_start + first_hops, first_hops
+        )
+        if not math.isfinite(destination_positive):
+            continue
+        paid_positive = max(0.0, float(variants.start_dual_cost[i]))
+        out[i] = (
+            benefit - pi_f - delay_lbs[first_hops]
+            - max(paid_positive, destination_positive)
+            + dual_view.max_negative_credit
+        )
+    return out
+
+
+def _bootstrap_incumbent(
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel,
+    *,
+    incumbent: tuple[float, Column] | None,
+    roots: int,
+    ranking: str = "score",
+    deadline: float | None = None,
+) -> tuple[float, Column] | None:
+    """Buy a real cutoff cheaply, by searching the few most promising start options.
+
+    The cutoff ``price_flight`` can assemble for free is not merely weak, it is
+    **structurally zero**, and that is a property of column generation rather than a defect
+    here.  ``seed_column``, ``_shifted_seed_incumbent`` and the master's ``known_column``
+    are all columns the master's pool already holds, and LP optimality over that pool forces
+    every pool column's reduced cost ``<= 0`` -- complementary slackness pins the basic one
+    at exactly ``0``.  Measured on ``density_faa_wing_zipline`` x12: the incumbent handed to
+    the search scores ``0.0000`` for all twelve flights in both sweeps, against optima of
+    8.5-20.5, and a flight's own previous priced column re-scored under the next duals gives
+    ``0.0`` or negative.  **So no reuse of anything already known can produce a positive
+    cutoff; the only source is a search.**
+
+    Cutoff quality is then the dominant lever on this search, which the tree measures from
+    several sides: 439x on one captured subproblem (:func:`price_flight`), 2.17x from
+    capping the completion envelope's length alone (:func:`_best_column`), and 98x on a
+    whole sweep under a perfect cutoff (``analysis/ab_colgen_oracle_cutoff.py``).
+
+    **Only the incumbent escapes.**  What comes back is fed to the real search as a cutoff
+    and nothing else; no bootstrap candidate reaches ``_certify_candidates``.  That
+    separation is load-bearing rather than tidy: a restricted search's labels compete for
+    dominance slots, and one of them evicting a survivor the unrestricted search would have
+    kept is how a prune stops being answer-neutral (``[[pruning-not-neutral-under-dominance]]``).
+
+    **Ranked, not truncated.**  Taking the earliest N departures misses an optimum that
+    departs late: measured, a 4- and an 8-step prefix both returned rc 4.4590 against an
+    8.4590 optimum on the second sweep and the main search declined anyway.
+    ``PreparedVariants.score`` is the root's own upper bound, so it puts the promising start
+    option first whenever it is, and it costs ``roots`` roots instead of
+    ``N * n_origin_lanes`` (240 at N=16 on the density straggler).  This is PR #76's rule
+    (``pr76:pricing.py:1253``); the score expressions agree term for term except that ours
+    weights the ground term into the objective's currency, which #76's predates.
+
+    **It re-uses the two real searches rather than writing a third**, which is where its
+    safety comes from.  Every column either returns has already passed
+    ``_canonical_candidate``, so the score is certified achievable and pruning against it
+    cannot discard anything strictly better.  A bootstrap that invented its own scoring
+    could sit above the true optimum and discard it -- silently, with no crash and no
+    fallback, which is the one failure mode here that does not raise.
+
+    Returns the incumbent unchanged when it finds nothing better, so a bootstrap that
+    declines outright leaves the caller exactly where it was.
+    """
+
+    # Rank ONCE, here, and hand the result to whichever search runs.  `prepare_variants` is
+    # pure Python -- `dp_prepare` has no numba anywhere -- so this works identically on a
+    # numba-less install, which is what keeps `--reference-baseline` a real gate rather than
+    # a second code path.  `prepared_for` is memoized per graph, so the packing is not
+    # rebuilt for this.
+    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if not (topology.ok and rows.ok):
+        # Both searches decline this graph too, so skipping here keeps them symmetric.
+        return incumbent
+    # WITH `envelopes`, which is not optional and was the first thing this got wrong.  The
+    # ranking has to happen over the same gated set the restricted search will see, or the
+    # top-scoring root can be one `completion_can_compete` rejects -- the allowlist then
+    # names a root the search immediately discards, `prepare_variants` returns EMPTY, and the
+    # bootstrap silently does nothing while still costing its own setup.  Measured on
+    # `colgen_test` flight 0: the gate takes 13,515 roots to 97, and the highest-scoring root
+    # of the ungated 13,515 is not among them.  The failure is invisible -- no crash, a
+    # successful `(-inf, None)`, the incumbent handed straight back -- which is why
+    # `prof_colgen_cutoff`'s `bt_lab` column exists to show it as zero labels.
+    envelopes = dp_prepare.CompletionEnvelopes(
+        fg,
+        cfg,
+        dual_view,
+        benefit=benefit,
+        pi_f=pi_f,
+        model=model,
+        forbidden_rows=forbidden_rows,
+        incumbent=incumbent,
+        deadline=deadline,
+    )
+    variants = dp_prepare.prepare_variants(
+        fg,
+        cfg,
+        dual_view,
+        topology,
+        rows,
+        benefit=benefit,
+        pi_f=pi_f,
+        cost_cutoff=None if incumbent is None else incumbent[0],
+        model=model,
+        forbidden_rows=forbidden_rows,
+        envelopes=envelopes,
+    )
+    if variants.departure_step.size <= 1:
+        # Nothing to bootstrap FROM: with one root the bootstrap IS the search.
+        return incumbent
+    # Descending, STABLE, so ties resolve by `prepare_variants`' insertion order --
+    # `(departure, lane)` ascending -- and the selection is a pure function of the graph,
+    # the duals and the incumbent.  It has to be, or the two searches could be handed
+    # different allowlists and the whole symmetry argument goes with it.
+    #
+    # `ranking` picks WHAT to sort on, and the two options are `g` versus `g + h`:
+    #
+    #   "score"  `variants.score` = -w_ground*ground_delay - w_air*origin_leg
+    #                               - start_dual_cost.  Cost already incurred at the root,
+    #            with the whole-route air term truncated to the origin fold leg and the
+    #            whole-column dual sum truncated to the origin claims.  No lookahead.
+    #   "bound"  `_root_bound` below: `completion_can_compete`'s own `hop_rc_bound` at the
+    #            root's minimum feasible hop count -- an UPPER bound on what the root can
+    #            ACHIEVE, already computed for every surviving root by the gate above.
+    #
+    # They rank identically whenever every root shares one lane geometry, because then the
+    # only thing separating roots is departure time and both collapse to "depart earlier"
+    # (measured: correlation exactly 1.000 on 7 of 8 density flights).  They diverge on
+    # multi-lane flights, and there the difference is not marginal -- on `density_faa` x50
+    # flight 16, `score` finds NO positive cutoff at any K (-48.56 at K=1, -9.60 at K=4,
+    # both worse than no incumbent) while `bound` finds +24.00 at K=1.  `score` charges
+    # `-w_air*origin_leg`, so it demotes long lanes outright; `bound` charges
+    # `-delay_lbs[h0]` with `h0 = hex_remaining[root cell]`, so it accounts for where the
+    # lane LEAVES you relative to the destination.
+    if ranking == "bound":
+        key = _root_bounds(topology, variants, envelopes, benefit, pi_f, dual_view)
+    else:
+        key = variants.score
+    order = np.argsort(-key, kind="stable")[:roots]
+    keep = frozenset(
+        (int(variants.departure_step[i]), int(variants.lane_idx[i])) for i in order
+    )
+    outcome = _best_column_compiled(
+        fg,
+        dual_view,
+        pi_f,
+        cfg,
+        benefit,
+        forbidden_rows,
+        incumbent=incumbent,
+        deadline=deadline,
+        model=model,
+        keep_roots=keep,
+        record_budget=False,
+    )
+    if isinstance(outcome, Declined):
+        # `roots` roots rather than the whole window, so the reference is affordable here in
+        # a way it is not for the main search.
+        outcome = _best_column(
+            fg,
+            dual_view,
+            pi_f,
+            cfg,
+            benefit,
+            forbidden_rows,
+            seed=False,
+            incumbent=incumbent,
+            deadline=deadline,
+            model=model,
+            keep_roots=keep,
+        )
+    score, column = outcome
+    if column is None:
+        return incumbent
+    if incumbent is not None and score <= incumbent[0] + _SCORE_EPS:
+        return incumbent
+    return score, column
+
+
 def _benefit(params: Any) -> float:
     try:
         value = float(params.M)
@@ -1202,6 +1411,7 @@ def _best_column(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
+    keep_roots: frozenset[tuple[int, int]] | None = None,
 ) -> tuple[float, Column | None]:
     """Return the most negative-reduced-cost column, or ``(-inf, None)`` when none exists.
 
@@ -1211,6 +1421,14 @@ def _best_column(
     speed, and every pruning rule below is an argument that the discarded label cannot
     lead to a strictly better column.  ``incumbent`` warm-starts that pruning with an
     already-certified ``(reduced_cost, column)`` pair.
+
+    ``keep_roots`` restricts the search to an explicit allowlist of
+    ``(departure_step, lane_idx)`` pairs, ``-1`` for a bare origin.  This is the axis
+    ``seed=True`` already restricts in its most degenerate form -- one departure, every lane
+    -- so it generalizes a bound this search has always had rather than adding one.  The
+    compiled search takes the same argument straight through to ``prepare_variants``, and
+    the allowlist is built ONCE by :func:`_bootstrap_incumbent`, so neither search ranks
+    roots for itself and the two cannot disagree about which ones they kept.
     """
 
     _check_deadline(deadline)
@@ -1567,6 +1785,10 @@ def _best_column(
         if not origin_claims.isdisjoint(forbidden_rows):
             continue
         for lane_idx, cell, lane_steps in origin_options:
+            if keep_roots is not None and (
+                departure_step, -1 if lane_idx is None else int(lane_idx)
+            ) not in keep_roots:
+                continue
             distance_to_go = remaining_distance(cell)
             start_step = departure_step + fg.takeoff_steps[0] + lane_steps
             if start_step >= fg.max_step:
@@ -1806,8 +2028,13 @@ _kernel_fallback_warned = False
 # conditions want different responses -- see `_warn_budget_growth`.
 _kernel_restart_warned = False
 _kernel_budget_warned = False
+# Flights already reported as near the label ceiling.  Per FLIGHT rather than once per
+# process, because "which flights have no headroom left" is the diagnostic -- and per
+# flight rather than per (flight, sweep), because a flight that is big in one sweep is big
+# in all of them and repeating it every iteration would bury the next distinct one.
+_kernel_high_water_warned: set = set()
 
-# Per-process tally of exact-pricing calls and how many could not be proved in the kernel.
+# Per-process tally of exact-pricing calls and how many fell back out of the kernel.
 #
 # A fallback is a 3-4.5x slowdown that produces the RIGHT answer, so nothing downstream can
 # notice it: the objective, the columns and the tests are all identical, only the clock
@@ -1826,13 +2053,72 @@ _kernel_budget_warned = False
 # split that one out, and they are a pair on purpose -- `label_restarts` is the precursor
 # and `budget_declined` is the failure, so a run whose restarts climb while declines stay 0
 # is one that is paying for the pool it needs without losing the compiled path yet.
-_KERNEL_STATS = {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0}
+#
+# A `Counter` rather than a fixed dict because `price_flight` also tallies one key per
+# `Declined` member, and the reachable set of those depends on the instance.
+_KERNEL_STATS: Counter[str] = Counter(
+    {"priced": 0, "fell_back": 0, "label_restarts": 0, "budget_declined": 0}
+)
 
 
 def kernel_stats() -> dict[str, int]:
     """Snapshot this process's compiled-pricing tally."""
 
     return dict(_KERNEL_STATS)
+
+
+class Declined(enum.Enum):
+    """Why the compiled search did not run. Members are the reasons the reference is used.
+
+    This replaces a boolean named ``proved``, which was a **capability** flag with the name
+    of a **safety** one -- and the name caused real misreadings. ``proved=True`` could never
+    detect divergence: if the kernel explored a different set than ``_best_column``, it
+    returned ``True`` beside a plausible wrong column and nothing raised. The inference from
+    "ran to completion" to "therefore this is the reference's column" is carried entirely by
+    the test suite at build time; there is no runtime cross-check anywhere, by design.
+
+    It was also lossy in a way that cost debugging time. "numba isn't installed" and "a
+    Shewchuk partial expansion saturated on real data" were the same value, and they warrant
+    opposite responses: one is a shrug, the other means the numeric machinery the whole
+    parity argument rests on hit a wall. Only the budget members vary at runtime with the
+    instance and that iteration's duals, which is why this cannot be a startup check and why
+    the reason has to ride on the return value.
+
+    **An ``Enum`` because it pickles by name.** The ``object()`` sentinel this also replaces
+    (``_UNPROVED``) pickles happily and arrives in a pool worker as a *different instance*,
+    so ``result is _UNPROVED`` is always False across a process boundary. The sequential path
+    could never have caught that -- nothing is pickled there -- so it would have surfaced
+    first on a production timeout under a pool.
+    """
+
+    NO_NUMBA = "numba_unavailable"
+    MULTI_LEVEL = "multi_level_graph"
+    TOPOLOGY = "topology_refused"
+    ROWS = "rows_refused"
+    NO_DESTINATION = "no_reachable_destination"
+    MISSING_CELL = "origin_cell_not_packed"
+    LABEL_BUDGET = "label_pool_exhausted"
+    STATE_BUDGET = "dominance_table_exhausted"
+    HEAP_BUDGET = "heap_exhausted"
+    FSUM_OVERFLOW = "fsum_partials_overflowed"
+    DEADLINE = "cancelled"
+    #: A kernel status with no member of its own.  Unreachable today; it exists so that
+    #: adding a status to `dp_kernel` degrades to a fallback rather than to a `KeyError`
+    #: raised from the function whose entire job is to decline gracefully.
+    KERNEL_STATUS = "unmapped_kernel_status"
+
+
+def _status_reason(kernel, status) -> Declined:
+    """Map a kernel stop status onto its reason. Built per call: `kernel` is imported lazily."""
+
+    return {
+        kernel.STATUS_LABEL_LIMIT: Declined.LABEL_BUDGET,
+        kernel.STATUS_STATE_LIMIT: Declined.STATE_BUDGET,
+        # `feasible_dag`'s heap, which `price_dag` never raises: the two searches share the
+        # status code, and only the feasible one grows a heap (`dp_kernel.py:2334-2338`).
+        kernel.STATUS_CANDIDATE_LIMIT: Declined.HEAP_BUDGET,
+        kernel.STATUS_FSUM_OVERFLOW: Declined.FSUM_OVERFLOW,
+    }.get(status, Declined.KERNEL_STATUS)
 
 
 def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
@@ -1863,6 +2149,31 @@ def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
     """
 
     global _kernel_restart_warned, _kernel_budget_warned
+
+    # A search that FILLED past the old ceiling is one that would have declined to the
+    # pure-Python reference before `MAX_LABEL_CAPACITY` was raised to 1<<26.  It succeeded,
+    # so nothing here is wrong -- but its headroom is gone, and the decline warning below
+    # only fires once it is too late.  This is the one that fires while there is still time
+    # to act (a bootstrap cutoff, a narrower objective, fewer flights per batch).
+    #
+    # Gated on STATUS_OK, and not merely to be tidy: a search that DECLINED already gets a
+    # more specific warning below, and saying "no headroom left" about a search that
+    # already ran out of it is noise on top of the real message.  The status test also
+    # short-circuits before `n_labels`, which is what lets a caller hand this function a
+    # decline that never filled a pool.
+    if result.status == kernel.STATUS_OK and result.n_labels >= kernel.LABEL_HIGH_WATER_WARN:
+        flight_id = fg.request.flight_id
+        if flight_id not in _kernel_high_water_warned:
+            _kernel_high_water_warned.add(flight_id)
+            print(
+                f"WARNING: compiled colgen pricing filled {result.n_labels:,} labels on "
+                f"flight {flight_id} -- at or past {kernel.LABEL_HIGH_WATER_WARN:,}, which "
+                f"was the ceiling before it was raised to "
+                f"{kernel.MAX_LABEL_CAPACITY:,} ({result.n_labels * 40 / 1e9:.2f} GB of "
+                f"label arena, PER pricing worker). The answer is correct; the headroom is "
+                f"not. This flight declines to the reference search if its demand grows",
+                file=sys.stderr,
+            )
 
     if result.attempts > 1:
         _KERNEL_STATS["label_restarts"] += result.attempts - 1
@@ -2026,21 +2337,23 @@ def _best_column_compiled(
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
-) -> tuple[tuple[float, Column | None], bool]:
-    """``_best_column`` over the compiled search: ``((reduced_cost, column), proved)``.
+    keep_roots: frozenset[tuple[int, int]] | None = None,
+    record_budget: bool = True,
+) -> tuple[float, Column | None] | Declined:
+    """``_best_column`` over the compiled search: ``(reduced_cost, column)``, or a reason.
 
-    ``proved`` is the whole contract. ``True`` means the compiled search ran to completion,
-    and because it reproduces the reference's explored set exactly -- same roots, same
-    completion gate, same mid-sweep incumbent, same dominance ties -- its sink set is the
-    reference's, so ranking it gives the reference's column. ``False`` means the caller
-    must run ``_best_column``: numba missing, a graph the packer refuses (multi-level, no
-    reachable destination), or a budget the kernel could not grow into.
+    A 2-tuple means the compiled search ran to completion, and because it reproduces the
+    reference's explored set exactly -- same roots, same completion gate, same mid-sweep
+    incumbent, same dominance ties -- its sink set is the reference's, so ranking it gives
+    the reference's column. A :class:`Declined` means the caller must run ``_best_column``,
+    and says which of the eight reachable causes applied.
 
-    Note what ``proved`` is NOT: a residual-bound argument over a superset search. PR #76
+    Note what completing is NOT: a residual-bound argument over a superset search. PR #76
     needed one because its kernel searched more than the reference and certified
-    separately. This one does not, which is why there is no bootstrap round and no
-    ``label_limit`` ladder here -- ``price_dag`` grows its own budgets and either finishes
-    or says it did not.
+    separately. This one does not, which is why there is no ``label_limit`` ladder here --
+    ``price_dag`` grows its own budgets and either finishes or says it did not. (A
+    *bootstrap* round is a different thing and does exist, in ``price_flight``, where both
+    searches receive its result; see :func:`_bootstrap_incumbent`.)
 
     A deadline is enforced two ways, because neither alone is enough: ``_check_deadline``
     between the Python stages, and a watchdog that sets the kernel's ``cancel`` flag, which
@@ -2049,13 +2362,17 @@ def _best_column_compiled(
     """
 
     kernel = _dp_kernel()
-    if kernel is None or len(fg.levels) != 1:
-        return (-math.inf, None), False
+    if kernel is None:
+        return Declined.NO_NUMBA
+    if len(fg.levels) != 1:
+        return Declined.MULTI_LEVEL
 
     _check_deadline(deadline)
     topology, rows = dp_prepare.prepared_for(fg, cfg)
-    if not (topology.ok and rows.ok):
-        return (-math.inf, None), False
+    if not topology.ok:
+        return Declined.TOPOLOGY
+    if not rows.ok:
+        return Declined.ROWS
 
     duals = dp_prepare.prepare_duals(dual_view, fg, topology, rows)
     envelopes = dp_prepare.CompletionEnvelopes(
@@ -2081,13 +2398,30 @@ def _best_column_compiled(
         model=model,
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
+        keep_roots=keep_roots,
     )
     if not variants.ok:
-        return (-math.inf, None), False
+        # Unreachable today, and kept anyway.  `prepare_variants` has exactly two returns and
+        # the failing one only ever propagates `topology.unsupported_reason or
+        # rows.unsupported_reason`, both of which the guard above already caught -- so this
+        # cannot fire without one of those two first.  A root set that the gate pruned to
+        # nothing is a different thing entirely: it comes back `ok` with empty arrays and
+        # correctly PROVES that no improving column exists.
+        return Declined.TOPOLOGY if not topology.ok else Declined.ROWS
     pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
 
-    with fg._search_cache.lock:
-        budget = fg._search_cache.dag_budget
+    # `record_budget=False` skips BOTH halves of the graph's budget memo, and it has to be
+    # both.  A restricted search shares this cache with the unrestricted one that follows it,
+    # and would corrupt it in each direction: reading, a 4-departure bootstrap would allocate
+    # the FULL search's pool (up to `MAX_LABEL_CAPACITY`, ~2.68 GB) for a search that needs a
+    # sliver of it; writing, the memo would end up holding the bootstrap's tiny budget, and
+    # since the write below sits past the `status != OK` guard, a declining flight -- the one
+    # this is all for -- would keep that number and make every later iteration re-climb the
+    # ladder from it.  Answer-neutral either way; the cost is entirely in wasted work.
+    budget = None
+    if record_budget:
+        with fg._search_cache.lock:
+            budget = fg._search_cache.dag_budget
     sizes = {}
     if budget is not None:
         # What the last completed search on this graph needed.  The duals move every
@@ -2138,12 +2472,13 @@ def _best_column_compiled(
         # here would spend the caller's whole remaining budget re-running what was just
         # abandoned; `solver.py` turns this into `termination_reason = "time_limit"`.
         _check_deadline(deadline)
-        return (-math.inf, None), False
+        return Declined.DEADLINE
     if result.status != kernel.STATUS_OK:
-        return (-math.inf, None), False
+        return _status_reason(kernel, result.status)
 
-    with fg._search_cache.lock:
-        fg._search_cache.dag_budget = result.budget
+    if record_budget:
+        with fg._search_cache.lock:
+            fg._search_cache.dag_budget = result.budget
 
     candidates = _dag_candidates(
         result,
@@ -2169,19 +2504,13 @@ def _best_column_compiled(
         incumbent=result.incumbent,
         deadline=deadline,
     )
-    return ((-math.inf, None) if best is None else best), True
+    return (-math.inf, None) if best is None else best
 
 
 def _cancel_search(flag) -> None:
     """Watchdog body: ask the kernel to stop at its next time layer."""
 
     flag[0] = 1
-
-
-#: "The compiled feasible search declined."  A distinct sentinel because ``None`` is a real
-#: answer from ``find_feasible_column`` -- a flight with no feasible column -- and returning
-#: it for "numba is missing" would report an infeasible flight instead of falling back.
-_UNPROVED = object()
 
 
 def _feasible_compiled(
@@ -2205,7 +2534,7 @@ def _feasible_compiled(
     deadline: float | None,
     model: CostModel,
 ):
-    """``find_feasible_column``'s search, compiled; ``_UNPROVED`` when it cannot run.
+    """``find_feasible_column``'s search, compiled; a :class:`Declined` when it cannot run.
 
     The **start loop stays in Python** and the kernel gets its result. That is not laziness:
     the guards need ``_endpoint_claims`` sets and the reference's own ``break`` on the
@@ -2219,13 +2548,17 @@ def _feasible_compiled(
     """
 
     kernel = _dp_kernel()
-    if kernel is None or len(fg.levels) != 1:
-        return _UNPROVED
+    if kernel is None:
+        return Declined.NO_NUMBA
+    if len(fg.levels) != 1:
+        return Declined.MULTI_LEVEL
     topology, rows = dp_prepare.prepared_for(fg, cfg)
-    if not (topology.ok and rows.ok):
-        return _UNPROVED
+    if not topology.ok:
+        return Declined.TOPOLOGY
+    if not rows.ok:
+        return Declined.ROWS
     if topology.dest_lane_idx.size == 0:
-        return _UNPROVED
+        return Declined.NO_DESTINATION
     cell_index = {
         (int(q), int(r)): i
         for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
@@ -2256,7 +2589,7 @@ def _feasible_compiled(
         for lane_idx, cell, lane_steps in origin_options:
             index = cell_index.get(cell)
             if index is None:
-                return _UNPROVED
+                return Declined.MISSING_CELL
             start_step = departure_step + fg.takeoff_steps[0] + lane_steps
             remaining = remaining_distance(cell)
             if start_step >= fg.max_step or start_step + remaining > fg.max_step:
@@ -2340,7 +2673,7 @@ def _feasible_compiled(
     )
     del stopped_early  # the early exit already put its column in `state`
     if status != kernel.STATUS_OK:
-        return _UNPROVED
+        return _status_reason(kernel, status)
     return state["best"]
 
 
@@ -2504,7 +2837,7 @@ def find_feasible_column(
         )
 
     # The compiled best-first search, when the graph has a packing and numba is present.
-    # `_UNPROVED` -- not `None` -- because `None` is a legitimate answer here: a flight with
+    # A `Declined` -- not `None` -- because `None` is a legitimate answer here: a flight with
     # no feasible column at all. Conflating the two would silently turn "the kernel declined"
     # into "this flight cannot fly".
     compiled = _feasible_compiled(
@@ -2527,7 +2860,7 @@ def find_feasible_column(
         deadline=deadline,
         model=model,
     )
-    if compiled is not _UNPROVED:
+    if not isinstance(compiled, Declined):
         return compiled
 
     counter = itertools.count()
@@ -2853,11 +3186,35 @@ def price_flight(
         )
         if incumbent is None or known_rc > incumbent[0] + _SCORE_EPS:
             incumbent = (known_rc, known_column)
+    # Everything folded in above is a column the master already holds, so LP optimality caps
+    # its reduced cost at 0 and the search would enter with no usable cutoff at all.  The
+    # bootstrap is the only way to a positive one -- see `_bootstrap_incumbent`.
+    #
+    # HERE, in the shared caller, and deliberately not inside the two searches.  `incumbent`
+    # is computed once and handed to `_best_column_compiled` and to the `_best_column`
+    # fallback below as the same object, so a bootstrap at this seam reaches BOTH by
+    # construction: whichever one runs explores the space the other would have.  Putting it
+    # in two bodies is how they drift, and the `Declined` contract -- that the compiled
+    # search explored exactly what the reference would -- is what would drift first.
+    if params.bootstrap_roots:
+        incumbent = _bootstrap_incumbent(
+            fg,
+            view,
+            pi_value,
+            cfg,
+            benefit,
+            forbidden,
+            model,
+            incumbent=incumbent,
+            roots=params.bootstrap_roots,
+            ranking=getattr(params, "bootstrap_ranking", "score"),
+            deadline=deadline,
+        )
     # The compiled search first, the reference when it cannot prove it ran to completion.
     # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
     # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of
     # flights, and the exclusion set is a bitset over dense row ids inside the kernel.
-    (reduced_cost, column), proved = _best_column_compiled(
+    outcome = _best_column_compiled(
         fg,
         view,
         pi_value,
@@ -2869,8 +3226,13 @@ def price_flight(
         model=model,
     )
     _KERNEL_STATS["priced"] += 1
-    if not proved:
+    if isinstance(outcome, Declined):
         _KERNEL_STATS["fell_back"] += 1
+        # The reason, not just the count.  `fell_back` alone cannot be acted on -- "install
+        # numba" and "a partial expansion saturated on real data" are opposite responses --
+        # and this is the only place both are in scope.  `solver.py` sums these into
+        # `planner_stats.json`, so an archived run can say WHICH.
+        _KERNEL_STATS[f"declined_{outcome.value}"] += 1
         # The ORIGINAL incumbent, deliberately, not whatever the abandoned compiled attempt
         # managed to certify first.  Warm-starting the fallback would be optimality-safe --
         # pruning against an achievable score never discards anything strictly better -- but
@@ -2889,6 +3251,8 @@ def price_flight(
             deadline=deadline,
             model=model,
         )
+    else:
+        reduced_cost, column = outcome
     if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
         return reduced_cost, None
     if known_column is not None and column == known_column:

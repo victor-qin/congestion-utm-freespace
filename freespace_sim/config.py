@@ -61,6 +61,25 @@ class SimConfig:
     # and climb_rate*dt=24 m while ground/hold were scaled by dt=4 s, so the advertised 1:3:3:4
     # was really 1:90:3:24 — one hex step cost as much as 360 s of ground delay and no detour or
     # climb was ever rational. Per step, these now read exactly 1 : 3 : 3 : 4.
+    # LOWERING `cost_air_lateral_per_s` IS A PRICING-TIME DECISION AS WELL AS AN ECONOMIC
+    # ONE, and the coupling is violent.  Colgen's completion bound terminates its envelope
+    # when `benefit - pi_f - delay_lb[hops]` falls below the incumbent, and `delay_lb`
+    # accumulates at `cost_air_lateral_per_s * dt_s` per hop -- so the envelope's LENGTH is
+    # ~1/air-weight, and the label count scales with the volume that length admits rather
+    # than with the length itself.  Measured on `density_faa_wing_zipline` x12, 2 iterations,
+    # sequential, with only this dial moving (issue #91):
+    #
+    #     ratio    WALL        fell_back   peak labels
+    #     1:1.0    1075.58 s       2       67,108,864  <- exhausts the 2^26 ceiling
+    #     1:1.5     383.72 s       1       67,108,864  <- still exhausts it
+    #     1:2.0      82.77 s       0       51,206,411
+    #     1:3.0      27.19 s       0       14,936,161  <- shipped
+    #
+    # 39.6x across a factor of 3, roughly `w_air^-3.35`.  Below ~1:2 the compiled search
+    # cannot complete on a density instance AT ANY CEILING and falls back to the pure-Python
+    # reference, so this is not a knob that trades accuracy for speed -- it decides whether
+    # the compiled path works at all.  It also moves the SCHEDULES, not merely the runtime:
+    # the ratio sets how much ground delay an optimum will buy to dodge a congestion dual.
     cost_ground_delay_per_s: float = 1.0        # wait on the pad          (1x, the numeraire)
     cost_air_lateral_per_s: float = 3.0         # cruise flight            (3x)
     cost_air_hold_per_s: float = 3.0            # loiter/hover mid-route   (3x)

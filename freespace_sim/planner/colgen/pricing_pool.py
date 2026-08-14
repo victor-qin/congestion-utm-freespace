@@ -77,7 +77,14 @@ from ...config import SimConfig
 from ...types import FlightRequest
 from .network import StaticTerminalCatalog, build_flight_graph
 from .params import ColGenParams
-from .pricing import DualView, PricingTimeout, kernel_stats, price_flight
+from .pricing import (
+    DualView,
+    PricingTimeout,
+    clear_search_record,
+    kernel_stats,
+    last_search_record,
+    price_flight,
+)
 from .translate import Column
 
 __all__ = [
@@ -131,6 +138,17 @@ class SweepResult:
     # as positional fields that is a constructor argument per counter, in a dataclass built
     # positionally at four sites and hand-built in the tests.
     kernel_counters: Counter[str] = field(default_factory=Counter)
+    #: One record per ACCEPTED flight, in the same index order as `flight_ids`, plus the
+    #: timed-out flight when there is one.  Diagnostics only -- nothing in the solve reads
+    #: these, and an empty tuple is a valid sweep.
+    #:
+    #: They exist because `task_total_s` is a SUM, and a sum cannot answer the question a
+    #: pool actually poses: a sweep can never finish faster than its slowest single task,
+    #: so "which flight is the straggler, and was it one of the flights that improved"
+    #: decides whether skip-filtering the cheap flights would buy any wall time at all.
+    #: Measured at 500 flights, the largest task is >=26x the mean, so this is the
+    #: difference between attacking the binding term and a non-binding one.
+    flight_records: tuple[dict[str, Any], ...] = ()
 
     @property
     def kernel_priced(self) -> int:
@@ -244,6 +262,10 @@ def _price_one(flight_id: int):
     # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
     # so shipping the absolute would double-count on the second task and beyond.
     before = kernel_stats()
+    # Cleared, not merely read after: a flight that declines BEFORE reaching the kernel
+    # leaves the PREVIOUS flight's record in place, and attributing one flight's 67M labels
+    # to another is worse than reporting nothing.
+    clear_search_record()
     started = time.perf_counter()
     try:
         reduced_cost, column = price_flight(
@@ -256,7 +278,13 @@ def _price_one(flight_id: int):
             deadline=_WORKER["deadline"],
         )
     except PricingTimeout:
-        return flight_id, False, 0.0, None, time.perf_counter() - started, {}
+        # The record still ships: a flight that timed out mid-search is the most
+        # interesting row in a straggler hunt, and it is exactly the one the sequential
+        # loop never produces a number for.
+        return (
+            flight_id, False, 0.0, None, time.perf_counter() - started, {},
+            last_search_record(),
+        )
     after = kernel_stats()
     # Subtraction over the UNION of keys, not over `before`'s: a `declined_<reason>` key
     # appears the first time that cause fires, so it exists in `after` and not in `before`.
@@ -267,6 +295,7 @@ def _price_one(flight_id: int):
         column,
         time.perf_counter() - started,
         {key: value - before.get(key, 0) for key, value in after.items()},
+        last_search_record(),
     )
 
 
@@ -316,9 +345,14 @@ def _sweep_sequential(
     columns: list[Column | None] = []
     task_total_s = 0.0
     before = Counter(kernel_stats())
+    # Built here too, and not only in the pool: the two arms must report the same SHAPE or
+    # a diagnostic that only exists under `--colgen-workers N` cannot be sanity-checked
+    # against the loop it is supposed to reproduce.
+    records: list[dict[str, Any]] = []
     sweep_started = time.perf_counter()
     for flight_id in pricing_order:
         task_started = time.perf_counter()
+        clear_search_record()
         try:
             reduced_cost, column = price_flight(
                 graphs[flight_id],
@@ -330,12 +364,17 @@ def _sweep_sequential(
                 deadline=deadline,
             )
         except PricingTimeout:
+            records.append(_flight_record(
+                flight_id, time.perf_counter() - task_started, priced=False
+            ))
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
-                Counter(kernel_stats()) - before,
+                Counter(kernel_stats()) - before, tuple(records),
             )
-        task_total_s += time.perf_counter() - task_started
+        task_s = time.perf_counter() - task_started
+        records.append(_flight_record(flight_id, task_s, priced=True))
+        task_total_s += task_s
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
@@ -344,8 +383,25 @@ def _sweep_sequential(
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
-        Counter(kernel_stats()) - before,
+        Counter(kernel_stats()) - before, tuple(records),
     )
+
+
+def _flight_record(flight_id: int, task_s: float, *, priced: bool, search=None) -> dict:
+    """One flight's diagnostic row: its clock, plus whatever the kernel recorded.
+
+    `search` is `pricing.last_search_record()` -- passed in by the pool arm, which read it
+    inside the worker, and read here directly by the sequential arm. Empty when the flight
+    never reached the compiled search at all, which is itself the answer to "why was this
+    one cheap".
+    """
+
+    record = {"flight_id": int(flight_id), "task_s": float(task_s), "priced": bool(priced)}
+    record.update(last_search_record() if search is None else search)
+    # After the update, so a stale `flight_id` in the search record can never rename the
+    # flight this row is about.
+    record["flight_id"] = int(flight_id)
+    return record
 
 
 def _sweep_parallel(
@@ -430,8 +486,10 @@ def _results_before_deadline(results, pricing_order, deadline):
             return
         except mp.TimeoutError:
             # Exactly the shape `_price_one` returns for a `PricingTimeout`, so the reducer
-            # needs no special case: no seconds, no counters, `priced` False.
-            yield pricing_order[index], False, 0.0, None, 0.0, {}
+            # needs no special case: no seconds, no counters, `priced` False -- and an
+            # EMPTY search record, because the worker that would have filled it is the one
+            # that never reported back.
+            yield pricing_order[index], False, 0.0, None, 0.0, {}, {}
             return
 
 
@@ -458,16 +516,21 @@ def _accepted_prefix(results) -> SweepResult:
     # `Counter.update` ADDS where `dict.update` would REPLACE, which is the whole reason
     # this is a Counter: a plain dict here would silently report only the last task's tally.
     counters: Counter[str] = Counter()
-    for flight_id, priced, reduced_cost, column, task_s, deltas in results:
+    records: list[dict[str, Any]] = []
+    for flight_id, priced, reduced_cost, column, task_s, deltas, search in results:
         if not priced:
             # Past the first gap nothing is accepted, so returning here stops consuming --
             # which abandons the outstanding tasks, and leaving the caller's `with` block
             # terminates the pool.  The timed-out task's own seconds are deliberately not
             # added: they are not work the sweep kept.
+            # The timed-out flight's row IS kept even though its seconds are not: it is
+            # the one the sweep stopped for, so a straggler hunt needs it most.
+            records.append(_flight_record(flight_id, task_s, priced=False, search=search))
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
-                task_total_s, 0.0, counters,
+                task_total_s, 0.0, counters, tuple(records),
             )
+        records.append(_flight_record(flight_id, task_s, priced=True, search=search))
         task_total_s += task_s
         counters.update(deltas)
         flight_ids.append(flight_id)
@@ -475,5 +538,5 @@ def _accepted_prefix(results) -> SweepResult:
         columns.append(column)
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
-        task_total_s, 0.0, counters,
+        task_total_s, 0.0, counters, tuple(records),
     )

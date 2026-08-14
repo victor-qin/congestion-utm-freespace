@@ -1215,6 +1215,13 @@ class ColGenSolver:
                     # straggler.  That distinguishes scheduling loss from dispatch overhead,
                     # and only the latter is something `chunksize` can address.
                     "sweep_task_total_s": sweep.task_total_s,
+                    # Per-flight rows behind that sum, in `pricing_order` index order.  The
+                    # sum says how much work the sweep did; only these say WHERE it went,
+                    # and a pool's wall clock is set by its slowest single task rather than
+                    # by the total.  Available under a pool as well as sequentially, which
+                    # `prof_colgen_cutoff.py` cannot be: its instrumentation rebinds a
+                    # module global in this process and a spawned worker imports its own.
+                    "sweep_flight_records": sweep.flight_records,
                     "columns": len(master.columns),
                     "columns_added": len(priced_columns),
                     "rc_sum": math.fsum(positives),

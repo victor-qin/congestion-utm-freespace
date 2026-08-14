@@ -209,9 +209,9 @@ def test_a_timeout_discards_later_results_that_completed():
     """
 
     accepted = _accepted_prefix(iter([
-        (7, True, 0.5, None, 1.0, {"priced": 1}),
-        (3, False, 0.0, None, 0.25, {}),
-        (9, True, 4.0, None, 8.0, {"priced": 1, "fell_back": 1}),
+        (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
+        (3, False, 0.0, None, 0.25, {}, {}),
+        (9, True, 4.0, None, 8.0, {"priced": 1, "fell_back": 1}, {}),
     ]))
 
     assert accepted.flight_ids == (7,)
@@ -230,9 +230,9 @@ def test_a_complete_sweep_keeps_index_order_and_sums_the_worker_tallies():
     downstream by a plain non-associative `sum`, so the sequence itself is the contract."""
 
     accepted = _accepted_prefix(iter([
-        (7, True, 0.5, None, 1.0, {"priced": 1}),
+        (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, True, 0.25, None, 0.5,
-         {"priced": 1, "fell_back": 1, "declined_label_pool_exhausted": 1}),
+         {"priced": 1, "fell_back": 1, "declined_label_pool_exhausted": 1}, {}),
     ]))
 
     assert accepted.complete
@@ -324,8 +324,8 @@ def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
 
     order = [7, 3, 9]
     priced = [
-        (7, True, 0.5, None, 1.0, {"priced": 1}),
-        (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}),
+        (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
+        (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
     accepted = _accepted_prefix(
         _results_before_deadline(_LostResult(priced, lose_at=2), order, deadline=0.0)
@@ -344,8 +344,8 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
 
     order = [7, 3]
     priced = [
-        (7, True, 0.5, None, 1.0, {"priced": 1}),
-        (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}),
+        (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
+        (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
     accepted = _accepted_prefix(
         _results_before_deadline(_LostResult(priced, lose_at=None), order, deadline=None)
@@ -354,3 +354,62 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
     assert accepted.complete
     assert accepted.timeout_flight_id is None
     assert accepted.flight_ids == (7, 3)
+
+
+def test_both_arms_report_the_same_per_flight_rows():
+    """A diagnostic that exists only under a pool cannot be checked against anything.
+
+    These rows are for hunting the straggler, and the straggler only matters under a pool
+    -- but that is exactly the arm whose numbers nobody can verify by hand.  Producing the
+    same SHAPE sequentially is what makes the pooled table trustworthy: same flights, same
+    order, same keys.  The clocks differ (contention is real) so only structure is compared.
+    """
+
+    cfg = _cfg()
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+        _request(3, (-4, 4), (4, -4), cfg),
+    ]
+    catalog = StaticTerminalCatalog((), cfg)
+    order = [1, 2, 3]
+
+    def sweep(n_workers):
+        params = _params(n_pricing_workers=n_workers)
+        graphs = {
+            r.flight_id: build_flight_graph(r, cfg, catalog, params) for r in requests
+        }
+        return price_sweep(
+            order, requests, graphs, cfg, params, catalog, {}, DualView({}, cfg),
+            dict.fromkeys(order, 0.0), {}, deadline=None,
+        )
+
+    seq, par = sweep(0), sweep(2)
+
+    assert [r["flight_id"] for r in seq.flight_records] == order
+    assert [r["flight_id"] for r in par.flight_records] == order
+    assert all(r["priced"] for r in seq.flight_records + par.flight_records)
+    # Same keys, so a field that only the in-process arm can fill would fail here rather
+    # than silently reading as absent in every pooled run.
+    assert [sorted(r) for r in seq.flight_records] == [sorted(r) for r in par.flight_records]
+    # The clock is per-flight and positive in both arms -- the whole point of the rows.
+    assert all(r["task_s"] > 0.0 for r in par.flight_records)
+
+
+def test_a_flight_that_never_reached_the_kernel_reports_no_stale_labels():
+    """`clear_search_record` is what stops one flight's 67M labels being filed under another.
+
+    The record is a module global, so without the clear a flight that declines BEFORE the
+    compiled search -- no numba, multi-level graph, refused topology -- inherits whatever
+    the previous flight left there.  In a straggler hunt that is worse than a missing row:
+    it names the wrong flight.
+    """
+
+    from freespace_sim.planner.colgen import pricing as pricing_mod
+
+    pricing_mod._LAST_SEARCH.update(flight_id=999, n_labels=67_108_864, attempts=7)
+    pricing_mod.clear_search_record()
+    assert pricing_mod.last_search_record() == {}
+
+    record = pricing_pool._flight_record(4, 1.5, priced=True)
+    assert record == {"flight_id": 4, "task_s": 1.5, "priced": True}

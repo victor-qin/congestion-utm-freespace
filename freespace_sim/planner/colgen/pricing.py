@@ -2067,6 +2067,40 @@ def kernel_stats() -> dict[str, int]:
     return dict(_KERNEL_STATS)
 
 
+#: The LAST compiled search's per-flight facts, for the caller that wants them PER FLIGHT
+#: rather than summed.  `_KERNEL_STATS` is a running total and cannot answer "which flight
+#: was the straggler" -- the question that decides whether skip-filtering the cheap flights
+#: would help at all, since a pool's makespan is set by its slowest single task.
+#:
+#: A module global rather than a return value because `_best_column_compiled` has nine
+#: return sites and every one of them is a `Declined` member or a column; widening that
+#: contract to carry diagnostics would put a profiling concern in the type every caller
+#: matches on.  It is written unconditionally and read by whoever cares.
+_LAST_SEARCH: dict[str, Any] = {}
+
+
+def last_search_record() -> dict[str, Any]:
+    """The last compiled search's facts, or ``{}`` if none ran in this process.
+
+    Returns a COPY: the caller in `pricing_pool` ships this across a process boundary, and
+    handing out the live dict would let the next flight's search mutate a record already
+    queued for pickling.
+    """
+
+    return dict(_LAST_SEARCH)
+
+
+def clear_search_record() -> None:
+    """Forget the last search, so a caller can tell "did not run" from "ran previously".
+
+    Without this a flight that declines BEFORE reaching the kernel -- no numba, multi-level
+    graph, refused topology -- would report the previous flight's labels as its own, which
+    is the most misleading possible answer for a straggler hunt.
+    """
+
+    _LAST_SEARCH.clear()
+
+
 class Declined(enum.Enum):
     """Why the compiled search did not run. Members are the reasons the reference is used.
 
@@ -2478,6 +2512,17 @@ def _best_column_compiled(
     # Before the status checks, so a search that restarted and THEN ran out of clock is
     # still recorded as having restarted -- `_check_deadline` below raises out of here.
     _warn_budget_growth(kernel, fg, result)
+    # Recorded at the same site and for the same reason: every path out of here below this
+    # line is a decline, and a decline is exactly the case a straggler hunt needs the
+    # numbers for.  Plain ints and a str so this pickles back from a pool worker without
+    # dragging `DagResult` or the kernel module across the boundary.
+    _LAST_SEARCH.update(
+        flight_id=int(fg.request.flight_id),
+        n_labels=int(result.n_labels),
+        attempts=int(result.attempts),
+        label_budget=int(result.budget[0]),
+        status=kernel.STATUS_NAMES.get(result.status, str(result.status)),
+    )
 
     if result.status == kernel.STATUS_CANCELLED:
         # The watchdog fired, so the deadline has passed.  Falling back to the reference
@@ -3213,7 +3258,10 @@ def price_flight(
     # construction: whichever one runs explores the space the other would have.  Putting it
     # in two bodies is how they drift, and the `Declined` contract -- that the compiled
     # search explored exactly what the reference would -- is what would drift first.
+    _bootstrap_s = 0.0
+    _bootstrap_labels = 0
     if params.bootstrap_roots:
+        _bootstrap_started = time.perf_counter()
         incumbent = _bootstrap_incumbent(
             fg,
             view,
@@ -3227,10 +3275,16 @@ def price_flight(
             ranking=getattr(params, "bootstrap_ranking", "score"),
             deadline=deadline,
         )
+        _bootstrap_s = time.perf_counter() - _bootstrap_started
+        # Snapshot NOW: `_bootstrap_incumbent` runs its own restricted
+        # `_best_column_compiled`, which writes `_LAST_SEARCH`, and the main search below
+        # overwrites it. Read late and this reports the main search's labels twice.
+        _bootstrap_labels = int(_LAST_SEARCH.get("n_labels", 0))
     # The compiled search first, the reference when it cannot prove it ran to completion.
     # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
     # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of
     # flights, and the exclusion set is a bitset over dense row ids inside the kernel.
+    _compiled_started = time.perf_counter()
     outcome = _best_column_compiled(
         fg,
         view,
@@ -3242,9 +3296,31 @@ def price_flight(
         deadline=deadline,
         model=model,
     )
+    # Split here rather than timing the whole call, because on a flight that DECLINES the
+    # two halves want opposite fixes and a combined number cannot tell them apart: a
+    # decomposition of one such straggler put 91.5% of it in the pure-Python fallback and
+    # only 8.5% in the compiled ladder that triggered it. Raising the label ceiling attacks
+    # the smaller half. Both are written unconditionally so a flight that never fell back
+    # still reports `fallback_s = 0.0` rather than a missing key.
+    _LAST_SEARCH["compiled_s"] = time.perf_counter() - _compiled_started
+    _LAST_SEARCH["fallback_s"] = 0.0
+    _LAST_SEARCH["declined"] = isinstance(outcome, Declined)
+    # The bootstrap is a SEPARATE `_best_column_compiled` call at the seam above, so it is
+    # not inside `compiled_s` and was previously unattributed -- 94% of one straggler's
+    # wall on a 500-flight sweep landed in neither field.
+    _LAST_SEARCH["bootstrap_s"] = _bootstrap_s
+    _LAST_SEARCH["bootstrap_labels"] = _bootstrap_labels
+    # What the main search actually ENTERS with, which is the number that separates the two
+    # explanations for an expensive flight: a cutoff at or near the final reduced cost means
+    # the cutoff was fine and the labels went somewhere else. `-inf` is no incumbent at all,
+    # the worst case for pruning, and LP optimality pins this at 0 without a bootstrap.
+    _LAST_SEARCH["entry_rc"] = (
+        float("-inf") if incumbent is None else float(incumbent[0])
+    )
     _KERNEL_STATS["priced"] += 1
     if isinstance(outcome, Declined):
         _KERNEL_STATS["fell_back"] += 1
+        _LAST_SEARCH["declined_reason"] = outcome.value
         # The reason, not just the count.  `fell_back` alone cannot be acted on -- "install
         # numba" and "a partial expansion saturated on real data" are opposite responses --
         # and this is the only place both are in scope.  `solver.py` sums these into
@@ -3256,6 +3332,7 @@ def price_flight(
         # it is not parity-safe: a stronger cutoff explores less than the reference did and
         # can return a different, equally optimal column.  The fallback exists to reproduce
         # the oracle, and it is rare enough that its speed is not the thing to optimize.
+        _fallback_started = time.perf_counter()
         reduced_cost, column = _best_column(
             fg,
             view,
@@ -3268,8 +3345,14 @@ def price_flight(
             deadline=deadline,
             model=model,
         )
+        _LAST_SEARCH["fallback_s"] = time.perf_counter() - _fallback_started
     else:
         reduced_cost, column = outcome
+    # Paired with `entry_rc` above, and the pair is the point: `final_rc - entry_rc` is how
+    # much of the answer the cutoff did NOT already know. Near zero means the bootstrap
+    # handed the search a bound worth having and the labels went elsewhere; a large gap
+    # means the search discovered the answer itself and the cutoff was doing nothing.
+    _LAST_SEARCH["final_rc"] = float(reduced_cost)
     if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
         return reduced_cost, None
     if known_column is not None and column == known_column:

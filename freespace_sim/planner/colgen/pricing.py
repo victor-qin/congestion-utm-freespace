@@ -2097,6 +2097,13 @@ class Declined(enum.Enum):
     ROWS = "rows_refused"
     NO_DESTINATION = "no_reachable_destination"
     MISSING_CELL = "origin_cell_not_packed"
+    #: A forbidden row landed outside the packed clock, so the bitmap does not carry it.
+    #: The kernel would then explore a state the reference forbids and return a column the
+    #: reference cannot -- a WRONG answer, not a slow one, and the one failure mode the
+    #: parity harness cannot catch, because nothing raises. `prepare_forbidden` already
+    #: counted these and said "the caller must refuse the compiled path"; this is the
+    #: caller doing so.
+    FORBIDDEN_UNMAPPED = "forbidden_row_outside_clock"
     LABEL_BUDGET = "label_pool_exhausted"
     STATE_BUDGET = "dominance_table_exhausted"
     HEAP_BUDGET = "heap_exhausted"
@@ -2409,6 +2416,11 @@ def _best_column_compiled(
         # correctly PROVES that no improving column exists.
         return Declined.TOPOLOGY if not topology.ok else Declined.ROWS
     pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
+    if pack.n_unmapped:
+        # Every other Declined here costs time; this one would cost correctness. A dropped
+        # forbidden row does not narrow the search, it WIDENS it past what the reference
+        # allows, so the kernel can return a column carrying a claim the master forbade.
+        return Declined.FORBIDDEN_UNMAPPED
 
     # `record_budget=False` skips BOTH halves of the graph's budget memo, and it has to be
     # both.  A restricted search shares this cache with the unrestricted one that follows it,
@@ -2615,6 +2627,11 @@ def _feasible_compiled(
         return best_column
 
     pack = dp_prepare.prepare_forbidden(forbidden, fg, rows, topology)
+    if pack.n_unmapped:
+        # Same refusal as `_best_column_compiled`'s, and it matters here too: this arm feeds
+        # the greedy's incumbent, and an incumbent carrying a forbidden claim is committed
+        # to the schedule rather than merely priced.
+        return Declined.FORBIDDEN_UNMAPPED
     state: dict[str, Any] = {"best": best_column}
 
     def certify(departure_step, origin_lane, dest_lane, step, hops, path):

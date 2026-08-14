@@ -505,10 +505,22 @@ def prepare_rows(fg: FlightGraph, cfg: SimConfig, topology: PreparedTopology) ->
             sorted(cell_index[c] for c in cells), dtype=np.int32
         )
 
-    # Bound the clock generously: endpoint windows pad outside [min_step, max_step], and a
-    # row id that does not exist would silently drop a claim.  The pad is at most the dwell
-    # plus the outward rounding, so one dwell's worth of steps on each side is ample.
-    pad = int(max(dwell.values()) / cfg.dt_s) + 8
+    # Bound the clock generously: claims pad outside [min_step, max_step], and a row id that
+    # does not exist would silently drop one.
+    #
+    # TWO independent sources widen it, and counting only the first was a real bug. The
+    # endpoint dwell is one. The other is the intermediate-cell window, which every visit
+    # claims through and which `derive_cell_window` grows with `time_buffer_s`: the default
+    # 4.0 s yields (-2, 1), but 100 s yields (-26, 25). At the default the `+8` slack
+    # happened to cover it, which is exactly why no shipped scenario exhibited this and why
+    # raising the buffer would have started dropping forbidden rows instead of failing.
+    #
+    # `max` rather than a sum because these are alternative furthest-out claims from one
+    # visit, not a stack: the clock has to reach past whichever is larger.
+    lo_offset, hi_offset = derive_cell_window(cfg)
+    pad = max(
+        int(max(dwell.values()) / cfg.dt_s), abs(lo_offset), abs(hi_offset)
+    ) + 8
     step0 = topology.min_step - pad
     n_steps = (topology.max_step + pad) - step0 + 1
 

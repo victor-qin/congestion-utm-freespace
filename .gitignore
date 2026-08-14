@@ -23,3 +23,6 @@ gurobi.log
 
 # editor-local debug configs
 .vscode/
+
+#misc
+experiments/batch/=3.3.2

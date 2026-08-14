@@ -20,7 +20,7 @@ from freespace_sim.planner.colgen.pricing_pool import (
     StalePricingWorker,
     SweepResult,
     _accepted_prefix,
-    _lane_assignment,
+    _worker_assignment,
     _sweep_results,
     price_sweep,
 )
@@ -340,8 +340,8 @@ def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
         (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
-    # One lane, so "the k-th result" and "the k-th flight of this lane" coincide and the
-    # loss lands on flight 9 exactly as it did before lanes existed.
+    # One worker, so "the k-th result" and "the k-th flight of this worker" coincide and the
+    # loss lands on flight 9 exactly as it did before workers existed.
     accepted = _accepted_prefix(
         _sweep_results(
             [_LostResult([[r] for r in priced], lose_at=2)], order,
@@ -377,25 +377,25 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
     assert accepted.flight_ids == (7, 3)
 
 
-def test_the_lane_merge_yields_pricing_order_when_lanes_finish_out_of_order():
+def test_the_worker_merge_yields_pricing_order_when_workers_finish_out_of_order():
     """The replacement for the global-FIFO property the shared queue used to give.
 
     `mp.Pool.imap` guaranteed "the k-th result is the k-th chunk" across ALL workers. With a
-    queue per lane that is gone, and the merge has to rebuild index order from per-lane
-    streams -- which works because a lane's own results stay FIFO in the order that lane's
-    flights appear in `pricing_order`. Lane 1 is fully ready here while lane 0 dribbles, so
+    queue per worker that is gone, and the merge has to rebuild index order from per-worker
+    streams -- which works because a worker's own results stay FIFO in the order that worker's
+    flights appear in `pricing_order`. Worker 1 is fully ready here while worker 0 dribbles, so
     a merge that emitted whatever was available would visibly reorder.
     """
 
-    order = [10, 11, 12, 13]          # lane 0 owns 10 and 12; lane 1 owns 11 and 13
-    lane_of = {10: 0, 11: 1, 12: 0, 13: 1}
-    lane0 = [[(10, True, 1.0, None, 0.1, {}, {})], [(12, True, 3.0, None, 0.1, {}, {})]]
-    lane1 = [[(11, True, 2.0, None, 0.1, {}, {}), (13, True, 4.0, None, 0.1, {}, {})]]
+    order = [10, 11, 12, 13]          # worker 0 owns 10 and 12; worker 1 owns 11 and 13
+    worker_of = {10: 0, 11: 1, 12: 0, 13: 1}
+    worker0 = [[(10, True, 1.0, None, 0.1, {}, {})], [(12, True, 3.0, None, 0.1, {}, {})]]
+    worker1 = [[(11, True, 2.0, None, 0.1, {}, {}), (13, True, 4.0, None, 0.1, {}, {})]]
 
     accepted = _accepted_prefix(
         _sweep_results(
-            [_LostResult(lane0, lose_at=None), _LostResult(lane1, lose_at=None)],
-            order, lane_of, deadline=None,
+            [_LostResult(worker0, lose_at=None), _LostResult(worker1, lose_at=None)],
+            order, worker_of, deadline=None,
         )
     )
 
@@ -405,7 +405,7 @@ def test_the_lane_merge_yields_pricing_order_when_lanes_finish_out_of_order():
     assert accepted.reduced_costs == (1.0, 2.0, 3.0, 4.0)
 
 
-def test_a_lane_that_returns_the_wrong_flight_is_refused():
+def test_a_worker_that_returns_the_wrong_flight_is_refused():
     """A merge bug must crash, not transpose two flights' reduced costs.
 
     Silently swapping them would be a wrong answer with no symptom: both flights were
@@ -413,28 +413,28 @@ def test_a_lane_that_returns_the_wrong_flight_is_refused():
     """
 
     order = [10, 11]
-    lane_of = {10: 0, 11: 0}
+    worker_of = {10: 0, 11: 0}
     wrong = [[(11, True, 2.0, None, 0.1, {}, {})], [(10, True, 1.0, None, 0.1, {}, {})]]
 
     with pytest.raises(RuntimeError, match="where pricing_order expects"):
         _accepted_prefix(
-            _sweep_results([_LostResult(wrong, lose_at=None)], order, lane_of, deadline=None)
+            _sweep_results([_LostResult(wrong, lose_at=None)], order, worker_of, deadline=None)
         )
 
 
-def test_lane_assignment_is_stable_and_balanced():
+def test_worker_assignment_is_stable_and_balanced():
     """Fixed for the solve, and even on sparse ids -- which `flight_id % n` is not."""
 
     sparse = [900, 3, 41, 7, 12, 88, 5]
-    lanes = _lane_assignment(sparse, 3)
-    assert set(lanes) == set(sparse)
-    counts = [sum(1 for v in lanes.values() if v == lane) for lane in range(3)]
+    workers = _worker_assignment(sparse, 3)
+    assert set(workers) == set(sparse)
+    counts = [sum(1 for v in workers.values() if v == worker) for worker in range(3)]
     assert max(counts) - min(counts) <= 1, counts
     # Independent of the order the ids arrive in: the map is keyed on the flight, so a
     # re-sorted `pricing_order` cannot move a flight to a different worker.
-    assert _lane_assignment(list(reversed(sparse)), 3) == lanes
-    # `flight_id % n_lanes` would have put 900, 3, 12 and 88 unevenly; sorted-index does not.
-    assert _lane_assignment(range(6), 3) == {0: 0, 1: 1, 2: 2, 3: 0, 4: 1, 5: 2}
+    assert _worker_assignment(list(reversed(sparse)), 3) == workers
+    # `flight_id % n_workers` would have put 900, 3, 12 and 88 unevenly; sorted-index does not.
+    assert _worker_assignment(range(6), 3) == {0: 0, 1: 1, 2: 2, 3: 0, 4: 1, 5: 2}
 
 
 def test_both_arms_report_the_same_per_flight_rows():
@@ -492,11 +492,11 @@ def test_a_flight_that_never_reached_the_kernel_reports_no_stale_labels():
     pricing_mod.clear_search_record()
     assert pricing_mod.last_search_record() == {}
 
-    # `lane`/`pid` describe the sequential arm as written -- one lane, this process. The
+    # `worker`/`pid` describe the sequential arm as written -- one worker, this process. The
     # pool overwrites both once it knows which worker actually ran the flight.
     record = pricing_pool._flight_record(4, 1.5, priced=True)
     assert record == {
-        "flight_id": 4, "task_s": 1.5, "priced": True, "lane": 0, "pid": os.getpid(),
+        "flight_id": 4, "task_s": 1.5, "priced": True, "worker": 0, "pid": os.getpid(),
     }
 
 
@@ -651,7 +651,7 @@ def test_a_worker_refuses_a_task_from_a_sweep_it_does_not_hold(monkeypatch):
     try:
         pricing_pool._price_one(("uid", 2), 1)
     except StalePricingWorker as exc:
-        assert "lane 0" in str(exc) and str(os.getpid()) in str(exc)
+        assert "worker 0" in str(exc) and str(os.getpid()) in str(exc)
 
 
 def test_a_respawned_worker_has_no_sweep_state_and_says_so(monkeypatch):
@@ -713,7 +713,7 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight():
         sweeps = [pool.run_sweep(order, {}, flight_duals, {}, None) for _ in range(3)]
 
     seen = [
-        {(r["flight_id"], r["lane"], r["pid"]) for r in sweep.flight_records}
+        {(r["flight_id"], r["worker"], r["pid"]) for r in sweep.flight_records}
         for sweep in sweeps
     ]
     pids = [{pid for _f, _l, pid in rows} for rows in seen]
@@ -721,8 +721,8 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight():
     assert len(pids[0]) == 2
     assert all(rows == seen[0] for rows in seen), "a flight moved between workers"
     assert os.getpid() not in pids[0], "the pool priced in the parent process"
-    # Two lanes over three flights, so the split is 2/1 and neither lane is empty.
-    assert {lane for _f, lane, _p in seen[0]} == {0, 1}
+    # Two workers over three flights, so the split is 2/1 and neither worker is empty.
+    assert {worker for _f, worker, _p in seen[0]} == {0, 1}
 
 
 def test_the_solver_hands_its_sweeps_one_pool():
@@ -750,11 +750,11 @@ def test_the_solver_hands_its_sweeps_one_pool():
         on_iteration=on_iteration,
     )
     assert result.stats["pricing_pool_setup_s"] > 0.0
-    assert rows and all("lane" in r and "pid" in r for r in rows)
+    assert rows and all("worker" in r and "pid" in r for r in rows)
     assert os.getpid() not in {r["pid"] for r in rows}
-    # Lane assignment is a pure function of the flight ids, so the solver's pool must have
+    # Worker assignment is a pure function of the flight ids, so the solver's pool must have
     # produced the same split this does.
-    assert {r["flight_id"]: r["lane"] for r in rows} == _lane_assignment([1, 2, 3], 2)
+    assert {r["flight_id"]: r["worker"] for r in rows} == _worker_assignment([1, 2, 3], 2)
 
 
 def test_pool_setup_is_charged_to_the_first_sweep_only():
@@ -801,7 +801,7 @@ def test_closing_the_pool_twice_is_safe():
 
 
 def test_a_pool_that_raised_mid_sweep_refuses_another(monkeypatch):
-    """An exception leaves the lanes half-consumed, exactly as an early return does.
+    """An exception leaves the workers half-consumed, exactly as an early return does.
 
     The incomplete-sweep path already poisons; this is the same hazard reached the other
     way -- the merge's own consistency check, or a task raising. Without it a caller that

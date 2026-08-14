@@ -933,7 +933,7 @@ class ColGenSolver:
         # ONE pool for the whole solve, not one per sweep.  Constructed here but not
         # STARTED: `spawn` happens on the first sweep, so no worker process exists during
         # the parent-only greedy stage and peak RSS is where it was.  See `PricingPool`
-        # for what a solve-scoped pool buys and why each flight is pinned to a lane.
+        # for what a solve-scoped pool buys and why each flight is pinned to a worker.
         sweep_pool = (
             None
             if params.n_pricing_workers == 0
@@ -1581,7 +1581,7 @@ class ColGenSolver:
             "pricing_task_total_s": pricing_task_total_s,
             # Seconds spent STARTING workers, across the solve.  Under a solve-scoped
             # pool this is paid on the first sweep and never again, so a value near
-            # `pricing_wall_s` means the pool is being rebuilt and the lanes are cold.
+            # `pricing_wall_s` means the pool is being rebuilt and the workers are cold.
             "pricing_pool_setup_s": pricing_pool_setup_s,
             "n_pricing_workers": params.n_pricing_workers,
             # Exact-pricing calls and how many fell back to the pure-Python reference.

@@ -188,7 +188,7 @@ FLAT_LABEL_ARENA = True
 # the obvious suspects.  Until that is found and fixed, the state dimension pays for what it
 # ASKS for, not what it uses, and climbing a ladder is strictly better than starting high.
 # The label arena is the opposite case: lazily mapped, so a flat ceiling costs nothing.
-INITIAL_LOG2CAP = 14
+INITIAL_LOG2CAP = 16
 
 
 # --------------------------------------------------------------------------- exact sums

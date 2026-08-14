@@ -604,7 +604,7 @@ def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch
 
     cfg = _cfg()
     graph, params = GRAPH_SHAPES[shape](cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     result, kernel_side = _kernel_candidates(graph, cfg, view, model)
@@ -631,7 +631,7 @@ def test_kernel_proposes_exactly_the_reference_sinks(monkeypatch):
 
     cfg = _cfg()
     graph, params = _graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 31337), cfg)
 
     result, kernel_side = _kernel_candidates(graph, cfg, view, model)
@@ -689,7 +689,7 @@ def test_the_bootstrap_selects_only_roots_that_survive_the_full_gate():
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
     seed = pricing.seed_column(graph, cfg, model=model)
     incumbent = (
@@ -723,7 +723,7 @@ def test_the_bootstrap_picks_the_highest_scoring_root():
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     variants, keep = _rank_roots(graph, cfg, view, model, 1)
@@ -750,7 +750,7 @@ def test_kernel_and_reference_restrict_roots_identically(monkeypatch):
 
     cfg = _cfg()
     graph, params = _graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 31337), cfg)
     _variants, keep = _rank_roots(graph, cfg, view, model, 4)
 
@@ -803,7 +803,7 @@ def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monk
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     kernel_trace = _certification_trace(monkeypatch)
@@ -838,7 +838,7 @@ def test_kernel_matches_the_reference_when_warm_started_with_an_incumbent(monkey
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     seed = pricing.seed_column(graph, cfg, model=model)
@@ -865,7 +865,7 @@ def test_kernel_matches_the_reference_when_warm_started_with_an_incumbent(monkey
 def _bootstrap_fixture(seed=606, overrun=4):
     cfg = _cfg()
     graph, params = _terminal_graph(cfg, overrun=overrun)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, seed), cfg)
     return cfg, graph, params, model, view
 
@@ -984,7 +984,7 @@ def test_kernel_survives_a_budget_restart_with_the_same_answer(monkeypatch):
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     result, kernel_side = _kernel_candidates(graph, cfg, view, model, label_capacity=1024)
@@ -1013,7 +1013,7 @@ def test_kernel_declines_at_the_capacity_ceiling_rather_than_allocating_past_it(
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     monkeypatch.setattr(dp_kernel, "MAX_LABEL_CAPACITY", 1024)
@@ -1064,7 +1064,7 @@ def test_a_restarted_label_pool_is_counted_and_announced_once(monkeypatch, capsy
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
     _quiet_kernel_telemetry(monkeypatch)
     graph._search_cache.dag_budget = (1024, 14, 4096)
@@ -1093,7 +1093,7 @@ def test_a_search_that_hits_the_capacity_ceiling_says_so_before_falling_back(
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
     _quiet_kernel_telemetry(monkeypatch)
     monkeypatch.setattr(dp_kernel, "MAX_LABEL_CAPACITY", 1024)
@@ -1134,7 +1134,7 @@ def test_destination_lane_tie_comes_from_the_envelopes_not_the_packed_lanes(monk
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     topology = dp_prepare.prepare_topology(graph, cfg)
@@ -1257,7 +1257,7 @@ def test_each_structural_decline_names_its_own_cause(monkeypatch):
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
     call = (graph, view, 0.0, cfg, 100.0, frozenset())
 
@@ -1331,7 +1331,7 @@ def test_kernel_honours_forbidden_rows(monkeypatch):
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     rng = random.Random(2718)
@@ -1584,7 +1584,7 @@ def test_price_flight_takes_the_compiled_path_and_returns_the_reference_column()
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
     seed = pricing.seed_column(graph, cfg, model=model)
     incumbent = (
@@ -1617,7 +1617,7 @@ def test_compiled_path_honours_forbidden_rows_without_falling_back():
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     rng = random.Random(4242)
@@ -1653,7 +1653,7 @@ def test_compiled_path_respects_the_pricing_deadline():
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     with pytest.raises(pricing.PricingTimeout):
@@ -1701,7 +1701,7 @@ def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg, overrun=overrun)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     rc, column = _compiled_or_fail(
@@ -1770,7 +1770,7 @@ def _random_case(rng, index):
         statics = ()
     graph = build_flight_graph(request, cfg, statics, params)
     model = rng.choice(
-        (cost_model(params, cfg), CostModel(ground_weight=9.0, air_weight=1.0))
+        (cost_model(cfg, params), CostModel(ground_weight=9.0, air_weight=1.0))
     )
     return cfg, graph, model, DualView(_random_duals(graph, cfg, rng.randrange(1 << 30)), cfg)
 
@@ -1880,7 +1880,7 @@ def test_compiled_feasible_search_returns_the_reference_column(shape):
 
     cfg = _cfg()
     graph, params = GRAPH_SHAPES[shape](cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     compiled, reference = _feasible_both(graph, cfg, model)
     assert compiled == reference
     assert compiled is not None, "the fixture has no feasible column, so this proves nothing"
@@ -1897,7 +1897,7 @@ def test_compiled_feasible_search_honours_the_early_improvement_exit():
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     dp_prepare.prepared_for(graph, cfg)
     baseline = pricing.find_feasible_column(graph, cfg, model=model)
     assert baseline is not None
@@ -1915,7 +1915,7 @@ def test_compiled_feasible_search_honours_forbidden_rows():
 
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     rng = random.Random(97531)
     forbidden = frozenset(
         RowKey.cell(cell[0], cell[1], 0, step)
@@ -1942,7 +1942,7 @@ def test_compiled_feasible_search_declines_rather_than_reporting_infeasible():
     assert pricing.Declined.NO_NUMBA is not None
     cfg = _cfg()
     graph, params = _terminal_graph(cfg)
-    model = cost_model(params, cfg)
+    model = cost_model(cfg, params)
     real = pricing._dp_kernel
     pricing._dp_kernel = lambda: None
     try:

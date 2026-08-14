@@ -1,25 +1,33 @@
-"""Inside `materialize_rows`: is it the per-row column scan, or the backend insert?
+"""What `materialize_rows` costs, and how the pool it reads is shaped.
 
-Issue #92 measured `add_violated_rows` at 36% of colgen's serial tail and named two
-candidates; splitting it puts 88% of the cost in `materialize_rows`. Its proposed fix -- an
-inverted `row -> [column_index]` map maintained in `add_column` -- only pays off against
-ONE of the two things that method does per row:
+**The scan this was written to measure is gone.** `materialize_rows` used to rebuild one row
+of the column->rows transpose per row it materialized:
 
     indices = [i for i, column in enumerate(self._columns) if row in column.claims]  # O(n_columns)
     self._backend.add_row(row, rhs, indices)                                         # O(|indices|)
 
-The scan is the quadratic and the index erases it. The backend insert is proportional to the
-RESULT, so the index cannot touch it -- and `_validate_column_indices` walks every index with
-`operator.index` plus a duplicate-detecting set build, which is not a cheap constant. If rows
-are claimed by many columns, the fix buys much less than the profile suggests.
+That line was 99.8% of the method and a third of colgen's serial tail (issue #92): at x500,
+26,227 rows x ~11,000 columns = 2.9e8 frozenset probes to find 15 hits per row, against a
+backend insert of 0.07 s. `RestrictedMaster._columns_by_row` replaced it with a lookup and it
+now measures ~0.1 s.
 
-Nothing here reimplements the shipped body: it wraps `materialize_rows` and the backend's
-`add_row`, so `scan = total - backend` needs no copy of the code that could drift from it.
-Also reports rows-per-call and columns-at-entry, which are the two factors of the quadratic.
+So this script no longer decomposes anything: the `host-side` row below is a lookup plus
+normalization, sorting and bookkeeping, NOT a scan, and it is not the ceiling of an
+optimization still to come. Two things it is still good for:
+
+* **Regression detection.** `materialize_rows` should stay ~0.1 s at x500. A figure in the
+  tens of seconds means the index stopped being maintained -- most likely because something
+  started trimming `self._columns`, which would silently invalidate every stored position.
+* **Pool shape.** The row-degree distribution and step spans below are what decided the index
+  design, and they are what any successor design has to be argued against.
+
+To measure the old scan again, check out a tree from before the index and run this there;
+nothing here reimplements the shipped body (it wraps `materialize_rows` and the backend's
+`add_row`, so `total - backend` cannot drift from the real code).
 
 Two iterations is enough. The departure ladder puts ~11k of the final 11.9k columns in the
-master before the first LP, so `n_columns` -- the factor that matters -- is already at full
-scale in iteration 1, and only the row count grows after that.
+master before the first LP, so `n_columns` is already at full scale in iteration 1, and only
+the row count grows after that.
 
     uv run python analysis/probe_materialize_rows.py --flights 500 --iterations 2 --workers 16
 """
@@ -199,7 +207,7 @@ def main() -> int:
     rows = STATS["backend_add_row_calls"]
     total = STATS["materialize_s"]
     backend = STATS["backend_add_row_s"]
-    scan = total - backend
+    host_side = total - backend
     columns = STATS["columns_at_entry"]
     mean_columns = sum(columns) / len(columns) if columns else 0.0
     print(f"\n--- materialize_rows, {args.scenario} x{args.flights}, {args.iterations} iters ---")
@@ -207,18 +215,27 @@ def main() -> int:
     print(f"calls              {STATS['materialize_calls']:>10d}")
     print(f"rows materialized  {rows:>10d}   ({rows / max(1, STATS['materialize_calls']):.1f}/call)")
     print(f"n_columns at entry {mean_columns:>10.0f}   (mean; max {max(columns or [0])})")
-    print(f"scan work          {rows * mean_columns:>10.3g}   rows x n_columns")
+    print(f"scan work AVOIDED  {rows * mean_columns:>10.3g}   rows x n_columns, the "
+          "counterfactual the index removed")
     print()
     print(f"total              {total:>10.2f}s   100.0%")
-    print(f"  per-row scan     {scan:>10.2f}s   {100 * scan / total if total else 0:5.1f}%"
-          "   <- erased by an inverted row->column index")
+    print(f"  host-side        {host_side:>10.2f}s   "
+          f"{100 * host_side / total if total else 0:5.1f}%"
+          "   <- lookup + normalize + sort + bookkeeping (NOT a scan)")
     print(f"  backend add_row  {backend:>10.2f}s   {100 * backend / total if total else 0:5.1f}%"
-          "   <- proportional to |indices|; the index CANNOT remove this")
+          "   <- proportional to |indices|")
     print()
     print(f"indices emitted    {STATS['indices_total']:>10d}   "
           f"({STATS['indices_total'] / max(1, rows):.1f} columns claim the average row)")
-    print(f"\nCeiling on the inverted-index fix for this method: {scan:.2f}s of {total:.2f}s "
-          f"= {100 * scan / total if total else 0:.1f}%")
+    # A THRESHOLD, not a ratio. The host/backend split is meaningless once both are ~0 -- at
+    # four flights it reads 54% host-side off a total near the timer's own resolution. What
+    # still carries information is the magnitude.
+    verdict = (
+        "OK -- the index is live"
+        if total < 1.0
+        else "SUSPECT -- expected ~0.1 s at x500; is `_columns_by_row` still maintained?"
+    )
+    print(f"\nmaterialize_rows total {total:.2f}s: {verdict}")
 
     if masters:
         pool = masters[-1].columns

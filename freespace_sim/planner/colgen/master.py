@@ -543,6 +543,21 @@ class RestrictedMaster:
         self._column_indices: dict[Column, int] = {}
         self._objectives: list[float] = []
         self._materialized: dict[RowKey, float] = {}
+        # Transpose of the pool's claim sets: row -> dense indices of every column claiming
+        # it, ascending.  `materialize_rows` needs one row of this to hand the backend a
+        # constraint, and rebuilding it by scanning `_columns` was 99.8% of that method and
+        # 33% of the serial tail at 500 flights (issue #92).
+        #
+        # NOT filtered by `_materialized`, unlike `materialized_claims` in `add_column` and
+        # unlike the backend's own `_row_columns`.  The query is "which columns claim this
+        # row" at the instant the row is FIRST materialized -- exactly the row a
+        # materialization-filtered map has never seen.  Ignoring materialization is what
+        # lets this answer without a back-fill, and is why the cheaper-looking variant that
+        # reuses `materialized_claims` cannot work.
+        #
+        # Correctness requires `_columns` to stay APPEND-ONLY: an index recorded here must
+        # never move.  Trimming the pool would silently corrupt every entry.
+        self._columns_by_row: dict[RowKey, list[int]] = {}
         self.last_flight_duals: dict[int, float] = {flight_id: 0.0 for flight_id in self.flight_ids}
         self.last_row_duals: dict[RowKey, float] = {}
         self.last_lp_objective = 0.0
@@ -612,6 +627,22 @@ class RestrictedMaster:
         index = len(self._columns)
         self._backend.add_column(objective, column.flight_id, materialized_claims)
         self._columns.append(column)
+        # THE ONLY SITE THAT MAINTAINS `_columns_by_row`, and it belongs here rather than in
+        # the claim loop above.  Three preconditions first hold on this line: `index` is not
+        # bound until two lines up; the `existing is not None` early return would otherwise
+        # append a second entry for a column already in the pool, which the COO builder sums
+        # into the coefficient two the assertion above exists to prevent; and the backend
+        # call can raise, which would leave an index referring to a column never appended.
+        #
+        # `get`/`is None` rather than `setdefault([])`: the default is evaluated eagerly on
+        # every call, and ~77% of these are hits on an existing row, so `setdefault` would
+        # allocate and discard millions of empty lists.
+        for row in normalized_claims:
+            bucket = self._columns_by_row.get(row)
+            if bucket is None:
+                self._columns_by_row[row] = [index]
+            else:
+                bucket.append(index)
         self._column_indices[column] = index
         self._objectives.append(objective)
         # Existing warm starts stay meaningful when pricing appends a column.
@@ -633,7 +664,11 @@ class RestrictedMaster:
             rhs = float(cap - self.fixed_loads.get(row, 0))
             if rhs < 0.0:
                 raise ValueError(f"fixed load exceeds capacity for row {row!r}")
-            indices = [index for index, column in enumerate(self._columns) if row in column.claims]
+            # A lookup, not a pool scan.  Identical to what the `enumerate(self._columns)`
+            # comprehension built -- ascending and unique, because `index` strictly
+            # increases across commits and `add_column` commits each distinct column once.
+            # The default covers a `fixed_loads` row that no column claims.
+            indices = self._columns_by_row.get(row, ())
             self._backend.add_row(row, rhs, indices)
             self.row_index.intern(row)
             self._materialized[row] = rhs

@@ -522,6 +522,52 @@ def test_master_lazy_lp_and_ip_rows_are_claim_feasible():
     assert master.last_ip_optimal is True
 
 
+def test_columns_by_row_is_the_enumerate_scan_it_replaced():
+    """The transpose `materialize_rows` reads must equal the pool scan it replaced.
+
+    Nothing else pins this list.  `materialize_rows` hands it straight to the backend as a
+    constraint's column membership, so a wrong entry is a wrong LP rather than a crash, and
+    the end-to-end parity run is the only other thing that would notice.
+    """
+
+    params = _params(M=1000.0)
+    shared = RowKey.cell((4, -2), 0, 9)
+    master = RestrictedMaster((1, 2), RowIndex(), params, seed=3)
+    columns = [
+        _synthetic_column(1, 0.0, frozenset({shared})),
+        _synthetic_column(
+            1, 4.0, frozenset({shared, RowKey.cell((10, 0), 0, 9)}), departure_step=1
+        ),
+        _synthetic_column(2, 0.0, frozenset({shared})),
+        _synthetic_column(2, 4.0, frozenset({RowKey.cell((-10, 0), 0, 9)}), departure_step=1),
+    ]
+    for column in columns:
+        master.add_column(column)
+    # Re-adding is idempotent and must NOT append a second index.  This is the case that
+    # maintaining the map in the pre-dedupe claim loop would have silently corrupted, into
+    # the coefficient two `add_column`'s own assertion exists to prevent.
+    for column in columns:
+        master.add_column(column)
+
+    assert len(master.columns) == len(columns)
+    for row in {claim for column in master.columns for claim in column.claims}:
+        expected = [index for index, c in enumerate(master.columns) if row in c.claims]
+        assert master._columns_by_row[row] == expected  # contents AND ascending order
+    assert master._columns_by_row[shared] == [0, 1, 2]
+
+    # The map is a property of the POOL, not of materialization state, so materializing a
+    # row must not disturb it -- that independence is what lets it answer without a
+    # back-fill at the moment a row first becomes explicit.
+    before = {row: list(indices) for row, indices in master._columns_by_row.items()}
+    assert master.materialize_rows([shared]) == 1
+    assert master._columns_by_row == before
+
+    # A column added AFTER a row is materialized still lands in the map.
+    late = _synthetic_column(1, 8.0, frozenset({shared}), departure_step=2)
+    assert master.add_column(late) == len(columns)
+    assert master._columns_by_row[shared] == [0, 1, 2, len(columns)]
+
+
 def test_highs_flight_row_owns_its_maximize_dual():
     """A redundant variable upper bound must not absorb the pricing dual pi_f."""
 

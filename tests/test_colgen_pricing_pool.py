@@ -856,3 +856,104 @@ def test_a_pool_that_fails_to_start_does_not_leak_its_workers(monkeypatch):
     # `close()` ran on the way out, so nothing is left holding worker processes.
     assert pool._pools is None
     pool.close()
+
+
+# --------------------------------------------------------------- worker-loss reporting
+
+
+def test_the_worker_loss_marker_survives_the_reducer():
+    """`_accepted_prefix` returns at the first gap, and used to drop that result's counters.
+
+    The only counter an unpriced result ever carries is the synthetic `pool_worker_lost`
+    marker, so dropping them discarded the single signal that separates "a worker died"
+    from "the clock ran out" -- and made `solver`'s `pricing_worker_lost` branch dead code.
+    Its seconds are still discarded, which is a different question: those are not work the
+    sweep kept.
+    """
+
+    lost = [
+        (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
+        (3, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}),
+    ]
+    accepted = _accepted_prefix(lost)
+
+    assert accepted.flight_ids == (7,)
+    assert accepted.timeout_flight_id == 3
+    assert accepted.kernel_counters.get("pool_worker_lost") == 1
+    assert accepted.task_total_s == 1.0
+
+
+def test_a_timeout_on_a_replaced_worker_is_reported_as_worker_loss():
+    """The ordered iterator is why this cannot be left to the `StalePricingWorker` handler.
+
+    When a worker dies mid-chunk its result is never produced; `mp.Pool` starts a
+    replacement, and the replacement's refusal queues BEHIND the missing result. The parent
+    therefore never sees the exception -- it waits out the deadline and lands in the
+    timeout branch. Asking whether the process changed is what recovers the signal.
+    """
+
+    order = [10, 11]
+    worker_of = {10: 0, 11: 0}
+    ready = [[(10, True, 1.0, None, 0.1, {}, {})]]
+
+    for replaced, expected in ((True, 1), (False, 0)):
+        accepted = _accepted_prefix(
+            _sweep_results(
+                [_LostResult(ready, lose_at=1)], order, worker_of, deadline=0.0,
+                worker_replaced=lambda _w, r=replaced: r,
+            )
+        )
+        assert accepted.flight_ids == (10,)
+        assert accepted.timeout_flight_id == 11
+        assert accepted.kernel_counters.get("pool_worker_lost", 0) == expected
+
+
+def test_a_replaced_worker_is_detected_and_its_pid_refreshed():
+    """`_worker_replaced` is both the death signal and the fix for stale pid reporting."""
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(
+        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
+    ) as pool:
+        pool.start()
+        original = dict(pool._worker_pid)
+        assert not pool._worker_replaced(0), "an untouched worker must not read as replaced"
+
+        # Exactly what the OOM killer does: the process disappears without an exception.
+        os.kill(original[0], 9)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if pool._worker_pids(0) and original[0] not in pool._worker_pids(0):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.skip("mp.Pool did not replace the killed worker in time")
+
+        assert pool._worker_replaced(0)
+        assert pool._worker_pid[0] != original[0], "the dead pid was still being reported"
+        # Idempotent: having refreshed, the same worker no longer reads as replaced.
+        assert not pool._worker_replaced(0)
+        assert pool._worker_pid[1] == original[1], "an untouched worker was disturbed"
+
+
+def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep():
+    """A startup that misses the deadline must look like a timeout, not raise.
+
+    `pool.apply()` has no timeout, so a worker killed rather than raised during its
+    initializer would hang the solve with no clock running. Bounding it is the fix; making
+    it an EXCEPTION would not be, because then an already-expired deadline errors on the
+    parallel path while the sequential path returns a short prefix for the same input.
+    """
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(
+        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
+    ) as pool:
+        result = pool.run_sweep(
+            [1, 2], {}, {1: 0.0, 2: 0.0}, {}, time.monotonic() - 1.0
+        )
+    assert not result.complete
+    assert result.timeout_flight_id == 1
+    assert result.flight_ids == ()

@@ -102,6 +102,7 @@ import itertools
 import multiprocessing as mp
 import os
 import pickle
+import threading
 import time
 import traceback
 import uuid
@@ -130,6 +131,33 @@ __all__ = [
     "SweepResult",
     "price_sweep",
 ]
+
+
+# How long `PricingPool.close` waits on a worker it has already SIGKILLed. Short on
+# purpose: the process has been killed, so this is reaping a zombie rather than waiting for
+# work, and the only way it expires is a process stuck in uninterruptible I/O -- which
+# waiting longer would not fix either.
+_CLOSE_JOIN_TIMEOUT_S = 5.0
+
+
+class _WorkerStartTimeout(RuntimeError):
+    """Startup did not finish inside the caller's deadline.
+
+    Internal: :meth:`PricingPool.run_sweep` turns it into an ordinary timed-out sweep,
+    because "the clock ran out before any flight could be priced" is what it means and
+    the caller already has a shape for that -- an empty accepted prefix. Raising out of
+    `run_sweep` instead would make an expired deadline an ERROR on the parallel path and
+    a short prefix on the sequential one, for the same input.
+    """
+
+
+def _terminate_quietly(pool) -> None:
+    """`Pool.terminate()` with its exceptions swallowed, for use on a daemon thread."""
+
+    try:
+        pool.terminate()
+    except Exception:
+        pass
 
 
 class StalePricingWorker(RuntimeError):
@@ -650,8 +678,50 @@ class PricingPool:
     def worker_of(self) -> dict[int, int]:
         return dict(self._worker_of)
 
-    def start(self) -> float:
-        """Bring the workers up. Idempotent; returns seconds spent, 0.0 if already running."""
+    def _worker_pids(self, worker: int) -> tuple:
+        """The live pids behind one worker slot, or `()` if the pool is gone.
+
+        Reads ``Pool._pool``, which is private, for the same reason the module docstring
+        reasons about ``_repopulate_pool_static``: the replacement behaviour this has to
+        detect is not exposed anywhere public.
+        """
+
+        if self._pools is None:
+            return ()
+        try:
+            return tuple(proc.pid for proc in self._pools[worker]._pool)
+        except Exception:
+            return ()
+
+    def _worker_replaced(self, worker: int) -> bool:
+        """Has this slot's process changed since it was last identified?
+
+        `mp.Pool` restarts a dead worker silently, so a changed pid is the observable that
+        a worker died -- and the only one available once its result has been lost. Refreshes
+        the recorded pid, so `_annotate` reports the process that is actually there rather
+        than the one that started the solve.
+        """
+
+        pids = self._worker_pids(worker)
+        if not pids:
+            return False
+        known = self._worker_pid.get(worker)
+        if known in pids:
+            return False
+        self._worker_pid[worker] = pids[0]
+        return known is not None
+
+    def start(self, deadline: float | None = None) -> float:
+        """Bring the workers up. Idempotent; returns seconds spent, 0.0 if already running.
+
+        ``deadline`` bounds the readiness probe, and bounding it matters: a worker
+        SIGKILLed during its initializer produces no exception and no result, so an
+        unbounded probe waits forever while `mp.Pool` respawns replacements that die the
+        same way -- outside any clock the solver owns. Bounded by the caller's OWN deadline
+        for the same reason :func:`_sweep_results` is: past it the sweep was going to stop
+        regardless, so no new number needs justifying. ``None`` blocks, which is the
+        documented behaviour for a caller that supplied no time limit.
+        """
 
         if self._pools is not None:
             return 0.0
@@ -679,8 +749,23 @@ class PricingPool:
             # `pool_setup_s` is then honest rather than half-charged to the first sweep's
             # tasks, and an initializer `MemoryError` surfaces HERE, named, instead of on
             # some later flight.
-            for worker, pool in enumerate(self._pools):
-                _, pid = pool.apply(_worker_identity, (None,))
+            #
+            # `apply_async(...).get(timeout)` rather than `apply()`: the latter has no
+            # timeout, so a worker killed rather than raised during startup would hang the
+            # solve with no clock running.
+            probes = [pool.apply_async(_worker_identity, (None,)) for pool in self._pools]
+            for worker, probe in enumerate(probes):
+                remaining = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    _, pid = probe.get(remaining)
+                except mp.TimeoutError:
+                    raise _WorkerStartTimeout(
+                        f"pricing worker {worker} did not become ready before the "
+                        f"pricing deadline; it was most likely killed during its "
+                        f"initializer, which produces no exception and no result"
+                    ) from None
                 self._worker_pid[worker] = pid
         except BaseException:
             self.close()
@@ -694,7 +779,23 @@ class PricingPool:
 
         if self._poisoned is not None:
             raise RuntimeError(f"pricing pool is no longer usable: {self._poisoned}")
-        setup_s = self.start()
+        # Distinct from the `sweep_started` below, which starts after `start()` so that
+        # `wall_s` measures the sweep and `pool_setup_s` measures the launch. This one
+        # only ever reports the failed-startup path.
+        attempt_started = time.perf_counter()
+        try:
+            setup_s = self.start(deadline)
+        except _WorkerStartTimeout as exc:
+            # An empty accepted prefix, which is what "the clock ran out before anything
+            # could be priced" already means everywhere else in this module -- and what the
+            # sequential arm returns for the same input. Raising instead would make an
+            # already-expired deadline an ERROR on the parallel path and a short prefix on
+            # the sequential one.
+            self._poisoned = f"workers never started: {exc}"
+            return SweepResult(
+                (), (), (), pricing_order[0] if pricing_order else None,
+                0.0, time.perf_counter() - attempt_started, Counter(), (), 0.0,
+            )
         epoch = (self._uid, next(self._counter))
         # Pickled ONCE for all workers -- see `_load_sweep_state` for why the mapping cannot
         # be sliced and why one buffer beats W traversals.
@@ -737,7 +838,10 @@ class PricingPool:
 
         try:
             accepted = _accepted_prefix(
-                _sweep_results(worker_iters, pricing_order, self._worker_of, deadline)
+                _sweep_results(
+                    worker_iters, pricing_order, self._worker_of, deadline,
+                    self._worker_replaced,
+                )
             )
         except BaseException as exc:
             # Same reasoning as the incomplete-sweep case below: the per-worker iterators are
@@ -775,9 +879,18 @@ class PricingPool:
         `_flight_record` untouched -- the reduction rule this module exists to enforce reads
         as unchanged in the diff, which is worth more than saving a dict copy.
 
-        These two keys are what make worker skew observable in every future run: the risk the
-        worker split takes is that `mp.Pool`'s rebalancing is gone, and `max` over `min` of
-        per-worker `task_s` is the number that will say whether it needs a cost-aware split.
+        These two keys are what make worker skew observable -- the risk the fixed split
+        takes is that `mp.Pool`'s rebalancing is gone, and `max` over `mean` of per-worker
+        `task_s` is the number that says whether it needs to be cost-aware.
+
+        Observable is not the same as recorded, and the difference matters: these rows reach
+        a caller only through `solve`'s per-iteration callback, are never returned in
+        `stats`, and are skipped entirely when a sweep ends early. Anything that wants the
+        skew after the fact has to aggregate them as they go, which is what
+        `analysis/run_colgen_timed.py:_worker_skew` does.
+
+        `pid` is refreshed by `_worker_replaced` rather than frozen at startup, so a
+        replaced worker is not reported under the pid of the process it replaced.
         """
 
         annotated = []
@@ -789,18 +902,53 @@ class PricingPool:
         return tuple(annotated)
 
     def close(self) -> None:
-        """Terminate the workers. Idempotent, and safe after any failure."""
+        """Terminate the workers. Idempotent, and bounded.
+
+        **Kills the processes before terminating the pool, and that order is the point.**
+        ``Pool.terminate()`` joins its own handler threads, and the task handler can be
+        blocked writing to the input queue of a worker that was SIGKILLed while holding
+        that queue's lock -- so terminating a pool whose worker died is exactly the shape
+        that hangs, and a solve-scoped pool sits idle between sweeps, which is when an
+        external kill is most likely to land. With the processes already gone the handlers
+        have nothing left to block on.
+
+        ``pool.join()`` is deliberately NOT called: it waits on those same handler threads,
+        it takes no timeout, and they are daemons -- so nothing is leaked by leaving them
+        to die with the interpreter, whereas waiting on them is unbounded.
+
+        This narrows the window rather than closing it. Teardown that is bounded by
+        construction needs explicit ``Process``/``Pipe`` workers with sentinel monitoring
+        instead of ``mp.Pool``'s queues, which is a larger change than this one.
+        """
 
         self._poisoned = self._poisoned or "closed"
         for pool in self._pools or ():
-            try:
-                pool.terminate()
-            except Exception:
-                pass
-            try:
-                pool.join()
-            except Exception:
-                pass
+            # ORDINARY TEARDOWN FIRST, on a daemon thread and bounded. `terminate()` joins
+            # the pool's own handler threads and takes no timeout of its own, so it cannot
+            # be trusted inline -- but with healthy workers it returns in milliseconds, and
+            # it is the path that actually closes the queues.
+            closer = threading.Thread(target=_terminate_quietly, args=(pool,), daemon=True)
+            closer.start()
+            closer.join(_CLOSE_JOIN_TIMEOUT_S)
+            if not closer.is_alive():
+                continue
+            # Stuck: the task handler is blocked writing to the input queue of a worker
+            # that died holding its lock, which is the failure a solve-scoped pool makes
+            # reachable by leaving workers idle between sweeps. Killing the processes is
+            # what unblocks it.
+            #
+            # The order matters and is easy to get backwards -- killing FIRST looks like
+            # the safe move and is the expensive one, because it guarantees the handler has
+            # a dead queue to wait on and every teardown then pays the full timeout. That
+            # cost is not hypothetical: it made a 4-worker parity arm 0.56x, i.e. slower
+            # than no pool at all.
+            for proc in list(getattr(pool, "_pool", ()) or ()):
+                try:
+                    if proc.is_alive():
+                        proc.kill()
+                except Exception:
+                    pass
+            closer.join(_CLOSE_JOIN_TIMEOUT_S)
         self._pools = None
 
     def __enter__(self) -> "PricingPool":
@@ -844,7 +992,7 @@ def _price_batch(task):
     return [_price_one(epoch, flight_id) for flight_id in flight_ids]
 
 
-def _sweep_results(worker_iters, pricing_order, worker_of, deadline):
+def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_replaced=None):
     """Merge the per-worker result streams into ``pricing_order`` order, bounded by ``deadline``.
 
     Without the deadline the sweep can wait forever, and the solver's own time limit never
@@ -897,6 +1045,23 @@ def _sweep_results(worker_iters, pricing_order, worker_of, deadline):
                 # is the one that never reported back.  Names the flight the parent is
                 # actually blocked on, which the chunk-indexed predecessor could only
                 # approximate with its chunk's first flight.
+                #
+                # ASK WHETHER THE WORKER IS STILL THE SAME PROCESS, because otherwise this
+                # is where a worker death is misreported as a clock expiry.  The
+                # `StalePricingWorker` handler below cannot catch that case: when a worker
+                # dies mid-chunk its result is never produced, `mp.Pool` starts a
+                # replacement, and the replacement's refusal is queued BEHIND the missing
+                # result on an ordered iterator -- so the parent waits out the deadline and
+                # arrives here, never having seen the exception. Checking process identity
+                # is what recovers the signal.
+                if worker_replaced is not None and worker_replaced(worker):
+                    warnings.warn(
+                        f"pricing worker {worker} was replaced mid-sweep; its result for "
+                        f"flight {flight_id} will never arrive (OOM killer?)",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    yield flight_id, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}
+                    return
                 yield flight_id, False, 0.0, None, 0.0, {}, {}
                 return
             except StalePricingWorker as exc:
@@ -954,6 +1119,13 @@ def _accepted_prefix(results) -> SweepResult:
             # The timed-out flight's row IS kept even though its seconds are not: it is
             # the one the sweep stopped for, so a straggler hunt needs it most.
             records.append(_flight_record(flight_id, task_s, priced=False, search=search))
+            # And its COUNTERS are kept, which the seconds argument above does not extend
+            # to.  The only counter an unpriced result ever carries is the synthetic
+            # `pool_worker_lost` marker `_sweep_results` attaches when it finds the worker
+            # gone -- an ordinary `PricingTimeout` returns `{}` -- so dropping them here
+            # discarded the one signal that distinguishes "a worker died" from "the clock
+            # ran out", and made `solver`'s `pricing_worker_lost` branch unreachable.
+            counters.update(deltas)
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, 0.0, counters, tuple(records),

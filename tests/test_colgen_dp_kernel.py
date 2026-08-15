@@ -341,6 +341,54 @@ def test_prepare_duals_never_scans_the_global_dual_mapping():
     assert prepared.row_value.tolist() == reference.row_value.tolist()
 
 
+def test_prepare_duals_touches_only_this_flight_s_own_resources():
+    """Not scanning the flat mapping is not enough -- the RESOURCE set is global too.
+
+    Filtering the global step buckets through `cell_index` reads like the fix and is not
+    one: it trades a row scan for a resource scan, both bounded by the master rather than
+    by the flight, so the per-flight cost still grows with the batch. The bound has to be
+    `topology.n_cells`.
+
+    Stated as a lookup count, which is exact and machine-independent: the number of probes
+    into `_cell_steps` must not grow when rows belonging to OTHER flights are added.
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    topology = dp_prepare.prepare_topology(graph, cfg)
+    rows = dp_prepare.prepare_rows(graph, cfg, topology)
+    base = _mixed_duals(graph, cfg, 5150)
+
+    class _CountingSteps(dict):
+        def __init__(self, wrapped):
+            super().__init__(wrapped)
+            self.probes = 0
+
+        def get(self, key, default=None):
+            self.probes += 1
+            return super().get(key, default)
+
+        def items(self):
+            raise AssertionError("prepare_duals scanned the global resource set")
+
+    def probes_for(duals):
+        view = DualView(duals, cfg)
+        counting = _CountingSteps(view._cell_steps)
+        view._cell_steps = counting
+        dp_prepare.prepare_duals(view, graph, topology, rows)
+        return counting.probes
+
+    small = probes_for(base)
+    # Ten times as many foreign resources, none of them this flight's.
+    crowded = dict(base)
+    for q in range(200, 500):
+        for step in range(graph.min_step, graph.min_step + 3):
+            crowded[RowKey.cell(q, -q, 0, step)] = 1.5
+    assert len(crowded) > len(base) * 1.4, "the fixture did not actually crowd the master"
+
+    assert probes_for(crowded) == small == topology.n_cells
+
+
 def test_dual_view_step_buckets_hold_the_same_floats_as_the_flat_mapping():
     """The retained buckets must be the accumulated value, bit for bit -- not a recompute."""
 

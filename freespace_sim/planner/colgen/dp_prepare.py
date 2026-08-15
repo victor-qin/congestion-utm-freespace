@@ -820,25 +820,28 @@ def prepare_duals(
         if slot is not None:
             term_series[slot] = add_series(prefix_series)
 
-    # Walk the RESOURCES that carry duals, not every dual ROW.  This loop runs once per
-    # FLIGHT (`pricing._best_column_compiled` calls it per pricing task), so scanning the
-    # global mapping made it O(flights x rows) and kept only the ~2% of rows this flight can
-    # reach.  `|resources| <= |rows|` always, by the number of priced steps per resource.
+    # Walk THIS FLIGHT'S resources and look each one up, rather than walking anything
+    # global.  This loop runs once per FLIGHT (`pricing._best_column_compiled` calls it per
+    # pricing task), so anything global in it is multiplied by the flight count.
+    #
+    # Iterating the global step buckets and filtering through `cell_index` -- the obvious
+    # first move, and what this did originally -- is NOT enough. It drops the row scan to a
+    # RESOURCE scan, which is smaller by the number of priced steps per resource, but the
+    # bound is still the master's active-resource count, so the cost still grows with the
+    # batch while the flight stays the same size. Driven from `cell_index` the bound is
+    # `topology.n_cells`: a property of this flight alone.
     #
     # Same pairs, and therefore the same `PreparedDuals`: `DualView` accumulates its step
     # buckets in the same pass and the same order as the flat mapping, so the values are the
-    # identical floats; the kept set is the same one stated from the other side; and
-    # `pairs.sort()` normalizes the order, which is total because `row_of_cell` and
-    # `row_of_term` occupy disjoint ranges and each is injective in `(index, step)`.
+    # identical floats; the kept set is the same one stated from the other side (the
+    # `level != 0` skip becomes the literal 0 in the lookup key, since a flight's cells are
+    # numbered at one level); and `pairs.sort()` normalizes the order, which is total
+    # because `row_of_cell` and `row_of_term` occupy disjoint ranges and each is injective
+    # in `(index, step)`.
     pairs: list[tuple[int, float]] = []
     n_out_of_range = 0
-    for (cell_coord, level), steps in view._cell_steps.items():
-        if level != 0:
-            continue
-        index = cell_index.get(cell_coord)
-        if index is None:
-            continue
-        for step, value in steps:
+    for cell_coord, index in cell_index.items():
+        for step, value in view._cell_steps.get((cell_coord, 0), ()):
             row = rows.row_of_cell(index, step)
             if row < 0:
                 n_out_of_range += 1

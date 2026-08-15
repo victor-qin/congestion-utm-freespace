@@ -252,6 +252,21 @@ def run_batch(
             "--colgen-max-iterations to continue.",
             batch_params.max_iterations,
         )
+    # The one truncated exit that is a FAULT rather than a budget, and it needs its own
+    # remedy for exactly that reason: raising the time limit does nothing, and the run will
+    # keep dying in the same place.  A pricing worker was replaced mid-sweep, which in
+    # practice means the OOM killer took it -- memory is linear in `--colgen-workers`, so
+    # the fix is fewer of them, not more patience.
+    elif stats.get("termination_reason") == "pricing_worker_lost":
+        log.warning(
+            "colgen lost a pricing worker mid-sweep after %s iteration(s) and stopped -- "
+            "this is the best schedule found before that, NOT a converged solution. A "
+            "worker that disappears without an exception is almost always the OOM killer, "
+            "and pricing memory is linear in worker count: RE-RUN WITH FEWER "
+            "--colgen-workers (currently %s), not with a bigger time limit.",
+            stats.get("iterations", "?"),
+            stats.get("n_pricing_workers", "?"),
+        )
     # A different fact with a different remedy, which is why it is not folded into either
     # message above: the generation loop finished, and only the final integer master failed
     # to PROVE its selection optimal over the pool it was handed.  The schedule is feasible

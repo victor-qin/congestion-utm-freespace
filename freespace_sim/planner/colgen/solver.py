@@ -1440,7 +1440,9 @@ class ColGenSolver:
         denied = tuple(flight_id for flight_id in flight_ids if flight_id not in incumbent)
         # Every truncated exit, by whatever mechanism: a flight the solve did not place is
         # then a compute-cap artifact, not the optimizer's verdict that no plan exists.
-        if termination_reason in {"time_limit", "iteration_limit", "ip_not_proven"}:
+        if termination_reason in {
+            "time_limit", "iteration_limit", "ip_not_proven", "pricing_worker_lost",
+        }:
             search_exhausted_flights.update(denied)
         search_exhausted = tuple(
             flight_id for flight_id in denied if flight_id in search_exhausted_flights

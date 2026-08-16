@@ -113,6 +113,13 @@ class FlightRequest:
     # return sets dest_terminal. Plain ``(id, capacity)`` tuples are accepted (normalized by builders).
     origin_terminal: "Terminal | None" = None
     dest_terminal: "Terminal | None" = None
+    # Round-trip link: on a RETURN leg, the flight_id of the outbound whose arrival this leg waits on.
+    # Demand models anchor the return's desired departure to a NOMINAL estimate of that arrival, which
+    # ignores whatever ground delay / hold / detour the outbound actually took — so under congestion a
+    # return can want to depart before its aircraft has landed. Naming the dependency explicitly (rather
+    # than leaving it an implicit flight_id + 1 convention) lets ``sim.run(return_anchor="realized")``
+    # re-anchor the return to the arrival its outbound actually achieved.
+    paired_outbound_id: "int | None" = None
 
     def __post_init__(self):
         # Single source of truth for the file/departure relationship: a flight departs no earlier than

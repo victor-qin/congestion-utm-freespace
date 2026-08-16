@@ -158,6 +158,83 @@ through the final landing without diluting the reported hourly demand rate. Run 
 bash experiments/batch/density_matrix.sh paper 0 1 2
 ```
 
+**Scheduling-lead arms.** FCFS order is `(t_request, flight_id)` and the density scenarios derive
+`t_request = t_departure − lead`, so filing further ahead moves a flight earlier in the queue at the
+same desired departure. Ground delay is measured against `t_departure`, so the lead is never itself
+charged as delay — the whole effect is queue position. Each arm re-cuts a mixed world with **one**
+operator's lead replaced while the other holds at its default, so the arm isolates that operator's
+queue position against an unchanged competitor. The ladder is operator-agnostic — 8 minutes is
+Wing/Zipline's own lead and 30 minutes is Amazon's — so the same three rungs mean "file like
+Wing/Zipline", an intermediate, and "file like Amazon" for either side:
+
+| scenario suffix | varied operator | lead |
+|---|---|---|
+| `_azlead08m` / `_azlead15m` / `_azlead30m` | Amazon | `N(480, 90)` / `N(900, 150)` / `N(1800, 300)` s |
+| `_wzlead08m` / `_wzlead15m` / `_wzlead30m` | Wing/Zipline | `N(480, 90)` / `N(900, 150)` / `N(1800, 300)` s |
+
+on each of `density_faa_wing_zipline_amazon` and `density_future_wing_zipline_amazon` — twelve arms.
+The two sweeps share a pivot: **`azlead30m` and `wzlead08m` are both operators at their defaults, so
+they are the same recipe under two names** — run one, not both. Together the arms trace a path from
+`azlead08m` (both at 8 min, Amazon's advantage removed) through that pivot (the status quo) to
+`wzlead30m` (both at 30 min, Wing/Zipline caught up).
+
+Unlike the base worlds, the arms pin the request clock to a fixed 3600 s preroll
+(`request_clock_offset_s`) instead of shifting by the realized preroll. That matters: the realized
+shift is a max-order statistic over the lead draws, so without pinning it, changing a lead translates
+*every* flight in absolute time. With it pinned, all twelve arms of a world share a byte-identical
+flight set and byte-identical desired departures, and only the varied operator's filing times move —
+so arms can be differenced flight-by-flight, not just in aggregate. Consequently `azlead30m` is *not*
+byte-identical to `density_*_wing_zipline_amazon` (it is that world rigidly translated); run it fresh
+as the reference arm rather than reusing archived base-world runs. Compare arms under
+`--mode sequential` or `--mode exact`; `relaxed` is result-affecting and would confound them.
+
+`_density_scenario` takes `wing_lead_s` and `amazon_lead_s` directly, so ad-hoc combinations (both
+leads at once, or a lead on a single-operator world) are one call away. Note that shifting the mean
+lead of the *only* operator present just translates every filing equally and leaves FCFS order
+untouched — the contrast is only meaningful when a second operator holds still.
+
+**Round-trip return anchoring.** A demand model emits every request before anything is planned, so it
+can only anchor a return's desired departure to a *nominal* estimate of its outbound's arrival —
+straight-line distance at cruise speed, ignoring the outbound's ground delay, air hold, and detour
+(including unavoidable hex-lattice overhead). Under congestion that schedules the return before its
+aircraft is back — measured on `density_faa_wing_zipline_amazon`, **80%** of returns are filed to
+depart before their outbound has even touched down, and **every one** of the 2551 before its pad
+clears (median 57 s early, worst 471 s). The slip correlates 0.999 with the outbound's total delay,
+so it worsens exactly where congestion does.
+
+`--return-anchor realized` couples the legs inside the one run: plan the outbound, then anchor its
+return to the arrival that actually happened — the moment its **landing column clears** (`touchdown +
+pad dwell`), plus `turnaround`. That column is the authority rather than the last centerline waypoint,
+because the corridor stops at the column's *edge* at cruise altitude and the descent inside is flown
+but unreserved: anchoring on the waypoint launches the return `climb_time_to(z_land)` before its own
+aircraft is down (16.7 s at the density scenarios' 100 m level).
+
+```bash
+uv run python -m experiments.run --scenario density_faa_wing_zipline_amazon --return-anchor realized
+```
+
+This is **exact, and free**. FCFS already guarantees the outbound is planned first: a paired return
+shares its outbound's filing time and takes the next `flight_id`, so `(t_request, flight_id)` sorts it
+immediately behind (measured: 100% adjacent), and a legacy return files strictly later still. So the
+arrival is always in hand by the time the return is planned — no second run, no approximation.
+
+Filing times never move, so FCFS order and the monotonic-`t_request` eviction invariant are untouched;
+the flight set is identical, and a return whose outbound was *denied* keeps its nominal anchor
+(dropping it would make the flight set depend on congestion).
+
+**Sequential mode only, per-flight planners only.** A speculative worker could plan a return before
+its outbound has committed, and exact mode would not catch it — the envelope check tracks *ledger
+reads*, and a stale `t_departure` is request data, so the speculation would be accepted and silently
+diverge. A whole-schedule planner (`colgen`) is refused for the opposite reason: it solves every
+flight at once and never enters the per-flight loop the coupling lives in, so the flag would do
+nothing at all. `run()` raises on both rather than letting either slide (and parallel loses to
+sequential on the density scenarios anyway).
+
+⚠️ **This interacts with the lead arms.** Re-anchored return departures depend on realized outbound
+delay, which is precisely what differs between arms — so returns are no longer byte-identical across
+arms and only *outbound* legs stay exactly paired. Use the nominal anchor for arm comparisons, or
+difference outbounds only.
+
 **3. READ OUT** — standalone consumers that load saved data (never re-simulate):
 
 | readout | scope | from | produces |

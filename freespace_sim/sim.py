@@ -263,6 +263,24 @@ def _astar_planners(planner) -> list:
     return out
 
 
+RETURN_ANCHORS = ("nominal", "realized")
+
+
+def realized_release_s(intent: OperationalIntent) -> float | None:
+    """When an accepted flight's landing column clears (touchdown + pad dwell) — the earliest its
+    aircraft can leave again, before turnaround. That is the destination cylinder's ``t_end``, hence
+    the largest the intent holds. ``None`` if nothing landed: denied, or no volumes reserved.
+
+    NOT ``centerline[-1]``: the corridor stops at the column's EDGE at cruise altitude because the
+    descent inside is flown but unreserved (``astar._build``), so the last waypoint precedes touchdown
+    by ``climb_time_to(z_land)`` — 16.7 s at the density scenarios' 100 m. Anchoring returns there
+    launched them mid-descent, and the shared pad cylinder billed the overlap back as ground delay.
+    """
+    if not intent.accepted or not intent.volumes:
+        return None
+    return float(max(v.t_end for v in intent.volumes))
+
+
 def run(
     cfg: SimConfig,
     *,
@@ -275,6 +293,7 @@ def run(
     progress: bool | ProgressCallback | None = None,
     telemetry: bool | TelemetryCollector = False,
     parallel=None,
+    return_anchor: str = "nominal",
 ) -> SimResult:
     """Run one strategic-layer simulation. Provide a scenario, an explicit request list, a `demand`
     model, or none (a default `UniformPoissonDemand` is then generated from `cfg`).
@@ -303,7 +322,36 @@ def run(
     (``astar``/``astar_ref``/``astar_shortcut``/``astar_heading_shortcut``/
     ``astar_batched_shortcut``). Composes with ``telemetry`` (worker streams are
     merged in commit order).
+
+    ``return_anchor`` decides what a round-trip return's desired departure waits on:
+
+    - ``"nominal"`` (default → byte-identical to today) keeps whatever the demand model set. Demand is
+      materialized before anything is planned, so that can only ever be a straight-line, undelayed
+      estimate of when the outbound lands — under congestion it schedules the return before its
+      aircraft is back.
+    - ``"realized"`` re-anchors each return to ``realized_release_s(outbound) + turnaround`` — the
+      arrival that actually happened. Exact and free: FCFS already plans the outbound first (a paired
+      return shares its filing time and takes the next flight_id), so the arrival is always in hand.
+      Filing times never move, so FCFS order and the monotonic-``t_request`` eviction are untouched.
+      A return whose outbound was DENIED keeps its nominal anchor — dropping it would make the flight
+      set depend on congestion and break paired comparisons across runs. The return still pays the
+      ordinary pad-reuse separation on top (~8 s: ASTM buffer + ``dt`` rounding), as any flight taking
+      over that pad would; the anchor says when the aircraft is ready, not who gets the pad.
+
+    ``turnaround_s`` comes from the demand model, so the realized anchor uses exactly the turnaround
+    the nominal one budgeted for.
     """
+    if return_anchor not in RETURN_ANCHORS:
+        raise ValueError(f"unknown return_anchor {return_anchor!r} (want one of {RETURN_ANCHORS})")
+    if return_anchor == "realized" and parallel is not None:
+        # A worker speculating on the return would read a t_departure its outbound has not fixed yet,
+        # and exact mode could not catch it: the envelope records LEDGER reads, and the stale value is
+        # request data, so the speculation would be accepted and silently diverge from sequential.
+        raise ValueError(
+            "return_anchor='realized' needs the sequential loop: it re-anchors each return to its "
+            "outbound's committed arrival, which a speculative worker may not have yet — and the "
+            "exact-mode envelope check cannot detect that (it tracks ledger reads, not request "
+            "fields). Run with parallel=None, or use return_anchor='nominal'.")
     if scenario is None:
         if requests is None:
             model = demand if demand is not None else UniformPoissonDemand()
@@ -389,6 +437,15 @@ def run(
     elif batch_planners:
         from .planner.colgen import run_batch
 
+        if return_anchor == "realized":
+            # A batch solve never enters the FCFS loop the coupling lives in, so the flag would do
+            # NOTHING — and since return_anchor is absent from index.parquet, the run would look
+            # coupled on disk. Refuse rather than no-op.
+            raise ValueError(
+                f"return_anchor='realized' is not implemented for whole-schedule planners: {pname!r} "
+                "solves every flight at once, so there is no moment at which an outbound has "
+                "committed and its return has not, and the per-flight coupling loop never runs. Use "
+                "a per-flight planner (astar*/milp), or return_anchor='nominal'.")
         # A whole-schedule planner solves for every flight at once, so it cannot share a
         # run with per-flight planners: the FCFS loop below would file some flights against
         # a ledger the batch solve already reserved against.
@@ -410,11 +467,64 @@ def run(
         )
     else:
         intents = []
+        # Round-trip coupling. `anchors[outbound_id]` = when that outbound's landing column cleared;
+        # its return pops it just before being planned. FCFS plans the outbound first, so the entry is
+        # always in hand, and popping keeps the dict near one entry (a paired return is the next event).
+        couple = return_anchor == "realized"
+        turnaround_s = 0.0
+        if couple:
+            # The turnaround has to match the one the NOMINAL anchor budgeted for, and only the demand
+            # model knows it. Without a model there is no way to recover it, and defaulting to 0 would
+            # quietly shorten every turnaround — so name the assumption instead of absorbing it.
+            if demand is None:
+                log.warning("return_anchor='realized' without a demand model: assuming turnaround_s=0. "
+                            "Pass demand= (alongside requests=) so the realized anchor uses the same "
+                            "turnaround the requests were generated with.")
+            else:
+                turnaround_s = float(getattr(demand, "turnaround_s", 0.0) or 0.0)
+        awaited = ({ev.request.paired_outbound_id for ev in scenario.events} - {None}) if couple else set()
+        # Only HubRadiusDemand links its legs, so asking for the realized anchor anywhere else is a
+        # no-op. Say so: silently doing nothing is exactly the failure this option exists to prevent.
+        if couple and not awaited:
+            log.warning("return_anchor='realized' but no request carries paired_outbound_id — nothing "
+                        "to re-anchor. Only the hub_radius demand model emits linked round-trip legs.")
+        elif couple:
+            # A link is only usable if its outbound is planned FIRST. Both shipped return modes
+            # guarantee that (a paired return shares its outbound's filing time and takes the next
+            # flight_id; a legacy one files strictly later), but a hand-built request list can point at
+            # a flight that is absent, or that FCFS orders after the return — in which case that leg
+            # silently keeps its nominal anchor. Check once, up front, rather than let it pass quietly.
+            pos = {ev.request.flight_id: k for k, ev in enumerate(scenario.events)}
+            unusable = sum(1 for k, ev in enumerate(scenario.events)
+                           if ev.request.paired_outbound_id is not None
+                           and pos.get(ev.request.paired_outbound_id, len(pos)) >= k)
+            if unusable:
+                log.warning(
+                    "return_anchor='realized': %d/%d linked return(s) name an outbound that is absent "
+                    "from the scenario or that FCFS orders no earlier than the return itself — their "
+                    "arrival is not known in time, so they keep the nominal anchor.",
+                    unusable, len(awaited))
+        anchors: dict[int, float] = {}
         for done, ev in enumerate(scenario.events, 1):
-            uss = usses.get(ev.request.uss_id, default_uss)
-            intent = uss.handle_request(ev.request)
+            req = ev.request
+            if couple and req.paired_outbound_id is not None:
+                released = anchors.pop(req.paired_outbound_id, None)
+                if released is not None:               # None ⇒ outbound denied; keep the nominal anchor
+                    # `replace`, NOT in-place: `requests` may be caller-owned, and mutating it leaks the
+                    # coupled departures into any later run over the same list — corrupting exactly the
+                    # anchor A/B this option invites. It also re-validates t_departure >= t_request via
+                    # __post_init__, which the max() keeps satisfied (unreachable for both shipped return
+                    # modes, but a future one that filed later would otherwise violate it silently).
+                    # Only turnaround is added: `released` already includes the pad dwell.
+                    req = replace(req, t_departure=max(req.t_request, released + turnaround_s))
+            uss = usses.get(req.uss_id, default_uss)
+            intent = uss.handle_request(req)
+            if req.flight_id in awaited:
+                free_at = realized_release_s(intent)
+                if free_at is not None:
+                    anchors[req.flight_id] = free_at
             intents.append(intent)
-            status(done, ev.request, intent)
+            status(done, req, intent)
             if report:
                 report(done, total, intent)
 

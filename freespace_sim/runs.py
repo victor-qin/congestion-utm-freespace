@@ -13,18 +13,22 @@ analyse, or replay it without re-running the sim**:
     trajectories.parquet what was actually flown — timed centerline waypoints per flight
     reservations.parquet what was reserved in 4D — every corridor box + hover cylinder + window
     flights.parquet      per-flight metrics rows
+    index_row.parquet    this run's row of the cross-run index (its own copy — see rebuild_index)
     replay.html          the standalone scrubbable replay (the "video")
 
 ``load_run(folder)`` is the exact reverse: it rebuilds a `SimResult`-shaped object (config + intents
 with their volumes and centerlines) so a replay or analysis can start from disk. An append-only
-``results/index.parquet`` indexes every run for cross-run queries.
+``results/index.parquet`` indexes every run for cross-run queries; concurrent writers serialise on a
+lock and `rebuild_index` restores it from the per-run rows if one is ever lost anyway.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import platform
 import subprocess
@@ -46,14 +50,32 @@ from .volumes import Volume4D
 
 DEFAULT_ROOT = Path("results")
 INDEX_FILENAME = "index.parquet"
+#: Each run's own copy of its index row. The shared index is appended by read-modify-write, so a
+#: concurrent writer can drop a row; :func:`rebuild_index` restores it from these.
+INDEX_ROW_FILENAME = "index_row.parquet"
 
 
 # --- metadata captures -----------------------------------------------------
 
 
-def _config_hash(cfg: SimConfig) -> str:
-    payload = json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=str).encode()
-    return hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:8]
+log = logging.getLogger(__name__)
+
+
+def _config_hash(cfg: SimConfig, scenario_spec: dict | None = None) -> str:
+    """Short digest of everything that makes a run a DIFFERENT run.
+
+    ``SimConfig`` alone is not enough. Two scenarios can share a byte-identical SimConfig and still be
+    different worlds, because the whole demand recipe — operator mix, per-USS rates, service radii, and
+    the scheduling leads the lead arms vary — lives in ``DemandSpec``, which SimConfig never sees. The
+    five FAA lead arms all hashed to a246cd5e, so under one ``--tag`` their run folders differed only by
+    a second-granularity timestamp and same-second finishers merged into one directory. Fold the
+    archived scenario recipe in when there is one.
+    """
+    payload = {"config": dataclasses.asdict(cfg)}
+    if scenario_spec is not None:
+        payload["scenario_spec"] = scenario_spec
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha1(blob, usedforsecurity=False).hexdigest()[:8]
 
 
 def _git_info() -> dict:
@@ -101,6 +123,13 @@ def _term_from_json(s):
     return tuple(json.loads(s))
 
 
+def _opt_int(v) -> int | None:
+    """A parquet cell back to ``int | None`` — None for a missing column or a NaN (unlinked) row."""
+    if v is None or (isinstance(v, float) and v != v):
+        return None
+    return int(v)
+
+
 def scenario_frame(result: SimResult) -> pd.DataFrame:
     """Every generated flight request — the scenario, independent of what got accepted. Carries each
     endpoint's terminal (hub) membership so a saved run — including its denied flights — records which hub
@@ -117,6 +146,12 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
             "origin_terminal": _term_to_json(r.origin_terminal),
             "dest_terminal": _term_to_json(r.dest_terminal),
+            # Round-trip link (return leg → its outbound). Without it a reloaded run cannot tell which
+            # legs were paired, so nothing downstream could re-derive the schedule slip or re-anchor a
+            # return post-hoc — the coupled t_departure above is the OUTCOME, not the relationship.
+            # pandas has no nullable-int dtype by default, so an unlinked leg stores NaN and
+            # load_run reads it back as None.
+            "paired_outbound_id": r.paired_outbound_id,
         })
     return pd.DataFrame(rows)
 
@@ -224,8 +259,24 @@ def save_run(
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
-    folder = Path(root) / f"{stamp}_{label}_{_config_hash(cfg)}"
-    folder.mkdir(parents=True, exist_ok=True)
+    # Seed in the name as well as the hash: a sweep's folders are read by eye far more often than they
+    # are parsed, and `_s0/_s1/_s2` is the axis one actually scans for. The hash still carries it.
+    base_name = f"{stamp}_{label}_s{cfg.seed}_{_config_hash(cfg, scenario_spec)}"
+    # exist_ok=False in a claim loop, NOT exist_ok=True. Two runs landing on one name used to merge
+    # their parquet into a single directory — a silent corruption, and the likeliest way to hit it is a
+    # Slurm array whose tasks share a tag and finish inside the same second. Suffixing keeps both runs
+    # (losing a finished multi-hour run to a raise would be worse) and says so.
+    folder = Path(root) / base_name
+    for attempt in range(2, 1000):
+        try:
+            folder.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            folder = Path(root) / f"{base_name}__{attempt}"
+            log.warning("run folder %s already exists — writing to %s instead, so the two runs cannot "
+                        "interleave parquet into one directory", base_name, folder.name)
+    else:
+        raise RuntimeError(f"could not find a free run folder for {base_name} after 998 attempts")
 
     (folder / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2, default=str))
     (folder / "env.json").write_text(json.dumps(_env_info(), indent=2))
@@ -348,11 +399,75 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
                                   "mean_solve_time_s", "p95_solve_time_s",
                                   "max_solve_time_s", "total_solve_time_s", "verified")},
            **steady_cols}
+    row_df = pd.DataFrame([row])
+    # Own copy first: if the append below loses the race, `rebuild_index` can put this row back.
+    row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
     path = root / INDEX_FILENAME
-    df = pd.DataFrame([row])
-    if path.exists():
-        df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
-    df.to_parquet(path, index=False)
+    with _index_lock(root):
+        out = pd.concat([pd.read_parquet(path), row_df], ignore_index=True) if path.exists() else row_df
+        out.to_parquet(path, index=False)
+
+
+@contextlib.contextmanager
+def _index_lock(root: Path):
+    """Serialise the index's read-modify-write (read whole file → concat → rewrite) across processes.
+
+    Without it, two runs finishing together read the same base and the second rewrite drops the
+    first's row — the normal case for a Slurm array, whose tasks start together and take about the
+    same time, leaving the sweep silently one arm short.
+
+    Best-effort: ``flock`` is absent on Windows and unreliable on some network filesystems, and
+    neither should abort a finished run. :func:`rebuild_index` is what makes that safe to accept.
+    """
+    try:
+        import fcntl
+    except ImportError:                                  # non-POSIX: no lock; folder rows still land
+        yield
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    with open(root / (INDEX_FILENAME + ".lock"), "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except OSError as exc:                           # filesystem without working flock
+            log.warning("could not lock the run index (%s) — concurrent writers may drop rows; "
+                        "run freespace_sim.runs.rebuild_index() afterwards to restore them", exc)
+            yield
+            return
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
+    """Reconstitute ``index.parquet`` from each run folder's own ``index_row.parquet``, and return it.
+
+    A dropped index row is invisible — a cross-run readout just reports one run fewer, with no error
+    and no gap to notice. Call this after a batch array (having every task call it means whichever
+    finishes last leaves a complete index, whatever the shared filesystem did with the lock).
+
+    Non-destructive and idempotent: index rows whose folder has no copy (runs archived before this
+    file existed, or folders since deleted) are KEPT; where both exist the folder's copy wins.
+    """
+    root = Path(root)
+    rows = []
+    for row_path in sorted(root.glob(f"*/{INDEX_ROW_FILENAME}")):
+        try:
+            rows.append(pd.read_parquet(row_path))
+        except Exception as exc:                         # one half-written row must not sink the rest
+            log.warning("skipping unreadable %s: %s", row_path, exc)
+    folder_rows = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    with _index_lock(root):
+        existing = load_index(root)
+        if len(existing) and len(folder_rows):
+            orphans = existing[~existing["path"].isin(set(folder_rows["path"]))]
+            out = pd.concat([orphans, folder_rows], ignore_index=True)
+        else:
+            out = folder_rows if len(folder_rows) else existing
+        if len(out):
+            out = out.sort_values("path", kind="stable", ignore_index=True)   # folder name is an ISO stamp
+            out.to_parquet(root / INDEX_FILENAME, index=False)
+    return out
 
 
 def load_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
@@ -474,7 +589,10 @@ def load_run(folder: Path | str) -> LoadedRun:
                             vec(s.dest_x, s.dest_y, s.dest_z), float(s.t_request),
                             t_departure=t_dep, uss_id=str(s.uss_id),
                             origin_terminal=_term_from_json(getattr(s, "origin_terminal", None)),
-                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)))
+                            dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)),
+                            # getattr + NaN check: runs archived before the column existed have neither
+                            # the attribute nor a value, and an unlinked leg stores NaN either way.
+                            paired_outbound_id=_opt_int(getattr(s, "paired_outbound_id", None)))
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(
             request=req,

@@ -49,7 +49,9 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     from freespace_sim.scenarios import SCENARIOS
     from freespace_sim.scenarios.spec import ScenarioSpec
 
-    spec = SCENARIOS["density_faa_wing_zipline_amazon"]        # tuples + a nested per-USS pair dict
+    # a lead arm: tuples + a nested per-USS pair dict + the pinned request clock, which an arm
+    # comparison silently loses its per-flight pairing without
+    spec = SCENARIOS["density_faa_wing_zipline_amazon_azlead08m"]
     folder = runs.save_run(_small(), root=tmp_path, label="t", experiment="unit",
                            scenario_spec=spec.to_json_dict(), wall_seconds=0.5)
 
@@ -58,8 +60,15 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     assert isinstance(back.region_m, tuple) and isinstance(back.flight_levels_m, tuple)
     assert isinstance(back.demand.uss, tuple) and isinstance(back.demand.hubs, tuple)
     assert all(isinstance(v, tuple) for v in back.demand.departure_offset_s.values())
+    assert back.demand.request_clock_offset_s == spec.demand.request_clock_offset_s
     back.demand_model()          # used to raise AttributeError
     back.config()
+
+    # and the floating-preroll base world still round-trips its absent offset as None
+    base = SCENARIOS["density_faa_wing_zipline_amazon"]
+    base_folder = runs.save_run(_small(), root=tmp_path, label="t2", experiment="unit",
+                                scenario_spec=base.to_json_dict(), wall_seconds=0.5)
+    assert runs.load_scenario_spec(base_folder).demand.request_clock_offset_s is None
 
     # every registry scenario must survive the trip, not just the richest one — a scenario-specific
     # tuple field the reconstructor forgets would come back a list and fail equality here.
@@ -260,3 +269,120 @@ def test_a_per_flight_run_writes_no_planner_stats(tmp_path):
     assert not (folder / "planner_stats.json").exists()
     index = pd.read_parquet(tmp_path / "index.parquet")
     assert index["planner_termination"].isna().all()
+
+def test_scenario_parquet_round_trips_the_round_trip_link(tmp_path):
+    """The pairing is a RELATIONSHIP; the coupled t_departure is only its outcome. Without the link
+    persisted, a reloaded run cannot tell which legs were paired, so nothing downstream can re-derive
+    the schedule slip or re-anchor a return post-hoc."""
+    from freespace_sim.demand import HubRadiusDemand
+    from freespace_sim.sim import run as sim_run
+
+    cfg = SimConfig(region_size_m=(9000.0, 9000.0), horizon_s=1800.0, demand_duration_s=120.0,
+                    planner="astar_shortcut")
+    model = HubRadiusDemand(n_hubs_per_uss={"a": 3}, lam_per_uss={"a": 600.0}, radius_m=2000.0,
+                            pads_per_hub=2, terminal_radius_m=120.0, return_flights=True)
+    res = sim_run(cfg, demand=model)
+    folder = runs.save_run(res, root=tmp_path, label="pairing", experiment="unit", wall_seconds=0.1)
+
+    sdf = pd.read_parquet(folder / "scenario.parquet")
+    assert "paired_outbound_id" in sdf.columns
+    original = {i.request.flight_id: i.request.paired_outbound_id for i in res.intents}
+    assert any(v is not None for v in original.values())          # the fixture really pairs legs
+
+    back = {i.request.flight_id: i.request.paired_outbound_id for i in runs.load_run(folder).intents}
+    assert back == original
+    # unlinked legs come back as None, not NaN or 0 — a 0 would alias flight_id 0's outbound
+    assert all(v is None or isinstance(v, int) for v in back.values())
+
+
+def test_load_run_tolerates_runs_archived_before_the_pairing_column(tmp_path):
+    folder = runs.save_run(_small(), root=tmp_path, label="legacy_pairing", wall_seconds=0.1)
+    sdf = pd.read_parquet(folder / "scenario.parquet").drop(columns=["paired_outbound_id"])
+    sdf.to_parquet(folder / "scenario.parquet", index=False)
+    loaded = runs.load_run(folder)                                # must NOT raise
+    assert all(i.request.paired_outbound_id is None for i in loaded.intents)
+
+
+def test_run_folders_of_different_lead_arms_do_not_collide(tmp_path):
+    """Regression: the arms share a byte-identical SimConfig and differ only in DemandSpec, so
+    _config_hash(cfg) alone gave all five the SAME hash (a246cd5e). Under one --tag their folders then
+    differed only by a second-granularity timestamp, and same-second finishers merged into one."""
+    from freespace_sim.scenarios import SCENARIOS
+
+    base = "density_faa_wing_zipline_amazon"
+    arms = ["azlead08m", "azlead15m", "azlead30m", "wzlead15m", "wzlead30m"]
+    hashes = {a: runs._config_hash(SCENARIOS[f"{base}_{a}"].config(),
+                                   SCENARIOS[f"{base}_{a}"].to_json_dict()) for a in arms}
+    assert len(set(hashes.values())) == len(arms), hashes
+
+    # the same recipe under a different registry NAME still separates — two folders, not one merged
+    pivot = [f"{base}_azlead30m", f"{base}_wzlead08m"]
+    assert SCENARIOS[pivot[0]].demand == SCENARIOS[pivot[1]].demand      # genuinely the same world
+    assert (runs._config_hash(SCENARIOS[pivot[0]].config(), SCENARIOS[pivot[0]].to_json_dict())
+            != runs._config_hash(SCENARIOS[pivot[1]].config(), SCENARIOS[pivot[1]].to_json_dict()))
+
+
+def test_run_folder_name_carries_the_seed(tmp_path):
+    for seed in (0, 1, 2):
+        res = run(SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0),
+                            seed=seed),
+                  requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
+        folder = runs.save_run(res, root=tmp_path, label="sweep", wall_seconds=0.1)
+        assert f"_s{seed}_" in folder.name, folder.name
+
+
+def test_colliding_run_folders_are_suffixed_not_merged(tmp_path, caplog):
+    # Identical config + label + second ⇒ the same base name. Merging would interleave two runs'
+    # parquet into one directory; losing a finished run to a raise would be worse. Suffix instead.
+    a = runs.save_run(_small(), root=tmp_path, label="dup", wall_seconds=0.1)
+    with caplog.at_level("WARNING"):
+        b = runs.save_run(_small(), root=tmp_path, label="dup", wall_seconds=0.1)
+    if a.name == b.name.rsplit("__", 1)[0]:            # same second ⇒ the collision path ran
+        assert b.name.endswith("__2")
+        assert any("already exists" in r.message for r in caplog.records)
+    assert a != b
+    for f in (a, b):                                   # both runs are complete and independent
+        assert (f / "summary.json").stat().st_size > 0
+        assert len(pd.read_parquet(f / "flights.parquet")) == len(_small().intents)
+
+
+# --- index durability: the append is a read-modify-write, so a row can be lost ------------------
+
+def test_every_run_keeps_its_own_copy_of_its_index_row(tmp_path):
+    folder = runs.save_run(_small(), root=tmp_path, label="solo", scenario="metro_2uss")
+    row = pd.read_parquet(folder / runs.INDEX_ROW_FILENAME)
+    idx = runs.load_index(tmp_path)
+    assert len(row) == 1
+    # identical to what landed in the shared index — this is what makes a rebuild lossless
+    pd.testing.assert_frame_equal(row, idx.reset_index(drop=True))
+
+
+def test_rebuild_index_restores_a_row_a_concurrent_writer_dropped(tmp_path):
+    """The lost update exactly: two array tasks read the same base and the second rewrite wins.
+    Nothing raises and no artifact is missing — the sweep is just silently one run short in every
+    readout, which is why this has to be recoverable rather than merely detected."""
+    a = runs.save_run(_small(), root=tmp_path, label="arm_a", scenario="s")
+    stale = pd.read_parquet(tmp_path / "index.parquet")          # a's row, as a racing task saw it
+    b = runs.save_run(_small(), root=tmp_path, label="arm_b", scenario="s")
+    lost = pd.concat([stale.iloc[0:0], pd.read_parquet(b / runs.INDEX_ROW_FILENAME)], ignore_index=True)
+    lost.to_parquet(tmp_path / "index.parquet", index=False)     # ...b's rewrite clobbers a's row
+    assert len(runs.load_index(tmp_path)) == 1
+
+    out = runs.rebuild_index(tmp_path)
+    assert set(out["path"]) == {str(a), str(b)}
+    assert len(runs.load_index(tmp_path)) == 2
+    assert runs.rebuild_index(tmp_path).equals(out)              # idempotent
+
+
+def test_rebuild_index_keeps_rows_it_cannot_find_a_folder_for(tmp_path):
+    # Runs archived before index_row.parquet existed (or whose folder has since been moved away) are
+    # only in the shared file. A rebuild must not quietly delete them to "restore" the index.
+    runs.save_run(_small(), root=tmp_path, label="current", scenario="s")
+    idx = runs.load_index(tmp_path)
+    legacy = idx.copy()
+    legacy["path"] = str(tmp_path / "2020-01-01T00-00-00_archived_s0_deadbeef")
+    pd.concat([legacy, idx], ignore_index=True).to_parquet(tmp_path / "index.parquet", index=False)
+
+    out = runs.rebuild_index(tmp_path)
+    assert len(out) == 2
+    assert any("archived" in p for p in out["path"])

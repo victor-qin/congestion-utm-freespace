@@ -31,7 +31,7 @@ from pathlib import Path
 
 from freespace_sim import metrics, runs
 from freespace_sim.scenarios import SCENARIOS, get_scenario, with_overrides
-from freespace_sim.sim import run
+from freespace_sim.sim import RETURN_ANCHORS, run
 
 log = logging.getLogger("experiments.run")
 
@@ -227,6 +227,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--return-flights", action=argparse.BooleanOptionalAction, default=None,
                    help="emit a return flight to the origin pad for each delivery")
     p.add_argument("--turnaround", type=float, default=None, help="return-flight turnaround (s)")
+    p.add_argument("--return-anchor", choices=RETURN_ANCHORS, default="nominal",
+                   dest="return_anchor",
+                   help="what a round-trip return's desired departure waits on. nominal (default): a "
+                        "straight-line undelayed estimate of the outbound's arrival, fixed when demand "
+                        "is generated — under congestion the return is scheduled before its aircraft "
+                        "lands. realized: plan the outbound, then anchor its return to the arrival that "
+                        "actually happened (+ turnaround). Same cost; sequential mode only. NOT a "
+                        "column in results/index.parquet (only experiment.json records it), so give "
+                        "the two anchors distinct --tag values or a cross-run readout cannot tell "
+                        "them apart")
     p.add_argument("--tag", default=None, help="run-folder label + index join key (default: scenario name)")
     p.add_argument("--window-frac", type=float, default=0.9,
                    help="steady-state plateau threshold: measure where airborne density ≥ frac×peak "
@@ -501,9 +511,41 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
             "never apply to it; a planner with its own internal pool reports that separately"
         )
 
+    if args.return_anchor == "realized":
+        from freespace_sim.planner import WHOLE_SCHEDULE_PLANNERS
+
+        # The coupling keys off FlightRequest.paired_outbound_id, which ONLY hub_radius sets. Testing
+        # `return_flights` alone is not enough: it defaults True on DemandSpec but the uniform and hub
+        # patterns ignore it entirely, so metro_2uss/dallas_hub_2uss would sail past the guard and the
+        # flag would be a silent no-op — the failure it exists to prevent.
+        if demand is None or spec.demand.pattern != "hub_radius" or not spec.demand.return_flights:
+            raise SystemExit(
+                "--return-anchor realized needs round-trip returns, which only the hub_radius demand "
+                f"pattern emits (scenario {spec.name!r} is pattern={spec.demand.pattern!r}, "
+                f"return_flights={spec.demand.return_flights}); drop the flag or pick a hub_radius "
+                "scenario such as a density_* world")
+        if pcfg is not None:
+            # run() raises on this too; catching it here keeps the CLI failure a one-line message
+            # rather than a traceback, and does it before the world is built.
+            raise SystemExit(
+                f"--return-anchor realized is sequential-only (got --mode {args.mode}): a speculative "
+                "worker may plan a return before its outbound has committed, and the exact-mode "
+                "envelope check cannot detect that. Use --mode sequential or --return-anchor nominal.")
+        if cfg.planner in WHOLE_SCHEDULE_PLANNERS:
+            # Also raised by run(); same reason as above for catching it here.
+            raise SystemExit(
+                f"--return-anchor realized is not implemented for --planner {cfg.planner}: a "
+                "whole-schedule solver plans every flight at once, so no outbound commits before its "
+                "return and the coupling loop never runs — the flag would silently leave every return "
+                "on the nominal anchor. Use a per-flight planner, or --return-anchor nominal.")
+        log.info("return anchor: realized — each return departs when its outbound's landing column "
+                 "actually cleared (touchdown + pad dwell) + %.0fs turnaround, not a nominal estimate",
+                 spec.demand.turnaround_s)
+
     t0 = time.time()
     res = run(cfg, demand=demand, progress=not args.no_progress, telemetry=args.telemetry,
-              parallel=pcfg, planner_params=colgen_params_from_args(args, cfg.planner))
+              parallel=pcfg, planner_params=colgen_params_from_args(args, cfg.planner),
+              return_anchor=args.return_anchor)
     wall = time.time() - t0
     sim_lo, sim_hi = metrics.simulation_window(res)
     log.info(

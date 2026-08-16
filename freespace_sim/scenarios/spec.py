@@ -51,6 +51,10 @@ class DemandSpec:
     # Strategic round-trip filing: return shares the outbound filing time and requests departure after
     # the outbound's nominal arrival. False preserves the legacy independently-filed return behavior.
     paired_return_request: bool = False
+    # timing_mode="departure": pin the clock shift to this FIXED constant instead of the realized
+    # preroll, so scenarios differing only in departure_offset_s share byte-identical desired departures
+    # and differ solely in FCFS filing order. None → the legacy data-dependent shift.
+    request_clock_offset_s: "float | None" = None
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
@@ -81,6 +85,7 @@ class DemandSpec:
                 departure_offset_s=self.departure_offset_s,
                 timing_mode=self.timing_mode,
                 paired_return_request=self.paired_return_request,
+                request_clock_offset_s=self.request_clock_offset_s,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
         if self.pattern != "uniform":

@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import collections
 import itertools
+import logging
 import multiprocessing as mp
 import os
 import pickle
@@ -112,6 +113,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ...config import SimConfig
+from ...progress import RollingRate
 from ...types import FlightRequest
 from .network import StaticTerminalCatalog, build_flight_graph
 from .params import ColGenParams
@@ -124,6 +126,9 @@ from .pricing import (
     price_flight,
 )
 from .translate import Column
+
+log = logging.getLogger(__name__)
+
 
 __all__ = [
     "PricingPool",
@@ -146,6 +151,78 @@ _CLOSE_JOIN_TIMEOUT_S = 5.0
 # not burn a long budget, long enough that the check is free against real task times
 # (a density flight prices in seconds).
 _WORKER_POLL_S = 2.0
+
+
+class _SweepProgress:
+    """Log a pricing sweep's advance while it is still running.
+
+    A sweep is the longest single block in a colgen solve -- 205 s for one iteration of the
+    full 4,636-flight density scenario -- and until now it printed nothing between "started"
+    and "finished". A run that is merely slow was indistinguishable from one that had
+    wedged, which matters most exactly when it is worst.
+
+    **Two tracks, because one does not cover both ends of the scale**, the same shape as
+    ``sim._MilestoneLog``: every ``every_n`` flights, which stays informative on a long
+    sweep, and every 10%, which still says something when the whole batch is smaller than
+    ``every_n``. The percentage track is suppressed below ``_MIN_FOR_PERCENT`` flights,
+    where ten lines to describe fifty flights is noise rather than progress.
+
+    The ETA rides the ROLLING rate rather than the cumulative one, so it re-forecasts
+    through a slowdown instead of trusting an average that lags it -- and the two are
+    printed together, because them diverging is the actual signal that the sweep is
+    degrading (a straggler, or a worker that has stopped returning).
+    """
+
+    _MIN_FOR_PERCENT = 100
+
+    def __init__(self, total: int, n_workers: int, every_n: int = 1000, window: int = 100):
+        self.total = int(total)
+        self.n_workers = int(n_workers)
+        self.every_n = max(1, int(every_n))
+        self.rate = RollingRate(min(window, max(1, self.total // 4)))
+        self.started = time.monotonic()
+        self._prev = self.started
+        self._marks = (
+            [(pct, max(1, self.total * pct // 100)) for pct in range(10, 100, 10)]
+            if self.total >= self._MIN_FOR_PERCENT else []
+        )
+        self._next_mark = 0
+
+    def begin(self) -> None:
+        log.info(
+            "pricing sweep: %d flights across %s",
+            self.total,
+            f"{self.n_workers} workers" if self.n_workers else "1 process (sequential)",
+        )
+
+    def advance(self, done: int) -> None:
+        now = time.monotonic()
+        self.rate.add(now - self._prev)
+        self._prev = now
+        due = done % self.every_n == 0
+        while self._next_mark < len(self._marks) and done >= self._marks[self._next_mark][1]:
+            due = True
+            self._next_mark += 1
+        if due and done < self.total:
+            log.info("  priced %s", self._line(done, now))
+
+    def finish(self, done: int, complete: bool) -> None:
+        log.info(
+            "pricing sweep %s: %s",
+            "done" if complete else "STOPPED EARLY",
+            self._line(done, time.monotonic()),
+        )
+
+    def _line(self, done: int, now: float) -> str:
+        elapsed = now - self.started
+        pct = 100.0 * done / max(self.total, 1)
+        rolling, eta = self.rate.roll_ms(), self.rate.eta_s(done, self.total)
+        return (
+            f"{done}/{self.total} ({pct:.0f}%)  elapsed={elapsed:.0f}s  "
+            f"wall/flight avg={self.rate.avg_ms(done):.0f}ms "
+            f"roll[{self.rate.window}]={'n/a' if rolling is None else f'{rolling:.0f}ms'}  "
+            f"ETA {'n/a' if eta is None else f'{eta:.0f}s'}"
+        )
 
 
 class _WorkerStartTimeout(RuntimeError):
@@ -566,6 +643,11 @@ def _sweep_sequential(
     # a diagnostic that only exists under `--colgen-workers N` cannot be sanity-checked
     # against the loop it is supposed to reproduce.
     records: list[dict[str, Any]] = []
+    # The sequential arm reports too, and has to: it is the arm a long production run uses
+    # by default (`n_pricing_workers` ships at 0), so progress that existed only under a
+    # pool would be missing exactly where a sweep takes longest.
+    progress = _SweepProgress(len(pricing_order), 0)
+    progress.begin()
     sweep_started = time.perf_counter()
     for flight_id in pricing_order:
         task_started = time.perf_counter()
@@ -584,6 +666,7 @@ def _sweep_sequential(
             records.append(_flight_record(
                 flight_id, time.perf_counter() - task_started, priced=False
             ))
+            progress.finish(len(flight_ids), complete=False)
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
@@ -595,6 +678,8 @@ def _sweep_sequential(
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        progress.advance(len(flight_ids))
+    progress.finish(len(flight_ids), complete=True)
     # One worker's worth of work, by definition -- which is what makes it the denominator
     # the parallel arm is compared against.
     return SweepResult(
@@ -1054,6 +1139,9 @@ def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_repl
     """
 
     pending = [collections.deque() for _ in worker_iters]
+    progress = _SweepProgress(len(pricing_order), len(worker_iters))
+    progress.begin()
+    done = 0
     for flight_id in pricing_order:
         worker = worker_of[flight_id]
         while not pending[worker]:
@@ -1091,10 +1179,12 @@ def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_repl
                         f"flight {flight_id} will never arrive (OOM killer?)",
                         RuntimeWarning, stacklevel=2,
                     )
+                    progress.finish(done, complete=False)
                     yield flight_id, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}
                     return
                 if remaining is not None and time.monotonic() >= deadline:
                     # The real deadline, not a poll boundary.
+                    progress.finish(done, complete=False)
                     yield flight_id, False, 0.0, None, 0.0, {}, {}
                     return
                 continue
@@ -1122,7 +1212,10 @@ def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_repl
                 f"pricing worker {worker} returned flight {result[0]} where pricing_order "
                 f"expects {flight_id}"
             )
+        done += 1
+        progress.advance(done)
         yield result
+    progress.finish(done, complete=True)
 
 
 def _accepted_prefix(results) -> SweepResult:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import logging
 import hashlib
 import json
 import resource
@@ -157,6 +158,11 @@ def main() -> int:
     )
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    # The library reports progress through `logging`; without this the INFO lines
+    # exist and go nowhere. Matches `experiments/run.py`'s format.
+    logging.basicConfig(
+        level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s"
+    )
     if args.greedy_budget_s is not None:
         _budgeted_greedy(args.greedy_budget_s)
 

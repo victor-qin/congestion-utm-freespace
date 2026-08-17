@@ -10,6 +10,8 @@ semantics as the LP/IP loop.
 
 from __future__ import annotations
 
+import logging
+
 import collections
 import math
 import time
@@ -42,6 +44,8 @@ from .pricing import (
 )
 from .pricing_pool import PricingPool, price_sweep
 from .translate import Column
+
+log = logging.getLogger(__name__)
 
 _FEASIBILITY_TOL = 1e-7
 _REDUCED_COST_TOL = 1e-9
@@ -943,6 +947,12 @@ class ColGenSolver:
         )
         try:
             for iteration in range(params.max_iterations):
+                # One line per iteration BEFORE any of its work, so a run that wedges says
+                # which iteration it wedged in.  The stage lines below say where inside it.
+                log.info(
+                    "colgen iteration %d/%d: %d columns in the master",
+                    iteration + 1, params.max_iterations, len(master.columns),
+                )
                 # Per-iteration stage timings.  The master block was one unattributed lump in
                 # the serial tail, and "the LP is slow" is only one of four candidates in it:
                 # the LP itself, the lazy-row re-solve loop around it, `_canonical_column`
@@ -1061,6 +1071,14 @@ class ColGenSolver:
                 best_reduced_costs: list[float] = []
                 rc_by_flight: dict[int, float] = {}
                 priced_columns: list[Column] = []
+                # The LP and the heuristic are done; pricing is the long block that follows.
+                # Naming the handoff is what turns "it is still going" into "it is in the
+                # part that takes minutes", which is the whole question while watching a run.
+                log.info(
+                    "  master LP + heuristic done in %.1fs (%d rows materialized); pricing next",
+                    sum(stage_s.values()),
+                    len(getattr(master, "materialized_rows", ()) or ()),
+                )
                 pricing_order = sorted(
                     flight_ids,
                     key=lambda flight_id: (
@@ -1125,6 +1143,12 @@ class ColGenSolver:
                 pricing_pool_setup_s += sweep.pool_setup_s
                 kernel_counters.update(sweep.kernel_counters)
 
+                log.info(
+                    "  pricing returned %d columns in %.1fs (%d with positive reduced "
+                    "cost); back to the master LP + heuristic",
+                    len(priced_columns), iteration_sweep_s,
+                    sum(1 for rc in sweep.reduced_costs if rc > 0.0),
+                )
                 before_pricing = len(master.columns)
                 for column in sorted(
                     priced_columns, key=lambda item: (item.flight_id, _column_key(item))

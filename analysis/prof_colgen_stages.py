@@ -25,6 +25,15 @@ invisible here --
 the parent would show only the greedy, the LP and canonicalization. A sequential sweep is
 exactly one worker's workload, which is the thing worth ranking anyway.
 
+**Lazy row separation is split by CALL SITE, not summed.** ``add_violated_rows`` is the
+largest serial item at 500 flights, and the rows nested under it -- ``fractional_loads`` and
+``materialize_rows`` -- are what decides which fix to write. They are not comparable:
+``fractional_loads`` walks only the LP support (sparse, ~1.5k of 11.9k columns), while
+``materialize_rows`` walks the whole pool once per row (dense), which is why it measures ~12x
+the other. ``materialize_rows`` also has a second caller, ``solve_ip``'s separation loop, and
+that time appears as ``materialize_rows (from solve_ip)`` rather than inflating the parent.
+``add_violated_rows`` MINUS its two nested rows is the ``violated`` comprehension itself.
+
 **Read fallbacks off ``--- KERNEL ---``, never off the stderr warnings.**
 ``pricing._warn_budget`` guards on module globals, so it fires once per PROCESS per kind,
 and the pool is rebuilt per sweep -- the warning count is therefore roughly
@@ -158,8 +167,71 @@ METHOD_STAGES: list[tuple[str, object, str]] = [
     ("master.solve_lp", master_mod.RestrictedMaster, "solve_lp"),
     ("master.round_heuristic", master_mod.RestrictedMaster, "round_heuristic"),
     ("master.add_column", master_mod.RestrictedMaster, "add_column"),
-    ("master.add_violated_rows", master_mod.RestrictedMaster, "add_violated_rows"),
+    ("master.solve_ip", master_mod.RestrictedMaster, "solve_ip"),
+    # `add_violated_rows` is installed by `_install_separation_timers` instead, because it
+    # has to set the call-site flag those timers read.
 ]
+
+# Set while the stack is inside `add_violated_rows`, so `materialize_rows` can be charged to
+# the caller that reached it.
+_IN_ADD_VIOLATED = False
+
+
+def _install_separation_timers() -> None:
+    """Split lazy row separation into its two halves, attributed by call site.
+
+    `add_violated_rows` is the largest single serial item at 500 flights, and it is two
+    candidates rather than one: `fractional_loads` accumulates loads over every column in
+    the LP support, then `materialize_rows` scans every column once per row it adds. They
+    have different fixes -- an early materialized-row filter versus an inverted
+    row->column index -- so a single outer timer cannot say which one to write.
+
+    Attributing by call site rather than summing: `materialize_rows` has a SECOND caller,
+    `solve_ip`'s separation loop (`master.py:896`), which reaches it with the *integral*
+    violated set. That path shares the per-row column scan and so shares the inverted-index
+    fix, but it is not part of `add_violated_rows` and folding the two together would
+    over-state the outer method.
+    """
+
+    cls = master_mod.RestrictedMaster
+    add_violated_rows = cls.add_violated_rows
+    fractional_loads = cls.fractional_loads
+    materialize_rows = cls.materialize_rows
+
+    def timed_add_violated_rows(self, *args, **kwargs):
+        global _IN_ADD_VIOLATED
+        previous, _IN_ADD_VIOLATED = _IN_ADD_VIOLATED, True
+        started = time.perf_counter()
+        try:
+            return add_violated_rows(self, *args, **kwargs)
+        finally:
+            _IN_ADD_VIOLATED = previous
+            TOTAL_S["master.add_violated_rows"] += time.perf_counter() - started
+            CALLS["master.add_violated_rows"] += 1
+
+    def timed_fractional_loads(self, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return fractional_loads(self, *args, **kwargs)
+        finally:
+            TOTAL_S["  fractional_loads (nested)"] += time.perf_counter() - started
+            CALLS["  fractional_loads (nested)"] += 1
+
+    def timed_materialize_rows(self, *args, **kwargs):
+        label = (
+            "  materialize_rows (nested)" if _IN_ADD_VIOLATED
+            else "  materialize_rows (from solve_ip)"
+        )
+        started = time.perf_counter()
+        try:
+            return materialize_rows(self, *args, **kwargs)
+        finally:
+            TOTAL_S[label] += time.perf_counter() - started
+            CALLS[label] += 1
+
+    cls.add_violated_rows = timed_add_violated_rows
+    cls.fractional_loads = timed_fractional_loads
+    cls.materialize_rows = timed_materialize_rows
 
 
 def _wrap(label: str, target: object, name: str) -> None:
@@ -185,6 +257,7 @@ def install_timers() -> None:
     for label, cls, name in METHOD_STAGES:
         if hasattr(cls, name):
             _wrap(label, cls, name)
+    _install_separation_timers()
 
 
 def main() -> int:

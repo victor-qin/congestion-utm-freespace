@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import multiprocessing as mp
 import os
+import pickle
 import time
 
 import pytest
@@ -15,9 +16,12 @@ from freespace_sim.planner.colgen.network import StaticTerminalCatalog, build_fl
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView
 from freespace_sim.planner.colgen.pricing_pool import (
+    PricingPool,
+    StalePricingWorker,
     SweepResult,
     _accepted_prefix,
-    _results_before_deadline,
+    _worker_assignment,
+    _sweep_results,
     price_sweep,
 )
 from freespace_sim.planner.colgen.solver import ColGenSolver
@@ -269,14 +273,19 @@ def test_a_worker_that_cannot_initialise_reports_from_its_first_task(monkeypatch
 
     # The contract is that THIS does not raise.
     pricing_pool._init_worker(
-        [_request(1, (-4, 0), (4, 0), cfg)], cfg, _params(),
-        StaticTerminalCatalog((), cfg), {}, {1: 0.0}, {}, None,
+        0, [_request(1, (-4, 0), (4, 0), cfg)], cfg, _params(),
+        StaticTerminalCatalog((), cfg),
     )
     with pytest.raises(RuntimeError, match="failed to initialise") as raised:
-        pricing_pool._price_one(1)
+        pricing_pool._price_one(("epoch", 1), 1)
     # The original cause, carried as text because the exception object itself has to
     # survive being pickled back to the parent.
     assert "MemoryError: label pool" in str(raised.value)
+    # And a state load must not overwrite the initializer's traceback with a failure
+    # caused BY it -- the cause is the useful message.
+    pricing_pool._load_sweep_state(("epoch", 1), pickle.dumps({}), {}, {}, None)
+    with pytest.raises(RuntimeError, match="failed to initialise"):
+        pricing_pool._price_one(("epoch", 1), 1)
 
 
 def test_explicit_zero_workers_matches_no_config_at_all():
@@ -292,26 +301,23 @@ def test_explicit_zero_workers_matches_no_config_at_all():
     assert _fingerprint(pinned) == _fingerprint(default)
 
 
-class _LostResult:
-    """An ``imap`` iterator whose k-th result never arrives, like a task whose worker died.
+class _ScriptedCollector:
+    """Stands in for `_PipeCollector`: scripted rounds of ``(results_by_worker, died)``.
 
-    `mp.Pool` does not fail that task -- it starts a replacement process and the lost
-    result is simply never produced -- so the real object blocks in `next(timeout)` until
-    the timeout and then raises. A fake is the only way to state that contract: killing a
-    worker for real is a race, and the hang it produces has no natural end.
+    The transport is a pipe now, so the merge takes a `collect(timeout)` callable rather
+    than an iterator. That is what makes this a two-line fake: killing a real worker to
+    observe the death path is a race, and the hang it used to produce had no natural end.
     """
 
-    def __init__(self, results, lose_at):
-        self._results, self._lose_at, self._i = results, lose_at, 0
+    def __init__(self, rounds):
+        self._rounds = list(rounds)
+        self.calls = 0
 
-    def next(self, timeout=None):
-        if self._i == self._lose_at:
-            raise mp.TimeoutError("worker died; this result will never arrive")
-        if self._i >= len(self._results):
-            raise StopIteration
-        value = self._results[self._i]
-        self._i += 1
-        return value
+    def __call__(self, timeout=None):
+        self.calls += 1
+        if not self._rounds:
+            return {}, set()
+        return self._rounds.pop(0)
 
 
 def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
@@ -327,10 +333,11 @@ def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
         (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
-    chunks = [[f] for f in order]
+    # 7 and 3 arrive; 9 never does, and the clock has already run out.
     accepted = _accepted_prefix(
-        _results_before_deadline(
-            _LostResult([[r] for r in priced], lose_at=2), chunks, deadline=0.0
+        _sweep_results(
+            _ScriptedCollector([({0: priced}, set())]), 1, order,
+            {7: 0, 3: 0, 9: 0}, deadline=0.0,
         )
     )
 
@@ -351,15 +358,81 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
     accepted = _accepted_prefix(
-        _results_before_deadline(
-            _LostResult([[r] for r in priced], lose_at=None), [[f] for f in order],
-            deadline=None,
+        _sweep_results(
+            _ScriptedCollector([({0: priced}, set())]), 1, order,
+            {7: 0, 3: 0}, deadline=None,
         )
     )
 
     assert accepted.complete
     assert accepted.timeout_flight_id is None
     assert accepted.flight_ids == (7, 3)
+
+
+def test_the_worker_merge_yields_pricing_order_when_workers_finish_out_of_order():
+    """The replacement for the global-FIFO property the shared queue used to give.
+
+    `mp.Pool.imap` guaranteed "the k-th result is the k-th chunk" across ALL workers. With a
+    queue per worker that is gone, and the merge has to rebuild index order from per-worker
+    streams -- which works because a worker's own results stay FIFO in the order that worker's
+    flights appear in `pricing_order`. Worker 1 is fully ready here while worker 0 dribbles, so
+    a merge that emitted whatever was available would visibly reorder.
+    """
+
+    order = [10, 11, 12, 13]          # worker 0 owns 10 and 12; worker 1 owns 11 and 13
+    worker_of = {10: 0, 11: 1, 12: 0, 13: 1}
+    # Worker 1 is completely finished before worker 0 has produced anything.
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([
+                ({1: [(11, True, 2.0, None, 0.1, {}, {}),
+                      (13, True, 4.0, None, 0.1, {}, {})]}, set()),
+                ({0: [(10, True, 1.0, None, 0.1, {}, {})]}, set()),
+                ({0: [(12, True, 3.0, None, 0.1, {}, {})]}, set()),
+            ]),
+            2, order, worker_of, deadline=None,
+        )
+    )
+
+    assert accepted.flight_ids == (10, 11, 12, 13)
+    # Index order is not cosmetic: `master.upper_bound` sums these with plain `sum`, and
+    # float addition is not associative.
+    assert accepted.reduced_costs == (1.0, 2.0, 3.0, 4.0)
+
+
+def test_a_worker_that_returns_the_wrong_flight_is_refused():
+    """A merge bug must crash, not transpose two flights' reduced costs.
+
+    Silently swapping them would be a wrong answer with no symptom: both flights were
+    priced, the prefix is full length, and `complete` is True.
+    """
+
+    order = [10, 11]
+    worker_of = {10: 0, 11: 0}
+    wrong = [(11, True, 2.0, None, 0.1, {}, {}), (10, True, 1.0, None, 0.1, {}, {})]
+
+    with pytest.raises(RuntimeError, match="where pricing_order expects"):
+        _accepted_prefix(
+            _sweep_results(
+                _ScriptedCollector([({0: wrong}, set())]), 1, order, worker_of,
+                deadline=None,
+            )
+        )
+
+
+def test_worker_assignment_is_stable_and_balanced():
+    """Fixed for the solve, and even on sparse ids -- which `flight_id % n` is not."""
+
+    sparse = [900, 3, 41, 7, 12, 88, 5]
+    workers = _worker_assignment(sparse, 3)
+    assert set(workers) == set(sparse)
+    counts = [sum(1 for v in workers.values() if v == worker) for worker in range(3)]
+    assert max(counts) - min(counts) <= 1, counts
+    # Independent of the order the ids arrive in: the map is keyed on the flight, so a
+    # re-sorted `pricing_order` cannot move a flight to a different worker.
+    assert _worker_assignment(list(reversed(sparse)), 3) == workers
+    # `flight_id % n_workers` would have put 900, 3, 12 and 88 unevenly; sorted-index does not.
+    assert _worker_assignment(range(6), 3) == {0: 0, 1: 1, 2: 2, 3: 0, 4: 1, 5: 2}
 
 
 def test_both_arms_report_the_same_per_flight_rows():
@@ -417,8 +490,12 @@ def test_a_flight_that_never_reached_the_kernel_reports_no_stale_labels():
     pricing_mod.clear_search_record()
     assert pricing_mod.last_search_record() == {}
 
+    # `worker`/`pid` describe the sequential arm as written -- one worker, this process. The
+    # pool overwrites both once it knows which worker actually ran the flight.
     record = pricing_pool._flight_record(4, 1.5, priced=True)
-    assert record == {"flight_id": 4, "task_s": 1.5, "priced": True}
+    assert record == {
+        "flight_id": 4, "task_s": 1.5, "priced": True, "worker": 0, "pid": os.getpid(),
+    }
 
 
 @pytest.mark.parametrize("chunksize", [1, 3])
@@ -472,3 +549,588 @@ def test_chunked_and_unchunked_pools_agree_exactly():
         requests, cfg, (), _params(n_pricing_workers=2, pricing_chunksize=3)
     )
     assert _fingerprint(many) == _fingerprint(one)
+
+
+# ------------------------------------------------- the pool outlives the sweep (issue #88)
+
+
+def _worker_fixture(cfg, flight_ids=(1,)):
+    """Bring one worker up in-process, exactly as `_init_worker` would in a spawned one."""
+
+    requests = [_request(fid, (-4, 0), (4, 0), cfg) for fid in flight_ids]
+    pricing_pool._init_worker(
+        0, requests, cfg, _params(), StaticTerminalCatalog((), cfg)
+    )
+    assert pricing_pool._WORKER.get("init_error") is None
+    return requests
+
+
+def _duals_that_reach_the_compiled_search(request, cfg, params):
+    """Duals on rows the seed actually claims, which is what forces the DAG search to run.
+
+    `price_flight` short-circuits when the shortest-path seed pays no row price: with a zero
+    dual on every claim, non-negative duals can only make alternatives weakly worse, so it
+    returns the seed and the compiled path is never entered (pricing.py, the
+    `seed_dual_cost == 0.0 and max_negative_credit == 0.0` branch). A fixture built on empty
+    duals therefore rebuilds NOTHING and passes a packing-reuse test vacuously -- which is
+    why the test below asserts the first sweep really did build.
+    """
+
+    from freespace_sim.planner.colgen import pricing as _pricing
+
+    graph = build_flight_graph(request, cfg, StaticTerminalCatalog((), cfg), params)
+    seed = _pricing.seed_column(graph, cfg)
+    return {row: 3.0 for row in list(seed.claims)[:4]}
+
+
+def test_the_packing_is_built_once_across_two_sweeps(monkeypatch):
+    """Issue #88, stated as a COUNT: a second sweep must not rebuild the compiled packing.
+
+    This is the assertion the whole change exists for, and it is deliberately a count rather
+    than a wall clock -- the packing costs ~184 ms a flight, which is real but far smaller
+    than the run-to-run variance on a shared machine, so a timing assertion would be both
+    weaker and flakier. `prepare_topology` running exactly once over two sweeps is exact.
+
+    Runs entirely in-process: `_init_worker` and `_load_sweep_state` are the two halves a
+    real worker executes, and driving them directly is what lets a unit test see across a
+    sweep boundary at all.
+    """
+
+    cfg = _cfg()
+    params = _params()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    requests = _worker_fixture(cfg)
+    duals = _duals_that_reach_the_compiled_search(requests[0], cfg, params)
+
+    from freespace_sim.planner.colgen import dp_prepare
+
+    calls = []
+    real = dp_prepare.prepare_topology
+    monkeypatch.setattr(
+        dp_prepare, "prepare_topology",
+        lambda *a, **k: (calls.append(1), real(*a, **k))[1],
+    )
+
+    blob = pickle.dumps(duals)
+    per_sweep = []
+    for sweep in (1, 2):
+        epoch = ("uid", sweep)
+        pricing_pool._load_sweep_state(epoch, blob, {1: 0.0}, {}, None)
+        assert pricing_pool._WORKER.get("sweep_error") is None
+        priced = pricing_pool._price_batch((epoch, [1]))
+        assert priced[0][1] is True
+        per_sweep.append(len(calls))
+
+    # The fixture has to REACH the compiled path, or "it did not rebuild" is vacuous.
+    assert per_sweep[0] == 1, "the first sweep never built a packing; fixture is inert"
+    assert per_sweep[1] == 1, f"the packing was rebuilt: {per_sweep[1]} builds over 2 sweeps"
+    graph = pricing_pool._WORKER["graphs"][1]
+    assert graph._search_cache.prepared is not None
+
+
+def test_a_worker_refuses_a_task_from_a_sweep_it_does_not_hold(monkeypatch):
+    """The stale-dual guard. Without it this is a wrong NUMBER, not an error.
+
+    `mp.Pool` replaces a dead worker by re-running the original initargs, which under a
+    solve-scoped pool carry solve constants only -- so the replacement holds no duals at
+    all. Pricing against the previous sweep's duals would return a reduced cost that
+    `master.upper_bound` accepts as a valid bound.
+    """
+
+    cfg = _cfg()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    _worker_fixture(cfg)
+    pricing_pool._load_sweep_state(("uid", 1), pickle.dumps({}), {1: 0.0}, {}, None)
+
+    with pytest.raises(StalePricingWorker, match="holds sweep state"):
+        pricing_pool._price_one(("uid", 2), 1)
+    # The message has to name the worker, because the operator's next question is which one
+    # died and whether it was the OOM killer.
+    try:
+        pricing_pool._price_one(("uid", 2), 1)
+    except StalePricingWorker as exc:
+        assert "worker 0" in str(exc) and str(os.getpid()) in str(exc)
+
+
+def test_a_respawned_worker_has_no_sweep_state_and_says_so(monkeypatch):
+    """A replacement worker runs the initializer and nothing else -- so it must refuse."""
+
+    cfg = _cfg()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    _worker_fixture(cfg)
+    with pytest.raises(StalePricingWorker, match="holds sweep state None"):
+        pricing_pool._price_batch((("uid", 1), [1]))
+
+
+def test_a_failed_state_load_does_not_leave_the_previous_sweep_readable(monkeypatch):
+    """The subtlest bug in the design, and the reason `sweep` is cleared BEFORE the try.
+
+    If building the `DualView` raises -- `MemoryError` is the realistic one, since it is
+    dense per resource -- a worker that kept the previous tuple would price iteration k
+    against iteration k-1's duals: plausible, wrong, and silent.
+    """
+
+    cfg = _cfg()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    _worker_fixture(cfg)
+    pricing_pool._load_sweep_state(("uid", 1), pickle.dumps({}), {1: 0.0}, {}, None)
+    assert pricing_pool._WORKER["sweep"] is not None
+
+    def out_of_memory(*_args, **_kwargs):
+        raise MemoryError("dual prefix series")
+
+    monkeypatch.setattr(pricing_pool, "DualView", out_of_memory)
+    pricing_pool._load_sweep_state(("uid", 2), pickle.dumps({}), {1: 0.0}, {}, None)
+
+    assert pricing_pool._WORKER["sweep"] is None, "sweep 1's duals survived a failed load"
+    with pytest.raises(RuntimeError, match="failed to load sweep state"):
+        pricing_pool._price_one(("uid", 2), 1)
+
+
+def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight():
+    """The end-to-end shape of the fix: same processes, same flight->worker, every sweep.
+
+    Driven through `PricingPool` directly rather than through a solve, because how many
+    sweeps a solve runs depends on when column generation converges -- a three-flight
+    problem finishes in one iteration, and a one-sweep run cannot show reuse ACROSS sweeps
+    no matter what it asserts. Worker identity is also exactly what an in-process test
+    cannot see, so this pays for real processes.
+    """
+
+    cfg = _cfg()
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+        _request(3, (-3, 1), (3, -1), cfg),
+    ]
+    order = [1, 2, 3]
+    flight_duals = dict.fromkeys(order, 0.0)
+    with PricingPool(
+        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
+    ) as pool:
+        sweeps = [pool.run_sweep(order, {}, flight_duals, {}, None) for _ in range(3)]
+
+    seen = [
+        {(r["flight_id"], r["worker"], r["pid"]) for r in sweep.flight_records}
+        for sweep in sweeps
+    ]
+    pids = [{pid for _f, _l, pid in rows} for rows in seen]
+    assert all(p == pids[0] for p in pids), f"workers were replaced between sweeps: {pids}"
+    assert len(pids[0]) == 2
+    assert all(rows == seen[0] for rows in seen), "a flight moved between workers"
+    assert os.getpid() not in pids[0], "the pool priced in the parent process"
+    # Two workers over three flights, so the split is 2/1 and neither worker is empty.
+    assert {worker for _f, worker, _p in seen[0]} == {0, 1}
+
+
+def test_the_solver_hands_its_sweeps_one_pool():
+    """`solve` has to OWN the pool, or every sweep pays the launch ramp again.
+
+    Distinct from the test above: that one proves `PricingPool` reuses workers, this one
+    proves the solver actually passes one rather than letting `price_sweep` build a
+    throwaway per sweep. `pricing_pool_setup_s` is the observable -- nonzero because a pool
+    was started, and far below `pricing_wall_s` because it was started once.
+    """
+
+    cfg = _cfg()
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+        _request(3, (-3, 1), (3, -1), cfg),
+    ]
+    rows = []
+
+    def on_iteration(state):
+        rows.extend(state.get("sweep_flight_records") or ())
+
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(n_pricing_workers=2, max_iterations=3),
+        on_iteration=on_iteration,
+    )
+    assert result.stats["pricing_pool_setup_s"] > 0.0
+    assert rows and all("worker" in r and "pid" in r for r in rows)
+    assert os.getpid() not in {r["pid"] for r in rows}
+    # Worker assignment is a pure function of the flight ids, so the solver's pool must have
+    # produced the same split this does.
+    assert {r["flight_id"]: r["worker"] for r in rows} == _worker_assignment([1, 2, 3], 2)
+
+
+def test_pool_setup_is_charged_to_the_first_sweep_only():
+    """`pool_setup_s` is what makes "the launch ramp stopped recurring" visible in a run."""
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)) as pool:
+        first = pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
+        second = pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
+    assert first.pool_setup_s > 0.0
+    assert second.pool_setup_s == 0.0
+    assert first.complete and second.complete
+    assert first.flight_ids == second.flight_ids == (1, 2)
+
+
+def test_the_pool_refuses_a_second_sweep_after_an_incomplete_one():
+    """An incomplete sweep abandons running tasks, so the pool must not be reused.
+
+    Safe to refuse because an incomplete sweep ALWAYS ends the solve (`solver` sets
+    `pricing_complete = False` and breaks). A future refactor that changes that gets this
+    exception rather than sweep k's leftovers interleaved into sweep k+1.
+    """
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)) as pool:
+        expired = pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, time.monotonic() - 1.0)
+        assert not expired.complete
+        with pytest.raises(RuntimeError, match="no longer usable"):
+            pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
+
+
+def test_closing_the_pool_twice_is_safe():
+    """`close` runs from a `finally` that may fire on a path where `start` never did."""
+
+    cfg = _cfg()
+    pool = PricingPool(
+        [_request(1, (-4, 0), (4, 0), cfg)], cfg, _params(n_pricing_workers=1),
+        StaticTerminalCatalog((), cfg),
+    )
+    pool.close()          # never started
+    pool.close()          # idempotent
+
+
+def test_a_pool_that_raised_mid_sweep_refuses_another(monkeypatch):
+    """An exception leaves the workers half-consumed, exactly as an early return does.
+
+    The incomplete-sweep path already poisons; this is the same hazard reached the other
+    way -- the merge's own consistency check, or a task raising. Without it a caller that
+    caught the error and retried would get sweep k's leftovers merged into sweep k+1.
+    """
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(
+        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
+    ) as pool:
+        pool.start()
+        monkeypatch.setattr(
+            pricing_pool, "_accepted_prefix",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("merge blew up")),
+        )
+        with pytest.raises(RuntimeError, match="merge blew up"):
+            pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
+        monkeypatch.undo()
+        with pytest.raises(RuntimeError, match="no longer usable"):
+            pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
+
+
+def test_a_pool_that_fails_to_start_does_not_leak_its_workers(monkeypatch):
+    """A partial `start()` must leave what it built reachable by `close()`.
+
+    `MemoryError` while spawning the nth worker is the realistic trigger -- it is what the
+    `n_pricing_workers` ceiling exists for -- and it is precisely when leaking the other
+    n-1 worker processes would hurt most.
+    """
+
+    cfg = _cfg()
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in (1, 2, 3)]
+    pool = PricingPool(
+        requests, cfg, _params(n_pricing_workers=3), StaticTerminalCatalog((), cfg)
+    )
+    real_ctx = mp.get_context("spawn")
+    calls = []
+
+    def explode_on_the_third(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 3:
+            raise MemoryError("no room for another worker")
+        return real_ctx.Process(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pricing_pool.mp, "get_context",
+        lambda _name: type("Ctx", (), {
+            "Process": staticmethod(explode_on_the_third),
+            "Pipe": staticmethod(real_ctx.Pipe),
+        })(),
+    )
+    with pytest.raises(MemoryError):
+        pool.start()
+    # `close()` ran on the way out, so nothing is left holding worker processes.
+    assert pool._channels is None
+    pool.close()
+
+
+# --------------------------------------------------------------- worker-loss reporting
+
+
+def test_the_worker_loss_marker_survives_the_reducer():
+    """`_accepted_prefix` returns at the first gap, and used to drop that result's counters.
+
+    The only counter an unpriced result ever carries is the synthetic `pool_worker_lost`
+    marker, so dropping them discarded the single signal that separates "a worker died"
+    from "the clock ran out" -- and made `solver`'s `pricing_worker_lost` branch dead code.
+    Its seconds are still discarded, which is a different question: those are not work the
+    sweep kept.
+    """
+
+    lost = [
+        (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
+        (3, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}),
+    ]
+    accepted = _accepted_prefix(lost)
+
+    assert accepted.flight_ids == (7,)
+    assert accepted.timeout_flight_id == 3
+    assert accepted.kernel_counters.get("pool_worker_lost") == 1
+    assert accepted.task_total_s == 1.0
+
+
+def test_a_dead_worker_is_worker_loss_and_a_slow_one_is_a_timeout():
+    """The ordered iterator is why this cannot be left to the `StalePricingWorker` handler.
+
+    When a worker dies mid-chunk its result is never produced; `mp.Pool` starts a
+    replacement, and the replacement's refusal queues BEHIND the missing result. The parent
+    therefore never sees the exception -- it waits out the deadline and lands in the
+    timeout branch. Asking whether the process changed is what recovers the signal.
+    """
+
+    order = [10, 11]
+    worker_of = {10: 0, 11: 0}
+    first = (10, True, 1.0, None, 0.1, {}, {})
+
+    # Died: reported as worker loss, with the marker the solver reads.
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([({0: [first]}, set()), ({}, {0})]), 1, order, worker_of,
+            deadline=None,
+        )
+    )
+    assert accepted.flight_ids == (10,)
+    assert accepted.timeout_flight_id == 11
+    assert accepted.kernel_counters.get("pool_worker_lost", 0) == 1
+
+    # Merely slow, with the clock expired: an ordinary timeout, NOT worker loss.
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([({0: [first]}, set())]), 1, order, worker_of, deadline=0.0,
+        )
+    )
+    assert accepted.flight_ids == (10,)
+    assert accepted.timeout_flight_id == 11
+    assert accepted.kernel_counters.get("pool_worker_lost", 0) == 0
+
+
+def test_a_killed_worker_is_detected_immediately_and_not_replaced():
+    """The transport's whole point: death is an event, not an inference.
+
+    Under `mp.Pool` a dead worker was silently REPLACED with one holding no duals, and the
+    only way to notice was to wait out the pricing deadline and then compare pids -- so a
+    worker lost in the first second of a 1,200 s budget consumed all 1,200. On a pipe the
+    process sentinel wakes the wait the moment it exits, and nothing comes back to take its
+    place.
+    """
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(
+        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
+    ) as pool:
+        pool.start()
+        original = dict(pool._worker_pid)
+        collect = pricing_pool._PipeCollector(pool._channels)
+
+        # Nothing has happened yet, so nothing is dead.
+        _, died = collect(0.05)
+        assert died == set()
+
+        # Exactly what the OOM killer does: the process disappears without an exception.
+        os.kill(original[0], 9)
+
+        started = time.monotonic()
+        seen = set()
+        while time.monotonic() - started < 30.0 and not seen:
+            _, died = collect(0.5)
+            seen |= died
+        assert seen == {0}, "the killed worker was not detected"
+        # Detected in well under a pricing deadline -- the point of the sentinel.
+        assert time.monotonic() - started < 10.0
+        # And it stays dead: no replacement is spawned behind our back holding no duals.
+        assert not pool._channels[0].proc.is_alive()
+        assert pool._channels[1].proc.is_alive(), "an untouched worker was disturbed"
+        assert pool._worker_pid[1] == original[1]
+
+
+def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep():
+    """A startup that misses the deadline must look like a timeout, not raise.
+
+    `pool.apply()` has no timeout, so a worker killed rather than raised during its
+    initializer would hang the solve with no clock running. Bounding it is the fix; making
+    it an EXCEPTION would not be, because then an already-expired deadline errors on the
+    parallel path while the sequential path returns a short prefix for the same input.
+    """
+
+    cfg = _cfg()
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    with PricingPool(
+        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
+    ) as pool:
+        result = pool.run_sweep(
+            [1, 2], {}, {1: 0.0, 2: 0.0}, {}, time.monotonic() - 1.0
+        )
+    assert not result.complete
+    assert result.timeout_flight_id == 1
+    assert result.flight_ids == ()
+
+
+def test_an_expired_deadline_does_not_spawn_the_whole_pool():
+    """`ctx.Pool()` is synchronous and not cancelable, so the check has to precede EACH one.
+
+    Consulting the deadline only before the readiness probes still pays the full serial
+    spawn ramp -- ~4.5 s per worker, about a minute at 16 -- for a solve that had already
+    run out of time. The overrun cannot be driven to zero without a bootstrap that can be
+    interrupted, but it can be bounded to the one worker already in flight.
+    """
+
+    cfg = _cfg()
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in (1, 2, 3, 4)]
+    pool = PricingPool(
+        requests, cfg, _params(n_pricing_workers=4), StaticTerminalCatalog((), cfg)
+    )
+    built = []
+    real_ctx = mp.get_context("spawn")
+
+    class _CountingCtx:
+        @staticmethod
+        def Pool(*args, **kwargs):
+            built.append(1)
+            return real_ctx.Pool(*args, **kwargs)
+
+    original = pricing_pool.mp.get_context
+    pricing_pool.mp.get_context = lambda _name: _CountingCtx()
+    try:
+        result = pool.run_sweep(
+            [1, 2, 3, 4], {}, dict.fromkeys([1, 2, 3, 4], 0.0), {},
+            time.monotonic() - 1.0,
+        )
+    finally:
+        pricing_pool.mp.get_context = original
+        pool.close()
+
+    assert not result.complete
+    assert built == [], f"an expired deadline still built {len(built)} of 4 pools"
+
+
+def test_worker_skew_counts_workers_that_drew_no_tasks():
+    """A worker with nothing to do is the MOST skewed case, not an absent one.
+
+    Dividing by the workers that appear in the records raises the mean and reports less
+    imbalance exactly when there is most of it.
+    """
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_timed", os.path.join(os.path.dirname(__file__), "..", "analysis",
+                               "run_colgen_timed.py"),
+    )
+    timed = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(timed)
+
+    rows = [
+        {"worker": 0, "task_s": 6.0},
+        {"worker": 1, "task_s": 2.0},
+    ]
+    # Two workers busy, two idle: the true mean is 2.0, not 4.0.
+    skew = timed._worker_skew(rows, n_workers=4)
+    assert skew["n_workers_seen"] == 4
+    assert skew["worker_task_s_mean"] == 2.0
+    assert skew["worker_skew"] == 3.0
+    # And the old denominator would have said 1.5, i.e. half the real imbalance.
+    assert timed._worker_skew(rows, n_workers=2)["worker_skew"] == 1.5
+
+
+def test_a_worker_ships_its_initializer_failure_with_the_readiness_message(monkeypatch):
+    """The failure has to reach the PARENT, or the pool waits on a worker that cannot work.
+
+    `_init_worker` records rather than raises, which is what stops a spawned worker dying
+    before it can say why. That only helps if someone carries the recorded traceback back:
+    `_worker_main` sends it with the readiness message, and `PricingPool.start` turns it
+    into a named failure of the whole pool instead of a hang.
+    """
+
+    class _FakeConn:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def recv(self):
+            return ("stop",)
+
+    def out_of_memory(*_args, **_kwargs):
+        raise MemoryError("label pool")
+
+    cfg = _cfg()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    monkeypatch.setattr(pricing_pool, "build_flight_graph", out_of_memory)
+    conn = _FakeConn()
+
+    pricing_pool._worker_main(
+        conn, 0, [_request(1, (-4, 0), (4, 0), cfg)], cfg, _params(),
+        StaticTerminalCatalog((), cfg),
+    )
+
+    assert conn.sent, "the worker exited without reporting anything"
+    tag, pid, init_error = conn.sent[0]
+    assert tag == "ready" and pid == os.getpid()
+    assert init_error is not None and "MemoryError: label pool" in init_error
+
+
+def test_close_does_not_wait_out_workers_that_cannot_hear_it():
+    """Teardown after an abandoned sweep must not be per-worker-timeout slow.
+
+    When a sweep ends early the parent stops draining, the pipes fill, and every surviving
+    worker blocks inside `send` -- so none of them will ever read `stop`, no matter where a
+    poll for it is placed (that was tried). Waiting on them individually made teardown take
+    `_CLOSE_JOIN_TIMEOUT_S` EACH: 15 s for three survivors, on a solve that had already
+    failed. One short shared grace window, then SIGKILL.
+    """
+
+    cfg = _cfg()
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in (1, 2, 3, 4)]
+    pool = PricingPool(
+        requests, cfg, _params(n_pricing_workers=4), StaticTerminalCatalog((), cfg)
+    )
+    pool.start()
+    procs = [ch.proc for ch in pool._channels]
+    started = time.monotonic()
+    pool.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < pricing_pool._CLOSE_JOIN_TIMEOUT_S, f"close took {elapsed:.1f}s"
+    for proc in procs:
+        assert not proc.is_alive(), "a worker survived close()"
+    assert pool._channels is None
+    pool.close()  # idempotent
+
+
+def test_results_already_in_the_pipe_survive_an_expired_deadline():
+    """Work that was done and delivered must not be thrown away by the clock.
+
+    The merge drains before it checks the deadline. Checking first would discard results
+    that had already arrived merely because the clock passed while they sat in the pipe --
+    flights that were priced, paid for, and belong in the prefix the sequential loop would
+    have kept.
+    """
+
+    order = [10, 11]
+    delivered = [(10, True, 1.0, None, 0.1, {"priced": 1}, {})]
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([({0: delivered}, set())]), 1, order, {10: 0, 11: 0},
+            deadline=0.0,
+        )
+    )
+    assert accepted.flight_ids == (10,), "a delivered result was dropped by the deadline"
+    assert accepted.timeout_flight_id == 11
+    assert not accepted.complete

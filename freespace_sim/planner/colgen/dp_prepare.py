@@ -700,7 +700,13 @@ class PreparedDuals:
       ``(a + v) - a != v`` in floating point, and ``claim_cost`` sums precisely these
       values. A dense array is not an option: 5M rows would be 40 MB per flight.
 
-    Rebuilt once per **sweep**, not per flight: duals are global to an iteration.
+    Rebuilt once per **flight**, not once per sweep. This said the opposite until it was
+    measured, and the error was not harmless: the duals it restates are global to an
+    iteration, so "one per sweep" reads as a fair description of the *inputs* -- but
+    :func:`prepare_duals` is called from ``pricing._best_column_compiled`` on every pricing
+    task, and its old body scanned the whole global mapping each time. That made it
+    O(flights x materialized rows) while looking, in the docstring, like O(rows). It now
+    walks the resources this flight owns; see the loop for why that is bit-identical.
     """
 
     row_id: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int64))
@@ -803,36 +809,62 @@ def prepare_duals(
         series_start.append(len(series_prefix))
         return slot
 
-    for (cell, level), prefix_series in view._cell.items():
-        if level != 0:
-            continue
-        index = cell_index.get(cell)
-        if index is not None:
+    # Driven from THIS FLIGHT'S resources, for the same reason the exact-row loop below is:
+    # both used to walk a global mapping and filter, which bounds a once-per-flight cost by
+    # the master's active-resource count instead of by the flight.  Fixing only one of them
+    # leaves the other paying it -- and `_cell`/`_terminal` are a separate mapping from
+    # `_cell_steps`/`_terminal_steps`, so a test that pins one says nothing about the other.
+    #
+    # This also REORDERS slot assignment, from "whichever order the global dict happened to
+    # be in" to this flight's cell numbering. That is layout, not arithmetic: a slot is only
+    # ever reached through `cell_series[index]` / `term_series[slot]`, and each resource's
+    # prefix array is summed independently inside `_prefix_series`, so no float is added to
+    # a different float than before. The parity gate is what proves it.
+    for cell, index in cell_index.items():
+        prefix_series = view._cell.get((cell, 0))
+        if prefix_series is not None:
             cell_series[index] = add_series(prefix_series)
-    for terminal_id, prefix_series in view._terminal.items():
-        slot = term_slot.get(terminal_id)
-        if slot is not None:
+    for terminal_id, slot in term_slot.items():
+        prefix_series = view._terminal.get(terminal_id)
+        if prefix_series is not None:
             term_series[slot] = add_series(prefix_series)
 
+    # Walk THIS FLIGHT'S resources and look each one up, rather than walking anything
+    # global.  This loop runs once per FLIGHT (`pricing._best_column_compiled` calls it per
+    # pricing task), so anything global in it is multiplied by the flight count.
+    #
+    # Iterating the global step buckets and filtering through `cell_index` -- the obvious
+    # first move, and what this did originally -- is NOT enough. It drops the row scan to a
+    # RESOURCE scan, which is smaller by the number of priced steps per resource, but the
+    # bound is still the master's active-resource count, so the cost still grows with the
+    # batch while the flight stays the same size. Driven from `cell_index` the bound is
+    # `topology.n_cells`: a property of this flight alone.
+    #
+    # Same pairs, and therefore the same `PreparedDuals`: `DualView` accumulates its step
+    # buckets in the same pass and the same order as the flat mapping, so the values are the
+    # identical floats; the kept set is the same one stated from the other side (the
+    # `level != 0` skip becomes the literal 0 in the lookup key, since a flight's cells are
+    # numbered at one level); and `pairs.sort()` normalizes the order, which is total
+    # because `row_of_cell` and `row_of_term` occupy disjoint ranges and each is injective
+    # in `(index, step)`.
     pairs: list[tuple[int, float]] = []
     n_out_of_range = 0
-    for key, value in view._duals.items():
-        if key.kind == "cell":
-            if key.level != 0:
+    for cell_coord, index in cell_index.items():
+        for step, value in view._cell_steps.get((cell_coord, 0), ()):
+            row = rows.row_of_cell(index, step)
+            if row < 0:
+                n_out_of_range += 1
                 continue
-            index = cell_index.get(key.cell_coord)
-            if index is None:
+            pairs.append((row, float(value)))
+    # Driven from `term_slot`, which holds at most this flight's two endpoints, rather than
+    # from every terminal that carries a dual.
+    for terminal_id, slot in term_slot.items():
+        for step, value in view._terminal_steps.get(terminal_id, ()):
+            row = rows.row_of_term(slot, step)
+            if row < 0:
+                n_out_of_range += 1
                 continue
-            row = rows.row_of_cell(index, key.step)
-        else:
-            slot = term_slot.get(key.terminal_id)
-            if slot is None:
-                continue
-            row = rows.row_of_term(slot, key.step)
-        if row < 0:
-            n_out_of_range += 1
-            continue
-        pairs.append((row, float(value)))
+            pairs.append((row, float(value)))
     pairs.sort()
 
     prepared = PreparedDuals(

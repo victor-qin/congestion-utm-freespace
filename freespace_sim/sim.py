@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -24,6 +23,7 @@ from .dss import DSS
 from .ledger import ReservationLedger
 from .mechanism import FCFSMechanism, Mechanism
 from .planner import get_planner
+from .progress import RollingRate
 from .scenario import Scenario, scenario_from_requests
 from .telemetry import TelemetryCollector, build_terminal_snapshot
 from .types import FlightRequest, IntentStatus, OperationalIntent, as_terminal
@@ -33,38 +33,6 @@ log = logging.getLogger(__name__)
 
 # Called after each flight is planned: (done, total, latest_intent). Return value ignored.
 ProgressCallback = Callable[[int, int, OperationalIntent], None]
-
-
-class _RollingRate:
-    """Cumulative + rolling mean of a per-flight duration (s), and the ETA the rolling rate implies for
-    the flights still to come. Shared by the live ``ConsoleProgress`` ticker (fed WALL time per flight, so
-    its ETA tracks the real finish clock) and the ``_MilestoneLog`` INFO lines (fed planner ``solve_time_s``)
-    so both surface a saturation slowdown the same way: the rolling value pulls ABOVE the cumulative avg,
-    instead of the slowdown hiding in a lagging whole-run average. ``roll_ms``/``eta_s`` return ``None``
-    until the ``window`` fills, so a caller never reports an estimate off a partial sample."""
-
-    def __init__(self, window: int = 100):
-        self.window = window
-        self._recent: deque[float] = deque(maxlen=window)
-        self._sum = 0.0
-
-    def add(self, dt_s: float) -> None:
-        self._sum += dt_s
-        self._recent.append(dt_s)
-
-    def avg_ms(self, done: int) -> float:
-        return 1000.0 * self._sum / max(done, 1)
-
-    def _roll_s(self) -> float | None:
-        return sum(self._recent) / self.window if len(self._recent) >= self.window else None
-
-    def roll_ms(self) -> float | None:
-        r = self._roll_s()
-        return None if r is None else 1000.0 * r
-
-    def eta_s(self, done: int, total: int) -> float | None:
-        r = self._roll_s()
-        return None if r is None else max(0, total - done) * r
 
 
 class ConsoleProgress:
@@ -84,7 +52,7 @@ class ConsoleProgress:
         self.last = 0.0
         self.acc = 0
         self.den = 0
-        self.rate = _RollingRate(window)
+        self.rate = RollingRate(window)
 
     def __call__(self, done: int, total: int, intent: OperationalIntent) -> None:
         if intent.accepted:
@@ -140,9 +108,9 @@ class _MilestoneLog:
         self.acc = 0
         self.den = 0
         # Per-flight PLANNER time (``intent.solve_time_s``) as a cumulative avg + rolling mean + ETA — the
-        # same _RollingRate treatment as the live ConsoleProgress ticker (which feeds it wall time), so a
+        # same `RollingRate` treatment as the live ConsoleProgress ticker (which feeds it wall time), so a
         # saturation slowdown pulls roll above avg here too instead of hiding in the whole-run average.
-        self.plan = _RollingRate(roll_window)
+        self.plan = RollingRate(roll_window)
         n_marks = max(1, round(1.0 / every_frac))
         # k/n_marks division, NOT horizon*every_frac*k: 0.05 is not float-representable and the
         # product overshoots the true fraction for ~a third of (horizon, k) pairs (1.0*0.05*3 =
@@ -171,7 +139,7 @@ class _MilestoneLog:
 
     def _perf(self, done: int) -> str:
         """This milestone's plan-time readout — cumulative avg always, plus the rolling mean and ETA once
-        the window fills (``n/a`` while warming up). Built from the shared :class:`_RollingRate`, so it
+        the window fills (``n/a`` while warming up). Built from the shared :class:`~freespace_sim.progress.RollingRate`, so it
         mirrors the live ConsoleProgress ticker; it's solve-time based, so its ETA slightly undershoots the
         wall clock by the per-flight commit overhead the ticker's wall-based ETA does capture."""
         roll, eta = self.plan.roll_ms(), self.plan.eta_s(done, self.total)

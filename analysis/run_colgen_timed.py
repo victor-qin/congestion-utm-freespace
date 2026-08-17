@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import logging
 import hashlib
 import json
 import resource
@@ -94,6 +95,41 @@ def _rss_mb(who) -> float:
     return resource.getrusage(who).ru_maxrss / _RSS_SCALE
 
 
+def _worker_skew(records, n_workers: int) -> dict:
+    """Collapse per-flight rows to the one number a fixed worker assignment risks.
+
+    Pinning each flight to a worker for the whole solve buys cache reuse and gives up
+    `mp.Pool`'s rebalancing, so the question it owes an answer to is how uneven the split
+    actually is. `sweep_flight_records` carries `worker` and `task_s` per flight, but it is
+    emitted only through the transient iteration callback and is far too bulky to archive
+    per flight -- so the ratio is computed here and the rows are dropped, which is what
+    makes the claim checkable after the fact rather than only while a run is live.
+
+    `max/mean` over per-worker task totals: 1.0 is a perfect split, and the sweep can never
+    finish faster than its slowest worker, so this is the ceiling on what better balance
+    could buy.
+    """
+
+    # Seeded with every CONFIGURED worker at zero, not only the ones that appear in the
+    # records. A worker that drew no tasks is the most skewed case there is, and
+    # omitting it raises the mean and so reports LESS imbalance exactly when there is
+    # most.
+    totals: dict[int, float] = {worker: 0.0 for worker in range(max(0, n_workers))}
+    for row in records:
+        worker = row.get("worker")
+        if worker is not None:
+            totals[worker] = totals.get(worker, 0.0) + float(row.get("task_s") or 0.0)
+    if not totals:
+        return {}
+    busiest, mean = max(totals.values()), sum(totals.values()) / len(totals)
+    return {
+        "n_workers_seen": len(totals),
+        "worker_task_s_max": round(busiest, 2),
+        "worker_task_s_mean": round(mean, 2),
+        "worker_skew": round(busiest / mean, 3) if mean > 0 else None,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--flights", type=int, default=500)
@@ -122,6 +158,11 @@ def main() -> int:
     )
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    # The library reports progress through `logging`; without this the INFO lines
+    # exist and go nowhere. Matches `experiments/run.py`'s format.
+    logging.basicConfig(
+        level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s"
+    )
     if args.greedy_budget_s is not None:
         _budgeted_greedy(args.greedy_budget_s)
 
@@ -175,6 +216,7 @@ def main() -> int:
                 "columns": state["columns"],
                 "rc_n_positive": state["rc_n_positive"],
                 "dual_nonzero": state["dual_nonzero"],
+                **_worker_skew(state.get("sweep_flight_records") or (), args.workers),
             }
         )
         print(

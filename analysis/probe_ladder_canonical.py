@@ -102,7 +102,11 @@ def main() -> int:
     params = ColGenParams(**overrides)
 
     install()
-    ColGenSolver().solve(requests, cfg, [], params)
+    # As `prof_colgen_stages.py` / `ab_colgen_parity.py` do. Without the scenario's permanent
+    # terminal volumes the ladder is built over a different route set, so a clean run here
+    # would attest to an invariant production never exercises.
+    static_terms = list(demand.terminals(cfg))
+    ColGenSolver().solve(requests, cfg, static_terms, params)
 
     ladder_calls = COUNTS["ladder.calls"]
     ladder_changed = COUNTS["ladder.changed"]

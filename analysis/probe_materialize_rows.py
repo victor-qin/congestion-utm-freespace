@@ -201,7 +201,13 @@ def main() -> int:
 
     install()
     started = time.perf_counter()
-    ColGenSolver().solve(requests, cfg, [], params)
+    # The scenario's permanent terminal volumes, exactly as `prof_colgen_stages.py` and
+    # `ab_colgen_parity.py` supply them. Passing `[]` is not a simplification: a hub scenario
+    # has 476 of these, they are always-active ledger volumes, and dropping them changes
+    # corridor exclusions and therefore routes, claim sets, row degrees and timings -- so the
+    # shape reported below would describe a workload production never runs.
+    static_terms = list(demand.terminals(cfg))
+    ColGenSolver().solve(requests, cfg, static_terms, params)
     wall = time.perf_counter() - started
 
     rows = STATS["backend_add_row_calls"]
@@ -215,8 +221,14 @@ def main() -> int:
     print(f"calls              {STATS['materialize_calls']:>10d}")
     print(f"rows materialized  {rows:>10d}   ({rows / max(1, STATS['materialize_calls']):.1f}/call)")
     print(f"n_columns at entry {mean_columns:>10.0f}   (mean; max {max(columns or [0])})")
-    print(f"scan work AVOIDED  {rows * mean_columns:>10.3g}   rows x n_columns, the "
-          "counterfactual the index removed")
+    # PER CALL, not totals x mean. The old scan probed `rows_added x n_columns` at the pool
+    # size prevailing in THAT call, and the two factors are correlated -- later calls see a
+    # larger pool and materialize fewer rows -- so `sum(rows) * mean(columns)` differs from
+    # the truth by their covariance, and being negative here it over-states. `rows_per_call`
+    # and `columns_at_entry` are appended once per call in the same order, so they align.
+    avoided = sum(r * c for r, c in zip(STATS["rows_per_call"], STATS["columns_at_entry"]))
+    print(f"scan work AVOIDED  {avoided:>10.3g}   sum over calls of rows_added x "
+          "n_columns, the counterfactual the index removed")
     print()
     print(f"total              {total:>10.2f}s   100.0%")
     print(f"  host-side        {host_side:>10.2f}s   "

@@ -94,7 +94,7 @@ def _rss_mb(who) -> float:
     return resource.getrusage(who).ru_maxrss / _RSS_SCALE
 
 
-def _worker_skew(records) -> dict:
+def _worker_skew(records, n_workers: int) -> dict:
     """Collapse per-flight rows to the one number a fixed worker assignment risks.
 
     Pinning each flight to a worker for the whole solve buys cache reuse and gives up
@@ -109,11 +109,15 @@ def _worker_skew(records) -> dict:
     could buy.
     """
 
-    totals: dict[int, float] = collections.defaultdict(float)
+    # Seeded with every CONFIGURED worker at zero, not only the ones that appear in the
+    # records. A worker that drew no tasks is the most skewed case there is, and
+    # omitting it raises the mean and so reports LESS imbalance exactly when there is
+    # most.
+    totals: dict[int, float] = {worker: 0.0 for worker in range(max(0, n_workers))}
     for row in records:
         worker = row.get("worker")
         if worker is not None:
-            totals[worker] += float(row.get("task_s") or 0.0)
+            totals[worker] = totals.get(worker, 0.0) + float(row.get("task_s") or 0.0)
     if not totals:
         return {}
     busiest, mean = max(totals.values()), sum(totals.values()) / len(totals)
@@ -206,7 +210,7 @@ def main() -> int:
                 "columns": state["columns"],
                 "rc_n_positive": state["rc_n_positive"],
                 "dual_nonzero": state["dual_nonzero"],
-                **_worker_skew(state.get("sweep_flight_records") or ()),
+                **_worker_skew(state.get("sweep_flight_records") or (), args.workers),
             }
         )
         print(

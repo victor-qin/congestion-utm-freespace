@@ -809,15 +809,24 @@ def prepare_duals(
         series_start.append(len(series_prefix))
         return slot
 
-    for (cell, level), prefix_series in view._cell.items():
-        if level != 0:
-            continue
-        index = cell_index.get(cell)
-        if index is not None:
+    # Driven from THIS FLIGHT'S resources, for the same reason the exact-row loop below is:
+    # both used to walk a global mapping and filter, which bounds a once-per-flight cost by
+    # the master's active-resource count instead of by the flight.  Fixing only one of them
+    # leaves the other paying it -- and `_cell`/`_terminal` are a separate mapping from
+    # `_cell_steps`/`_terminal_steps`, so a test that pins one says nothing about the other.
+    #
+    # This also REORDERS slot assignment, from "whichever order the global dict happened to
+    # be in" to this flight's cell numbering. That is layout, not arithmetic: a slot is only
+    # ever reached through `cell_series[index]` / `term_series[slot]`, and each resource's
+    # prefix array is summed independently inside `_prefix_series`, so no float is added to
+    # a different float than before. The parity gate is what proves it.
+    for cell, index in cell_index.items():
+        prefix_series = view._cell.get((cell, 0))
+        if prefix_series is not None:
             cell_series[index] = add_series(prefix_series)
-    for terminal_id, prefix_series in view._terminal.items():
-        slot = term_slot.get(terminal_id)
-        if slot is not None:
+    for terminal_id, slot in term_slot.items():
+        prefix_series = view._terminal.get(terminal_id)
+        if prefix_series is not None:
             term_series[slot] = add_series(prefix_series)
 
     # Walk THIS FLIGHT'S resources and look each one up, rather than walking anything

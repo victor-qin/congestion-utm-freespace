@@ -140,6 +140,14 @@ __all__ = [
 _CLOSE_JOIN_TIMEOUT_S = 5.0
 
 
+# How long the result merge blocks before re-checking whether a worker is still alive.
+# Not a deadline of its own: the sweep still stops at the caller's, this only decides
+# how promptly a death inside it is NOTICED. Short enough that a worker lost early does
+# not burn a long budget, long enough that the check is free against real task times
+# (a density flight prices in seconds).
+_WORKER_POLL_S = 2.0
+
+
 class _WorkerStartTimeout(RuntimeError):
     """Startup did not finish inside the caller's deadline.
 
@@ -737,6 +745,18 @@ class PricingPool:
         self._pools = []
         try:
             for worker in range(self._n_workers):
+                # CHECKED BEFORE EACH CONSTRUCTOR, not only before the readiness probes.
+                # `ctx.Pool()` is synchronous and not cancelable, and `spawn` re-pickles
+                # the initargs per worker, so a deadline consulted only afterwards still
+                # pays the whole serial ramp -- ~4.5 s x W, about a minute at 16 workers,
+                # for a solve that had already run out of time before it started. This
+                # bounds the overrun to the one worker already in flight; bounding it to
+                # zero needs a bootstrap that can be interrupted, i.e. not `mp.Pool`.
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _WorkerStartTimeout(
+                        f"the pricing deadline passed while starting worker {worker} of "
+                        f"{self._n_workers}"
+                    )
                 self._pools.append(ctx.Pool(
                     processes=1,
                     initializer=_init_worker,
@@ -904,21 +924,25 @@ class PricingPool:
     def close(self) -> None:
         """Terminate the workers. Idempotent, and bounded.
 
-        **Kills the processes before terminating the pool, and that order is the point.**
-        ``Pool.terminate()`` joins its own handler threads, and the task handler can be
-        blocked writing to the input queue of a worker that was SIGKILLed while holding
-        that queue's lock -- so terminating a pool whose worker died is exactly the shape
-        that hangs, and a solve-scoped pool sits idle between sweeps, which is when an
-        external kill is most likely to land. With the processes already gone the handlers
-        have nothing left to block on.
+        **Ordinary teardown first, escalating to a kill only if it sticks.** The reverse --
+        killing the processes and then terminating -- reads as the safer order and is much
+        worse: it guarantees the task handler has a dead queue to wait on, so every healthy
+        teardown pays the full timeout. Measured, that version made a 4-worker parity arm
+        0.56x, i.e. slower than using no pool at all.
 
-        ``pool.join()`` is deliberately NOT called: it waits on those same handler threads,
-        it takes no timeout, and they are daemons -- so nothing is leaked by leaving them
-        to die with the interpreter, whereas waiting on them is unbounded.
+        ``pool.join()`` is deliberately NOT called: it waits on the same handler threads,
+        takes no timeout, and they are daemons, so waiting on them is unbounded while
+        leaving them is not.
 
-        This narrows the window rather than closing it. Teardown that is bounded by
-        construction needs explicit ``Process``/``Pipe`` workers with sentinel monitoring
-        instead of ``mp.Pool``'s queues, which is a larger change than this one.
+        **What this does not fix.** If the ORIGINAL worker died holding the input queue's
+        lock, killing its replacement cannot release that lock, so the ``terminate()``
+        thread stays blocked and is left behind: one leaked daemon thread and its queue
+        graph per pool that lost a worker, and ``_CLOSE_JOIN_TIMEOUT_S`` of delay. That is
+        a bounded, once-per-solve cost on a solve that is already failing, and it beats the
+        indefinite hang it replaced -- but it is a leak, and calling it anything else would
+        be wrong. Teardown that is bounded *by construction* needs explicit
+        ``Process``/``Pipe`` workers with sentinel monitoring rather than ``mp.Pool``'s
+        queues, which is a larger change than this one.
         """
 
         self._poisoned = self._poisoned or "closed"
@@ -948,7 +972,10 @@ class PricingPool:
                         proc.kill()
                 except Exception:
                     pass
-            closer.join(_CLOSE_JOIN_TIMEOUT_S)
+            # Not joined again. Killing the REPLACEMENT cannot release a lock the ORIGINAL
+            # died holding, so a second wait buys nothing in the case that reaches here and
+            # doubles the delay -- 10 s per affected pool rather than 5 -- for a thread
+            # that is being left behind either way. See the docstring.
         self._pools = None
 
     def __enter__(self) -> "PricingPool":
@@ -1031,29 +1058,33 @@ def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_repl
         worker = worker_of[flight_id]
         while not pending[worker]:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            # POLL, rather than waiting out the whole budget in one call. Blocking for
+            # `remaining` and only then asking whether the worker is still alive means a
+            # worker that dies in the first second of a 1200 s budget consumes all 1200 --
+            # the death is detected exactly once, at the moment it no longer matters. It
+            # also made detection a race: `mp.Pool` had to have published the replacement
+            # by that single instant or the loss read as an ordinary timeout.
+            #
+            # Slicing the same total wait into `_WORKER_POLL_S` pieces changes neither the
+            # deadline nor the result -- `IMapIterator.next` resumes waiting where it left
+            # off -- and turns one check into one per interval.
+            slice_s = remaining if remaining is None else min(remaining, _WORKER_POLL_S)
             try:
-                pending[worker].extend(worker_iters[worker].next(remaining))
-            except StopIteration:
-                raise RuntimeError(
-                    f"pricing worker {worker} is exhausted but pricing_order still expects "
-                    f"flight {flight_id}: the worker split and this merge disagree"
-                ) from None
+                pending[worker].extend(worker_iters[worker].next(slice_s))
             except mp.TimeoutError:
-                # Exactly the shape `_price_one` returns for a `PricingTimeout`, so the
-                # reducer needs no special case: no seconds, no counters, `priced` False --
-                # and an EMPTY search record, because the worker that would have filled it
-                # is the one that never reported back.  Names the flight the parent is
-                # actually blocked on, which the chunk-indexed predecessor could only
-                # approximate with its chunk's first flight.
+                # Either shape below is exactly what `_price_one` returns for a
+                # `PricingTimeout`, so the reducer needs no special case: no seconds,
+                # `priced` False, and an EMPTY search record because the worker that
+                # would have filled it is the one that never reported back. Both name
+                # the flight the parent is actually blocked on, which the
+                # chunk-indexed predecessor could only approximate.
                 #
-                # ASK WHETHER THE WORKER IS STILL THE SAME PROCESS, because otherwise this
-                # is where a worker death is misreported as a clock expiry.  The
-                # `StalePricingWorker` handler below cannot catch that case: when a worker
-                # dies mid-chunk its result is never produced, `mp.Pool` starts a
-                # replacement, and the replacement's refusal is queued BEHIND the missing
-                # result on an ordered iterator -- so the parent waits out the deadline and
-                # arrives here, never having seen the exception. Checking process identity
-                # is what recovers the signal.
+                # ASKING WHETHER THE PROCESS CHANGED is what separates a dead worker
+                # from a slow one. The `StalePricingWorker` handler below cannot: when
+                # a worker dies mid-chunk its result is never produced, `mp.Pool`
+                # starts a replacement, and the replacement's refusal queues BEHIND
+                # the missing result on an ordered iterator -- so that exception never
+                # arrives and only process identity is left to read.
                 if worker_replaced is not None and worker_replaced(worker):
                     warnings.warn(
                         f"pricing worker {worker} was replaced mid-sweep; its result for "
@@ -1062,8 +1093,16 @@ def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_repl
                     )
                     yield flight_id, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}
                     return
-                yield flight_id, False, 0.0, None, 0.0, {}, {}
-                return
+                if remaining is not None and time.monotonic() >= deadline:
+                    # The real deadline, not a poll boundary.
+                    yield flight_id, False, 0.0, None, 0.0, {}, {}
+                    return
+                continue
+            except StopIteration:
+                raise RuntimeError(
+                    f"pricing worker {worker} is exhausted but pricing_order still expects "
+                    f"flight {flight_id}: the worker split and this merge disagree"
+                ) from None
             except StalePricingWorker as exc:
                 # A worker died and `mp.Pool` quietly replaced it with one holding no sweep
                 # state.  End the sweep the way a lost result does -- the prefix so far is

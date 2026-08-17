@@ -360,23 +360,32 @@ def test_prepare_duals_touches_only_this_flight_s_own_resources():
     base = _mixed_duals(graph, cfg, 5150)
 
     class _CountingSteps(dict):
-        def __init__(self, wrapped):
+        def __init__(self, wrapped, name):
             super().__init__(wrapped)
             self.probes = 0
+            self._name = name
 
         def get(self, key, default=None):
             self.probes += 1
             return super().get(key, default)
 
         def items(self):
-            raise AssertionError("prepare_duals scanned the global resource set")
+            raise AssertionError(f"prepare_duals scanned all of {self._name}")
+
+        def __iter__(self):
+            raise AssertionError(f"prepare_duals iterated all of {self._name}")
 
     def probes_for(duals):
         view = DualView(duals, cfg)
-        counting = _CountingSteps(view._cell_steps)
-        view._cell_steps = counting
+        # ALL FOUR global mappings, not just the exact-row ones: the prefix-SERIES arrays
+        # are built from `_cell`/`_terminal`, which is a separate walk that a test pinning
+        # only `_cell_steps` cannot see.
+        counted = {}
+        for name in ("_cell", "_cell_steps", "_terminal", "_terminal_steps"):
+            counted[name] = _CountingSteps(getattr(view, name), name)
+            setattr(view, name, counted[name])
         dp_prepare.prepare_duals(view, graph, topology, rows)
-        return counting.probes
+        return counted["_cell"].probes + counted["_cell_steps"].probes
 
     small = probes_for(base)
     # Ten times as many foreign resources, none of them this flight's.
@@ -386,7 +395,9 @@ def test_prepare_duals_touches_only_this_flight_s_own_resources():
             crowded[RowKey.cell(q, -q, 0, step)] = 1.5
     assert len(crowded) > len(base) * 1.4, "the fixture did not actually crowd the master"
 
-    assert probes_for(crowded) == small == topology.n_cells
+    # Two probes per cell now -- one into `_cell` for the series, one into `_cell_steps`
+    # for the exact rows -- and neither grows with the master.
+    assert probes_for(crowded) == small == topology.n_cells * 2
 
 
 def test_dual_view_step_buckets_hold_the_same_floats_as_the_flat_mapping():

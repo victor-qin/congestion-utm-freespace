@@ -957,3 +957,70 @@ def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep():
     assert not result.complete
     assert result.timeout_flight_id == 1
     assert result.flight_ids == ()
+
+
+def test_an_expired_deadline_does_not_spawn_the_whole_pool():
+    """`ctx.Pool()` is synchronous and not cancelable, so the check has to precede EACH one.
+
+    Consulting the deadline only before the readiness probes still pays the full serial
+    spawn ramp -- ~4.5 s per worker, about a minute at 16 -- for a solve that had already
+    run out of time. The overrun cannot be driven to zero without a bootstrap that can be
+    interrupted, but it can be bounded to the one worker already in flight.
+    """
+
+    cfg = _cfg()
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in (1, 2, 3, 4)]
+    pool = PricingPool(
+        requests, cfg, _params(n_pricing_workers=4), StaticTerminalCatalog((), cfg)
+    )
+    built = []
+    real_ctx = mp.get_context("spawn")
+
+    class _CountingCtx:
+        @staticmethod
+        def Pool(*args, **kwargs):
+            built.append(1)
+            return real_ctx.Pool(*args, **kwargs)
+
+    original = pricing_pool.mp.get_context
+    pricing_pool.mp.get_context = lambda _name: _CountingCtx()
+    try:
+        result = pool.run_sweep(
+            [1, 2, 3, 4], {}, dict.fromkeys([1, 2, 3, 4], 0.0), {},
+            time.monotonic() - 1.0,
+        )
+    finally:
+        pricing_pool.mp.get_context = original
+        pool.close()
+
+    assert not result.complete
+    assert built == [], f"an expired deadline still built {len(built)} of 4 pools"
+
+
+def test_worker_skew_counts_workers_that_drew_no_tasks():
+    """A worker with nothing to do is the MOST skewed case, not an absent one.
+
+    Dividing by the workers that appear in the records raises the mean and reports less
+    imbalance exactly when there is most of it.
+    """
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_timed", os.path.join(os.path.dirname(__file__), "..", "analysis",
+                               "run_colgen_timed.py"),
+    )
+    timed = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(timed)
+
+    rows = [
+        {"worker": 0, "task_s": 6.0},
+        {"worker": 1, "task_s": 2.0},
+    ]
+    # Two workers busy, two idle: the true mean is 2.0, not 4.0.
+    skew = timed._worker_skew(rows, n_workers=4)
+    assert skew["n_workers_seen"] == 4
+    assert skew["worker_task_s_mean"] == 2.0
+    assert skew["worker_skew"] == 3.0
+    # And the old denominator would have said 1.5, i.e. half the real imbalance.
+    assert timed._worker_skew(rows, n_workers=2)["worker_skew"] == 1.5

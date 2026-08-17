@@ -544,6 +544,7 @@ def _pre_master_timeout_result(
             "n_pricing_workers": 0,
             "kernel_priced": 0,
             "kernel_fell_back": 0,
+            "pricing_worker_lost": 0,
             "kernel_label_restarts": 0,
             "kernel_budget_declined": 0,
             "kernel_declined_by_reason": {},
@@ -702,6 +703,7 @@ class ColGenSolver:
                     "n_pricing_workers": 0,
                     "kernel_priced": 0,
                     "kernel_fell_back": 0,
+                    "pricing_worker_lost": 0,
                     "kernel_label_restarts": 0,
                     "kernel_budget_declined": 0,
                     "kernel_declined_by_reason": {},
@@ -1466,6 +1468,20 @@ class ColGenSolver:
         )
 
         materialized_rows = getattr(master, "materialized_rows", ())
+        # A LOST WORKER OUTRANKS EVERY LATER REASON, and it has to be re-asserted here
+        # because four phases downstream of the generation loop overwrite
+        # `termination_reason` on their own terms -- skipping the final IP, failing to
+        # prove it, and two repair paths -- all of which report `time_limit` or
+        # `ip_not_proven`. Every one of those tells a reader to raise a budget, which is
+        # the wrong action: a worker that vanished without an exception is the OOM killer,
+        # and the fix is FEWER workers. The generation loop's fault is also the earlier
+        # fact, so it is the one that explains the rest.
+        #
+        # Derived from the counter rather than tracked in a second flag: `kernel_counters`
+        # already accumulates it across sweeps, so there is no way for the two to disagree.
+        worker_losses = kernel_counters.get("pool_worker_lost", 0)
+        if worker_losses:
+            termination_reason = "pricing_worker_lost"
         stats: dict[str, Any] = {
             "backend": _backend_name(master),
             "iterations": iterations,
@@ -1600,6 +1616,11 @@ class ColGenSolver:
             # the compiled path yet.
             "kernel_label_restarts": kernel_counters.get("label_restarts", 0),
             "kernel_budget_declined": kernel_counters.get("budget_declined", 0),
+            # Its own key rather than a member of the histogram below, which filters to
+            # `declined_*`: a worker that disappeared is not a pricing verdict, and the
+            # evidence has to survive even when `termination_reason` does not -- a run that
+            # lost a worker and then also ran out of clock should still show WHY.
+            "pricing_worker_lost": worker_losses,
             "kernel_declined_by_reason": {
                 key.removeprefix("declined_"): value
                 for key, value in sorted(kernel_counters.items())

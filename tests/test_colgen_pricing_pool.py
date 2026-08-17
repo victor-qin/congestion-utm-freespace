@@ -281,10 +281,6 @@ def test_a_worker_that_cannot_initialise_reports_from_its_first_task(monkeypatch
     # The original cause, carried as text because the exception object itself has to
     # survive being pickled back to the parent.
     assert "MemoryError: label pool" in str(raised.value)
-    # The readiness probe has to re-raise it too, or `PricingPool.start()` would block
-    # forever against a worker whose replacement dies the same way.
-    with pytest.raises(RuntimeError, match="failed to initialise"):
-        pricing_pool._worker_identity(None)
     # And a state load must not overwrite the initializer's traceback with a failure
     # caused BY it -- the cause is the useful message.
     pricing_pool._load_sweep_state(("epoch", 1), pickle.dumps({}), {}, {}, None)
@@ -305,26 +301,23 @@ def test_explicit_zero_workers_matches_no_config_at_all():
     assert _fingerprint(pinned) == _fingerprint(default)
 
 
-class _LostResult:
-    """An ``imap`` iterator whose k-th result never arrives, like a task whose worker died.
+class _ScriptedCollector:
+    """Stands in for `_PipeCollector`: scripted rounds of ``(results_by_worker, died)``.
 
-    `mp.Pool` does not fail that task -- it starts a replacement process and the lost
-    result is simply never produced -- so the real object blocks in `next(timeout)` until
-    the timeout and then raises. A fake is the only way to state that contract: killing a
-    worker for real is a race, and the hang it produces has no natural end.
+    The transport is a pipe now, so the merge takes a `collect(timeout)` callable rather
+    than an iterator. That is what makes this a two-line fake: killing a real worker to
+    observe the death path is a race, and the hang it used to produce had no natural end.
     """
 
-    def __init__(self, results, lose_at):
-        self._results, self._lose_at, self._i = results, lose_at, 0
+    def __init__(self, rounds):
+        self._rounds = list(rounds)
+        self.calls = 0
 
-    def next(self, timeout=None):
-        if self._i == self._lose_at:
-            raise mp.TimeoutError("worker died; this result will never arrive")
-        if self._i >= len(self._results):
-            raise StopIteration
-        value = self._results[self._i]
-        self._i += 1
-        return value
+    def __call__(self, timeout=None):
+        self.calls += 1
+        if not self._rounds:
+            return {}, set()
+        return self._rounds.pop(0)
 
 
 def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
@@ -340,11 +333,10 @@ def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
         (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
-    # One worker, so "the k-th result" and "the k-th flight of this worker" coincide and the
-    # loss lands on flight 9 exactly as it did before workers existed.
+    # 7 and 3 arrive; 9 never does, and the clock has already run out.
     accepted = _accepted_prefix(
         _sweep_results(
-            [_LostResult([[r] for r in priced], lose_at=2)], order,
+            _ScriptedCollector([({0: priced}, set())]), 1, order,
             {7: 0, 3: 0, 9: 0}, deadline=0.0,
         )
     )
@@ -367,7 +359,7 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
     ]
     accepted = _accepted_prefix(
         _sweep_results(
-            [_LostResult([[r] for r in priced], lose_at=None)], order,
+            _ScriptedCollector([({0: priced}, set())]), 1, order,
             {7: 0, 3: 0}, deadline=None,
         )
     )
@@ -389,13 +381,16 @@ def test_the_worker_merge_yields_pricing_order_when_workers_finish_out_of_order(
 
     order = [10, 11, 12, 13]          # worker 0 owns 10 and 12; worker 1 owns 11 and 13
     worker_of = {10: 0, 11: 1, 12: 0, 13: 1}
-    worker0 = [[(10, True, 1.0, None, 0.1, {}, {})], [(12, True, 3.0, None, 0.1, {}, {})]]
-    worker1 = [[(11, True, 2.0, None, 0.1, {}, {}), (13, True, 4.0, None, 0.1, {}, {})]]
-
+    # Worker 1 is completely finished before worker 0 has produced anything.
     accepted = _accepted_prefix(
         _sweep_results(
-            [_LostResult(worker0, lose_at=None), _LostResult(worker1, lose_at=None)],
-            order, worker_of, deadline=None,
+            _ScriptedCollector([
+                ({1: [(11, True, 2.0, None, 0.1, {}, {}),
+                      (13, True, 4.0, None, 0.1, {}, {})]}, set()),
+                ({0: [(10, True, 1.0, None, 0.1, {}, {})]}, set()),
+                ({0: [(12, True, 3.0, None, 0.1, {}, {})]}, set()),
+            ]),
+            2, order, worker_of, deadline=None,
         )
     )
 
@@ -414,11 +409,14 @@ def test_a_worker_that_returns_the_wrong_flight_is_refused():
 
     order = [10, 11]
     worker_of = {10: 0, 11: 0}
-    wrong = [[(11, True, 2.0, None, 0.1, {}, {})], [(10, True, 1.0, None, 0.1, {}, {})]]
+    wrong = [(11, True, 2.0, None, 0.1, {}, {}), (10, True, 1.0, None, 0.1, {}, {})]
 
     with pytest.raises(RuntimeError, match="where pricing_order expects"):
         _accepted_prefix(
-            _sweep_results([_LostResult(wrong, lose_at=None)], order, worker_of, deadline=None)
+            _sweep_results(
+                _ScriptedCollector([({0: wrong}, set())]), 1, order, worker_of,
+                deadline=None,
+            )
         )
 
 
@@ -838,23 +836,26 @@ def test_a_pool_that_fails_to_start_does_not_leak_its_workers(monkeypatch):
     pool = PricingPool(
         requests, cfg, _params(n_pricing_workers=3), StaticTerminalCatalog((), cfg)
     )
-    real_pool = mp.get_context("spawn").Pool
+    real_ctx = mp.get_context("spawn")
     calls = []
 
     def explode_on_the_third(*args, **kwargs):
         calls.append(1)
         if len(calls) == 3:
             raise MemoryError("no room for another worker")
-        return real_pool(*args, **kwargs)
+        return real_ctx.Process(*args, **kwargs)
 
     monkeypatch.setattr(
         pricing_pool.mp, "get_context",
-        lambda _name: type("Ctx", (), {"Pool": staticmethod(explode_on_the_third)})(),
+        lambda _name: type("Ctx", (), {
+            "Process": staticmethod(explode_on_the_third),
+            "Pipe": staticmethod(real_ctx.Pipe),
+        })(),
     )
     with pytest.raises(MemoryError):
         pool.start()
     # `close()` ran on the way out, so nothing is left holding worker processes.
-    assert pool._pools is None
+    assert pool._channels is None
     pool.close()
 
 
@@ -883,7 +884,7 @@ def test_the_worker_loss_marker_survives_the_reducer():
     assert accepted.task_total_s == 1.0
 
 
-def test_a_timeout_on_a_replaced_worker_is_reported_as_worker_loss():
+def test_a_dead_worker_is_worker_loss_and_a_slow_one_is_a_timeout():
     """The ordered iterator is why this cannot be left to the `StalePricingWorker` handler.
 
     When a worker dies mid-chunk its result is never produced; `mp.Pool` starts a
@@ -894,22 +895,39 @@ def test_a_timeout_on_a_replaced_worker_is_reported_as_worker_loss():
 
     order = [10, 11]
     worker_of = {10: 0, 11: 0}
-    ready = [[(10, True, 1.0, None, 0.1, {}, {})]]
+    first = (10, True, 1.0, None, 0.1, {}, {})
 
-    for replaced, expected in ((True, 1), (False, 0)):
-        accepted = _accepted_prefix(
-            _sweep_results(
-                [_LostResult(ready, lose_at=1)], order, worker_of, deadline=0.0,
-                worker_replaced=lambda _w, r=replaced: r,
-            )
+    # Died: reported as worker loss, with the marker the solver reads.
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([({0: [first]}, set()), ({}, {0})]), 1, order, worker_of,
+            deadline=None,
         )
-        assert accepted.flight_ids == (10,)
-        assert accepted.timeout_flight_id == 11
-        assert accepted.kernel_counters.get("pool_worker_lost", 0) == expected
+    )
+    assert accepted.flight_ids == (10,)
+    assert accepted.timeout_flight_id == 11
+    assert accepted.kernel_counters.get("pool_worker_lost", 0) == 1
+
+    # Merely slow, with the clock expired: an ordinary timeout, NOT worker loss.
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([({0: [first]}, set())]), 1, order, worker_of, deadline=0.0,
+        )
+    )
+    assert accepted.flight_ids == (10,)
+    assert accepted.timeout_flight_id == 11
+    assert accepted.kernel_counters.get("pool_worker_lost", 0) == 0
 
 
-def test_a_replaced_worker_is_detected_and_its_pid_refreshed():
-    """`_worker_replaced` is both the death signal and the fix for stale pid reporting."""
+def test_a_killed_worker_is_detected_immediately_and_not_replaced():
+    """The transport's whole point: death is an event, not an inference.
+
+    Under `mp.Pool` a dead worker was silently REPLACED with one holding no duals, and the
+    only way to notice was to wait out the pricing deadline and then compare pids -- so a
+    worker lost in the first second of a 1,200 s budget consumed all 1,200. On a pipe the
+    process sentinel wakes the wait the moment it exits, and nothing comes back to take its
+    place.
+    """
 
     cfg = _cfg()
     requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
@@ -918,23 +936,27 @@ def test_a_replaced_worker_is_detected_and_its_pid_refreshed():
     ) as pool:
         pool.start()
         original = dict(pool._worker_pid)
-        assert not pool._worker_replaced(0), "an untouched worker must not read as replaced"
+        collect = pricing_pool._PipeCollector(pool._channels)
+
+        # Nothing has happened yet, so nothing is dead.
+        _, died = collect(0.05)
+        assert died == set()
 
         # Exactly what the OOM killer does: the process disappears without an exception.
         os.kill(original[0], 9)
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            if pool._worker_pids(0) and original[0] not in pool._worker_pids(0):
-                break
-            time.sleep(0.05)
-        else:
-            pytest.skip("mp.Pool did not replace the killed worker in time")
 
-        assert pool._worker_replaced(0)
-        assert pool._worker_pid[0] != original[0], "the dead pid was still being reported"
-        # Idempotent: having refreshed, the same worker no longer reads as replaced.
-        assert not pool._worker_replaced(0)
-        assert pool._worker_pid[1] == original[1], "an untouched worker was disturbed"
+        started = time.monotonic()
+        seen = set()
+        while time.monotonic() - started < 30.0 and not seen:
+            _, died = collect(0.5)
+            seen |= died
+        assert seen == {0}, "the killed worker was not detected"
+        # Detected in well under a pricing deadline -- the point of the sentinel.
+        assert time.monotonic() - started < 10.0
+        # And it stays dead: no replacement is spawned behind our back holding no duals.
+        assert not pool._channels[0].proc.is_alive()
+        assert pool._channels[1].proc.is_alive(), "an untouched worker was disturbed"
+        assert pool._worker_pid[1] == original[1]
 
 
 def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep():
@@ -1024,3 +1046,91 @@ def test_worker_skew_counts_workers_that_drew_no_tasks():
     assert skew["worker_skew"] == 3.0
     # And the old denominator would have said 1.5, i.e. half the real imbalance.
     assert timed._worker_skew(rows, n_workers=2)["worker_skew"] == 1.5
+
+
+def test_a_worker_ships_its_initializer_failure_with_the_readiness_message(monkeypatch):
+    """The failure has to reach the PARENT, or the pool waits on a worker that cannot work.
+
+    `_init_worker` records rather than raises, which is what stops a spawned worker dying
+    before it can say why. That only helps if someone carries the recorded traceback back:
+    `_worker_main` sends it with the readiness message, and `PricingPool.start` turns it
+    into a named failure of the whole pool instead of a hang.
+    """
+
+    class _FakeConn:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def recv(self):
+            return ("stop",)
+
+    def out_of_memory(*_args, **_kwargs):
+        raise MemoryError("label pool")
+
+    cfg = _cfg()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    monkeypatch.setattr(pricing_pool, "build_flight_graph", out_of_memory)
+    conn = _FakeConn()
+
+    pricing_pool._worker_main(
+        conn, 0, [_request(1, (-4, 0), (4, 0), cfg)], cfg, _params(),
+        StaticTerminalCatalog((), cfg),
+    )
+
+    assert conn.sent, "the worker exited without reporting anything"
+    tag, pid, init_error = conn.sent[0]
+    assert tag == "ready" and pid == os.getpid()
+    assert init_error is not None and "MemoryError: label pool" in init_error
+
+
+def test_close_does_not_wait_out_workers_that_cannot_hear_it():
+    """Teardown after an abandoned sweep must not be per-worker-timeout slow.
+
+    When a sweep ends early the parent stops draining, the pipes fill, and every surviving
+    worker blocks inside `send` -- so none of them will ever read `stop`, no matter where a
+    poll for it is placed (that was tried). Waiting on them individually made teardown take
+    `_CLOSE_JOIN_TIMEOUT_S` EACH: 15 s for three survivors, on a solve that had already
+    failed. One short shared grace window, then SIGKILL.
+    """
+
+    cfg = _cfg()
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in (1, 2, 3, 4)]
+    pool = PricingPool(
+        requests, cfg, _params(n_pricing_workers=4), StaticTerminalCatalog((), cfg)
+    )
+    pool.start()
+    procs = [ch.proc for ch in pool._channels]
+    started = time.monotonic()
+    pool.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < pricing_pool._CLOSE_JOIN_TIMEOUT_S, f"close took {elapsed:.1f}s"
+    for proc in procs:
+        assert not proc.is_alive(), "a worker survived close()"
+    assert pool._channels is None
+    pool.close()  # idempotent
+
+
+def test_results_already_in_the_pipe_survive_an_expired_deadline():
+    """Work that was done and delivered must not be thrown away by the clock.
+
+    The merge drains before it checks the deadline. Checking first would discard results
+    that had already arrived merely because the clock passed while they sat in the pipe --
+    flights that were priced, paid for, and belong in the prefix the sequential loop would
+    have kept.
+    """
+
+    order = [10, 11]
+    delivered = [(10, True, 1.0, None, 0.1, {"priced": 1}, {})]
+    accepted = _accepted_prefix(
+        _sweep_results(
+            _ScriptedCollector([({0: delivered}, set())]), 1, order, {10: 0, 11: 0},
+            deadline=0.0,
+        )
+    )
+    assert accepted.flight_ids == (10,), "a delivered result was dropped by the deadline"
+    assert accepted.timeout_flight_id == 11
+    assert not accepted.complete

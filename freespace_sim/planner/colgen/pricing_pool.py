@@ -33,13 +33,11 @@ a 50-flight density instance -- and an OOM-killed worker hangs this sweep rather
 failing it (see the deadlock note below). Speed is not the constraint: 3.5x at 4 workers.
 
 **The pool is SOLVE-scoped, and the worker assignment is why that is worth anything.**
-:class:`PricingPool` holds W single-worker ``mp.Pool`` instances and pins each flight to one
-of them for the whole solve (:func:`_worker_assignment`), so a worker keeps the state it
-derived for its own flights instead of deriving it again every iteration. Per-sweep duals
-arrive as a task rather than through the initializer, stamped with an epoch that
-:func:`_price_one` refuses to price against if it does not match -- because ``mp.Pool``
-replaces a dead worker by re-running the ORIGINAL initargs, and the replacement would
-otherwise price with no duals at all and return a plausible wrong number.
+:class:`PricingPool` holds W long-lived processes, one duplex ``Pipe`` each, and pins every
+flight to one of them for the whole solve (:func:`_worker_assignment`) -- so a worker keeps
+the state it derived for its own flights instead of deriving it again every iteration.
+Per-sweep duals arrive as a message rather than through an initializer, stamped with an
+epoch :func:`_price_one` refuses to price against if it does not match.
 
 **Two costs this removes, and the second is the one that was invisible.**
 
@@ -68,32 +66,37 @@ costs to rebuild (0.11 ms) and what its cache costs to rebuild (~184 ms) are thr
 of magnitude apart, and only the first was ever measured. Keeping the WORKER is what keeps
 the cache; shipping the graph never could.
 
-**``mp.Pool``, never ``ProcessPoolExecutor``.** The latter deadlocks on CPython 3.14.2 when
-``max_tasks_per_child`` fires -- see ``[[colgen-parallel-pricing-pool]]``. For the same
-reason no worker-recycling budget is set here.
+**Raw processes and pipes, not ``mp.Pool`` and not ``ProcessPoolExecutor``.** The executor
+deadlocks on CPython 3.14.2 when ``max_tasks_per_child`` fires. ``mp.Pool`` was used here
+first and had a worse problem for a SOLVE-scoped pool: its handler threads sit between the
+parent and the worker, and the task handler blocks forever writing to the input queue of a
+worker that was SIGKILLed while holding that queue's lock. ``terminate()`` takes no timeout,
+so teardown could only be bounded from outside -- leaving the blocked thread behind. A pipe
+has no intermediary, so ``close`` is bounded by construction. ``freespace_sim.parallel``
+runs the same shape for the A* speculative runner.
 
 **macOS spawn hazard, deliberately accepted.** Under the ``spawn`` start method a caller
 script that does work at module level rather than under ``if __name__ == "__main__":`` dies
 in ``_check_not_importing_main``. Every shipped entry point already guards its main.
 
-**A worker KILLED mid-task no longer hangs the sweep.** ``mp.Pool`` does not fail a task
-whose worker died: ``_repopulate_pool_static`` starts a replacement and the task's result
-is simply never produced, so an unguarded ``imap`` waits for it forever -- and the solver's
-own time limit never fires, because the parent is blocked inside the sweep rather than
-checking a clock. The realistic trigger is the OOM killer, which is reachable rather than
-hypothetical: memory is linear in workers.
+**A worker KILLED mid-sweep is an event, not a timeout.** The parent waits on every
+worker's pipe AND its process sentinel, so an OOM kill -- reachable rather than
+hypothetical, since memory is linear in workers -- wakes the wait immediately and is
+reported as ``pool_worker_lost``. Under ``mp.Pool`` the same failure produced a task whose
+result was simply never sent, so it could only be inferred after the entire pricing
+deadline had elapsed, and even then only by comparing pids against a silently spawned
+replacement.
 
-:func:`_sweep_results` bounds the wait by the caller's own ``pricing_deadline`` and reports
-a lost result as that flight timing out, so the sweep degrades to a short prefix instead of
-blocking. Bounding it by a deadline the caller already owns is what makes this safe to add
-without inventing a grace period, and without reaching for the pool implementation that
-deadlocks on this interpreter. It also merges the per-worker result
-streams back into ``pricing_order`` order, which rule 2 requires and which a queue per
-worker no longer gives for free.
+:func:`_sweep_results` still bounds its wait by the caller's own ``pricing_deadline``, so a
+worker that is merely SLOW degrades to a short prefix rather than blocking, and the two
+outcomes are reported differently: a death says use fewer workers, an expiry says raise the
+budget. It also merges the per-worker result streams back into ``pricing_order`` order,
+which rule 2 requires and which a queue per worker does not give for free.
 
-A worker that fails in its *initializer* is a different failure with the same symptom, and
-is handled separately: ``mp.Pool`` calls the initializer outside the try/except that wraps
-a task, so :func:`_init_worker` records the traceback and :func:`_price_one` re-raises it.
+A worker that fails in its *initializer* is a different failure with the same symptom:
+:func:`_init_worker` records the traceback rather than raising, :func:`_worker_main` sends
+it with the readiness message, and :meth:`PricingPool.start` fails the whole pool with the
+cause attached.
 """
 from __future__ import annotations
 
@@ -101,9 +104,9 @@ import collections
 import itertools
 import logging
 import multiprocessing as mp
+import multiprocessing.connection as mp_connection
 import os
 import pickle
-import threading
 import time
 import traceback
 import uuid
@@ -143,6 +146,11 @@ __all__ = [
 # work, and the only way it expires is a process stuck in uninterruptible I/O -- which
 # waiting longer would not fix either.
 _CLOSE_JOIN_TIMEOUT_S = 5.0
+
+# How long `close` waits for workers to stop POLITELY before killing them. An idle
+# worker exits in milliseconds; anything slower is one that cannot see the message at
+# all, so waiting longer only delays a teardown that is already going to be a kill.
+_GRACEFUL_STOP_S = 0.5
 
 
 # How long the result merge blocks before re-checking whether a worker is still alive.
@@ -236,28 +244,101 @@ class _WorkerStartTimeout(RuntimeError):
     """
 
 
-def _terminate_quietly(pool) -> None:
-    """`Pool.terminate()` with its exceptions swallowed, for use on a daemon thread."""
+class _WorkerChannel:
+    """One worker process and the pipe to it."""
 
-    try:
-        pool.terminate()
-    except Exception:
-        pass
+    __slots__ = ("index", "proc", "conn", "pid", "dead")
+
+    def __init__(self, index: int, proc, conn):
+        self.index = index
+        self.proc = proc
+        self.conn = conn
+        self.pid: int | None = None
+        self.dead = False
+
+    def send(self, message) -> None:
+        self.conn.send(message)
+
+    def close(self) -> None:
+        for shut in (self.conn.close,):
+            try:
+                shut()
+            except Exception:
+                pass
+
+
+class _PipeCollector:
+    """Drain whatever the workers have produced, and notice the ones that have died.
+
+    Waits on every live worker's pipe AND its process sentinel in one
+    ``multiprocessing.connection.wait``. The sentinel is what makes death immediate: it
+    becomes readable the moment the process exits, so an OOM kill is observed as an event
+    rather than inferred from a result that never comes.
+
+    Drains EVERY ready pipe, not only the one the merge is currently blocked on. That is
+    required, not tidy: a column is ~13.7 KB against a ~64 KB pipe buffer, so a worker whose
+    results nobody reads blocks after a handful of them and stops making progress on flights
+    the merge will need later.
+    """
+
+    def __init__(self, channels):
+        self._channels = list(channels)
+
+    def __call__(self, timeout: float | None):
+        live = [ch for ch in self._channels if not ch.dead]
+        if not live:
+            return {}, set()
+        waitables: dict[Any, tuple[_WorkerChannel, bool]] = {}
+        for ch in live:
+            waitables[ch.conn] = (ch, True)
+            waitables[ch.proc.sentinel] = (ch, False)
+        ready = mp_connection.wait(list(waitables), timeout)
+
+        collected: dict[int, list] = {}
+        died: set[int] = set()
+        for handle in ready:
+            channel, is_pipe = waitables[handle]
+            if not is_pipe:
+                # The sentinel fired. Its pipe may still hold results the worker sent
+                # before exiting, and those are perfectly good -- drain them below rather
+                # than discarding work that was already done.
+                channel.dead = True
+                died.add(channel.index)
+                continue
+            while True:
+                try:
+                    if not channel.conn.poll():
+                        break
+                    message = channel.conn.recv()
+                except (EOFError, OSError):
+                    channel.dead = True
+                    died.add(channel.index)
+                    break
+                if message[0] == "results":
+                    collected.setdefault(channel.index, []).extend(message[1])
+                elif message[0] == "error":
+                    raise RuntimeError(
+                        f"pricing worker {channel.index} raised:\n{message[1]}"
+                    )
+        # A worker that exited cleanly at the end of its assignment is not a failure, but
+        # the merge cannot tell the difference and does not have to: it only consults
+        # `died` when it is still WAITING on that worker for a flight.
+        return collected, died
 
 
 class StalePricingWorker(RuntimeError):
     """A worker was handed a task from a sweep whose state it does not hold.
 
-    Carries a single string so it survives the trip back through ``imap`` intact.
+    Carries a single string so it survives the trip back down the pipe intact.
 
-    There is exactly one way to reach this, and it is why the class exists: ``mp.Pool``
-    silently replaces a worker that DIED, and ``_repopulate_pool_static`` re-runs the
-    ORIGINAL ``initargs``.  Under a solve-scoped pool those initargs carry solve constants
-    only -- the duals arrive per sweep, as a task -- so the replacement comes back with no
-    sweep state at all.  Without this check it would price against whatever it happened to
-    hold and return a reduced cost that ``master.upper_bound`` would treat as a valid
-    bound: a wrong number, with no exception and no log line.  The OOM killer makes that
-    reachable rather than hypothetical (see the memory note in the module docstring).
+    Kept as defence in depth rather than as the load-bearing guard it once was. Under
+    ``mp.Pool`` a dead worker was silently REPLACED, re-running the original initargs --
+    which carry solve constants only, since the duals arrive per sweep -- so the
+    replacement would price against no duals at all and return a reduced cost
+    ``master.upper_bound`` accepts as a valid bound: a wrong number, no exception, no log
+    line. Raw processes are not replaced, so that path is gone; what remains is a parent
+    bug dispatching against state a worker does not hold, which this still turns into an
+    exception rather than a number.
     """
 
 
@@ -267,7 +348,7 @@ def _worker_assignment(flight_ids, n_workers: int) -> dict[int, int]:
     Keyed on the FLIGHT, not on its position in ``pricing_order`` -- that order is re-sorted
     every sweep (``solver`` ranks by the heuristic's delay), so a positional rule would send
     a flight to a different worker each iteration and the retained packing would never be
-    hit.  That is not a small effect: on ``mp.Pool``'s single shared queue a flight visits
+    hit.  That is not a small effect: on a single shared queue a flight visits
     ``W(1 - (1 - 1/W)^I)`` distinct workers, which is 5.14 of 6 at 16 workers and 6
     iterations, so a solve-scoped pool WITHOUT this recovers about 14% of the rebuild.
 
@@ -402,17 +483,11 @@ def _init_worker(
     must see the identical wall catalogue, and re-deriving it here would be a second source
     of truth for something the parent already snapshotted.  It pickles to 12.2 KB.
 
-    A failure here is RECORDED, never raised, and that is a hang the parent would otherwise
-    have no way out of.  ``mp.Pool`` calls the initializer outside the try/except that wraps
-    a task, so an exception kills the worker before it reads its first one,
-    ``_repopulate_pool_static`` immediately starts a replacement, and the replacement dies
-    on the same argument -- forever, at full CPU, while the parent's ``imap`` waits for a
-    result no worker will ever produce and nothing is printed.  Rebuilding every graph is
-    also the largest allocation a worker makes, so ``MemoryError`` -- the failure the
-    ``n_workers`` ceiling is about -- lands exactly here.  :func:`_price_one` re-raises it
-    from the first task instead, which reaches the caller as an ordinary traceback.  That
-    contract matters MORE under a solve-scoped pool, not less: the respawn loop it prevents
-    would now last the whole solve rather than one sweep.
+    A failure here is RECORDED, never raised, and :func:`_worker_main` ships it with the
+    readiness message so the parent fails the pool with the cause attached. Rebuilding
+    every graph is the largest allocation a worker makes, so ``MemoryError`` -- the failure
+    the ``n_workers`` ceiling is about -- lands exactly here, and a worker that merely
+    exited would otherwise be indistinguishable from one that was killed.
     """
 
     _WORKER.clear()
@@ -468,9 +543,9 @@ def _load_sweep_state(
     _WORKER.pop("sweep_error", None)
     try:
         # Not untrusted input: this buffer was produced by `PricingPool.run_sweep` in the
-        # parent of this very process and handed over `mp.Pool`'s own task queue, which
-        # pickles every argument anyway. Pre-pickling changes WHEN the mapping is
-        # serialized (once, not once per worker), not whether.
+        # parent of this very process and handed down a pipe that pickles every message
+        # anyway. Pre-pickling changes WHEN the mapping is serialized (once, not once per
+        # worker), not whether.
         duals = pickle.loads(duals_blob)
         # `DualView` is rebuilt here rather than pickled so the worker owns its own caches.
         # `time.monotonic` is a system-wide clock on both Linux and macOS, so a deadline
@@ -482,18 +557,81 @@ def _load_sweep_state(
         _WORKER["sweep_error"] = traceback.format_exc()
 
 
-def _worker_identity(_ignored=None) -> tuple:
-    """``(worker, pid)`` -- the only way a caller can prove a worker was REUSED.
+def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
+    """One pricing worker: build this worker's flights, then serve the parent's pipe.
 
-    Re-raises an initializer failure for the same reason :func:`_price_one` does: this runs
-    as :meth:`PricingPool.start`'s readiness probe, and a probe that ignored `init_error`
-    would block forever against a worker whose replacement dies the same way.
+    Replaces ``mp.Pool``'s task queue, and the reason is teardown. A pool's handler THREADS
+    sit between the parent and the worker, and the task handler can block forever writing to
+    the input queue of a worker that was SIGKILLed while holding that queue's lock -- so
+    ``terminate()`` had no bound, and bounding it from outside could only ever leave the
+    blocked thread behind. A pipe has no such intermediary: the parent holds the only other
+    end, the process either exits or is killed, and both are observable and bounded.
+
+    Two more things fall out, neither of which ``mp.Pool`` could give:
+
+    * **Death is a sentinel, not a timeout.** The parent waits on this pipe AND on the
+      process sentinel, so a worker that dies is known immediately instead of after the
+      pricing deadline expires -- which is how a worker lost in the first second of a
+      1,200 s budget used to consume all 1,200.
+    * **No silent respawn.** ``_repopulate_pool_static`` restarted a dead worker with the
+      ORIGINAL initargs, which carry no duals, so the replacement would have priced against
+      nothing. Here a dead worker stays dead and is reported.
+
+    Messages, FIFO per pipe (the ordering `_load_sweep_state` relies on -- a sweep's duals
+    are always drained before the tasks that read them):
+
+      ("sweep", epoch, duals_blob, flight_duals, known_columns, deadline)  -> install duals
+      ("price", epoch, flight_ids, chunksize)  -> stream ("results", [...]) per chunk
+      ("stop",)                                -> exit
+
+    Results are streamed per CHUNK rather than per message-batch so the parent can drain
+    them as they are produced. That is flow control, not cosmetics: a column is ~13.7 KB and
+    a pipe buffer is ~64 KB, so a worker that produced everything before sending would block
+    on a full pipe while the parent waited for a different one.
     """
 
-    init_error = _WORKER.get("init_error")
-    if init_error is not None:
-        raise RuntimeError(f"pricing worker failed to initialise:\n{init_error}")
-    return (_WORKER.get("worker_index"), os.getpid())
+    try:
+        _init_worker(worker_index, requests, cfg, params, catalog)
+        # The initializer RECORDS rather than raises (see `_init_worker`), so the error --
+        # if any -- rides the readiness message. The parent then fails the whole pool with
+        # the cause, instead of discovering it on some later flight.
+        conn.send(("ready", os.getpid(), _WORKER.get("init_error")))
+    except BaseException:  # noqa: BLE001 - the parent must learn about ANY startup failure
+        try:
+            conn.send(("ready", os.getpid(), traceback.format_exc()))
+        except Exception:
+            pass
+        return
+
+    while True:
+        try:
+            message = conn.recv()
+        except (EOFError, KeyboardInterrupt):
+            return
+        tag = message[0]
+        if tag == "stop":
+            return
+        if tag == "sweep":
+            _, epoch, duals_blob, flight_duals, known_columns, deadline = message
+            _load_sweep_state(epoch, duals_blob, flight_duals, known_columns, deadline)
+            continue
+        if tag == "price":
+            _, epoch, flight_ids, chunksize = message
+            try:
+                for start in range(0, len(flight_ids), chunksize):
+                    chunk = flight_ids[start:start + chunksize]
+                    conn.send(("results", _price_batch((epoch, chunk))))
+                    # NOT polled for `stop` between chunks, which was tried and does not
+                    # work: when the parent abandons a sweep it stops draining, the pipe
+                    # fills, and the worker blocks inside `send` -- so it never reaches a
+                    # poll no matter where one is put. Teardown handles it by killing,
+                    # which is why `close` keeps its grace window short.
+            except BaseException:  # noqa: BLE001 - reported, never allowed to kill the pipe
+                try:
+                    conn.send(("error", traceback.format_exc()))
+                except Exception:
+                    pass
+            continue
 
 
 def _price_one(epoch: tuple, flight_id: int):
@@ -519,8 +657,8 @@ def _price_one(epoch: tuple, flight_id: int):
     timeout under a pool.
 
     A timeout is reported rather than raised for a related reason: propagating it would
-    make `mp.Pool` pickle and re-raise the exception in the parent, and a timeout here is
-    an ordinary outcome, not a failure.
+    make the parent re-raise it, and a timeout here is an ordinary outcome, not a
+    failure.
     """
 
     init_error = _WORKER.get("init_error")
@@ -537,7 +675,7 @@ def _price_one(epoch: tuple, flight_id: int):
         raise StalePricingWorker(
             f"worker {_WORKER.get('worker_index')!r} (pid {os.getpid()}) holds sweep state {held!r} "
             f"but was asked to price flight {flight_id} for sweep {epoch!r}; it was almost "
-            f"certainly respawned after dying -- see mp.Pool._repopulate_pool_static"
+            f"certainly a dispatch against state it was never sent"
         )
     if flight_id not in _WORKER["worker_flights"]:
         # A named error rather than a bare KeyError three frames down, and a real
@@ -716,15 +854,18 @@ def _flight_record(flight_id: int, task_s: float, *, priced: bool, search=None) 
 class PricingPool:
     """Worker processes that outlive the sweep, one worker each.
 
-    **Why W single-worker pools and not one W-worker pool.** ``mp.Pool`` has a single shared
-    task queue, so it can express neither "keep this worker" nor "send this flight to THAT
-    worker" -- and the second is what makes the first worth having (see
-    :func:`_worker_assignment`). One single-worker pool each gives both for free, and keeps everything
-    ``mp.Pool`` was chosen for: ``imap(..., 1)`` still returns the ``IMapIterator`` whose
-    ``.next(timeout)`` the deadline guard needs, :func:`_init_worker`'s record-don't-raise
-    contract is untouched, and the feeder thread means the parent never blocks pushing a
-    multi-megabyte dual payload into a worker that is still returning results -- the
-    deadlock class ``parallel.py`` had to invent an idle-only outbox flush to avoid.
+    **Why a pipe per worker rather than a shared task queue.** A queue can express neither
+    "keep this worker" nor "send this flight to THAT worker", and the second is what makes
+    the first worth having (see :func:`_worker_assignment`). A pipe per process gives both,
+    and gives two things a queue cannot: the parent can wait on a worker's PROCESS SENTINEL
+    beside its results, so death is an event rather than a result that never comes; and
+    teardown has no handler thread to get stuck behind, so :meth:`close` is bounded by
+    construction rather than by a timeout wrapped around something unbounded.
+
+    Sending never blocks on a busy peer, which is the hazard ``parallel.py`` had to invent
+    an idle-only outbox flush to avoid. Both parent sends happen at sweep start, when every
+    worker is idle in ``recv``; the only large payload flows the other way, and the parent
+    drains every ready pipe on each wait rather than only the one it needs.
 
     **What this actually buys.** Two things, and the second was the larger one when measured:
 
@@ -759,7 +900,7 @@ class PricingPool:
         self._worker_requests: list[list] = [[] for _ in range(self._n_workers)]
         for request in self._requests:
             self._worker_requests[self._worker_of[request.flight_id]].append(request)
-        self._pools: list | None = None
+        self._channels: list | None = None
         self._worker_pid: dict[int, int] = {}
         # A pool instance's own id, so an epoch from a DIFFERENT pool can never compare
         # equal to one of ours -- belt and braces against a future caller that builds two.
@@ -771,107 +912,79 @@ class PricingPool:
     def worker_of(self) -> dict[int, int]:
         return dict(self._worker_of)
 
-    def _worker_pids(self, worker: int) -> tuple:
-        """The live pids behind one worker slot, or `()` if the pool is gone.
-
-        Reads ``Pool._pool``, which is private, for the same reason the module docstring
-        reasons about ``_repopulate_pool_static``: the replacement behaviour this has to
-        detect is not exposed anywhere public.
-        """
-
-        if self._pools is None:
-            return ()
-        try:
-            return tuple(proc.pid for proc in self._pools[worker]._pool)
-        except Exception:
-            return ()
-
-    def _worker_replaced(self, worker: int) -> bool:
-        """Has this slot's process changed since it was last identified?
-
-        `mp.Pool` restarts a dead worker silently, so a changed pid is the observable that
-        a worker died -- and the only one available once its result has been lost. Refreshes
-        the recorded pid, so `_annotate` reports the process that is actually there rather
-        than the one that started the solve.
-        """
-
-        pids = self._worker_pids(worker)
-        if not pids:
-            return False
-        known = self._worker_pid.get(worker)
-        if known in pids:
-            return False
-        self._worker_pid[worker] = pids[0]
-        return known is not None
-
     def start(self, deadline: float | None = None) -> float:
         """Bring the workers up. Idempotent; returns seconds spent, 0.0 if already running.
 
-        ``deadline`` bounds the readiness probe, and bounding it matters: a worker
-        SIGKILLed during its initializer produces no exception and no result, so an
-        unbounded probe waits forever while `mp.Pool` respawns replacements that die the
-        same way -- outside any clock the solver owns. Bounded by the caller's OWN deadline
-        for the same reason :func:`_sweep_results` is: past it the sweep was going to stop
-        regardless, so no new number needs justifying. ``None`` blocks, which is the
-        documented behaviour for a caller that supplied no time limit.
+        ``deadline`` bounds the readiness wait, and bounding it matters: a worker killed
+        during its initializer produces no exception and no result, so an unbounded wait
+        would sit outside every clock the solver owns. Bounded by the caller's OWN deadline,
+        for the same reason :func:`_sweep_results` is.
         """
 
-        if self._pools is not None:
+        if self._channels is not None:
             return 0.0
         started = time.perf_counter()
         # `spawn` explicitly rather than by platform default: `fork` would inherit the
         # parent's numba runtime and thread state, which is exactly the combination that is
         # unsafe.
         ctx = mp.get_context("spawn")
-        # Appended one at a time, and `self._pools` bound BEFORE the loop, so a failure
-        # partway through leaves the pools that were created reachable by `close()` rather
-        # than orphaned with live worker processes.  `MemoryError` here is the realistic
-        # case and is exactly when leaking 15 of 16 workers would hurt most.
-        self._pools = []
+        # Bound to the list BEFORE the loop, so a failure partway through leaves the
+        # processes that were created reachable by `close()` rather than orphaned.
+        self._channels = []
         try:
             for worker in range(self._n_workers):
-                # CHECKED BEFORE EACH CONSTRUCTOR, not only before the readiness probes.
-                # `ctx.Pool()` is synchronous and not cancelable, and `spawn` re-pickles
-                # the initargs per worker, so a deadline consulted only afterwards still
-                # pays the whole serial ramp -- ~4.5 s x W, about a minute at 16 workers,
-                # for a solve that had already run out of time before it started. This
-                # bounds the overrun to the one worker already in flight; bounding it to
-                # zero needs a bootstrap that can be interrupted, i.e. not `mp.Pool`.
+                # CHECKED BEFORE EACH SPAWN, not only before the readiness wait. Starting a
+                # process is synchronous and `spawn` re-pickles the arguments each time, so
+                # a deadline consulted only afterwards still pays the whole serial ramp --
+                # ~4.5 s per worker, about a minute at 16, for a solve already out of time.
                 if deadline is not None and time.monotonic() >= deadline:
                     raise _WorkerStartTimeout(
                         f"the pricing deadline passed while starting worker {worker} of "
                         f"{self._n_workers}"
                     )
-                self._pools.append(ctx.Pool(
-                    processes=1,
-                    initializer=_init_worker,
-                    initargs=(
-                        worker, self._worker_requests[worker], self._cfg, self._params,
-                        self._catalog,
+                parent_conn, child_conn = ctx.Pipe()
+                proc = ctx.Process(
+                    target=_worker_main,
+                    args=(
+                        child_conn, worker, self._worker_requests[worker], self._cfg,
+                        self._params, self._catalog,
                     ),
-                ))
-            # Block until every worker has finished its initializer. Two reasons:
-            # `pool_setup_s` is then honest rather than half-charged to the first sweep's
-            # tasks, and an initializer `MemoryError` surfaces HERE, named, instead of on
-            # some later flight.
-            #
-            # `apply_async(...).get(timeout)` rather than `apply()`: the latter has no
-            # timeout, so a worker killed rather than raised during startup would hang the
-            # solve with no clock running.
-            probes = [pool.apply_async(_worker_identity, (None,)) for pool in self._pools]
-            for worker, probe in enumerate(probes):
+                    daemon=True,
+                )
+                proc.start()
+                # The parent's copy of the CHILD end is closed immediately, and that is what
+                # makes EOF meaningful: while any copy stays open in this process, a dead
+                # worker's pipe never reports end-of-file and death would be invisible.
+                child_conn.close()
+                self._channels.append(_WorkerChannel(worker, proc, parent_conn))
+
+            # Wait for every worker to report. Blocking here rather than on the first flight
+            # keeps `pool_setup_s` honest and surfaces an initializer failure named, at
+            # startup, instead of on some later flight.
+            for channel in self._channels:
                 remaining = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
-                try:
-                    _, pid = probe.get(remaining)
-                except mp.TimeoutError:
+                if not channel.conn.poll(remaining):
                     raise _WorkerStartTimeout(
-                        f"pricing worker {worker} did not become ready before the "
-                        f"pricing deadline; it was most likely killed during its "
-                        f"initializer, which produces no exception and no result"
-                    ) from None
-                self._worker_pid[worker] = pid
+                        f"pricing worker {channel.index} did not report ready before the "
+                        f"pricing deadline"
+                    )
+                try:
+                    tag, pid, init_error = channel.conn.recv()
+                except EOFError as exc:
+                    raise _WorkerStartTimeout(
+                        f"pricing worker {channel.index} died before reporting ready"
+                    ) from exc
+                if tag != "ready":
+                    raise RuntimeError(f"unexpected startup message: {tag!r}")
+                if init_error is not None:
+                    raise RuntimeError(
+                        f"pricing worker {channel.index} failed to "
+                        f"initialise:\n{init_error}"
+                    )
+                channel.pid = pid
+                self._worker_pid[channel.index] = pid
         except BaseException:
             self.close()
             raise
@@ -901,6 +1014,7 @@ class PricingPool:
                 (), (), (), pricing_order[0] if pricing_order else None,
                 0.0, time.perf_counter() - attempt_started, Counter(), (), 0.0,
             )
+
         epoch = (self._uid, next(self._counter))
         # Pickled ONCE for all workers -- see `_load_sweep_state` for why the mapping cannot
         # be sliced and why one buffer beats W traversals.
@@ -910,50 +1024,41 @@ class PricingPool:
         for flight_id in pricing_order:
             worker_order[self._worker_of[flight_id]].append(flight_id)
 
-        # Started before any work is dispatched, and after `start()`, so `wall_s` measures
-        # the sweep and `pool_setup_s` measures the launch. The predecessor folded the two
-        # together because it had no way to separate them.
         sweep_started = time.perf_counter()
-        worker_iters = []
-        for worker, pool in enumerate(self._pools):
-            own = set(worker_order[worker])
-            # FIFO on this worker's queue, so it is guaranteed to run before the tasks below
-            # it -- which is the entire delivery mechanism for per-sweep duals, and works
-            # only because the worker has exactly one worker.
-            pool.apply_async(
-                _load_sweep_state,
-                (
-                    epoch,
-                    duals_blob,
-                    {f: flight_duals[f] for f in own if f in flight_duals},
-                    {f: c for f, c in known_columns.items() if f in own},
-                    deadline,
-                ),
-            )
-            # Chunked HERE rather than by `imap`, and that is a correctness requirement.
-            # `Pool.imap` only returns an `IMapIterator` when `chunksize == 1`; above 1 it
-            # returns `(item for chunk in result for item in chunk)` -- a plain generator,
-            # which has no `.next(timeout)`, so the deadline guard would raise
-            # `AttributeError` before yielding a single result.
-            chunks = [
-                (epoch, worker_order[worker][i:i + self._params.pricing_chunksize])
-                for i in range(0, len(worker_order[worker]), self._params.pricing_chunksize)
-            ]
-            worker_iters.append(pool.imap(_price_batch, chunks, 1))
+        for channel in self._channels:
+            own = set(worker_order[channel.index])
+            # FIFO on this worker's pipe, so the duals are installed before the tasks that
+            # read them. That ordering is the whole delivery mechanism, and it works because
+            # the worker is idle in `recv` at this moment -- so neither send can block on a
+            # busy peer.
+            channel.send((
+                "sweep",
+                epoch,
+                duals_blob,
+                {f: flight_duals[f] for f in own if f in flight_duals},
+                {f: c for f, c in known_columns.items() if f in own},
+                deadline,
+            ))
+            # ONE message carrying every flight this worker owns, rather than one per chunk:
+            # it is a list of ints, so it cannot fill the pipe, and the worker streams the
+            # RESULTS back in `pricing_chunksize` pieces, which is where flow control is
+            # actually needed.
+            channel.send((
+                "price", epoch, worker_order[channel.index],
+                max(1, int(self._params.pricing_chunksize)),
+            ))
 
+        progress = _SweepProgress(len(pricing_order), self._n_workers)
         try:
             accepted = _accepted_prefix(
                 _sweep_results(
-                    worker_iters, pricing_order, self._worker_of, deadline,
-                    self._worker_replaced,
+                    _PipeCollector(self._channels), self._n_workers, pricing_order,
+                    self._worker_of, deadline, progress,
                 )
             )
         except BaseException as exc:
-            # Same reasoning as the incomplete-sweep case below: the per-worker iterators are
-            # half consumed and their tasks are still running, so this pool cannot be
-            # trusted for another sweep.  Reached when the merge catches the worker split and
-            # itself disagreeing, and when a task raises `StalePricingWorker` outside the
-            # merge's own handler.
+            # The workers are mid-assignment and their pipes hold results nobody will read,
+            # so this pool cannot be trusted for another sweep.
             self._poisoned = f"sweep raised {type(exc).__name__}: {exc}"
             raise
         accepted = replace(
@@ -963,15 +1068,13 @@ class PricingPool:
             flight_records=self._annotate(accepted.flight_records),
         )
         if not accepted.complete:
-            # The prefix stopped early, so this worker's `imap` is half-consumed and tasks are
-            # still running behind it. Rather than reason about how those interleave with a
-            # next sweep, refuse one: an incomplete sweep ALWAYS ends the solve (`solver`
-            # sets `pricing_complete = False` and breaks), so there is no reachable caller
-            # that wants another. A future refactor that changes that gets this exception
-            # instead of a silently interleaved sweep.
+            # The prefix stopped early, so the workers are still working and their pipes
+            # still hold results. Rather than reason about how those interleave with a next
+            # sweep, refuse one: an incomplete sweep ALWAYS ends the solve (`solver` sets
+            # `pricing_complete = False` and breaks), so no reachable caller wants another.
             self._poisoned = (
                 f"sweep ended early at flight {accepted.timeout_flight_id}; "
-                f"outstanding tasks were abandoned"
+                f"outstanding work was abandoned"
             )
         return accepted
 
@@ -979,23 +1082,19 @@ class PricingPool:
         """Add ``worker`` and ``pid`` to each diagnostic row.
 
         Done in the PARENT rather than returned by the worker, which is possible only
-        because the assignment is static: the worker follows from the flight id alone, and the
-        pid from the worker. That keeps `_price_one`'s result tuple, `_accepted_prefix` and
-        `_flight_record` untouched -- the reduction rule this module exists to enforce reads
-        as unchanged in the diff, which is worth more than saving a dict copy.
+        because the assignment is static: the worker follows from the flight id alone, and
+        the pid from the worker. That keeps `_price_one`'s result tuple, `_accepted_prefix`
+        and `_flight_record` untouched -- the reduction rule this module exists to enforce
+        reads as unchanged in the diff.
 
         These two keys are what make worker skew observable -- the risk the fixed split
-        takes is that `mp.Pool`'s rebalancing is gone, and `max` over `mean` of per-worker
+        takes is that dynamic rebalancing is gone, and `max` over `mean` of per-worker
         `task_s` is the number that says whether it needs to be cost-aware.
 
-        Observable is not the same as recorded, and the difference matters: these rows reach
-        a caller only through `solve`'s per-iteration callback, are never returned in
-        `stats`, and are skipped entirely when a sweep ends early. Anything that wants the
-        skew after the fact has to aggregate them as they go, which is what
-        `analysis/run_colgen_timed.py:_worker_skew` does.
-
-        `pid` is refreshed by `_worker_replaced` rather than frozen at startup, so a
-        replaced worker is not reported under the pid of the process it replaced.
+        Observable is not the same as recorded: these rows reach a caller only through
+        `solve`'s per-iteration callback, are never returned in `stats`, and are skipped
+        when a sweep ends early. Anything wanting the skew afterwards has to aggregate them
+        as they go, which is what `analysis/run_colgen_timed.py:_worker_skew` does.
         """
 
         annotated = []
@@ -1007,61 +1106,47 @@ class PricingPool:
         return tuple(annotated)
 
     def close(self) -> None:
-        """Terminate the workers. Idempotent, and bounded.
+        """Stop the workers. Idempotent, bounded, and it leaks nothing.
 
-        **Ordinary teardown first, escalating to a kill only if it sticks.** The reverse --
-        killing the processes and then terminating -- reads as the safer order and is much
-        worse: it guarantees the task handler has a dead queue to wait on, so every healthy
-        teardown pays the full timeout. Measured, that version made a 4-worker parity arm
-        0.56x, i.e. slower than using no pool at all.
-
-        ``pool.join()`` is deliberately NOT called: it waits on the same handler threads,
-        takes no timeout, and they are daemons, so waiting on them is unbounded while
-        leaving them is not.
-
-        **What this does not fix.** If the ORIGINAL worker died holding the input queue's
-        lock, killing its replacement cannot release that lock, so the ``terminate()``
-        thread stays blocked and is left behind: one leaked daemon thread and its queue
-        graph per pool that lost a worker, and ``_CLOSE_JOIN_TIMEOUT_S`` of delay. That is
-        a bounded, once-per-solve cost on a solve that is already failing, and it beats the
-        indefinite hang it replaced -- but it is a leak, and calling it anything else would
-        be wrong. Teardown that is bounded *by construction* needs explicit
-        ``Process``/``Pipe`` workers with sentinel monitoring rather than ``mp.Pool``'s
-        queues, which is a larger change than this one.
+        Three escalating steps, none of which can block indefinitely: ask each worker to
+        stop, wait a bounded time for it to exit, then SIGKILL whatever is still alive and
+        reap it. There are no handler threads between the parent and the worker, which is
+        what makes this statement possible at all -- the previous ``mp.Pool`` transport
+        could only ever bound ``terminate()`` from outside and leave its blocked thread
+        behind, because that thread was waiting on the input-queue lock of a worker that
+        had died holding it.
         """
 
         self._poisoned = self._poisoned or "closed"
-        for pool in self._pools or ():
-            # ORDINARY TEARDOWN FIRST, on a daemon thread and bounded. `terminate()` joins
-            # the pool's own handler threads and takes no timeout of its own, so it cannot
-            # be trusted inline -- but with healthy workers it returns in milliseconds, and
-            # it is the path that actually closes the queues.
-            closer = threading.Thread(target=_terminate_quietly, args=(pool,), daemon=True)
-            closer.start()
-            closer.join(_CLOSE_JOIN_TIMEOUT_S)
-            if not closer.is_alive():
-                continue
-            # Stuck: the task handler is blocked writing to the input queue of a worker
-            # that died holding its lock, which is the failure a solve-scoped pool makes
-            # reachable by leaving workers idle between sweeps. Killing the processes is
-            # what unblocks it.
-            #
-            # The order matters and is easy to get backwards -- killing FIRST looks like
-            # the safe move and is the expensive one, because it guarantees the handler has
-            # a dead queue to wait on and every teardown then pays the full timeout. That
-            # cost is not hypothetical: it made a 4-worker parity arm 0.56x, i.e. slower
-            # than no pool at all.
-            for proc in list(getattr(pool, "_pool", ()) or ()):
-                try:
-                    if proc.is_alive():
-                        proc.kill()
-                except Exception:
-                    pass
-            # Not joined again. Killing the REPLACEMENT cannot release a lock the ORIGINAL
-            # died holding, so a second wait buys nothing in the case that reaches here and
-            # doubles the delay -- 10 s per affected pool rather than 5 -- for a thread
-            # that is being left behind either way. See the docstring.
-        self._pools = None
+        channels = self._channels or ()
+        for channel in channels:
+            try:
+                channel.send(("stop",))
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        # ONE short grace window shared by all of them, not `_CLOSE_JOIN_TIMEOUT_S` each.
+        # An idle worker sees `stop` and exits in milliseconds, so the polite path costs
+        # nothing; a worker mid-assignment is blocked writing into a pipe the parent has
+        # stopped draining and will NEVER see `stop`, so waiting on it is pure delay. That
+        # is not hypothetical -- per-worker joins made teardown after a lost worker take
+        # 15 s for three survivors, on a solve that had already failed.
+        graceful_until = time.monotonic() + _GRACEFUL_STOP_S
+        for channel in channels:
+            try:
+                channel.proc.join(max(0.0, graceful_until - time.monotonic()))
+            except Exception:
+                pass
+        for channel in channels:
+            try:
+                if channel.proc.is_alive():
+                    channel.proc.kill()
+                    # Reaping a SIGKILLed process, which is prompt; the longer bound is
+                    # only here so a process wedged in uninterruptible I/O cannot hang us.
+                    channel.proc.join(_CLOSE_JOIN_TIMEOUT_S)
+            except Exception:
+                pass
+            channel.close()
+        self._channels = None
 
     def __enter__(self) -> "PricingPool":
         return self
@@ -1092,117 +1177,84 @@ def _sweep_parallel(
 def _price_batch(task):
     """Price one chunk of flights in a worker, in order.
 
-    Module level because `spawn` pickles by qualified name. Exists so the sweep can hand
-    `imap` a chunksize of one whatever `pricing_chunksize` is -- see the note in
-    :meth:`PricingPool.run_sweep`.
-
-    Takes ONE argument, still, so `imap`'s return type stays `IMapIterator`; the epoch rides
-    inside it rather than as a second parameter.
+    Module level because `spawn` pickles by qualified name. Kept as its own function, taking
+    one packed argument, because the in-process tests drive it directly to exercise a
+    worker's pricing path without spawning anything.
     """
 
     epoch, flight_ids = task
     return [_price_one(epoch, flight_id) for flight_id in flight_ids]
 
 
-def _sweep_results(worker_iters, pricing_order, worker_of, deadline, worker_replaced=None):
+def _sweep_results(collect, n_workers, pricing_order, worker_of, deadline, progress=None):
     """Merge the per-worker result streams into ``pricing_order`` order, bounded by ``deadline``.
 
-    Without the deadline the sweep can wait forever, and the solver's own time limit never
-    gets a chance to fire. ``mp.Pool`` does not fail a task whose worker DIED: the sentinel
-    thread starts a replacement and the lost task's result is simply never produced, so the
-    ordered iterator blocks on a value nobody will send. The realistic trigger is the OOM
-    killer, which is reachable rather than hypothetical here -- memory is linear in workers
-    (22.7 GB at 8 on density x100) and that is what the ``n_workers`` ceiling exists for.
+    ``collect(timeout) -> (results_by_worker, died)`` is the only thing this needs from the
+    transport, which is what lets it be tested without processes at all.
 
-    The bound is the caller's OWN absolute deadline, not a grace period invented here.
-    That distinction is the reason this is safe: past ``deadline`` the sweep was going to
-    stop regardless, so nothing is abandoned that would otherwise have been kept.
+    **Death is an event now, not an inference.** ``collect`` waits on process sentinels
+    alongside the pipes, so a worker that dies is reported in ``died`` immediately. The
+    predecessor could only notice by waiting out the entire remaining budget and then asking
+    whether the process had changed -- so a worker lost in the first second of a 1,200 s
+    solve consumed all 1,200 before anyone said so, and even then it was a race.
 
-    A give-up is reported as **that flight timing out**, which is deliberate: it re-enters
-    the discard rule the sequential loop already defines, so the caller gets a short prefix
-    with ``timeout_flight_id`` set and ``complete`` False. Returning a truncated prefix that
-    merely *looked* complete would be far worse than the hang -- `master.upper_bound` would
-    take a bound over flights that were never priced.
+    The deadline still bounds the wait, and the bound is the caller's OWN absolute deadline
+    rather than a grace period invented here: past it the sweep was going to stop regardless,
+    so nothing is abandoned that would otherwise have been kept.
 
-    **Why there is no reorder buffer.** The predecessor of this function leaned on one
-    global FIFO -- "the k-th chunk is ``chunks[k]``" -- and that is gone, because each worker
-    is now its own queue. It is not needed: a worker's results are FIFO in the order that
-    worker's flights appear in ``pricing_order``, so the j-th result out of worker *w* IS the
-    j-th ``pricing_order`` entry assigned to *w*. Walking ``pricing_order`` and blocking on
-    the one worker that owns the next index therefore yields exactly index order, with a
-    deque per worker holding whatever arrived early.
+    Both give-ups are reported as **that flight timing out**, which re-enters the discard
+    rule the sequential loop already defines: the caller gets a short prefix with
+    ``timeout_flight_id`` set and ``complete`` False. A truncated prefix that merely *looked*
+    complete would be far worse than a hang -- ``master.upper_bound`` would take a bound over
+    flights that were never priced.
 
-    Blocking on that single worker costs nothing, and this is the subtle part: index order
-    means the next result is REQUIRED before any other can be emitted, so time spent
-    waiting for it is not time another worker's result could have used. That is what keeps
-    ``master.upper_bound``'s non-associative ``sum`` fed in a fixed order -- rule 2.
+    **Why there is no reorder buffer.** Each worker is its own queue, so the global FIFO the
+    original leaned on is gone. It is not needed: a worker's results are FIFO in the order
+    that worker's flights appear in ``pricing_order``, so the j-th result out of worker *w*
+    IS the j-th ``pricing_order`` entry assigned to *w*. Walking ``pricing_order`` and taking
+    from the one worker that owns the next index therefore yields exactly index order, which
+    rule 2 requires.
     """
 
-    pending = [collections.deque() for _ in worker_iters]
-    progress = _SweepProgress(len(pricing_order), len(worker_iters))
-    progress.begin()
+    pending = [collections.deque() for _ in range(n_workers)]
+    if progress is None:
+        progress = _SweepProgress(len(pricing_order), n_workers)
+    dead: set[int] = set()
     done = 0
+    progress.begin()
     for flight_id in pricing_order:
         worker = worker_of[flight_id]
         while not pending[worker]:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            # POLL, rather than waiting out the whole budget in one call. Blocking for
-            # `remaining` and only then asking whether the worker is still alive means a
-            # worker that dies in the first second of a 1200 s budget consumes all 1200 --
-            # the death is detected exactly once, at the moment it no longer matters. It
-            # also made detection a race: `mp.Pool` had to have published the replacement
-            # by that single instant or the loss read as an ordinary timeout.
-            #
-            # Slicing the same total wait into `_WORKER_POLL_S` pieces changes neither the
-            # deadline nor the result -- `IMapIterator.next` resumes waiting where it left
-            # off -- and turns one check into one per interval.
-            slice_s = remaining if remaining is None else min(remaining, _WORKER_POLL_S)
-            try:
-                pending[worker].extend(worker_iters[worker].next(slice_s))
-            except mp.TimeoutError:
-                # Either shape below is exactly what `_price_one` returns for a
-                # `PricingTimeout`, so the reducer needs no special case: no seconds,
-                # `priced` False, and an EMPTY search record because the worker that
-                # would have filled it is the one that never reported back. Both name
-                # the flight the parent is actually blocked on, which the
-                # chunk-indexed predecessor could only approximate.
-                #
-                # ASKING WHETHER THE PROCESS CHANGED is what separates a dead worker
-                # from a slow one. The `StalePricingWorker` handler below cannot: when
-                # a worker dies mid-chunk its result is never produced, `mp.Pool`
-                # starts a replacement, and the replacement's refusal queues BEHIND
-                # the missing result on an ordered iterator -- so that exception never
-                # arrives and only process identity is left to read.
-                if worker_replaced is not None and worker_replaced(worker):
-                    warnings.warn(
-                        f"pricing worker {worker} was replaced mid-sweep; its result for "
-                        f"flight {flight_id} will never arrive (OOM killer?)",
-                        RuntimeWarning, stacklevel=2,
-                    )
-                    progress.finish(done, complete=False)
-                    yield flight_id, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}
-                    return
-                if remaining is not None and time.monotonic() >= deadline:
-                    # The real deadline, not a poll boundary.
-                    progress.finish(done, complete=False)
-                    yield flight_id, False, 0.0, None, 0.0, {}, {}
-                    return
-                continue
-            except StopIteration:
-                raise RuntimeError(
-                    f"pricing worker {worker} is exhausted but pricing_order still expects "
-                    f"flight {flight_id}: the worker split and this merge disagree"
-                ) from None
-            except StalePricingWorker as exc:
-                # A worker died and `mp.Pool` quietly replaced it with one holding no sweep
-                # state.  End the sweep the way a lost result does -- the prefix so far is
-                # still valid -- but count it, so `solve` can report why rather than
-                # blaming the clock.
+            if worker in dead:
                 warnings.warn(
-                    f"pricing worker {worker} lost its worker: {exc}", RuntimeWarning,
-                    stacklevel=2,
+                    f"pricing worker {worker} died mid-sweep; its result for flight "
+                    f"{flight_id} will never arrive (OOM killer?)",
+                    RuntimeWarning, stacklevel=2,
                 )
+                progress.finish(done, complete=False)
                 yield flight_id, False, 0.0, None, 0.0, {"pool_worker_lost": 1}, {}
+                return
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            # COLLECT FIRST, then check the clock. Testing the deadline before draining
+            # would discard results that had already arrived merely because the clock
+            # passed while they sat in the pipe -- work that was done, paid for, and is
+            # part of the prefix the sequential loop would have kept.
+            #
+            # Sliced rather than waiting the whole remaining budget in one call, so a
+            # worker that dies is noticed within a poll interval even if its sentinel
+            # somehow does not wake the wait.
+            slice_s = (
+                _WORKER_POLL_S if remaining is None else min(remaining, _WORKER_POLL_S)
+            )
+            collected, died = collect(slice_s)
+            for index, results in collected.items():
+                pending[index].extend(results)
+            dead |= died
+            if pending[worker] or worker in dead:
+                continue
+            if remaining is not None and time.monotonic() >= deadline:
+                progress.finish(done, complete=False)
+                yield flight_id, False, 0.0, None, 0.0, {}, {}
                 return
         result = pending[worker].popleft()
         if result[0] != flight_id:

@@ -336,8 +336,16 @@ def save_run(
         viz_html.write_html(result, folder / "replay.html")
 
     if index:
-        _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
-                      scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
+        try:
+            _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
+                          scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
+        except Exception:
+            # The shared index is derived data; every fact it holds about this run is already in
+            # the folder's own index_row.parquet. Failing here would report a finished multi-hour
+            # run as a failed one to any wrapper watching the exit code.
+            log.warning("cross-run index update failed — run folder %s is complete and keeps its "
+                        "own index_row.parquet; run freespace_sim.runs.rebuild_index() to restore "
+                        "index.parquet", folder.name, exc_info=True)
     return folder
 
 
@@ -403,9 +411,23 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
     # Own copy first: if the append below loses the race, `rebuild_index` can put this row back.
     row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
     path = root / INDEX_FILENAME
+    rebuild = False
     with _index_lock(root):
-        out = pd.concat([pd.read_parquet(path), row_df], ignore_index=True) if path.exists() else row_df
-        out.to_parquet(path, index=False)
+        try:
+            out = pd.concat([pd.read_parquet(path), row_df], ignore_index=True) if path.exists() else row_df
+        except Exception as exc:
+            # An unreadable index (a torn write from a crash or an unlocked pre-fix appender)
+            # otherwise fails EVERY subsequent run against this root at its final step. Sideline
+            # it and rebuild from the per-run rows instead; if the sideline itself failed, leave
+            # the file for a human and skip the append — this run's row is safe in its folder.
+            rebuild = _sideline_corrupt_index(path, exc) is not None
+            out = None
+        if out is not None:
+            out.to_parquet(path, index=False)
+    if rebuild:
+        # Outside the lock: `rebuild_index` takes it again, and a second flock on the same file
+        # in one process blocks. The row written above is on disk, so the rebuild includes it.
+        rebuild_index(root)
 
 
 @contextlib.contextmanager
@@ -439,6 +461,30 @@ def _index_lock(root: Path):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+def _sideline_corrupt_index(path: Path, exc: Exception) -> Path | None:
+    """Rename an unreadable ``index.parquet`` out of the way, keeping its bytes for salvage.
+
+    Rename rather than delete: rows of runs archived before ``index_row.parquet`` existed live
+    only in this file, and the sidelined copy is the single remaining artifact a manual repair
+    could recover them from. Returns the quarantine path, or ``None`` if the rename failed too
+    (a read-only or misbehaving filesystem), in which case the file is left untouched.
+    """
+    quarantine = path.with_name(
+        f"{path.name}.corrupt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    try:
+        path.rename(quarantine)
+    except OSError as rename_exc:
+        log.warning("the run index %s is unreadable (%s) and could not be sidelined (%s) — "
+                    "move it aside manually, then run freespace_sim.runs.rebuild_index()",
+                    path, exc, rename_exc)
+        return None
+    log.warning("the run index %s was unreadable (%s) — moved it to %s and rebuilding from each "
+                "run folder's index_row.parquet; rows of runs saved without index_row.parquet "
+                "survive only in the sidelined file", path.name, exc, quarantine.name)
+    return quarantine
+
+
 def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
     """Reconstitute ``index.parquet`` from each run folder's own ``index_row.parquet``, and return it.
 
@@ -448,6 +494,8 @@ def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
 
     Non-destructive and idempotent: index rows whose folder has no copy (runs archived before this
     file existed, or folders since deleted) are KEPT; where both exist the folder's copy wins.
+    An index that cannot be read at all is sidelined to ``index.parquet.corrupt-<stamp>`` and the
+    rebuild proceeds from the folder rows alone.
     """
     root = Path(root)
     rows = []
@@ -458,7 +506,13 @@ def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
             log.warning("skipping unreadable %s: %s", row_path, exc)
     folder_rows = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     with _index_lock(root):
-        existing = load_index(root)
+        try:
+            existing = load_index(root)
+        except Exception as exc:
+            # The repair tool must not die on the very file it exists to repair. Orphan rows in
+            # an unreadable index are beyond reach either way; sidelining keeps their bytes.
+            _sideline_corrupt_index(root / INDEX_FILENAME, exc)
+            existing = pd.DataFrame()
         if len(existing) and len(folder_rows):
             orphans = existing[~existing["path"].isin(set(folder_rows["path"]))]
             out = pd.concat([orphans, folder_rows], ignore_index=True)

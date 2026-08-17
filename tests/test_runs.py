@@ -386,3 +386,31 @@ def test_rebuild_index_keeps_rows_it_cannot_find_a_folder_for(tmp_path):
     out = runs.rebuild_index(tmp_path)
     assert len(out) == 2
     assert any("archived" in p for p in out["path"])
+
+
+def test_save_run_survives_a_corrupt_index_and_rebuilds_it(tmp_path, caplog):
+    """A truncated index.parquet (torn write from a killed job) used to fail every LATER run at its
+    final step, reporting hours of finished solve as a failed run. The append must instead sideline
+    the corrupt file, rebuild from the per-run rows, and let the run exit clean."""
+    a = runs.save_run(_small(), root=tmp_path, label="before", scenario="s")
+    (tmp_path / "index.parquet").write_bytes(b"PAR1\x00truncated")
+    with caplog.at_level("WARNING"):
+        b = runs.save_run(_small(), root=tmp_path, label="after", scenario="s")
+
+    assert (b / "summary.json").stat().st_size > 0               # the run itself completed
+    idx = runs.load_index(tmp_path)                              # the index reads again...
+    assert set(idx["path"]) == {str(a), str(b)}                  # ...with BOTH rows restored
+    assert list(tmp_path.glob("index.parquet.corrupt-*"))        # bytes kept for manual salvage
+    assert any("unreadable" in r.message for r in caplog.records)
+
+
+def test_rebuild_index_sidelines_a_corrupt_index_instead_of_dying_on_it(tmp_path):
+    # The repair tool is what the corrupt-index warning tells people to run, so it cannot itself
+    # require the index it is repairing to be readable.
+    a = runs.save_run(_small(), root=tmp_path, label="x", scenario="s")
+    (tmp_path / "index.parquet").write_bytes(b"\x00garbage")
+
+    out = runs.rebuild_index(tmp_path)
+    assert set(out["path"]) == {str(a)}
+    assert set(runs.load_index(tmp_path)["path"]) == {str(a)}
+    assert list(tmp_path.glob("index.parquet.corrupt-*"))

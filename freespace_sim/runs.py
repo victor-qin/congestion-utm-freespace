@@ -482,9 +482,15 @@ def _sideline_corrupt_index(path: Path, exc: Exception) -> Path | None:
     could recover them from. Returns the quarantine path, or ``None`` if the rename failed too
     (a read-only or misbehaving filesystem), in which case the file is left untouched.
     """
-    quarantine = path.with_name(
-        f"{path.name}.corrupt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
-    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
+    # Second-resolution stamps collide exactly as run folder names do above, and `rename` REPLACES
+    # its target silently — which would destroy the earlier quarantine, i.e. the one artifact a
+    # manual salvage of pre-index_row.parquet rows has left. Suffix instead, as the claim loop does.
+    for attempt in range(2, 1000):
+        if not quarantine.exists():
+            break
+        quarantine = path.with_name(f"{path.name}.corrupt-{stamp}__{attempt}")
     try:
         path.rename(quarantine)
     except OSError as rename_exc:
@@ -507,8 +513,10 @@ def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
 
     Non-destructive and idempotent: index rows whose folder has no copy (runs archived before this
     file existed, or folders since deleted) are KEPT; where both exist the folder's copy wins.
-    An index that cannot be read at all is sidelined to ``index.parquet.corrupt-<stamp>`` and the
-    rebuild proceeds from the folder rows alone.
+    The one exception: an index that cannot be read at all is sidelined to
+    ``index.parquet.corrupt-<stamp>`` and the rebuild proceeds from the folder rows alone, so its
+    orphan rows are NOT kept — unreadable bytes cannot be merged, and they survive only in the
+    sidelined file, for a manual salvage.
     """
     root = Path(root)
     rows = []

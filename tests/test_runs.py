@@ -431,3 +431,16 @@ def test_a_failed_own_index_row_write_still_raises(tmp_path, monkeypatch, caplog
     with caplog.at_level("WARNING"), pytest.raises(OSError):
         runs.save_run(_small(), root=tmp_path, label="doomed", scenario="s")
     assert not any("keeps its own index_row.parquet" in r.message for r in caplog.records)
+
+
+def test_a_second_sideline_in_the_same_second_keeps_the_first_quarantine(tmp_path):
+    # Sidelining is a rename, which replaces its target silently. Two corruptions inside one second
+    # (the Slurm-array case the run-folder claim loop exists for) must not erase the earlier bytes:
+    # rows of runs archived before index_row.parquet existed live ONLY there.
+    runs.save_run(_small(), root=tmp_path, label="x", scenario="s")
+    for bytes_ in (b"PAR1\x00first", b"PAR1\x00second"):
+        (tmp_path / "index.parquet").write_bytes(bytes_)
+        runs.rebuild_index(tmp_path)
+
+    quarantined = sorted(p.read_bytes() for p in tmp_path.glob("index.parquet.corrupt-*"))
+    assert quarantined == [b"PAR1\x00first", b"PAR1\x00second"]

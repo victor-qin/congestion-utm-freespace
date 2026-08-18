@@ -40,7 +40,7 @@ from .types import DenialReason, OperationalIntent
 from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
 
 
-# Bumped whenever a persisted metric changes MEANING (not when one is added). `runs._append_index`
+# Bumped whenever a persisted metric changes MEANING (not when one is added). `runs._index_row`
 # stamps it on every row so `results/index.parquet` — which is appended to, and therefore accumulates
 # rows written by different versions of this file — can never silently average incomparable numbers.
 #   1  original: capacity + rate denominators both cfg.horizon_s; measurement window [0, horizon_s]

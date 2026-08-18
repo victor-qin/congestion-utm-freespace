@@ -336,12 +336,19 @@ def save_run(
         viz_html.write_html(result, folder / "replay.html")
 
     if index:
+        row_df = _index_row(result, folder, wall_seconds, scenario=scenario,
+                            scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
+        # Own copy first, and deliberately OUTSIDE the guard below: it is the only thing
+        # `rebuild_index` can put this row back from, so swallowing its failure would lose the run
+        # from every readout silently. A folder that refuses a write this late (a filling disk) also
+        # casts doubt on the artifacts written above it, which are themselves unguarded — that is a
+        # real failure and must still raise.
+        row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
         try:
-            _append_index(result, folder, Path(root), wall_seconds, scenario=scenario,
-                          scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
+            _append_index(row_df, Path(root))
         except Exception:
-            # The shared index is derived data; every fact it holds about this run is already in
-            # the folder's own index_row.parquet. Failing here would report a finished multi-hour
+            # The shared index is derived data; every fact it holds about this run is now in the
+            # folder's own index_row.parquet. Failing here would report a finished multi-hour
             # run as a failed one to any wrapper watching the exit code.
             log.warning("cross-run index update failed — run folder %s is complete and keeps its "
                         "own index_row.parquet; run freespace_sim.runs.rebuild_index() to restore "
@@ -349,11 +356,11 @@ def save_run(
     return folder
 
 
-def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: float | None,
-                  *, scenario: str | None = None, tag: str | None = None,
-                  demand: str | None = None, agg: dict | None = None,
-                  scenario_description: str | None = None) -> None:
-    """Append one queryable row per run to ``results/index.parquet``.
+def _index_row(result: SimResult, folder: Path, wall_seconds: float | None,
+               *, scenario: str | None = None, tag: str | None = None,
+               demand: str | None = None, agg: dict | None = None,
+               scenario_description: str | None = None) -> pd.DataFrame:
+    """Build the one queryable row this run contributes to ``results/index.parquet``.
 
     The ``scenario`` / ``tag`` / ``demand`` columns are the join keys cross-run readouts filter on:
     a batch sweep stamps every run with the same ``tag`` so a readout can select exactly its runs.
@@ -407,9 +414,15 @@ def _append_index(result: SimResult, folder: Path, root: Path, wall_seconds: flo
                                   "mean_solve_time_s", "p95_solve_time_s",
                                   "max_solve_time_s", "total_solve_time_s", "verified")},
            **steady_cols}
-    row_df = pd.DataFrame([row])
-    # Own copy first: if the append below loses the race, `rebuild_index` can put this row back.
-    row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
+    return pd.DataFrame([row])
+
+
+def _append_index(row_df: pd.DataFrame, root: Path) -> None:
+    """Merge one run's row into the shared ``results/index.parquet`` under the cross-process lock.
+
+    The caller has already written the row to the run's own folder, so anything lost here — a race,
+    an unreadable file, a filesystem that will not lock — is recoverable by :func:`rebuild_index`.
+    """
     path = root / INDEX_FILENAME
     rebuild = False
     with _index_lock(root):

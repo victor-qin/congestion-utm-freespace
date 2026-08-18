@@ -414,3 +414,20 @@ def test_rebuild_index_sidelines_a_corrupt_index_instead_of_dying_on_it(tmp_path
     assert set(out["path"]) == {str(a)}
     assert set(runs.load_index(tmp_path)["path"]) == {str(a)}
     assert list(tmp_path.glob("index.parquet.corrupt-*"))
+
+
+def test_a_failed_own_index_row_write_still_raises(tmp_path, monkeypatch, caplog):
+    """The guard above covers the SHARED index only. The folder's own row is what `rebuild_index`
+    rebuilds from, so swallowing its failure would drop the run from every readout with a warning
+    claiming the opposite — and a folder refusing a write this late impugns the artifacts above it."""
+    real = pd.DataFrame.to_parquet
+
+    def refuse_the_row(self, path, *a, **kw):              # a disk that fills mid-run
+        if str(path).endswith(runs.INDEX_ROW_FILENAME):
+            raise OSError(28, "No space left on device")
+        return real(self, path, *a, **kw)
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", refuse_the_row)
+    with caplog.at_level("WARNING"), pytest.raises(OSError):
+        runs.save_run(_small(), root=tmp_path, label="doomed", scenario="s")
+    assert not any("keeps its own index_row.parquet" in r.message for r in caplog.records)

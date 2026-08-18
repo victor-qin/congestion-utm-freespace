@@ -440,11 +440,24 @@ def _relative_cost_gap(cost_upper_bound: float, cost_lower_bound: float) -> floa
     gap by that revenue would make a few seconds of delay look converged.  The
     equivalent minimization objective charges delay to selected flights and
     ``M`` to an omitted flight; its scale is the one the configured gaps mean.
+
+    The cost objective is a sum of non-negative delays plus ``M`` per omitted flight, so
+    **zero is always a valid lower bound**, and the better of two valid lower bounds is
+    valid.  That matters because the Lagrangian bound this is usually handed --
+    ``LP + sum(max(0, rc))`` transformed back to cost -- carries one slack term per
+    flight, so at scale it goes NEGATIVE: measured at -848k on 4,636 flights and -568M on
+    2,000, against costs of 1.4M and 350k.  Un-floored, the gap then reads 1.65 or 1621,
+    and any value above 1 is self-refuting -- it says the certificate is weaker than the
+    free bound, while still being the number a `gap_metric="cost"` run is gated on.
+    Flooring does not manufacture convergence: a bound of 0 gives a gap of ~1, which
+    still cannot pass `lp_gap`.  It makes the metric honestly useless instead of
+    misleadingly precise, and it caps the reported gap at 1.
     """
 
     if not math.isfinite(cost_upper_bound) or not math.isfinite(cost_lower_bound):
         return math.inf
-    return max(0.0, cost_upper_bound - cost_lower_bound) / max(1.0, abs(cost_upper_bound))
+    floor = max(0.0, cost_lower_bound)
+    return max(0.0, cost_upper_bound - floor) / max(1.0, abs(cost_upper_bound))
 
 
 def _loads_for(
@@ -528,6 +541,10 @@ def _pre_master_timeout_result(
             "heuristic_costs": (),
             "final_lp_objective": -math.inf,
             "upper_bound": math.inf,
+            # No iteration ran, so no bound was ever earned to freeze.  0 rather than the
+            # iteration count, which is also 0: the key means "iterations that bought
+            # nothing", and this exit had none to spend.
+            "bound_frozen_for": 0,
             "cost_upper_bound": math.inf,
             "cost_lower_bound": -math.inf,
             "lp_gap": math.inf,
@@ -690,6 +707,7 @@ class ColGenSolver:
                     "heuristic_costs": (),
                     "final_lp_objective": 0.0,
                     "upper_bound": 0.0,
+                    "bound_frozen_for": 0,
                     "cost_upper_bound": 0.0,
                     "cost_lower_bound": 0.0,
                     "lp_gap": 0.0,
@@ -929,6 +947,15 @@ class ColGenSolver:
         lazy_row_rounds = 0
         termination_reason = "iteration_limit"
         last_upper_bound = math.inf
+        # Consecutive iterations whose bound did not improve on the running minimum.  The
+        # dual bound is the only thing that can certify a schedule, so a run where it
+        # freezes at iteration 1 is not converging however busy pricing looks -- and that
+        # is exactly what the gap alone cannot say, since the gap ALSO moves when the
+        # primal moves.  Measured: on density_faa the entire 1.62 -> 1.65 drift over seven
+        # iterations was the denominator improving under a numerator frozen since the
+        # first one, which read as "the gap is getting worse" when the truth was "the
+        # bound stopped and the schedule got better".
+        bound_frozen_for = 0
         last_lp_objective = -math.inf
         last_x: np.ndarray | None = None
         iterations = 0
@@ -959,6 +986,10 @@ class ColGenSolver:
                 # (run once per priced column, in the parent), and `add_column`.
                 stage_s: dict[str, float] = collections.defaultdict(float)
                 stage_n: dict[str, int] = collections.defaultdict(int)
+                # `lazy_rows_added` is cumulative over the solve; the interesting quantity
+                # is this iteration's delta, because that is what drove this iteration's
+                # separation rounds.
+                lazy_rows_at_iteration_start = lazy_rows_added
 
                 def _timed(key, fn, *a, **kw):
                     t0 = time.perf_counter()
@@ -975,6 +1006,13 @@ class ColGenSolver:
                 # A bound is meaningful only for the full claim-feasible relaxation.
                 # Materialize violated rows and re-solve until the current LP is clean.
                 lp_complete = False
+                # At most one pool-based pass per iteration.  The solution-based loop below
+                # is self-limiting -- it stops when `x` overloads nothing -- but the pool's
+                # candidate set is refilled by every column pricing adds, so running it per
+                # ROUND would let one iteration chase its own tail.  Once per iteration also
+                # keeps the extra rows attributable: they land in exactly one LP re-solve.
+                contested_pass_done = False
+                contested_rows_added = 0
                 while True:
                     remaining_s = pricing_deadline - time.monotonic()
                     if remaining_s <= 0.0:
@@ -987,6 +1025,31 @@ class ColGenSolver:
                     added_rows = _timed(
                         "add_violated_rows", master.add_violated_rows, x, _FEASIBILITY_TOL
                     )
+                    if (
+                        not added_rows
+                        and params.contested_row_separation
+                        and not contested_pass_done
+                    ):
+                        # Deliberately AFTER solution-based separation has run dry, so this
+                        # only ever adds rows the LP did not already find -- and inside the
+                        # loop, so the LP re-solves against them.  Re-solving is the whole
+                        # point: the objective is to change the DUALS pricing will see, not
+                        # to make the master's own report tidier.
+                        contested_pass_done = True
+                        candidates = _timed(
+                            "contested_rows", master.contested_rows,
+                            params.contested_row_separation, params.contested_rows_limit,
+                        )
+                        added_rows = _timed(
+                            "add_contested_rows", master.materialize_rows, candidates
+                        )
+                        contested_rows_added += added_rows
+                        if added_rows:
+                            log.info(
+                                "  pool separation materialized %d contested rows "
+                                "(min_excess=%d, %d candidates)",
+                                added_rows, params.contested_row_separation, len(candidates),
+                            )
                     if not added_rows:
                         lp_complete = True
                         break
@@ -1071,13 +1134,33 @@ class ColGenSolver:
                 best_reduced_costs: list[float] = []
                 rc_by_flight: dict[int, float] = {}
                 priced_columns: list[Column] = []
+                # Positionally aligned with `priced_columns`.  Kept separately rather than
+                # zipped into it because `priced_columns` is read in four other places that
+                # want columns, and only the cap wants the score.
+                priced_reduced_costs: list[float] = []
                 # The LP and the heuristic are done; pricing is the long block that follows.
                 # Naming the handoff is what turns "it is still going" into "it is in the
                 # part that takes minutes", which is the whole question while watching a run.
+                # Broken out by stage, not summed.  The block grows superlinearly on a dense
+                # instance -- 65 s at iteration 1 to 987 s at iteration 8 on density_faa --
+                # and the total cannot say whether that is the LP itself, the separation
+                # loop re-solving it N times, or `round_heuristic`'s n_tries passes over the
+                # pool.  Those want three different fixes, so a reader watching the log
+                # should not have to re-run under a harness to find out which one it is.
+                # `lp_rounds` is the count that turns "the LP is slow" into "the LP ran
+                # eleven times": every extra separation round is a full re-solve.
                 log.info(
-                    "  master LP + heuristic done in %.1fs (%d rows materialized); pricing next",
+                    "  master LP + heuristic done in %.1fs [%s] (%d rows materialized, "
+                    "+%d this iteration over %d lp_rounds); pricing next",
                     sum(stage_s.values()),
+                    " ".join(
+                        f"{name}={stage_s[name]:.1f}s"
+                        f"{'' if stage_n[name] == 1 else f'/{stage_n[name]}'}"
+                        for name in sorted(stage_s, key=lambda k: -stage_s[k])
+                    ),
                     len(getattr(master, "materialized_rows", ()) or ()),
+                    lazy_rows_added - lazy_rows_at_iteration_start,
+                    stage_n["solve_lp"],
                 )
                 pricing_order = sorted(
                     flight_ids,
@@ -1128,6 +1211,7 @@ class ColGenSolver:
                                 column, graphs[flight_id], cfg,
                             )
                         )
+                        priced_reduced_costs.append(reduced_cost)
                 if not sweep.complete:
                     pricing_complete = False
                     pricing_timeout_flight_id = sweep.timeout_flight_id
@@ -1150,8 +1234,38 @@ class ColGenSolver:
                     sum(1 for rc in sweep.reduced_costs if rc > 0.0),
                 )
                 before_pricing = len(master.columns)
+                # Which of the priced columns actually get banked.  The bound below is
+                # computed from `best_reduced_costs`, the FULL sweep, and stays valid
+                # whatever is banked -- the Lagrangian bound is a statement about the
+                # subproblems, not about the pool.  Deferring a column loses nothing
+                # permanently either: its flight is priced again next iteration against
+                # duals that have moved, so what is dropped is one proposal, not a route.
+                banked_columns = priced_columns
+                columns_deferred = 0
+                cap = params.max_columns_per_iteration
+                if cap and len(priced_columns) > cap:
+                    # Ranked by reduced cost, then by the same total order the bank loop
+                    # uses, so the cut is reproducible rather than dependent on sort
+                    # stability over ties -- and rc ties are common here, with hundreds of
+                    # flights sitting at exactly M.
+                    kept = sorted(
+                        range(len(priced_columns)),
+                        key=lambda i: (
+                            -priced_reduced_costs[i],
+                            priced_columns[i].flight_id,
+                            _column_key(priced_columns[i]),
+                        ),
+                    )[:cap]
+                    banked_columns = [priced_columns[i] for i in kept]
+                    columns_deferred = len(priced_columns) - len(banked_columns)
+                    log.info(
+                        "  banking %d of %d priced columns (rc cut at %.6g); %d deferred "
+                        "to the next iteration",
+                        len(banked_columns), len(priced_columns),
+                        priced_reduced_costs[kept[-1]], columns_deferred,
+                    )
                 for column in sorted(
-                    priced_columns, key=lambda item: (item.flight_id, _column_key(item))
+                    banked_columns, key=lambda item: (item.flight_id, _column_key(item))
                 ):
                     _timed("add_column", master.add_column, column)
                 if not pricing_complete:
@@ -1171,7 +1285,13 @@ class ColGenSolver:
                 raw_upper_bound = master.upper_bound(last_lp_objective, best_reduced_costs)
                 # Each iteration's value is a valid global upper bound.  Their
                 # running minimum remains valid and removes harmless solver jitter.
-                last_upper_bound = min(last_upper_bound, max(last_lp_objective, raw_upper_bound))
+                improved_upper_bound = min(
+                    last_upper_bound, max(last_lp_objective, raw_upper_bound)
+                )
+                bound_frozen_for = (
+                    0 if improved_upper_bound < last_upper_bound else bound_frozen_for + 1
+                )
+                last_upper_bound = improved_upper_bound
                 # Transform maximize revenue back to the user objective before
                 # measuring gaps.  Revenue-scale gaps are diluted by n*M and can
                 # incorrectly certify a trajectory that is tens of seconds worse.
@@ -1191,6 +1311,20 @@ class ColGenSolver:
                     lp_gap, heuristic_gap = lp_gap_revenue, heuristic_gap_revenue
                 else:
                     lp_gap, heuristic_gap = lp_gap_cost, heuristic_gap_cost
+
+                # The bound, next to the gap it produced.  A gap alone cannot say which of
+                # its two ends moved, and on a large instance the answer is neither the
+                # obvious one nor a good one: the bound freezes at iteration 1 while the
+                # schedule keeps improving, so the gap DRIFTS UP and reads like a
+                # regression.  `frozen=k` is the number that says so directly, and
+                # `raw=` says whether this iteration's own bound was merely jittery
+                # (close to the running minimum) or has genuinely degraded away from it.
+                log.info(
+                    "  bound: cost_ub=%.6g cost_lb=%.6g gap_cost=%.4g gap_rev=%.4g "
+                    "(raw_ub=%.10g, frozen for %d iteration%s)",
+                    cost_upper_bound, cost_lower_bound, lp_gap_cost, lp_gap_revenue,
+                    raw_upper_bound, bound_frozen_for, "" if bound_frozen_for == 1 else "s",
+                )
 
                 lp_objectives.append(last_lp_objective)
                 upper_bounds.append(last_upper_bound)
@@ -1227,6 +1361,11 @@ class ColGenSolver:
                         "lp_objective": last_lp_objective,
                         "upper_bound": last_upper_bound,
                         "raw_upper_bound": raw_upper_bound,
+                        # Consecutive iterations the running-minimum bound has not improved.
+                        # 0 means this iteration tightened it.  Reconstructing this from a
+                        # recorded `upper_bound` series is possible but nobody did it, which
+                        # is why a seven-iteration run reported a "worsening" gap for weeks.
+                        "bound_frozen_for": bound_frozen_for,
                         "cost_upper_bound": cost_upper_bound,
                         "cost_lower_bound": cost_lower_bound,
                         "lp_gap": lp_gap,
@@ -1273,7 +1412,13 @@ class ColGenSolver:
                         # module global in this process and a spawned worker imports its own.
                         "sweep_flight_records": sweep.flight_records,
                         "columns": len(master.columns),
-                        "columns_added": len(priced_columns),
+                        # What was BANKED, not what was priced -- analysis that slices the
+                        # pool's tail by this number (the study's virgin-claim measurement
+                        # does) would read the wrong columns otherwise.  `columns_priced`
+                        # carries the other half, so the cap's effect stays visible.
+                        "columns_added": len(banked_columns),
+                        "columns_priced": len(priced_columns),
+                        "columns_deferred": columns_deferred,
                         "rc_sum": math.fsum(positives),
                         "rc_n_positive": len(positives),
                         "rc_max": positives[-1] if positives else 0.0,
@@ -1288,6 +1433,12 @@ class ColGenSolver:
                         "stage_n": dict(stage_n),
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
+                        # This iteration's rows from the POOL, against the cumulative total
+                        # above which is dominated by solution-based separation.  Reported
+                        # separately because the question the feature exists to answer is
+                        # whether pricing into un-priced lattice falls, and that needs the
+                        # two sources told apart.
+                        "contested_rows_added": contested_rows_added,
                     })
                 prev_capacity_duals = dict(capacity_duals)
 
@@ -1520,6 +1671,12 @@ class ColGenSolver:
             "heuristic_costs": tuple(heuristic_costs),
             "final_lp_objective": last_lp_objective,
             "upper_bound": last_upper_bound,
+            # How many of the final iterations bought no bound improvement.  Reported on
+            # the run rather than only per-iteration because it is the one number that
+            # distinguishes "stopped early, converged" from "ran the clock out with a
+            # certificate that stopped moving after the first sweep" -- and the two look
+            # identical in `termination_reason` plus a final gap.
+            "bound_frozen_for": bound_frozen_for,
             "cost_upper_bound": total_benefit - last_lp_objective,
             "cost_lower_bound": final_cost_lower_bound,
             "lp_gap": (

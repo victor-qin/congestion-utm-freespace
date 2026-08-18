@@ -132,6 +132,51 @@ class ColGenParams:
     max_air_overrun_hops: int = 3
     solver: str = "auto"
     max_iterations: int = 30
+    # How many priced columns an iteration may BANK, 0 for all of them (the shipped
+    # behaviour, and what keeps this inert by default).
+    #
+    # Pricing returns one column per flight with positive reduced cost -- ~1,865 of 2,000 on
+    # density_faa, every iteration, and the LP then gives x > 0 to 3-25% of them.  The cost
+    # of the rest is not the columns: each one claims ~460 (cell, step) rows, the separation
+    # loop materializes whatever they overload, and the master's row count grew 83,509 ->
+    # 161,406 over twelve iterations with no sign of saturating (a 500-flight instance
+    # settles at ~51 rows/flight and stops).  Since the master's cost is superlinear in rows
+    # -- one LP solve went 0.17 s -> 24.81 s over those same twelve iterations -- the
+    # columns the LP never uses are what makes the iterations unaffordable.
+    #
+    # ANSWER-AFFECTING, unlike every other knob in this block: a capped iteration banks a
+    # different pool, so the duals differ, so the next subproblem differs.  It is a
+    # convergence-RATE trade -- fewer rows per iteration against more iterations to cover
+    # every flight -- and only a measurement can say which side wins on a given instance.
+    #
+    # Ranked by reduced cost, which is the standard rule and is NOT obviously the right one
+    # here: reduced cost is ~M for exactly the flights whose route avoids every priced row,
+    # so top-k preferentially banks the columns that route through unpriced lattice -- the
+    # ones generating the most new rows.  Measure before believing.
+    max_columns_per_iteration: int = 0
+    # Separate capacity rows on the COLUMN POOL as well as on the LP solution, 0 = off.
+    #
+    # `add_violated_rows` creates a row only once the LP's own `x` overloads it, so a row no
+    # solution has yet overloaded carries no dual and pricing values it at zero.  Measured on
+    # density_faa x2000: 90% of every priced column's claims are on such rows, and that is
+    # the escape route behind the reduced-cost tail -- a flight blocked by a row the LP has
+    # priced at M reroutes through un-priced lattice and prices at `rc ~ M`, which is what
+    # pins `cost_lb` (frozen 12 iterations at 36,189 while cost fell 21%).
+    #
+    # The value is `min_excess` for `RestrictedMaster.contested_rows`: 1 materializes any row
+    # more distinct flights claim than it can hold, 2 requires one spare flight beyond that,
+    # and so on.  Higher is safer -- the candidate set is large and materializing all of it
+    # reproduces the master blow-up this exists to avoid.
+    #
+    # ANSWER-AFFECTING and OFF by default: it changes which rows exist, hence the duals,
+    # hence every subsequent subproblem.  Pair with `contested_rows_limit`.
+    contested_row_separation: int = 0
+    # Most rows one iteration's pool-based pass may materialize, 0 = unlimited.  A guard on
+    # wall clock rather than on correctness: at 2,000 flights the candidate set can run to
+    # tens of thousands of rows, and the master is superlinear in rows on every backend
+    # measured.  Ranked most-contested first, so a truncated pass still takes the rows the
+    # LP was most likely to overload next.
+    contested_rows_limit: int = 0
     # 20 minutes, raised from 120 s. The old default could not finish a single pricing
     # sweep on a real instance: measured on `density_faa_wing_zipline` x100, iteration 1
     # alone is 147 s and the sweeps LENGTHEN as the pool grows -- 147, 213, 222, 234, 235,
@@ -506,6 +551,28 @@ class ColGenParams:
         if chunksize < 1:
             raise ValueError("pricing_chunksize must be positive")
         object.__setattr__(self, "pricing_chunksize", chunksize)
+
+        if isinstance(self.max_columns_per_iteration, bool):
+            raise TypeError("max_columns_per_iteration must be an integer")
+        try:
+            column_cap = operator.index(self.max_columns_per_iteration)
+        except TypeError as exc:
+            raise TypeError("max_columns_per_iteration must be an integer") from exc
+        if column_cap < 0:
+            raise ValueError("max_columns_per_iteration must be non-negative")
+        object.__setattr__(self, "max_columns_per_iteration", column_cap)
+
+        for name in ("contested_row_separation", "contested_rows_limit"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            try:
+                normalized = operator.index(value)
+            except TypeError as exc:
+                raise TypeError(f"{name} must be an integer") from exc
+            if normalized < 0:
+                raise ValueError(f"{name} must be non-negative")
+            object.__setattr__(self, name, normalized)
 
         if isinstance(self.bootstrap_roots, bool):
             raise TypeError("bootstrap_roots must be an integer")

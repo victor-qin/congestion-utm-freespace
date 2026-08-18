@@ -558,6 +558,17 @@ class RestrictedMaster:
         # Correctness requires `_columns` to stay APPEND-ONLY: an index recorded here must
         # never move.  Trimming the pool would silently corrupt every entry.
         self._columns_by_row: dict[RowKey, list[int]] = {}
+        # Distinct FLIGHTS claiming each row, and the unmaterialized rows where that count
+        # already exceeds capacity.  Flights, not columns: two columns of one flight can
+        # never occupy a slot together -- the cover constraint forbids it -- so a
+        # column count would call every row contested the moment a departure ladder gives
+        # each flight 21 near-identical copies of one route.
+        #
+        # Maintained incrementally beside `_columns_by_row` rather than recomputed, because
+        # the recompute is a full walk of ~850,000 rows building a set per row, per
+        # iteration.  Both are append-only for the same reason `_columns` is.
+        self._flights_by_row: dict[RowKey, set[int]] = {}
+        self._contested_candidates: set[RowKey] = set()
         self.last_flight_duals: dict[int, float] = {flight_id: 0.0 for flight_id in self.flight_ids}
         self.last_row_duals: dict[RowKey, float] = {}
         self.last_lp_objective = 0.0
@@ -643,6 +654,20 @@ class RestrictedMaster:
                 self._columns_by_row[row] = [index]
             else:
                 bucket.append(index)
+            # Same loop, same preconditions.  A row enters the candidate set on the single
+            # append that pushes its distinct-flight count past capacity, so the set is
+            # exact without anything ever scanning the index.  Already-materialized rows
+            # are skipped: they are constraints now, and re-adding them is what
+            # `materialize_rows` would have to filter out anyway.
+            flights = self._flights_by_row.get(row)
+            if flights is None:
+                flights = self._flights_by_row[row] = {column.flight_id}
+            elif column.flight_id in flights:
+                continue
+            else:
+                flights.add(column.flight_id)
+            if row not in self._materialized and len(flights) > self.row_index.cap(row):
+                self._contested_candidates.add(row)
         self._column_indices[column] = index
         self._objectives.append(objective)
         # Existing warm starts stay meaningful when pricing appends a column.
@@ -680,6 +705,10 @@ class RestrictedMaster:
             self._backend.add_row(row, rhs, indices)
             self.row_index.intern(row)
             self._materialized[row] = rhs
+            # A materialized row is a constraint, so it is no longer a CANDIDATE to become
+            # one.  Discarded here rather than filtered at read time so the set cannot grow
+            # without bound across a long solve.
+            self._contested_candidates.discard(row)
             added += 1
         return added
 
@@ -753,6 +782,53 @@ class RestrictedMaster:
                 loads[row] += 1
         return dict(loads)
 
+    def contested_rows(self, min_excess: int = 1, limit: int = 0) -> frozenset[RowKey]:
+        """Unmaterialized rows that more distinct flights want than the row can hold.
+
+        :meth:`add_violated_rows` separates on the LP SOLUTION -- a row becomes a
+        constraint only once the current ``x`` overloads it.  Every row that has not
+        happened to be created carries no dual, so pricing values it at zero however
+        contested it really is, and at 2,000 density flights **90% of every priced
+        column's claims land on such rows**.  That is not a small error: it is what lets a
+        flight escape a capacity row the LP has priced at the full per-flight benefit ``M``
+        by detouring through lattice the master has never heard of, which is the measured
+        origin of the reduced-cost tail that pins the dual bound.
+
+        This separates on the POOL instead.  A row that ``cap+min_excess-1`` distinct
+        flights already claim is one the LP will overload eventually; creating it now means
+        pricing is charged for it in the very next sweep rather than the iteration after
+        the conflict finally shows up in ``x``.
+
+        ``min_excess`` raises the bar (2 = "at least one flight more than capacity, plus
+        one"), and ``limit`` caps how many rows a single call returns, most-contested
+        first.  Both exist because the candidate set can be enormous and materializing all
+        of it at once reproduces the master blow-up this is meant to avoid; ties break on
+        :func:`_row_sort_key` so a truncated result is still deterministic.
+        """
+
+        if min_excess < 1:
+            raise ValueError("min_excess must be positive")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        # `_contested_candidates` is maintained at `cap`; `min_excess > 1` filters further.
+        # It can hold a row that was materialized between two calls only if something other
+        # than `materialize_rows` did it, so the membership test is belt-and-braces.
+        rows = [
+            row
+            for row in self._contested_candidates
+            if row not in self._materialized
+            and len(self._flights_by_row[row]) >= self.row_index.cap(row) + min_excess
+        ]
+        if limit and len(rows) > limit:
+            rows.sort(
+                key=lambda row: (
+                    -(len(self._flights_by_row[row]) - self.row_index.cap(row)),
+                    _row_sort_key(row),
+                )
+            )
+            rows = rows[:limit]
+        return frozenset(rows)
+
     def violated_claim_rows(
         self,
         selection: Mapping[int, Column] | Iterable[Column],
@@ -807,6 +883,21 @@ class RestrictedMaster:
             key=lambda index: (-self._objectives[index], _column_sort_key(self._columns[index])),
         )
 
+        # Hoisted out of the `tries` loop: `forced` reads only `probabilities`, `values` and
+        # the column pool, none of which a try mutates, and building it consumes no rng --
+        # so every try was rebuilding the identical list, and the rng call sequence (hence
+        # the schedule) is unchanged by computing it once.
+        forced = sorted(
+            (index for index, value in enumerate(probabilities) if value >= 1.0),
+            key=lambda index: (-values[index], _column_sort_key(self._columns[index])),
+        )
+        # The membership test below runs once per column per try.  Against the LIST that is
+        # a linear scan, so the loop is O(tries * |pool| * |forced|) -- quadratic in flight
+        # count, measured at 101.46 ms per try against 0.239 ms with a set at |forced|=3000.
+        # A plain `set`, deliberately not a subclass: subclassing deoptimizes CPython's
+        # CONTAINS_OP_SET specialization by ~1.3x, which is most of what this buys.
+        forced_set = set(forced)
+
         best: dict[int, Column] = {}
         best_objective = -math.inf
         best_signature: tuple[tuple[object, ...], ...] | None = None
@@ -814,16 +905,12 @@ class RestrictedMaster:
             selected: dict[int, Column] = {}
             loads: Counter[RowKey] = Counter(self.fixed_loads)
 
-            forced = sorted(
-                (index for index, value in enumerate(probabilities) if value >= 1.0),
-                key=lambda index: (-values[index], _column_sort_key(self._columns[index])),
-            )
             random_order = rng.permutation(len(self._columns)).tolist()
             for index in forced + random_order:
                 column = self._columns[index]
                 if column.flight_id in selected or probabilities[index] <= 0.0:
                     continue
-                if index not in forced and rng.random() >= probabilities[index]:
+                if index not in forced_set and rng.random() >= probabilities[index]:
                     continue
                 if not self._can_add(column, loads):
                     continue

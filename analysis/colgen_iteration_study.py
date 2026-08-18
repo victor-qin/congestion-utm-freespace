@@ -88,6 +88,20 @@ def _finite(value):
     return value
 
 
+def _fmt(value, width: int = 11, digits: int = 5) -> str:
+    """Format a `_finite`-processed value, which may already be the string 'nan'/'inf'.
+
+    Needed because the values worth printing are exactly the ones that start out
+    non-finite: `dual_l2` has no previous iteration to difference against on iteration 1,
+    and an unbounded master reports `inf`.  A bare ``:g`` raises on those, which turned a
+    diagnostic into a crash of the run it was diagnosing.
+    """
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:<{width}.{digits}g}"
+    return f"{value!s:<{width}}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--flights", type=int, default=500)
@@ -100,6 +114,31 @@ def main() -> int:
         help="the SHIPPED default; both scales are reported regardless.",
     )
     ap.add_argument("--ladder", type=int, default=None, help="default: the shipped value")
+    ap.add_argument(
+        "--M", type=float, default=None, dest="big_m",
+        help="per-flight benefit (default: the shipped 1e6). Only has to exceed the "
+             "priciest column so denial is never attractive -- measured max_column_cost is "
+             "891.6 at 2,000 density flights, so the shipped value is ~1,100x its floor. "
+             "ANSWER-AFFECTING, and below the floor it makes denial CHEAPER THAN FLYING: "
+             "watch `selected_flights` in the summary, not just the timings.",
+    )
+    ap.add_argument(
+        "--contested-rows", type=int, default=0,
+        help="separate capacity rows on the COLUMN POOL as well as the LP solution: "
+             "materialize unmaterialized rows that at least cap+N-1 distinct flights claim "
+             "(0 = off, the shipped behaviour). ANSWER-AFFECTING.",
+    )
+    ap.add_argument(
+        "--contested-rows-limit", type=int, default=0,
+        help="cap how many rows one pool-based pass may materialize, most-contested first "
+             "(0 = unlimited).",
+    )
+    ap.add_argument(
+        "--max-columns", type=int, default=0,
+        help="bank at most this many priced columns per iteration, top-k by reduced cost "
+             "(0 = all, the shipped behaviour). ANSWER-AFFECTING: a capped iteration banks "
+             "a different pool, so the duals and the next subproblem differ.",
+    )
     ap.add_argument(
         "--no-ip-every-iteration", action="store_true",
         help="skip the per-iteration IP. Leaves the master unperturbed, so this arm is the "
@@ -130,6 +169,10 @@ def main() -> int:
         lp_gap=0.0,
         ip_gap=0.0,
         n_pricing_workers=args.workers,
+        max_columns_per_iteration=args.max_columns,
+        contested_row_separation=args.contested_rows,
+        contested_rows_limit=args.contested_rows_limit,
+        **({} if args.big_m is None else {"M": args.big_m}),
         **({} if args.ladder is None else {"seed_ladder_steps": args.ladder}),
     )
 
@@ -162,6 +205,13 @@ def main() -> int:
     header = {
         "scenario": args.scenario, "flights": len(requests), "solver": args.solver,
         "max_iterations": args.iterations, "workers": args.workers,
+        "max_columns_per_iteration": params.max_columns_per_iteration,
+        "contested_row_separation": params.contested_row_separation,
+        "contested_rows_limit": params.contested_rows_limit,
+        # Recorded because `cost_upper_bound` is `n*M - lp_objective`: with zero denials it
+        # equals total delay and compares across M, and with any denial it silently carries
+        # M per denied flight and does not.  `selected_flights` in the summary is the check.
+        "M": params.M,
         "gap_metric": params.gap_metric, "seed_ladder_steps": params.seed_ladder_steps,
         "greedy_budget_s_per_flight": params.greedy_budget_s_per_flight,
         "greedy_budget_s": params.greedy_budget_s_per_flight * len(requests),
@@ -172,14 +222,94 @@ def main() -> int:
 
     rows: list[dict] = []
     master_ref: dict = {}
+    # Index range in `master.columns` that the PREVIOUS iteration's pricing appended.
+    # Safe to hold across iterations only because the pool is append-only (master.py:558);
+    # if that ever changes these indices silently point at the wrong columns.
+    prev_added: tuple[int, int] | None = None
 
     def on_iteration(state: dict) -> None:
+        nonlocal prev_added
         master = state.get("master")
         master_ref["master"] = master
+        # THE QUESTION BEHIND A FLAT LP: pricing accepts a column on the SIGN of its
+        # reduced cost, which says it improves the basis -- not that the next LP gives it
+        # x > 0.  When thousands of positive-rc columns land per iteration and the
+        # objective does not move, those two have come apart, and only `lp_x` can tell
+        # them apart from outside (the solver's own note at solver.py:1247).  Measured
+        # here one iteration late, because "does the LP use it" needs the NEXT LP.
+        used = added_span = None
+        if prev_added is not None and state.get("lp_x") is not None:
+            lo, hi = prev_added
+            x = np.asarray(state["lp_x"], dtype=float)
+            if hi <= len(x):
+                added_span = hi - lo
+                used = int((x[lo:hi] > 1e-9).sum())
+        row_prev_used, row_prev_span = used, added_span
+
+        # How much of what pricing just proposed was routed through capacity rows the
+        # master has never materialized.  Those rows carry NO dual, so pricing values them
+        # at zero -- they are free by construction, however contested they really are.  A
+        # high, non-decaying fraction is the signature of column generation and row
+        # separation chasing each other rather than converging.
+        virgin_claims = virgin_total = None
+        added_now = state.get("columns_added") or 0
+        n_cols_now = state.get("columns") or 0
+        if master is not None and added_now:
+            materialized = master.materialized_rows          # frozenset, built once
+            pool = master.columns                            # tuple copy, taken once
+            fresh = pool[n_cols_now - added_now:n_cols_now]
+            virgin_total = sum(len(c.claims) for c in fresh)
+            virgin_claims = sum(
+                1 for c in fresh for r in c.claims if r not in materialized
+            )
+        prev_added = (n_cols_now - added_now, n_cols_now) if added_now else None
+
+        # WHERE THE BENEFIT WENT.  `n_uncovered=0` beside `n_rc_near_M=945` refutes the
+        # explanation `_coverage_diagnostics` was written for -- these flights are covered,
+        # so their rc of ~M is not a slack cover constraint.  Complementary slackness names
+        # the alternative: for any column the LP uses, `pi_f = M - cost - sum(row duals)`,
+        # so a flight prices at ~M exactly when its ROW duals already consumed the benefit
+        # and left the cover constraint worth nothing.  That distinguishes a big-M scaling
+        # artefact (a few rows priced at ~M) from genuine congestion pricing (the mass
+        # spread over many rows), and those want different fixes.
+        M = float(params.M)
+        duals = state.get("capacity_duals") or {}
+        dual_values = np.fromiter(
+            (abs(float(v)) for v in duals.values()), dtype=float, count=len(duals)
+        ) if duals else np.zeros(0)
+        n_dual_near_M = int((dual_values >= 0.5 * M).sum())
+        dual_sum = float(dual_values.sum())
+        dual_max = float(dual_values.max()) if dual_values.size else 0.0
+        # Implied cover duals over the LP's own support, which is where complementary
+        # slackness holds.  Costed at ~1M dict lookups an iteration; the alternative is
+        # plumbing cover duals out of the backend, which changes the solver to answer an
+        # analysis question.
+        pi_used: list[float] = []
+        x_now = state.get("lp_x")
+        if master is not None and x_now is not None:
+            get = duals.get
+            for value, column in zip(np.asarray(x_now, dtype=float), master.columns,
+                                     strict=False):
+                if value <= 1e-9:
+                    continue
+                pi_used.append(
+                    M - float(column.delay_s)
+                    - math.fsum(float(get(r, 0.0)) for r in column.claims)
+                )
+        pi_arr = np.asarray(pi_used, dtype=float) if pi_used else np.zeros(0)
+
         row = {
             "iteration": state["iteration"],
             "lp_objective": _finite(state.get("lp_objective")),
             "upper_bound": _finite(state.get("upper_bound")),
+            # This iteration's OWN bound, against the running minimum kept above it, and
+            # how many iterations that minimum has stood.  A gap moves when either end
+            # moves; only these say which.  `raw` degrading away from `upper_bound` while
+            # `bound_frozen_for` climbs is the signature of duals wandering rather than
+            # converging -- and it is invisible in the gap, which the improving primal
+            # drags in the opposite direction.
+            "raw_upper_bound": _finite(state.get("raw_upper_bound")),
+            "bound_frozen_for": state.get("bound_frozen_for"),
             "cost_lower_bound": _finite(state.get("cost_lower_bound")),
             "cost_upper_bound": _finite(state.get("cost_upper_bound")),
             # BOTH scales, always.  A run configured for one silently hides the other, and
@@ -191,12 +321,62 @@ def main() -> int:
             "heuristic_cost": _finite(state.get("heuristic_cost")),
             "columns": state.get("columns"),
             "columns_added": state.get("columns_added"),
+            # What pricing OFFERED against what the cap let in.  Equal when uncapped.
+            "columns_priced": state.get("columns_priced"),
+            "columns_deferred": state.get("columns_deferred"),
+            # Of the previous iteration's priced columns, how many this LP actually uses.
+            "prev_added_span": row_prev_span,
+            "prev_added_used": row_prev_used,
+            # Claims on rows the master had not materialized when this column was priced.
+            "virgin_claims": virgin_claims,
+            "virgin_claims_total": virgin_total,
             "rc_n_positive": state.get("rc_n_positive"),
             "rc_sum": _finite(state.get("rc_sum")),
+            # WHERE `rc_sum` comes from, which decides whether a stuck bound is targetable.
+            # The bound is `LP + sum(max(0, rc))`, so a handful of flights at rc ~ M swamp
+            # thousands at rc ~ 1.  `rc_max` against `rc_p50` separates those two worlds, and
+            # `n_rc_near_M` / `n_overlap` name the mechanism: a flight the LP leaves
+            # fractionally uncovered has a zero cover dual, so its rc is roughly the whole
+            # benefit (see `_coverage_diagnostics` in solver.py).
+            "rc_max": _finite(state.get("rc_max")),
+            "rc_p50": _finite(state.get("rc_p50")),
+            "rc_p90": _finite(state.get("rc_p90")),
+            "n_uncovered": state.get("n_uncovered"),
+            "n_rc_near_M": state.get("n_rc_near_M"),
+            "n_overlap": state.get("n_overlap"),
+            "max_column_cost": _finite(state.get("max_column_cost")),
+            # Tailing-off with a frozen bound has two causes needing opposite fixes -- duals
+            # converging slowly (run more iterations) or duals oscillating (stabilize).  The
+            # solver computes the separator and nothing recorded it.
+            "dual_l2": _finite(state.get("dual_l2")),
+            "dual_linf": _finite(state.get("dual_linf")),
             "dual_nonzero": state.get("dual_nonzero"),
+            # Row-dual mass, and how much of it sits at big-M scale.  `n_dual_near_M > 0`
+            # means the LP is pricing individual (cell, step) rows at an entire flight's
+            # benefit, which is what leaves a covered flight's implied cover dual at ~0.
+            "n_dual_near_M": n_dual_near_M,
+            "dual_sum": dual_sum,
+            "dual_max": dual_max,
+            # Implied cover duals over the LP's support: pi_f = M - cost - sum(row duals).
+            # Near zero means the row duals took the benefit; near M means the flight is
+            # cheap to fly and pricing has nothing to gain from it.
+            "pi_used_n": int(pi_arr.size),
+            "pi_used_min": float(pi_arr.min()) if pi_arr.size else None,
+            "pi_used_p50": float(np.median(pi_arr)) if pi_arr.size else None,
+            "pi_used_max": float(pi_arr.max()) if pi_arr.size else None,
+            "pi_used_near_zero": int((np.abs(pi_arr) < 0.01 * M).sum()),
             "sweep_s": round(float(state.get("sweep_s") or 0.0), 2),
             "sweep_task_total_s": round(float(state.get("sweep_task_total_s") or 0.0), 2),
             "lazy_rows_added": state.get("lazy_rows_added"),
+            # Rows this iteration got from the POOL rather than from the LP solution.
+            "contested_rows_added": state.get("contested_rows_added"),
+            # The serial master block, per iteration rather than summed over the solve.  A
+            # total cannot answer "does this grow as the pool grows", and that is the whole
+            # question about the tail: `solve_lp` is the LP, everything else beside it is
+            # Python walking the pool once (`add_violated_rows`) or n_tries times
+            # (`round_heuristic`), so which of them grows decides what is worth fixing.
+            "stage_s": {k: round(float(v), 3) for k, v in (state.get("stage_s") or {}).items()},
+            "stage_n": dict(state.get("stage_n") or {}),
             "rss_mb": round(
                 resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / _RSS_SCALE, 1
             ),
@@ -235,13 +415,34 @@ def main() -> int:
 
         rows.append(row)
         print(
-            f"  it {row['iteration']:>3} lp={row['lp_objective']:<14.8g} "
-            f"gap_rev={row['lp_gap_revenue']:<11.4g} gap_cost={row['lp_gap_cost']:<11.4g} "
+            f"  it {row['iteration']:>3} lp={_fmt(row['lp_objective'], 14, 8)} "
+            f"gap_rev={_fmt(row['lp_gap_revenue'], 11, 4)} "
+            f"gap_cost={_fmt(row['lp_gap_cost'], 11, 4)} "
             f"stop_rev={row['would_stop_lp_revenue']!s:<5} "
             f"ip={row.get('ip_objective', 'n/a')} "
             f"ip_delay={row.get('ip_total_delay_s', 'n/a')} "
             f"cols={row['columns']:>6} sweep={row['sweep_s']:>8.1f}s "
-            f"eff={row['worker_efficiency']}",
+            f"eff={row['worker_efficiency']}\n"
+            f"        cost_ub={_fmt(row['cost_upper_bound'], 12, 6)} "
+            f"cost_lb={_fmt(row['cost_lower_bound'], 12, 6)} "
+            f"frozen={row['bound_frozen_for']!s:<3} "
+            f"rc_sum={_fmt(row['rc_sum'], 12, 6)} rc_n+={row['rc_n_positive']:<6} "
+            f"rc_max={_fmt(row['rc_max'])} rc_p50={_fmt(row['rc_p50'], 10, 4)} "
+            f"nearM={row['n_rc_near_M']:<4} uncov={row['n_uncovered']:<4} "
+            f"dual_l2={_fmt(row['dual_l2'])}\n"
+            f"        dual_nearM={row['n_dual_near_M']:<5} "
+            f"dual_max={_fmt(row['dual_max'], 11, 6)} "
+            f"pi_used p50={_fmt(row['pi_used_p50'], 11, 5)} "
+            f"~0={row['pi_used_near_zero']}/{row['pi_used_n']}\n"
+            f"        prev_added_used={row['prev_added_used']}/{row['prev_added_span']}  "
+            f"virgin_claims={row['virgin_claims']}/{row['virgin_claims_total']}"
+            + (
+                f" ({100.0 * row['virgin_claims'] / row['virgin_claims_total']:.1f}%)"
+                if row["virgin_claims_total"] else ""
+            ) + "\n"
+            "        master " + " ".join(
+                f"{k}={v:.2f}" for k, v in sorted(row["stage_s"].items())
+            ),
             flush=True,
         )
         if args.out:  # flushed per iteration: an hours-long run must survive being killed

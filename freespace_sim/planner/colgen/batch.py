@@ -49,15 +49,22 @@ def _log_iteration(state: dict) -> None:
     Both gap scales, because which one is the gate is a parameter and the other is the
     honest magnitude; `columns_added` because a sweep that stops adding columns is the
     signal that the pool has converged, whatever the bound says.
+
+    `frozen` is the one that says whether any of the rest is progress.  A gap moves when
+    EITHER end moves, so a run whose bound stopped at iteration 1 and whose schedule keeps
+    improving reports a gap that drifts upward -- which reads as "getting worse" when the
+    truth is "certifying nothing while getting better".  Measured on density_faa: seven
+    iterations, one bound.
     """
 
     log.info(
-        "colgen iter %s: lp=%.6g gap_revenue=%.3g gap_cost=%.3g columns=%s (+%s) "
+        "colgen iter %s: lp=%.6g gap_revenue=%.3g gap_cost=%.3g frozen=%s columns=%s (+%s) "
         "rc_sum=%.6g rc_n+=%s sweep_s=%.1f",
         state.get("iteration", "?"),
         state.get("lp_objective", float("nan")),
         state.get("lp_gap_revenue", float("nan")),
         state.get("lp_gap_cost", float("nan")),
+        state.get("bound_frozen_for", "?"),
         state.get("columns", "?"),
         state.get("columns_added", "?"),
         state.get("rc_sum", float("nan")),

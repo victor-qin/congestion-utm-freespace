@@ -197,8 +197,8 @@ def test_derive_cell_window_value():
         corridor_height_m=14.0,
     )
 
-    assert derive_cell_window(default) == (-2, 1)
-    assert derive_cell_window(stacked) == (-2, 1)
+    assert derive_cell_window(default) == (-1, 1)
+    assert derive_cell_window(stacked) == (-1, 1)
     assert derive_cell_window(replace(default, time_buffer_s=0.0)) == (-1, 0)
 
 
@@ -1011,6 +1011,50 @@ def test_translate_containment_parity_vs_astar(kind):
         )
 
 
+@pytest.mark.parametrize("kind", ["clean", "resampled"])
+def test_committed_transit_boxes_carry_a_leading_only_pad(kind):
+    """A committed transit sub-box spans ``[raw_t0, raw_t1 + buf)`` — the atomicity guard.
+
+    ``_retime_lattice_reservation`` ``replace()``s the builder's windows wholesale, so the pad lives
+    in *two* places: :func:`corridor_segment_volume` and the retime. Change one without the other and
+    every committed colgen box is a buffer wider (or narrower) than the capacity rows measured from
+    the builder — silently, because both halves stay internally consistent. These asserts are stated
+    against the absolute lattice clock precisely so a uniform shift of the whole ladder cannot hide.
+    """
+
+    cfg, req, col = _translation_fixture(kind)
+    intent = column_to_intent(col, req, cfg)
+    *_, corridor_t0, _origin_term, _dest_term = column_to_corners(col, req, cfg)
+    dt, buf = cfg.dt_s, cfg.time_buffer_s
+    start_step = round(corridor_t0 / dt)
+    boxes = intent.volumes[1:-1]
+
+    # Absolutely anchored, not merely dt-aligned: a symmetric pad would open the ladder one buffer
+    # early, and since buf == dt at defaults that shift is still a lattice multiple.
+    assert boxes[0].t_start == start_step * dt
+    assert boxes[-1].t_end == (start_step + len(col.cell_path) - 1) * dt + buf
+
+    # Consecutive boxes share one instant: box i's leading pad is exactly box i+1's opening. This is
+    # what makes the pad sum between two *conflicting* transits one buffer rather than two.
+    for earlier, later in zip(boxes, boxes[1:]):
+        assert later.t_start == earlier.t_end - buf
+
+    # Each window is a fixed point of the builder: hand corridor_segment_volume the traverse the box
+    # claims to cover and it must reproduce that window bit-for-bit.
+    for box in boxes:
+        rebuilt = corridor_segment_volume(
+            vec(0.0, 0.0, 0.0), box.t_start, vec(120.0, 0.0, 0.0), box.t_end - buf, cfg
+        )
+        assert (rebuilt.t_start, rebuilt.t_end) == (box.t_start, box.t_end)
+
+    if kind == "clean":
+        # No resampling here, so the ladder is exactly one box per lattice hop.
+        assert len(boxes) == len(col.cell_path) - 1
+        for hop, box in enumerate(boxes):
+            assert box.t_start == (start_step + hop) * dt
+            assert box.t_end == (start_step + hop + 1) * dt + buf
+
+
 @pytest.mark.parametrize(
     ("time_buffer_s", "second_departure_step"),
     [(4.0, 4), (0.0, 2)],
@@ -1337,7 +1381,12 @@ def test_covering_theorem(time_buffer_s):
                         second_direction,
                         shift,
                     )
-    assert hop_conflicts >= (600 if time_buffer_s else 100)
+    # A floor on the sweep's own richness: if a refactor silently stopped generating conflicting
+    # pairs, the coverage assertion above would pass vacuously. Re-derived when filing moved to a
+    # leading-only pad, which shrank each hop window 12 s -> 8 s: the swept count went 660 -> 396
+    # (exactly 0.6x), so the old 600 floor rescales at the same slack ratio to 360. The zero-buffer
+    # arm is untouched -- at time_buffer_s=0 the two filings build literally the same box.
+    assert hop_conflicts >= (360 if time_buffer_s else 100)
 
     # Hop x customer endpoint: sample offsets continuously instead of placing
     # every endpoint on a convenient cell centre.  Nearby edges include spillover
@@ -1603,7 +1652,11 @@ def test_customer_endpoint_rows_are_owned_by_column_claims():
 
 def test_claims_deduped_constructed():
     cfg = _cfg()
-    path = ((0, 0), (1, 0), (1, -1), (0, 0), (1, 0), (2, 0), (3, 0))
+    # Deliberately tighter than pricing would ever emit: two visits share a row only when
+    # they are <= W-1 steps apart, which is exactly what the revisit ban forbids, so a
+    # duplicate coefficient is unreachable from the search and must be constructed by hand.
+    # W moved 4 -> 3 with leading-only pads, so the return leg tightened from 3 steps to 2.
+    path = ((0, 0), (1, 0), (0, 0), (1, 0), (2, 0), (3, 0))
     req = FlightRequest(
         600,
         _ground_point(path[0], cfg),
@@ -1619,9 +1672,9 @@ def test_claims_deduped_constructed():
         for row_step in visit_rows(visit_step, offsets)
     ]
 
-    # The triangle returns to (0, 0) after three steps, so its two visit
-    # windows share the row at first_visit + 1.  The production result must
-    # retain one coefficient, never COO-style coefficient 2.
+    # The path returns to (0, 0) after two steps, so its two visit windows
+    # share the row at first_visit + 1.  The production result must retain
+    # one coefficient, never COO-style coefficient 2.
     duplicate = RowKey.cell((0, 0), col.level, corridor_start + 1)
     assert raw_visit_rows.count(duplicate) == 2
     assert len(raw_visit_rows) > len(set(raw_visit_rows))

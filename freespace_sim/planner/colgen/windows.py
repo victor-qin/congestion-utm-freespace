@@ -4,7 +4,7 @@ The helpers in this module are the sole source of truth for translating the
 ledger's continuous, half-open reservation volumes into ``colgen`` capacity
 rows.  In particular, the temporal offsets are measured from volumes built by
 :func:`~freespace_sim.volumes.corridor_segment_volume`; callers must not copy a
-hard-coded four-period window.
+hard-coded three-period window.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def _periods_overlapping(t0: float, t1: float, dt: float) -> range:
     touched period is ``floor(t0 / dt)`` and the exclusive stop is
     ``ceil(t1 / dt)``.  This helper deliberately has no tolerance padding:
     template corridor times are created directly by the ledger builder and the
-    expected default offset tuple is exactly ``(-2, 1)``.
+    expected default offset tuple is exactly ``(-1, 1)``.
     """
 
     # Division can put an exact constructed boundary on the wrong side of its
@@ -80,7 +80,7 @@ def visit_rows(v: int, offsets: CellWindow) -> range:
 
     ``offsets`` is the inclusive ``(lo, hi)`` tuple returned by
     :func:`derive_cell_window`.  With the default reservation geometry this is
-    ``(-2, 1)``, so a visit at step ``v`` claims ``v-2, ..., v+1``.  Returning a
+    ``(-1, 1)``, so a visit at step ``v`` claims ``v-1, v, v+1``.  Returning a
     :class:`range` keeps both pricing and claim construction allocation-light.
 
     Args:
@@ -282,11 +282,13 @@ def derive_cell_window(cfg: SimConfig) -> CellWindow:
     windows—not an assumed width—determine the periods in which the cell's
     reservation is present.  The returned tuple is inclusive.
 
-    The default geometry yields ``(-2, 1)``.  Setting ``time_buffer_s=0``
-    yields ``(-1, 0)``; this asymmetry is why deriving only a scalar width and
-    reconstructing offsets later would be incorrect.  A representative FCL
-    conflict scan is run once per cached configuration as an independent
-    coverage check.
+    The default geometry yields ``(-1, 1)``: the pad is leading-only, so the
+    inbound hop spans ``[-dt, buf)`` and the outbound ``[0, dt + buf)``,
+    touching three periods.  Setting ``time_buffer_s=0`` yields ``(-1, 0)``,
+    which is *not* centred on the visit — that shifted case is why deriving
+    only a scalar width and reconstructing offsets later would be incorrect.  A
+    representative FCL conflict scan is run once per cached configuration as an
+    independent coverage check.
 
     Args:
         cfg: Simulation geometry and global-clock configuration.

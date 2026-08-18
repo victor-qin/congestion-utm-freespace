@@ -370,13 +370,13 @@ def test_visit_cost_prefix_sums_equal_the_explicit_claim_sum(time_buffer_s):
     builds the explicit ``RowKey`` window and sums it.  Pricing has only ever used
     the second, so the first had no caller and no coverage — yet it is the cheap
     form any bulk pricing path wants.  Both offset regimes are exercised because
-    ``derive_cell_window`` is asymmetric: ``(-2, 1)`` by default, ``(-1, 0)`` at
-    ``time_buffer_s=0``.
+    ``derive_cell_window`` is centred on the visit by default but *shifted* at
+    ``time_buffer_s=0``; the arithmetic below reads the measured offsets, so the
+    window value itself stays owned by ``test_derive_cell_window_value``.
     """
 
     cfg = _cfg(time_buffer_s=time_buffer_s)
     offsets = derive_cell_window(cfg)
-    assert offsets == ((-2, 1) if time_buffer_s else (-1, 0))
     rng = np.random.default_rng(20260803)
 
     for _trial in range(60):
@@ -459,12 +459,15 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
     reduced_cost, column = price_flight(graph, duals, 0.0, cfg, params)
 
     assert column is not None
+    # The revisit of (0, 0) lands at gap 3 == W, which is the claim; W moved 4 -> 3 with the
+    # move to leading-only reservation pads, so the loop tightened by one cell and the
+    # `min_repeat` check at the bottom (derived, not pinned) follows it automatically.
     assert column.cell_path == (
         (0, 0),
         (-1, 0),
         (-1, 1),
-        (0, 1),
         (0, 0),
+        (0, 1),
         (1, 0),
         (2, 0),
     )
@@ -735,7 +738,7 @@ def test_rounding_honours_fixed_and_unmaterialized_claims():
 
 
 def test_hand_checked_60deg_crossing():
-    """Two unique geodesics share one cell; W=4 makes one hold 4 steps (16 s)."""
+    """Two unique geodesics share one cell; W=3 makes one hold 3 steps (12 s)."""
 
     cfg = _cfg(max_ground_delay_s=32.0)
     requests = [
@@ -752,11 +755,11 @@ def test_hand_checked_60deg_crossing():
     result = ColGenSolver().solve(requests, cfg, (), _params())
 
     assert len(result.columns) == 2
-    assert result.stats["objective"] == pytest.approx(16.0, abs=1e-8)
+    assert result.stats["objective"] == pytest.approx(12.0, abs=1e-8)
     assert result.stats["initial_heuristic_flights"] == 2
-    assert result.stats["initial_heuristic_delay_s"] == pytest.approx(16.0, abs=1e-8)
+    assert result.stats["initial_heuristic_delay_s"] == pytest.approx(12.0, abs=1e-8)
     assert sorted(column.delay_s for column in result.columns.values()) == pytest.approx(
-        [0.0, 16.0], abs=1e-8
+        [0.0, 12.0], abs=1e-8
     )
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg)
@@ -797,12 +800,12 @@ def test_two_crossing_flights_bruteforce_optimal():
     )
     result = ColGenSolver().solve(requests, cfg, (), params)
 
-    assert brute == pytest.approx(16.0)
+    assert brute == pytest.approx(12.0)
     assert result.stats["objective"] == pytest.approx(brute, abs=1e-8)
 
 
 def test_hand_checked_merge_three_flights():
-    """Three unique geodesics share one cell; holds 0, 4, 8 steps cost 48 s."""
+    """Three unique geodesics share one cell; holds 0, 3, 6 steps cost 36 s."""
 
     cfg = _cfg(max_ground_delay_s=48.0)
     requests = [
@@ -819,18 +822,32 @@ def test_hand_checked_merge_three_flights():
     result = ColGenSolver().solve(requests, cfg, (), _params())
 
     assert len(result.columns) == 3
-    assert result.stats["objective"] == pytest.approx(48.0, abs=1e-8)
+    assert result.stats["objective"] == pytest.approx(36.0, abs=1e-8)
     assert sorted(column.delay_s for column in result.columns.values()) == pytest.approx(
-        [0.0, 16.0, 32.0], abs=1e-8
+        [0.0, 12.0, 24.0], abs=1e-8
     )
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg)
 
 
 def test_hand_checked_detour_beats_hold():
-    """One extra hop (4 s) resolves a crossing that otherwise needs a W-step hold."""
+    """One extra hop (4 s) resolves a crossing that otherwise needs a W-step hold.
 
-    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=20.0)
+    ``cost_air_lateral_per_s`` is pinned here rather than inherited, because this instance sits
+    exactly on the substitution knife-edge after the move to leading-only reservation pads.  A
+    W-step hold costs ``W * dt * w_ground`` and a one-hop detour costs ``dt * w_air``, so the
+    detour wins iff ``W * w_ground > w_air``.  W was 4 and is now 3, and the config default is
+    1:3 -- which is a dead-exact TIE (12 vs 12), where the tie-break takes the hold and the
+    named claim is untestable.  ``w_air = 2`` restores a strict win by 4, the same margin this
+    test documented before, and the solver really does take the extra hop (see the hop counts).
+    """
+
+    cfg = _cfg(
+        flight_levels_m=(30.0,),
+        max_ground_delay_s=20.0,
+        cost_air_lateral_per_s=2.0,
+        cost_air_hold_per_s=2.0,
+    )
     requests = [
         _request(1, (-2, -5), (-2, -11), cfg),
         _request(2, (-8, -4), (0, -4), cfg),
@@ -856,17 +873,18 @@ def test_hand_checked_detour_beats_hold():
         _params(max_air_overrun_hops=1, gap_metric="cost"),
     )
 
-    # The claim is unchanged and is the name of the test: a one-hop detour still beats a
-    # four-step hold.  Only the margin moved.  Under the config's 1:3 weighting the hold
-    # costs 16 (16 ground seconds, w_ground = 1, the numeraire) and the detour costs 12
-    # (1 hop x dt(4 s) x w_air(3)) -- so the detour wins by 4 where it used to win by 12.
-    # That narrowing is the point of the weighting, and a ratio above 4:1 would flip it.
-    assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
-    assert with_detour.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    # The claim is the name of the test: a one-hop detour beats the hold.  The hold is now a
+    # THREE-step hold costing 12 (12 ground seconds, w_ground = 1, the numeraire) and the
+    # detour costs 8 (1 hop x dt(4 s) x w_air(2)) -- the detour wins by 4.
+    assert no_detour.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert with_detour.stats["objective"] == pytest.approx(8.0, abs=1e-8)
     assert with_detour.stats["objective"] < no_detour.stats["objective"]
-    assert with_detour.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
-    assert with_detour.stats["cost_upper_bound"] == pytest.approx(12.0, abs=1e-7)
-    assert sorted(column.delay_s for column in with_detour.columns.values()) == [0.0, 12.0]
+    assert with_detour.stats["cost_lower_bound"] == pytest.approx(8.0, abs=1e-7)
+    assert with_detour.stats["cost_upper_bound"] == pytest.approx(8.0, abs=1e-7)
+    assert sorted(column.delay_s for column in with_detour.columns.values()) == [0.0, 8.0]
+    # It is genuinely flying the detour, not holding: one hop longer than the no-detour arm.
+    assert sorted(len(c.cell_path) - 1 for c in with_detour.columns.values()) == [6, 9]
+    assert sorted(len(c.cell_path) - 1 for c in no_detour.columns.values()) == [6, 8]
     assert any(
         len(column.cell_path) - 1 == hg.hex_distance(column.cell_path[0], column.cell_path[-1]) + 1
         for column in with_detour.columns.values()
@@ -889,7 +907,17 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     and that distinction is the thing worth not rediscovering.
     """
 
-    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=20.0)
+    # Same knife-edge as `test_hand_checked_detour_beats_hold`, and pinned for the same
+    # reason: at the config's default 1:3 weighting the W=3 hold and the one-hop detour tie
+    # at 12, the LP proves that at iteration 1, and BOTH gaps collapse to zero -- leaving
+    # nothing for this test to observe.  w_air = 2 makes the detour strictly better (8), so
+    # the early stop again happens with the cost scale genuinely open.
+    cfg = _cfg(
+        flight_levels_m=(30.0,),
+        max_ground_delay_s=20.0,
+        cost_air_lateral_per_s=2.0,
+        cost_air_hold_per_s=2.0,
+    )
     requests = [
         _request(1, (-2, -5), (-2, -11), cfg),
         _request(2, (-8, -4), (0, -4), cfg),
@@ -901,10 +929,9 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
 
     assert revenue.stats["termination_reason"] == "lp_gap"
     assert revenue.stats["iterations"] == 1
-    # Optimal solution ... (12 = 1 detour hop x dt(4 s) x w_air(3); the same column as
-    # before the objective default moved to the config's 1:3 weighting, repriced)
-    assert revenue.stats["objective"] == pytest.approx(12.0, abs=1e-8)
-    assert revenue.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
+    # Optimal solution ... (8 = 1 detour hop x dt(4 s) x w_air(2))
+    assert revenue.stats["objective"] == pytest.approx(8.0, abs=1e-8)
+    assert revenue.stats["cost_lower_bound"] == pytest.approx(8.0, abs=1e-7)
     # ... reached while the two scales disagree by orders of magnitude.  Asserted as the
     # RATIO between them rather than as a floor on the cost gap: `lp_gap_cost` normalises
     # the same absolute gap by total cost, so repricing the optimum from 4 to 12 divides it
@@ -943,17 +970,17 @@ def test_colgen_beats_fcfs_on_constructed_congestion():
         ledger.commit(request.flight_id, intent.volumes)
         fcfs_delays.append(total_delay_s(intent, astar_cfg))
 
-    assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 16.0]
+    assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 12.0]
     assert fcfs_delays == pytest.approx([0.0, 24.0, 24.0])
     # `objective` is in the cost model's currency, which is now the config's 1:3 weighting
     # and NOT seconds in general.  It is comparable to the A* delays here for a reason
     # specific to this instance: colgen resolves the congestion entirely with GROUND delay
-    # (the columns above are 0/0/16 s of hold and no detour), and `cost_ground_delay_per_s`
+    # (the columns above are 0/0/12 s of hold and no detour), and `cost_ground_delay_per_s`
     # is the numeraire at 1.0, so ground seconds and cost coincide exactly.  An instance
     # that resolved it with a detour would scale that term by 3 and the comparison below
     # would be between two different units.
     assert colgen.stats["objective_name"] == "total_cost"
-    assert colgen.stats["objective"] == pytest.approx(16.0)
+    assert colgen.stats["objective"] == pytest.approx(12.0)
     # The premise of that paragraph, asserted rather than assumed: every column flies the
     # geodesic, so the air term is zero and only the ground term is left.
     assert all(
@@ -992,12 +1019,18 @@ def test_fixed_claim_displaces_a_flight_by_the_measured_window():
 
     assert len(result.columns) == 1
     selected = result.columns[request.flight_id]
-    assert selected.delay_s == pytest.approx(16.0, abs=1e-8)
+    # One window width, which is the name of the test: W shrank 4 -> 3 with the move to
+    # leading-only reservation pads, so the displacement shrank with it (16 s -> 12 s).
+    assert selected.delay_s == pytest.approx(12.0, abs=1e-8)
     assert selected.claims.isdisjoint(fixed)
 
 
 def test_budget_limited_crossing_denies_exactly_one_in_repair():
-    cfg = _cfg(max_ground_delay_s=12.0)
+    # The budget must sit BELOW the crossing's minimum hold, which is one window width.  W
+    # shrank 4 -> 3 with leading-only reservation pads, so the old 12 s budget now exactly
+    # ACCOMMODATES the 12 s hold and nothing is denied -- the fixture stopped constructing
+    # its own premise.  8 s is under the 12 s hold again, so the repair must deny one.
+    cfg = _cfg(max_ground_delay_s=8.0)
     requests = [
         _request(1, (-4, 0), (4, 0), cfg),
         _request(2, (0, -4), (0, 4), cfg),
@@ -1274,7 +1307,7 @@ def test_repair_finds_feasible_column_even_when_delay_exceeds_m():
     assert result.stats["ip_upper_bound"] == pytest.approx(0.0)
     assert result.stats["ip_gap"] == pytest.approx(0.0)
     assert result.stats["ip_gap_met"] is True
-    assert result.columns[7].delay_s == pytest.approx(16.0)
+    assert result.columns[7].delay_s == pytest.approx(12.0)
     assert result.columns[7].claims.isdisjoint(fixed)
 
 
@@ -1292,7 +1325,7 @@ def test_disconnected_static_wall_denies_only_that_flight():
 
 
 def test_swap_never_selected_and_head_on_files_cleanly():
-    """Canonical endpoint claims make this full-ledger head-on optimum 64 s, not 32 s."""
+    """Canonical endpoint claims make this full-ledger head-on optimum 60 s, not 32 s."""
 
     cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=80.0)
     params = _params()
@@ -1301,7 +1334,7 @@ def test_swap_never_selected_and_head_on_files_cleanly():
         _request(2, (10, 0), (-2, 0), cfg),
     ]
     result = ColGenSolver().solve(requests, cfg, (), params)
-    assert result.stats["objective"] == pytest.approx(64.0, abs=1e-8)
+    assert result.stats["objective"] == pytest.approx(60.0, abs=1e-8)
 
     graph_by_id = {
         request.flight_id: build_flight_graph(request, cfg, (), params) for request in requests
@@ -1384,10 +1417,14 @@ def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
     explanation for any slow run.
     """
 
-    cfg = _cfg(max_ground_delay_s=32.0)
+    # Three flights merging through one cell, not two crossing: with leading-only pads the
+    # two-flight crossing's LP relaxation is integral on the seed pool, so the IP is skipped
+    # outright and there is no elapsed time to attribute.  The merge instance still needs it.
+    cfg = _cfg(max_ground_delay_s=48.0)
     requests = [
         _request(1, (-4, 0), (4, 0), cfg),
         _request(2, (0, -4), (0, 4), cfg),
+        _request(3, (-4, 4), (4, -4), cfg),
     ]
 
     # ladder off so the heuristic cannot prove the gap and skip the MILP outright.

@@ -578,7 +578,7 @@ function draw(t){{
     }}
   }}
   resetLabels();
-  const tq = (t - START)*DATA.qt, lo = tq - TBQ, hi = tq + TBQ;
+  const tq = (t - START)*DATA.qt, lo = tq - TBQ;
   const bk = buckets[Math.max(0, Math.min(buckets.length-1, Math.floor((t - START)/BW)))] || [];
   let nActive = 0;
   for(const fi of bk){{
@@ -590,11 +590,13 @@ function draw(t){{
       for(const bx of fl.b){{ if(bx[9]>tq || tq>=bx[10]) continue; on=true;
         for(let k=0;k<8;k++) POLY[k]=bx[k]*IQ;
         strokePoly(POLY, fl.k, bx[8]*IQ); }}
-    }} else {{      // segment i spans [t[i]-buf, t[i+1]+buf), so it is live when t[i] <= hi && t[i+1] > lo.
-                   // Both bounds are upperBound: the window is half-open, and on a dt-aligned clock the
-                   // trailing edge lands exactly on t[i+1] == lo every frame.
+    }} else {{      // segment i spans [t[i], t[i+1]+buf) — the pad is LEADING-ONLY — so it is live when
+                   // t[i] <= tq && t[i+1] > lo. Both bounds are upperBound because the window is
+                   // half-open at BOTH ends every frame on a dt-aligned clock: the oldest segment
+                   // expires exactly at tq (t[i+1]+buf == tq, i.e. t[i+1] == lo) as the newest one
+                   // opens exactly at tq (t[i] == tq). Neither boundary may be decided by epsilon.
       const a = Math.max(0, upperBound(fl.t, lo) - 1);
-      const z = Math.min(fl.t.length - 2, upperBound(fl.t, hi) - 1);
+      const z = Math.min(fl.t.length - 2, upperBound(fl.t, tq) - 1);
       for(let i=a;i<=z;i++){{ on=true; strokePoly(POLY, fl.k, segPoly(fl, i, POLY)); }}
     }}
     for(const cy of fl.c){{ if(cy[3]>tq || tq>=cy[4]) continue; on=true;

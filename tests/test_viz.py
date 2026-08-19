@@ -269,6 +269,62 @@ console.log(JSON.stringify(out));
         assert abs(rec["z"] - vol.shape.center[2]) < 1e-9, f"box centre altitude for {p0}→{p1}"
 
 
+def _shipped_js_line(fragment: str) -> str:
+    """The single shipped `_HTML` line containing `fragment`, un-escaped from the format template.
+
+    Raises `ValueError` if the fragment is gone — that is the point: this pins *shipped* source, so a
+    reformat that moves the live-range arithmetic must fail loudly rather than silently test nothing.
+    """
+    html = viz_html._HTML
+    i = html.index(fragment)
+    line = html[html.rindex("\n", 0, i) + 1 : html.index("\n", i)]
+    return line.replace("{{", "{").replace("}}", "}")
+
+
+def test_shipped_replay_draws_a_segment_from_exactly_its_start_time():
+    """Runs the REAL shipped active-range arithmetic in node against the leading-only pad.
+
+    A transit box is filed `[t[i], t[i+1] + buf)` — all pad in front — so segment `i` must go live at
+    *exactly* `t[i]` and not one tick earlier. The upper bound therefore has to track the filing: the
+    symmetric-pad era's `upperBound(fl.t, tq + buf)` was right for `[t[i] - buf, ...)` and, left in
+    place, would draw one extra segment ahead of every drone every frame. Nothing Python-side can
+    catch that — the range exists only in the embedded JS — so this executes the shipped lines.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; cannot execute the shipped JS")
+
+    buf = SimConfig().time_buffer_s
+    # DATA.qt = 1 and START = 0 make the quantised clock plain seconds, so `fl.t` below is dt-aligned
+    # wall time and every value under test is exactly representable.
+    harness = f"""
+{_shipped_js_line("function upperBound(a, v)")}
+{_shipped_js_line("while(lo<hi)")}
+const START = 0, DATA = {{qt: 1}}, TBQ = {buf};
+const fl = {{t: [0, 4, 8, 12, 16]}};       // 4 segments; segment i spans [4i, 4i+8)
+const out = [];
+for (const t of [10, 8, 8 - 1e-9]) {{
+  {_shipped_js_line("const tq = (t - START)*DATA.qt")}
+  {_shipped_js_line("const a = Math.max(0, upperBound(fl.t, lo) - 1)")}
+  {_shipped_js_line("const z = Math.min(fl.t.length - 2, upperBound(fl.t, tq) - 1)")}
+  out.push([a, z]);
+}}
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    mid, exact, just_before = json.loads(proc.stdout)
+
+    # Mid-segment: 0 died at t[1]+buf == 8, 3 is not live until t[3] == 12.
+    assert mid == [1, 2]
+    # Exactly t[2]: segment 2 turns on at its own start instant, and segment 0 expires at the same
+    # instant (its window is half-open, so t[1]+buf == 8 is already outside).
+    assert exact == [1, 2]
+    # One epsilon earlier: segment 2 must NOT be drawn yet. The old symmetric-pad bound returned
+    # z == 2 here, one segment ahead of the drone.
+    assert just_before == [0, 1]
+
+
 def test_shipped_view_transform_zooms_about_a_fixed_point():
     """Runs the shipped zoom/pan maths in node: the world point under the cursor must not move.
 

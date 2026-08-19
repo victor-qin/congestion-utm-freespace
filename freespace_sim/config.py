@@ -42,7 +42,10 @@ class SimConfig:
     # --- corridor geometry (WIDTH & HEIGHT are knobs; LENGTH is derived from speed×dt) ---
     corridor_width_m: float = 60.0     # full lateral width of each corridor box
     corridor_height_m: float = 30.0    # full vertical extent, centered on the segment
-    time_buffer_s: float = 4.0         # ASTM time buffer (§4.3.11); ≈ one dt
+    # ASTM time buffer (§4.3.11); ≈ one dt. Filed LEADING-ONLY (`[t0, t1 + buf)`), so this is the FULL
+    # pairwise gap between two conflicting transits, not half of it. Widening it past one dt re-widens
+    # the colgen capacity footprint to four periods — see corridor_segment_volume's conservation law.
+    time_buffer_s: float = 4.0
 
     # --- hover cylinder (own radius knob; defaults to corridor width) ---
     hover_radius_m: float | None = None   # None ⇒ effective_hover_radius_m = corridor_width_m

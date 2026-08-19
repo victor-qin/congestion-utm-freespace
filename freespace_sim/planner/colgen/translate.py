@@ -277,7 +277,10 @@ def _retime_lattice_reservation(
             retimed_volumes.append(
                 replace(
                     edge,
-                    t_start=raw_t0 - cfg.time_buffer_s,
+                    # Leading-only pad, matching ``corridor_segment_volume`` exactly: this
+                    # ``replace`` overwrites the builder's windows wholesale, so any drift here
+                    # silently re-files boxes wider than the capacity rows measured from the builder.
+                    t_start=raw_t0,
                     t_end=raw_t1 + cfg.time_buffer_s,
                 )
             )

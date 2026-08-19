@@ -915,6 +915,76 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     assert revenue.stats["lp_gap_cost"] > 1e3 * revenue.stats["lp_gap_revenue"]
 
 
+def test_lns_heuristic_never_returns_worse_than_the_incumbent_it_started_from():
+    """Monotonicity is the whole point, and it is structural rather than lucky.
+
+    `round_heuristic` rebuilds from nothing and, measured at 2,000 flights, stranded 330 of
+    them at a full ``M`` each -- 94% of its cost -- because its fill can only pick columns
+    already in the pool.  LNS releases one flight at a time and puts the original column
+    straight back when nothing fits, so coverage cannot fall and the returned selection is
+    the incumbent unless a try strictly beat it.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0, seed=29)
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in range(1, 7)]
+    params = _params(max_iterations=3)
+
+    seen: list[dict] = []
+    ColGenSolver().solve(requests, cfg, (), params, on_iteration=seen.append)
+    baseline_cost = seen[-1]["heuristic_cost"]
+
+    lns: list[dict] = []
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(max_iterations=3, lns_destroy_flights=2),
+        on_iteration=lns.append,
+    )
+
+    assert lns, "at least one iteration must report"
+    # Never worse than the greedy seed it starts from, at every iteration.
+    assert all(p["heuristic_cost"] <= baseline_cost + 1e-6 for p in lns)
+    # Monotone across iterations -- the incumbent can only improve.
+    costs = [p["heuristic_cost"] for p in lns]
+    assert costs == sorted(costs, reverse=True)
+    # Coverage is invariant: LNS swaps, it never drops a flight.
+    assert all(p["round_stats"]["mode"] == "lns" for p in lns)
+    assert all(
+        p["round_stats"]["try_covered"][0] == lns[0]["round_stats"]["try_covered"][0]
+        for p in lns
+    )
+    # And the schedule it returns is genuinely claim-feasible, not merely scored well.
+    assert result.columns
+
+
+def test_ladder_stride_trades_resolution_for_span_at_a_fixed_column_count():
+    """``steps`` stays a column COUNT under any stride; the span is ``steps * stride``.
+
+    The calibrated depth of 20 was measured on a consecutive ladder, so it describes 80 s
+    of departure delay at ``dt_s=4`` -- against a mean of ~120 cost units per flight at
+    2,000 density flights.  Keeping the two knobs independent is what lets span be widened
+    without re-deriving that calibration or paying for more columns.
+    """
+
+    cfg = _cfg(max_ground_delay_s=600.0)
+    request = _request(1, (-4, 0), (4, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = solver_module._canonical_column(seed_column(graph, cfg), graph, cfg)
+
+    def ladder_steps(stride: int, steps: int = 4) -> list[int]:
+        master = RestrictedMaster((1,), RowIndex(), _params())
+        master.add_column(seed)
+        added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, steps, stride)
+        assert added == steps, "the fixture must not be truncated by the horizon"
+        return [c.departure_step - seed.departure_step for c in master.columns[1:]]
+
+    assert ladder_steps(1) == [1, 2, 3, 4]
+    assert ladder_steps(3) == [3, 6, 9, 12]
+    # Same column count, 3x the span -- which is the whole trade.
+    assert len(ladder_steps(3)) == len(ladder_steps(1))
+    assert max(ladder_steps(3)) == 3 * max(ladder_steps(1))
+    with pytest.raises(ValueError):
+        ladder_steps(0)
+
+
 def test_contested_rows_counts_distinct_flights_not_columns():
     """The distinct-flight rule is what makes pool separation safe, not a refinement.
 

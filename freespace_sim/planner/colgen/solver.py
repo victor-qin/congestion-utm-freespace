@@ -146,7 +146,7 @@ def _shift_column(
     )
 
 
-def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
+def _add_departure_ladder(master, seed, graph, cfg, model, steps: int, stride: int = 1) -> int:
     """Offer the master `steps` pure clock translations of one flight's seed.
 
     Pricing spends its early iterations rediscovering exactly these: measured over a
@@ -163,10 +163,22 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     by the solution's slip, not by `max_ground_delay_s` -- which allows 900 steps here.
 
     Denser traffic slips further and moves the knee, so 20 is calibrated, not universal.
+
+    ``stride`` spaces the rungs.  The knee above was measured on a CONSECUTIVE ladder, so
+    "no schedule wants more than 14 steps" is a statement about 56 s of span at ``dt_s=4``,
+    not about 14 rungs -- and at 2,000 flights the mean flight carries ~120 cost units
+    against a ``max_ground_delay_s`` of 3,600 s, so 20 consecutive rungs cover 80 s of a far
+    wider distribution.  Striding trades resolution for span at a fixed column count, which
+    is the right trade if the ladder's job is to give the LP an in-pool ALTERNATIVE per
+    flight -- the thing that pins ``pi_f`` and stops a single tight row absorbing the whole
+    benefit -- rather than to contain the optimum, which pricing's DP re-derives at exact
+    departure resolution every sweep regardless.
     """
 
     if steps <= 0:
         return 0
+    if stride < 1:
+        raise ValueError("stride must be positive")
     # BOTH bounds, stated.  `latest_departure_step` alone is not the limit: this path must
     # also arrive by `max_step`, which is the bound `_initial_feasible_selection` computes
     # explicitly for the same reason.  Leaving it to be caught as a `ValueError` from
@@ -186,7 +198,14 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     )
     latest = min(graph.latest_departure_step, path_latest_departure)
     added = 0
-    for step in range(seed.departure_step + 1, min(seed.departure_step + steps, latest) + 1):
+    # `steps` stays a COLUMN COUNT under any stride -- the span is `steps * stride` -- so
+    # the two knobs are independent and the calibrated depth above keeps its meaning.
+    # `latest` still truncates, so a strided ladder on a tight horizon simply yields fewer
+    # rungs rather than overshooting it.
+    for k in range(1, steps + 1):
+        step = seed.departure_step + k * stride
+        if step > latest:
+            break
         master.add_column(_canonical_column(_shift_column(seed, step, cfg, model), graph, cfg))
         added += 1
     return added
@@ -572,6 +591,7 @@ def _pre_master_timeout_result(
             "seeded_columns": 0,
             "ladder_columns": 0,
             "ip_elapsed_s": 0.0,
+            "ip_trajectory": (),
             "ip_objective": None,
             "ip_upper_bound": None,
             "ip_cost_lower_bound": None,
@@ -732,6 +752,7 @@ class ColGenSolver:
                     "seeded_columns": 0,
                     "ladder_columns": 0,
                     "ip_elapsed_s": 0.0,
+                    "ip_trajectory": (),
                     "ip_objective": None,
                     "ip_upper_bound": None,
                     "ip_cost_lower_bound": None,
@@ -887,7 +908,8 @@ class ColGenSolver:
             seeds[flight_id] = seed
             master.add_column(seed)
             ladder_columns += _add_departure_ladder(
-                master, seed, graphs[flight_id], cfg, model, params.seed_ladder_steps
+                master, seed, graphs[flight_id], cfg, model,
+                params.seed_ladder_steps, params.seed_ladder_stride,
             )
         seed_elapsed_s = time.monotonic() - seed_started
 
@@ -980,6 +1002,13 @@ class ColGenSolver:
                     "colgen iteration %d/%d: %d columns in the master",
                     iteration + 1, params.max_iterations, len(master.columns),
                 )
+                # Wall for THIS iteration, so the stage timers can be checked against the
+                # clock rather than trusted.  The residual `iteration_wall_s - sweep_s -
+                # sum(stage_s)` is the block nothing names, and on a 4,636-flight run that
+                # residual was 146 s of a 192 s serial tail -- the largest single term in
+                # the solve, invisible because only the parts someone thought to time were
+                # reported.  A total cannot expose it; only a per-iteration wall can.
+                iteration_started = time.monotonic()
                 # Per-iteration stage timings.  The master block was one unattributed lump in
                 # the serial tail, and "the LP is slow" is only one of four candidates in it:
                 # the LP itself, the lazy-row re-solve loop around it, `_canonical_column`
@@ -1059,14 +1088,42 @@ class ColGenSolver:
                     termination_reason = "time_limit"
                     break
 
+                # BOX THE ROW DUALS, if asked.  A capacity row's dual is the marginal value
+                # of one more slot of airspace; the LP is free to drive it to the whole
+                # per-flight benefit `M`, and on density_faa x2000 it does -- `dual_max` is
+                # 999,945 against a `max_column_cost` of 891.6, so one (cell, step) is
+                # priced above the most expensive complete route in the pool.  That is what
+                # creates the reduced-cost tail: the ~50 flights whose used column crosses
+                # such a row have an implied cover dual of ~0, so any detour around it
+                # prices at `rc ~ M` and the bound reads `cost_ub - rc_sum` far below zero.
+                #
+                # VALIDITY: clamping DOWNWARD keeps the bound valid.  With `pi~ <= pi*`
+                # componentwise, every column's reduced cost rises, so the best one does
+                # too, so `RMP + sum(max(0, rc~)) >= RMP + sum(max(0, rc*))` -- a larger
+                # upper bound, still an upper bound.  The corollary is the honest one: this
+                # can only make the REPORTED bound weaker, never tighter.  Its case is
+                # entirely indirect -- pricing that is not told a slot is worth 1,000x a
+                # whole route should propose sane routes instead of escapes, giving later
+                # iterations a better pool and less degenerate true duals.
                 iterations = iteration + 1
                 last_lp_objective = float(lp_objective)
                 last_x = np.asarray(x, dtype=float)
                 columns_at_lp = len(master.columns)
 
-                heuristic = _timed(
-                    "round_heuristic", master.round_heuristic, last_x, rng, params.n_heuristic_tries
-                )
+                # LNS needs something to start from; `best_heuristic` is the greedy seed on
+                # iteration 1 and a real incumbent after, so it is never empty here -- but
+                # guard anyway, because an empty incumbent would silently return {} and
+                # look like a heuristic that found nothing.
+                if params.lns_destroy_flights and best_heuristic:
+                    heuristic = _timed(
+                        "lns_heuristic", master.lns_heuristic, last_x, rng,
+                        best_heuristic, params.lns_destroy_flights, params.n_heuristic_tries,
+                    )
+                else:
+                    heuristic = _timed(
+                        "round_heuristic", master.round_heuristic, last_x, rng,
+                        params.n_heuristic_tries,
+                    )
                 heuristic = _timed(
                     "canonical_heuristic",
                     lambda h: {
@@ -1427,10 +1484,23 @@ class ColGenSolver:
                         "dual_l2": dual_l2,
                         "dual_linf": dual_linf,
                         "dual_nonzero": sum(1 for v in capacity_duals.values() if v != 0.0),
+                        # What the LP asked for before the box, and how much of it was
+                        # refused.  Without the raw maximum a boxed run cannot say whether
+                        # the box bound anything at all, and `dual_max` alone would just
+                        # report the box back.
                         "elapsed_s": time.monotonic() - started,
+                        # This iteration alone, against which `sweep_s` and `stage_s` are a
+                        # partial accounting.  Their residual is the unattributed block.
+                        "iteration_wall_s": time.monotonic() - iteration_started,
                         **_coverage_diagnostics(master, last_x, rc_by_flight, params.M),
                         "stage_s": dict(stage_s),
                         "stage_n": dict(stage_n),
+                        # Per-try outcomes of this iteration's rounding heuristic, and how
+                        # many columns the LP left integral enough to commit outright.  The
+                        # stage has never once beaten the greedy seed at scale, and without
+                        # these a reader cannot tell a try that stranded one flight (costing
+                        # a full M) from one that was merely slower everywhere.
+                        "round_stats": dict(getattr(master, "last_round_stats", {}) or {}),
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
                         # This iteration's rows from the POOL, against the cumulative total
@@ -1729,6 +1799,13 @@ class ColGenSolver:
             "ip_optimal": ip_optimal,
             "ip_skipped": ip_skipped,
             "ip_elapsed_s": ip_elapsed_s,
+            # (elapsed_s, incumbent, bound) per MILP incumbent, Gurobi only -- scipy's
+            # `milp` exposes no callback, so this is empty on HiGHS.  Recorded because the
+            # final MILP is otherwise a black box: a 25-minute solve and a hang look
+            # identical, and "would a looser ip_gap have stopped it, and when" is
+            # unanswerable without the trajectory.  Both values are in MAXIMIZE revenue
+            # sense, matching `ip_upper_bound`.
+            "ip_trajectory": tuple(getattr(master, "last_ip_trajectory", ()) or ()),
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
             "objective": objective_value,

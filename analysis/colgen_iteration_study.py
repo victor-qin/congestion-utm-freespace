@@ -115,12 +115,29 @@ def main() -> int:
     )
     ap.add_argument("--ladder", type=int, default=None, help="default: the shipped value")
     ap.add_argument(
+        "--ladder-stride", type=int, default=None,
+        help="spacing between ladder rungs in lattice steps (default 1 = consecutive). "
+             "stride 3 at dt_s=4 spans 240 s with the same 20 columns. ANSWER-AFFECTING.",
+    )
+    ap.add_argument(
+        "--ip-gap", type=float, default=0.0,
+        help="relative tolerance for the FINAL MILP. The study default of 0.0 forces a "
+             "proof of exact optimality over the whole pool, which does not terminate at "
+             "scale; 1e-3 is the shipped value and is what a production run would use.",
+    )
+    ap.add_argument(
         "--M", type=float, default=None, dest="big_m",
         help="per-flight benefit (default: the shipped 1e6). Only has to exceed the "
              "priciest column so denial is never attractive -- measured max_column_cost is "
              "891.6 at 2,000 density flights, so the shipped value is ~1,100x its floor. "
              "ANSWER-AFFECTING, and below the floor it makes denial CHEAPER THAN FLYING: "
              "watch `selected_flights` in the summary, not just the timings.",
+    )
+    ap.add_argument(
+        "--lns", type=int, default=0,
+        help="flights released per LNS try (0 = the shipped randomized rounding). LNS "
+             "starts from the incumbent and swaps one flight at a time, so coverage is "
+             "invariant and the result can never be worse than what it started with.",
     )
     ap.add_argument(
         "--contested-rows", type=int, default=0,
@@ -167,13 +184,15 @@ def main() -> int:
         time_limit_s=86400.0,
         gap_metric=args.gap_metric,
         lp_gap=0.0,
-        ip_gap=0.0,
+        ip_gap=args.ip_gap,
         n_pricing_workers=args.workers,
         max_columns_per_iteration=args.max_columns,
+        lns_destroy_flights=args.lns,
         contested_row_separation=args.contested_rows,
         contested_rows_limit=args.contested_rows_limit,
         **({} if args.big_m is None else {"M": args.big_m}),
         **({} if args.ladder is None else {"seed_ladder_steps": args.ladder}),
+        **({} if args.ladder_stride is None else {"seed_ladder_stride": args.ladder_stride}),
     )
 
     seed_columns = None
@@ -206,6 +225,7 @@ def main() -> int:
         "scenario": args.scenario, "flights": len(requests), "solver": args.solver,
         "max_iterations": args.iterations, "workers": args.workers,
         "max_columns_per_iteration": params.max_columns_per_iteration,
+        "lns_destroy_flights": params.lns_destroy_flights,
         "contested_row_separation": params.contested_row_separation,
         "contested_rows_limit": params.contested_rows_limit,
         # Recorded because `cost_upper_bound` is `n*M - lp_objective`: with zero denials it
@@ -213,6 +233,7 @@ def main() -> int:
         # M per denied flight and does not.  `selected_flights` in the summary is the check.
         "M": params.M,
         "gap_metric": params.gap_metric, "seed_ladder_steps": params.seed_ladder_steps,
+        "seed_ladder_stride": params.seed_ladder_stride, "ip_gap": params.ip_gap,
         "greedy_budget_s_per_flight": params.greedy_budget_s_per_flight,
         "greedy_budget_s": params.greedy_budget_s_per_flight * len(requests),
         "ip_every_iteration": not args.no_ip_every_iteration,
@@ -351,6 +372,7 @@ def main() -> int:
             "dual_l2": _finite(state.get("dual_l2")),
             "dual_linf": _finite(state.get("dual_linf")),
             "dual_nonzero": state.get("dual_nonzero"),
+            # What the LP wanted before the box, and how many rows it refused.
             # Row-dual mass, and how much of it sits at big-M scale.  `n_dual_near_M > 0`
             # means the LP is pricing individual (cell, step) rows at an entire flight's
             # benefit, which is what leaves a covered flight's implied cover dual at ~0.
@@ -365,8 +387,49 @@ def main() -> int:
             "pi_used_p50": float(np.median(pi_arr)) if pi_arr.size else None,
             "pi_used_max": float(pi_arr.max()) if pi_arr.size else None,
             "pi_used_near_zero": int((np.abs(pi_arr) < 0.01 * M).sum()),
+            # Whole-iteration wall, and what the named stages fail to explain.  Reported
+            # because a stage table that does not sum to the clock is a table nobody can
+            # act on -- the residual has been the largest single block in a solve before.
+            "iteration_wall_s": round(float(state.get("iteration_wall_s") or 0.0), 2),
+            "unattributed_s": round(
+                float(state.get("iteration_wall_s") or 0.0)
+                - float(state.get("sweep_s") or 0.0)
+                - sum(float(v) for v in (state.get("stage_s") or {}).values()),
+                2,
+            ),
+            "elapsed_s": round(float(state.get("elapsed_s") or 0.0), 2),
             "sweep_s": round(float(state.get("sweep_s") or 0.0), 2),
             "sweep_task_total_s": round(float(state.get("sweep_task_total_s") or 0.0), 2),
+            # Rounding-heuristic autopsy: best/worst try, how many flights each covered
+            # against the full batch, and how much LP guidance there was to begin with.
+            "round_n_forced": (state.get("round_stats") or {}).get("n_forced"),
+            "round_n_swapped_best": (state.get("round_stats") or {}).get("n_swapped_best"),
+            "round_n_swapped_max": (state.get("round_stats") or {}).get("n_swapped_max"),
+            "round_mode": (state.get("round_stats") or {}).get("mode", "round"),
+            "round_try_covered_min": min(
+                (state.get("round_stats") or {}).get("try_covered") or [0], default=0
+            ),
+            "round_try_covered_max": max(
+                (state.get("round_stats") or {}).get("try_covered") or [0], default=0
+            ),
+            "round_try_cost_best": _finite(
+                min(
+                    (
+                        (state.get("round_stats") or {}).get("n_flights", 0) * params.M - o
+                        for o in ((state.get("round_stats") or {}).get("try_objectives") or ())
+                    ),
+                    default=float("nan"),
+                )
+            ),
+            "round_try_cost_worst": _finite(
+                max(
+                    (
+                        (state.get("round_stats") or {}).get("n_flights", 0) * params.M - o
+                        for o in ((state.get("round_stats") or {}).get("try_objectives") or ())
+                    ),
+                    default=float("nan"),
+                )
+            ),
             "lazy_rows_added": state.get("lazy_rows_added"),
             # Rows this iteration got from the POOL rather than from the LP solution.
             "contested_rows_added": state.get("contested_rows_added"),
@@ -440,6 +503,14 @@ def main() -> int:
                 f" ({100.0 * row['virgin_claims'] / row['virgin_claims_total']:.1f}%)"
                 if row["virgin_claims_total"] else ""
             ) + "\n"
+            f"        {row['round_mode']}: forced={row['round_n_forced']} "
+            f"swapped={row['round_n_swapped_best']}/{row['round_n_swapped_max']} "
+            f"covered={row['round_try_covered_min']}-{row['round_try_covered_max']}"
+            f"/{len(requests)} "
+            f"try_cost={_fmt(row['round_try_cost_best'], 10, 6)}..{_fmt(row['round_try_cost_worst'], 10, 6)} "
+            f"incumbent={_fmt(row['heuristic_cost'], 10, 6)}\n"
+            f"        wall={row['iteration_wall_s']}s sweep={row['sweep_s']}s "
+            f"master={sum(row['stage_s'].values()):.1f}s unattributed={row['unattributed_s']}s\n"
             "        master " + " ".join(
                 f"{k}={v:.2f}" for k, v in sorted(row["stage_s"].items())
             ),

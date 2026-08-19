@@ -177,6 +177,18 @@ class ColGenParams:
     # measured.  Ranked most-contested first, so a truncated pass still takes the rows the
     # LP was most likely to overload next.
     contested_rows_limit: int = 0
+    # Flights one LNS try releases, 0 = off (use `round_heuristic`, the shipped behaviour).
+    #
+    # `round_heuristic` rebuilds a schedule from nothing every try and, measured at 2,000
+    # density flights, its best try covered 1,670 of 2,000 -- the 330 stranded flights cost
+    # a full `M` each, 94% of the try's total, so it lost by 3.3 million while placing what
+    # it did place 24% BETTER than the greedy incumbent (133 s/flight against 175).  The
+    # completion is what fails, and it cannot be fixed in place: the fill may only choose
+    # columns already in the pool.
+    #
+    # `lns_heuristic` starts FROM the incumbent and swaps one flight at a time, so coverage
+    # is invariant and the result is never worse than what it started with.  ANSWER-AFFECTING.
+    lns_destroy_flights: int = 0
     # 20 minutes, raised from 120 s. The old default could not finish a single pricing
     # sweep on a real instance: measured on `density_faa_wing_zipline` x100, iteration 1
     # alone is 147 s and the sweeps LENGTHEN as the pool grows -- 147, 213, 222, 234, 235,
@@ -250,6 +262,18 @@ class ColGenParams:
     # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
     # 0 disables.
     seed_ladder_steps: int = 20
+    # Spacing between ladder rungs, in lattice steps.  1 (the shipped value) makes the 20
+    # rungs consecutive, so at `dt_s=4` they span only 80 s of departure delay -- against a
+    # measured mean of ~120 cost units per flight at 2,000 density flights and a
+    # `max_ground_delay_s` of 3,600 s.  A stride of 3 spans 240 s for the SAME column count
+    # and the same row cost.
+    #
+    # The trade is resolution for span, and the reason it is likely worth taking is what the
+    # ladder is actually for: giving the LP an in-pool ALTERNATIVE per flight, which pins
+    # `pi_f` and stops one tight capacity row absorbing the whole per-flight benefit.  The
+    # optimum does not have to sit on a rung -- pricing's DP re-derives the exact departure
+    # every sweep.  ANSWER-AFFECTING.
+    seed_ladder_stride: int = 1
     # Wall clock for the post-first-LP greedy, PER FLIGHT.  **NOW 0, WHICH DISABLES THE
     # STAGE.**  It was 0.7, and the history matters: the value scales with the batch because
     # the stage splits its budget across up to `max(64, n_heuristic_tries * 16)` candidates,
@@ -561,6 +585,27 @@ class ColGenParams:
         if column_cap < 0:
             raise ValueError("max_columns_per_iteration must be non-negative")
         object.__setattr__(self, "max_columns_per_iteration", column_cap)
+
+        if isinstance(self.lns_destroy_flights, bool):
+            raise TypeError("lns_destroy_flights must be an integer")
+        try:
+            destroy = operator.index(self.lns_destroy_flights)
+        except TypeError as exc:
+            raise TypeError("lns_destroy_flights must be an integer") from exc
+        if destroy < 0:
+            raise ValueError("lns_destroy_flights must be non-negative")
+        object.__setattr__(self, "lns_destroy_flights", destroy)
+
+
+        if isinstance(self.seed_ladder_stride, bool):
+            raise TypeError("seed_ladder_stride must be an integer")
+        try:
+            stride = operator.index(self.seed_ladder_stride)
+        except TypeError as exc:
+            raise TypeError("seed_ladder_stride must be an integer") from exc
+        if stride < 1:
+            raise ValueError("seed_ladder_stride must be positive")
+        object.__setattr__(self, "seed_ladder_stride", stride)
 
         for name in ("contested_row_separation", "contested_rows_limit"):
             value = getattr(self, name)

@@ -142,6 +142,11 @@ class HighsBackend:
         # Retained as part of the common deterministic-backend contract.  The
         # scipy.optimize wrappers currently expose no HiGHS random-seed option.
         self.seed = operator.index(seed)
+        # ALWAYS EMPTY here, and that is a property of the wrapper rather than a gap worth
+        # filling: `scipy.optimize.milp` exposes no callback, so HiGHS's incumbent
+        # trajectory is unreachable without dropping to `highspy`.  Declared so callers can
+        # read the field unconditionally instead of branching on backend name.
+        self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
 
     def add_column(
         self,
@@ -325,6 +330,8 @@ class GurobiBackend:
         except gp.GurobiError as exc:  # pragma: no cover - depends on local license
             raise _GurobiUnavailable(f"Gurobi could not start: {exc}") from exc
         self._model = model
+        # (elapsed_s, incumbent, bound) per MIPSOL, filled by `solve_ip`'s callback.
+        self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
         model.Params.OutputFlag = 0
         model.Params.Threads = 1
         model.Params.Seed = self.seed
@@ -423,7 +430,30 @@ class GurobiBackend:
         self._model.Params.MIPGap = self.ip_gap
         self._model.Params.TimeLimit = self.time_limit_s
         self._model.update()
-        self._model.optimize()
+        # THE MILP IS THE ONE BLOCK NOTHING CAN SEE INSIDE.  `OutputFlag = 0` suppresses
+        # console AND log-file output, and a bare `optimize()` records nothing, so a solve
+        # that runs for 25 minutes is indistinguishable from one that hung -- and three
+        # questions this repo actually asks cannot be answered at all: when would a looser
+        # `ip_gap` have stopped it, did it ever improve on the warm start, and is the tail
+        # spent searching or proving.  One callback answers all three for the cost of a
+        # tuple per incumbent.
+        #
+        # MIPSOL only, deliberately: MIPNODE fires per node and would turn a long solve's
+        # trajectory into hundreds of thousands of rows describing nothing new.
+        trajectory: list[tuple[float, float, float]] = []
+        started = time.perf_counter()
+        grb = self._gp.GRB
+
+        def _record(model, where):
+            if where == grb.Callback.MIPSOL:
+                trajectory.append((
+                    time.perf_counter() - started,
+                    float(model.cbGet(grb.Callback.MIPSOL_OBJBST)),
+                    float(model.cbGet(grb.Callback.MIPSOL_OBJBND)),
+                ))
+
+        self._model.optimize(_record)
+        self.last_ip_trajectory = tuple(trajectory)
         if self._model.SolCount < 1 and self._model.Status == self._gp.GRB.TIME_LIMIT:
             # As with HiGHS, a sub-millisecond limit can expire before Gurobi
             # processes the supplied MIP start.  RestrictedMaster owns the
@@ -541,6 +571,10 @@ class RestrictedMaster:
             raise ValueError("backend flight ids do not match the restricted master")
         self._columns: list[Column] = []
         self._column_indices: dict[Column, int] = {}
+        # Flight -> its column indices, append-only for the same reason `_columns` is.
+        # The LNS repair needs "what else could this flight fly", which is otherwise a
+        # scan of the whole pool per released flight.
+        self._columns_by_flight: dict[int, list[int]] = {}
         self._objectives: list[float] = []
         self._materialized: dict[RowKey, float] = {}
         # Transpose of the pool's claim sets: row -> dense indices of every column claiming
@@ -558,6 +592,17 @@ class RestrictedMaster:
         # Correctness requires `_columns` to stay APPEND-ONLY: an index recorded here must
         # never move.  Trimming the pool would silently corrupt every entry.
         self._columns_by_row: dict[RowKey, list[int]] = {}
+        # Distinct FLIGHTS claiming each row, and the unmaterialized rows where that count
+        # already exceeds capacity.  Flights, not columns: two columns of one flight can
+        # never occupy a slot together -- the cover constraint forbids it -- so a
+        # column count would call every row contested the moment a departure ladder gives
+        # each flight 21 near-identical copies of one route.
+        #
+        # Maintained incrementally beside `_columns_by_row` rather than recomputed, because
+        # the recompute is a full walk of ~850,000 rows building a set per row, per
+        # iteration.  Both are append-only for the same reason `_columns` is.
+        self._flights_by_row: dict[RowKey, set[int]] = {}
+        self._contested_candidates: set[RowKey] = set()
         self.last_flight_duals: dict[int, float] = {flight_id: 0.0 for flight_id in self.flight_ids}
         self.last_row_duals: dict[RowKey, float] = {}
         self.last_lp_objective = 0.0
@@ -565,6 +610,10 @@ class RestrictedMaster:
         self.last_ip_objective: float | None = None
         self.last_ip_bound: float | None = None
         self.last_ip_status: str | None = None
+        # The backend's incumbent trajectory for the last IP, empty on HiGHS.
+        self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
+        # Per-try outcomes of the last `round_heuristic` call; see there.
+        self.last_round_stats: dict = {}
         self.last_ip_optimal: bool | None = None
         self._warm_start: np.ndarray | None = None
         self._heuristic_selection: dict[int, Column] = {}
@@ -643,7 +692,22 @@ class RestrictedMaster:
                 self._columns_by_row[row] = [index]
             else:
                 bucket.append(index)
+            # Same loop, same preconditions.  A row enters the candidate set on the single
+            # append that pushes its distinct-flight count past capacity, so the set is
+            # exact without anything ever scanning the index.  Already-materialized rows
+            # are skipped: they are constraints now, and re-adding them is what
+            # `materialize_rows` would have to filter out anyway.
+            flights = self._flights_by_row.get(row)
+            if flights is None:
+                flights = self._flights_by_row[row] = {column.flight_id}
+            elif column.flight_id in flights:
+                continue
+            else:
+                flights.add(column.flight_id)
+            if row not in self._materialized and len(flights) > self.row_index.cap(row):
+                self._contested_candidates.add(row)
         self._column_indices[column] = index
+        self._columns_by_flight.setdefault(column.flight_id, []).append(index)
         self._objectives.append(objective)
         # Existing warm starts stay meaningful when pricing appends a column.
         if self._warm_start is not None:
@@ -680,6 +744,10 @@ class RestrictedMaster:
             self._backend.add_row(row, rhs, indices)
             self.row_index.intern(row)
             self._materialized[row] = rhs
+            # A materialized row is a constraint, so it is no longer a CANDIDATE to become
+            # one.  Discarded here rather than filtered at read time so the set cannot grow
+            # without bound across a long solve.
+            self._contested_candidates.discard(row)
             added += 1
         return added
 
@@ -753,6 +821,53 @@ class RestrictedMaster:
                 loads[row] += 1
         return dict(loads)
 
+    def contested_rows(self, min_excess: int = 1, limit: int = 0) -> frozenset[RowKey]:
+        """Unmaterialized rows that more distinct flights want than the row can hold.
+
+        :meth:`add_violated_rows` separates on the LP SOLUTION -- a row becomes a
+        constraint only once the current ``x`` overloads it.  Every row that has not
+        happened to be created carries no dual, so pricing values it at zero however
+        contested it really is, and at 2,000 density flights **90% of every priced
+        column's claims land on such rows**.  That is not a small error: it is what lets a
+        flight escape a capacity row the LP has priced at the full per-flight benefit ``M``
+        by detouring through lattice the master has never heard of, which is the measured
+        origin of the reduced-cost tail that pins the dual bound.
+
+        This separates on the POOL instead.  A row that ``cap+min_excess-1`` distinct
+        flights already claim is one the LP will overload eventually; creating it now means
+        pricing is charged for it in the very next sweep rather than the iteration after
+        the conflict finally shows up in ``x``.
+
+        ``min_excess`` raises the bar (2 = "at least one flight more than capacity, plus
+        one"), and ``limit`` caps how many rows a single call returns, most-contested
+        first.  Both exist because the candidate set can be enormous and materializing all
+        of it at once reproduces the master blow-up this is meant to avoid; ties break on
+        :func:`_row_sort_key` so a truncated result is still deterministic.
+        """
+
+        if min_excess < 1:
+            raise ValueError("min_excess must be positive")
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        # `_contested_candidates` is maintained at `cap`; `min_excess > 1` filters further.
+        # It can hold a row that was materialized between two calls only if something other
+        # than `materialize_rows` did it, so the membership test is belt-and-braces.
+        rows = [
+            row
+            for row in self._contested_candidates
+            if row not in self._materialized
+            and len(self._flights_by_row[row]) >= self.row_index.cap(row) + min_excess
+        ]
+        if limit and len(rows) > limit:
+            rows.sort(
+                key=lambda row: (
+                    -(len(self._flights_by_row[row]) - self.row_index.cap(row)),
+                    _row_sort_key(row),
+                )
+            )
+            rows = rows[:limit]
+        return frozenset(rows)
+
     def violated_claim_rows(
         self,
         selection: Mapping[int, Column] | Iterable[Column],
@@ -807,23 +922,41 @@ class RestrictedMaster:
             key=lambda index: (-self._objectives[index], _column_sort_key(self._columns[index])),
         )
 
+        # Hoisted out of the `tries` loop: `forced` reads only `probabilities`, `values` and
+        # the column pool, none of which a try mutates, and building it consumes no rng --
+        # so every try was rebuilding the identical list, and the rng call sequence (hence
+        # the schedule) is unchanged by computing it once.
+        forced = sorted(
+            (index for index, value in enumerate(probabilities) if value >= 1.0),
+            key=lambda index: (-values[index], _column_sort_key(self._columns[index])),
+        )
+        # The membership test below runs once per column per try.  Against the LIST that is
+        # a linear scan, so the loop is O(tries * |pool| * |forced|) -- quadratic in flight
+        # count, measured at 101.46 ms per try against 0.239 ms with a set at |forced|=3000.
+        # A plain `set`, deliberately not a subclass: subclassing deoptimizes CPython's
+        # CONTAINS_OP_SET specialization by ~1.3x, which is most of what this buys.
+        forced_set = set(forced)
+
         best: dict[int, Column] = {}
         best_objective = -math.inf
         best_signature: tuple[tuple[object, ...], ...] | None = None
+        # PER-TRY OUTCOMES.  The stage has produced exactly one observable -- "no
+        # improvement" -- across 192 tries at 2,000 flights, which cannot say whether a try
+        # loses by stranding a single flight (each one costs a full M in
+        # `_selection_objective`, 83x the mean per-flight delay) or by accumulating delay
+        # across all of them.  Those want opposite fixes, and the counters are two appends.
+        try_objectives: list[float] = []
+        try_covered: list[int] = []
         for _ in range(tries):
             selected: dict[int, Column] = {}
             loads: Counter[RowKey] = Counter(self.fixed_loads)
 
-            forced = sorted(
-                (index for index, value in enumerate(probabilities) if value >= 1.0),
-                key=lambda index: (-values[index], _column_sort_key(self._columns[index])),
-            )
             random_order = rng.permutation(len(self._columns)).tolist()
             for index in forced + random_order:
                 column = self._columns[index]
                 if column.flight_id in selected or probabilities[index] <= 0.0:
                     continue
-                if index not in forced and rng.random() >= probabilities[index]:
+                if index not in forced_set and rng.random() >= probabilities[index]:
                     continue
                 if not self._can_add(column, loads):
                     continue
@@ -839,6 +972,8 @@ class RestrictedMaster:
                     loads.update(column.claims)
 
             objective = self.objective_of(selected)
+            try_objectives.append(objective)
+            try_covered.append(len(selected))
             signature = tuple(
                 _column_sort_key(selected[flight_id])
                 for flight_id in self.flight_ids
@@ -851,6 +986,159 @@ class RestrictedMaster:
                 best = selected
                 best_objective = objective
                 best_signature = signature
+        # `n_forced` is the other half of the diagnosis: it is how much of the LP's
+        # solution was integral enough to commit outright, so `n_forced == 0` means the
+        # rounding had no LP guidance at all and every try was a near-uniform draw.
+        self.last_round_stats = {
+            "n_forced": len(forced),
+            "n_columns": len(self._columns),
+            "n_flights": len(self.flight_ids),
+            "try_objectives": tuple(try_objectives),
+            "try_covered": tuple(try_covered),
+        }
+        return {flight_id: best[flight_id] for flight_id in self.flight_ids if flight_id in best}
+
+    def lns_heuristic(
+        self,
+        x: Sequence[float],
+        rng: np.random.Generator,
+        incumbent: Mapping[int, Column],
+        destroy: int,
+        n_tries: int | None = None,
+    ) -> dict[int, Column]:
+        """LP-guided destroy-and-repair over an existing incumbent.
+
+        WHY THIS EXISTS, measured rather than assumed.  ``round_heuristic`` rebuilds a
+        schedule from nothing every try, and at 2,000 density flights its best try covered
+        **1,670 of 2,000** -- the 330 it stranded cost a full ``M`` each, 94% of the try's
+        total, so it lost by 3.3 million while being *better* on what it did place (133 s
+        per covered flight against the greedy incumbent's 175 s).  The LP guidance was
+        working; the completion was not.  It could not be: the fill may only pick columns
+        already in the pool, and a flight needing a departure later than the ladder spans
+        simply has none, whereas ``_initial_feasible_selection`` builds the column it needs.
+
+        So this never leaves the feasible set.  It starts FROM the incumbent, and releases
+        one flight at a time: the flight's column is removed from ``loads``, a replacement
+        is sampled from its own columns by LP value, and if none fits the original goes
+        straight back -- which it always can, since exactly one column was removed and at
+        most one added.  Coverage is therefore invariant at ``len(incumbent)`` and every
+        intermediate state is claim-feasible, by construction rather than by check.
+
+        ``destroy`` is how many flights one try releases.  The candidates are ranked by how
+        much the LP DISAGREES with the incumbent -- ``1 - x`` of the incumbent's own column
+        -- because those are the flights the relaxation says are placed wrong, and a
+        release the LP has no opinion about is a wasted draw.
+        """
+
+        values = np.asarray(x, dtype=float)
+        if values.shape != (len(self._columns),):
+            raise ValueError("x has the wrong number of columns")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("x must contain finite values")
+        tries = self.params.n_heuristic_tries if n_tries is None else operator.index(n_tries)
+        if tries < 1:
+            raise ValueError("n_tries must be positive")
+        if destroy < 1:
+            raise ValueError("destroy must be positive")
+        base = {
+            flight_id: column
+            for flight_id, column in incumbent.items()
+            if column in self._column_indices
+        }
+        if not base:
+            return {}
+
+        # How wrong the LP thinks each incumbent placement is, in [0, 1].
+        disagreement: list[tuple[float, int]] = []
+        base_loads: Counter[RowKey] = Counter(self.fixed_loads)
+        for flight_id, column in base.items():
+            base_loads.update(column.claims)
+            disagreement.append((1.0 - float(values[self._column_indices[column]]), flight_id))
+        # Deterministic order, most-disagreed first; ties by flight id so a try's release
+        # set does not depend on dict iteration order.
+        disagreement.sort(key=lambda item: (-item[0], item[1]))
+        ranked = [flight_id for _, flight_id in disagreement]
+
+        best = dict(base)
+        best_objective = self.objective_of(base)
+        best_signature: tuple[tuple[object, ...], ...] | None = None
+        best_swaps = 0
+        try_swaps: list[int] = []
+        # A window wider than `destroy` so tries differ; the LP's opinion is a ranking,
+        # not a partition, and taking the top `destroy` outright would make every try
+        # release the identical set.
+        window = min(len(ranked), 4 * destroy)
+        for _ in range(tries):
+            selected = dict(base)
+            loads: Counter[RowKey] = Counter(base_loads)
+            # How many releases actually moved.  Without it "LNS bought 0.78%" cannot be
+            # told apart from "LNS reverted 197 of its 200 releases", which is the failure
+            # mode the probabilistic accept above caused.
+            swapped = 0
+            # Sample the release set from the most-disagreed WINDOW rather than taking the
+            # top `destroy` outright: identical release sets would make every try identical
+            # once the rng is only consumed downstream.
+            released = [
+                ranked[i]
+                for i in sorted(rng.choice(window, size=min(destroy, window), replace=False))
+            ]
+            for flight_id in released:
+                previous = selected[flight_id]
+                for row in previous.claims:
+                    loads[row] -= 1
+                placed = False
+                # DETERMINISTIC repair: take the best-valued replacement that fits.  The
+                # first version kept the original rounding's `rng.random() >= value` accept,
+                # and that was a mistake worth naming -- with mean `x ~ 0.04` at 2,000
+                # flights it rejected ~96% of candidates by coin flip, so most released
+                # flights simply reverted and a try barely moved.  In LNS the randomness
+                # belongs in WHICH flights are released, not in whether an improvement is
+                # taken; the release set already differs per try because it is sampled from
+                # a window four times its size.
+                candidates = sorted(
+                    self._columns_by_flight.get(flight_id, ()),
+                    key=lambda i: (-values[i], _column_sort_key(self._columns[i])),
+                )
+                for index in candidates:
+                    if float(values[index]) <= self.params.epsilon:
+                        break
+                    column = self._columns[index]
+                    if column == previous or not self._can_add(column, loads):
+                        continue
+                    selected[flight_id] = column
+                    loads.update(column.claims)
+                    placed = True
+                    swapped += 1
+                    break
+                if not placed:
+                    loads.update(previous.claims)
+            objective = self.objective_of(selected)
+            signature = tuple(
+                _column_sort_key(selected[flight_id])
+                for flight_id in self.flight_ids
+                if flight_id in selected
+            )
+            try_swaps.append(swapped)
+            if objective > best_objective + 1e-9 or (
+                abs(objective - best_objective) <= 1e-9
+                and best_signature is not None
+                and signature < best_signature
+            ):
+                best = selected
+                best_objective = objective
+                best_signature = signature
+                best_swaps = swapped
+        self.last_round_stats = {
+            "mode": "lns",
+            "n_released": destroy,
+            "n_window": window,
+            "n_swapped_best": best_swaps,
+            "n_swapped_max": max(try_swaps, default=0),
+            "n_columns": len(self._columns),
+            "n_flights": len(self.flight_ids),
+            "try_objectives": (best_objective,),
+            "try_covered": (len(best),),
+        }
         return {flight_id: best[flight_id] for flight_id in self.flight_ids if flight_id in best}
 
     def set_heuristic(self, selection: Mapping[int, Column]) -> None:
@@ -954,6 +1242,7 @@ class RestrictedMaster:
                 self.last_ip_bound = max(self.last_ip_objective, float(result.upper_bound))
                 self.last_ip_status = result.status
                 self.last_ip_optimal = result.optimal
+                self.last_ip_trajectory = getattr(self._backend, "last_ip_trajectory", ())
                 return selection
         finally:
             self._backend.time_limit_s = original_time_limit_s

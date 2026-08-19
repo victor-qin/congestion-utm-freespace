@@ -915,6 +915,361 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     assert revenue.stats["lp_gap_cost"] > 1e3 * revenue.stats["lp_gap_revenue"]
 
 
+def test_lns_heuristic_never_returns_worse_than_the_incumbent_it_started_from():
+    """Monotonicity is the whole point, and it is structural rather than lucky.
+
+    `round_heuristic` rebuilds from nothing and, measured at 2,000 flights, stranded 330 of
+    them at a full ``M`` each -- 94% of its cost -- because its fill can only pick columns
+    already in the pool.  LNS releases one flight at a time and puts the original column
+    straight back when nothing fits, so coverage cannot fall and the returned selection is
+    the incumbent unless a try strictly beat it.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0, seed=29)
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in range(1, 7)]
+    params = _params(max_iterations=3)
+
+    seen: list[dict] = []
+    ColGenSolver().solve(requests, cfg, (), params, on_iteration=seen.append)
+    baseline_cost = seen[-1]["heuristic_cost"]
+
+    lns: list[dict] = []
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(max_iterations=3, lns_destroy_flights=2),
+        on_iteration=lns.append,
+    )
+
+    assert lns, "at least one iteration must report"
+    # Never worse than the greedy seed it starts from, at every iteration.
+    assert all(p["heuristic_cost"] <= baseline_cost + 1e-6 for p in lns)
+    # Monotone across iterations -- the incumbent can only improve.
+    costs = [p["heuristic_cost"] for p in lns]
+    assert costs == sorted(costs, reverse=True)
+    # Coverage is invariant: LNS swaps, it never drops a flight.
+    assert all(p["round_stats"]["mode"] == "lns" for p in lns)
+    assert all(
+        p["round_stats"]["try_covered"][0] == lns[0]["round_stats"]["try_covered"][0]
+        for p in lns
+    )
+    # And the schedule it returns is genuinely claim-feasible, not merely scored well.
+    assert result.columns
+
+
+def test_ladder_stride_trades_resolution_for_span_at_a_fixed_column_count():
+    """``steps`` stays a column COUNT under any stride; the span is ``steps * stride``.
+
+    The calibrated depth of 20 was measured on a consecutive ladder, so it describes 80 s
+    of departure delay at ``dt_s=4`` -- against a mean of ~120 cost units per flight at
+    2,000 density flights.  Keeping the two knobs independent is what lets span be widened
+    without re-deriving that calibration or paying for more columns.
+    """
+
+    cfg = _cfg(max_ground_delay_s=600.0)
+    request = _request(1, (-4, 0), (4, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = solver_module._canonical_column(seed_column(graph, cfg), graph, cfg)
+
+    def ladder_steps(stride: int, steps: int = 4) -> list[int]:
+        master = RestrictedMaster((1,), RowIndex(), _params())
+        master.add_column(seed)
+        added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, steps, stride)
+        assert added == steps, "the fixture must not be truncated by the horizon"
+        return [c.departure_step - seed.departure_step for c in master.columns[1:]]
+
+    assert ladder_steps(1) == [1, 2, 3, 4]
+    assert ladder_steps(3) == [3, 6, 9, 12]
+    # Same column count, 3x the span -- which is the whole trade.
+    assert len(ladder_steps(3)) == len(ladder_steps(1))
+    assert max(ladder_steps(3)) == 3 * max(ladder_steps(1))
+    with pytest.raises(ValueError):
+        ladder_steps(0)
+
+
+def test_contested_rows_counts_distinct_flights_not_columns():
+    """The distinct-flight rule is what makes pool separation safe, not a refinement.
+
+    Two columns of ONE flight can never occupy a slot together -- the cover constraint
+    already forbids it -- so a column count would call a row contested the moment a
+    departure ladder gives each flight 21 shifted copies of one route, which at the shipped
+    ``seed_ladder_steps=20`` is every row the pool touches.
+    """
+
+    params = _params(M=1000.0)
+    row = RowKey.cell((4, -2), 0, 9)
+    rows = RowIndex()
+    master = RestrictedMaster((1, 2), rows, params, seed=3)
+    assert rows.cap(row) == 1, "the fixture assumes a single-slot row"
+
+    # Two columns, ONE flight, same row: wanted twice, contested by nobody.
+    master.add_column(_synthetic_column(1, 0.0, frozenset({row})))
+    master.add_column(_synthetic_column(1, 4.0, frozenset({row}), departure_step=1))
+    assert master.contested_rows() == frozenset()
+
+    # A second flight on the same row is what makes it contested.
+    master.add_column(_synthetic_column(2, 0.0, frozenset({row})))
+    assert master.contested_rows() == frozenset({row})
+    # ...and `min_excess` raises the bar: 2 distinct flights on a cap-1 row is an excess of
+    # 1, so requiring 2 excludes it.
+    assert master.contested_rows(min_excess=2) == frozenset()
+
+
+def test_contested_rows_drops_materialized_rows_and_honours_the_limit():
+    """A materialized row is a constraint, so it is no longer a candidate to become one.
+
+    The limit exists because the candidate set can be enormous and materializing all of it
+    at once reproduces the master blow-up pool separation is meant to avoid; it ranks
+    most-contested first so a truncated pass still takes the rows the LP would have
+    overloaded soonest.
+    """
+
+    params = _params(M=1000.0)
+    hot = RowKey.cell((4, -2), 0, 9)
+    warm = RowKey.cell((5, -2), 0, 9)
+    master = RestrictedMaster((1, 2, 3), RowIndex(), params, seed=3)
+    for flight_id in (1, 2, 3):
+        master.add_column(_synthetic_column(flight_id, 0.0, frozenset({hot})))
+    for flight_id in (1, 2):
+        master.add_column(
+            _synthetic_column(flight_id, 4.0, frozenset({warm}), departure_step=1)
+        )
+
+    assert master.contested_rows() == frozenset({hot, warm})
+    # `hot` has 3 flights on a cap-1 row (excess 2), `warm` has 2 (excess 1), so a limit of
+    # one must take `hot`.
+    assert master.contested_rows(limit=1) == frozenset({hot})
+
+    master.materialize_rows([hot])
+    assert master.contested_rows() == frozenset({warm}), "a constraint is not a candidate"
+
+
+def test_pool_separation_materializes_rows_the_lp_solution_never_overloaded():
+    """The point of the feature, end to end.
+
+    `add_violated_rows` creates a row only once the LP's own `x` overloads it, so a row two
+    flights both want but the fractional solution happens to split stays implicit -- and
+    implicit means dual 0, which is what pricing then treats as free lattice.
+    """
+
+    cfg = _cfg(max_ground_delay_s=64.0)
+    requests = [
+        _request(1, (-6, 0), (6, 0), cfg),
+        _request(2, (-2, -4), (-2, 4), cfg),
+        _request(3, (2, -4), (2, 4), cfg, departure=16.0),
+    ]
+
+    off: list[dict] = []
+    on: list[dict] = []
+    ColGenSolver().solve(
+        requests, cfg, (), _params(max_iterations=3), on_iteration=off.append
+    )
+    ColGenSolver().solve(
+        requests, cfg, (),
+        _params(max_iterations=3, contested_row_separation=1),
+        on_iteration=on.append,
+    )
+
+    assert off and on
+    # Off is inert: the field reports, and reports zero.
+    assert all(p["contested_rows_added"] == 0 for p in off)
+    # On, the pool contributes rows the solution-based loop did not find.
+    assert sum(p["contested_rows_added"] for p in on) > 0
+    assert on[-1]["lazy_rows_added"] > off[-1]["lazy_rows_added"]
+
+
+def test_column_cap_banks_the_top_k_by_reduced_cost_and_defers_the_rest():
+    """``max_columns_per_iteration`` trades rows per iteration against iterations.
+
+    Pricing offers one column per positive-reduced-cost flight -- ~1,865 of 2,000 on
+    density_faa -- and each claims ~460 rows the separation loop may then materialize.
+    Capping is the direct lever on that row growth, and it is answer-affecting, so what
+    is pinned here is the SELECTION RULE: exactly `cap` banked, ranked by reduced cost,
+    and the deferred ones still counted so a run can see what it gave up.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0, seed=29)
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in range(1, 7)]
+
+    uncapped: list[dict] = []
+    capped: list[dict] = []
+    ColGenSolver().solve(
+        requests, cfg, (), _params(max_iterations=3), on_iteration=uncapped.append
+    )
+    ColGenSolver().solve(
+        requests, cfg, (),
+        _params(max_iterations=3, max_columns_per_iteration=2),
+        on_iteration=capped.append,
+    )
+
+    assert uncapped and capped
+    # Uncapped: the two counts agree and nothing is deferred -- the default is inert.
+    assert all(p["columns_added"] == p["columns_priced"] for p in uncapped)
+    assert all(p["columns_deferred"] == 0 for p in uncapped)
+    # Capped: `columns_added` is what reached the pool, never more than the cap, and the
+    # difference from `columns_priced` is accounted for rather than silently dropped.
+    assert any(p["columns_priced"] > 2 for p in capped), "the cap must actually bind"
+    for p in capped:
+        assert p["columns_added"] <= 2
+        assert p["columns_added"] + p["columns_deferred"] == p["columns_priced"]
+    # The pool really is smaller -- the cap is not just a relabelling of the counters.
+    assert capped[-1]["columns"] < uncapped[-1]["columns"]
+
+
+def test_round_heuristic_is_unchanged_by_hoisting_the_forced_set(monkeypatch):
+    """The `forced` hoist and the list->set membership swap must be byte-identical.
+
+    `forced` reads only `probabilities`, `values` and the pool, and builds without touching
+    the rng, so computing it once per call instead of once per try cannot move the schedule
+    -- but "cannot" is the kind of claim that wants a test, because the rng call sequence
+    is what the incumbent depends on and it is invisible in the result.
+    """
+
+    cfg = _cfg(max_ground_delay_s=64.0)
+    requests = [
+        _request(1, (-6, 0), (6, 0), cfg),
+        _request(2, (-2, -4), (-2, 4), cfg),
+        _request(3, (2, -4), (2, 4), cfg, departure=16.0),
+    ]
+    params = _params()
+
+    shipped = ColGenSolver().solve(requests, cfg, (), params)
+
+    # A verbatim copy of the pre-hoist loop body, rebuilding `forced` per try and testing
+    # membership against the LIST, run through the same public entry point.
+    original = master_module.RestrictedMaster.round_heuristic
+
+    def per_try_forced(self, x, rng, n_tries=None):
+        values = np.asarray(x, dtype=float)
+        tries = self.params.n_heuristic_tries if n_tries is None else n_tries
+        epsilon = self.params.epsilon
+        probabilities = np.clip(values, 0.0, 1.0)
+        probabilities[probabilities <= epsilon] = 0.0
+        probabilities[probabilities >= 1.0 - epsilon] = 1.0
+        greedy_order = sorted(
+            range(len(self._columns)),
+            key=lambda i: (
+                -self._objectives[i], master_module._column_sort_key(self._columns[i])
+            ),
+        )
+        best: dict[int, Column] = {}
+        best_objective = -math.inf
+        for _ in range(tries):
+            selected: dict[int, Column] = {}
+            loads: Counter = Counter(self.fixed_loads)
+            forced = sorted(
+                (i for i, value in enumerate(probabilities) if value >= 1.0),
+                key=lambda i: (-values[i], master_module._column_sort_key(self._columns[i])),
+            )
+            random_order = rng.permutation(len(self._columns)).tolist()
+            for index in forced + random_order:
+                column = self._columns[index]
+                if column.flight_id in selected or probabilities[index] <= 0.0:
+                    continue
+                if index not in forced and rng.random() >= probabilities[index]:
+                    continue
+                if not self._can_add(column, loads):
+                    continue
+                selected[column.flight_id] = column
+                loads.update(column.claims)
+            for index in greedy_order:
+                column = self._columns[index]
+                if self._objectives[index] <= 0.0 or column.flight_id in selected:
+                    continue
+                if self._can_add(column, loads):
+                    selected[column.flight_id] = column
+                    loads.update(column.claims)
+            objective = self.objective_of(selected)
+            if objective > best_objective:
+                best, best_objective = dict(selected), objective
+        return best
+
+    monkeypatch.setattr(master_module.RestrictedMaster, "round_heuristic", per_try_forced)
+    assert master_module.RestrictedMaster.round_heuristic is not original
+    reference = ColGenSolver().solve(requests, cfg, (), params)
+
+    assert shipped.stats["objective"] == reference.stats["objective"]
+    assert shipped.stats["iterations"] == reference.stats["iterations"]
+    assert sorted(shipped.columns) == sorted(reference.columns)
+
+
+def test_cost_gap_falls_back_to_the_free_zero_bound():
+    """A negative Lagrangian bound is weaker than the one the objective gives for free.
+
+    The cost objective sums non-negative delays plus ``M`` per omitted flight, so
+    ``cost >= 0`` always holds.  The bound the loop actually computes,
+    ``LP + sum(max(0, rc))``, carries one slack term per flight and goes negative at
+    scale -- measured at -567,724,832 on 2,000 density flights against a cost of 350,352,
+    which made ``gap_cost`` read 1621 and, being > 1, certify strictly less than nothing.
+    """
+
+    # The measured 2,000-flight numbers.  Un-floored this is 1621.44; the floor caps it
+    # at 1.0, which is what "no useful certificate" should look like.
+    assert solver_module._relative_cost_gap(350_351.95, -567_724_832.78) == pytest.approx(1.0)
+    # A gap can never exceed 1 now, for any negative bound however large.
+    assert solver_module._relative_cost_gap(1.0, -1e300) == pytest.approx(1.0)
+    # A genuine bound is untouched -- this is a report fix, not a threshold change.
+    assert solver_module._relative_cost_gap(100.0, 90.0) == pytest.approx(0.1)
+    assert solver_module._relative_cost_gap(12.0, 12.0) == 0.0
+    assert solver_module._relative_cost_gap(math.inf, 0.0) == math.inf
+    # And it still cannot manufacture convergence: floored to zero, a real cost is its
+    # own gap, which is nowhere near any usable `lp_gap`.
+    assert solver_module._relative_cost_gap(350_351.95, -1.0) > 0.99
+
+
+def test_bound_frozen_for_counts_iterations_that_bought_no_certificate(monkeypatch):
+    """``bound_frozen_for`` separates "the gap moved" from "the bound moved".
+
+    The gap has two ends.  On a large instance the bound freezes at iteration 1 while the
+    schedule keeps improving, so the gap drifts UP and reads as a regression when the
+    truth is the opposite -- the exact misreading that a seven-iteration density_faa run
+    produced.  Pinned here by forcing the freeze rather than by finding an instance that
+    exhibits it, so the counter's semantics are asserted and not the instance's.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0, seed=29)
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in range(1, 7)]
+
+    # Constant bound: iteration 1 improves on `inf`, and nothing after it can improve.
+    monkeypatch.setattr(
+        master_module.RestrictedMaster,
+        "upper_bound",
+        lambda self, rmp_value, reduced_costs: 8_000_000.0,
+    )
+    seen: list[dict] = []
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(max_iterations=4), on_iteration=seen.append
+    )
+
+    assert len(seen) >= 3, "the freeze is only observable across several iterations"
+    assert [p["bound_frozen_for"] for p in seen] == list(range(len(seen)))
+    assert result.stats["bound_frozen_for"] == len(seen) - 1
+    # The bound is what froze, not the run: pricing stayed productive underneath it, which
+    # is precisely the state the gap alone cannot report -- busy and certifying nothing.
+    assert len({p["upper_bound"] for p in seen}) == 1
+    assert all(p["columns_added"] > 0 for p in seen)
+    assert seen[-1]["columns"] > seen[0]["columns"]
+
+
+def test_bound_frozen_for_stays_zero_while_the_bound_is_still_tightening():
+    """The healthy shape, as the contrast that gives the counter meaning.
+
+    Same instance unpatched: the bound tightens every single iteration, so the counter
+    never leaves 0.  A run reporting `frozen=0` throughout is one whose certificate is
+    still being earned -- the thing density_faa stopped doing after its first sweep.
+    """
+
+    cfg = _cfg(max_ground_delay_s=120.0, seed=29)
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in range(1, 7)]
+
+    seen: list[dict] = []
+    result = ColGenSolver().solve(requests, cfg, (), _params(), on_iteration=seen.append)
+
+    assert len(seen) >= 3
+    assert all(p["bound_frozen_for"] == 0 for p in seen)
+    assert result.stats["bound_frozen_for"] == 0
+    bounds = [p["upper_bound"] for p in seen]
+    assert bounds == sorted(bounds, reverse=True) and bounds[-1] < bounds[0]
+
+
 def test_colgen_beats_fcfs_on_constructed_congestion():
     """One global hold clears two crossings that FCFS handles independently."""
 

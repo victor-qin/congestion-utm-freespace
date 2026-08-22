@@ -274,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "dominates the cost and one sweep at 100 flights is already 147 s, so the "
                         "default buys roughly three iterations there — a scenario-scale solve needs "
                         "more, and a solve that stops early says so in its termination reason")
+    p.add_argument("--colgen-ip-time-limit", type=float, default=None, metavar="S",
+                   help="colgen: wall budget for the FINAL restricted-master IP alone (default "
+                        "120). Separate from --colgen-time-limit because the IP otherwise "
+                        "inherits everything the CG loop did not spend — a solve that converges "
+                        "early hands the MILP hours. Exceeding it is not a failure: the run "
+                        "falls back to the validated rounding incumbent and reports a "
+                        "non-optimal ip_status, so the schedule is still claim-feasible, just "
+                        "uncertified")
     p.add_argument("--colgen-max-iterations", type=int, default=None, metavar="N",
                    help="colgen: cap on column-generation iterations (default 30)")
     p.add_argument("--colgen-objective", choices=("total_delay", "total_cost"), default=None,
@@ -283,10 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "ground-for-air swap exactly free and leaves the pricing search with "
                         "large families of tied columns it cannot order")
     p.add_argument("--colgen-solver", choices=("auto", "gurobi", "highs"), default=None,
-                   help="colgen: LP/IP backend for the restricted master (default auto: Gurobi when "
-                        "importable, HiGHS otherwise). Result-affecting on a degenerate master — the "
+                   help="colgen: LP/IP backend for the restricted master (default gurobi — needs "
+                        "`uv sync --extra gurobi` and a licence; 'auto' falls back to HiGHS instead "
+                        "of failing, 'highs' pins it). Result-affecting on a degenerate master — the "
                         "two backends return different optimal dual vertices, which changes both the "
-                        "pricing subproblems and how tight the reported LP bound is")
+                        "pricing subproblems and how tight the reported LP bound is. HiGHS also runs "
+                        "the final IP cold (scipy.optimize.milp takes no incumbent), which dominates "
+                        "the solve at scale")
     p.add_argument("--colgen-gap-metric", choices=("revenue", "cost"), default=None,
                    help="colgen: which scale the lp_gap/ip_gap thresholds are measured on. revenue "
                         "(default) is the paper's eq. (10)/(11), normalised by an objective whose "
@@ -314,6 +325,16 @@ def build_parser() -> argparse.ArgumentParser:
     # flag turns something ON. Worth stating because the flip means an unset flag no longer
     # implies "the documented behaviour happens", and the help strings below are the only
     # place a caller sees which way each one points.
+    p.add_argument("--colgen-warm-start", choices=("astar",), default=None,
+                   help="colgen: run this planner first and hand colgen its schedule, as pool "
+                        "columns AND as the starting incumbent (default off). Result-affecting "
+                        "and REPORTED IN STATS, because it changes what the run is measuring: "
+                        "on density_faa_wing_zipline x1500, unaided colgen is 235,388 (+11.3%% "
+                        "vs A*) while A*-seeded colgen is 196,398 (-7.1%%), so leaving this on "
+                        "silently would turn 'colgen beats A*' into 'refining A* beats A*'. "
+                        "Costs one extra planner pass (64 s against a 3,750 s solve at x1500); "
+                        "flights whose route the column model cannot express — an air hold, or "
+                        "a route outside the O-D ellipse — are dropped and logged, not forced.")
     p.add_argument("--colgen-workers", type=int, default=None, metavar="N",
                    help="colgen: fan each pricing sweep across N worker processes (default 0, "
                         "in-process). Note this is NOT --workers, which sizes the simulation's "
@@ -402,6 +423,7 @@ def _colgen_overrides(args) -> dict:
         name: value
         for name, value in (
             ("time_limit_s", args.colgen_time_limit),
+            ("ip_time_limit_s", args.colgen_ip_time_limit),
             ("max_iterations", args.colgen_max_iterations),
             ("objective", args.colgen_objective),
             ("solver", args.colgen_solver),
@@ -410,6 +432,7 @@ def _colgen_overrides(args) -> dict:
             ("n_pricing_workers", args.colgen_workers),
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
+            ("warm_start_planner", args.colgen_warm_start),
         )
         if value is not None
     }

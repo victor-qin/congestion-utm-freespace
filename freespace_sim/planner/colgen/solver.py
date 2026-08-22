@@ -24,7 +24,6 @@ import numpy as np
 
 from ...config import SimConfig
 from ...types import FlightRequest, as_terminal
-from .master import BackendTimeout, RestrictedMaster
 from .objective import DELAY_MODEL, CostModel, cost_model
 from .network import (
     FlightGraph,
@@ -34,6 +33,8 @@ from .network import (
     build_flight_graph,
     column_claims,
 )
+from .master import BackendTimeout, RestrictedMaster
+from .master import gurobi_lp_method as _gurobi_lp_method
 from .params import ColGenParams
 from .pricing import (
     DualView,
@@ -554,7 +555,13 @@ def _pre_master_timeout_result(
             "kernel_declined_by_reason": {},
             "seeded_columns": 0,
             "ladder_columns": 0,
+            "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
+            "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
             "ip_elapsed_s": 0.0,
+            "ip_time_limit_s": params.ip_time_limit_s,
+            "ip_eager_rows": 0,
+            "ip_separation_rounds": 0,
+            "ip_setup_s": 0.0,
             "ip_objective": None,
             "ip_upper_bound": None,
             "ip_cost_lower_bound": None,
@@ -573,6 +580,7 @@ def _pre_master_timeout_result(
             "search_exhausted_flight_ids": denied,
             "repair_added": 0,
             "seedless_flight_ids": tuple(sorted(seedless_flight_ids)),
+            "warm_start_planner": params.warm_start_planner,
             "initial_heuristic_strategy": "time_limit",
             "initial_heuristic_flights": 0,
             "initial_heuristic_delay_s": 0.0,
@@ -626,6 +634,7 @@ class ColGenSolver:
         fixed_claims: Sequence[frozenset[RowKey]] = (),
         on_iteration=None,
         seed_columns: Mapping[int, Sequence[Column]] | None = None,
+        flight_overrun: Mapping[int, int] | None = None,
     ) -> ColGenResult:
         """Run the column-generation loop to convergence, a bound, or a time limit.
 
@@ -713,7 +722,15 @@ class ColGenSolver:
                     "kernel_declined_by_reason": {},
                     "seeded_columns": 0,
                     "ladder_columns": 0,
+                    "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
+                    "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
+            "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
+            "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
                     "ip_elapsed_s": 0.0,
+                    "ip_time_limit_s": params.ip_time_limit_s,
+                    "ip_eager_rows": 0,
+                    "ip_separation_rounds": 0,
+                    "ip_setup_s": 0.0,
                     "ip_objective": None,
                     "ip_upper_bound": None,
                     "ip_cost_lower_bound": None,
@@ -732,6 +749,7 @@ class ColGenSolver:
                     "seedless_flight_ids": (),
                     "budget_denied_flight_ids": (),
                     "search_exhausted_flight_ids": (),
+                    "warm_start_planner": params.warm_start_planner,
                     "initial_heuristic_strategy": "empty",
                     "initial_heuristic_flights": 0,
                     "initial_heuristic_delay_s": 0.0,
@@ -785,11 +803,24 @@ class ColGenSolver:
                     catalog=static_catalog,
                     graph_build_elapsed_s=time.monotonic() - graph_build_started,
                 )
+            # `max_air_overrun_hops` sizes the O-D ellipse, and one global value has to
+            # cover the WIDEST route anyone might want.  Measured on `density_faa_wing_zipline`
+            # x1000: 92.3% of A*'s routes are pure geodesics needing zero slack, while a single
+            # flight needs 6 -- so a global 6 would widen 1,000 corridors to contain 7 routes,
+            # and the ellipse grows quadratically in the slack.  A per-flight override gives
+            # each graph only the room its own route needs.  Safe because `build_flight_graph`
+            # is the ONLY reader of this knob; pricing takes `max_air_hops`/`max_step` off the
+            # graph it is handed.
+            graph_params = params
+            if flight_overrun is not None:
+                override = flight_overrun.get(request.flight_id)
+                if override is not None and override != params.max_air_overrun_hops:
+                    graph_params = replace(params, max_air_overrun_hops=override)
             graphs[request.flight_id] = build_flight_graph(
                 request,
                 cfg,
                 static_catalog,
-                params,
+                graph_params,
             )
         graph_build_elapsed_s = time.monotonic() - graph_build_started
         if time.monotonic() >= pricing_deadline:
@@ -902,12 +933,58 @@ class ColGenSolver:
         # have produced, and it changes which optimum is reached only by the same
         # tie-breaking that column order already governs.
         seeded_columns = 0
+        seeded_first: dict[int, Column] = {}
         for flight_id, extras in (seed_columns or {}).items():
             if flight_id not in graphs:
                 raise KeyError(f"seed_columns names flight {flight_id}, which is not in this batch")
-            for column in extras:
-                master.add_column(_canonical_column(column, graphs[flight_id], cfg))
+            for position, column in enumerate(extras):
+                canonical = _canonical_column(column, graphs[flight_id], cfg)
+                master.add_column(canonical)
                 seeded_columns += 1
+                if position == 0:
+                    seeded_first[flight_id] = canonical
+        # The seed columns are also a candidate INCUMBENT, not only pool contents.  Adding
+        # them to the pool alone leaves them reachable exclusively through the final IP --
+        # and when that IP is truncated the run returns the shifted-seed heuristic instead,
+        # so a caller who supplied a whole better schedule gets none of it.  Measured at
+        # 1,500 flights: the heuristic's 233,520 was reported while A*'s 211,440 sat unused
+        # in the pool.  Taking it as the incumbent makes the fallback the BETTER of the two.
+        #
+        # Guarded, not assumed: the seeds are only an incumbent if they are jointly claim
+        # feasible (a caller's schedule need not be, and a warm start must never smuggle in
+        # an infeasible selection) and only if they actually beat the heuristic.
+        #
+        # The flights the seeds do NOT name are re-picked around them rather than left on
+        # their shifted-seed columns.  Overlaying the seeds on the heuristic was the
+        # obvious reading and it does not work: at 1,500 flights the 7 routes the graph
+        # could not express kept heuristic columns that clashed with the 1,493 seeded
+        # ones, `is_claim_feasible` failed on the overlay, and the warm start was thrown
+        # away over 0.5% of the schedule.  `complete_selection` pins the seeds and fills
+        # the rest greedily, so a leftover flight can only cost what its own best
+        # compatible column costs.
+        if seeded_first:
+            seeds_feasible = master.is_claim_feasible(seeded_first)
+            candidate = master.complete_selection(seeded_first) if seeds_feasible else {}
+            # WHY a warm start was refused is not recoverable after the fact: a candidate
+            # missing k flights loses on `k*M` while a clashing one never gets built at
+            # all, and both surface only as `initial_heuristic_strategy == "shifted_seeds"`.
+            # Measured at 1,500 flights, the two differ by 155x in magnitude and point at
+            # completely different fixes, so the run has to say which one happened.
+            log.info(
+                "  warm start: %d seeds, pins %s, completed to %d/%d flights, "
+                "objective %.1f vs heuristic %.1f",
+                len(seeded_first),
+                "feasible" if seeds_feasible else "INFEASIBLE",
+                len(candidate),
+                len(best_heuristic),
+                _selection_objective(candidate, params.M) if candidate else -math.inf,
+                _selection_objective(best_heuristic, params.M),
+            )
+            if candidate and _selection_objective(candidate, params.M) > _selection_objective(
+                best_heuristic, params.M
+            ):
+                best_heuristic = candidate
+                initial_heuristic_strategy = "seed_columns"
         if best_heuristic:
             master.set_heuristic(best_heuristic)
 
@@ -1347,14 +1424,39 @@ class ColGenSolver:
             ip_status = "time_limit_skipped"
             termination_reason = "time_limit"
         elif not ip_skipped:
-            master.backend.time_limit_s = max(1e-6, deadline - time.monotonic())
+            # The IP gets its OWN budget, not "whatever is left".  Both bounds are real:
+            # `deadline` keeps the solve inside the time limit it was given, and
+            # `ip_time_limit_s` keeps a loop that converged early from handing the MILP
+            # hours (see ColGenParams.ip_time_limit_s).  Whichever binds first wins.
+            # `ip_time_limit_s` is handed to `solve_ip` as a BUDGET rather than folded into
+            # a deadline here, because eager row materialization happens inside `solve_ip`
+            # and is setup, not search.  Pre-shrinking the deadline charged that setup to
+            # the solver: at x1500 it is 272 s, so a 900 s cap delivered 628 s of MILP and
+            # a 300 s cap delivered ~28 s and returned the incumbent untouched.  The
+            # whole-solve `deadline` still binds and is still the hard wall.
+            master.backend.time_limit_s = max(1e-6, params.ip_time_limit_s)
             master.set_heuristic(incumbent)
+            # Re-scale the MIP tolerance now that the incumbent's COST is known.
+            # `create_backend` can only assume the worst case (cost -> 0) and so hands the
+            # backend `ip_gap / (n*M)` -- an ABSOLUTE tolerance of `ip_gap` revenue units.
+            # At 1,000 flights that is 1e-12 relative, i.e. "prove a cost of 129,000 to
+            # within 0.001": ~129,000x tighter than the 0.1% `ip_gap` reads as, and the
+            # measured cause of the final MILP's blow-up (round 5 of separation went 6.5 s
+            # to 39.1 s, round 6 11.7 s to 134.6 s, purely from this).  Here the incumbent
+            # gives a real cost scale, so the same user-facing tolerance can be expressed
+            # against it.  `max(..., 1.0)` keeps the conservative old value when cost is
+            # genuinely tiny, which is the case the original conversion was protecting.
+            incumbent_cost = total_benefit - _selection_objective(incumbent, params.M)
+            revenue_scale = max(1.0, total_benefit)
+            master.backend.ip_gap = params.ip_gap * max(incumbent_cost, 1.0) / revenue_scale
             # Timed because it was the one unattributed block left in the solve.  Worth
             # knowing precisely: on a 1,138-column 100-flight pool the whole solve took
             # 643s and the IP was under a second of it, so "the IP is slow" is a
             # hypothesis that needs a number before anyone acts on it.
             ip_started = time.monotonic()
-            ip_selection = master.solve_ip(deadline=deadline)
+            ip_selection = master.solve_ip(
+                deadline=deadline, budget_s=params.ip_time_limit_s
+            )
             ip_elapsed_s = time.monotonic() - ip_started
             ip_selection = {
                 flight_id: _canonical_column(column, graphs[flight_id], cfg)
@@ -1572,6 +1674,16 @@ class ColGenSolver:
             "ip_optimal": ip_optimal,
             "ip_skipped": ip_skipped,
             "ip_elapsed_s": ip_elapsed_s,
+            # Reported alongside the elapsed time so a reader can tell an IP that finished
+            # from one the cap cut off, without inferring it from `ip_optimal` alone.
+            "ip_time_limit_s": params.ip_time_limit_s,
+            # Rows the bindability filter pre-materialized, and how many separation rounds
+            # were still needed afterwards.  A nonzero round count after an eager solve is
+            # the signal that some violable row was not predicted -- worth a look, since the
+            # filter is supposed to be exact rather than approximate.
+            "ip_eager_rows": master.last_ip_eager_rows,
+            "ip_separation_rounds": master.last_ip_rounds,
+            "ip_setup_s": master.last_ip_setup_s,
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
             "objective": objective_value,
@@ -1583,6 +1695,7 @@ class ColGenSolver:
             "search_exhausted_flight_ids": search_exhausted,
             "repair_added": repair_added,
             "seedless_flight_ids": tuple(sorted(seedless_flights)),
+            "warm_start_planner": params.warm_start_planner,
             "initial_heuristic_strategy": initial_heuristic_strategy,
             "initial_heuristic_flights": len(initial_heuristic),
             "initial_heuristic_delay_s": math.fsum(
@@ -1653,6 +1766,13 @@ class ColGenSolver:
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,
+            # WHICH DUAL VECTOR PRICED THIS RUN.  Recorded because it is answer-affecting
+            # and was, until now, an environment variable nothing wrote down: the same pool
+            # under simplex and under barrier gave 196,332.8 and 184,729.0 at x1500.  An
+            # archived run without this cannot be compared to anything.  `-1` is Gurobi's
+            # automatic choice; `2 / 0` is barrier without crossover, the default.
+            "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
+            "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,

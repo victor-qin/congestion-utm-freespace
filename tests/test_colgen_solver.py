@@ -896,7 +896,16 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     ]
 
     revenue = ColGenSolver().solve(
-        requests, cfg, (), _params(max_air_overrun_hops=1, gap_metric="revenue")
+        requests,
+        cfg,
+        (),
+        # M pinned, because this test IS the demonstration that the revenue scale goes
+        # degenerate when M dwarfs cost -- so it cannot ride on whatever M ships.  The
+        # shipped default is now 1e4, where the same absolute gap reads ~1.2e-4 instead of
+        # ~1.2e-6 and no longer closes: the denominator is `n*M - cost`, so shrinking M by
+        # 100 grows the ratio by 100.  That is precisely why the default moved, and pinning
+        # 1e6 here keeps the pathology on the record rather than deleting the evidence.
+        _params(max_air_overrun_hops=1, gap_metric="revenue", M=1_000_000.0),
     )
 
     assert revenue.stats["termination_reason"] == "lp_gap"
@@ -1391,13 +1400,303 @@ def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
     ]
 
     # ladder off so the heuristic cannot prove the gap and skip the MILP outright.
-    result = ColGenSolver().solve(requests, cfg, (), _params(seed_ladder_steps=0))
+    # `max_iterations=1` is what keeps this fixture reaching the IP at all.  Under the
+    # shipped `gap_metric="cost"` the loop runs to convergence on a two-flight instance
+    # (3 iterations, terminating on `lp_gap`), the heuristic reaches the optimum,
+    # `heuristic_gap_cost` is exactly 0.0, and the solver correctly SKIPS the MILP --
+    # there is nothing left for it to close.  A test about IP mechanics has to stop the
+    # loop short of that, so it is asserting on an IP that actually ran.
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(seed_ladder_steps=0, max_iterations=1)
+    )
 
     assert result.stats["ip_status"] != "skipped", "this fixture must reach the IP"
     elapsed = result.stats["ip_elapsed_s"]
     assert isinstance(elapsed, float)
     assert 0.0 <= elapsed <= result.stats["elapsed_s"] + 1e-6, (
         "the IP is one block inside the solve, so its time cannot exceed the whole"
+    )
+
+
+def test_a_row_only_one_flight_can_claim_is_never_bindable():
+    """The filter's whole premise: one flight cannot overfill a capacity-one row.
+
+    The flight rows are ``sum(x_c for c in flight) <= 1``, so however many columns a single
+    flight has on a row, at most one of them is ever selected.  Measured consequence on
+    ``density_faa_wing_zipline`` x1000: 95.3% of the 2,184,200 touched rows are in this
+    class and need never be materialized at all.
+    """
+
+    shared = RowKey.cell((0, 0), 0, 0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+
+    # Four columns of ONE flight, all claiming the same row.
+    for step in range(4):
+        master.add_column(
+            _synthetic_column(1, float(step), frozenset({shared}), departure_step=step)
+        )
+    assert shared not in master.bindable_rows, "one flight can never overfill a cap-1 row"
+    assert master.materialize_bindable_rows() == 0
+
+    # A second flight on the same row makes it violable, and only then.
+    master.add_column(_synthetic_column(2, 0.0, frozenset({shared})))
+    assert shared in master.bindable_rows
+    assert master.materialize_bindable_rows() == 1
+    assert shared in master.materialized_rows
+
+
+def test_bindability_respects_terminal_pad_capacity():
+    """A pad row with N pads needs N+1 distinct flights, not two.
+
+    Using capacity one for every row would materialize terminal rows far too eagerly --
+    hubs are exactly where many flights share a row legitimately.
+    """
+
+    rows = RowIndex({"hub": 3})
+    pad = RowKey.term("hub", 7)
+    master = RestrictedMaster((1, 2, 3, 4), rows, _params())
+
+    for flight_id in (1, 2, 3):
+        master.add_column(_synthetic_column(flight_id, 0.0, frozenset({pad})))
+        assert pad not in master.bindable_rows, f"{flight_id} flights cannot overfill 3 pads"
+    master.add_column(_synthetic_column(4, 0.0, frozenset({pad})))
+    assert pad in master.bindable_rows
+
+
+def test_a_row_already_full_of_committed_load_binds_on_its_first_claimant():
+    """``fixed_loads`` consumes capacity, so headroom — not cap — is what counts.
+
+    No column-driven update would ever promote such a row (one claimant is enough to break
+    it), so the constructor has to seed it.
+    """
+
+    row = RowKey.cell((5, 5), 0, 2)
+    master = RestrictedMaster((1, 2), RowIndex(), _params(), fixed_loads={row: 1})
+    assert row in master.bindable_rows, "a row with no headroom binds immediately"
+
+
+def test_eager_materialization_removes_the_separation_rounds():
+    """The payoff: the loop should confirm feasibility, not search for it.
+
+    Measured motivation — at 1000 flights the lazy loop ran 16 rounds in 900 s and still
+    returned ``time_limit_separation``, having materialized 59,843 rows of the ~95,000 that
+    can bind.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+    # `max_iterations=1` is what keeps this fixture reaching the IP at all.  Under the
+    # shipped `gap_metric="cost"` the loop runs to convergence on a two-flight instance
+    # (3 iterations, terminating on `lp_gap`), the heuristic reaches the optimum,
+    # `heuristic_gap_cost` is exactly 0.0, and the solver correctly SKIPS the MILP --
+    # there is nothing left for it to close.  A test about IP mechanics has to stop the
+    # loop short of that, so it is asserting on an IP that actually ran.
+    result = ColGenSolver().solve(
+        requests, cfg, (), _params(seed_ladder_steps=0, max_iterations=1)
+    )
+
+    assert result.stats["ip_status"] != "skipped", "this fixture must reach the IP"
+    assert result.stats["ip_separation_rounds"] == 0, (
+        "every violable row should already be materialized, so separation has nothing to add"
+    )
+    assert result.stats["ip_eager_rows"] >= 0
+
+
+def test_max_eager_rows_is_all_or_nothing():
+    """Over the bound, do nothing — a half-materialized set is the worst of both.
+
+    It would look eager while still needing separation, and the run's stats would say rows
+    were pre-materialized when the loop had to search anyway.
+    """
+
+    shared = RowKey.cell((0, 0), 0, 0)
+    other = RowKey.cell((1, 1), 0, 0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+    for flight_id in (1, 2):
+        master.add_column(
+            _synthetic_column(flight_id, 0.0, frozenset({shared, other}))
+        )
+    assert len(master.bindable_rows) == 2
+    assert master.materialize_bindable_rows(max_rows=1) == 0
+    assert not master.materialized_rows, "nothing may be materialized when over the bound"
+    assert master.materialize_bindable_rows(max_rows=2) == 2
+
+
+def test_a_better_seed_schedule_becomes_the_incumbent_not_just_pool_contents():
+    """A supplied schedule must be reachable when the IP is truncated, not only through it.
+
+    Pool-only seeding leaves the caller's schedule behind a final MILP that may never
+    finish: measured at 1,500 flights, the run reported the shifted-seed heuristic's
+    233,520 while A*'s 211,440 sat unused in the pool.  Taking a feasible, better seed
+    selection as the INCUMBENT makes the fallback the better of the two.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    params = _params(seed_ladder_steps=0)
+
+    plain = ColGenSolver().solve(requests, cfg, (), params)
+    assert plain.stats["initial_heuristic_strategy"] == "shifted_seeds"
+
+    # Re-offer the solve's own answer as a seed: feasible by construction, so it is a
+    # legitimate incumbent whenever it is also better.
+    seeds = {fid: [column] for fid, column in plain.columns.items()}
+    seeded = ColGenSolver().solve(requests, cfg, (), params, seed_columns=seeds)
+    assert seeded.stats["seeded_columns"] == len(seeds)
+    # Either it was adopted, or it was not better -- never adopted while worse.
+    if seeded.stats["initial_heuristic_strategy"] == "seed_columns":
+        assert seeded.stats["objective"] <= plain.stats["objective"] + 1e-9
+
+
+def test_an_infeasible_seed_selection_is_never_taken_as_the_incumbent():
+    """A caller's schedule need not be jointly feasible, and must not smuggle one in."""
+
+    shared = RowKey.cell((0, 0), 0, 0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+    clashing = {
+        flight_id: _synthetic_column(flight_id, 0.0, frozenset({shared}))
+        for flight_id in (1, 2)
+    }
+    for column in clashing.values():
+        master.add_column(column)
+    # Both claim one cap-1 row, so as a SELECTION they are infeasible even though each
+    # column is individually valid -- exactly the case the guard exists for.
+    assert not master.is_claim_feasible(clashing)
+
+
+def test_completion_repicks_the_flights_the_pins_leave_out():
+    """A flight the warm start misses takes its best COMPATIBLE column, not its cheapest.
+
+    The 1,500-flight failure in miniature.  Overlaying seeds onto another heuristic keeps
+    that heuristic's column for every uncovered flight, and one clash there discards the
+    whole warm start -- measured as 7 leftovers sinking 1,493 good columns.
+    """
+
+    pinned_row = RowKey.cell((0, 0), 0, 0)
+    free_row = RowKey.cell((1, 0), 0, 0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+
+    pin = _synthetic_column(1, 0.0, frozenset({pinned_row}))
+    clashing = _synthetic_column(2, 0.0, frozenset({pinned_row}))
+    alternative = _synthetic_column(2, 30.0, frozenset({free_row}), departure_step=1)
+    for column in (pin, clashing, alternative):
+        master.add_column(column)
+
+    completed = master.complete_selection({1: pin})
+    assert completed[1] == pin
+    # `clashing` is free and `alternative` costs 30 s, so cost order prefers the clash;
+    # it is rejected on the row, not on the price.
+    assert completed[2] == alternative
+    assert master.is_claim_feasible(completed)
+
+
+def test_completion_refuses_pins_that_already_clash():
+    """Completion fills around a warm start; it does not silently repair one."""
+
+    shared = RowKey.cell((0, 0), 0, 0)
+    master = RestrictedMaster((1, 2), RowIndex(), _params())
+    clashing = {
+        flight_id: _synthetic_column(flight_id, 0.0, frozenset({shared}))
+        for flight_id in (1, 2)
+    }
+    for column in clashing.values():
+        master.add_column(column)
+
+    with pytest.raises(ValueError, match="violates 1 capacity claims"):
+        master.complete_selection(clashing)
+
+
+def test_completion_refuses_a_column_the_master_does_not_hold():
+    """Pins are looked up, not trusted: an outside column has no index to pin."""
+
+    master = RestrictedMaster((1,), RowIndex(), _params())
+    stranger = _synthetic_column(1, 0.0, frozenset({RowKey.cell((0, 0), 0, 0)}))
+
+    with pytest.raises(ValueError, match="outside this master"):
+        master.complete_selection({1: stranger})
+
+
+def test_a_partial_seed_still_produces_a_complete_feasible_incumbent():
+    """Seeding a subset must not strand the rest -- they are re-picked, not left as-is."""
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    params = _params(seed_ladder_steps=0)
+
+    plain = ColGenSolver().solve(requests, cfg, (), params)
+    # Cover ONE flight.  `set_heuristic` validates whatever the incumbent path builds, so
+    # an incumbent that stranded flight 2 on a clashing column would raise inside solve.
+    seeded = ColGenSolver().solve(
+        requests, cfg, (), params, seed_columns={1: [plain.columns[1]]}
+    )
+    assert seeded.stats["seeded_columns"] == 1
+    assert set(seeded.columns) == {1, 2}
+
+
+def test_ip_gets_its_own_budget_not_the_whole_solve_remainder(monkeypatch):
+    """The IP is capped by ``ip_time_limit_s``, however much of the solve is left.
+
+    Without this the IP inherits ``deadline - now``, which is unbounded from the IP's
+    point of view exactly when the loop went WELL — a solve that converges early hands
+    the MILP every remaining second.  Measured on ``density_faa_wing_zipline`` x1000
+    with ``time_limit_s=10800``: pricing finished in ~21 minutes, then the IP ran 30+
+    minutes with ~2 hours of budget still to burn.
+
+    Asserted on the budget the backend is actually given rather than on wall time, so
+    the test pins the arithmetic instead of racing a real MILP.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+
+    seen: list[float] = []
+    original = master_module.RestrictedMaster.solve_ip
+
+    def record(self, heuristic=None, **kwargs):
+        # Observed on the BACKEND at the moment it is asked to solve, not on entry to
+        # `solve_ip`.  `ip_time_limit_s` now reaches the master as a budget rather than a
+        # pre-shrunk deadline -- eager materialization is setup and must not be charged to
+        # the solver -- so the clipping against the whole-solve deadline happens inside the
+        # separation loop.  Sampling on entry would read the raw budget and prove nothing.
+        real_backend_ip = self._backend.solve_ip
+
+        def spy(warm_start=None):
+            seen.append(self._backend.time_limit_s)
+            return real_backend_ip(warm_start)
+
+        self._backend.solve_ip = spy
+        return original(self, heuristic, **kwargs)
+
+    monkeypatch.setattr(master_module.RestrictedMaster, "solve_ip", record)
+
+    # A huge whole-solve budget the loop cannot possibly consume: under the old rule the
+    # IP would be handed essentially all of it.
+    result = ColGenSolver().solve(
+            requests, cfg, (), _params(seed_ladder_steps=0, max_iterations=1,
+                                       time_limit_s=9000.0, ip_time_limit_s=7.0)
+    )
+
+    assert result.stats["ip_status"] != "skipped", "this fixture must reach the IP"
+    assert seen, "solve_ip was never called"
+    assert seen[0] <= 7.0 + 1e-6, (
+        f"the IP was given {seen[0]}s of a 9000s solve budget; ip_time_limit_s must cap it"
+    )
+    assert result.stats["ip_time_limit_s"] == 7.0
+
+    # And the whole-solve deadline still binds when it is the smaller of the two.
+    seen.clear()
+    ColGenSolver().solve(
+        requests, cfg, (), _params(seed_ladder_steps=0, max_iterations=1,
+                                   time_limit_s=30.0, ip_time_limit_s=9000.0)
+    )
+    assert seen and seen[0] <= 30.0 + 1e-6, (
+        f"the IP was given {seen[0]}s from a 30s solve budget; the deadline must still bind"
     )
 
 
@@ -1651,10 +1950,19 @@ def test_ip_deadline_stops_lazy_separation_and_keeps_heuristic(monkeypatch):
         )
 
     monkeypatch.setattr(master.backend, "solve_ip", overloaded_ip)
-    clock = iter((0.0, 2.0))
+    # Four ticks, and the first two are the setup timer: `solve_ip` now brackets eager
+    # materialization to report `last_ip_setup_s` separately from the solve.  Both read 0.0
+    # here (nothing is materialized under `eager=False`), so setup is 0 s and the two the
+    # separation loop consumes are unchanged -- 0.0 leaves the full 1.0 s deadline for the
+    # backend call, 2.0 is past it and returns the heuristic.
+    clock = iter((0.0, 0.0, 0.0, 2.0))
     monkeypatch.setattr(master_module.time, "monotonic", lambda: next(clock))
 
-    selected = master.solve_ip(deadline=1.0)
+    # `eager=False` on purpose: this fixture is about the LAZY separation path, and the
+    # shared row is bindable (two flights claim it), so the eager pass would materialize it
+    # up front and the mock's violating solution would then be a backend contract breach
+    # rather than a separation round.
+    selected = master.solve_ip(deadline=1.0, eager=False)
 
     assert selected == heuristic
     assert calls == [pytest.approx(1.0)]
@@ -1952,3 +2260,55 @@ def test_the_air_time_ceiling_is_a_flat_budget_not_a_fraction_of_the_flight():
     # would leave the loop above asserting nothing. At the seed above the `overrun=1` arm of
     # the 5-hop flight binds exactly -- eccentricity 1 against a budget of 1, at the hop cap.
     assert eccentric, "no priced column left the geodesic; the containment check is vacuous"
+
+
+def test_warm_start_planner_defaults_off_and_validates_its_name():
+    """An unknown name must fail loudly, not degrade into an unseeded run.
+
+    A silent no-op warm start is invisible in the output: the run looks like an ordinary
+    unseeded solve, so the seeded and unseeded arms of an experiment become impossible to
+    tell apart afterwards.  Off by default because turning it on changes what "colgen"
+    means -- unaided colgen is +11.3% against A* at x1500, A*-seeded is -7.1%.
+    """
+
+    assert ColGenParams().warm_start_planner is None
+    assert ColGenParams(warm_start_planner="astar").warm_start_planner == "astar"
+    with pytest.raises(ValueError, match="warm_start_planner must be None or one of"):
+        ColGenParams(warm_start_planner="milp")
+    with pytest.raises(TypeError, match="warm_start_planner must be a string or None"):
+        ColGenParams(warm_start_planner=5)
+
+
+def test_an_unseeded_batch_builds_no_warm_start():
+    """The default path must not run a second planner behind the caller's back."""
+
+    from freespace_sim.planner.colgen import batch as batch_module
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg)]
+    assert batch_module._build_warm_start(requests, cfg, (), _params()) is None
+
+
+def test_warm_start_translation_rejects_a_route_it_cannot_express():
+    """Inexpressible routes are refused with a reason, never approximated.
+
+    A column claiming cells the aircraft does not fly is worse than no column at all, so
+    `intent_to_column` returns a reason rather than a best effort.  The air hold is the
+    load-bearing case: a centreline that dwells produces a non-neighbour hop between
+    sampled points, and nothing in the column model represents it.
+    """
+
+    from freespace_sim.planner.colgen.warm_start import intent_to_column
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    request = _request(1, (-4, 0), (4, 0), cfg)
+
+    class _Stub:
+        def __init__(self, centerline):
+            self.centerline = centerline
+            self.request = request
+            self.ground_delay_s = 0.0
+
+    graph = object()
+    column, why = intent_to_column(_Stub(((np.array([0.0, 0.0, 0.0]), 0.0),)), graph, cfg)
+    assert column is None and why == "degenerate path"

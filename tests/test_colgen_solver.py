@@ -39,6 +39,7 @@ from freespace_sim.planner.colgen.pricing import (
     _visit_claims,
     price_flight,
     seed_column,
+    seed_route_fan,
 )
 from freespace_sim.planner.colgen.objective import DELAY_MODEL, cost_model
 from freespace_sim.planner.colgen.solver import (
@@ -1232,6 +1233,147 @@ def test_the_departure_ladder_offers_clock_translations_up_to_the_ground_budget(
         assert column_claims(column, graph, cfg) == column.claims
 
     assert _add_departure_ladder(_ColumnRecorder(), seed, graph, cfg, DELAY_MODEL, 0) == 0
+
+
+def test_the_route_fan_offers_delay_tied_alternatives_that_claim_different_cells():
+    """Every variant costs EXACTLY what the seed costs and claims somewhere else.
+
+    This is the whole premise of `seed_route_variants`, and it is a property of the
+    objective rather than of the hop count: `_canonical_candidate` sets `delay_s` from
+    `intent.air_detour_m` -- the folded corridor geometry -- so equal length does not by
+    itself imply equal cost.  It holds here because a hex geodesic's polyline is `hops`
+    pitches long whatever shape it takes, and it is asserted rather than assumed because a
+    change to folding would otherwise let the solver ladder a MORE EXPENSIVE route as
+    though it were free.
+
+    The O-D is diagonal on purpose.  An axis-aligned pair has exactly one geodesic and
+    would pass this test vacuously with an empty fan -- see the next test.
+    """
+
+    cfg = _cfg()
+    request = _request(1, (-4, -2), (4, 2), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = seed_column(graph, cfg)
+    assert len(seed.cell_path) - 1 == hg.hex_distance(seed.cell_path[0], seed.cell_path[-1])
+
+    fan = seed_route_fan(graph, cfg, seed, variants=5)
+
+    assert len(fan) == 4
+    paths = {column.cell_path for column in fan}
+    assert len(paths) == 4 and seed.cell_path not in paths
+    for column in fan:
+        assert column.delay_s == pytest.approx(seed.delay_s, abs=1e-9)
+        assert len(column.cell_path) == len(seed.cell_path)
+        # A variant is a pure lateral swap: it leaves and arrives exactly where the seed
+        # does, at the same time, on the same lanes.  Anything else is a different column
+        # family and the ladder's arithmetic would not transfer to it.
+        assert column.cell_path[0] == seed.cell_path[0]
+        assert column.cell_path[-1] == seed.cell_path[-1]
+        assert column.departure_step == seed.departure_step
+        assert (column.level, column.origin_lane_idx, column.dest_lane_idx) == (
+            seed.level,
+            seed.origin_lane_idx,
+            seed.dest_lane_idx,
+        )
+        # The fan feeds `master.add_column` through `_canonical_column`, exactly like the
+        # ladder, so an uncertified claim set would land straight in the LP.
+        assert column_claims(column, graph, cfg) == column.claims
+
+    assert seed_route_fan(graph, cfg, seed, variants=1) == ()
+
+
+def test_the_route_fan_is_empty_when_the_lattice_offers_one_geodesic():
+    """An axis-aligned O-D has a single shortest path, and the fan must say so quietly.
+
+    2.2% of flights in `density_faa_wing_zipline` are in this position.  Returning nothing
+    is the correct answer -- there is no tied alternative to offer -- and the run reports
+    `fan_columns` so a scenario where this is the common case is visible rather than
+    mistaken for the fan being switched off.
+    """
+
+    cfg = _cfg()
+    request = _request(1, (-4, 0), (4, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = seed_column(graph, cfg)
+
+    assert seed_route_fan(graph, cfg, seed, variants=8) == ()
+
+
+def test_the_route_fan_spreads_rather_than_shuffling_one_cell():
+    """Minimum overlap is load-bearing: near-identical geodesics claim near-identical rows.
+
+    A hex lattice offers enormous numbers of geodesics (median 10^19 per flight on
+    `density_faa_wing_zipline`), and consecutive ones in any natural enumeration order
+    differ in a cell or two.  A fan of those would hand a cap-1 master four columns that
+    are excluded by the same conflicts, which is no alternative at all.  `seed_route_fan`
+    picks each variant by minimum cell overlap with everything chosen so far, so on an
+    O-D with room the variants share only the two endpoints they are required to share.
+    """
+
+    cfg = _cfg()
+    request = _request(1, (-5, -3), (5, 3), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = seed_column(graph, cfg)
+
+    fan = seed_route_fan(graph, cfg, seed, variants=5)
+
+    assert len(fan) == 4
+    endpoints = {seed.cell_path[0], seed.cell_path[-1]}
+    for column in fan:
+        assert set(column.cell_path) & set(seed.cell_path) == endpoints
+    # And they spread from each other, not just from the seed: five paths of 17 cells that
+    # merely shuffled would union to barely more than 17.
+    union = set(seed.cell_path).union(*(set(c.cell_path) for c in fan))
+    assert len(union) > 3 * len(seed.cell_path)
+
+
+def test_the_congestion_prior_steers_the_fan_off_contested_rows():
+    """The fan's tie class is enormous, so what breaks the tie decides what enters the pool.
+
+    Minimum overlap is satisfied by a huge number of geodesics -- every path down the far
+    side of the parallelogram shares only the two endpoints -- and without a prior the
+    winner is whichever is lexicographically smallest, which is arbitrary. `seed_row_load`
+    replaces that arbitrary choice with a dual-free estimate of where the master's prices
+    will land.
+
+    Tested by loading exactly the rows the unaimed fan picks and checking the aimed fan
+    goes somewhere else, rather than by re-deriving the DP's own arithmetic. The load is
+    synthetic on purpose: a two-flight fixture would leave which row is contested up to
+    corridor geometry, and the property under test is the steering, not the geometry.
+    """
+
+    cfg = _cfg()
+    request = _request(1, (-5, -3), (5, 3), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = seed_column(graph, cfg)
+
+    unaimed = seed_route_fan(graph, cfg, seed, variants=3)
+    assert len(unaimed) == 2
+
+    # Every row the unaimed fan wanted, as if a crowd of other flights had filed there.
+    load = Counter()
+    for column in unaimed:
+        load.update(dict.fromkeys(column.claims, 9))
+    aimed = seed_route_fan(graph, cfg, seed, variants=3, row_load=load)
+
+    assert len(aimed) == 2
+    assert {c.cell_path for c in aimed} != {c.cell_path for c in unaimed}
+    # Steered, not merely perturbed: the aimed fan sits on quieter rows than the fan that
+    # could not see the load.
+    assert sum(sum(load[row] for row in c.claims) for c in aimed) < sum(
+        sum(load[row] for row in c.claims) for c in unaimed
+    )
+    # And it is still a fan: delay-tied, and spread rather than collapsed onto one corridor.
+    for column in aimed:
+        assert column.delay_s == pytest.approx(seed.delay_s, abs=1e-9)
+        assert column_claims(column, graph, cfg) == column.claims
+    assert aimed[0].cell_path != aimed[1].cell_path
+
+    # An empty load must reproduce the unaimed fan exactly -- otherwise `row_load` is doing
+    # something other than breaking ties and the two arms of an A/B would not be comparable.
+    assert [c.cell_path for c in seed_route_fan(graph, cfg, seed, variants=3, row_load={})] == [
+        c.cell_path for c in unaimed
+    ]
 
 
 def test_the_departure_ladder_stops_at_the_arrival_horizon_not_the_ground_budget():

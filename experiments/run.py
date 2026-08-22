@@ -358,6 +358,17 @@ def build_parser() -> argparse.ArgumentParser:
                         # ValueError at parser construction, i.e. every invocation.
                         "-6%% to -19%% objective for 1.6-13.7x the pricing. At 100 flights the "
                         "ladder is 2000 of the final 2186 columns")
+    p.add_argument("--colgen-seed-routes", type=int, default=None, metavar="N",
+                   help="colgen: seed each flight with N distinct ROUTES rather than one "
+                        "(default 1 = unchanged). The ladder opens the pool's time axis; this "
+                        "opens its space axis, with variants picked by minimum cell overlap so "
+                        "they claim different rows instead of shuffling a cell. They are "
+                        "DELAY-IDENTICAL to the seed -- same lanes, same hop count -- which is "
+                        "what 84.4%% of everything reduced-cost pricing discovers turns out to "
+                        "be, at 1,686 s of a 4,561 s x1500 solve. THE POOL IS A BUDGET: N x "
+                        "(ladder+1) columns per flight all become MILP binaries and pool size "
+                        "is not monotone in quality, so widen this by shortening --colgen-seed-"
+                        "ladder rather than on top of it")
     p.add_argument("--colgen-greedy-budget-rate", type=float, default=None, metavar="S",
                    help="colgen: seconds PER FLIGHT for the initial greedy feasible-selection "
                         "stage. DEFAULT 0, WHICH DISABLES THE STAGE — pass a rate to enable it "
@@ -431,6 +442,7 @@ def _colgen_overrides(args) -> dict:
             ("max_air_overrun_hops", args.colgen_max_air_overrun),
             ("n_pricing_workers", args.colgen_workers),
             ("seed_ladder_steps", args.colgen_seed_ladder),
+            ("seed_route_variants", args.colgen_seed_routes),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),
         )

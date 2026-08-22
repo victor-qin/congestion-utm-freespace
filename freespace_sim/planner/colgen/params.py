@@ -291,6 +291,68 @@ class ColGenParams:
     # in the pool.  See :func:`solver._add_departure_ladder` for the depth measurements;
     # 0 disables.
     seed_ladder_steps: int = 20
+    # Distinct ROUTES seeded per flight, against the ladder's distinct DEPARTURES.  1 (the
+    # shipped default) is today's behaviour exactly: one geodesic, re-timed.
+    #
+    # The two knobs span the two axes of the same pool, and until now only one of them was
+    # open.  Measured on the x1500 barrier pool: seeds give 1.000 distinct routes per
+    # flight, and 99.3% of what PRICING then returns is a new route -- 84.4% of which
+    # shares the seed's endpoint lanes AND its hop count, making it delay-identical to the
+    # seed (all 9,592 such columns, to the millisecond).  Pricing is spending 1,686 s of a
+    # 4,561 s solve on alternatives that differ only in which rows they claim, and a hex
+    # lattice hands those out for free: 97.8% of flights have many geodesics, median 10^19.
+    #
+    # `pricing.seed_route_fan` enumerates them by minimum cell overlap, so the variants
+    # spread across the lattice instead of shuffling one or two cells.  Flights whose seed
+    # is longer than `hex_distance` -- an ellipse or block forced a detour -- get no fan,
+    # because the equal-cost argument does not hold for them.
+    #
+    # TREAT THE POOL AS A BUDGET.  `(variants) x (ladder + 1)` columns per flight all
+    # become binary variables in the final MILP, and pool size is not monotone in quality:
+    # at x1500 the marks between 35,790 and 39,446 columns returned the incumbent unchanged
+    # where both 33,425 and 41,954 beat A*.  Widen the fan by shortening the ladder.
+    seed_route_variants: int = 1
+    # Break the fan's ties by PREDICTED CONGESTION rather than lexicographically.
+    #
+    # The fan picks each variant by minimum cell overlap, and on a lattice offering ~10^19
+    # geodesics the set achieving the minimum is enormous -- so what breaks that tie decides
+    # which routes actually enter the pool.  Left alone it is the lexicographically smallest
+    # path, which is arbitrary.  With this on, `seed_row_load` counts how many flights'
+    # nominal seeds want each capacity row and the fan prefers the rows fewer of them want.
+    #
+    # That is the answer to "must a seed fan be blind": no.  The duals are large exactly
+    # where demand exceeds a cap-1 row, and "how many flights would claim this row if nobody
+    # moved" is the zeroth-order version of the same quantity -- available before the first
+    # LP, for the cost of a `Counter` over claims the solver already holds.  It is a ranking
+    # prior over a tie class, not a feasibility test, and nothing downstream trusts it.
+    #
+    # Requires `seed_route_variants > 1`; inert otherwise.  ON by default because the
+    # alternative it replaces is an arbitrary tie-break, not a considered choice -- but the
+    # two are separable on purpose, so an A/B can say how much of the fan's value is the
+    # breadth and how much is aiming it.
+    seed_fan_congestion_prior: bool = True
+    # Columns to take from EACH pricing subproblem, where 1 (the shipped default) is the
+    # one-column-per-flight-per-sweep that column generation has always done.
+    #
+    # It has always done it on an assumption that is measurably false.  Over 1,764
+    # certifications (`.context/probe_rc_plateau.py`), the gap from the column pricing
+    # RETURNS to the runner-up is **0.000000 s at p10, at the median and at p90**: the
+    # search is not selecting a unique best, it is picking one arbitrarily out of a tie
+    # ~16 wide -- and that width is CENSORED at the recorder's cap of 20, and it grows as
+    # the duals mature rather than closing.  99.8% of the tied set shares the winner's hop
+    # count, so they are lateral swaps: identical cost, different rows.
+    #
+    # So this is not "generate more columns"; it is "stop throwing away fifteen of the
+    # sixteen the label search already paid for".  The extra cost is one
+    # `_canonical_candidate` per candidate examined, against a search that is 60-86% of the
+    # sweep.
+    #
+    # NOT the rejected top-k proposal, and the distinction is the measurement above.  Top-k
+    # returned the k highest reduced costs, which are mostly strictly worse columns priced
+    # under duals that had already moved; this returns only EXACT ties, chosen among
+    # themselves for minimum row overlap because the median tied alternative still shares
+    # 55% of the winner's rows and k near-duplicates are excluded by the same conflict.
+    pricing_tied_columns: int = 1
     # Wall clock for the post-first-LP greedy, PER FLIGHT.  **NOW 0, WHICH DISABLES THE
     # STAGE.**  It was 0.7, and the history matters: the value scales with the batch because
     # the stage splits its budget across up to `max(64, n_heuristic_tries * 16)` candidates,
@@ -584,6 +646,31 @@ class ColGenParams:
         if ladder < 0:
             raise ValueError("seed_ladder_steps must be non-negative")
         object.__setattr__(self, "seed_ladder_steps", ladder)
+
+        if isinstance(self.seed_route_variants, bool):
+            raise TypeError("seed_route_variants must be an integer")
+        try:
+            variants = operator.index(self.seed_route_variants)
+        except TypeError as exc:
+            raise TypeError("seed_route_variants must be an integer") from exc
+        # 1, not 0, is the floor: the nominal seed is not optional, so "zero routes" has no
+        # meaning here the way "zero extra departures" does for the ladder.
+        if variants < 1:
+            raise ValueError("seed_route_variants must be at least 1")
+        object.__setattr__(self, "seed_route_variants", variants)
+
+        if not isinstance(self.seed_fan_congestion_prior, bool):
+            raise TypeError("seed_fan_congestion_prior must be a bool")
+
+        if isinstance(self.pricing_tied_columns, bool):
+            raise TypeError("pricing_tied_columns must be an integer")
+        try:
+            tied = operator.index(self.pricing_tied_columns)
+        except TypeError as exc:
+            raise TypeError("pricing_tied_columns must be an integer") from exc
+        if tied < 1:
+            raise ValueError("pricing_tied_columns must be at least 1")
+        object.__setattr__(self, "pricing_tied_columns", tied)
 
         if isinstance(self.n_pricing_workers, bool):
             raise TypeError("n_pricing_workers must be an integer")

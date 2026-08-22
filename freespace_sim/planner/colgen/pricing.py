@@ -25,7 +25,7 @@ import time
 import heapq
 import itertools
 from collections import Counter
-from collections.abc import Iterable, Mapping, Set as AbstractSet
+from collections.abc import Callable, Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Hashable
 
@@ -1352,6 +1352,45 @@ def _column_sort_key(column: Column) -> tuple[Any, ...]:
     )
 
 
+# --- top-k observation hook -----------------------------------------------------------
+# Pricing returns ONE column per flight per sweep, so "what else was on the table" is not
+# recoverable after the fact -- and that is exactly the question a top-k proposal turns on:
+# whether the column iteration 7 eventually used was already ranked highly at iteration 2,
+# or whether it only became attractive once the duals had moved.
+#
+# Deliberately an OBSERVER.  It runs after `_certify_candidates` has chosen, appends to a
+# caller-owned list, and cannot reach `best` -- so a recorded run generates exactly the
+# columns an unrecorded one does.  Anything that perturbed the trajectory would answer a
+# different question than the one being asked.
+#
+# `None` is off and costs one `is not None` per certification.  When on it pays extra
+# `_canonical_candidate` calls, which is the expensive per-candidate step, so this is for
+# instrumented probe runs and never for production.
+_TOP_K_RECORDER: list | None = None
+_TOP_K_N: int = 0
+
+# --- tied-column sink -----------------------------------------------------------------
+# The production sibling of the recorder above, and the difference matters: the recorder
+# OBSERVES and its output is thrown away, while this one's output is added to the master.
+# Both run after `best` is final, so neither can change which column pricing returns; what
+# this changes is how many OTHER columns come back with it.
+#
+# Set per call by `price_flight`, never globally, because a pricing worker prices many
+# flights and a sink that outlived one call would attribute one flight's ties to another.
+_TIED_SINK: list | None = None
+_TIED_N: int = 1
+
+
+def set_top_k_recorder(sink: list | None, n: int = 20) -> None:
+    """Record the top-``n`` certified sinks per flight into ``sink``.  ``None`` disables."""
+
+    global _TOP_K_RECORDER, _TOP_K_N
+    if sink is not None and n <= 0:
+        raise ValueError("top-k recorder needs a positive n")
+    _TOP_K_RECORDER = sink
+    _TOP_K_N = int(n)
+
+
 def _certify_candidates(
     candidates: list[_Candidate],
     fg: FlightGraph,
@@ -1415,7 +1454,92 @@ def _certify_candidates(
         if rc > best_rc + _SCORE_EPS or (abs(rc - best_rc) <= _SCORE_EPS and column_key < best_key):
             best = canonical
 
+    # Observation only, and AFTER `best` is final so it cannot influence it.  `candidates`
+    # is already sorted by provisional reduced cost, so the first entries that survive
+    # canonicalization are the top-k.  Oversampled 4x because canonicalization rejects
+    # some (forbidden rows, translation failures) and a short list would silently be a
+    # top-3 labelled top-20.
+    if _TOP_K_RECORDER is not None:
+        recorded: list[tuple[float, Column]] = []
+        for candidate in candidates[: _TOP_K_N * 4]:
+            canonical = _canonical_candidate(
+                candidate, fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model
+            )
+            if canonical is not None:
+                recorded.append(canonical)
+            if len(recorded) >= _TOP_K_N:
+                break
+        _TOP_K_RECORDER.append((fg.request.flight_id, len(candidates), recorded))
+
+    # Tied columns, for the caller that asked for them.  ALSO after `best` is final and for
+    # the same reason as the recorder: `best` is chosen by the existing rule, and this only
+    # decides what ELSE to hand back.  A run with `_TIED_SINK` set returns the identical
+    # column at rank 0.
+    if _TIED_SINK is not None and best is not None:
+        _TIED_SINK.extend(_tied_alternatives(
+            candidates, best, fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model
+        ))
+
     return best
+
+
+def _tied_alternatives(
+    candidates: list[_Candidate],
+    best: tuple[float, Column],
+    fg: FlightGraph,
+    dual_view: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel,
+) -> list[Column]:
+    """Up to ``_TIED_N - 1`` columns whose reduced cost EQUALS the one pricing returned.
+
+    Measured over 1,764 certifications (`.context/probe_rc_plateau.py`): the gap from rank 0
+    to rank 1 is **0.000000 s at p10, at the median and at p90**, and the exactly-tied set is
+    ~16 wide and censored at the recorder's cap of 20.  Pricing is not selecting a unique
+    best column, it is picking one arbitrarily out of a tie -- and discarding fifteen columns
+    the search has already paid for.  99.8% of them share the winner's hop count, so they are
+    lateral swaps: same cost, different rows, which is the only currency a cap-1 set-packing
+    master trades in.
+
+    **Which ones, out of a tie, is the whole design.**  The median tied alternative shares
+    55% of the winner's capacity rows -- taking the next k by rank would hand the master
+    columns excluded by the same conflicts, which is the near-duplicate failure the earlier
+    top-k proposal was rejected for.  Selection is therefore greedy by minimum row overlap
+    with what has been taken so far, which leaves ~2.28 genuinely disjoint alternatives per
+    flight per round.  The reduced costs are exactly equal, so ordering within the tie costs
+    nothing and cannot change which column is returned as `best`.
+
+    Ties are compared with `_SCORE_EPS`, the same tolerance `_certify_candidates` uses to
+    decide a tie; anything looser would smuggle in strictly worse columns under the name
+    "tied".
+    """
+
+    best_rc, best_column = best
+    taken: list[Column] = []
+    claimed = set(best_column.claims)
+    pool: list[Column] = []
+    # `candidates` is sorted by PROVISIONAL reduced cost, which is an upper bound on the
+    # certified one, so a candidate below the cutoff cannot certify above it -- the scan can
+    # stop.  Oversampled the same 4x as the recorder because canonicalization rejects some.
+    for candidate in candidates[: _TIED_N * 8]:
+        if candidate.reduced_cost < best_rc - _SCORE_EPS:
+            break
+        canonical = _canonical_candidate(
+            candidate, fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model
+        )
+        if canonical is None or abs(canonical[0] - best_rc) > _SCORE_EPS:
+            continue
+        if canonical[1] != best_column:
+            pool.append(canonical[1])
+    while pool and len(taken) < _TIED_N - 1:
+        pick = min(pool, key=lambda c: (len(c.claims & claimed), _column_sort_key(c)))
+        pool.remove(pick)
+        taken.append(pick)
+        claimed |= pick.claims
+    return taken
 
 
 def _best_column(
@@ -3165,8 +3289,17 @@ def price_flight(
     require_improving: bool = True,
     known_column: Column | None = None,
     deadline: float | None = None,
+    tied_sink: list[Column] | None = None,
 ) -> tuple[float, Column | None]:
     """Return the best positive-reduced-cost column for one flight.
+
+    ``tied_sink`` is an OUT-PARAMETER rather than a third return value, and deliberately:
+    the ``(reduced_cost, column)`` contract is depended on by the pool, the sequential
+    sweep, the repair path and a large number of tests, and widening it to carry an
+    optional extra would touch every one of them for a feature that is off by default.  A
+    caller that passes a list gets up to ``params.pricing_tied_columns - 1`` further
+    columns appended, each with reduced cost EQUAL to the returned one; a caller that does
+    not is on a path with one `is not None` added to it.
 
     ``known_column`` is a column the caller already holds for this flight -- the
     restricted master's current selection.  Its reduced cost under the current duals is
@@ -3299,6 +3432,38 @@ def price_flight(
         # `_best_column_compiled`, which writes `_LAST_SEARCH`, and the main search below
         # overwrites it. Read late and this reports the main search's labels twice.
         _bootstrap_labels = int(_LAST_SEARCH.get("n_labels", 0))
+    # Armed HERE, after the bootstrap, and disarmed in the `finally` below.  The bootstrap
+    # runs its own restricted `_best_column_compiled`, which certifies too -- its candidates
+    # come from a search deliberately narrowed to a few roots and are not the tied set of
+    # the real subproblem.  Arming earlier would mix the two silently.
+    global _TIED_SINK, _TIED_N
+    _tied = int(getattr(params, "pricing_tied_columns", 1))
+    if tied_sink is not None and _tied > 1:
+        _TIED_SINK, _TIED_N = tied_sink, _tied
+    try:
+        return _price_main_search(
+            fg, view, pi_value, cfg, benefit, forbidden, params, model,
+            incumbent=incumbent, known_column=known_column,
+            require_improving=require_improving, deadline=deadline,
+            tied_sink=tied_sink, _bootstrap_s=_bootstrap_s, _bootstrap_labels=_bootstrap_labels,
+        )
+    finally:
+        _TIED_SINK, _TIED_N = None, 1
+
+
+def _price_main_search(
+    fg, view, pi_value, cfg, benefit, forbidden, params, model, *,
+    incumbent, known_column, require_improving, deadline,
+    tied_sink, _bootstrap_s, _bootstrap_labels,
+) -> tuple[float, Column | None]:
+    """`price_flight`'s search half, split out so the tied sink has a `finally` to clear it.
+
+    Verbatim body, moved.  It is separate only because arming a module-level sink around a
+    block that has four exit paths -- fallback, timeout, no improving column, and "the best
+    column is the one the caller already holds" -- needs one `try` around all of them, and
+    wrapping the search in place would have re-indented it and buried the diff.
+    """
+
     # The compiled search first, the reference when it cannot prove it ran to completion.
     # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
     # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of
@@ -3381,12 +3546,28 @@ def price_flight(
     # means the search discovered the answer itself and the cutoff was doing nothing.
     _LAST_SEARCH["final_rc"] = float(reduced_cost)
     if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
+        # Nothing improving was found, so nothing is tied WITH anything worth adding.  The
+        # sink is cleared rather than left: a caller reusing one list across flights would
+        # otherwise ship a rejected flight's ties under the next flight's name.
+        if tied_sink is not None:
+            tied_sink.clear()
         return reduced_cost, None
     if known_column is not None and column == known_column:
         # The best column IS the one the caller already holds.  Reporting it would let a
         # column the master already owns read as pricing progress and keep column
         # generation iterating on nothing.
+        #
+        # The TIES ARE KEPT.  They are equal in reduced cost to a column the master holds,
+        # not to nothing, and they are different columns -- so they are exactly the case
+        # this feature exists for: the search proved a tie and the master owns only one
+        # member of it.  Reporting `None` as the priced column is still right; that is
+        # about progress accounting, and these are not that column.
         return reduced_cost, None
+    if tied_sink is not None:
+        # The fallback path re-searches and can return a different member of the same tie
+        # than the compiled path certified, so the sink -- filled by whichever certified --
+        # may contain the returned column itself.  Cheap to drop, confusing to keep.
+        tied_sink[:] = [c for c in tied_sink if c != column]
     return reduced_cost, column
 
 
@@ -3468,10 +3649,260 @@ def seed_column(
     return column
 
 
+def _geodesic_layers(
+    fg: FlightGraph, start: Cell, destination: Cell, hops: int
+) -> tuple[list[set[Cell]], dict[Cell, tuple[Cell, ...]]] | None:
+    """Layer the cells on SOME geodesic from ``start`` to ``destination``, with their arcs.
+
+    A cell is on a geodesic exactly when ``hex_distance(start, c) + hex_distance(c, dest)``
+    equals ``hops``, and every geodesic hop raises ``hex_distance(start, ·)`` by one -- so
+    the sub-DAG is topologically sorted by that distance and needs no priority queue.  The
+    walk is restricted to ``outgoing_neighbors``, which carries the O-D ellipse and the
+    static blocks, so a lattice geodesic that leaves the flight's graph is simply absent.
+
+    **Only the distance to the DESTINATION is tested**, and skipping the other one is exact
+    rather than merely cheap.  If ``c`` sits at ``hops - depth`` from the destination and a
+    neighbour ``n`` at ``hops - depth - 1``, the triangle inequality bounds
+    ``hex_distance(start, n)`` below by ``depth + 1`` and the single hop bounds it above by
+    the same, so it IS ``depth + 1``.  The previous form paid a second `hex_distance` per
+    arc to re-derive that, and the distance itself is inlined here because at ~9,000 arcs
+    per flight the call overhead outweighed the arithmetic.
+
+    **The forward adjacency is returned rather than rediscovered.**  `outgoing_neighbors` is
+    the expensive call on this path -- on a cold arc cache each miss builds corridor
+    sub-volumes and queries the static-wall index, which the profile puts at 82% of the
+    walk -- and `_least_overlapping_geodesic` used to re-walk the whole DAG through it once
+    per variant.  Handing back what this pass already computed makes every variant pay no
+    graph cost at all.
+
+    ``None`` when the destination is unreachable inside the DAG, which happens when the
+    ellipse clips every geodesic; the caller then has no tied alternative to offer.
+    """
+
+    layers: list[set[Cell]] = [{start}]
+    forward: dict[Cell, tuple[Cell, ...]] = {}
+    # Keyed on cells TOUCHED, not cells kept: a rejected neighbour is re-offered by every
+    # other cell of its layer that borders it, which on a wide parallelogram is most of them.
+    to_dest: dict[Cell, int] = {}
+    dest_q, dest_r = destination
+    for depth in range(hops):
+        remaining = hops - depth - 1
+        nxt: set[Cell] = set()
+        for cell in layers[depth]:
+            ahead: list[Cell] = []
+            for neighbour in fg.outgoing_neighbors(cell):
+                distance = to_dest.get(neighbour)
+                if distance is None:
+                    q, r = neighbour
+                    dq, dr = q - dest_q, r - dest_r
+                    distance = (abs(dq) + abs(dq + dr) + abs(dr)) // 2
+                    to_dest[neighbour] = distance
+                if distance == remaining:
+                    ahead.append(neighbour)
+                    nxt.add(neighbour)
+            forward[cell] = tuple(ahead)
+        if not nxt:
+            return None
+        layers.append(nxt)
+    return (layers, forward) if layers[-1] == {destination} else None
+
+
+def _least_overlapping_geodesic(
+    layers: list[set[Cell]],
+    forward: Mapping[Cell, tuple[Cell, ...]],
+    used: AbstractSet[Cell],
+    row_load: Mapping[RowKey, int] | None = None,
+    level: int = 0,
+    corridor_start_step: int = 0,
+) -> tuple[Cell, ...] | None:
+    """The geodesic through ``layers`` sharing the fewest cells with ``used``.
+
+    Minimising overlap rather than taking the next path in some enumeration order is the
+    whole point of the fan: adjacent geodesics differ in one or two cells and claim nearly
+    the same rows, which is no use to a cap-1 master.
+
+    ``contention`` breaks the ties, and on a lattice offering ~10^19 geodesics the tie class
+    is enormous -- so this is not a detail.  Without it the tie falls to the
+    lexicographically smallest path, which is arbitrary; with it the fan prefers cells that
+    FEWER OTHER FLIGHTS' nominal seeds want.  That is a dual-free estimate of where the
+    master's prices will land, available before the first LP has been solved, and it is why
+    a seed fan need not be blind.  ``(overlap, contention)`` and not the reverse: spreading
+    is what makes the variants alternatives at all, and a fan that collapsed onto one
+    uncongested corridor would be k copies excluded by the same conflict.
+
+    The estimate is keyed on the real row a visit at depth ``d`` would claim --
+    ``corridor_start_step + d``, the same arithmetic `column_claims` uses -- rather than on
+    cells smeared over time, so a corridor that is busy at a DIFFERENT hour costs nothing.
+    It reads only the window's centre offset and so under-counts a little; it is a ranking
+    prior over an enormous tie class, not a feasibility test, and nothing downstream trusts
+    it.  ``row_load=None`` recovers the pure-overlap fan.
+    """
+
+    (start,) = layers[0]
+    # (overlap, contention, path) -- compared as a tuple, so `path` is the final
+    # deterministic tie-break exactly as in `_shortest_cell_path`.
+    best: dict[Cell, tuple[int, int, tuple[Cell, ...]]] = {start: (0, 0, (start,))}
+    for depth in range(1, len(layers)):
+        nxt: dict[Cell, tuple[int, int, tuple[Cell, ...]]] = {}
+        for cell, (overlap, contention, path) in best.items():
+            # `forward` is already filtered to the next layer, so there is no membership
+            # test and, more to the point, no `outgoing_neighbors` call: the arcs were
+            # discovered once by `_geodesic_layers` and every variant reuses them.
+            for neighbour in forward[cell]:
+                load = (
+                    0
+                    if row_load is None
+                    else row_load.get(
+                        RowKey.cell(neighbour, level, corridor_start_step + depth), 0
+                    )
+                )
+                candidate = (
+                    overlap + (neighbour in used),
+                    contention + load,
+                    (*path, neighbour),
+                )
+                previous = nxt.get(neighbour)
+                if previous is None or candidate < previous:
+                    nxt[neighbour] = candidate
+        if not nxt:
+            return None
+        best = nxt
+    (destination,) = layers[-1]
+    reached = best.get(destination)
+    return None if reached is None else reached[2]
+
+
+def seed_row_load(seeds: Mapping[int, Column]) -> Counter:
+    """Count how many flights' NOMINAL seeds want each capacity row.
+
+    A dual-free estimate of where the master's prices will land, and the only one available
+    before the first LP: the duals are large exactly where demand exceeds a cap-1 row, and
+    "how many flights would claim this row if nobody moved" is the zeroth-order version of
+    that.  Nominal seeds only -- counting the ladder too would smear each flight across 21
+    steps and wash the signal out, and the ladder rungs are alternatives to the seed rather
+    than additional demand.
+
+    Free: `solve` already holds every seed's certified `claims`.
+    """
+
+    load: Counter = Counter()
+    for column in seeds.values():
+        load.update(column.claims)
+    return load
+
+
+def seed_route_fan(
+    fg: FlightGraph,
+    cfg: SimConfig,
+    seed: Column,
+    *,
+    variants: int,
+    model: CostModel = DELAY_MODEL,
+    row_load: Mapping[RowKey, int] | None = None,
+) -> tuple[Column, ...]:
+    """Return up to ``variants - 1`` routes that cost EXACTLY what ``seed`` costs.
+
+    The seed stage puts one route per flight into the pool and `_add_departure_ladder`
+    re-times it; every spatial alternative has to come from reduced-cost pricing.  That is
+    where the wall goes -- 1,686 s of a 4,561 s solve at x1500 -- and measured on that
+    run's own pool, **84.4% of what pricing discovered over ten rounds shares the seed's
+    endpoint lanes AND its hop count**, with a further 12.7% differing only in approach.
+    All 9,592 such columns are delay-identical to the seed to the millisecond, at matched
+    and at shifted departures alike (`.context/probe_lateral_swaps.py`).
+
+    So most of what the DP buys is a cell path of the same length between the same two
+    lane cells -- free in the objective, different only in which rows it claims, which is
+    the one currency a cap-1 set-packing master trades in.  A hex lattice offers those in
+    bulk: 97.8% of flights have many geodesics, median 10^19 of them.  Enumerating a few
+    costs a layered DP per variant and no search at all.
+
+    **This is not a substitute for pricing and must not be read as one.**  Pricing picks
+    WHICH swap using duals; the fan picks blind, spreading over the lattice by minimising
+    cell overlap.  Whether blind breadth in this dimension pays is the experiment, and the
+    honest prior is mixed: dual-free breadth in the TIME dimension (the ladder) is worth
+    3.6% at 600 flights, while a pool of the wrong 36,805 columns beat nothing at all.
+    Budget-neutrality is therefore part of the design -- trade ladder depth for fan width,
+    do not add both.
+
+    Only exact lattice geodesics are fanned.  When the seed is longer than
+    ``hex_distance`` -- the ellipse or a static block forced a detour -- the equal-cost
+    guarantee does not hold, and the flight silently keeps its single route rather than
+    being offered alternatives this docstring's argument does not cover.
+    """
+
+    if variants <= 1 or len(seed.cell_path) < 2:
+        return ()
+    start, destination = seed.cell_path[0], seed.cell_path[-1]
+    hops = len(seed.cell_path) - 1
+    if hops != hg.hex_distance(start, destination):
+        return ()
+    built = _geodesic_layers(fg, start, destination, hops)
+    if built is None:
+        return ()
+    layers, forward = built
+
+    # The same arithmetic `column_claims` uses, so a load key built from other flights'
+    # certified claims lines up with the rows this flight's variants would claim.
+    lane_steps = (
+        0 if seed.origin_lane_idx is None else fg.origin_lanes[seed.origin_lane_idx].steps
+    )
+    corridor_start_step = seed.departure_step + fg.takeoff_steps[seed.level] + lane_steps
+    # This flight's own contribution is deliberately NOT subtracted, and the reason is that
+    # doing so would be a no-op at real cost.  A variant differs from the seed everywhere
+    # except the endpoints, which every candidate shares -- so the seed's own load is a
+    # constant across the candidates being ranked, and the few en-route cells a variant
+    # cannot avoid are already charged by the overlap term.  Rebuilding a 300k-row mapping
+    # per flight to cancel a constant is 1,500 x 300k operations for no change in argmin.
+    view = DualView({}, cfg)
+    used: set[Cell] = set(seed.cell_path)
+    seen: set[tuple[Cell, ...]] = {seed.cell_path}
+    fan: list[Column] = []
+    while len(fan) < variants - 1:
+        path = _least_overlapping_geodesic(
+            layers, forward, used, row_load, seed.level, corridor_start_step
+        )
+        if path is None or path in seen:
+            break
+        seen.add(path)
+        used.update(path)
+        label = _Label(0.0, seed.departure_step, seed.origin_lane_idx, path, frozenset())
+        delay_s = _path_delay_s(fg, cfg, label, model)
+        canonical = _canonical_candidate(
+            _Candidate(-delay_s, delay_s, label, seed.dest_lane_idx),
+            fg,
+            view,
+            0.0,
+            cfg,
+            0.0,
+            _EMPTY_ROWS,
+            model,
+        )
+        # A geodesic can still fail the canonical wall/detour gate -- path-position
+        # dependent terminal tagging is exactly the case `_shortest_seed_columns` records
+        # as `unresolved_shortest_path`.  Drop it and keep fanning; the cells it used stay
+        # in `used` so the next variant moves further away rather than retrying next door.
+        if canonical is None:
+            continue
+        column = canonical[1]
+        # The claim this whole stage rests on, checked rather than trusted.  `delay_s`
+        # comes from the FOLDED corridor geometry, not from the hop count, so a change to
+        # folding could make a fan variant quietly cost more than the seed -- and the
+        # caller would price ladder copies of it as if it were free.
+        if abs(column.delay_s - seed.delay_s) > _RECOMPUTE_EPS:
+            raise AssertionError(
+                f"fan variant for flight {fg.request.flight_id} is not delay-tied: "
+                f"{column.delay_s} vs seed {seed.delay_s} at equal hops {hops}"
+            )
+        fan.append(column)
+    return tuple(fan)
+
+
 __all__ = [
     "DualView",
     "PricingTimeout",
     "find_feasible_column",
     "price_flight",
     "seed_column",
+    "seed_route_fan",
+    "seed_row_load",
 ]

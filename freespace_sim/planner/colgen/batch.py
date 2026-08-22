@@ -66,6 +66,73 @@ def _log_iteration(state: dict) -> None:
     )
 
 
+def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenParams):
+    """Run ``params.warm_start_planner`` and translate its schedule into seed columns.
+
+    Returns ``None`` when no warm-start planner is configured, which is the shipped
+    default -- see `ColGenParams.warm_start_planner` for why this is opt-in.
+
+    Failures here are LOUD.  A warm start that silently produces nothing is invisible in
+    the output: the run simply looks like an ordinary unseeded solve, and the seeded and
+    unseeded arms of an experiment become indistinguishable after the fact.  The one thing
+    that is tolerated quietly is individual flights the column model cannot express (an
+    air hold, a route outside the O-D ellipse); those are counted and logged, and
+    `RestrictedMaster.complete_selection` re-picks them around the ones that placed.
+    """
+
+    planner = params.warm_start_planner
+    if planner is None:
+        return None
+
+    # Imported here, not at module scope: `sim` imports this module to reach
+    # `ColumnGenerationPlanner`, so a top-level import would be circular.
+    from freespace_sim import sim
+    from freespace_sim.planner.colgen import warm_start as warm_start_module
+    from freespace_sim.planner.colgen.network import (
+        RowIndex,
+        StaticTerminalCatalog,
+        build_flight_graph,
+    )
+    from freespace_sim.planner.colgen.objective import cost_model
+
+    started = time.monotonic()
+    seeded = sim.run(cfg, requests=list(requests), planner_name=planner, progress=False)
+    accepted = {
+        intent.request.flight_id: intent for intent in seeded.intents if intent.accepted
+    }
+    if not accepted:
+        raise RuntimeError(
+            f"warm_start_planner={planner!r} accepted no flights; there is nothing to seed"
+        )
+    catalog = StaticTerminalCatalog(list(static_terms), cfg)
+    graphs = {
+        request.flight_id: build_flight_graph(request, cfg, catalog, params)
+        for request in requests
+        if request.flight_id in accepted
+    }
+    row_index = RowIndex({terminal.id: terminal.capacity for _c, terminal in catalog.entries})
+    seed_columns, stats = warm_start_module.build(
+        accepted, graphs, cfg, cost_model(cfg, params), row_index
+    )
+    log.info(
+        "warm start from %s: %d/%d flights accepted, %d placed as columns, "
+        "%d held, %d rows over cap, %.1fs",
+        planner,
+        len(accepted),
+        len(requests),
+        stats["placed"],
+        stats["total held steps"],
+        stats["rows over cap"],
+        time.monotonic() - started,
+    )
+    if not seed_columns:
+        raise RuntimeError(
+            f"warm_start_planner={planner!r} produced no usable columns from "
+            f"{len(accepted)} accepted flights; seeding would be a silent no-op"
+        )
+    return seed_columns
+
+
 def run_batch(
     scenario: Scenario,
     cfg: SimConfig,
@@ -165,9 +232,14 @@ def run_batch(
          if batch_params.greedy_budget_s_per_flight else "off"),
         batch_params.seed_ladder_steps or "off",
     )
+    # Optional warm start from another planner.  Built HERE rather than inside the solver
+    # because it needs `sim.run`, and the sim imports colgen -- doing it in `solver` would
+    # close an import cycle.  This is the layer that already owns the scenario.
+    seed_columns = _build_warm_start(requests, cfg, static_terms, batch_params)
     solve_started = time.monotonic()
     result = ColGenSolver().solve(
         requests, cfg, static_terms, batch_params,
+        seed_columns=seed_columns,
         on_iteration=on_iteration if on_iteration is not None else _log_iteration,
         # Worker count is NOT plumbed here: it rides on `batch_params.n_pricing_workers`,
         # which `price_sweep` reads directly.  This used to build a `ParallelPricingConfig`

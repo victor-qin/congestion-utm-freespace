@@ -9,6 +9,7 @@ which is why it has to be caught one function at a time.
 from __future__ import annotations
 
 import math
+import os
 import pickle           # round-tripping this test's OWN enum members; nothing external is read
 import random
 import time
@@ -2043,9 +2044,34 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
     the shared caller: applied to one search only, this sweep is what would fail.
     """
 
+    # FIVE cases by default, not the forty this swept originally.  Each case runs the
+    # PYTHON REFERENCE as well as the kernel -- that is the whole point, and the reference
+    # is the 41-79x slower half -- so the sweep cost 925 s of a 1,190 s colgen suite, 78%
+    # of it for one test.  Five keeps the everyday loop usable.
+    #
+    # WHAT THE FIRST FIVE COVER, checked rather than assumed: both endpoint shapes
+    # (`terminal` alternates on `index % 2`, so 5 cases always give both), ground budgets
+    # 48 and 96, and hop ceilings 0, 1 and 3.  What they do NOT draw is **ceiling 9** --
+    # which is exactly why they run in 1.9 s against the full sweep's 925 s, since that
+    # ceiling is what explodes the search space.  Speed and big-ceiling fuzz are the same
+    # dial here; you cannot keep both.
+    #
+    # That gap is covered deterministically by
+    # `test_compiled_path_matches_the_reference_across_hop_ceilings[9]`, so ceiling 9 is
+    # still compared against the reference on every run -- just not against random duals.
+    #
+    # There is no CI to run cases 5-39, so they happen only when someone asks.
+    # `KERNEL_FUZZ_CASES=40` is that ask, and is worth doing before merging anything that
+    # touches dominance, the label score, or the completion bound -- the three places
+    # where a kernel/reference divergence is silent and returns an equally-optimal
+    # DIFFERENT column.
+    #
+    # The guards below scale with the count rather than being deleted; they exist so a
+    # sweep of declined no-ops cannot read as green, and that risk grows as N shrinks.
+    cases = int(os.environ.get("KERNEL_FUZZ_CASES", "5"))
     rng = random.Random(20260810)
     compared = nontrivial = 0
-    for index in range(40):
+    for index in range(cases):
         cfg, graph, model, view = _random_case(rng, index)
         incumbent = None
         if index % 3 == 0:
@@ -2085,8 +2111,16 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
         assert column == ref_column, f"case {index}: different column"
         assert rc == ref_rc, f"case {index}: {rc!r} != {ref_rc!r}"
 
-    assert compared >= 30, f"only {compared} cases ran compiled; the sweep proves little"
-    assert nontrivial >= 20, f"only {nontrivial} cases found a column at all"
+    # Held at the original 75% / 50% of the case count, so shrinking the sweep cannot
+    # quietly shrink what it proves.
+    min_compared = -(-cases * 3 // 4)
+    min_nontrivial = -(-cases // 2)
+    assert compared >= min_compared, (
+        f"only {compared} of {cases} cases ran compiled; the sweep proves little"
+    )
+    assert nontrivial >= min_nontrivial, (
+        f"only {nontrivial} of {cases} cases found a column at all"
+    )
 
 
 # ------------------------------------------------------ the compiled feasible search

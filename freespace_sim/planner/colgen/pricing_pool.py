@@ -424,6 +424,15 @@ class SweepResult:
     #: cost ~4.2-4.8 s per worker per sweep, measured. Kept as its own field rather than
     #: folded into `wall_s` so a run can still SEE that cost after it stops recurring.
     pool_setup_s: float = 0.0
+    #: Extra columns whose reduced cost EQUALS the accepted one, one tuple per entry of
+    #: `columns` (empty when `pricing_tied_columns == 1`, which is the default).  Kept
+    #: alongside rather than merged into `columns` because `columns` is index-aligned with
+    #: `reduced_costs` and consumed by `master.upper_bound`, which sums those costs with
+    #: plain `sum` -- appending ties there would double-count every tie in the bound.
+    #:
+    #: A trailing field with a default so the four positional construction sites and the
+    #: hand-built ones in the tests keep working unchanged.
+    tied_columns: tuple[tuple[Column, ...], ...] = ()
 
     @property
     def kernel_priced(self) -> int:
@@ -693,6 +702,9 @@ def _price_one(epoch: tuple, flight_id: int):
     # to another is worse than reporting nothing.
     clear_search_record()
     started = time.perf_counter()
+    # One list per CALL: a worker prices many flights, and a sink that outlived one call
+    # would ship the previous flight's ties under this flight's name.
+    tied: list = []
     try:
         reduced_cost, column = price_flight(
             _WORKER["graphs"][flight_id],
@@ -702,6 +714,7 @@ def _price_one(epoch: tuple, flight_id: int):
             _WORKER["params"],
             known_column=known_columns.get(flight_id),
             deadline=deadline,
+            tied_sink=tied,
         )
     except PricingTimeout:
         # The record still ships: a flight that timed out mid-search is the most
@@ -709,7 +722,7 @@ def _price_one(epoch: tuple, flight_id: int):
         # loop never produces a number for.
         return (
             flight_id, False, 0.0, None, time.perf_counter() - started, {},
-            last_search_record(),
+            last_search_record(), (),
         )
     after = kernel_stats()
     # Subtraction over the UNION of keys, not over `before`'s: a `declined_<reason>` key
@@ -722,6 +735,7 @@ def _price_one(epoch: tuple, flight_id: int):
         time.perf_counter() - started,
         {key: value - before.get(key, 0) for key, value in after.items()},
         last_search_record(),
+        tuple(tied),
     )
 
 
@@ -775,6 +789,7 @@ def _sweep_sequential(
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    tied_all: list[tuple[Column, ...]] = []
     task_total_s = 0.0
     before = Counter(kernel_stats())
     # Built here too, and not only in the pool: the two arms must report the same SHAPE or
@@ -790,6 +805,7 @@ def _sweep_sequential(
     for flight_id in pricing_order:
         task_started = time.perf_counter()
         clear_search_record()
+        tied: list = []
         try:
             reduced_cost, column = price_flight(
                 graphs[flight_id],
@@ -799,6 +815,7 @@ def _sweep_sequential(
                 params,
                 known_column=known_columns.get(flight_id),
                 deadline=deadline,
+                tied_sink=tied,
             )
         except PricingTimeout:
             records.append(_flight_record(
@@ -809,6 +826,7 @@ def _sweep_sequential(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
                 Counter(kernel_stats()) - before, tuple(records),
+                tied_columns=tuple(tied_all),
             )
         task_s = time.perf_counter() - task_started
         records.append(_flight_record(flight_id, task_s, priced=True))
@@ -816,6 +834,7 @@ def _sweep_sequential(
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        tied_all.append(tuple(tied))
         progress.advance(len(flight_ids))
     progress.finish(len(flight_ids), complete=True)
     # One worker's worth of work, by definition -- which is what makes it the denominator
@@ -824,6 +843,7 @@ def _sweep_sequential(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
         Counter(kernel_stats()) - before, tuple(records),
+        tied_columns=tuple(tied_all),
     )
 
 
@@ -1289,12 +1309,19 @@ def _accepted_prefix(results) -> SweepResult:
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    tied_all: list[tuple[Column, ...]] = []
     task_total_s = 0.0
     # `Counter.update` ADDS where `dict.update` would REPLACE, which is the whole reason
     # this is a Counter: a plain dict here would silently report only the last task's tally.
     counters: Counter[str] = Counter()
     records: list[dict[str, Any]] = []
-    for flight_id, priced, reduced_cost, column, task_s, deltas, search in results:
+    for result in results:
+        # Seven or eight, for the same reason `SweepResult`'s later fields carry defaults:
+        # this reducer is exercised by fixtures that build the minimum a result needs, and
+        # `tied` is empty on every path unless `pricing_tied_columns > 1`.  Widening the
+        # tuple should not make eight reducer tests carry a `()` that says nothing.
+        flight_id, priced, reduced_cost, column, task_s, deltas, search = result[:7]
+        tied = result[7] if len(result) > 7 else ()
         if not priced:
             # Past the first gap nothing is accepted, so returning here stops consuming --
             # which abandons the outstanding tasks, and leaving the caller's `with` block
@@ -1313,6 +1340,7 @@ def _accepted_prefix(results) -> SweepResult:
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, 0.0, counters, tuple(records),
+                tied_columns=tuple(tied_all),
             )
         records.append(_flight_record(flight_id, task_s, priced=True, search=search))
         task_total_s += task_s
@@ -1320,7 +1348,9 @@ def _accepted_prefix(results) -> SweepResult:
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        tied_all.append(tuple(tied))
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, 0.0, counters, tuple(records),
+        tied_columns=tuple(tied_all),
     )

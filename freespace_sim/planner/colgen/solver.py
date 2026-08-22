@@ -42,6 +42,8 @@ from .pricing import (
     find_feasible_column,
     price_flight,
     seed_column,
+    seed_route_fan,
+    seed_row_load,
 )
 from .pricing_pool import PricingPool, price_sweep
 from .translate import Column
@@ -555,6 +557,8 @@ def _pre_master_timeout_result(
             "kernel_declined_by_reason": {},
             "seeded_columns": 0,
             "ladder_columns": 0,
+            "fan_columns": 0,
+            "tied_columns": 0,
             "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
             "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
             "ip_elapsed_s": 0.0,
@@ -722,6 +726,8 @@ class ColGenSolver:
                     "kernel_declined_by_reason": {},
                     "seeded_columns": 0,
                     "ladder_columns": 0,
+                    "fan_columns": 0,
+                    "tied_columns": 0,
                     "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
                     "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
             "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
@@ -868,6 +874,8 @@ class ColGenSolver:
         seedless_flights: set[int] = set()
         seeds: dict[int, Column] = {}
         ladder_columns = 0
+        fan_columns = 0
+        tied_columns_added = 0
         seed_started = time.monotonic()
         for flight_id in flight_ids:
             try:
@@ -902,6 +910,41 @@ class ColGenSolver:
             ladder_columns += _add_departure_ladder(
                 master, seed, graphs[flight_id], cfg, model, params.seed_ladder_steps
             )
+        # The route fan is a SECOND PASS, and the ordering is the point: a fan built while
+        # the seeds are still arriving can only see the flights ahead of it in the loop, so
+        # flight 1 would fan blind and flight 1,500 against a full picture.  Running it
+        # after every seed exists lets `seed_row_load` supply the same dual-free congestion
+        # estimate to all of them.  When `seed_route_variants == 1` this loop does not run
+        # at all, so column order -- which checkpoint indices and tie-breaking depend on --
+        # is byte-identical to a tree without the fan.
+        #
+        # Each tied variant gets the SAME ladder as the seed, so the pool is the full
+        # (routes x departures) grid rather than one route re-timed plus a few unshiftable
+        # alternatives.  A variant is delay-identical to the seed by construction, so a
+        # shift of it costs exactly what the same shift of the seed costs -- the ladder's
+        # arithmetic is as valid here as it is there.
+        #
+        # NOT offered to `_initial_feasible_selection`: `seeds` stays one column per
+        # flight.  That pass is the incumbent builder, it is O(flights) greedy, and
+        # widening its candidate set would change the starting incumbent -- which is a
+        # second variable, and this knob is meant to move pool contents only.
+        if params.seed_route_variants > 1:
+            row_load = seed_row_load(seeds) if params.seed_fan_congestion_prior else None
+            for flight_id, seed in seeds.items():
+                for variant in seed_route_fan(
+                    graphs[flight_id],
+                    cfg,
+                    seed,
+                    variants=params.seed_route_variants,
+                    model=model,
+                    row_load=row_load,
+                ):
+                    variant = _canonical_column(variant, graphs[flight_id], cfg)
+                    master.add_column(variant)
+                    fan_columns += 1
+                    ladder_columns += _add_departure_ladder(
+                        master, variant, graphs[flight_id], cfg, model, params.seed_ladder_steps
+                    )
         seed_elapsed_s = time.monotonic() - seed_started
 
         shifted_seed_heuristic = _initial_feasible_selection(
@@ -1192,10 +1235,21 @@ class ColGenSolver:
                 # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
                 # float addition is not associative.  `SweepResult` has already discarded
                 # everything at or past the first timeout, reproducing the loop's `break`.
-                for flight_id, reduced_cost, column in zip(
-                    sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
+                # `tied_columns` is empty unless `pricing_tied_columns > 1`, and is padded
+                # here rather than zipped strictly: a sweep built by an older code path (or
+                # by a test) carries no ties at all, and that is a valid sweep.
+                tied_per_flight = sweep.tied_columns or ((),) * len(sweep.flight_ids)
+                for flight_id, reduced_cost, column, tied in zip(
+                    sweep.flight_ids, sweep.reduced_costs, sweep.columns,
+                    tied_per_flight, strict=True,
                 ):
                     pricing_flights_completed += 1
+                    # ONE reduced cost per flight, the accepted column's -- deliberately not
+                    # one per tied column.  `master.upper_bound` sums these into the
+                    # Lagrangian bound `z + sum_f max(0, rc_f)`, which takes the best column
+                    # PER FLIGHT; adding a tie's identical rc a second time would inflate
+                    # the bound by a factor of however many ties came back and silently
+                    # loosen every `lp_gap` in the run.
                     best_reduced_costs.append(reduced_cost)
                     rc_by_flight[flight_id] = reduced_cost
                     if column is not None and reduced_cost > _REDUCED_COST_TOL:
@@ -1205,6 +1259,17 @@ class ColGenSolver:
                                 column, graphs[flight_id], cfg,
                             )
                         )
+                        # The ties ride with the accepted column and only with it: they are
+                        # equal to it in reduced cost, so if it does not clear the improving
+                        # tolerance neither do they.
+                        for extra in tied:
+                            priced_columns.append(
+                                _timed(
+                                    "canonical_priced", _canonical_column,
+                                    extra, graphs[flight_id], cfg,
+                                )
+                            )
+                            tied_columns_added += 1
                 if not sweep.complete:
                     pricing_complete = False
                     pricing_timeout_flight_id = sweep.timeout_flight_id
@@ -1766,6 +1831,16 @@ class ColGenSolver:
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,
+            # Reported unconditionally, including the 0 that `seed_route_variants=1`
+            # produces: a missing key reads as "this run predates the fan" and a present 0
+            # reads as "the fan was asked for and found nothing", and those want opposite
+            # responses.  With the fan on, `fan_columns / (variants - 1)` under the flight
+            # count is the share of flights whose seed was a true lattice geodesic.
+            "fan_columns": fan_columns,
+            # Reported unconditionally for the same reason as `fan_columns`: a present 0
+            # says the tie sink was armed and the search never returned a tie, which is a
+            # very different fact from a missing key.
+            "tied_columns": tied_columns_added,
             # WHICH DUAL VECTOR PRICED THIS RUN.  Recorded because it is answer-affecting
             # and was, until now, an environment variable nothing wrote down: the same pool
             # under simplex and under barrier gave 196,332.8 and 184,729.0 at x1500.  An

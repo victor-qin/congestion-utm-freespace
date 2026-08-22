@@ -334,15 +334,95 @@ def derive_cell_window(cfg: SimConfig) -> CellWindow:
     return offsets
 
 
+def hop_box_stays_in_its_cells(cfg: SimConfig) -> bool:
+    """Is a lattice hop's corridor box contained in the union of its two hexes?
+
+    :func:`corridor_segment_volume` builds a hop box that runs between the two cell
+    centres, overhangs each end by ``ext = corridor_width_m / 2`` and is
+    ``corridor_width_m`` wide.  Split it at the midpoint and each half must fit in
+    its own hex:
+
+    * the far corners ``(pitch/2, ±width/2)`` sit on the shared edge, whose half
+      length is the circumradius over two, so ``width <= circumradius``;
+    * the near corners ``(-width/2, ±width/2)`` are inside whenever they are within
+      the inradius ``pitch/2`` of the centre.
+
+    Both hold for the shipped 60 m corridor on a 120 m pitch (60 <= 69.28 and
+    42.43 <= 60), but neither is implied by anything else in the configuration, so
+    :func:`endpoint_claim_cells` asks rather than assumes.
+    """
+
+    hex_radius = circumradius(cfg)
+    pitch = float(cfg.corridor_segment_len_m)
+    width = float(cfg.corridor_width_m)
+    if not math.isfinite(pitch) or pitch <= 0.0 or not math.isfinite(width) or width < 0.0:
+        return False
+    return width <= hex_radius and math.hypot(width / 2.0, width / 2.0) <= pitch / 2.0
+
+
+def _distance_to_hex(px: float, py: float, cell: AxialCell, hex_radius: float) -> float:
+    """Exact planar distance from a point to the CLOSED hexagon of ``cell`` (0 inside).
+
+    ``hex_center``'s convention puts a neighbour along +x, so +x is an edge-midpoint
+    direction and the six vertices sit at 30 degrees + 60k.  A hexagon is convex, so the
+    distance is zero inside and otherwise the smallest point-to-edge distance.
+
+    This is what ``endpoint_claim_cells`` needs and the centre test only approximates: a hex
+    whose CENTRE is inside ``radius + circumradius`` can still be out of reach of the disk,
+    by up to a full circumradius.  Measured: 4.23 cells per endpoint under the centre test
+    against 3.89 under this one.
+    """
+
+    cx, cy = hex_center(cell[0], cell[1], hex_radius)
+    rx, ry = px - float(cx), py - float(cy)
+    vertices = [
+        (
+            hex_radius * math.cos(math.radians(30.0 + 60.0 * k)),
+            hex_radius * math.sin(math.radians(30.0 + 60.0 * k)),
+        )
+        for k in range(6)
+    ]
+    inside = True
+    best = math.inf
+    for index in range(6):
+        ax, ay = vertices[index]
+        bx, by = vertices[(index + 1) % 6]
+        # Vertices are counter-clockwise, so a point left of every edge is interior.
+        if (bx - ax) * (ry - ay) - (by - ay) * (rx - ax) < 0.0:
+            inside = False
+        dx, dy = bx - ax, by - ay
+        denominator = dx * dx + dy * dy
+        t = (
+            0.0
+            if denominator == 0.0
+            else max(0.0, min(1.0, ((rx - ax) * dx + (ry - ay) * dy) / denominator))
+        )
+        best = min(best, math.hypot(rx - (ax + t * dx), ry - (ay + t * dy)))
+    return 0.0 if inside else best
+
+
 def endpoint_claim_cells(point: Vec, radius: float, cfg: SimConfig) -> list[AxialCell]:
     """Return cells conservatively reached by an endpoint cylinder.
 
-    A cylinder centred at ``point`` with radius ``radius`` can conflict with a
-    transit box whose centreline reaches beyond its endpoint and laterally by
-    the configured corridor width.  Candidate hexes are therefore tested
-    against a disk enlarged by the larger of that width and another endpoint's
-    hover radius, plus one hex circumradius.  The latter turns the centre test
-    into a conservative hex-intersection test.
+    The claim must cover both ways an endpoint cylinder can conflict: with another
+    endpoint cylinder, and with a transit's corridor box.  Both are covered by the
+    hexes the cylinder's own disk touches, tested conservatively as centre distance
+    below ``radius + circumradius``:
+
+    * *cylinder/cylinder* — two disks that overlap do so at some point ``x``, and the
+      hex containing ``x`` is within one circumradius of ``x``, hence claimed by both
+      endpoints whatever their radii.
+    * *cylinder/transit* — a hop box lies inside the union of the two hexes it runs
+      between (:func:`hop_box_stays_in_its_cells`), so a box meeting the disk meets it
+      inside a hex the transit itself VISITS, and that hex touches the disk.
+
+    That second bound is why no corridor-width term appears.  Adding one — as the
+    original ``radius + max(corridor_width_m, effective_hover_radius_m) +
+    circumradius`` did — reaches 189.28 m instead of 129.28 m at defaults and claims
+    9.0 cells where 4.2 suffice, and every extra cell is a cap-1 row that forbids
+    traffic which provably cannot conflict (GitHub issue #101: at 2,000 flights it was
+    1,272 of 1,287 over-capacity rows, none of them a real conflict).  Configurations
+    that break containment keep the wider reach.
 
     Enumeration is bounded to a finite axial ring around ``cell(point)`` and
     the result is sorted lexicographically for deterministic column claims.
@@ -373,14 +453,21 @@ def endpoint_claim_cells(point: Vec, radius: float, cfg: SimConfig) -> list[Axia
     if not math.isfinite(pitch) or pitch <= 0.0:
         raise ValueError(f"corridor pitch must be finite and positive, got {pitch!r}")
 
-    # At defaults both terms are 60 m, reproducing the plan's r_cyl + 60 + R
-    # bound.  Taking the maximum keeps cylinder/cylinder coverage valid when a
-    # caller increases the independent hover-radius knob.
-    footprint_reach = max(float(cfg.corridor_width_m), float(cfg.effective_hover_radius_m))
-    threshold = radius + footprint_reach + hex_radius
+    # One circumradius turns the centre test into a conservative hex-intersection
+    # test.  A hop box cannot leave the hexes it runs between, so it needs no reach
+    # of its own here; a corridor wide enough to escape them does, and falls back.
+    threshold = radius + hex_radius
+    if not hop_box_stays_in_its_cells(cfg):
+        threshold += max(float(cfg.corridor_width_m), float(cfg.effective_hover_radius_m))
     ring_radius = math.ceil(threshold / pitch) + 1
     origin = enu_to_axial(px, py, hex_radius)
 
+    # The centre test is the cheap outer bound; when containment holds it is refined to the
+    # exact disk-touches-hexagon question, which is the predicate the cover argument actually
+    # rests on.  Exact is a strict subset of the centre test, so this only ever drops cells,
+    # and it drops the ones that produce phantom conflicts between two endpoints on opposite
+    # sides of a hex neither of them reaches (GitHub issue #101).
+    exact = hop_box_stays_in_its_cells(cfg)
     cells: list[AxialCell] = []
     oq, or_ = origin
     for q in range(oq - ring_radius, oq + ring_radius + 1):
@@ -389,8 +476,15 @@ def endpoint_claim_cells(point: Vec, radius: float, cfg: SimConfig) -> list[Axia
             if hex_distance(origin, cell) > ring_radius:
                 continue
             cx, cy = hex_center(q, r, hex_radius)
-            if math.hypot(float(cx) - px, float(cy) - py) < threshold:
-                cells.append(cell)
+            if math.hypot(float(cx) - px, float(cy) - py) >= threshold:
+                continue
+            # ``>`` not ``>=``: at a hex centre the shipped disk is EXACTLY tangent to all six
+            # edges (hover radius 60 m == inradius 60 m), and a tangent touch is contact, not
+            # clearance.  Excluding it would drop every neighbour of a centred endpoint --
+            # measured as four solver fixtures losing the geometry they were written to test.
+            if exact and _distance_to_hex(px, py, cell, hex_radius) > radius:
+                continue
+            cells.append(cell)
     return cells
 
 
@@ -486,6 +580,7 @@ __all__ = [
     "derive_cell_window",
     "endpoint_claim_cells",
     "endpoint_claim_steps",
+    "hop_box_stays_in_its_cells",
     "terminal_claim_steps",
     "validate_edge_locality",
     "visit_rows",

@@ -237,8 +237,14 @@ def _warn_kernel_fallback() -> None:
 
 class AStarPlanner:
     def __init__(self, max_expansions: int = 3_000_000, vertical_edges: bool = True,
-                 compiled: bool = True, kernel_log2_min: int | None = None):
+                 compiled: bool = True, kernel_log2_min: int | None = None,
+                 incremental_release: bool = False):
         self.max_expansions = max_expansions
+        # LNS destroy support: derive occupancy/capacity services in removal mode (per-owner row
+        # tracking) and subscribe them to `ledger.subscribe_release`, so a `release_many` is
+        # un-absorbed in O(released volumes) instead of tripping the O(everything) shrink rebuild.
+        # Default False ⇒ services and subscriptions are byte-identical to before.
+        self.incremental_release = incremental_release
         # starting g-hash/heap size (1 << kernel_log2_min slots): the ADAPTIVE floor of the kernel work
         # arrays — overflow grows ×4 and re-runs exactly (see _kernel_state). None (default) starts at
         # the ceiling = the old fixed sizing, so a lone sequential run is byte-identical in BEHAVIOR AND
@@ -307,11 +313,15 @@ class AStarPlanner:
         volumes; a ledger shrink (release) trips a from-scratch rebuild + warning (add-only)."""
         svc = self._svc
         if svc is None or self._svc_ledger is not ledger:
-            svc = self._svc = HexOccupancyService(cfg)
-            self._tcap = TerminalCapacity(cfg, ledger)       # temporal pad capacity, same ledger
+            svc = self._svc = HexOccupancyService(cfg, track_removal=self.incremental_release)
+            self._tcap = TerminalCapacity(cfg, ledger,       # temporal pad capacity, same ledger
+                                          track_removal=self.incremental_release)
             self._svc_ledger = ledger
             ledger.subscribe(svc.on_commit)                 # publish hook: future commits auto-feed
             ledger.subscribe(self._tcap.on_commit)
+            if self.incremental_release:                     # removal hook: release_many un-absorbs
+                ledger.subscribe_release(svc.on_release)
+                ledger.subscribe_release(self._tcap.on_release)
             _absorb(svc, ledger)                             # absorb anything already committed
             _absorb(self._tcap, ledger)
             ledger.subscribe_static(svc._on_static)          # derive always-active routing walls from the
@@ -772,9 +782,11 @@ class AStarPlanner:
         cocc = self._cocc
         if cocc is None or self._cocc_ledger is not ledger:
             from .compiled_hex_occupancy import CompiledHexOccupancy
-            cocc = self._cocc = CompiledHexOccupancy(cfg)
+            cocc = self._cocc = CompiledHexOccupancy(cfg, track_removal=self.incremental_release)
             self._cocc_ledger = ledger
             ledger.subscribe(cocc.on_commit)
+            if self.incremental_release:                     # removal hook: release_many un-absorbs
+                ledger.subscribe_release(cocc.on_release)
             _absorb(cocc, ledger)
             ledger.subscribe_static(cocc._on_static)         # derive the compiled routing walls from the
             #                                                  ledger's permanent terminal volumes (replays

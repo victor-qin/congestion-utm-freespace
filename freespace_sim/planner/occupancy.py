@@ -49,8 +49,15 @@ _EMPTY: dict = {}
 
 
 class HexOccupancyService:
-    def __init__(self, cfg: SimConfig):
+    def __init__(self, cfg: SimConfig, track_removal: bool = False):
         self.cfg = cfg
+        # Removal mode (LNS destroy): step buckets hold per-cell REFCOUNTS instead of sets (two
+        # flights' inflated rasters can legitimately cover the same (step, cell), so removing one
+        # must not free the cell), and each committed flight's applied rows are recorded so
+        # `on_release` can reverse them exactly. Membership queries are unchanged (`in` works on
+        # dict keys); flag off ⇒ the original set-based structures, byte-for-byte.
+        self.track_removal = track_removal
+        self._rows: dict[int, list[tuple]] = {}                   # fid -> applied rows (mode on)
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R   # corridor footprint
         self.infl_pad = cfg.effective_hover_radius_m + self.R     # wider hover-cylinder footprint
@@ -68,7 +75,40 @@ class HexOccupancyService:
         self.evicted_before: int | None = None   # lowest retained step
 
     # ----- maintenance -----
-    def add_volume(self, vol: Volume4D, own_cols: tuple = ()) -> None:
+    @staticmethod
+    def _bump(bucket: dict, s: int, key, tid=None) -> None:
+        """Refcounted insert (removal mode): blocked/pad hold cell->count; term_cells holds
+        cell -> {tid: count}."""
+        d = bucket.setdefault(s, {})
+        if tid is None:
+            d[key] = d.get(key, 0) + 1
+        else:
+            e = d.setdefault(key, {})
+            e[tid] = e.get(tid, 0) + 1
+
+    @staticmethod
+    def _drop(bucket: dict, s: int, key, tid=None) -> None:
+        """Exact reverse of `_bump`; raises KeyError on drift (a row removed twice or never added)."""
+        d = bucket[s]
+        if tid is None:
+            n = d[key] - 1
+            if n:
+                d[key] = n
+            else:
+                del d[key]
+        else:
+            e = d[key]
+            n = e[tid] - 1
+            if n:
+                e[tid] = n
+            else:
+                del e[tid]
+                if not e:
+                    del d[key]
+        if not d:
+            del bucket[s]
+
+    def add_volume(self, vol: Volume4D, own_cols: tuple = (), _rows: list | None = None) -> None:
         """Rasterize one committed volume (once). Ordinary corridor cells feed the binary blocked/pad
         step-buckets; a shared terminal column instead records its hub id in the per-cell set.
 
@@ -86,6 +126,7 @@ class HexOccupancyService:
         # its steps; the shared geometry sweep is still done once (via rasterize_ranges' memo), which
         # is what the compiled image reuses. `own`/`in_blk`/`is_column` are per-cell, hoisted out of
         # the step loop.
+        track = self.track_removal
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -95,29 +136,75 @@ class HexOccupancyService:
                 own = own_cols and self._inside_a_column(q, r, own_cols)
                 if own:
                     continue             # the committing flight's own terminal interior — unreserved
-                for s in range(s_lo, s_hi + 1):
-                    self.pad.setdefault(s, set()).add((q, r, L))
-                    if in_blk:
-                        self.blocked.setdefault(s, set()).add((q, r, L))
+                cell = (q, r, L)
+                if track:
+                    if _rows is not None:
+                        _rows.append(("c", cell, s_lo, s_hi, in_blk))
+                    for s in range(s_lo, s_hi + 1):
+                        self._bump(self.pad, s, cell)
+                        if in_blk:
+                            self._bump(self.blocked, s, cell)
+                else:
+                    for s in range(s_lo, s_hi + 1):
+                        self.pad.setdefault(s, set()).add(cell)
+                        if in_blk:
+                            self.blocked.setdefault(s, set()).add(cell)
             elif in_blk:
                 # shared terminal column: record `tid` over its inner (blocked-strength) footprint at
                 # level L — the cells A* queries for the own-hub cruise exemption (capacity lives in
                 # TerminalCapacity).
-                for s in range(s_lo, s_hi + 1):
-                    self.term_cells.setdefault(s, {}).setdefault((q, r, L), set()).add(tid)
+                cell = (q, r, L)
+                if track:
+                    if _rows is not None:
+                        _rows.append(("t", cell, s_lo, s_hi, tid))
+                    for s in range(s_lo, s_hi + 1):
+                        self._bump(self.term_cells, s, cell, tid)
+                else:
+                    for s in range(s_lo, s_hi + 1):
+                        self.term_cells.setdefault(s, {}).setdefault(cell, set()).add(tid)
         self.n_added += 1
 
     def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
-    def on_commit(self, _flight_id, volumes) -> None:
+    def on_commit(self, flight_id, volumes) -> None:
         """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes,
         dropping the corridor cells inside its own terminal columns (the unreserved tactical interior)."""
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        rows = [] if self.track_removal else None
         for v in volumes:
-            self.add_volume(v, own_cols=own_cols)
+            self.add_volume(v, own_cols=own_cols, _rows=rows)
+        if self.track_removal:
+            entry = self._rows.setdefault(flight_id, [])
+            entry.append(len(volumes))                 # n_added contribution, for the reversal
+            entry.extend(rows)
+
+    def on_release(self, flight_id, volumes) -> None:
+        """Ledger release subscriber (removal mode): reverse the flight's recorded rows so the
+        maps stay exact without a rebuild — and keep ``n_added`` in lockstep with the ledger so
+        the shrink tripwire stays silent. Steps already evicted are skipped (eviction dropped
+        them; the same clamp `add_volume` applies on insert)."""
+        rows = self._rows.pop(flight_id)
+        floor = self.evicted_before
+        n_volumes = 0
+        for row in rows:
+            if isinstance(row, int):                   # a commit's volume count
+                n_volumes += row
+                continue
+            kind, cell, s_lo, s_hi = row[0], row[1], row[2], row[3]
+            if floor is not None and s_lo < floor:
+                s_lo = floor
+            if kind == "c":
+                for s in range(s_lo, s_hi + 1):
+                    self._drop(self.pad, s, cell)
+                    if row[4]:
+                        self._drop(self.blocked, s, cell)
+            else:
+                for s in range(s_lo, s_hi + 1):
+                    self._drop(self.term_cells, s, cell, row[4])
+        self.n_added -= n_volumes
 
     def _on_static(self, center, term) -> None:
         """Derive this hub's discrete routing wall from a ledger static-terminal registration — the
@@ -145,6 +232,7 @@ class HexOccupancyService:
         self.blocked.clear()
         self.pad.clear()
         self.term_cells.clear()
+        self._rows.clear()
         self.n_added = 0
         self.evicted_before = None
 

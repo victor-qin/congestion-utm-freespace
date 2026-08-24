@@ -188,11 +188,20 @@ class _Pool:
             slot = int(iv[slot, P_NXT])
         return True
 
+    def reset_cell(self, c: int) -> None:
+        """Re-seed cell ``c``'s list to the single free interval ``[0, MAXS]`` (removal-mode cell
+        rebuild). The old chain's overflow slots are abandoned — a dead slot is harmless (nothing
+        links to it) and the bump allocator's growth bounds the leak; callers re-apply the cell's
+        surviving claims immediately after."""
+        self.iv[c, P_LO] = 0
+        self.iv[c, P_HI] = self.MAXS
+        self.iv[c, P_NXT] = -1
+
 
 class CompiledHexOccupancy:
     """Two incremental flat pools (corridor + column) feeding the numba A* kernel. Commit-hook driven."""
 
-    def __init__(self, cfg, margin: int = 64):
+    def __init__(self, cfg, margin: int = 64, track_removal: bool = False):
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
@@ -200,6 +209,12 @@ class CompiledHexOccupancy:
         self.n_levels = cfg.n_levels
         self.n_added = 0
         self.evicted_before: int | None = None
+        # Removal mode (LNS destroy): every applied block_range is recorded per owner AND per cell,
+        # so `on_release` can rebuild exactly the touched cells (reset_cell + re-apply survivors)
+        # in O(released rows) instead of a whole-pool reset+reabsorb. Flag off ⇒ zero bookkeeping.
+        self.track_removal = track_removal
+        self._claims: dict[tuple[int, int], list[tuple[int, int, int]]] = {}  # (pool, cell) -> [(s0, s1, fid)]
+        self._rows: dict[int, list] = {}                                      # fid -> [count, (pool, c, s0, s1), ...]
 
         qmin, rmin, qspan, rspan, maxs = self._box(cfg, margin)
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
@@ -245,20 +260,54 @@ class CompiledHexOccupancy:
         return (iq * self.rspan + ir) * self.n_levels + L
 
     # ---------- commit hook ----------
-    def on_commit(self, _flight_id, volumes) -> None:
+    def on_commit(self, flight_id, volumes) -> None:
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        rows = [] if self.track_removal else None
         for v in volumes:
-            self._add(v, own_cols)
+            self._add(v, own_cols, flight_id, rows)
         self.n_added += len(volumes)
+        if self.track_removal:
+            entry = self._rows.setdefault(flight_id, [])
+            entry.append(len(volumes))
+            entry.extend(rows)
+
+    def on_release(self, flight_id, volumes) -> None:
+        """Ledger release subscriber (removal mode): drop the flight's recorded claims and rebuild
+        exactly the cells it touched — reset each cell's interval list and re-apply the surviving
+        claims (short per-cell lists). Keeps ``n_added`` in lockstep so the shrink tripwire stays
+        silent. ``col_owners`` is deliberately NOT pruned (documented conservative superset)."""
+        rows = self._rows.pop(flight_id)
+        n_volumes = 0
+        touched: set[tuple[int, int]] = set()
+        for row in rows:
+            if isinstance(row, int):
+                n_volumes += row
+                continue
+            pool_idx, c, s0, s1 = row
+            self._claims[(pool_idx, c)].remove((s0, s1, flight_id))
+            touched.add((pool_idx, c))
+        pools = (self.corr, self.col)
+        for key in touched:
+            pool_idx, c = key
+            pool = pools[pool_idx]
+            pool.reset_cell(c)
+            survivors = self._claims.get(key, ())
+            if survivors:
+                for s0, s1, _fid in survivors:
+                    pool.block_range(c, s0, s1)
+            else:
+                self._claims.pop(key, None)
+        self.n_added -= n_volumes
 
     def _inside_a_column(self, q, r, cols) -> bool:
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
-    def _add(self, vol, own_cols) -> None:
+    def _add(self, vol, own_cols, fid=None, _rows: list | None = None) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
+        track = self.track_removal
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -273,6 +322,8 @@ class CompiledHexOccupancy:
                 if c >= 0:
                     self.col.block_range(c, int(s_lo), int(s_hi))
                     self.col_owners.setdefault(c, set()).add(tid)
+                    if track:
+                        self._record(1, c, int(s_lo), int(s_hi), fid, _rows)
             else:                                       # → corridor pool (minus committing own interior)
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue
@@ -286,6 +337,13 @@ class CompiledHexOccupancy:
                     self.oob_corridor_cells += 1
                     continue
                 self.corr.block_range(c, int(s_lo), int(s_hi))
+                if track:
+                    self._record(0, c, int(s_lo), int(s_hi), fid, _rows)
+
+    def _record(self, pool_idx: int, c: int, s0: int, s1: int, fid, _rows: list | None) -> None:
+        self._claims.setdefault((pool_idx, c), []).append((s0, s1, fid))
+        if _rows is not None:
+            _rows.append((pool_idx, c, s0, s1))
 
     def _on_static(self, center, term) -> None:
         """Derive the compiled routing wall from a ledger static-terminal registration — the
@@ -321,6 +379,8 @@ class CompiledHexOccupancy:
         self.evicted_before = None
         self.col_owners.clear()
         self.oob_corridor_cells = 0
+        self._claims.clear()
+        self._rows.clear()
         self.corr.reset()
         self.col.reset()
         # Static terminals are NOT ledger-derived (a shrink rebuild must keep them) — re-mark them into the

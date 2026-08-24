@@ -74,12 +74,22 @@ class ReservationLedger:
     # Partner-id sentinel reported by `conflicts` for an always-active terminal WALL (a permanent
     # `_static_vols` entry owns no flight). Callers treat it as "static wall", never a real flight id.
     STATIC_WALL_FID = -1
+    # Owner sentinel for a tombstoned (released-in-place) volume — see release_many. Never yielded by
+    # iter_committed, never a candidate in conflicts (its AABB is the empty box below).
+    TOMBSTONE_FID = -2
+
+    # Empty AABB carried by tombstoned volumes: min > max on every axis, so `_aabb_miss` rejects it
+    # against ANY query box and every AABB-pruned read path (conflicts/any_conflict/column_clear) skips
+    # the dead entry without knowing tombstones exist.
+    _DEAD_AABB = (np.inf, np.inf, np.inf, -np.inf, -np.inf, -np.inf)
 
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         self._vols: list[Volume4D] = []
         self._fids: list[int] = []
         self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
+        self._n_dead = 0                     # tombstoned entries in _vols (release_many); compacted lazily
+        self._release_subs: list = []        # release_many subscribers (removal publish hook)
         # committed-volume index keyed by (step, cell_x, cell_y): a TIME bucket (discrete step) CROSSED with an
         # xy SPATIAL sub-index, so a query scans only volumes sharing its timestep AND near its xy — not every
         # volume metro-wide that merely shares the step (issue #30). See commit / _candidate_indices.
@@ -103,6 +113,14 @@ class ReservationLedger:
         publish hook (ASTM F3548-21 Subscription/notification analogue). Used by the A* planner's
         incremental hex-occupancy service to absorb new volumes without rebuilding from scratch."""
         self._observers.append(callback)
+
+    def subscribe_release(self, callback) -> None:
+        """Register ``callback(flight_id, volumes)``, fired by ``release_many`` for each removed
+        flight — the removal analogue of ``subscribe``. Services that track per-owner rows use it
+        to un-absorb a flight in O(its volumes) and keep ``n_added`` in lockstep with
+        ``n_volumes``, so the shrink tripwire (their safety net) stays silent. Legacy ``release``
+        predates this hook and refuses to run while release subscribers exist."""
+        self._release_subs.append(callback)
 
     def register_static_terminal(self, center, term) -> None:
         """File a hub's always-active terminal airspace as a PERMANENT ledger volume (whole horizon), so
@@ -167,27 +185,76 @@ class ReservationLedger:
                 or a[5] < b[2] or b[5] < a[2])  # z
 
     # ----- writes -----
+    def _append(self, flight_id: int, v: Volume4D) -> None:
+        """Insert one volume into the arrays and the (step, cell) buckets — the commit loop body,
+        shared with `_compact` (which must NOT re-fire observers)."""
+        idx = len(self._vols)
+        self._vols.append(v)
+        self._fids.append(flight_id)
+        vbb = self._flat_aabb(v)
+        self._aabb.append(vbb)
+        cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))   # xy-cells this box touches (enumerate once)
+        for s in self._steps(v):
+            for key in cells:            # FULL cross product steps × cells — a diagonal pairing would miss conflicts
+                self._buckets.setdefault((s, *key), []).append(idx)
+
     def commit(self, flight_id: int, volumes: list[Volume4D]) -> None:
         """Add a flight's volumes to the ledger (FCFS: it becomes an obstacle for later flights)."""
         for v in volumes:
-            idx = len(self._vols)
-            self._vols.append(v)
-            self._fids.append(flight_id)
-            vbb = self._flat_aabb(v)
-            self._aabb.append(vbb)
-            cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))   # xy-cells this box touches (enumerate once)
-            for s in self._steps(v):
-                for key in cells:            # FULL cross product steps × cells — a diagonal pairing would miss conflicts
-                    self._buckets.setdefault((s, *key), []).append(idx)
+            self._append(flight_id, v)
         for cb in self._observers:           # publish hook: notify subscribers of the new volumes
             cb(flight_id, volumes)
 
     def release(self, flight_id: int) -> None:
         """Remove a flight (operator-initiated replanning). Rare in v0; rebuilds the index."""
-        keep = [(f, v) for f, v in zip(self._fids, self._vols) if f != flight_id]
+        if self._release_subs:
+            raise RuntimeError(
+                "legacy release() re-feeds commit observers volume-by-volume and would desync "
+                "release subscribers' per-owner rows — use release_many instead"
+            )
+        keep = [(f, v) for f, v in zip(self._fids, self._vols)
+                if f != flight_id and f != self.TOMBSTONE_FID]
         self._vols, self._fids, self._aabb, self._buckets = [], [], [], {}
+        self._n_dead = 0
         for f, v in keep:
             self.commit(f, [v])
+
+    def release_many(self, flight_ids) -> int:
+        """Remove several flights by tombstoning their volumes in place — the LNS destroy primitive.
+
+        O(current volumes) flag pass, no bucket rebuild, and — unlike ``release`` — **no observer
+        re-feed**: the planners' incremental occupancy services notice the shrink themselves
+        (``ledger.n_volumes < svc.n_added``) on their next ``plan()`` and rebuild from
+        ``iter_committed``. A tombstone keeps its slot in ``_vols``/``_buckets`` but its AABB becomes
+        the empty box, so every AABB-pruned read (``conflicts``/``any_conflict``/the terminal-capacity
+        column scan) skips it; ``iter_committed`` skips it by owner id. Arrays are compacted once dead
+        entries outnumber live ones. Returns the number of volumes tombstoned."""
+        doomed = set(flight_ids)
+        removed: dict[int, list[Volume4D]] = {}
+        n = 0
+        for i, f in enumerate(self._fids):
+            if f in doomed:
+                self._fids[i] = self.TOMBSTONE_FID
+                self._aabb[i] = self._DEAD_AABB
+                if self._release_subs:
+                    removed.setdefault(f, []).append(self._vols[i])
+                n += 1
+        self._n_dead += n
+        if self._n_dead > len(self._vols) - self._n_dead:
+            self._compact()
+        for fid, vols in removed.items():   # removal publish hook (one call per flight, like commit)
+            for cb in self._release_subs:
+                cb(fid, vols)
+        return n
+
+    def _compact(self) -> None:
+        """Drop tombstoned entries and rebuild the buckets. Silent to observers by design: a
+        compaction changes indices, not content, and the services never hold ledger indices."""
+        keep = [(f, v) for f, v in zip(self._fids, self._vols) if f != self.TOMBSTONE_FID]
+        self._vols, self._fids, self._aabb, self._buckets = [], [], [], {}
+        self._n_dead = 0
+        for f, v in keep:
+            self._append(f, v)
 
     # ----- reads -----
     def conflicts(self, volumes: list[Volume4D]) -> list[tuple[int, Volume4D]]:
@@ -235,8 +302,11 @@ class ReservationLedger:
         return {fid for fid, _ in self.conflicts(volumes) if fid != self.STATIC_WALL_FID}
 
     def iter_committed(self):
-        """Yield every committed (flight_id, Volume4D) — used by verify and viz."""
-        yield from zip(self._fids, self._vols)
+        """Yield every committed (flight_id, Volume4D) — used by verify and viz. Tombstoned entries
+        (release_many) are skipped, so consumers see only live volumes, in commit order — each
+        flight's volumes stay CONTIGUOUS (``_absorb`` groups by adjacent runs and relies on this)."""
+        tomb = self.TOMBSTONE_FID
+        yield from ((f, v) for f, v in zip(self._fids, self._vols) if f != tomb)
 
     def static_volumes(self) -> tuple:
         """The permanent always-active terminal walls (read-only view; empty unless registered)."""
@@ -253,4 +323,6 @@ class ReservationLedger:
 
     @property
     def n_volumes(self) -> int:
-        return len(self._vols)
+        """LIVE committed volumes (tombstones excluded) — the count the occupancy services compare
+        against their `n_added` to detect a shrink, so it must drop the moment volumes are released."""
+        return len(self._vols) - self._n_dead

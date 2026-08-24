@@ -110,13 +110,34 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
         for request in requests
         if request.flight_id in accepted
     }
+    # Built the SAME WAY `ColGenSolver.solve` builds its own, and that is a correctness
+    # requirement rather than tidiness: `warm_start.build` calls `row_index.cap(row)` on
+    # every claim of every candidate column, and `RowIndex.cap` raises `KeyError` for an
+    # unregistered terminal rather than assuming capacity one.  The static catalog alone
+    # covers today's scenarios only because `run_batch` refuses terminal endpoints unless
+    # `terminal_airspace_always_active`, which puts every terminal in `static_terms` -- an
+    # invariant enforced three frames away.  Registering the graphs' own terminals too costs
+    # nothing and removes the dependency on it.
     row_index = RowIndex({terminal.id: terminal.capacity for _c, terminal in catalog.entries})
+    for graph in graphs.values():
+        for terminal_id, capacity in graph.terminal_capacities.items():
+            row_index.register_terminal(terminal_id, capacity)
     seed_columns, stats = warm_start_module.build(
         accepted, graphs, cfg, cost_model(cfg, params), row_index
     )
+    # Every flight that did NOT place, by reason.  The counts existed and were thrown away,
+    # which left the one number a reader needs -- why 7 of 1,500 were dropped -- derivable
+    # only as `accepted - placed`, with no way to tell an inexpressible route (an air hold)
+    # from one the repair loop could not fit inside `max_shift`.  Those two point at
+    # completely different fixes.
+    unplaced = sorted(
+        (reason, count)
+        for reason, count in stats.items()
+        if reason.startswith("unconvertible: ") or reason == "dropped (no feasible shift)"
+    )
     log.info(
         "warm start from %s: %d/%d flights accepted, %d placed as columns, "
-        "%d held, %d rows over cap, %.1fs",
+        "%d held, %d rows over cap, %.1fs%s",
         planner,
         len(accepted),
         len(requests),
@@ -124,6 +145,11 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
         stats["total held steps"],
         stats["rows over cap"],
         time.monotonic() - started,
+        (
+            "; unplaced: " + ", ".join(f"{reason} x{count}" for reason, count in unplaced)
+            if unplaced
+            else ""
+        ),
     )
     if not seed_columns:
         raise RuntimeError(

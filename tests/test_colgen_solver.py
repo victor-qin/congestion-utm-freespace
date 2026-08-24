@@ -1502,7 +1502,46 @@ def test_eager_materialization_removes_the_separation_rounds():
     assert result.stats["ip_separation_rounds"] == 0, (
         "every violable row should already be materialized, so separation has nothing to add"
     )
-    assert result.stats["ip_eager_rows"] >= 0
+    # `>= 0` would have passed on an eager pass that did nothing at all, which is the one
+    # outcome this test exists to rule out: zero rounds is only evidence of eagerness if
+    # eagerness happened.  These two flights cross, so at least one row two flights can
+    # claim must exist and must have been pre-materialized.
+    assert result.stats["ip_eager_rows"] > 0, (
+        "the crossing fixture has bindable rows; an eager pass that added none proves nothing"
+    )
+
+
+def test_max_eager_ip_rows_reaches_the_final_ip():
+    """The ceiling is a real knob, not an unused argument on ``solve_ip``.
+
+    ``RestrictedMaster.solve_ip`` has taken ``max_eager_rows`` since the eager pass landed,
+    but nothing passed it, so the documented brake on a pool denser than any measured here
+    could not be applied to an actual run.  ``0`` is the sharpest probe: the pass is
+    all-or-nothing, so a ceiling below the pending count means it adds NOTHING and the lazy
+    separation loop runs exactly as it did before -- which is also how to pin the old
+    behaviour for an A/B.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [
+        _request(1, (-4, 0), (4, 0), cfg),
+        _request(2, (0, -4), (0, 4), cfg),
+    ]
+    controls = {"seed_ladder_steps": 0, "max_iterations": 1}
+
+    eager = ColGenSolver().solve(requests, cfg, (), _params(**controls))
+    capped = ColGenSolver().solve(
+        requests, cfg, (), _params(max_eager_ip_rows=0, **controls)
+    )
+
+    assert eager.stats["ip_status"] != "skipped"
+    assert capped.stats["ip_status"] != "skipped"
+    assert eager.stats["ip_eager_rows"] > 0
+    assert capped.stats["ip_eager_rows"] == 0, "a ceiling of 0 must disable the eager pass"
+    # Same answer either way: this bounds SETUP, not the feasible set.  The separation loop
+    # is still live, so the capped arm reaches the same schedule by searching for the rows
+    # the eager arm pre-materialized.
+    assert capped.stats["objective"] == pytest.approx(eager.stats["objective"], abs=1e-9)
 
 
 def test_max_eager_rows_is_all_or_nothing():
@@ -1634,6 +1673,100 @@ def test_a_partial_seed_still_produces_a_complete_feasible_incumbent():
     )
     assert seeded.stats["seeded_columns"] == 1
     assert set(seeded.columns) == {1, 2}
+
+
+def test_an_adopted_warm_start_reports_its_own_flight_count_and_delay(monkeypatch):
+    """``initial_heuristic_strategy`` and ``initial_heuristic_*`` must describe ONE selection.
+
+    Adoption replaces the incumbent, so a run that reports ``strategy == "seed_columns"``
+    beside the flight count and delay of the shifted-seed selection it just discarded is a
+    sentence about two different schedules -- and it reads as a warm start that changed
+    nothing, which is exactly the diagnosis the field exists to prevent.
+
+    The heuristic is handicapped on purpose.  On every fixture small enough to run here the
+    shipped shifted-seed pass is already optimal, so the completed candidate ties it, the
+    strictly-better guard correctly declines, and adoption never fires -- a test that seeded
+    a real solve and asserted on the outcome would pass without ever entering the branch.
+    Dropping one flight from the heuristic makes the two-flight warm start better by ``M``,
+    which is the only term large enough to be unambiguous.
+    """
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    params = _params(seed_ladder_steps=0)
+
+    plain = ColGenSolver().solve(requests, cfg, (), params)
+    seeds = {flight_id: [column] for flight_id, column in plain.columns.items()}
+    assert set(seeds) == {1, 2}, "the fixture must place both flights to be seedable"
+
+    real_selection = solver_module._initial_feasible_selection
+
+    def covering_only_flight_one(*args, **kwargs):
+        full = real_selection(*args, **kwargs)
+        return {flight_id: column for flight_id, column in full.items() if flight_id == 1}
+
+    monkeypatch.setattr(
+        solver_module, "_initial_feasible_selection", covering_only_flight_one
+    )
+
+    seeded = ColGenSolver().solve(requests, cfg, (), params, seed_columns=seeds)
+
+    assert seeded.stats["initial_heuristic_strategy"] == "seed_columns"
+    assert seeded.stats["initial_heuristic_flights"] == 2, (
+        "the adopted incumbent covers both flights; 1 is the discarded heuristic's count"
+    )
+    assert seeded.stats["initial_heuristic_delay_s"] == pytest.approx(
+        sum(column.delay_s for column in plain.columns.values())
+    )
+
+
+def test_the_dual_regime_stats_follow_the_backend_that_actually_ran():
+    """``lp_method`` describes the backend that ran, NOT the one that was requested.
+
+    ``solver="auto"`` resolves to HiGHS whenever gurobipy is missing, so keying these off
+    ``params.solver`` reported ``lp_method=2`` -- barrier without crossover -- for a run
+    HiGHS priced with a completely different dual vertex.  These fields exist to make
+    archived runs comparable, and that is the one way they could lie.
+
+    The mapping is asserted directly because the interesting case is unreachable on a
+    machine that HAS Gurobi: the invariant below then covers both environments.
+    """
+
+    assert solver_module._dual_regime_stats("highs") == {
+        "lp_method": None,
+        "lp_crossover": None,
+        "gurobi_threads": None,
+    }
+    # The auto fall-back and the exits that never build a master both land here.
+    assert solver_module._dual_regime_stats("none")["lp_method"] is None
+    gurobi = solver_module._dual_regime_stats("gurobi")
+    assert (gurobi["lp_method"], gurobi["lp_crossover"]) == master_module.gurobi_lp_method()
+    assert gurobi["gurobi_threads"] == master_module.gurobi_threads()
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg)]
+    for solver in ("highs", "auto"):
+        stats = ColGenSolver().solve(requests, cfg, (), _params(solver=solver)).stats
+        assert (stats["lp_method"] is not None) is (stats["backend"] == "gurobi"), (
+            f"solver={solver!r} ran on {stats['backend']!r} but reported "
+            f"lp_method={stats['lp_method']!r}"
+        )
+
+
+def test_a_malformed_gurobi_env_var_names_itself(monkeypatch):
+    """These are set by shell wrappers, so a typo in an export is how this is reached.
+
+    A bare ``int('')`` raises ``invalid literal for int() with base 10: ''``, which names
+    neither the variable nor the fix, and the traceback is the only place it can be read.
+    """
+
+    monkeypatch.setenv("COLGEN_GUROBI_THREADS", "all")
+    with pytest.raises(ValueError, match="COLGEN_GUROBI_THREADS must be an integer"):
+        master_module.gurobi_threads()
+
+    monkeypatch.setenv("COLGEN_GUROBI_LP_METHOD", "barrier")
+    with pytest.raises(ValueError, match="COLGEN_GUROBI_LP_METHOD must be an integer"):
+        master_module.gurobi_lp_method()
 
 
 def test_ip_gets_its_own_budget_not_the_whole_solve_remainder(monkeypatch):
@@ -2270,6 +2403,13 @@ def test_warm_start_planner_defaults_off_and_validates_its_name():
     tell apart afterwards.  Off by default because turning it on changes what "colgen"
     means -- unaided colgen is +11.3% against A* at x1500, A*-seeded is -7.1%.
     """
+
+    assert ColGenParams().max_eager_ip_rows is None
+    assert ColGenParams(max_eager_ip_rows=0).max_eager_ip_rows == 0
+    with pytest.raises(ValueError, match="max_eager_ip_rows must be non-negative"):
+        ColGenParams(max_eager_ip_rows=-1)
+    with pytest.raises(TypeError, match="max_eager_ip_rows must be an integer or None"):
+        ColGenParams(max_eager_ip_rows=1.5)
 
     assert ColGenParams().warm_start_planner is None
     assert ColGenParams(warm_start_planner="astar").warm_start_planner == "astar"

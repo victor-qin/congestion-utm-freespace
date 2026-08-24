@@ -35,6 +35,7 @@ from .network import (
 )
 from .master import BackendTimeout, RestrictedMaster
 from .master import gurobi_lp_method as _gurobi_lp_method
+from .master import gurobi_threads as _gurobi_threads
 from .params import ColGenParams
 from .pricing import (
     DualView,
@@ -487,6 +488,36 @@ def _backend_name(master: RestrictedMaster) -> str:
     return type(backend).__name__.removesuffix("Backend").lower()
 
 
+def _dual_regime_stats(backend_name: str) -> dict[str, int | None]:
+    """WHICH DUAL VECTOR PRICED THIS RUN, keyed off the backend that ACTUALLY ran.
+
+    Recorded because these are answer-affecting and were, until now, environment variables
+    nothing wrote down: the same pool under simplex and under barrier gave 196,332.8 and
+    184,729.0 at x1500.  An archived run without them cannot be compared to anything.
+    ``lp_method`` ``-1`` is Gurobi's automatic choice; ``2 / 0`` is barrier without
+    crossover, the default.
+
+    Keyed on the RESOLVED backend rather than on ``params.solver``, and the difference is
+    the whole point: ``solver="auto"`` falls back to HiGHS whenever gurobipy is missing, so
+    a `params`-keyed test reports ``lp_method=2`` for a run HiGHS actually priced -- exactly
+    the mislabelling these fields exist to prevent.  ``None`` means "no Gurobi LP ran", which
+    covers HiGHS, the auto fall-back, and the exits that never build a master at all.
+
+    Returned as a dict spliced into each stats block with ``**``, because
+    `test_every_exit_reports_the_same_stats_keys` pins the key SET across all three exits
+    and hand-copying these keys into three dicts is what produced a duplicated pair before.
+    """
+
+    if backend_name != "gurobi":
+        return {"lp_method": None, "lp_crossover": None, "gurobi_threads": None}
+    method, crossover = _gurobi_lp_method()
+    return {
+        "lp_method": method,
+        "lp_crossover": crossover,
+        "gurobi_threads": _gurobi_threads(),
+    }
+
+
 def _pre_master_timeout_result(
     flight_ids: Sequence[int],
     started: float,
@@ -513,10 +544,11 @@ def _pre_master_timeout_result(
     for graph in graph_values:
         arc_stats.update(graph.arc_cache_stats)
     wall_stats = {} if catalog is None else catalog.wall_index.stats
+    backend_name = "none" if master is None else _backend_name(master)
     return ColGenResult(
         columns={},
         stats={
-            "backend": "none" if master is None else _backend_name(master),
+            "backend": backend_name,
             "iterations": 0,
             "termination_reason": "time_limit",
             "lp_objectives": (),
@@ -555,8 +587,7 @@ def _pre_master_timeout_result(
             "kernel_declined_by_reason": {},
             "seeded_columns": 0,
             "ladder_columns": 0,
-            "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
-            "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
+            **_dual_regime_stats(backend_name),
             "ip_elapsed_s": 0.0,
             "ip_time_limit_s": params.ip_time_limit_s,
             "ip_eager_rows": 0,
@@ -634,7 +665,6 @@ class ColGenSolver:
         fixed_claims: Sequence[frozenset[RowKey]] = (),
         on_iteration=None,
         seed_columns: Mapping[int, Sequence[Column]] | None = None,
-        flight_overrun: Mapping[int, int] | None = None,
     ) -> ColGenResult:
         """Run the column-generation loop to convergence, a bound, or a time limit.
 
@@ -722,8 +752,8 @@ class ColGenSolver:
                     "kernel_declined_by_reason": {},
                     "seeded_columns": 0,
                     "ladder_columns": 0,
-                    "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
-                    "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
+                    # "none": this exit precedes any master, so no LP ran to have duals.
+                    **_dual_regime_stats("none"),
                     "ip_elapsed_s": 0.0,
                     "ip_time_limit_s": params.ip_time_limit_s,
                     "ip_eager_rows": 0,
@@ -801,24 +831,11 @@ class ColGenSolver:
                     catalog=static_catalog,
                     graph_build_elapsed_s=time.monotonic() - graph_build_started,
                 )
-            # `max_air_overrun_hops` sizes the O-D ellipse, and one global value has to
-            # cover the WIDEST route anyone might want.  Measured on `density_faa_wing_zipline`
-            # x1000: 92.3% of A*'s routes are pure geodesics needing zero slack, while a single
-            # flight needs 6 -- so a global 6 would widen 1,000 corridors to contain 7 routes,
-            # and the ellipse grows quadratically in the slack.  A per-flight override gives
-            # each graph only the room its own route needs.  Safe because `build_flight_graph`
-            # is the ONLY reader of this knob; pricing takes `max_air_hops`/`max_step` off the
-            # graph it is handed.
-            graph_params = params
-            if flight_overrun is not None:
-                override = flight_overrun.get(request.flight_id)
-                if override is not None and override != params.max_air_overrun_hops:
-                    graph_params = replace(params, max_air_overrun_hops=override)
             graphs[request.flight_id] = build_flight_graph(
                 request,
                 cfg,
                 static_catalog,
-                graph_params,
+                params,
             )
         graph_build_elapsed_s = time.monotonic() - graph_build_started
         if time.monotonic() >= pricing_deadline:
@@ -989,6 +1006,13 @@ class ColGenSolver:
             if candidate and _selection_objective(candidate, params.M) > _selection_objective(
                 best_heuristic, params.M
             ):
+                # BOTH, and they have to move together.  `initial_heuristic` is what
+                # `initial_heuristic_flights` / `initial_heuristic_delay_s` are computed
+                # from, while `initial_heuristic_strategy` is set here -- so updating only
+                # the strategy leaves a run reporting "seed_columns" beside the flight count
+                # and delay of the shifted-seed selection it just replaced, which is a
+                # sentence about two different schedules.
+                initial_heuristic = candidate
                 best_heuristic = candidate
                 initial_heuristic_strategy = "seed_columns"
         if best_heuristic:
@@ -1461,7 +1485,9 @@ class ColGenSolver:
             # hypothesis that needs a number before anyone acts on it.
             ip_started = time.monotonic()
             ip_selection = master.solve_ip(
-                deadline=deadline, budget_s=params.ip_time_limit_s
+                deadline=deadline,
+                budget_s=params.ip_time_limit_s,
+                max_eager_rows=params.max_eager_ip_rows,
             )
             ip_elapsed_s = time.monotonic() - ip_started
             ip_selection = {
@@ -1772,13 +1798,7 @@ class ColGenSolver:
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,
-            # WHICH DUAL VECTOR PRICED THIS RUN.  Recorded because it is answer-affecting
-            # and was, until now, an environment variable nothing wrote down: the same pool
-            # under simplex and under barrier gave 196,332.8 and 184,729.0 at x1500.  An
-            # archived run without this cannot be compared to anything.  `-1` is Gurobi's
-            # automatic choice; `2 / 0` is barrier without crossover, the default.
-            "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
-            "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
+            **_dual_regime_stats(_backend_name(master)),
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,

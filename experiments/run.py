@@ -282,6 +282,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "falls back to the validated rounding incumbent and reports a "
                         "non-optimal ip_status, so the schedule is still claim-feasible, just "
                         "uncertified")
+    p.add_argument("--colgen-max-eager-rows", type=int, default=None, metavar="N",
+                   help="colgen: ceiling on the rows the final IP may pre-materialize "
+                        "(default none). The pre-pass is all-or-nothing — over the ceiling it "
+                        "materializes NOTHING and the lazy separation loop runs exactly as it "
+                        "did before, because a half-materialized set looks eager in the stats "
+                        "and still has to search. Worth setting on a pool denser than the ones "
+                        "measured here: at 1,500 flights the pre-pass is 495,574 rows and 272 s "
+                        "and it scales WITH the pool. 0 pins the old lazy loop for an A/B")
     p.add_argument("--colgen-max-iterations", type=int, default=None, metavar="N",
                    help="colgen: cap on column-generation iterations (default 30)")
     p.add_argument("--colgen-objective", choices=("total_delay", "total_cost"), default=None,
@@ -299,11 +307,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "the final IP cold (scipy.optimize.milp takes no incumbent), which dominates "
                         "the solve at scale")
     p.add_argument("--colgen-gap-metric", choices=("revenue", "cost"), default=None,
-                   help="colgen: which scale the lp_gap/ip_gap thresholds are measured on. revenue "
-                        "(default) is the paper's eq. (10)/(11), normalised by an objective whose "
-                        "scale includes n*M — with M an artificial big-M it can close at iteration 1. "
-                        "cost normalises by total cost instead: far stricter, and its termination gate "
-                        "additionally requires that no new columns arrived")
+                   help="colgen: which scale the lp_gap/ip_gap thresholds are measured on. cost "
+                        "(default) normalises by total cost: far stricter, and its termination gate "
+                        "additionally requires that no new columns arrived. revenue is the paper's "
+                        "eq. (10)/(11), normalised by an objective whose scale includes n*M — n "
+                        "cancels, so the gate reduces to 'stop unless the average flight can still "
+                        "save tau*M seconds' and moves with M, which is why it is no longer the "
+                        "default")
     # The knob that sizes the pricing search itself. The budget flags above decide how long a
     # solve may run; this decides how much work each iteration IS, and pricing is ~98% of the
     # cost — so without it a run cannot be tuned, only given more time.
@@ -424,6 +434,7 @@ def _colgen_overrides(args) -> dict:
         for name, value in (
             ("time_limit_s", args.colgen_time_limit),
             ("ip_time_limit_s", args.colgen_ip_time_limit),
+            ("max_eager_ip_rows", args.colgen_max_eager_rows),
             ("max_iterations", args.colgen_max_iterations),
             ("objective", args.colgen_objective),
             ("solver", args.colgen_solver),

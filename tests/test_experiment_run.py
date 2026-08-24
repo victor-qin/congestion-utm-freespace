@@ -111,9 +111,15 @@ def test_colgen_flags_reach_the_planner_params():
         "--colgen-workers", "4",
         "--colgen-seed-ladder", "30",
         "--colgen-greedy-budget-rate", "1.5",
+        "--colgen-ip-time-limit", "300",
+        "--colgen-max-eager-rows", "1000",
+        "--colgen-warm-start", "astar",
     )
     params = colgen_params_from_args(args, "colgen")
 
+    assert params.ip_time_limit_s == 300.0
+    assert params.max_eager_ip_rows == 1000
+    assert params.warm_start_planner == "astar"
     assert params.time_limit_s == 900.0
     assert params.max_iterations == 50
     assert params.objective == "total_cost"
@@ -165,6 +171,27 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     #   here needs an `ab_colgen_parity.py` re-baseline, not just a green suite.
     assert defaults.bootstrap_roots == 1
     assert defaults.bootstrap_ranking == "bound"
+    #   The four that moved (or arrived) with the objective-scale change, pinned here for
+    #   the same reason as everything above -- these are the ones an archived run cannot be
+    #   compared across, so drifting one silently is the expensive failure:
+    #
+    #   `solver` "auto" -> "gurobi".  Not a speed knob: the two backends return different
+    #   optimal dual vertices on a degenerate master, so "auto" quietly falling back to
+    #   HiGHS changes the answer.  Failing loudly is the point.
+    #
+    #   `M` 1e6 -> 1e4 and `gap_metric` "revenue" -> "cost" SHIP AS A PAIR.  The revenue
+    #   gate reduces to `tau*M` (n cancels), so moving M alone retunes the stopping rule by
+    #   100x and turns ordinary runs into time-limit runs.
+    #
+    #   `ip_time_limit_s` is new: without it the final MILP inherits whatever the CG loop
+    #   did not spend, which is unbounded exactly when the loop went well.
+    assert defaults.solver == "gurobi"
+    assert defaults.M == 10_000.0
+    assert defaults.gap_metric == "cost"
+    assert defaults.ip_time_limit_s == 120.0
+    # None is "no ceiling", which is what every measurement in this PR ran under.
+    assert defaults.max_eager_ip_rows is None
+    assert defaults.warm_start_planner is None
 
 
 def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():
@@ -196,6 +223,9 @@ def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():
         ("--colgen-workers", "4"),
         ("--colgen-seed-ladder", "30"),
         ("--colgen-greedy-budget-rate", "1.5"),
+        ("--colgen-ip-time-limit", "300"),
+        ("--colgen-max-eager-rows", "1000"),
+        ("--colgen-warm-start", "astar"),
     ],
 )
 def test_colgen_flags_require_the_colgen_planner(colgen_flag):

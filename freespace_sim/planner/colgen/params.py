@@ -191,6 +191,18 @@ class ColGenParams:
     # When the loop consumes its whole budget the reserve still binds and the IP gets the
     # smaller tail.
     ip_time_limit_s: float = 120.0
+    # Ceiling on the rows the final IP may pre-materialize, or ``None`` for no ceiling --
+    # which is the shipped default and preserves the behaviour measured everywhere in this
+    # PR.  `RestrictedMaster.materialize_bindable_rows` is all-or-nothing: over the bound it
+    # materializes NOTHING and the separation loop behaves exactly as it did before, because
+    # a partially materialized set is the worst of both (it looks eager in the stats and
+    # still has to search).
+    #
+    # Worth having reachable rather than left as an unused argument: eager materialization
+    # is 495,574 rows and 272 s at x1500 and scales WITH the pool, so a denser pool than any
+    # measured here has no brake at all otherwise.  `ip_eager_rows == 0` beside a nonzero
+    # `ip_separation_rounds` in a run's stats is what hitting this looks like.
+    max_eager_ip_rows: int | None = None
     lp_gap: float = 1e-4
     ip_gap: float = 1e-3
     # Revenue per served flight in the set-packing objective `sum (M - delay_s) x`.  Its ONLY
@@ -543,6 +555,22 @@ class ColGenParams:
                 f"ip_time_limit_s must be finite and positive, got {self.ip_time_limit_s!r}"
             )
         object.__setattr__(self, "ip_time_limit_s", ip_limit)
+
+        # ``None`` is "no ceiling", which is different from 0 -- 0 means "never materialize
+        # eagerly", a legitimate way to pin the old lazy separation loop for an A/B.  Both
+        # are reachable, so the validator only has to reject negatives and non-integers.
+        if self.max_eager_ip_rows is not None:
+            if isinstance(self.max_eager_ip_rows, bool):
+                raise TypeError("max_eager_ip_rows must be an integer or None")
+            try:
+                max_eager = operator.index(self.max_eager_ip_rows)
+            except TypeError as exc:
+                raise TypeError("max_eager_ip_rows must be an integer or None") from exc
+            if max_eager < 0:
+                raise ValueError(
+                    f"max_eager_ip_rows must be non-negative, got {self.max_eager_ip_rows!r}"
+                )
+            object.__setattr__(self, "max_eager_ip_rows", max_eager)
 
         if not isinstance(self.solver, str):
             raise TypeError("solver must be a string")

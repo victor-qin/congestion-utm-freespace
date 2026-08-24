@@ -93,6 +93,40 @@ class LpBackend(Protocol):
     def solve_ip(self, warm_start: np.ndarray | None = None) -> BackendIpResult: ...
 
 
+def _env_int(name: str, default: int) -> int:
+    """``int(os.environ[name])``, but failing with a message that names the variable.
+
+    A bare ``int('')`` raises ``invalid literal for int() with base 10: ''``, which names
+    neither the variable nor the fix.  These three knobs are set by analysis scripts and
+    shell wrappers rather than by code, so a typo in an export is the expected way to reach
+    this, and the traceback is the only place it can be diagnosed.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer, got {raw!r} (unset it to use the default {default})"
+        ) from exc
+
+
+def gurobi_threads() -> int:
+    """``Threads`` for the master's Gurobi model.  **One by default.**
+
+    Reported in ``stats`` for the same reason :func:`gurobi_lp_method` is: it is
+    answer-affecting and it lives in an environment variable nothing else writes down.
+    Measured here, everything else fixed, 4 / 8 / 16 threads return an IDENTICAL objective
+    and 1 is fine, but **2 is reproducibly ~10% worse** -- which was misread as MILP noise
+    until the thread count was the thing being varied.  An archived run that does not record
+    this cannot be compared with one that ran at a different count.
+    """
+
+    return _env_int("COLGEN_GUROBI_THREADS", 1)
+
+
 def gurobi_lp_method() -> tuple[int, int]:
     """``(Method, Crossover)`` for the master LP.  **Barrier without crossover by default.**
 
@@ -132,8 +166,8 @@ def gurobi_lp_method() -> tuple[int, int]:
     """
 
     return (
-        int(os.environ.get("COLGEN_GUROBI_LP_METHOD", "2")),
-        int(os.environ.get("COLGEN_GUROBI_CROSSOVER", "0")),
+        _env_int("COLGEN_GUROBI_LP_METHOD", 2),
+        _env_int("COLGEN_GUROBI_CROSSOVER", 0),
     )
 
 
@@ -384,8 +418,9 @@ class GurobiBackend:
         # column sets across runs.  The cost is real -- at 1,500 flights the final IP is the
         # binding stage and burns its whole budget on one core while the rest sit idle
         # (`ip_status status_9` at 900.1 s of a 900 s cap) -- so `COLGEN_GUROBI_THREADS`
-        # exists to measure that trade.  0 means "every core Gurobi can see".
-        model.Params.Threads = int(os.environ.get("COLGEN_GUROBI_THREADS", "1"))
+        # exists to measure that trade.  0 means "every core Gurobi can see".  Reported in
+        # `stats` as `gurobi_threads`, because it changes the answer (see `gurobi_threads`).
+        model.Params.Threads = gurobi_threads()
         model.Params.Seed = self.seed
         model.ModelSense = gp.GRB.MAXIMIZE
         self._flight_rows = {
@@ -799,8 +834,14 @@ class RestrictedMaster:
 
         Exact, not a heuristic, and it rests on one property: the flight rows are
         ``sum(x_c for c in flight) <= 1``, so a row only one flight can reach carries at most
-        one selected column and cannot exceed a capacity of at least one.  That invariant is
-        asserted in :meth:`materialize_bindable_rows` rather than assumed.
+        one selected column and cannot exceed a capacity of at least one.
+
+        That property is MAINTAINED in :meth:`add_column` -- the one place a column is
+        committed -- rather than asserted anywhere, because asserting it would mean
+        re-deriving the per-row flight sets this class exists to avoid storing.  What checks
+        it at runtime is `last_ip_rounds`: the separation loop is still live after an eager
+        solve, so a row this set wrongly omitted comes back as a separation round, and a
+        nonzero `ip_separation_rounds` in a run's stats is that failure being reported.
         """
 
         return frozenset(self._bindable)

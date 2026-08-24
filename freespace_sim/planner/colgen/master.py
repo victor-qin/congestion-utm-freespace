@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -65,6 +66,13 @@ class LpBackend(Protocol):
     name: str
     flight_ids: tuple[int, ...]
     time_limit_s: float
+    # Both of these are RE-SET by the caller between construction and the final IP, so they
+    # are part of the contract rather than constructor trivia.  `time_limit_s` has always
+    # been; `ip_gap` joined it when the solver started re-scaling the MIP tolerance against
+    # the incumbent's cost -- `create_backend` can only assume the worst case (cost -> 0),
+    # which is ~n*M times too tight once a real incumbent exists.  Declared here so a new
+    # backend satisfying only this Protocol cannot silently lack the attribute.
+    ip_gap: float
 
     def add_column(
         self,
@@ -83,6 +91,84 @@ class LpBackend(Protocol):
     def solve_lp(self) -> BackendLpResult: ...
 
     def solve_ip(self, warm_start: np.ndarray | None = None) -> BackendIpResult: ...
+
+
+def _env_int(name: str, default: int) -> int:
+    """``int(os.environ[name])``, but failing with a message that names the variable.
+
+    A bare ``int('')`` raises ``invalid literal for int() with base 10: ''``, which names
+    neither the variable nor the fix.  These three knobs are set by analysis scripts and
+    shell wrappers rather than by code, so a typo in an export is the expected way to reach
+    this, and the traceback is the only place it can be diagnosed.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer, got {raw!r} (unset it to use the default {default})"
+        ) from exc
+
+
+def gurobi_threads() -> int:
+    """``Threads`` for the master's Gurobi model.  **One by default.**
+
+    Reported in ``stats`` for the same reason :func:`gurobi_lp_method` is: it is
+    answer-affecting and it lives in an environment variable nothing else writes down.
+    Measured here, everything else fixed, 4 / 8 / 16 threads return an IDENTICAL objective
+    and 1 is fine, but **2 is reproducibly ~10% worse** -- which was misread as MILP noise
+    until the thread count was the thing being varied.  An archived run that does not record
+    this cannot be compared with one that ran at a different count.
+    """
+
+    return _env_int("COLGEN_GUROBI_THREADS", 1)
+
+
+def gurobi_lp_method() -> tuple[int, int]:
+    """``(Method, Crossover)`` for the master LP.  **Barrier without crossover by default.**
+
+    The master is a cap-1 set-packing LP, so it is severely degenerate and its optimal DUAL
+    set is a polyhedron rather than a point.  Simplex stops at an arbitrary extreme vertex
+    of that set -- sparse, with most rows priced at zero -- and pricing then chases whatever
+    corner the pivot rule happened to land on.  Barrier without crossover stops near the
+    analytic centre instead, which spreads price across the rows that are actually competing
+    and varies CONTINUOUSLY with the column pool, so each round's columns stay relevant to
+    the next.
+
+    Measured on `density_faa_wing_zipline`, one instance each, everything else fixed:
+
+        x600,  8 iterations, both arms PROVED optimality (so the objective is exact)
+            simplex   lp_gap 0.0154    objective 72,706.4   wall 2,773 s
+            barrier   lp_gap 0.00346   objective 72,045.4   wall 1,151 s
+        x1500, 10 iterations, both truncated at 900 s (so both objectives are floors)
+            simplex   lp_gap 0.0176    196,332.8  (-7.1% vs A*)   pricing 2,350 s
+            barrier   lp_gap 0.00924   184,729.0  (-12.6% vs A*)  pricing 1,686 s
+
+    **Correctness is untouched.**  The Lagrangian bound `z + sum_f max(0, rc_f)` is valid
+    for ANY optimal dual vector, so this changes the convergence rate, not validity.
+
+    **The default was `-1`, and flipping it is deliberate.**  Leaving it opt-in meant every
+    analysis script had to remember two environment variables, and the ones that forgot
+    measured simplex while being compared against barrier baselines -- which is how a
+    headline plateau measurement and a ladder ablation ended up on different dual regimes
+    from the runs they were quoted beside.  `COLGEN_GUROBI_LP_METHOD=-1` restores the old
+    behaviour, and both values are reported in `stats` so archived runs can be told apart.
+
+    **One risk remains untested rather than cleared.**  Barrier without crossover returns a
+    non-basic primal -- fractional almost everywhere -- and `round_heuristic` rounds exactly
+    that.  In every run measured so far `round_heuristic` never beat the A* incumbent under
+    EITHER regime, so the two arms were identical to the decimal and the risk was never
+    exercised.  On an instance where the rounding heuristic actually contributes, watch
+    `heuristic_objective` and not only the final number.
+    """
+
+    return (
+        _env_int("COLGEN_GUROBI_LP_METHOD", 2),
+        _env_int("COLGEN_GUROBI_CROSSOVER", 0),
+    )
 
 
 def _flight_tuple(flight_ids: Iterable[int]) -> tuple[int, ...]:
@@ -326,7 +412,15 @@ class GurobiBackend:
             raise _GurobiUnavailable(f"Gurobi could not start: {exc}") from exc
         self._model = model
         model.Params.OutputFlag = 0
-        model.Params.Threads = 1
+        # ONE thread by default, and it is a determinism choice rather than a performance
+        # one: parallel Gurobi breaks ties by whichever worker got there first, so a threaded
+        # solve is not reproducible even at a fixed `Seed`, and this repo pins objectives and
+        # column sets across runs.  The cost is real -- at 1,500 flights the final IP is the
+        # binding stage and burns its whole budget on one core while the rest sit idle
+        # (`ip_status status_9` at 900.1 s of a 900 s cap) -- so `COLGEN_GUROBI_THREADS`
+        # exists to measure that trade.  0 means "every core Gurobi can see".  Reported in
+        # `stats` as `gurobi_threads`, because it changes the answer (see `gurobi_threads`).
+        model.Params.Threads = gurobi_threads()
         model.Params.Seed = self.seed
         model.ModelSense = gp.GRB.MAXIMIZE
         self._flight_rows = {
@@ -382,20 +476,48 @@ class GurobiBackend:
         if not math.isfinite(bound) or bound < 0.0:
             raise ValueError("capacity-row rhs must be finite and non-negative")
         indices = _validate_column_indices(column_indices, len(self._variables))
-        self._model.update()
+        # NO `self._model.update()` here, in either position.  `update()` flushes the whole
+        # pending-modification queue, so calling it per row makes materialization quadratic
+        # in the number of rows: measured 30 us/row at 2k rows, 53 at 8k, 89 at 20k, and
+        # 897 s for the 495,574 rows of a 1,500-flight IP.  Batched it is ~7.5 us/row flat.
+        #
+        # Safe because Gurobi's lazy update mode (the default since v7) permits referencing
+        # objects created since the last update inside EXPRESSIONS, which is all this does --
+        # and `add_column` above already relies on exactly that, adding variables with no
+        # update at all.  Nothing reads a constraint ATTRIBUTE until after `optimize()`, and
+        # both `solve_lp` and `solve_ip` call `update()` before optimizing.
         expression = self._gp.quicksum(self._variables[index] for index in indices)
         constraint = self._model.addConstr(
             expression <= bound,
             name=f"capacity[{len(self._capacity_rows)}]",
         )
         self._capacity_rows[row] = constraint
-        self._model.update()
 
     def solve_lp(self) -> BackendLpResult:
         for variable in self._variables:
             variable.VType = self._gp.GRB.CONTINUOUS
             variable.UB = self._gp.GRB.INFINITY
         self._model.Params.TimeLimit = self.time_limit_s
+        # WHICH optimal dual vector the LP returns is answer-affecting, because pricing
+        # maximises `(M - d_c) - pi_f - sum_r a_rc mu_r` and the argmax depends on mu.  On a
+        # degenerate master -- and cap-1 rows plus one-column-per-flight make this one very
+        # degenerate -- the optimal dual SET is a polyhedron with many extreme points, all
+        # giving the same LP objective and different pricing targets.  Simplex returns a
+        # vertex, and a different vertex each iteration, so pricing chases a moving target.
+        # `Method=2, Crossover=0` stops at the analytic centre instead, which moves
+        # continuously with the pool.
+        #
+        # Already observed here: HiGHS and Gurobi agree on the LP optimum but hand back
+        # different dual vertices, and HiGHS runs 17 iterations where Gurobi stops at 1 --
+        # for a 34% worse schedule.  Same LP, same optimum, different vertex.
+        #
+        # Correctness is untouched: the Lagrangian bound `z + sum_f max(0, rc_f)` holds for
+        # ANY optimal dual, so this changes the convergence rate, not validity.  The cost is
+        # that an interior primal is fractional almost everywhere, which is what
+        # `round_heuristic` rounds -- watch `heuristic_objective`, not just the final number.
+        method, crossover = gurobi_lp_method()
+        self._model.Params.Method = method
+        self._model.Params.Crossover = crossover
         self._model.update()
         self._model.optimize()
         if self._model.Status == self._gp.GRB.TIME_LIMIT:
@@ -422,6 +544,11 @@ class GurobiBackend:
             )
         self._model.Params.MIPGap = self.ip_gap
         self._model.Params.TimeLimit = self.time_limit_s
+        # Restored to automatic: the LP phase may have pinned barrier-without-crossover to
+        # get centred duals, and those settings would otherwise also govern the MILP's root
+        # relaxation -- a different question, and one this experiment is not asking.
+        self._model.Params.Method = -1
+        self._model.Params.Crossover = -1
         self._model.update()
         self._model.optimize()
         if self._model.SolCount < 1 and self._model.Status == self._gp.GRB.TIME_LIMIT:
@@ -558,6 +685,26 @@ class RestrictedMaster:
         # Correctness requires `_columns` to stay APPEND-ONLY: an index recorded here must
         # never move.  Trimming the pool would silently corrupt every entry.
         self._columns_by_row: dict[RowKey, list[int]] = {}
+        # --- bindability ---------------------------------------------------------------
+        # A row can only ever be violated if columns from MORE THAN `cap` DISTINCT flights
+        # claim it, because the flight rows are `sum(x_c for c in flight) <= 1` and so at
+        # most one column per flight is ever selected.  Measured on `density_faa_wing_zipline`
+        # x1000 with the shipped 20-step ladder: 2,184,200 rows are touched by some column and
+        # **95.3% of them only one flight can reach**, leaving 95,136 that can bind.  Tracking
+        # that lets the final IP materialize the bindable rows up front instead of discovering
+        # them a selection at a time (16 separation rounds and 900 s reached only 59,843).
+        #
+        # NOT `dict[RowKey, set[int]]`: a set per row over 2.18M rows is ~470 MB.  A cap-1 row
+        # only needs the FIRST flight that claimed it -- a second distinct one promotes it --
+        # and both trackers drop their entry on promotion, so the memory is transient.
+        self._row_first_flight: dict[RowKey, int] = {}
+        self._row_flight_sets: dict[RowKey, set[int]] = {}   # cap > 1 rows only (terminals)
+        self._bindable: set[RowKey] = set()
+        # A row whose committed load already fills it binds on its first claimant, and no
+        # column-driven update would ever see it, so seed those here.
+        for row, load in self.fixed_loads.items():
+            if load >= self.row_index.cap(row):
+                self._bindable.add(row)
         self.last_flight_duals: dict[int, float] = {flight_id: 0.0 for flight_id in self.flight_ids}
         self.last_row_duals: dict[RowKey, float] = {}
         self.last_lp_objective = 0.0
@@ -566,6 +713,14 @@ class RestrictedMaster:
         self.last_ip_bound: float | None = None
         self.last_ip_status: str | None = None
         self.last_ip_optimal: bool | None = None
+        # Diagnostics for the eager path: how many rows it pre-materialized, and how many
+        # separation rounds were still needed.  Rounds > 0 after an eager solve means the
+        # bindability filter missed something and is worth investigating, not ignoring.
+        self.last_ip_eager_rows = 0
+        self.last_ip_rounds = 0
+        # Setup is reported, not absorbed: at x1500 it is 272 s, and an IP "elapsed" that
+        # silently includes it makes a 900 s cap look spent when 628 s reached the solver.
+        self.last_ip_setup_s = 0.0
         self._warm_start: np.ndarray | None = None
         self._heuristic_selection: dict[int, Column] = {}
 
@@ -643,12 +798,71 @@ class RestrictedMaster:
                 self._columns_by_row[row] = [index]
             else:
                 bucket.append(index)
+            # Bindability, maintained here for the same reason `_columns_by_row` is: this is
+            # the one place a column is committed, and the checks above have already run.
+            if row in self._bindable:
+                continue
+            headroom = self.row_index.cap(row) - self.fixed_loads.get(row, 0)
+            if headroom <= 0:
+                self._bindable.add(row)
+            elif headroom == 1:
+                first = self._row_first_flight.get(row)
+                if first is None:
+                    self._row_first_flight[row] = column.flight_id
+                elif first != column.flight_id:
+                    self._bindable.add(row)
+                    del self._row_first_flight[row]
+            else:
+                seen = self._row_flight_sets.get(row)
+                if seen is None:
+                    self._row_flight_sets[row] = {column.flight_id}
+                else:
+                    seen.add(column.flight_id)
+                    if len(seen) > headroom:
+                        self._bindable.add(row)
+                        del self._row_flight_sets[row]
         self._column_indices[column] = index
         self._objectives.append(objective)
         # Existing warm starts stay meaningful when pricing appends a column.
         if self._warm_start is not None:
             self._warm_start = np.pad(self._warm_start, (0, 1))
         return index
+
+    @property
+    def bindable_rows(self) -> frozenset[RowKey]:
+        """Rows more than ``cap`` distinct flights can claim — the only violable ones.
+
+        Exact, not a heuristic, and it rests on one property: the flight rows are
+        ``sum(x_c for c in flight) <= 1``, so a row only one flight can reach carries at most
+        one selected column and cannot exceed a capacity of at least one.
+
+        That property is MAINTAINED in :meth:`add_column` -- the one place a column is
+        committed -- rather than asserted anywhere, because asserting it would mean
+        re-deriving the per-row flight sets this class exists to avoid storing.  What checks
+        it at runtime is `last_ip_rounds`: the separation loop is still live after an eager
+        solve, so a row this set wrongly omitted comes back as a separation round, and a
+        nonzero `ip_separation_rounds` in a run's stats is that failure being reported.
+        """
+
+        return frozenset(self._bindable)
+
+    def materialize_bindable_rows(self, *, max_rows: int | None = None) -> int:
+        """Materialize every row that could ever bind, and return how many were added.
+
+        This is the alternative to discovering violations one IP solution at a time.  The
+        separation loop in :meth:`solve_ip` remains, but with these rows already present it
+        should confirm feasibility in a single round instead of dozens.
+
+        ``max_rows`` bounds the damage if a pool is denser than the 95,136 measured on
+        ``density_faa_wing_zipline`` x1000: over that, this does nothing and the loop behaves
+        exactly as before.  Silent truncation would be worse than either -- a partially
+        materialized set looks eager but still needs separation -- so it is all or nothing.
+        """
+
+        pending = [row for row in self._bindable if row not in self._materialized]
+        if max_rows is not None and len(pending) > max_rows:
+            return 0
+        return self.materialize_rows(pending)
 
     def materialize_rows(self, rows: Iterable[RowKey | tuple[object, ...]]) -> int:
         """Materialize previously implicit rows in deterministic key order."""
@@ -782,6 +996,65 @@ class RestrictedMaster:
     def _can_add(self, column: Column, loads: Mapping[RowKey, int]) -> bool:
         return all(loads.get(row, 0) + 1 <= self.row_index.cap(row) for row in column.claims)
 
+    def _greedy_order(self) -> list[int]:
+        """Column indices, best objective first, ties broken canonically.
+
+        Shared by `round_heuristic`'s fill and `complete_selection` so the two greedy
+        passes cannot drift apart on the ordering that decides what each one picks.
+        """
+
+        return sorted(
+            range(len(self._columns)),
+            key=lambda index: (-self._objectives[index], _column_sort_key(self._columns[index])),
+        )
+
+    def complete_selection(self, pinned: Mapping[int, Column]) -> dict[int, Column]:
+        """Keep `pinned` exactly, and fill every flight it does not name around it.
+
+        A caller's warm start need not cover the batch -- `astar_warm_start` drops routes
+        the flight graph cannot express -- and the flights it leaves out must not simply
+        keep whatever column some other heuristic gave them.  Measured on
+        ``density_faa_wing_zipline`` x1500: 7 such leftovers clashed with the 1,493 seeded
+        columns, the combined selection failed `is_claim_feasible`, and the entire warm
+        start was discarded over 0.5% of the schedule.  Re-picking the leftovers AROUND
+        the pins is what makes it usable.
+
+        Raises `ValueError` when `pinned` is not itself feasible.  This completes a warm
+        start, it does not repair one: quietly dropping offending pins would report a
+        caller's infeasible schedule as an adopted incumbent.
+        """
+
+        pinned_columns: dict[int, Column] = {}
+        for raw_flight_id, column in pinned.items():
+            flight_id = operator.index(raw_flight_id)
+            if flight_id != column.flight_id:
+                raise ValueError("pinned mapping key does not match column flight_id")
+            try:
+                index = self._column_indices[column]
+            except KeyError as exc:
+                raise ValueError("pinned contains a column outside this master") from exc
+            pinned_columns[flight_id] = self._columns[index]
+        loads: Counter[RowKey] = Counter(self.claim_loads(pinned_columns))
+        over = [row for row, load in loads.items() if load > self.row_index.cap(row)]
+        if over:
+            raise ValueError(f"pinned selection violates {len(over)} capacity claims")
+
+        selected = dict(pinned_columns)
+        for index in self._greedy_order():
+            column = self._columns[index]
+            # A column whose objective is non-positive is worse than leaving the flight
+            # unassigned, so `round_heuristic` skips it and so does this.
+            if self._objectives[index] <= 0.0 or column.flight_id in selected:
+                continue
+            if self._can_add(column, loads):
+                selected[column.flight_id] = column
+                loads.update(column.claims)
+        return {
+            flight_id: selected[flight_id]
+            for flight_id in self.flight_ids
+            if flight_id in selected
+        }
+
     def round_heuristic(
         self,
         x: Sequence[float],
@@ -802,10 +1075,7 @@ class RestrictedMaster:
         probabilities = np.clip(values, 0.0, 1.0)
         probabilities[probabilities <= epsilon] = 0.0
         probabilities[probabilities >= 1.0 - epsilon] = 1.0
-        greedy_order = sorted(
-            range(len(self._columns)),
-            key=lambda index: (-self._objectives[index], _column_sort_key(self._columns[index])),
-        )
+        greedy_order = self._greedy_order()
 
         best: dict[int, Column] = {}
         best_objective = -math.inf
@@ -903,8 +1173,33 @@ class RestrictedMaster:
         heuristic: Mapping[int, Column] | None = None,
         *,
         deadline: float | None = None,
+        budget_s: float | None = None,
+        eager: bool = True,
+        max_eager_rows: int | None = None,
     ) -> dict[int, Column]:
-        """Solve the current binary RMP, separating claim rows until it is clean."""
+        """Solve the current binary RMP, separating claim rows until it is clean.
+
+        ``eager`` materializes every bindable row FIRST (see
+        :meth:`materialize_bindable_rows`), which is what turns the separation loop from a
+        search into a confirmation.  Pass ``eager=False`` for a per-iteration call: these
+        rows persist in ``_materialized``, so carrying ~95k of them through the
+        column-generation loop would slow every subsequent LP.  The solver's single
+        end-of-run call is the intended user.
+
+        Two different clocks, and conflating them cost 30% of every IP budget:
+
+        ``deadline``  a hard absolute wall (the whole solve's), which never moves.
+        ``budget_s``  seconds of SOLVING, started after materialization -- because
+                      materializing is setup, not search.
+
+        Eager materialization is not cheap at scale: 495,574 rows took **272 s** on
+        ``density_faa_wing_zipline`` x1500.  Charging that to the solver's budget made a
+        900 s cap deliver 628 s of MILP and a 300 s cap deliver ~28 s, which returned the
+        incumbent untouched and read as "the MILP found nothing in 300 s".  It also scales
+        WITH the pool, so any experiment varying pool size was confounded by a setup cost
+        that grew alongside the variable under test.  ``last_ip_setup_s`` reports it rather
+        than hiding it inside the caller's elapsed time.
+        """
 
         if heuristic is not None:
             self.set_heuristic(heuristic)
@@ -912,6 +1207,20 @@ class RestrictedMaster:
             deadline = float(deadline)
             if not math.isfinite(deadline):
                 raise ValueError("IP deadline must be finite")
+        setup_started = time.monotonic()
+        self.last_ip_eager_rows = (
+            self.materialize_bindable_rows(max_rows=max_eager_rows) if eager else 0
+        )
+        self.last_ip_setup_s = time.monotonic() - setup_started
+        self.last_ip_rounds = 0
+        if budget_s is not None:
+            budget_s = float(budget_s)
+            if not math.isfinite(budget_s) or budget_s <= 0.0:
+                raise ValueError("IP budget must be finite and positive")
+            # Starts NOW, after setup.  Still clipped by `deadline`, so a solve that has
+            # already overrun its whole-run wall cannot buy time back through this.
+            from_here = time.monotonic() + budget_s
+            deadline = from_here if deadline is None else min(deadline, from_here)
         self.last_ip_objective = None
         self.last_ip_bound = None
         self.last_ip_status = None
@@ -936,6 +1245,7 @@ class RestrictedMaster:
                 selection = self._selection_from_x(result.x)
                 violated = self.violated_claim_rows(selection)
                 if violated:
+                    self.last_ip_rounds += 1
                     added = self.materialize_rows(violated)
                     if not added:
                         raise RuntimeError(

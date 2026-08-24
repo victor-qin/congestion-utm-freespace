@@ -24,7 +24,6 @@ import numpy as np
 
 from ...config import SimConfig
 from ...types import FlightRequest, as_terminal
-from .master import BackendTimeout, RestrictedMaster
 from .objective import DELAY_MODEL, CostModel, cost_model
 from .network import (
     FlightGraph,
@@ -34,6 +33,9 @@ from .network import (
     build_flight_graph,
     column_claims,
 )
+from .master import BackendTimeout, RestrictedMaster
+from .master import gurobi_lp_method as _gurobi_lp_method
+from .master import gurobi_threads as _gurobi_threads
 from .params import ColGenParams
 from .pricing import (
     DualView,
@@ -486,6 +488,36 @@ def _backend_name(master: RestrictedMaster) -> str:
     return type(backend).__name__.removesuffix("Backend").lower()
 
 
+def _dual_regime_stats(backend_name: str) -> dict[str, int | None]:
+    """WHICH DUAL VECTOR PRICED THIS RUN, keyed off the backend that ACTUALLY ran.
+
+    Recorded because these are answer-affecting and were, until now, environment variables
+    nothing wrote down: the same pool under simplex and under barrier gave 196,332.8 and
+    184,729.0 at x1500.  An archived run without them cannot be compared to anything.
+    ``lp_method`` ``-1`` is Gurobi's automatic choice; ``2 / 0`` is barrier without
+    crossover, the default.
+
+    Keyed on the RESOLVED backend rather than on ``params.solver``, and the difference is
+    the whole point: ``solver="auto"`` falls back to HiGHS whenever gurobipy is missing, so
+    a `params`-keyed test reports ``lp_method=2`` for a run HiGHS actually priced -- exactly
+    the mislabelling these fields exist to prevent.  ``None`` means "no Gurobi LP ran", which
+    covers HiGHS, the auto fall-back, and the exits that never build a master at all.
+
+    Returned as a dict spliced into each stats block with ``**``, because
+    `test_every_exit_reports_the_same_stats_keys` pins the key SET across all three exits
+    and hand-copying these keys into three dicts is what produced a duplicated pair before.
+    """
+
+    if backend_name != "gurobi":
+        return {"lp_method": None, "lp_crossover": None, "gurobi_threads": None}
+    method, crossover = _gurobi_lp_method()
+    return {
+        "lp_method": method,
+        "lp_crossover": crossover,
+        "gurobi_threads": _gurobi_threads(),
+    }
+
+
 def _pre_master_timeout_result(
     flight_ids: Sequence[int],
     started: float,
@@ -512,10 +544,11 @@ def _pre_master_timeout_result(
     for graph in graph_values:
         arc_stats.update(graph.arc_cache_stats)
     wall_stats = {} if catalog is None else catalog.wall_index.stats
+    backend_name = "none" if master is None else _backend_name(master)
     return ColGenResult(
         columns={},
         stats={
-            "backend": "none" if master is None else _backend_name(master),
+            "backend": backend_name,
             "iterations": 0,
             "termination_reason": "time_limit",
             "lp_objectives": (),
@@ -554,7 +587,12 @@ def _pre_master_timeout_result(
             "kernel_declined_by_reason": {},
             "seeded_columns": 0,
             "ladder_columns": 0,
+            **_dual_regime_stats(backend_name),
             "ip_elapsed_s": 0.0,
+            "ip_time_limit_s": params.ip_time_limit_s,
+            "ip_eager_rows": 0,
+            "ip_separation_rounds": 0,
+            "ip_setup_s": 0.0,
             "ip_objective": None,
             "ip_upper_bound": None,
             "ip_cost_lower_bound": None,
@@ -573,6 +611,7 @@ def _pre_master_timeout_result(
             "search_exhausted_flight_ids": denied,
             "repair_added": 0,
             "seedless_flight_ids": tuple(sorted(seedless_flight_ids)),
+            "warm_start_planner": params.warm_start_planner,
             "initial_heuristic_strategy": "time_limit",
             "initial_heuristic_flights": 0,
             "initial_heuristic_delay_s": 0.0,
@@ -713,7 +752,13 @@ class ColGenSolver:
                     "kernel_declined_by_reason": {},
                     "seeded_columns": 0,
                     "ladder_columns": 0,
+                    # "none": this exit precedes any master, so no LP ran to have duals.
+                    **_dual_regime_stats("none"),
                     "ip_elapsed_s": 0.0,
+                    "ip_time_limit_s": params.ip_time_limit_s,
+                    "ip_eager_rows": 0,
+                    "ip_separation_rounds": 0,
+                    "ip_setup_s": 0.0,
                     "ip_objective": None,
                     "ip_upper_bound": None,
                     "ip_cost_lower_bound": None,
@@ -732,6 +777,7 @@ class ColGenSolver:
                     "seedless_flight_ids": (),
                     "budget_denied_flight_ids": (),
                     "search_exhausted_flight_ids": (),
+                    "warm_start_planner": params.warm_start_planner,
                     "initial_heuristic_strategy": "empty",
                     "initial_heuristic_flights": 0,
                     "initial_heuristic_delay_s": 0.0,
@@ -897,17 +943,78 @@ class ColGenSolver:
         # Optional warm start.  The policy above is a deliberate bet -- that route
         # alternatives are cheaper to discover by reduced-cost pricing than to enumerate
         # up front -- and `seed_columns` is how that bet gets tested rather than assumed.
-        # It is a pool-contents knob only: every column still goes through the same
-        # canonical claim gate, so it cannot introduce a trajectory pricing could not
-        # have produced, and it changes which optimum is reached only by the same
-        # tie-breaking that column order already governs.
+        # Every column still goes through the same canonical claim gate, so it cannot
+        # introduce a trajectory pricing could not have produced.
+        #
+        # IT IS NO LONGER A POOL-CONTENTS KNOB ONLY, and the ORDER of each flight's sequence
+        # is now load-bearing: element 0 is the flight's entry in the candidate INCUMBENT
+        # assembled below, and elements 1.. are pool contents alone.  `warm_start.build`
+        # relies on that -- it returns the repaired, mutually row-feasible column first and
+        # its departure-shifted alternatives after -- so a caller that re-orders a sequence
+        # silently changes which schedule is offered as the incumbent, not just which
+        # columns exist.  A caller with no incumbent to propose can pass any order it likes;
+        # the feasibility and improvement guards below reject a candidate that is not
+        # jointly claim-feasible or not better than the heuristic.
         seeded_columns = 0
+        seeded_first: dict[int, Column] = {}
         for flight_id, extras in (seed_columns or {}).items():
             if flight_id not in graphs:
                 raise KeyError(f"seed_columns names flight {flight_id}, which is not in this batch")
-            for column in extras:
-                master.add_column(_canonical_column(column, graphs[flight_id], cfg))
+            for position, column in enumerate(extras):
+                canonical = _canonical_column(column, graphs[flight_id], cfg)
+                master.add_column(canonical)
                 seeded_columns += 1
+                if position == 0:
+                    seeded_first[flight_id] = canonical
+        # The seed columns are also a candidate INCUMBENT, not only pool contents.  Adding
+        # them to the pool alone leaves them reachable exclusively through the final IP --
+        # and when that IP is truncated the run returns the shifted-seed heuristic instead,
+        # so a caller who supplied a whole better schedule gets none of it.  Measured at
+        # 1,500 flights: the heuristic's 233,520 was reported while A*'s 211,440 sat unused
+        # in the pool.  Taking it as the incumbent makes the fallback the BETTER of the two.
+        #
+        # Guarded, not assumed: the seeds are only an incumbent if they are jointly claim
+        # feasible (a caller's schedule need not be, and a warm start must never smuggle in
+        # an infeasible selection) and only if they actually beat the heuristic.
+        #
+        # The flights the seeds do NOT name are re-picked around them rather than left on
+        # their shifted-seed columns.  Overlaying the seeds on the heuristic was the
+        # obvious reading and it does not work: at 1,500 flights the 7 routes the graph
+        # could not express kept heuristic columns that clashed with the 1,493 seeded
+        # ones, `is_claim_feasible` failed on the overlay, and the warm start was thrown
+        # away over 0.5% of the schedule.  `complete_selection` pins the seeds and fills
+        # the rest greedily, so a leftover flight can only cost what its own best
+        # compatible column costs.
+        if seeded_first:
+            seeds_feasible = master.is_claim_feasible(seeded_first)
+            candidate = master.complete_selection(seeded_first) if seeds_feasible else {}
+            # WHY a warm start was refused is not recoverable after the fact: a candidate
+            # missing k flights loses on `k*M` while a clashing one never gets built at
+            # all, and both surface only as `initial_heuristic_strategy == "shifted_seeds"`.
+            # Measured at 1,500 flights, the two differ by 155x in magnitude and point at
+            # completely different fixes, so the run has to say which one happened.
+            log.info(
+                "  warm start: %d seeds, pins %s, completed to %d/%d flights, "
+                "objective %.1f vs heuristic %.1f",
+                len(seeded_first),
+                "feasible" if seeds_feasible else "INFEASIBLE",
+                len(candidate),
+                len(best_heuristic),
+                _selection_objective(candidate, params.M) if candidate else -math.inf,
+                _selection_objective(best_heuristic, params.M),
+            )
+            if candidate and _selection_objective(candidate, params.M) > _selection_objective(
+                best_heuristic, params.M
+            ):
+                # BOTH, and they have to move together.  `initial_heuristic` is what
+                # `initial_heuristic_flights` / `initial_heuristic_delay_s` are computed
+                # from, while `initial_heuristic_strategy` is set here -- so updating only
+                # the strategy leaves a run reporting "seed_columns" beside the flight count
+                # and delay of the shifted-seed selection it just replaced, which is a
+                # sentence about two different schedules.
+                initial_heuristic = candidate
+                best_heuristic = candidate
+                initial_heuristic_strategy = "seed_columns"
         if best_heuristic:
             master.set_heuristic(best_heuristic)
 
@@ -1347,14 +1454,41 @@ class ColGenSolver:
             ip_status = "time_limit_skipped"
             termination_reason = "time_limit"
         elif not ip_skipped:
-            master.backend.time_limit_s = max(1e-6, deadline - time.monotonic())
+            # The IP gets its OWN budget, not "whatever is left".  Both bounds are real:
+            # `deadline` keeps the solve inside the time limit it was given, and
+            # `ip_time_limit_s` keeps a loop that converged early from handing the MILP
+            # hours (see ColGenParams.ip_time_limit_s).  Whichever binds first wins.
+            # `ip_time_limit_s` is handed to `solve_ip` as a BUDGET rather than folded into
+            # a deadline here, because eager row materialization happens inside `solve_ip`
+            # and is setup, not search.  Pre-shrinking the deadline charged that setup to
+            # the solver: at x1500 it is 272 s, so a 900 s cap delivered 628 s of MILP and
+            # a 300 s cap delivered ~28 s and returned the incumbent untouched.  The
+            # whole-solve `deadline` still binds and is still the hard wall.
+            master.backend.time_limit_s = max(1e-6, params.ip_time_limit_s)
             master.set_heuristic(incumbent)
+            # Re-scale the MIP tolerance now that the incumbent's COST is known.
+            # `create_backend` can only assume the worst case (cost -> 0) and so hands the
+            # backend `ip_gap / (n*M)` -- an ABSOLUTE tolerance of `ip_gap` revenue units.
+            # At 1,000 flights that is 1e-12 relative, i.e. "prove a cost of 129,000 to
+            # within 0.001": ~129,000x tighter than the 0.1% `ip_gap` reads as, and the
+            # measured cause of the final MILP's blow-up (round 5 of separation went 6.5 s
+            # to 39.1 s, round 6 11.7 s to 134.6 s, purely from this).  Here the incumbent
+            # gives a real cost scale, so the same user-facing tolerance can be expressed
+            # against it.  `max(..., 1.0)` keeps the conservative old value when cost is
+            # genuinely tiny, which is the case the original conversion was protecting.
+            incumbent_cost = total_benefit - _selection_objective(incumbent, params.M)
+            revenue_scale = max(1.0, total_benefit)
+            master.backend.ip_gap = params.ip_gap * max(incumbent_cost, 1.0) / revenue_scale
             # Timed because it was the one unattributed block left in the solve.  Worth
             # knowing precisely: on a 1,138-column 100-flight pool the whole solve took
             # 643s and the IP was under a second of it, so "the IP is slow" is a
             # hypothesis that needs a number before anyone acts on it.
             ip_started = time.monotonic()
-            ip_selection = master.solve_ip(deadline=deadline)
+            ip_selection = master.solve_ip(
+                deadline=deadline,
+                budget_s=params.ip_time_limit_s,
+                max_eager_rows=params.max_eager_ip_rows,
+            )
             ip_elapsed_s = time.monotonic() - ip_started
             ip_selection = {
                 flight_id: _canonical_column(column, graphs[flight_id], cfg)
@@ -1572,6 +1706,16 @@ class ColGenSolver:
             "ip_optimal": ip_optimal,
             "ip_skipped": ip_skipped,
             "ip_elapsed_s": ip_elapsed_s,
+            # Reported alongside the elapsed time so a reader can tell an IP that finished
+            # from one the cap cut off, without inferring it from `ip_optimal` alone.
+            "ip_time_limit_s": params.ip_time_limit_s,
+            # Rows the bindability filter pre-materialized, and how many separation rounds
+            # were still needed afterwards.  A nonzero round count after an eager solve is
+            # the signal that some violable row was not predicted -- worth a look, since the
+            # filter is supposed to be exact rather than approximate.
+            "ip_eager_rows": master.last_ip_eager_rows,
+            "ip_separation_rounds": master.last_ip_rounds,
+            "ip_setup_s": master.last_ip_setup_s,
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
             "objective": objective_value,
@@ -1583,6 +1727,7 @@ class ColGenSolver:
             "search_exhausted_flight_ids": search_exhausted,
             "repair_added": repair_added,
             "seedless_flight_ids": tuple(sorted(seedless_flights)),
+            "warm_start_planner": params.warm_start_planner,
             "initial_heuristic_strategy": initial_heuristic_strategy,
             "initial_heuristic_flights": len(initial_heuristic),
             "initial_heuristic_delay_s": math.fsum(
@@ -1653,6 +1798,7 @@ class ColGenSolver:
             "n_columns": len(master.columns),
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,
+            **_dual_regime_stats(_backend_name(master)),
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,

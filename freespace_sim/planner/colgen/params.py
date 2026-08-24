@@ -8,6 +8,12 @@ import os
 from dataclasses import dataclass
 
 
+# Planners whose schedule can be translated into a colgen warm start.  Kept as a module
+# constant so `params` validates a name without importing the planner registry -- colgen is
+# imported BY the sim, so reaching back for it here would be circular.
+WARM_START_PLANNERS = frozenset({"astar"})
+
+
 @dataclass(frozen=True, slots=True)
 class ColGenParams:
     """Network and solver controls for one column-generation run.
@@ -130,7 +136,24 @@ class ColGenParams:
     # is the dominant term in how much search a sweep does, so it is also where speed tuning
     # starts.
     max_air_overrun_hops: int = 3
-    solver: str = "auto"
+    # Gurobi by default, NOT "auto".  The difference is what happens when gurobipy is
+    # missing: "auto" falls back to HiGHS silently, so a run that believes it is on Gurobi
+    # can quietly be on the other backend -- and the backend is answer-affecting, not just
+    # a speed knob (Gurobi's duals close the default revenue gap at iteration 1 where HiGHS
+    # runs 17).  "gurobi" raises instead, naming the missing extra.
+    #
+    # It is also the backend that scales.  HiGHS reaches the master through
+    # `scipy.optimize.milp`, which has no incumbent parameter, so the final IP runs COLD --
+    # measured on `density_faa_wing_zipline` x1000, a 23.5k-column / 46k-row pool: over 30
+    # minutes and still going, more than all three pricing sweeps put together (610 + 459 +
+    # 190 s).  Gurobi takes the rounding incumbent as a warm start and is multi-threaded.
+    #
+    # `pyproject.toml` deliberately keeps gurobipy an opt-in extra because the PyPI wheel
+    # ships a size-limited trial that silently caps model size; this default therefore makes
+    # `uv sync --extra gurobi` (and a real licence) a requirement for colgen, and says so
+    # loudly rather than degrading.  Set `solver="highs"` to opt out, or "auto" for the old
+    # fall-back behaviour.
+    solver: str = "gurobi"
     max_iterations: int = 30
     # 20 minutes, raised from 120 s. The old default could not finish a single pricing
     # sweep on a real instance: measured on `density_faa_wing_zipline` x100, iteration 1
@@ -146,9 +169,63 @@ class ColGenParams:
     # raising this lifts that stage's effective ceiling on a batch large enough for
     # `rate * n_flights` to reach it (about 1,700 flights at the old 0.7 rate).
     time_limit_s: float = 1200.0
+    # A cap on the FINAL restricted-master IP, in seconds of its own -- not a share of
+    # `time_limit_s`.  Without it the IP simply inherits whatever is left of the whole-solve
+    # deadline, which is unbounded from the IP's point of view precisely when the loop went
+    # WELL: a solve that converges on `lp_gap` or hits `max_iterations` early hands the MILP
+    # every remaining second. Measured on `density_faa_wing_zipline` x1000 with
+    # `time_limit_s=10800`: the CG loop finished three iterations in ~21 minutes of pricing,
+    # then the IP ran over 30 minutes and was still going, with ~2 hours of budget left to
+    # burn -- longer than every pricing sweep combined, and single-threaded on HiGHS, whose
+    # `scipy.optimize.milp` takes no incumbent so it cannot even start from the rounding
+    # solution the solver already holds.
+    #
+    # Exceeding it is not a failure: `solve_ip` falls back to the independently validated
+    # rounding incumbent and reports `time_limit_separation` / a non-optimal `ip_status`, so
+    # the run still produces a claim-feasible schedule -- just an uncertified one.  That is
+    # the right trade for a stage whose marginal value is proving what the heuristic already
+    # found; raise it when the IP's certificate is what you are after.
+    #
+    # It composes with, rather than replaces, `ip_reserve_s = min(5, 0.05 * time_limit_s)`:
+    # that is how much the pricing loop holds BACK, this is how long the IP may then run.
+    # When the loop consumes its whole budget the reserve still binds and the IP gets the
+    # smaller tail.
+    ip_time_limit_s: float = 120.0
+    # Ceiling on the rows the final IP may pre-materialize, or ``None`` for no ceiling --
+    # which is the shipped default and preserves the behaviour measured everywhere in this
+    # PR.  `RestrictedMaster.materialize_bindable_rows` is all-or-nothing: over the bound it
+    # materializes NOTHING and the separation loop behaves exactly as it did before, because
+    # a partially materialized set is the worst of both (it looks eager in the stats and
+    # still has to search).
+    #
+    # Worth having reachable rather than left as an unused argument: eager materialization
+    # is 495,574 rows and 272 s at x1500 and scales WITH the pool, so a denser pool than any
+    # measured here has no brake at all otherwise.  `ip_eager_rows == 0` beside a nonzero
+    # `ip_separation_rounds` in a run's stats is what hitting this looks like.
+    max_eager_ip_rows: int | None = None
     lp_gap: float = 1e-4
     ip_gap: float = 1e-3
-    M: float = 1_000_000.0
+    # Revenue per served flight in the set-packing objective `sum (M - delay_s) x`.  Its ONLY
+    # requirement is that serving a flight always beats denying it -- `M > max delay_s` -- and
+    # everything above that threshold is pure numerical harm.
+    #
+    # `delay_s = 1*ground + 3*(air beyond reference)`.  Ground is capped by
+    # `cfg.max_ground_delay_s` (3600 on the density scenarios) and air by
+    # `max_air_overrun_hops` plus lattice overhead (~35 s typical, a few hundred at worst), so
+    # the bound is ~4,600 and 1e4 clears it ~2.2x.  Exceeding 1e4 would need >2,100 s of extra
+    # flying, which the 3-hop cap makes impossible.
+    #
+    # 1e6 cost a factor of 100 in conditioning for nothing.  Coefficients are `M - delay_s`:
+    # at 1e6 that is ~999,855 varying by ~1,000, so the quantity being optimized is 0.1% of
+    # the number carrying it and lives in the last three digits.  At 1e4 the same variation is
+    # 10% of the coefficient.  The `LB -1e9` dual escape recorded on the density runs is what
+    # that looks like from the outside.
+    #
+    # Reported figures do NOT move with M: runs report `cost = n*M - ip_objective`, and
+    # `Column.delay_s` has no M in it, so archived cost numbers stay on this same ruler.  The
+    # SOLUTIONS may differ -- a differently conditioned search takes a different path -- so
+    # this is answer-affecting even though the metric is not.
+    M: float = 10_000.0
     epsilon: float = 1e-6
     # Two consumers, and they scale differently.
     #
@@ -197,7 +274,28 @@ class ColGenParams:
     #                objective, whose scale includes n*M.
     #   "cost"    -- the same absolute gap normalized by total cost instead, which is
     #                what this repo used before and is far stricter when M >> cost.
-    gap_metric: str = "revenue"
+    #
+    # Pinned to "cost" because "revenue" is not scale-free in M and M just moved.  The revenue
+    # gate reduces to `tau*M` -- `n` cancels -- so it literally reads "stop unless the average
+    # flight can still save more than `tau*M` seconds": 100 s at M=1e6, but 1 s at M=1e4.
+    # Leaving the default on "revenue" would have turned the M change into a silent 100x
+    # tightening of the stopping rule, converting ordinary runs into time-limit runs.  "cost"
+    # measures the gap against the quantity being optimized and does not move with M at all,
+    # which is the property a default needs.  Every analysis script in this investigation was
+    # already passing "cost" explicitly for exactly this reason.
+    gap_metric: str = "cost"
+    # Optionally run another planner first and hand colgen its schedule -- as pool columns
+    # AND as the starting incumbent.  ``None`` (the shipped default) means colgen opens
+    # from its own geodesic seeds; ``"astar"`` seeds from FCFS A*.
+    #
+    # OFF BY DEFAULT ON PURPOSE, and the reason is reporting rather than cost.  Measured on
+    # `density_faa_wing_zipline` x1500: unaided colgen is 235,388 (+11.3% against A*), and
+    # A*-seeded colgen is 196,398 (-7.1%).  Turning this on silently would make "colgen" in
+    # every future result mean "A* plus colgen refinement", so "colgen beats A*" would
+    # quietly become "refining A* beats A*" -- a different and much weaker claim, with no
+    # way to tell archived runs apart afterwards.  It is reported in `stats` for the same
+    # reason.  A* itself costs 64 s against a 3,750 s solve, so the price is not the issue.
+    warm_start_planner: str | None = None
     # Pure clock translations of each flight's seed, offered to the master before the
     # first LP.  A shift is arithmetic, not a search, and pricing otherwise spends its
     # early iterations rediscovering exactly these -- 91% of the columns added in
@@ -445,6 +543,35 @@ class ColGenParams:
             raise ValueError("max_air_overrun_hops must be non-negative")
         object.__setattr__(self, "max_air_overrun_hops", overrun)
 
+        # Zero would make every IP a no-op that silently returns the rounding incumbent,
+        # which is a legitimate thing to want but not a legitimate thing to reach by
+        # accident, so it has to be asked for as a positive number.
+        try:
+            ip_limit = float(self.ip_time_limit_s)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("ip_time_limit_s must be a number") from exc
+        if not math.isfinite(ip_limit) or ip_limit <= 0.0:
+            raise ValueError(
+                f"ip_time_limit_s must be finite and positive, got {self.ip_time_limit_s!r}"
+            )
+        object.__setattr__(self, "ip_time_limit_s", ip_limit)
+
+        # ``None`` is "no ceiling", which is different from 0 -- 0 means "never materialize
+        # eagerly", a legitimate way to pin the old lazy separation loop for an A/B.  Both
+        # are reachable, so the validator only has to reject negatives and non-integers.
+        if self.max_eager_ip_rows is not None:
+            if isinstance(self.max_eager_ip_rows, bool):
+                raise TypeError("max_eager_ip_rows must be an integer or None")
+            try:
+                max_eager = operator.index(self.max_eager_ip_rows)
+            except TypeError as exc:
+                raise TypeError("max_eager_ip_rows must be an integer or None") from exc
+            if max_eager < 0:
+                raise ValueError(
+                    f"max_eager_ip_rows must be non-negative, got {self.max_eager_ip_rows!r}"
+                )
+            object.__setattr__(self, "max_eager_ip_rows", max_eager)
+
         if not isinstance(self.solver, str):
             raise TypeError("solver must be a string")
         solver = self.solver.lower()
@@ -464,6 +591,17 @@ class ColGenParams:
             raise TypeError("gap_metric must be a string")
         if self.gap_metric not in {"revenue", "cost"}:
             raise ValueError("gap_metric must be 'revenue' or 'cost'")
+        # Validated against a whitelist rather than resolved lazily: an unknown name here
+        # would otherwise surface as a silent no-op warm start, and "colgen ran unseeded"
+        # is indistinguishable in the output from "colgen was seeded and it did not help".
+        if self.warm_start_planner is not None:
+            if not isinstance(self.warm_start_planner, str):
+                raise TypeError("warm_start_planner must be a string or None")
+            if self.warm_start_planner not in WARM_START_PLANNERS:
+                raise ValueError(
+                    f"warm_start_planner must be None or one of "
+                    f"{sorted(WARM_START_PLANNERS)}, got {self.warm_start_planner!r}"
+                )
 
         if isinstance(self.seed_ladder_steps, bool):
             raise TypeError("seed_ladder_steps must be an integer")

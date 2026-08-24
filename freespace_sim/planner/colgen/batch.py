@@ -66,6 +66,127 @@ def _log_iteration(state: dict) -> None:
     )
 
 
+# The keys `warm_start.build` writes that describe the PLACED columns rather than a reason a
+# flight was left out.  Everything else in its stats counter is an unplaced-flight reason and
+# is logged as one -- see `_build_warm_start`.  Kept beside the reader rather than exported
+# from `warm_start`, because the coupling is one-way: adding a reason there needs no edit
+# here, while adding a summary key does, and a summary key leaking into the log is visible.
+_BUILD_SUMMARY_KEYS = frozenset(
+    {"placed", "placed after a hold", "ladder columns", "total held steps", "rows over cap", "cost"}
+)
+
+
+def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenParams):
+    """Run ``params.warm_start_planner`` and translate its schedule into seed columns.
+
+    Returns ``None`` when no warm-start planner is configured, which is the shipped
+    default -- see `ColGenParams.warm_start_planner` for why this is opt-in.
+
+    Failures here are LOUD.  A warm start that silently produces nothing is invisible in
+    the output: the run simply looks like an ordinary unseeded solve, and the seeded and
+    unseeded arms of an experiment become indistinguishable after the fact.  The one thing
+    that is tolerated quietly is individual flights the column model cannot express (an
+    air hold, a route outside the O-D ellipse); those are counted and logged, and
+    `RestrictedMaster.complete_selection` re-picks them around the ones that placed.
+    """
+
+    planner = params.warm_start_planner
+    if planner is None:
+        return None
+
+    # Imported here, not at module scope: `sim` imports this module to reach
+    # `ColumnGenerationPlanner`, so a top-level import would be circular.
+    from freespace_sim import sim
+    from freespace_sim.planner.colgen import warm_start as warm_start_module
+    from freespace_sim.planner.colgen.network import (
+        RowIndex,
+        StaticTerminalCatalog,
+        build_flight_graph,
+    )
+    from freespace_sim.planner.colgen.objective import cost_model
+
+    started = time.monotonic()
+    # `static_terminals` is handed over rather than left to `sim.run` to re-derive, and this
+    # is a correctness requirement.  That derivation is not a function of the requests: from
+    # a demand model it is every PLACED hub, from a bare request list only the hubs a flight
+    # touches.  This call passes a bare request list, so without the override a hub that
+    # draws no flight in the horizon would be SOLID for the colgen solve and OPEN for the A*
+    # pass seeding it -- measured on `density_faa_wing_zipline` truncated to 600 s, 182
+    # against 180, so A* routes through two walls colgen enforces and the columns carrying
+    # them are then rejected in translation and counted as drops.
+    seeded = sim.run(
+        cfg,
+        requests=list(requests),
+        planner_name=planner,
+        progress=False,
+        static_terminals=list(static_terms),
+    )
+    accepted = {
+        intent.request.flight_id: intent for intent in seeded.intents if intent.accepted
+    }
+    if not accepted:
+        raise RuntimeError(
+            f"warm_start_planner={planner!r} accepted no flights; there is nothing to seed"
+        )
+    catalog = StaticTerminalCatalog(list(static_terms), cfg)
+    graphs = {
+        request.flight_id: build_flight_graph(request, cfg, catalog, params)
+        for request in requests
+        if request.flight_id in accepted
+    }
+    # Built the SAME WAY `ColGenSolver.solve` builds its own, and that is a correctness
+    # requirement rather than tidiness: `warm_start.build` calls `row_index.cap(row)` on
+    # every claim of every candidate column, and `RowIndex.cap` raises `KeyError` for an
+    # unregistered terminal rather than assuming capacity one.  The static catalog alone
+    # covers today's scenarios only because `run_batch` refuses terminal endpoints unless
+    # `terminal_airspace_always_active`, which puts every terminal in `static_terms` -- an
+    # invariant enforced three frames away.  Registering the graphs' own terminals too costs
+    # nothing and removes the dependency on it.
+    row_index = RowIndex({terminal.id: terminal.capacity for _c, terminal in catalog.entries})
+    for graph in graphs.values():
+        for terminal_id, capacity in graph.terminal_capacities.items():
+            row_index.register_terminal(terminal_id, capacity)
+    seed_columns, stats = warm_start_module.build(
+        accepted, graphs, cfg, cost_model(cfg, params), row_index
+    )
+    # Every flight that did NOT place, by reason.  The counts existed and were thrown away,
+    # which left the one number a reader needs -- why 7 of 1,500 were dropped -- derivable
+    # only as `accepted - placed`, with no way to tell an inexpressible route (an air hold)
+    # from one the repair loop could not fit inside `max_shift`.  Those two point at
+    # completely different fixes.
+    #
+    # Selected by EXCLUDING the summary keys rather than by matching a reason prefix, and
+    # the direction matters: `build` interpolates its reasons (`f"unconvertible: {why}"`),
+    # so a prefix filter silently loses any reason phrased differently later, which is the
+    # failure this logging exists to prevent.  Excluding instead means a new key shows up
+    # uninvited -- noise in one log line, not a missing diagnosis.
+    unplaced = sorted(
+        (reason, count) for reason, count in stats.items() if reason not in _BUILD_SUMMARY_KEYS
+    )
+    log.info(
+        "warm start from %s: %d/%d flights accepted, %d placed as columns, "
+        "%d held, %d rows over cap, %.1fs%s",
+        planner,
+        len(accepted),
+        len(requests),
+        stats["placed"],
+        stats["total held steps"],
+        stats["rows over cap"],
+        time.monotonic() - started,
+        (
+            "; unplaced: " + ", ".join(f"{reason} x{count}" for reason, count in unplaced)
+            if unplaced
+            else ""
+        ),
+    )
+    if not seed_columns:
+        raise RuntimeError(
+            f"warm_start_planner={planner!r} produced no usable columns from "
+            f"{len(accepted)} accepted flights; seeding would be a silent no-op"
+        )
+    return seed_columns
+
+
 def run_batch(
     scenario: Scenario,
     cfg: SimConfig,
@@ -165,9 +286,14 @@ def run_batch(
          if batch_params.greedy_budget_s_per_flight else "off"),
         batch_params.seed_ladder_steps or "off",
     )
+    # Optional warm start from another planner.  Built HERE rather than inside the solver
+    # because it needs `sim.run`, and the sim imports colgen -- doing it in `solver` would
+    # close an import cycle.  This is the layer that already owns the scenario.
+    seed_columns = _build_warm_start(requests, cfg, static_terms, batch_params)
     solve_started = time.monotonic()
     result = ColGenSolver().solve(
         requests, cfg, static_terms, batch_params,
+        seed_columns=seed_columns,
         on_iteration=on_iteration if on_iteration is not None else _log_iteration,
         # Worker count is NOT plumbed here: it rides on `batch_params.n_pricing_workers`,
         # which `price_sweep` reads directly.  This used to build a `ParallelPricingConfig`

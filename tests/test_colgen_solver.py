@@ -2312,3 +2312,160 @@ def test_warm_start_translation_rejects_a_route_it_cannot_express():
     graph = object()
     column, why = intent_to_column(_Stub(((np.array([0.0, 0.0, 0.0]), 0.0),)), graph, cfg)
     assert column is None and why == "degenerate path"
+
+
+def test_warm_start_round_trips_a_column_through_an_intent():
+    """`intent_to_column` must recover the route a column already describes.
+
+    The translation is the load-bearing half of the warm start and it had no positive test:
+    every existing case asserts a REJECTION.  Round-tripping a real seed column through
+    `column_to_intent` and back pins the rasterisation, the departure-step recovery and the
+    endpoint lane indices against the very geometry the master will re-canonicalise.
+    """
+
+    from freespace_sim.planner.colgen.pricing import seed_column
+    from freespace_sim.planner.colgen.warm_start import intent_to_column
+
+    cfg = _cfg(max_ground_delay_s=64.0)
+    params = _params()
+    model = cost_model(cfg, params)
+    request = _request(1, (-3, 0), (3, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), params)
+
+    original = seed_column(graph, cfg, model=model)
+    rebuilt, why = intent_to_column(
+        column_to_intent(original, request, cfg), graph, cfg, model
+    )
+
+    assert rebuilt is not None, f"a seed column must round-trip, got {why!r}"
+    assert rebuilt.cell_path == original.cell_path
+    assert rebuilt.departure_step == original.departure_step
+    # `delay_s` is the master's objective coefficient, and a warm-start column that carried
+    # 0.0 would be free to the LP -- the failure the module docstring calls out by name.
+    assert rebuilt.delay_s == pytest.approx(original.delay_s)
+
+
+def test_warm_start_repair_holds_the_later_flight_rather_than_dropping_it():
+    """Two flights on one path: FCFS keeps the first, the second is held, both survive.
+
+    Snapping continuous departures onto ``dt`` is what makes translation insufficient on its
+    own -- two flights the ledger cleared a couple of seconds apart round to the same step
+    and collide on a cap-1 cell row that never existed in the source schedule.  `build`
+    walks flight-id order (the priority the source planner itself used) and shifts the loser
+    later until its claims fit, so a collision costs a hold rather than a flight.
+    """
+
+    from freespace_sim.planner.colgen import warm_start as warm_start_module
+    from freespace_sim.planner.colgen.pricing import seed_column
+
+    cfg = _cfg(max_ground_delay_s=64.0)
+    params = _params()
+    model = cost_model(cfg, params)
+    # Crossing paths departing together: they contend only around the centre cell, which is
+    # the shape the default `max_shift=8` can actually repair.  Two flights sharing an
+    # ORIGIN need 16 and two on an identical path need 16, so both fall outside the default
+    # — see `test_warm_start_max_shift_is_below_the_shared_origin_threshold`.
+    requests = [
+        _request(1, (-3, 0), (3, 0), cfg),
+        _request(2, (0, -3), (0, 3), cfg),
+    ]
+    graphs = {r.flight_id: build_flight_graph(r, cfg, (), params) for r in requests}
+    accepted = {
+        r.flight_id: column_to_intent(seed_column(graphs[r.flight_id], cfg, model=model), r, cfg)
+        for r in requests
+    }
+
+    seed_columns, stats = warm_start_module.build(accepted, graphs, cfg, model, RowIndex())
+
+    assert set(seed_columns) == {1, 2}, "a collision must cost a hold, not a flight"
+    assert stats["placed"] == 2
+    assert stats["rows over cap"] == 0, "the repaired set is what makes it an incumbent"
+    # FCFS: the lower flight id keeps its slot and the later one yields.
+    assert seed_columns[1][0].departure_step < seed_columns[2][0].departure_step
+    assert stats["total held steps"] >= 1
+    assert stats["placed after a hold"] == 1
+
+    # And the repaired set is jointly feasible in the master's own terms, which is the
+    # property `solve` checks before adopting it as an incumbent.
+    master = RestrictedMaster((1, 2), RowIndex(), params)
+    for columns in seed_columns.values():
+        for column in columns:
+            master.add_column(column)
+    assert master.is_claim_feasible({fid: cols[0] for fid, cols in seed_columns.items()})
+
+
+def test_warm_start_drops_a_flight_it_cannot_place_within_max_shift():
+    """An unplaceable flight is dropped and counted, never forced into a violation.
+
+    `max_shift=0` removes the repair loop's only tool, so the second flight has nowhere to
+    go.  It must fall out of the seed set with `dropped (no feasible shift)` recorded --
+    `complete_selection` then re-picks it around the survivors, which is only correct if it
+    was genuinely omitted rather than silently overlaid.
+    """
+
+    from freespace_sim.planner.colgen import warm_start as warm_start_module
+    from freespace_sim.planner.colgen.pricing import seed_column
+
+    cfg = _cfg(max_ground_delay_s=64.0)
+    params = _params()
+    model = cost_model(cfg, params)
+    requests = [_request(flight_id, (-3, 0), (3, 0), cfg) for flight_id in (1, 2)]
+    graphs = {r.flight_id: build_flight_graph(r, cfg, (), params) for r in requests}
+    accepted = {
+        r.flight_id: column_to_intent(seed_column(graphs[r.flight_id], cfg, model=model), r, cfg)
+        for r in requests
+    }
+
+    seed_columns, stats = warm_start_module.build(
+        accepted, graphs, cfg, model, RowIndex(), max_shift=0
+    )
+
+    assert set(seed_columns) == {1}, "flight 2 has no shift available and must be dropped"
+    assert stats["placed"] == 1
+    assert stats["dropped (no feasible shift)"] == 1
+    assert stats["rows over cap"] == 0
+
+
+def test_warm_start_max_shift_is_below_the_shared_origin_threshold():
+    """``max_shift=8`` cannot separate two flights that share an origin.  It needs 16.
+
+    Pinned because the constant is hardcoded in `build`'s signature, is never overridden by
+    `batch._build_warm_start`, and is not reachable from `ColGenParams` or the CLI -- so the
+    only record of what it buys is here.  A column's claims span roughly twenty steps of
+    corridor, so eight steps of hold does not clear a co-located pair: the repair loop can
+    fix a CROSSING conflict (4 steps suffice) but not a shared-origin one, and a
+    hub-and-spoke scenario is made of shared origins.
+
+    A dropped flight is not lost -- `complete_selection` re-picks it around the survivors --
+    so this is a warm-start QUALITY bound, not a correctness bug.  Raise the number here if
+    a scenario starts reporting a large `dropped (no feasible shift)` count.
+    """
+
+    from freespace_sim.planner.colgen import warm_start as warm_start_module
+    from freespace_sim.planner.colgen.pricing import seed_column
+
+    # A departure window far wider than any shift tried, so `max_shift` is the only bound.
+    cfg = _cfg(max_ground_delay_s=600.0)
+    params = _params()
+    model = cost_model(cfg, params)
+    requests = [
+        _request(1, (-3, 0), (3, 0), cfg),
+        _request(2, (-3, 0), (0, 3), cfg),      # same origin, different destination
+    ]
+    graphs = {r.flight_id: build_flight_graph(r, cfg, (), params) for r in requests}
+    accepted = {
+        r.flight_id: column_to_intent(seed_column(graphs[r.flight_id], cfg, model=model), r, cfg)
+        for r in requests
+    }
+
+    at_default, stats = warm_start_module.build(
+        accepted, graphs, cfg, model, RowIndex(), max_shift=8
+    )
+    assert set(at_default) == {1}, "the shipped max_shift is expected to drop the second"
+    assert stats["dropped (no feasible shift)"] == 1
+
+    at_sixteen, stats = warm_start_module.build(
+        accepted, graphs, cfg, model, RowIndex(), max_shift=16
+    )
+    assert set(at_sixteen) == {1, 2}, "sixteen steps is enough to clear a shared origin"
+    assert stats["rows over cap"] == 0

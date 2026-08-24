@@ -9,8 +9,8 @@ objective and returned inequality marginals.
 from __future__ import annotations
 
 import math
-import os
 import operator
+import os
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -66,6 +66,13 @@ class LpBackend(Protocol):
     name: str
     flight_ids: tuple[int, ...]
     time_limit_s: float
+    # Both of these are RE-SET by the caller between construction and the final IP, so they
+    # are part of the contract rather than constructor trivia.  `time_limit_s` has always
+    # been; `ip_gap` joined it when the solver started re-scaling the MIP tolerance against
+    # the incumbent's cost -- `create_backend` can only assume the worst case (cost -> 0),
+    # which is ~n*M times too tight once a real incumbent exists.  Declared here so a new
+    # backend satisfying only this Protocol cannot silently lack the attribute.
+    ip_gap: float
 
     def add_column(
         self,

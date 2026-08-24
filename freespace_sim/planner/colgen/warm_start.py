@@ -115,12 +115,29 @@ def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
     ), None
 
 
-def _column_at(intent, graph, cfg: "SimConfig", model, delta: int):
-    """The intent's column held ``delta`` steps later, claims computed, or a reason."""
+def _column_at(intent, graph, cfg: "SimConfig", model, delta: int, base=None):
+    """The intent's column held ``delta`` steps later, claims computed, or a reason.
 
-    column, why = intent_to_column(intent, graph, cfg, model)
-    if column is None:
-        return None, why
+    ``base`` is the UNSHIFTED column, which does not depend on ``delta``.  `build` builds it
+    once per flight and hands it to every shift, because the repair loop asks for up to
+    ``max_shift + 1`` of them and the ladder several more -- recomputing it per delta re-ran
+    the centreline rasterisation, `column_to_intent` and `model.evaluate` for a
+    byte-identical result.  Passing ``None`` rebuilds it, which is what a caller outside
+    that loop wants.
+
+    This is a clarity change, NOT a measured speedup, and the number is here so nobody
+    over-credits it later: `intent_to_column` is 0.18 ms on a 16-hop O-D, so the repeat cost
+    only ~1.4 ms per HELD OR DROPPED flight (about 2 s if all 1,500 were held) and exactly
+    nothing for a flight that places at delta 0, which is most of them.  What it actually
+    buys is that the loop's cost no longer scales with ``max_shift`` -- which matters
+    because that constant is the one worth RAISING (see the shared-origin threshold test).
+    """
+
+    if base is None:
+        base, why = intent_to_column(intent, graph, cfg, model)
+        if base is None:
+            return None, why
+    column = base
     if delta:
         step = column.departure_step + delta
         if step > graph.latest_departure_step:
@@ -128,7 +145,19 @@ def _column_at(intent, graph, cfg: "SimConfig", model, delta: int):
         column = replace(column, departure_step=step)
         # Recomputed, never carried: `delay_s` is the objective coefficient and a held
         # column is strictly more expensive than the one it was shifted from.
-        translated = column_to_intent(column, graph.request, cfg)
+        #
+        # Guarded for the same reason the delta-0 call inside `intent_to_column` is.  Today
+        # the only departure-dependent rejection is the ground-delay cap, and the window
+        # check above is exactly equivalent to it (`build_flight_graph` sets
+        # `latest_departure_step = base_step + max_ground_steps`, the same bound
+        # `column_to_intent` re-derives) -- so this cannot currently fire.  It is guarded
+        # anyway because those two bounds live in different modules with no shared
+        # constant, and an uncaught ValueError here does not drop one flight, it aborts the
+        # whole solve from inside the repair loop.
+        try:
+            translated = column_to_intent(column, graph.request, cfg)
+        except ValueError as exc:
+            return None, f"shifted translation rejected: {str(exc)[:50]}"
         column = replace(
             column,
             delay_s=model.evaluate(
@@ -180,20 +209,26 @@ def build(
         if graph is None:
             stats["no graph"] += 1
             continue
+        # Rasterised ONCE per flight and reused by every shift below.  It does not depend on
+        # `delta`, and this loop asks for up to `max_shift + 1` of them plus `ladder` more.
+        base, base_why = intent_to_column(accepted[flight_id], graph, cfg, model)
         placed = None
-        for delta in range(max_shift + 1):
-            column, why = _column_at(accepted[flight_id], graph, cfg, model, delta)
-            if column is None:
-                if delta == 0:
-                    # Only the unshifted failure names a real inexpressibility; a later
-                    # delta failing usually just means the window ran out.
-                    stats[f"unconvertible: {why}"] += 1
-                    break
-                continue
-            if any(loads[row] + 1 > row_index.cap(row) for row in column.claims):
-                continue
-            placed = (delta, column)
-            break
+        if base is None:
+            stats[f"unconvertible: {base_why}"] += 1
+        else:
+            for delta in range(max_shift + 1):
+                column, why = _column_at(accepted[flight_id], graph, cfg, model, delta, base)
+                if column is None:
+                    if delta == 0:
+                        # Only the unshifted failure names a real inexpressibility; a later
+                        # delta failing usually just means the window ran out.
+                        stats[f"unconvertible: {why}"] += 1
+                        break
+                    continue
+                if any(loads[row] + 1 > row_index.cap(row) for row in column.claims):
+                    continue
+                placed = (delta, column)
+                break
         if placed is None:
             stats["dropped (no feasible shift)"] += 1
             continue
@@ -206,7 +241,9 @@ def build(
             loads[row] += 1
         columns = [column]
         for extra in range(1, ladder + 1):
-            more, _why = _column_at(accepted[flight_id], graph, cfg, model, delta + extra)
+            more, _why = _column_at(
+                accepted[flight_id], graph, cfg, model, delta + extra, base
+            )
             if more is not None:
                 columns.append(more)
                 stats["ladder columns"] += 1

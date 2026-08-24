@@ -724,8 +724,6 @@ class ColGenSolver:
                     "ladder_columns": 0,
                     "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
                     "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
-            "lp_method": _gurobi_lp_method()[0] if params.solver != "highs" else None,
-            "lp_crossover": _gurobi_lp_method()[1] if params.solver != "highs" else None,
                     "ip_elapsed_s": 0.0,
                     "ip_time_limit_s": params.ip_time_limit_s,
                     "ip_eager_rows": 0,
@@ -928,10 +926,18 @@ class ColGenSolver:
         # Optional warm start.  The policy above is a deliberate bet -- that route
         # alternatives are cheaper to discover by reduced-cost pricing than to enumerate
         # up front -- and `seed_columns` is how that bet gets tested rather than assumed.
-        # It is a pool-contents knob only: every column still goes through the same
-        # canonical claim gate, so it cannot introduce a trajectory pricing could not
-        # have produced, and it changes which optimum is reached only by the same
-        # tie-breaking that column order already governs.
+        # Every column still goes through the same canonical claim gate, so it cannot
+        # introduce a trajectory pricing could not have produced.
+        #
+        # IT IS NO LONGER A POOL-CONTENTS KNOB ONLY, and the ORDER of each flight's sequence
+        # is now load-bearing: element 0 is the flight's entry in the candidate INCUMBENT
+        # assembled below, and elements 1.. are pool contents alone.  `warm_start.build`
+        # relies on that -- it returns the repaired, mutually row-feasible column first and
+        # its departure-shifted alternatives after -- so a caller that re-orders a sequence
+        # silently changes which schedule is offered as the incumbent, not just which
+        # columns exist.  A caller with no incumbent to propose can pass any order it likes;
+        # the feasibility and improvement guards below reject a candidate that is not
+        # jointly claim-feasible or not better than the heuristic.
         seeded_columns = 0
         seeded_first: dict[int, Column] = {}
         for flight_id, extras in (seed_columns or {}).items():

@@ -2534,7 +2534,12 @@ def test_warm_start_round_trips_a_column_through_an_intent():
 
 
 def test_warm_start_repair_holds_the_later_flight_rather_than_dropping_it():
-    """Two flights on one path: FCFS keeps the first, the second is held, both survive.
+    """Two CROSSING flights: FCFS keeps the first, the second is held, both survive.
+
+    Crossing, not co-located -- the distinction is the whole subject of
+    `test_warm_start_max_shift_is_below_the_shared_origin_threshold` and the two cases fall
+    on opposite sides of the shipped ``max_shift``.  A crossing pair contends only around
+    the intersection and separates in 4 steps; a shared origin needs 13 and is dropped.
 
     Snapping continuous departures onto ``dt`` is what makes translation insufficient on its
     own -- two flights the ledger cleared a couple of seconds apart round to the same step
@@ -2549,10 +2554,10 @@ def test_warm_start_repair_holds_the_later_flight_rather_than_dropping_it():
     cfg = _cfg(max_ground_delay_s=64.0)
     params = _params()
     model = cost_model(cfg, params)
-    # Crossing paths departing together: they contend only around the centre cell, which is
-    # the shape the default `max_shift=8` can actually repair.  Two flights sharing an
-    # ORIGIN need 16 and two on an identical path need 16, so both fall outside the default
-    # — see `test_warm_start_max_shift_is_below_the_shared_origin_threshold`.
+    # Crossing paths departing together: they contend only around the centre cell, so 4
+    # steps of hold separate them and that is the shape the default `max_shift=8` repairs.
+    # A shared ORIGIN needs 13 and an identical path 15, both outside the default — see
+    # `test_warm_start_max_shift_is_below_the_shared_origin_threshold`.
     requests = [
         _request(1, (-3, 0), (3, 0), cfg),
         _request(2, (0, -3), (0, 3), cfg),
@@ -2570,7 +2575,10 @@ def test_warm_start_repair_holds_the_later_flight_rather_than_dropping_it():
     assert stats["rows over cap"] == 0, "the repaired set is what makes it an incumbent"
     # FCFS: the lower flight id keeps its slot and the later one yields.
     assert seed_columns[1][0].departure_step < seed_columns[2][0].departure_step
-    assert stats["total held steps"] >= 1
+    # EXACTLY 4, not merely "some hold".  `>= 1` would let this drift toward the shipped
+    # `max_shift` of 8 unnoticed, and how much headroom the default has over the conflict it
+    # is meant to repair is the number the threshold test is about.
+    assert stats["total held steps"] == 4
     assert stats["placed after a hold"] == 1
 
     # And the repaired set is jointly feasible in the master's own terms, which is the
@@ -2585,10 +2593,15 @@ def test_warm_start_repair_holds_the_later_flight_rather_than_dropping_it():
 def test_warm_start_drops_a_flight_it_cannot_place_within_max_shift():
     """An unplaceable flight is dropped and counted, never forced into a violation.
 
-    `max_shift=0` removes the repair loop's only tool, so the second flight has nowhere to
-    go.  It must fall out of the seed set with `dropped (no feasible shift)` recorded --
+    `max_shift=0` offers each flight exactly ONE departure -- its own translated one -- so
+    the repair loop has nothing to search and the second flight has nowhere to go.  It must
+    fall out of the seed set with `dropped (no feasible shift)` recorded;
     `complete_selection` then re-picks it around the survivors, which is only correct if it
     was genuinely omitted rather than silently overlaid.
+
+    Note the flight is NOT out of legal ground delay here -- `max_ground_delay_s=64.0`
+    leaves the graph's departure window wide open.  `max_shift` bounds the SEARCH, and this
+    is the case that separates the two bounds.
     """
 
     from freespace_sim.planner.colgen import warm_start as warm_start_module
@@ -2615,18 +2628,37 @@ def test_warm_start_drops_a_flight_it_cannot_place_within_max_shift():
 
 
 def test_warm_start_max_shift_is_below_the_shared_origin_threshold():
-    """``max_shift=8`` cannot separate two flights that share an origin.  It needs 16.
+    """``max_shift=8`` cannot separate two flights that share an origin.  The threshold is 13.
+
+    Both numbers are SEARCH DEPTHS in ``cfg.dt_s`` steps -- not seconds, and not a delay
+    cap.  ``max_shift=8`` means the loop offers NINE departures (the translated one plus
+    eight successive steps), which at the 4 s timestep here is 32 s of hold to choose from,
+    and the pair needs 52.  16 is asserted below rather than 13 only because it is a round
+    number safely past the threshold; 13 is where it actually flips.
+
+    The legal ground-delay bound is deliberately not what binds: ``max_ground_delay_s=600.0``
+    leaves the departure window far wider than any shift tried, so this measures the search
+    and nothing else.  That separation is the whole point -- raising ``max_shift`` buys more
+    SEARCH, not more legal delay, and the two are easy to conflate.
+
+    Measured thresholds on this fixture shape, which is why the default lands where it does:
+
+        crossing paths        4 steps (16 s)  -- inside the default 8
+        shared origin        13 steps (52 s)  -- outside it, asserted here
+        identical path       15 steps (60 s)  -- outside it
+
+    A column's claims span roughly twenty steps of corridor, so two flights leaving the SAME
+    cell stay in contact until one clears most of that span, whereas a crossing pair shares
+    only the cells near the intersection.  Hub-and-spoke scenarios are made of shared
+    origins, so the shipped 8 is expected to drop flights exactly where the warm start
+    matters most.
 
     Pinned because the constant is hardcoded in `build`'s signature, is never overridden by
     `batch._build_warm_start`, and is not reachable from `ColGenParams` or the CLI -- so the
-    only record of what it buys is here.  A column's claims span roughly twenty steps of
-    corridor, so eight steps of hold does not clear a co-located pair: the repair loop can
-    fix a CROSSING conflict (4 steps suffice) but not a shared-origin one, and a
-    hub-and-spoke scenario is made of shared origins.
-
-    A dropped flight is not lost -- `complete_selection` re-picks it around the survivors --
-    so this is a warm-start QUALITY bound, not a correctness bug.  Raise the number here if
-    a scenario starts reporting a large `dropped (no feasible shift)` count.
+    only record of what it buys is here.  A dropped flight is not lost --
+    `complete_selection` re-picks it around the survivors -- so this is a warm-start QUALITY
+    bound, not a correctness bug.  Raise the number here if a run's warm-start log line
+    starts reporting a large `dropped (no feasible shift)` count.
     """
 
     from freespace_sim.planner.colgen import warm_start as warm_start_module

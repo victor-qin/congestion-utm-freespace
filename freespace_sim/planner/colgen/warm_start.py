@@ -22,6 +22,18 @@ cap-1 row that never existed in the original schedule.  `build` walks flights in
 order -- FCFS, the same priority A* itself used -- and holds a conflicting column later
 until its claims fit, so an earlier flight keeps its slot and a later one yields.
 
+``max_shift`` bounds that hold, and it is a SEARCH DEPTH rather than a delay limit: the
+loop offers each flight ``max_shift + 1`` candidate departures (its own, then that many
+successive ``dt`` steps later) and takes the first that fits under the running claim
+counter.  One step is ``cfg.dt_s``, so the default 8 is 32 s of ground hold at the shipped
+4 s timestep.  The PHYSICAL cap is a different and much looser bound -- the flight graph's
+``latest_departure_step``, derived from ``cfg.max_ground_delay_s`` and checked separately
+inside `_column_at` -- so raising ``max_shift`` buys more search, not more legal delay.
+Exhausting it drops the flight from the warm start entirely (counted as
+``dropped (no feasible shift)``, and logged by `batch._build_warm_start`), which costs
+warm-start QUALITY and not correctness: `RestrictedMaster.complete_selection` re-picks
+every dropped flight around the ones that placed.
+
 What survives at x1500: 1,493 of 1,500 placed, 0 rows over capacity.  The 7 that do not
 are the genuinely inexpressible ones, and `RestrictedMaster.complete_selection` re-picks
 those around the pins rather than leaving them on columns chosen for a different schedule.
@@ -185,8 +197,32 @@ def build(
 
     Flights are repaired in flight-id order, which is FCFS order, so the pass mirrors the
     priority the source planner itself used: an earlier flight keeps its slot and a later
-    one holds.  A flight that cannot be placed within ``max_shift`` steps is dropped rather
-    than forced; the master's `complete_selection` re-picks it around the survivors.
+    one holds.
+
+    ``max_shift`` is how DEEP that hold may search, not how long a flight may legally be
+    held.  Each flight is offered ``max_shift + 1`` departures -- its translated one, then
+    that many successive ``cfg.dt_s`` steps later -- and takes the first whose claims fit
+    under the running counter; the legal bound is the graph's ``latest_departure_step``
+    (from ``cfg.max_ground_delay_s``) and is enforced separately and far more loosely.
+
+    At the shipped 8 that is 32 s of hold to choose from at a 4 s timestep, and the measured
+    thresholds on a two-flight instance say which conflicts that clears:
+
+        crossing paths        4 steps (16 s)  -- inside the default
+        shared origin        13 steps (52 s)  -- outside it
+        identical path       15 steps (60 s)  -- outside it
+
+    The pattern is corridor overlap: a column's claims span roughly twenty steps, so two
+    flights leaving the SAME cell stay in contact until one clears most of that span, while
+    a crossing pair shares only the cells near the intersection.  Hub-and-spoke scenarios
+    are made of shared origins, so the default is expected to drop flights exactly where the
+    warm start matters most --
+    `test_warm_start_max_shift_is_below_the_shared_origin_threshold` pins it.
+
+    A flight no offered departure fits is dropped rather than forced, counted as
+    ``dropped (no feasible shift)`` and logged; the master's `complete_selection` re-picks
+    it around the survivors, which is why this bound costs warm-start QUALITY rather than
+    correctness.
 
     ``ladder`` adds that many extra departure-shifted copies of each placed column to the
     pool.  They are deliberately NOT checked against the claim counter -- they are

@@ -32,6 +32,7 @@ Experiments are a three-stage pipeline joined through saved run folders on disk 
 
 ```bash
 uv sync                                 # installs numba too (default-group), so A* gets the compiled kernel
+uv sync --extra gurobi                  # ONLY for `--planner colgen`, which now defaults to the Gurobi backend
 uv run --extra dev pytest -q -m "not slow"   # full suite; pytest lives in the `dev` EXTRA, which uv sync does not install
 
 # EXECUTE one named scenario → a complete, reloadable run folder (the folder path is the last stdout line):
@@ -101,9 +102,26 @@ reserved; `colgen` instead solves the whole schedule at once.
 
 `colgen` is not FCFS — it optimizes every flight jointly, so it answers a different question from the
 rest of the table ("what is the best schedule" rather than "what can this flight get, given the
-others"). Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-max-iterations`,
-`--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`, and the one that sizes the pricing
-search itself as `--colgen-max-air-overrun` (the hop budget over the lattice geodesic, which is also
+others"). **It needs Gurobi**: `--colgen-solver` defaults to `gurobi`, so `uv sync --extra gurobi`
+and a real licence are prerequisites and a run without them fails at startup naming the missing
+extra. That is deliberate rather than incidental — the two backends return different optimal dual
+vertices on a master this degenerate, so the old silent fall-back to HiGHS changed the answer, and
+HiGHS additionally runs the final IP cold because `scipy.optimize.milp` takes no incumbent. Pass
+`--colgen-solver highs` to opt out, or `auto` for the old fall-back. Note the PyPI `gurobipy` wheel
+ships a size-limited trial that imports fine and only fails at `optimize()`, so verify by solving a
+model rather than by importing the module.
+
+Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-ip-time-limit` (the FINAL MILP's
+own budget, separate because it otherwise inherits whatever the generation loop did not spend, and
+paired with `--colgen-max-eager-rows`, which bounds the row pre-materialization that budget is
+measured after — 495,574 rows and 272 s at 1,500 flights, and it scales with the pool),
+`--colgen-max-iterations`, `--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`, plus
+`--colgen-warm-start astar`, which plans the batch through A* first and hands colgen that schedule as
+both pool columns and the starting incumbent. Leave the warm start OFF unless you mean it: it is
+reported in `planner_stats.json` because it changes what the run measures — unaided colgen is +11.3%
+against A* at 1,500 flights and A*-seeded colgen is −7.1%, so turning it on silently would convert
+"colgen beats A*" into "refining A* beats A*". The knob that sizes the pricing
+search itself is `--colgen-max-air-overrun` (the hop budget over the lattice geodesic, which is also
 the half-width of the O-D ellipse a flight is priced over — the budget implies the ellipse, since a
 route within it cannot reach a cell outside). Three more tune the cost of the sweep rather than what
 it answers: `--colgen-workers` fans pricing across worker processes (default 0, in-process; measured

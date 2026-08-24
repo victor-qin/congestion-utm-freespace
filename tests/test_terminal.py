@@ -378,3 +378,32 @@ def test_terminal_column_spans_the_regulated_tube():
     cols = [v for v in res.accepted[0].volumes
             if v.terminal_id == "H" and isinstance(v.shape, CylinderSpec)]
     assert cols and all(abs(c.shape.z_hi - cfg.airspace_ceiling_m) < 1e-6 for c in cols)
+
+
+def test_static_terminals_override_walls_a_hub_no_flight_touches():
+    """``sim.run`` derives its walls two ways, and the override is how two runs share one set.
+
+    From a demand model the walled set is every PLACED hub; from a bare request list it is
+    only the hubs some request touches.  A caller re-running the same flights through a
+    second planner therefore gets a DIFFERENT airspace by default -- measured on
+    ``density_faa_wing_zipline`` truncated to 600 s, 182 placed hubs against 180
+    flight-carrying ones.  ``freespace_sim.planner.colgen.batch._build_warm_start`` is that
+    caller: it re-plans the batch through A* to seed column generation, and without this its
+    A* pass flies through walls the colgen solve enforces.
+    """
+
+    cfg = _astar(terminal_airspace_always_active=True)
+    req = _terminal_req()
+    unused = (vec(_HUB[0] + 1200.0, _HUB[1] + 1200.0, 0.0), Terminal("unused", 1, radius=90.0))
+
+    derived = run(cfg, requests=[req])
+    assert "unused" not in derived.ledger._static_terminal_ids, (
+        "no request touches it, so the request-derived set cannot contain it"
+    )
+
+    overridden = run(cfg, requests=[req], static_terminals=[*derived.ledger._static_terms, unused])
+    assert "unused" in overridden.ledger._static_terminal_ids
+    # The override REPLACES the derivation rather than extending it, so the hubs the flights
+    # do touch have to be carried in by the caller -- which is what makes it able to express
+    # a smaller set too, and why `_build_warm_start` passes the batch's whole list.
+    assert derived.ledger._static_terminal_ids <= overridden.ledger._static_terminal_ids

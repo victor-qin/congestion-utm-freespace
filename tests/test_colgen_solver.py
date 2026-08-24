@@ -2429,6 +2429,54 @@ def test_an_unseeded_batch_builds_no_warm_start():
     assert batch_module._build_warm_start(requests, cfg, (), _params()) is None
 
 
+def test_the_warm_start_plans_against_the_batch_s_walls_not_its_own(monkeypatch):
+    """The seeding planner must fly the airspace colgen is solving, wall for wall.
+
+    ``sim.run`` derives the walled-hub set two ways and they are NOT the same set: from a
+    demand model it is every PLACED hub, from a bare request list only the hubs some flight
+    touches.  `_build_warm_start` re-runs the batch's flights as a bare request list, so a
+    hub drawing no flight this horizon is SOLID for the colgen solve and OPEN for the A*
+    pass seeding it.  Measured on ``density_faa_wing_zipline`` truncated to 600 s: 182
+    placed hubs against 180 flight-carrying ones, so A* routes through two walls colgen
+    enforces and the columns carrying them are rejected in translation and booked as drops.
+
+    Asserted on what reaches ``sim.run`` rather than on a routing outcome, because the
+    divergence needs a zero-flight hub to be observable and building one here would test
+    the fixture instead of the plumbing.
+    """
+
+    from freespace_sim.planner.colgen import batch as batch_module
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg)]
+    # A hub NO request touches -- exactly the case the two derivations disagree about.
+    unused_hub = (_point((6, 6), cfg), Terminal("unused-hub", 1, radius=90.0))
+
+    import freespace_sim.sim as sim_module
+
+    class _StopAfterCapture(Exception):
+        """Ends the sub-run once its arguments are captured; planning them proves nothing."""
+
+    seen: dict = {}
+
+    def spy(_cfg, **kwargs):
+        seen.update(kwargs)
+        raise _StopAfterCapture
+
+    monkeypatch.setattr(sim_module, "run", spy)
+    with pytest.raises(_StopAfterCapture):
+        batch_module._build_warm_start(
+            requests, cfg, (unused_hub,), _params(warm_start_planner="astar")
+        )
+
+    assert "static_terminals" in seen, (
+        "the warm start must hand its walls over, not let sim.run re-derive them"
+    )
+    assert [term.id for _center, term in seen["static_terminals"]] == ["unused-hub"], (
+        "a hub no request touches is still a wall the batch is solved against"
+    )
+
+
 def test_warm_start_translation_rejects_a_route_it_cannot_express():
     """Inexpressible routes are refused with a reason, never approximated.
 

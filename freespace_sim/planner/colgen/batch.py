@@ -66,6 +66,16 @@ def _log_iteration(state: dict) -> None:
     )
 
 
+# The keys `warm_start.build` writes that describe the PLACED columns rather than a reason a
+# flight was left out.  Everything else in its stats counter is an unplaced-flight reason and
+# is logged as one -- see `_build_warm_start`.  Kept beside the reader rather than exported
+# from `warm_start`, because the coupling is one-way: adding a reason there needs no edit
+# here, while adding a summary key does, and a summary key leaking into the log is visible.
+_BUILD_SUMMARY_KEYS = frozenset(
+    {"placed", "placed after a hold", "ladder columns", "total held steps", "rows over cap", "cost"}
+)
+
+
 def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenParams):
     """Run ``params.warm_start_planner`` and translate its schedule into seed columns.
 
@@ -96,7 +106,21 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     from freespace_sim.planner.colgen.objective import cost_model
 
     started = time.monotonic()
-    seeded = sim.run(cfg, requests=list(requests), planner_name=planner, progress=False)
+    # `static_terminals` is handed over rather than left to `sim.run` to re-derive, and this
+    # is a correctness requirement.  That derivation is not a function of the requests: from
+    # a demand model it is every PLACED hub, from a bare request list only the hubs a flight
+    # touches.  This call passes a bare request list, so without the override a hub that
+    # draws no flight in the horizon would be SOLID for the colgen solve and OPEN for the A*
+    # pass seeding it -- measured on `density_faa_wing_zipline` truncated to 600 s, 182
+    # against 180, so A* routes through two walls colgen enforces and the columns carrying
+    # them are then rejected in translation and counted as drops.
+    seeded = sim.run(
+        cfg,
+        requests=list(requests),
+        planner_name=planner,
+        progress=False,
+        static_terminals=list(static_terms),
+    )
     accepted = {
         intent.request.flight_id: intent for intent in seeded.intents if intent.accepted
     }
@@ -130,10 +154,14 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     # only as `accepted - placed`, with no way to tell an inexpressible route (an air hold)
     # from one the repair loop could not fit inside `max_shift`.  Those two point at
     # completely different fixes.
+    #
+    # Selected by EXCLUDING the summary keys rather than by matching a reason prefix, and
+    # the direction matters: `build` interpolates its reasons (`f"unconvertible: {why}"`),
+    # so a prefix filter silently loses any reason phrased differently later, which is the
+    # failure this logging exists to prevent.  Excluding instead means a new key shows up
+    # uninvited -- noise in one log line, not a missing diagnosis.
     unplaced = sorted(
-        (reason, count)
-        for reason, count in stats.items()
-        if reason.startswith("unconvertible: ") or reason == "dropped (no feasible shift)"
+        (reason, count) for reason, count in stats.items() if reason not in _BUILD_SUMMARY_KEYS
     )
     log.info(
         "warm start from %s: %d/%d flights accepted, %d placed as columns, "

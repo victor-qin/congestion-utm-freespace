@@ -262,9 +262,18 @@ def run(
     telemetry: bool | TelemetryCollector = False,
     parallel=None,
     return_anchor: str = "nominal",
+    static_terminals: list | None = None,
 ) -> SimResult:
     """Run one strategic-layer simulation. Provide a scenario, an explicit request list, a `demand`
     model, or none (a default `UniformPoissonDemand` is then generated from `cfg`).
+
+    ``static_terminals`` overrides the walled-hub set derived below, and exists because that
+    derivation is NOT a function of the requests alone: with a `demand` model it is every
+    PLACED hub, and without one it is only the hubs some request actually touches. A caller
+    re-running the same flights through a second planner therefore gets a DIFFERENT airspace
+    unless it says otherwise -- measured on `density_faa_wing_zipline` truncated to 600 s,
+    182 placed hubs against 180 flight-carrying ones, so two hubs are solid for one run and
+    open for the other. Pass the set the first run used to keep the two comparable.
 
     ``progress`` gives live feedback through long runs: ``True`` prints a throttled status line
     (done/total, accepted/denied, elapsed, ETA); a callable is invoked as ``progress(done, total,
@@ -338,7 +347,11 @@ def run(
         # the demand model's FULL placed-hub set (permanent infrastructure — a vertiport is walled even
         # when it draws no request this horizon, matching the demand foreign-column filter which drops
         # against ALL placed hubs); fall back to the flight-carrying hubs from the scenario otherwise.
-        if demand is not None and hasattr(demand, "terminals"):
+        if static_terminals is not None:
+            # An explicit set wins over both branches below: the caller already knows which
+            # walls this run must share with another one.  See the argument's docstring.
+            static_terms = list(static_terminals)
+        elif demand is not None and hasattr(demand, "terminals"):
             static_terms = list(demand.terminals(cfg))
         else:
             terms: dict = {}

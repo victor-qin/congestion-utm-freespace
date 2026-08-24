@@ -27,10 +27,10 @@ from dataclasses import replace
 
 import numpy as np
 
-from ..config import SimConfig
-from ..cost import endpoint_altitude_change_m, trajectory_cost
-from ..ledger import ReservationLedger
-from ..types import (
+from ...config import SimConfig
+from ...cost import endpoint_altitude_change_m, trajectory_cost
+from ...ledger import ReservationLedger
+from ...types import (
     DenialReason,
     FlightRequest,
     IntentStatus,
@@ -38,7 +38,7 @@ from ..types import (
     TimedPoint,
     as_terminal,
 )
-from ..volumes import (
+from ...volumes import (
     column_dwell_s,
     corridor_segment_volume,
     enroute_detour_m,
@@ -49,11 +49,11 @@ from ..volumes import (
     segment_overlaps_column,
     terminal_radius,
 )
-from . import hexgrid as hg
+from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
 from .compiled_hex_occupancy import hover_tail_steps, search_horizon
 from .occupancy import HexOccupancyService
-from .terminal_capacity import TerminalCapacity
+from ..terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
 _BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
@@ -282,7 +282,7 @@ class AStarPlanner:
         self._kernel = None
         if compiled:
             try:
-                from .astar_kernel import _search
+                from .kernel import _search
                 self._kernel = _search
             except ImportError:
                 self.compiled = False                   # numba absent → pure-Python everywhere
@@ -372,7 +372,7 @@ class AStarPlanner:
         traverse outruns the buffer (+3.67 s slack at 180 m, −4.33 s at 350 m) — so the traverse is
         added explicitly, per terminal, or a concurrent commit in those last seconds would be
         invisible to exact-mode revalidation."""
-        from ..parallel import PlanEnvelope, cell_bbox_to_aabb
+        from ...parallel import PlanEnvelope, cell_bbox_to_aabb
 
         infl_pad = cfg.effective_hover_radius_m + hg.circumradius(cfg)   # occupancy pad inflation
         hubs = []
@@ -965,7 +965,7 @@ class AStarPlanner:
             self._kernel = None
 
     def _plan_compiled(self, req, ledger, cfg):
-        from . import astar_kernel as K
+        from . import kernel as K
 
         # ---- setup: IDENTICAL to _plan_reference's head, so the kernel gets identical inputs ----
         dt = cfg.dt_s

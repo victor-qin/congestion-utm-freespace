@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 cloud = ["huggingface_hub>=0.20"]   # optional: push/pull run folders to a HF Hub dataset repo
-compiled = ["numba>=0.59"]          # optional: numba JIT for the compiled A* air-search kernel (astar_kernel)
+compiled = ["numba>=0.59"]          # optional: numba JIT for the compiled A* air-search kernel (planner/astar/kernel.py)
 # optional: Gurobi backend for the colgen restricted master (`ColGenParams(solver="gurobi")`,
 # imported directly in `master.py`, NOT through pulp). Install with `uv sync --extra gurobi`.
 #

@@ -43,7 +43,7 @@ from time import perf_counter
 
 import freespace_sim.sim as sim_mod
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.planner._packed import P_NXT
+from freespace_sim.planner.astar._packed import P_NXT
 from freespace_sim.planner.terminal_capacity import TerminalCapacity
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run

@@ -19,8 +19,8 @@ from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
-from freespace_sim.planner.compiled_hex_occupancy import CompiledHexOccupancy
-from freespace_sim.planner.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import Volume4D
 
@@ -392,7 +392,7 @@ def test_compiled_absent_falls_back_to_reference():
 def test_compiled_fallback_on_kernel_valve_matches_reference():
     # Force the kernel to report FB_HASH → the plan must transparently fall back to the reference,
     # count the fallback, warn, and return the reference result exactly.
-    from freespace_sim.planner import astar_kernel as K
+    from freespace_sim.planner.astar import kernel as K
 
     def led():
         lg = ReservationLedger(CFG); lg.commit(99, [_wall()]); return lg
@@ -488,7 +488,7 @@ def test_compiled_replay_exact_saturated_terminal():
     """Saturated fixed-lane terminal replay (pads=1, high λ ⇒ large ground delays): full compiled==reference
     parity — status, cost, last_expansions, centerline — across the batch, 0 fallbacks. This is COVERAGE of
     the terminal-takeoff path under heavy base_g, NOT a discriminating guard for the A1 associativity fix:
-    reverting the parenthesisation at astar_kernel.py leaves this green, because the ~1-ULP takeoff-edge
+    reverting the parenthesisation at astar/kernel.py leaves this green, because the ~1-ULP takeoff-edge
     difference (~3.7% of takeoff-lane edges here) never flips a heap ``(f, counter)`` tie in practice
     (verified by reverting + re-running). The fix is correct-by-construction — the kernel now assembles
     ``base_g + (takeoff_cost + lane_lat)`` exactly as the reference builds its single-float edge cost — so no

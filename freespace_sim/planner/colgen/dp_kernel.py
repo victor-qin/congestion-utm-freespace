@@ -41,7 +41,7 @@ certifies it exactly as ``consider_sink`` would, and the search resumes from its
 position.  Measured on one real search: 27,410 sinks, 6 certifications.
 
 Numba is optional: importing this module raises :class:`ImportError` without it, and the
-host is expected to warn once and use the reference (see ``astar_kernel`` for the same
+host is expected to warn once and use the reference (see ``astar/kernel.py`` for the same
 contract).
 """
 from __future__ import annotations
@@ -57,7 +57,7 @@ from .dp_prepare import EnvelopeArena
 SCORE_EPS = 1e-12
 RECOMPUTE_EPS = 1e-8
 
-_MAGIC = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci hashing multiplier, as in `astar_kernel`
+_MAGIC = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci hashing multiplier, as in `astar.kernel`
 
 # Arc role bits.  Restated from `dp_prepare` rather than imported so numba can treat them as
 # compile-time constants; `test_kernel_arc_role_bits_match_dp_prepare` fails if they drift.

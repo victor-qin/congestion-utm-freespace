@@ -12,7 +12,7 @@ takeoff/landing *edge* exists at a candidate time:
     and ask the ledger (the same FCL conflict check that gates commit; same-hub volumes are exempt, so
     it returns True iff a FOREIGN volume intrudes).
 
-Unlike :class:`~freespace_sim.planner.occupancy.HexOccupancyService` this holds **no hex state** —
+Unlike :class:`~freespace_sim.planner.astar.occupancy.HexOccupancyService` this holds **no hex state** —
 capacity is 1-D in time, not 3-D in cells — so it is the one authority every planner (A* and the
 MILP family) can consult at plan time. The column radius is a **per-hub constant** (asserted on
 record).
@@ -316,7 +316,7 @@ class TerminalCapacity:
         flight flies from the column EDGE toward ``toward`` (origin→dest on takeoff; dest←origin on
         landing) is free of committed conflict over the dwell window ``[t0, t0 + hover + climb)``. Only
         reached via ``dwell_ok(..., toward=...)``; the default fixed-lane path does the same job with
-        exact cell occupancy in :meth:`planner.occupancy.HexOccupancyService.is_blocked` (issue #18) and
+        exact cell occupancy in :meth:`planner.astar.occupancy.HexOccupancyService.is_blocked` (issue #18) and
         never calls this.
 
         It is the PRECISE (FCL) check: same-hub SIBLING exit lanes are box↔box — NOT column-exempt

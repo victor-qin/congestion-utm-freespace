@@ -36,7 +36,7 @@ from ...volumes import (
     enroute_reference_m,
 )
 from .. import hexgrid as hg
-from ..astar import _lattice_overhead_m
+from ..astar.planner import _lattice_overhead_m
 
 if TYPE_CHECKING:
     from .network import RowKey

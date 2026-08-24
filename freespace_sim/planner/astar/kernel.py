@@ -120,7 +120,7 @@ def _probe(g_pack, gen, key, cap, log2cap):
 @njit(cache=True, nogil=True)
 def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
            heap_f, heap_c, heap_n, size, max_heap, nkey, ng, f, ctr, st_key):
-    """Relax edge into ``nkey`` at cost ``ng``, priority ``f``. Mirrors astar.py:317-322:
+    """Relax edge into ``nkey`` at cost ``ng``, priority ``f``. Mirrors planner.py:317-322:
     push iff ``ng < g.get(nkey, inf)``; on relax, update g/came but PRESERVE the closed bit (the
     reference never reopens — with a consistent heuristic a closed node is never relaxed anyway).
     Returns ``(size, ctr, rc)`` with rc: 1 pushed, 0 no-op, -1 hash-full, -2 heap-full."""
@@ -261,7 +261,7 @@ def _search(
         iq = cell2 // rspan
         q = iq + qmin; r = ir + rmin; L = Lp - 1; step = sp + base
 
-        if L >= 0:                                     # air state → goal test (astar.py:282-305)
+        if L >= 0:                                     # air state → goal test (planner.py:282-305)
             is_goal = False
             for gidx in range(n_goal):
                 if q == goal_q[gidx] and r == goal_r[gidx]:
@@ -291,7 +291,7 @@ def _search(
             return 0, 0.0, n_exp, NO_PATH_TRUNC, -1
 
         # ============ expand (inlined _edges, exact successor order) ============
-        if L < 0:                                      # ---- ground state (astar.py:376-409) ----
+        if L < 0:                                      # ---- ground state (planner.py:376-409) ----
             gi = step - base
             if gi >= n_gsteps:                          # ground step beyond the bounded mask → widen+re-run
                 return 0, 0.0, n_exp, FB_MASK, step
@@ -337,7 +337,7 @@ def _search(
                             return 0, 0.0, n_exp, FB_HEAP, -1
             continue
 
-        # ---- air state (astar.py:410-433) ----
+        # ---- air state (planner.py:410-433) ----
         ns = step + 1
         if ns > max_step:
             continue

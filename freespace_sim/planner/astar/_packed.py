@@ -38,7 +38,7 @@ GEN_WRAP = 1 << 30          # re-stamp before `gen` outgrows `ov_own_gen`'s int3
 # NOT packed, deliberately: the frontier heap. It was tried (32 B records, 4-ary so a node's four
 # children fill one aligned line) and was byte-exact but **21% slower end to end** — a heap's sift
 # path stays in the top few resident levels and its one deep access per operation walks index `size`
-# by ±1, so it prefetches perfectly and had no random-access problem to fix. See `astar_kernel._hpop`.
+# by ±1, so it prefetches perfectly and had no random-access problem to fix. See `kernel._hpop`.
 # The lesson generalizes: pack what is probed at RANDOM, not everything with several parallel arrays.
 
 # free-interval pool record columns, int32. The 4th column is padding, not waste: 12 B rows would

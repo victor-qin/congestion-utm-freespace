@@ -121,7 +121,7 @@ def exit_radius(term, cfg: SimConfig) -> float:
     default). ``overlap > 0`` penetrates the column; ``< 0`` leaves a clearance gap. (Issue #10.)
 
     The single source of truth for the fold/lane radius — used by the A* head/tail fold
-    (:func:`planner.astar._fold_path`, which drives both the commit and the landing gate) and
+    (:func:`planner.astar.planner._fold_path`, which drives both the commit and the landing gate) and
     :meth:`planner.terminal_capacity.TerminalCapacity.exit_clear` — so the gate, the commit, and the
     exit-lane check all root the lane at the same edge and cannot drift."""
     ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0

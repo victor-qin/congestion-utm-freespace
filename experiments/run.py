@@ -57,7 +57,7 @@ def _kernel_status(planner_name: str) -> str:
     if planner_name == "astar_ref":
         return "pure-Python reference (explicitly requested via astar_ref)"
     try:
-        from freespace_sim.planner import astar_kernel  # noqa: F401
+        from freespace_sim.planner.astar import kernel  # noqa: F401
         return "compiled (numba kernel active)"
     except ImportError:
         return ("REFERENCE FALLBACK — numba unavailable, ~5-7x slower search. "

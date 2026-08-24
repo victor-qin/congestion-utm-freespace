@@ -128,7 +128,7 @@ def test_block_range_matches_free_set_oracle():
     circular; the oracle validates the interval surgery from first principles instead.) Random spans,
     some straddling holes earlier spans punched (the multi-interval case) and some running off both
     ends, must leave ``blocked_at`` agreeing with the oracle at every step of every cell."""
-    from freespace_sim.planner.compiled_hex_occupancy import _Pool
+    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
 
     NC, MAXS = 4, 40
     rng = np.random.default_rng(0)

@@ -459,8 +459,15 @@ def endpoint_claim_cells(point: Vec, radius: float, cfg: SimConfig) -> list[Axia
     threshold = radius + hex_radius
     if not hop_box_stays_in_its_cells(cfg):
         threshold += max(float(cfg.corridor_width_m), float(cfg.effective_hover_radius_m))
-    ring_radius = math.ceil(threshold / pitch) + 1
     origin = enu_to_axial(px, py, hex_radius)
+
+    # Axial rings are not Euclidean circles: along a vertex direction, a cell in
+    # ring ``n`` can be only ``sqrt(3) / 2 * n * pitch`` from the origin centre.
+    # The endpoint itself can also sit one circumradius from that snapped centre.
+    # Bound both effects so a large endpoint disc cannot reach a cell beyond the
+    # finite enumeration even though its centre-distance predicate would accept it.
+    min_distance_per_ring = math.sqrt(3.0) * pitch / 2.0
+    ring_radius = math.ceil((threshold + hex_radius) / min_distance_per_ring)
 
     # The centre test is the cheap outer bound; when containment holds it is refined to the
     # exact disk-touches-hexagon question, which is the predicate the cover argument actually

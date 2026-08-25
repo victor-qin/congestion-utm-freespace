@@ -242,6 +242,35 @@ def test_endpoint_claim_reach_covers_custom_large_hover_radius():
     assert shared.isdisjoint({first_cell, second_cell})
 
 
+def test_endpoint_claim_ring_covers_diagonal_large_radius_overlap():
+    """Finite axial enumeration cannot truncate a large endpoint disc.
+
+    Along diagonal lattice directions, axial rings are closer together than the
+    centre-to-centre pitch.  This near-tangent pair used to reach common cells just
+    outside the pitch-derived ring bound, leaving two FCL-conflicting cylinders with
+    disjoint master claims.
+    """
+
+    cfg = replace(_cfg(), hover_radius_m=1_600.0)
+    radius = cfg.effective_hover_radius_m
+    first = vec(0.0, 0.0, 0.0)
+    bearing = math.radians(22.0)
+    separation = 2.0 * radius - 1.0
+    second = vec(
+        separation * math.cos(bearing),
+        separation * math.sin(bearing),
+        0.0,
+    )
+
+    first_volume = hover_reservation(first, 0.0, cfg)
+    second_volume = hover_reservation(second, 0.0, cfg)
+    assert volumes_conflict(first_volume, second_volume)
+
+    first_claims = set(endpoint_claim_cells(first, radius, cfg))
+    second_claims = set(endpoint_claim_cells(second, radius, cfg))
+    assert first_claims & second_claims
+
+
 def test_a_covering_endpoint_claim_must_forbid_a_pair_the_ledger_accepts():
     """The false positive is structural, not a tuning error.
 

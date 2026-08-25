@@ -981,3 +981,32 @@ def test_astar_shortcut_deconflicts_from_committed_traffic_laterally(planner_nam
     assert CFG.cost_air_lateral_per_m * i2.air_detour_m < one_rung          # ... undercutting a climb
     assert CFG.cost_ground_delay_per_s * i2.ground_delay_s < one_rung       # and undercutting a hold
     assert max(round(float(p[2]), 1) for p, _ in i2.centerline) < CFG.level_z(1)   # stayed at the floor level
+
+
+def test_shortcut_reuses_the_inner_capacity_authority():
+    """The refiner must find the pad-capacity authority its inner planner already bound to a ledger.
+
+    Regression pin for a SILENT failure mode. ``_terminal_capacity_for`` returning None does not
+    raise — it makes ``plan`` hand back the UNREFINED inner intent for every terminal flight, i.e.
+    ``astar_shortcut`` quietly degrading to bare ``astar``. Nothing else in this file catches it:
+    the ``Inner`` fakes supply their own authority, and
+    ``test_terminal_refinement_without_capacity_authority_is_conservative`` deliberately pins the
+    DEGRADED branch as correct. This pins the other half — that the lookup actually succeeds.
+
+    It is also the contract test for ``Planner.capacity_authority``: drop that method from
+    ``AStarPlanner`` (or rename the private ``_tcap``/``_svc_ledger`` pair it reads) and this fails
+    loudly instead of costing a silent 0-refinement run.
+    """
+    astar = AStarPlanner()
+    led = ReservationLedger(CFG)
+    astar.plan(_req(), led, CFG)                       # binds the authority to THIS ledger
+
+    found = shortcut_mod._terminal_capacity_for(astar, led)
+    assert isinstance(found, TerminalCapacity), "inner authority not found — refinement would no-op"
+    assert found is astar._tcap, "found a DIFFERENT authority — the point is to reuse, not rebuild"
+
+    # reachable through the wrapper chain, which is how ShortcutRefiner actually calls it
+    assert shortcut_mod._terminal_capacity_for(ShortcutRefiner(astar), led) is found
+
+    # ...and correctly ABSENT for a ledger this planner never planned against
+    assert shortcut_mod._terminal_capacity_for(astar, ReservationLedger(CFG)) is None

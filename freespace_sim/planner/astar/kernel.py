@@ -120,7 +120,9 @@ def _probe(g_pack, gen, key, cap, log2cap):
 @njit(cache=True, nogil=True)
 def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
            heap_f, heap_c, heap_n, size, max_heap, nkey, ng, f, ctr, st_key):
-    """Relax edge into ``nkey`` at cost ``ng``, priority ``f``. Mirrors planner.py:317-322:
+    """Relax edge into ``nkey`` at cost ``ng``, priority ``f``. Mirrors the relax/push tail of
+    ``AStarPlanner._plan_reference``'s expansion loop (the ``ng < g.get(nst, math.inf)`` guard and
+    the ``heapq.heappush(pq, (ng + hh, next(counter), nst))`` under it):
     push iff ``ng < g.get(nkey, inf)``; on relax, update g/came but PRESERVE the closed bit (the
     reference never reopens — with a consistent heuristic a closed node is never relaxed anyway).
     Returns ``(size, ctr, rc)`` with rc: 1 pushed, 0 no-op, -1 hash-full, -2 heap-full."""
@@ -261,7 +263,7 @@ def _search(
         iq = cell2 // rspan
         q = iq + qmin; r = ir + rmin; L = Lp - 1; step = sp + base
 
-        if L >= 0:                                     # air state → goal test (planner.py:282-305)
+        if L >= 0:                          # air state → goal test (_plan_reference goal_ok)
             is_goal = False
             for gidx in range(n_goal):
                 if q == goal_q[gidx] and r == goal_r[gidx]:
@@ -291,7 +293,7 @@ def _search(
             return 0, 0.0, n_exp, NO_PATH_TRUNC, -1
 
         # ============ expand (inlined _edges, exact successor order) ============
-        if L < 0:                                      # ---- ground state (planner.py:376-409) ----
+        if L < 0:                          # ---- ground state (_edges, st[0] == "g" branch) ----
             gi = step - base
             if gi >= n_gsteps:                          # ground step beyond the bounded mask → widen+re-run
                 return 0, 0.0, n_exp, FB_MASK, step
@@ -321,8 +323,9 @@ def _search(
                             continue
                         liq = lq - qmin; lir = lr - rmin
                         nkey = ((liq * rspan + lir) * nlp1 + (Lv + 1)) * step_span + (ts - base)
-                        # parenthesised to match the reference's single-float edge cost EXACTLY: astar.py
-                        # builds ``takeoff_cost[L] + c_lat*(lane.dist-o_r)`` first, then ``base_g + cost`` — so
+                        # parenthesised to match the reference's single-float edge cost EXACTLY: _edges
+                        # builds ``takeoff_cost[L] + c_lat*(lane.dist-o_r)`` as ONE edge cost, then
+                        # _plan_reference's expansion loop does ``ng = base_g + cost`` — so
                         # the kernel must add ``(a+b)`` to base_g, not left-assoc ``(base_g+a)+b`` (float + is
                         # non-associative: the two differ by ~1 ULP for ~0.7% of large-base_g takeoffs, which
                         # can flip a heap tie and break the compiled==reference node-count/centerline parity).
@@ -337,7 +340,7 @@ def _search(
                             return 0, 0.0, n_exp, FB_HEAP, -1
             continue
 
-        # ---- air state (planner.py:410-433) ----
+        # ---- air state (_edges, the air branch below its st[0] == "g" return) ----
         ns = step + 1
         if ns > max_step:
             continue

@@ -36,7 +36,6 @@ from ...volumes import (
     enroute_reference_m,
 )
 from .. import hexgrid as hg
-from ..astar.planner import _lattice_overhead_m
 
 if TYPE_CHECKING:
     from .network import RowKey
@@ -380,7 +379,7 @@ def column_to_intent(
         ground_delay_s=report_g_delay,
         air_hold_s=0.0,
         air_detour_m=detour,
-        lattice_overhead_m=_lattice_overhead_m(col.cell_path, cfg.corridor_segment_len_m, detour),
+        lattice_overhead_m=hg.lattice_overhead_m(col.cell_path, cfg.corridor_segment_len_m, detour),
         altitude_change_m=endpoint_altitude_change_m(z, z, cum_dz, cfg),
         planner="colgen",
         solve_time_s=solve_share_s,

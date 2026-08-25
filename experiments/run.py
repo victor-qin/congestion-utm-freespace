@@ -49,9 +49,16 @@ def _scaled_lam_per_uss(spec, total_lam: float) -> dict[str, float]:
 
 
 def _kernel_status(planner_name: str) -> str:
-    """One-line compiled-kernel status for the startup INFO block. Mirrors AStarPlanner's own import
-    probe; the module lands in ``sys.modules`` so the sim's later import is free. Only the astar
-    family has a kernel — anything else reports n/a rather than paying the numba import."""
+    """One-line compiled-kernel status for the startup INFO block. The module lands in
+    ``sys.modules`` so the sim's later import is free. Only the astar family has a kernel —
+    anything else reports n/a rather than paying the numba import.
+
+    Reaching ``kernel`` runs the ``astar`` package ``__init__`` first, so this import pulls the
+    whole family (planner, both occupancy modules, and through them volumes/cost/ledger). A bare
+    ``except ImportError`` would therefore print the numba banner for an unrelated broken
+    dependency and send the operator to ``uv sync`` for a fault that has nothing to do with numba.
+    Only a numba-rooted failure is the fallback; anything else propagates as itself.
+    """
     if "astar" not in planner_name:
         return "n/a (planner has no compiled kernel)"
     if planner_name == "astar_ref":
@@ -59,7 +66,9 @@ def _kernel_status(planner_name: str) -> str:
     try:
         from freespace_sim.planner.astar import kernel  # noqa: F401
         return "compiled (numba kernel active)"
-    except ImportError:
+    except ImportError as e:
+        if (e.name or "").partition(".")[0] != "numba":
+            raise                    # a real break in the A* import graph, not a missing JIT
         return ("REFERENCE FALLBACK — numba unavailable, ~5-7x slower search. "
                 "Run via plain `uv run` (numba is in tool.uv default-groups) or `uv sync`.")
 

@@ -199,6 +199,13 @@ class MILPOptPlanner:
         self._tcap.evict_before(t_request)
         return self._tcap
 
+    def capacity_authority(self, ledger) -> TerminalCapacity | None:
+        """The pad-capacity authority already current for ``ledger``, or None (see the ``Planner``
+        Protocol). ``_capacity`` binds ``_tcap`` and ``_tcap_ledger`` together; the A* twin of this
+        keys on ``_svc_ledger`` instead, which is exactly why the consumer should call a NAMED method
+        rather than guess which private pair a given planner family uses."""
+        return self._tcap if self._tcap_ledger is ledger else None
+
     def _absorb_committed(self, ledger) -> None:
         by_fid: dict = {}
         for fid, vol in ledger.iter_committed():

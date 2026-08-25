@@ -1,26 +1,32 @@
-"""Space-time A* on the hex lattice — the planner, its compiled twin, and their occupancy images.
+"""Space-time A* on the hex lattice — the reference search, its compiled twin, and the occupancy.
 
-The family is five modules that only make sense together:
+``planner`` holds :class:`AStarPlanner`; ``kernel`` is the ``@njit`` hot loop that must reproduce
+it byte-for-byte and is the family's only numba entry point; ``occupancy`` and
+``compiled_hex_occupancy`` are the same ledger image in the two shapes the two searches need. Each
+module's own docstring is authoritative on its contents — deliberately not restated here, so this
+one cannot drift out of date.
 
-  ``planner``                 :class:`AStarPlanner` — the search, the four cost levers, the commit
-                              geometry. Also the reference oracle the kernel is pinned byte-for-byte
-                              against, so it must stay importable without numba.
-  ``kernel``                  the ``@njit`` hot loop (``while pq`` + ``_edges`` + ``is_blocked``).
-  ``occupancy``               :class:`HexOccupancyService` — incremental hex rasterization of the ledger.
-  ``compiled_hex_occupancy``  :class:`CompiledHexOccupancy` — the same image as flat interval pools,
-                              the only form the kernel can read in O(1).
-  ``_packed``                 the array-of-structs record layout the kernel and the compiled occupancy
-                              share.
+Two couplings are easy to get wrong from the file names alone:
 
-What deliberately stayed OUT, at ``planner/`` level: ``hexgrid`` and ``terminal_capacity`` (lattice and
-pad-capacity primitives that colgen, the MILP, and ``demand`` also consume — the same reason ``colgen/``
-does not own them) and ``shortcut`` (a planner-agnostic refiner; it wraps the MILP too, in the
-``astar_milp_shortcut`` sandwich).
+  * ``_packed`` is NOT compiled-only. ``planner`` imports seven names from it for the pure-Python
+    reference's own g-hash, so its layout constants are pinned by the parity suite on BOTH sides —
+    editing them without re-pinning the oracle is the trap the array-of-structs work left behind.
+  * ``compiled_hex_occupancy`` is NOT compiled-only either. Alongside :class:`CompiledHexOccupancy`
+    it owns ``search_horizon`` / ``hover_tail_steps`` / ``schedulable_horizon_steps``, plain
+    cfg-to-step arithmetic and the ONE definition (issue #5) shared by the reference path, the
+    compiled path, and the ledger. Gating this module on numba would silently un-bound all three.
 
-Unlike ``colgen``, nothing here is re-exported lazily: ``planner`` already imports both occupancy
-modules at module level, so a ``__getattr__`` would defer nothing. The one genuinely lazy import is
-numba, and that guard lives where it belongs — inside ``AStarPlanner``, which falls back to the
-reference search when the kernel will not compile.
+What stayed at ``planner/`` level, owned by neither family: ``hexgrid`` (the lattice primitives —
+colgen, ``milp``, ``demand``, ``volumes``, ``viz_html`` and ``parallel`` all consume it, and it
+also owns ``lattice_overhead_m``, the geometry-vs-traffic split both planners report),
+``terminal_capacity`` (``milp``, ``shortcut``, ``parallel``), and ``shortcut`` — a refiner that is
+planner-agnostic in its imports and wraps the MILP, not an A*, in the ``astar_milp_shortcut`` arm.
+With ``lattice_overhead_m`` hoisted, colgen imports nothing from this package.
+
+Nothing is re-exported lazily. ``AStarPlanner`` is the surface every consumer wants and it pulls
+both occupancy modules at import anyway; the cost is that importing a leaf here (``occupancy``,
+``_packed``) also builds the planner — about ten extra modules. numba is the one import genuinely
+deferred, and its guard lives in ``AStarPlanner.__init__``, which falls back to the reference.
 
 ``AStarPlanner`` is re-exported so ``from freespace_sim.planner.astar import AStarPlanner`` reads
 exactly as it did when this package was a single module.

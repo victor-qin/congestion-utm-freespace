@@ -45,6 +45,32 @@ def hex_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
     return (abs(dq) + abs(dq + dr) + abs(dr)) // 2
 
 
+
+def lattice_overhead_m(cells, pitch, air_detour_m):
+    """The share of ``air_detour_m`` that is hex geometry rather than traffic, in metres.
+
+    The traffic share is derived EXACTLY and subtracted: every lateral edge is exactly one pitch, so
+    ``moves actually flown − the lattice geodesic between the first and last cell`` is the berth
+    traffic forced, in whole hex steps. That residual is exactly 0 for an unimpeded flight at ANY
+    bearing — which is the invariant that makes the congestion reading trustworthy.
+
+    Everything else in ``air_detour_m`` is geometry and lands here: the staircase a 6-direction
+    lattice imposes on an off-axis bearing (0 on-axis, peaking at 2/√3 − 1 ≈ 15.5% at 30° off), plus
+    the endpoint snap of origin/dest onto cell centres.
+
+    The IN-COLUMN part of the terminal fold does not land here: ``air_detour_m`` is measured exit
+    lane → exit lane on both sides (issue #50), so hub centre → column edge is outside the measurement
+    entirely — terminal operations, accounted as that hub's capacity.
+
+    What DOES land here is the column edge → lane-cell hop, because A*'s path starts on a boundary
+    hex rather than on the reference circle, so folding EXTENDS it (measured +169.58 m of a 724.41 m
+    band on an unimpeded hub flight). That is lane snap — the same quantization as (2), just at a
+    terminal — so the bucket is still "geometry, not traffic".
+    """
+    moves = sum(1 for a, b in zip(cells, cells[1:]) if a != b)
+    forced = max(0, moves - hex_distance(cells[0], cells[-1])) * pitch
+    return max(0.0, air_detour_m - forced)
+
 def circumradius(cfg: SimConfig) -> float:
     """Hex circumradius R, from pitch = nominal_speed·dt and pitch = √3·R."""
     return cfg.nominal_speed_mps * cfg.dt_s / SQRT3

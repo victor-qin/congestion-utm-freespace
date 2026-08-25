@@ -51,7 +51,8 @@ def build_wall(args, cfg: SimConfig) -> Volume4D:
 
 
 def blocked_cells(ledger: ReservationLedger, cfg: SimConfig, R: float, step: int | None):
-    """Rebuild A*'s blocked-set the way ``AStarPlanner.plan`` does (astar/planner.py:64-67).
+    """Rebuild A*'s blocked-set the way ``AStarPlanner`` does — the ``svc = self._occupancy(...)``
+    binding in ``_plan_reference``, whose ``HexOccupancyService.is_blocked`` the search then probes.
 
     Returns ``{(q, r): {steps...}}``. With ``step=None`` we keep every cell blocked at any step
     (the right view for a permanent wall); pass a concrete step to inspect a time-windowed obstacle.

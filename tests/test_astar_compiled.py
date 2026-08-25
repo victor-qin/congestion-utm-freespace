@@ -9,6 +9,7 @@ terminal replay, and the transparent-fallback safety valve.
 from __future__ import annotations
 
 import itertools
+import sys
 import warnings
 
 import numpy as np
@@ -379,14 +380,29 @@ def test_out_of_box_committed_corridor_skipped_not_crash():
 
 # ---------------- E: safety valves / fallback ----------------
 
-def test_compiled_absent_falls_back_to_reference():
-    # numba-absent story: compiled=False is byte-identical to the reference.
+def test_compiled_absent_falls_back_to_reference(monkeypatch):
+    """numba-absent story: ``AStarPlanner(compiled=True)`` must DEGRADE to the reference, not raise.
+
+    Blocking the kernel module makes ``__init__``'s ``from .kernel import _search`` raise ImportError
+    — the same thing a numba-less install does. That import is a relative one, so it is also the line
+    a wrong package depth would break; because the ``except ImportError`` fails CLOSED into the silent
+    5-7x reference path, a bad depth would otherwise cost only a line on stderr. Pin both halves: the
+    planner reports itself uncompiled, and its answer is byte-identical to the reference's.
+    """
+    monkeypatch.setitem(sys.modules, "freespace_sim.planner.astar.kernel", None)
+    com = AStarPlanner(compiled=True)                    # asks for the kernel, cannot have it
+    assert com.compiled is False and com._kernel is None, "fell back without recording it"
+
     ref = AStarPlanner(compiled=False)
-    com = AStarPlanner(compiled=False)
-    led = ReservationLedger(CFG); led.commit(99, [_wall()])
-    a = ref.plan(_req(), ReservationLedger(CFG), CFG)  # empty
-    b = com.plan(_req(), ReservationLedger(CFG), CFG)
+    def led():
+        lg = ReservationLedger(CFG)
+        lg.commit(99, [_wall()])
+        return lg
+
+    a = ref.plan(_req(), led(), CFG)
+    b = com.plan(_req(), led(), CFG)
     assert a.cost == b.cost
+    assert [repr(v) for v in a.volumes] == [repr(v) for v in b.volumes]
 
 
 def test_compiled_fallback_on_kernel_valve_matches_reference():

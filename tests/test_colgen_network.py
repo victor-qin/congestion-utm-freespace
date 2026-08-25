@@ -45,6 +45,7 @@ from freespace_sim.planner.colgen.windows import (
     derive_cell_window,
     endpoint_claim_cells,
     endpoint_claim_steps,
+    hop_box_stays_in_its_cells,
     terminal_claim_steps,
     visit_rows,
 )
@@ -215,13 +216,222 @@ def test_wide_corridor_rejected_when_nonincident_edges_can_conflict():
 
 
 def test_endpoint_claim_reach_covers_custom_large_hover_radius():
+    """Two overlapping cylinders share a claimed cell, at any hover radius.
+
+    What the cover needs is a shared cell, not that either endpoint claims the
+    *other's* snapped cell: the two disks overlap at some point, and the hex holding
+    that point is within one circumradius of it, hence inside both claim discs.  The
+    witness here is a cell between the two, which neither endpoint sits in — pinning
+    the stronger "claims the other's cell" property instead would demand a reach that
+    over-claims by 2.1x at defaults (GitHub issue #101).
+    """
+
     cfg = replace(_cfg(), hover_radius_m=100.0)
     first = vec(0.0, 0.0, 0.0)
     second = vec(
         195.0, 0.0, 0.0
     )  # 100 m cylinders overlap, but their snapped centres are 240 m apart
+    first_cell = hg.enu_to_axial(float(first[0]), float(first[1]), hg.circumradius(cfg))
     second_cell = hg.enu_to_axial(float(second[0]), float(second[1]), hg.circumradius(cfg))
-    assert second_cell in endpoint_claim_cells(first, cfg.effective_hover_radius_m, cfg)
+    assert first_cell != second_cell
+
+    first_claims = set(endpoint_claim_cells(first, cfg.effective_hover_radius_m, cfg))
+    second_claims = set(endpoint_claim_cells(second, cfg.effective_hover_radius_m, cfg))
+    shared = first_claims & second_claims
+    assert shared, (sorted(first_claims), sorted(second_claims))
+    assert shared.isdisjoint({first_cell, second_cell})
+
+
+def test_endpoint_claim_ring_covers_diagonal_large_radius_overlap():
+    """Finite axial enumeration cannot truncate a large endpoint disc.
+
+    Along diagonal lattice directions, axial rings are closer together than the
+    centre-to-centre pitch.  This near-tangent pair used to reach common cells just
+    outside the pitch-derived ring bound, leaving two FCL-conflicting cylinders with
+    disjoint master claims.
+    """
+
+    cfg = replace(_cfg(), hover_radius_m=1_600.0)
+    radius = cfg.effective_hover_radius_m
+    first = vec(0.0, 0.0, 0.0)
+    bearing = math.radians(22.0)
+    separation = 2.0 * radius - 1.0
+    second = vec(
+        separation * math.cos(bearing),
+        separation * math.sin(bearing),
+        0.0,
+    )
+
+    first_volume = hover_reservation(first, 0.0, cfg)
+    second_volume = hover_reservation(second, 0.0, cfg)
+    assert volumes_conflict(first_volume, second_volume)
+
+    first_claims = set(endpoint_claim_cells(first, radius, cfg))
+    second_claims = set(endpoint_claim_cells(second, radius, cfg))
+    assert first_claims & second_claims
+
+
+def test_a_covering_endpoint_claim_must_forbid_a_pair_the_ledger_accepts():
+    """The false positive is structural, not a tuning error.
+
+    The module contract is one-way: a real conflict must share a row, extra rows are
+    allowed.  This pins what that permission costs, using the ledger as the referee.
+
+    The witness is the extremal configuration, so the argument does not depend on *how*
+    the claim is tested.  Straight up from a pointy-top hex centre is a VERTEX
+    direction, so a cylinder centred one ``radius + circumradius`` away still touches
+    the hex -- exactly at that vertex.  Any rule that covers cylinder/cylinder
+    conflicts must therefore claim the hex for it.  Place a second cylinder the same
+    distance beyond the opposite vertex and both claim the hex, while the two are
+    ``2 * (radius + circumradius)`` apart and could not touch if they tried.  Capacity
+    one then refuses a pair ``volumes_conflict`` passes.
+
+    This is not hypothetical at the shipped reach, which tests centre distance and so
+    fires well inside the extreme: on ``density_faa_wing_zipline`` at 1,000 flights it
+    is 24 of the 30 residual over-capacity rows, and flights 1336 and 3170 are refused
+    while delivering 192.3 m apart (GitHub issue #101).  An exact disk/hexagon test
+    removes those but not this one --
+    :func:`test_endpoint_claims_are_disjoint_beyond_twice_the_reach` is what bounds it.
+    """
+
+    cfg = _cfg()
+    radius = cfg.effective_hover_radius_m
+    hex_radius = hg.circumradius(cfg)
+    centre = np.asarray(hg.hex_center(0, 0, hex_radius), dtype=float)
+    up = np.array([0.0, 1.0])
+    reach = radius + hex_radius
+    # A metre inside the extreme, not an ulp: the disk then reaches a whole metre PAST
+    # the vertex, so the witness does not turn on how a predicate rounds its boundary.
+    offset = reach - 1.0
+
+    below = vec(*(centre - offset * up), 0.0)
+    above = vec(*(centre + offset * up), 0.0)
+
+    # Each disk genuinely reaches into hex (0, 0), touching it at the near vertex --
+    # so claiming that hex is forced by the cover, not by the choice of predicate.
+    for point, vertex in ((below, centre - hex_radius * up), (above, centre + hex_radius * up)):
+        assert math.dist((float(point[0]), float(point[1])), tuple(vertex)) <= radius
+
+    below_claims = set(endpoint_claim_cells(below, radius, cfg))
+    above_claims = set(endpoint_claim_cells(above, radius, cfg))
+    assert (0, 0) in below_claims & above_claims
+
+    # ... and yet the cylinders provably cannot meet: two radii is the whole reach.
+    separation = 2.0 * offset
+    assert separation > 2.0 * radius
+    first = hover_reservation(below, 0.0, cfg)
+    second = hover_reservation(above, 0.0, cfg)
+    assert first.t_start < second.t_end and second.t_start < first.t_end
+    assert not volumes_conflict(first, second)
+
+
+@pytest.mark.parametrize("hover_radius_m", [None, 100.0])
+def test_endpoint_claims_are_disjoint_beyond_twice_the_reach(hover_radius_m):
+    """How wrong the endpoint rows can be is bounded by twice their reach.
+
+    Two endpoints share a claimed cell only if some hex centre is inside both claim
+    discs, so the coupling can never exceed ``2 * (radius + circumradius)`` -- 258.6 m
+    at defaults, against a 120 m true conflict distance.  That bound is what makes the
+    false positive in
+    :func:`test_a_covering_endpoint_claim_must_forbid_a_pair_the_ledger_accepts` a
+    known, bounded modelling cost rather than an open-ended one, and it is the first
+    thing a re-widened reach breaks: the ``footprint_reach`` term removed for GitHub
+    issue #101 pushed this cut-off from 258.6 m out to 378.6 m.
+
+    The bound is also checked tight, so it cannot pass by being vacuously generous.
+    """
+
+    cfg = replace(_cfg(), hover_radius_m=hover_radius_m)
+    assert hop_box_stays_in_its_cells(cfg)  # the tightened-reach branch, not the fallback
+    radius = cfg.effective_hover_radius_m
+    hex_radius = hg.circumradius(cfg)
+    reach = radius + hex_radius
+
+    rng = random.Random(20260819)
+    widest_coupled = 0.0
+    for _ in range(3000):
+        first = vec(rng.uniform(-500.0, 500.0), rng.uniform(-500.0, 500.0), 0.0)
+        second = vec(rng.uniform(-500.0, 500.0), rng.uniform(-500.0, 500.0), 0.0)
+        shared = set(endpoint_claim_cells(first, radius, cfg)) & set(
+            endpoint_claim_cells(second, radius, cfg)
+        )
+        if not shared:
+            continue
+        separation = math.hypot(
+            float(first[0]) - float(second[0]), float(first[1]) - float(second[1])
+        )
+        assert separation < 2.0 * reach, (separation, sorted(shared))
+        widest_coupled = max(widest_coupled, separation)
+
+    # Tight: a pair just inside the bound really is coupled, on the vertex axis where
+    # the reach is attained.  Without this the assertion above could hold trivially.
+    centre = np.asarray(hg.hex_center(0, 0, hex_radius), dtype=float)
+    up = np.array([0.0, 1.0])
+    edge = reach - 1e-6
+    assert (0, 0) in set(endpoint_claim_cells(vec(*(centre - edge * up), 0.0), radius, cfg))
+    assert (0, 0) in set(endpoint_claim_cells(vec(*(centre + edge * up), 0.0), radius, cfg))
+    # ... and the random sample actually reached into the false-positive band.
+    assert widest_coupled > 2.0 * radius
+
+
+def test_hop_box_stays_inside_the_two_cells_it_runs_between():
+    """The containment lemma ``endpoint_claim_cells`` drops its corridor term for.
+
+    Checked against the built geometry rather than the predicate's arithmetic: every
+    corner of every directed hop box must lie inside the union of the two hexes it
+    runs between.  If this ever stops holding at defaults, the endpoint claim reach is
+    no longer a cover and :func:`hop_box_stays_in_its_cells` must say so.
+    """
+
+    cfg = _cfg()
+    assert hop_box_stays_in_its_cells(cfg)
+    radius = hg.circumradius(cfg)
+
+    def hex_contains(cell, x, y):
+        cx, cy = hg.hex_center(*cell, radius)
+        # A hexagon is the intersection of three slabs, each bounded by the inradius.
+        px, py = x - float(cx), y - float(cy)
+        inradius = float(cfg.corridor_segment_len_m) / 2.0
+        for angle in (0.0, 60.0, 120.0):
+            axis = math.radians(angle)
+            if abs(px * math.cos(axis) + py * math.sin(axis)) > inradius + 1e-9:
+                return False
+        return True
+
+    for direction in hg.AXIAL_NEIGHBORS:
+        source = (0, 0)
+        target = (direction[0], direction[1])
+        volume = _hop_volume(source, direction, 0, cfg)
+        lo, hi = volume.shape.aabb()
+        rot = np.asarray(volume.shape.rot, dtype=float).reshape(3, 3)
+        centre = np.asarray(volume.shape.center, dtype=float)
+        half = np.asarray(volume.shape.extents, dtype=float) / 2.0
+        del lo, hi
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                for sz in (-1, 1):
+                    corner = centre + rot @ (half * np.array([sx, sy, sz], dtype=float))
+                    assert hex_contains(source, corner[0], corner[1]) or hex_contains(
+                        target, corner[0], corner[1]
+                    ), (direction, corner)
+
+
+def test_wide_corridor_keeps_the_conservative_endpoint_reach():
+    """A corridor too wide to stay in its cells falls back to the old wider disc.
+
+    The tightened reach is only sound while the containment lemma holds, so the
+    predicate has to be load-bearing rather than decorative.
+    """
+
+    narrow = _cfg()
+    wide = replace(narrow, corridor_width_m=100.0)
+    assert hop_box_stays_in_its_cells(narrow)
+    assert not hop_box_stays_in_its_cells(wide)
+
+    point = vec(0.0, 0.0, 0.0)
+    narrow_cells = endpoint_claim_cells(point, narrow.effective_hover_radius_m, narrow)
+    wide_cells = endpoint_claim_cells(point, wide.effective_hover_radius_m, wide)
+    assert len(wide_cells) > len(narrow_cells)
 
 
 def test_visit_rows_uses_inclusive_derived_offsets():

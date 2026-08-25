@@ -80,9 +80,14 @@ class TerminalCapacity:
     their exact tagged output to :meth:`reservation_admitted` before accepting a retimed candidate.
     """
 
-    def __init__(self, cfg: SimConfig, ledger: ReservationLedger):
+    def __init__(self, cfg: SimConfig, ledger: ReservationLedger, track_removal: bool = False):
         self.cfg = cfg
         self.ledger = ledger
+        # Removal mode (LNS destroy): each flight's recorded dwell rows are kept per owner so
+        # `on_release` can subtract them exactly (dwells are a counting structure — remove one
+        # instance by value). Flag off ⇒ zero bookkeeping, byte-identical behavior.
+        self.track_removal = track_removal
+        self._rows: dict[int, list] = {}                              # fid -> [count, (tid, t0, t1), ...]
         self.dwells: dict[Hashable, list[tuple[float, float]]] = {}   # tid -> [(t_start, t_end), ...]
         self.radius: dict[Hashable, float] = {}                       # tid -> the hub's one column radius
         # Every dynamic ledger volume observed through ``on_commit``. Unlike the dwell count, this
@@ -99,11 +104,16 @@ class TerminalCapacity:
         self._ft_seen = 0                                             # ledger length at last query (shrink tripwire)
 
     # ----- maintenance (push, via ledger.subscribe) -----
-    def on_commit(self, _flight_id, volumes) -> None:
+    def on_commit(self, flight_id, volumes) -> None:
         """Record every committed terminal-column cylinder as a per-hub dwell interval. A single flight
         may contribute two (origin + dest). The column radius is a hub constant — asserted here so the
         union-coverage skip in :meth:`column_clear` stays sound."""
         self._n_observed_volumes += len(volumes)
+        rows = None
+        if self.track_removal:
+            rows = self._rows.setdefault(flight_id, [])
+            rows.append(len(volumes))
+        floor = self.evicted_before
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 r = self.radius.setdefault(v.terminal_id, v.shape.radius)
@@ -112,7 +122,38 @@ class TerminalCapacity:
                         f"terminal {v.terminal_id!r}: same-hub column radius must be constant "
                         f"({r} vs {v.shape.radius})"
                     )
+                if floor is not None and v.t_end <= floor:
+                    continue        # already behind the eviction watermark: `evict_before` would have
+                    #                 dropped it, and it can never overlap a future query window. Not
+                    #                 recorded either, so `dwells` and `_rows` stay in exact
+                    #                 correspondence — see on_release.
                 self.dwells.setdefault(v.terminal_id, []).append((v.t_start, v.t_end))
+                if rows is not None:
+                    rows.append((v.terminal_id, v.t_start, v.t_end))
+
+    def on_release(self, flight_id, volumes) -> None:
+        """Reverse this flight's dwell rows and invalidate the foreign-transit cache.
+
+        Rows absent at or before :attr:`evicted_before` were intentionally evicted; any other absence
+        is drift. Never remove an arbitrary equal-valued dwell because it may belong to another
+        committed flight. Keeps ``_n_observed_volumes`` aligned with the ledger.
+        """
+        rows = self._rows.pop(flight_id, ())
+        floor = self.evicted_before
+        for row in rows:
+            if isinstance(row, int):
+                self._n_observed_volumes -= row
+                continue
+            tid, t0, t1 = row
+            if floor is not None and t1 <= floor:
+                continue                               # eviction already dropped this dwell
+            ivs = self.dwells[tid]
+            ivs.remove((t0, t1))                       # KeyError/ValueError here IS the drift signal
+            if not ivs:
+                del self.dwells[tid]
+        self._ft.clear()
+        self._ftn.clear()
+        self._ft_seen = 0
 
     def evict_before(self, t: float) -> None:
         """Drop dwells ending at or before ``t`` (monotonic). The caller passes the request clock: with
@@ -137,6 +178,7 @@ class TerminalCapacity:
     def reset(self) -> None:
         self.dwells.clear()
         self.radius.clear()
+        self._rows.clear()
         self._ft.clear()
         self._ftn.clear()
         self._ft_seen = 0

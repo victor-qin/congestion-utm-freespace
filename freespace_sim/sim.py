@@ -161,6 +161,11 @@ class SimResult:
     # a run that stopped at iteration 1 files a complete, feasible, ordinary-looking accepted set.
     # `runs.save_run` persists this as planner_stats.json.
     planner_stats: dict | None = None
+    # The `return_anchor` mode this run flew ("nominal" | "realized"). Carried because it is a property
+    # of the SCHEDULE that the intents cannot answer: under "realized" a paired return's departure was
+    # anchored to its outbound's realized arrival, so any post-hoc re-timing of that outbound (LNS) must
+    # respect the turnaround — and a re-timer that defaults to "nominal" would silently skip the guard.
+    return_anchor: str = "nominal"
 
     @property
     def accepted(self) -> list[OperationalIntent]:
@@ -232,6 +237,17 @@ def _astar_planners(planner) -> list:
 
 
 RETURN_ANCHORS = ("nominal", "realized")
+
+
+def demand_turnaround_s(demand) -> float:
+    """The ground turnaround a demand model budgeted between an outbound and its paired return.
+
+    One reader, because two would be worse than none: the realized-anchor coupling in :func:`run` uses
+    it to place each return, and the LNS paired-return guard uses it to decide whether a re-timed
+    outbound still lands in time for that return. If those two disagreed, the guard would either reject
+    valid repairs or — the dangerous direction — admit an outbound that lands after its return has
+    already departed, with no error and no log line. Models without the attribute budget nothing."""
+    return float(getattr(demand, "turnaround_s", 0.0) or 0.0)
 
 
 def realized_release_s(intent: OperationalIntent) -> float | None:
@@ -462,7 +478,7 @@ def run(
                             "Pass demand= (alongside requests=) so the realized anchor uses the same "
                             "turnaround the requests were generated with.")
             else:
-                turnaround_s = float(getattr(demand, "turnaround_s", 0.0) or 0.0)
+                turnaround_s = demand_turnaround_s(demand)
         awaited = ({ev.request.paired_outbound_id for ev in scenario.events} - {None}) if couple else set()
         # Only HubRadiusDemand links its legs, so asking for the realized anchor anywhere else is a
         # no-op. Say so: silently doing nothing is exactly the failure this option exists to prevent.
@@ -515,4 +531,4 @@ def run(
     # and the reported planner label would describe cfg.planner, not the planner that ran.
     result_cfg = cfg if pname == cfg.planner else replace(cfg, planner=pname)
     return SimResult(config=result_cfg, intents=intents, ledger=ledger, verified=verified,
-                     telemetry=collector, planner_stats=planner_stats)
+                     telemetry=collector, planner_stats=planner_stats, return_anchor=return_anchor)

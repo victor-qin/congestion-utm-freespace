@@ -924,6 +924,37 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     assert revenue.stats["lp_gap_cost"] > 1e3 * revenue.stats["lp_gap_revenue"]
 
 
+def test_cost_gap_stops_after_a_productive_pricing_sweep():
+    """A met cost gap must not wait for a sweep that adds zero columns.
+
+    The first sweep on this fixture reaches a 25% cost gap while banking the detour
+    that makes the final IP optimal.  Requiring an empty sweep delayed termination
+    despite the pricing bound already proving the requested tolerance.
+    """
+
+    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=20.0)
+    requests = [
+        _request(1, (-2, -5), (-2, -11), cfg),
+        _request(2, (-8, -4), (0, -4), cfg),
+    ]
+    seen: list[dict] = []
+
+    result = ColGenSolver().solve(
+        requests,
+        cfg,
+        (),
+        _params(max_air_overrun_hops=1, gap_metric="cost", lp_gap=0.3),
+        on_iteration=seen.append,
+    )
+
+    assert len(seen) == 1
+    assert seen[0]["columns_added"] > 0
+    assert seen[0]["lp_gap_cost"] == pytest.approx(0.25)
+    assert result.stats["termination_reason"] == "lp_gap"
+    assert result.stats["iterations"] == 1
+    assert result.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+
+
 def test_colgen_beats_fcfs_on_constructed_congestion():
     """One global hold clears two crossings that FCFS handles independently."""
 

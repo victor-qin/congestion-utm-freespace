@@ -1399,17 +1399,12 @@ class ColGenSolver:
                 prev_capacity_duals = dict(capacity_duals)
 
                 new_columns_since_lp = len(master.columns) > columns_at_lp
-                # Section 4.2.3 stops as soon as the LP gap is under threshold, full stop --
-                # the bound `RMP + sum(max(0, phi_max))` is valid however many columns were
-                # just banked, and further columns can only move the RMP toward it.  The
-                # `not new_columns_since_lp` guard is a stricter local rule that makes the
-                # criterion effectively unreachable while pricing is still productive, so it
-                # applies only to the cost-scale metric this repo used before.
-                gate = params.gap_metric == "revenue" or not new_columns_since_lp
-                if lp_gap <= params.lp_gap and gate:
+                # The pricing bound remains valid when this sweep banks columns, and the
+                # final IP already sees them, so an in-threshold gap terminates immediately.
+                if lp_gap <= params.lp_gap:
                     termination_reason = "lp_gap"
                     break
-                if best_heuristic and heuristic_gap <= params.ip_gap and gate:
+                if best_heuristic and heuristic_gap <= params.ip_gap:
                     termination_reason = "heuristic_gap"
                     break
                 if not priced_columns and not new_columns_since_lp:

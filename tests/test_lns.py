@@ -87,7 +87,7 @@ def test_release_many_compaction_preserves_content():
 def test_incremental_release_reference_service_refcounts():
     """Two flights covering the same cells: removing one must NOT free the cells (refcounts),
     removing both must."""
-    from freespace_sim.planner.occupancy import HexOccupancyService
+    from freespace_sim.planner.astar.occupancy import HexOccupancyService
 
     svc = HexOccupancyService(CFG, track_removal=True)
     svc.on_commit(1, [_wall()])
@@ -107,7 +107,7 @@ def test_incremental_release_reference_service_refcounts():
 def test_incremental_release_compiled_matches_fresh_absorb():
     """After removing one flight, every pool query must match a fresh instance that only ever
     saw the surviving flight."""
-    from freespace_sim.planner.compiled_hex_occupancy import CompiledHexOccupancy
+    from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
 
     keep, drop = _wall(3000.0), _wall(1000.0)
     occ = CompiledHexOccupancy(CFG, track_removal=True)
@@ -136,7 +136,7 @@ def test_pool_reset_cell_reclaims_overflow_slots():
     """`reset_cell` is called on the same hot cells every LNS iteration. Abandoning the old chain's
     slots is harmless per call but unbounded per run: `_alloc` only bumps, so the pool would grow
     (and `_grow` would double the array) for a working set that never grows."""
-    from freespace_sim.planner.compiled_hex_occupancy import _Pool
+    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
 
     pool = _Pool(8, 1000)
     base = pool.nslots
@@ -546,7 +546,7 @@ def test_repair_restores_the_ledger_on_denial_and_on_exception(monkeypatch):
     """Every exit from the destroyed state must put the incumbent back. The ledger is the run's only
     copy of the schedule: a transaction that unwinds without restoring loses flights outright, and
     nothing downstream can tell (the next iteration replans against a world short k flights)."""
-    from freespace_sim.planner.astar import _deny
+    from freespace_sim.planner.astar.planner import _deny
     from freespace_sim.types import DenialReason
 
     res = run(_congested(lam=400.0, horizon=240.0))
@@ -597,7 +597,7 @@ def test_claim_index_excludes_the_flights_own_terminal_interior():
     contended, and the map-based operator picks its neighborhoods BY contention."""
     from freespace_sim.geometry import CylinderSpec
     from freespace_sim.planner import hexgrid as hg
-    from freespace_sim.planner.occupancy import HexOccupancyService
+    from freespace_sim.planner.astar.occupancy import HexOccupancyService
     from freespace_sim.volumes import corridor_segment_volume, hover_reservation
 
     cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
@@ -1030,8 +1030,8 @@ def test_pool_reset_clears_the_free_list():
     """`reset()` restarts the bump allocator at NC, invalidating every previously-freed slot id.
     Keeping them hands the same slot out twice — once from the free list, again as nslots climbs past
     it — aliasing two cells' interval chains and silently corrupting blocked_at."""
-    from freespace_sim.planner._packed import P_NXT
-    from freespace_sim.planner.compiled_hex_occupancy import _Pool
+    from freespace_sim.planner.astar._packed import P_NXT
+    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
 
     pool = _Pool(8, 1000)
     pool.block_range(3, 100, 200)

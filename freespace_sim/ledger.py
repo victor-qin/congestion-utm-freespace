@@ -123,27 +123,13 @@ class ReservationLedger:
         return self._epoch
 
     def detach_subscribers(self) -> None:
-        """Drop EVERY subscriber — commit, release and static — and bump :attr:`epoch`. The ownership
-        transfer a new solver performs when it takes over a completed run's ledger (LNS
-        destroy/repair), and the teardown it performs when it hands the ledger back.
+        """Detach commit, release, and static subscribers during an ownership transfer.
 
-        Clearing alone is not enough: a planner whose services were subscribed still holds
-        ``_svc_ledger is ledger``, so it would neither re-subscribe nor rebuild, and would plan against
-        an occupancy frozen at the moment of the takeover. The shrink tripwire (``n_volumes <
-        n_added``) cannot catch that — a release/re-commit pair nets to the same count. The epoch does,
-        deterministically.
-
-        ``_static_subs`` goes too, and for the same reason the other two do. It holds BOUND METHODS of
-        the detached services, so keeping it pins the very objects the transfer exists to release (a
-        measured 8.4 MB of pool arrays on a 6 km single-level box, and the full occupancy image on a
-        density scenario) and every later rebind appends another pair without removing the dead one.
-        Nothing is lost by dropping them: ``subscribe_static`` REPLAYS every registered hub to each new
-        subscriber, which is exactly why re-deriving the walls after a takeover is free.
-
-        Deliberately returns nothing. An earlier version handed back the removed callbacks "so a caller
-        can restore them", which cannot work: ``_epoch`` only ever increments, so re-subscribed
-        services rebind and discard their state on the next ``plan()``. Re-binding is the supported
-        way back, not restoration."""
+        Bumping :attr:`epoch` makes previously bound planners rebuild and resubscribe; volume counts
+        cannot detect a release/re-commit cycle. Static callbacks are cleared too, and
+        :meth:`subscribe_static` replays registered hubs on rebind. Rebinding, rather than restoring
+        old callbacks, is the supported handoff.
+        """
         self._observers.clear()
         self._release_subs.clear()
         self._static_subs.clear()

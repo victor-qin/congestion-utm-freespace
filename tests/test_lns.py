@@ -3,7 +3,9 @@ and the anytime solver's invariants (feasible + monotone incumbent, exact revert
 determinism, frozen flights, paired-return guard)."""
 
 import hashlib
+import logging
 import pickle
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -731,7 +733,7 @@ def test_paired_return_anchor_guard_rejects_and_reverts(monkeypatch):
     assert _ledger_multiset(res.ledger) == before
 
 
-# ------------------------------------------------------- transaction atomicity (review round 2)
+# --------------------------------------------------------------- transaction atomicity
 @pytest.mark.slow
 def test_repair_restores_when_the_commit_itself_raises(monkeypatch):
     """`ledger.commit` appends the volumes and only THEN fires observers, so an observer that raises
@@ -787,6 +789,50 @@ def test_repair_restores_when_the_destroy_itself_raises():
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("method_name", ["_index_remove", "_index_add"])
+def test_repair_restores_when_accept_index_mutation_raises(monkeypatch, method_name):
+    """An accept-side index failure is caught by ``try_repair``, so its rollback must restore every
+    in-memory view as well as the ledger before re-raising."""
+    res = run(CFG, requests=[_req(1)])
+    state = LNSState(res.config, res.ledger, res.intents)
+    fid = state.movable_ids()[0]
+    old = state.incumbent[fid]
+    candidate = replace(old, cost=old.cost - 1.0)
+
+    ledger_before = _ledger_multiset(res.ledger)
+    cost_before = state.total_cost
+    claims_before = {cell: list(rows) for cell, rows in state._claims.items()}
+    cells_before = {owner: list(rows) for owner, rows in state._cells_of.items()}
+    contention_before = list(state.contention_cells())
+
+    monkeypatch.setattr(
+        state.repair_planner, "plan", lambda request, ledger, cfg: candidate
+    )
+    original = getattr(state, method_name)
+    calls = 0
+
+    def explode_after_mutation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = original(*args, **kwargs)
+        if calls == 1:
+            raise RuntimeError("index mutation exploded")
+        return result
+
+    monkeypatch.setattr(state, method_name, explode_after_mutation)
+    with pytest.raises(RuntimeError, match="index mutation exploded"):
+        state.try_repair([fid], np.random.default_rng(0))
+
+    assert state.incumbent[fid] is old
+    assert state.total_cost == cost_before
+    assert _ledger_multiset(res.ledger) == ledger_before
+    assert state._claims == claims_before
+    assert state._cells_of == cells_before
+    assert state.contention_cells() == contention_before
+    assert lns_state._same_committed_schedule(res.ledger, state.final_intents())
+
+
+@pytest.mark.slow
 def test_lns_seed_changes_the_search():
     """LNSConfig.seed is the reproducibility knob and nothing else in the suite varies it, so a
     solver that ignored it entirely would still look deterministic."""
@@ -832,6 +878,40 @@ def test_run_lns_hands_the_ledger_back_clean():
     assert not res.ledger._observers
     assert not res.ledger._release_subs
     assert not res.ledger._static_subs
+
+
+@pytest.mark.slow
+def test_run_lns_logs_and_detaches_when_an_iteration_raises(monkeypatch, caplog):
+    from freespace_sim.planner.lns import solver as lns_solver
+
+    res = run(CFG, requests=[_req(1)])
+
+    def explode(self, victims, rng, accept_epsilon=0.0, order_mode="premium"):
+        fid = next(iter(victims))
+        request = self.incumbent[fid].request
+        self.repair_planner._occupancy(request, self.ledger, self.cfg)
+        assert self.ledger._observers
+        assert self.ledger._release_subs
+        assert self.ledger._static_subs
+        raise RuntimeError("repair iteration exploded")
+
+    monkeypatch.setattr(lns_solver.LNSState, "try_repair", explode)
+    config = LNSConfig(
+        max_iterations=1,
+        neighborhood_size=1,
+        operators=("random",),
+        adaptive=False,
+        log_every=0,
+    )
+    with caplog.at_level(logging.ERROR, logger="freespace_sim.lns"):
+        with pytest.raises(RuntimeError, match="repair iteration exploded"):
+            lns_solver.run_lns(res.config, res.ledger, res.intents, config)
+
+    assert not res.ledger._observers
+    assert not res.ledger._release_subs
+    assert not res.ledger._static_subs
+    records = [record for record in caplog.records if "lns aborted" in record.message]
+    assert len(records) == 1 and records[0].exc_info is not None
 
 
 def test_milp_capacity_rebinds_after_a_takeover():
@@ -912,6 +992,21 @@ def test_lns_state_refuses_intents_that_are_not_this_ledgers():
     led.commit(1, [_wall()])
     with pytest.raises(ValueError, match="not the same schedule"):
         LNSState(CFG, led, [])
+
+
+def test_lns_state_refuses_a_same_count_different_schedule():
+    """A count-only guard misses a stale schedule when both versions contain the same number of
+    volumes; the exact run-pair check must reject it before taking over the ledger."""
+    res = run(CFG, requests=[_req(1)])
+    intent = res.intents[0]
+    different = [replace(v, t_start=v.t_start + 1000.0, t_end=v.t_end + 1000.0)
+                 for v in intent.volumes]
+    ledger = ReservationLedger(CFG)
+    ledger.commit(intent.request.flight_id, different)
+    assert ledger.n_volumes == len(intent.volumes)
+
+    with pytest.raises(ValueError, match="not the same schedule"):
+        LNSState(CFG, ledger, [intent])
 
 
 def test_lns_refuses_a_baseline_it_cannot_measure():

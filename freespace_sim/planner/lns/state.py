@@ -48,6 +48,48 @@ Cell = tuple[int, int, int]
 # incumbent are denominated in the same currency. ``astar_ref`` is the same search without the compiled
 # kernel (byte-identical by contract); the shortcut/MILP/colgen families are NOT — see LNSState.
 _REPRODUCIBLE_PLANNERS = frozenset({"astar", "astar_ref"})
+_MISSING = object()
+
+
+def _same_committed_schedule(
+    ledger: ReservationLedger, intents: list[OperationalIntent]
+) -> bool:
+    """Whether the ledger holds the exact volume objects owned by the accepted intents.
+
+    Commits retain the immutable ``Volume4D`` objects from each intent. Comparing those references is
+    exact without hashing geometry, and the ledger's per-flight runs let this use O(flights) memory.
+    Flight commit order may change after a repair; volume order within each flight may not.
+    """
+    expected: dict[int, list] = {}
+    for intent in intents:
+        if not intent.accepted:
+            continue
+        fid = intent.request.flight_id
+        if fid in expected:  # duplicate ownership cannot describe one ledger schedule
+            return False
+        expected[fid] = intent.volumes or []
+
+    seen: set[int] = set()
+    current_fid = _MISSING
+    current_volumes: list = []
+    position = 0
+    for fid, volume in ledger.iter_committed():
+        if fid != current_fid:
+            if current_fid is not _MISSING and position != len(current_volumes):
+                return False
+            if fid in seen or fid not in expected:
+                return False
+            seen.add(fid)
+            current_fid = fid
+            current_volumes = expected[fid]
+            position = 0
+        if position >= len(current_volumes) or volume is not current_volumes[position]:
+            return False
+        position += 1
+
+    if current_fid is not _MISSING and position != len(current_volumes):
+        return False
+    return len(seen) == len(expected)
 
 
 @dataclass
@@ -90,19 +132,15 @@ class LNSState:
         self.order = [it.request.flight_id for it in intents]
         self.incumbent: dict[int, OperationalIntent] = {it.request.flight_id: it for it in intents}
 
-        # The intents must BE the schedule this ledger holds. They are two views of one thing and
-        # nothing else re-checks it: `run_lns` mutates the ledger in place and never writes back to the
-        # caller's intent list, so feeding the same SimResult to a second pass (the natural A/B shape)
-        # measures a stale baseline against an already-improved ledger and returns a genuinely
-        # conflicting schedule — measured: a real inter-flight 4D conflict, `verified False`, and the
-        # runner writes the JSON anyway. A live-volume count is O(1) here and turns that into an error.
+        # `run_lns` mutates the ledger in place, so its intents and ledger must still be the exact pair
+        # produced by the same run (use LNSResult.intents after an earlier pass).
         n_intent_vols = sum(len(it.volumes) for it in intents if it.accepted)
-        if n_intent_vols != ledger.n_volumes:
+        if n_intent_vols != ledger.n_volumes or not _same_committed_schedule(ledger, intents):
             raise ValueError(
                 f"intents describe {n_intent_vols} live volumes but the ledger holds "
-                f"{ledger.n_volumes} — they are not the same schedule. Re-run sim.run for a matching "
-                f"(intents, ledger) pair; an LNS pass mutates the ledger in place and supersedes the "
-                f"intents it was given (use LNSResult.intents afterwards).")
+                f"{ledger.n_volumes}, or their owners/content differ — they are not the same schedule. "
+                f"Re-run sim.run for a matching (intents, ledger) pair; an LNS pass mutates the ledger "
+                f"in place and supersedes the intents it was given (use LNSResult.intents afterwards).")
 
         movable = [
             it.request.flight_id
@@ -115,14 +153,8 @@ class LNSState:
         self._movable_set = set(self._movable)
         self.total_cost = float(sum(it.cost for it in intents if it.accepted))
 
-        # Both the unimpeded ruler below and the repair planner are plain A*. If the baseline was flown
-        # by a different planner, `delay(fid) = incumbent.cost - unimpeded.cost` subtracts one
-        # planner's cost from another's: measured on an `astar_shortcut` baseline (70 flights), 18 have
-        # a NEGATIVE raw premium that `delay`'s max(0.0, ...) silently clamps to zero, and 7 of the 58
-        # flights actually held on the ground report zero delay — so the agent seed and the premium
-        # repair order go blind to genuinely delayed flights, and accepted repairs swap refined plans
-        # for unrefined ones while cost_new < cost_old compares the two rulers. Refuse rather than
-        # report a wrong number; pass `repair_planner=` explicitly to override.
+        # Baseline, unimpeded, and repaired costs must come from compatible planners; otherwise delay
+        # premiums and acceptance comparisons use different currencies.
         if repair_planner is None and cfg.planner not in _REPRODUCIBLE_PLANNERS:
             raise ValueError(
                 f"LNS cannot measure a {cfg.planner!r} baseline: its unimpeded ruler and its repair "
@@ -208,12 +240,21 @@ class LNSState:
         self._contended: set[Cell] = set()
         self._contended_list: list[Cell] | None = None
         self._visits: dict[int, list[tuple[int, Cell]]] = {}
+        self._rebuild_claim_index()
+
+    # ------------------------------------------------------------------ claim index
+    def _rebuild_claim_index(self) -> None:
+        """Rebuild all destroy-heuristic claims from the incumbent schedule."""
+        self._claims.clear()
+        self._cells_of.clear()
+        self._contended.clear()
+        self._contended_list = None
+        self._visits.clear()
         for fid in self._movable:
             self._index_add(fid, self.incumbent[fid].volumes, refresh=False)
         for cell in self._claims:  # one contention sweep instead of a refresh per row
             self._refresh_contention(cell)
 
-    # ------------------------------------------------------------------ claim index
     def _index_add(self, fid: int, volumes, refresh: bool = True) -> None:
         rows = self._cells_of.setdefault(fid, [])
         # The flight's own terminal columns. A corridor cell INSIDE one of them is the vertiport's
@@ -339,16 +380,11 @@ class LNSState:
         accept_epsilon: float = 0.0,
         order_mode: str = "premium",
     ) -> RepairOutcome:
-        """One LNS iteration body: release the victims, PP-replan them in priority order,
-        accept iff the neighborhood's summed weighted cost strictly improves, else restore the
-        old plans verbatim.
+        """Release and PP-repair victims; accept only a strict weighted-cost improvement.
 
-        ``order_mode="premium"`` (default) plans the most-delayed victims first with random
-        tie-breaking among equal premiums — measured on 150 agent-based neighborhoods to
-        capture +51% improvement mass over uniform random order and to collapse the
-        exact-no-op rate 47% -> 11.5% (FCFS re-lock: an undelayed victim planned first
-        deterministically re-picks its old geodesic and walls the delayed one back out; see
-        context/lns_plan.md §4). ``"random"`` is the paper's uniform order, kept for A/Bs."""
+        ``premium`` repairs the most-delayed first with random ties; ``random`` retains the paper's
+        order for A/B comparisons. See ``context/lns_plan.md`` §4.
+        """
         victims = sorted(victims)
         assert all(f in self._movable_set for f in victims)
         old = {f: self.incumbent[f] for f in victims}
@@ -369,7 +405,7 @@ class LNSState:
         new: dict[int, OperationalIntent] = {}
         reason = "improved"
         cost_at_entry = self.total_cost
-        applied: list[int] = []   # fids the accept loop has already rewritten in memory
+        applied: list[int] = []   # fids whose accept-side in-memory rewrite has started
         # EVERYTHING that can leave the schedule half-destroyed lives inside this block — the destroy
         # itself included. `release_many` tombstones every victim volume BEFORE it notifies removal
         # subscribers, and each of those hooks can raise, so a destroy that dies part-way is exactly
@@ -400,12 +436,12 @@ class LNSState:
                 # index, so a raise part-way (rasterize, MemoryError, a second SIGINT) would otherwise
                 # leave them describing a schedule the ledger does not hold, with `old` already gone.
                 for fid, it in new.items():
+                    applied.append(fid)
                     self.total_cost += float(it.cost) - float(self.incumbent[fid].cost)
                     self.incumbent[fid] = it
                     self._index_remove(fid)
                     self._index_add(fid, it.volumes)
                     self._visits.pop(fid, None)
-                    applied.append(fid)
                 return RepairOutcome(True, "improved", cost_old, cost_new, len(new))
         except BaseException:
             self._rewind(victims, old, cost_at_entry, applied)
@@ -417,26 +453,14 @@ class LNSState:
         return RepairOutcome(False, reason, cost_old, cost_new, len(new))
 
     def _rewind(self, victims, old, cost_at_entry, applied=()) -> None:
-        """Put the incumbent back — ledger AND in-memory state — after a rejected or aborted
-        transaction.
+        """Restore the ledger and any partially applied in-memory acceptance.
 
-        Releases the VICTIMS rather than only what the repair recorded. The two differ precisely when a
-        commit dies part-way: `ledger.commit` appends the volumes and only then fires observers, so an
-        observer that raises leaves those volumes live while the caller's `new[fid] = it` never ran.
-        Every fid the repair can have committed is a victim, and re-releasing an already-tombstoned
-        flight is a no-op, so releasing `victims` covers the torn case for free — where releasing
-        `new.keys()` would leave the flight double-booked against its own restored plan.
-
-        Each victim is re-committed in ONE call (`_absorb` groups by adjacent runs, so a flight's
-        volumes must stay contiguous), and every victim gets its attempt even if one fails: the
-        restoring commit re-fires the same observers that may have just raised, and aborting the loop
-        there would strand every victim after it. The first failure is re-raised once the rest are
-        home.
-
-        ``applied`` names the fids the ACCEPT loop had already rewritten in memory before dying — the
-        only case where the incumbent, the running cost and the claim index need rolling back too. It
-        is empty on the ordinary reject path, which therefore costs exactly what it always did (one
-        release plus k commits) and never re-rasterizes an index that did not change."""
+        Release every victim because ``commit`` can append before a subscriber raises, leaving live
+        volumes absent from the repair's bookkeeping. Every victim gets a restore attempt even if an
+        earlier one fails. If acceptance had begun, rebuild the full claim index from the restored
+        incumbent; that exceptional O(all claims) path also heals partial index mutations while the
+        ordinary rejection path remains one release plus k commits.
+        """
         self.ledger.release_many(victims)
         failures = []
         for fid in victims:
@@ -448,9 +472,7 @@ class LNSState:
             self.total_cost = cost_at_entry
             for fid in applied:
                 self.incumbent[fid] = old[fid]
-                self._index_remove(fid)
-                self._index_add(fid, old[fid].volumes)
-                self._visits.pop(fid, None)
+            self._rebuild_claim_index()
         if failures:
             fids = [f for f, _ in failures]
             raise RuntimeError(

@@ -267,6 +267,11 @@ class AStarPlanner:
         self.evict_floor: float | None = None
         self._svc: HexOccupancyService | None = None   # incremental hex-occupancy (per ledger)
         self._svc_ledger: ReservationLedger | None = None
+        # The ledger's subscription generation at bind time. A bump means our hooks were detached
+        # (another solver took the ledger over — see ReservationLedger.detach_subscribers) and commits
+        # happened that our services never saw, so they must REBIND, not just rebuild.
+        self._svc_epoch = 0
+        self._cocc_epoch = 0
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
         # Always-active terminal walls (cfg.terminal_airspace_always_active) are PERMANENT ledger volumes now
         # (filed by sim.run via ledger.register_static_terminal); the occupancy services derive their routing
@@ -312,8 +317,12 @@ class AStarPlanner:
         publish hook (ASTM-subscription style). First use subscribes and absorbs any pre-existing
         volumes; a ledger shrink (release) trips a from-scratch rebuild + warning (add-only)."""
         svc = self._svc
+        if svc is not None and self._svc_ledger is ledger and self._svc_epoch != ledger.epoch:
+            svc = None      # detached mid-life: re-subscribe and re-absorb (the shrink tripwire below
+            #                 cannot see this — a release + re-commit nets to the same n_volumes)
         if svc is None or self._svc_ledger is not ledger:
             svc = self._svc = HexOccupancyService(cfg, track_removal=self.incremental_release)
+            self._svc_epoch = ledger.epoch
             self._tcap = TerminalCapacity(cfg, ledger,       # temporal pad capacity, same ledger
                                           track_removal=self.incremental_release)
             self._svc_ledger = ledger
@@ -780,10 +789,13 @@ class AStarPlanner:
         evict to the request clock). Coexists with ``_occupancy`` — the host still needs the reference
         service for ``pad_clear`` (non-terminal takeoff/landing gate)."""
         cocc = self._cocc
+        if cocc is not None and self._cocc_ledger is ledger and self._cocc_epoch != ledger.epoch:
+            cocc = None                                  # detached mid-life — rebind (see _occupancy)
         if cocc is None or self._cocc_ledger is not ledger:
             from .compiled_hex_occupancy import CompiledHexOccupancy
             cocc = self._cocc = CompiledHexOccupancy(cfg, track_removal=self.incremental_release)
             self._cocc_ledger = ledger
+            self._cocc_epoch = ledger.epoch
             ledger.subscribe(cocc.on_commit)
             if self.incremental_release:                     # removal hook: release_many un-absorbs
                 ledger.subscribe_release(cocc.on_release)

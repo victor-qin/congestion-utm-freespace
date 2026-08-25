@@ -98,6 +98,7 @@ class MILPOptPlanner:
         # per-ledger pad-capacity authority (bound lazily in _capacity, AStarPlanner._occupancy-style)
         self._tcap: TerminalCapacity | None = None
         self._tcap_ledger: ReservationLedger | None = None
+        self._tcap_epoch = 0            # ledger subscription generation at bind time (see _capacity)
 
     def plan(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
@@ -182,11 +183,16 @@ class MILPOptPlanner:
         Per-planner-instance by design (the established A* pattern): in ``astar_milp`` both the MILP
         and its warm A* keep an index on the shared ledger — duplicated commit work, consistent by
         construction; a shared per-ledger authority is a possible future dedup."""
-        if self._tcap_ledger is not ledger:
+        # A subscription generation change means our commit hook was detached (another solver took the
+        # ledger over — ReservationLedger.detach_subscribers) and commits happened we never saw, so we
+        # must REBIND, not merely rebuild. The count tripwire below cannot see it: LNS restores every
+        # flight it releases, so n_volumes ends at or above the frozen count (measured 1287 vs 1280).
+        if self._tcap_ledger is not ledger or self._tcap_epoch != ledger.epoch:
             self._tcap = TerminalCapacity(cfg, ledger)
             ledger.subscribe(self._tcap.on_commit)
             self._absorb_committed(ledger)
             self._tcap_ledger = ledger
+            self._tcap_epoch = ledger.epoch
         elif ledger.n_volumes < self._tcap._n_observed_volumes:
             self._tcap.reset()
             self._absorb_committed(ledger)

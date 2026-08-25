@@ -21,6 +21,7 @@ import numpy as np
 from freespace_sim import verify
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
+from freespace_sim.sim import demand_turnaround_s
 from freespace_sim.planner.lns.neighborhood import (
     AdaptiveSelector,
     agent_based_neighborhood,
@@ -47,7 +48,6 @@ class LNSConfig:
     map_max_cells: int = 4096           # map-based: BFS exploration bound
     frozen_flight_ids: frozenset = frozenset()      # never destroyed (USS-restriction hook)
     movable_uss_ids: frozenset | None = None        # None -> system operator may move every USS's intents
-    enforce_return_anchor: bool = False  # set when the baseline ran return_anchor="realized"
     incremental_release: bool = True     # O(victims) occupancy removal; False = rebuild path (parity ref)
     time_limit_s: float | None = None
     verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
@@ -88,86 +88,122 @@ def run_lns(
     intents: list[OperationalIntent],
     lns: LNSConfig,
     *,
-    static_terms: tuple = (),
+    static_terms: tuple | None = None,
     turnaround_s: float | None = None,
 ) -> LNSResult:
     """Improve a committed schedule in place. ``ledger``/``intents`` are a completed run's
-    (the ledger is mutated; the returned intents supersede the input list)."""
+    (the ledger is mutated; the returned intents supersede the input list).
+
+    ``static_terms`` defaults to the walls the LEDGER actually holds. Passing ``()`` explicitly means
+    "a world with no always-active terminal airspace", which is a different claim: it makes the
+    unimpeded baseline free of walls (so every delay premium — the ranking that picks victims and
+    orders the repair — is inflated) and it makes the closing ``verify`` replay a world the schedule
+    was never planned against, so ``verified`` can come back True for an infeasible schedule.
+    ``turnaround_s=None`` likewise disables the paired-return guard; supply it whenever the baseline
+    ran ``return_anchor="realized"``. ``run_lns_on_result`` derives both correctly."""
+    # Validate the operator set BEFORE constructing LNSState: the constructor detaches the caller's
+    # ledger subscribers irrecoverably and spends one A* plan per movable flight (minutes at scenario
+    # scale), and an argument error must not cost either.
+    known = {"agent", "map", "random"}
+    unknown = [name for name in lns.operators if name not in known]
+    if unknown:
+        raise ValueError(f"unknown LNS operators {unknown!r} (want subset of agent/map/random)")
+    if not lns.operators:   # else the first pick indexes an empty wheel (numpy: "high <= 0")
+        raise ValueError("LNSConfig.operators is empty — need at least one of agent/map/random")
+    if len(set(lns.operators)) != len(lns.operators):
+        # `ops` would collapse the duplicate while AdaptiveSelector.names keeps it, silently handing
+        # that operator a double share of the roulette and reporting a weights dict shorter than the
+        # configuration — a run that is quietly not the experiment that was asked for.
+        raise ValueError(f"duplicate LNS operators {list(lns.operators)!r} — each name at most once")
+
     t0 = time.monotonic()
     state = LNSState(
         cfg,
         ledger,
         intents,
-        static_terms=static_terms,
+        static_terms=ledger.static_terminals() if static_terms is None else static_terms,
         frozen_flight_ids=lns.frozen_flight_ids,
         movable_uss_ids=lns.movable_uss_ids,
         turnaround_s=turnaround_s,
         incremental_release=lns.incremental_release,
     )
+    static_terms = state.static_terms
     init_s = time.monotonic() - t0
     cost_before = state.total_cost
 
     tabu: set[int] = set()
-    ops = {}
-    if "agent" in lns.operators:
-        ops["agent"] = lambda ctx, n: agent_based_neighborhood(ctx, n, tabu, lns.max_walks)
-    if "map" in lns.operators:
-        ops["map"] = lambda ctx, n: map_based_neighborhood(ctx, n, lns.map_max_cells)
-    if "random" in lns.operators:
-        ops["random"] = random_neighborhood
-    unknown = [name for name in lns.operators if name not in ops]
-    if unknown:
-        raise ValueError(f"unknown LNS operators {unknown!r} (want subset of agent/map/random)")
+    ops = {
+        "agent": lambda ctx, n: agent_based_neighborhood(ctx, n, tabu, lns.max_walks),
+        "map": lambda ctx, n: map_based_neighborhood(ctx, n, lns.map_max_cells),
+        "random": random_neighborhood,
+    }
+    ops = {name: ops[name] for name in lns.operators}
     selector = AdaptiveSelector(tuple(lns.operators), lns.gamma)
 
     trajectory: list[dict] = []
     n_accepted = 0
     n_iter = 0
     # Every iteration's first plan() rebuilds the occupancy from the shrunk ledger — that is the
-    # designed heal, so the reference path's per-shrink RuntimeWarning is pure noise here.
-    warnings.filterwarnings("ignore", message="ReservationLedger shrank", append=True)
-    for i in range(lns.max_iterations):
-        if lns.time_limit_s is not None and time.monotonic() - t0 > lns.time_limit_s:
-            break
-        n_iter = i + 1
-        rng_i = np.random.default_rng(np.random.SeedSequence([lns.seed, i]))
-        state.rng = rng_i
-        if lns.adaptive:
-            name = selector.pick(rng_i)
-        else:
-            name = lns.operators[int(rng_i.integers(len(lns.operators)))]
-        victims = ops[name](state, lns.neighborhood_size)
-        if not victims:
+    # designed heal, so the reference path's per-shrink UserWarning is pure noise here. SCOPED to this
+    # loop: a bare filterwarnings() edits the process-global filter list and would stay in force for
+    # everything the caller does afterwards, including a later run that genuinely wants the warning.
+    # PREPENDED (not append=True): an appended filter sits behind every pre-existing one, so a caller
+    # running under `-W error::UserWarning` or a pytest `filterwarnings = ["error"]` would keep the
+    # broader filter and the warning would become a live exception out of plan() on iteration 0 — the
+    # exact failure this block exists to prevent, in the one mode (incremental_release=False) that
+    # trips the warning every iteration.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="ReservationLedger shrank")
+        for i in range(lns.max_iterations):
+            if lns.time_limit_s is not None and time.monotonic() - t0 > lns.time_limit_s:
+                break
+            n_iter = i + 1
+            rng_i = np.random.default_rng(np.random.SeedSequence([lns.seed, i]))
+            state.rng = rng_i
             if lns.adaptive:
-                selector.update(name, 0.0)
+                name = selector.pick(rng_i)
+            else:
+                name = lns.operators[int(rng_i.integers(len(lns.operators)))]
+            victims = ops[name](state, lns.neighborhood_size)
+            if not victims:
+                if lns.adaptive:
+                    selector.update(name, 0.0)
+                trajectory.append(dict(
+                    iter=i, op=name, n=0, victims=[], accepted=False, reason="empty",
+                    cost_old=0.0, cost_new=0.0,
+                    incumbent_cost=state.total_cost, wall_s=time.monotonic() - t0,
+                ))
+                continue
+            out = state.try_repair(victims, rng_i, lns.accept_epsilon, order_mode=lns.repair_order)
+            if lns.adaptive:
+                selector.update(name, out.improvement)
+            n_accepted += int(out.accepted)
             trajectory.append(dict(
-                iter=i, op=name, n=0, victims=[], accepted=False, reason="empty",
-                cost_old=0.0, cost_new=0.0,
+                iter=i, op=name, n=len(victims), victims=sorted(victims),
+                accepted=out.accepted, reason=out.reason,
+                cost_old=out.cost_old,
+                cost_new=None if math.isinf(out.cost_new) else out.cost_new,
                 incumbent_cost=state.total_cost, wall_s=time.monotonic() - t0,
             ))
-            continue
-        out = state.try_repair(victims, rng_i, lns.accept_epsilon, order_mode=lns.repair_order)
-        if lns.adaptive:
-            selector.update(name, out.improvement)
-        n_accepted += int(out.accepted)
-        trajectory.append(dict(
-            iter=i, op=name, n=len(victims), victims=sorted(victims),
-            accepted=out.accepted, reason=out.reason,
-            cost_old=out.cost_old,
-            cost_new=None if math.isinf(out.cost_new) else out.cost_new,
-            incumbent_cost=state.total_cost, wall_s=time.monotonic() - t0,
-        ))
-        if out.accepted and lns.verify_every and n_accepted % lns.verify_every == 0:
-            bad = verify.find_interflight_conflict(state.final_intents(), cfg, static_terminals=static_terms)
-            if bad is not None:
-                raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
-        if lns.log_every and (i + 1) % lns.log_every == 0:
-            log.info(
-                "lns %d/%d: cost %.0f (%.2f%% below start), %d accepted, weights %s",
-                i + 1, lns.max_iterations, state.total_cost,
-                100.0 * (cost_before - state.total_cost) / max(1e-9, cost_before),
-                n_accepted, {k: round(v, 3) for k, v in selector.weights.items()},
-            )
+            if out.accepted and lns.verify_every and n_accepted % lns.verify_every == 0:
+                bad = verify.find_interflight_conflict(state.final_intents(), cfg,
+                                                      static_terminals=static_terms)
+                if bad is not None:
+                    raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+            if lns.log_every and (i + 1) % lns.log_every == 0:
+                log.info(
+                    "lns %d/%d: cost %.0f (%.2f%% below start), %d accepted, weights %s",
+                    i + 1, lns.max_iterations, state.total_cost,
+                    100.0 * (cost_before - state.total_cost) / max(1e-9, cost_before),
+                    n_accepted, {k: round(v, 3) for k, v in selector.weights.items()},
+                )
+
+    # Hand the ledger back clean. The takeover detached the caller's subscribers; without a symmetric
+    # teardown the repair planner's three services stay wired to a ledger whose owner is gone (measured
+    # ~10.2 MB retained on a 24-flight toy world, the full occupancy image at scenario scale), and any
+    # later commit by the caller silently feeds those dead services — the takeover's own failure mode,
+    # in the other direction. The epoch bump makes every planner rebind rather than trust stale state.
+    ledger.detach_subscribers()
 
     final = state.final_intents()
     bad = verify.find_interflight_conflict(final, cfg, static_terminals=static_terms)
@@ -185,15 +221,43 @@ def run_lns(
     )
 
 
-def run_lns_on_result(res, demand, lns: LNSConfig, *, return_anchor: str = "nominal") -> LNSResult:
-    """Convenience entry over a ``sim.run`` result: derives the static terminals from the
-    demand model and, when the baseline used realized return anchors, the turnaround the
-    paired-return guard must respect."""
-    static_terms = tuple(demand.terminals(res.config)) if demand is not None else ()
+def run_lns_on_result(res, demand, lns: LNSConfig, *, return_anchor: str | None = None) -> LNSResult:
+    """Convenience entry over a ``sim.run`` result: takes the static terminals and the return-anchor
+    mode from the RESULT (what the baseline actually flew), and, when that mode was ``"realized"``,
+    the turnaround the paired-return guard must respect from the demand model.
+
+    Both are read off the result rather than re-derived, because both are silent when wrong:
+
+    * ``ledger.static_terminals()`` is the set of permanent walls the run really filed. Re-deriving
+      it as ``demand.terminals(cfg)`` invents walls whenever ``terminal_airspace_always_active`` is
+      off (the unimpeded baseline then over-charges every flight, distorting delay premiums, and the
+      final ``verify`` replays a world the schedule was never planned against), crashes outright on a
+      demand model without a ``terminals`` method, and misses ``sim.run``'s scenario-collected
+      fallback for those models.
+    * ``res.return_anchor`` decides whether the paired-return guard runs at all. Defaulting it to
+      ``"nominal"`` disabled the guard for exactly the runs that need it, with no error and no log
+      line — the LNS would happily re-time an outbound past its return's departure. Pass
+      ``return_anchor=`` only to assert the mode; disagreeing with the result is an error, not an
+      override.
+    """
+    try:
+        recorded = res.return_anchor
+    except AttributeError:                     # never default: "nominal" is the value that DISARMS
+        raise TypeError(                       # the guard, so guessing it is the unsafe direction
+            f"{type(res).__name__} carries no return_anchor — run_lns_on_result needs the anchor mode "
+            "the baseline actually flew. Pass a sim.run() SimResult, or call run_lns directly with an "
+            "explicit turnaround_s.") from None
+    if return_anchor is not None and return_anchor != recorded:
+        raise ValueError(
+            f"return_anchor={return_anchor!r} contradicts the baseline's {recorded!r} — the anchor mode "
+            "is a property of the schedule being improved, not a knob of the improvement pass")
     turnaround_s = None
-    if return_anchor == "realized" or lns.enforce_return_anchor:
-        turnaround_s = float(getattr(demand, "turnaround_s", 0.0) or 0.0)
+    if recorded == "realized":
+        if demand is None:
+            log.warning("lns: return_anchor='realized' without a demand model — assuming turnaround_s=0 "
+                        "(the paired-return guard then only enforces release <= the return's departure)")
+        turnaround_s = demand_turnaround_s(demand)
     return run_lns(
         res.config, res.ledger, res.intents, lns,
-        static_terms=static_terms, turnaround_s=turnaround_s,
+        static_terms=res.ledger.static_terminals(), turnaround_s=turnaround_s,
     )

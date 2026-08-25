@@ -85,6 +85,10 @@ class ReservationLedger:
 
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
+        # `_vols` KEEPS a tombstoned volume's object (only its `_fids` owner and `_aabb` box are
+        # overwritten — see release_many), so a raw `zip(_fids, _vols)` walk sees dead geometry as if it
+        # were committed. Every read path either prunes by AABB or filters the owner; iterate with
+        # `iter_committed()`, never over these lists directly.
         self._vols: list[Volume4D] = []
         self._fids: list[int] = []
         self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
@@ -107,6 +111,43 @@ class ReservationLedger:
         self._static_terms: list[tuple] = []   # (center, term) pairs, for the occupancy-derivation replay
         self._static_terminal_ids: set = set()  # O(1) proof that a queried hub has its permanent wall
         self._static_subs: list = []           # static-terminal subscribers (occupancy routing-wall hook)
+        # Bumped by `detach_subscribers`. A service binds itself to (ledger, epoch); a mismatch means
+        # commits happened that it could not observe, so its incremental state is unrecoverable and it
+        # must REBIND (re-subscribe + rebuild), not merely rebuild. See detach_subscribers.
+        self._epoch = 0
+
+    @property
+    def epoch(self) -> int:
+        """Subscription generation — see :meth:`detach_subscribers`. Services store it at bind time and
+        rebind when it changes; a ledger that never changes hands stays at 0 (zero overhead)."""
+        return self._epoch
+
+    def detach_subscribers(self) -> None:
+        """Drop EVERY subscriber — commit, release and static — and bump :attr:`epoch`. The ownership
+        transfer a new solver performs when it takes over a completed run's ledger (LNS
+        destroy/repair), and the teardown it performs when it hands the ledger back.
+
+        Clearing alone is not enough: a planner whose services were subscribed still holds
+        ``_svc_ledger is ledger``, so it would neither re-subscribe nor rebuild, and would plan against
+        an occupancy frozen at the moment of the takeover. The shrink tripwire (``n_volumes <
+        n_added``) cannot catch that — a release/re-commit pair nets to the same count. The epoch does,
+        deterministically.
+
+        ``_static_subs`` goes too, and for the same reason the other two do. It holds BOUND METHODS of
+        the detached services, so keeping it pins the very objects the transfer exists to release (a
+        measured 8.4 MB of pool arrays on a 6 km single-level box, and the full occupancy image on a
+        density scenario) and every later rebind appends another pair without removing the dead one.
+        Nothing is lost by dropping them: ``subscribe_static`` REPLAYS every registered hub to each new
+        subscriber, which is exactly why re-deriving the walls after a takeover is free.
+
+        Deliberately returns nothing. An earlier version handed back the removed callbacks "so a caller
+        can restore them", which cannot work: ``_epoch`` only ever increments, so re-subscribed
+        services rebind and discard their state on the next ``plan()``. Re-binding is the supported
+        way back, not restoration."""
+        self._observers.clear()
+        self._release_subs.clear()
+        self._static_subs.clear()
+        self._epoch += 1
 
     def subscribe(self, callback) -> None:
         """Register ``callback(flight_id, volumes)``, fired after each successful commit — the
@@ -119,7 +160,8 @@ class ReservationLedger:
         flight — the removal analogue of ``subscribe``. Services that track per-owner rows use it
         to un-absorb a flight in O(its volumes) and keep ``n_added`` in lockstep with
         ``n_volumes``, so the shrink tripwire (their safety net) stays silent. Legacy ``release``
-        predates this hook and refuses to run while release subscribers exist."""
+        predates this hook and delegates to ``release_many`` whenever such a subscriber exists — its
+        own rebuild re-feeds commit observers volume-by-volume, which would desync per-owner rows."""
         self._release_subs.append(callback)
 
     def register_static_terminal(self, center, term) -> None:
@@ -206,12 +248,16 @@ class ReservationLedger:
             cb(flight_id, volumes)
 
     def release(self, flight_id: int) -> None:
-        """Remove a flight (operator-initiated replanning). Rare in v0; rebuilds the index."""
+        """Remove a flight (operator-initiated replanning). Rare in v0; rebuilds the index.
+
+        The rebuild re-commits every surviving volume, which re-feeds commit observers one volume at a
+        time — how a commit-only service (no removal hook) stays in sync. That re-feed would desync a
+        service that DOES track per-owner rows, so once release subscribers exist this delegates to
+        ``release_many``, whose removal publish is exact for them (and whose shrink leaves the
+        commit-only services' tripwire to heal them). Same live content either way."""
         if self._release_subs:
-            raise RuntimeError(
-                "legacy release() re-feeds commit observers volume-by-volume and would desync "
-                "release subscribers' per-owner rows — use release_many instead"
-            )
+            self.release_many([flight_id])
+            return
         keep = [(f, v) for f, v in zip(self._fids, self._vols)
                 if f != flight_id and f != self.TOMBSTONE_FID]
         self._vols, self._fids, self._aabb, self._buckets = [], [], [], {}
@@ -311,6 +357,15 @@ class ReservationLedger:
     def static_volumes(self) -> tuple:
         """The permanent always-active terminal walls (read-only view; empty unless registered)."""
         return tuple(self._static_vols)
+
+    def static_terminals(self) -> tuple:
+        """The ``(center, term)`` pairs actually registered as permanent walls — the record of what this
+        ledger was BUILT with, for replaying the same world (``verify.find_interflight_conflict``'s
+        ``static_terminals``, a re-derived unimpeded ledger). Re-deriving them from the demand model
+        instead is wrong in both directions: it invents walls the run never filed when
+        ``terminal_airspace_always_active`` is off, and it misses the scenario-collected fallback
+        ``sim.run`` uses for demand models without ``terminals``. Empty unless registered."""
+        return tuple(self._static_terms)
 
     def has_static_terminal(self, terminal_id) -> bool:
         """Whether ``terminal_id`` has a registered permanent ground-to-ceiling ledger wall.

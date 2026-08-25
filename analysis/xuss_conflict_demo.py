@@ -70,7 +70,7 @@ def main() -> None:
         if r:
             last.clear()
             for q in vols:
-                for f, cv in zip(led._fids, led._vols):
+                for f, cv in led.iter_committed():      # live volumes only (a raw _fids/_vols zip sees tombstones)
                     if volumes_conflict(q, cv):
                         last["p"] = f
                         break

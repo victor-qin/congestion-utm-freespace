@@ -110,6 +110,7 @@ class _Pool:
         self.iv[: self.NC, P_HI] = self.MAXS
         self.iv[: self.NC, P_NXT] = -1
         self.nslots = self.NC
+        self._free: list[int] = []      # every overflow slot is reclaimed by the bump reset above
 
     def _grow(self):
         cap = self.cap * 2
@@ -119,11 +120,14 @@ class _Pool:
         self.cap = cap
 
     def _alloc(self, lo, hi, nxt) -> int:
-        if self.nslots >= self.cap:
-            self._grow()
-        s = self.nslots
+        if self._free:                  # reuse a slot freed by reset_cell before bumping
+            s = self._free.pop()
+        else:
+            if self.nslots >= self.cap:
+                self._grow()
+            s = self.nslots
+            self.nslots += 1
         self.iv[s, P_LO] = lo; self.iv[s, P_HI] = hi; self.iv[s, P_NXT] = nxt
-        self.nslots += 1
         return s
 
     def block(self, c: int, s: int) -> None:
@@ -190,9 +194,20 @@ class _Pool:
 
     def reset_cell(self, c: int) -> None:
         """Re-seed cell ``c``'s list to the single free interval ``[0, MAXS]`` (removal-mode cell
-        rebuild). The old chain's overflow slots are abandoned — a dead slot is harmless (nothing
-        links to it) and the bump allocator's growth bounds the leak; callers re-apply the cell's
-        surviving claims immediately after."""
+        rebuild); callers re-apply the cell's surviving claims immediately after.
+
+        The old chain's overflow slots are RECLAIMED onto the free list. Abandoning them instead is
+        harmless per call (nothing links to a dropped slot) but not per run: ``_alloc`` is a pure bump
+        allocator, so under LNS — which resets and re-applies the same hot cells every iteration —
+        ``nslots`` grows without bound and drags ``cap`` through repeated doubling, for a working set
+        that never actually grows. Reuse costs one list pop and keeps the pool's footprint proportional
+        to LIVE fragmentation. Slot indices are pure storage (every reader walks the chain), so which
+        slot holds an interval never affects an answer."""
+        free = self._free
+        slot = int(self.iv[c, P_NXT])
+        while slot != -1:                      # walk only the overflow tail; head slot `c` is re-seeded
+            free.append(slot)
+            slot = int(self.iv[slot, P_NXT])
         self.iv[c, P_LO] = 0
         self.iv[c, P_HI] = self.MAXS
         self.iv[c, P_NXT] = -1

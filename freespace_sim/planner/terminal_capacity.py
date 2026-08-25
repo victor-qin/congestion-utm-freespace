@@ -113,6 +113,7 @@ class TerminalCapacity:
         if self.track_removal:
             rows = self._rows.setdefault(flight_id, [])
             rows.append(len(volumes))
+        floor = self.evicted_before
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 r = self.radius.setdefault(v.terminal_id, v.shape.radius)
@@ -121,16 +122,35 @@ class TerminalCapacity:
                         f"terminal {v.terminal_id!r}: same-hub column radius must be constant "
                         f"({r} vs {v.shape.radius})"
                     )
+                if floor is not None and v.t_end <= floor:
+                    continue        # already behind the eviction watermark: `evict_before` would have
+                    #                 dropped it, and it can never overlap a future query window. Not
+                    #                 recorded either, so `dwells` and `_rows` stay in exact
+                    #                 correspondence — see on_release.
                 self.dwells.setdefault(v.terminal_id, []).append((v.t_start, v.t_end))
                 if rows is not None:
                     rows.append((v.terminal_id, v.t_start, v.t_end))
 
     def on_release(self, flight_id, volumes) -> None:
-        """Ledger release subscriber (removal mode): subtract the flight's recorded dwell rows
-        (skipping any eviction already dropped) and invalidate the lazy foreign-transit index —
-        the released volumes may be indexed in `_ft`, and its append-only tail assumption breaks
-        once the ledger can shrink mid-run. Keeps `_n_observed_volumes` in lockstep."""
-        rows = self._rows.pop(flight_id)
+        """Ledger release subscriber (removal mode): subtract the flight's recorded dwell rows and
+        invalidate the lazy foreign-transit index — the released volumes may be indexed in `_ft`, and
+        its append-only tail assumption breaks once the ledger can shrink mid-run. Keeps
+        `_n_observed_volumes` in lockstep.
+
+        A recorded row is absent from ``dwells`` in exactly one case: :meth:`evict_before` dropped every
+        interval ending at or before its watermark, without touching the per-owner rows. The floor test
+        below reproduces that condition EXACTLY — but only because :meth:`on_commit` applies the same
+        clamp, so a dwell behind the watermark is never recorded in the first place. Insert and remove
+        must agree; that symmetry is what makes "absent" and "evicted" the same set.
+
+        Removing by value alone is NOT a substitute, and looks safer than it is: after an eviction the
+        rows and the intervals have diverged, so ``remove((t0, t1))`` can consume a DIFFERENT,
+        still-committed flight's identical dwell — two same-hub legs sharing a window is ordinary — and
+        that survivor's pad capacity vanishes with no error (same-hub columns are conflict-exempt, so
+        ``verify`` cannot see it either). Absence is therefore *derived*, never *tolerated*: a missing
+        interval that the floor does not explain is real drift and raises, matching the loud-on-drift
+        contract :meth:`HexOccupancyService._drop` states."""
+        rows = self._rows.pop(flight_id, ())
         floor = self.evicted_before
         for row in rows:
             if isinstance(row, int):
@@ -140,7 +160,7 @@ class TerminalCapacity:
             if floor is not None and t1 <= floor:
                 continue                               # eviction already dropped this dwell
             ivs = self.dwells[tid]
-            ivs.remove((t0, t1))
+            ivs.remove((t0, t1))                       # KeyError/ValueError here IS the drift signal
             if not ivs:
                 del self.dwells[tid]
         self._ft.clear()

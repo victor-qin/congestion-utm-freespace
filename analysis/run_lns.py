@@ -91,7 +91,6 @@ def main() -> None:
         neighborhood_size=args.neighborhood,
         operators=tuple(s.strip() for s in args.operators.split(",") if s.strip()),
         gamma=args.gamma,
-        enforce_return_anchor=args.return_anchor == "realized",
         incremental_release=not args.no_incremental,
         repair_order=args.repair_order,
         time_limit_s=args.time_limit,

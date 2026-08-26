@@ -53,24 +53,28 @@ def _kernel_status(planner_name: str) -> str:
     ``sys.modules`` so the sim's later import is free. Only the astar family has a kernel —
     anything else reports n/a rather than paying the numba import.
 
-    Reaching ``kernel`` runs the ``astar`` package ``__init__`` first, so this import pulls the
-    whole family (planner, both occupancy modules, and through them volumes/cost/ledger). A bare
-    ``except ImportError`` would therefore print the numba banner for an unrelated broken
-    dependency and send the operator to ``uv sync`` for a fault that has nothing to do with numba.
-    Only a numba-rooted failure is the fallback; anything else propagates as itself.
+    Load the ``astar`` package outside the fallback guard: its ``__init__`` pulls the whole family
+    (planner, both occupancy modules, and through them volumes/cost/ledger), so any break in that
+    graph must propagate as itself. Probe numba separately because its compatibility checks raise
+    plain ``ImportError`` (``name=None``), while a missing transitive dependency names e.g.
+    ``llvmlite``; neither can be classified reliably from ``ImportError.name``. Once numba imports,
+    load the kernel outside the guard too, so a broken kernel import is never mislabeled as an
+    optional-dependency fallback.
     """
     if "astar" not in planner_name:
         return "n/a (planner has no compiled kernel)"
     if planner_name == "astar_ref":
         return "pure-Python reference (explicitly requested via astar_ref)"
+
+    import freespace_sim.planner.astar  # noqa: F401  # validate the non-numba import graph first
     try:
-        from freespace_sim.planner.astar import kernel  # noqa: F401
-        return "compiled (numba kernel active)"
-    except ImportError as e:
-        if (e.name or "").partition(".")[0] != "numba":
-            raise                    # a real break in the A* import graph, not a missing JIT
+        from numba import njit as _njit  # noqa: F401  # exact dependency kernel.py imports
+    except ImportError:
         return ("REFERENCE FALLBACK — numba unavailable, ~5-7x slower search. "
                 "Run via plain `uv run` (numba is in tool.uv default-groups) or `uv sync`.")
+
+    from freespace_sim.planner.astar import kernel  # noqa: F401
+    return "compiled (numba kernel active)"
 
 
 class _StderrTee:

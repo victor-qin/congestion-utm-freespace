@@ -91,6 +91,22 @@ def get_planner(name: str, params=None) -> Planner:
         from .astar import AStarPlanner
 
         return AStarPlanner(compiled=False)              # pure-Python reference oracle (A/B + fallback)
+    if name == "sipp":
+        from .sipp import SIPPPlanner
+
+        # Cost-aware Safe Interval Path Planning: same cost model, terminal gating and output contract as
+        # A*, but the air search collapses the per-step axis into safe intervals (Pareto over
+        # (arrival, cost)). Compiled by default, auto-falling back to A* when the kernel bails.
+        return SIPPPlanner(compiled=True)
+    if name == "sipp_ref":
+        from .sipp import SIPPPlanner
+
+        return SIPPPlanner(compiled=False)               # pure-Python SIPP oracle (A/B + the fallback path)
+    if name == "sipp_shortcut":
+        from .shortcut import ShortcutRefiner
+        from .sipp import SIPPPlanner
+
+        return ShortcutRefiner(SIPPPlanner(compiled=True), label="sipp_sc")
     if name == "astar_milp":
         return _astar_milp()
     if name == "astar_shortcut":

@@ -3,9 +3,8 @@
 The headline guarantee is **cost equivalence with A***: on the same committed ledger SIPP returns the
 same accepted/denied outcome and the same optimal weighted cost as the A* planner — verified by
 "replay" (plan every flight with both planners against the SAME, A*-committed, ledger, isolating
-per-plan optimality from FCFS tie-cascade). Exact for non-terminal and legacy-terminal worlds; for the
-default fixed-exit-lanes terminal path there is a rare marginal ground/hover tie (documented below),
-where SIPP stays within a small tolerance, same accept set, still verified.
+per-plan optimality from FCFS tie-cascade). Exact for non-terminal, legacy-terminal, and default
+fixed-exit-lanes worlds.
 """
 import numpy as np
 import pytest
@@ -117,17 +116,12 @@ def test_sipp_replay_exact_legacy_terminal():
     assert all(abs(ca - cs) < 1e-5 for a, s, ca, cs in rows if a)
 
 
-def test_sipp_replay_fixed_lanes_near_optimal():
-    # Default fixed-exit-lanes terminal path: SIPP matches A* accept-for-accept and total cost within 1%.
-    # KNOWN GAP: a rare marginal ground/hover tie at terminal takeoffs makes the fixed-lane SIPP and A*
-    # optima differ by a few cost units per affected flight (both directions; ~0.03% aggregate here).
-    # Not a safety issue — see test_sipp_fixed_lanes_full_run_verified. Tracked for an exact fix.
+def test_sipp_replay_fixed_lanes_exact():
+    # Destination-lane tails are scored explicitly, so fixed-lane SIPP and A* share the exact objective.
     rows = _replay("dallas_hub_2uss_large", 150.0, 400.0, 0,
                    demand_ov={"pads_per_hub": 2, "radius_m": 2500.0}, fixed=True)
-    assert all(a == s for a, s, _, _ in rows)                       # identical accept set
-    tot_a = sum(ca for a, s, ca, cs in rows if a)
-    tot_s = sum(cs for a, s, ca, cs in rows if a)
-    assert abs(tot_s - tot_a) <= tot_a * 0.01                       # within 1% of optimal, either way
+    assert all(a == s for a, s, _, _ in rows)
+    assert all(abs(ca - cs) < 1e-9 for a, s, ca, cs in rows if a)
 
 
 def test_sipp_fixed_lanes_full_run_verified():

@@ -1,8 +1,8 @@
 """Compiled (numba) SIPP kernel: exact equivalence with the pure-Python reference.
 
 The pure-Python ``SIPPPlanner`` (``sipp_ref``) is the oracle — already proven cost-equivalent to A*
-(see ``test_sipp.py``). The compiled ``sipp`` must reproduce it **exactly** on non-terminal flights
-(the air-cruise kernel; terminal flights fall back to the reference in Phase 1). These tests assert
+(see ``test_sipp.py``). The compiled ``sipp`` must reproduce it **exactly**, including fixed-terminal
+lane choice. These tests assert
 ``compiled == reference`` (cost + accept + centerline), that the kernel actually runs (low fallback),
 that the dense interval pool matches ``SafeIntervalIndex``, and that absent numba degrades to the
 reference. If numba is unavailable every plan falls back, so equivalence still holds trivially.
@@ -13,18 +13,19 @@ import pytest
 from freespace_sim.config import SimConfig
 from freespace_sim.demand import UniformPoissonDemand
 from freespace_sim.dss import DSS
-from freespace_sim.geometry import box_from_segment
+from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.astar.compiled_hex_occupancy import schedulable_horizon_steps
 from freespace_sim.planner.astar.planner import _absorb
 from freespace_sim.planner.compiled_occupancy import CompiledOccupancy
 from freespace_sim.planner.sipp import SIPPPlanner, SafeIntervalIndex
 from freespace_sim.scenario import scenario_from_requests
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, vec
+from freespace_sim.types import DenialReason, FlightRequest, vec
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
@@ -68,6 +69,48 @@ def test_compiled_reroutes_around_wall_exactly():
     assert len(o["sipp"].centerline) == len(o["sipp_ref"].centerline)
 
 
+@pytest.mark.skipif(not _COMPILED, reason="requires the compiled SIPP kernel")
+def test_compiled_long_route_is_not_truncated_by_occupancy_horizon():
+    """A short demand horizon is not a flight-duration cap: the pool must cover the route tail."""
+    cfg = SimConfig(
+        region_size_m=(30_000.0, 20_000.0),
+        horizon_s=100.0,
+        max_ground_delay_s=0.0,
+        flight_levels_m=(30.0,),
+    )
+    req = FlightRequest(1, vec(7_000, 10_000, 0), vec(21_400, 10_000, 0), 0.0)
+    compiled = get_planner("sipp")
+    reference = get_planner("sipp_ref")
+    got = compiled.plan(req, ReservationLedger(cfg), cfg)
+    want = reference.plan(req, ReservationLedger(cfg), cfg)
+
+    assert CompiledOccupancy(cfg).MAXS == schedulable_horizon_steps(cfg)
+    assert got.accepted and want.accepted
+    assert got.cost == pytest.approx(want.cost, abs=1e-9)
+    assert len(got.centerline) == len(want.centerline)
+    assert compiled._sfb == 0
+
+
+@pytest.mark.skipif(not _COMPILED, reason="requires the compiled SIPP kernel")
+def test_compiled_late_departure_past_pool_horizon_uses_reference():
+    cfg = SimConfig(region_size_m=(1_000.0, 1_000.0), horizon_s=100.0)
+    req = FlightRequest(
+        1,
+        vec(200, 500, 0),
+        vec(800, 500, 0),
+        0.0,
+        t_departure=(CompiledOccupancy(cfg).MAXS + 20) * cfg.dt_s,
+    )
+    compiled = get_planner("sipp")
+    got = compiled.plan(req, ReservationLedger(cfg), cfg)
+    want = get_planner("sipp_ref").plan(req, ReservationLedger(cfg), cfg)
+    assert got.accepted and want.accepted
+    assert got.cost == pytest.approx(want.cost, abs=1e-9)
+    assert len(got.centerline) == len(want.centerline)
+    assert all(np.allclose(gp, wp) and gt == pytest.approx(wt)
+               for (gp, gt), (wp, wt) in zip(got.centerline, want.centerline))
+
+
 def test_compiled_deterministic():
     a = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
     b = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
@@ -105,6 +148,60 @@ def test_astar_warm_failure_keeps_sipp_kernel_fallback_on_astar_reference(monkey
     monkeypatch.setattr(planner, "_plan_compiled", compiled_must_not_run)
     got = planner._fallback(_req(), ReservationLedger(CFG), CFG)
     assert got is reference and got.planner == "sipp"
+
+
+@pytest.mark.parametrize("planner_name", ("astar_ref", "astar", "sipp_ref", "sipp"))
+def test_ground_delay_budget_is_binding_for_every_lattice_path(planner_name):
+    """The route horizon bounds arrival; it must not extend the legal ground-delay domain."""
+    cfg = SimConfig(
+        region_size_m=(1_000.0, 1_000.0),
+        max_ground_delay_s=8.0,
+        flight_levels_m=(30.0,),
+    )
+    req = FlightRequest(1, vec(300, 500, 0), vec(700, 500, 0), 0.0)
+    ledger = ReservationLedger(cfg)
+    ledger.commit(99, [Volume4D(CylinderSpec(300, 500, 100, 0, 150), 0.0, 12.0)])
+
+    intent = get_planner(planner_name).plan(req, ledger, cfg)
+    assert not intent.accepted
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
+
+
+@pytest.mark.parametrize("planner_name", ("sipp_ref", "sipp"))
+def test_sipp_bounded_infeasibility_is_budget_exceeded(planner_name):
+    cfg = SimConfig(
+        region_size_m=(1_000.0, 1_000.0),
+        horizon_s=100.0,
+        max_ground_delay_s=0.0,
+        flight_levels_m=(30.0,),
+    )
+    req = FlightRequest(1, vec(300, 500, 0), vec(700, 500, 0), 0.0)
+    ledger = ReservationLedger(cfg)
+    ledger.commit(99, [Volume4D(CylinderSpec(700, 500, 100, 0, 150), 0.0, 1e5)])
+
+    intent = get_planner(planner_name).plan(req, ledger, cfg)
+    assert not intent.accepted
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
+
+
+@pytest.mark.skipif(not _COMPILED, reason="requires the compiled SIPP kernel")
+def test_compiled_kernel_no_path_is_budget_exceeded(monkeypatch):
+    from freespace_sim.planner.sipp_kernel import NO_PATH
+
+    planner = SIPPPlanner(compiled=True)
+    monkeypatch.setattr(planner, "_skernel", lambda *_: (-1, 0.0, 17, NO_PATH))
+    intent = planner.plan(_req(), ReservationLedger(CFG), CFG)
+
+    assert not intent.accepted
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
+
+
+def test_sipp_reference_compute_truncation_stays_search_exhausted():
+    intent = SIPPPlanner(max_expansions=0, compiled=False).plan(
+        _req(), ReservationLedger(CFG), CFG
+    )
+    assert not intent.accepted
+    assert intent.denial_reason is DenialReason.SEARCH_EXHAUSTED
 
 
 # ---- dense interval pool == SafeIntervalIndex oracle ----
@@ -220,8 +317,7 @@ def test_compiled_replay_exact_big_dense_short_flights():
 
 def test_compiled_replay_dallas_terminal_accept_set():
     """Terminal (exit-lane) flights: the compiled kernel and the pure-Python reference must agree on
-    WHO FLIES and must not lean on the A* fallback. Cost equality is asserted separately (and is a
-    known xfail — see test_compiled_replay_exact_dallas_terminal)."""
+    WHO FLIES and must not lean on the A* fallback. Cost equality is asserted separately."""
     rows, fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
     assert rows
     assert all(ca == ra for ca, ra, _, _, _, _ in rows), "accept-set mismatch vs reference"
@@ -230,22 +326,9 @@ def test_compiled_replay_dallas_terminal_accept_set():
         assert fb < 0.15 * len(rows), f"kernel fell back too often ({fb}/{len(rows)})"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP: the bounded fixed-lanes/terminal tie. On INBOUND flights (dest terminal, no origin "
-    "terminal) the kernel and the reference pick DIFFERENT exit lanes of equal reachability, so their "
-    "costs differ in BOTH directions — measured 19/102 accepted flights (18.6%), mean 1.9% / max 6.8% "
-    "relative. Both sides are occupancy-VALID: every cell on the kernel's path is free in "
-    "HexOccupancyService, SafeIntervalIndex AND CompiledOccupancy, and both plans clear "
-    "ledger.any_conflict. The reference matches A* exactly, and where they differ the kernel is usually "
-    "CHEAPER — i.e. A*/the reference are the suboptimal side on inbound landings, so asserting equality "
-    "would pin A*'s suboptimality in place as the expected answer. Closing this means resolving the "
-    "lane-choice tie in the shared terminal model, not changing the kernel. Accept-set agreement and "
-    "occupancy validity are covered by test_compiled_replay_dallas_terminal_accept_set and "
-    "test_compiled_terminal_path_never_routes_through_blocked."))
 @pytest.mark.slow
 def test_compiled_replay_exact_dallas_terminal():
-    """Strict compiled==reference cost on dallas terminal flights. Fails today (see the xfail reason);
-    kept strict so it reports loudly the moment the terminal lane-choice tie is resolved."""
+    """Exact destination-lane scoring keeps compiled and reference terminal costs identical."""
     rows, _fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
     assert rows
     assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
@@ -261,9 +344,8 @@ def test_compiled_terminal_path_never_routes_through_blocked():
     hover/route a flight THROUGH a foreign corridor occupying its own landing lane. Guard the exact
     invariant the bug broke: no accepted compiled terminal path visits an ``is_blocked`` cell-step.
 
-    A strict ``compiled == reference`` assertion can't be used here — at this density the two settle
-    on different (occupancy-VALID) optima via the bounded fixed-lanes tie — so we assert occupancy
-    validity directly, which is robust to that tie and is precisely what the OOB violated.
+    This test asserts occupancy validity directly because that is precisely the invariant the overlay
+    OOB violated; exact terminal cost equivalence is covered by the Dallas replay above.
     """
     if not _COMPILED:
         pytest.skip("numba unavailable; every plan falls back to the reference")

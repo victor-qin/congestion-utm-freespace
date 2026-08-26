@@ -71,7 +71,7 @@ def run(*, nlevels, base=0, max_step=20,
         takeoff_steps, takeoff_cost, rung_steps, rung_cost,
         goal_cells, lf_lo, lf_hi,
         c_hold, c_lat, pitch, dt, gx, gy, R, h_off,
-        blocked=(), walled=(), max_lab=5000, max_heap=5000, maxpath=200):
+        goal_costs=None, blocked=(), walled=(), max_lab=5000, max_heap=5000, maxpath=200):
     """Build the kernel's flat-array inputs for one scenario and return (m, g, n_exp, status, path)."""
     NC = QSPAN * RSPAN * nlevels
     cap = NC + 64
@@ -105,8 +105,13 @@ def run(*, nlevels, base=0, max_step=20,
     rung_cost = np.asarray(rung_cost, np.float64)
 
     goal_gen = np.zeros(NC, np.int64)
-    for gc in goal_cells:
+    goal_cost = np.zeros(NC, np.float64)
+    if goal_costs is None:
+        goal_costs = [0.0] * len(goal_cells)
+    for gc, cost in zip(goal_cells, goal_costs):
         goal_gen[gc] = gen
+        goal_cost[gc] = cost
+    goal_cost_lb = min(goal_costs, default=0.0)
     # per-level landing intervals: replicate the given window to every level (lf_off[L]:lf_off[L+1])
     lf_lo_in, lf_hi_in = list(lf_lo), list(lf_hi)
     k = len(lf_lo_in)
@@ -152,8 +157,8 @@ def run(*, nlevels, base=0, max_step=20,
         QMIN, RMIN, RSPAN, QSPAN, base, max_step, nlevels,
         lane_qr, lane_lat, np.zeros(n_lanes, np.int64), n_lanes, to_ok, n_to, c_gd,
         takeoff_steps, takeoff_cost, rung_steps, rung_cost,
-        goal_gen, lf_lo, lf_hi, lf_off,
-        c_hold, c_lat, pitch, dt, gx, gy, R, h_off,
+        goal_gen, goal_cost, lf_lo, lf_hi, lf_off,
+        c_hold, c_lat, pitch, dt, gx, gy, R, h_off, goal_cost_lb,
         gen, front_head, front_tail, front_gen,
         lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_prev, lab_dead, max_lab,
         heap_f, heap_c, heap_n, max_heap,
@@ -178,6 +183,22 @@ def test_single_level_straight_shot():
     assert status == OK
     assert path == [(0, 0, 0, 0), (1, 0, 0, 1), (2, 0, 0, 2), (3, 0, 0, 3)]
     assert g == pytest.approx(3 * (R * SQRT3))         # three lateral hops, no hover
+
+
+def test_terminal_goal_scoring_includes_lane_distance():
+    """Equal-hop landing lanes are not equal-cost when their terminal-edge tails differ."""
+    R = 100.0
+    expensive, cheap = qr_of(2, 0), qr_of(0, 2)
+    m, _g, _n, status, path = run(
+        nlevels=1,
+        lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1], c_gd=1.0,
+        takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],
+        goal_cells=[expensive, cheap], goal_costs=[1000.0, 0.0], lf_lo=[0], lf_hi=[20],
+        c_hold=3.0, c_lat=1.0, pitch=R * SQRT3, dt=1.0,
+        gx=0.0, gy=0.0, R=R, h_off=10_000.0,
+    )
+    assert status == OK and m > 0
+    assert path[-1][:2] == (0, 2)
 
 
 def test_vertical_rung_climb():

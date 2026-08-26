@@ -38,6 +38,7 @@ from ..volumes import (
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
+    exit_radius,
     terminal_radius,
 )
 from . import hexgrid as hg
@@ -290,9 +291,9 @@ class SIPPPlanner(AStarPlanner):
         return sidx
 
     def plan(self, req, ledger, cfg):
-        """Dispatch: the compiled air-cruise kernel for non-terminal flights (Phase 1); the pure-Python
-        reference for terminal flights (Phase 2, not yet compiled) and as the universal fallback when
-        numba is absent, a flight strays out of the kernel box, or a capacity valve trips."""
+        """Dispatch to the compiled safe-interval kernel, with the pure-Python reference as the fallback
+        when numba is absent, legacy terminal folding is requested, a flight strays out of the kernel
+        box, or a capacity valve trips."""
         if not self.sipp_compiled:
             return self._splan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
@@ -346,21 +347,26 @@ class SIPPPlanner(AStarPlanner):
         o_r = terminal_radius(o_term, cfg) if o_term is not None else 0.0
 
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
+        d_r = exit_radius(d_term, cfg) if d_lanes else 0.0
+        goal_cost_by_cell = {lane.cell: c_lat * (lane.dist - d_r) for lane in d_lanes}
+        goal_cost_lb = min(goal_cost_by_cell.values(), default=0.0)
 
         def h_air(q, r, L):
             dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
-            return c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off) + takeoff_cost[L]
+            return (c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off)
+                    + takeoff_cost[L] + goal_cost_lb)
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
         h_off_o = terminal_radius(o_term, cfg) if o_lanes else 0.0   # takeoff charges only (dist - o_r)
         h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off - h_off_o)
-                    + 2.0 * takeoff_cost[0])
+                    + 2.0 * takeoff_cost[0] + goal_cost_lb)
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)      # extra step budget for mid-route rungs
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
+        ground_max_step = base + int(math.ceil(cfg.max_ground_delay_s / dt))
 
         SI = _SafeIntervals(sidx, own, base, max_step, fixed_lanes)
         came: dict = {}
@@ -390,22 +396,33 @@ class SIPPPlanner(AStarPlanner):
         c_hold = cfg.cost_air_hold_per_s
         pq = [(h_ground, next(counter), start, 0.0, -1)]   # heap: (f, tie, AS, g, interval-index)
         goal_state = None
+        goal_score = math.inf
         expansions = 0
+        truncated = False
 
         while pq:
-            _, _, st, gst, iv = heapq.heappop(pq)
+            fst, _, st, gst, iv = heapq.heappop(pq)
+            if goal_state is not None and fst >= goal_score:
+                break                                      # every remaining label has an objective LB >= incumbent
             if gst > g.get(st, math.inf):
                 continue                                   # stale (a cheaper label for this AS won)
             if st[0] == "a" and is_goal_cell(st[1], st[2]) and goal_ok(st):
-                goal_state = st
-                break                                      # first gate-passing pop (f-order) = optimal
+                # The lane-cell→terminal-edge segment is not a lattice edge, but it is part of the
+                # reported en-route distance. Score it here and keep searching until the open-set lower
+                # bound proves the best feasible lane exact; equal-hop lanes can have different radii.
+                score = gst + takeoff_cost[st[3]] + goal_cost_by_cell.get((st[1], st[2]), 0.0)
+                if score < goal_score:
+                    goal_state, goal_score = st, score
+                if fst >= goal_score:
+                    break
             expansions += 1
             if expansions > self.max_expansions:
+                truncated = True
                 break
             for nst, cost, w, niv in self._succ(
                 st, iv, SI, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
                 dwell_steps, own, o_cap, o_term, origin, tcap, dest, o_lanes, o_r, fixed_lanes,
-                max_step, is_goal_cell,
+                ground_max_step, max_step, is_goal_cell,
             ):
                 ng = gst + cost
                 if ng >= g.get(nst, math.inf):
@@ -426,8 +443,10 @@ class SIPPPlanner(AStarPlanner):
                 heapq.heappush(pq, (ng + hh, next(counter), nst, ng, niv))
 
         self.last_expansions = expansions          # search-effort telemetry (mirrors A*; benchmarks/tests)
-        if goal_state is None:
+        if truncated:
             return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+        if goal_state is None:
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
         # ---- reconstruct, re-expanding folded reroute waits so cruise_wps matches A*'s per-step list ----
         path = [goal_state]
@@ -523,6 +542,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_front_tail = np.full(tot, -1, np.int64)   # sorted-by-arr staircase per slot
             self._k_front_gen = np.zeros(tot, np.int64)
             self._k_goal_gen = np.zeros(cocc.cap, np.int64)        # per-cell goal flag (version-stamped)
+            self._k_goal_cost = np.zeros(cocc.cap, np.float64)     # exact lane-cell→terminal-edge cost
             self._k_ov_head = np.full(cocc.cap, -1, np.int64)      # per-cell overlay redirect (slot >= cap)
             self._k_ov_gen = np.zeros(cocc.cap, np.int64)          # version-stamped (own-cell transparency)
             self._k_ov_lo = np.empty(ovcap, np.int64)
@@ -660,6 +680,7 @@ class SIPPPlanner(AStarPlanner):
         tcap = self._tcap
         c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
                                cfg.cost_air_lateral_per_m)
+        d_r = exit_radius(d_term, cfg) if d_lanes else 0.0
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if nlev > 1 else 0)
@@ -667,8 +688,11 @@ class SIPPPlanner(AStarPlanner):
                                   n_hops, climb_span, cfg)
 
         oqr, gqr = cocc.qr_index(oq, orr), cocc.qr_index(gq, grr)   # level-less lane/goal indices
-        if oqr < 0 or gqr < 0:
-            return self._splan_reference(req, ledger, cfg)          # out of kernel box → reference
+        if oqr < 0 or gqr < 0 or max_step > cocc.MAXS:
+            # A demand endpoint / route outside the cfg-only box, or a late/oversized-terminal flight
+            # beyond its cfg-only time bound, must use the unbounded reference rather than letting the
+            # finite interval pool make every cell look blocked past MAXS.
+            return self._splan_reference(req, ledger, cfg)
 
         # ---- per-plan kernel state + own-lane transparency overlay (pool blocks columns foreign-to-all) ----
         self._skernel_state(cocc)
@@ -700,12 +724,16 @@ class SIPPPlanner(AStarPlanner):
             lane_qr, lane_lat, lane_st = [oqr], [0.0], [0]   # non-terminal: climb in place, no egress
             for s in range(base, smax + 1):
                 to_ok.extend(svc.pad_clear(oq, orr, s, dwell_steps[L]) for L in range(nlev))
-        if not lane_qr or not any(to_ok):
-            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+        if not lane_qr:
+            return self._splan_reference(req, ledger, cfg)          # every terminal lane fell outside the box
+        if not any(to_ok):
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
         # ---- goal cell(s) at EVERY level + PER-LEVEL landing-feasible step intervals (lf_off[L]:lf_off[L+1]) ----
         if fixed and d_term is not None:                      # dest exit-lane cells; column-capacity landing
-            goal_qr = [q for q in (cocc.qr_index(lane.cell[0], lane.cell[1]) for lane in d_lanes) if q >= 0]
+            goal_pairs = [(q, c_lat * (lane.dist - d_r)) for lane in d_lanes
+                          if (q := cocc.qr_index(lane.cell[0], lane.cell[1])) >= 0]
+            goal_qr = [q for q, _ in goal_pairs]
             if not goal_qr:
                 return self._splan_reference(req, ledger, cfg)
 
@@ -713,12 +741,16 @@ class SIPPPlanner(AStarPlanner):
                 return tcap.dwell_ok(d_term, dest, s * dt, d_cap, z=levels[L])
         else:                                                 # single dest hex; pad-clear landing
             goal_qr = [gqr]
+            goal_pairs = [(gqr, 0.0)]
 
             def _land(s, L):
                 return svc.pad_clear(gq, grr, s, dwell_steps[L])
-        for q in goal_qr:                                     # land from ANY level ⇒ mark the cell at all levels
+        goal_cost_lb = min((cost for _, cost in goal_pairs), default=0.0)
+        for q, goal_cost in goal_pairs:                        # land from ANY level ⇒ mark at all levels
             for L in range(nlev):
-                self._k_goal_gen[q * nlev + L] = self._sgen
+                cell = q * nlev + L
+                self._k_goal_gen[cell] = self._sgen
+                self._k_goal_cost[cell] = goal_cost
         lf_lo, lf_hi, lf_off = [], [], [0]                    # per-level landing runs, concatenated
         for L in range(nlev):
             lo = -1
@@ -732,7 +764,7 @@ class SIPPPlanner(AStarPlanner):
                 lf_lo.append(lo); lf_hi.append(max_step)
             lf_off.append(len(lf_lo))
         if not lf_lo:
-            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
         # ---- call the kernel ----
         n, _cost, _n_exp, flag = self._skernel(
@@ -744,9 +776,9 @@ class SIPPPlanner(AStarPlanner):
             np.asarray(to_ok, np.bool_), n_to, c_gd,
             np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
             np.asarray(rung_steps, np.int64), np.asarray(rung_cost, np.float64),
-            self._k_goal_gen, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64),
+            self._k_goal_gen, self._k_goal_cost, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64),
             np.asarray(lf_off, np.int64),
-            c_hold, c_lat, pitch, dt, gx, gy, R, h_off,
+            c_hold, c_lat, pitch, dt, gx, gy, R, h_off, goal_cost_lb,
             self._sgen, self._k_front_head, self._k_front_tail, self._k_front_gen,
             self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
             self._k_lab_next, self._k_lab_prev, self._k_lab_dead, self._k_max,
@@ -765,7 +797,7 @@ class SIPPPlanner(AStarPlanner):
                 self._sfb_oob += 1                        # reroute strayed outside the kernel box
             return self._fallback(req, ledger, cfg)
         if flag == NO_PATH:
-            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
         # ---- reconstruct: out_* is goal→start; reverse + re-expand folded hover (a rung's climb is a gap) ----
         labels = [(int(self._k_out_q[i]), int(self._k_out_r[i]), int(self._k_out_L[i]), int(self._k_out_s[i]))
@@ -811,7 +843,7 @@ class SIPPPlanner(AStarPlanner):
 
     def _succ(self, st, iv, SI, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
               dwell_steps, own, o_cap, o_term, origin, tcap, dest, o_lanes, o_r, fixed_lanes,
-              max_step, is_goal_cell):
+              ground_max_step, max_step, is_goal_cell):
         """Successors as ``(AS, edge_cost, wait_steps, interval_index)`` — the multi-altitude safe-interval
         collapse. ``iv`` is the popped state's interval index (carried in the heap → no ``index_of`` scan in
         the hot loop); each air successor carries its OWN interval index (``-1`` for ground). Ground →
@@ -827,7 +859,7 @@ class SIPPPlanner(AStarPlanner):
         out = []
         if st[0] == "g":
             _, q, r, s = st
-            if s + 1 <= max_step:
+            if s + 1 <= ground_max_step:
                 out.append((("g", q, r, s + 1), c_gd * dt, 0, -1))      # ground-wait ray (== A* g→g)
             if fixed_lanes and o_term is not None:                       # one takeoff edge per (lane, level)
                 level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)

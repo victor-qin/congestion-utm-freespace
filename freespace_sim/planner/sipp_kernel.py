@@ -70,8 +70,8 @@ def _search(
     qmin, rmin, rspan, qspan, base, max_step, nlevels,              # box + step window + flight-level axis
     lane_qr, lane_lat, lane_st, n_lanes, to_ok, n_to, c_gd,         # takeoff lanes + egress steps + gd mask
     takeoff_steps, takeoff_cost, rung_steps, rung_cost,            # per-level takeoff + per-rung vertical edges
-    goal_gen, lf_lo, lf_hi, lf_off,                                  # goal cells + PER-LEVEL landing ivals (lf_off[L]:lf_off[L+1])
-    c_hold, c_lat, pitch, dt, gx, gy, R, h_off,                     # cost + heuristic params
+    goal_gen, goal_cost, lf_lo, lf_hi, lf_off,                       # goal flags/cost + landing intervals
+    c_hold, c_lat, pitch, dt, gx, gy, R, h_off, goal_cost_lb,       # cost + heuristic params
     gen, front_head, front_tail, front_gen,                          # per-slot sorted-by-arr staircase
     lab_cell, lab_slot, lab_arr, lab_g, lab_par, lab_next, lab_prev, lab_dead, max_lab,  # labels
     heap_f, heap_c, heap_n, max_heap,                                # binary heap
@@ -83,6 +83,8 @@ def _search(
     ctr = 0
     n_exp = 0
     ch_dt = c_hold * dt                                 # per-step air-hover cost (staircase key slope)
+    best_lab = -1
+    best_score = np.inf
 
     # ---- takeoff enumeration (folded), per flight level: ground-step si × lane li × level Lk. A start
     # label at level Lk arrives ts = base+si+takeoff_steps[Lk] (per-level climb) at cell
@@ -129,7 +131,8 @@ def _search(
                 q = iq + qmin; r = qr - iq * rspan + rmin
                 dxx = R * _SQRT3 * (q + r / 2.0) - gx
                 dyy = R * 1.5 * r - gy
-                f = g + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + takeoff_cost[Lk]
+                f = (g + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off)
+                     + takeoff_cost[Lk] + goal_cost_lb)
                 heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L; ctr += 1
                 ii = size; size += 1
                 while ii > 0:
@@ -143,6 +146,7 @@ def _search(
                         break
 
     while size > 0:
+        fcur = heap_f[0]
         L = heap_n[0]
         size -= 1                                       # pop min → sift down
         heap_f[0] = heap_f[size]; heap_c[0] = heap_c[size]; heap_n[0] = heap_n[size]
@@ -160,6 +164,8 @@ def _search(
             tn = heap_n[i]; heap_n[i] = heap_n[sm]; heap_n[sm] = tn
             i = sm
 
+        if best_lab >= 0 and fcur >= best_score:
+            break                                      # remaining heap is bounded below by the incumbent
         if lab_dead[L] == gen:                          # evicted since pushed (a dominator was inserted)
             continue
         cell = lab_cell[L]; slot = lab_slot[L]; arr = lab_arr[L]; g = lab_g[L]
@@ -178,17 +184,15 @@ def _search(
                     feasible = True
                     break
             if feasible:
-                m = 0                                   # reconstruct: walk parents into out_* (goal→start)
-                cur = L
-                while cur != -1:
-                    cc = lab_cell[cur]; ccqr = cc // nlevels; ci = ccqr // rspan
-                    out_q[m] = ci + qmin
-                    out_r[m] = ccqr - ci * rspan + rmin
-                    out_L[m] = cc % nlevels
-                    out_s[m] = lab_arr[cur]
-                    cur = lab_par[cur]
-                    m += 1
-                return m, g, n_exp, OK
+                # The final lane-cell→terminal-edge segment is outside the lattice graph. Include
+                # its exact, lane-specific cost (plus mandatory descent) in goal selection, then keep
+                # searching until the heap lower bound proves this incumbent optimal.
+                score = g + takeoff_cost[Lc] + goal_cost[cell]
+                if score < best_score:
+                    best_score = score
+                    best_lab = L
+                if fcur >= best_score:
+                    break
 
         n_exp += 1
         hh = ov_hi[slot - cap] if slot >= cap else iv_hi[slot]
@@ -293,7 +297,8 @@ def _search(
                                 e = ne
                         dxx = R * _SQRT3 * (nq + nr / 2.0) - gx
                         dyy = R * 1.5 * nr - gy
-                        f = ng + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + takeoff_cost[Lc]
+                        f = (ng + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off)
+                             + takeoff_cost[Lc] + goal_cost_lb)
                         heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L2; ctr += 1
                         ii = size; size += 1
                         while ii > 0:
@@ -407,7 +412,8 @@ def _search(
                                     e = ne
                             dxx = R * _SQRT3 * (q + r / 2.0) - gx
                             dyy = R * 1.5 * r - gy
-                            f = ng + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + takeoff_cost[tlv]
+                            f = (ng + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off)
+                                 + takeoff_cost[tlv] + goal_cost_lb)
                             heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = nl; ctr += 1
                             ii = size; size += 1
                             while ii > 0:
@@ -436,7 +442,9 @@ def _search(
             lab_g[L2] = g + ch_dt; lab_par[L2] = L; lab_next[L2] = -1; lab_prev[L2] = -1
             dxx = R * _SQRT3 * (q + r / 2.0) - gx
             dyy = R * 1.5 * r - gy
-            f = (g + c_hold * dt) + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off) + takeoff_cost[Lc]
+            f = ((g + c_hold * dt)
+                 + c_lat * max(0.0, np.sqrt(dxx * dxx + dyy * dyy) - h_off)
+                 + takeoff_cost[Lc] + goal_cost_lb)
             heap_f[size] = f; heap_c[size] = ctr; heap_n[size] = L2; ctr += 1
             ii = size; size += 1
             while ii > 0:
@@ -449,4 +457,16 @@ def _search(
                 else:
                     break
 
+    if best_lab >= 0:
+        m = 0                                           # reconstruct: walk parents into out_* (goal→start)
+        cur = best_lab
+        while cur != -1:
+            cc = lab_cell[cur]; ccqr = cc // nlevels; ci = ccqr // rspan
+            out_q[m] = ci + qmin
+            out_r[m] = ccqr - ci * rspan + rmin
+            out_L[m] = cc % nlevels
+            out_s[m] = lab_arr[cur]
+            cur = lab_par[cur]
+            m += 1
+        return m, lab_g[best_lab], n_exp, OK
     return -1, 0.0, n_exp, NO_PATH

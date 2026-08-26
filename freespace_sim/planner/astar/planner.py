@@ -490,15 +490,18 @@ class AStarPlanner:
         # computed inline as scalars and the distance via math.sqrt(dx*dx+dy*dy) — bit-for-bit the same
         # value np.linalg.norm returns for a length-2 vector, but ~19x cheaper (no array alloc / ufunc).
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
+        d_r = exit_radius(d_term, cfg) if d_lanes else 0.0
+        goal_cost_by_cell = {lane.cell: c_lat * (lane.dist - d_r) for lane in d_lanes}
+        goal_cost_lb = min(goal_cost_by_cell.values(), default=0.0)
 
         def h_air(q, r, L):
             dx, dy = R * sqrt3 * (q + r / 2.0) - gx, R * 1.5 * r - gy
             return (c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off)
-                    + takeoff_cost[L])                       # == c_alt*(levels[L]-ground_z), precomputed
+                    + takeoff_cost[L] + goal_cost_lb)        # descent + unavoidable terminal-lane tail
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
         h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off - h_off_o)
-                    + 2.0 * takeoff_cost[0])                 # mandatory descent from the lowest level + back
+                    + 2.0 * takeoff_cost[0] + goal_cost_lb)  # mandatory descent + terminal-lane tail
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
@@ -509,6 +512,7 @@ class AStarPlanner:
         # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
+        ground_max_step = base + int(math.ceil(cfg.max_ground_delay_s / dt))
 
         start = ("g", oq, orr, base)
         g = {start: 0.0}
@@ -517,11 +521,14 @@ class AStarPlanner:
         pq = [(h_ground, next(counter), start)]
         closed: set = set()
         goal_state = None
+        goal_score = math.inf
         expansions = 0
         truncated = False                                # True ⇒ stopped at the expansion cap (compute)
 
         while pq:
-            _, _, st = heapq.heappop(pq)
+            fst, _, st = heapq.heappop(pq)
+            if goal_state is not None and fst >= goal_score:
+                break                                      # every remaining state has objective LB >= incumbent
             if st in closed:
                 continue
             closed.add(st)
@@ -547,8 +554,14 @@ class AStarPlanner:
                         else svc_q.pad_clear(gq, grr, st[4], dwell_steps[st[3]])
                     )
                 if goal_ok:
-                    goal_state = st
-                    break
+                    # The final boundary-cell→terminal-edge segment is outside the lattice graph.
+                    # Score its exact lane distance and retain the best feasible goal until the open-set
+                    # lower bound proves optimality; equal-hop lanes need not have equal radii.
+                    score = g[st] + takeoff_cost[st[3]] + goal_cost_by_cell.get((st[1], st[2]), 0.0)
+                    if score < goal_score:
+                        goal_state, goal_score = st, score
+                    if fst >= goal_score:
+                        break
             # reaching the dest hex whose landing dwell is blocked is NOT a goal — fall through and
             # keep expanding (the ground-wait/hover levers find an arrival whose dwell is clear).
             expansions += 1
@@ -558,7 +571,8 @@ class AStarPlanner:
             base_g = g[st]
             for nst, cost in self._edges(
                 st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost, dwell_steps,
-                c_alt, c_lat, svc_q, max_step, own, o_cap, o_term, origin, tcap, dest, o_lanes,
+                c_alt, c_lat, svc_q, max_step, ground_max_step, own, o_cap, o_term, origin, tcap, dest,
+                o_lanes,
             ):
                 ng = base_g + cost
                 if ng < g.get(nst, math.inf):
@@ -575,13 +589,12 @@ class AStarPlanner:
             # truncated ⇒ SEARCH_EXHAUSTED: the read set was cut short, so it cannot certify cleanliness.
             self._mk_envelope(req, cfg, o_term, d_term, origin, dest, max_step, rec.bbox,
                               unbounded=truncated)
+        if truncated:
+            return _deny(req, DenialReason.SEARCH_EXHAUSTED)
         if goal_state is None:
-            # Two ways to reach no-goal, opposite meanings (see DenialReason). The queue emptied ⇒ A*
-            # (complete within the horizon) proved NO feasible plan exists inside max_ground_delay /
-            # max_step — real congestion ⇒ BUDGET_EXCEEDED. We stopped at the expansion cap ⇒ the search
-            # was truncated before exhausting — a compute artifact a higher cap might beat ⇒ SEARCH_EXHAUSTED.
-            return _deny(req, DenialReason.SEARCH_EXHAUSTED if truncated
-                         else DenialReason.BUDGET_EXCEEDED)
+            # The queue emptied after a complete bounded search: no feasible plan exists inside the
+            # legal ground-delay / arrival horizon, so this is real congestion rather than a compute cap.
+            return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
         # reconstruct the path
         path = [goal_state]
@@ -630,13 +643,14 @@ class AStarPlanner:
         return intent
 
     def _edges(self, st, cfg, pitch, levels, takeoff_steps, takeoff_cost, rung_steps, rung_cost,
-               dwell_steps, c_alt, c_lat, svc, max_step, own=(), o_cap=1, o_term=None, origin=None,
+               dwell_steps, c_alt, c_lat, svc, max_step, ground_max_step=None, own=(), o_cap=1,
+               o_term=None, origin=None,
                tcap=None, dest=None, o_lanes=()):
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
             _, q, r, s = st
-            if s + 1 <= max_step:
+            if ground_max_step is None or s + 1 <= ground_max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             if cfg.fixed_exit_lanes and o_term is not None:
                 # Fixed exit lanes × multi-altitude: one takeoff edge per (boundary-hex lane, flight
@@ -925,13 +939,14 @@ class AStarPlanner:
             _warm_gp[:, G_GEN] = 0                        # this compiles the signature actually used
             self._kernel(
                 _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
-                0, 0, 3, 3, 1, 0, MAXS,
+                0, 0, 3, 3, 1, 0, MAXS, MAXS,
                 1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]),
                 np.array([0], np.int64), 1,
                 np.array([1], np.int64), np.array([0.0]), np.ones(ng, np.bool_), ng, 1.0,
                 np.array([1], np.int64), np.array([0.0]), 1.0, 3.0, False,
-                np.array([1], np.int64), np.array([1], np.int64), 1, np.ones(ng, np.bool_),
-                0.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]), 1,
+                np.ones(ng, np.bool_),
+                0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0,
                 2, _warm_gp, _warm_gp.view(np.float64), 64, 6,
                 np.empty(64, np.float64), np.empty(64, np.int64), np.empty(64, np.int64), 64,
                 np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
@@ -997,9 +1012,11 @@ class AStarPlanner:
         h_off_o = terminal_radius(o_term, cfg) if o_lanes else 0.0   # see _plan_reference for why
 
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
+        d_r = exit_radius(d_term, cfg) if d_lanes else 0.0
+        goal_cost_lb = min((c_lat * (lane.dist - d_r) for lane in d_lanes), default=0.0)
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
         h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off - h_off_o)
-                    + 2.0 * takeoff_cost[0])
+                    + 2.0 * takeoff_cost[0] + goal_cost_lb)
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
@@ -1009,6 +1026,7 @@ class AStarPlanner:
         # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
+        ground_max_step = base + int(math.ceil(cfg.max_ground_delay_s / dt))
 
         # ---- box / window membership guard: else fall back to the reference ----
         if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:
@@ -1039,10 +1057,12 @@ class AStarPlanner:
         if fixed_lanes and d_term is not None:
             goal_q = np.asarray([L.cell[0] for L in d_lanes], np.int64)
             goal_r = np.asarray([L.cell[1] for L in d_lanes], np.int64)
+            goal_lat = np.asarray([c_lat * (L.dist - d_r) for L in d_lanes], np.float64)
             land_terminal = True
         else:                                            # non-terminal destination
             goal_q = np.asarray([gq], np.int64)
             goal_r = np.asarray([grr], np.int64)
+            goal_lat = np.asarray([0.0], np.float64)
             land_terminal = False
 
         rs = np.asarray(rung_steps if rung_steps else (0,), np.int64)
@@ -1105,12 +1125,12 @@ class AStarPlanner:
             n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
                 cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],
-                cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step,
+                cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step, ground_max_step,
                 oq, orr, lane_q, lane_r, lane_lat, lane_stp, len(lane_q),
                 tks, tkc, to_ok, n_gsteps, c_gd_dt,
                 rs, rc, c_lat_pitch, c_hold_dt, self.vertical_edges,
-                goal_q, goal_r, len(goal_q), land_ok,
-                gx, gy, R, h_off, c_lat, h_ground,
+                goal_q, goal_r, goal_lat, len(goal_q), land_ok,
+                gx, gy, R, h_off, c_lat, goal_cost_lb, h_ground,
                 gen, kc["g_pack"], kc["g_packf"], kc["cap"], kc["log2"],
                 kc["heap_f"], kc["heap_c"], kc["heap_n"], kc["mh"],
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,

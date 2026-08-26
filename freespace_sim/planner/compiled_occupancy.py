@@ -29,6 +29,7 @@ import numpy as np
 
 from ..geometry import CylinderSpec
 from . import hexgrid as hg
+from .astar.compiled_hex_occupancy import schedulable_horizon_steps
 
 
 class CompiledOccupancy:
@@ -59,8 +60,10 @@ class CompiledOccupancy:
             qs.append(q); rs.append(r)
         qmin, qmax = min(qs) - margin, max(qs) + margin
         rmin, rmax = min(rs) - margin, max(rs) + margin
-        dt = cfg.dt_s
-        maxs = int(np.ceil(cfg.horizon_s / dt) + np.ceil(cfg.max_ground_delay_s / dt)) + 64
+        # One owner for the absolute step horizon shared with compiled A*: latest in-envelope departure
+        # + worst in-region route/detour + takeoff/climb + landing tail. This pool stores interval
+        # ENDPOINTS rather than a dense time axis, so the correct bound does not multiply its memory.
+        maxs = schedulable_horizon_steps(cfg)
         return qmin, rmin, qmax - qmin + 1, rmax - rmin + 1, maxs
 
     def _init_pool(self):

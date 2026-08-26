@@ -84,6 +84,37 @@ def test_release_many_compaction_preserves_content():
     assert _ledger_multiset(led) == before_live
 
 
+def test_release_many_handles_a_flight_committed_in_several_calls():
+    """`_runs` records a flight's slot runs and coalesces contiguous appends, so a flight committed
+    in ONE call costs one run and a flight committed in several (interleaved with another's) costs
+    several. Releasing must take all of them — a single-run index would silently strand volumes in
+    the ledger with nobody owning them."""
+    led = ReservationLedger(CFG)
+    led.commit(1, [_wall(1000.0), _wall(1500.0)])
+    led.commit(2, [_wall(3000.0)])
+    led.commit(1, [_wall(2000.0)])                   # non-contiguous second run for flight 1
+    assert led._runs[1] == [[0, 2], [3, 4]] and led._runs[2] == [[2, 3]]
+    assert led.release_many([1]) == 3                # both runs, not just the first
+    assert [f for f, _ in led.iter_committed()] == [2]
+    assert led.n_volumes == 1
+    assert 1 not in led._runs
+
+
+def test_compact_renumbers_runs_and_buckets():
+    """Compaction moves every live slot, so the own-slot index and the (step, cell) buckets have to
+    move with it. A stale run would tombstone SOMEONE ELSE's volume on the next release."""
+    led = ReservationLedger(CFG)
+    for fid in range(6):
+        led.commit(fid, [_wall(1000.0 + 500 * fid)])
+    led.release_many([0, 1, 2, 3])                   # 4 dead > 2 live -> compaction fires
+    assert led._n_dead == 0
+    assert sorted(led._runs) == [4, 5]
+    assert sorted(r for runs in led._runs.values() for r in runs) == [[0, 1], [1, 2]]
+    probe = [_wall(1000.0 + 500 * 4)]                # flight 4's wall is still found after renumber
+    assert {f for f, _ in led.conflicts(probe)} == {4}
+    assert led.release_many([4]) == 1 and led.conflicts(probe) == []
+
+
 def test_incremental_release_reference_service_refcounts():
     """Two flights covering the same cells: removing one must NOT free the cells (refcounts),
     removing both must."""
@@ -802,7 +833,7 @@ def test_repair_restores_when_accept_index_mutation_raises(monkeypatch, method_n
     ledger_before = _ledger_multiset(res.ledger)
     cost_before = state.total_cost
     claims_before = {cell: list(rows) for cell, rows in state._claims.items()}
-    cells_before = {owner: list(rows) for owner, rows in state._cells_of.items()}
+    cells_before = {owner: set(rows) for owner, rows in state._cells_of.items()}
     contention_before = list(state.contention_cells())
 
     monkeypatch.setattr(
@@ -827,9 +858,53 @@ def test_repair_restores_when_accept_index_mutation_raises(monkeypatch, method_n
     assert state.total_cost == cost_before
     assert _ledger_multiset(res.ledger) == ledger_before
     assert state._claims == claims_before
-    assert state._cells_of == cells_before
+    assert {owner: set(rows) for owner, rows in state._cells_of.items()} == cells_before
     assert state.contention_cells() == contention_before
     assert lns_state._same_committed_schedule(res.ledger, state.final_intents())
+
+
+# ------------------------------------------------------------------ unimpeded delay ruler
+def test_unimpeded_costs_parallel_matches_sequential():
+    """The ruler shards across processes because its ledger is never committed to — plan i cannot
+    observe plan j. Force the pool (probe prefix of 0, no projection floor) and require the SAME
+    costs in the SAME request order: this is the only thing standing between a throughput knob and
+    a silently different delay premium, which would re-rank every victim and every repair."""
+    from freespace_sim.planner.lns import unimpeded as U
+
+    reqs = [_req(fid, y=200.0 * fid) for fid in range(1, 13)]
+    seq = U.unimpeded_costs(CFG, (), reqs, n_workers=1)
+    par = _forced_parallel(U, CFG, reqs, workers=4)
+    assert [r[0] for r in seq] == [r.flight_id for r in reqs]     # request order, not shard order
+    assert par == seq
+    assert all(c is not None for _f, c, _d in seq)                # a walls-free world places them all
+
+
+def test_unimpeded_costs_survives_a_dead_worker(monkeypatch):
+    """A worker that dies must cost throughput, not a flight: its shard is replanned in-process.
+    Losing one silently would leave `delay()` reading a KeyError-free but WRONG premium."""
+    from freespace_sim.planner.lns import unimpeded as U
+
+    reqs = [_req(fid, y=200.0 * fid) for fid in range(1, 9)]
+    expected = U.unimpeded_costs(CFG, (), reqs, n_workers=1)
+
+    # module level: `spawn` pickles the Process target BY NAME, so a closure cannot be one
+    monkeypatch.setattr(U, "_worker_main", _suicide_worker)
+    assert _forced_parallel(U, CFG, reqs, workers=2) == expected
+
+
+def _suicide_worker(conn, cfg, static_terms, requests):
+    """A worker that exits without answering (see test_unimpeded_costs_survives_a_dead_worker)."""
+    conn.close()
+
+
+def _forced_parallel(U, cfg, reqs, workers):
+    """Run `unimpeded_costs` with the pool forced on regardless of how fast the probe ran."""
+    probe, floor = U._PROBE_N, U._MIN_PARALLEL_S
+    U._PROBE_N, U._MIN_PARALLEL_S = 0, -1.0
+    try:
+        return U.unimpeded_costs(cfg, (), reqs, n_workers=workers)
+    finally:
+        U._PROBE_N, U._MIN_PARALLEL_S = probe, floor
 
 
 @pytest.mark.slow

@@ -45,6 +45,8 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--no-incremental", action="store_true",
                     help="use the reset+reabsorb occupancy path instead of O(victims) removal (parity A/Bs)")
+    ap.add_argument("--unimpeded-workers", type=int, default=None,
+                    help="processes for the unimpeded delay ruler (default min(8, cpu-2); 1 = in-process)")
     ap.add_argument("--repair-order", default="premium", choices=["premium", "random"],
                     help="PP priority order: premium = most-delayed first (default), random = paper's")
     ap.add_argument("--out", default=None, help="JSON output path")
@@ -92,6 +94,7 @@ def main() -> None:
         operators=tuple(s.strip() for s in args.operators.split(",") if s.strip()),
         gamma=args.gamma,
         incremental_release=not args.no_incremental,
+        unimpeded_workers=args.unimpeded_workers,
         repair_order=args.repair_order,
         time_limit_s=args.time_limit,
         verify_every=args.verify_every,

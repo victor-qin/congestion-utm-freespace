@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from array import array
 
 import numpy as np
 
@@ -213,6 +214,15 @@ class _Pool:
         self.iv[c, P_NXT] = -1
 
 
+# Packed-claim field layout (see `CompiledHexOccupancy._claims`): three 20-bit fields in an int64,
+# s0 | s1 | fid_code. 20 bits is ~1e6 — four orders of magnitude past any realistic step horizon or
+# flight count — and both are range-checked where they enter, so a field can never silently wrap.
+_SPAN_BITS = 20
+_S0_SHIFT = 2 * _SPAN_BITS
+_SPAN_LIMIT = 1 << _SPAN_BITS
+_FIELD_MASK = _SPAN_LIMIT - 1
+
+
 class CompiledHexOccupancy:
     """Two incremental flat pools (corridor + column) feeding the numba A* kernel. Commit-hook driven."""
 
@@ -228,13 +238,27 @@ class CompiledHexOccupancy:
         # so `on_release` can rebuild exactly the touched cells (reset_cell + re-apply survivors)
         # in O(released rows) instead of a whole-pool reset+reabsorb. Flag off ⇒ zero bookkeeping.
         self.track_removal = track_removal
-        self._claims: dict[tuple[int, int], list[tuple[int, int, int]]] = {}  # (pool, cell) -> [(s0, s1, fid)]
-        self._rows: dict[int, list] = {}                                      # fid -> [count, (pool, c, s0, s1), ...]
+        # Both structures are PACKED, because they are per-claim and therefore linear in schedule size
+        # (measured 68 MB of tuples at 290 flights). One claim is one int64:
+        #     key    = c << 1 | pool_idx                 (which pool, which cell)
+        #     claim  = s0 << 40 | s1 << 20 | fid_code    (`_fids[fid_code]` recovers the owner)
+        # Ranges are checked in `_record`; the constructor rejects a horizon too deep to pack.
+        # `_rows[fid]` is a flat array of (key, claim) pairs — 16 B/row against ~120 for the tuple
+        # form — and `_claims[key]` is a list of those same ints, so `remove` compares ints, not
+        self._claims: dict[int, list[int]] = {}      # packed (pool, cell) key -> [packed claims]
+        self._rows: dict[int, array] = {}            # fid -> flat int64 (key, claim) pairs
+        self._nvol: dict[int, int] = {}              # fid -> volumes absorbed
+        self._fids: list = []                        # fid_code -> flight id
+        self._fid_codes: dict = {}                   # flight id -> fid_code
 
         qmin, rmin, qspan, rspan, maxs = self._box(cfg, margin)
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
         self.NC = qspan * rspan * self.n_levels
         self.MAXS = maxs
+        if track_removal and maxs >= _SPAN_LIMIT:    # see `_claims`: s0/s1 get 20 bits each
+            raise ValueError(
+                f"CompiledHexOccupancy: horizon of {maxs} steps exceeds the removal journal's "
+                f"{_SPAN_LIMIT}-step packing limit")
         self.corr = _Pool(self.NC, self.MAXS)
         self.col = _Pool(self.NC, self.MAXS)
         # cell → {terminal ids whose column EVER covers it, across all steps}. Lets the host detect an
@@ -283,9 +307,12 @@ class CompiledHexOccupancy:
             self._add(v, own_cols, flight_id, rows)
         self.n_added += len(volumes)
         if self.track_removal:
-            entry = self._rows.setdefault(flight_id, [])
-            entry.append(len(volumes))
-            entry.extend(rows)
+            entry = self._rows.get(flight_id)
+            if entry is None:
+                self._rows[flight_id] = array("q", rows)
+            else:
+                entry.extend(rows)
+            self._nvol[flight_id] = self._nvol.get(flight_id, 0) + len(volumes)
 
     def on_release(self, flight_id, volumes) -> None:
         """Ledger release subscriber (removal mode): drop the flight's recorded claims and rebuild
@@ -293,27 +320,24 @@ class CompiledHexOccupancy:
         claims (short per-cell lists). Keeps ``n_added`` in lockstep so the shrink tripwire stays
         silent. ``col_owners`` is deliberately NOT pruned (documented conservative superset)."""
         rows = self._rows.pop(flight_id)
-        n_volumes = 0
-        touched: set[tuple[int, int]] = set()
-        for row in rows:
-            if isinstance(row, int):
-                n_volumes += row
-                continue
-            pool_idx, c, s0, s1 = row
-            self._claims[(pool_idx, c)].remove((s0, s1, flight_id))
-            touched.add((pool_idx, c))
+        claims = self._claims
+        touched: set[int] = set()
+        for i in range(0, len(rows), 2):              # flat (key, claim) pairs; see `_claims`
+            key = rows[i]
+            claims[key].remove(rows[i + 1])           # ValueError here IS the drift signal
+            touched.add(key)
         pools = (self.corr, self.col)
         for key in touched:
-            pool_idx, c = key
-            pool = pools[pool_idx]
+            pool = pools[key & 1]
+            c = key >> 1
             pool.reset_cell(c)
-            survivors = self._claims.get(key, ())
+            survivors = claims.get(key)
             if survivors:
-                for s0, s1, _fid in survivors:
-                    pool.block_range(c, s0, s1)
+                for packed in survivors:
+                    pool.block_range(c, packed >> _S0_SHIFT, (packed >> _SPAN_BITS) & _FIELD_MASK)
             else:
-                self._claims.pop(key, None)
-        self.n_added -= n_volumes
+                claims.pop(key, None)
+        self.n_added -= self._nvol.pop(flight_id)
 
     def _inside_a_column(self, q, r, cols) -> bool:
         c = hg.hex_center(q, r, self.R)
@@ -356,9 +380,29 @@ class CompiledHexOccupancy:
                     self._record(0, c, int(s_lo), int(s_hi), fid, _rows)
 
     def _record(self, pool_idx: int, c: int, s0: int, s1: int, fid, _rows: list | None) -> None:
-        self._claims.setdefault((pool_idx, c), []).append((s0, s1, fid))
+        if s1 >= _SPAN_LIMIT:
+            # A committed volume can outlive the box (a late return commits past MAXS and box-guards
+            # to the reference), so the constructor's MAXS check does not bound this. One compare
+            # against a field overflow that would silently corrupt a survivor's span on release.
+            raise ValueError(f"CompiledHexOccupancy: step {s1} exceeds the removal journal's "
+                             f"{_SPAN_LIMIT}-step packing limit")
+        code = self._fid_codes.get(fid)
+        if code is None:
+            code = self._fid_codes[fid] = len(self._fids)
+            if code >= _SPAN_LIMIT:
+                raise ValueError("CompiledHexOccupancy: too many distinct flights for the "
+                                 "removal journal's packing")
+            self._fids.append(fid)
+        key = (c << 1) | pool_idx
+        packed = (s0 << _S0_SHIFT) | (s1 << _SPAN_BITS) | code
+        lst = self._claims.get(key)
+        if lst is None:
+            self._claims[key] = [packed]
+        else:
+            lst.append(packed)
         if _rows is not None:
-            _rows.append((pool_idx, c, s0, s1))
+            _rows.append(key)
+            _rows.append(packed)
 
     def _on_static(self, center, term) -> None:
         """Derive the compiled routing wall from a ledger static-terminal registration — the
@@ -396,6 +440,8 @@ class CompiledHexOccupancy:
         self.oob_corridor_cells = 0
         self._claims.clear()
         self._rows.clear()
+        self._nvol.clear()
+        # `_fids` is an interning pool — value-identical across a rebuild, so it survives reset().
         self.corr.reset()
         self.col.reset()
         # Static terminals are NOT ledger-derived (a shrink rebuild must keep them) — re-mark them into the

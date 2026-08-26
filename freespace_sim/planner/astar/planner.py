@@ -27,10 +27,10 @@ from dataclasses import replace
 
 import numpy as np
 
-from ..config import SimConfig
-from ..cost import endpoint_altitude_change_m, trajectory_cost
-from ..ledger import ReservationLedger
-from ..types import (
+from ...config import SimConfig
+from ...cost import endpoint_altitude_change_m, trajectory_cost
+from ...ledger import ReservationLedger
+from ...types import (
     DenialReason,
     FlightRequest,
     IntentStatus,
@@ -38,7 +38,7 @@ from ..types import (
     TimedPoint,
     as_terminal,
 )
-from ..volumes import (
+from ...volumes import (
     column_dwell_s,
     corridor_segment_volume,
     enroute_detour_m,
@@ -49,11 +49,11 @@ from ..volumes import (
     segment_overlaps_column,
     terminal_radius,
 )
-from . import hexgrid as hg
+from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
 from .compiled_hex_occupancy import hover_tail_steps, search_horizon
 from .occupancy import HexOccupancyService
-from .terminal_capacity import TerminalCapacity
+from ..terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
 _BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
@@ -109,32 +109,6 @@ def _deny(req, reason):
     return OperationalIntent(
         request=req, status=IntentStatus.REJECTED, denial_reason=reason, planner="astar"
     )
-
-
-def _lattice_overhead_m(cells, pitch, air_detour_m):
-    """The share of ``air_detour_m`` that is hex geometry rather than traffic, in metres.
-
-    The traffic share is derived EXACTLY and subtracted: every lateral edge is exactly one pitch, so
-    ``moves actually flown − the lattice geodesic between the first and last cell`` is the berth
-    traffic forced, in whole hex steps. That residual is exactly 0 for an unimpeded flight at ANY
-    bearing — which is the invariant that makes the congestion reading trustworthy.
-
-    Everything else in ``air_detour_m`` is geometry and lands here: the staircase a 6-direction
-    lattice imposes on an off-axis bearing (0 on-axis, peaking at 2/√3 − 1 ≈ 15.5% at 30° off), plus
-    the endpoint snap of origin/dest onto cell centres.
-
-    The IN-COLUMN part of the terminal fold does not land here: ``air_detour_m`` is measured exit
-    lane → exit lane on both sides (issue #50), so hub centre → column edge is outside the measurement
-    entirely — terminal operations, accounted as that hub's capacity.
-
-    What DOES land here is the column edge → lane-cell hop, because A*'s path starts on a boundary
-    hex rather than on the reference circle, so folding EXTENDS it (measured +169.58 m of a 724.41 m
-    band on an unimpeded hub flight). That is lane snap — the same quantization as (2), just at a
-    terminal — so the bucket is still "geometry, not traffic".
-    """
-    moves = sum(1 for a, b in zip(cells, cells[1:]) if a != b)
-    forced = max(0, moves - hg.hex_distance(cells[0], cells[-1])) * pitch
-    return max(0.0, air_detour_m - forced)
 
 
 def _absorb(svc, ledger):
@@ -282,7 +256,7 @@ class AStarPlanner:
         self._kernel = None
         if compiled:
             try:
-                from .astar_kernel import _search
+                from .kernel import _search
                 self._kernel = _search
             except ImportError:
                 self.compiled = False                   # numba absent → pure-Python everywhere
@@ -360,6 +334,15 @@ class AStarPlanner:
         self._tcap.evict_before(wm)
         return svc
 
+    def capacity_authority(self, ledger) -> TerminalCapacity | None:
+        """The pad-capacity authority already current for ``ledger``, or None (see the ``Planner``
+        Protocol). ``_occupancy`` binds ``_tcap`` and ``_svc_ledger`` together, so a match means this
+        planner has just planned against this ledger and a post-pass can reuse the authority instead
+        of building a second one. A public accessor because ``shortcut`` is a DIFFERENT module
+        reading it: leaving it to sniff ``_tcap``/``_svc_ledger`` made a rename here degrade the
+        refiner to a no-op silently — see ``shortcut._terminal_capacity_for``."""
+        return self._tcap if self._svc_ledger is ledger else None
+
     def _mk_envelope(self, req, cfg, o_term, d_term, origin, dest, max_step, bbox, unbounded):
         """Build ``last_envelope`` (Track A read-set summary) for the plan that just ran. ``bbox`` is
         the 8-slot probe accumulator (kernel ``read_bbox`` or ``_RecordingOcc.bbox``); the o/d hub discs
@@ -372,7 +355,7 @@ class AStarPlanner:
         traverse outruns the buffer (+3.67 s slack at 180 m, −4.33 s at 350 m) — so the traverse is
         added explicitly, per terminal, or a concurrent commit in those last seconds would be
         invisible to exact-mode revalidation."""
-        from ..parallel import PlanEnvelope, cell_bbox_to_aabb
+        from ...parallel import PlanEnvelope, cell_bbox_to_aabb
 
         infl_pad = cfg.effective_hover_radius_m + hg.circumradius(cfg)   # occupancy pad inflation
         hubs = []
@@ -639,7 +622,7 @@ class AStarPlanner:
             ground_delay_s=delay,
             air_hold_s=n_hover * dt,
             air_detour_m=detour,
-            lattice_overhead_m=_lattice_overhead_m([(s[1], s[2]) for s in air], pitch, detour),
+            lattice_overhead_m=hg.lattice_overhead_m([(s[1], s[2]) for s in air], pitch, detour),
             altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="astar",
         )
@@ -965,7 +948,7 @@ class AStarPlanner:
             self._kernel = None
 
     def _plan_compiled(self, req, ledger, cfg):
-        from . import astar_kernel as K
+        from . import kernel as K
 
         # ---- setup: IDENTICAL to _plan_reference's head, so the kernel gets identical inputs ----
         dt = cfg.dt_s
@@ -1214,7 +1197,7 @@ class AStarPlanner:
             ground_delay_s=ground_steps * dt,
             air_hold_s=n_hover * dt,
             air_detour_m=detour,
-            lattice_overhead_m=_lattice_overhead_m([(a[0], a[1]) for a in air], pitch, detour),
+            lattice_overhead_m=hg.lattice_overhead_m([(a[0], a[1]) for a in air], pitch, detour),
             altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="astar",
         )

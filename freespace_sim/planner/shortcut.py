@@ -32,6 +32,7 @@ from ..ledger import ReservationLedger
 from ..types import FlightRequest, IntentStatus, OperationalIntent
 from ..volumes import (build_reservation_from_corners, enroute_detour_m,
                        enroute_flown_m, enroute_reference_m)
+from . import iter_planner_chain
 from .terminal_capacity import TerminalCapacity
 
 _EPS = 1e-9
@@ -381,23 +382,25 @@ def _shortcut_turn_seeded(corners, had_holds: bool,
 def _terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
     """Find a capacity authority already brought current by the inner A*/MILP plan.
 
-    Reuse avoids a second ledger subscription/index. A* binds its authority with ``_svc_ledger``;
-    MILP uses ``_tcap_ledger``. Wrapper traversal also supports nested warm planners.
+    Reuse avoids a second ledger subscription/index. Asks each planner in the wrapper chain via the
+    optional ``capacity_authority(ledger)`` member (see the ``Planner`` Protocol) and takes the first
+    that answers; planners holding no authority simply do not implement it.
+
+    This used to reach into ``_tcap`` plus whichever of ``_tcap_ledger`` / ``_svc_ledger`` the family
+    happened to use. That was a silent-failure shape, not just a style one: renaming any of those
+    three private names — all of them internal to planners this module does not own — made every
+    lookup return None, and returning None here does not raise, it makes ``plan`` hand back the
+    UNREFINED inner intent for every terminal flight. ``astar_shortcut`` would quietly become bare
+    ``astar``. Named method ⇒ a rename is a grep away, and ``test_shortcut_reuses_the_inner_capacity_
+    authority`` pins that the reuse actually happens.
     """
-    seen: set[int] = set()
-    stack = [planner]
-    while stack:
-        current = stack.pop()
-        if current is None or id(current) in seen:
+    for p in iter_planner_chain(planner):
+        get = getattr(p, "capacity_authority", None)
+        if get is None:
             continue
-        seen.add(id(current))
-        tcap = getattr(current, "_tcap", None)
-        bound = getattr(current, "_tcap_ledger", None)
-        if bound is None:
-            bound = getattr(current, "_svc_ledger", None)
-        if isinstance(tcap, TerminalCapacity) and bound is ledger:
+        tcap = get(ledger)
+        if isinstance(tcap, TerminalCapacity):
             return tcap
-        stack.extend((getattr(current, "inner", None), getattr(current, "warm_planner", None)))
     return None
 
 

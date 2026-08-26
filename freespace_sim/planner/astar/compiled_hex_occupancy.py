@@ -1,6 +1,6 @@
 """Dense per-(cell, level) free-interval pools for the compiled A* kernel (issue #8 Track B, A* port).
 
-The numba kernel (:mod:`astar_kernel`) needs O(1) array reads to answer ``is (q, r, L) blocked at step
+The numba kernel (:mod:`kernel`) needs O(1) array reads to answer ``is (q, r, L) blocked at step
 s?`` — A*'s per-node obstacle test — reproducing :meth:`HexOccupancyService.is_blocked` exactly. The
 "cell" is a **(q, r, L)** triple (a hex at a flight level). Two flat interval pools, both maintained
 incrementally from the ledger commit hook via :func:`hexgrid.rasterize_volume_dual`:
@@ -40,9 +40,9 @@ import warnings
 
 import numpy as np
 
-from ..geometry import CylinderSpec
-from ..types import as_terminal
-from . import hexgrid as hg
+from ...geometry import CylinderSpec
+from ...types import as_terminal
+from .. import hexgrid as hg
 from ._packed import P_HI, P_LO, P_NXT, aligned_2d
 
 

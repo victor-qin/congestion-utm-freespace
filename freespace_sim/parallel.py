@@ -244,19 +244,12 @@ class AdaptiveWindow:
 
 
 def _iter_astar(planner):
-    """Every ``AStarPlanner`` reachable via the ``inner``/``warm_planner`` chain — local copy of
-    ``sim._astar_planners`` (kept here to avoid a sim ↔ parallel import cycle)."""
+    """Every ``AStarPlanner`` reachable via the ``inner``/``warm_planner`` chain. Shares one walker
+    with ``sim`` (``planner.iter_planner_chain``) — this was a hand-copy of ``sim._astar_planners``
+    kept to dodge a sim ↔ parallel cycle, which the neutral home in ``planner`` removes."""
+    from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
-    out, seen, stack = [], set(), [planner]
-    while stack:
-        p = stack.pop()
-        if p is None or id(p) in seen:
-            continue
-        seen.add(id(p))
-        if isinstance(p, AStarPlanner):
-            out.append(p)
-        stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
-    return out
+    return [p for p in iter_planner_chain(planner) if isinstance(p, AStarPlanner)]
 
 
 def _flat_aabb_t(vol):

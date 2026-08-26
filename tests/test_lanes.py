@@ -77,7 +77,7 @@ def test_static_terminal_walls_foreign_keeps_own_passable():
     """The occupancy's ledger subscribe_static hook (``_on_static``) makes a hub's cells a permanent FOREIGN
     wall (any step), while the hub's own flights pass through (transparent, absent a committed sibling
     corridor). (``_on_static`` is the body the ``ReservationLedger.subscribe_static`` replay drives.)"""
-    from freespace_sim.planner.occupancy import HexOccupancyService
+    from freespace_sim.planner.astar.occupancy import HexOccupancyService
 
     svc = HexOccupancyService(CFG)
     center, term = tuple(hg.hex_center(0, 0, R)), _term(120)

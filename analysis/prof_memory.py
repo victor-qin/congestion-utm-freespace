@@ -38,7 +38,7 @@ import time
 import numpy as np
 from numba import njit
 
-# Mirrors astar_kernel._MAGIC / _slot0 exactly — the whole point is to reproduce that probe sequence.
+# Mirrors astar.kernel._MAGIC / _slot0 exactly — the whole point is to reproduce that probe sequence.
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)
 _LCG_A = np.uint64(6364136223846793005)
 _LCG_C = np.uint64(1442695040888963407)

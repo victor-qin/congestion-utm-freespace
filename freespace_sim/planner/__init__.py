@@ -20,6 +20,40 @@ class Planner(Protocol):
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
     ) -> OperationalIntent: ...
 
+    # Optional, duck-typed members a planner MAY also expose (the house pattern for markers, as with
+    # ``plans_whole_schedule`` / ``plans_terminal_airspace``) — deliberately not declared above, so
+    # planners that have no use for them stay structurally conformant:
+    #
+    #   capacity_authority(ledger) -> TerminalCapacity | None
+    #       The pad-capacity authority this planner has ALREADY brought current for ``ledger``, or
+    #       None if it holds none bound to that ledger. Lets a post-pass reuse the authority the
+    #       inner plan just built instead of paying a second ledger subscription + index. A*
+    #       and the MILP implement it; ``shortcut._terminal_capacity_for`` is the consumer.
+
+
+def iter_planner_chain(planner):
+    """Every planner reachable from ``planner`` through the ``inner``/``warm_planner`` wrapper chain,
+    ``planner`` itself first. Deduped by identity, so a diamond (``astar_milp_shortcut`` wraps a MILP
+    that is warm-started by a *different* ShortcutRefiner) visits each node once.
+
+    ONE definition of "walk the wrapper chain": ``sim`` uses it to find where to attach telemetry and
+    whether the committed corridor is wall-aware, ``parallel`` to reach the A* instances inside a
+    worker's planner, and ``shortcut`` to find a capacity authority. Those four had drifted into four
+    identical copies (``parallel``'s even documented itself as one), which is a silent-divergence
+    risk: add a fifth wrapper attribute, miss one copy, and that caller quietly sees no planners
+    rather than raising. Order is load-bearing — ``_terminal_capacity_for`` returns the FIRST match —
+    so this reproduces the copies exactly: LIFO, ``warm_planner`` visited before ``inner``.
+    """
+    seen: set[int] = set()
+    stack = [planner]
+    while stack:
+        p = stack.pop()
+        if p is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        yield p
+        stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
+
 
 #: Planners that solve every flight at once, so `sim.run` routes them to `colgen.run_batch` and they
 #: never enter the per-flight FCFS loop (nor its round-trip coupling). Names, for callers holding only

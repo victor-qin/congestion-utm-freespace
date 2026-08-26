@@ -9,6 +9,7 @@ terminal replay, and the transparent-fallback safety valve.
 from __future__ import annotations
 
 import itertools
+import sys
 import warnings
 
 import numpy as np
@@ -19,8 +20,8 @@ from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
-from freespace_sim.planner.compiled_hex_occupancy import CompiledHexOccupancy
-from freespace_sim.planner.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import Volume4D
 
@@ -379,20 +380,35 @@ def test_out_of_box_committed_corridor_skipped_not_crash():
 
 # ---------------- E: safety valves / fallback ----------------
 
-def test_compiled_absent_falls_back_to_reference():
-    # numba-absent story: compiled=False is byte-identical to the reference.
+def test_compiled_absent_falls_back_to_reference(monkeypatch):
+    """numba-absent story: ``AStarPlanner(compiled=True)`` must DEGRADE to the reference, not raise.
+
+    Blocking the kernel module makes ``__init__``'s ``from .kernel import _search`` raise ImportError
+    — the same thing a numba-less install does. That import is a relative one, so it is also the line
+    a wrong package depth would break; because the ``except ImportError`` fails CLOSED into the silent
+    5-7x reference path, a bad depth would otherwise cost only a line on stderr. Pin both halves: the
+    planner reports itself uncompiled, and its answer is byte-identical to the reference's.
+    """
+    monkeypatch.setitem(sys.modules, "freespace_sim.planner.astar.kernel", None)
+    com = AStarPlanner(compiled=True)                    # asks for the kernel, cannot have it
+    assert com.compiled is False and com._kernel is None, "fell back without recording it"
+
     ref = AStarPlanner(compiled=False)
-    com = AStarPlanner(compiled=False)
-    led = ReservationLedger(CFG); led.commit(99, [_wall()])
-    a = ref.plan(_req(), ReservationLedger(CFG), CFG)  # empty
-    b = com.plan(_req(), ReservationLedger(CFG), CFG)
+    def led():
+        lg = ReservationLedger(CFG)
+        lg.commit(99, [_wall()])
+        return lg
+
+    a = ref.plan(_req(), led(), CFG)
+    b = com.plan(_req(), led(), CFG)
     assert a.cost == b.cost
+    assert [repr(v) for v in a.volumes] == [repr(v) for v in b.volumes]
 
 
 def test_compiled_fallback_on_kernel_valve_matches_reference():
     # Force the kernel to report FB_HASH → the plan must transparently fall back to the reference,
     # count the fallback, warn, and return the reference result exactly.
-    from freespace_sim.planner import astar_kernel as K
+    from freespace_sim.planner.astar import kernel as K
 
     def led():
         lg = ReservationLedger(CFG); lg.commit(99, [_wall()]); return lg
@@ -488,7 +504,7 @@ def test_compiled_replay_exact_saturated_terminal():
     """Saturated fixed-lane terminal replay (pads=1, high λ ⇒ large ground delays): full compiled==reference
     parity — status, cost, last_expansions, centerline — across the batch, 0 fallbacks. This is COVERAGE of
     the terminal-takeoff path under heavy base_g, NOT a discriminating guard for the A1 associativity fix:
-    reverting the parenthesisation at astar_kernel.py leaves this green, because the ~1-ULP takeoff-edge
+    reverting the parenthesisation at astar/kernel.py leaves this green, because the ~1-ULP takeoff-edge
     difference (~3.7% of takeoff-lane edges here) never flips a heap ``(f, counter)`` tie in practice
     (verified by reverting + re-running). The fix is correct-by-construction — the kernel now assembles
     ``base_g + (takeoff_cost + lane_lat)`` exactly as the reference builds its single-float edge cost — so no

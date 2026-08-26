@@ -39,11 +39,11 @@ from __future__ import annotations
 
 from collections.abc import Collection, Hashable
 
-from . import hexgrid as hg
-from ..config import SimConfig
-from ..geometry import CylinderSpec
-from ..types import as_terminal
-from ..volumes import Volume4D
+from .. import hexgrid as hg
+from ...config import SimConfig
+from ...geometry import CylinderSpec
+from ...types import as_terminal
+from ...volumes import Volume4D
 
 _EMPTY: dict = {}
 

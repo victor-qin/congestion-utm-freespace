@@ -8,9 +8,10 @@ from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner, hexgrid as hg
-from freespace_sim.planner.astar import AStarPlanner, _committed_arrival
+from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.planner import _committed_arrival
 from freespace_sim.planner.milp import MILPOptPlanner
-from freespace_sim.planner.occupancy import HexOccupancyService
 from freespace_sim.planner.shortcut import ShortcutRefiner
 from freespace_sim.sim import run
 from freespace_sim.types import (
@@ -585,7 +586,7 @@ def test_read_envelope_covers_the_landing_dwell_traverse():
     version of this test did exactly that.
     """
     from freespace_sim.parallel import envelope_intersects
-    from freespace_sim.planner.compiled_hex_occupancy import hover_tail_steps
+    from freespace_sim.planner.astar.compiled_hex_occupancy import hover_tail_steps
 
     def env_at(radius):
         cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), airspace_ceiling_m=135.0,

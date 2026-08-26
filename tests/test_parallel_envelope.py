@@ -19,7 +19,7 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.parallel import PlanEnvelope, envelope_intersects
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
-from freespace_sim.planner.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.types import FlightRequest, Terminal, vec
 from freespace_sim.volumes import Volume4D
 

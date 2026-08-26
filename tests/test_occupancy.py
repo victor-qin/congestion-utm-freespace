@@ -4,7 +4,7 @@
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
-from freespace_sim.planner.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
 
 CFG = SimConfig(planner="astar", region_size_m=(3000.0, 3000.0), lam_per_hour=400.0,
                 horizon_s=300.0, seed=3)

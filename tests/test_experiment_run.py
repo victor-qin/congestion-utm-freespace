@@ -1,5 +1,6 @@
 """CLI-to-ScenarioSpec override tests for the execute entry point, plus its stderr capture."""
 
+import builtins
 import multiprocessing as mp
 import os
 import sys
@@ -25,6 +26,48 @@ def _args(scenario: str, *extra: str):
     a flag breaks these tests with an ``AttributeError`` that says nothing about the actual change.
     """
     return parse_args(["--scenario", scenario, *extra])
+
+
+@pytest.mark.parametrize(
+    "numba_error",
+    [
+        ImportError("Numba needs NumPy 2.4 or less. Got NumPy 2.5."),
+        ModuleNotFoundError("No module named 'llvmlite'", name="llvmlite"),
+    ],
+    ids=("plain-compatibility-error", "missing-transitive-dependency"),
+)
+def test_kernel_status_falls_back_for_every_numba_import_error(monkeypatch, numba_error):
+    """Numba failures are not reliably named ``numba`` on the exception.
+
+    Its version guard raises a plain ``ImportError`` with ``name=None`` and a broken installation
+    can name the missing transitive module (usually ``llvmlite``). Both mean the optional kernel is
+    unavailable, so the experiment must keep the reference fallback that ``AStarPlanner`` itself
+    provides instead of dying in the startup INFO block.
+    """
+    real_import = builtins.__import__
+
+    def fail_numba(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "numba":
+            raise numba_error
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_numba)
+    assert run_module._kernel_status("astar").startswith("REFERENCE FALLBACK")
+
+
+def test_kernel_status_does_not_mask_astar_graph_import_errors(monkeypatch):
+    """A mandatory A* dependency failure is not evidence that the optional JIT is unavailable."""
+    real_import = builtins.__import__
+    broken = ModuleNotFoundError("No module named 'freespace_sim.cost'", name="freespace_sim.cost")
+
+    def fail_astar(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "freespace_sim.planner.astar":
+            raise broken
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_astar)
+    with pytest.raises(ModuleNotFoundError, match="freespace_sim.cost"):
+        run_module._kernel_status("astar")
 
 
 @pytest.mark.parametrize("planner_args", [(), ("--planner", "astar"), ("--planner", "milp")])

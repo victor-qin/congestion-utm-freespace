@@ -14,11 +14,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from freespace_sim.planner._packed import (
+from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.astar._packed import (
     CACHE_LINE, G_CAME, G_GEN, G_KEY, G_VAL, GEN_MASK, GEN_STEP, GEN_WRAP,
     P_HI, P_LO, P_NXT, aligned_2d,
 )
-from freespace_sim.planner.astar import AStarPlanner
 
 
 @pytest.mark.parametrize("cols,dtype,row_bytes", [(4, np.int64, 32), (4, np.int32, 16)])

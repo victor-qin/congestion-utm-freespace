@@ -205,35 +205,19 @@ def _wall_aware(planner) -> bool:
     astar_milp_shortcut → both). Used only to gate
     ``terminal_airspace_always_active`` (see ``run``): tagged columns are exempt from their own hub's
     permanent wall, whereas a planner that builds untagged near-hub columns would collide with it."""
+    from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
-    seen: set = set()
-    stack = [planner]
-    while stack:
-        p = stack.pop()
-        if p is None or id(p) in seen:
-            continue
-        seen.add(id(p))
-        if isinstance(p, AStarPlanner) or getattr(p, "plans_terminal_airspace", False):
-            return True
-        stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
-    return False
+    return any(isinstance(p, AStarPlanner) or getattr(p, "plans_terminal_airspace", False)
+               for p in iter_planner_chain(planner))
 
 
 def _astar_planners(planner) -> list:
     """Every ``AStarPlanner`` reachable from ``planner`` via the inner/warm_planner chain — so telemetry
     attaches to the A* inside any shortcut refiner or a warm-start wrapper (astar_milp, …), not just
     a bare top-level planner."""
+    from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
-    out, seen, stack = [], set(), [planner]
-    while stack:
-        p = stack.pop()
-        if p is None or id(p) in seen:
-            continue
-        seen.add(id(p))
-        if isinstance(p, AStarPlanner):
-            out.append(p)
-        stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
-    return out
+    return [p for p in iter_planner_chain(planner) if isinstance(p, AStarPlanner)]
 
 
 RETURN_ANCHORS = ("nominal", "realized")

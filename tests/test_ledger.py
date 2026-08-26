@@ -176,7 +176,7 @@ def test_static_wall_is_time_invariant_covers_late_departures():
     MAXS*dt / horizon_s. A late-departing return (t_request + est_trip + turnaround_s > horizon_s) commits a
     corridor past any finite cfg-derived bound; the earlier MAXS*dt wall missed those, the sentinel t_end
     covers them (this asserts crossings past MAXS*dt that the finite bound would have let through)."""
-    from freespace_sim.planner.compiled_hex_occupancy import schedulable_horizon_steps
+    from freespace_sim.planner.astar.compiled_hex_occupancy import schedulable_horizon_steps
     cfg = SimConfig(max_detour_factor=1.2)
     hx, hy = 3000.0, 3000.0
     led = ReservationLedger(cfg)

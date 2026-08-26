@@ -236,7 +236,7 @@ def _shift_request_clock(requests: list[FlightRequest], offset_s: float | None =
     ``departure_offset_s`` keeps byte-identical desired departures and differs solely in FCFS filing
     order — the paired per-flight comparison the scheduling-lead arms rely on. The constant must cover
     the realized preroll: a filing before t=0 would break the planner's monotonic-``t_request``
-    occupancy eviction (see ``planner/occupancy.py``), so an undersized offset raises rather than clips.
+    occupancy eviction (see ``planner/astar/occupancy.py``), so an undersized offset raises rather than clips.
     """
     if not requests:
         return 0.0

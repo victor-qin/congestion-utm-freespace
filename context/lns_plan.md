@@ -211,7 +211,165 @@ FCFS charges a premium (measured: 11%→19%→68% of cost at 974/FAA/future scal
 e2e test therefore runs in that regime, and offline results on density cuts must always report
 the deny-rate alongside cost.
 
-## 6. Build order from here
+## 6. Efficiency pass (2026-08-25) — what the loop actually spends
+
+Measured on `density_faa_wing_zipline --demand-duration 120 --horizon 1500` (290 legs, 26,216
+committed volumes), 300 iterations, seed 0. Every step below is answer-neutral and was A/B'd with a
+sha over the whole trajectory (per-iteration operator, victims, accept/reject, costs) — it stayed
+`d72adb89b9315204` throughout, and the result stayed 78,183 -> 75,404 (-3.554%, 62 accepted,
+verified). Harness: `.context/perf/ab_lns.py`.
+
+Headline, both arms run back to back so ambient machine load hits each equally (`b9d42c3` in a
+pristine worktree vs this tree):
+
+| | main `b9d42c3` | this branch | |
+|---|---|---|---|
+| total | 92.94 s | 78.32 s | **-15.7%** |
+| state build (init) | 10.58 s | 4.23 s | **2.50x** |
+| iteration loop | 82.36 s | 74.08 s | -10.1% |
+| peak RSS | 1,068 MB | 906 MB | -162 MB |
+| index + journals | 192.2 MB | 80.3 MB | **2.40x** |
+| trajectory sha | `d72adb89b9315204` | `d72adb89b9315204` | identical |
+
+The same pairing on the **600 s cut** (1,526 legs, 137,770 committed volumes — 5.3x the schedule),
+which is what the asymptotic arguments above are actually about:
+
+| | main `b9d42c3` | this branch | |
+|---|---|---|---|
+| total | 249.91 s | 184.11 s | **-26.3%** |
+| state build (init) | 56.14 s | 15.23 s | **3.69x** |
+| iteration loop | 193.77 s | 168.88 s | -12.8% |
+| peak RSS | 2,923 MB | 2,285 MB | -639 MB |
+| index + journals | 947.0 MB | 348.6 MB | **2.72x** |
+| trajectory sha | `da73a15e18323cdc` | `da73a15e18323cdc` | identical |
+
+Both arms improve 421,348 -> 413,289 (-1.913%, verified). The gains GROW with schedule size
+(-15.7% -> -26.3% total, -10.1% -> -12.8% loop, 2.40x -> 2.72x memory), which is the point: what
+was removed were terms linear in `n_volumes` sitting inside a per-iteration path whose real work is
+linear in the neighborhood.
+
+and the incremental attribution (single arm, same machine, quiet):
+
+| step | total | init | loop | peak RSS | index+journal |
+|---|---|---|---|---|---|
+| before | 94.3 s | 11.3 s | 83.0 s | 1,029 MB | 192 MB |
+| `release_many` slot runs | 95.9 s | 11.8 s | 84.1 s | 1,026 MB | 192 MB |
+| packed journals + inlined refcounts | 86.2 s | 11.1 s | 75.0 s | 907 MB | 80 MB |
+| parallel unimpeded ruler (8 workers) | 81.8 s | **4.5 s** | 77.3 s | 901 MB | 80 MB |
+| rasterisation memo sized to a neighborhood | 78.7 s | 4.6 s | 74.1 s | 896 MB | 80 MB |
+
+**1. `release_many` scanned every committed volume** (`for i, f in enumerate(self._fids)`) to
+tombstone the ~380 that a neighborhood owns — a 69x over-scan, and the last per-iteration term
+still growing with schedule size (incremental release exists precisely to make that cost flat).
+`ReservationLedger._runs` now records each flight's `[start, stop)` slot runs at `_append` (the one
+insertion point, coalescing contiguous appends), so the destroy touches only its own slots.
+`_compact` renumbers the existing buckets instead of re-deriving every survivor's geometry.
+
+*Honest caveat:* at 290 legs this is **inside timing noise** — the scan profiles at ~0.3% of loop
+wall, not the 5.4% it was reported as, and the step's own A/B came back +1.7% (noise). The case
+for it is asymptotic: the scan is linear in `n_volumes` while the work it does is linear in the
+neighborhood, so at the 600 s cut it scans 137,770 slots per destroy to touch ~2,000. The loop win
+does grow with schedule size (-10.1% at 290 legs vs -12.8% at 1,526), but that measures this step
+together with the journal packing — do not attribute the whole of it here.
+
+**2. The unimpeded delay ruler was sequential.** It is one A* plan per movable flight against a
+ledger holding nothing but the static walls, and it is essentially the whole state build. Because
+that ledger is never committed to, plan *i* cannot observe plan *j*: the pass is a pure function
+per flight, so `lns/unimpeded.py` shards it across processes with no validation machinery at all
+(contrast `freespace_sim.parallel`, whose read-envelopes exist because its plans DO see each
+other's commits). A probe prefix decides whether the pool is worth its ~0.4 s spawn, so small
+worlds stay in-process; a dead worker has its shard replanned in the parent, loudly.
+Ruler planners also take `kernel_log2_min=18`: the `max_expansions`-derived g-hash/heap ceiling is
+~470 MB, absurd for searches on an empty world, and dropping it measured **473 -> 214 MB per
+worker and 7% faster** (cache residency) with bit-identical costs.
+
+**3. The journals were 192 MB of tuples at 290 flights** — not 60, and `LNSState`'s own claim index
+is the largest single block, not the occupancy services'. All of it is per-claim, so all of it is
+linear in schedule size: the same structures measure **947 MB at 1,526 legs**, which is what makes
+this a scaling limit rather than a footprint nicety.
+
+| structure | before | after | how |
+|---|---|---|---|
+| `HexOccupancyService._rows` | 48.8 MB | 8.5 MB | flat int64 `(cell_id, s_lo, s_hi, code)`; cells interned once |
+| `CompiledHexOccupancy._rows` | 31.6 MB | 4.3 MB | flat int64 `(key, packed_claim)` pairs |
+| `CompiledHexOccupancy._claims` | 36.0 MB | 22.1 MB | one packed int per claim (`s0<<40 \| s1<<20 \| fid_code`) |
+| `LNSState._cells_of` | 43.6 MB | 12.0 MB | the DISTINCT cells, not one row per (cell, span) |
+| `LNSState._claims` | 32.2 MB | 33.3 MB | unchanged (the shared cell tuples now bill here) |
+
+`_cells_of`'s spans were never read — `_index_remove` bound them to `_s_lo`/`_s_hi` and dropped
+them — and its 257,954 rows are only **78,705 distinct cells**, so both the removal filter and the
+contention refresh were doing the same per-cell work 3.3x over.
+
+**4. Two constants were sized for a different caller.** `_RANGE_CACHE_CAP = 128` matched the FCFS
+sim's reuse window (one flight's volumes); under LNS the claim index is a third consumer that
+rasterises only after ALL victims are committed, so a default 8-flight neighborhood evicted most of
+its own rows first. 1024 (~1 MB) covers it. And the refcounted `_bump`/`_drop` (8.4 M calls per
+60 iterations) built the `setdefault` default EAGERLY, allocating a throwaway dict on every hit;
+inlined to `.get` + a None test.
+
+### Follow-on: the compiled rasteriser (lever A), 2026-08-25
+
+**Goal of this phase.** Rasterisation — turning a committed `Volume4D` into the hex cells it blocks
+— is not on the path INTO the ledger (`commit()` stores volumes verbatim); it runs in the ledger's
+subscribers, rebuilding the discrete obstacle map the next A\* search reads. That is a write-side
+cost, and it is disproportionately an LNS cost: the FCFS sim rasterises each volume once, while LNS
+re-commits a neighbourhood every iteration and, on a rejected one (79%), commits twice. This phase
+made each rasterisation ~6x cheaper without changing a single cell.
+
+| change | point | how it works | issues | outcome |
+|---|---|---|---|---|
+| `planner/hexgrid_kernel.py` (new) — `sweep_box`, `sweep_cyl` | 62 candidates per volume, 10 kept; ~10 numpy calls on 62-element arrays is ~3.4 us of dispatch each for a few flops | `@njit(cache=True, nogil=True)`, flat scalars in, caller-allocated arrays out, **emits only the kept cells** so the host never materialises the 84% discards | q-major/r-minor is load-bearing (a transposed nest keeps every cell but reorders `_rows`/`_claims`/`block_range` — nothing raises); `np.hypot` is not `sqrt(dx²+dy²)`; no rounding in the kernel (`_axial_round` is banker's, numba's differs) | 39.41 -> **6.62 us/volume (5.96x)** on `rasterize_volume_ranges` |
+| `hexgrid._sweep_kept` + `_axial_rect` | three public rasterisers each open-coded "slack then mask" and would drift; the A/B and the rollback need ONE switch | one helper returns the kept cells; the four-corner rectangle is lifted so both paths derive it identically; `USE_COMPILED` selects | `(q1-q0+1)*(r1-r0+1)` bounds the output exactly; three small `np.empty` per volume cost ~1-2 us against 33.9 saved | `USE_COMPILED=False` is the old numpy path bit-for-bit; `rasterize_volume`/`_dual` get the kernel for free |
+| `_levels_overlapped` reads `flat_aabb()` | allocated two throwaway `np.array`s per volume just to read two z scalars | one-line substitution; `flat_aabb` is pinned bit-for-bit against `aabb()` | none — the pinning test is the guarantee | two fewer allocations per volume per rasterise |
+
+**The exactness argument, and why it is not bit-parity.** numpy's `(N,3) @ (3,3)` does not sum in
+the order a register-scalar expression does. Measured over 359,512 real cell evaluations, the numba
+box path is **84.8% bit-identical, max delta 1.1e-13 m**; the cylinder path is **100% identical**
+(numba's `np.hypot` is numpy's, so the ULP hazard flagged for it does not exist). The bar is
+therefore *decision*-identical, and what makes it safe is the **boundary margin**: across both cuts
+the closest any cell comes to an inflation threshold is **9.1e-4 m**, ~**8e9x** the float delta. A
+flip is not merely unobserved, it is nine orders of magnitude out of reach.
+`.context/perf/verify_rasteriser.py` asserts ordered row equality per volume and reports that margin
+— re-run it if the inflations or the lattice pitch ever change.
+
+**Measured, paired against `b9d42c3` (both arms back to back, trajectory sha identical):**
+
+| | 120 s cut (290 legs) | | 600 s cut (1,526 legs) | |
+|---|---|---|---|---|
+| | main | branch | main | branch |
+| total | 93.17 s | **70.43 s** (-24.4%) | 241.70 s | **158.68 s** (-34.4%) |
+| state build | 11.24 s | 3.57 s (3.15x) | 55.98 s | 11.54 s (**4.85x**) |
+| iteration loop | 81.93 s | 66.87 s | 185.72 s | 147.14 s |
+| FCFS baseline sim | 21.6 s | 12.1 s | 67.9 s | 58.6 s |
+| peak RSS | 1,084 MB | 913 MB | 2,996 MB | 2,303 MB |
+| sha | `d72adb89b9315204` | same | `da73a15e18323cdc` | same |
+
+The rasteriser alone (against the pre-A branch) is **-10.1%** at 290 legs and **-13.8%** at 1,526.
+Suite: 1115 passed / 2 skipped; ruff clean.
+
+### Next levers, re-measured AFTER the rasteriser
+
+The loop is now genuinely dominated by search: `_plan_compiled`'s 36.6% profiled self-time is the
+numba A\* kernel itself (cProfile cannot see into it, so it bills to the caller).
+
+* **Occupancy insert loops — the new largest addressable block.** `HexOccupancyService.on_commit`
+  7.9 s + `CompiledHexOccupancy.on_commit` 3.9 s of a 32.7 s profiled run: per-(step, cell) refcount
+  bumps and 862 k `_Pool.block_range` calls. Now that the geometry is compiled, THIS is what a
+  commit costs.
+* **Restore-commit undo cache (~8.7% of loop).** Unchanged in share by A, and it attacks the same
+  insert loops from the other end: 79% of iterations are rejected, and `_rewind` re-inserts exactly
+  what the destroy just removed. Needs a two-generation identity-keyed stash (the reject path
+  releases twice before restoring).
+* **`_absorb` (5.4 s, one-time).** The repair planner rebinds and re-absorbs the whole schedule on
+  its first plan. Only avoidable by handing over warm services, which the FCFS sim cannot supply
+  (`track_removal=False`, eviction watermark advanced).
+
+**Lever C is DROPPED.** Deriving the LNS claim index from the occupancy journal measured 1.9% / 4.3%
+before A and **0.8% / 1.8% after** (`_rebuild_claim_index` 0.53 s / 2.89 s) — A is what made the
+rasterisation C would have removed cheap. Not worth the coupling it required (reaching into the
+service's journal, reproducing its eviction clamp, and only working with `incremental_release=True`).
+
+## 7. Build order from here
 
 1. ~~Offline core~~ (this change).
 2. Offline measurement on `density_faa_wing_zipline` cuts (`--demand-duration` 300/600 s, then

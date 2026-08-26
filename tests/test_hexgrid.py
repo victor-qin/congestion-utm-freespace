@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from freespace_sim.config import SimConfig
 from freespace_sim.planner import hexgrid as hg
@@ -61,9 +62,22 @@ def test_rasterize_blocks_cells_near_a_corridor_and_not_far():
     assert not any((far_q, far_r, L, 0) in cells for L in range(CFG.n_levels))  # distant: clear
 
 
-def test_vectorized_rasterize_matches_scalar_reference():
+@pytest.fixture
+def sweep_mode(request, monkeypatch):
+    """Run a test body once per rasteriser backend. ``True`` is a no-op when numba is absent, so a
+    numba-less environment still exercises the reference rather than silently skipping."""
+    monkeypatch.setattr(hg, "USE_COMPILED", request.param and hg._COMPILED)
+    hg._RANGE_CACHE.clear()                       # the memo is keyed on the volume, not the backend
+    yield
+    hg._RANGE_CACHE.clear()
+
+
+@pytest.mark.parametrize("sweep_mode", [False, True], indirect=True)
+def test_vectorized_rasterize_matches_scalar_reference(sweep_mode):
     """The vectorized rasterizer (single + dual) must be byte-identical to the scalar oracle, across
-    several box orientations and a hover cylinder."""
+    several box orientations and a hover cylinder — for BOTH backends. The oracle
+    (``_hexes_in_box`` + ``_footprint_contains``) is independent of either sweep, so it is what
+    stops the compiled path and the numpy path from being wrong together."""
     z = CFG.cruise_level_m
     vols = [
         corridor_segment_volume(vec(800, 200, z), 40.0, vec(920, 260, z), 44.0, CFG),   # diagonal
@@ -191,3 +205,68 @@ def test_vertical_climb_box_overlaps_only_its_traversed_levels():
     box = corridor_segment_volume(vec(500, 0, CFG.level_z(0)), 0.0,
                                   vec(500, 0, CFG.level_z(1)), 2 * CFG.dt_s, CFG)
     assert hg._levels_overlapped(box, CFG) == [0, 1]
+
+
+# ------------------------------------------------------ compiled sweep (hexgrid_kernel)
+@pytest.mark.slow
+def test_compiled_rasteriser_rows_match_reference_on_a_real_cut():
+    """Every committed volume of a real cut, compiled vs reference, compared as ORDERED rows.
+
+    Ordering is the point. The compiled sweep is not bit-identical to numpy on the box path (numpy's
+    ``(N,3) @ (3,3)`` does not sum in the order a register-scalar expression does; measured max
+    delta 1.1e-13 m), so what is being asserted is that no cell's ``slack <= infl`` DECISION moved.
+    And a transposed loop nest would keep every cell while changing the sequence, which silently
+    reorders ``HexOccupancyService._rows``, ``CompiledHexOccupancy._claims`` and the interval pool's
+    ``block_range`` applications — a set comparison would pass that.
+
+    Synthetic volumes cannot stand in for this: only a real schedule produces corridor boxes at
+    every bearing, terminal columns, and climb boxes spanning several levels.
+    """
+    if not hg._COMPILED:
+        pytest.skip("numba unavailable — nothing to compare against")
+    from freespace_sim import sim
+    from freespace_sim.scenarios import get_scenario
+    from freespace_sim.scenarios.spec import with_overrides
+
+    spec = with_overrides(get_scenario("density_faa_wing_zipline"),
+                          demand_duration_s=30.0, horizon_s=900.0)
+    cfg = spec.config()
+    res = sim.run(cfg, demand=spec.demand_model(), planner_name="astar", progress=False)
+    r_circ = hg.circumradius(cfg)
+    infl_b = cfg.corridor_width_m / 2.0 + r_circ
+    infl_p = cfg.effective_hover_radius_m + r_circ
+    vols = [v for _fid, v in res.ledger.iter_committed()]
+    assert vols, "the cut committed nothing — the comparison would be vacuous"
+
+    def sweep(vol, compiled):
+        hg.USE_COMPILED = compiled
+        hg._RANGE_CACHE.clear()
+        return (list(hg.rasterize_volume_ranges(vol, cfg, r_circ, infl_b, infl_p)),
+                list(hg.rasterize_volume_dual(vol, cfg, r_circ, infl_b, infl_p)),
+                list(hg.rasterize_volume(vol, cfg, r_circ)))
+
+    try:
+        for vol in vols:
+            assert sweep(vol, True) == sweep(vol, False)
+    finally:
+        hg.USE_COMPILED = False
+        hg._RANGE_CACHE.clear()
+
+
+def test_rasteriser_falls_back_when_kernel_is_absent(monkeypatch):
+    """With ``USE_COMPILED`` on but no kernel, the reference must still run (and say so once), so a
+    numba-less environment keeps working instead of raising a NameError deep in a commit hook."""
+    monkeypatch.setattr(hg, "_COMPILED", False)
+    monkeypatch.setattr(hg, "USE_COMPILED", True)
+    monkeypatch.setattr(hg, "_compiled_warned", False)
+    hg._RANGE_CACHE.clear()
+    z = CFG.cruise_level_m
+    vol = corridor_segment_volume(vec(800, 200, z), 40.0, vec(920, 260, z), 44.0, CFG)
+    infl_b = CFG.corridor_width_m / 2.0 + R
+    infl_p = CFG.effective_hover_radius_m + R
+
+    got = list(hg.rasterize_volume_ranges(vol, CFG, R, infl_b, infl_p))
+    monkeypatch.setattr(hg, "USE_COMPILED", False)
+    hg._RANGE_CACHE.clear()
+    assert got == list(hg.rasterize_volume_ranges(vol, CFG, R, infl_b, infl_p))
+    assert hg._compiled_warned                       # warned, once

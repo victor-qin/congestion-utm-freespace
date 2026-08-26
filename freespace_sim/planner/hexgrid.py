@@ -16,6 +16,7 @@ the true continuous gap, and FCL verify is the backstop.
 from __future__ import annotations
 
 import math
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -28,6 +29,37 @@ from ..volumes import Volume4D, exit_radius
 
 SQRT3 = math.sqrt(3.0)
 AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
+
+# ---- compiled footprint sweep (see hexgrid_kernel) ------------------------------------------
+# The reference sweep below (`_candidate_slack` + a mask) stays the oracle and the fallback. The
+# kernel evaluates the same candidates in compiled code and emits only the ones that pass, which is
+# what removes the ~84% of candidates the host currently materialises just to discard.
+try:
+    from .hexgrid_kernel import sweep_box as _sweep_box, sweep_cyl as _sweep_cyl
+    _COMPILED = True
+except ImportError:                                  # numba absent → reference everywhere
+    _COMPILED = False
+#: Runtime switch. False == the numpy expressions below, bit-for-bit — the A/B arm and the rollback.
+#: On by default: verified decision-identical (ordered rows, per volume) across the 120 s and 600 s
+#: density_faa cuts — 163,965 volumes, 0 differences — at 5.96x on `rasterize_volume_ranges`. The
+#: box path is NOT bit-identical to numpy (max delta 1.1e-13 m); what makes that harmless is the
+#: measured boundary margin, min |slack - inflation| = 9.1e-4 m, ~8e9x the delta. Re-run
+#: `.context/perf/verify_rasteriser.py` if the inflations or the lattice pitch ever change.
+USE_COMPILED = True
+_compiled_warned = False
+
+
+def _warn_no_kernel() -> None:
+    """One stderr line, once per process, when the compiled sweep was requested but numba won't
+    import. The fallback is the reference, so nothing downstream notices — which is exactly how a
+    silent slowdown survives a whole sweep (cf. `astar._warn_kernel_fallback`, issue #30)."""
+    global _compiled_warned
+    if _compiled_warned:
+        return
+    _compiled_warned = True
+    print("WARNING: compiled hex rasteriser unavailable (numba import failed) — using the numpy "
+          "reference sweep. Results are identical. Fix: run via plain `uv run` (numba is in "
+          "tool.uv default-groups) or `uv sync`.", file=sys.stderr)
 
 
 def hex_neighbors(q: int, r: int) -> list[tuple[int, int]]:
@@ -203,8 +235,8 @@ def _levels_overlapped(vol: Volume4D, cfg: SimConfig) -> list[int]:
     """Indices of the flight levels whose corridor band ``[z_L ± corridor_height/2]`` overlaps the
     volume's z-AABB. A level corridor box touches exactly one; a slanted/climb box touches ≥2; a
     ``[ground, ceiling]`` hover/terminal column touches every in-band level (the regulated tube)."""
-    lo, hi = vol.aabb()
-    zlo, zhi = float(lo[2]), float(hi[2])
+    _x0, _y0, zlo, _x1, _y1, zhi = vol.flat_aabb()   # scalars, no throwaway arrays; flat_aabb is
+    #                                                   pinned bit-for-bit against aabb()
     half = cfg.corridor_height_m / 2.0
     return [L for L, z in enumerate(cfg.flight_levels_m) if zlo <= z + half and z - half <= zhi]
 
@@ -258,27 +290,79 @@ def _footprint_slack(shape, cx: np.ndarray, cy: np.ndarray, cfg: SimConfig,
     return np.maximum(radial, z_slack)
 
 
-def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float, z: float | None = None):
-    """Candidate axial hexes (centres within the volume AABB inflated by ``infl``) and each one's
-    :func:`_footprint_slack` at altitude probe ``z``. The (q, r) enumeration reproduces
-    :func:`_hexes_in_box` as arrays."""
-    lo, hi = vol.aabb()
-    amin = lo[:2] - infl
-    amax = hi[:2] + infl
+def _axial_rect(xmin: float, ymin: float, xmax: float, ymax: float, R: float):
+    """Inclusive axial rectangle ``(q0, q1, r0, r1)`` covering every hex whose centre could lie in the
+    xy box — the same superset :func:`_hexes_in_box` walks, as bounds instead of a generator.
+
+    Both sweeps derive their candidates from HERE rather than each rolling their own, because a
+    compiled sweep that enumerated a differently-sized rectangle would silently keep a different
+    cell set at the margin. Rounding stays in Python on purpose: :func:`_axial_round` uses banker's
+    ``round``, whose numba semantics differ, so the kernel is handed bounds and never rounds.
+    """
     qs, rs = [], []
-    for x in (amin[0], amax[0]):
-        for y in (amin[1], amax[1]):
+    for x in (xmin, xmax):
+        for y in (ymin, ymax):
             q, r = enu_to_axial(x, y, R)
             qs.append(q)
             rs.append(r)
+    return min(qs) - 1, max(qs) + 1, min(rs) - 1, max(rs) + 1
+
+
+def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float, z: float | None = None):
+    """Candidate axial hexes (centres within the volume AABB inflated by ``infl``) and each one's
+    :func:`_footprint_slack` at altitude probe ``z``. The (q, r) enumeration reproduces
+    :func:`_hexes_in_box` as arrays.
+
+    The numpy REFERENCE sweep: kept as the oracle the compiled kernel is pinned against, and as the
+    fallback when numba is absent or ``USE_COMPILED`` is off."""
+    lo, hi = vol.aabb()
+    q0, q1, r0, r1 = _axial_rect(lo[0] - infl, lo[1] - infl, hi[0] + infl, hi[1] + infl, R)
     q_grid, r_grid = np.meshgrid(
-        np.arange(min(qs) - 1, max(qs) + 2), np.arange(min(rs) - 1, max(rs) + 2), indexing="ij"
+        np.arange(q0, q1 + 1), np.arange(r0, r1 + 1), indexing="ij"
     )
     q_grid = q_grid.ravel()
     r_grid = r_grid.ravel()
     cx = R * SQRT3 * (q_grid + r_grid / 2.0)
     cy = R * 1.5 * r_grid
     return q_grid, r_grid, _footprint_slack(vol.shape, cx, cy, cfg, z=z)
+
+
+def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float,
+                z: float | None = None):
+    """``(qs, rs, in_blocked)`` for the cells of ``vol``'s footprint at altitude probe ``z`` — the
+    single place the compiled/reference choice is made.
+
+    All three public rasterisers funnel through here so they cannot drift apart and so one switch
+    (``USE_COMPILED``) controls the A/B and the rollback for every one of them. ``infl_pad`` sizes
+    the candidate rectangle (it is the wider inflation, so the blocked cells are a subset);
+    ``in_blocked`` flags membership in the narrower corridor footprint.
+    """
+    z = cfg.cruise_level_m if z is None else z
+    if _COMPILED and USE_COMPILED:
+        x0, y0, _z0, x1, y1, _z1 = vol.flat_aabb()   # scalars; pinned bit-for-bit against aabb()
+        q0, q1, r0, r1 = _axial_rect(x0 - infl_pad, y0 - infl_pad,
+                                     x1 + infl_pad, y1 + infl_pad, R)
+        n_cand = (q1 - q0 + 1) * (r1 - r0 + 1)       # exact upper bound: overflow is impossible
+        oq = np.empty(n_cand, np.int64)
+        orr = np.empty(n_cand, np.int64)
+        ob = np.empty(n_cand, np.bool_)
+        s = vol.shape
+        if isinstance(s, BoxSpec):
+            m, e = s.rot, s.extents
+            n = _sweep_box(q0, q1, r0, r1, R, s.center[0], s.center[1], s.center[2],
+                           m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
+                           e[0] / 2.0, e[1] / 2.0, e[2] / 2.0,
+                           z, infl_pad, infl_blocked, oq, orr, ob)
+        else:
+            n = _sweep_cyl(q0, q1, r0, r1, R, s.cx, s.cy, s.radius, s.z_lo, s.z_hi,
+                           z, infl_pad, infl_blocked, oq, orr, ob)
+        return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
+    if not _COMPILED and USE_COMPILED:
+        _warn_no_kernel()
+    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=z)
+    in_pad = slack <= infl_pad
+    return (q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
+            (slack[in_pad] <= infl_blocked).tolist())
 
 
 def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
@@ -317,18 +401,16 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
         infl = cfg.corridor_width_m / 2.0 + R      # corridor half-width + one hex (conservative)
     steps = _step_range(vol, cfg)
     if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
-        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl, z=cfg.flight_levels_m[levels[0]])
-        mask = slack <= infl
-        cells = list(zip(q_grid[mask].tolist(), r_grid[mask].tolist()))
+        qs, rs, _b = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[levels[0]])
+        cells = list(zip(qs, rs))
         for L in levels:
             for q, r in cells:
                 for s in steps:
                     yield q, r, L, s
         return
     for L in levels:
-        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl, z=cfg.flight_levels_m[L])
-        mask = slack <= infl
-        for q, r in zip(q_grid[mask].tolist(), r_grid[mask].tolist()):
+        qs, rs, _b = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[L])
+        for q, r in zip(qs, rs):
             for s in steps:
                 yield q, r, L, s
 
@@ -346,21 +428,15 @@ def rasterize_volume_dual(
         return
     steps = _step_range(vol, cfg)
     if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
-        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[levels[0]])
-        in_pad = slack <= infl_pad
-        rows = list(zip(q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
-                        (slack[in_pad] <= infl_blocked).tolist()))
+        rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
+                                     z=cfg.flight_levels_m[levels[0]])))
         for L in levels:
             for q, r, b in rows:
                 for s in steps:
                     yield q, r, L, s, b
         return
     for L in levels:
-        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[L])
-        in_pad = slack <= infl_pad
-        in_blk = (slack[in_pad] <= infl_blocked).tolist()
-        qp = q_grid[in_pad].tolist()
-        rp = r_grid[in_pad].tolist()
+        qp, rp, in_blk = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad, z=cfg.flight_levels_m[L])
         for q, r, b in zip(qp, rp, in_blk):
             for s in steps:
                 yield q, r, L, s, b
@@ -387,20 +463,14 @@ def rasterize_volume_ranges(
     if s_hi < s_lo:
         return
     if _cylinder_z_independent(vol, cfg, levels):
-        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[levels[0]])
-        in_pad = slack <= infl_pad
-        rows = list(zip(q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
-                        (slack[in_pad] <= infl_blocked).tolist()))
+        rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
+                                     z=cfg.flight_levels_m[levels[0]])))
         for L in levels:
             for q, r, b in rows:
                 yield q, r, L, s_lo, s_hi, b
         return
     for L in levels:
-        q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=cfg.flight_levels_m[L])
-        in_pad = slack <= infl_pad
-        in_blk = (slack[in_pad] <= infl_blocked).tolist()
-        qp = q_grid[in_pad].tolist()
-        rp = r_grid[in_pad].tolist()
+        qp, rp, in_blk = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad, z=cfg.flight_levels_m[L])
         for q, r, b in zip(qp, rp, in_blk):
             yield q, r, L, s_lo, s_hi, b
 
@@ -408,10 +478,14 @@ def rasterize_volume_ranges(
 _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 # Both occupancy images consume the SAME volume with the SAME params on each commit (hex then
 # compiled), so the geometry sweep (`_candidate_slack`) is memoized once and reused by the second
-# consumer. The cap must exceed one flight's volume count for that reuse to fire — 128 dwarfs any
-# real trajectory (corridor segments + 2 terminal columns). Overshooting only wastes a miss's
-# recompute, never correctness; undershooting silently loses the sharing, so this errs high.
-_RANGE_CACHE_CAP = 128
+# consumer. The cap must exceed the reuse WINDOW for that sharing to fire. For the FCFS sim that
+# window is one flight's volumes; under LNS it is one NEIGHBORHOOD's, because the claim index
+# (`lns.state._index_add`, a third consumer at the same inflations) rasterizes the victims only
+# after all of them have been committed — at 128 a default 8-flight neighborhood evicted most of
+# its own rows before reaching it. An entry is ~10 rows (a corridor box covers ~10 hexes), so 1024
+# costs ~1 MB. Overshooting only wastes a miss's recompute, never correctness; undershooting
+# silently loses the sharing, so this errs high.
+_RANGE_CACHE_CAP = 1024
 
 
 def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float):

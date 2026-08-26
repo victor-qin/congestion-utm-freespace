@@ -21,7 +21,7 @@ import math
 
 import numpy as np
 
-from freespace_sim.planner._packed import aligned_2d
+from freespace_sim.planner.astar._packed import aligned_2d
 import pytest
 
 pytest.importorskip("numba")  # kernel import does ``from numba import njit`` — skip the module if absent

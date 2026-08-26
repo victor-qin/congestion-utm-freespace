@@ -17,7 +17,7 @@ from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
-from freespace_sim.planner.astar import _absorb
+from freespace_sim.planner.astar.planner import _absorb
 from freespace_sim.planner.compiled_occupancy import CompiledOccupancy
 from freespace_sim.planner.sipp import SafeIntervalIndex
 from freespace_sim.scenario import scenario_from_requests

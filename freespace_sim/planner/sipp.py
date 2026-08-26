@@ -41,9 +41,10 @@ from ..volumes import (
     terminal_radius,
 )
 from . import hexgrid as hg
-from .astar import AStarPlanner, _absorb, _committed_arrival, _lattice_overhead_m
-from ._packed import aligned_2d
-from .compiled_hex_occupancy import search_horizon
+from .astar import AStarPlanner
+from .astar._packed import aligned_2d
+from .astar.compiled_hex_occupancy import search_horizon
+from .astar.planner import _absorb, _committed_arrival
 from .compiled_occupancy import CompiledOccupancy
 
 _EPS = 1e-6
@@ -241,6 +242,7 @@ class SIPPPlanner(AStarPlanner):
         super().__init__(max_expansions)
         self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
         self._sidx_ledger = None
+        self._sidx_epoch = 0                           # ledger.epoch at bind (detach tripwire, #109)
         # --- compiled (numba) air-cruise kernel; falls back to the pure-Python reference ---
         self.compiled = compiled
         self._skernel = None
@@ -252,6 +254,7 @@ class SIPPPlanner(AStarPlanner):
                 self.compiled = False                  # numba absent → pure-Python everywhere
         self._scocc: CompiledOccupancy | None = None    # interval pool (per ledger)
         self._scocc_ledger = None
+        self._scocc_epoch = 0                          # ledger.epoch at bind (detach tripwire, #109)
         self._sgen = 0                                  # version stamp for reused kernel state
         self._k_cap = -1                               # frontier size the kernel arrays are sized to
         self._k_lab_cell = None                        # kernel work arrays (allocated lazily)
@@ -267,9 +270,13 @@ class SIPPPlanner(AStarPlanner):
         subscribes the commit hook + absorbs existing volumes; a ledger shrink rebuilds; then evict to
         the request clock."""
         sidx = self._sidx
+        if sidx is not None and self._sidx_ledger is ledger and self._sidx_epoch != ledger.epoch:
+            sidx = None     # detached mid-life: re-subscribe and re-absorb (the shrink tripwire
+            #                 below cannot see it — a release + re-commit nets to the same n_volumes)
         if sidx is None or self._sidx_ledger is not ledger:
             sidx = self._sidx = SafeIntervalIndex(cfg)
             self._sidx_ledger = ledger
+            self._sidx_epoch = ledger.epoch
             ledger.subscribe(sidx.on_commit)
             _absorb(sidx, ledger)
             ledger.subscribe_static(sidx._on_static)   # replays every hub registered before we bound
@@ -464,7 +471,7 @@ class SIPPPlanner(AStarPlanner):
             ground_delay_s=delay,
             air_hold_s=n_hover * dt,
             air_detour_m=detour,
-            lattice_overhead_m=_lattice_overhead_m([(t[1], t[2]) for t in air], pitch, detour),
+            lattice_overhead_m=hg.lattice_overhead_m([(t[1], t[2]) for t in air], pitch, detour),
             altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg),
             planner="sipp",
         )
@@ -475,9 +482,12 @@ class SIPPPlanner(AStarPlanner):
     def _scompiled_occ(self, req, ledger, cfg) -> CompiledOccupancy:
         """Maintain the dense interval table in lockstep with the ledger (mirrors ``_sipp_index``)."""
         cocc = self._scocc
+        if cocc is not None and self._scocc_ledger is ledger and self._scocc_epoch != ledger.epoch:
+            cocc = None     # detached mid-life — rebind (see _sipp_index)
         if cocc is None or self._scocc_ledger is not ledger:
             cocc = self._scocc = CompiledOccupancy(cfg)
             self._scocc_ledger = ledger
+            self._scocc_epoch = ledger.epoch
             ledger.subscribe(cocc.on_commit)
             _absorb(cocc, ledger)
             ledger.subscribe_static(cocc._on_static)   # replays every hub registered before we bound
@@ -784,7 +794,7 @@ class SIPPPlanner(AStarPlanner):
         intent = OperationalIntent(
             request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
             ground_delay_s=delay, air_hold_s=n_hover * dt, air_detour_m=detour,
-            lattice_overhead_m=_lattice_overhead_m([(t[0], t[1]) for t in air], pitch, detour),
+            lattice_overhead_m=hg.lattice_overhead_m([(t[0], t[1]) for t in air], pitch, detour),
             altitude_change_m=endpoint_altitude_change_m(z_takeoff, z_land, cruise_dz, cfg), planner="sipp",
         )
         intent.cost = trajectory_cost(intent, cfg)

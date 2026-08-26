@@ -128,7 +128,12 @@ class CompiledOccupancy:
     def _add(self, vol, own_cols) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
+        # Range-blocked, and deliberately the SHARED producer (issue #114): `rasterize_ranges` memoizes
+        # the geometry sweep per (id(vol), R, infl_*), and this structure's inflation radii are
+        # identical to `HexOccupancyService`'s, so the sweep the hex image just did on this same commit
+        # is reused rather than repeated. The per-STEP `rasterize_volume_dual` this replaced did
+        # neither: it missed the memo AND yielded ~8x the rows (span median 7), one `_block` each.
+        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:
@@ -151,30 +156,68 @@ class CompiledOccupancy:
                     self._warned_oob = True
                 self.oob_corridor_cells += 1
                 continue
-            self._block(c, int(s))
+            self.block_range(c, int(s_lo), int(s_hi))
 
     def _block(self, c: int, s: int) -> None:
-        """Split cell ``c``'s free interval containing step ``s`` (linked-list pool, in place)."""
-        if s < 0 or s > self.MAXS:
+        """Split cell ``c``'s free interval containing step ``s`` (linked-list pool, in place).
+        Equivalent to ``block_range(c, s, s)``; kept for callers/tests that block a single step
+        (mirrors ``CompiledHexOccupancy.block``)."""
+        self.block_range(c, s, s)
+
+    def block_range(self, c: int, s0: int, s1: int) -> None:
+        """Remove the whole contiguous span ``[s0, s1]`` from cell ``c``'s free intervals in one pass.
+
+        A committed volume occupies each cell over a contiguous step range, so this replaces ``S``
+        single-step splits with one walk — the SoA twin of ``CompiledHexOccupancy.block_range`` (issue
+        #8 Phase E), which the hex image has had since the A* commit floor was profiled. The free-STEP
+        set is identical to blocking ``s0, s0+1, …, s1`` one at a time, so the kernel is byte-unaffected.
+
+        The chain (head = slot ``c``) is sorted ascending and every adjacent pair is separated by at
+        least one blocked step, an invariant this and ``_block`` both preserve: a split inserts the
+        right remainder immediately after the left. The span may straddle several intervals once
+        earlier commits punched holes — the first keeps a left remainder ``[a, s0-1]``, the last a
+        right remainder ``[s1+1, b]``, and anything fully inside is marked empty (``lo>hi``) rather
+        than unlinked, since the flat pool cannot cheaply drop a fixed head/middle slot and every
+        reader (the kernel walk, ``free_intervals_py``) already skips ``lo > hi``.
+
+        The ``a > s1`` early return is safe in the presence of those empty slots: an emptied interval
+        keeps ``lo`` no greater than its successor's, so if it sits right of the span, so does
+        everything after it.
+
+        Every access re-reads ``self.iv_*``: ``_alloc`` can ``_grow``, which REPLACES all three arrays,
+        so a hoisted reference would write into the dead buffer."""
+        if s0 < 0:
+            s0 = 0
+        if s1 > self.MAXS:
+            s1 = self.MAXS
+        if s0 > s1:
             return
         slot = c
         while slot != -1:
             a, b = int(self.iv_lo[slot]), int(self.iv_hi[slot])
-            if a <= s <= b:                               # interval [a,b] contains s → split out s
-                if s + 1 <= b:
-                    if a <= s - 1:                        # both sides survive
-                        self.iv_hi[slot] = s - 1
-                        ns = self._alloc(s + 1, b, int(self.iv_nxt[slot]))
-                        self.iv_nxt[slot] = ns
-                    else:                                  # s == a → slot becomes the right part
-                        self.iv_lo[slot] = s + 1
-                elif a <= s - 1:                           # s == b → slot becomes the left part
-                    self.iv_hi[slot] = s - 1
-                else:                                      # s == a == b → degenerate (lo>hi), skipped
-                    self.iv_lo[slot] = s + 1
+            nxt = int(self.iv_nxt[slot])
+            if b < s0:                                    # wholly left of the span → keep walking
+                slot = nxt
+                continue
+            if a > s1:                                    # wholly right (list sorted) → done
                 return
-            slot = int(self.iv_nxt[slot])
-        # s already blocked (no interval contains it) → no-op
+            keep_left = a <= s0 - 1
+            keep_right = s1 + 1 <= b
+            if keep_left and keep_right:                  # span sits inside one interval → split once
+                self.iv_hi[slot] = s0 - 1
+                ns = self._alloc(s1 + 1, b, nxt)
+                self.iv_nxt[slot] = ns
+                return
+            if keep_right:                                # right remainder is > s1 → nothing past it
+                self.iv_lo[slot] = s1 + 1
+                return
+            if keep_left:                                 # left remainder kept; span may reach further
+                self.iv_hi[slot] = s0 - 1
+            else:                                         # interval fully covered → empty (lo>hi)
+                self.iv_lo[slot] = 1
+                self.iv_hi[slot] = 0
+            slot = nxt
+        # span already blocked (no interval overlaps it) → no-op
 
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:

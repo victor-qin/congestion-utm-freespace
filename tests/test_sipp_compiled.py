@@ -481,3 +481,86 @@ def test_compiled_full_run_verified_and_matches_reference():
     rr = run(SimConfig(planner="sipp_ref", **cfg))
     assert rc.verified and rr.verified
     assert rc.summary()["n_accepted"] == rr.summary()["n_accepted"]
+
+
+# ---- issue #114: the range-blocked commit path ----
+
+def _block_one_step(pool, c, s):
+    """The single-step splitter `CompiledOccupancy._block` used before it delegated to `block_range`.
+
+    Kept here as the ORACLE for the equivalence property below, not as dead code: `block_range`'s whole
+    licence to exist is that one span-walk leaves the same free-STEP set as `s1 - s0 + 1` of these, and
+    that claim has to be pinned against an independent implementation rather than against itself."""
+    if s < 0 or s > pool.MAXS:
+        return
+    slot = c
+    while slot != -1:
+        a, b = int(pool.iv_lo[slot]), int(pool.iv_hi[slot])
+        if a <= s <= b:
+            if s + 1 <= b:
+                if a <= s - 1:
+                    pool.iv_hi[slot] = s - 1
+                    ns = pool._alloc(s + 1, b, int(pool.iv_nxt[slot]))
+                    pool.iv_nxt[slot] = ns
+                else:
+                    pool.iv_lo[slot] = s + 1
+            elif a <= s - 1:
+                pool.iv_hi[slot] = s - 1
+            else:
+                pool.iv_lo[slot] = s + 1
+            return
+        slot = int(pool.iv_nxt[slot])
+
+
+def _free_steps(pool, c, hi):
+    """Cell `c`'s free steps as a set — the only view the kernel and `free_intervals_py` can observe,
+    so the representation (which slot holds what, how empties are encoded) is deliberately not compared."""
+    out, slot = set(), c
+    while slot != -1:
+        lo_, hi_ = int(pool.iv_lo[slot]), int(pool.iv_hi[slot])
+        if lo_ <= hi_:
+            out |= set(range(max(lo_, 0), min(hi_, hi) + 1))
+        slot = int(pool.iv_nxt[slot])
+    return out
+
+
+def test_block_range_equals_per_step_blocking():
+    """`block_range(c, s0, s1)` == blocking every step in `[s0, s1]` individually, including when spans
+    straddle holes an earlier commit punched, touch/abut existing boundaries, repeat, and run off the
+    end of the pool. Random spans, fixed seed, checked cell-by-cell against the single-step oracle."""
+    cfg = SimConfig(region_size_m=(2000.0, 2000.0), horizon_s=300.0, seed=0)
+    rng = np.random.default_rng(12345)
+    span = CompiledOccupancy(cfg)
+    step = CompiledOccupancy(cfg)
+    cells = [span.cell_id(q, r, 0) for q, r in ((0, 0), (1, 0), (0, 1), (2, -1))]
+    assert all(c >= 0 for c in cells)
+
+    for _ in range(400):
+        c = cells[int(rng.integers(len(cells)))]
+        s0 = int(rng.integers(-2, 60))                 # negative start: clipped to 0 by both paths
+        s1 = s0 + int(rng.integers(0, 12))
+        span.block_range(c, s0, s1)
+        for s in range(max(s0, 0), s1 + 1):
+            _block_one_step(step, c, s)
+
+    for c in cells:
+        assert _free_steps(span, c, 80) == _free_steps(step, c, 80), f"cell {c} diverged"
+
+    # A span past MAXS is clipped, not an IndexError, and a fully-consumed cell reads as empty.
+    c = cells[0]
+    span.block_range(c, 0, span.MAXS + 500)
+    assert _free_steps(span, c, 80) == set()
+    assert span.free_intervals_py(0, 0, 0, 0, 80) == []
+
+
+def test_commit_hook_shares_one_geometry_sweep_across_all_three_structures():
+    """Issue #114: `HexOccupancyService`, `CompiledOccupancy` and `SafeIntervalIndex` must agree on
+    `(R, infl_blocked, infl_pad)` — that tuple IS the `hexgrid._RANGE_CACHE` key, so if they ever drift
+    each commit silently pays its own `_candidate_slack` sweep again and the fix quietly un-does itself.
+    A cheap invariant to assert, and invisible to any behavioural test (results stay correct, just 3x)."""
+    from freespace_sim.planner.astar.occupancy import HexOccupancyService
+
+    cfg = SimConfig(region_size_m=(4000.0, 4000.0), horizon_s=300.0, seed=0)
+    svc, cocc, sidx = HexOccupancyService(cfg), CompiledOccupancy(cfg), SafeIntervalIndex(cfg)
+    keys = {(s.R, s.infl_blocked, s.infl_pad) for s in (svc, cocc, sidx)}
+    assert len(keys) == 1, f"structures disagree on the rasterization key: {keys}"

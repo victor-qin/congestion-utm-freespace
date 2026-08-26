@@ -542,13 +542,32 @@ _RANGE_CACHE_CAP = 1024
 
 
 def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float):
-    """Materialized :func:`rasterize_volume_ranges`, shared between a commit's two occupancy consumers.
+    """Materialized :func:`rasterize_volume_ranges`, shared between a commit's occupancy consumers.
 
-    ~98% of the coordinator's serial commit floor is these two per-commit rasterizations (issue #8
-    Phase E), and the geometry is identical between them, so it is computed once here and reused. The
-    identity guard (``hit[0] is vol``) keeps reuse correct if a freed volume's ``id`` is recycled; the
-    LRU cap bounds retention. Only the two on_commit consumers use this — per-plan callers (e.g. the
-    own-column overlay) stay on the generator so they never evict the live commit-volume rows."""
+    ~98% of the coordinator's serial commit floor is these per-commit rasterizations (issue #8 Phase
+    E), and the geometry is identical between them, so it is computed once here and reused. Consumers
+    are A*'s ``HexOccupancyService`` + ``CompiledHexOccupancy`` and, on a SIPP plan, additionally
+    ``CompiledOccupancy`` + ``SafeIntervalIndex`` (issue #114) — all four derive ``R``/``infl_blocked``/
+    ``infl_pad`` identically from ``cfg``, and within one commit they share the ``cfg`` object and the
+    backend flag too, which is what makes them share a key. The LRU cap bounds retention; it must
+    exceed ONE FLIGHT's volume count, since that is the whole reuse window (see below).
+
+    WHY THE WINDOW IS ONE COMMIT, AND WHY EVICTION IS NOT THE HAZARD. ``ledger.commit`` fans out
+    synchronously (``for cb in self._observers``), so the consumers run back-to-back with no yield
+    point: the first inserts a flight's rows, the rest read them immediately. Once that fan-out
+    returns, the entries are dead — the next commit carries different volume objects and would miss on
+    them anyway. So evicting them costs nothing, and indeed eviction is already the steady state
+    (measured on `dallas_hub_2uss_large`: 44,469 evictions, hit rate pinned at its ceiling regardless).
+
+    Per-plan callers therefore stay on the generator NOT to protect the commit rows — routing the
+    own-column overlay through here was measured to change the commit hit rate by exactly zero
+    (133,791/178,388 either way) — but because it would be pure loss: that caller builds a FRESH
+    ``hover_reservation`` per call, so its lookups are a measured 0/1,286 hits, all overhead, and each
+    insert would pin a dead volume and its rows alive for the life of its cache slot.
+
+    ``hit[0] is vol`` is defensive only: the entry holds a STRONG reference to ``vol``, so a cached
+    volume cannot be freed and its ``id`` cannot be recycled while cached (measured: 0 guard failures
+    in 179,674 lookups). Keep it — it is the invariant that would catch a future weak-ref rewrite."""
     # Backend and config identity are output inputs too. Keeping the identities in the key and the
     # objects in the value makes id reuse harmless while avoiding a hash of the full frozen config.
     backend = bool(_COMPILED and USE_COMPILED)

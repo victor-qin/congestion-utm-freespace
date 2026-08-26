@@ -93,6 +93,21 @@ def test_payload_carries_uss_and_colors():
     assert all(c.startswith("#") and len(c) == 7 for c in payload["uss_colors"].values())
 
 
+def test_replay_exposes_grid_for_every_hex_lattice_planner_family():
+    res = _small_run()
+    for planner in ("astar", "astar_milp", "sipp", "sipp_ref", "sipp_shortcut", "colgen"):
+        configured = dataclasses.replace(res, config=dataclasses.replace(res.config, planner=planner))
+        payload = viz_html._payload(configured)
+        assert payload["hex_available"] is True, planner
+        assert payload["hex_R"] > 0.0, planner
+
+    for planner in ("straight", "decoupled", "milp"):
+        configured = dataclasses.replace(res, config=dataclasses.replace(res.config, planner=planner))
+        payload = viz_html._payload(configured)
+        assert payload["hex_available"] is False, planner
+        assert payload["hex_R"] == 0.0, planner
+
+
 def test_box_footprint_is_four_xy_corners_of_right_size():
     spec = box_from_segment(vec(0, 0, 150), vec(120, 0, 150), 60.0, 30.0)
     fp = viz.box_footprint(spec)

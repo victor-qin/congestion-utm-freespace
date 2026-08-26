@@ -50,31 +50,40 @@ def _scaled_lam_per_uss(spec, total_lam: float) -> dict[str, float]:
 
 def _kernel_status(planner_name: str) -> str:
     """One-line compiled-kernel status for the startup INFO block. The module lands in
-    ``sys.modules`` so the sim's later import is free. Only the astar family has a kernel —
-    anything else reports n/a rather than paying the numba import.
+    ``sys.modules`` so the sim's later import is free. Only the A* and SIPP families have per-flight
+    kernels; anything else reports n/a rather than paying the numba import.
 
-    Load the ``astar`` package outside the fallback guard: its ``__init__`` pulls the whole family
-    (planner, both occupancy modules, and through them volumes/cost/ledger), so any break in that
-    graph must propagate as itself. Probe numba separately because its compatibility checks raise
-    plain ``ImportError`` (``name=None``), while a missing transitive dependency names e.g.
-    ``llvmlite``; neither can be classified reliably from ``ImportError.name``. Once numba imports,
-    load the kernel outside the guard too, so a broken kernel import is never mislabeled as an
-    optional-dependency fallback.
+    Load the selected planner module outside the fallback guard, so any break in its mandatory import
+    graph propagates as itself. Probe numba separately because its compatibility checks raise plain
+    ``ImportError`` (``name=None``), while a missing transitive dependency names e.g. ``llvmlite``;
+    neither can be classified reliably from ``ImportError.name``. Once numba imports, load the selected
+    kernel outside the guard too, so a broken kernel import is never mislabeled as an optional-dependency
+    fallback.
     """
-    if "astar" not in planner_name:
+    if "astar" in planner_name:
+        family = "A*"
+    elif "sipp" in planner_name:
+        family = "SIPP"
+    else:
         return "n/a (planner has no compiled kernel)"
-    if planner_name == "astar_ref":
-        return "pure-Python reference (explicitly requested via astar_ref)"
+    if planner_name in ("astar_ref", "sipp_ref"):
+        return f"pure-Python {family} reference (explicitly requested via {planner_name})"
 
-    import freespace_sim.planner.astar  # noqa: F401  # validate the non-numba import graph first
+    if family == "A*":
+        import freespace_sim.planner.astar  # noqa: F401  # validate non-numba graph first
+    else:
+        import freespace_sim.planner.sipp  # noqa: F401  # validate non-numba graph first
     try:
-        from numba import njit as _njit  # noqa: F401  # exact dependency kernel.py imports
+        from numba import njit as _njit  # noqa: F401  # exact dependency both kernels import
     except ImportError:
-        return ("REFERENCE FALLBACK — numba unavailable, ~5-7x slower search. "
+        return (f"REFERENCE FALLBACK ({family}) — numba unavailable, ~5-7x slower search. "
                 "Run via plain `uv run` (numba is in tool.uv default-groups) or `uv sync`.")
 
-    from freespace_sim.planner.astar import kernel  # noqa: F401
-    return "compiled (numba kernel active)"
+    if family == "A*":
+        from freespace_sim.planner.astar import kernel  # noqa: F401
+    else:
+        from freespace_sim.planner import sipp_kernel  # noqa: F401
+    return f"compiled ({family} numba kernel active)"
 
 
 class _StderrTee:
@@ -530,7 +539,7 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
     if spec.description:
         log.info("description: %s", spec.description)
     log.info("active demand duration=%ss", cfg.effective_demand_duration_s)
-    log.info("A* kernel: %s", _kernel_status(cfg.planner))
+    log.info("planner kernel: %s", _kernel_status(cfg.planner))
 
     pcfg = None
     if args.mode != "sequential":

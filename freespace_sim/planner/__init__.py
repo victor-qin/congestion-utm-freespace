@@ -62,6 +62,16 @@ def iter_planner_chain(planner):
 WHOLE_SCHEDULE_PLANNERS = ("colgen",)
 
 
+def uses_hex_lattice(name: str) -> bool:
+    """Whether a planner registry name searches the shared axial hex lattice.
+
+    Keep this classification next to :func:`get_planner` so metrics and replay integrations do not
+    each grow their own incomplete string check when a lattice-planner family is registered.
+    """
+    return any(name == family or name.startswith(f"{family}_")
+               for family in ("astar", "sipp", "colgen"))
+
+
 def get_planner(name: str, params=None) -> Planner:
     """Resolve a planner by name.
 

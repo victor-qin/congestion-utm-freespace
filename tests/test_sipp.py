@@ -20,7 +20,7 @@ from freespace_sim.planner import get_planner
 from freespace_sim.scenario import scenario_from_requests
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run
-from freespace_sim.types import FlightRequest, vec
+from freespace_sim.types import DenialReason, FlightRequest, vec
 from freespace_sim.uss import USS
 from freespace_sim.volumes import Volume4D
 
@@ -65,6 +65,15 @@ def test_sipp_deterministic():
     a = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
     b = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
     assert abs(a.cost - b.cost) < 1e-12 and len(a.centerline) == len(b.centerline)
+
+
+@pytest.mark.parametrize("planner_name", ("sipp", "sipp_ref"))
+@pytest.mark.parametrize("reason", (DenialReason.BUDGET_EXCEEDED, DenialReason.CONFLICT_FILED))
+def test_sipp_file_denials_keep_sipp_attribution(planner_name, reason):
+    planner = get_planner(planner_name)
+    intent = planner._file_deny(_req(), reason, [], ReservationLedger(CFG))
+    assert intent.planner == "sipp"
+    assert intent.denial_reason is reason
 
 
 # ---- replay equivalence (the headline): both plan against the SAME A*-committed ledger ----

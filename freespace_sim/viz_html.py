@@ -35,6 +35,7 @@ import numpy as np
 
 from . import metrics, volumes
 from .geometry import BoxSpec, CylinderSpec
+from .planner import uses_hex_lattice
 from .sim import SimResult
 from .types import as_terminal
 from .viz import box_footprint, flight_color_by_uss, result_uss_hues, uss_swatch_hex
@@ -225,9 +226,9 @@ def _payload(result: SimResult, clip_to_horizon: bool | None = None) -> dict:
                         for v in vols if isinstance(v.shape, BoxSpec)]
         flights.append(rec)
 
-    # The hex lattice only exists if an A*-based planner ran (astar / astar_milp / astar_shortcut). When
-    # it did, expose its circumradius so the replay can overlay the exact grid A* searched on.
-    hex_available = "astar" in cfg.planner
+    # Expose the circumradius whenever the selected planner searches the shared axial lattice, so the
+    # replay can overlay the exact grid used by A*, SIPP, or column generation (including wrappers).
+    hex_available = uses_hex_lattice(cfg.planner)
     from .planner.hexgrid import circumradius
     # always-active terminal WALLS (permanent no-fly columns) live in the ledger, NOT in any accepted
     # intent's volumes — render them as permanent overlays so a denial's blocker is visible. Each also

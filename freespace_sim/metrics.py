@@ -35,6 +35,7 @@ import pandas as pd
 
 from .config import SimConfig
 from .geometry import BoxSpec, CylinderSpec
+from .planner import uses_hex_lattice
 from .sim import SimResult
 from .types import DenialReason, OperationalIntent
 from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
@@ -47,7 +48,9 @@ from .volumes import Volume4D, enroute_flown_m, enroute_reference_m
 #   2  denominators split (dur_s = realized run for capacity, rate_dur_s = demand window for rates);
 #      measurement window widened to simulation_window, so airspace_utilization changed for EVERY
 #      scenario, and window membership moved from the filing clock to the occupancy clock
-METRICS_VERSION = 2
+#   3  SIPP registry names use the lattice-floor altitude baseline, and native filed denials retain
+#      SIPP attribution; fixes nominal time, delay/cost, and planner-grouped results for SIPP runs
+METRICS_VERSION = 3
 
 # The realized run may legitimately exceed horizon_s (post-horizon return tail) but not by orders of
 # magnitude. Generous on purpose: the density family's tail runs ~1.3x its envelope, and this only has
@@ -267,17 +270,16 @@ def _straight_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
 
 
 def _unimpeded_cruise_z(cfg: SimConfig) -> float:
-    """The altitude the run's planner cruises at when UNIMPEDED. The A* family deconflicts by altitude on
-    the discrete ladder, so its unimpeded cruise is the lowest flight level; colgen prices columns on
-    the same ladder (single-level in v1) and shares that baseline; the MILP cruises the
-    continuous band [z_min_m, z_max_m], so its unimpeded cruise is the band floor; only the truly
-    single-plane planners (straight / decoupled) are pinned to ``cruise_level_m`` (no altitude lever).
+    """The altitude the run's planner cruises at when UNIMPEDED. The hex-lattice families deconflict by
+    altitude on the discrete ladder, so their unimpeded cruise is the lowest flight level; the MILP
+    cruises the continuous band [z_min_m, z_max_m], so its unimpeded cruise is the band floor; only the
+    truly single-plane planners (straight / decoupled) are pinned to ``cruise_level_m`` (no altitude lever).
 
     Keyed on ``cfg.planner`` — the run's registry name — NOT ``intent.planner``, which a refiner
     relabels to its own stage (``astar_milp`` stamps 'milp'), dropping the A* origin. So a
     single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced
     climb above the floor reads positive excess (real congestion)."""
-    if "astar" in cfg.planner or "colgen" in cfg.planner:
+    if uses_hex_lattice(cfg.planner):
         return cfg.flight_levels_m[0]
     if "milp" in cfg.planner:
         return cfg.z_min_m           # MILP band floor (astar_milp takes the astar branch — same value)

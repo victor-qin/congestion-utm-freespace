@@ -17,9 +17,10 @@ from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
+from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.astar.planner import _absorb
 from freespace_sim.planner.compiled_occupancy import CompiledOccupancy
-from freespace_sim.planner.sipp import SafeIntervalIndex
+from freespace_sim.planner.sipp import SIPPPlanner, SafeIntervalIndex
 from freespace_sim.scenario import scenario_from_requests
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run
@@ -27,7 +28,7 @@ from freespace_sim.types import FlightRequest, vec
 from freespace_sim.volumes import Volume4D
 
 CFG = SimConfig()
-_COMPILED = get_planner("sipp").compiled        # False if numba is unavailable → everything falls back
+_COMPILED = get_planner("sipp").sipp_compiled   # False if numba is unavailable → SIPP uses its reference
 
 
 def _req(fid=1, dx=2000.0):
@@ -75,13 +76,35 @@ def test_compiled_deterministic():
 
 def test_numba_absent_falls_back_to_reference():
     """compiled=False is byte-identical to the reference (the optional-dependency contract)."""
-    from freespace_sim.planner.sipp import SIPPPlanner
     off = SIPPPlanner(compiled=False)
+    assert off.sipp_compiled is False and off.compiled is False
     ref = get_planner("sipp_ref")
     for fid, dx in ((1, 2000.0), (2, 3500.0)):
         a = off.plan(_req(fid, dx), ReservationLedger(CFG), CFG)
         b = ref.plan(_req(fid, dx), ReservationLedger(CFG), CFG)
         assert abs(a.cost - b.cost) < 1e-12 and a.accepted == b.accepted
+
+
+def test_astar_warm_failure_keeps_sipp_kernel_fallback_on_astar_reference(monkeypatch):
+    """The SIPP flag must not erase an A* warm-up failure before the FB_* safety path runs."""
+    def fail_warm(planner):
+        planner.compiled = False
+        planner._kernel = None
+
+    monkeypatch.setattr(AStarPlanner, "_warm_jit", fail_warm)
+    planner = SIPPPlanner(compiled=True)
+    assert planner.compiled is False and planner._kernel is None
+    assert planner.sipp_compiled is (planner._skernel is not None)
+
+    reference = type("FallbackIntent", (), {"planner": "astar"})()
+    monkeypatch.setattr(planner, "_plan_reference", lambda *_: reference)
+
+    def compiled_must_not_run(*_):
+        pytest.fail("SIPP fallback selected the unavailable compiled A* kernel")
+
+    monkeypatch.setattr(planner, "_plan_compiled", compiled_must_not_run)
+    got = planner._fallback(_req(), ReservationLedger(CFG), CFG)
+    assert got is reference and got.planner == "sipp"
 
 
 # ---- dense interval pool == SafeIntervalIndex oracle ----

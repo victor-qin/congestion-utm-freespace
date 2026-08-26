@@ -239,19 +239,22 @@ class SIPPPlanner(AStarPlanner):
         # as far — a long multi-altitude flight can need ~700k expansions (3× the 2D count), which the old
         # 600k default truncated while the kernel (bigger cap) found the identical optimum. Only affects
         # ``_plan_reference`` / the A* ``_fallback``; the compiled path caps on ``_k_max`` directly.
-        super().__init__(max_expansions)
+        # A* owns ``self.compiled`` for the kernel used by our safety fallback. SIPP's kernel needs an
+        # independent flag: an A* warm-up failure must remain recorded so ``_fallback`` dispatches to
+        # A*'s reference path rather than calling a missing ``self._kernel``.
+        super().__init__(max_expansions, compiled=compiled)
         self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
         self._sidx_ledger = None
         self._sidx_epoch = 0                           # ledger.epoch at bind (detach tripwire, #109)
         # --- compiled (numba) air-cruise kernel; falls back to the pure-Python reference ---
-        self.compiled = compiled
+        self.sipp_compiled = compiled
         self._skernel = None
         if compiled:
             try:
                 from .sipp_kernel import _search
                 self._skernel = _search
             except ImportError:
-                self.compiled = False                  # numba absent → pure-Python everywhere
+                self.sipp_compiled = False              # SIPP kernel absent → pure-Python SIPP
         self._scocc: CompiledOccupancy | None = None    # interval pool (per ledger)
         self._scocc_ledger = None
         self._scocc_epoch = 0                          # ledger.epoch at bind (detach tripwire, #109)
@@ -290,7 +293,7 @@ class SIPPPlanner(AStarPlanner):
         """Dispatch: the compiled air-cruise kernel for non-terminal flights (Phase 1); the pure-Python
         reference for terminal flights (Phase 2, not yet compiled) and as the universal fallback when
         numba is absent, a flight strays out of the kernel box, or a capacity valve trips."""
-        if not self.compiled:
+        if not self.sipp_compiled:
             return self._splan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
         if (o_term is not None or d_term is not None) and not cfg.fixed_exit_lanes:
@@ -607,6 +610,12 @@ class SIPPPlanner(AStarPlanner):
         intent = AStarPlanner.plan(self, req, ledger, cfg)
         if intent is not None:
             intent.planner = "sipp"                    # attribute to the selected planner (A* is internal)
+        return intent
+
+    def _file_deny(self, req, reason, volumes, ledger):
+        """Preserve A*'s filed-corridor telemetry while attributing the native SIPP denial to SIPP."""
+        intent = super()._file_deny(req, reason, volumes, ledger)
+        intent.planner = "sipp"
         return intent
 
     def _splan_compiled(self, req, ledger, cfg):

@@ -36,7 +36,10 @@ def _args(scenario: str, *extra: str):
     ],
     ids=("plain-compatibility-error", "missing-transitive-dependency"),
 )
-def test_kernel_status_falls_back_for_every_numba_import_error(monkeypatch, numba_error):
+@pytest.mark.parametrize("planner_name", ("astar", "sipp"))
+def test_kernel_status_falls_back_for_every_numba_import_error(
+    monkeypatch, numba_error, planner_name
+):
     """Numba failures are not reliably named ``numba`` on the exception.
 
     Its version guard raises a plain ``ImportError`` with ``name=None`` and a broken installation
@@ -52,7 +55,9 @@ def test_kernel_status_falls_back_for_every_numba_import_error(monkeypatch, numb
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fail_numba)
-    assert run_module._kernel_status("astar").startswith("REFERENCE FALLBACK")
+    status = run_module._kernel_status(planner_name)
+    assert status.startswith("REFERENCE FALLBACK")
+    assert ("A*" if planner_name == "astar" else "SIPP") in status
 
 
 def test_kernel_status_does_not_mask_astar_graph_import_errors(monkeypatch):
@@ -68,6 +73,15 @@ def test_kernel_status_does_not_mask_astar_graph_import_errors(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fail_astar)
     with pytest.raises(ModuleNotFoundError, match="freespace_sim.cost"):
         run_module._kernel_status("astar")
+
+
+def test_kernel_status_reports_sipp_execution_path():
+    assert "SIPP" in run_module._kernel_status("sipp")
+    assert "SIPP" in run_module._kernel_status("sipp_shortcut")
+    assert run_module._kernel_status("sipp_ref") == (
+        "pure-Python SIPP reference (explicitly requested via sipp_ref)"
+    )
+    assert run_module._kernel_status("straight") == "n/a (planner has no compiled kernel)"
 
 
 @pytest.mark.parametrize("planner_args", [(), ("--planner", "astar"), ("--planner", "milp")])

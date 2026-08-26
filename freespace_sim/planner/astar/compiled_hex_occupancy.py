@@ -46,13 +46,23 @@ from .. import hexgrid as hg
 from ._packed import P_HI, P_LO, P_NXT, aligned_2d
 
 
+def ground_delay_steps(cfg) -> int:
+    """Largest number of whole ``dt`` waits whose reported delay stays within the configured cap.
+
+    Ground delay is emitted in whole timesteps, so rounding the cap upward can produce an intent whose
+    ``ground_delay_s`` exceeds ``max_ground_delay_s`` (for example, 8 s at ``dt_s=4`` under a 5 s cap).
+    Keep the tiny tolerance used by colgen so an exactly integral floating-point ratio is not rounded down.
+    """
+    return int(math.floor(cfg.max_ground_delay_s / cfg.dt_s + 1e-12))
+
+
 def search_horizon(base: int, takeoff_steps_max: int, n_hops: int, climb_span: int, cfg) -> int:
     """The largest ``step`` an A* plan can reach: takeoff + a 3× lateral detour budget + a full ground-
     delay allowance + the mid-route climb span. ONE definition (issue #5) — ``_plan_reference``,
     ``_plan_compiled``, and ``CompiledHexOccupancy._box`` (with worst-case args) all call it, so the
     kernel's search bound, the box guard, and ``MAXS`` cannot drift apart. Monotone in ``base``/``n_hops``,
     so ``_box``'s worst-case value bounds every per-flight one."""
-    return (base + takeoff_steps_max + int(math.ceil(cfg.max_ground_delay_s / cfg.dt_s))
+    return (base + takeoff_steps_max + ground_delay_steps(cfg)
             + 3 * n_hops + 2 * climb_span + 6)
 
 

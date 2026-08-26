@@ -51,7 +51,7 @@ from ...volumes import (
 )
 from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
-from .compiled_hex_occupancy import hover_tail_steps, search_horizon
+from .compiled_hex_occupancy import ground_delay_steps, hover_tail_steps, search_horizon
 from .occupancy import HexOccupancyService
 from ..terminal_capacity import TerminalCapacity
 
@@ -512,7 +512,7 @@ class AStarPlanner:
         # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
-        ground_max_step = base + int(math.ceil(cfg.max_ground_delay_s / dt))
+        ground_max_step = base + ground_delay_steps(cfg)
 
         start = ("g", oq, orr, base)
         g = {start: 0.0}
@@ -1026,7 +1026,7 @@ class AStarPlanner:
         # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
-        ground_max_step = base + int(math.ceil(cfg.max_ground_delay_s / dt))
+        ground_max_step = base + ground_delay_steps(cfg)
 
         # ---- box / window membership guard: else fall back to the reference ----
         if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:

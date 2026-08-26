@@ -44,7 +44,7 @@ from ..volumes import (
 from . import hexgrid as hg
 from .astar import AStarPlanner
 from .astar._packed import aligned_2d
-from .astar.compiled_hex_occupancy import search_horizon
+from .astar.compiled_hex_occupancy import ground_delay_steps, search_horizon
 from .astar.planner import _absorb, _committed_arrival
 from .compiled_occupancy import CompiledOccupancy
 
@@ -268,6 +268,7 @@ class SIPPPlanner(AStarPlanner):
         self._sfb_oob = 0                               # of which: reroute strayed outside the kernel box
         self._sfb_hash = 0                              # of which: (cell, step) best-g table saturated
         self._n_expansions = 0                         # kernel expansions on the last compiled plan
+        self._air = []                                  # last successful compiled path (diagnostics/tests)
 
     def _sipp_index(self, req, ledger, cfg) -> "SafeIntervalIndex":
         """Maintain the SafeIntervalIndex in lockstep with the ledger (mirrors ``_occupancy``): first use
@@ -294,6 +295,11 @@ class SIPPPlanner(AStarPlanner):
         """Dispatch to the compiled safe-interval kernel, with the pure-Python reference as the fallback
         when numba is absent, legacy terminal folding is requested, a flight strays out of the kernel
         box, or a capacity valve trips."""
+        # Per-plan diagnostics must never leak a previous compiled flight through an early host denial,
+        # a reference dispatch, or a kernel fallback. Cumulative fallback counters remain cumulative.
+        self.last_expansions = 0
+        self._n_expansions = 0
+        self._air = []
         if not self.sipp_compiled:
             return self._splan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
@@ -366,7 +372,7 @@ class SIPPPlanner(AStarPlanner):
                       if cfg.n_levels > 1 else 0)      # extra step budget for mid-route rungs
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
-        ground_max_step = base + int(math.ceil(cfg.max_ground_delay_s / dt))
+        ground_max_step = base + ground_delay_steps(cfg)
 
         SI = _SafeIntervals(sidx, own, base, max_step, fixed_lanes)
         came: dict = {}
@@ -525,9 +531,16 @@ class SIPPPlanner(AStarPlanner):
         The caller must keep the ledger FROZEN (no commits) while workers plan in parallel; each worker
         keeps its OWN kernel state (``_k_*``), so the only shared mutation is the benign
         ``evict_before`` watermark. With the ``nogil`` kernel, N workers search on N real threads."""
-        self._svc = master._svc; self._svc_ledger = master._svc_ledger; self._tcap = master._tcap
-        self._scocc = master._scocc; self._scocc_ledger = master._scocc_ledger
-        self._sidx = master._sidx; self._sidx_ledger = master._sidx_ledger
+        self._svc = master._svc
+        self._svc_ledger = master._svc_ledger
+        self._tcap = master._tcap
+        self._svc_epoch = master._svc_epoch
+        self._scocc = master._scocc
+        self._scocc_ledger = master._scocc_ledger
+        self._scocc_epoch = master._scocc_epoch
+        self._sidx = master._sidx
+        self._sidx_ledger = master._sidx_ledger
+        self._sidx_epoch = master._sidx_epoch
 
     def _skernel_state(self, cocc) -> None:
         """(Re)allocate version-stamped kernel work arrays. The frontier is sized to the interval pool
@@ -707,7 +720,7 @@ class SIPPPlanner(AStarPlanner):
         # enumeration (dwell_ok/pad_clear precomputed here per step, the lane free-interval lookup in njit).
         # Terminal: the exit lanes (own-transparent via the overlay). Non-terminal: the origin cell itself
         # (climb-in-place; the kernel's pool lookup reproduces `is_blocked`, so only pad_clear stays here). ----
-        smax = base + int(math.ceil(cfg.max_ground_delay_s / dt))
+        smax = base + ground_delay_steps(cfg)
         n_to = smax - base + 1                                 # ground-delay steps; to_ok is per (step, level)
         to_ok = []                                             # flat mask, indexed [si*nlev + L]
         if fixed and o_term is not None:                       # exit lanes (level-less qr; kernel adds L)
@@ -787,6 +800,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_q, self._k_out_r, self._k_out_s, self._k_out_L,
         )
         self._n_expansions = int(_n_exp)
+        self.last_expansions = self._n_expansions          # inherited public telemetry contract
         if flag == FB_OOB or flag == FB_CAP or flag == FB_HASH:
             self._sfb += 1
             if flag == FB_CAP:

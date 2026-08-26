@@ -18,12 +18,14 @@ The global pool encodes the **non-terminal corridor** occupancy (flight-independ
 (shared columns) are own-dependent — recorded in ``self.cols`` for the Phase-2 per-flight patch, unused
 by the Phase-1 non-terminal kernel.
 
-Cells are encoded over a bounding box from the region corners + a reroute ``margin``; a committed cell
-outside the box is an error (widen ``margin``). The kernel bound-checks *query* cells and falls back to
-the pure-Python reference for any out-of-box stray (the planner never enforced region bounds), so the
-margin only needs to cover realistic edge-skirting detours.
+Cells are encoded over a bounding box from the region corners + a reroute ``margin``. A committed corridor
+cell outside the box is skipped and counted: a later kernel query to that cell is itself bounds-checked and
+falls back to the pure-Python reference, so a fallback flight can never crash the ledger's commit hook.
+The margin therefore only needs to cover realistic edge-skirting detours.
 """
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
@@ -50,6 +52,10 @@ class CompiledOccupancy:
         self.NC = qspan * rspan * self.nlevels        # one pre-seeded slot per (q, r, L) cell
         self.MAXS = maxs
         self._init_pool()
+        # Keep the same observable safety diagnostic as compiled A*: skipped cells are safe because every
+        # query is bounds-checked, but a non-zero count signals that ``margin`` may be too narrow.
+        self.oob_corridor_cells = 0
+        self._warned_oob = False                       # warn once per instance (persists across reset)
 
     def _box(self, cfg, margin):
         w, h = cfg.region_size_m
@@ -136,8 +142,15 @@ class CompiledOccupancy:
             if c < 0:
                 if is_column:
                     continue                              # a column footprint cell just past the box edge
-                raise IndexError(
-                    f"committed corridor cell ({q},{r},L={L}) outside kernel box — widen margin")
+                if not self._warned_oob:
+                    warnings.warn(
+                        "CompiledOccupancy: a committed corridor cell fell outside the kernel box — "
+                        "skipped (its flights fall back via FB_OOB). Consider widening `margin`.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    self._warned_oob = True
+                self.oob_corridor_cells += 1
+                continue
             self._block(c, int(s))
 
     def _block(self, c: int, s: int) -> None:
@@ -170,6 +183,7 @@ class CompiledOccupancy:
     def reset(self) -> None:
         self.n_added = 0
         self.evicted_before = None
+        self.oob_corridor_cells = 0
         self._init_pool()
         for center, term in self._static_hubs:      # _init_pool cleared the walls; re-wall each hub
             self._wall_static_terminal(center, term)

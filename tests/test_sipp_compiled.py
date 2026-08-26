@@ -167,6 +167,27 @@ def test_ground_delay_budget_is_binding_for_every_lattice_path(planner_name):
     assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
 
 
+@pytest.mark.parametrize("planner_name", ("astar_ref", "astar", "sipp_ref", "sipp"))
+def test_non_integral_ground_delay_cap_rounds_down_for_every_lattice_path(planner_name):
+    """A discrete delay may not round the configured seconds cap upward to the next timestep."""
+    cfg = SimConfig(
+        region_size_m=(1_000.0, 1_000.0),
+        dt_s=4.0,
+        time_buffer_s=0.0,
+        max_ground_delay_s=5.0,
+        flight_levels_m=(30.0,),
+    )
+    req = FlightRequest(1, vec(300, 500, 0), vec(700, 500, 0), 0.0)
+    ledger = ReservationLedger(cfg)
+    # The pad is blocked at departure steps 0 and 1, then free at step 2. Rounding 5/4 upward therefore
+    # accepts with an illegal 8 s delay; rounding down allows only steps 0..1 and correctly denies.
+    ledger.commit(99, [Volume4D(CylinderSpec(300, 500, 100, 0, 150), 0.0, 0.0)])
+
+    intent = get_planner(planner_name).plan(req, ledger, cfg)
+    assert not intent.accepted
+    assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
+
+
 @pytest.mark.parametrize("planner_name", ("sipp_ref", "sipp"))
 def test_sipp_bounded_infeasibility_is_budget_exceeded(planner_name):
     cfg = SimConfig(
@@ -194,6 +215,29 @@ def test_compiled_kernel_no_path_is_budget_exceeded(monkeypatch):
 
     assert not intent.accepted
     assert intent.denial_reason is DenialReason.BUDGET_EXCEEDED
+    assert planner.last_expansions == planner._n_expansions == 17
+    assert planner._air == []
+
+
+@pytest.mark.skipif(not _COMPILED, reason="requires the compiled SIPP kernel")
+def test_compiled_diagnostics_use_sipp_fallback_counter_and_clear_old_path(monkeypatch):
+    from freespace_sim.planner.sipp_kernel import FB_CAP
+
+    planner = SIPPPlanner(compiled=True)
+    first = planner.plan(_req(), ReservationLedger(CFG), CFG)
+    assert first.accepted
+    assert planner._air
+    assert planner.last_expansions == planner._n_expansions > 0
+
+    monkeypatch.setattr(planner, "_skernel", lambda *_: (-1, 0.0, 23, FB_CAP))
+    second = planner.plan(_req(2), ReservationLedger(CFG), CFG)
+
+    assert second.accepted and second.planner == "sipp"
+    assert planner._sfb == 1 and planner._sfb_cap == 1
+    assert planner._fb == 0                    # inherited counter is only for a secondary A* kernel fallback
+    assert planner._n_expansions == 23         # the failed SIPP attempt remains available for diagnosis
+    assert planner.last_expansions > 0         # final A* fallback search owns the public per-plan telemetry
+    assert planner._air == []                  # never expose the first flight's compiled path as the second's
 
 
 def test_sipp_reference_compute_truncation_stays_search_exhausted():
@@ -231,6 +275,54 @@ def test_compiled_occupancy_matches_safe_interval_index():
     assert checked > 50
 
 
+def test_compiled_occupancy_skips_out_of_box_committed_corridor():
+    """A fallback flight may commit outside the finite SIPP box without crashing every subscriber."""
+    cfg = SimConfig()
+    cocc = CompiledOccupancy(cfg, margin=0)
+    far = Volume4D(
+        box_from_segment(vec(-5000, -5000, 150), vec(-4400, -5000, 150), 40, 400),
+        0.0,
+        5.0,
+    )
+
+    with pytest.warns(RuntimeWarning, match="outside the kernel box"):
+        cocc.on_commit(7, [far])                 # must skip, not raise from the ledger commit hook
+    assert cocc.oob_corridor_cells > 0
+    assert cocc._warned_oob
+
+    cocc.reset()
+    assert cocc.oob_corridor_cells == 0          # current-pool diagnostic resets; warn-once state persists
+    assert cocc._warned_oob
+
+    near = Volume4D(
+        box_from_segment(vec(3000, 3000, 150), vec(3600, 3000, 150), 40, 400),
+        0.0,
+        5.0,
+    )
+    ok = CompiledOccupancy(cfg)
+    ok.on_commit(8, [near])
+    assert ok.oob_corridor_cells == 0
+
+
+def test_shared_sipp_occupancy_preserves_nonzero_ledger_epoch():
+    """A worker must reuse the master's frozen caches instead of rebuilding them after a handoff."""
+    ledger = ReservationLedger(CFG)
+    ledger.detach_subscribers()                  # make the regression observable: epoch is now non-zero
+    req = _req()
+    master = SIPPPlanner(compiled=False)
+    worker = SIPPPlanner(compiled=False)
+    svc = master._occupancy(req, ledger, CFG)
+    sidx = master._sipp_index(req, ledger, CFG)
+    cocc = master._scompiled_occ(req, ledger, CFG)
+
+    worker.share_occupancy_from(master)
+
+    assert worker._svc_epoch == worker._sidx_epoch == worker._scocc_epoch == ledger.epoch
+    assert worker._occupancy(req, ledger, CFG) is svc
+    assert worker._sipp_index(req, ledger, CFG) is sidx
+    assert worker._scompiled_occ(req, ledger, CFG) is cocc
+
+
 # ---- replay equivalence (headline): compiled vs reference against the SAME A*-committed ledger ----
 
 def _replay_cc(scenario, lam, H, seed, region=None):
@@ -258,7 +350,7 @@ def _replay_cc(scenario, lam, H, seed, region=None):
         rows.append((c.accepted, r.accepted, c.cost, r.cost,
                      len(c.centerline) if c.centerline is not None else -1,
                      len(r.centerline) if r.centerline is not None else -1))
-    return rows, getattr(sipp, "_fb", 0)
+    return rows, sipp._sfb
 
 
 @pytest.mark.parametrize("lam", [120.0, 400.0])
@@ -309,7 +401,7 @@ def test_compiled_replay_exact_big_dense_short_flights():
     assert all(ca == ra for ca, ra, _, _ in rows), "accept-set mismatch"
     assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc in rows if ca), "cost mismatch vs reference"
     if _COMPILED:
-        assert getattr(sipp, "_fb", 0) < 0.10 * len(rows), "kernel fell back too often"
+        assert sipp._sfb < 0.10 * len(rows), "kernel fell back too often"
 
 
 # ---- the ground-state fold's exit-lane path: compiled == reference on terminal flights ----
@@ -368,9 +460,9 @@ def test_compiled_terminal_path_never_routes_through_blocked():
     violations, checked = [], 0
     for ev in sc.events[WARM:WARM + 200]:
         rq = ev.request
-        fb0 = sipp._fb
+        fb0 = sipp._sfb
         c = sipp.plan(rq, led, cfg)
-        if not c.accepted or sipp._fb != fb0:         # skip denied / fell-back-to-reference plans
+        if not c.accepted or sipp._sfb != fb0:        # skip denied / fell-back-to-A* plans
             continue
         own, svc = sipp._own, sipp._svc
         for (q, r, L, s) in sipp._air:                 # the per-step compiled search path (per flight level)

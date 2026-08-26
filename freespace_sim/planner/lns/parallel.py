@@ -1,0 +1,806 @@
+"""Parallel LNS — DROP-LNS's destroy/repair operation parallelism, as processes.
+
+Chan et al., *Anytime MAPF using Operation Parallelism in LNS* (arXiv:2402.01961,
+``context/drop-lns-parallel-2024.pdf``). The paper runs a main thread plus m worker threads over
+a shared best-known solution ``P_min`` guarded by two mutexes; each worker takes a private copy
+of ``P_min``, destroys, repairs, and writes back under the lock.
+
+Two things make the port here different from the paper, and both are simplifications:
+
+**1. The private copy is a persistent replica synced by delta.** The paper's ``P`` is a list of
+paths, so copying it is free. Ours is a ``ReservationLedger`` plus an occupancy service stack
+plus a claim index — building one from scratch is the O(schedule) rebuild that PR #109 measured
+at 3.74 s, 94% of an iteration, and then eliminated. So a worker builds its replica ONCE and is
+afterwards told "the incumbent moved" by a compacted diff, which costs O(the flights that
+changed). ``LNSState.apply_delta`` is that operation; it rides the ``release_many`` /
+``subscribe_release`` machinery #109 already built.
+
+**2. There are no mutexes, because there is no shared memory.** A single-threaded coordinator IS
+``M_main`` and ``M_task``. It owns the incumbent — as its own ``LNSState`` over the caller's
+ledger, so the write-back is just ``apply_delta`` and the seed selection shares one implementation
+with the workers (see the note above ``_Changelog``) — and it never plans. Workers are
+spawned processes on one duplex ``Pipe`` each — the transport ``freespace_sim.parallel`` and
+``colgen.pricing_pool`` both established, and for the same reasons (``fork`` inherits the numba
+runtime and thread state; ``mp.Pool`` silently respawns a dead worker with the original initargs;
+``ProcessPoolExecutor`` deadlocks on ``max_tasks_per_child``). Zero lock contention is not a
+detail: synchronization overhead is exactly what the paper measures degrading DROP at 16 threads.
+
+Processes rather than threads even though ``astar.kernel`` is ``@njit(nogil=True)``: the Python
+host around ``plan()`` was measured at ~31% of profiled self-time in the mask build alone, and
+``hexgrid._RANGE_CACHE`` is a process-global ``OrderedDict`` with a check-then-act eviction.
+
+**The always-rewind rule.** A worker never keeps its own accept — it reports the repair and
+immediately restores its replica. So ``applied_version`` is always exactly a
+coordinator-blessed version and a sync diff is always well-defined, with no three-way merge
+anywhere. It costs one extra ``release_many`` plus k commits on the ~21% of tasks that accept.
+
+Modes:
+
+* ``sync``   — a barrier per round; the best of m results is applied (paper Eq. 3). Deterministic,
+  and at ``search_workers=1`` byte-identical to the sequential loop, which is what makes it the
+  replication vehicle and the parity gate.
+* ``drop``   — asynchronous; a result is applied as soon as it lands. Nondeterministic by
+  construction (completion order is wall clock). Built on the same worker and protocol.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import multiprocessing as mp
+import os
+import time
+import warnings
+from dataclasses import dataclass
+from multiprocessing import connection as mp_connection
+
+import numpy as np
+
+from freespace_sim import verify
+from freespace_sim.config import SimConfig
+from freespace_sim.ledger import ReservationLedger
+from freespace_sim.planner.lns.neighborhood import (
+    AdaptiveSelector,
+    _select_most_delayed,
+    agent_based_neighborhood,
+    map_based_neighborhood,
+    random_neighborhood,
+)
+from freespace_sim.planner.lns.state import LNSState
+from freespace_sim.types import OperationalIntent
+
+log = logging.getLogger("freespace_sim.lns")
+
+_GRACEFUL_STOP_S = 0.5        # one window shared by ALL workers (per-worker joins cost 15 s
+_CLOSE_JOIN_TIMEOUT_S = 5.0   # after a single loss — see colgen.pricing_pool.close)
+
+
+# ====================================================================== messages
+@dataclass(frozen=True)
+class WorkerSpec:
+    """Everything a worker needs to build a replica and run tasks. Must be picklable.
+
+    Every field that changes what a repair is ALLOWED to do lives here, because a worker that
+    silently differs from the coordinator's belief is the failure mode with no symptom: dropping
+    ``turnaround_s`` disarms the paired-return anchor guard, and ``verify`` checks 4D conflicts
+    only, so the run still reports ``verified``.
+    """
+
+    neighborhood_size: int
+    accept_epsilon: float
+    repair_order: str
+    max_walks: int
+    map_max_cells: int
+    turnaround_s: float | None
+    frozen_flight_ids: frozenset
+    movable_uss_ids: frozenset | None
+    incremental_release: bool
+    kernel_log2_min: int | None
+
+
+@dataclass
+class TaskResult:
+    """One destroy/repair operation, as reported home. ``base_version`` is the incumbent version
+    the worker's replica held when it started — the coordinator's staleness test reads it."""
+
+    rnd: int
+    slot: int
+    worker: int
+    base_version: int
+    op: str
+    victims: tuple
+    new_intents: dict
+    cost_old: float
+    cost_new: float
+    envelopes: tuple
+    reason: str
+
+    @property
+    def improved(self) -> bool:
+        return self.reason == "improved"
+
+    @property
+    def improvement(self) -> float:
+        return self.cost_old - self.cost_new if self.improved else 0.0
+
+
+class WorkerLost(RuntimeError):
+    """A worker died mid-round. Raised rather than absorbed: an OOM-killed worker that is merely
+    waited on HANGS the run, which is the documented failure mode of every pool in this repo."""
+
+
+# ====================================================================== coordinator helpers
+# The coordinator holds ONE ``LNSState`` on the CALLER's ledger rather than a hand-rolled
+# incumbent dict plus a shim context. That is a deliberate departure from the first sketch of this
+# design, and it deletes three problems rather than solving them:
+#
+# * ``tabu`` is a serial recurrence that ``_select_most_delayed`` mutates, so the seeds must be
+#   chosen centrally (m workers with private tabus would all pick the same most-delayed flight and
+#   run m copies of one neighborhood). Choosing them off a real ``LNSState`` means the coordinator
+#   and the workers share ONE implementation of ``movable_ids`` and ``delay`` — a shim reproducing
+#   them is a second implementation that can drift, silently changing which flights get destroyed.
+# * ``run_lns``'s contract is that the caller's ledger is mutated in place and the returned intents
+#   supersede the input list. With the state on that ledger, ``apply_delta`` IS the write-back:
+#   incremental, exact, and already covered by the transaction tests. A coordinator that owned only
+#   data would have to reconstruct it at the end, and would have to remember to take the ledger over
+#   first — ``ledger.commit`` fires the FCFS run's observers, so a late write-back re-absorbs into
+#   services that are about to be discarded.
+# * ``final_intents`` and the closing ``verify`` replay work unchanged.
+#
+# The cost is one extra resident state (the coordinator's), which holds the caller's ledger that
+# exists anyway. The coordinator still never PLANS: its ``repair_planner`` is constructed but never
+# used, and the A* services bind lazily, so it never subscribes to the ledger at all.
+
+
+class _Changelog:
+    """Versioned record of accepted repairs, so a worker at version v can be caught up in
+    O(flights changed since v) rather than O(schedule).
+
+    Entries are compacted on read — a flight touched three times since v only needs its latest
+    intent — which is what keeps a sync diff small even for a worker that has fallen far behind.
+    """
+
+    def __init__(self) -> None:
+        self.version = 0
+        self._entries: list[tuple[int, dict, dict]] = []      # (version, new_by_fid, old_by_fid)
+
+    def record(self, changes: dict, olds: dict) -> int:
+        self.version += 1
+        self._entries.append((self.version, dict(changes), dict(olds)))
+        return self.version
+
+    def diff_since(self, base_version: int) -> dict:
+        out: dict = {}
+        for v, changes, _olds in self._entries:
+            if v > base_version:
+                out.update(changes)          # last write wins: only the latest intent matters
+        return out
+
+    def touched_since(self, base_version: int) -> set:
+        return {fid for v, changes, _ in self._entries if v > base_version for fid in changes}
+
+    def boxes_since(self, base_version: int):
+        """Every volume REMOVED or ADDED since ``base_version``, as the envelope test's triples.
+
+        Removed as well as added: added-only would be enough for feasibility (deleting an obstacle
+        cannot create a conflict) but not for the stronger claim the merge rests on — that the
+        stale plan is the plan the worker would have produced against the CURRENT incumbent.
+        """
+        from freespace_sim.parallel import _flat_aabb_t
+
+        out = []
+        for v, changes, olds in self._entries:
+            if v <= base_version:
+                continue
+            for it in changes.values():
+                out.extend(_flat_aabb_t(vol) for vol in it.volumes)
+            for it in olds.values():
+                out.extend(_flat_aabb_t(vol) for vol in it.volumes)
+        return out
+
+    def revert_to(self, base_version: int) -> dict:
+        """The intents that ``base_version`` held, for every fid changed since — i.e. what it takes
+        to walk the incumbent back to the state a stale worker planned against.
+
+        The FIRST recorded ``old`` per fid is the one at ``base_version``: later entries' olds are
+        intermediate values this walk-back skips over.
+        """
+        out: dict = {}
+        for v, _changes, olds in self._entries:
+            if v <= base_version:
+                continue
+            for fid, it in olds.items():
+                out.setdefault(fid, it)
+        return out
+
+    def trim(self, min_live_version: int) -> None:
+        """Drop entries no worker can still need."""
+        self._entries = [e for e in self._entries if e[0] > min_live_version]
+
+
+# ====================================================================== worker
+_OPS = {
+    "agent": agent_based_neighborhood,
+    "map": map_based_neighborhood,
+    "random": random_neighborhood,
+}
+
+
+def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
+                 unimp_raw: dict, spec: WorkerSpec, index: int) -> None:
+    """One worker process: a private replica, then destroy/repair tasks against it.
+
+    ``unimp_raw`` keeps its ``None``s: ``LNSState.__init__`` is the single owner of the
+    "ruler denied this flight -> treat as undelayed" rule, so the coordinator and every worker
+    resolve it identically by construction rather than by agreement.
+    """
+    try:
+        state = LNSState.replica(
+            cfg, intents,
+            static_terms=static_terms,
+            unimpeded_cost=unimp_raw,
+            turnaround_s=spec.turnaround_s,
+            frozen_flight_ids=spec.frozen_flight_ids,
+            movable_uss_ids=spec.movable_uss_ids,
+            incremental_release=spec.incremental_release,
+            kernel_log2_min=spec.kernel_log2_min,
+        )
+    except BaseException:                                       # noqa: BLE001 - reported home
+        import traceback
+        conn.send(("ready", os.getpid(), traceback.format_exc()))
+        return
+    conn.send(("ready", os.getpid(), None))
+
+    applied_version = 0
+    tabu: set[int] = set()          # only reached when the coordinator does NOT supply a seed
+    # Scoped INSIDE the worker: the parent's filter (solver.run_lns) cannot reach a spawned
+    # process, and the incremental_release=False reference path warns once per iteration.
+    # Scoped rather than global for the same reason the parent scopes it — a caller that wants
+    # to see the warning afterwards must still be able to.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="ReservationLedger shrank")
+        while True:
+            msg = conn.recv()
+            kind = msg[0]
+            if kind == "stop":
+                return
+            if kind == "sync":
+                _, version, changes = msg
+                state.apply_delta(changes)
+                applied_version = version
+                continue
+            if kind != "task":
+                raise RuntimeError(f"lns worker got an unknown message {kind!r}")
+
+            _, rnd, slot, op, seed_fid, rng_state, weights = msg
+            rng = np.random.default_rng()
+            # The generator STATE, not a seed: the coordinator already consumed one draw for the
+            # ALNS roulette from this same stream, and a freshly seeded generator would start a
+            # draw earlier — enough to change every victim set. See run_lns_parallel.
+            rng.bit_generator.state = rng_state
+            state.rng = rng
+
+            if op == "agent":
+                victims = agent_based_neighborhood(state, spec.neighborhood_size, tabu,
+                                                   spec.max_walks, seed_fid=seed_fid)
+            elif op == "map":
+                victims = map_based_neighborhood(state, spec.neighborhood_size,
+                                                 spec.map_max_cells)
+            else:
+                victims = random_neighborhood(state, spec.neighborhood_size)
+
+            if not victims:
+                # The sequential loop short-circuits here with reason="empty" and never calls
+                # try_repair. Falling through would compute cost_new = 0.0, fail the strict
+                # 0.0 < 0.0 - eps test, and report "no_improvement" — a parity break with
+                # nothing to do with parallelism. Reachable whenever contention_cells() is empty.
+                conn.send(("result", rnd, slot, index, applied_version, op,
+                           (), {}, 0.0, 0.0, (), "empty"))
+                continue
+
+            old = {f: state.incumbent[f] for f in victims}
+            out = state.try_repair(victims, rng, spec.accept_epsilon,
+                                   order_mode=spec.repair_order)
+            if out.accepted:
+                state.apply_delta(old)      # ALWAYS rewind: the coordinator owns the incumbent
+            conn.send(("result", rnd, slot, index, applied_version, op,
+                       tuple(sorted(victims)), out.new_intents, out.cost_old, out.cost_new,
+                       out.envelopes, out.reason))
+
+
+# ====================================================================== pool
+class LNSWorkerPool:
+    """m spawned workers, one duplex pipe each, modelled on ``colgen.pricing_pool.PricingPool``.
+
+    The details copied from it are all failure modes it already paid for: closing the parent's
+    copy of the child end (else EOF never fires and worker death is invisible), waiting on
+    ``proc.sentinel`` alongside the pipe (else an OOM-killed worker hangs the run instead of
+    failing it), and one SHARED grace window at teardown (per-worker joins made teardown after a
+    single loss take 15 s).
+    """
+
+    def __init__(self, cfg: SimConfig, intents: list, static_terms: tuple, unimp_raw: dict,
+                 spec: WorkerSpec, n_workers: int) -> None:
+        self._cfg = cfg
+        self._intents = intents
+        self._static_terms = static_terms
+        self._unimp_raw = unimp_raw
+        self._spec = spec
+        self.n_workers = int(n_workers)
+        self._procs: list = []
+        self._conns: list = []
+        self.worker_version: list[int] = []
+        self.spawn_s = 0.0
+
+    # ---------------------------------------------------------------- lifecycle
+    def start(self) -> "LNSWorkerPool":
+        # The numba kernel is already compiled in this process: the schedule being improved came
+        # out of an in-process A* run (LNSState's constructor requires the ledger and intents to
+        # be the very same objects). So the on-disk cache=True artifact exists and the workers
+        # load it instead of racing to compile it — the stampede parallel.py warms against.
+        from freespace_sim.planner.astar import kernel  # noqa: F401  (import = cache present)
+
+        ctx = mp.get_context("spawn")   # never fork: it inherits the numba runtime + thread state
+        t0 = time.monotonic()
+        for i in range(self.n_workers):
+            parent, child = ctx.Pipe()
+            p = ctx.Process(
+                target=_worker_main,
+                args=(child, self._cfg, self._intents, self._static_terms,
+                      self._unimp_raw, self._spec, i),
+                daemon=True,
+            )
+            p.start()
+            child.close()    # parent's copy of the CHILD end: without this EOF never fires
+            self._procs.append(p)
+            self._conns.append(parent)
+        for i, conn in enumerate(self._conns):
+            kind, pid, err = conn.recv()
+            if err:
+                self.close()
+                raise WorkerLost(f"lns worker {i} failed to build its replica:\n{err}")
+            log.debug("lns worker %d ready (pid %d)", i, pid)
+        self.worker_version = [0] * self.n_workers
+        self.spawn_s = time.monotonic() - t0
+        log.info("lns: %d workers up in %.1fs", self.n_workers, self.spawn_s)
+        return self
+
+    def close(self) -> None:
+        for conn in self._conns:
+            try:
+                conn.send(("stop",))
+            except (OSError, BrokenPipeError, ValueError):
+                pass
+        deadline = time.monotonic() + _GRACEFUL_STOP_S      # ONE window for all of them
+        for p in self._procs:
+            p.join(timeout=max(0.0, deadline - time.monotonic()))
+        for p in self._procs:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=_CLOSE_JOIN_TIMEOUT_S)
+        for conn in self._conns:
+            try:
+                conn.close()
+            except (OSError, ValueError):
+                pass
+        self._procs, self._conns = [], []
+
+    def __enter__(self) -> "LNSWorkerPool":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # ---------------------------------------------------------------- traffic
+    def sync(self, worker: int, changelog: _Changelog) -> None:
+        """Bring one worker up to the current incumbent version, if it is behind."""
+        base = self.worker_version[worker]
+        if base == changelog.version:
+            return
+        diff = changelog.diff_since(base)
+        self._conns[worker].send(("sync", changelog.version, diff))
+        self.worker_version[worker] = changelog.version
+
+    def sync_all(self, changelog: _Changelog) -> None:
+        for w in range(self.n_workers):
+            self.sync(w, changelog)
+
+    def dispatch(self, worker: int, rnd: int, slot: int, op: str, seed_fid, rng_state,
+                 weights: dict) -> None:
+        self._conns[worker].send(("task", rnd, slot, op, seed_fid, rng_state, weights))
+
+    def collect(self, n: int, timeout: float | None = None) -> list[TaskResult]:
+        """Wait for ``n`` results. Waits on every worker's SENTINEL as well as its pipe, so a
+        worker that dies surfaces as ``WorkerLost`` instead of an indefinite block."""
+        sentinels = {p.sentinel: i for i, p in enumerate(self._procs)}
+        by_conn = {c: i for i, c in enumerate(self._conns)}
+        out: list[TaskResult] = []
+        while len(out) < n:
+            ready = mp_connection.wait(list(self._conns) + list(sentinels), timeout=timeout)
+            if not ready:
+                raise WorkerLost(f"lns pool timed out with {len(out)}/{n} results")
+            for obj in ready:
+                if obj in sentinels:
+                    i = sentinels[obj]
+                    raise WorkerLost(
+                        f"lns worker {i} died (exit {self._procs[i].exitcode}) with "
+                        f"{len(out)}/{n} results in — an OOM kill looks exactly like this")
+                try:
+                    msg = obj.recv()
+                except EOFError as exc:
+                    raise WorkerLost(f"lns worker {by_conn[obj]} closed its pipe") from exc
+                (_, rnd, slot, worker, base_version, op, victims, new_intents,
+                 cost_old, cost_new, envelopes, reason) = msg
+                out.append(TaskResult(rnd, slot, worker, base_version, op, victims,
+                                      new_intents, cost_old, cost_new, envelopes, reason))
+                if len(out) >= n:
+                    break
+        return out
+
+
+# ====================================================================== coordinator
+def _traj_row(i, op, victims, accepted, reason, cost_old, cost_new, incumbent_cost, wall_s):
+    """One trajectory row, in the SEQUENTIAL loop's exact shape.
+
+    ``iter`` is the GLOBAL task index (``rnd + slot``), never the round, so the anytime curve keeps
+    a monotone x-axis, ``len(trajectory) == n_iterations``, and a one-worker run is row-for-row
+    comparable with ``run_lns``. ``cost_new`` is JSON-safe (None rather than inf), as upstream.
+    """
+    return dict(
+        iter=i, op=op, n=len(victims), victims=list(victims), accepted=accepted, reason=reason,
+        cost_old=cost_old,
+        cost_new=None if (cost_new is None or math.isinf(cost_new)) else cost_new,
+        incumbent_cost=incumbent_cost, wall_s=wall_s,
+    )
+
+
+def _auc(trajectory) -> float:
+    """Trapezoidal integral of the best-known cost against WALL CLOCK (paper §5.2).
+
+    Wall clock, not iteration index: the whole point of the comparison is that m workers reach a
+    given quality sooner, and an iteration-indexed curve is blind to that by construction.
+
+    **Only comparable between runs that ran for the SAME wall span.** The paper integrates over a
+    fixed budget T (60 s in its evaluation), so every arm covers [0, T]. Ours defaults to an
+    ITERATION budget, and integrating over whatever wall that took rewards an arm merely for
+    finishing sooner — a run that halves its wall roughly halves its AUC without improving
+    anything. Compare AUC only across arms sharing a ``time_limit_s``; otherwise read
+    ``cost_after`` against ``wall_s`` and treat AUC as a within-arm convergence shape.
+    """
+    pts = [(r["wall_s"], r["incumbent_cost"]) for r in trajectory]
+    return float(sum((t1 - t0) * (c0 + c1) / 2.0
+                     for (t0, c0), (t1, c1) in zip(pts, pts[1:])))
+
+
+def _pick_task(state, lns, selector, tabu, i):
+    """Choose the operator and (for ``agent``) the seed for global task index ``i``.
+
+    Returns ``(op, seed_fid, rng_state)``. Two things here are load-bearing:
+
+    * The seed is chosen by the COORDINATOR. ``tabu`` is a serial recurrence that
+      ``_select_most_delayed`` mutates, so m workers with private copies would every one of them
+      pick the same most-delayed flight — the pool would run m duplicates of one neighborhood and
+      look perfectly healthy doing it.
+    * What travels is the generator STATE, not the seed. ``AdaptiveSelector.pick`` consumes one
+      draw from this very stream before the destroy operator reads it, so a worker re-seeding from
+      ``(seed, i)`` would start a draw earlier — enough to change every victim set.
+    """
+    rng = np.random.default_rng(np.random.SeedSequence([lns.seed, i]))
+    if lns.adaptive:
+        op = selector.pick(rng)
+    else:
+        op = lns.operators[int(rng.integers(len(lns.operators)))]
+    seed_fid = _select_most_delayed(state, tabu) if op == "agent" else None
+    return op, seed_fid, rng.bit_generator.state
+
+
+def _out_of_budget(lns, t0) -> bool:
+    return lns.time_limit_s is not None and time.monotonic() - t0 > lns.time_limit_s
+
+
+def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before):
+    """SYNC-LNS: a barrier per round, then apply the single best of m results (paper Eq. 3).
+
+    Deterministic — the slot order is fixed and every decision is a pure function of it — which is
+    what makes ``search_workers=1`` byte-identical to the sequential loop and therefore the parity
+    gate for the whole design.
+
+    Note the shape this gives at a FIXED ITERATION budget: m workers consume m tasks per round and
+    m-1 of them are discarded, so quality per iteration FALLS as m rises. That is the paper's own
+    SYNC behaviour, not a bug — SYNC buys wall clock, not iterations, and the paper reports quality
+    against a fixed time budget for exactly this reason. DROP is the mode that converts throughput
+    into accepted improvements.
+    """
+    m = pool.n_workers
+    n_iter = n_accepted = n_not_selected = 0
+    rnd = 0
+    while rnd < lns.max_iterations:
+        if _out_of_budget(lns, t0):
+            break
+        n_slots = min(m, lns.max_iterations - rnd)
+        pool.sync_all(changelog)
+        for slot in range(n_slots):
+            op, seed_fid, rng_state = _pick_task(state, lns, selector, tabu, rnd + slot)
+            pool.dispatch(slot, rnd, slot, op, seed_fid, rng_state, dict(selector.weights))
+
+        results = sorted(pool.collect(n_slots), key=lambda r: r.slot)
+        n_iter += n_slots
+
+        winner = None
+        for r in results:
+            if r.improved and (winner is None or r.improvement > winner.improvement):
+                winner = r
+        if winner is not None:
+            olds = {f: state.incumbent[f] for f in winner.new_intents}
+            state.apply_delta(winner.new_intents)
+            changelog.record(winner.new_intents, olds)
+            n_accepted += 1
+
+        for r in results:
+            is_winner = r is winner
+            # Only the APPLIED result earns credit; everything else decays — which is exactly what
+            # the sequential loop does when it feeds `out.improvement == 0.0` on a rejection.
+            selector.update(r.op, r.improvement if is_winner else 0.0)
+            reason = r.reason
+            if r.improved and not is_winner:
+                reason = "not_selected"
+                n_not_selected += 1
+            trajectory.append(_traj_row(
+                r.rnd + r.slot, r.op, r.victims, is_winner, reason,
+                r.cost_old, r.cost_new, state.total_cost, time.monotonic() - t0))
+
+        _maybe_verify(state, lns, n_accepted, winner is not None)
+        _maybe_log(lns, "sync", m, n_iter, n_accepted, state, selector, cost_before)
+        rnd += n_slots
+    return {"n_iter": n_iter, "n_accepted": n_accepted, "n_not_selected": n_not_selected,
+            "n_stale": 0, "n_dirty": 0, "n_overwrite": 0}
+
+
+def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before):
+    """DROP-LNS: no barrier. A result is applied the moment it lands and its worker is
+    re-dispatched, so no worker ever idles on another (paper Fig. 1a).
+
+    Results now arrive against a STALE ``base_version``, and the accept rule gains three cases
+    beyond the sequential one:
+
+    * **clean** — nothing committed since the worker's base touched its read set, so the plan is
+      exactly the plan it would have produced against the current incumbent. MERGE it, keeping both
+      workers' improvements. The paper has no such case; it always discards or overwrites. Soundness
+      is Track A's argument: a repaired path that occupies (cell, step) must have READ it to confirm
+      it free, so it is inside the recorded envelope, and a non-intersecting commit cannot conflict.
+    * **overwrite** — dirty, but the worker's whole solution still beats the incumbent
+      (paper Alg. 2 line 23). Walk the interleaved flights back to the worker's base and apply its
+      repair; the result is exactly the worker's own replica, hence feasible by construction.
+    * **discard** — dirty and not better.
+
+    Nondeterministic by construction: which of these fires depends on completion order, i.e. on the
+    wall clock. Rows carry ``base_version`` so a run stays auditable.
+    """
+    m = pool.n_workers
+    n_iter = n_accepted = n_clean = n_dirty = n_overwrite = 0
+    n_stale_victims = n_stale_cost = 0
+    next_i = 0
+    inflight: dict[int, int] = {}
+
+    def _dispatch(w: int) -> bool:
+        nonlocal next_i
+        if next_i >= lns.max_iterations or _out_of_budget(lns, t0):
+            return False
+        i = next_i
+        next_i += 1
+        op, seed_fid, rng_state = _pick_task(state, lns, selector, tabu, i)
+        pool.sync(w, changelog)          # bring it current, THEN give it work
+        pool.dispatch(w, i, 0, op, seed_fid, rng_state, dict(selector.weights))
+        inflight[w] = i
+        return True
+
+    for w in range(m):
+        _dispatch(w)
+
+    while inflight:
+        r = pool.collect(1)[0]
+        inflight.pop(r.worker, None)
+        n_iter += 1
+        applied, reason = False, r.reason
+
+        if r.improved:
+            stale_by = changelog.version - r.base_version
+            if stale_by == 0:
+                applied = True
+            elif set(r.victims) & changelog.touched_since(r.base_version):
+                reason, n_stale_victims = "stale_victims", n_stale_victims + 1
+            elif _read_set_is_clean(r.envelopes, changelog.boxes_since(r.base_version)):
+                applied, reason = True, "improved"
+                n_clean += 1
+            else:
+                n_dirty += 1
+                # Paper Alg. 2 line 23: a stale result overwrites wholesale iff its own whole
+                # solution still beats the incumbent. Write C_base for the incumbent cost at the
+                # worker's base and S for what everyone else has since removed from it, so
+                #     c(P)   = C_base - r.improvement      (base, with this worker's repair)
+                #     c(P_min) = C_base - S                (base, with everyone else's)
+                # and c(P) < c(P_min)  <=>  r.improvement > S.
+                #
+                # S is measured over exactly the flights the overwrite would walk back, as
+                # (their cost at base) - (their cost now); improvements lowered those costs, so S
+                # is >= 0. Getting this subtraction backwards makes the test `improvement > -S`,
+                # which is true almost always: measured on the 290-leg FAA cut it fired 15 times
+                # in 60 tasks and left DROP at -0.82% against SYNC's -1.39% while accepting twice
+                # as often — more accepts, worse schedule, because each one reverted real work.
+                reverts = changelog.revert_to(r.base_version)
+                improvement_since = sum(float(it.cost) - float(state.incumbent[f].cost)
+                                        for f, it in reverts.items())
+                if r.improvement > improvement_since:
+                    olds = {f: state.incumbent[f] for f in reverts}
+                    state.apply_delta(reverts)
+                    changelog.record(reverts, olds)
+                    applied, reason = True, "overwrite"
+                    n_overwrite += 1
+                else:
+                    reason, n_stale_cost = "stale", n_stale_cost + 1
+
+        if applied:
+            olds = {f: state.incumbent[f] for f in r.new_intents}
+            state.apply_delta(r.new_intents)
+            changelog.record(r.new_intents, olds)
+            n_accepted += 1
+
+        selector.update(r.op, r.improvement if applied else 0.0)
+        row = _traj_row(r.rnd, r.op, r.victims, applied, reason,
+                        r.cost_old, r.cost_new, state.total_cost, time.monotonic() - t0)
+        row["base_version"] = r.base_version
+        row["worker"] = r.worker
+        trajectory.append(row)
+
+        _maybe_verify(state, lns, n_accepted, applied)
+        _maybe_log(lns, "drop", m, n_iter, n_accepted, state, selector, cost_before)
+        changelog.trim(min(pool.worker_version) if pool.worker_version else 0)
+        _dispatch(r.worker)
+
+    return {"n_iter": n_iter, "n_accepted": n_accepted, "n_not_selected": 0,
+            # Split deliberately: "the victims overlapped" and "the read set was dirty" are
+            # different phenomena with different fixes. Victim overlap says the neighborhoods
+            # collided (a seed-diversity problem); a dirty read set says the repairs collided in
+            # SPACE (the envelope test's own resolution). Collapsing them hides which one binds.
+            "n_stale_victims": n_stale_victims, "n_stale_cost": n_stale_cost,
+            "n_dirty": n_dirty, "n_overwrite": n_overwrite, "n_clean_merge": n_clean}
+
+
+def _finish_stats(stats: dict, n_iter: int) -> dict:
+    """Derive the rates the modes must be judged on.
+
+    ``dirty_rate`` is first-class because it is the design's main empirical risk: the destroy
+    heuristics are contention-seeking by construction, so neighborhoods may cluster at the same hub
+    mouths and most stale results would then fail the read-set test. If it approaches 1, DROP
+    degrades to the paper's own behaviour — correct, just less parallel-efficient.
+    """
+    out = dict(stats)
+    n = max(1, n_iter)
+    stale_eligible = stats.get("n_clean_merge", 0) + stats.get("n_dirty", 0)
+    out["dirty_rate"] = (stats.get("n_dirty", 0) / stale_eligible) if stale_eligible else 0.0
+    out["discard_rate"] = (stats.get("n_stale_victims", 0) + stats.get("n_stale_cost", 0)) / n
+    out["accept_rate"] = stats.get("n_accepted", 0) / n
+    return out
+
+
+def _read_set_is_clean(envelopes, boxes) -> bool:
+    """Did anything committed since the worker's base touch what its repair READ?
+
+    A ``None`` envelope is ALWAYS dirty: the planner resets ``last_envelope`` per plan and only
+    ``_mk_envelope`` sets it, so None means "read set unknown", not "read nothing".
+    """
+    from freespace_sim.parallel import envelope_intersects
+
+    if not boxes:
+        return True
+    for env in envelopes:
+        if env is None or envelope_intersects(env, boxes):
+            return False
+    return True
+
+
+def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
+    """Independent conflict replay. Only the coordinator can do this — it needs the whole intent
+    list, and no worker holds the blessed incumbent."""
+    if not (just_applied and lns.verify_every and n_accepted % lns.verify_every == 0):
+        return
+    bad = verify.find_interflight_conflict(
+        state.final_intents(), state.cfg, static_terminals=state.static_terms)
+    if bad is not None:
+        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+
+
+def _maybe_log(lns, mode, m, n_iter, n_accepted, state, selector, cost_before) -> None:
+    if not lns.log_every or n_iter % lns.log_every != 0:
+        return
+    log.info("lns[%s x%d] %d/%d: cost %.0f (%.2f%% below start), %d accepted, weights %s",
+             mode, m, n_iter, lns.max_iterations, state.total_cost,
+             100.0 * (cost_before - state.total_cost) / max(1e-9, cost_before),
+             n_accepted, {k: round(v, 3) for k, v in selector.weights.items()})
+
+
+def run_lns_parallel(
+    cfg: SimConfig,
+    ledger: ReservationLedger,
+    intents: list[OperationalIntent],
+    lns,
+    *,
+    static_terms: tuple | None = None,
+    turnaround_s: float | None = None,
+):
+    """DROP-LNS over a committed schedule. Same contract as ``run_lns``; see that docstring.
+
+    ``sync`` runs a barrier per round and applies the best of m results (paper Eq. 3). At
+    ``search_workers=1`` it is byte-identical to the sequential loop, which is the parity gate the
+    whole design is verified against.
+    """
+    from freespace_sim.planner.lns.solver import LNSResult   # deferred: solver imports this module
+
+    t0 = time.monotonic()
+    state = LNSState(
+        cfg, ledger, intents,
+        static_terms=ledger.static_terminals() if static_terms is None else static_terms,
+        frozen_flight_ids=lns.frozen_flight_ids,
+        movable_uss_ids=lns.movable_uss_ids,
+        turnaround_s=turnaround_s,
+        incremental_release=lns.incremental_release,
+    )
+    static_terms = state.static_terms
+    init_s = time.monotonic() - t0
+    cost_before = state.total_cost
+
+    spec = WorkerSpec(
+        neighborhood_size=lns.neighborhood_size,
+        accept_epsilon=lns.accept_epsilon,
+        repair_order=lns.repair_order,
+        max_walks=lns.max_walks,
+        map_max_cells=lns.map_max_cells,
+        turnaround_s=turnaround_s,
+        frozen_flight_ids=lns.frozen_flight_ids,
+        movable_uss_ids=lns.movable_uss_ids,
+        incremental_release=lns.incremental_release,
+        kernel_log2_min=lns.worker_kernel_log2,
+    )
+
+    selector = AdaptiveSelector(tuple(lns.operators), lns.gamma)
+    tabu: set[int] = set()
+    changelog = _Changelog()
+    trajectory: list[dict] = []
+    n_accepted = 0
+    n_iter = 0
+    stats: dict = {}
+    pool = None
+    try:
+        pool = LNSWorkerPool(cfg, state.final_intents(), static_terms,
+                             dict(state._unimp_cost), spec, lns.search_workers).start()
+        loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
+        stats = loop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before)
+        n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
+
+        final = state.final_intents()
+        bad = verify.find_interflight_conflict(final, cfg, static_terminals=static_terms)
+        return LNSResult(
+            intents=final,
+            trajectory=trajectory,
+            cost_before=cost_before,
+            cost_after=state.total_cost,
+            n_iterations=n_iter,
+            n_accepted=n_accepted,
+            wall_s=time.monotonic() - t0,
+            init_wall_s=init_s,
+            weights=dict(selector.weights),
+            verified=bad is None,
+            search_workers=pool.n_workers if pool else lns.search_workers,
+            parallel_mode=lns.parallel_mode,
+            npo=n_iter,
+            auc=_auc(trajectory),
+            pool_spawn_s=pool.spawn_s if pool else 0.0,
+            parallel_stats=_finish_stats(stats, n_iter),
+        )
+    except BaseException:
+        log.exception("lns aborted; detaching repair-planner subscribers before propagating")
+        raise
+    finally:
+        if pool is not None:
+            pool.close()
+        ledger.detach_subscribers()

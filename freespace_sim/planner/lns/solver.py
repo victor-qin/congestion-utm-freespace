@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -53,6 +54,29 @@ class LNSConfig:
     # implicit `spawn` can re-execute an unguarded caller's top-level code. Guarded applications may
     # explicitly pass None for min(8, cpu-2) automatic parallelism.
     unimpeded_workers: int | None = 1
+    # --- parallel destroy/repair (DROP-LNS; freespace_sim.planner.lns.parallel) ---
+    # 1 = the in-process loop below. Above 1, `run_lns` hands off to `run_lns_parallel`; at exactly
+    # 1 that function is byte-identical to this loop, which is the parity gate.
+    #
+    # The default is 1 because the win INVERTS with instance size, not because parallel loses. On
+    # FULL density_faa (4,636 legs) m=8 reaches the sequential schedule in 1.91x less wall (2.11%
+    # in 1,046 s vs 2.06% in 2,000 s) and m=4 beats it outright (2.64% in 1,721 s); on the 120 s cut
+    # (290 legs) the same knobs are 1.03x (m=4) and 0.76x (m=8) — a LOSS. A neighborhood of 8
+    # collides far less often inside 4,636 flights than inside 290, and per-task cost grows with the
+    # schedule, so there is more for the pool to hide. Until the crossover between those scales is
+    # pinned, the safe default is the one that cannot lose. Memory is also LINEAR in workers
+    # (~350 MiB each at 290 legs) — the same reason colgen's pricing pool is still defaulted off.
+    #
+    # The TWO worker knobs are deliberately separate and compose: `unimpeded_workers` shards the
+    # one-off state build (independent plans, cannot move a cost), `search_workers` runs the
+    # destroy/repair loop (dependent plans, needs the whole staleness machinery). A replica pins
+    # `unimpeded_workers=1` explicitly (now also the library default) so the two can never nest
+    # into m x m processes even if that default is later relaxed.
+    search_workers: int = 1
+    parallel_mode: str = "sync"          # "sync": barrier per round, deterministic | "drop": async
+    worker_kernel_log2: int | None = None  # AStarPlanner.kernel_log2_min in the workers; oversized
+    #                                        kernel arrays were measured to slow CONCURRENT plans
+    #                                        ~1.75x at 8 workers while a lone worker matched serial
     time_limit_s: float | None = None
     verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
     log_every: int = 200
@@ -70,9 +94,22 @@ class LNSResult:
     init_wall_s: float                  # state build incl. the unimpeded baseline pass
     weights: dict[str, float]
     verified: bool
+    # --- parallel only; defaulted so every existing construction site is untouched ---
+    search_workers: int = 1
+    parallel_mode: str = "sequential"
+    npo: int = 0            # paper §5.2 NPO*: destroy/repair operations actually run
+    auc: float = 0.0        # paper §5.2 AUC: best-known cost integrated over WALL CLOCK
+    pool_spawn_s: float = 0.0
+    parallel_stats: dict = field(default_factory=dict)   # mode counters + dirty/accept rates
 
     def summary(self) -> dict:
         return {
+            "search_workers": self.search_workers,
+            "parallel_stats": dict(self.parallel_stats),
+            "parallel_mode": self.parallel_mode,
+            "npo": self.npo,
+            "auc": self.auc,
+            "pool_spawn_s": self.pool_spawn_s,
             "cost_before": self.cost_before,
             "cost_after": self.cost_after,
             "improvement": self.cost_before - self.cost_after,
@@ -114,11 +151,30 @@ def run_lns(
         raise ValueError(f"unknown LNS operators {unknown!r} (want subset of agent/map/random)")
     if not lns.operators:   # else the first pick indexes an empty wheel (numpy: "high <= 0")
         raise ValueError("LNSConfig.operators is empty — need at least one of agent/map/random")
+    if isinstance(lns.search_workers, bool) or int(lns.search_workers) < 1:
+        # bool is an int subclass, and `search_workers=True` would silently mean 1.
+        raise ValueError(f"LNSConfig.search_workers must be an int >= 1, got {lns.search_workers!r}")
+    ceiling = 4 * (os.cpu_count() or 1)
+    if int(lns.search_workers) > ceiling:
+        raise ValueError(
+            f"LNSConfig.search_workers={lns.search_workers} exceeds {ceiling} (4x cores) — each "
+            f"worker holds its own replica of the schedule (ledger + occupancy pools + claim "
+            f"index), so memory is linear in workers, not amortised across them")
+    if lns.parallel_mode not in ("sync", "drop"):
+        raise ValueError(f"unknown LNSConfig.parallel_mode {lns.parallel_mode!r} (want 'sync' or 'drop')")
     if len(set(lns.operators)) != len(lns.operators):
         # `ops` would collapse the duplicate while AdaptiveSelector.names keeps it, silently handing
         # that operator a double share of the roulette and reporting a weights dict shorter than the
         # configuration — a run that is quietly not the experiment that was asked for.
         raise ValueError(f"duplicate LNS operators {list(lns.operators)!r} — each name at most once")
+
+    if int(lns.search_workers) > 1:
+        # Deferred import: keeps multiprocessing (and the pool module) off the sequential path,
+        # and breaks the cycle — parallel.py needs LNSResult from here.
+        from freespace_sim.planner.lns.parallel import run_lns_parallel
+
+        return run_lns_parallel(cfg, ledger, intents, lns,
+                                static_terms=static_terms, turnaround_s=turnaround_s)
 
     t0 = time.monotonic()
     state = LNSState(

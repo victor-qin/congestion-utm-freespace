@@ -385,4 +385,159 @@ service's journal, reproducing its eviction clamp, and only working with `increm
    the rest of the neighborhood `A_s`; PP-repair with the FCFS placement as fallback; freeze
    airborne + departing-within-epsilon flights via `frozen_flight_ids`. The offline transaction
    is reused unchanged — newcomers are victims with no incumbent (revert = FCFS fallback).
-5. Parallel LNS (DROP-LNS) — separate effort, separate branch.
+5. ~~Parallel LNS (DROP-LNS)~~ — §8. Built and measured: 2.25x (m=4) / 2.55x (m=8) per second of
+   loop wall on FULL density_faa, but break-even-to-losing on the 120 s cut. `search_workers`
+   stays defaulted to 1 only until the crossover between those two scales is pinned.
+
+## 8. Parallel LNS — DROP-LNS (2026-08-25)
+
+Build step 5 of §7. `context/drop-lns-parallel-2024.pdf` — Chan et al., *Anytime MAPF using
+Operation Parallelism in LNS*. Both of the paper's synchronising variants are built (`sync` and
+`drop`); DETA is not.
+
+```
+freespace_sim/planner/lns/parallel.py   WorkerSpec / TaskResult / _Changelog / LNSWorkerPool
+                                        _loop_sync / _loop_drop / run_lns_parallel
+freespace_sim/planner/lns/state.py      + LNSState.replica, + apply_delta, + _apply_in_memory,
+                                        + unimpeded_cost= injection, RepairOutcome.{new_intents,envelopes}
+freespace_sim/planner/lns/solver.py     + LNSConfig.{search_workers,parallel_mode,worker_kernel_log2}
+                                        + LNSResult.{search_workers,parallel_mode,npo,auc,parallel_stats}
+freespace_sim/planner/lns/neighborhood.py  agent_based_neighborhood(seed_fid=...)
+analysis/prof_lns_replica_memory.py     the replica-memory gate
+tests/test_lns_parallel.py              25 tests: parity, replica fidelity, apply_delta, pool, DROP
+```
+
+### The two departures from the paper, and why
+
+**1. The private copy is a persistent replica synced by delta.** The paper's `P` is a list of
+paths, so `P <- P_min` is free. Ours is a ledger + occupancy stack + claim index; building one is
+the O(schedule) rebuild §3 measured at 3.74 s and removed. So a worker builds its replica ONCE and
+is afterwards told "the incumbent moved" by a compacted diff — `LNSState.apply_delta`, riding the
+`release_many`/`subscribe_release` machinery. **Incremental release is what makes DROP-LNS
+affordable here at all.**
+
+**2. No mutexes: a single-threaded coordinator IS `M_main` and `M_task`.** It holds its own
+`LNSState` over the CALLER's ledger, so `apply_delta` is also the write-back and the seed
+selection shares one implementation of `movable_ids`/`delay` with the workers. Workers are spawned
+processes on one duplex pipe each (`colgen.pricing_pool`'s shape, for its documented reasons).
+Processes not threads despite `astar_kernel` being `nogil`: §6 measured `_plan_compiled`'s mask
+build at ~31% of profiled self-time, and `hexgrid._RANGE_CACHE` is a process-global `OrderedDict`
+with a check-then-act eviction.
+
+**The always-rewind rule** is what removes three-way merges: a worker never keeps its own accept,
+so its `applied_version` is always a coordinator-blessed version. It costs one extra
+`release_many` + k commits on the ~21-50% of tasks that accept.
+
+### Two traps that byte-parity caught, and one that only measurement caught
+
+* **The RNG stream position, not the seed.** `AdaptiveSelector.pick` consumes exactly one draw from
+  the SAME generator the destroy operators then read (`solver.py:155-161`). A worker rebuilding
+  `default_rng(SeedSequence([seed, i]))` starts a draw earlier and picks different victims from
+  iteration 0. The coordinator ships `rng.bit_generator.state`.
+* **`apply_delta` commits in the CALLER's order, not sorted**, so the ledger's `_vols`/`_fids`
+  layout matches what the in-process repair would have produced.
+* **The wholesale-overwrite guard's sign** (paper Alg. 2 line 23). With `C_base` the incumbent cost
+  at the worker's base and `S` what everyone else has since removed from it, `c(P) < c(P_min)` iff
+  `improvement > S`. Written backwards it becomes `improvement > -S`, which is true almost always:
+  it fired 15 times in 60 tasks and left DROP at **-0.82%** while ACCEPTING TWICE AS OFTEN as SYNC's
+  -1.39%. More accepts, worse schedule, because each one reverted real work. Fixed: -0.82% -> -2.12%,
+  overwrites 15 -> 1. Nothing in the test suite caught this; the density readout did.
+
+### Measured — and the honest verdict
+
+Replica memory (`analysis/prof_lns_replica_memory.py`, 120 s FAA cut, 290 legs, 26,218 volumes):
+**~350 MiB per worker, flat** (1079 / 1411 / 2075 / 3397 MiB of tree RSS at m = 1/2/4/8). Spawn is
+~0.4 s per worker and parent-serial; the replica build is 1.8 s and concurrent.
+
+**The verdict depends on SCALE, and the 120 s cut is the wrong place to read it.** Both tables
+below are seed 0, neighborhood 8, every arm verified conflict-free, measured on top of §6
+(`analysis/sweep_lns_workers.py`). The rate column is improvement per second of LOOP wall,
+normalised to sequential.
+
+**120 s cut — 290 legs, 26,216 volumes:**
+
+| arm | tasks | accepted | improvement | loop wall | task/s | vs seq |
+|---|---|---|---|---|---|---|
+| sequential | 60 | 30 (50%) | 2.46% | 19.3 s | 3.11 | 1.00x |
+| drop m=4 | 120 | 26 (22%) | 1.99% | 15.1 s | 7.97 | 1.03x |
+| drop m=8 | 180 | 28 (16%) | 1.90% | 19.7 s | 9.14 | 0.76x |
+| sync m=4 | 120 | 21 (18%) | 1.68% | 21.9 s | 5.49 | 0.60x |
+
+**FULL density_faa_wing_zipline — 4,636 legs, 426,756 volumes:**
+
+| arm | tasks | accepted | improvement | loop wall | task/s | vs seq |
+|---|---|---|---|---|---|---|
+| sequential | 2000 | 497 (25%) | 2.06% | 2000.1 s | 1.00 | 1.00x |
+| drop m=4 | 2000 | 376 (19%) | 1.56% | 677.4 s | 2.95 | 2.25x |
+| drop m=8 | 2000 | 314 (16%) | 1.14% | 435.8 s | 4.59 | 2.55x |
+| **drop m=4** | 6000 | 903 (15%) | **2.64%** | 1721.3 s | 3.49 | 1.49x |
+| **drop m=8** | 6000 | 747 (12%) | **2.11%** | **1046.1 s** | 5.74 | 1.96x |
+
+**The wall-clock headline, matched on QUALITY rather than task count** (the 6000-task rows exist
+for exactly this — no extrapolation):
+
+* **m=8 reaches the sequential schedule in 1.91x less wall** — 2.11% in 1,046 s against 2.06% in
+  2,000 s.
+* **m=4 beats it outright**: 2.64% in 1,721 s, i.e. 28% more improvement in 14% less wall.
+
+Note the rate column FALLS as the budget grows (m=8: 2.55x at 2000 tasks, 1.96x at 6000), because
+LNS has diminishing returns and the parallel arm is further along its own curve. So "the speedup"
+is not one number — it is a function of both instance size AND budget, and any single figure has
+to name both.
+
+**At full scale parallel LNS wins, and the ordering of m REVERSES.** At 290 legs m=4 was
+break-even and m=8 was a 0.76x loss; at 4,636 legs m=4 is 2.25x and m=8 is 2.55x. Two things move
+together to produce that:
+
+* **Per-task cost grows with the schedule** — 3.11 tasks/s at 290 legs, 1.00 at 4,636 — so there
+  is 3x more work per task for the pool to hide, and more of the loop is inside the worker rather
+  than the coordinator. Throughput efficiency rises with it: 64% -> 74% at m=4.
+* **Staleness falls relative to the work.** Discarded-stale is 67/2000 = 3.4% at full scale
+  against ~10% on the cut, and clean merges roughly equal dirty ones (94 vs 95 at m=4) where the
+  cut was 11 vs 13 out of far fewer tasks. A neighborhood of 8 collides far less often inside
+  4,636 flights than inside 290 — which is exactly the "bigger instances" prediction, confirmed.
+
+The redundancy story from the cut still holds, just weakened: value per task still falls (25% ->
+19% accept at m=4) but only by 1.32x against a 2.95x throughput gain, where on the cut the two
+cancelled almost exactly (2.3x vs 2.56x). m=8 pays more for it — dirty 201 vs 100 clean, 67%
+dirty rate against m=4's 50% — and still nets out ahead because throughput is 4.59x.
+
+**Caveat on how to read these:** the 2000-task rows are matched on TASK COUNT, so the parallel arms
+reach a worse absolute schedule in much less wall — use the rate column, or the 6000-task rows,
+which are matched on quality instead.
+The `rss` column in the sweep is sampled AFTER `pool.close()`, so it is the coordinator's
+footprint, not the peak — use `analysis/prof_lns_replica_memory.py` for per-worker cost.
+
+`[[parallel-loses-on-density-scenarios]]` is NOT the same result and must not be quoted alongside
+this one. That is the A* speculative runner losing 0.66-0.74x on density because its serial commit
+floor dominates a compiled per-flight plan — a coordinator bottleneck that gets WORSE with scale.
+The LNS pool's small-instance loss came from redundant neighborhoods instead, which gets BETTER
+with scale, and does: 1.03x at 290 legs, 2.25x at 4,636. Same superficial shape on the cut,
+opposite behaviour where it matters.
+
+SYNC is worse than DROP wherever both were measured, exactly as the paper reports and for the
+paper's reason: best-of-m discards m-1 results (`notsel=18` of 120 on the cut). It was NOT run at
+full scale — every full-scale row above is DROP — so treat "SYNC loses" as a cut-only finding.
+Its value here was never throughput anyway: it is DETERMINISTIC, and at `search_workers=1`
+byte-identical to the sequential loop, which is the gate every other claim on this page rests on.
+
+### Where it goes from here
+
+Items 2 and 3 of the earlier list are now DONE and are what produced the full-scale table:
+bigger instances and longer budgets were the lever, not a code change. What is left:
+
+1. **Raise the default once the scale rule is pinned.** `search_workers` stays 1 because the
+   verdict inverts between 290 and 4,636 legs and nothing yet says WHERE. The missing measurement
+   is the 300 s (754 legs) and 600 s (1,526 legs) cuts, which bracket the crossover; with those,
+   the default can become scale-dependent instead of conservative. Note this is the same shape as
+   `[[lns-neighborhood-size-is-scale-dependent]]` — N=8 wins at 1,526 legs, N=2 at 4,636 — so the
+   two knobs should be swept together rather than one at a time.
+2. **Seed diversity, still unbuilt and still the best code lever.** m workers rank the same
+   incumbent and so attack the same congested region; give slot j a seed from a different
+   contention cluster. It should matter MORE at m=8, where the dirty rate is 67% against m=4's
+   50% — that gap is the redundancy this would attack.
+3. **Is the envelope too coarse?** `dirty_rate` is 50-67%, and the read-set test is an xy bbox plus
+   hub discs — a conservative superset. Worth checking whether the neighborhoods genuinely collide
+   before treating the dirty rate as a property of the problem rather than of the test.
+4. **m > 8.** m=8 is still improving (2.55x vs m=4's 2.25x) at full scale, so the knee the paper
+   reports at 4-8 threads has NOT been reached here. Sweep 16 and 32 before assuming it exists.

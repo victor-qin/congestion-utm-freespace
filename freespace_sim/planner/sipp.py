@@ -43,6 +43,7 @@ from ..volumes import (
 from . import hexgrid as hg
 from .astar import AStarPlanner, _absorb, _committed_arrival, _lattice_overhead_m
 from ._packed import aligned_2d
+from .compiled_hex_occupancy import search_horizon
 from .compiled_occupancy import CompiledOccupancy
 
 _EPS = 1e-6
@@ -341,13 +342,15 @@ class SIPPPlanner(AStarPlanner):
             return c_lat * max(0.0, math.sqrt(dx * dx + dy * dy) - h_off) + takeoff_cost[L]
 
         dx0, dy0 = R * sqrt3 * (oq + orr / 2.0) - gx, R * 1.5 * orr - gy
-        h_ground = c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off) + 2.0 * takeoff_cost[0]
+        h_off_o = terminal_radius(o_term, cfg) if o_lanes else 0.0   # takeoff charges only (dist - o_r)
+        h_ground = (c_lat * max(0.0, math.sqrt(dx0 * dx0 + dy0 * dy0) - h_off - h_off_o)
+                    + 2.0 * takeoff_cost[0])
 
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)      # extra step budget for mid-route rungs
-        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
-                    + 3 * n_hops + 2 * climb_span + 6)
+        max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
+                                  n_hops, climb_span, cfg)
 
         SI = _SafeIntervals(sidx, own, base, max_step, fixed_lanes)
         came: dict = {}
@@ -429,7 +432,9 @@ class SIPPPlanner(AStarPlanner):
                 for k in range(1, w + 1):                  # w>0 only for an air reroute ⇒ cur is a 5-tuple
                     expanded.append((cur[0], cur[1], cur[2], cur[3], cur[4] + k))
         air = [s for s in expanded if s[0] == "a"]
-        ground_steps = air[0][4] - takeoff_steps[air[0][3]] - base
+        lane_steps = {ln.cell: ln.steps for ln in o_lanes}
+        ground_steps = (air[0][4] - takeoff_steps[air[0][3]] - base
+                        - lane_steps.get((air[0][1], air[0][2]), 0))   # issue #52
         delay = ground_steps * dt
 
         cruise_wps: list[TimedPoint] = [
@@ -639,8 +644,8 @@ class SIPPPlanner(AStarPlanner):
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if nlev > 1 else 0)
-        max_step = (base + max(takeoff_steps) + int(math.ceil(cfg.max_ground_delay_s / dt))
-                    + 3 * n_hops + 2 * climb_span + 6)
+        max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
+                                  n_hops, climb_span, cfg)
 
         oqr, gqr = cocc.qr_index(oq, orr), cocc.qr_index(gq, grr)   # level-less lane/goal indices
         if oqr < 0 or gqr < 0:
@@ -663,16 +668,17 @@ class SIPPPlanner(AStarPlanner):
         n_to = smax - base + 1                                 # ground-delay steps; to_ok is per (step, level)
         to_ok = []                                             # flat mask, indexed [si*nlev + L]
         if fixed and o_term is not None:                       # exit lanes (level-less qr; kernel adds L)
-            lane_qr, lane_lat = [], []
+            lane_qr, lane_lat, lane_st = [], [], []
             for lane in o_lanes:
                 lq = cocc.qr_index(lane.cell[0], lane.cell[1])
                 if lq >= 0:
                     lane_qr.append(lq); lane_lat.append(c_lat * (lane.dist - o_r))
+                    lane_st.append(lane.steps)               # issue #52: climb, THEN translate out
             for s in range(base, smax + 1):                    # per-(step, level) dwell/column, lane-independent
                 lv = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
                 to_ok.extend(bool(lv[L]) for L in range(nlev))
         else:                                                  # non-terminal: origin cell, per-level pad-clear
-            lane_qr, lane_lat = [oqr], [0.0]
+            lane_qr, lane_lat, lane_st = [oqr], [0.0], [0]   # non-terminal: climb in place, no egress
             for s in range(base, smax + 1):
                 to_ok.extend(svc.pad_clear(oq, orr, s, dwell_steps[L]) for L in range(nlev))
         if not lane_qr or not any(to_ok):
@@ -714,7 +720,8 @@ class SIPPPlanner(AStarPlanner):
             cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt,
             self._k_ov_lo, self._k_ov_hi, self._k_ov_nxt, self._k_ov_head, self._k_ov_gen, cocc.cap,
             cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan, base, max_step, nlev,
-            np.asarray(lane_qr, np.int64), np.asarray(lane_lat, np.float64), len(lane_qr),
+            np.asarray(lane_qr, np.int64), np.asarray(lane_lat, np.float64),
+            np.asarray(lane_st, np.int64), len(lane_qr),
             np.asarray(to_ok, np.bool_), n_to, c_gd,
             np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
             np.asarray(rung_steps, np.int64), np.asarray(rung_cost, np.float64),
@@ -755,7 +762,9 @@ class SIPPPlanner(AStarPlanner):
                 for k in range(a + 1, stop):
                     air.append((q, r, L, k))
         self._air = air            # last compiled per-step search path [(q,r,L,step)] (diagnostics + tests)
-        ground_steps = air[0][3] - takeoff_steps[air[0][2]] - base
+        lane_steps = {ln.cell: ln.steps for ln in o_lanes}
+        ground_steps = (air[0][3] - takeoff_steps[air[0][2]] - base
+                        - lane_steps.get((air[0][0], air[0][1]), 0))   # issue #52
         delay = ground_steps * dt
         cruise_wps: list[TimedPoint] = [
             (np.array([*hg.hex_center(q, r, R), levels[L]]), a * dt) for (q, r, L, a) in air]
@@ -805,8 +814,9 @@ class SIPPPlanner(AStarPlanner):
                 level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
                 for lane in o_lanes:
                     lq, lr = lane.cell
+                    lane_st = lane.steps                     # issue #52: climb, THEN translate out
                     for L in range(len(levels)):
-                        ts = s + takeoff_steps[L]
+                        ts = s + takeoff_steps[L] + lane_st
                         if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
                             out.append((("a", lq, lr, L, ts),
                                         takeoff_cost[L] + c_lat * (lane.dist - o_r), 0,

@@ -68,7 +68,7 @@ def _search(
     iv_lo, iv_hi, iv_nxt,                                            # global interval pool (slot < cap)
     ov_lo, ov_hi, ov_nxt, ov_head, ov_gen, cap,                      # per-flight overlay (slot >= cap)
     qmin, rmin, rspan, qspan, base, max_step, nlevels,              # box + step window + flight-level axis
-    lane_qr, lane_lat, n_lanes, to_ok, n_to, c_gd,                  # takeoff lanes (level-less qr) + gd mask
+    lane_qr, lane_lat, lane_st, n_lanes, to_ok, n_to, c_gd,         # takeoff lanes + egress steps + gd mask
     takeoff_steps, takeoff_cost, rung_steps, rung_cost,            # per-level takeoff + per-rung vertical edges
     goal_gen, lf_lo, lf_hi, lf_off,                                  # goal cells + PER-LEVEL landing ivals (lf_off[L]:lf_off[L+1])
     c_hold, c_lat, pitch, dt, gx, gy, R, h_off,                     # cost + heuristic params
@@ -96,7 +96,7 @@ def _search(
             for Lk in range(nlevels):
                 if not to_ok[si * nlevels + Lk]:        # per-(ground-step, level) dwell/pad gate
                     continue
-                ts = base + si + takeoff_steps[Lk]      # per-level climb steps (top level outlasts preferred)
+                ts = base + si + takeoff_steps[Lk] + lane_st[li]   # climb, THEN translate out (issue #52)
                 if ts > max_step:
                     continue
                 cell = qr * nlevels + Lk

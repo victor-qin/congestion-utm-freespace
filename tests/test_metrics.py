@@ -282,6 +282,24 @@ def test_altitude_recorded_as_cost_and_both_time_readings():
     assert db["altitude_delay_costeq_s"] > db["altitude_delay_phys_s"]
 
 
+@pytest.mark.parametrize("planner", ("sipp", "sipp_ref", "sipp_shortcut"))
+def test_sipp_family_uses_lattice_floor_for_altitude_metrics(planner):
+    """Every SIPP registry variant shares A*'s flight-level ladder and therefore its 30 m baseline."""
+    cfg = SimConfig(planner=planner)
+    floor = cfg.flight_levels_m[0]
+    assert metrics.nominal_altitude_change_m(cfg) == 2.0 * floor
+    assert metrics.nominal_flight_time_s(2400.0, cfg) == pytest.approx(
+        2400.0 / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_to(floor)
+    )
+
+    intent = _accepted(altitude_change_m=2.0 * cfg.level_z(1), planner="sipp")
+    row = metrics.flight_row(intent, cfg)
+    excess = 2.0 * (cfg.level_z(1) - floor)
+    assert row["excess_altitude_m"] == pytest.approx(excess)
+    assert row["total_delay_s"] == pytest.approx(excess / cfg.climb_rate_mps)
+    assert row["congestion_cost"] == pytest.approx(excess * cfg.cost_altitude_change_per_m)
+
+
 def test_excess_altitude_is_zero_at_the_floor():
     # multi-level A* in empty airspace cruises at the lowest level ⇒ no congestion climb, no alt delay
     res = run(SimConfig(planner="astar"),

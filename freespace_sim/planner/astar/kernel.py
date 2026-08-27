@@ -200,29 +200,29 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
 
 
 @njit(cache=True, nogil=True)
-def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost):
+def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb):
     dx = R * _SQRT3 * (q + r / 2.0) - gx
     dy = R * 1.5 * r - gy
     d = np.sqrt(dx * dx + dy * dy)
     m = d - h_off
     if m < 0.0:
         m = 0.0
-    return c_lat * m + takeoff_cost[L]
+    return c_lat * m + takeoff_cost[L] + goal_cost_lb
 
 
 @njit(cache=True, nogil=True)
 def _search(
     # ---- occupancy pool + static walls + per-flight overlay (CompiledHexOccupancy) ----
     iv, cv, static_col, ov_own_gen,
-    qmin, rmin, qspan, rspan, n_levels, base, max_step,
+    qmin, rmin, qspan, rspan, n_levels, base, max_step, ground_max_step,
     # ---- ground / takeoff-fan (host masks) ----
     oq, orr, lane_q, lane_r, lane_lat, lane_stp, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
     # ---- air edges ----
     rung_steps, rung_cost, c_lat_pitch, c_hold_dt, vertical_edges,
     # ---- goal (host masks) ----
-    goal_q, goal_r, n_goal, land_ok,
+    goal_q, goal_r, goal_lat, n_goal, land_ok,
     # ---- heuristic ----
-    gx, gy, R, h_off, c_lat, h_ground,
+    gx, gy, R, h_off, c_lat, goal_cost_lb, h_ground,
     # ---- g/closed/came open-addressing hash (version-stamped, packed 32 B records: see _packed) ----
     gen, g_pack, g_packf, hash_cap, log2cap,
     # ---- heap (binary, three arrays — see _hpop for why this one is NOT packed) ----
@@ -245,9 +245,15 @@ def _search(
     size = _hpush(heap_f, heap_c, heap_n, 0, h_ground, 0, start_key)
     ctr = 1
     n_exp = 0
+    best_key = -1
+    best_g = 0.0
+    best_score = np.inf
 
     while size > 0:
+        fcur = heap_f[0]
         st_key, size = _hpop(heap_f, heap_c, heap_n, size)
+        if best_key >= 0 and fcur >= best_score:
+            break                                      # every remaining heap key is an objective lower bound
         sslot = _probe(g_pack, gen, st_key, hash_cap, log2cap)
         if g_pack[sslot, 1] & 1:                       # already closed → skip (lazy-deletion heap)
             continue
@@ -265,28 +271,25 @@ def _search(
 
         if L >= 0:                          # air state → goal test (_plan_reference goal_ok)
             is_goal = False
+            goal_idx = -1
             for gidx in range(n_goal):
                 if q == goal_q[gidx] and r == goal_r[gidx]:
                     is_goal = True
+                    goal_idx = gidx
                     break
             if is_goal and sp >= n_gsteps:             # goal reached beyond the bounded mask → widen+re-run
                 return 0, 0.0, n_exp, FB_MASK, step
             if is_goal and land_ok[sp * n_levels + L]:
-                m = 0                                  # reconstruct: walk came goal→start into out_*
-                cur = st_key
-                while cur != -1:
-                    csp = cur % step_span
-                    crem = cur // step_span
-                    cLp = crem % nlp1
-                    ccell = crem // nlp1
-                    cir = ccell % rspan
-                    ciq = ccell // rspan
-                    out_q[m] = ciq + qmin; out_r[m] = cir + rmin
-                    out_L[m] = cLp - 1; out_s[m] = csp + base
-                    cslot = _probe(g_pack, gen, cur, hash_cap, log2cap)
-                    cur = g_pack[cslot, 3]
-                    m += 1
-                return m, base_g, n_exp, OK, -1
+                # The final boundary-cell→terminal-edge segment is outside the lattice graph. Score
+                # its exact lane radius, then retain the best feasible goal until the heap lower bound
+                # proves it optimal. This removes the equal-hop terminal-lane tie.
+                score = base_g + takeoff_cost[L] + goal_lat[goal_idx]
+                if score < best_score:
+                    best_key = st_key
+                    best_g = base_g
+                    best_score = score
+                if fcur >= best_score:
+                    break
 
         n_exp += 1
         if n_exp > max_expansions:
@@ -297,7 +300,7 @@ def _search(
             gi = step - base
             if gi >= n_gsteps:                          # ground step beyond the bounded mask → widen+re-run
                 return 0, 0.0, n_exp, FB_MASK, step
-            if step + 1 <= max_step:                    # ground-wait g→g (emitted FIRST)
+            if step + 1 <= ground_max_step:             # legal ground-wait g→g (emitted FIRST)
                 nkey = ((iq0 * rspan + ir0) * nlp1 + 0) * step_span + (step + 1 - base)
                 ng = base_g + c_gd_dt
                 size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
@@ -330,7 +333,7 @@ def _search(
                         # non-associative: the two differ by ~1 ULP for ~0.7% of large-base_g takeoffs, which
                         # can flip a heap tie and break the compiled==reference node-count/centerline parity).
                         ng = base_g + (takeoff_cost[Lv] + lane_lat[li])
-                        hh = _h_air(lq, lr, Lv, gx, gy, R, h_off, c_lat, takeoff_cost)
+                        hh = _h_air(lq, lr, Lv, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb)
                         size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                                heap_f, heap_c, heap_n, size, max_heap,
                                                nkey, ng, ng + hh, ctr, st_key)
@@ -366,7 +369,7 @@ def _search(
             niq = nq - qmin; nir = nr - rmin
             nkey = ((niq * rspan + nir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_lat_pitch
-            hh = _h_air(nq, nr, L, gx, gy, R, h_off, c_lat, takeoff_cost)
+            hh = _h_air(nq, nr, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb)
             size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                    heap_f, heap_c, heap_n, size, max_heap, nkey, ng, ng + hh, ctr, st_key)
             if rc == -1:
@@ -378,7 +381,7 @@ def _search(
                     iv, cv, static_col, ov_own_gen, gen, read_bbox) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt
-            hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost)
+            hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb)
             size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                    heap_f, heap_c, heap_n, size, max_heap, nkey, ng, ng + hh, ctr, st_key)
             if rc == -1:
@@ -411,7 +414,7 @@ def _search(
                     continue
                 nkey = ((iq * rspan + ir) * nlp1 + (L2 + 1)) * step_span + (ts - base)
                 ng = base_g + rung_cost[rung]
-                hh = _h_air(q, r, L2, gx, gy, R, h_off, c_lat, takeoff_cost)
+                hh = _h_air(q, r, L2, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb)
                 size, ctr, rc = _relax(g_pack, g_packf, gen, hash_cap, log2cap,
                                        heap_f, heap_c, heap_n, size, max_heap, nkey, ng, ng + hh, ctr, st_key)
                 if rc == -1:
@@ -419,4 +422,20 @@ def _search(
                 if rc == -2:
                     return 0, 0.0, n_exp, FB_HEAP, -1
 
+    if best_key >= 0:
+        m = 0                                          # reconstruct: walk came goal→start into out_*
+        cur = best_key
+        while cur != -1:
+            csp = cur % step_span
+            crem = cur // step_span
+            cLp = crem % nlp1
+            ccell = crem // nlp1
+            cir = ccell % rspan
+            ciq = ccell // rspan
+            out_q[m] = ciq + qmin; out_r[m] = cir + rmin
+            out_L[m] = cLp - 1; out_s[m] = csp + base
+            cslot = _probe(g_pack, gen, cur, hash_cap, log2cap)
+            cur = g_pack[cslot, 3]
+            m += 1
+        return m, best_g, n_exp, OK, -1
     return 0, 0.0, n_exp, NO_PATH_EMPTY, -1

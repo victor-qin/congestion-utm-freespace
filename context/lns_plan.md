@@ -779,3 +779,94 @@ the paper, and (1) above says why the next lever should not be argued from cache
 remaining ideas from that list are unaffected by this result — the mask build (idea #3, ~a third of
 host self-time, a genuinely different cost) and N=4 over N=8 (idea #4, free and already measured at
 1.3x) are both still open, and neither depends on the occupancy structure at all.
+
+## 10. The footprint release (2026-08-27) — the destroy costs as much as the search
+
+**Goal of this phase.** §9 ended by saying the next lever should not be argued from cache size.
+This one was found by measuring instead: a stage-by-stage attribution of the LNS loop
+(`.context/perf/prof_lns_loop.py`) put **`release_many` at 35% — as large as the A\* search itself**,
+which is not on any prior list of ideas. This section is the measurement, the brainstorm it drove,
+and the fix that came out of it: **1.127× on the loop, byte-identical trajectory**.
+
+### Where an LNS operation's ~1 s actually goes
+
+Exclusive time per stage, full `density_faa`, 120 iterations at N=8, dense window off. Two
+measurement traps had to be removed first — `run_lns` stamps `wall_s` AFTER its closing `verify`
+replay (4,636 commits landing in the `commit` bucket), and the repair planner's first plan
+re-absorbs the whole schedule (**38 s, one-time**). Steady state after both:
+
+| stage | ms/task | % of loop |
+|---|---|---|
+| A\* search (numba kernel) | 455 | **45.3%** |
+| **destroy — `release_many`** | 354 | **35.3%** |
+| commit (repair + rewind) | 124 | 12.4% |
+| A\* host (mask, volumes, conflict check, overlay) | 44 | 4.4% |
+| destroy heuristic + claim index | 19 | 1.9% |
+
+Two conclusions land immediately. **Even a free search buys only 1.8×.** And **idea #3 from the code
+read — "vectorise the mask build, est. 1.2–1.5×" — is dead**: the whole A\* host is 4.4% and the mask
+is 1.5%. The "~31%" that motivated it was a share of cProfile *self*-time, a denominator that
+excludes the kernel entirely, and cProfile inflates this code 3.6× (359M calls), over-weighting
+exactly the call-heavy loops that idea targeted.
+
+### Why the destroy is expensive, and the brainstorm it drove
+
+`_Pool` stores **free** intervals, which can absorb a block but cannot subtract one, so
+`on_release` is `reset_cell` plus a re-apply of every SURVIVING claim on each touched cell. The
+reference `HexOccupancyService` holds the same information as **refcounts**, where removal is a
+decrement — and costs 2.5% of the loop against the compiled pool's 24.4%. Same information, two
+representations, an order of magnitude apart on removal.
+
+Four designs could attack it, each sized by exactly one measurement, so Phase 0 measured before
+designing (`.context/perf/probe_release_cost.py`):
+
+| # | measurement | 1,526 legs | 4,636 legs | verdict |
+|---|---|---|---|---|
+| 1 | victim overlap inside one `release_many` | 1.15× | 1.17× | **batching nearly dead** |
+| 2 | release+commit spent on tasks that REVERT | 94.3% | **95.1%** | **the lever** |
+| 3 | rebuild vs the released flight's own footprint | 5.4× | **12.2×** | grows with congestion |
+| 4 | a pool-less probe's scan vs today's interval walk | 2.8× | **3.3×** | gates dropping the pool |
+| 5 | `on_release` share of the loop | 8.0% | **19.8%** | worsens with scale |
+
+(1) killed the cheapest idea: `release_many` publishes per flight so a shared cell is rebuilt once
+per victim, and the agent-based operator *deliberately* picks colliding flights — but they overlap
+on only ~15% of cells, so batching is worth ~3% of the loop. (4) killed the most ambitious: the pool
+is a query accelerator derived from `_claims`, and serving probes from `_claims` directly would make
+release O(own) at the cost of scanning 3.3× more on the **query** side, which is 45% of the loop.
+(3) is the one that should worry: the blowup is not geometry, it is congestion, and it more than
+doubles between the two scales.
+
+### What shipped: the reject-path undo journal
+
+| change | point | how it works | issues | outcome |
+|---|---|---|---|---|
+| `_Pool.chain` / `_Pool.restore_cell` | get a cell back to a known earlier state in O(its own intervals) instead of O(its survivors) | `chain` walks out the live free intervals; `restore_cell` re-seeds the head and relinks the rest | `_alloc` can `_grow`, which REPLACES `iv`, so the array is re-read every step | restore is O(10.8) where the rebuild was O(35 `block_range` walks) |
+| `CompiledHexOccupancy.begin_undo` / `rollback_undo` / `discard_undo` / `resume_undo` | 79–90% of tasks reject, and a rejected task ends where it started | copy-on-write: snapshot a cell's chain and claims the first time the transaction touches it; roll back by writing them straight back | what is NOT journalled needs an argument, not an omission — `col_owners` is a documented never-pruned superset, `_fids` is a monotone interning pool, and `evicted_before` cannot move (LNS pins `evict_floor=0.0`) | `_rewind` 284 → **63 ms** |
+| `_suspended` on both ledger hooks | `_rewind` still restores the LEDGER — it is the source of truth — and those calls would re-do work the rollback already undid | after a rollback the service ignores callbacks until `resume_undo` | a service left suspended would silently ignore every later commit, so `resume_undo` is in a `finally`; and `on_release` would `KeyError` on the popped rows, so suspension is required rather than an optimisation | the ledger stays authoritative with no ledger-side seam |
+| `LNSState._rollback_and_rewind`, `AStarPlanner.undo_journals` | one place that opens and closes the transaction | opened before the destroy, discarded AFTER the accept path's in-memory move (so a raise there still has a journal), rolled back on every other exit | only removal-mode services qualify — with `incremental_release=False` there is no release subscriber at all and suspending would desync | `LNSConfig.undo_journal`, on by default |
+
+**Measured, paired at the loop level (200 iterations, full `density_faa`):** 215.1 → **190.9 s,
+1.127×**, with both arms producing 200 tasks, 65 accepts and cost 1,350,294 — *identical*. The
+bucketed profile confirms the win is where it was predicted rather than somewhere else: `_rewind`
+inclusive 24.1 → 5.4 s, `release_many` 355 → 237 ms/task, loop 158.5 → 139.0 s.
+
+Parity is pinned on ANSWERS, not bytes, because the restore is deliberately canonical — it drops
+the empty `lo > hi` slots `block_range` leaves behind, so a restored chain can be shorter than a
+rebuilt one while describing the same free-step set (`_Pool.reset_cell` already states that slot
+identity never affects an answer). `test_undo_journal_is_answer_identical_to_release_and_recommit`
+compares per-task outcomes, a `blocked_py` sample and the committed multiset; a second test forces a
+raise mid-repair and asserts the journal is closed, the service unsuspended, and the occupancy
+restored.
+
+### What is left
+
+* **The reference service is the rest of the rewind.** 63 ms still goes to `HexOccupancyService`'s
+  release + re-commit, which is not journalled. Worth ~4% more, and harder: its state is refcount
+  dicts, so a snapshot may cost as much as the work it saves. Measure before building.
+* **Batching (1) composes** and is worth ~3%; it is now the cheapest remaining item.
+* **The one-time `_absorb` is 38 s** — 24% of a 120-iteration run, amortising to ~2% at 2,000, but
+  paid by EVERY parallel worker at startup.
+* **The blowup still grows with congestion.** The journal removes it on the reject path only; a
+  destroy that is accepted still pays 12.2×. That is the case a representation change (option 4)
+  would fix, and (4)'s 3.3× query penalty is what would have to be bought off first — plausibly by
+  making the §9 window mandatory rather than capped.

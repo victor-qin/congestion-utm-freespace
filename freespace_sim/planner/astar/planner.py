@@ -899,6 +899,16 @@ class AStarPlanner:
         flights — the ones that reach max_expansions — must fit here)."""
         return max(20, (self.max_expansions * 2 - 1).bit_length())
 
+    def undo_journals(self) -> tuple:
+        """Occupancy services that support a transactional rollback — the LNS reject path's seam.
+
+        Only removal-mode services qualify: with ``incremental_release=False`` there is no release
+        subscriber at all (the service notices the ledger shrink and rebuilds), so there is nothing
+        to journal and suspending its callbacks would desync it. Empty until the first plan binds a
+        service, which is correct — a transaction opened before then has nothing to undo."""
+        c = self._cocc
+        return (c,) if c is not None and c.track_removal else ()
+
     def _build_window(self, cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
                       goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops) -> bool:
         """Materialise this plan's dense occupancy bitmap (:mod:`window`), or leave it off.

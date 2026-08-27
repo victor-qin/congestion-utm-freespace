@@ -37,6 +37,7 @@ from freespace_sim.geometry import CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.lns.unimpeded import resolve_workers, unimpeded_costs
 from freespace_sim.sim import realized_release_s
 from freespace_sim.types import OperationalIntent
 
@@ -122,6 +123,8 @@ class LNSState:
         turnaround_s: float | None = None,
         repair_planner: AStarPlanner | None = None,
         incremental_release: bool = True,
+        # Safe for direct construction too: None is an explicit opt-in to automatic multiprocessing.
+        unimpeded_workers: int | None = 1,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger
@@ -209,25 +212,23 @@ class LNSState:
 
         # Unimpeded weighted cost per movable flight — the paper's d(s_i, g_i) analogue, so
         # delay(fid) = incumbent cost - unimpeded cost. One plan per flight on a static-walls-only
-        # ledger (its own planner instance: one planner per ledger).
+        # ledger, which nothing is ever committed to: the plans cannot see each other, so
+        # `unimpeded_costs` may shard them across processes without changing a cost (see its
+        # docstring). This is the whole of the state build, and it grows with the schedule.
         self._unimp_cost: dict[int, float] = {}
         # Kept so the solver's verify replays the SAME world the unimpeded baseline was measured in —
         # one owner for "which walls is this run about", not two that can drift apart.
         self.static_terms = tuple(static_terms)
-        free = ReservationLedger(cfg)
-        for center, term in self.static_terms:
-            free.register_static_terminal(center, term)
-        planner_u = AStarPlanner()
-        planner_u.evict_floor = 0.0
-        for k, fid in enumerate(self._movable):
-            u = planner_u.plan(self.incumbent[fid].request, free, cfg)
-            if u.accepted:
-                self._unimp_cost[fid] = float(u.cost)
+        rows = unimpeded_costs(
+            cfg, self.static_terms, [self.incumbent[fid].request for fid in self._movable],
+            n_workers=resolve_workers(unimpeded_workers),
+        )
+        for fid, cost, denial in rows:
+            if cost is not None:
+                self._unimp_cost[fid] = cost
             else:  # can't even place it alone (cap artifact): treat as undelayed, never seed a walk
                 self._unimp_cost[fid] = float(self.incumbent[fid].cost)
-                log.warning("lns: unimpeded plan denied for flight %d (%s)", fid, u.denial_reason)
-            if (k + 1) % 1000 == 0:
-                log.info("lns: unimpeded baseline %d/%d", k + 1, len(self._movable))
+                log.warning("lns: unimpeded plan denied for flight %d (%s)", fid, denial)
 
         # Claim index for the destroy heuristics: cell -> [(s_lo, s_hi, fid)] over the same
         # inflated corridor/pad raster A* deconflicts against (blocked rows only; the
@@ -236,7 +237,11 @@ class LNSState:
         self._infl_b = cfg.corridor_width_m / 2.0 + self._R
         self._infl_p = cfg.effective_hover_radius_m + self._R
         self._claims: dict[Cell, list[tuple[int, int, int]]] = {}
-        self._cells_of: dict[int, list[tuple[Cell, int, int]]] = {}
+        # fid -> the DISTINCT cells it claims. `_index_remove` filters each cell's row list by owner
+        # and re-derives its contention, both of which are per-cell — so a per-ROW list did the same
+        # work once per (cell, span) instead of once per cell, and stored a `(cell, s_lo, s_hi)`
+        # triple whose spans nothing ever read (measured 44 MB at 290 flights).
+        self._cells_of: dict[int, set[Cell]] = {}
         self._contended: set[Cell] = set()
         self._contended_list: list[Cell] | None = None
         self._visits: dict[int, list[tuple[int, Cell]]] = {}
@@ -256,7 +261,9 @@ class LNSState:
             self._refresh_contention(cell)
 
     def _index_add(self, fid: int, volumes, refresh: bool = True) -> None:
-        rows = self._cells_of.setdefault(fid, [])
+        rows = self._cells_of.get(fid)
+        if rows is None:
+            rows = self._cells_of[fid] = set()
         # The flight's own terminal columns. A corridor cell INSIDE one of them is the vertiport's
         # unreserved tactical interior — the occupancy services drop it (HexOccupancyService.add_volume
         # / CompiledHexOccupancy._add), so A* never deconflicts there. Indexing it anyway would make
@@ -276,10 +283,18 @@ class LNSState:
                 if own_cols and self._inside_own_column(q, r, own_cols):
                     continue
                 cell = (q, r, level)
-                self._claims.setdefault(cell, []).append((s_lo, s_hi, fid))
-                rows.append((cell, s_lo, s_hi))
-                if refresh:
-                    self._refresh_contention(cell)
+                entries = self._claims.get(cell)
+                if entries is None:
+                    self._claims[cell] = [(s_lo, s_hi, fid)]
+                else:
+                    entries.append((s_lo, s_hi, fid))
+                if cell not in rows:
+                    # A flight claims the same cell in several volumes (adjacent corridor boxes
+                    # overlap). Contention is the cell's OWNER SET, which the second and later
+                    # claims cannot change — so refresh on the first only. Same final state.
+                    rows.add(cell)
+                    if refresh:
+                        self._refresh_contention(cell)
 
     def _inside_own_column(self, q: int, r: int, cols) -> bool:
         """Same test as the occupancy services' ``_inside_a_column`` — hex centre inside any of the
@@ -288,7 +303,7 @@ class LNSState:
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
     def _index_remove(self, fid: int) -> None:
-        for cell, _s_lo, _s_hi in self._cells_of.pop(fid, ()):
+        for cell in self._cells_of.pop(fid, ()):
             entries = self._claims.get(cell)
             if not entries:
                 continue

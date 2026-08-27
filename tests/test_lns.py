@@ -84,6 +84,51 @@ def test_release_many_compaction_preserves_content():
     assert _ledger_multiset(led) == before_live
 
 
+def test_release_many_handles_a_flight_committed_in_several_calls():
+    """`_runs` records a flight's slot runs and coalesces contiguous appends, so a flight committed
+    in ONE call costs one run and a flight committed in several (interleaved with another's) costs
+    several. Releasing must take all of them — a single-run index would silently strand volumes in
+    the ledger with nobody owning them."""
+    led = ReservationLedger(CFG)
+    led.commit(1, [_wall(1000.0), _wall(1500.0)])
+    led.commit(2, [_wall(3000.0)])
+    led.commit(1, [_wall(2000.0)])                   # non-contiguous second run for flight 1
+    assert led._runs[1] == [[0, 2], [3, 4]] and led._runs[2] == [[2, 3]]
+    assert led.release_many([1]) == 3                # both runs, not just the first
+    assert [f for f, _ in led.iter_committed()] == [2]
+    assert led.n_volumes == 1
+    assert 1 not in led._runs
+
+
+def test_compact_renumbers_runs_and_buckets():
+    """Compaction moves every live slot, so the own-slot index and the (step, cell) buckets have to
+    move with it. A stale run would tombstone SOMEONE ELSE's volume on the next release."""
+    led = ReservationLedger(CFG)
+    for fid in range(6):
+        led.commit(fid, [_wall(1000.0 + 500 * fid)])
+    led.release_many([0, 1, 2, 3])                   # 4 dead > 2 live -> compaction fires
+    assert led._n_dead == 0
+    assert sorted(led._runs) == [4, 5]
+    assert sorted(r for runs in led._runs.values() for r in runs) == [[0, 1], [1, 2]]
+    probe = [_wall(1000.0 + 500 * 4)]                # flight 4's wall is still found after renumber
+    assert {f for f, _ in led.conflicts(probe)} == {4}
+    assert led.release_many([4]) == 1 and led.conflicts(probe) == []
+
+
+def test_compact_coalesces_runs_that_become_adjacent():
+    led = ReservationLedger(CFG)
+    led.commit(1, [_wall(1000.0)])
+    led.commit(2, [_wall(1500.0)])
+    led.commit(1, [_wall(2000.0)])
+    led.commit(3, [_wall(2500.0)])
+    led.commit(4, [_wall(3000.0)])
+
+    led.release_many([2, 3, 4])                    # compaction removes every gap around flight 1
+    assert led._runs == {1: [[0, 2]]}
+    assert led.release_many([1]) == 2
+    assert led.n_volumes == 0
+
+
 def test_incremental_release_reference_service_refcounts():
     """Two flights covering the same cells: removing one must NOT free the cells (refcounts),
     removing both must."""
@@ -130,6 +175,30 @@ def test_incremental_release_compiled_matches_fresh_absorb():
                     assert (occ.blocked_py(q + dq, r, level, s)
                             == fresh.blocked_py(q + dq, r, level, s)), (x, dq, level, s)
     assert occ.n_added == fresh.n_added == 1
+
+
+def test_incremental_release_compiled_treats_identical_spans_as_a_multiset():
+    """The claim need not repeat its owner: equal spans are fungible, but their multiplicity is not."""
+    from freespace_sim.planner import hexgrid as hg
+    from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
+
+    wall = _wall()
+    occ = CompiledHexOccupancy(CFG, track_removal=True)
+    occ.on_commit(1, [wall])
+    occ.on_commit(2, [wall])
+    q, r, level, s_lo, _s_hi, _in_blk = next(
+        row for row in hg.rasterize_ranges(
+            wall, CFG, occ.R, occ.infl_blocked, occ.infl_pad
+        ) if row[-1]
+    )
+    step = max(0, s_lo)                                  # pools seed their query horizon at step 0
+    assert occ.blocked_py(q, r, level, step)
+
+    occ.on_release(1, [wall])
+    assert occ.blocked_py(q, r, level, step)          # the equal claim from flight 2 survives
+    occ.on_release(2, [wall])
+    assert not occ.blocked_py(q, r, level, step)
+    assert occ.n_added == 0
 
 
 def test_pool_reset_cell_reclaims_overflow_slots():
@@ -802,7 +871,7 @@ def test_repair_restores_when_accept_index_mutation_raises(monkeypatch, method_n
     ledger_before = _ledger_multiset(res.ledger)
     cost_before = state.total_cost
     claims_before = {cell: list(rows) for cell, rows in state._claims.items()}
-    cells_before = {owner: list(rows) for owner, rows in state._cells_of.items()}
+    cells_before = {owner: set(rows) for owner, rows in state._cells_of.items()}
     contention_before = list(state.contention_cells())
 
     monkeypatch.setattr(
@@ -827,9 +896,120 @@ def test_repair_restores_when_accept_index_mutation_raises(monkeypatch, method_n
     assert state.total_cost == cost_before
     assert _ledger_multiset(res.ledger) == ledger_before
     assert state._claims == claims_before
-    assert state._cells_of == cells_before
+    assert {owner: set(rows) for owner, rows in state._cells_of.items()} == cells_before
     assert state.contention_cells() == contention_before
     assert lns_state._same_committed_schedule(res.ledger, state.final_intents())
+
+
+# ------------------------------------------------------------------ unimpeded delay ruler
+def test_unimpeded_costs_parallel_matches_sequential():
+    """The ruler shards across processes because its ledger is never committed to — plan i cannot
+    observe plan j. Force the pool (probe prefix of 0, no projection floor) and require the SAME
+    costs in the SAME request order: this is the only thing standing between a throughput knob and
+    a silently different delay premium, which would re-rank every victim and every repair."""
+    from freespace_sim.planner.lns import unimpeded as U
+
+    reqs = [_req(fid, y=200.0 * fid) for fid in range(1, 13)]
+    seq = U.unimpeded_costs(CFG, (), reqs, n_workers=1)
+    par = _forced_parallel(U, CFG, reqs, workers=4)
+    assert [r[0] for r in seq] == [r.flight_id for r in reqs]     # request order, not shard order
+    assert par == seq
+    assert all(c is not None for _f, c, _d in seq)                # a walls-free world places them all
+
+
+def test_unimpeded_costs_survives_a_dead_worker(monkeypatch):
+    """A worker that dies must cost throughput, not a flight: its shard is replanned in-process.
+    Losing one silently would leave `delay()` reading a KeyError-free but WRONG premium."""
+    from freespace_sim.planner.lns import unimpeded as U
+
+    reqs = [_req(fid, y=200.0 * fid) for fid in range(1, 9)]
+    expected = U.unimpeded_costs(CFG, (), reqs, n_workers=1)
+
+    # module level: `spawn` pickles the Process target BY NAME, so a closure cannot be one
+    monkeypatch.setattr(U, "_worker_main", _suicide_worker)
+    assert _forced_parallel(U, CFG, reqs, workers=2) == expected
+
+
+def test_unimpeded_costs_cleans_up_after_partial_spawn_failure(monkeypatch):
+    """If worker N fails to start, workers 0..N-1 must be reaped and every request replanned."""
+    from freespace_sim.planner.lns import unimpeded as U
+
+    reqs = [_req(fid, y=200.0 * fid) for fid in range(1, 3)]
+    expected = U.unimpeded_costs(CFG, (), reqs, n_workers=1)
+
+    class FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, fail):
+            self.fail = fail
+            self.pid = None
+            self.exitcode = None
+            self.alive = False
+            self.terminated = False
+
+        def start(self):
+            if self.fail:
+                raise OSError("spawn limit")
+            self.pid = 123
+            self.alive = True
+
+        def join(self, timeout=None):
+            if self.terminated:
+                self.alive = False
+                self.exitcode = -15
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+    class FakeContext:
+        def __init__(self):
+            self.processes = []
+            self.connections = []
+
+        def Pipe(self, duplex=False):
+            assert duplex is False
+            pair = FakeConn(), FakeConn()
+            self.connections.extend(pair)
+            return pair
+
+        def Process(self, **_kwargs):
+            proc = FakeProcess(fail=bool(self.processes))
+            self.processes.append(proc)
+            return proc
+
+    ctx = FakeContext()
+    monkeypatch.setattr(U.mp, "get_context", lambda _method: ctx)
+
+    assert _forced_parallel(U, CFG, reqs, workers=2) == expected
+    assert ctx.processes[0].terminated
+    assert all(conn.closed for conn in ctx.connections)
+
+
+def _suicide_worker(conn, cfg, static_terms, requests):
+    """A worker that exits without answering (see test_unimpeded_costs_survives_a_dead_worker)."""
+    conn.close()
+
+
+def _forced_parallel(U, cfg, reqs, workers):
+    """Run `unimpeded_costs` with the pool forced on regardless of how fast the probe ran."""
+    probe, floor = U._PROBE_N, U._MIN_PARALLEL_S
+    U._PROBE_N, U._MIN_PARALLEL_S = 0, -1.0
+    try:
+        return U.unimpeded_costs(cfg, (), reqs, n_workers=workers)
+    finally:
+        U._PROBE_N, U._MIN_PARALLEL_S = probe, floor
 
 
 @pytest.mark.slow
@@ -932,6 +1112,23 @@ def test_milp_capacity_rebinds_after_a_takeover():
 
 
 # -------------------------------------------------------------------- run_lns argument contract
+def test_run_lns_defaults_unimpeded_ruler_to_in_process(monkeypatch):
+    """A public API caller must opt into spawn; its top-level module may not have a main guard."""
+    seen = []
+
+    def capture(_cfg, _static_terms, _requests, *, n_workers, log_every=1000):
+        seen.append(n_workers)
+        return []
+
+    monkeypatch.setattr(lns_state, "unimpeded_costs", capture)
+    assert LNSConfig().unimpeded_workers == 1
+
+    run_lns(CFG, ReservationLedger(CFG), [],
+            LNSConfig(max_iterations=0, log_every=0))
+    LNSState(CFG, ReservationLedger(CFG), [])       # direct construction is safe by default too
+    assert seen == [1, 1]
+
+
 def test_run_lns_defaults_its_walls_to_the_ledgers(monkeypatch):
     """Left at (), the unimpeded baseline is wall-free — inflating every delay premium, which is the
     ranking that picks victims and orders the repair — and the closing verify replays a world the

@@ -37,6 +37,7 @@ Cells are bucketed by step (``step -> {(q, r)}``); volumes themselves are NOT re
 
 from __future__ import annotations
 
+from array import array
 from collections.abc import Collection, Hashable
 
 from .. import hexgrid as hg
@@ -56,8 +57,20 @@ class HexOccupancyService:
         # must not free the cell), and each committed flight's applied rows are recorded so
         # `on_release` can reverse them exactly. Membership queries are unchanged (`in` works on
         # dict keys); flag off ⇒ the original set-based structures, byte-for-byte.
+        # Journal layout (mode on): `_rows[fid]` is a FLAT int64 array of 4-slot rows
+        # ``(cell_id, s_lo, s_hi, code)`` rather than a list of ``(kind, cell, s_lo, s_hi, extra)``
+        # tuples — measured 185 B/row against 32 B here, and at ~900 rows per flight the tuple form
+        # cost 49 MB at 290 flights (linear in schedule size). ``cell_id`` indexes `_cells`, which
+        # interns each ``(q, r, L)`` ONCE, so a reversal reads back the very tuple it inserted with:
+        # no per-row allocation, unlike re-packing ``(q, r, L)`` out of three stored ints.
+        # ``code``: -1 = corridor pad-only, -2 = corridor pad+blocked, >= 0 = terminal column whose
+        # hub id is ``_tids[code]``. The release callback supplies the exact committed volumes.
         self.track_removal = track_removal
-        self._rows: dict[int, list[tuple]] = {}                   # fid -> applied rows (mode on)
+        self._rows: dict[int, array] = {}                         # fid -> flat rows (mode on)
+        self._cells: list[tuple[int, int, int]] = []              # cell_id -> (q, r, L)
+        self._cell_ids: dict[tuple[int, int, int], int] = {}      # (q, r, L) -> cell_id
+        self._tids: list = []                                     # code -> terminal id
+        self._tid_ids: dict = {}                                  # terminal id -> code
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R   # corridor footprint
         self.infl_pad = cfg.effective_hover_radius_m + self.R     # wider hover-cylinder footprint
@@ -127,42 +140,84 @@ class HexOccupancyService:
         # is what the compiled image reuses. `own`/`in_blk`/`is_column` are per-cell, hoisted out of
         # the step loop.
         track = self.track_removal
+        pad_b, blk_b, floor = self.pad, self.blocked, self.evicted_before
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
-            if self.evicted_before is not None and s_lo < self.evicted_before:
-                s_lo = self.evicted_before   # guard: never resurrect an already-evicted past step
+            if floor is not None and s_lo < floor:
+                s_lo = floor                 # guard: never resurrect an already-evicted past step
             if not is_column:
                 own = own_cols and self._inside_a_column(q, r, own_cols)
                 if own:
                     continue             # the committing flight's own terminal interior — unreserved
                 cell = (q, r, L)
+                # `_bump`/`setdefault(s, <new container>)` inlined over the step run: this is the
+                # service's hottest loop (8.4 M bumps in a 60-iteration LNS run) and `setdefault`'s
+                # default argument is built EAGERLY, so the dict/set it allocated was thrown away on
+                # every hit. `.get` + a None test allocates only on a genuinely new step.
                 if track:
+                    # Intern whenever the journal is on, `_rows` or not: the bucket key must be the
+                    # canonical object either way, or the sharing that makes the packing pay is lost.
+                    cell, cid = self._intern(cell)
                     if _rows is not None:
-                        _rows.append(("c", cell, s_lo, s_hi, in_blk))
+                        _rows.append(cid)
+                        _rows.append(s_lo)
+                        _rows.append(s_hi)
+                        _rows.append(-2 if in_blk else -1)
                     for s in range(s_lo, s_hi + 1):
-                        self._bump(self.pad, s, cell)
+                        d = pad_b.get(s)
+                        if d is None:
+                            d = pad_b[s] = {}
+                        d[cell] = d.get(cell, 0) + 1
                         if in_blk:
-                            self._bump(self.blocked, s, cell)
+                            d = blk_b.get(s)
+                            if d is None:
+                                d = blk_b[s] = {}
+                            d[cell] = d.get(cell, 0) + 1
                 else:
                     for s in range(s_lo, s_hi + 1):
-                        self.pad.setdefault(s, set()).add(cell)
+                        d = pad_b.get(s)
+                        if d is None:
+                            d = pad_b[s] = set()
+                        d.add(cell)
                         if in_blk:
-                            self.blocked.setdefault(s, set()).add(cell)
+                            d = blk_b.get(s)
+                            if d is None:
+                                d = blk_b[s] = set()
+                            d.add(cell)
             elif in_blk:
                 # shared terminal column: record `tid` over its inner (blocked-strength) footprint at
                 # level L — the cells A* queries for the own-hub cruise exemption (capacity lives in
                 # TerminalCapacity).
                 cell = (q, r, L)
                 if track:
+                    cell, cid = self._intern(cell)
                     if _rows is not None:
-                        _rows.append(("t", cell, s_lo, s_hi, tid))
+                        code = self._tid_ids.get(tid)
+                        if code is None:
+                            code = self._tid_ids[tid] = len(self._tids)
+                            self._tids.append(tid)
+                        _rows.append(cid)
+                        _rows.append(s_lo)
+                        _rows.append(s_hi)
+                        _rows.append(code)
                     for s in range(s_lo, s_hi + 1):
                         self._bump(self.term_cells, s, cell, tid)
                 else:
                     for s in range(s_lo, s_hi + 1):
                         self.term_cells.setdefault(s, {}).setdefault(cell, set()).add(tid)
         self.n_added += 1
+
+    def _intern(self, cell: tuple[int, int, int]) -> tuple[tuple[int, int, int], int]:
+        """``(canonical_cell, cell_id)``, registering the cell if new. Returning the canonical TUPLE
+        (not just its id) is what lets the bucket keys, the journal and `on_release` all share ONE
+        tuple per distinct cell — the difference between 80 bytes per row and 80 bytes per cell."""
+        cid = self._cell_ids.get(cell)
+        if cid is None:
+            cid = self._cell_ids[cell] = len(self._cells)
+            self._cells.append(cell)
+            return cell, cid
+        return self._cells[cid], cid
 
     def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
         c = hg.hex_center(q, r, self.R)
@@ -177,9 +232,12 @@ class HexOccupancyService:
         for v in volumes:
             self.add_volume(v, own_cols=own_cols, _rows=rows)
         if self.track_removal:
-            entry = self._rows.setdefault(flight_id, [])
-            entry.append(len(volumes))                 # n_added contribution, for the reversal
-            entry.extend(rows)
+            entry = self._rows.get(flight_id)
+            if entry is None:
+                self._rows[flight_id] = array("q", rows)   # 'q' = int64: cell ids and steps cannot
+                #                                            overflow it, so packing stays total
+            else:
+                entry.extend(rows)
 
     def on_release(self, flight_id, volumes) -> None:
         """Ledger release subscriber (removal mode): reverse the flight's recorded rows so the
@@ -188,23 +246,37 @@ class HexOccupancyService:
         them; the same clamp `add_volume` applies on insert)."""
         rows = self._rows.pop(flight_id)
         floor = self.evicted_before
-        n_volumes = 0
-        for row in rows:
-            if isinstance(row, int):                   # a commit's volume count
-                n_volumes += row
-                continue
-            kind, cell, s_lo, s_hi = row[0], row[1], row[2], row[3]
+        cells, pad_b, blk_b = self._cells, self.pad, self.blocked
+        for i in range(0, len(rows), 4):               # flat 4-slot rows; see `_rows`
+            s_lo, s_hi, code = rows[i + 1], rows[i + 2], rows[i + 3]
             if floor is not None and s_lo < floor:
                 s_lo = floor
-            if kind == "c":
+            cell = cells[rows[i]]
+            if code < 0:                              # corridor: -1 pad-only, -2 pad + blocked
+                in_blk = code == -2
+                for s in range(s_lo, s_hi + 1):       # `_drop` inlined, mirroring `add_volume`
+                    d = pad_b[s]
+                    n = d[cell] - 1
+                    if n:
+                        d[cell] = n
+                    else:
+                        del d[cell]
+                        if not d:
+                            del pad_b[s]
+                    if in_blk:
+                        d = blk_b[s]
+                        n = d[cell] - 1
+                        if n:
+                            d[cell] = n
+                        else:
+                            del d[cell]
+                            if not d:
+                                del blk_b[s]
+            else:                                     # shared terminal column
+                tid = self._tids[code]
                 for s in range(s_lo, s_hi + 1):
-                    self._drop(self.pad, s, cell)
-                    if row[4]:
-                        self._drop(self.blocked, s, cell)
-            else:
-                for s in range(s_lo, s_hi + 1):
-                    self._drop(self.term_cells, s, cell, row[4])
-        self.n_added -= n_volumes
+                    self._drop(self.term_cells, s, cell, tid)
+        self.n_added -= len(volumes)
 
     def _on_static(self, center, term) -> None:
         """Derive this hub's discrete routing wall from a ledger static-terminal registration — the
@@ -233,6 +305,8 @@ class HexOccupancyService:
         self.pad.clear()
         self.term_cells.clear()
         self._rows.clear()
+        # `_cells` / `_tids` are pure interning pools — value-identical across a rebuild and never
+        # read except through a live row, so keeping them saves re-interning the same cells.
         self.n_added = 0
         self.evicted_before = None
 

@@ -93,6 +93,13 @@ class ReservationLedger:
         self._fids: list[int] = []
         self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
         self._n_dead = 0                     # tombstoned entries in _vols (release_many); compacted lazily
+        # flight_id -> the [start, stop) slot RUNS it owns in `_vols`, so a release touches only its own
+        # entries instead of scanning every committed volume (the LNS destroy is ~380 volumes out of
+        # ~26k — a 69x over-scan, and the last per-iteration term that grew with schedule size).
+        # Maintained in `_append`, which is the single insertion point (commit / _compact / release),
+        # and which COALESCES an append onto the previous run when it is contiguous — so a flight
+        # committed in one call costs one run, and `_compact`/`release` rebuild the index for free.
+        self._runs: dict[int, list[list[int]]] = {}
         self._release_subs: list = []        # release_many subscribers (removal publish hook)
         # committed-volume index keyed by (step, cell_x, cell_y): a TIME bucket (discrete step) CROSSED with an
         # xy SPATIAL sub-index, so a query scans only volumes sharing its timestep AND near its xy — not every
@@ -221,6 +228,13 @@ class ReservationLedger:
         self._fids.append(flight_id)
         vbb = self._flat_aabb(v)
         self._aabb.append(vbb)
+        runs = self._runs.get(flight_id)          # own-slot index (see `_runs`); coalesce when contiguous
+        if runs is None:
+            self._runs[flight_id] = [[idx, idx + 1]]
+        elif runs[-1][1] == idx:
+            runs[-1][1] = idx + 1
+        else:
+            runs.append([idx, idx + 1])
         cells = list(_xy_cell_span(vbb, _DYNAMIC_GRID_CELL_M))   # xy-cells this box touches (enumerate once)
         for s in self._steps(v):
             for key in cells:            # FULL cross product steps × cells — a diagonal pairing would miss conflicts
@@ -247,6 +261,7 @@ class ReservationLedger:
         keep = [(f, v) for f, v in zip(self._fids, self._vols)
                 if f != flight_id and f != self.TOMBSTONE_FID]
         self._vols, self._fids, self._aabb, self._buckets = [], [], [], {}
+        self._runs = {}
         self._n_dead = 0
         for f, v in keep:
             self.commit(f, [v])
@@ -254,23 +269,36 @@ class ReservationLedger:
     def release_many(self, flight_ids) -> int:
         """Remove several flights by tombstoning their volumes in place — the LNS destroy primitive.
 
-        O(current volumes) flag pass, no bucket rebuild, and — unlike ``release`` — **no observer
-        re-feed**: the planners' incremental occupancy services notice the shrink themselves
-        (``ledger.n_volumes < svc.n_added``) on their next ``plan()`` and rebuild from
-        ``iter_committed``. A tombstone keeps its slot in ``_vols``/``_buckets`` but its AABB becomes
-        the empty box, so every AABB-pruned read (``conflicts``/``any_conflict``/the terminal-capacity
-        column scan) skips it; ``iter_committed`` skips it by owner id. Arrays are compacted once dead
-        entries outnumber live ones. Returns the number of volumes tombstoned."""
-        doomed = set(flight_ids)
+        O(released volumes), no bucket rebuild, and — unlike ``release`` — **no observer re-feed**:
+        removal subscribers reverse their rows directly; commit-only services detect the shrink on
+        their next ``plan()`` and rebuild from ``iter_committed``. A tombstone keeps its slot in
+        ``_vols``/``_buckets`` but its AABB becomes the empty box, so every AABB-pruned read
+        (``conflicts``/``any_conflict``/the terminal-capacity column scan) skips it;
+        ``iter_committed`` skips it by owner id. Arrays are compacted once dead entries outnumber
+        live ones. Returns the number of volumes tombstoned."""
+        # `_runs` gives each victim's own slots directly, so this costs O(released volumes) rather
+        # than O(everything committed). Publish order is by first slot — i.e. commit order, what the
+        # old full scan produced — so subscribers see an unchanged sequence.
+        owned = []
+        for fid in set(flight_ids):
+            runs = self._runs.get(fid)
+            if runs is not None:                  # already released, or never committed
+                owned.append((runs[0][0], fid, runs))
+        owned.sort()                              # first slot == commit order
         removed: dict[int, list[Volume4D]] = {}
+        tomb, dead = self.TOMBSTONE_FID, self._DEAD_AABB
+        fids, aabb = self._fids, self._aabb
         n = 0
-        for i, f in enumerate(self._fids):
-            if f in doomed:
-                self._fids[i] = self.TOMBSTONE_FID
-                self._aabb[i] = self._DEAD_AABB
-                if self._release_subs:
-                    removed.setdefault(f, []).append(self._vols[i])
-                n += 1
+        for _first, fid, runs in owned:
+            del self._runs[fid]
+            vols = removed.setdefault(fid, []) if self._release_subs else None
+            for lo, hi in runs:
+                for i in range(lo, hi):
+                    fids[i] = tomb
+                    aabb[i] = dead
+                if vols is not None:
+                    vols.extend(self._vols[lo:hi])
+                n += hi - lo
         self._n_dead += n
         if self._n_dead > len(self._vols) - self._n_dead:
             self._compact()
@@ -280,13 +308,40 @@ class ReservationLedger:
         return n
 
     def _compact(self) -> None:
-        """Drop tombstoned entries and rebuild the buckets. Silent to observers by design: a
-        compaction changes indices, not content, and the services never hold ledger indices."""
-        keep = [(f, v) for f, v in zip(self._fids, self._vols) if f != self.TOMBSTONE_FID]
-        self._vols, self._fids, self._aabb, self._buckets = [], [], [], {}
+        """Drop tombstoned entries and RENUMBER the index in place. Silent to observers by design: a
+        compaction changes indices, not content, and the services never hold ledger indices.
+
+        Renumbering, rather than re-appending every survivor, is what keeps this cheap: the bucket
+        keys a volume belongs to are already known, so re-deriving them (``_flat_aabb`` +
+        ``_steps`` × ``_xy_cell_span``, per volume) buys nothing. Survivor order is preserved, so
+        each flight's volumes stay contiguous (``iter_committed``'s contract) and every bucket list
+        stays ascending (the remap is monotone)."""
+        tomb = self.TOMBSTONE_FID
+        remap = [-1] * len(self._fids)            # old slot -> new slot, -1 = tombstoned (list, not
+        #                                           dict: the bucket remap below is the hot loop)
+        vols, fids, aabb = [], [], []
+        runs: dict[int, list[list[int]]] = {}
+        for i, f in enumerate(self._fids):
+            if f == tomb:
+                continue
+            new_idx = remap[i] = len(vols)
+            vols.append(self._vols[i])
+            fids.append(f)
+            aabb.append(self._aabb[i])
+            owned = runs.get(f)
+            if owned is None:
+                runs[f] = [[new_idx, new_idx + 1]]
+            elif owned[-1][1] == new_idx:
+                owned[-1][1] = new_idx + 1
+            else:
+                owned.append([new_idx, new_idx + 1])
+        buckets = {}
+        for key, idxs in self._buckets.items():
+            live = [j for j in map(remap.__getitem__, idxs) if j >= 0]
+            if live:
+                buckets[key] = live
+        self._vols, self._fids, self._aabb, self._buckets, self._runs = vols, fids, aabb, buckets, runs
         self._n_dead = 0
-        for f, v in keep:
-            self._append(f, v)
 
     # ----- reads -----
     def conflicts(self, volumes: list[Volume4D]) -> list[tuple[int, Volume4D]]:

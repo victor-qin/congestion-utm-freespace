@@ -530,7 +530,7 @@ def rasterize_volume_ranges(
 
 _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 # Both occupancy images consume the SAME volume with the SAME params on each commit (hex then
-# compiled), so the geometry sweep (`_candidate_slack`) is memoized once and reused by the second
+# compiled), so the geometry sweep (`_sweep_kept`) is memoized once and reused by the second
 # consumer. The cap must exceed the reuse WINDOW for that sharing to fire. For the FCFS sim that
 # window is one flight's volumes; under LNS it is one NEIGHBORHOOD's, because the claim index
 # (`lns.state._index_add`, a third consumer at the same inflations) rasterizes the victims only

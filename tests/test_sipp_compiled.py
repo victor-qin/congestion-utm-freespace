@@ -527,14 +527,18 @@ def test_commit_hook_shares_one_geometry_sweep_across_all_three_structures(monke
     volumes = [Volume4D(shape, 8.0, 12.0, terminal_id="hub") for _ in range(nvol)]
 
     calls = 0
-    real = hg._candidate_slack
+    # `_sweep_kept` is "the single place the compiled/reference choice is made", so counting here is
+    # backend-independent. It replaced `_candidate_slack` as the sweep entry point in #115, which
+    # silently zeroed this counter (0/1025) rather than changing the answer — the assert below is what
+    # catches that class of drift, so keep it counting the funnel, not either backend's leaf.
+    real = hg._sweep_kept
 
     def counting(*args, **kwargs):
         nonlocal calls
         calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(hg, "_candidate_slack", counting)
+    monkeypatch.setattr(hg, "_sweep_kept", counting)
     monkeypatch.setattr(hg, "_RANGE_CACHE_CAP", hg._RANGE_CACHE_MIN_CAP)
     hg._RANGE_CACHE.clear()
     try:

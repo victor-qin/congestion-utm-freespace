@@ -64,6 +64,13 @@ class LNSConfig:
     # times, which is exactly the list-walk growth `analysis/prof_ledger_scaling.py` measures), so
     # the A/B has to be runnable end to end: `analysis/ab_dense_window.py`.
     window_bytes: int | None = None
+    # Reject-path undo journal (`CompiledHexOccupancy.begin_undo`). ANSWER-NEUTRAL — it restores the
+    # occupancy to a state it provably held, and `_rewind` still restores the ledger itself — so this
+    # is a pure speed knob and every byte-parity gate holds at either value. On by default because
+    # the work it removes is measured waste: 79-90% of tasks reject, and `_rewind` is 15.2% of the
+    # loop. False runs the release-and-re-commit path, which is the A/B baseline and the fallback if
+    # a service ever gains state the journal does not cover.
+    undo_journal: bool = True
     time_limit_s: float | None = None
     verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
     log_every: int = 200
@@ -357,6 +364,7 @@ def _build_lns_state(
         unimpeded_workers=lns.unimpeded_workers,
         maintain_claim_index=maintain_claim_index,
         window_bytes=lns.window_bytes,
+        undo_journal=lns.undo_journal,
     )
 
 

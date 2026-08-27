@@ -310,6 +310,7 @@ class CompiledHexOccupancy:
 
     # ---------- commit hook ----------
     def on_commit(self, flight_id, volumes) -> None:
+        hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         rows = [] if self.track_removal else None

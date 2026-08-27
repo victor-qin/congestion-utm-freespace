@@ -96,6 +96,7 @@ class SafeIntervalIndex:
         self.evicted_before: int | None = None
 
     def on_commit(self, _flight_id, volumes) -> None:
+        hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         for v in volumes:
@@ -109,15 +110,22 @@ class SafeIntervalIndex:
     def _add(self, vol, own_cols) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        for q, r, L, s, in_blk in hg.rasterize_volume_dual(
+        # Same shared range producer as `CompiledOccupancy._add` and `HexOccupancyService._add`
+        # (issue #114) — identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per
+        # commit instead of three. This index is step-keyed, so like the hex service it expands the
+        # span back out; the saving here is the sweep and the per-row dispatch, not the storage shape.
+        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:
                 continue                                        # is_blocked only consults in_blk cells
+            cell = (q, r, L)
             if is_column:
-                self.cols.setdefault((q, r, L), {}).setdefault(s, set()).add(tid)
+                d = self.cols.setdefault(cell, {})
+                for s in range(s_lo, s_hi + 1):
+                    d.setdefault(s, set()).add(tid)
             elif not (own_cols and self._inside_a_column(q, r, own_cols)):
-                self.corr.setdefault((q, r, L), set()).add(s)   # (skip own terminal interior, as occupancy)
+                self.corr.setdefault(cell, set()).update(range(s_lo, s_hi + 1))  # (skip own terminal interior)
 
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:

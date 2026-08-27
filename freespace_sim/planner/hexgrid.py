@@ -530,7 +530,7 @@ def rasterize_volume_ranges(
 
 _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 # Both occupancy images consume the SAME volume with the SAME params on each commit (hex then
-# compiled), so the geometry sweep (`_candidate_slack`) is memoized once and reused by the second
+# compiled), so the geometry sweep (`_sweep_kept`) is memoized once and reused by the second
 # consumer. The cap must exceed the reuse WINDOW for that sharing to fire. For the FCFS sim that
 # window is one flight's volumes; under LNS it is one NEIGHBORHOOD's, because the claim index
 # (`lns.state._index_add`, a third consumer at the same inflations) rasterizes the victims only
@@ -538,17 +538,62 @@ _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 # its own rows before reaching it. An entry is ~10 rows (a corridor box covers ~10 hexes), so 1024
 # costs ~1 MB. Overshooting only wastes a miss's recompute, never correctness; undershooting
 # silently loses the sharing, so this errs high.
+#
+# 1024 is a FLOOR, not the whole story: `prepare_range_cache_for_commit` raises the active cap when a
+# single commit carries more volumes than that, so an unusually long trajectory still stays resident
+# through the fan-out. It never lowers the cap below this floor, which is what keeps the LNS
+# neighborhood window (spanning SEVERAL commits) intact.
+_RANGE_CACHE_MIN_CAP = 1024
 _RANGE_CACHE_CAP = 1024
 
 
-def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float):
-    """Materialized :func:`rasterize_volume_ranges`, shared between a commit's two occupancy consumers.
+def prepare_range_cache_for_commit(volumes) -> None:
+    """Size the shared raster cache for one synchronous ledger commit.
 
-    ~98% of the coordinator's serial commit floor is these two per-commit rasterizations (issue #8
-    Phase E), and the geometry is identical between them, so it is computed once here and reused. The
-    identity guard (``hit[0] is vol``) keeps reuse correct if a freed volume's ``id`` is recycled; the
-    LRU cap bounds retention. Only the two on_commit consumers use this — per-plan callers (e.g. the
-    own-column overlay) stay on the generator so they never evict the live commit-volume rows."""
+    Every occupancy observer calls this before walking ``volumes``. The first call raises the active
+    LRU to the commit size when that exceeds ``_RANGE_CACHE_MIN_CAP``; later observers repeat the same
+    cheap assignment and therefore see every row produced by the first. ``ReservationLedger.commit``
+    invokes observers synchronously, so no unrelated rasterization can interleave with that window.
+
+    It never drops below the floor. That matters for LNS, whose claim index reads victim rows
+    rasterized across SEVERAL earlier commits — sizing down to the latest commit would evict exactly
+    the rows that window exists to keep.
+    """
+    global _RANGE_CACHE_CAP
+    _RANGE_CACHE_CAP = max(_RANGE_CACHE_MIN_CAP, len(volumes))
+    while len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
+        _RANGE_CACHE.popitem(last=False)
+
+
+def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float):
+    """Materialized :func:`rasterize_volume_ranges`, shared between a commit's occupancy consumers.
+
+    ~98% of the coordinator's serial commit floor is these per-commit rasterizations (issue #8 Phase
+    E), and the geometry is identical between them, so it is computed once here and reused. Consumers
+    are A*'s ``HexOccupancyService`` + ``CompiledHexOccupancy``, LNS's claim index, and on a SIPP plan
+    additionally ``CompiledOccupancy`` + ``SafeIntervalIndex`` (issue #114) — all derive ``R``/
+    ``infl_blocked``/``infl_pad`` identically from ``cfg``, and within a commit they share the ``cfg``
+    object and the backend flag too, which is what makes them share a key.
+
+    WHY THE WINDOW IS ONE COMMIT, AND WHY EVICTION IS NOT THE HAZARD. ``ledger.commit`` fans out
+    synchronously (``for cb in self._observers``), so the consumers run back-to-back with no yield
+    point: the first inserts a flight's rows, the rest read them immediately, and
+    :func:`prepare_range_cache_for_commit` has already sized the cache to hold the whole flight. Once
+    that fan-out returns the entries are dead — the next commit carries different volume objects and
+    would miss on them anyway. So evicting them costs nothing, and eviction is already the steady
+    state (measured on `dallas_hub_2uss_large`: 44,469 evictions, hit rate pinned at its ceiling).
+    The exception is LNS, where the claim index reads victims rasterized across SEVERAL earlier
+    commits — that longer window is what the 1024 floor exists for.
+
+    Per-plan callers therefore stay on the generator NOT to protect the commit rows — routing the
+    own-column overlay through here was measured to change the commit hit rate by exactly zero
+    (133,791/178,388 either way) — but because it would be pure loss: that caller builds a FRESH
+    ``hover_reservation`` per call, so its lookups are a measured 0/1,286 hits, all overhead, and each
+    insert would pin a dead volume and its rows alive for the life of its cache slot.
+
+    ``hit[0] is vol`` is defensive only: the entry holds a STRONG reference to ``vol``, so a cached
+    volume cannot be freed and its ``id`` cannot be recycled while cached (measured: 0 guard failures
+    in 179,674 lookups). Keep it — it is the invariant that would catch a future weak-ref rewrite."""
     # Backend and config identity are output inputs too. Keeping the identities in the key and the
     # objects in the value makes id reuse harmless while avoiding a hash of the full frozen config.
     backend = bool(_COMPILED and USE_COMPILED)
@@ -560,7 +605,7 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     rows = list(rasterize_volume_ranges(vol, cfg, R, infl_blocked, infl_pad))
     _RANGE_CACHE[key] = (vol, cfg, rows)
     _RANGE_CACHE.move_to_end(key)
-    if len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
+    while len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
         _RANGE_CACHE.popitem(last=False)
     return rows
 

@@ -302,11 +302,8 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
                            (), {}, 0.0, 0.0, (), "empty"))
                 continue
 
-            old = {f: state.incumbent[f] for f in victims}
             out = state.try_repair(victims, rng, spec.accept_epsilon,
-                                   order_mode=spec.repair_order)
-            if out.accepted:
-                state.apply_delta(old)      # ALWAYS rewind: the coordinator owns the incumbent
+                                   order_mode=spec.repair_order, report_only=True)
             conn.send(("result", rnd, slot, index, applied_version, op,
                        tuple(sorted(victims)), out.new_intents, out.cost_old, out.cost_new,
                        out.envelopes, out.reason))
@@ -338,12 +335,6 @@ class LNSWorkerPool:
 
     # ---------------------------------------------------------------- lifecycle
     def start(self, *, deadline: float | None = None) -> "LNSWorkerPool":
-        # The numba kernel is already compiled in this process: the schedule being improved came
-        # out of an in-process A* run (LNSState's constructor requires the ledger and intents to
-        # be the very same objects). So the on-disk cache=True artifact exists and the workers
-        # load it instead of racing to compile it — the stampede parallel.py warms against.
-        from freespace_sim.planner.astar import kernel  # noqa: F401  (import = cache present)
-
         ctx = mp.get_context("spawn")   # never fork: it inherits the numba runtime + thread state
         t0 = time.monotonic()
         try:
@@ -475,18 +466,22 @@ class LNSWorkerPool:
 
 
 # ====================================================================== coordinator
-def _traj_row(i, op, victims, accepted, reason, cost_old, cost_new, incumbent_cost, wall_s):
-    """One trajectory row, in the SEQUENTIAL loop's exact shape.
+def _traj_row(
+    i, op, victims, accepted, reason, cost_old, cost_new,
+    incumbent_before, incumbent_cost, wall_s,
+):
+    """One trajectory row compatible with the sequential loop's schema.
 
-    ``iter`` is the GLOBAL task index (``rnd + slot``), never the round, so the anytime curve keeps
-    a monotone x-axis, ``len(trajectory) == n_iterations``, and a one-worker run is row-for-row
-    comparable with ``run_lns``. ``cost_new`` is JSON-safe (None rather than inf), as upstream.
+    ``iter`` follows row/completion order, so the anytime curve is monotone and a one-worker run is
+    row-for-row comparable with ``run_lns``. ``cost_new`` is JSON-safe (None rather than inf).
     """
     return dict(
         iter=i, op=op, n=len(victims), victims=list(victims), accepted=accepted, reason=reason,
         cost_old=cost_old,
         cost_new=None if (cost_new is None or math.isinf(cost_new)) else cost_new,
-        incumbent_cost=incumbent_cost, wall_s=wall_s,
+        incumbent_cost=incumbent_cost,
+        realized_improvement=float(incumbent_before) - float(incumbent_cost),
+        wall_s=wall_s,
     )
 
 
@@ -514,6 +509,24 @@ def _pick_task(state, lns, selector, tabu, i):
 
 def _out_of_budget(lns, t0) -> bool:
     return lns.time_limit_s is not None and time.monotonic() - t0 > lns.time_limit_s
+
+
+def _stale_overwrite(state, changelog, result, accept_epsilon):
+    """Return ``(combined_delta, net_gain)`` when a stale whole solution still wins.
+
+    If the worker improved its base by R and intervening commits improved it by S, replacing the
+    incumbent with the worker's solution realizes R-S. The combined delta makes that replacement
+    one ledger transaction even when the same victim changed in both solutions.
+    """
+    reverts = changelog.revert_to(result.base_version)
+    intervening_gain = sum(
+        float(intent.cost) - float(state.incumbent[fid].cost)
+        for fid, intent in reverts.items()
+    )
+    net_gain = result.improvement - intervening_gain
+    if net_gain <= max(0.0, float(accept_epsilon)):
+        return None, net_gain
+    return {**reverts, **result.new_intents}, net_gain
 
 
 def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before):
@@ -549,6 +562,7 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
         for r in results:
             if r.improved and (winner is None or r.improvement > winner.improvement):
                 winner = r
+        incumbent_cursor = state.total_cost
         if winner is not None:
             olds = {f: state.incumbent[f] for f in winner.new_intents}
             state.apply_delta(winner.new_intents)
@@ -565,15 +579,18 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
             if r.improved and not is_winner:
                 reason = "not_selected"
                 n_not_selected += 1
+            incumbent_after = state.total_cost if is_winner else incumbent_cursor
             trajectory.append(_traj_row(
                 r.rnd + r.slot, r.op, r.victims, is_winner, reason,
-                r.cost_old, r.cost_new, state.total_cost, time.monotonic() - t0))
+                r.cost_old, r.cost_new, incumbent_cursor, incumbent_after,
+                time.monotonic() - t0))
+            incumbent_cursor = incumbent_after
 
         _maybe_verify(state, lns, n_accepted, winner is not None)
         _maybe_log(lns, "sync", m, n_iter, n_accepted, state, selector, cost_before)
         rnd += n_slots
     return {"n_iter": n_iter, "n_accepted": n_accepted, "n_not_selected": n_not_selected,
-            "n_stale": 0, "n_dirty": 0, "n_overwrite": 0}
+            "n_dirty": 0, "n_overwrite": 0}
 
 
 def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before):
@@ -600,7 +617,7 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
     n_iter = n_accepted = n_clean = n_dirty = n_overwrite = 0
     n_stale_victims = n_stale_cost = 0
     next_i = 0
-    inflight: dict[int, int] = {}
+    inflight: set[int] = set()
 
     def _dispatch(w: int) -> bool:
         nonlocal next_i
@@ -611,7 +628,7 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
         op, seed_fid, rng_state = _pick_task(state, lns, selector, tabu, i)
         pool.sync(w, changelog)          # bring it current, THEN give it work
         pool.dispatch(w, i, 0, op, seed_fid, rng_state)
-        inflight[w] = i
+        inflight.add(w)
         return True
 
     for w in range(m):
@@ -619,8 +636,9 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
 
     while inflight:
         r = pool.collect(1)[0]
-        inflight.pop(r.worker, None)
+        inflight.discard(r.worker)
         n_iter += 1
+        incumbent_before = state.total_cost
         applied, reason = False, r.reason
         changes: dict = {}
         realized_improvement = 0.0
@@ -631,41 +649,32 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
                 applied = True
                 changes = r.new_intents
                 realized_improvement = r.improvement
-            elif set(r.victims) & changelog.touched_since(r.base_version):
-                reason, n_stale_victims = "stale_victims", n_stale_victims + 1
-            elif _read_set_is_clean(r.envelopes, changelog.boxes_since(r.base_version)):
-                applied, reason = True, "improved"
-                changes = r.new_intents
-                realized_improvement = r.improvement
-                n_clean += 1
             else:
-                n_dirty += 1
-                # Paper Alg. 2 line 23: a stale result overwrites wholesale iff its own whole
-                # solution still beats the incumbent. Write C_base for the incumbent cost at the
-                # worker's base and S for what everyone else has since removed from it, so
-                #     c(P)   = C_base - r.improvement      (base, with this worker's repair)
-                #     c(P_min) = C_base - S                (base, with everyone else's)
-                # and c(P) < c(P_min)  <=>  r.improvement > S.
-                #
-                # S is measured over exactly the flights the overwrite would walk back, as
-                # (their cost at base) - (their cost now); improvements lowered those costs, so S
-                # is >= 0. Getting this subtraction backwards makes the test `improvement > -S`,
-                # which is true almost always: measured on the 290-leg FAA cut it fired 15 times
-                # in 60 tasks and left DROP at -0.82% against SYNC's -1.39% while accepting twice
-                # as often — more accepts, worse schedule, because each one reverted real work.
-                reverts = changelog.revert_to(r.base_version)
-                improvement_since = sum(float(it.cost) - float(state.incumbent[f].cost)
-                                        for f, it in reverts.items())
-                net_improvement = r.improvement - improvement_since
-                if net_improvement > max(0.0, float(lns.accept_epsilon)):
-                    applied, reason = True, "overwrite"
-                    # One transaction and one version: a failure cannot strand the incumbent at
-                    # the stale worker's base, and no other worker can observe half an overwrite.
-                    changes = {**reverts, **r.new_intents}
-                    realized_improvement = net_improvement
-                    n_overwrite += 1
+                victims_changed = bool(
+                    set(r.victims) & changelog.touched_since(r.base_version))
+                read_set_clean = not victims_changed and _read_set_is_clean(
+                    r.envelopes, changelog.boxes_since(r.base_version))
+                if read_set_clean:
+                    applied, reason = True, "improved"
+                    changes = r.new_intents
+                    realized_improvement = r.improvement
+                    n_clean += 1
                 else:
-                    reason, n_stale_cost = "stale", n_stale_cost + 1
+                    if not victims_changed:
+                        n_dirty += 1
+                    overwrite, net_gain = _stale_overwrite(
+                        state, changelog, r, lns.accept_epsilon)
+                    if overwrite is not None:
+                        applied, reason = True, "overwrite"
+                        changes = overwrite
+                        realized_improvement = net_gain
+                        n_overwrite += 1
+                    elif victims_changed:
+                        reason = "stale_victims"
+                        n_stale_victims += 1
+                    else:
+                        reason = "stale"
+                        n_stale_cost += 1
 
         if applied:
             olds = {f: state.incumbent[f] for f in changes}
@@ -675,8 +684,12 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
 
         if lns.adaptive:
             selector.update(r.op, realized_improvement if applied else 0.0)
-        row = _traj_row(r.rnd, r.op, r.victims, applied, reason,
-                        r.cost_old, r.cost_new, state.total_cost, time.monotonic() - t0)
+        row = _traj_row(
+            n_iter - 1, r.op, r.victims, applied, reason,
+            r.cost_old, r.cost_new, incumbent_before, state.total_cost,
+            time.monotonic() - t0,
+        )
+        row["dispatch_iter"] = r.rnd
         row["base_version"] = r.base_version
         row["worker"] = r.worker
         trajectory.append(row)
@@ -771,10 +784,12 @@ def run_lns_parallel(
     )
 
     search_workers = _validate_lns_config(lns)
+    pool_workers = min(search_workers, max(0, lns.max_iterations))
     t0 = time.monotonic()
     state = _build_lns_state(
         cfg, ledger, intents, lns,
         static_terms=static_terms, turnaround_s=turnaround_s,
+        maintain_claim_index=False,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0
@@ -791,7 +806,7 @@ def run_lns_parallel(
         movable_uss_ids=lns.movable_uss_ids,
         incremental_release=lns.incremental_release,
         kernel_log2_min=lns.worker_kernel_log2,
-        record_envelope=lns.parallel_mode == "drop" and search_workers > 1,
+        record_envelope=lns.parallel_mode == "drop" and pool_workers > 1,
     )
 
     selector = AdaptiveSelector(tuple(lns.operators), lns.gamma)
@@ -802,40 +817,47 @@ def run_lns_parallel(
     n_iter = 0
     stats: dict = {
         "n_iter": 0, "n_accepted": 0, "n_not_selected": 0,
-        "n_stale": 0, "n_stale_victims": 0, "n_stale_cost": 0,
+        "n_stale_victims": 0, "n_stale_cost": 0,
         "n_dirty": 0, "n_overwrite": 0, "n_clean_merge": 0,
     }
     pool = None
+    pool_spawn_s = 0.0
     try:
-        if lns.max_iterations > 0 and not _out_of_budget(lns, t0):
-            pool = LNSWorkerPool(
-                cfg, state.final_intents(), static_terms,
-                dict(state._unimp_cost), spec, search_workers,
-            )
-            deadline = None if lns.time_limit_s is None else t0 + lns.time_limit_s
-            try:
-                pool.start(deadline=deadline)
-            except WorkerStartTimeout:
-                # Startup is part of the configured wall-clock budget. Return the valid baseline
-                # when it consumes that budget; the pool has already torn down partial workers.
-                log.info("lns: wall-clock budget expired while starting search workers")
-            else:
-                loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
-                stats = loop(
-                    state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before)
-                n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
+        try:
+            if pool_workers and not _out_of_budget(lns, t0):
+                pool = LNSWorkerPool(
+                    cfg, state.final_intents(), static_terms,
+                    dict(state._unimp_cost), spec, pool_workers,
+                )
+                deadline = None if lns.time_limit_s is None else t0 + lns.time_limit_s
+                try:
+                    pool.start(deadline=deadline)
+                except WorkerStartTimeout:
+                    # Startup is part of the configured wall-clock budget. Return the valid baseline
+                    # when it consumes that budget; the pool already tore down partial workers.
+                    log.info("lns: wall-clock budget expired while starting search workers")
+                else:
+                    loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
+                    stats = loop(
+                        state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before)
+                    n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
+        finally:
+            # Verification replays the full schedule into another ledger. Release every worker's
+            # full replica first so a completed run does not hit its peak memory during finalization.
+            if pool is not None:
+                pool_spawn_s = pool.spawn_s
+                pool.close()
+                pool = None
 
         return _finalize_lns_result(
             state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
-            search_workers=search_workers,
+            search_workers=pool_workers,
             parallel_mode=lns.parallel_mode,
-            pool_spawn_s=pool.spawn_s if pool else 0.0,
+            pool_spawn_s=pool_spawn_s,
             parallel_stats=_finish_stats(stats, n_iter),
         )
     except BaseException:
         log.exception("lns aborted; detaching repair-planner subscribers before propagating")
         raise
     finally:
-        if pool is not None:
-            pool.close()
         ledger.detach_subscribers()

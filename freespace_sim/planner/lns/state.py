@@ -17,11 +17,11 @@ context/lns_plan.md):
 * The repair planner runs with ``evict_floor = 0.0`` (the Track A out-of-order
   dispatch knob), so the eviction watermark never advances and victims can be
   replanned in ANY priority order — random PP orderings stay exact.
-* On reject/failure/exception the new plans are tombstoned and the old volumes re-committed
-  verbatim, one ``commit`` per flight (``_absorb`` needs each flight's volumes contiguous)
-  — see ``_rewind``. It runs on EVERY exit from the destroyed state, including an
-  exception thrown mid-repair: the ledger is the run's only copy of the schedule, so a
-  transaction that unwinds without it loses flights outright.
+* On reject/failure/exception—or a worker's report-only success—the new plans are tombstoned
+  and the old volumes re-committed verbatim, one ``commit`` per flight (``_absorb`` needs each
+  flight's volumes contiguous)—see ``_rewind``. It runs on EVERY non-adopting exit from the
+  destroyed state: the ledger is the run's only copy of the schedule, so a transaction that
+  unwinds without it loses flights outright.
 """
 
 from __future__ import annotations
@@ -135,6 +135,7 @@ class LNSState:
         # Safe for direct construction too: None is an explicit opt-in to automatic multiprocessing.
         unimpeded_workers: int | None = 1,
         unimpeded_cost: dict[int, float | None] | None = None,
+        maintain_claim_index: bool = True,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger
@@ -270,6 +271,7 @@ class LNSState:
         self._contended: set[Cell] = set()
         self._contended_list: list[Cell] | None = None
         self._visits: dict[int, list[tuple[int, Cell]]] = {}
+        self._maintain_claim_index = maintain_claim_index
         self._rebuild_claim_index()
 
     # ------------------------------------------------------------------ parallel replica
@@ -346,6 +348,8 @@ class LNSState:
         self._contended.clear()
         self._contended_list = None
         self._visits.clear()
+        if not self._maintain_claim_index:
+            return
         for fid in self._movable:
             self._index_add(fid, self.incumbent[fid].volumes, refresh=False)
         for cell in self._claims:  # one contention sweep instead of a refresh per row
@@ -485,11 +489,15 @@ class LNSState:
         rng: np.random.Generator,
         accept_epsilon: float = 0.0,
         order_mode: str = "premium",
+        *,
+        report_only: bool = False,
     ) -> RepairOutcome:
         """Release and PP-repair victims; accept only a strict weighted-cost improvement.
 
         ``premium`` repairs the most-delayed first with random ties; ``random`` retains the paper's
-        order for A/B comparisons. See ``context/lns_plan.md`` §4.
+        order for A/B comparisons. ``report_only`` returns an accepted candidate but restores the
+        incumbent ledger without adopting it; parallel workers use this because only the coordinator
+        may commit a result. See ``context/lns_plan.md`` §4.
         """
         victims = sorted(victims)
         assert all(f in self._movable_set for f in victims)
@@ -517,6 +525,7 @@ class LNSState:
         # builds nothing; `record_envelope` off leaves `last_envelope` None for every plan anyway.
         rec_env = bool(getattr(self.repair_planner, "record_envelope", False))
         envelopes: list = []
+        candidate: RepairOutcome | None = None
         # EVERYTHING that can leave the schedule half-destroyed lives inside this block — the destroy
         # itself included. `release_many` tombstones every victim volume BEFORE it notifies removal
         # subscribers, and each of those hooks can raise, so a destroy that dies part-way is exactly
@@ -545,19 +554,25 @@ class LNSState:
 
             cost_new = float(sum(it.cost for it in new.values())) if reason == "improved" else math.inf
             if reason == "improved" and cost_new < cost_old - accept_epsilon:
-                # Inside the try as well: this rewrites the incumbent, the running cost and the claim
-                # index, so a raise part-way (rasterize, MemoryError, a second SIGINT) would otherwise
-                # leave them describing a schedule the ledger does not hold, with `old` already gone.
-                # LEDGER-FREE by construction: the repair loop above already committed these volumes,
-                # so only the in-memory views are behind. `apply_delta` is the variant that moves the
-                # ledger too, for a replica syncing to someone else's accepted schedule.
-                self._apply_in_memory(new, applied)
-                return RepairOutcome(True, "improved", cost_old, cost_new, len(new),
-                                     new_intents=dict(new), envelopes=tuple(envelopes))
+                candidate = RepairOutcome(
+                    True, "improved", cost_old, cost_new, len(new),
+                    new_intents=dict(new), envelopes=tuple(envelopes),
+                )
+                if not report_only:
+                    # Inside the try as well: this rewrites the incumbent, running cost, and claim
+                    # index, so a raise part-way would otherwise leave them describing a schedule
+                    # the ledger does not hold. LEDGER-FREE: the loop already committed the plans.
+                    self._apply_in_memory(new, applied)
+                    return candidate
         except BaseException:
             self._rewind(victims, old, cost_at_entry, applied)
             raise
 
+        if candidate is not None:
+            # Leave in-memory state (including claim/visit indexes) untouched. Restore once outside
+            # the exception handler so a failed restore cannot trigger a second rewind and mask it.
+            self._rewind(victims, old, cost_at_entry)
+            return candidate
         if reason == "improved":
             reason = "no_improvement"
         self._rewind(victims, old, cost_at_entry)
@@ -602,9 +617,10 @@ class LNSState:
             applied.append(fid)
             self.total_cost += float(it.cost) - float(self.incumbent[fid].cost)
             self.incumbent[fid] = it
-            self._index_remove(fid)
-            self._index_add(fid, it.volumes)
-            self._visits.pop(fid, None)
+            if self._maintain_claim_index:
+                self._index_remove(fid)
+                self._index_add(fid, it.volumes)
+                self._visits.pop(fid, None)
 
     def apply_delta(self, changes: dict[int, OperationalIntent]) -> None:
         """Adopt someone else's accepted repair: move the LEDGER **and** the in-memory views.

@@ -178,6 +178,7 @@ def _build_lns_state(
     *,
     static_terms: tuple | None,
     turnaround_s: float | None,
+    maintain_claim_index: bool = True,
 ) -> LNSState:
     """One construction path for the sequential runner and the parallel coordinator."""
     return LNSState(
@@ -190,6 +191,7 @@ def _build_lns_state(
         turnaround_s=turnaround_s,
         incremental_release=lns.incremental_release,
         unimpeded_workers=lns.unimpeded_workers,
+        maintain_claim_index=maintain_claim_index,
     )
 
 

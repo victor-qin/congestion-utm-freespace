@@ -73,6 +73,11 @@ def _parse_arms(text: str):
     return arms
 
 
+def _relative_rate(rate: float, base_rate: float) -> float | None:
+    """Return a speedup only when the sequential arm established a non-zero baseline."""
+    return rate / base_rate if base_rate > 0.0 else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -147,7 +152,9 @@ def main() -> None:
             base_rate = seq["improvement_pct"] / max(1e-9, seq["loop_s"])
             for r in rows:
                 rate = r["improvement_pct"] / max(1e-9, r["loop_s"])
-                print(f"  {r['mode']:<10} m={r['workers']}: {rate / base_rate:5.2f}x "
+                relative = _relative_rate(rate, base_rate)
+                comparison = "n/a" if relative is None else f"{relative:.2f}x"
+                print(f"  {r['mode']:<10} m={r['workers']}: {comparison:>6} "
                       f"({rate:.4f} %/s vs {base_rate:.4f})")
 
     if args.out:

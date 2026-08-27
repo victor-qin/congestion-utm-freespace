@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import sys
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -37,29 +38,60 @@ AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
 try:
     from .hexgrid_kernel import sweep_box as _sweep_box, sweep_cyl as _sweep_cyl
     _COMPILED = True
-except ImportError:                                  # numba absent → reference everywhere
+    _compiled_error = None
+except Exception as exc:                             # optional acceleration must fail open
     _COMPILED = False
-#: Runtime switch. False == the numpy expressions below, bit-for-bit — the A/B arm and the rollback.
-#: On by default: verified decision-identical (ordered rows, per volume) across the 120 s and 600 s
-#: density_faa cuts — 163,965 volumes, 0 differences — at 5.96x on `rasterize_volume_ranges`. The
-#: box path is NOT bit-identical to numpy (max delta 1.1e-13 m); what makes that harmless is the
-#: measured boundary margin, min |slack - inflation| = 9.1e-4 m, ~8e9x the delta. Re-run
-#: `.context/perf/verify_rasteriser.py` if the inflations or the lattice pitch ever change.
+    _compiled_error = exc
+#: Runtime switch. False selects the numpy oracle; True selects the compiled sweep when available.
+#: Box cells within a conservative floating-point envelope of either threshold are re-evaluated by
+#: the oracle, so this switch cannot change raster decisions.
 USE_COMPILED = True
 _compiled_warned = False
 
 
-def _warn_no_kernel() -> None:
-    """One stderr line, once per process, when the compiled sweep was requested but numba won't
-    import. The fallback is the reference, so nothing downstream notices — which is exactly how a
-    silent slowdown survives a whole sweep (cf. `astar._warn_kernel_fallback`, issue #30)."""
+def _warn_no_kernel(error: Exception | None = None) -> None:
+    """One stderr line, once per process, when optional compiled acceleration cannot run."""
     global _compiled_warned
     if _compiled_warned:
         return
     _compiled_warned = True
-    print("WARNING: compiled hex rasteriser unavailable (numba import failed) — using the numpy "
-          "reference sweep. Results are identical. Fix: run via plain `uv run` (numba is in "
-          "tool.uv default-groups) or `uv sync`.", file=sys.stderr)
+    detail = f" ({type(error).__name__}: {error})" if error is not None else ""
+    print(f"WARNING: compiled hex rasteriser unavailable{detail} — using the numpy reference "
+          "sweep. Fix: run via plain `uv run` (numba is in tool.uv default-groups) or `uv sync`.",
+          file=sys.stderr)
+
+
+def _disable_compiled(error: Exception) -> None:
+    """Permanently fall back after a lazy numba/cache/LLVM failure in this process."""
+    global _COMPILED, _compiled_error
+    _COMPILED = False
+    _compiled_error = error
+    cache = globals().get("_RANGE_CACHE")
+    if cache is not None:
+        cache.clear()
+    _warn_no_kernel(error)
+
+
+def set_compiled_rasterizer(enabled: bool) -> None:
+    """Select the compiled or reference sweep and invalidate rows produced by the old backend."""
+    global USE_COMPILED
+    enabled = bool(enabled)
+    if USE_COMPILED != enabled:
+        USE_COMPILED = enabled
+        cache = globals().get("_RANGE_CACHE")
+        if cache is not None:
+            cache.clear()
+
+
+@contextmanager
+def rasterizer_backend(compiled: bool):
+    """Temporarily select a rasterizer backend, restoring the prior selection on every exit."""
+    previous = USE_COMPILED
+    set_compiled_rasterizer(compiled)
+    try:
+        yield
+    finally:
+        set_compiled_rasterizer(previous)
 
 
 def hex_neighbors(q: int, r: int) -> list[tuple[int, int]]:
@@ -348,17 +380,38 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
         ob = np.empty(n_cand, np.bool_)
         s = vol.shape
         if isinstance(s, BoxSpec):
+            oa = np.empty(n_cand, np.bool_)
             m, e = s.rot, s.extents
-            n = _sweep_box(q0, q1, r0, r1, R, s.center[0], s.center[1], s.center[2],
-                           m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
-                           e[0] / 2.0, e[1] / 2.0, e[2] / 2.0,
-                           z, infl_pad, infl_blocked, oq, orr, ob)
+            try:
+                n = _sweep_box(q0, q1, r0, r1, R, s.center[0], s.center[1], s.center[2],
+                               m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
+                               e[0] / 2.0, e[1] / 2.0, e[2] / 2.0,
+                               z, infl_pad, infl_blocked, oq, orr, ob, oa)
+            except Exception as exc:
+                _disable_compiled(exc)
+            else:
+                ambiguous = np.flatnonzero(oa[:n])
+                if ambiguous.size:
+                    aq, ar = oq[ambiguous], orr[ambiguous]
+                    cx = R * SQRT3 * (aq + ar / 2.0)
+                    cy = R * 1.5 * ar
+                    slack = _footprint_slack(s, cx, cy, cfg, z=z)
+                    keep = np.ones(n, dtype=np.bool_)
+                    keep[ambiguous] = slack <= infl_pad
+                    ob[ambiguous] = slack <= infl_blocked
+                    return (oq[:n][keep].tolist(), orr[:n][keep].tolist(),
+                            ob[:n][keep].tolist())
+                return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
         else:
-            n = _sweep_cyl(q0, q1, r0, r1, R, s.cx, s.cy, s.radius, s.z_lo, s.z_hi,
-                           z, infl_pad, infl_blocked, oq, orr, ob)
-        return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
+            try:
+                n = _sweep_cyl(q0, q1, r0, r1, R, s.cx, s.cy, s.radius, s.z_lo, s.z_hi,
+                               z, infl_pad, infl_blocked, oq, orr, ob)
+            except Exception as exc:
+                _disable_compiled(exc)
+            else:
+                return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
     if not _COMPILED and USE_COMPILED:
-        _warn_no_kernel()
+        _warn_no_kernel(_compiled_error)
     q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=z)
     in_pad = slack <= infl_pad
     return (q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
@@ -496,13 +549,16 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     identity guard (``hit[0] is vol``) keeps reuse correct if a freed volume's ``id`` is recycled; the
     LRU cap bounds retention. Only the two on_commit consumers use this — per-plan callers (e.g. the
     own-column overlay) stay on the generator so they never evict the live commit-volume rows."""
-    key = (id(vol), R, infl_blocked, infl_pad)
+    # Backend and config identity are output inputs too. Keeping the identities in the key and the
+    # objects in the value makes id reuse harmless while avoiding a hash of the full frozen config.
+    backend = bool(_COMPILED and USE_COMPILED)
+    key = (id(vol), id(cfg), R, infl_blocked, infl_pad, backend)
     hit = _RANGE_CACHE.get(key)
-    if hit is not None and hit[0] is vol:
+    if hit is not None and hit[0] is vol and hit[1] is cfg:
         _RANGE_CACHE.move_to_end(key)
-        return hit[1]
+        return hit[2]
     rows = list(rasterize_volume_ranges(vol, cfg, R, infl_blocked, infl_pad))
-    _RANGE_CACHE[key] = (vol, rows)
+    _RANGE_CACHE[key] = (vol, cfg, rows)
     _RANGE_CACHE.move_to_end(key)
     if len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
         _RANGE_CACHE.popitem(last=False)

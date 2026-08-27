@@ -292,7 +292,7 @@ this a scaling limit rather than a footprint nicety.
 |---|---|---|---|
 | `HexOccupancyService._rows` | 48.8 MB | 8.5 MB | flat int64 `(cell_id, s_lo, s_hi, code)`; cells interned once |
 | `CompiledHexOccupancy._rows` | 31.6 MB | 4.3 MB | flat int64 `(key, packed_claim)` pairs |
-| `CompiledHexOccupancy._claims` | 36.0 MB | 22.1 MB | one packed int per claim (`s0<<40 \| s1<<20 \| fid_code`) |
+| `CompiledHexOccupancy._claims` | 36.0 MB | 22.1 MB | one packed span per claim (`s0<<20 \| s1`); ownership stays in `_rows` |
 | `LNSState._cells_of` | 43.6 MB | 12.0 MB | the DISTINCT cells, not one row per (cell, span) |
 | `LNSState._claims` | 32.2 MB | 33.3 MB | unchanged (the shared cell tuples now bill here) |
 
@@ -314,23 +314,24 @@ inlined to `.get` + a None test.
 subscribers, rebuilding the discrete obstacle map the next A\* search reads. That is a write-side
 cost, and it is disproportionately an LNS cost: the FCFS sim rasterises each volume once, while LNS
 re-commits a neighbourhood every iteration and, on a rejected one (79%), commits twice. This phase
-made each rasterisation ~6x cheaper without changing a single cell.
+made each rasterisation ~4.8x cheaper while keeping the numpy cell decisions exact.
 
 | change | point | how it works | issues | outcome |
 |---|---|---|---|---|
-| `planner/hexgrid_kernel.py` (new) — `sweep_box`, `sweep_cyl` | 62 candidates per volume, 10 kept; ~10 numpy calls on 62-element arrays is ~3.4 us of dispatch each for a few flops | `@njit(cache=True, nogil=True)`, flat scalars in, caller-allocated arrays out, **emits only the kept cells** so the host never materialises the 84% discards | q-major/r-minor is load-bearing (a transposed nest keeps every cell but reorders `_rows`/`_claims`/`block_range` — nothing raises); `np.hypot` is not `sqrt(dx²+dy²)`; no rounding in the kernel (`_axial_round` is banker's, numba's differs) | 39.41 -> **6.62 us/volume (5.96x)** on `rasterize_volume_ranges` |
-| `hexgrid._sweep_kept` + `_axial_rect` | three public rasterisers each open-coded "slack then mask" and would drift; the A/B and the rollback need ONE switch | one helper returns the kept cells; the four-corner rectangle is lifted so both paths derive it identically; `USE_COMPILED` selects | `(q1-q0+1)*(r1-r0+1)` bounds the output exactly; three small `np.empty` per volume cost ~1-2 us against 33.9 saved | `USE_COMPILED=False` is the old numpy path bit-for-bit; `rasterize_volume`/`_dual` get the kernel for free |
+| `planner/hexgrid_kernel.py` (new) — `sweep_box`, `sweep_cyl` | 62 candidates per volume, 10 kept; ~10 numpy calls on 62-element arrays is ~3.4 us of dispatch each for a few flops | `@njit(cache=True, nogil=True)`, flat scalars in, caller-allocated arrays out, **emits only the kept cells** so the host never materialises the 84% discards | q-major/r-minor is load-bearing (a transposed nest keeps every cell but reorders `_rows`/`_claims`/`block_range` — nothing raises); `np.hypot` is not `sqrt(dx²+dy²)`; no rounding in the kernel (`_axial_round` is banker's, numba's differs) | post-boundary-repair seeded benchmark: 39.2 -> **8.2 us/volume (4.8x)** on `rasterize_volume_ranges` |
+| `hexgrid._sweep_kept` + `_axial_rect` | three public rasterisers each open-coded "slack then mask" and would drift; the A/B and rollback need one switch | one helper returns the kept cells; the four-corner rectangle is lifted so both paths derive it identically; a context manager switches and restores the backend | `(q1-q0+1)*(r1-r0+1)` bounds output exactly; box cells near a threshold are resolved by the numpy oracle | `USE_COMPILED=False` is the old numpy path bit-for-bit; all public rasterisers get the kernel and fallback for free |
 | `_levels_overlapped` reads `flat_aabb()` | allocated two throwaway `np.array`s per volume just to read two z scalars | one-line substitution; `flat_aabb` is pinned bit-for-bit against `aabb()` | none — the pinning test is the guarantee | two fewer allocations per volume per rasterise |
 
 **The exactness argument, and why it is not bit-parity.** numpy's `(N,3) @ (3,3)` does not sum in
-the order a register-scalar expression does. Measured over 359,512 real cell evaluations, the numba
-box path is **84.8% bit-identical, max delta 1.1e-13 m**; the cylinder path is **100% identical**
-(numba's `np.hypot` is numpy's, so the ULP hazard flagged for it does not exist). The bar is
-therefore *decision*-identical, and what makes it safe is the **boundary margin**: across both cuts
-the closest any cell comes to an inflation threshold is **9.1e-4 m**, ~**8e9x** the float delta. A
-flip is not merely unobserved, it is nine orders of magnitude out of reach.
-`.context/perf/verify_rasteriser.py` asserts ordered row equality per volume and reports that margin
-— re-run it if the inflations or the lattice pitch ever change.
+the order a register-scalar expression does. A measured scenario margin is not a correctness proof:
+a corridor can put a cell exactly at an inflation threshold, and a two-ULP difference was reproduced
+that made the raw scalar kernel omit the cell. The box kernel now computes a conservative roundoff
+envelope from the absolute dot-product terms, emits scalar misses just outside the pad when they are
+inside that envelope, and marks cells near either threshold. `_sweep_kept` re-evaluates only those
+marked cells with the numpy oracle. Ordinary cells stay compiled; boundary decisions are exact by
+construction. The cylinder path remains bit-identical (`np.hypot`).
+`analysis/verify_rasteriser.py` is tracked and asserts ordered row equality per volume on both full
+cuts; the suite also pins the concrete two-ULP regression and a short real cut.
 
 **Measured, paired against `b9d42c3` (both arms back to back, trajectory sha identical):**
 

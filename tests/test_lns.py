@@ -115,6 +115,20 @@ def test_compact_renumbers_runs_and_buckets():
     assert led.release_many([4]) == 1 and led.conflicts(probe) == []
 
 
+def test_compact_coalesces_runs_that_become_adjacent():
+    led = ReservationLedger(CFG)
+    led.commit(1, [_wall(1000.0)])
+    led.commit(2, [_wall(1500.0)])
+    led.commit(1, [_wall(2000.0)])
+    led.commit(3, [_wall(2500.0)])
+    led.commit(4, [_wall(3000.0)])
+
+    led.release_many([2, 3, 4])                    # compaction removes every gap around flight 1
+    assert led._runs == {1: [[0, 2]]}
+    assert led.release_many([1]) == 2
+    assert led.n_volumes == 0
+
+
 def test_incremental_release_reference_service_refcounts():
     """Two flights covering the same cells: removing one must NOT free the cells (refcounts),
     removing both must."""
@@ -161,6 +175,30 @@ def test_incremental_release_compiled_matches_fresh_absorb():
                     assert (occ.blocked_py(q + dq, r, level, s)
                             == fresh.blocked_py(q + dq, r, level, s)), (x, dq, level, s)
     assert occ.n_added == fresh.n_added == 1
+
+
+def test_incremental_release_compiled_treats_identical_spans_as_a_multiset():
+    """The claim need not repeat its owner: equal spans are fungible, but their multiplicity is not."""
+    from freespace_sim.planner import hexgrid as hg
+    from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
+
+    wall = _wall()
+    occ = CompiledHexOccupancy(CFG, track_removal=True)
+    occ.on_commit(1, [wall])
+    occ.on_commit(2, [wall])
+    q, r, level, s_lo, _s_hi, _in_blk = next(
+        row for row in hg.rasterize_ranges(
+            wall, CFG, occ.R, occ.infl_blocked, occ.infl_pad
+        ) if row[-1]
+    )
+    step = max(0, s_lo)                                  # pools seed their query horizon at step 0
+    assert occ.blocked_py(q, r, level, step)
+
+    occ.on_release(1, [wall])
+    assert occ.blocked_py(q, r, level, step)          # the equal claim from flight 2 survives
+    occ.on_release(2, [wall])
+    assert not occ.blocked_py(q, r, level, step)
+    assert occ.n_added == 0
 
 
 def test_pool_reset_cell_reclaims_overflow_slots():
@@ -890,6 +928,73 @@ def test_unimpeded_costs_survives_a_dead_worker(monkeypatch):
     # module level: `spawn` pickles the Process target BY NAME, so a closure cannot be one
     monkeypatch.setattr(U, "_worker_main", _suicide_worker)
     assert _forced_parallel(U, CFG, reqs, workers=2) == expected
+
+
+def test_unimpeded_costs_cleans_up_after_partial_spawn_failure(monkeypatch):
+    """If worker N fails to start, workers 0..N-1 must be reaped and every request replanned."""
+    from freespace_sim.planner.lns import unimpeded as U
+
+    reqs = [_req(fid, y=200.0 * fid) for fid in range(1, 3)]
+    expected = U.unimpeded_costs(CFG, (), reqs, n_workers=1)
+
+    class FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, fail):
+            self.fail = fail
+            self.pid = None
+            self.exitcode = None
+            self.alive = False
+            self.terminated = False
+
+        def start(self):
+            if self.fail:
+                raise OSError("spawn limit")
+            self.pid = 123
+            self.alive = True
+
+        def join(self, timeout=None):
+            if self.terminated:
+                self.alive = False
+                self.exitcode = -15
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+    class FakeContext:
+        def __init__(self):
+            self.processes = []
+            self.connections = []
+
+        def Pipe(self, duplex=False):
+            assert duplex is False
+            pair = FakeConn(), FakeConn()
+            self.connections.extend(pair)
+            return pair
+
+        def Process(self, **_kwargs):
+            proc = FakeProcess(fail=bool(self.processes))
+            self.processes.append(proc)
+            return proc
+
+    ctx = FakeContext()
+    monkeypatch.setattr(U.mp, "get_context", lambda _method: ctx)
+
+    assert _forced_parallel(U, CFG, reqs, workers=2) == expected
+    assert ctx.processes[0].terminated
+    assert all(conn.closed for conn in ctx.connections)
 
 
 def _suicide_worker(conn, cfg, static_terms, requests):

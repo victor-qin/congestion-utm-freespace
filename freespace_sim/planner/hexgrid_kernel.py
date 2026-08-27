@@ -17,14 +17,13 @@ cheap rather than to have fewer of them — and to **emit only the cells that pa
 never materialises the ~84% that don't.
 
 **Relationship to the reference.** ``_candidate_slack`` / ``_footprint_slack`` stay in ``hexgrid``
-unchanged and remain the oracle: ``hexgrid.USE_COMPILED = False`` restores them bit-for-bit, and the
-scalar-geometry oracle in ``tests/test_hexgrid.py`` gates both paths. These kernels are **not**
-bit-identical to numpy on the box path — numpy's ``(N,3) @ (3,3)`` does not sum in the order a
-register-scalar expression does. Measured over 359,512 real cell evaluations: 84.8% bit-identical,
-**max |delta| 1.1e-13 m, zero kept-set flips**, against a boundary margin where **0 of 370,077
-cells** came within 1e-9 m of an inflation threshold. The cylinder path measures **100% identical**
-(numba's ``np.hypot`` is numpy's). The contract is therefore *decision*-identical, verified per
-volume on whole scenarios — see ``.context/perf/verify_rasteriser.py``.
+unchanged and remain the oracle. The scalar box arithmetic is not bit-identical to numpy's matrix
+multiply, so this kernel marks cells close enough to either inflation threshold for the host to
+re-evaluate with that oracle. It also emits near-pad cells just outside the scalar threshold, since
+rounding may put the numpy result just inside. Ordinary cells stay entirely in compiled code; the
+boundary repair makes the public result decision-identical for every finite input rather than
+depending on a measured scenario margin. The cylinder path is already bit-identical (numba's
+``np.hypot`` is numpy's).
 
 Conventions follow ``astar_kernel``: ``@njit(cache=True, nogil=True)``, flat scalars in,
 caller-allocated output arrays, no Python objects and no rounding (``hexgrid._axial_round`` uses
@@ -38,12 +37,16 @@ import numpy as np
 from numba import njit
 
 _SQRT3 = 1.7320508075688772
+# Conservative roundoff envelope for the difference between two length-three dot-product
+# evaluations (numba scalars vs numpy matmul), including abs/subtract/max and threshold comparison.
+# The scale is the sum of the absolute products, so cancellation cannot make the guard too small.
+_ROUND_GUARD = 64.0 * np.finfo(np.float64).eps
 
 
 @njit(cache=True, nogil=True)
 def sweep_box(q0, q1, r0, r1, R,
               ox, oy, oz, m0, m1, m2, m3, m4, m5, m6, m7, m8, h0, h1, h2,
-              z, infl_pad, infl_blk, out_q, out_r, out_b):
+              z, infl_pad, infl_blk, out_q, out_r, out_b, out_ambiguous):
     """Kept cells of an oriented box's footprint at altitude probe ``z``. Returns the count.
 
     ``m0..m8`` is ``BoxSpec.rot`` row-major, ``h*`` the half-extents. Mirrors ``_footprint_slack``:
@@ -58,29 +61,45 @@ def sweep_box(q0, q1, r0, r1, R,
     ``block_range`` applications. Nothing would raise, so the parity test compares ORDERED rows.
     """
     n = 0
-    dz = z - oz                                     # loop-invariant, but the three PRODUCTS below
-    #                                                 are deliberately NOT hoisted: lifting `dz*m6`
-    #                                                 out changes how many multiplies the adds can
-    #                                                 contract into FMAs, which changes rounding.
-    #                                                 This expression is the one parity was measured
-    #                                                 on (84.8% bit-identical, max delta 1.1e-13 m).
+    dz = z - oz
     for q in range(q0, q1 + 1):
         for r in range(r0, r1 + 1):
             cx = R * _SQRT3 * (q + r / 2.0)
             cy = R * 1.5 * r
             dx = cx - ox
             dy = cy - oy
-            s = abs(dx * m0 + dy * m3 + dz * m6) - h0
-            l1 = abs(dx * m1 + dy * m4 + dz * m7) - h1
+            x0, y0, z0 = dx * m0, dy * m3, dz * m6
+            x1, y1, z1 = dx * m1, dy * m4, dz * m7
+            x2, y2, z2 = dx * m2, dy * m5, dz * m8
+            s = abs(x0 + y0 + z0) - h0
+            l1 = abs(x1 + y1 + z1) - h1
             if l1 > s:
                 s = l1
-            l2 = abs(dx * m2 + dy * m5 + dz * m8) - h2
+            l2 = abs(x2 + y2 + z2) - h2
             if l2 > s:
                 s = l2
-            if s <= infl_pad:
+            scale = abs(x0) + abs(y0) + abs(z0) + abs(h0)
+            scale1 = abs(x1) + abs(y1) + abs(z1) + abs(h1)
+            if scale1 > scale:
+                scale = scale1
+            scale2 = abs(x2) + abs(y2) + abs(z2) + abs(h2)
+            if scale2 > scale:
+                scale = scale2
+            if abs(infl_pad) > scale:
+                scale = abs(infl_pad)
+            if abs(infl_blk) > scale:
+                scale = abs(infl_blk)
+            if scale < 1.0:
+                scale = 1.0
+            guard = _ROUND_GUARD * scale
+            near_pad = abs(s - infl_pad) <= guard
+            near_blk = abs(s - infl_blk) <= guard
+            # Include near-pad scalar misses: numpy may round to the other side of the threshold.
+            if s <= infl_pad + guard:
                 out_q[n] = q
                 out_r[n] = r
                 out_b[n] = s <= infl_blk
+                out_ambiguous[n] = near_pad or near_blk
                 n += 1
     return n
 

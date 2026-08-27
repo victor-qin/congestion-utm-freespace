@@ -64,10 +64,9 @@ class HexOccupancyService:
         # interns each ``(q, r, L)`` ONCE, so a reversal reads back the very tuple it inserted with:
         # no per-row allocation, unlike re-packing ``(q, r, L)`` out of three stored ints.
         # ``code``: -1 = corridor pad-only, -2 = corridor pad+blocked, >= 0 = terminal column whose
-        # hub id is ``_tids[code]``. Volume counts live in `_nvol`, out of the row stream.
+        # hub id is ``_tids[code]``. The release callback supplies the exact committed volumes.
         self.track_removal = track_removal
         self._rows: dict[int, array] = {}                         # fid -> flat rows (mode on)
-        self._nvol: dict[int, int] = {}                           # fid -> volumes absorbed (mode on)
         self._cells: list[tuple[int, int, int]] = []              # cell_id -> (q, r, L)
         self._cell_ids: dict[tuple[int, int, int], int] = {}      # (q, r, L) -> cell_id
         self._tids: list = []                                     # code -> terminal id
@@ -239,7 +238,6 @@ class HexOccupancyService:
                 #                                            overflow it, so packing stays total
             else:
                 entry.extend(rows)
-            self._nvol[flight_id] = self._nvol.get(flight_id, 0) + len(volumes)
 
     def on_release(self, flight_id, volumes) -> None:
         """Ledger release subscriber (removal mode): reverse the flight's recorded rows so the
@@ -278,7 +276,7 @@ class HexOccupancyService:
                 tid = self._tids[code]
                 for s in range(s_lo, s_hi + 1):
                     self._drop(self.term_cells, s, cell, tid)
-        self.n_added -= self._nvol.pop(flight_id)
+        self.n_added -= len(volumes)
 
     def _on_static(self, center, term) -> None:
         """Derive this hub's discrete routing wall from a ledger static-terminal registration — the
@@ -307,7 +305,6 @@ class HexOccupancyService:
         self.pad.clear()
         self.term_cells.clear()
         self._rows.clear()
-        self._nvol.clear()
         # `_cells` / `_tids` are pure interning pools — value-identical across a rebuild and never
         # read except through a live row, so keeping them saves re-interning the same cells.
         self.n_added = 0

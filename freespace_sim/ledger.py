@@ -269,13 +269,13 @@ class ReservationLedger:
     def release_many(self, flight_ids) -> int:
         """Remove several flights by tombstoning their volumes in place — the LNS destroy primitive.
 
-        O(current volumes) flag pass, no bucket rebuild, and — unlike ``release`` — **no observer
-        re-feed**: the planners' incremental occupancy services notice the shrink themselves
-        (``ledger.n_volumes < svc.n_added``) on their next ``plan()`` and rebuild from
-        ``iter_committed``. A tombstone keeps its slot in ``_vols``/``_buckets`` but its AABB becomes
-        the empty box, so every AABB-pruned read (``conflicts``/``any_conflict``/the terminal-capacity
-        column scan) skips it; ``iter_committed`` skips it by owner id. Arrays are compacted once dead
-        entries outnumber live ones. Returns the number of volumes tombstoned."""
+        O(released volumes), no bucket rebuild, and — unlike ``release`` — **no observer re-feed**:
+        removal subscribers reverse their rows directly; commit-only services detect the shrink on
+        their next ``plan()`` and rebuild from ``iter_committed``. A tombstone keeps its slot in
+        ``_vols``/``_buckets`` but its AABB becomes the empty box, so every AABB-pruned read
+        (``conflicts``/``any_conflict``/the terminal-capacity column scan) skips it;
+        ``iter_committed`` skips it by owner id. Arrays are compacted once dead entries outnumber
+        live ones. Returns the number of volumes tombstoned."""
         # `_runs` gives each victim's own slots directly, so this costs O(released volumes) rather
         # than O(everything committed). Publish order is by first slot — i.e. commit order, what the
         # old full scan produced — so subscribers see an unchanged sequence.
@@ -320,25 +320,26 @@ class ReservationLedger:
         remap = [-1] * len(self._fids)            # old slot -> new slot, -1 = tombstoned (list, not
         #                                           dict: the bucket remap below is the hot loop)
         vols, fids, aabb = [], [], []
+        runs: dict[int, list[list[int]]] = {}
         for i, f in enumerate(self._fids):
             if f == tomb:
                 continue
-            remap[i] = len(vols)
+            new_idx = remap[i] = len(vols)
             vols.append(self._vols[i])
             fids.append(f)
             aabb.append(self._aabb[i])
+            owned = runs.get(f)
+            if owned is None:
+                runs[f] = [[new_idx, new_idx + 1]]
+            elif owned[-1][1] == new_idx:
+                owned[-1][1] = new_idx + 1
+            else:
+                owned.append([new_idx, new_idx + 1])
         buckets = {}
         for key, idxs in self._buckets.items():
             live = [j for j in map(remap.__getitem__, idxs) if j >= 0]
             if live:
                 buckets[key] = live
-        runs: dict[int, list[list[int]]] = {}
-        for fid, old_runs in self._runs.items():
-            new_runs: list[list[int]] = []
-            for lo, hi in old_runs:
-                start = remap[lo]                    # live by construction: `_runs` drops released flights
-                new_runs.append([start, start + hi - lo])
-            runs[fid] = new_runs
         self._vols, self._fids, self._aabb, self._buckets, self._runs = vols, fids, aabb, buckets, runs
         self._n_dead = 0
 

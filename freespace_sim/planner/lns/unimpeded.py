@@ -89,6 +89,29 @@ def _worker_main(conn, cfg, static_terms, requests):
         conn.close()
 
 
+def _finish_processes(procs, timeout=5.0) -> None:
+    """Reap every started worker, escalating from join to terminate to kill.
+
+    One shared deadline per phase keeps a broken pool from multiplying ``timeout`` by its worker
+    count. Processes whose ``start`` failed have no pid and require no OS cleanup.
+    """
+    started = [proc for proc in procs if proc.pid is not None]
+    deadline = time.monotonic() + timeout
+    for proc in started:
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+    alive = [proc for proc in started if proc.is_alive()]
+    for proc in alive:
+        proc.terminate()
+    deadline = time.monotonic() + timeout
+    for proc in alive:
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+    alive = [proc for proc in alive if proc.is_alive()]
+    for proc in alive:
+        proc.kill()
+    for proc in alive:
+        proc.join()
+
+
 def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000):
     """Unimpeded cost per request, as ``[(flight_id, cost | None, denial_reason | None), ...]`` in
     the order ``requests`` was given — regardless of how the work was sharded, so a caller's log
@@ -120,20 +143,24 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
     shards = [rest[w::W] for w in range(W)]         # round-robin: adjacent flights are the same
     #                                                 delivery's legs, so a contiguous split would
     #                                                 hand one worker a whole slow region
-    ctx = mp.get_context("spawn")
     conns, procs = [], []
-    for shard in shards:
-        parent, child = ctx.Pipe(duplex=False)
-        proc = ctx.Process(target=_worker_main, args=(child, cfg, static_terms, shard), daemon=True)
-        proc.start()
-        child.close()
-        conns.append(parent)
-        procs.append(proc)
-
     by_worker: list = [None] * W
-    index = {conn: w for w, conn in enumerate(conns)}
-    waiting = list(conns)
+    pool_error = None
     try:
+        ctx = mp.get_context("spawn")
+        for shard in shards:
+            parent, child = ctx.Pipe(duplex=False)
+            conns.append(parent)
+            try:
+                proc = ctx.Process(target=_worker_main,
+                                   args=(child, cfg, static_terms, shard), daemon=True)
+                procs.append(proc)
+                proc.start()
+            finally:
+                child.close()
+
+        index = {conn: w for w, conn in enumerate(conns)}
+        waiting = list(conns)
         while waiting:
             for conn in mp_connection.wait(waiting):
                 waiting.remove(conn)
@@ -142,11 +169,21 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
                     by_worker[w] = conn.recv()
                 except EOFError:                    # died before sending — exitcode says why
                     by_worker[w] = None
+    except Exception as exc:
+        # Pool construction/IPC is an optimization. Replan the whole remainder in-process rather
+        # than returning a partial ruler; the finally below first tears down any workers that did
+        # start. KeyboardInterrupt/SystemExit still propagate after the same cleanup.
+        pool_error = exc
     finally:
         for conn in conns:
             conn.close()
-        for proc in procs:
-            proc.join(timeout=5.0)
+        _finish_processes(procs)
+
+    if pool_error is not None:
+        log.warning("lns: unimpeded worker pool failed (%s) — replanning %d flights in-process",
+                    pool_error, len(rest))
+        return probe + _sequential(cfg, static_terms, rest, planner, free,
+                                   log_every, len(probe))
 
     for w, rows in enumerate(by_worker):
         if rows is None:

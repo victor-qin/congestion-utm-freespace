@@ -10,9 +10,9 @@ pool**, maintained incrementally from the ledger commit hook:
     further intervals of c live in slots [NC, nslots) and are linked via iv_nxt from slot c.
 
 So a cell's intervals are walked from slot ``c`` along ``iv_nxt``; the **slot index is the kernel's
-frontier node id** (unique per (cell, interval), no wasted width, no overflow). A blocked step splits
-the containing interval in place (+ maybe one new slot) — O(intervals in the cell) per (cell, step).
-Degenerate slots (``lo > hi``, from single-step blocks) are left in the chain and skipped by the kernel.
+frontier node id** (unique per (cell, interval), no wasted width, no overflow). A blocked range removes
+its overlap in one pass (+ at most one new slot) — O(intervals in the cell) per (cell, span).
+Degenerate slots (``lo > hi``, from fully covered intervals) remain in the chain and are skipped.
 
 The global pool encodes the **non-terminal corridor** occupancy (flight-independent). Terminal cells
 (shared columns) are own-dependent — recorded in ``self.cols`` for the Phase-2 per-flight patch, unused
@@ -115,6 +115,7 @@ class CompiledOccupancy:
 
     # ---------- commit hook (mirrors SafeIntervalIndex) ----------
     def on_commit(self, _flight_id, volumes) -> None:
+        hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         for v in volumes:
@@ -132,7 +133,7 @@ class CompiledOccupancy:
         # the geometry sweep per (id(vol), R, infl_*), and this structure's inflation radii are
         # identical to `HexOccupancyService`'s, so the sweep the hex image just did on this same commit
         # is reused rather than repeated. The per-STEP `rasterize_volume_dual` this replaced did
-        # neither: it missed the memo AND yielded ~8x the rows (span median 7), one `_block` each.
+        # neither: it missed the memo AND yielded ~8x the rows (span median 7), one pool walk each.
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -158,22 +159,16 @@ class CompiledOccupancy:
                 continue
             self.block_range(c, int(s_lo), int(s_hi))
 
-    def _block(self, c: int, s: int) -> None:
-        """Split cell ``c``'s free interval containing step ``s`` (linked-list pool, in place).
-        Equivalent to ``block_range(c, s, s)``; kept for callers/tests that block a single step
-        (mirrors ``CompiledHexOccupancy.block``)."""
-        self.block_range(c, s, s)
-
     def block_range(self, c: int, s0: int, s1: int) -> None:
         """Remove the whole contiguous span ``[s0, s1]`` from cell ``c``'s free intervals in one pass.
 
         A committed volume occupies each cell over a contiguous step range, so this replaces ``S``
-        single-step splits with one walk — the SoA twin of ``CompiledHexOccupancy.block_range`` (issue
+        single-step calls with one walk — the SoA twin of ``CompiledHexOccupancy.block_range`` (issue
         #8 Phase E), which the hex image has had since the A* commit floor was profiled. The free-STEP
         set is identical to blocking ``s0, s0+1, …, s1`` one at a time, so the kernel is byte-unaffected.
 
         The chain (head = slot ``c``) is sorted ascending and every adjacent pair is separated by at
-        least one blocked step, an invariant this and ``_block`` both preserve: a split inserts the
+        least one blocked step, an invariant this method preserves: a split inserts the
         right remainder immediately after the left. The span may straddle several intervals once
         earlier commits punched holes — the first keeps a left remainder ``[a, s0-1]``, the last a
         right remainder ``[s1+1, b]``, and anything fully inside is marked empty (``lo>hi``) rather

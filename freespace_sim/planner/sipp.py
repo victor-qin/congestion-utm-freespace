@@ -96,6 +96,7 @@ class SafeIntervalIndex:
         self.evicted_before: int | None = None
 
     def on_commit(self, _flight_id, volumes) -> None:
+        hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         for v in volumes:

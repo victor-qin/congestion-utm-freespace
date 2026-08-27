@@ -226,6 +226,7 @@ class HexOccupancyService:
     def on_commit(self, flight_id, volumes) -> None:
         """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes,
         dropping the corridor cells inside its own terminal columns (the unreserved tactical interior)."""
+        hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         rows = [] if self.track_removal else None

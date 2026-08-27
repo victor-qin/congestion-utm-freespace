@@ -44,8 +44,8 @@ def qr_of(q, r):
 
 
 def _block(iv_lo, iv_hi, iv_nxt, state, c, s):
-    """Split cell ``c``'s free interval containing step ``s`` — faithful copy of
-    ``CompiledOccupancy._block`` so the fragmentation matches what the host pool would produce."""
+    """Split cell ``c``'s free interval containing step ``s`` so fragmentation matches repeated
+    host-side ``block_range(c, s, s)`` calls."""
     slot = c
     while slot != -1:
         a, b = int(iv_lo[slot]), int(iv_hi[slot])

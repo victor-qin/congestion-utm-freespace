@@ -538,7 +538,31 @@ _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 # its own rows before reaching it. An entry is ~10 rows (a corridor box covers ~10 hexes), so 1024
 # costs ~1 MB. Overshooting only wastes a miss's recompute, never correctness; undershooting
 # silently loses the sharing, so this errs high.
+#
+# 1024 is a FLOOR, not the whole story: `prepare_range_cache_for_commit` raises the active cap when a
+# single commit carries more volumes than that, so an unusually long trajectory still stays resident
+# through the fan-out. It never lowers the cap below this floor, which is what keeps the LNS
+# neighborhood window (spanning SEVERAL commits) intact.
+_RANGE_CACHE_MIN_CAP = 1024
 _RANGE_CACHE_CAP = 1024
+
+
+def prepare_range_cache_for_commit(volumes) -> None:
+    """Size the shared raster cache for one synchronous ledger commit.
+
+    Every occupancy observer calls this before walking ``volumes``. The first call raises the active
+    LRU to the commit size when that exceeds ``_RANGE_CACHE_MIN_CAP``; later observers repeat the same
+    cheap assignment and therefore see every row produced by the first. ``ReservationLedger.commit``
+    invokes observers synchronously, so no unrelated rasterization can interleave with that window.
+
+    It never drops below the floor. That matters for LNS, whose claim index reads victim rows
+    rasterized across SEVERAL earlier commits — sizing down to the latest commit would evict exactly
+    the rows that window exists to keep.
+    """
+    global _RANGE_CACHE_CAP
+    _RANGE_CACHE_CAP = max(_RANGE_CACHE_MIN_CAP, len(volumes))
+    while len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
+        _RANGE_CACHE.popitem(last=False)
 
 
 def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float):
@@ -546,18 +570,20 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
 
     ~98% of the coordinator's serial commit floor is these per-commit rasterizations (issue #8 Phase
     E), and the geometry is identical between them, so it is computed once here and reused. Consumers
-    are A*'s ``HexOccupancyService`` + ``CompiledHexOccupancy`` and, on a SIPP plan, additionally
-    ``CompiledOccupancy`` + ``SafeIntervalIndex`` (issue #114) — all four derive ``R``/``infl_blocked``/
-    ``infl_pad`` identically from ``cfg``, and within one commit they share the ``cfg`` object and the
-    backend flag too, which is what makes them share a key. The LRU cap bounds retention; it must
-    exceed ONE FLIGHT's volume count, since that is the whole reuse window (see below).
+    are A*'s ``HexOccupancyService`` + ``CompiledHexOccupancy``, LNS's claim index, and on a SIPP plan
+    additionally ``CompiledOccupancy`` + ``SafeIntervalIndex`` (issue #114) — all derive ``R``/
+    ``infl_blocked``/``infl_pad`` identically from ``cfg``, and within a commit they share the ``cfg``
+    object and the backend flag too, which is what makes them share a key.
 
     WHY THE WINDOW IS ONE COMMIT, AND WHY EVICTION IS NOT THE HAZARD. ``ledger.commit`` fans out
     synchronously (``for cb in self._observers``), so the consumers run back-to-back with no yield
-    point: the first inserts a flight's rows, the rest read them immediately. Once that fan-out
-    returns, the entries are dead — the next commit carries different volume objects and would miss on
-    them anyway. So evicting them costs nothing, and indeed eviction is already the steady state
-    (measured on `dallas_hub_2uss_large`: 44,469 evictions, hit rate pinned at its ceiling regardless).
+    point: the first inserts a flight's rows, the rest read them immediately, and
+    :func:`prepare_range_cache_for_commit` has already sized the cache to hold the whole flight. Once
+    that fan-out returns the entries are dead — the next commit carries different volume objects and
+    would miss on them anyway. So evicting them costs nothing, and eviction is already the steady
+    state (measured on `dallas_hub_2uss_large`: 44,469 evictions, hit rate pinned at its ceiling).
+    The exception is LNS, where the claim index reads victims rasterized across SEVERAL earlier
+    commits — that longer window is what the 1024 floor exists for.
 
     Per-plan callers therefore stay on the generator NOT to protect the commit rows — routing the
     own-column overlay through here was measured to change the commit hit rate by exactly zero
@@ -579,7 +605,7 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     rows = list(rasterize_volume_ranges(vol, cfg, R, infl_blocked, infl_pad))
     _RANGE_CACHE[key] = (vol, cfg, rows)
     _RANGE_CACHE.move_to_end(key)
-    if len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
+    while len(_RANGE_CACHE) > _RANGE_CACHE_CAP:
         _RANGE_CACHE.popitem(last=False)
     return rows
 

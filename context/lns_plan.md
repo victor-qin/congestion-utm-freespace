@@ -691,3 +691,91 @@ cells ~= 131 MB table) is exactly where their thread knee drops to 4 and City/De
 
 Realistic ceiling for 1-3 is maybe 3-5x, not 200x; the rest is problem structure (777M space-time
 cells vs ~200k, W=4 footprints, terminal capacity, 3D levels) that they simply do not model.
+## 9. The dense occupancy window (2026-08-27) — idea #1 from the MAPF-LNS code read
+
+**Goal of this phase.** After comparing this world against MAPF-LNS's C++ (§8's follow-up), the
+ranked list of ideas put **local dense occupancy** first and estimated it "large". This section is
+that idea built, measured, and re-estimated: it works, it is byte-identical, and it is worth
+**~1.08–1.14x**, not the 3–5x the ranking guessed. The reasoning behind the guess was wrong in a
+specific and reusable way, which is most of what this section is for.
+
+### The idea
+
+Their `PathTable` is `vector<vector<int>>` over `[location][timestep]` and `constrained()` is 3–5
+direct array reads. On a 32x32 Room map that table is ~0.8 MB. Ours cannot be global — 144k hexes x
+3 levels x ~1,800 steps is ~777M space-time cells — so `kernel._blocked` instead walks two
+free-interval pools per probe, plus a `static_col` read and an `ov_own_gen` read.
+
+`planner/astar/window.py` builds the same table over the box ONE plan reads: a **bitmap**, one bit
+per (cell, step), set iff the corridor pool blocks it OR a foreign column walls it. One bit suffices
+because everything `_blocked` returns 1 for is an OR, and both per-cell terms fold in at build time
+(`static_col` is step-independent; `ov_own_gen` is stamped with the same per-plan `gen`).
+
+| change | point | how it works | issues | outcome |
+|---|---|---|---|---|
+| `planner/astar/window.py` (new) | give `_blocked` a cache-resident structure to answer from | `window_bounds` sizes a box around the origin hex, its exit lanes and the landing lanes; `build_window` fills a bit per (cell, step) | the build must not be O(window area) or it costs more than it saves — the first version was, and measured **0.866x** | 1-bit rows, byte-padded |
+| `build_window`'s interval merge | make the build O(claims) | `free = corridor-free ∩ (own ∨ column-free)`: an untouched cell (one seed interval, no successor) writes NOTHING; a claimed cell is filled blocked and cleared back over a two-pointer merge of the two free lists | relies on the pools' ascending-sort invariant — which `_Pool.block_range`'s own early-exit already relies on, so it is not new risk | **0.866x -> 1.036x** on metro, and the same rewrite is what makes the density numbers positive |
+| `kernel._blocked` + `_search` | the read side | three extra args (`win`, `wbox`, `win_stats`); in-window ⇒ one byte read, a shift, a mask; out-of-window ⇒ the original walk, unchanged | `wbox[W_STEPS] == 0` is the single OFF switch, known only to `_blocked` and `window.disable` | probes outside the window are exact, so undersizing costs speed and never correctness |
+| `AStarPlanner.window_bytes`, `LNSConfig.window_bytes`, `WorkerSpec.window_bytes` | make the A/B expressible end to end | 0 = off, default 2 MB | `WorkerSpec` has no field defaults on purpose, so adding one broke a test's construction — which is the discipline working | the LNS loop A/B runs from a config flag, not a monkeypatch |
+
+### Measured
+
+Byte-identical everywhere: the paired A/B compares accept/deny, cost, every volume AND
+`last_expansions`, and the LNS A/B compares the whole trajectory.
+
+| measurement | arms | result |
+|---|---|---|
+| plan wall, density_faa, 120 flights vs the full 426,756-volume ledger | off / on | **1.144x** |
+| plan wall, same, 60 flights at 1 / 4 / 8 concurrent processes | off / on | 1.075x / 1.058x / **1.088x** |
+| **LNS loop**, density_faa, 300 iterations at N=8, `run_lns` end to end | off / on | **1.075x** (300 tasks, 96 accepted, cost 1,348,639 — identical in both) |
+| plan wall, metro_2uss (155 legs, 4,464 volumes) | off / on | 1.036x |
+| **ceiling**: window built from each plan's OWN recorded read bbox | off / oracle | **1.157x** |
+
+### Three things measurement corrected
+
+**1. The mechanism is the LIST WALK, not DRAM latency.** The idea was argued from "1.2 GB working
+set against a 12 MB L2, so ~137 ns per probe against ~2 ns". That reasoning does not survive
+contact: a plan touches only ~5,550 cells (`.context/perf/probe_read_window.py`), i.e. ~180 KB of
+pool head slots, which is L2-resident after first touch. The 52 MB is the pool, not what one plan
+streams through. What the window actually removes is the free-interval traversal (mean chain 4.4,
+worse on hot cells) and two per-cell array reads — a real but bounded saving, and the measured
+1.08–1.14x is the size of it.
+
+**2. Concurrency does not amplify it.** `_packed`'s precedent (2.5x solo, 3.1x at 8 processes) was
+the reason to expect more under `search_workers=8`. It does not repeat: 1.075x / 1.058x / 1.088x at
+1 / 4 / 8. Consistent with (1) — if the structure was already effectively cache-resident per plan,
+shrinking it further buys little even when eight processes share the cache.
+
+**3. The bounds are not worth tuning.** The shipped heuristic answers 84% of probes from the window
+and gives up entirely on 8% of plans (box over the cap), which looks like obvious headroom. It is
+not: an oracle window built from each plan's own recorded `read_bbox` — 100% hits, no plan skipped,
+and un-buildable in practice since capturing it costs an extra plan — is worth **1.157x against the
+heuristic's 1.144x**, i.e. **1.011x**. Measuring the ceiling before tuning saved the tuning.
+
+### One trap, caught by asking rather than by a test
+
+`planner.py` imports `window` at module level (for `empty_wbox` / `window_bounds` / `disable`, which
+are plain Python), but `AStarPlanner.__init__`'s numba fallback is an `except ImportError` around
+`from .kernel import _search` — a DEFERRED import — and it cannot see a module-level one. So
+`window`'s `from numba import njit` turned the documented "degrade to the pure-Python reference,
+~5-7x slower, results identical" into "`import freespace_sim.planner.astar` raises
+`ModuleNotFoundError`". Nothing in the 1,000-test suite caught it, because the suite runs WITH
+numba; it surfaced from checking a sentence written in `astar/__init__.py`'s docstring claiming the
+existing guard covered the new module. `window` now carries its own guard whose stand-in RAISES
+rather than interpreting (a silently-interpreted `build_window` would be an unbounded slowdown), and
+`test_window_module_imports_without_numba` reproduces a numba-less install in a subprocess.
+
+A fourth expectation also failed, more mildly: the LNS loop was supposed to reward the window MORE
+than a static ledger does, since destroy/repair re-fragments the same congested cells thousands of
+times and §6 named that fragmentation as the run's slowdown. It measured 1.075x on the loop against
+1.144x on plan wall — lower, not higher, because the loop also contains commit/release/index work
+the window does not touch.
+
+### Where it goes from here
+
+The window is on by default because it is exact, cheap in memory (~0.1 MB typical, 2 MB capped) and
+positive at every scale measured. But at 1.08–1.14x it is not the lever that closes the ~200x gap to
+the paper, and (1) above says why the next lever should not be argued from cache size either. The
+remaining ideas from that list are unaffected by this result — the mask build (idea #3, ~a third of
+host self-time, a genuinely different cost) and N=4 over N=8 (idea #4, free and already measured at
+1.3x) are both still open, and neither depends on the occupancy structure at all.

@@ -52,11 +52,26 @@ from ...volumes import (
 from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
 from .compiled_hex_occupancy import ground_delay_steps, hover_tail_steps, search_horizon
+from . import window as W
+from .compiled_hex_occupancy import hover_tail_steps, search_horizon
 from .occupancy import HexOccupancyService
 from ..terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
 _BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
+
+# ---- per-plan dense occupancy window (`window`) defaults ----
+# 2 MB, which is a ceiling on outliers rather than a working size: the measured 1-bit windows at
+# density_faa scale are ~0.1 MB at p50 and ~0.25 MB at p90 (`.context/perf/probe_read_window.py`), so
+# eight of them still fit inside one 12 MB cluster L2 with room to spare. A plan whose box exceeds
+# this simply runs the pre-window path.
+_WINDOW_BYTES = 2 << 20
+# Hexes of slack around the origin/lane/goal bbox. A* explores an ellipse between the endpoints; this
+# covers the reroute fan around it. Undersizing costs pool-walk misses, never an answer — and
+# `.context/perf/probe_window_oracle.py` measured the whole bound-quality question at 1.011x (a
+# window built from each plan's OWN recorded read set beats these bounds by only that), so this is
+# deliberately a simple rule and not a tuned one.
+_WINDOW_MARGIN_HEX = 12
 
 
 class _RecordingOcc:
@@ -212,8 +227,17 @@ def _warn_kernel_fallback() -> None:
 class AStarPlanner:
     def __init__(self, max_expansions: int = 3_000_000, vertical_edges: bool = True,
                  compiled: bool = True, kernel_log2_min: int | None = None,
-                 incremental_release: bool = False):
+                 incremental_release: bool = False, window_bytes: int = _WINDOW_BYTES):
         self.max_expansions = max_expansions
+        # Per-plan dense occupancy bitmap (`window`): the byte ceiling for one, 0 = off. It replaces
+        # `_blocked`'s two free-interval list walks (mean chain 4.4 at density_faa, worse on hot
+        # cells) and its two per-cell array reads with one bit lookup. Measured 1.08-1.14x on plan
+        # wall and 1.075x on the LNS loop, FLAT in worker count. Answer-neutral: the window caches
+        # the pools it was built from, and anything outside it takes the original walk.
+        self.window_bytes = int(window_bytes)
+        self._win_bytes_peak = 0                        # largest window actually built (diagnostics)
+        self._win_off = 0                               # plans that got no window (too big / degenerate)
+        self._win_painted = 0                           # window cells that held a claim (build cost)
         # LNS destroy support: derive occupancy/capacity services in removal mode (per-owner row
         # tracking) and subscribe them to `ledger.subscribe_release`, so a `release_many` is
         # un-absorbed in O(released volumes) instead of tripping the O(everything) shrink rebuild.
@@ -832,6 +856,11 @@ class AStarPlanner:
                 "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
                 "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
                 "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
+                # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
+                # counters. Reused across plans — `build_window` clears only the bytes it uses.
+                "win": np.zeros(max(1, self.window_bytes), np.uint8),
+                "wbox": W.empty_wbox(),
+                "win_stats": np.zeros(W.WSTATS_N, np.int64),
             }
         kc = self._ks_caps.get(log2)
         if kc is None:
@@ -870,6 +899,42 @@ class AStarPlanner:
         so this governs the fallback RATE, not correctness (the catastrophic-tail note: the hardest
         flights — the ones that reach max_expansions — must fit here)."""
         return max(20, (self.max_expansions * 2 - 1).bit_length())
+
+    def _build_window(self, cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
+                      goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops) -> None:
+        """Materialise this plan's dense occupancy bitmap (:mod:`window`), or leave it off.
+
+        Anchored on every cell the search STARTS or ENDS at — the origin hex, its exit lanes and the
+        landing lanes — because A* explores an ellipse between them. The step tail covers the takeoff
+        climb, the lane traverse (issue #52) and the flight itself at the same 3x detour budget the
+        bounded mask uses, so the window spans the same reach the search is allowed to use.
+
+        Everything here is a performance decision: ``window_bytes = 0``, a box that clips to nothing, or
+        a window over the cap all leave ``wbox`` disabled and the kernel on its original pool walk, which
+        returns the same answers. That is what makes the bounds tunable from measurement instead of proof.
+        """
+        wbox = ks["wbox"]
+        cap = min(self.window_bytes, len(ks["win"]))
+        if cap <= 0:
+            W.disable(wbox)
+            return
+        tail = (int(tks.max()) + int(lane_stp.max()) + 3 * n_hops + 2 * climb_span + 8)
+        nbytes = W.window_bounds(
+            cocc, wbox,
+            q_cells=(oq, int(lane_q.min()), int(lane_q.max()), int(goal_q.min()), int(goal_q.max())),
+            r_cells=(orr, int(lane_r.min()), int(lane_r.max()), int(goal_r.min()), int(goal_r.max())),
+            base=base, max_step=max_step, n_gsteps=n_gsteps,
+            lateral_margin=_WINDOW_MARGIN_HEX, tail_steps=tail, max_bytes=cap,
+        )
+        if nbytes == 0:
+            self._win_off += 1
+            W.disable(wbox)
+            return
+        if nbytes > self._win_bytes_peak:
+            self._win_bytes_peak = nbytes
+        self._win_painted += int(W.build_window(
+            cocc.corr.iv, cocc.col.iv, cocc.static_col, ks["ov_own_gen"], gen,
+            cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox, ks["win"]))
 
     def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
         """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
@@ -951,6 +1016,7 @@ class AStarPlanner:
                 np.empty(64, np.float64), np.empty(64, np.int64), np.empty(64, np.int64), 64,
                 np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
                 1000, np.zeros(8, np.int64),
+                np.zeros(1, np.uint8), W.empty_wbox(), np.zeros(W.WSTATS_N, np.int64),
             )
         except Exception as e:                                # compile failure → degrade to pure Python
             warnings.warn(
@@ -1122,6 +1188,11 @@ class AStarPlanner:
                     RuntimeWarning, stacklevel=2,
                 )
                 return self._plan_reference(req, ledger, cfg)
+            # Dense occupancy window, built INSIDE the widen loop and after the overlay: it folds
+            # `ov_own_gen == gen` in, so it must be rebuilt whenever `gen` moves, and its step span is
+            # sized from `n_gsteps`, which the FB_MASK widen changes.
+            self._build_window(cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
+                               goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops)
             n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
                 cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],
@@ -1134,7 +1205,7 @@ class AStarPlanner:
                 gen, kc["g_pack"], kc["g_packf"], kc["cap"], kc["log2"],
                 kc["heap_f"], kc["heap_c"], kc["heap_n"], kc["mh"],
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
-                rb,
+                rb, ks["win"], ks["wbox"], ks["win_stats"],
             )
             if status == K.FB_MASK and n_gsteps < full_ng:
                 self._remask += 1

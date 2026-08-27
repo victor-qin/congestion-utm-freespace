@@ -136,6 +136,7 @@ class LNSState:
         unimpeded_workers: int | None = 1,
         unimpeded_cost: dict[int, float | None] | None = None,
         maintain_claim_index: bool = True,
+        window_bytes: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger
@@ -207,7 +208,8 @@ class LNSState:
         # (the byte-parity reference for A/Bs).
         self.repair_planner = repair_planner
         if self.repair_planner is None:
-            self.repair_planner = AStarPlanner(incremental_release=incremental_release)
+            kw = {} if window_bytes is None else {"window_bytes": window_bytes}
+            self.repair_planner = AStarPlanner(incremental_release=incremental_release, **kw)
             self.repair_planner.evict_floor = 0.0
 
         # Paired-return anchor guard (only when the baseline ran return_anchor="realized"):
@@ -289,6 +291,7 @@ class LNSState:
         incremental_release: bool = True,
         kernel_log2_min: int | None = None,
         record_envelope: bool = True,
+        window_bytes: int | None = None,
     ) -> "LNSState":
         """A private copy of the incumbent for a parallel worker: own ledger, own planner.
 
@@ -309,6 +312,9 @@ class LNSState:
           (wrong) set.
         * ``incremental_release`` is the rebuild-path byte-parity reference (``--no-incremental``);
           hardcoding it would make that A/B inexpressible under parallelism.
+        * ``window_bytes`` is answer-neutral (the dense occupancy window is a cache of the pools),
+          but it is per-PLANNER state, so a worker that did not receive it would measure the
+          coordinator's default rather than the one under test.
 
         ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
         SYNC skips that bookkeeping, and effective widths below two stay in-process.
@@ -323,7 +329,8 @@ class LNSState:
             if it.accepted and it.volumes:
                 led.commit(it.request.flight_id, it.volumes)
         planner = AStarPlanner(incremental_release=incremental_release,
-                               kernel_log2_min=kernel_log2_min)
+                               kernel_log2_min=kernel_log2_min,
+                               **({} if window_bytes is None else {"window_bytes": window_bytes}))
         planner.evict_floor = 0.0        # random/premium repair orders need the full-horizon occupancy
         planner.record_envelope = record_envelope
         return cls(

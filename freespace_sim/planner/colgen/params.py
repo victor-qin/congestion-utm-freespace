@@ -54,6 +54,8 @@ class ColGenParams:
     # silent fall-back.
     solver: str = "gurobi"
     max_iterations: int = 30
+    # Flights released per LNS try; zero retains the rounding heuristic.
+    lns_destroy_flights: int = 0
     # Best-effort whole-solve wall budget (20 min). The old 120 s default could not finish a
     # single pricing sweep on a real instance and reported `time_limit` with a heuristic-only
     # schedule. `ip_reserve_s = min(5, 0.05 * t)` is already at its cap here, so the tail left
@@ -121,6 +123,8 @@ class ColGenParams:
     # A shift is arithmetic, not a search, and pricing otherwise spends its early iterations
     # rediscovering exactly these. See :func:`solver._add_departure_ladder`; 0 disables.
     seed_ladder_steps: int = 20
+    # Spacing between departure alternatives in lattice steps.
+    seed_ladder_stride: int = 1
     # Wall clock for the post-first-LP greedy, PER FLIGHT. NOW 0, WHICH DISABLES THE STAGE. The
     # stage's cutoff is measurably worthless: it produces `best_heuristic`, handed to pricing as
     # the `known_column` each subproblem prunes against, whose reduced cost `entry_rc` is exactly
@@ -287,6 +291,16 @@ class ColGenParams:
         if chunksize < 1:
             raise ValueError("pricing_chunksize must be positive")
         object.__setattr__(self, "pricing_chunksize", chunksize)
+
+        if isinstance(self.lns_destroy_flights, bool):
+            raise TypeError("lns_destroy_flights must be an integer")
+        try:
+            destroy = operator.index(self.lns_destroy_flights)
+        except TypeError as exc:
+            raise TypeError("lns_destroy_flights must be an integer") from exc
+        if destroy < 0:
+            raise ValueError("lns_destroy_flights must be non-negative")
+        object.__setattr__(self, "lns_destroy_flights", destroy)
 
         if isinstance(self.bootstrap_roots, bool):
             raise TypeError("bootstrap_roots must be an integer")

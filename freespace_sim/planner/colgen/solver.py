@@ -186,7 +186,7 @@ def _shift_column(
     )
 
 
-def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
+def _add_departure_ladder(master, seed, graph, cfg, model, steps: int, stride: int = 1) -> int:
     """Offer the master `steps` pure clock translations of one flight's seed.
 
     One rung of the warm pool's init (see context/figures/cg_loop.png).
@@ -208,7 +208,8 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     - graph (FlightGraph): the flight's pricing graph, supplying the departure/horizon bounds.
     - cfg (SimConfig): supplies ``dt_s`` and lattice geometry.
     - model (CostModel): cost weights for each shifted column's ``delay_s``.
-    - steps (int): maximum number of successive one-period rungs to offer.
+    - steps (int): maximum number of departure alternatives to offer.
+    - stride (int): lattice steps between alternatives; trades resolution for span.
 
     Return
     --------
@@ -218,6 +219,8 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
 
     if steps <= 0:
         return 0
+    if stride < 1:
+        raise ValueError("stride must be positive")
     # BOTH bounds, stated.  `latest_departure_step` alone is not the limit: this path must
     # also arrive by `max_step`, which is the bound `_initial_feasible_selection` computes
     # explicitly for the same reason.  Leaving it to be caught as a `ValueError` from
@@ -237,7 +240,14 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     )
     latest = min(graph.latest_departure_step, path_latest_departure)
     added = 0
-    for step in range(seed.departure_step + 1, min(seed.departure_step + steps, latest) + 1):
+    # `steps` stays a COLUMN COUNT under any stride -- the span is `steps * stride` -- so
+    # the two knobs are independent and the calibrated depth above keeps its meaning.
+    # `latest` still truncates, so a strided ladder on a tight horizon simply yields fewer
+    # rungs rather than overshooting it.
+    for k in range(1, steps + 1):
+        step = seed.departure_step + k * stride
+        if step > latest:
+            break
         master.add_column(_canonical_column(_shift_column(seed, step, cfg, model), graph, cfg))
         added += 1
     return added
@@ -724,6 +734,7 @@ def _pre_master_timeout_result(
             "ip_eager_rows": 0,
             "ip_separation_rounds": 0,
             "ip_setup_s": 0.0,
+            "ip_trajectory": (),
             "ip_objective": None,
             "ip_upper_bound": None,
             "ip_cost_lower_bound": None,
@@ -905,6 +916,7 @@ class ColGenSolver:
                     "ip_eager_rows": 0,
                     "ip_separation_rounds": 0,
                     "ip_setup_s": 0.0,
+                    "ip_trajectory": (),
                     "ip_objective": None,
                     "ip_upper_bound": None,
                     "ip_cost_lower_bound": None,
@@ -1061,7 +1073,8 @@ class ColGenSolver:
             seeds[flight_id] = seed
             master.add_column(seed)
             ladder_columns += _add_departure_ladder(
-                master, seed, graphs[flight_id], cfg, model, params.seed_ladder_steps
+                master, seed, graphs[flight_id], cfg, model,
+                params.seed_ladder_steps, params.seed_ladder_stride,
             )
         seed_elapsed_s = time.monotonic() - seed_started
 
@@ -1204,6 +1217,13 @@ class ColGenSolver:
                     "colgen iteration %d/%d: %d columns in the master",
                     iteration + 1, params.max_iterations, len(master.columns),
                 )
+                # Wall for THIS iteration, so the stage timers can be checked against the
+                # clock rather than trusted.  The residual `iteration_wall_s - sweep_s -
+                # sum(stage_s)` is the block nothing names, and on a 4,636-flight run that
+                # residual was 146 s of a 192 s serial tail -- the largest single term in
+                # the solve, invisible because only the parts someone thought to time were
+                # reported.  A total cannot expose it; only a per-iteration wall can.
+                iteration_started = time.monotonic()
                 # Per-iteration stage timings.  The master block was one unattributed lump in
                 # the serial tail, and "the LP is slow" is only one of four candidates in it:
                 # the LP itself, the lazy-row re-solve loop around it, `_canonical_column`
@@ -1252,9 +1272,20 @@ class ColGenSolver:
                 last_x = np.asarray(x, dtype=float)
                 columns_at_lp = len(master.columns)
 
-                heuristic = _timed(
-                    "round_heuristic", master.round_heuristic, last_x, rng, params.n_heuristic_tries
-                )
+                # LNS needs something to start from; `best_heuristic` is the greedy seed on
+                # iteration 1 and a real incumbent after, so it is never empty here -- but
+                # guard anyway, because an empty incumbent would silently return {} and
+                # look like a heuristic that found nothing.
+                if params.lns_destroy_flights and best_heuristic:
+                    heuristic = _timed(
+                        "lns_heuristic", master.lns_heuristic, last_x, rng,
+                        best_heuristic, params.lns_destroy_flights, params.n_heuristic_tries,
+                    )
+                else:
+                    heuristic = _timed(
+                        "round_heuristic", master.round_heuristic, last_x, rng,
+                        params.n_heuristic_tries,
+                    )
                 heuristic = _timed(
                     "canonical_heuristic",
                     lambda h: {
@@ -1521,9 +1552,18 @@ class ColGenSolver:
                         "dual_linf": dual_linf,
                         "dual_nonzero": sum(1 for v in capacity_duals.values() if v != 0.0),
                         "elapsed_s": time.monotonic() - started,
+                        # This iteration alone, against which `sweep_s` and `stage_s` are a
+                        # partial accounting.  Their residual is the unattributed block.
+                        "iteration_wall_s": time.monotonic() - iteration_started,
                         **_coverage_diagnostics(master, last_x, rc_by_flight, params.M),
                         "stage_s": dict(stage_s),
                         "stage_n": dict(stage_n),
+                        # Per-try outcomes of this iteration's rounding heuristic, and how
+                        # many columns the LP left integral enough to commit outright.  The
+                        # stage has never once beaten the greedy seed at scale, and without
+                        # these a reader cannot tell a try that stranded one flight (costing
+                        # a full M) from one that was merely slower everywhere.
+                        "round_stats": dict(getattr(master, "last_round_stats", {}) or {}),
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
                     })
@@ -1838,6 +1878,13 @@ class ColGenSolver:
             "ip_eager_rows": master.last_ip_eager_rows,
             "ip_separation_rounds": master.last_ip_rounds,
             "ip_setup_s": master.last_ip_setup_s,
+            # (elapsed_s, incumbent, bound) per MILP incumbent, Gurobi only -- scipy's
+            # `milp` exposes no callback, so this is empty on HiGHS.  Recorded because the
+            # final MILP is otherwise a black box: a 25-minute solve and a hang look
+            # identical, and "would a looser ip_gap have stopped it, and when" is
+            # unanswerable without the trajectory.  Both values are in MAXIMIZE revenue
+            # sense, matching `ip_upper_bound`.
+            "ip_trajectory": tuple(getattr(master, "last_ip_trajectory", ()) or ()),
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
             "objective": objective_value,

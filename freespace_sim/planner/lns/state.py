@@ -123,7 +123,8 @@ class LNSState:
         turnaround_s: float | None = None,
         repair_planner: AStarPlanner | None = None,
         incremental_release: bool = True,
-        unimpeded_workers: int | None = None,
+        # Safe for direct construction too: None is an explicit opt-in to automatic multiprocessing.
+        unimpeded_workers: int | None = 1,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger

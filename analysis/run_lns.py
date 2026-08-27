@@ -46,7 +46,8 @@ def main() -> None:
     ap.add_argument("--no-incremental", action="store_true",
                     help="use the reset+reabsorb occupancy path instead of O(victims) removal (parity A/Bs)")
     ap.add_argument("--unimpeded-workers", type=int, default=None,
-                    help="processes for the unimpeded delay ruler (default min(8, cpu-2); 1 = in-process)")
+                    help="processes for the unimpeded delay ruler (default: automatic in this guarded CLI; "
+                         "1 = in-process)")
     ap.add_argument("--repair-order", default="premium", choices=["premium", "random"],
                     help="PP priority order: premium = most-delayed first (default), random = paper's")
     ap.add_argument("--out", default=None, help="JSON output path")

@@ -49,9 +49,10 @@ class LNSConfig:
     frozen_flight_ids: frozenset = frozenset()      # never destroyed (USS-restriction hook)
     movable_uss_ids: frozenset | None = None        # None -> system operator may move every USS's intents
     incremental_release: bool = True     # O(victims) occupancy removal; False = rebuild path (parity ref)
-    # Processes used for the unimpeded delay ruler at state build (None -> min(8, cpu-2), 1 -> in
-    # process). Throughput only: the ruler's plans are independent, so the count cannot move a cost.
-    unimpeded_workers: int | None = None
+    # Processes used for the unimpeded delay ruler at state build. The library default is in-process:
+    # implicit `spawn` can re-execute an unguarded caller's top-level code. Guarded applications may
+    # explicitly pass None for min(8, cpu-2) automatic parallelism.
+    unimpeded_workers: int | None = 1
     time_limit_s: float | None = None
     verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
     log_every: int = 200

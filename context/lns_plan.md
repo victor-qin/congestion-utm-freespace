@@ -279,6 +279,9 @@ per flight, so `lns/unimpeded.py` shards it across processes with no validation 
 (contrast `freespace_sim.parallel`, whose read-envelopes exist because its plans DO see each
 other's commits). A probe prefix decides whether the pool is worth its ~0.4 s spawn, so small
 worlds stay in-process; a dead worker has its shard replanned in the parent, loudly.
+The public library default is one in-process worker because implicit `spawn` can re-import and
+execute an unguarded caller's top-level script. The guarded `analysis/run_lns.py` runner explicitly
+passes `None` to opt into the adaptive automatic worker count.
 Ruler planners also take `kernel_log2_min=18`: the `max_expansions`-derived g-hash/heap ceiling is
 ~470 MB, absurd for searches on an empty world, and dropping it measured **473 -> 214 MB per
 worker and 7% faster** (cache residency) with bit-identical costs.

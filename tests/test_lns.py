@@ -1112,6 +1112,23 @@ def test_milp_capacity_rebinds_after_a_takeover():
 
 
 # -------------------------------------------------------------------- run_lns argument contract
+def test_run_lns_defaults_unimpeded_ruler_to_in_process(monkeypatch):
+    """A public API caller must opt into spawn; its top-level module may not have a main guard."""
+    seen = []
+
+    def capture(_cfg, _static_terms, _requests, *, n_workers, log_every=1000):
+        seen.append(n_workers)
+        return []
+
+    monkeypatch.setattr(lns_state, "unimpeded_costs", capture)
+    assert LNSConfig().unimpeded_workers == 1
+
+    run_lns(CFG, ReservationLedger(CFG), [],
+            LNSConfig(max_iterations=0, log_every=0))
+    LNSState(CFG, ReservationLedger(CFG), [])       # direct construction is safe by default too
+    assert seen == [1, 1]
+
+
 def test_run_lns_defaults_its_walls_to_the_ledgers(monkeypatch):
     """Left at (), the unimpeded baseline is wall-free — inflating every delay premium, which is the
     ranking that picks victims and orders the repair — and the closing verify replays a world the

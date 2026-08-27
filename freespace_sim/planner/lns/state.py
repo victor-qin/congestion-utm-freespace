@@ -286,6 +286,7 @@ class LNSState:
         movable_uss_ids: frozenset[str] | None = None,
         incremental_release: bool = True,
         kernel_log2_min: int | None = None,
+        record_envelope: bool = True,
     ) -> "LNSState":
         """A private copy of the incumbent for a parallel worker: own ledger, own planner.
 
@@ -307,9 +308,10 @@ class LNSState:
         * ``incremental_release`` is the rebuild-path byte-parity reference (``--no-incremental``);
           hardcoding it would make that A/B inexpressible under parallelism.
 
-        ``record_envelope`` is on because the coordinator's staleness test reads the per-plan read
-        sets, and ``unimpeded_workers=1`` is pinned because this constructor runs INSIDE a search
-        worker — the ruler's own pool would otherwise fan out to m x m processes.
+        ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
+        SYNC and one-worker DROP skip that bookkeeping. ``unimpeded_workers=1`` is pinned because
+        this constructor runs INSIDE a search worker — the ruler's own pool would otherwise fan out
+        to m x m processes.
         """
         led = ReservationLedger(cfg)
         for center, term in static_terms:
@@ -320,7 +322,7 @@ class LNSState:
         planner = AStarPlanner(incremental_release=incremental_release,
                                kernel_log2_min=kernel_log2_min)
         planner.evict_floor = 0.0        # random/premium repair orders need the full-horizon occupancy
-        planner.record_envelope = True
+        planner.record_envelope = record_envelope
         return cls(
             cfg, led, intents,
             static_terms=static_terms,
@@ -604,7 +606,7 @@ class LNSState:
             self._index_add(fid, it.volumes)
             self._visits.pop(fid, None)
 
-    def apply_delta(self, changes: dict[int, OperationalIntent], *, rollback: bool = True) -> None:
+    def apply_delta(self, changes: dict[int, OperationalIntent]) -> None:
         """Adopt someone else's accepted repair: move the LEDGER **and** the in-memory views.
 
         The replica-sync counterpart of ``try_repair``'s accept branch. The difference is the
@@ -614,9 +616,7 @@ class LNSState:
         parallel worker's "take a private copy of P_min" affordable at all.
 
         One ``commit`` per flight, because ``_absorb`` groups a flight's volumes by adjacent runs
-        and needs them contiguous. ``rollback=False`` is for a caller that already owns an
-        enclosing rewind: running two would re-release and re-commit, and the second ``_rewind``'s
-        ``RuntimeError`` would mask the original exception.
+        and needs them contiguous. Any failure rewinds the whole delta before propagating.
         """
         # The CALLER's order, not sorted. `changes` comes out of a repair in PP priority order, and
         # replaying it in that order lands the ledger's `_vols`/`_fids` in the same layout the
@@ -635,8 +635,7 @@ class LNSState:
                 self.ledger.commit(fid, changes[fid].volumes)
             self._apply_in_memory(changes, applied)
         except BaseException:
-            if rollback:
-                self._rewind(fids, old, cost_at_entry, applied)
+            self._rewind(fids, old, cost_at_entry, applied)
             raise
 
     # ---------------------------------------------------------------------- readout

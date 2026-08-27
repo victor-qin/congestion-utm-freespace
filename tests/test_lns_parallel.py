@@ -15,6 +15,8 @@ See ``context/lns_plan.md`` and the DROP-LNS design record for why each of these
 
 import hashlib
 import multiprocessing as mp
+import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -44,6 +46,10 @@ def _state_digest(state) -> tuple:
         _claim_digest(state),
         tuple(_intent_digest(i) for i in state.final_intents()),
     )
+
+
+def _exit_before_ready(*_args):
+    """Spawn-safe worker target used to exercise the startup EOF/sentinel path."""
 
 
 # ------------------------------------------------------------------ replica fidelity
@@ -231,7 +237,10 @@ def test_envelopes_are_recorded_only_when_the_planner_records_them():
     # replica() turns record_envelope on; the plain constructor leaves it off.
     rep = LNSState.replica(res.config, intents, static_terms=base.static_terms,
                            unimpeded_cost=unimp)
+    quiet = LNSState.replica(res.config, intents, static_terms=base.static_terms,
+                             unimpeded_cost=unimp, record_envelope=False)
     assert rep.repair_planner.record_envelope is True
+    assert quiet.repair_planner.record_envelope is False
     assert base.repair_planner.record_envelope is False
 
     rng = np.random.default_rng(np.random.SeedSequence([7, 0]))
@@ -298,6 +307,8 @@ def test_one_worker_sync_matches_sequential():
     assert [_intent_digest(i) for i in par.intents] == [_intent_digest(i) for i in seq.intents]
     assert par.weights == seq.weights
     assert par.n_accepted == seq.n_accepted and par.verified
+    assert par.npo == par.n_iterations == 40
+    assert seq.npo == seq.n_iterations == 40
     assert seq.n_accepted > 0, "a vacuous run would make this gate meaningless"
 
 
@@ -382,13 +393,32 @@ def test_a_dead_worker_fails_loudly_rather_than_hanging():
         pool.close()
 
 
+def test_worker_exit_during_startup_is_cleaned_up(monkeypatch):
+    """A child that exits before its ready message must neither hang nor leak sibling workers."""
+    from freespace_sim.config import SimConfig
+    from freespace_sim.planner.lns import parallel
+
+    monkeypatch.setattr(parallel, "_worker_main", _exit_before_ready)
+    spec = parallel.WorkerSpec(
+        neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
+        max_walks=10, map_max_cells=4096, turnaround_s=None,
+        frozen_flight_ids=frozenset(), movable_uss_ids=None,
+        incremental_release=True, kernel_log2_min=None,
+    )
+    pool = parallel.LNSWorkerPool(SimConfig(), [], (), {}, spec, 2)
+    with pytest.raises(parallel.WorkerLost, match="before reporting ready"):
+        pool.start(deadline=time.monotonic() + 10.0)
+    assert pool._procs == []
+    assert pool._conns == []
+
+
 def test_search_workers_and_parallel_mode_are_validated():
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.lns import LNSConfig, run_lns
     from freespace_sim.config import SimConfig
 
     cfg = SimConfig()
-    for bad in (0, -1, True):
+    for bad in (0, -1, True, 1.5, "1"):
         with pytest.raises(ValueError, match="search_workers"):
             run_lns(cfg, ReservationLedger(cfg), [],
                     LNSConfig(max_iterations=0, log_every=0, search_workers=bad))
@@ -398,6 +428,44 @@ def test_search_workers_and_parallel_mode_are_validated():
     with pytest.raises(ValueError, match="parallel_mode"):
         run_lns(cfg, ReservationLedger(cfg), [],
                 LNSConfig(max_iterations=0, log_every=0, parallel_mode="deta"))
+
+
+def test_auc_integrates_the_full_step_trajectory():
+    """AUC includes the initial segment and final tail; incumbent cost changes at completion."""
+    from freespace_sim.planner.lns.solver import _trajectory_auc
+
+    trajectory = [
+        {"wall_s": 2.0, "incumbent_cost": 80.0},
+        {"wall_s": 4.0, "incumbent_cost": 60.0},
+    ]
+    assert _trajectory_auc(trajectory, cost_before=100.0, horizon_s=4.0) == 360.0
+    assert _trajectory_auc(trajectory, cost_before=100.0, horizon_s=6.0) == 480.0
+    assert _trajectory_auc([], cost_before=100.0, horizon_s=3.0) == 300.0
+
+
+def test_parallel_state_build_honors_unimpeded_workers(monkeypatch):
+    """The parallel coordinator must forward the parent's one-off ruler pool setting."""
+    from freespace_sim.config import SimConfig
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.lns import LNSConfig
+    from freespace_sim.planner.lns import state as state_module
+    from freespace_sim.planner.lns.parallel import run_lns_parallel
+
+    seen = []
+
+    def fake_unimpeded_costs(_cfg, _static_terms, requests, *, n_workers):
+        seen.append((list(requests), n_workers))
+        return []
+
+    monkeypatch.setattr(state_module, "unimpeded_costs", fake_unimpeded_costs)
+    cfg = SimConfig()
+    out = run_lns_parallel(
+        cfg, ReservationLedger(cfg), [],
+        LNSConfig(max_iterations=0, log_every=0, search_workers=2, unimpeded_workers=3),
+    )
+    assert seen == [([], 3)]
+    assert out.n_iterations == out.npo == 0
+    assert out.pool_spawn_s == 0.0
 
 
 def test_default_config_is_the_sequential_path():
@@ -470,6 +538,152 @@ def test_drop_rows_cover_every_dispatched_task():
     assert sorted(r["iter"] for r in out.trajectory) == list(range(24))
 
 
+def test_sync_trims_history_and_does_not_adapt_in_uniform_mode():
+    from freespace_sim.planner.lns.neighborhood import AdaptiveSelector
+    from freespace_sim.planner.lns.parallel import (
+        TaskResult,
+        _Changelog,
+        _loop_sync,
+    )
+
+    intent = SimpleNamespace(cost=10.0, volumes=())
+    changelog = _Changelog()
+    changelog.record({1: intent}, {1: intent})
+    result = TaskResult(0, 0, 0, 1, "random", (), {}, 0.0, 0.0, (), "empty")
+
+    class Pool:
+        n_workers = 1
+        worker_version = [0]
+
+        def sync_all(self, log):
+            self.worker_version = [log.version]
+
+        def dispatch(self, *_args):
+            pass
+
+        def collect(self, _n):
+            return [result]
+
+    lns = SimpleNamespace(
+        max_iterations=1, time_limit_s=None, seed=0, adaptive=False,
+        operators=("random",), verify_every=0, log_every=0,
+    )
+    selector = AdaptiveSelector(("random",), gamma=0.25)
+    trajectory = []
+    stats = _loop_sync(
+        SimpleNamespace(total_cost=10.0), Pool(), lns, selector, set(), changelog,
+        time.monotonic(), trajectory, 10.0,
+    )
+
+    assert changelog._entries == []
+    assert selector.weights == {"random": 1.0}
+    assert stats["n_iter"] == 1
+
+
+def test_drop_does_not_adapt_in_uniform_mode():
+    from freespace_sim.planner.lns.neighborhood import AdaptiveSelector
+    from freespace_sim.planner.lns.parallel import TaskResult, _Changelog, _loop_drop
+
+    result = TaskResult(0, 0, 0, 0, "random", (), {}, 0.0, 0.0, (), "empty")
+
+    class Pool:
+        n_workers = 1
+        worker_version = [0]
+
+        def sync(self, *_args):
+            pass
+
+        def dispatch(self, *_args):
+            pass
+
+        def collect(self, _n):
+            return [result]
+
+    lns = SimpleNamespace(
+        max_iterations=1, time_limit_s=None, seed=0, adaptive=False,
+        operators=("random",), accept_epsilon=0.0, verify_every=0, log_every=0,
+    )
+    selector = AdaptiveSelector(("random",), gamma=0.25)
+    _loop_drop(
+        SimpleNamespace(total_cost=10.0), Pool(), lns, selector, set(), _Changelog(),
+        time.monotonic(), [], 10.0,
+    )
+    assert selector.weights == {"random": 1.0}
+
+
+@pytest.mark.parametrize(("accept_epsilon", "accepted"), [(2.0, False), (1.0, True)])
+def test_drop_overwrite_is_one_atomic_net_improvement(accept_epsilon, accepted, monkeypatch):
+    """A stale overwrite applies once and is judged/rewarded by its realized net gain."""
+    from freespace_sim.planner.lns import parallel
+    from freespace_sim.planner.lns.neighborhood import AdaptiveSelector
+
+    base_a = SimpleNamespace(cost=50.0, volumes=())
+    current_a = SimpleNamespace(cost=41.0, volumes=())
+    old_b = SimpleNamespace(cost=50.0, volumes=())
+    new_b = SimpleNamespace(cost=39.0, volumes=())
+
+    class State:
+        def __init__(self):
+            self.incumbent = {1: current_a, 2: old_b}
+            self.total_cost = 91.0
+            self.apply_calls = []
+
+        def apply_delta(self, changes):
+            self.apply_calls.append(tuple(changes))
+            for fid, intent in changes.items():
+                self.total_cost += intent.cost - self.incumbent[fid].cost
+                self.incumbent[fid] = intent
+
+    result = parallel.TaskResult(
+        0, 0, 0, 0, "random", (2,), {2: new_b}, 50.0, 39.0, (), "improved",
+    )
+
+    class Pool:
+        n_workers = 1
+        worker_version = [0]
+
+        def sync(self, *_args):
+            pass
+
+        def dispatch(self, *_args):
+            pass
+
+        def collect(self, _n):
+            return [result]
+
+    # Force the dirty branch. The changelog's empty fake volumes otherwise make the geometric
+    # read-set check vacuously clean, which is unrelated to this acceptance test.
+    monkeypatch.setattr(parallel, "_read_set_is_clean", lambda *_args: False)
+    changelog = parallel._Changelog()
+    changelog.record({1: current_a}, {1: base_a})  # others already realized 9 s of gain
+    state = State()
+    selector = AdaptiveSelector(("random",), gamma=1.0)
+    lns = SimpleNamespace(
+        max_iterations=1, time_limit_s=None, seed=0, adaptive=True,
+        operators=("random",), accept_epsilon=accept_epsilon,
+        verify_every=0, log_every=0,
+    )
+    trajectory = []
+    stats = parallel._loop_drop(
+        state, Pool(), lns, selector, set(), changelog,
+        time.monotonic(), trajectory, 100.0,
+    )
+
+    assert trajectory[0]["accepted"] is accepted
+    if accepted:
+        # Local gain 11 minus the reverted gain 9 = a realized gain of 2.
+        assert state.apply_calls == [(1, 2)]
+        assert state.total_cost == 89.0
+        assert changelog.version == 2
+        assert selector.weights["random"] == 2.0
+        assert stats["n_overwrite"] == 1
+    else:
+        # Equality to epsilon is not a strict improvement, and nothing is partially reverted.
+        assert state.apply_calls == []
+        assert state.total_cost == 91.0
+        assert changelog.version == 1
+
+
 # ==================================================================== _Changelog
 @pytest.mark.slow
 def test_changelog_diff_revert_and_touched():
@@ -495,6 +709,7 @@ def test_changelog_diff_revert_and_touched():
 
     assert cl.version == 3
     assert cl.diff_since(0) == {a: oldA, b: oldB}      # last write wins
+    assert list(cl.diff_since(0)) == [b, a]             # last TOUCH wins replay order
     assert cl.diff_since(2) == {a: oldA}
     assert cl.touched_since(0) == {a, b}
     assert cl.touched_since(2) == {a}

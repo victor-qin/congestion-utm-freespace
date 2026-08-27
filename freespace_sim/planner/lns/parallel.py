@@ -96,6 +96,7 @@ class WorkerSpec:
     movable_uss_ids: frozenset | None
     incremental_release: bool
     kernel_log2_min: int | None
+    record_envelope: bool = True
 
 
 @dataclass
@@ -127,6 +128,10 @@ class TaskResult:
 class WorkerLost(RuntimeError):
     """A worker died mid-round. Raised rather than absorbed: an OOM-killed worker that is merely
     waited on HANGS the run, which is the documented failure mode of every pool in this repo."""
+
+
+class WorkerStartTimeout(WorkerLost):
+    """The wall-clock budget expired while workers were starting."""
 
 
 # ====================================================================== coordinator helpers
@@ -173,7 +178,12 @@ class _Changelog:
         out: dict = {}
         for v, changes, _olds in self._entries:
             if v > base_version:
-                out.update(changes)          # last write wins: only the latest intent matters
+                for fid, intent in changes.items():
+                    # Last write wins AND last touch determines replay order. Plain ``update``
+                    # replaces an existing value without moving its insertion position, which can
+                    # change the ledger layout and break one-worker parity after an A, B, A history.
+                    out.pop(fid, None)
+                    out[fid] = intent
         return out
 
     def touched_since(self, base_version: int) -> set:
@@ -219,18 +229,11 @@ class _Changelog:
 
 
 # ====================================================================== worker
-_OPS = {
-    "agent": agent_based_neighborhood,
-    "map": map_based_neighborhood,
-    "random": random_neighborhood,
-}
-
-
 def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
-                 unimp_raw: dict, spec: WorkerSpec, index: int) -> None:
+                 unimpeded_cost: dict, spec: WorkerSpec, index: int) -> None:
     """One worker process: a private replica, then destroy/repair tasks against it.
 
-    ``unimp_raw`` keeps its ``None``s: ``LNSState.__init__`` is the single owner of the
+    ``unimpeded_cost`` keeps its ``None``s: ``LNSState.__init__`` is the single owner of the
     "ruler denied this flight -> treat as undelayed" rule, so the coordinator and every worker
     resolve it identically by construction rather than by agreement.
     """
@@ -238,12 +241,13 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
         state = LNSState.replica(
             cfg, intents,
             static_terms=static_terms,
-            unimpeded_cost=unimp_raw,
+            unimpeded_cost=unimpeded_cost,
             turnaround_s=spec.turnaround_s,
             frozen_flight_ids=spec.frozen_flight_ids,
             movable_uss_ids=spec.movable_uss_ids,
             incremental_release=spec.incremental_release,
             kernel_log2_min=spec.kernel_log2_min,
+            record_envelope=spec.record_envelope,
         )
     except BaseException:                                       # noqa: BLE001 - reported home
         import traceback
@@ -272,7 +276,7 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
             if kind != "task":
                 raise RuntimeError(f"lns worker got an unknown message {kind!r}")
 
-            _, rnd, slot, op, seed_fid, rng_state, weights = msg
+            _, rnd, slot, op, seed_fid, rng_state = msg
             rng = np.random.default_rng()
             # The generator STATE, not a seed: the coordinator already consumed one draw for the
             # ALNS roulette from this same stream, and a freshly seeded generator would start a
@@ -319,12 +323,12 @@ class LNSWorkerPool:
     single loss take 15 s).
     """
 
-    def __init__(self, cfg: SimConfig, intents: list, static_terms: tuple, unimp_raw: dict,
+    def __init__(self, cfg: SimConfig, intents: list, static_terms: tuple, unimpeded_cost: dict,
                  spec: WorkerSpec, n_workers: int) -> None:
         self._cfg = cfg
         self._intents = intents
         self._static_terms = static_terms
-        self._unimp_raw = unimp_raw
+        self._unimpeded_cost = unimpeded_cost
         self._spec = spec
         self.n_workers = int(n_workers)
         self._procs: list = []
@@ -333,7 +337,7 @@ class LNSWorkerPool:
         self.spawn_s = 0.0
 
     # ---------------------------------------------------------------- lifecycle
-    def start(self) -> "LNSWorkerPool":
+    def start(self, *, deadline: float | None = None) -> "LNSWorkerPool":
         # The numba kernel is already compiled in this process: the schedule being improved came
         # out of an in-process A* run (LNSState's constructor requires the ledger and intents to
         # be the very same objects). So the on-disk cache=True artifact exists and the workers
@@ -342,28 +346,55 @@ class LNSWorkerPool:
 
         ctx = mp.get_context("spawn")   # never fork: it inherits the numba runtime + thread state
         t0 = time.monotonic()
-        for i in range(self.n_workers):
-            parent, child = ctx.Pipe()
-            p = ctx.Process(
-                target=_worker_main,
-                args=(child, self._cfg, self._intents, self._static_terms,
-                      self._unimp_raw, self._spec, i),
-                daemon=True,
-            )
-            p.start()
-            child.close()    # parent's copy of the CHILD end: without this EOF never fires
-            self._procs.append(p)
-            self._conns.append(parent)
-        for i, conn in enumerate(self._conns):
-            kind, pid, err = conn.recv()
-            if err:
-                self.close()
-                raise WorkerLost(f"lns worker {i} failed to build its replica:\n{err}")
-            log.debug("lns worker %d ready (pid %d)", i, pid)
-        self.worker_version = [0] * self.n_workers
-        self.spawn_s = time.monotonic() - t0
-        log.info("lns: %d workers up in %.1fs", self.n_workers, self.spawn_s)
-        return self
+        try:
+            for i in range(self.n_workers):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise WorkerStartTimeout("lns worker startup exhausted the wall-clock budget")
+                parent, child = ctx.Pipe()
+                p = ctx.Process(
+                    target=_worker_main,
+                    args=(child, self._cfg, self._intents, self._static_terms,
+                          self._unimpeded_cost, self._spec, i),
+                    daemon=True,
+                )
+                try:
+                    p.start()
+                except BaseException:
+                    parent.close()
+                    child.close()
+                    raise
+                child.close()    # without closing this parent-side copy, EOF never fires
+                self._procs.append(p)
+                self._conns.append(parent)
+
+            for i, (conn, proc) in enumerate(zip(self._conns, self._procs)):
+                timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                ready = mp_connection.wait([conn, proc.sentinel], timeout=timeout)
+                if not ready:
+                    raise WorkerStartTimeout(
+                        f"lns worker {i} did not become ready before the wall-clock budget expired")
+                if conn not in ready:
+                    raise WorkerLost(
+                        f"lns worker {i} died before reporting ready (exit {proc.exitcode})")
+                try:
+                    msg = conn.recv()
+                except EOFError as exc:
+                    raise WorkerLost(f"lns worker {i} closed its pipe before reporting ready") from exc
+                if len(msg) != 3 or msg[0] != "ready":
+                    raise WorkerLost(f"lns worker {i} sent an invalid startup message {msg!r}")
+                _, pid, err = msg
+                if err:
+                    raise WorkerLost(f"lns worker {i} failed to build its replica:\n{err}")
+                log.debug("lns worker %d ready (pid %d)", i, pid)
+
+            self.worker_version = [0] * self.n_workers
+            self.spawn_s = time.monotonic() - t0
+            log.info("lns: %d workers up in %.1fs", self.n_workers, self.spawn_s)
+            return self
+        except BaseException:
+            self.spawn_s = time.monotonic() - t0
+            self.close()
+            raise
 
     def close(self) -> None:
         for conn in self._conns:
@@ -373,17 +404,23 @@ class LNSWorkerPool:
                 pass
         deadline = time.monotonic() + _GRACEFUL_STOP_S      # ONE window for all of them
         for p in self._procs:
-            p.join(timeout=max(0.0, deadline - time.monotonic()))
+            try:
+                p.join(timeout=max(0.0, deadline - time.monotonic()))
+            except (AssertionError, OSError, ValueError):
+                pass
         for p in self._procs:
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=_CLOSE_JOIN_TIMEOUT_S)
+            try:
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=_CLOSE_JOIN_TIMEOUT_S)
+            except (AssertionError, OSError, ValueError):
+                pass
         for conn in self._conns:
             try:
                 conn.close()
             except (OSError, ValueError):
                 pass
-        self._procs, self._conns = [], []
+        self._procs, self._conns, self.worker_version = [], [], []
 
     def __enter__(self) -> "LNSWorkerPool":
         return self
@@ -405,9 +442,8 @@ class LNSWorkerPool:
         for w in range(self.n_workers):
             self.sync(w, changelog)
 
-    def dispatch(self, worker: int, rnd: int, slot: int, op: str, seed_fid, rng_state,
-                 weights: dict) -> None:
-        self._conns[worker].send(("task", rnd, slot, op, seed_fid, rng_state, weights))
+    def dispatch(self, worker: int, rnd: int, slot: int, op: str, seed_fid, rng_state) -> None:
+        self._conns[worker].send(("task", rnd, slot, op, seed_fid, rng_state))
 
     def collect(self, n: int, timeout: float | None = None) -> list[TaskResult]:
         """Wait for ``n`` results. Waits on every worker's SENTINEL as well as its pipe, so a
@@ -452,24 +488,6 @@ def _traj_row(i, op, victims, accepted, reason, cost_old, cost_new, incumbent_co
         cost_new=None if (cost_new is None or math.isinf(cost_new)) else cost_new,
         incumbent_cost=incumbent_cost, wall_s=wall_s,
     )
-
-
-def _auc(trajectory) -> float:
-    """Trapezoidal integral of the best-known cost against WALL CLOCK (paper §5.2).
-
-    Wall clock, not iteration index: the whole point of the comparison is that m workers reach a
-    given quality sooner, and an iteration-indexed curve is blind to that by construction.
-
-    **Only comparable between runs that ran for the SAME wall span.** The paper integrates over a
-    fixed budget T (60 s in its evaluation), so every arm covers [0, T]. Ours defaults to an
-    ITERATION budget, and integrating over whatever wall that took rewards an arm merely for
-    finishing sooner — a run that halves its wall roughly halves its AUC without improving
-    anything. Compare AUC only across arms sharing a ``time_limit_s``; otherwise read
-    ``cost_after`` against ``wall_s`` and treat AUC as a within-arm convergence shape.
-    """
-    pts = [(r["wall_s"], r["incumbent_cost"]) for r in trajectory]
-    return float(sum((t1 - t0) * (c0 + c1) / 2.0
-                     for (t0, c0), (t1, c1) in zip(pts, pts[1:])))
 
 
 def _pick_task(state, lns, selector, tabu, i):
@@ -519,9 +537,10 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
             break
         n_slots = min(m, lns.max_iterations - rnd)
         pool.sync_all(changelog)
+        changelog.trim(min(pool.worker_version))
         for slot in range(n_slots):
             op, seed_fid, rng_state = _pick_task(state, lns, selector, tabu, rnd + slot)
-            pool.dispatch(slot, rnd, slot, op, seed_fid, rng_state, dict(selector.weights))
+            pool.dispatch(slot, rnd, slot, op, seed_fid, rng_state)
 
         results = sorted(pool.collect(n_slots), key=lambda r: r.slot)
         n_iter += n_slots
@@ -540,7 +559,8 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
             is_winner = r is winner
             # Only the APPLIED result earns credit; everything else decays — which is exactly what
             # the sequential loop does when it feeds `out.improvement == 0.0` on a rejection.
-            selector.update(r.op, r.improvement if is_winner else 0.0)
+            if lns.adaptive:
+                selector.update(r.op, r.improvement if is_winner else 0.0)
             reason = r.reason
             if r.improved and not is_winner:
                 reason = "not_selected"
@@ -590,7 +610,7 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
         next_i += 1
         op, seed_fid, rng_state = _pick_task(state, lns, selector, tabu, i)
         pool.sync(w, changelog)          # bring it current, THEN give it work
-        pool.dispatch(w, i, 0, op, seed_fid, rng_state, dict(selector.weights))
+        pool.dispatch(w, i, 0, op, seed_fid, rng_state)
         inflight[w] = i
         return True
 
@@ -602,15 +622,21 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
         inflight.pop(r.worker, None)
         n_iter += 1
         applied, reason = False, r.reason
+        changes: dict = {}
+        realized_improvement = 0.0
 
         if r.improved:
             stale_by = changelog.version - r.base_version
             if stale_by == 0:
                 applied = True
+                changes = r.new_intents
+                realized_improvement = r.improvement
             elif set(r.victims) & changelog.touched_since(r.base_version):
                 reason, n_stale_victims = "stale_victims", n_stale_victims + 1
             elif _read_set_is_clean(r.envelopes, changelog.boxes_since(r.base_version)):
                 applied, reason = True, "improved"
+                changes = r.new_intents
+                realized_improvement = r.improvement
                 n_clean += 1
             else:
                 n_dirty += 1
@@ -630,22 +656,25 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
                 reverts = changelog.revert_to(r.base_version)
                 improvement_since = sum(float(it.cost) - float(state.incumbent[f].cost)
                                         for f, it in reverts.items())
-                if r.improvement > improvement_since:
-                    olds = {f: state.incumbent[f] for f in reverts}
-                    state.apply_delta(reverts)
-                    changelog.record(reverts, olds)
+                net_improvement = r.improvement - improvement_since
+                if net_improvement > max(0.0, float(lns.accept_epsilon)):
                     applied, reason = True, "overwrite"
+                    # One transaction and one version: a failure cannot strand the incumbent at
+                    # the stale worker's base, and no other worker can observe half an overwrite.
+                    changes = {**reverts, **r.new_intents}
+                    realized_improvement = net_improvement
                     n_overwrite += 1
                 else:
                     reason, n_stale_cost = "stale", n_stale_cost + 1
 
         if applied:
-            olds = {f: state.incumbent[f] for f in r.new_intents}
-            state.apply_delta(r.new_intents)
-            changelog.record(r.new_intents, olds)
+            olds = {f: state.incumbent[f] for f in changes}
+            state.apply_delta(changes)
+            changelog.record(changes, olds)
             n_accepted += 1
 
-        selector.update(r.op, r.improvement if applied else 0.0)
+        if lns.adaptive:
+            selector.update(r.op, realized_improvement if applied else 0.0)
         row = _traj_row(r.rnd, r.op, r.victims, applied, reason,
                         r.cost_old, r.cost_new, state.total_cost, time.monotonic() - t0)
         row["base_version"] = r.base_version
@@ -734,16 +763,18 @@ def run_lns_parallel(
     ``search_workers=1`` it is byte-identical to the sequential loop, which is the parity gate the
     whole design is verified against.
     """
-    from freespace_sim.planner.lns.solver import LNSResult   # deferred: solver imports this module
+    # Deferred because solver imports this module only for the parallel path.
+    from freespace_sim.planner.lns.solver import (
+        _build_lns_state,
+        _finalize_lns_result,
+        _validate_lns_config,
+    )
 
+    search_workers = _validate_lns_config(lns)
     t0 = time.monotonic()
-    state = LNSState(
-        cfg, ledger, intents,
-        static_terms=ledger.static_terminals() if static_terms is None else static_terms,
-        frozen_flight_ids=lns.frozen_flight_ids,
-        movable_uss_ids=lns.movable_uss_ids,
-        turnaround_s=turnaround_s,
-        incremental_release=lns.incremental_release,
+    state = _build_lns_state(
+        cfg, ledger, intents, lns,
+        static_terms=static_terms, turnaround_s=turnaround_s,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0
@@ -760,6 +791,7 @@ def run_lns_parallel(
         movable_uss_ids=lns.movable_uss_ids,
         incremental_release=lns.incremental_release,
         kernel_log2_min=lns.worker_kernel_log2,
+        record_envelope=lns.parallel_mode == "drop" and search_workers > 1,
     )
 
     selector = AdaptiveSelector(tuple(lns.operators), lns.gamma)
@@ -768,32 +800,35 @@ def run_lns_parallel(
     trajectory: list[dict] = []
     n_accepted = 0
     n_iter = 0
-    stats: dict = {}
+    stats: dict = {
+        "n_iter": 0, "n_accepted": 0, "n_not_selected": 0,
+        "n_stale": 0, "n_stale_victims": 0, "n_stale_cost": 0,
+        "n_dirty": 0, "n_overwrite": 0, "n_clean_merge": 0,
+    }
     pool = None
     try:
-        pool = LNSWorkerPool(cfg, state.final_intents(), static_terms,
-                             dict(state._unimp_cost), spec, lns.search_workers).start()
-        loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
-        stats = loop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before)
-        n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
+        if lns.max_iterations > 0 and not _out_of_budget(lns, t0):
+            pool = LNSWorkerPool(
+                cfg, state.final_intents(), static_terms,
+                dict(state._unimp_cost), spec, search_workers,
+            )
+            deadline = None if lns.time_limit_s is None else t0 + lns.time_limit_s
+            try:
+                pool.start(deadline=deadline)
+            except WorkerStartTimeout:
+                # Startup is part of the configured wall-clock budget. Return the valid baseline
+                # when it consumes that budget; the pool has already torn down partial workers.
+                log.info("lns: wall-clock budget expired while starting search workers")
+            else:
+                loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
+                stats = loop(
+                    state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before)
+                n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
 
-        final = state.final_intents()
-        bad = verify.find_interflight_conflict(final, cfg, static_terminals=static_terms)
-        return LNSResult(
-            intents=final,
-            trajectory=trajectory,
-            cost_before=cost_before,
-            cost_after=state.total_cost,
-            n_iterations=n_iter,
-            n_accepted=n_accepted,
-            wall_s=time.monotonic() - t0,
-            init_wall_s=init_s,
-            weights=dict(selector.weights),
-            verified=bad is None,
-            search_workers=pool.n_workers if pool else lns.search_workers,
+        return _finalize_lns_result(
+            state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
+            search_workers=search_workers,
             parallel_mode=lns.parallel_mode,
-            npo=n_iter,
-            auc=_auc(trajectory),
             pool_spawn_s=pool.spawn_s if pool else 0.0,
             parallel_stats=_finish_stats(stats, n_iter),
         )

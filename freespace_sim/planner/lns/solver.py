@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import operator
 import os
 import time
 import warnings
@@ -54,24 +55,9 @@ class LNSConfig:
     # implicit `spawn` can re-execute an unguarded caller's top-level code. Guarded applications may
     # explicitly pass None for min(8, cpu-2) automatic parallelism.
     unimpeded_workers: int | None = 1
-    # --- parallel destroy/repair (DROP-LNS; freespace_sim.planner.lns.parallel) ---
-    # 1 = the in-process loop below. Above 1, `run_lns` hands off to `run_lns_parallel`; at exactly
-    # 1 that function is byte-identical to this loop, which is the parity gate.
-    #
-    # The default is 1 because the win INVERTS with instance size, not because parallel loses. On
-    # FULL density_faa (4,636 legs) m=8 reaches the sequential schedule in 1.91x less wall (2.11%
-    # in 1,046 s vs 2.06% in 2,000 s) and m=4 beats it outright (2.64% in 1,721 s); on the 120 s cut
-    # (290 legs) the same knobs are 1.03x (m=4) and 0.76x (m=8) — a LOSS. A neighborhood of 8
-    # collides far less often inside 4,636 flights than inside 290, and per-task cost grows with the
-    # schedule, so there is more for the pool to hide. Until the crossover between those scales is
-    # pinned, the safe default is the one that cannot lose. Memory is also LINEAR in workers
-    # (~350 MiB each at 290 legs) — the same reason colgen's pricing pool is still defaulted off.
-    #
-    # The TWO worker knobs are deliberately separate and compose: `unimpeded_workers` shards the
-    # one-off state build (independent plans, cannot move a cost), `search_workers` runs the
-    # destroy/repair loop (dependent plans, needs the whole staleness machinery). A replica pins
-    # `unimpeded_workers=1` explicitly (now also the library default) so the two can never nest
-    # into m x m processes even if that default is later relaxed.
+    # Parallel destroy/repair (DROP-LNS). The conservative default stays in-process because the
+    # crossover is instance-dependent and every search worker holds a full schedule replica.
+    # `unimpeded_workers` remains a separate, parent-only knob for the one-off delay ruler.
     search_workers: int = 1
     parallel_mode: str = "sync"          # "sync": barrier per round, deterministic | "drop": async
     worker_kernel_log2: int | None = None  # AStarPlanner.kernel_log2_min in the workers; oversized
@@ -97,10 +83,14 @@ class LNSResult:
     # --- parallel only; defaulted so every existing construction site is untouched ---
     search_workers: int = 1
     parallel_mode: str = "sequential"
-    npo: int = 0            # paper §5.2 NPO*: destroy/repair operations actually run
     auc: float = 0.0        # paper §5.2 AUC: best-known cost integrated over WALL CLOCK
     pool_spawn_s: float = 0.0
     parallel_stats: dict = field(default_factory=dict)   # mode counters + dirty/accept rates
+
+    @property
+    def npo(self) -> int:
+        """Paper §5.2 NPO*: destroy/repair operations actually run."""
+        return self.n_iterations
 
     def summary(self) -> dict:
         return {
@@ -123,6 +113,125 @@ class LNSResult:
         }
 
 
+def _validate_lns_config(lns: LNSConfig) -> int:
+    """Validate all arguments that must fail before ``LNSState`` takes over the ledger.
+
+    Returns the normalized search-worker count. ``operator.index`` accepts real integer scalar
+    types (including NumPy integers) without silently truncating floats or parsing strings.
+    """
+    known = {"agent", "map", "random"}
+    unknown = [name for name in lns.operators if name not in known]
+    if unknown:
+        raise ValueError(f"unknown LNS operators {unknown!r} (want subset of agent/map/random)")
+    if not lns.operators:
+        raise ValueError("LNSConfig.operators is empty — need at least one of agent/map/random")
+    if len(set(lns.operators)) != len(lns.operators):
+        raise ValueError(
+            f"duplicate LNS operators {list(lns.operators)!r} — each name at most once")
+
+    value = lns.search_workers
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"LNSConfig.search_workers must be an int >= 1, got {value!r}")
+    try:
+        search_workers = operator.index(value)
+    except TypeError:
+        raise ValueError(
+            f"LNSConfig.search_workers must be an int >= 1, got {value!r}") from None
+    if search_workers < 1:
+        raise ValueError(f"LNSConfig.search_workers must be an int >= 1, got {value!r}")
+    ceiling = 4 * (os.cpu_count() or 1)
+    if search_workers > ceiling:
+        raise ValueError(
+            f"LNSConfig.search_workers={search_workers} exceeds {ceiling} (4x cores) — each "
+            f"worker holds its own replica of the schedule (ledger + occupancy pools + claim "
+            f"index), so memory is linear in workers, not amortised across them")
+    if lns.parallel_mode not in ("sync", "drop"):
+        raise ValueError(
+            f"unknown LNSConfig.parallel_mode {lns.parallel_mode!r} (want 'sync' or 'drop')")
+    return search_workers
+
+
+def _trajectory_auc(trajectory: list[dict], cost_before: float, horizon_s: float) -> float:
+    """Integrate the best-known cost as a right-continuous step function over ``[0, horizon]``."""
+    horizon = max(0.0, float(horizon_s))
+    area = 0.0
+    previous_t = 0.0
+    previous_cost = float(cost_before)
+    for row in trajectory:
+        # Completion timestamps should already be monotone. Clamp defensively so telemetry can
+        # never manufacture negative area or integrate beyond the reported run horizon.
+        current_t = min(horizon, max(previous_t, float(row["wall_s"])))
+        area += (current_t - previous_t) * previous_cost
+        previous_t = current_t
+        previous_cost = float(row["incumbent_cost"])
+        if current_t >= horizon:
+            break
+    area += (horizon - previous_t) * previous_cost
+    return float(area)
+
+
+def _build_lns_state(
+    cfg: SimConfig,
+    ledger: ReservationLedger,
+    intents: list[OperationalIntent],
+    lns: LNSConfig,
+    *,
+    static_terms: tuple | None,
+    turnaround_s: float | None,
+) -> LNSState:
+    """One construction path for the sequential runner and the parallel coordinator."""
+    return LNSState(
+        cfg,
+        ledger,
+        intents,
+        static_terms=ledger.static_terminals() if static_terms is None else static_terms,
+        frozen_flight_ids=lns.frozen_flight_ids,
+        movable_uss_ids=lns.movable_uss_ids,
+        turnaround_s=turnaround_s,
+        incremental_release=lns.incremental_release,
+        unimpeded_workers=lns.unimpeded_workers,
+    )
+
+
+def _finalize_lns_result(
+    state: LNSState,
+    trajectory: list[dict],
+    cost_before: float,
+    n_iter: int,
+    n_accepted: int,
+    t0: float,
+    init_s: float,
+    selector: AdaptiveSelector,
+    *,
+    search_workers: int = 1,
+    parallel_mode: str = "sequential",
+    pool_spawn_s: float = 0.0,
+    parallel_stats: dict | None = None,
+) -> LNSResult:
+    """Verify and build the common sequential/parallel result without metric drift."""
+    final = state.final_intents()
+    bad = verify.find_interflight_conflict(
+        final, state.cfg, static_terminals=state.static_terms)
+    wall_s = time.monotonic() - t0
+    return LNSResult(
+        intents=final,
+        trajectory=trajectory,
+        cost_before=cost_before,
+        cost_after=state.total_cost,
+        n_iterations=n_iter,
+        n_accepted=n_accepted,
+        wall_s=wall_s,
+        init_wall_s=init_s,
+        weights=dict(selector.weights),
+        verified=bad is None,
+        search_workers=search_workers,
+        parallel_mode=parallel_mode,
+        auc=_trajectory_auc(trajectory, cost_before, wall_s),
+        pool_spawn_s=pool_spawn_s,
+        parallel_stats={} if parallel_stats is None else dict(parallel_stats),
+    )
+
+
 def run_lns(
     cfg: SimConfig,
     ledger: ReservationLedger,
@@ -142,33 +251,11 @@ def run_lns(
     was never planned against, so ``verified`` can come back True for an infeasible schedule.
     ``turnaround_s=None`` likewise disables the paired-return guard; supply it whenever the baseline
     ran ``return_anchor="realized"``. ``run_lns_on_result`` derives both correctly."""
-    # Validate the operator set BEFORE constructing LNSState: the constructor detaches the caller's
-    # ledger subscribers irrecoverably and spends one A* plan per movable flight (minutes at scenario
-    # scale), and an argument error must not cost either.
-    known = {"agent", "map", "random"}
-    unknown = [name for name in lns.operators if name not in known]
-    if unknown:
-        raise ValueError(f"unknown LNS operators {unknown!r} (want subset of agent/map/random)")
-    if not lns.operators:   # else the first pick indexes an empty wheel (numpy: "high <= 0")
-        raise ValueError("LNSConfig.operators is empty — need at least one of agent/map/random")
-    if isinstance(lns.search_workers, bool) or int(lns.search_workers) < 1:
-        # bool is an int subclass, and `search_workers=True` would silently mean 1.
-        raise ValueError(f"LNSConfig.search_workers must be an int >= 1, got {lns.search_workers!r}")
-    ceiling = 4 * (os.cpu_count() or 1)
-    if int(lns.search_workers) > ceiling:
-        raise ValueError(
-            f"LNSConfig.search_workers={lns.search_workers} exceeds {ceiling} (4x cores) — each "
-            f"worker holds its own replica of the schedule (ledger + occupancy pools + claim "
-            f"index), so memory is linear in workers, not amortised across them")
-    if lns.parallel_mode not in ("sync", "drop"):
-        raise ValueError(f"unknown LNSConfig.parallel_mode {lns.parallel_mode!r} (want 'sync' or 'drop')")
-    if len(set(lns.operators)) != len(lns.operators):
-        # `ops` would collapse the duplicate while AdaptiveSelector.names keeps it, silently handing
-        # that operator a double share of the roulette and reporting a weights dict shorter than the
-        # configuration — a run that is quietly not the experiment that was asked for.
-        raise ValueError(f"duplicate LNS operators {list(lns.operators)!r} — each name at most once")
+    # Validate BEFORE constructing LNSState: it detaches the caller's subscribers and may spend
+    # minutes building the unimpeded ruler, so an argument error must not cost either.
+    search_workers = _validate_lns_config(lns)
 
-    if int(lns.search_workers) > 1:
+    if search_workers > 1:
         # Deferred import: keeps multiprocessing (and the pool module) off the sequential path,
         # and breaks the cycle — parallel.py needs LNSResult from here.
         from freespace_sim.planner.lns.parallel import run_lns_parallel
@@ -177,16 +264,9 @@ def run_lns(
                                 static_terms=static_terms, turnaround_s=turnaround_s)
 
     t0 = time.monotonic()
-    state = LNSState(
-        cfg,
-        ledger,
-        intents,
-        static_terms=ledger.static_terminals() if static_terms is None else static_terms,
-        frozen_flight_ids=lns.frozen_flight_ids,
-        movable_uss_ids=lns.movable_uss_ids,
-        turnaround_s=turnaround_s,
-        incremental_release=lns.incremental_release,
-        unimpeded_workers=lns.unimpeded_workers,
+    state = _build_lns_state(
+        cfg, ledger, intents, lns,
+        static_terms=static_terms, turnaround_s=turnaround_s,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0
@@ -256,19 +336,8 @@ def run_lns(
                         n_accepted, {k: round(v, 3) for k, v in selector.weights.items()},
                     )
 
-        final = state.final_intents()
-        bad = verify.find_interflight_conflict(final, cfg, static_terminals=static_terms)
-        return LNSResult(
-            intents=final,
-            trajectory=trajectory,
-            cost_before=cost_before,
-            cost_after=state.total_cost,
-            n_iterations=n_iter,
-            n_accepted=n_accepted,
-            wall_s=time.monotonic() - t0,
-            init_wall_s=init_s,
-            weights=dict(selector.weights),
-            verified=bad is None,
+        return _finalize_lns_result(
+            state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
         )
     except BaseException:
         log.exception("lns aborted; detaching repair-planner subscribers before propagating")

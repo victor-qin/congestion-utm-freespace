@@ -914,3 +914,41 @@ later `enable_blocked` never has to reconcile two row vintages — which means A
 `_rows` append, nor the `rasterize_ranges`/`_intern` work those buckets also carry. That is why the
 estimate was "~4–5.5%, not half the bucket", and why 1.052× is the estimate landing rather than the
 implementation underperforming.
+
+### Phase 0 for area 1 (the pool-less occupancy) — C SURVIVES, with a different shape
+
+`release.compiled` is still 26.5% of the loop after #120, because the journal only fixed the reject
+path: an accepted destroy still rebuilds every touched cell from its survivors. Removing that means
+removing the free-interval pools, whose measured blocker was a **3.3x point-probe penalty** for
+answering from `_claims`. A MANDATORY window has no point probes, so the question is the build.
+
+Five measurements, and three of them moved the design:
+
+| measurement | result | consequence |
+|---|---|---|
+| **gate** — does `_claims` hold what the pools hold? | equal over 10k+ (cell, step) points on a fragmented schedule, INCLUDING post-`on_release` state | **PASS** — checked while both exist, via `blocked_py_claims` vs `blocked_py` |
+| build from a flat arena (`paint` alone) | 0.514 ms vs the pool build's 1.443 ms | **2.81x FASTER** — a claim IS a blocked span, so the paint replaces invert-and-merge |
+| build keeping `_claims` as a dict of lists | 38.1 ms (flatten 37.6) | **26x slower — fatal.** The arena is not an optimisation for this phase, it IS the phase |
+| `_claims` as a flat arena | **37 MB** against the pools' **52 MB** | **saves memory.** The plan feared 100-200 MB; that was the dict, and the arena replaces something bigger |
+| window coverage INSIDE the LNS loop | 79.0% probe hit, and only **58.3% of plans** miss-free at the shipped bounds | the real risk — under a mandatory window one miss forces a widen-and-rerun, so plan-level coverage is the statistic, not probe-level |
+
+The last one is the one that would have killed C, and it is a tuning problem rather than a design
+problem:
+
+| margin | cap | plans with ZERO misses | probe hit | plans with no window | peak |
+|---|---|---|---|---|---|
+| 12 (ships) | 2 MB | 58.3% | 60.9% | 7 | 1.7 MB |
+| **24** | **8 MB** | **100.0%** | **100.00%** | **0** | 3.9 MB |
+| 48 | 32 MB | 100.0% | 100.00% | 0 | 6.3 MB |
+
+At margin 24 the widen-and-rerun path becomes a rare safety valve instead of the common case, and
+the wider build is affordable precisely because the claims paint is 2.81x cheaper. Note the peak
+window grows to 3.9 MB, which eight workers cannot hold in one 12 MB cluster L2 — but §9 already
+established that the window's win is the LIST WALK and not cache residency, so that is a thing to
+re-measure rather than a thing to fear.
+
+**Revised scope for C, against what the plan said:** the arena is mandatory (not an "if flattening
+is slow" contingency), the memory objection is inverted (it saves 15 MB rather than costing 150),
+and the bounds must widen to margin 24 / 8 MB in the same change. The collateral is unchanged and
+large: `_Pool`, the #120 undo journal and its five call sites, and four window tests that reach into
+pool internals.

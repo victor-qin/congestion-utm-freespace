@@ -57,7 +57,7 @@ def main() -> None:
                          "parallelism. The win INVERTS with scale: on FULL density_faa m=8 reaches "
                          "the sequential schedule in 1.91x less wall, but on the 120 s cut m=4 is "
                          "break-even and m=8 LOSES -- see context/lns_plan.md")
-    ap.add_argument("--parallel-mode", default="sync", choices=["sync", "drop"],
+    ap.add_argument("--parallel-mode", default="drop", choices=["sync", "drop"],
                     help="sync: barrier per round, best of N applied -- DETERMINISTIC, and at "
                          "--search-workers 1 byte-identical to the sequential loop. drop: "
                          "asynchronous, every clean result merged -- faster, NOT reproducible "

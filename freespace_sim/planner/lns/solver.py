@@ -63,7 +63,7 @@ class LNSConfig:
     # crossover is instance-dependent and every search worker holds a full schedule replica.
     # `unimpeded_workers` remains a separate, parent-only knob for the one-off delay ruler.
     search_workers: int = 1
-    parallel_mode: str = "sync"          # "sync": barrier per round, deterministic | "drop": async
+    parallel_mode: str = "drop"          # "drop": async throughput | "sync": deterministic barrier
     worker_kernel_log2: int | None = None  # non-negative AStarPlanner.kernel_log2_min; oversized
     #                                        kernel arrays were measured to slow CONCURRENT plans
     #                                        ~1.75x at 8 workers while a lone worker matched serial

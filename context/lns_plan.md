@@ -518,8 +518,10 @@ opposite behaviour where it matters.
 SYNC is worse than DROP wherever both were measured, exactly as the paper reports and for the
 paper's reason: best-of-m discards m-1 results (`notsel=18` of 120 on the cut). It was NOT run at
 full scale — every full-scale row above is DROP — so treat "SYNC loses" as a cut-only finding.
-Its value here was never throughput anyway: it is DETERMINISTIC. Effective widths below two now
-use the sequential engine directly; a private replica cannot add concurrency in that case.
+Its value here was never throughput anyway: it is DETERMINISTIC. DROP is therefore the default
+mode when parallel search is explicitly enabled; `search_workers=1` still keeps LNS sequential by
+default. Effective widths below two use the sequential engine directly because a private replica
+cannot add concurrency in that case.
 
 ### Where it goes from here
 

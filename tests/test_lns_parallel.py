@@ -407,7 +407,10 @@ def test_sync_is_deterministic_at_every_worker_count():
     from freespace_sim.planner.lns.parallel import run_lns_parallel
 
     cfg = _congested(lam=400.0, horizon=240.0)
-    kw = dict(seed=3, neighborhood_size=4, log_every=0, max_iterations=24, search_workers=3)
+    kw = dict(
+        seed=3, neighborhood_size=4, log_every=0, max_iterations=24,
+        search_workers=3, parallel_mode="sync",
+    )
     outs = []
     for _ in range(2):
         res = run(cfg)
@@ -596,7 +599,7 @@ def test_lns_config_preserves_the_legacy_positional_tail():
     )
     assert (config.time_limit_s, config.verify_every, config.log_every) == (12.5, 3, 4)
     assert (config.search_workers, config.parallel_mode, config.worker_kernel_log2) == (
-        1, "sync", None,
+        1, "drop", None,
     )
 
 
@@ -736,7 +739,8 @@ def test_infinite_time_limit_starts_the_pool_without_a_deadline(monkeypatch):
     parallel.run_lns_parallel(
         cfg, ReservationLedger(cfg), [],
         LNSConfig(
-            max_iterations=2, search_workers=2, time_limit_s=float("inf"), log_every=0,
+            max_iterations=2, search_workers=2, parallel_mode="sync",
+            time_limit_s=float("inf"), log_every=0,
         ),
     )
     assert deadlines == [None]
@@ -894,7 +898,7 @@ def test_default_config_is_the_sequential_path():
 
     c = LNSConfig()
     assert c.search_workers == 1
-    assert c.parallel_mode == "sync"
+    assert c.parallel_mode == "drop"
 
 
 # ==================================================================== DROP mode

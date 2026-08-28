@@ -50,9 +50,16 @@ from ...volumes import (
     terminal_radius,
 )
 from .. import hexgrid as hg
-from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
+from ._packed import G_GEN, GEN_STEP, GEN_WRAP, aligned_2d
 from . import window as W
-from .compiled_hex_occupancy import ground_delay_steps, hover_tail_steps, search_horizon
+from .compiled_hex_occupancy import (
+    _FIELD_MASK,
+    _S0_SHIFT,
+    _SPAN_BITS,
+    ground_delay_steps,
+    hover_tail_steps,
+    search_horizon,
+)
 from .occupancy import HexOccupancyService
 from ..terminal_capacity import TerminalCapacity
 
@@ -60,17 +67,21 @@ _EPS = 1e-6
 _BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
 
 # ---- per-plan dense occupancy window (`window`) defaults ----
-# 2 MB, which is a ceiling on outliers rather than a working size: the measured 1-bit windows at
-# density_faa scale are ~0.1 MB at p50 and ~0.25 MB at p90 (`.context/perf/probe_read_window.py`), so
-# eight of them still fit inside one 12 MB cluster L2 with room to spare. A plan whose box exceeds
-# this simply runs the pre-window path.
-_WINDOW_BYTES = 2 << 20
+# 8 MB / margin 24, chosen from the plan-level coverage sweep rather than from the window's typical
+# size. What matters once the window is the ONLY occupancy answer is not the hit RATE but the share of
+# plans with zero misses, since one miss forces a widen-and-rerun: at margin 12 / 2 MB that share is
+# 58.3% (79% of probes), and at margin 24 / 8 MB it is 100.0% with no plan left without a window.
+# Peak observed 3.9 MB; the median is far smaller.
+_WINDOW_BYTES = 8 << 20
 # Hexes of slack around the origin/lane/goal bbox. A* explores an ellipse between the endpoints; this
-# covers the reroute fan around it. Undersizing costs pool-walk misses, never an answer — and
-# `.context/perf/probe_window_oracle.py` measured the whole bound-quality question at 1.011x (a
-# window built from each plan's OWN recorded read set beats these bounds by only that), so this is
-# deliberately a simple rule and not a tuned one.
-_WINDOW_MARGIN_HEX = 12
+# covers the reroute fan around it. `probe_window_oracle.py` measured the SPEED question at 1.011x —
+# a window built from each plan's own recorded read set beats these bounds by only that — so this is
+# sized for COVERAGE, which is the property that matters once nothing else can answer a probe.
+_WINDOW_MARGIN_HEX = 24
+# How far `_build_window` may widen when a plan probes outside its window. Each step doubles the
+# lateral margin and the step tail, so three steps is a 8x box in each axis — past the point where
+# the box clips to the global one, which is where the loop terminates anyway.
+_WINDOW_WIDEN_MAX = 3
 
 
 class _RecordingOcc:
@@ -234,9 +245,16 @@ class AStarPlanner:
         # wall and 1.075x on the LNS loop, FLAT in worker count. Answer-neutral: the window caches
         # the pools it was built from, and anything outside it takes the original walk.
         self.window_bytes = int(window_bytes)
+        if compiled and self.window_bytes <= 0:
+            # There is nothing behind the window any more: the interval pools are gone, so a disabled
+            # window means the kernel cannot answer a single probe. `compiled=False` is the off switch.
+            raise ValueError("AStarPlanner: window_bytes must be > 0 on the compiled path — the "
+                             "dense window IS the occupancy. Use compiled=False for the reference.")
         self._win_bytes_peak = 0                        # largest window actually built (diagnostics)
         self._win_off = 0                               # plans that got no window (too big / degenerate)
         self._win_painted = 0                           # window cells that held a claim (build cost)
+        self._win_widen = 0                             # plans that had to grow their window and re-run
+        self._win_exhausted = 0                         # plans still missing at the widen ceiling
         # LNS destroy support: derive occupancy/capacity services in removal mode (per-owner row
         # tracking) and subscribe them to `ledger.subscribe_release`, so a `release_many` is
         # un-absorbed in O(released volumes) instead of tripping the O(everything) shrink rebuild.
@@ -910,18 +928,9 @@ class AStarPlanner:
         flights — the ones that reach max_expansions — must fit here)."""
         return max(20, (self.max_expansions * 2 - 1).bit_length())
 
-    def undo_journals(self) -> tuple:
-        """Occupancy services that support a transactional rollback — the LNS reject path's seam.
-
-        Only removal-mode services qualify: with ``incremental_release=False`` there is no release
-        subscriber at all (the service notices the ledger shrink and rebuilds), so there is nothing
-        to journal and suspending its callbacks would desync it. Empty until the first plan binds a
-        service, which is correct — a transaction opened before then has nothing to undo."""
-        c = self._cocc
-        return (c,) if c is not None and c.track_removal else ()
-
     def _build_window(self, cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
-                      goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops) -> bool:
+                      goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops,
+                      widen: int = 0) -> bool:
         """Materialise this plan's dense occupancy bitmap (:mod:`window`), or leave it off.
 
         Anchored on every cell the search STARTS or ENDS at — the origin hex, its exit lanes and the
@@ -941,24 +950,30 @@ class AStarPlanner:
         if cap <= 0:
             W.disable(wbox)
             return True
-        tail = (int(tks.max()) + int(lane_stp.max()) + 3 * n_hops + 2 * climb_span + 8)
+        scale = 1 << widen                     # each widen level doubles both extents
+        tail = (int(tks.max()) + int(lane_stp.max()) + 3 * n_hops + 2 * climb_span + 8) * scale
         nbytes = W.window_bounds(
             cocc, wbox,
             q_cells=(oq, int(lane_q.min()), int(lane_q.max()), int(goal_q.min()), int(goal_q.max())),
             r_cells=(orr, int(lane_r.min()), int(lane_r.max()), int(goal_r.min()), int(goal_r.max())),
             base=base, max_step=max_step, n_gsteps=n_gsteps,
-            lateral_margin=_WINDOW_MARGIN_HEX, tail_steps=tail, max_bytes=cap,
+            lateral_margin=_WINDOW_MARGIN_HEX * scale, tail_steps=tail,
+            max_bytes=cap if widen == 0 else len(ks["win"]),
         )
         if nbytes == 0:
+            # No window means no answers, so this is now a REFERENCE dispatch rather than a slower
+            # in-kernel path. `_plan_compiled` checks `wbox` and hands over.
             self._win_off += 1
             W.disable(wbox)
             return True
         if nbytes > self._win_bytes_peak:
             self._win_bytes_peak = nbytes
+        a = cocc._arena
         try:
-            painted = W.build_window(
-                cocc.corr.iv, cocc.col.iv, cocc.static_col, ks["ov_own_gen"], gen,
+            painted = W.build_window_claims(
+                a.arena, a.start, a.length, cocc.static_col, ks["ov_own_gen"], gen,
                 cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox, ks["win"],
+                _S0_SHIFT, _SPAN_BITS, _FIELD_MASK,
             )
         except Exception as e:
             # ``build_window`` has its own @njit dispatcher. A cache/load failure can therefore
@@ -1042,16 +1057,11 @@ class AStarPlanner:
         component = "search kernel"
         try:
             NC, MAXS = 9, 5
-            _warm_iv = aligned_2d(NC, 4, np.int32)
-            _warm_iv[:, P_LO] = 0
-            _warm_iv[:, P_HI] = MAXS
-            _warm_iv[:, P_NXT] = -1
-            _warm_cv = _warm_iv.copy()
             ng = 6
             _warm_gp = aligned_2d(64, 4)                   # same 2-D packed layout as production, so
             _warm_gp[:, G_GEN] = 0                        # this compiles the signature actually used
             self._kernel(
-                _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
+                np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
                 0, 0, 3, 3, 1, 0, MAXS, MAXS,
                 1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]),
                 np.array([0], np.int64), 1,
@@ -1076,9 +1086,12 @@ class AStarPlanner:
             warm_wbox[W.W_RSPAN] = 1
             warm_wbox[W.W_STEPS] = MAXS + 1
             warm_wbox[W.W_ROWB] = (MAXS + 8) // 8
-            W.build_window(
-                _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32), 1,
+            W.build_window_claims(
+                np.zeros(1, np.int64), np.zeros(2 * NC, np.int64),
+                np.zeros(2 * NC, np.int64), np.zeros(NC, np.bool_),
+                np.zeros(NC, np.int32), 1,
                 0, 0, 3, 1, warm_wbox, np.zeros(warm_wbox[W.W_ROWB], np.uint8),
+                _S0_SHIFT, _SPAN_BITS, _FIELD_MASK,
             )
         except Exception as e:                                # compile failure → degrade to pure Python
             self._disable_compiled(component, e)
@@ -1205,6 +1218,7 @@ class AStarPlanner:
         rb = ks["read_bbox"]
         rb[0] = rb[2] = rb[4] = rb[6] = _BBOX_HUGE
         rb[1] = rb[3] = rb[5] = rb[7] = -_BBOX_HUGE
+        widen = 0                       # window escalation level; see the FB-style retry below
         while True:
             to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
             if to_terminal:
@@ -1249,11 +1263,20 @@ class AStarPlanner:
             if not self._build_window(
                 cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
                 goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops,
+                widen=widen,
             ):
                 self._ref_dispatch["window-jit"] += 1
                 return self._plan_reference(req, ledger, cfg)
+            if ks["wbox"][W.W_STEPS] == 0:
+                # The box degenerated or exceeded the cap even at the widen ceiling. With the pools
+                # gone the kernel has no fallback, so hand the whole plan to the reference search —
+                # the same exit FB_OOB has always used.
+                self._fb += 1
+                self._fb_reasons["window-exhausted"] += 1
+                self._win_exhausted += 1
+                return self._plan_reference(req, ledger, cfg)
+            ks["win_stats"][W.WS_MISSED] = 0     # per-plan sticky flag; read right after the kernel
             n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
-                cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step, ground_max_step,
                 oq, orr, lane_q, lane_r, lane_lat, lane_stp, len(lane_q),
@@ -1266,6 +1289,14 @@ class AStarPlanner:
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
                 rb, ks["win"], ks["wbox"], ks["win_stats"],
             )
+            if ks["win_stats"][W.WS_MISSED] and widen < _WINDOW_WIDEN_MAX:
+                # A probe fell outside the window. Same exact-retry discipline as the FB_MASK widen:
+                # grow the box and re-run under a fresh `gen`, using no partial output. Harmless while
+                # the interval pools still answer misses correctly — it is the ESCALATION PATH being
+                # exercised here, so that it is already proven by the time the pools are gone.
+                self._win_widen += 1
+                widen += 1
+                continue
             if status == K.FB_MASK and n_gsteps < full_ng:
                 self._remask += 1
                 n_gsteps = full_ng                       # widen to the full range and re-run (exact)

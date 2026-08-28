@@ -30,8 +30,8 @@ box is skipped (counted in ``oob_corridor_cells``) — safe, because any *query*
 ``cell_id < 0`` and the kernel falls back via ``FB_OOB``; it never crashes on commit. ``MAXS`` covers the
 worst-case per-flight ``max_step`` (a region-diagonal, latest-departing flight — see ``_box``), so every
 reachable query step lies inside the seed interval. Committed steps *beyond* ``MAXS`` (a landing column's
-hover tail) are dropped by ``_Pool.block``, which is harmless: every kernel query is ``≤ max_step ≤ MAXS``
-(guarded in ``_plan_compiled``), so those far-future steps are never read.
+hover tail) are recorded but never read: every kernel query is ``≤ max_step ≤ MAXS`` (guarded in
+``_plan_compiled``).
 """
 from __future__ import annotations
 
@@ -44,7 +44,6 @@ import numpy as np
 from ...geometry import CylinderSpec
 from ...types import as_terminal
 from .. import hexgrid as hg
-from ._packed import P_HI, P_LO, P_NXT, aligned_2d
 from .claim_arena import ClaimArena
 
 
@@ -71,7 +70,7 @@ def search_horizon(base: int, takeoff_steps_max: int, n_hops: int, climb_span: i
 def hover_tail_steps(cfg) -> int:
     """Extra steps a committed landing column occupies PAST the arrival step — hover dwell + climb to the
     top level + the ASTM time buffer, in dt units (mirrors ``volumes.hover_reservation`` /
-    ``hexgrid._step_range``). ``MAXS`` adds this so ``_Pool.block`` never silently drops a committed step;
+    ``hexgrid._step_range``). ``MAXS`` adds this so the box covers every committed step;
     query correctness never needs it (every query is ``≤ max_step ≤ MAXS``), but it removes the old
     hand-tuned ``+16`` slack that only happened to cover the tail on default numbers (issue #1)."""
     max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
@@ -101,166 +100,7 @@ def schedulable_horizon_steps(cfg) -> int:
     return search_horizon(base_max, takeoff_max, n_hops_max, climb_span, cfg) + hover_tail_steps(cfg)
 
 
-class _Pool:
-    """Flat linked-list free-interval pool: cell ``c``'s intervals are walked from slot ``c`` along
-    ``nxt``; a blocked step splits the containing interval in place. Slot 0..NC-1 pre-seeded ``[0, MAXS]``.
-
-    Rows are packed ``(lo, hi, nxt, pad)`` int32 in one ``iv`` block — 16 B, 8 rows per cache line — so
-    a list walk touches ONE line per node instead of one in each of three separate multi-MB arrays.
-    This is the hottest layout in the whole search: the kernel's ``_blocked`` walks two of these lists
-    for every neighbour of every expansion. See ``_packed`` for the measurement behind it."""
-
-    def __init__(self, NC: int, MAXS: int):
-        self.NC = NC
-        self.MAXS = MAXS
-        self.cap = max(2 * NC, 1 << 18)
-        self.iv = aligned_2d(self.cap, 4, np.int32)
-        self.reset()
-
-    def reset(self):
-        self.iv[: self.NC, P_LO] = 0
-        self.iv[: self.NC, P_HI] = self.MAXS
-        self.iv[: self.NC, P_NXT] = -1
-        self.nslots = self.NC
-        self._free: list[int] = []      # every overflow slot is reclaimed by the bump reset above
-
-    def _grow(self):
-        cap = self.cap * 2
-        iv = aligned_2d(cap, 4, np.int32)
-        iv[: self.cap] = self.iv
-        self.iv = iv
-        self.cap = cap
-
-    def _alloc(self, lo, hi, nxt) -> int:
-        if self._free:                  # reuse a slot freed by reset_cell before bumping
-            s = self._free.pop()
-        else:
-            if self.nslots >= self.cap:
-                self._grow()
-            s = self.nslots
-            self.nslots += 1
-        self.iv[s, P_LO] = lo; self.iv[s, P_HI] = hi; self.iv[s, P_NXT] = nxt
-        return s
-
-    def block(self, c: int, s: int) -> None:
-        """Split cell ``c``'s free interval containing ``s`` (in place). Equivalent to
-        ``block_range(c, s, s)``; kept for callers/tests that block a single step."""
-        self.block_range(c, s, s)
-
-    def block_range(self, c: int, s0: int, s1: int) -> None:
-        """Remove the whole contiguous span ``[s0, s1]`` from cell ``c``'s free intervals in one pass.
-
-        A committed volume occupies each cell over a contiguous step range, so this replaces ``S``
-        single-step splits with one walk (issue #8 Phase E). The free-STEP set is identical to
-        blocking ``s0, s0+1, …, s1`` individually, so the compiled kernel is byte-unaffected.
-
-        The interval list (head = slot ``c``) is kept sorted ascending by ``block``/this. The span may
-        straddle several free intervals when earlier commits already punched holes: the first keeps a
-        left remainder ``[a, s0-1]``, the last a right remainder ``[s1+1, b]``, and any interval fully
-        inside ``[s0, s1]`` is marked empty (``lo>hi``, never matches a query) rather than unlinked —
-        the flat pool has no cheap way to drop its fixed head/middle slots, and a dead slot is
-        harmless (the kernel's interval walk simply skips it). Every access goes through ``self.iv``:
-        ``_alloc`` can ``_grow``, which REPLACES the array, so a hoisted reference would write into the
-        dead buffer."""
-        if s0 < 0:
-            s0 = 0
-        if s1 > self.MAXS:
-            s1 = self.MAXS
-        if s0 > s1:
-            return
-        slot = c
-        while slot != -1:
-            a, b = int(self.iv[slot, P_LO]), int(self.iv[slot, P_HI])
-            nxt = int(self.iv[slot, P_NXT])
-            if b < s0:                                  # wholly left of the span → keep walking
-                slot = nxt
-                continue
-            if a > s1:                                  # wholly right (list sorted) → done
-                return
-            keep_left = a <= s0 - 1
-            keep_right = s1 + 1 <= b
-            if keep_left and keep_right:                # span sits inside one interval → split once
-                self.iv[slot, P_HI] = s0 - 1
-                ns = self._alloc(s1 + 1, b, nxt)
-                self.iv[slot, P_NXT] = ns
-                return
-            if keep_right:                              # right remainder is > s1 → nothing past it
-                self.iv[slot, P_LO] = s1 + 1
-                return
-            if keep_left:                               # left remainder kept; span may reach further
-                self.iv[slot, P_HI] = s0 - 1
-            else:                                       # interval fully covered → mark empty (lo>hi)
-                self.iv[slot, P_LO] = 1
-                self.iv[slot, P_HI] = 0
-            slot = nxt
-
-    def blocked_at(self, c: int, s: int) -> bool:
-        """True iff step ``s`` is in NO free interval of cell ``c``."""
-        iv = self.iv                                   # no allocation here, so hoisting is safe
-        slot = c
-        while slot != -1:
-            if int(iv[slot, P_LO]) <= s <= int(iv[slot, P_HI]):
-                return False
-            slot = int(iv[slot, P_NXT])
-        return True
-
-    def chain(self, c: int) -> list:
-        """Cell ``c``'s LIVE free intervals, for the undo journal. Empty ``lo > hi`` slots are dropped:
-        they hold no steps, so a chain rebuilt without them answers ``blocked_at`` identically — the
-        restore is canonical, not byte-identical, which is the same contract ``reset_cell`` already
-        states (slot indices are pure storage)."""
-        out = []
-        slot = c
-        while slot != -1:
-            lo, hi = int(self.iv[slot, P_LO]), int(self.iv[slot, P_HI])
-            if lo <= hi:
-                out.append((lo, hi))
-            slot = int(self.iv[slot, P_NXT])
-        return out
-
-    def restore_cell(self, c: int, ivs) -> None:
-        """Re-seed cell ``c``'s chain to exactly ``ivs`` (from :meth:`chain`), in O(len(ivs)).
-
-        This is the whole point of the undo journal: getting a cell back to a known earlier state
-        costs one pass over ITS OWN intervals, where ``on_release``'s rebuild costs one
-        ``block_range`` per SURVIVING claim on that cell — measured 12.2x the released flight's own
-        footprint at density_faa scale, and growing with congestion.
-
-        ``self.iv`` is re-read after every ``_alloc`` because ``_grow`` REPLACES the array."""
-        self.reset_cell(c)                      # reclaims the old overflow slots onto `_free`
-        if not ivs:                             # nothing free ⇒ head marks empty (lo > hi)
-            self.iv[c, P_LO] = 1; self.iv[c, P_HI] = 0; self.iv[c, P_NXT] = -1
-            return
-        lo, hi = ivs[0]
-        self.iv[c, P_LO] = lo; self.iv[c, P_HI] = hi; self.iv[c, P_NXT] = -1
-        prev = c
-        for lo, hi in ivs[1:]:
-            nxt = self._alloc(lo, hi, -1)
-            self.iv[prev, P_NXT] = nxt
-            prev = nxt
-
-    def reset_cell(self, c: int) -> None:
-        """Re-seed cell ``c``'s list to the single free interval ``[0, MAXS]`` (removal-mode cell
-        rebuild); callers re-apply the cell's surviving claims immediately after.
-
-        The old chain's overflow slots are RECLAIMED onto the free list. Abandoning them instead is
-        harmless per call (nothing links to a dropped slot) but not per run: ``_alloc`` is a pure bump
-        allocator, so under LNS — which resets and re-applies the same hot cells every iteration —
-        ``nslots`` grows without bound and drags ``cap`` through repeated doubling, for a working set
-        that never actually grows. Reuse costs one list pop and keeps the pool's footprint proportional
-        to LIVE fragmentation. Slot indices are pure storage (every reader walks the chain), so which
-        slot holds an interval never affects an answer."""
-        free = self._free
-        slot = int(self.iv[c, P_NXT])
-        while slot != -1:                      # walk only the overflow tail; head slot `c` is re-seeded
-            free.append(slot)
-            slot = int(self.iv[slot, P_NXT])
-        self.iv[c, P_LO] = 0
-        self.iv[c, P_HI] = self.MAXS
-        self.iv[c, P_NXT] = -1
-
-
-# Packed-claim field layout (see `CompiledHexOccupancy._claims`): three 20-bit fields in an int64,
+# Packed-claim field layout (see `claim_arena`): three 20-bit fields in an int64,
 # s0 | s1 | fid_code. 20 bits is ~1e6 — four orders of magnitude past any realistic step horizon or
 # flight count — and both are range-checked where they enter, so a field can never silently wrap.
 _SPAN_BITS = 20
@@ -272,8 +112,7 @@ _FIELD_MASK = _SPAN_LIMIT - 1
 class CompiledHexOccupancy:
     """Two incremental flat pools (corridor + column) feeding the numba A* kernel. Commit-hook driven."""
 
-    def __init__(self, cfg, margin: int = 64, track_removal: bool = False,
-                 claim_arena: bool = True):
+    def __init__(self, cfg, margin: int = 64, track_removal: bool = False):
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
@@ -281,25 +120,20 @@ class CompiledHexOccupancy:
         self.n_levels = cfg.n_levels
         self.n_added = 0
         self.evicted_before: int | None = None
-        # Removal mode (LNS destroy): every applied block_range is recorded per owner AND per cell,
-        # so `on_release` can rebuild exactly the touched cells (reset_cell + re-apply survivors)
-        # in O(released rows) instead of a whole-pool reset+reabsorb. Flag off ⇒ zero bookkeeping.
+        # Kept for compatibility with callers that still pass it; the per-owner row stream it used to
+        # gate is now unconditional, because it is how the arena is fed rather than an opt-in journal.
         self.track_removal = track_removal
-        # Both structures are PACKED, because they are per-claim and therefore linear in schedule size
-        # (measured 68 MB of tuples at 290 flights). One claim is one int64:
-        #     key    = c << 1 | pool_idx                 (which pool, which cell)
+        # THE occupancy. One claim is one int64, in a flat arena (see `claim_arena`) constructed below
+        # once NC is known:
+        #     key    = c << 1 | pool_idx                 (corridor or column, which cell)
         #     claim  = s0 << 40 | s1 << 20 | fid_code    (`_fids[fid_code]` recovers the owner)
-        # Ranges are checked in `_record`; the constructor rejects a horizon too deep to pack.
-        # `_rows[fid]` is a flat array of (key, claim) pairs — 16 B/row against ~120 for the tuple
-        # form — and `_claims[key]` is a list of those same ints, so `remove` compares ints, not
-        # Flat, numba-visible twin of `_claims` (see `claim_arena`), constructed below once NC is
-        # known. Step 1 of the pool-less work: maintained ALONGSIDE the dict and the pools, changing
-        # nothing, so its real commit/release cost is measured and its answers checked at full scale
-        # before anything is deleted. Only meaningful in removal mode — `_record` feeds it, and that
-        # is `track_removal`-gated.
-        self._arena: ClaimArena | None = None
-        self._claims: dict[int, list[int]] = {}      # packed (pool, cell) key -> [packed claims]
+        # Packed because it is per-claim and therefore linear in schedule size (the tuple form
+        # measured 68 MB at 290 flights). Ranges are checked in `_record`; the constructor rejects a
+        # horizon too deep to pack. `_rows[fid]` is the same pairs per owner, which is what makes a
+        # release O(the flight's own footprint).
+        self._arena: ClaimArena
         self._rows: dict[int, array] = {}            # fid -> flat int64 (key, claim) pairs
+        self._nvol: dict[int, int] = {}              # fid -> volumes absorbed
         self._fids: list = []                        # fid_code -> flight id
         self._fid_codes: dict = {}                   # flight id -> fid_code
 
@@ -307,14 +141,14 @@ class CompiledHexOccupancy:
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
         self.NC = qspan * rspan * self.n_levels
         self.MAXS = maxs
-        if track_removal and maxs >= _SPAN_LIMIT:    # see `_claims`: s0/s1 get 20 bits each
+        if maxs >= _SPAN_LIMIT:       # see the packed-claim layout: s0/s1 get 20 bits each. No longer
+            #                           `track_removal`-gated: every mode records claims now, so a
+            #                           too-deep horizon must fail HERE, with a readable message,
+            #                           rather than mid-commit inside `_record`.
             raise ValueError(
                 f"CompiledHexOccupancy: horizon of {maxs} steps exceeds the removal journal's "
                 f"{_SPAN_LIMIT}-step packing limit")
-        self.corr = _Pool(self.NC, self.MAXS)
-        self.col = _Pool(self.NC, self.MAXS)
-        if track_removal and claim_arena:
-            self._arena = ClaimArena(2 * self.NC, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+        self._arena = ClaimArena(2 * self.NC, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
         # cell → {terminal ids whose column EVER covers it, across all steps}. Lets the host detect an
         # own∩foreign shared cell (issue #3) and fall back to the reference, instead of the overlay boolean
         # silently treating a foreign column as transparent. Deliberately TIME-COLLAPSED and NOT pruned by
@@ -333,9 +167,6 @@ class CompiledHexOccupancy:
         # cell gets cell_id < 0 and the kernel falls back via FB_OOB. Non-zero ⇒ consider widening `margin`.
         self.oob_corridor_cells = 0
         self._warned_oob = False                        # warn ONCE per instance (persists across reset())
-        # ---- LNS reject-path undo journal (see `begin_undo`). None ⇒ off, zero overhead. ----
-        self._undo: dict | None = None
-        self._suspended = False
 
 
     def _box(self, cfg, margin):
@@ -358,66 +189,45 @@ class CompiledHexOccupancy:
 
     # ---------- commit hook ----------
     def on_commit(self, flight_id, volumes) -> None:
-        if self._suspended:      # a rollback already put this service where these volumes belong
-            return
-        self._snap_owner(flight_id)
+        """Ledger commit subscriber: rasterize the flight's volumes into claims and add them.
+
+        The per-owner row stream is no longer optional. It was `track_removal`-gated when it existed
+        only to let `on_release` un-absorb; now it is how the arena — the occupancy itself — is fed,
+        so every mode records. `rows` is exactly THIS commit's pairs, where `_rows[fid]` accumulates
+        across commits for the same flight, so the arena must be fed from the former."""
         hg.prepare_range_cache_for_commit(volumes)   # main (#117): size the shared raster LRU so
         #                                              every observer of THIS commit reuses one sweep
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
-        rows = [] if self.track_removal else None
+        rows: list = []
         for v in volumes:
             self._add(v, own_cols, flight_id, rows)
         self.n_added += len(volumes)
-        if self.track_removal:
-            entry = self._rows.get(flight_id)
-            if entry is None:
-                self._rows[flight_id] = array("q", rows)
-            else:
-                entry.extend(rows)
-            if self._arena is not None:
-                # `rows` is exactly THIS commit's (key, claim) pairs — `_rows[fid]` accumulates
-                # across commits for the same flight, so feeding the arena from it would re-add.
-                flat = np.asarray(rows, np.int64).reshape(-1, 2)
-                self._arena.add(flat[:, 0], flat[:, 1])
-                if self._undo is not None:
-                    self._undo["arena_add"].extend(rows)
+        entry = self._rows.get(flight_id)
+        if entry is None:
+            self._rows[flight_id] = array("q", rows)
+        else:
+            entry.extend(rows)
+        self._nvol[flight_id] = self._nvol.get(flight_id, 0) + len(volumes)
+        if rows:
+            flat = np.asarray(rows, np.int64).reshape(-1, 2)
+            self._arena.add(flat[:, 0], flat[:, 1])
 
     def on_release(self, flight_id, volumes) -> None:
-        """Ledger release subscriber (removal mode): drop the flight's recorded claims and rebuild
-        exactly the cells it touched — reset each cell's interval list and re-apply the surviving
-        claims (short per-cell lists). Keeps ``n_added`` in lockstep so the shrink tripwire stays
-        silent. ``col_owners`` is deliberately NOT pruned (documented conservative superset)."""
-        if self._suspended:      # ditto — and `_rows` was restored, so the pop below would KeyError
-            return
-        self._snap_owner(flight_id)
+        """Ledger release subscriber: drop the flight's claims. O(ITS OWN footprint).
+
+        This is the whole point of the pool-less occupancy. The interval pools stored FREE intervals,
+        which can absorb a block but cannot subtract one, so this method used to reset every cell the
+        flight touched and re-apply all the SURVIVING claims on it — measured at 12.2x the flight's
+        own footprint at density_faa scale, and growing with congestion, because the multiplier is how
+        many OTHER flights share those cells. A claim is a blocked span, so removing one is removing
+        one. ``col_owners`` is still deliberately NOT pruned (documented conservative superset)."""
         rows = self._rows.pop(flight_id)
-        if self._arena is not None:
+        if rows:
             flat = np.frombuffer(rows, dtype=np.int64).reshape(-1, 2)
             self._arena.remove(np.ascontiguousarray(flat[:, 0]),
                                np.ascontiguousarray(flat[:, 1]))
-            if self._undo is not None:
-                self._undo["arena_rm"].extend(rows)
-        claims = self._claims
-        touched: set[int] = set()
-        for i in range(0, len(rows), 2):              # flat (key, claim) pairs; see `_claims`
-            key = rows[i]
-            self._snap_cell(key)                      # snapshots the chain AND the claims list
-            claims[key].remove(rows[i + 1])           # ValueError here IS the drift signal
-            touched.add(key)
-        pools = (self.corr, self.col)
-        for key in touched:
-            self._snap_cell(key)
-            pool = pools[key & 1]
-            c = key >> 1
-            pool.reset_cell(c)
-            survivors = claims.get(key)
-            if survivors:
-                for packed in survivors:
-                    pool.block_range(c, packed >> _S0_SHIFT, (packed >> _SPAN_BITS) & _FIELD_MASK)
-            else:
-                claims.pop(key, None)
-        self.n_added -= len(volumes)      # main's accounting: symmetric with on_commit
+        self.n_added -= self._nvol.pop(flight_id)
 
     def _inside_a_column(self, q, r, cols) -> bool:
         c = hg.hex_center(q, r, self.R)
@@ -426,7 +236,6 @@ class CompiledHexOccupancy:
     def _add(self, vol, own_cols, fid=None, _rows: list | None = None) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        track = self.track_removal
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -437,14 +246,10 @@ class CompiledHexOccupancy:
             if s_lo > s_hi:
                 continue
             c = self.cell_id(q, r, L)
-            if is_column:                               # → column pool (all columns; own/foreign per plan)
+            if is_column:                               # column claims: own/foreign resolved per plan
                 if c >= 0:
-                    if self._undo is not None:
-                        self._snap_cell((c << 1) | 1)
-                    self.col.block_range(c, int(s_lo), int(s_hi))
                     self.col_owners.setdefault(c, set()).add(tid)
-                    if track:
-                        self._record(1, c, int(s_lo), int(s_hi), fid, _rows)
+                    self._record(1, c, int(s_lo), int(s_hi), fid, _rows)
             else:                                       # → corridor pool (minus committing own interior)
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue
@@ -457,11 +262,7 @@ class CompiledHexOccupancy:
                         self._warned_oob = True
                     self.oob_corridor_cells += 1
                     continue
-                if self._undo is not None:
-                    self._snap_cell(c << 1)
-                self.corr.block_range(c, int(s_lo), int(s_hi))
-                if track:
-                    self._record(0, c, int(s_lo), int(s_hi), fid, _rows)
+                self._record(0, c, int(s_lo), int(s_hi), fid, _rows)
 
     def _record(self, pool_idx: int, c: int, s0: int, s1: int, fid, _rows: list | None) -> None:
         if s1 >= _SPAN_LIMIT:
@@ -477,16 +278,8 @@ class CompiledHexOccupancy:
                 raise ValueError("CompiledHexOccupancy: too many distinct flights for the "
                                  "removal journal's packing")
             self._fids.append(fid)
-        key = (c << 1) | pool_idx
-        packed = (s0 << _S0_SHIFT) | (s1 << _SPAN_BITS) | code
-        lst = self._claims.get(key)
-        if lst is None:
-            self._claims[key] = [packed]
-        else:
-            lst.append(packed)
-        if _rows is not None:
-            _rows.append(key)
-            _rows.append(packed)
+        _rows.append((c << 1) | pool_idx)
+        _rows.append((s0 << _S0_SHIFT) | (s1 << _SPAN_BITS) | code)
 
     def _on_static(self, center, term) -> None:
         """Derive the compiled routing wall from a ledger static-terminal registration — the
@@ -513,140 +306,19 @@ class CompiledHexOccupancy:
                     self.static_col[c] = True
                     self.col_owners.setdefault(c, set()).add(tid)
 
-    # ------------------------------------------------------------------ reject-path undo journal
-    #
-    # 79-90% of LNS iterations REJECT, and a rejected task ends with the ledger holding exactly the
-    # volumes it held at entry — so every byte of occupancy work it did was thrown away. Measured:
-    # `_rewind` is 15.2% of the LNS loop (284 ms per rejected task), and two thirds of that is
-    # `on_release` rebuilding cells from their survivors.
-    #
-    # The journal makes that undo O(the cells touched) instead: snapshot each cell's free-interval
-    # chain the FIRST time the transaction modifies it (copy-on-write), then `rollback_undo` writes
-    # the snapshots straight back. `_rewind` still restores the LEDGER — it is the source of truth —
-    # but this service ignores the callbacks that restore fires (`_suspended`), because rolling back
-    # already put it where those callbacks would have taken it.
-    #
-    # Deliberately NOT journalled, because none of them can differ after a rollback + rewind:
-    #   * `col_owners` — a documented conservative, time-collapsed SUPERSET that is never pruned, so
-    #     entries added during the transaction stay valid (they may only cause an extra own/foreign
-    #     overlap fallback, which is safe).
-    #   * `_fids` / `_fid_codes` — a monotone interning pool; codes are never reused or compared
-    #     across generations.
-    #   * `evicted_before` — the watermark only advances, and LNS pins `evict_floor = 0.0` so it
-    #     never moves during a transaction. Asserted in `begin_undo` rather than assumed.
-
-    def begin_undo(self) -> None:
-        """Open a copy-on-write journal. Idempotent-unsafe on purpose: a second open without a
-        matching close means a caller lost track of its transaction, which would silently roll back
-        to the wrong point."""
-        if self._undo is not None:
-            raise RuntimeError("CompiledHexOccupancy: undo journal already open")
-        self._undo = {"cells": {}, "claims": {}, "rows": {},
-                      "n_added": self.n_added, "evicted": self.evicted_before,
-                      # The arena rolls back by inverse replay, not by snapshot — see
-                      # `_arena_rollback`. Flat (key, claim) pairs, same shape as `_rows`.
-                      "arena_add": [], "arena_rm": []}
-
-    def discard_undo(self) -> None:
-        """Close the journal keeping the current state (the ACCEPT path)."""
-        self._undo = None
-
-    def rollback_undo(self) -> None:
-        """Restore every journalled cell and bookkeeping entry, then SUSPEND: the caller is about to
-        restore the ledger, and the callbacks that fires would re-do work already undone here."""
-        u = self._undo
-        self._undo = None                       # stop journalling before the restore mutates cells
-        if u is None:
-            raise RuntimeError("CompiledHexOccupancy: rollback without an open undo journal")
-        pools = (self.corr, self.col)
-        for key, ivs in u["cells"].items():
-            pools[key & 1].restore_cell(key >> 1, ivs)
-        claims = self._claims
-        for key, lst in u["claims"].items():
-            if lst is None:
-                claims.pop(key, None)
-            else:
-                claims[key] = lst
-        for fid, rows in u["rows"].items():
-            if rows is None:
-                self._rows.pop(fid, None)
-            else:
-                self._rows[fid] = rows
-        # No per-flight volume count to restore: `n_added` is snapshotted whole below, and
-        # `on_release` subtracts the caller's `len(volumes)`, so nothing derives it per flight.
-        self.n_added = u["n_added"]
-        self.evicted_before = u["evicted"]
-        self._arena_rollback(u)
-        self._suspended = True
-
-    def resume_undo(self) -> None:
-        """Stop ignoring ledger callbacks. Pairs with ``rollback_undo`` in a ``finally``."""
-        self._suspended = False
-
-    def _snap_cell(self, key: int) -> None:
-        u = self._undo
-        if u is not None and key not in u["cells"]:
-            pool = (self.corr, self.col)[key & 1]
-            u["cells"][key] = pool.chain(key >> 1)
-            c = u["claims"]
-            if key not in c:
-                lst = self._claims.get(key)
-                c[key] = None if lst is None else list(lst)
-
-    def _arena_rollback(self, u: dict) -> None:
-        """Undo the transaction's arena writes by REPLAYING THEM INVERSELY.
-
-        The pools and the claim dict roll back from state snapshots, which they can afford because a
-        snapshot is one cell's short interval chain. The arena cannot: its state is one flat buffer,
-        so a snapshot means the whole thing. The first version of this re-derived the arena from
-        ``_claims`` instead — O(live claims) per rejected task, measured at **4.29 million re-adds
-        per task**, which made a 59 ns/claim structure look like 252 ms of work. Replaying the
-        transaction's OWN adds and removes is O(what it touched): ~7,450 claims, under a millisecond.
-
-        This whole path is step-1 scaffolding. When the pools go, the undo journal goes with them —
-        an arena release is already O(the flight's own footprint), which is what the journal exists
-        to buy for the pools."""
-        # `u` is passed in, NOT read from `self._undo`: `rollback_undo` clears that field before it
-        # starts restoring (so the restore's own writes are not journalled), so reading it here would
-        # silently find None and do nothing — which is exactly the drift
-        # `test_arena_survives_the_lns_reject_path` caught.
-        a = self._arena
-        if a is None:
-            return
-        added, removed = u["arena_add"], u["arena_rm"]
-        if added:
-            arr = np.asarray(added, np.int64).reshape(-1, 2)
-            a.remove(np.ascontiguousarray(arr[:, 0]), np.ascontiguousarray(arr[:, 1]))
-        if removed:
-            arr = np.asarray(removed, np.int64).reshape(-1, 2)
-            a.add(np.ascontiguousarray(arr[:, 0]), np.ascontiguousarray(arr[:, 1]))
-
-    def _snap_owner(self, fid) -> None:
-        u = self._undo
-        if u is not None and fid not in u["rows"]:
-            rows = self._rows.get(fid)
-            u["rows"][fid] = None if rows is None else array("q", rows)
-
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:
             self.evicted_before = step
 
     def reset(self) -> None:
-        # A rebuild-from-scratch has no earlier state to return to, and a journal that survived it
-        # would restore cells into a pool that no longer contains the rest of the schedule.
-        self._undo = None
-        self._suspended = False
         self.n_added = 0
         self.evicted_before = None
         self.col_owners.clear()
         self.oob_corridor_cells = 0
-        self._claims.clear()
         self._rows.clear()
-        if self._arena is not None:
-            self._arena.reset()
+        self._nvol.clear()
+        self._arena.reset()
         # `_fids` is an interning pool — value-identical across a rebuild, so it survives reset().
-        self.corr.reset()
-        self.col.reset()
         # Static terminals are NOT ledger-derived (a shrink rebuild must keep them) — re-mark them into the
         # freshly-cleared col_owners (static_col was never cleared, so this is idempotent). Mirrors
         # HexOccupancyService.reset() leaving static_term_cells intact.
@@ -654,76 +326,20 @@ class CompiledHexOccupancy:
             self._mark_static(center, term)
 
     # ---------- pure-Python oracle (kernel parity + tests) ----------
-    def _claim_blocked(self, key: int, s: int) -> bool:
-        """Is ``(pool, cell)`` blocked at ``s`` according to the CLAIM journal rather than the pool?
+    def blocked_py(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
+        """Point query reproducing the kernel's fold — the pure-Python oracle every compiled-path
+        parity test compares against.
 
-        A claim is a blocked span, so this is a direct membership test where the pool stores the
-        complement and answers by walking free intervals. The two must agree for every step the pool
-        can represent — ``[0, MAXS]`` — which is the whole of `blocked_py`'s domain: ``_add`` clips
-        ``s_lo`` to ``evicted_before`` before BOTH the ``block_range`` and the ``_record``, and the
-        kernel never queries past ``MAXS`` (``_plan_compiled`` box-guards on it). Above ``MAXS`` they
-        deliberately differ: ``_Pool.block_range`` drops those steps, ``_record`` keeps them."""
-        for packed in self._claims.get(key, ()):
-            if (packed >> _S0_SHIFT) <= s <= ((packed >> _SPAN_BITS) & _FIELD_MASK):
-                return True
-        return False
+        Now a scan of the cell's claim slab. That is ~3.3x more work per probe than the interval
+        walk it replaces, which is why the per-plan window is no longer optional: the kernel reads
+        the window, not this, and this exists for tests and diagnostics.
 
-    def arena_matches_claims(self) -> bool:
-        """Does the flat arena describe the same claim multiset as ``_claims``?
-
-        The step-1 contract, checkable at any point in a run. Compares MULTISETS per key, not
-        sequences: a swap-remove reorders a slab and a growth re-homes it, both deliberately, so
-        insertion order carries no meaning and requiring it would pin something that is not true."""
-        a = self._arena
-        if a is None:
-            return True
-        live = {k: sorted(v) for k, v in self._claims.items() if v}
-        return a.as_dict() == live
-
-    def blocked_py_arena(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
-        """:meth:`blocked_py`, answered from the flat arena. The third implementation of one
-        question — pools, claim dict, arena — kept only so the suite can pin all three together
-        while the pools still exist."""
-        if self._arena is None:
-            raise RuntimeError("blocked_py_arena needs the claim arena (track_removal + claim_arena)")
+        ``own_cells``: cell ids that are the planning flight's OWN column footprint (empty / ``None``
+        for ``own=∅``). Out-of-box ⇒ ``True`` (the kernel would fall back)."""
         c = self.cell_id(q, r, L)
         if c < 0:
             return True
         colb = self._arena.blocked((c << 1) | 1, s) or bool(self.static_col[c])
         if colb and (own_cells is None or c not in own_cells):
-            return True
-        return self._arena.blocked(c << 1, s)
-
-    def blocked_py_claims(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
-        """:meth:`blocked_py`, answered from ``_claims`` instead of the interval pools.
-
-        This exists to be COMPARED, not yet to be used: dropping the pools (so that removing a flight
-        costs its own footprint instead of 12.2x it) rests entirely on the claim journal being a
-        faithful complement of what the pools hold, and that is checkable now, while both are
-        maintained, rather than after the pools are gone.
-
-        Requires ``track_removal`` — ``_add`` only journals in removal mode — which is itself one of
-        the decisions the pool-less design has to make."""
-        if not self.track_removal:
-            raise RuntimeError("blocked_py_claims needs track_removal=True (the claim journal is off)")
-        c = self.cell_id(q, r, L)
-        if c < 0:
-            return True
-        colb = self._claim_blocked((c << 1) | 1, s) or bool(self.static_col[c])
-        if colb and (own_cells is None or c not in own_cells):
-            return True
-        return self._claim_blocked(c << 1, s)
-
-    def blocked_py(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
-        """Point query reproducing the kernel ``_blocked`` (and thus ``HexOccupancyService.is_blocked``).
-
-        ``own_cells``: a set of ``cell_id``s that are the planning flight's OWN column footprint (empty /
-        ``None`` for ``own=∅`` — the occupancy-parity contract vs ``is_blocked(..., own=())``). Out-of-box ⇒
-        ``True`` (the kernel would FALLBACK)."""
-        c = self.cell_id(q, r, L)
-        if c < 0:
-            return True
-        colb = self.col.blocked_at(c, s) or bool(self.static_col[c])   # transient OR always-active column
-        if colb and (own_cells is None or c not in own_cells):
             return True                                 # foreign column → wall
-        return self.corr.blocked_at(c, s)               # corridor / own-column fixed-lane sibling
+        return self._arena.blocked(c << 1, s)           # corridor / own-column fixed-lane sibling

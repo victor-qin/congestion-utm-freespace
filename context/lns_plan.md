@@ -996,3 +996,59 @@ comes out ahead in the final design, which deletes **both** the 52 MB of pools *
 dict — but "the arena is smaller than the pools" (Phase 0's claim) is only true of the packed data,
 not of the allocator, and a bulk-load path that sizes slabs exactly during `_absorb` is the obvious
 next lever.
+
+### Steps 2 and 3: the pool-less occupancy (2026-08-27) — 1.51x, identical schedule
+
+**Goal.** Delete the free-interval pools, so that removing a flight costs its own footprint instead
+of a rebuild of every cell it touched from that cell's survivors (12.2x, growing with congestion).
+
+**Step 2 — the window becomes mandatory.** Bounds widened from margin 12 / 2 MB to **margin 24 /
+8 MB**, chosen from the plan-level coverage sweep rather than the window's typical size: what matters
+once the window is the only answer is not the hit RATE but the share of plans with ZERO misses (one
+miss forces a re-run), and that is 58.3% at the old bounds and 100.0% at the new. A probe outside the
+window raises a per-plan sticky flag; the host reads it once after the search, widens and re-runs
+under a fresh `gen`, using none of the previous output — the FB_MASK discipline.
+
+*Why a flag and not a new return code:* only one of `_search`'s five `_blocked` call sites inspects
+the returned value (the neighbour test, looking for the out-of-box -1). The other four compare
+against zero, so a new negative code would read as "blocked" at four of them — silently pruning a
+legal edge without raising anything. One branch per plan beats five per probe, and cannot be misread.
+
+**Step 3 — delete the pools, the claim dict, and #120's undo journal.** `build_window_claims` paints
+from the arena: a claim IS a blocked span, so it is `win |= span`, where the pool build had to fill
+each claimed row and clear back over a two-pointer merge of two free-interval lists. `_Pool` and its
+`chain`/`restore_cell`/`block_range`/`blocked_at`/`reset_cell` are gone, and with them the undo
+journal — which existed to make the pools' rebuild cheap on the reject path, and has nothing left to
+undo now that a release is O(own footprint).
+
+`window_bytes = 0` stops meaning "window off, same answers" and starts meaning "the kernel cannot
+answer a probe", so it now raises; `compiled=False` is the off switch. A window that cannot be built
+even at the widen ceiling dispatches to `_plan_reference` with `_fb_reasons["window-exhausted"]`.
+
+**Measured**, like-for-like (both `--sub`, 120 iterations, full `density_faa`, same seed):
+
+| bucket | with pools | pool-less |
+|---|---|---|
+| **loop** | 124.9 s | **82.5 s** |
+| `release.compiled` | 24.8 s (15.79 ms/call) | **0.1 s (0.06 ms/call)** — 263x |
+| `commit.compiled` | 23.2 s (3.73 ms) | 12.2 s (1.97 ms) |
+| one-time `_absorb` | 34.1 s | 24.0 s |
+| per task | 1041 ms | **688 ms** |
+
+End to end via `run_lns` at 200 iterations: **186.5 -> 119.0 s, 1.57x**, and the SCHEDULE IS
+IDENTICAL — 120/200 tasks, 35/65 accepted, cost 1,352,414 / 1,350,294 matching values recorded before
+the pools were deleted, both verified conflict-free.
+
+**What the parity gates became.** The window tests used to compare window-on against window-off;
+that arm no longer exists, so they now compare the compiled path against the pure-Python reference —
+strictly stronger, since the reference shares no occupancy structure with the window where the old
+off-arm shared the pools the window was built from. `test_compiled_occupancy_matches_is_blocked` is
+the external oracle for `blocked_py`, which is now an arena scan. Deleted: two `_Pool` unit tests,
+the `block_range` free-set oracle, the two #120 journal tests, and three window tests that reached
+into pool internals.
+
+**What is left.** `commit.reference` is now the largest occupancy bucket at 24.3% — the reference
+`HexOccupancyService`, which Phase A already halved and which exists to answer `pad_clear` at two
+cells per plan. `_absorb` is still 24.0 s one-time, now almost entirely that service plus
+`TerminalCapacity`. And the arena holds ~99 MB of allocation for 34 MB of live claims; sizing slabs
+exactly during a bulk load is the obvious next lever.

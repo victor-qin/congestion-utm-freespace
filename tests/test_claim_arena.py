@@ -1,14 +1,16 @@
 """Flat claim arena (``planner.astar.claim_arena``) — the storage the pool-less occupancy needs.
 
-Step 1 of that work maintains the arena ALONGSIDE the existing claim dict and interval pools, so its
-one contract is that all three answer the same question the same way. That is checked at three
-levels, because they fail differently:
+The arena replaced both the claim dict and the free-interval pools: a claim is a blocked span, so
+removing a flight removes its own claims instead of rebuilding every cell it touched from that cell's
+survivors. Checked at three levels, because they fail differently:
 
 * the arena's own operations (growth, swap-remove, compaction, the atomic-add guarantee) — unit
   tests over hand-built batches, where a bug is visible directly rather than as a wrong plan;
-* the arena against ``_claims`` on a real schedule, through commits AND releases;
-* the arena against the interval pools through ``blocked_py``, which is what the kernel actually
-  reads and therefore the only comparison that says the substitution would be safe.
+* the arena's behaviour on a real schedule — a release must return it to exactly its pre-commit
+  state, which is the internal invariant now that no second structure exists to diff against;
+* ``blocked_py`` over a partly-released schedule. The EXTERNAL check lives in
+  ``test_compiled_occupancy_matches_is_blocked``, which compares that same ``blocked_py`` against
+  ``HexOccupancyService.is_blocked`` — an independent implementation that never used the pools.
 
 Multisets, not sequences: a swap-remove reorders a slab and a growth re-homes it, both deliberately,
 so insertion order carries no meaning and pinning it would pin something untrue.
@@ -148,25 +150,39 @@ def _committed_occupancy():
     return cfg, led, cocc, fids
 
 
-def test_arena_tracks_the_claim_dict_through_commit_and_release():
+def test_release_returns_the_arena_to_its_pre_commit_state():
+    """A commit followed by its release must leave the arena exactly as it was.
+
+    With the claim dict and the interval pools gone the arena IS the occupancy, so there is no second
+    structure left to compare it against — this is the internal invariant, and
+    ``test_compiled_occupancy_matches_is_blocked`` supplies the external one by checking
+    ``blocked_py`` (now an arena scan) against ``HexOccupancyService.is_blocked``, an entirely
+    independent implementation that never used the pools."""
     cfg, led, cocc, fids = _committed_occupancy()
-    assert cocc._arena is not None and cocc._arena.n_claims > 50_000
-    assert cocc.arena_matches_claims(), "arena and claim dict differ after the commits"
-    led.release_many(fids[: max(1, len(fids) // 4)])
-    assert cocc._arena.n_claims > 0
-    assert cocc.arena_matches_claims(), "arena and claim dict differ after a release"
+    assert cocc._arena.n_claims > 50_000
+    before = {int(k): sorted(int(x) for x in cocc._arena.slab(int(k)))
+              for k in np.nonzero(cocc._arena.length)[0]}
+    victims = fids[: max(1, len(fids) // 4)]
+    removed = [(fid, [v for f, v in led.iter_committed() if f == fid]) for fid in victims]
+    led.release_many(victims)
+    assert cocc._arena.n_claims < sum(len(v) for v in before.values())
+    for fid, vols in removed:
+        cocc.on_commit(fid, vols)
+    after = {int(k): sorted(int(x) for x in cocc._arena.slab(int(k)))
+             for k in np.nonzero(cocc._arena.length)[0]}
+    assert after == before, "release + re-commit did not restore the arena"
 
 
-def test_arena_pools_and_claim_dict_answer_blocked_identically():
-    """The comparison that says the substitution is safe: three independent implementations of the
-    same question — free-interval pools, the claim dict, and the flat arena — over a schedule that
-    has been partly released, so the pools carry split intervals and empty ``lo > hi`` slots and the
-    slabs carry swap-removed holes."""
+def test_arena_answers_blocked_over_a_partly_released_schedule():
+    """``blocked_py`` is the compiled path's oracle and is now an arena scan. Exercise it over a
+    schedule that has been partly released, so the slabs carry swap-removed holes, and assert the
+    sample is neither all-free nor all-blocked — a constant would otherwise pass."""
     import random
 
     cfg, led, cocc, fids = _committed_occupancy()
     led.release_many(fids[: max(1, len(fids) // 4)])
-    cells = {key >> 1 for key in cocc._claims}
+    keys = np.nonzero(cocc._arena.length)[0]
+    cells = {int(k) >> 1 for k in keys}
     assert len(cells) > 500
     own = set(sorted(cells)[::11])
     random.seed(0)
@@ -176,21 +192,16 @@ def test_arena_pools_and_claim_dict_answer_blocked_identically():
         ir, L = divmod(rem, cocc.n_levels)
         q, r = iq + cocc.qmin, ir + cocc.rmin
         for s in range(0, cocc.MAXS, 9):
-            pool = cocc.blocked_py(q, r, L, s, own_cells=own)
-            claims = cocc.blocked_py_claims(q, r, L, s, own_cells=own)
-            arena = cocc.blocked_py_arena(q, r, L, s, own_cells=own)
-            assert pool == claims == arena, \
-                f"pool={pool} claims={claims} arena={arena} at (q={q},r={r},L={L},s={s})"
             checked += 1
-            blocked += pool
+            blocked += cocc.blocked_py(q, r, L, s, own_cells=own)
     assert checked > 10_000
-    assert 0 < blocked < checked, "sample is all-free or all-blocked — constants would pass this"
+    assert 0 < blocked < checked
 
 
 def test_arena_survives_the_lns_reject_path():
-    """A rejected LNS task rolls the pools and the claim dict back from the #120 undo journal. The
-    arena has no snapshot, so it re-derives — and if that re-derivation were wrong or skipped, the
-    arena would drift from the dict on the first reject and never recover."""
+    """A rejected LNS task releases its victims, commits repairs, then restores the incumbent. With
+    the arena as the occupancy that is release-then-re-commit all the way down — no journal, no
+    snapshot — so the invariant is simply that the claim count comes back to where it started."""
     from freespace_sim.planner.lns.neighborhood import random_neighborhood
     from freespace_sim.planner.lns.state import LNSState
     from freespace_sim.sim import run
@@ -214,6 +225,10 @@ def test_arena_survives_the_lns_reject_path():
         victims = random_neighborhood(st, 4)
         if not victims:
             continue
-        rejects += int(not st.try_repair(victims, rng, 0.0, "premium").accepted)
-        assert cocc.arena_matches_claims(), "arena drifted from the claim dict during the loop"
-    assert rejects, "no task rejected — the rollback path was never exercised"
+        before = cocc._arena.n_claims
+        out = st.try_repair(victims, rng, 0.0, "premium")
+        if out.accepted:
+            continue
+        rejects += 1
+        assert cocc._arena.n_claims == before, "a rejected task left claims behind"
+    assert rejects, "no task rejected — the revert path was never exercised"

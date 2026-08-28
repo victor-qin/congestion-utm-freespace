@@ -433,8 +433,7 @@ def test_a_dead_worker_fails_loudly_rather_than_hanging():
     spec = WorkerSpec(neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
                       max_walks=10, map_max_cells=4096, turnaround_s=None,
                       frozen_flight_ids=frozenset(), movable_uss_ids=None,
-                      incremental_release=True, kernel_log2_min=None, window_bytes=None,
-                      undo_journal=True)
+                      incremental_release=True, kernel_log2_min=None, window_bytes=None)
     pool = LNSWorkerPool(res.config, base.final_intents(), base.static_terms,
                          dict(base._unimp_cost), spec, 2).start()
     try:

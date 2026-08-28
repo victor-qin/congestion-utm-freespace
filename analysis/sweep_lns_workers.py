@@ -88,8 +88,9 @@ def _worker_metadata(requested_workers: int, result) -> dict:
 
 
 def _sequential_baseline(rows: list[dict]) -> dict | None:
-    """Find the true in-process arm, not a parallel arm capped to one worker."""
-    return next((row for row in rows if row["mode"] == "sequential"), None)
+    """Find the explicitly requested in-process arm, not another arm capped into that engine."""
+    return next((row for row in rows
+                 if row["mode"] == "sequential" and row["requested_workers"] == 1), None)
 
 
 def main() -> None:

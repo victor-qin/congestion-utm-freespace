@@ -311,7 +311,8 @@ class LNSState:
           hardcoding it would make that A/B inexpressible under parallelism.
 
         ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
-        SYNC and one-worker DROP skip that bookkeeping. ``unimpeded_workers=1`` is pinned because
+        SYNC skips that bookkeeping, and effective widths below two stay in-process.
+        ``unimpeded_workers=1`` is pinned because
         this constructor runs INSIDE a search worker — the ruler's own pool would otherwise fan out
         to m x m processes.
         """
@@ -635,9 +636,8 @@ class LNSState:
         and needs them contiguous. Any failure rewinds the whole delta before propagating.
         """
         # The CALLER's order, not sorted. `changes` comes out of a repair in PP priority order, and
-        # replaying it in that order lands the ledger's `_vols`/`_fids` in the same layout the
-        # in-process repair would have produced — which is what lets a one-worker parallel run be
-        # byte-identical to the sequential loop. Deterministic either way: every producer of this
+        # replaying it in that order lands the ledger's `_vols`/`_fids` in the same layout an
+        # in-process repair would have produced. Deterministic either way: every producer of this
         # dict builds it from a seeded order.
         fids = list(changes)
         if not fids:

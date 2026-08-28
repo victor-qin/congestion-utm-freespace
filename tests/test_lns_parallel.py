@@ -336,10 +336,8 @@ def _trajectory_key(out):
 def test_one_worker_sync_matches_sequential():
     """THE gate. Not `cost_after` — a cost tie would hide a divergent victim set.
 
-    The subtle failure this pins: `AdaptiveSelector.pick` consumes one draw from the SAME
-    generator the destroy operators then read, so a worker that re-seeded from (seed, i) would
-    start a draw earlier and pick different victims from iteration 0. The coordinator ships
-    `rng.bit_generator.state` instead of the seed precisely to avoid that.
+    Effective widths below two deliberately use the in-process engine: a private replica cannot
+    add concurrency, and this pins that routing preserves the complete schedule trajectory.
     """
     from freespace_sim.planner.lns import LNSConfig, run_lns
     from freespace_sim.planner.lns.parallel import run_lns_parallel
@@ -356,6 +354,7 @@ def test_one_worker_sync_matches_sequential():
     assert [_intent_digest(i) for i in par.intents] == [_intent_digest(i) for i in seq.intents]
     assert par.weights == seq.weights
     assert par.n_accepted == seq.n_accepted and par.verified
+    assert par.parallel_mode == "sequential" and par.parallel_stats == {}
     assert par.npo == par.n_iterations == 40
     assert seq.npo == seq.n_iterations == 40
     assert seq.n_accepted > 0, "a vacuous run would make this gate meaningless"
@@ -505,18 +504,35 @@ def test_search_workers_and_parallel_mode_are_validated():
     with pytest.raises(ValueError, match="parallel_mode"):
         run_lns(cfg, ReservationLedger(cfg), [],
                 LNSConfig(max_iterations=0, log_every=0, parallel_mode="deta"))
+    with pytest.raises(ValueError, match="operators"):
+        run_lns(cfg, ReservationLedger(cfg), [],
+                LNSConfig(max_iterations=0, log_every=0, operators=(1,)))
 
 
-def test_iteration_epsilon_and_worker_kernel_config_are_validated():
+def test_execution_config_is_validated_before_ledger_takeover():
     from freespace_sim.config import SimConfig
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.lns import LNSConfig, run_lns
 
     cfg = SimConfig()
     invalid = {
+        "seed": (-1, True, 1.5, "1"),
         "max_iterations": (-1, True, 1.5, "1"),
+        "neighborhood_size": (0, -1, True, 1.5, "1"),
+        "adaptive": (0, 1, "true"),
+        "gamma": (-0.1, 1.1, float("nan"), float("inf"), True, "0.5"),
         "accept_epsilon": (-1.0, -float("inf"), float("nan"), True, "1"),
+        "repair_order": ("bogus", "Premium", 1),
+        "max_walks": (-1, True, 1.5, "1"),
+        "map_max_cells": (-1, True, 1.5, "1"),
+        "frozen_flight_ids": (None, "1", frozenset({True}), frozenset({1.5})),
+        "movable_uss_ids": ("uss", frozenset({1}), 1),
+        "incremental_release": (0, 1, "true"),
+        "unimpeded_workers": (0, -1, True, 1.5, "1"),
         "worker_kernel_log2": (-1, True, 1.5, "1"),
+        "time_limit_s": (-1.0, -float("inf"), float("nan"), True, "1"),
+        "verify_every": (-1, True, 1.5, "1"),
+        "log_every": (-1, True, 1.5, "1"),
     }
     for name, values in invalid.items():
         for value in values:
@@ -534,18 +550,41 @@ def test_lns_config_normalizes_compatible_numpy_scalars():
     from freespace_sim.planner.lns.solver import _validate_lns_config
 
     normalized = _validate_lns_config(LNSConfig(
+        seed=np.int64(3),
         max_iterations=np.int64(1),
+        neighborhood_size=np.int64(4),
+        operators=["agent", "random"],
+        adaptive=np.bool_(True),
+        gamma=np.float32(0.25),
         search_workers=np.int64(2),
         accept_epsilon=np.float32(0.25),
+        max_walks=np.int64(2),
+        map_max_cells=np.int64(32),
+        frozen_flight_ids={np.int64(1), np.int64(2)},
+        movable_uss_ids={"uss-a", "uss-b"},
+        incremental_release=np.bool_(False),
+        unimpeded_workers=np.int64(2),
         worker_kernel_log2=np.int64(0),
+        time_limit_s=np.float32(10.0),
+        verify_every=np.int64(1),
+        log_every=np.int64(0),
     ))
-    assert type(normalized.max_iterations) is int
-    assert type(normalized.search_workers) is int
-    assert type(normalized.accept_epsilon) is float
-    assert type(normalized.worker_kernel_log2) is int
+    for name in (
+        "seed", "max_iterations", "neighborhood_size", "search_workers", "max_walks",
+        "map_max_cells", "unimpeded_workers", "worker_kernel_log2", "verify_every", "log_every",
+    ):
+        assert type(getattr(normalized, name)) is int
+    for name in ("gamma", "accept_epsilon", "time_limit_s"):
+        assert type(getattr(normalized, name)) is float
+    assert normalized.operators == ("agent", "random")
+    assert normalized.frozen_flight_ids == frozenset({1, 2})
+    assert normalized.movable_uss_ids == frozenset({"uss-a", "uss-b"})
+    assert type(normalized.adaptive) is bool
+    assert type(normalized.incremental_release) is bool
 
-    unlimited = _validate_lns_config(LNSConfig(accept_epsilon=float("inf")))
-    assert unlimited.accept_epsilon == float("inf")
+    unlimited = _validate_lns_config(LNSConfig(
+        accept_epsilon=float("inf"), time_limit_s=float("inf")))
+    assert unlimited.accept_epsilon == unlimited.time_limit_s == float("inf")
 
 
 def test_auc_integrates_the_full_step_trajectory():
@@ -559,6 +598,26 @@ def test_auc_integrates_the_full_step_trajectory():
     assert _trajectory_auc(trajectory, cost_before=100.0, horizon_s=4.0) == 360.0
     assert _trajectory_auc(trajectory, cost_before=100.0, horizon_s=6.0) == 480.0
     assert _trajectory_auc([], cost_before=100.0, horizon_s=3.0) == 300.0
+
+
+def test_shared_trajectory_factory_preserves_mode_specific_schema():
+    from freespace_sim.planner.lns.solver import _trajectory_row
+
+    sequential = _trajectory_row(
+        0, "random", (2, 1), False, "denied", 10.0, float("inf"), 100.0, 0.5,
+    )
+    assert sequential == {
+        "iter": 0, "op": "random", "n": 2, "victims": [2, 1],
+        "accepted": False, "reason": "denied", "cost_old": 10.0,
+        "cost_new": None, "incumbent_cost": 100.0, "wall_s": 0.5,
+    }
+    parallel = _trajectory_row(
+        1, "agent", (3,), True, "overwrite", 20.0, 15.0, 95.0, 0.75,
+        incumbent_before=100.0,
+        audit={"dispatch_iter": 4, "base_version": 2, "worker": 1},
+    )
+    assert parallel["realized_improvement"] == 5.0
+    assert (parallel["dispatch_iter"], parallel["base_version"], parallel["worker"]) == (4, 2, 1)
 
 
 def test_parallel_state_build_honors_unimpeded_workers(monkeypatch):
@@ -624,14 +683,82 @@ def test_parallel_caps_pool_skips_coordinator_index_and_closes_before_verify(mon
     cfg = SimConfig()
     out = parallel.run_lns_parallel(
         cfg, ReservationLedger(cfg), [],
-        LNSConfig(max_iterations=np.int64(1), log_every=0,
+        LNSConfig(max_iterations=np.int64(2), log_every=0,
                   search_workers=np.int64(4), parallel_mode="drop"),
     )
-    assert observed == {"closed": True, "workers": 1, "record_envelope": False}
+    assert observed == {"closed": True, "workers": 2, "record_envelope": True}
     assert type(out.search_workers) is int
-    assert out.search_workers == 1
+    assert out.search_workers == 2
     assert out.pool_spawn_s == 0.25
     json.dumps(out.summary())
+
+
+@pytest.mark.parametrize("iterations", [0, 1])
+def test_effective_width_below_two_uses_the_sequential_engine(monkeypatch, iterations):
+    from freespace_sim.config import SimConfig
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.lns import LNSConfig, parallel, run_lns
+
+    class UnexpectedPool:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("a zero/one-task budget must not build a worker replica")
+
+    monkeypatch.setattr(parallel, "LNSWorkerPool", UnexpectedPool)
+    cfg = SimConfig()
+    config = LNSConfig(
+        max_iterations=iterations, operators=("random",), log_every=0,
+        search_workers=4, parallel_mode="drop",
+    )
+    for runner in (run_lns, parallel.run_lns_parallel):
+        out = runner(cfg, ReservationLedger(cfg), [], config)
+        assert out.parallel_mode == "sequential"
+        assert out.search_workers == 1
+        assert out.pool_spawn_s == 0.0
+        assert out.n_iterations == iterations
+
+
+def test_budget_exhaustion_before_pool_start_reports_zero_workers(monkeypatch):
+    from freespace_sim.config import SimConfig
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.lns import LNSConfig, parallel
+
+    class UnexpectedPool:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("an exhausted budget must not construct the pool")
+
+    monkeypatch.setattr(parallel, "LNSWorkerPool", UnexpectedPool)
+    monkeypatch.setattr(parallel, "_out_of_budget", lambda *_args: True)
+    cfg = SimConfig()
+    out = parallel.run_lns_parallel(
+        cfg, ReservationLedger(cfg), [],
+        LNSConfig(max_iterations=2, search_workers=2, parallel_mode="drop", log_every=0),
+    )
+    assert out.parallel_mode == "drop"
+    assert out.search_workers == 0
+    assert out.n_iterations == 0
+    assert out.pool_spawn_s == 0.0
+
+
+def test_pool_start_timeout_is_closed_and_reported_as_zero_workers():
+    from freespace_sim.planner.lns.parallel import WorkerStartTimeout, _run_and_close_pool
+
+    class Pool:
+        spawn_s = 0.25
+        n_workers = 2
+        closed = False
+
+        def start(self, *, deadline=None):
+            raise WorkerStartTimeout("budget")
+
+        def close(self):
+            self.closed = True
+
+    pool = Pool()
+    completed, spawn_s, started = _run_and_close_pool(
+        pool, deadline=1.0, execute=lambda _pool: pytest.fail("loop must not run"),
+    )
+    assert (completed, spawn_s, started) == (None, 0.25, 0)
+    assert pool.closed
 
 
 def test_zero_sequential_rate_has_no_relative_comparison():
@@ -646,18 +773,18 @@ def test_sweep_reports_effective_workers_without_mislabeling_the_baseline():
     from analysis.sweep_lns_workers import _sequential_baseline, _worker_metadata
 
     capped = _worker_metadata(
-        4, SimpleNamespace(search_workers=np.int64(1), parallel_mode="drop")
+        4, SimpleNamespace(search_workers=np.int64(1), parallel_mode="sequential")
     )
     sequential = _worker_metadata(
         1, SimpleNamespace(search_workers=1, parallel_mode="sequential")
     )
-    assert capped == {"requested_workers": 4, "workers": 1, "mode": "drop"}
+    assert capped == {"requested_workers": 4, "workers": 1, "mode": "sequential"}
     assert _sequential_baseline([capped, sequential]) is sequential
 
 
 def test_default_config_is_the_sequential_path():
-    """search_workers=1 by default: a worker holds a full private replica, so memory is linear
-    in workers — the same reason colgen's pricing pool is still defaulted off."""
+    """search_workers=1 stays in-process; enabling real workers adds full private replicas, so
+    memory is linear in workers — the same reason colgen's pricing pool is defaulted off."""
     from freespace_sim.planner.lns import LNSConfig
 
     c = LNSConfig()
@@ -668,9 +795,7 @@ def test_default_config_is_the_sequential_path():
 # ==================================================================== DROP mode
 @pytest.mark.slow
 def test_drop_at_one_worker_matches_sequential():
-    """With one worker nothing can interleave, so every result lands with base_version == the
-    current version and DROP's accept rule collapses to the sequential one. A divergence here
-    means the staleness branches are firing when they cannot possibly apply."""
+    """A requested DROP run with no possible concurrency uses the sequential engine unchanged."""
     from freespace_sim.planner.lns import LNSConfig, run_lns
     from freespace_sim.planner.lns.parallel import run_lns_parallel
 
@@ -685,8 +810,8 @@ def test_drop_at_one_worker_matches_sequential():
 
     assert _trajectory_key(drop) == _trajectory_key(seq)
     assert [_intent_digest(i) for i in drop.intents] == [_intent_digest(i) for i in seq.intents]
-    st = drop.parallel_stats
-    assert st["n_stale_victims"] == st["n_stale_cost"] == st["n_dirty"] == 0
+    assert drop.parallel_mode == "sequential"
+    assert drop.parallel_stats == {}
 
 
 @pytest.mark.slow

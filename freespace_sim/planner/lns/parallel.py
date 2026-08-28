@@ -37,8 +37,8 @@ anywhere. It costs one extra ``release_many`` plus k commits on the ~21% of task
 Modes:
 
 * ``sync``   — a barrier per round; the best of m results is applied (paper Eq. 3). Deterministic,
-  and at ``search_workers=1`` byte-identical to the sequential loop, which is what makes it the
-  replication vehicle and the parity gate.
+  and uses the same seeded task-selection stream as the sequential loop. Effective widths of zero
+  or one stay in-process; a private replica cannot add concurrency in that case.
 * ``drop``   — asynchronous; a result is applied as soon as it lands. Nondeterministic by
   construction (completion order is wall clock). Built on the same worker and protocol.
 """
@@ -46,12 +46,11 @@ Modes:
 from __future__ import annotations
 
 import logging
-import math
 import multiprocessing as mp
 import os
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import connection as mp_connection
 
 import numpy as np
@@ -67,6 +66,14 @@ from freespace_sim.planner.lns.neighborhood import (
     random_neighborhood,
 )
 from freespace_sim.planner.lns.state import LNSState
+from freespace_sim.planner.lns.solver import (
+    _build_lns_state,
+    _effective_search_workers,
+    _finalize_lns_result,
+    _trajectory_row,
+    _validate_lns_config,
+    run_lns,
+)
 from freespace_sim.types import OperationalIntent
 
 log = logging.getLogger("freespace_sim.lns")
@@ -466,25 +473,6 @@ class LNSWorkerPool:
 
 
 # ====================================================================== coordinator
-def _traj_row(
-    i, op, victims, accepted, reason, cost_old, cost_new,
-    incumbent_before, incumbent_cost, wall_s,
-):
-    """One trajectory row compatible with the sequential loop's schema.
-
-    ``iter`` follows row/completion order, so the anytime curve is monotone and a one-worker run is
-    row-for-row comparable with ``run_lns``. ``cost_new`` is JSON-safe (None rather than inf).
-    """
-    return dict(
-        iter=i, op=op, n=len(victims), victims=list(victims), accepted=accepted, reason=reason,
-        cost_old=cost_old,
-        cost_new=None if (cost_new is None or math.isinf(cost_new)) else cost_new,
-        incumbent_cost=incumbent_cost,
-        realized_improvement=float(incumbent_before) - float(incumbent_cost),
-        wall_s=wall_s,
-    )
-
-
 def _pick_task(state, lns, selector, tabu, i):
     """Choose the operator and (for ``agent``) the seed for global task index ``i``.
 
@@ -533,8 +521,7 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
     """SYNC-LNS: a barrier per round, then apply the single best of m results (paper Eq. 3).
 
     Deterministic — the slot order is fixed and every decision is a pure function of it — which is
-    what makes ``search_workers=1`` byte-identical to the sequential loop and therefore the parity
-    gate for the whole design.
+    keeps task selection deterministic for a fixed worker count and seed.
 
     Note the shape this gives at a FIXED ITERATION budget: m workers consume m tasks per round and
     m-1 of them are discarded, so quality per iteration FALLS as m rises. That is the paper's own
@@ -580,10 +567,11 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
                 reason = "not_selected"
                 n_not_selected += 1
             incumbent_after = state.total_cost if is_winner else incumbent_cursor
-            trajectory.append(_traj_row(
+            trajectory.append(_trajectory_row(
                 r.rnd + r.slot, r.op, r.victims, is_winner, reason,
-                r.cost_old, r.cost_new, incumbent_cursor, incumbent_after,
-                time.monotonic() - t0))
+                r.cost_old, r.cost_new, incumbent_after, time.monotonic() - t0,
+                incumbent_before=incumbent_cursor,
+            ))
             incumbent_cursor = incumbent_after
 
         _maybe_verify(state, lns, n_accepted, winner is not None)
@@ -684,14 +672,16 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
 
         if lns.adaptive:
             selector.update(r.op, realized_improvement if applied else 0.0)
-        row = _traj_row(
+        row = _trajectory_row(
             n_iter - 1, r.op, r.victims, applied, reason,
-            r.cost_old, r.cost_new, incumbent_before, state.total_cost,
-            time.monotonic() - t0,
+            r.cost_old, r.cost_new, state.total_cost, time.monotonic() - t0,
+            incumbent_before=incumbent_before,
+            audit={
+                "dispatch_iter": r.rnd,
+                "base_version": r.base_version,
+                "worker": r.worker,
+            },
         )
-        row["dispatch_iter"] = r.rnd
-        row["base_version"] = r.base_version
-        row["worker"] = r.worker
         trajectory.append(row)
 
         _maybe_verify(state, lns, n_accepted, applied)
@@ -761,6 +751,24 @@ def _maybe_log(lns, mode, m, n_iter, n_accepted, state, selector, cost_before) -
              n_accepted, {k: round(v, 3) for k, v in selector.weights.items()})
 
 
+def _run_and_close_pool(pool, *, deadline, execute):
+    """Start a pool, execute its loop, and close every replica before returning.
+
+    Startup timeout is the one non-fatal pool outcome: the configured wall budget was consumed
+    before search began, so the valid incumbent is returned with zero started workers. Every other
+    startup/loop failure propagates after the same teardown.
+    """
+    try:
+        try:
+            pool.start(deadline=deadline)
+        except WorkerStartTimeout:
+            log.info("lns: wall-clock budget expired while starting search workers")
+            return None, pool.spawn_s, 0
+        return execute(pool), pool.spawn_s, pool.n_workers
+    finally:
+        pool.close()
+
+
 def run_lns_parallel(
     cfg: SimConfig,
     ledger: ReservationLedger,
@@ -772,19 +780,18 @@ def run_lns_parallel(
 ):
     """DROP-LNS over a committed schedule. Same contract as ``run_lns``; see that docstring.
 
-    ``sync`` runs a barrier per round and applies the best of m results (paper Eq. 3). At
-    ``search_workers=1`` it is byte-identical to the sequential loop, which is the parity gate the
-    whole design is verified against.
+    ``sync`` runs a barrier per round and applies the best of m results (paper Eq. 3). An effective
+    width below two delegates to the sequential engine instead of building a replica that cannot
+    run concurrently.
     """
-    # Deferred because solver imports this module only for the parallel path.
-    from freespace_sim.planner.lns.solver import (
-        _build_lns_state,
-        _finalize_lns_result,
-        _validate_lns_config,
-    )
-
     lns = _validate_lns_config(lns)
-    pool_workers = min(lns.search_workers, lns.max_iterations)
+    pool_workers = _effective_search_workers(lns)
+    if pool_workers <= 1:
+        return run_lns(
+            cfg, ledger, intents, replace(lns, search_workers=1),
+            static_terms=static_terms, turnaround_s=turnaround_s,
+        )
+
     t0 = time.monotonic()
     state = _build_lns_state(
         cfg, ledger, intents, lns,
@@ -820,38 +827,31 @@ def run_lns_parallel(
         "n_stale_victims": 0, "n_stale_cost": 0,
         "n_dirty": 0, "n_overwrite": 0, "n_clean_merge": 0,
     }
-    pool = None
     pool_spawn_s = 0.0
+    started_workers = 0
     try:
-        try:
-            if pool_workers and not _out_of_budget(lns, t0):
-                pool = LNSWorkerPool(
-                    cfg, state.final_intents(), static_terms,
-                    dict(state._unimp_cost), spec, pool_workers,
-                )
-                deadline = None if lns.time_limit_s is None else t0 + lns.time_limit_s
-                try:
-                    pool.start(deadline=deadline)
-                except WorkerStartTimeout:
-                    # Startup is part of the configured wall-clock budget. Return the valid baseline
-                    # when it consumes that budget; the pool already tore down partial workers.
-                    log.info("lns: wall-clock budget expired while starting search workers")
-                else:
-                    loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
-                    stats = loop(
-                        state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before)
-                    n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
-        finally:
-            # Verification replays the full schedule into another ledger. Release every worker's
-            # full replica first so a completed run does not hit its peak memory during finalization.
-            if pool is not None:
-                pool_spawn_s = pool.spawn_s
-                pool.close()
-                pool = None
+        if not _out_of_budget(lns, t0):
+            pool = LNSWorkerPool(
+                cfg, state.final_intents(), static_terms,
+                dict(state._unimp_cost), spec, pool_workers,
+            )
+            deadline = None if lns.time_limit_s is None else t0 + lns.time_limit_s
+            loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
+            completed, pool_spawn_s, started_workers = _run_and_close_pool(
+                pool,
+                deadline=deadline,
+                execute=lambda active: loop(
+                    state, active, lns, selector, tabu, changelog,
+                    t0, trajectory, cost_before,
+                ),
+            )
+            if completed is not None:
+                stats = completed
+                n_iter, n_accepted = stats["n_iter"], stats["n_accepted"]
 
         return _finalize_lns_result(
             state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
-            search_workers=pool_workers,
+            search_workers=started_workers,
             parallel_mode=lns.parallel_mode,
             pool_spawn_s=pool_spawn_s,
             parallel_stats=_finish_stats(stats, n_iter),

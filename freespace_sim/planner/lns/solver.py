@@ -128,14 +128,48 @@ def _integer_config_value(name: str, value, *, minimum: int) -> int:
     return int(normalized)
 
 
-def _nonnegative_float_config_value(name: str, value) -> float:
-    """Normalize a non-negative real config value, rejecting booleans and NaNs."""
+def _float_config_value(
+    name: str,
+    value,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    allow_positive_infinity: bool = False,
+) -> float:
+    """Normalize a bounded real config value without accepting booleans or NaNs."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        raise ValueError(f"LNSConfig.{name} must be a non-negative real, got {value!r}")
+        raise ValueError(f"LNSConfig.{name} must be a real number, got {value!r}")
     normalized = float(value)
-    if math.isnan(normalized) or normalized < 0.0:
-        raise ValueError(f"LNSConfig.{name} must be a non-negative real, got {value!r}")
+    invalid_infinity = math.isinf(normalized) and not (
+        allow_positive_infinity and normalized > 0.0
+    )
+    if (math.isnan(normalized) or invalid_infinity
+            or (minimum is not None and normalized < minimum)
+            or (maximum is not None and normalized > maximum)):
+        bounds = (
+            f" between {minimum} and {maximum}" if maximum is not None
+            else f" >= {minimum}" if minimum is not None
+            else ""
+        )
+        raise ValueError(f"LNSConfig.{name} must be a real number{bounds}, got {value!r}")
     return normalized
+
+
+def _boolean_config_value(name: str, value) -> bool:
+    """Normalize Python/NumPy booleans without treating arbitrary truthy values as flags."""
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"LNSConfig.{name} must be a bool, got {value!r}")
+    return bool(value)
+
+
+def _iterable_config_value(name: str, value) -> list:
+    """Materialize a collection field once, rejecting strings masquerading as collections."""
+    if isinstance(value, (str, bytes)):
+        raise ValueError(f"LNSConfig.{name} must be a collection, got {value!r}")
+    try:
+        return list(value)
+    except TypeError:
+        raise ValueError(f"LNSConfig.{name} must be a collection, got {value!r}") from None
 
 
 def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
@@ -144,24 +178,76 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     Normalized execution-control fields use ordinary Python scalars so pool widths and result
     summaries remain JSON-serializable when callers supplied compatible NumPy scalar types.
     """
+    if isinstance(lns.operators, str) or not isinstance(lns.operators, (tuple, list)):
+        raise ValueError(
+            f"LNSConfig.operators must be a sequence of operator names, got {lns.operators!r}")
+    operators = tuple(lns.operators)
+    if any(not isinstance(name, str) for name in operators):
+        raise ValueError(f"LNSConfig.operators must contain only strings, got {operators!r}")
     known = {"agent", "map", "random"}
-    unknown = [name for name in lns.operators if name not in known]
+    unknown = [name for name in operators if name not in known]
     if unknown:
         raise ValueError(f"unknown LNS operators {unknown!r} (want subset of agent/map/random)")
-    if not lns.operators:
+    if not operators:
         raise ValueError("LNSConfig.operators is empty — need at least one of agent/map/random")
-    if len(set(lns.operators)) != len(lns.operators):
+    if len(set(operators)) != len(operators):
         raise ValueError(
-            f"duplicate LNS operators {list(lns.operators)!r} — each name at most once")
+            f"duplicate LNS operators {list(operators)!r} — each name at most once")
+    if lns.repair_order not in ("premium", "random"):
+        raise ValueError(
+            f"unknown LNSConfig.repair_order {lns.repair_order!r} (want 'premium' or 'random')")
 
-    search_workers = _integer_config_value("search_workers", lns.search_workers, minimum=1)
-    max_iterations = _integer_config_value("max_iterations", lns.max_iterations, minimum=0)
-    accept_epsilon = _nonnegative_float_config_value("accept_epsilon", lns.accept_epsilon)
-    worker_kernel_log2 = (
-        None if lns.worker_kernel_log2 is None
-        else _integer_config_value("worker_kernel_log2", lns.worker_kernel_log2, minimum=0)
+    integer_minima = {
+        "seed": 0,
+        "search_workers": 1,
+        "max_iterations": 0,
+        "neighborhood_size": 1,
+        "max_walks": 0,
+        "map_max_cells": 0,
+        "verify_every": 0,
+        "log_every": 0,
+    }
+    integers = {
+        name: _integer_config_value(name, getattr(lns, name), minimum=minimum)
+        for name, minimum in integer_minima.items()
+    }
+    optional_integers = {}
+    for name, minimum in {"unimpeded_workers": 1, "worker_kernel_log2": 0}.items():
+        value = getattr(lns, name)
+        optional_integers[name] = (
+            None if value is None
+            else _integer_config_value(name, value, minimum=minimum)
+        )
+    booleans = {
+        name: _boolean_config_value(name, getattr(lns, name))
+        for name in ("adaptive", "incremental_release")
+    }
+    frozen_flight_ids = frozenset(
+        _integer_config_value("frozen_flight_ids", fid, minimum=0)
+        for fid in _iterable_config_value("frozen_flight_ids", lns.frozen_flight_ids)
+    )
+    if lns.movable_uss_ids is None:
+        movable_uss_ids = None
+    else:
+        uss_ids = _iterable_config_value("movable_uss_ids", lns.movable_uss_ids)
+        if any(not isinstance(uss_id, str) for uss_id in uss_ids):
+            raise ValueError(
+                f"LNSConfig.movable_uss_ids must contain only strings, got {lns.movable_uss_ids!r}")
+        movable_uss_ids = frozenset(uss_ids)
+    gamma = _float_config_value("gamma", lns.gamma, minimum=0.0, maximum=1.0)
+    accept_epsilon = _float_config_value(
+        "accept_epsilon", lns.accept_epsilon,
+        minimum=0.0, allow_positive_infinity=True,
+    )
+    time_limit_s = (
+        None if lns.time_limit_s is None
+        else _float_config_value(
+            "time_limit_s", lns.time_limit_s,
+            minimum=0.0, allow_positive_infinity=True,
+        )
     )
     ceiling = 4 * (os.cpu_count() or 1)
+    search_workers = integers["search_workers"]
     if search_workers > ceiling:
         raise ValueError(
             f"LNSConfig.search_workers={search_workers} exceeds {ceiling} (4x cores) — each "
@@ -172,11 +258,49 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
             f"unknown LNSConfig.parallel_mode {lns.parallel_mode!r} (want 'sync' or 'drop')")
     return replace(
         lns,
-        search_workers=search_workers,
-        max_iterations=max_iterations,
+        operators=operators,
+        gamma=gamma,
         accept_epsilon=accept_epsilon,
-        worker_kernel_log2=worker_kernel_log2,
+        frozen_flight_ids=frozen_flight_ids,
+        movable_uss_ids=movable_uss_ids,
+        time_limit_s=time_limit_s,
+        **integers,
+        **optional_integers,
+        **booleans,
     )
+
+
+def _effective_search_workers(lns: LNSConfig) -> int:
+    """Processes that can receive work under this configuration's task budget."""
+    return min(lns.search_workers, lns.max_iterations)
+
+
+def _trajectory_row(
+    i,
+    op,
+    victims,
+    accepted,
+    reason,
+    cost_old,
+    cost_new,
+    incumbent_cost,
+    wall_s,
+    *,
+    incumbent_before=None,
+    audit: dict | None = None,
+) -> dict:
+    """Build the common trajectory schema without coupling it to an execution mode."""
+    row = dict(
+        iter=i, op=op, n=len(victims), victims=list(victims),
+        accepted=accepted, reason=reason, cost_old=cost_old,
+        cost_new=None if (cost_new is None or math.isinf(cost_new)) else cost_new,
+        incumbent_cost=incumbent_cost, wall_s=wall_s,
+    )
+    if incumbent_before is not None:
+        row["realized_improvement"] = float(incumbent_before) - float(incumbent_cost)
+    if audit:
+        row.update(audit)
+    return row
 
 
 def _trajectory_auc(trajectory: list[dict], cost_before: float, horizon_s: float) -> float:
@@ -285,9 +409,9 @@ def run_lns(
     # minutes building the unimpeded ruler, so an argument error must not cost either.
     lns = _validate_lns_config(lns)
 
-    if lns.search_workers > 1:
+    if _effective_search_workers(lns) > 1:
         # Deferred import: keeps multiprocessing (and the pool module) off the sequential path,
-        # and breaks the cycle — parallel.py needs LNSResult from here.
+        # while parallel.py can import the shared solver helpers only after this module is loaded.
         from freespace_sim.planner.lns.parallel import run_lns_parallel
 
         return run_lns_parallel(cfg, ledger, intents, lns,
@@ -297,6 +421,7 @@ def run_lns(
     state = _build_lns_state(
         cfg, ledger, intents, lns,
         static_terms=static_terms, turnaround_s=turnaround_s,
+        maintain_claim_index=lns.max_iterations > 0,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0
@@ -333,10 +458,9 @@ def run_lns(
                 if not victims:
                     if lns.adaptive:
                         selector.update(name, 0.0)
-                    trajectory.append(dict(
-                        iter=i, op=name, n=0, victims=[], accepted=False, reason="empty",
-                        cost_old=0.0, cost_new=0.0,
-                        incumbent_cost=state.total_cost, wall_s=time.monotonic() - t0,
+                    trajectory.append(_trajectory_row(
+                        i, name, (), False, "empty", 0.0, 0.0,
+                        state.total_cost, time.monotonic() - t0,
                     ))
                     continue
                 out = state.try_repair(
@@ -345,12 +469,10 @@ def run_lns(
                 if lns.adaptive:
                     selector.update(name, out.improvement)
                 n_accepted += int(out.accepted)
-                trajectory.append(dict(
-                    iter=i, op=name, n=len(victims), victims=sorted(victims),
-                    accepted=out.accepted, reason=out.reason,
-                    cost_old=out.cost_old,
-                    cost_new=None if math.isinf(out.cost_new) else out.cost_new,
-                    incumbent_cost=state.total_cost, wall_s=time.monotonic() - t0,
+                trajectory.append(_trajectory_row(
+                    i, name, sorted(victims), out.accepted, out.reason,
+                    out.cost_old, out.cost_new,
+                    state.total_cost, time.monotonic() - t0,
                 ))
                 if out.accepted and lns.verify_every and n_accepted % lns.verify_every == 0:
                     bad = verify.find_interflight_conflict(

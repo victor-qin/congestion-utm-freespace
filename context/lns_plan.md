@@ -518,8 +518,8 @@ opposite behaviour where it matters.
 SYNC is worse than DROP wherever both were measured, exactly as the paper reports and for the
 paper's reason: best-of-m discards m-1 results (`notsel=18` of 120 on the cut). It was NOT run at
 full scale — every full-scale row above is DROP — so treat "SYNC loses" as a cut-only finding.
-Its value here was never throughput anyway: it is DETERMINISTIC, and at `search_workers=1`
-byte-identical to the sequential loop, which is the gate every other claim on this page rests on.
+Its value here was never throughput anyway: it is DETERMINISTIC. Effective widths below two now
+use the sequential engine directly; a private replica cannot add concurrency in that case.
 
 ### Where it goes from here
 

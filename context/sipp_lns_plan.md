@@ -64,7 +64,7 @@ Derived from the code, not assumed. Seven requirements; SIPP satisfies two.
 | R1 | `plan(req, ledger, cfg) -> OperationalIntent` | `state.py:527` (the only method `try_repair` calls) | OK |
 | R2 | `evict_floor == 0.0`, so victims may be replanned in ANY priority order | `state.py:192` (raises, but only for a BORROWED planner — see §6) | attribute inherited; **its own two structures ignore it** (G3) |
 | R3 | Not already bound to this ledger | `state.py:181` | OK (checks `_svc_ledger`/`_cocc_ledger`, both inherited) |
-| R4 | Survive `detach_subscribers()` + epoch bump by REBINDING | `state.py:202`; SIPP's tripwires at `sipp.py:287`, `sipp.py:522` | OK — pinned by `test_shared_sipp_occupancy_preserves_nonzero_ledger_epoch` |
+| R4 | Survive `detach_subscribers()` + epoch bump by REBINDING | `state.py:201`; SIPP's tripwires at `sipp.py:287`, `sipp.py:522` | OK — pinned by `test_shared_sipp_occupancy_preserves_nonzero_ledger_epoch` |
 | R5 | Un-absorb `release_many` in O(victim volumes) under `incremental_release=True` | `astar/planner.py:305-307`, `:797-798` | **absent for `_sidx` + `_scocc`** (G1) |
 | R6 | Costs in the same currency as the unimpeded ruler and the incumbent | `state.py:171` — but it reads `cfg.planner`, NOT the repair planner (§6) | untested in congestion (G4) |
 | R7 | For DROP with m>1: reset `last_envelope` per plan, set it when `record_envelope` | `parallel.py:715-727`, `:794` | **absent, and worse than absent** (G2) |
@@ -140,7 +140,7 @@ clips nothing. The only release-side clamp in the repo is `HexOccupancyService.o
 
 ### G4 (currency). The ruler is A*, the repair would be SIPP, and no congested test compares them.
 
-- `unimpeded._new_ruler` (`unimpeded.py:57-69`) hardcodes `AStarPlanner`.
+- `unimpeded._new_ruler` (`unimpeded.py:51-69`) hardcodes `AStarPlanner`.
 - The only SIPP-vs-A* cost comparison is on an **empty world** at 1e-6
   (`test_sipp_compiled.py:61`). Every replay test (`:357`, `:381`) compares SIPP-compiled against
   SIPP-*reference* on an A*-committed ledger — never SIPP against A*.
@@ -207,6 +207,9 @@ only threads `_rows` into `_add` leaves `self._rows` permanently empty and the f
 `reset()` explicitly.
 
 ### 4.1 `SafeIntervalIndex` — refcounts (`freespace_sim/planner/sipp.py`)
+
+**ADD the import** `from array import array` to `sipp.py` (it has none;
+`compiled_hex_occupancy.py:40` is the precedent).
 
 **MODIFY `SafeIntervalIndex.__init__(self, cfg, track_removal=False)`**
 
@@ -325,6 +328,13 @@ commit-derived. No release ever touches it.
 
 ### 4.2 `CompiledOccupancy` — claim journal + per-cell rebuild (`compiled_occupancy.py`)
 
+**ADD the imports.** `from array import array`, and extend the existing
+`from .astar.compiled_hex_occupancy import schedulable_horizon_steps` (`compiled_occupancy.py:34`) to
+also pull `_FIELD_MASK, _SPAN_BITS, _SPAN_LIMIT`. That module is already a dependency and does not
+import back (`compiled_hex_occupancy.py:36-47`), so this adds no cycle — and **sharing the constants
+is the point**: two journals with independently-defined packing widths is a silent-corruption bug
+waiting for someone to widen one of them.
+
 **MODIFY `_init_pool`** — add `self._free: list[int] = []`. (Note this is also what makes `reset()`
 free-list-correct for nothing: `reset()` calls `_init_pool`, so `_free` is re-created there and
 needs no separate clear.)
@@ -370,21 +380,26 @@ pool index (one pool, so `key = c` rather than `c << 1 | pool_idx`):
 if s0 < 0:  s0 = 0
 if s1 > self.MAXS: s1 = self.MAXS        # record what block_range WILL apply, not the raw span
 if s0 > s1: return
-if s1 >= _SPAN_LIMIT:                    # belt and braces — see below
-    raise ValueError(f"CompiledOccupancy: step {s1} exceeds the removal journal's "
-                     f"{_SPAN_LIMIT}-step packing limit")
+# NO per-row _SPAN_LIMIT raise, unlike A* — see below.
 packed = (s0 << _SPAN_BITS) | s1
 self._claims.setdefault(c, []).append(packed)
 if _rows is not None: _rows += (c, packed)
 ```
 
-**The clamp AND the per-row raise are both required, and A\* explains why the constructor check is
-not enough** (`compiled_hex_occupancy.py:392-397`): "A committed volume can outlive the box (a late
-return commits past MAXS and box-guards to the reference), so the constructor's MAXS check does not
-bound this." The spans arrive raw from `rasterize_ranges`, *before* `block_range`'s own internal
-`if s1 > self.MAXS` clamp, so recording them unclamped packs `s_hi >= 1<<20` into the `s0` field —
-and on release every *surviving* claim in that cell replays at a garbage span. Recording the
-post-clamp values also keeps the journal exactly reversible: what was applied is what is replayed.
+**Why the clamp, and why — unlike A\* — there is no per-row raise.** The spans arrive raw from
+`rasterize_ranges`, *before* `block_range`'s own internal `if s1 > self.MAXS` clamp. A committed
+volume can outlive the box (a late return commits past `MAXS` and box-guards to the reference), so
+recording them unclamped would pack `s_hi >= 1<<20` into the `s0` field, and on release every
+*surviving* claim in that cell replays at a garbage span. Clamping first also makes the journal
+exactly reversible: what was applied is what is replayed.
+
+That clamp is precisely the **divergence from A\***, and it makes A*'s per-row guard
+(`compiled_hex_occupancy.py:392-397`) dead code here. A* records the raw span, so its constructor's
+`MAXS` check genuinely does not bound `_record` and the raise is load-bearing. Post-clamp,
+`0 <= s0 <= s1 <= MAXS < _SPAN_LIMIT` holds by construction, so the same raise can never fire.
+Keep the constructor's `MAXS >= _SPAN_LIMIT` check as the single bound and carry a one-line comment
+recording why the two `_record`s differ — importing A*'s justification wholesale would assert
+something the clamp has already made untrue.
 
 **ADD `on_release(self, flight_id, volumes)`**
 
@@ -398,6 +413,7 @@ for c in touched:
     self.reset_cell(c)                  # reclaims overflow slots onto _free
     if c in self._static_cells:         # <-- see "the one subtle thing", below
         self.iv_lo[c] = 0; self.iv_hi[c] = -1; self.iv_nxt[c] = -1
+        self._claims.pop(c, None)       # the non-static branch's cleanup, which `continue` skips
         continue                        # walled ⇒ content irrelevant, and a replay would leak slots
     survivors = self._claims.get(c)
     if survivors:
@@ -516,6 +532,23 @@ p.record_envelope = record_envelope
 return p
 ```
 
+**MODIFY `_validate_lns_config`** (`solver.py:116`) — add the name check there, next to the
+`operators` check. **This is not a stylistic preference; the allowlist raise cannot live only in
+`_new_repair_planner`.** That function is called from `state.py:207-210`, which is *after*
+`ledger.detach_subscribers()` at `state.py:201` — so a typo'd `--repair-planner sipp2` would strip
+the caller's ledger of every observer and release subscriber and bump its epoch, and only then
+raise. That is exactly the failure the vet block above it names: "a constructor that raises must not
+leave the caller's ledger stripped of its subscribers" (`state.py:178-179`). `_validate_lns_config`
+exists for this — "Validate all arguments that must fail before `LNSState` takes over the ledger" —
+and both entry points already call it first (`solver.py:256`, `parallel.py:773`).
+
+**And hoist the construction above the detach.** Inside `LNSState.__init__`, call
+`_new_repair_planner(...)` into a local *before* `ledger.detach_subscribers()` and assign
+`self.repair_planner` after. The validator covers a bad *name*, but the constructor also runs the
+SIPP kernel import and `AStarPlanner._warm_jit()` (`astar/planner.py:276-277`) — any of which can
+raise inside the same post-detach window. Hoisting is the fix rather than try/except-and-resubscribe
+because **the epoch bump is not reversible.**
+
 Deliberately a small allowlist rather than `get_planner(name)`: the registry contains
 `ShortcutRefiner` wrappers and the whole-schedule `colgen`, neither of which satisfies R1-R7 (a
 wrapper has no `evict_floor` of its own — `state.py:190` documents exactly that trap). An explicit
@@ -550,7 +583,21 @@ the failure mode with no symptom", `parallel.py:83-86`).
 `lns.repair_planner`.
 
 **MODIFY `analysis/run_lns.py`** — `--repair-planner {astar,astar_ref,sipp,sipp_ref}`, default
-`astar`.
+`astar`; and read `len(ledger._release_subs)` / `len(ledger._observers)` once after
+`run_lns_on_result` returns (the runner holds the same ledger object, so no hook is needed) into the
+JSON output. That is the direct check on §0's 4:3 claim and it costs one line.
+
+**ADD plan-side / commit-side timers**, because §9 needs a split no current readout can produce:
+`LNSResult.summary()` carries only `wall_s`/`init_wall_s`/`auc` (`solver.py:95-113`), and a
+trajectory row only cumulative `wall_s` (`solver.py:318-324`). Two accumulators on `LNSState`,
+incremented in `try_repair` — one around `self.repair_planner.plan(...)` (`state.py:527`), one
+around `self.ledger.commit(...)` (`state.py:531`) plus `_rewind`'s release+commit loop
+(`state.py:575-579`) — surfaced through `_finalize_lns_result` into `LNSResult.summary()`. Without
+these the number that decides the default has no instrument.
+
+*(A `perf_counter` per call is exactly what `[[colclr-per-flight-scaling]]` warns against for
+per-flight attribution. It is fine here: these are two counters over a whole run, read once, not a
+per-flight ranking — but do not let them grow into one.)*
 
 ---
 
@@ -567,7 +614,7 @@ if repair_planner is None and cfg.planner not in _REPRODUCIBLE_PLANNERS:   # sta
 ```
 
 It reads **`cfg.planner`** — the planner that produced the *baseline* — and never inspects the
-repair planner. The §9 A/B baselines on A* (`analysis/run_lns.py:71` passes
+repair planner. The §9 A/B baselines on A* (`analysis/run_lns.py:83` passes
 `planner_name="astar"`), so `repair_planner_name="sipp"` passes this check today, with or without
 an edit. Adding `"sipp"` to the set would therefore not gate anything Phase 2 introduces; what it
 *would* newly license is the opposite mixing — a SIPP-baselined run silently defaulting to an A*
@@ -616,8 +663,15 @@ plus a `_mk_envelope` call on the SIPP compiled path. Deferred because:
   which is only true once the `last_envelope = None` reset above is in.
 
 Consequently: allow `repair_planner="sipp"` with `parallel_mode="drop"`, but **log a warning once**
-naming the degradation, rather than raising. Raising would make the honest combination
-inexpressible for measurement.
+naming the degradation, rather than raising. Raising would make the honest combination inexpressible
+for measurement.
+
+**Emit it in `_validate_lns_config` (`solver.py:116`), guarded on
+`lns.repair_planner.startswith("sipp") and lns.parallel_mode == "drop" and search_workers > 1`.**
+The obvious home — `_new_repair_planner` — is the wrong process: it runs inside `LNSState.replica`
+in a spawned worker (`parallel.py:241-251`), whose stderr is not the coordinator's log stream. A
+warning nobody reads, fired once per worker, is functionally silent — which defeats the only reason
+this warning exists.
 
 ---
 
@@ -686,7 +740,7 @@ with no locality.
 5. **Slot reclaim** — port `tests/test_lns.py:204` (`test_pool_reset_cell_reclaims_overflow_slots`):
    `nslots` stays bounded across many destroy/repair cycles on the same cells. Unbounded growth has
    no other symptom until memory.
-6. **New, no A\* precedent** — three failures this plan introduced and had to design around:
+6. **New, no A\* precedent** — four failures this plan introduced and had to design around:
    - *static walls*: release a flight whose corridor touches an always-active hub's walled cells;
      assert the wall survives. Must fail before the §4.2 fix.
    - *`reset()` + journal*: with `track_removal=True`, commit two flights, force the shrink
@@ -700,15 +754,32 @@ with no locality.
 8. **Phase 2:** `repair_planner="sipp"` runs sequentially, `verify_every=1`, conflict-free. Also
    confirm `tests/test_lns.py` raises no `ValueError` with `repair_planner_name="sipp"` —
    demonstrating (§6) that `_REPRODUCIBLE_PLANNERS` was never the gate.
-9. **Phase 3:** the two cost-parity tests.
-10. **Phase 4:** `last_envelope` is `None` after a native SIPP plan that follows an A*-fallback plan.
-11. **Parallel:** `search_workers=1` with `repair_planner="sipp"` byte-identical to the sequential
+9. **Bad name leaves the ledger intact:** construct an `LNSState` with
+   `repair_planner_name="nope"`, assert `ValueError`, then assert `ledger._observers` and
+   `ledger._release_subs` are still non-empty and `ledger.epoch` is unchanged. This is the pin for
+   §5's validate-before-takeover ordering, and it fails silently without it.
+10. **Phase 3:** the two cost-parity tests.
+11. **Phase 4:** `last_envelope` is `None` after a native SIPP plan that follows an A*-fallback plan.
+12. **Parallel:** `search_workers=1` with `repair_planner="sipp"` byte-identical to the sequential
     SIPP loop — #118's parity gate on the new arm. It is also what catches a worker that silently
     ran A* because the `replica(...)` forward (§5) was missed.
 
-*Test hygiene, after Phase 1 lands:* revisit whether gates 3+6 overlap gate 7 enough to move the
-slow trajectory run behind `@pytest.mark.slow`, as `test_compiled_replay_exact_big_dense_short_flights`
-already is (`tests/test_sipp_compiled.py:380`).
+*Test hygiene, after Phase 1 lands:*
+
+- Revisit whether gates 3+6 overlap gate 7 enough to move the slow trajectory run behind
+  `@pytest.mark.slow`, as `test_compiled_replay_exact_big_dense_short_flights` already is
+  (`tests/test_sipp_compiled.py:380`).
+- Gate 6's *reset() + journal* case and gate 3's *matches fresh absorb* assert the **same oracle**
+  (query-parity against a fresh instance holding only the survivor) by different entry paths. Keep
+  both, but label the `reset()` one as the **defensive** unit test it is: under
+  `incremental_release=True` that path is unreachable — `on_release` keeps `n_added` in lockstep, and
+  `ledger.release` delegates to `release_many` whenever `_release_subs` is non-empty
+  (`ledger.py:258-260`). A future reader must not mistake it for a live path and "simplify" the
+  `reset()` clear back out.
+- `tests/test_sipp_compiled.py:270` reads `sidx.corr.keys()` — the **only** cross-module reader of
+  `corr` outside `sipp.py`. It is unaffected by §4.1's value-type switch (outer dict keys, and it
+  builds a `track_removal=False` index), but re-run that file explicitly after §4.1 rather than
+  trusting the full suite to surface it.
 
 **The measurement that decides the default** (`analysis/run_lns.py`):
 
@@ -720,7 +791,11 @@ direct check on §0's 4:3 claim, and it costs nothing.
 
 Two scales, because `[[lns-neighborhood-size-is-scale-dependent]]` and
 `[[drop-lns-parallel-implementation]]` both invert with instance size and a single cut would
-mislead: the 1,526-leg cut (`--demand-duration 600`) and full 4,636.
+mislead: the 1,526-leg cut and full 4,636. **`--demand-duration` and `--horizon` must be passed
+together** — `analysis/run_lns.py:76-77` calls `ap.error` otherwise, so `--demand-duration 600`
+alone aborts before the baseline runs. Follow the module docstring's paired shape
+(`analysis/run_lns.py:3-8`, e.g. `--demand-duration 120 --horizon 1500`) and scale the horizon to
+match.
 
 Quote gains against the 19.3% that is actually delay, not against total cost
 (`[[density-faa-delay-is-19pct]]`).

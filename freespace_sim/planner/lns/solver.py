@@ -16,7 +16,8 @@ import operator
 import os
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from numbers import Real
 
 import numpy as np
 
@@ -39,12 +40,12 @@ log = logging.getLogger("freespace_sim.lns")
 @dataclass
 class LNSConfig:
     seed: int = 0
-    max_iterations: int = 2000
+    max_iterations: int = 2000           # non-negative task budget
     neighborhood_size: int = 8          # paper N in {2,4,8,16}; larger favors less-congested instances
     operators: tuple[str, ...] = ("agent", "map", "random")
     adaptive: bool = True               # ALNS roulette; False -> uniform random operator choice
     gamma: float = 0.01                 # ALNS reaction factor (paper value)
-    accept_epsilon: float = 0.0         # required strict improvement in weighted seconds
+    accept_epsilon: float = 0.0         # non-negative required improvement; +inf rejects all
     repair_order: str = "premium"       # PP priority: "premium" (most-delayed first) | "random" (paper)
     max_walks: int = 10                 # agent-based: walk restarts before giving up on size N
     map_max_cells: int = 4096           # map-based: BFS exploration bound
@@ -60,7 +61,7 @@ class LNSConfig:
     # `unimpeded_workers` remains a separate, parent-only knob for the one-off delay ruler.
     search_workers: int = 1
     parallel_mode: str = "sync"          # "sync": barrier per round, deterministic | "drop": async
-    worker_kernel_log2: int | None = None  # AStarPlanner.kernel_log2_min in the workers; oversized
+    worker_kernel_log2: int | None = None  # non-negative AStarPlanner.kernel_log2_min; oversized
     #                                        kernel arrays were measured to slow CONCURRENT plans
     #                                        ~1.75x at 8 workers while a lone worker matched serial
     time_limit_s: float | None = None
@@ -113,11 +114,35 @@ class LNSResult:
         }
 
 
-def _validate_lns_config(lns: LNSConfig) -> int:
-    """Validate all arguments that must fail before ``LNSState`` takes over the ledger.
+def _integer_config_value(name: str, value, *, minimum: int) -> int:
+    """Normalize an integer config value without truncating floats or parsing strings."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"LNSConfig.{name} must be an int >= {minimum}, got {value!r}")
+    try:
+        normalized = operator.index(value)
+    except TypeError:
+        raise ValueError(
+            f"LNSConfig.{name} must be an int >= {minimum}, got {value!r}") from None
+    if normalized < minimum:
+        raise ValueError(f"LNSConfig.{name} must be an int >= {minimum}, got {value!r}")
+    return int(normalized)
 
-    Returns the normalized search-worker count. ``operator.index`` accepts real integer scalar
-    types (including NumPy integers) without silently truncating floats or parsing strings.
+
+def _nonnegative_float_config_value(name: str, value) -> float:
+    """Normalize a non-negative real config value, rejecting booleans and NaNs."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"LNSConfig.{name} must be a non-negative real, got {value!r}")
+    normalized = float(value)
+    if math.isnan(normalized) or normalized < 0.0:
+        raise ValueError(f"LNSConfig.{name} must be a non-negative real, got {value!r}")
+    return normalized
+
+
+def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
+    """Validate and normalize arguments before ``LNSState`` takes over the ledger.
+
+    Normalized execution-control fields use ordinary Python scalars so pool widths and result
+    summaries remain JSON-serializable when callers supplied compatible NumPy scalar types.
     """
     known = {"agent", "map", "random"}
     unknown = [name for name in lns.operators if name not in known]
@@ -129,16 +154,13 @@ def _validate_lns_config(lns: LNSConfig) -> int:
         raise ValueError(
             f"duplicate LNS operators {list(lns.operators)!r} — each name at most once")
 
-    value = lns.search_workers
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"LNSConfig.search_workers must be an int >= 1, got {value!r}")
-    try:
-        search_workers = operator.index(value)
-    except TypeError:
-        raise ValueError(
-            f"LNSConfig.search_workers must be an int >= 1, got {value!r}") from None
-    if search_workers < 1:
-        raise ValueError(f"LNSConfig.search_workers must be an int >= 1, got {value!r}")
+    search_workers = _integer_config_value("search_workers", lns.search_workers, minimum=1)
+    max_iterations = _integer_config_value("max_iterations", lns.max_iterations, minimum=0)
+    accept_epsilon = _nonnegative_float_config_value("accept_epsilon", lns.accept_epsilon)
+    worker_kernel_log2 = (
+        None if lns.worker_kernel_log2 is None
+        else _integer_config_value("worker_kernel_log2", lns.worker_kernel_log2, minimum=0)
+    )
     ceiling = 4 * (os.cpu_count() or 1)
     if search_workers > ceiling:
         raise ValueError(
@@ -148,7 +170,13 @@ def _validate_lns_config(lns: LNSConfig) -> int:
     if lns.parallel_mode not in ("sync", "drop"):
         raise ValueError(
             f"unknown LNSConfig.parallel_mode {lns.parallel_mode!r} (want 'sync' or 'drop')")
-    return search_workers
+    return replace(
+        lns,
+        search_workers=search_workers,
+        max_iterations=max_iterations,
+        accept_epsilon=accept_epsilon,
+        worker_kernel_log2=worker_kernel_log2,
+    )
 
 
 def _trajectory_auc(trajectory: list[dict], cost_before: float, horizon_s: float) -> float:
@@ -255,9 +283,9 @@ def run_lns(
     ran ``return_anchor="realized"``. ``run_lns_on_result`` derives both correctly."""
     # Validate BEFORE constructing LNSState: it detaches the caller's subscribers and may spend
     # minutes building the unimpeded ruler, so an argument error must not cost either.
-    search_workers = _validate_lns_config(lns)
+    lns = _validate_lns_config(lns)
 
-    if search_workers > 1:
+    if lns.search_workers > 1:
         # Deferred import: keeps multiprocessing (and the pool module) off the sequential path,
         # and breaks the cycle — parallel.py needs LNSResult from here.
         from freespace_sim.planner.lns.parallel import run_lns_parallel

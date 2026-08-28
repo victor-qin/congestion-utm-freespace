@@ -78,6 +78,20 @@ def _relative_rate(rate: float, base_rate: float) -> float | None:
     return rate / base_rate if base_rate > 0.0 else None
 
 
+def _worker_metadata(requested_workers: int, result) -> dict:
+    """Keep the requested width while reporting the pool width that could actually run."""
+    return {
+        "requested_workers": int(requested_workers),
+        "workers": int(result.search_workers),
+        "mode": result.parallel_mode,
+    }
+
+
+def _sequential_baseline(rows: list[dict]) -> dict | None:
+    """Find the true in-process arm, not a parallel arm capped to one worker."""
+    return next((row for row in rows if row["mode"] == "sequential"), None)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -120,7 +134,7 @@ def main() -> None:
             loop_s = out.wall_s - out.init_wall_s
             st = dict(out.parallel_stats)
             row = {
-                "workers": m, "mode": mode if m > 1 else "sequential", "iterations": iters,
+                **_worker_metadata(m, out), "iterations": iters,
                 "n_accepted": out.n_accepted, "n_iterations": out.n_iterations,
                 "cost_before": out.cost_before, "cost_after": out.cost_after,
                 "improvement_pct": 100.0 * (out.cost_before - out.cost_after)
@@ -136,7 +150,12 @@ def main() -> None:
                 **st,
             }
             rows.append(row)
-            print(f"{row['mode']:<10} m={m} it={iters:>4}  {out.n_accepted:>3} acc  "
+            requested_note = (
+                "" if row["workers"] == row["requested_workers"]
+                else f" ({row['requested_workers']} requested)"
+            )
+            print(f"{row['mode']:<10} m={row['workers']}{requested_note} "
+                  f"it={iters:>4}  {out.n_accepted:>3} acc  "
                   f"{out.cost_after:.0f} ({row['improvement_pct']:5.2f}%)  "
                   f"loop {loop_s:6.1f}s  {row['tasks_per_s']:5.2f} task/s  "
                   f"rss {rss:6.0f} MiB  verified={out.verified} ok={bad is None}  "
@@ -146,7 +165,7 @@ def main() -> None:
                   f"notsel={st.get('n_not_selected', 0)}", flush=True)
 
     if rows:
-        seq = next((r for r in rows if r["workers"] == 1), None)
+        seq = _sequential_baseline(rows)
         if seq:
             print("\nvs sequential (per second of loop wall):")
             base_rate = seq["improvement_pct"] / max(1e-9, seq["loop_s"])
@@ -154,7 +173,11 @@ def main() -> None:
                 rate = r["improvement_pct"] / max(1e-9, r["loop_s"])
                 relative = _relative_rate(rate, base_rate)
                 comparison = "n/a" if relative is None else f"{relative:.2f}x"
-                print(f"  {r['mode']:<10} m={r['workers']}: {comparison:>6} "
+                requested_note = (
+                    "" if r["workers"] == r["requested_workers"]
+                    else f"/{r['requested_workers']} requested"
+                )
+                print(f"  {r['mode']:<10} m={r['workers']}{requested_note}: {comparison:>6} "
                       f"({rate:.4f} %/s vs {base_rate:.4f})")
 
     if args.out:

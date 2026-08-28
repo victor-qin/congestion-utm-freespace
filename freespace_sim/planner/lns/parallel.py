@@ -783,8 +783,8 @@ def run_lns_parallel(
         _validate_lns_config,
     )
 
-    search_workers = _validate_lns_config(lns)
-    pool_workers = min(search_workers, max(0, lns.max_iterations))
+    lns = _validate_lns_config(lns)
+    pool_workers = min(lns.search_workers, lns.max_iterations)
     t0 = time.monotonic()
     state = _build_lns_state(
         cfg, ledger, intents, lns,

@@ -507,6 +507,47 @@ def test_search_workers_and_parallel_mode_are_validated():
                 LNSConfig(max_iterations=0, log_every=0, parallel_mode="deta"))
 
 
+def test_iteration_epsilon_and_worker_kernel_config_are_validated():
+    from freespace_sim.config import SimConfig
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.lns import LNSConfig, run_lns
+
+    cfg = SimConfig()
+    invalid = {
+        "max_iterations": (-1, True, 1.5, "1"),
+        "accept_epsilon": (-1.0, -float("inf"), float("nan"), True, "1"),
+        "worker_kernel_log2": (-1, True, 1.5, "1"),
+    }
+    for name, values in invalid.items():
+        for value in values:
+            kwargs = {"max_iterations": 0, "log_every": 0}
+            kwargs[name] = value
+            ledger = ReservationLedger(cfg)
+            ledger.subscribe(lambda _fid, _volumes: None)
+            with pytest.raises(ValueError, match=name):
+                run_lns(cfg, ledger, [], LNSConfig(**kwargs))
+            assert ledger._observers and ledger.epoch == 0
+
+
+def test_lns_config_normalizes_compatible_numpy_scalars():
+    from freespace_sim.planner.lns import LNSConfig
+    from freespace_sim.planner.lns.solver import _validate_lns_config
+
+    normalized = _validate_lns_config(LNSConfig(
+        max_iterations=np.int64(1),
+        search_workers=np.int64(2),
+        accept_epsilon=np.float32(0.25),
+        worker_kernel_log2=np.int64(0),
+    ))
+    assert type(normalized.max_iterations) is int
+    assert type(normalized.search_workers) is int
+    assert type(normalized.accept_epsilon) is float
+    assert type(normalized.worker_kernel_log2) is int
+
+    unlimited = _validate_lns_config(LNSConfig(accept_epsilon=float("inf")))
+    assert unlimited.accept_epsilon == float("inf")
+
+
 def test_auc_integrates_the_full_step_trajectory():
     """AUC includes the initial segment and final tail; incumbent cost changes at completion."""
     from freespace_sim.planner.lns.solver import _trajectory_auc
@@ -546,6 +587,8 @@ def test_parallel_state_build_honors_unimpeded_workers(monkeypatch):
 
 
 def test_parallel_caps_pool_skips_coordinator_index_and_closes_before_verify(monkeypatch):
+    import json
+
     from freespace_sim.config import SimConfig
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.lns import LNSConfig, parallel, solver
@@ -581,11 +624,14 @@ def test_parallel_caps_pool_skips_coordinator_index_and_closes_before_verify(mon
     cfg = SimConfig()
     out = parallel.run_lns_parallel(
         cfg, ReservationLedger(cfg), [],
-        LNSConfig(max_iterations=1, log_every=0, search_workers=4, parallel_mode="drop"),
+        LNSConfig(max_iterations=np.int64(1), log_every=0,
+                  search_workers=np.int64(4), parallel_mode="drop"),
     )
     assert observed == {"closed": True, "workers": 1, "record_envelope": False}
+    assert type(out.search_workers) is int
     assert out.search_workers == 1
     assert out.pool_spawn_s == 0.25
+    json.dumps(out.summary())
 
 
 def test_zero_sequential_rate_has_no_relative_comparison():
@@ -594,6 +640,19 @@ def test_zero_sequential_rate_has_no_relative_comparison():
     assert _relative_rate(0.0, 0.0) is None
     assert _relative_rate(2.0, 0.0) is None
     assert _relative_rate(2.0, 1.0) == 2.0
+
+
+def test_sweep_reports_effective_workers_without_mislabeling_the_baseline():
+    from analysis.sweep_lns_workers import _sequential_baseline, _worker_metadata
+
+    capped = _worker_metadata(
+        4, SimpleNamespace(search_workers=np.int64(1), parallel_mode="drop")
+    )
+    sequential = _worker_metadata(
+        1, SimpleNamespace(search_workers=1, parallel_mode="sequential")
+    )
+    assert capped == {"requested_workers": 4, "workers": 1, "mode": "drop"}
+    assert _sequential_baseline([capped, sequential]) is sequential
 
 
 def test_default_config_is_the_sequential_path():

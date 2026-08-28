@@ -125,9 +125,13 @@ def main() -> None:
           f"{s['n_accepted']}/{s['n_iterations']} accepted, verified={s['verified']}, "
           f"wall {s['wall_s']:.0f}s (init {s['init_wall_s']:.0f}s)", flush=True)
     print(f"weights: { {k: round(v, 3) for k, v in s['weights'].items()} }")
-    if args.search_workers > 1:
+    if s["parallel_mode"] != "sequential":
         st = s["parallel_stats"]
-        print(f"parallel[{args.parallel_mode} x{args.search_workers}]: spawn "
+        requested_note = (
+            "" if s["search_workers"] == args.search_workers
+            else f", {args.search_workers} requested"
+        )
+        print(f"parallel[{s['parallel_mode']} x{s['search_workers']}{requested_note}]: spawn "
               f"{s['pool_spawn_s']:.1f}s, accept {st.get('accept_rate', 0):.1%}, "
               f"clean-merge {st.get('n_clean_merge', 0)}, dirty {st.get('n_dirty', 0)} "
               f"(rate {st.get('dirty_rate', 0):.1%}), overwrite {st.get('n_overwrite', 0)}, "

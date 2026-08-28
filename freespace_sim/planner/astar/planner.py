@@ -318,7 +318,12 @@ class AStarPlanner:
             svc = None      # detached mid-life: re-subscribe and re-absorb (the shrink tripwire below
             #                 cannot see this — a release + re-commit nets to the same n_volumes)
         if svc is None or self._svc_ledger is not ledger:
-            svc = self._svc = HexOccupancyService(cfg, track_removal=self.incremental_release)
+            # `maintain_blocked=False` on the compiled path: `is_blocked` is the map's only reader
+            # and `_plan_compiled` never calls it (measured: 62,537 `pad_clear` and ZERO `is_blocked`
+            # over 20 LNS tasks), while 98.3% of `pad` bumps also bump `blocked`. `_plan_reference`
+            # arms it before it searches, so a fallback still gets an exact map.
+            svc = self._svc = HexOccupancyService(cfg, track_removal=self.incremental_release,
+                                                  maintain_blocked=not self.compiled)
             self._svc_epoch = ledger.epoch
             self._tcap = TerminalCapacity(cfg, ledger,       # temporal pad capacity, same ledger
                                           track_removal=self.incremental_release)
@@ -461,6 +466,12 @@ class AStarPlanner:
         # hover_time_s + climb_time_s, so the search must not land where a later corridor sweeps
         # through mid-descent (else post-build CONFLICT_FILED). See occupancy.py.
         svc = self._occupancy(req, ledger, cfg)
+        # THIS is the search that reads `blocked`, and on a compiled planner the service was built not
+        # maintaining it. Arm it here — before any `is_blocked` — rather than lazily inside the query:
+        # the service holds no ledger, and a query that could not rebuild would have to choose between
+        # a wrong answer and a raise deep inside the oracle. Sticky, so a run that falls back repeatedly
+        # pays the O(schedule) rebuild once.
+        svc.enable_blocked(ledger)
         tcap = self._tcap
         # Track A read-set recording: wrap the occupancy in the accumulating shim so every search
         # probe (is_blocked / pad_clear, incl. the goal-gate pad check) lands in the bbox. Pure

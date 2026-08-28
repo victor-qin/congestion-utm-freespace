@@ -37,6 +37,7 @@ Cells are bucketed by step (``step -> {(q, r)}``); volumes themselves are NOT re
 
 from __future__ import annotations
 
+import itertools
 from array import array
 from collections.abc import Collection, Hashable
 
@@ -50,8 +51,21 @@ _EMPTY: dict = {}
 
 
 class HexOccupancyService:
-    def __init__(self, cfg: SimConfig, track_removal: bool = False):
+    def __init__(self, cfg: SimConfig, track_removal: bool = False,
+                 maintain_blocked: bool = True):
         self.cfg = cfg
+        # `blocked` has exactly ONE reader, `is_blocked`, and that is called only by the pure-Python
+        # reference search (`AStarPlanner._plan_reference`) and the envelope-recording shim around it.
+        # `_plan_compiled` never calls it: measured over 20 LNS tasks at density_faa scale, `pad_clear`
+        # 62,537 calls and `is_blocked` ZERO. Yet 98.3% of `pad` bumps also bump `blocked`, so on a
+        # compiled planner the map is half this service's dict traffic, written and never read.
+        #
+        # DEFAULT TRUE on purpose. Every direct construction — the whole test suite, and anything that
+        # queries the service itself — keeps the map, so this parameter changes behaviour at exactly one
+        # call site: `AStarPlanner._occupancy`, which is the only place that knows the compiled kernel
+        # will answer the obstacle test instead. A reference dispatch re-arms it (`enable_blocked`).
+        self._maintain_blocked = bool(maintain_blocked)
+        self._blocked_live = self._maintain_blocked
         # Removal mode (LNS destroy): step buckets hold per-cell REFCOUNTS instead of sets (two
         # flights' inflated rasters can legitimately cover the same (step, cell), so removing one
         # must not free the cell), and each committed flight's applied rows are recorded so
@@ -121,7 +135,8 @@ class HexOccupancyService:
         if not d:
             del bucket[s]
 
-    def add_volume(self, vol: Volume4D, own_cols: tuple = (), _rows: list | None = None) -> None:
+    def add_volume(self, vol: Volume4D, own_cols: tuple = (), _rows: list | None = None,
+                   _pad: bool = True) -> None:
         """Rasterize one committed volume (once). Ordinary corridor cells feed the binary blocked/pad
         step-buckets; a shared terminal column instead records its hub id in the per-cell set.
 
@@ -140,7 +155,12 @@ class HexOccupancyService:
         # is what the compiled image reuses. `own`/`in_blk`/`is_column` are per-cell, hoisted out of
         # the step loop.
         track = self.track_removal
-        pad_b, blk_b, floor = self.pad, self.blocked, self.evicted_before
+        # Two hoisted selectors over ONE rasterise/skip/clamp path: `blk_live` is the write-only-map
+        # switch, `_pad` lets `enable_blocked` re-derive `blocked` alone. A second loop over the same
+        # geometry would have to re-derive the own-column skip, the refcount-vs-set branch and the
+        # eviction clamp — three chances to drift from the original.
+        blk_live, floor = self._blocked_live, self.evicted_before
+        pad_b, blk_b = self.pad, self.blocked
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -165,22 +185,24 @@ class HexOccupancyService:
                         _rows.append(s_hi)
                         _rows.append(-2 if in_blk else -1)
                     for s in range(s_lo, s_hi + 1):
-                        d = pad_b.get(s)
-                        if d is None:
-                            d = pad_b[s] = {}
-                        d[cell] = d.get(cell, 0) + 1
-                        if in_blk:
+                        if _pad:
+                            d = pad_b.get(s)
+                            if d is None:
+                                d = pad_b[s] = {}
+                            d[cell] = d.get(cell, 0) + 1
+                        if in_blk and blk_live:
                             d = blk_b.get(s)
                             if d is None:
                                 d = blk_b[s] = {}
                             d[cell] = d.get(cell, 0) + 1
                 else:
                     for s in range(s_lo, s_hi + 1):
-                        d = pad_b.get(s)
-                        if d is None:
-                            d = pad_b[s] = set()
-                        d.add(cell)
-                        if in_blk:
+                        if _pad:
+                            d = pad_b.get(s)
+                            if d is None:
+                                d = pad_b[s] = set()
+                            d.add(cell)
+                        if in_blk and blk_live:
                             d = blk_b.get(s)
                             if d is None:
                                 d = blk_b[s] = set()
@@ -247,6 +269,11 @@ class HexOccupancyService:
         them; the same clamp `add_volume` applies on insert)."""
         rows = self._rows.pop(flight_id)
         floor = self.evicted_before
+        # Guard on the CURRENT state, not on whether the map was live when the row was written:
+        # `enable_blocked` rebuilds from the ledger, so every live flight is represented in `blocked`
+        # whenever it is on, whatever order the flag flipped in. The flag is one-way (off -> on), so
+        # there is no symmetric case where a decrement could miss its increment.
+        blk_live = self._blocked_live
         cells, pad_b, blk_b = self._cells, self.pad, self.blocked
         for i in range(0, len(rows), 4):               # flat 4-slot rows; see `_rows`
             s_lo, s_hi, code = rows[i + 1], rows[i + 2], rows[i + 3]
@@ -264,7 +291,7 @@ class HexOccupancyService:
                         del d[cell]
                         if not d:
                             del pad_b[s]
-                    if in_blk:
+                    if in_blk and blk_live:
                         d = blk_b[s]
                         n = d[cell] - 1
                         if n:
@@ -302,6 +329,12 @@ class HexOccupancyService:
         self.evicted_before = step
 
     def reset(self) -> None:
+        # Back to the construction-time policy: a rebuild-from-shrink re-absorbs through `on_commit`,
+        # which writes `blocked` only while the map is live — so a reset that KEPT a rebuilt-live flag
+        # would be fine, but one that kept it live without re-absorbing would not. Resetting the flag
+        # makes the invariant "live ⇒ every committed flight is in `blocked`" hold by construction;
+        # the next reference dispatch re-arms it.
+        self._blocked_live = self._maintain_blocked
         self.blocked.clear()
         self.pad.clear()
         self.term_cells.clear()
@@ -312,6 +345,30 @@ class HexOccupancyService:
         self.evicted_before = None
 
     # ----- queries (the A* search hot path) -----
+    def enable_blocked(self, ledger) -> None:
+        """Populate ``blocked`` from the ledger and keep it maintained for the rest of the run.
+
+        One-way and sticky: a service that has answered one ``is_blocked`` will answer more (a run
+        that falls back once tends to fall back again), so paying the O(schedule) rebuild repeatedly
+        would be worse than never having turned the map off.
+
+        Routed through ``add_volume`` with ``_pad=False`` rather than a fresh loop, because the three
+        things a second loop would have to re-derive are the three it would get wrong: the committing
+        flight's own-column skip (`add_volume`'s ``own`` test), the refcount-vs-set branch on
+        ``track_removal``, and the ``evicted_before`` clamp. ``own_cols`` is rebuilt per flight exactly
+        as ``on_commit`` does, which is why this groups the ledger itself instead of calling
+        ``planner._absorb`` (that delegates to ``on_commit``, which always writes pad)."""
+        if self._blocked_live:
+            return
+        self._blocked_live = True
+        self.blocked.clear()
+        for _fid, grp in itertools.groupby(ledger.iter_committed(), key=lambda fv: fv[0]):
+            vols = [v for _, v in grp]        # iter_committed yields (fid, volume) PAIRS
+            own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in vols
+                             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+            for v in vols:
+                self.add_volume(v, own_cols=own_cols, _rows=None, _pad=False)
+
     def is_blocked(self, q: int, r: int, L: int, s: int, own: Collection[Hashable] = ()) -> bool:
         """Is hex (q, r) at flight level ``L`` an obstacle at step ``s``?
 
@@ -331,6 +388,13 @@ class HexOccupancyService:
         the exact same-hub cell occupancy. The flight's own (uncommitted) corridor is absent during its
         plan, so this never self-blocks; the 90 m interior is skipped from ``blocked`` (``add_volume``
         ``own_cols``), so the climb stays clear. Flag off ⇒ ``False`` here, i.e. unchanged."""
+        if not self._blocked_live:
+            # Unreachable by construction: `_plan_reference` arms the map before it searches, and it
+            # is the only caller. Raising beats answering — a silently stale oracle would be compared
+            # against by every compiled-path parity gate in the suite.
+            raise RuntimeError(
+                "HexOccupancyService.is_blocked with `blocked` unmaintained — call enable_blocked(ledger) "
+                "first (AStarPlanner._plan_reference does this; a direct caller must too)")
         # ``static_term_cells`` (always-active terminals) adds step- and level-independent foreign walls
         # (the [ground, ceiling] tube), merged with the per-step/level ``term_cells`` so a cell covered by
         # EITHER (foreign) blocks. Both empty ⇒ unchanged (zero overhead).

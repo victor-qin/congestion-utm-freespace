@@ -56,6 +56,9 @@ class LNSConfig:
     # implicit `spawn` can re-execute an unguarded caller's top-level code. Guarded applications may
     # explicitly pass None for min(8, cpu-2) automatic parallelism.
     unimpeded_workers: int | None = 1
+    time_limit_s: float | None = None
+    verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
+    log_every: int = 200
     # Parallel destroy/repair (DROP-LNS). The conservative default stays in-process because the
     # crossover is instance-dependent and every search worker holds a full schedule replica.
     # `unimpeded_workers` remains a separate, parent-only knob for the one-off delay ruler.
@@ -64,9 +67,6 @@ class LNSConfig:
     worker_kernel_log2: int | None = None  # non-negative AStarPlanner.kernel_log2_min; oversized
     #                                        kernel arrays were measured to slow CONCURRENT plans
     #                                        ~1.75x at 8 workers while a lone worker matched serial
-    time_limit_s: float | None = None
-    verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
-    log_every: int = 200
 
 
 @dataclass

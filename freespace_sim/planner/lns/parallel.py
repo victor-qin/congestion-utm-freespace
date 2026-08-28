@@ -46,6 +46,7 @@ Modes:
 from __future__ import annotations
 
 import logging
+import math
 import multiprocessing as mp
 import os
 import time
@@ -575,7 +576,10 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
             incumbent_cursor = incumbent_after
 
         _maybe_verify(state, lns, n_accepted, winner is not None)
-        _maybe_log(lns, "sync", m, n_iter, n_accepted, state, selector, cost_before)
+        _maybe_log(
+            lns, "sync", m, n_iter, n_accepted, state, selector, cost_before,
+            previous_iter=n_iter - n_slots,
+        )
         rnd += n_slots
     return {"n_iter": n_iter, "n_accepted": n_accepted, "n_not_selected": n_not_selected,
             "n_dirty": 0, "n_overwrite": 0}
@@ -685,7 +689,10 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
         trajectory.append(row)
 
         _maybe_verify(state, lns, n_accepted, applied)
-        _maybe_log(lns, "drop", m, n_iter, n_accepted, state, selector, cost_before)
+        _maybe_log(
+            lns, "drop", m, n_iter, n_accepted, state, selector, cost_before,
+            previous_iter=n_iter - 1,
+        )
         changelog.trim(min(pool.worker_version) if pool.worker_version else 0)
         _dispatch(r.worker)
 
@@ -742,8 +749,11 @@ def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
         raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
 
 
-def _maybe_log(lns, mode, m, n_iter, n_accepted, state, selector, cost_before) -> None:
-    if not lns.log_every or n_iter % lns.log_every != 0:
+def _maybe_log(
+    lns, mode, m, n_iter, n_accepted, state, selector, cost_before, *, previous_iter
+) -> None:
+    if (not lns.log_every
+            or n_iter // lns.log_every == previous_iter // lns.log_every):
         return
     log.info("lns[%s x%d] %d/%d: cost %.0f (%.2f%% below start), %d accepted, weights %s",
              mode, m, n_iter, lns.max_iterations, state.total_cost,
@@ -835,7 +845,10 @@ def run_lns_parallel(
                 cfg, state.final_intents(), static_terms,
                 dict(state._unimp_cost), spec, pool_workers,
             )
-            deadline = None if lns.time_limit_s is None else t0 + lns.time_limit_s
+            deadline = (
+                None if lns.time_limit_s is None or math.isinf(lns.time_limit_s)
+                else t0 + lns.time_limit_s
+            )
             loop = _loop_sync if lns.parallel_mode == "sync" else _loop_drop
             completed, pool_spawn_s, started_workers = _run_and_close_pool(
                 pool,

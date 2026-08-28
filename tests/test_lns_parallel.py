@@ -587,6 +587,19 @@ def test_lns_config_normalizes_compatible_numpy_scalars():
     assert unlimited.accept_epsilon == unlimited.time_limit_s == float("inf")
 
 
+def test_lns_config_preserves_the_legacy_positional_tail():
+    from freespace_sim.planner.lns import LNSConfig
+
+    config = LNSConfig(
+        7, 11, 4, ("random",), False, 0.25, 0.5, "random", 3, 99,
+        frozenset({1}), frozenset({"uss-a"}), False, 2, 12.5, 3, 4,
+    )
+    assert (config.time_limit_s, config.verify_every, config.log_every) == (12.5, 3, 4)
+    assert (config.search_workers, config.parallel_mode, config.worker_kernel_log2) == (
+        1, "sync", None,
+    )
+
+
 def test_auc_integrates_the_full_step_trajectory():
     """AUC includes the initial segment and final tail; incumbent cost changes at completion."""
     from freespace_sim.planner.lns.solver import _trajectory_auc
@@ -693,6 +706,63 @@ def test_parallel_caps_pool_skips_coordinator_index_and_closes_before_verify(mon
     json.dumps(out.summary())
 
 
+def test_infinite_time_limit_starts_the_pool_without_a_deadline(monkeypatch):
+    from freespace_sim.config import SimConfig
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.lns import LNSConfig, parallel
+
+    deadlines = []
+
+    class Pool:
+        spawn_s = 0.0
+
+        def __init__(self, _cfg, _intents, _static_terms, _unimpeded, _spec, n_workers):
+            self.n_workers = n_workers
+
+        def start(self, *, deadline=None):
+            deadlines.append(deadline)
+            return self
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(parallel, "LNSWorkerPool", Pool)
+    monkeypatch.setattr(
+        parallel, "_loop_sync",
+        lambda *_args: {"n_iter": 0, "n_accepted": 0, "n_not_selected": 0},
+    )
+
+    cfg = SimConfig()
+    parallel.run_lns_parallel(
+        cfg, ReservationLedger(cfg), [],
+        LNSConfig(
+            max_iterations=2, search_workers=2, time_limit_s=float("inf"), log_every=0,
+        ),
+    )
+    assert deadlines == [None]
+
+
+def test_sync_logging_fires_when_an_interval_is_crossed(monkeypatch):
+    from freespace_sim.planner.lns import parallel
+
+    calls = []
+    monkeypatch.setattr(parallel.log, "info", lambda *args: calls.append(args))
+    lns = SimpleNamespace(log_every=200, max_iterations=500)
+    state = SimpleNamespace(total_cost=90.0)
+    selector = SimpleNamespace(weights={"random": 1.0})
+
+    parallel._maybe_log(
+        lns, "sync", 3, 201, 1, state, selector, 100.0, previous_iter=198,
+    )
+    parallel._maybe_log(
+        lns, "sync", 3, 204, 1, state, selector, 100.0, previous_iter=201,
+    )
+    parallel._maybe_log(
+        lns, "sync", 3, 402, 2, state, selector, 100.0, previous_iter=399,
+    )
+    assert [args[3] for args in calls] == [201, 402]
+
+
 @pytest.mark.parametrize("iterations", [0, 1])
 def test_effective_width_below_two_uses_the_sequential_engine(monkeypatch, iterations):
     from freespace_sim.config import SimConfig
@@ -767,6 +837,41 @@ def test_zero_sequential_rate_has_no_relative_comparison():
     assert _relative_rate(0.0, 0.0) is None
     assert _relative_rate(2.0, 0.0) is None
     assert _relative_rate(2.0, 1.0) == 2.0
+
+
+def test_replica_profiler_warms_lazy_planner_state_before_ready(monkeypatch):
+    from analysis import prof_lns_replica_memory as profiler
+
+    events = []
+    rng = object()
+
+    class State:
+        ledger = SimpleNamespace(n_volumes=17)
+
+        def __init__(self):
+            self.rng = rng
+
+        def movable_ids(self):
+            return list(range(12))
+
+        def try_repair(self, victims, actual_rng, epsilon, **kwargs):
+            events.append(("repair", victims, actual_rng, epsilon, kwargs))
+
+    class Conn:
+        def send(self, message):
+            events.append(("send", message[0]))
+
+        def recv(self):
+            return ("stop",)
+
+    monkeypatch.setattr(profiler.LNSState, "replica", lambda *_args, **_kwargs: State())
+    profiler._worker_main(Conn(), None, None, None, None, None)
+
+    kind, victims, actual_rng, epsilon, kwargs = events[0]
+    assert kind == "repair" and victims == list(range(8)) and actual_rng is rng
+    assert epsilon == float("inf")
+    assert kwargs == {"order_mode": "premium", "report_only": True}
+    assert events[1] == ("send", "ready")
 
 
 def test_sweep_reports_effective_workers_without_mislabeling_the_baseline():

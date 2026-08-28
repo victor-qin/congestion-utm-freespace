@@ -8,8 +8,8 @@ and it is also its whole risk: memory is LINEAR in workers. The colgen pricing p
 (``tests/test_experiment_run.py`` pins ``n_pricing_workers == 0``).
 
 This script measures the real thing rather than estimating it: it spawns m workers, each of which
-builds a replica of the same schedule and then sits still, and reads the summed RSS of the whole
-process tree while they are all alive.
+builds a replica of the same schedule, runs one representative repair to materialize lazy planner
+state, and then sits still while the parent reads the summed RSS of the whole process tree.
 
 **It reuses ``sweep_pricing_workers._tree_rss_mib`` deliberately.**
 ``getrusage(RUSAGE_CHILDREN).ru_maxrss`` is the largest SINGLE child by POSIX definition, never
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import sys
@@ -51,6 +52,15 @@ from freespace_sim.planner.lns.state import LNSState  # noqa: E402
 # the very number this script exists to measure. The child needs LNSState and nothing else.
 
 
+def _warm_replica(state: LNSState) -> None:
+    """Materialize the planner state retained by a live search worker."""
+    victims = state.movable_ids()[:8]
+    if victims:
+        state.try_repair(
+            victims, state.rng, math.inf, order_mode="premium", report_only=True,
+        )
+
+
 def _worker_main(conn, cfg, intents, static_terms, unimp, kernel_log2):
     """Build one replica, report, then hold it alive until told to stop.
 
@@ -63,6 +73,7 @@ def _worker_main(conn, cfg, intents, static_terms, unimp, kernel_log2):
             t0 = time.monotonic()
             state = LNSState.replica(cfg, intents, static_terms=static_terms,
                                      unimpeded_cost=unimp, kernel_log2_min=kernel_log2)
+            _warm_replica(state)
             build_s = time.monotonic() - t0
         conn.send(("ready", os.getpid(), build_s, state.ledger.n_volumes, None))
     except BaseException as exc:                                   # noqa: BLE001 - reported home

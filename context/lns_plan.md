@@ -870,3 +870,47 @@ restored.
   destroy that is accepted still pays 12.2×. That is the case a representation change (option 4)
   would fix, and (4)'s 3.3× query penalty is what would have to be bought off first — plausibly by
   making the §9 window mandatory rather than capped.
+
+## 11. Areas 2, 1, 3 from the post-#120 profile — Phase A (2026-08-27)
+
+**Goal of this phase.** §10's attribution left a ranked list; a plan-critic pass then found that the
+obvious implementation of its smallest item breaks eight existing tests. This section is Phase A
+built the way that review forced: **1.052×, byte-identical, and zero test edits.**
+
+### The finding
+
+`HexOccupancyService` maintains two per-(cell, step) maps. `pad` is read by `pad_clear`; `blocked`
+is read by `is_blocked` — and `is_blocked` is called ONLY from `_plan_reference` and the
+envelope-recording shim around it. `_plan_compiled` never calls it: measured over 20 LNS tasks,
+`pad_clear` 62,537 calls and `is_blocked` **zero**. Yet **98.3% of `pad` bumps also bump `blocked`**,
+so on a compiled planner the map is half this service's dict traffic, written and never read.
+
+| change | point | how it works | issues | outcome |
+|---|---|---|---|---|
+| `HexOccupancyService(maintain_blocked=True)` | make the map optional at the ONE site that knows it will not be read | a `_blocked_live` flag hoisted into `add_volume`/`on_release` beside the existing `track`, extending the guards that were already there (`if in_blk` → `if in_blk and blk_live`) | **the default must be True.** Every test constructs the service directly and six files read `svc.blocked` or call `is_blocked` on one; a default-off parameter — or a gate on `track_removal` — breaks them. Default-on means the parameter changes behaviour at exactly one call site | zero test edits |
+| `AStarPlanner._occupancy` passes `maintain_blocked=not self.compiled` | the planner is the only object that knows which search will answer the obstacle test | one argument at `planner.py:321` | a planner that later dispatches to the reference needs the map after all — hence the next row | the saving applies exactly where it was measured |
+| `enable_blocked(ledger)`, armed at the top of `_plan_reference` | a fallback must get an EXACT map, not a stale one | re-derives `blocked` through `add_volume` with a new `_pad=False` selector | a fresh per-volume loop would drop the committing flight's own-column skip (making its own 90 m interior read as a wall), write sets where removal mode needs refcount dicts (`TypeError` on the next destroy), and miss the `evicted_before` clamp. Routing through `add_volume` inherits all three | one rasterise/skip/clamp path, two boolean selectors |
+| `is_blocked` raises when the map is unmaintained | a silently stale oracle is compared against by every compiled-path parity gate | one guard | unreachable by construction, which is the point: it converts a future wiring mistake into a crash instead of a wrong parity result | — |
+
+### Measured
+
+**1.052×** — median of 3 alternating passes per arm, full `density_faa`, 120 iterations, identical
+trajectory across all 6 (35 accepts, cost 1,352,414 every time). The `on` arm won every pass
+(131.5→125.6, 134.5→129.3, 132.2→123.2). Profiler agrees: `commit.reference` 25.9→21.6 s,
+`release.reference` 3.8→2.3 s, `_absorb` 36.6→34.1 s.
+
+**A measurement bug worth recording, because it nearly shipped.** The first A/B reported **1.137×**.
+It was wrong: a sed-based edit had left `undo_journal=on` in the arm config, so the "off" arm ran
+with #120 disabled and the number was the two changes together. Two things caught it — the profiler
+delta was only 1.037×, and this box's run-to-run spread is ~10% (the same configuration measured 933
+and 1029 ms/task on different runs), which is larger than the effect. **A single pass per arm cannot
+measure a 5% change here.** `probe_blocked_map.py` now alternates and reports medians, and its
+docstring says the pin on the constructor is the ONLY difference between arms.
+
+### What A did NOT do
+
+`add_volume` still writes the `-2 if in_blk else -1` row code whether or not the map is live, so a
+later `enable_blocked` never has to reconcile two row vintages — which means A does not save the
+`_rows` append, nor the `rasterize_ranges`/`_intern` work those buckets also carry. That is why the
+estimate was "~4–5.5%, not half the bucket", and why 1.052× is the estimate landing rather than the
+implementation underperforming.

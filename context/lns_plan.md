@@ -952,3 +952,47 @@ is slow" contingency), the memory objection is inverted (it saves 15 MB rather t
 and the bounds must widen to margin 24 / 8 MB in the same change. The collateral is unchanged and
 large: `_Pool`, the #120 undo journal and its five call sites, and four window tests that reach into
 pool internals.
+
+### Step 1 of the pool-less occupancy: the flat claim arena (2026-08-27)
+
+**Goal of this step.** Phase 0 said the arena IS phase C (keeping `_claims` as a dict of lists makes
+the window build 26x worse than the pool build it replaces). Step 1 builds it **alongside** the dict
+and the pools, changes nothing, and answers one question: *does maintaining it cost more than the
+dict it would replace?*
+
+| structure | commit | release | total | note |
+|---|---|---|---|---|
+| **arena** | 0.03 s | 0.03 s | **0.06 s** | 43 ns per added claim, 55 ns per removed one |
+| claim dict (what it replaces) | 0.15 s | 0.00 s | 0.15 s | upper bound — also charges `_record`'s row appends, which survive |
+| pools (what deleting them removes) | 7.19 s | 0.28 s | **7.47 s** | 11.8% of the loop |
+
+40 LNS tasks at N=8 on full `density_faa`, with `arena_matches_claims()` asserted after **every**
+task, not sampled. The arena is **cheaper than the dict** and **125x cheaper than the pools**.
+
+`claim_arena.py`: one int64 arena holding every claim, each cell's claims in one contiguous slab
+described by `start`/`length`/`cap`. Removal is a **swap-remove** — order within a slab carries no
+meaning, since the window paint ORs spans and `blocked_at` is a membership test — so removing a
+flight costs its OWN footprint. `add_many` computes the tail it needs before writing anything, so a
+caller can grow and retry with no risk of double-applying a partial batch.
+
+**Three things went wrong, and each is the useful part of this step.**
+
+1. **The first measurement said the arena cost 252 ms/task.** It was the step-1 shim: a rolled-back
+   transaction re-derived the arena from `_claims`, i.e. **4.29 million re-adds per rejected task**.
+   Replaced with an inverse replay of the transaction's OWN adds and removes — ~7,450 claims. That
+   is what took `arena` from 10.09 s to 0.06 s; the structure was never the problem.
+2. **The inverse replay silently did nothing at first.** `rollback_undo` clears `self._undo` before
+   restoring (so the restore is not itself journalled), and `_arena_rollback` read that field — so
+   it found `None` and returned. Caught by `test_arena_survives_the_lns_reject_path`, which compares
+   the arena to the dict after every task; the journal is now passed in explicitly.
+3. **Memory came out 4x the Phase 0 projection** — 150 MB against 37 MB. The projection assumed
+   exact packing; real slabs are powers of two and the buffer doubles, so a bulk load settles at
+   ~2.7x its live size with almost no garbage. A garbage-only compaction trigger never fires there.
+   Adding a `tail > 2 x live` trigger and right-sizing the compacted buffer took it to **99 MB**
+   holding 34 MB of claims.
+
+The memory story is honest but not finished: 99 MB of allocation for 34 MB of live claims. It still
+comes out ahead in the final design, which deletes **both** the 52 MB of pools **and** the ~186 MB
+dict — but "the arena is smaller than the pools" (Phase 0's claim) is only true of the packed data,
+not of the allocator, and a bulk-load path that sizes slabs exactly during `_absorb` is the obvious
+next lever.

@@ -45,6 +45,7 @@ from ...geometry import CylinderSpec
 from ...types import as_terminal
 from .. import hexgrid as hg
 from ._packed import P_HI, P_LO, P_NXT, aligned_2d
+from .claim_arena import ClaimArena
 
 
 def ground_delay_steps(cfg) -> int:
@@ -138,9 +139,7 @@ class _Pool:
                 self._grow()
             s = self.nslots
             self.nslots += 1
-        self.iv[s, P_LO] = lo
-        self.iv[s, P_HI] = hi
-        self.iv[s, P_NXT] = nxt
+        self.iv[s, P_LO] = lo; self.iv[s, P_HI] = hi; self.iv[s, P_NXT] = nxt
         return s
 
     def block(self, c: int, s: int) -> None:
@@ -261,10 +260,11 @@ class _Pool:
         self.iv[c, P_NXT] = -1
 
 
-# Packed-claim field layout (see `CompiledHexOccupancy._claims`): two 20-bit step fields in an int64,
-# s0 | s1. Ownership already lives in `_rows`; equal spans from different owners are fungible in a
-# cell's multiset, so repeating a flight code in every claim only consumed bits and interning state.
+# Packed-claim field layout (see `CompiledHexOccupancy._claims`): three 20-bit fields in an int64,
+# s0 | s1 | fid_code. 20 bits is ~1e6 — four orders of magnitude past any realistic step horizon or
+# flight count — and both are range-checked where they enter, so a field can never silently wrap.
 _SPAN_BITS = 20
+_S0_SHIFT = 2 * _SPAN_BITS
 _SPAN_LIMIT = 1 << _SPAN_BITS
 _FIELD_MASK = _SPAN_LIMIT - 1
 
@@ -272,7 +272,8 @@ _FIELD_MASK = _SPAN_LIMIT - 1
 class CompiledHexOccupancy:
     """Two incremental flat pools (corridor + column) feeding the numba A* kernel. Commit-hook driven."""
 
-    def __init__(self, cfg, margin: int = 64, track_removal: bool = False):
+    def __init__(self, cfg, margin: int = 64, track_removal: bool = False,
+                 claim_arena: bool = True):
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
@@ -287,13 +288,20 @@ class CompiledHexOccupancy:
         # Both structures are PACKED, because they are per-claim and therefore linear in schedule size
         # (measured 68 MB of tuples at 290 flights). One claim is one int64:
         #     key    = c << 1 | pool_idx                 (which pool, which cell)
-        #     claim  = s0 << 20 | s1                     (inclusive blocked span)
+        #     claim  = s0 << 40 | s1 << 20 | fid_code    (`_fids[fid_code]` recovers the owner)
         # Ranges are checked in `_record`; the constructor rejects a horizon too deep to pack.
         # `_rows[fid]` is a flat array of (key, claim) pairs — 16 B/row against ~120 for the tuple
-        # form — and `_claims[key]` is a multiset of those same ints. The owner journal says how many
-        # equal spans to remove; which identical instance is removed cannot affect the rebuilt pool.
+        # form — and `_claims[key]` is a list of those same ints, so `remove` compares ints, not
+        # Flat, numba-visible twin of `_claims` (see `claim_arena`), constructed below once NC is
+        # known. Step 1 of the pool-less work: maintained ALONGSIDE the dict and the pools, changing
+        # nothing, so its real commit/release cost is measured and its answers checked at full scale
+        # before anything is deleted. Only meaningful in removal mode — `_record` feeds it, and that
+        # is `track_removal`-gated.
+        self._arena: ClaimArena | None = None
         self._claims: dict[int, list[int]] = {}      # packed (pool, cell) key -> [packed claims]
         self._rows: dict[int, array] = {}            # fid -> flat int64 (key, claim) pairs
+        self._fids: list = []                        # fid_code -> flight id
+        self._fid_codes: dict = {}                   # flight id -> fid_code
 
         qmin, rmin, qspan, rspan, maxs = self._box(cfg, margin)
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
@@ -305,6 +313,8 @@ class CompiledHexOccupancy:
                 f"{_SPAN_LIMIT}-step packing limit")
         self.corr = _Pool(self.NC, self.MAXS)
         self.col = _Pool(self.NC, self.MAXS)
+        if track_removal and claim_arena:
+            self._arena = ClaimArena(2 * self.NC, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
         # cell → {terminal ids whose column EVER covers it, across all steps}. Lets the host detect an
         # own∩foreign shared cell (issue #3) and fall back to the reference, instead of the overlay boolean
         # silently treating a foreign column as transparent. Deliberately TIME-COLLAPSED and NOT pruned by
@@ -327,14 +337,14 @@ class CompiledHexOccupancy:
         self._undo: dict | None = None
         self._suspended = False
 
+
     def _box(self, cfg, margin):
         w, h = cfg.region_size_m
         R = self.R
         qs, rs = [], []
         for x, y in ((0.0, 0.0), (w, 0.0), (0.0, h), (w, h)):
             q, r = hg.enu_to_axial(x, y, R)
-            qs.append(q)
-            rs.append(r)
+            qs.append(q); rs.append(r)
         qmin, qmax = min(qs) - margin, max(qs) + margin
         rmin, rmax = min(rs) - margin, max(rs) + margin
         maxs = schedulable_horizon_steps(cfg)   # worst-case search_horizon + hover tail (see the shared fn)
@@ -351,12 +361,13 @@ class CompiledHexOccupancy:
         if self._suspended:      # a rollback already put this service where these volumes belong
             return
         self._snap_owner(flight_id)
-        hg.prepare_range_cache_for_commit(volumes)
+        hg.prepare_range_cache_for_commit(volumes)   # main (#117): size the shared raster LRU so
+        #                                              every observer of THIS commit reuses one sweep
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         rows = [] if self.track_removal else None
         for v in volumes:
-            self._add(v, own_cols, rows)
+            self._add(v, own_cols, flight_id, rows)
         self.n_added += len(volumes)
         if self.track_removal:
             entry = self._rows.get(flight_id)
@@ -364,6 +375,13 @@ class CompiledHexOccupancy:
                 self._rows[flight_id] = array("q", rows)
             else:
                 entry.extend(rows)
+            if self._arena is not None:
+                # `rows` is exactly THIS commit's (key, claim) pairs — `_rows[fid]` accumulates
+                # across commits for the same flight, so feeding the arena from it would re-add.
+                flat = np.asarray(rows, np.int64).reshape(-1, 2)
+                self._arena.add(flat[:, 0], flat[:, 1])
+                if self._undo is not None:
+                    self._undo["arena_add"].extend(rows)
 
     def on_release(self, flight_id, volumes) -> None:
         """Ledger release subscriber (removal mode): drop the flight's recorded claims and rebuild
@@ -374,6 +392,12 @@ class CompiledHexOccupancy:
             return
         self._snap_owner(flight_id)
         rows = self._rows.pop(flight_id)
+        if self._arena is not None:
+            flat = np.frombuffer(rows, dtype=np.int64).reshape(-1, 2)
+            self._arena.remove(np.ascontiguousarray(flat[:, 0]),
+                               np.ascontiguousarray(flat[:, 1]))
+            if self._undo is not None:
+                self._undo["arena_rm"].extend(rows)
         claims = self._claims
         touched: set[int] = set()
         for i in range(0, len(rows), 2):              # flat (key, claim) pairs; see `_claims`
@@ -390,16 +414,16 @@ class CompiledHexOccupancy:
             survivors = claims.get(key)
             if survivors:
                 for packed in survivors:
-                    pool.block_range(c, packed >> _SPAN_BITS, packed & _FIELD_MASK)
+                    pool.block_range(c, packed >> _S0_SHIFT, (packed >> _SPAN_BITS) & _FIELD_MASK)
             else:
                 claims.pop(key, None)
-        self.n_added -= len(volumes)
+        self.n_added -= len(volumes)      # main's accounting: symmetric with on_commit
 
     def _inside_a_column(self, q, r, cols) -> bool:
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
-    def _add(self, vol, own_cols, _rows: list | None = None) -> None:
+    def _add(self, vol, own_cols, fid=None, _rows: list | None = None) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         track = self.track_removal
@@ -420,7 +444,7 @@ class CompiledHexOccupancy:
                     self.col.block_range(c, int(s_lo), int(s_hi))
                     self.col_owners.setdefault(c, set()).add(tid)
                     if track:
-                        self._record(1, c, int(s_lo), int(s_hi), _rows)
+                        self._record(1, c, int(s_lo), int(s_hi), fid, _rows)
             else:                                       # → corridor pool (minus committing own interior)
                 if own_cols and self._inside_a_column(q, r, own_cols):
                     continue
@@ -437,17 +461,24 @@ class CompiledHexOccupancy:
                     self._snap_cell(c << 1)
                 self.corr.block_range(c, int(s_lo), int(s_hi))
                 if track:
-                    self._record(0, c, int(s_lo), int(s_hi), _rows)
+                    self._record(0, c, int(s_lo), int(s_hi), fid, _rows)
 
-    def _record(self, pool_idx: int, c: int, s0: int, s1: int, _rows: list | None) -> None:
+    def _record(self, pool_idx: int, c: int, s0: int, s1: int, fid, _rows: list | None) -> None:
         if s1 >= _SPAN_LIMIT:
             # A committed volume can outlive the box (a late return commits past MAXS and box-guards
             # to the reference), so the constructor's MAXS check does not bound this. One compare
             # against a field overflow that would silently corrupt a survivor's span on release.
             raise ValueError(f"CompiledHexOccupancy: step {s1} exceeds the removal journal's "
                              f"{_SPAN_LIMIT}-step packing limit")
+        code = self._fid_codes.get(fid)
+        if code is None:
+            code = self._fid_codes[fid] = len(self._fids)
+            if code >= _SPAN_LIMIT:
+                raise ValueError("CompiledHexOccupancy: too many distinct flights for the "
+                                 "removal journal's packing")
+            self._fids.append(fid)
         key = (c << 1) | pool_idx
-        packed = (s0 << _SPAN_BITS) | s1
+        packed = (s0 << _S0_SHIFT) | (s1 << _SPAN_BITS) | code
         lst = self._claims.get(key)
         if lst is None:
             self._claims[key] = [packed]
@@ -511,7 +542,10 @@ class CompiledHexOccupancy:
         if self._undo is not None:
             raise RuntimeError("CompiledHexOccupancy: undo journal already open")
         self._undo = {"cells": {}, "claims": {}, "rows": {},
-                      "n_added": self.n_added, "evicted": self.evicted_before}
+                      "n_added": self.n_added, "evicted": self.evicted_before,
+                      # The arena rolls back by inverse replay, not by snapshot — see
+                      # `_arena_rollback`. Flat (key, claim) pairs, same shape as `_rows`.
+                      "arena_add": [], "arena_rm": []}
 
     def discard_undo(self) -> None:
         """Close the journal keeping the current state (the ACCEPT path)."""
@@ -538,10 +572,11 @@ class CompiledHexOccupancy:
                 self._rows.pop(fid, None)
             else:
                 self._rows[fid] = rows
-        # No per-flight volume count to restore: `n_added` is snapshotted whole, and `on_release`
-        # subtracts the caller's `len(volumes)` (main's accounting), so nothing derives it per fid.
+        # No per-flight volume count to restore: `n_added` is snapshotted whole below, and
+        # `on_release` subtracts the caller's `len(volumes)`, so nothing derives it per flight.
         self.n_added = u["n_added"]
         self.evicted_before = u["evicted"]
+        self._arena_rollback(u)
         self._suspended = True
 
     def resume_undo(self) -> None:
@@ -557,6 +592,34 @@ class CompiledHexOccupancy:
             if key not in c:
                 lst = self._claims.get(key)
                 c[key] = None if lst is None else list(lst)
+
+    def _arena_rollback(self, u: dict) -> None:
+        """Undo the transaction's arena writes by REPLAYING THEM INVERSELY.
+
+        The pools and the claim dict roll back from state snapshots, which they can afford because a
+        snapshot is one cell's short interval chain. The arena cannot: its state is one flat buffer,
+        so a snapshot means the whole thing. The first version of this re-derived the arena from
+        ``_claims`` instead — O(live claims) per rejected task, measured at **4.29 million re-adds
+        per task**, which made a 59 ns/claim structure look like 252 ms of work. Replaying the
+        transaction's OWN adds and removes is O(what it touched): ~7,450 claims, under a millisecond.
+
+        This whole path is step-1 scaffolding. When the pools go, the undo journal goes with them —
+        an arena release is already O(the flight's own footprint), which is what the journal exists
+        to buy for the pools."""
+        # `u` is passed in, NOT read from `self._undo`: `rollback_undo` clears that field before it
+        # starts restoring (so the restore's own writes are not journalled), so reading it here would
+        # silently find None and do nothing — which is exactly the drift
+        # `test_arena_survives_the_lns_reject_path` caught.
+        a = self._arena
+        if a is None:
+            return
+        added, removed = u["arena_add"], u["arena_rm"]
+        if added:
+            arr = np.asarray(added, np.int64).reshape(-1, 2)
+            a.remove(np.ascontiguousarray(arr[:, 0]), np.ascontiguousarray(arr[:, 1]))
+        if removed:
+            arr = np.asarray(removed, np.int64).reshape(-1, 2)
+            a.add(np.ascontiguousarray(arr[:, 0]), np.ascontiguousarray(arr[:, 1]))
 
     def _snap_owner(self, fid) -> None:
         u = self._undo
@@ -579,6 +642,9 @@ class CompiledHexOccupancy:
         self.oob_corridor_cells = 0
         self._claims.clear()
         self._rows.clear()
+        if self._arena is not None:
+            self._arena.reset()
+        # `_fids` is an interning pool — value-identical across a rebuild, so it survives reset().
         self.corr.reset()
         self.col.reset()
         # Static terminals are NOT ledger-derived (a shrink rebuild must keep them) — re-mark them into the
@@ -601,6 +667,32 @@ class CompiledHexOccupancy:
             if (packed >> _S0_SHIFT) <= s <= ((packed >> _SPAN_BITS) & _FIELD_MASK):
                 return True
         return False
+
+    def arena_matches_claims(self) -> bool:
+        """Does the flat arena describe the same claim multiset as ``_claims``?
+
+        The step-1 contract, checkable at any point in a run. Compares MULTISETS per key, not
+        sequences: a swap-remove reorders a slab and a growth re-homes it, both deliberately, so
+        insertion order carries no meaning and requiring it would pin something that is not true."""
+        a = self._arena
+        if a is None:
+            return True
+        live = {k: sorted(v) for k, v in self._claims.items() if v}
+        return a.as_dict() == live
+
+    def blocked_py_arena(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
+        """:meth:`blocked_py`, answered from the flat arena. The third implementation of one
+        question — pools, claim dict, arena — kept only so the suite can pin all three together
+        while the pools still exist."""
+        if self._arena is None:
+            raise RuntimeError("blocked_py_arena needs the claim arena (track_removal + claim_arena)")
+        c = self.cell_id(q, r, L)
+        if c < 0:
+            return True
+        colb = self._arena.blocked((c << 1) | 1, s) or bool(self.static_col[c])
+        if colb and (own_cells is None or c not in own_cells):
+            return True
+        return self._arena.blocked(c << 1, s)
 
     def blocked_py_claims(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
         """:meth:`blocked_py`, answered from ``_claims`` instead of the interval pools.

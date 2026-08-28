@@ -588,6 +588,40 @@ class CompiledHexOccupancy:
             self._mark_static(center, term)
 
     # ---------- pure-Python oracle (kernel parity + tests) ----------
+    def _claim_blocked(self, key: int, s: int) -> bool:
+        """Is ``(pool, cell)`` blocked at ``s`` according to the CLAIM journal rather than the pool?
+
+        A claim is a blocked span, so this is a direct membership test where the pool stores the
+        complement and answers by walking free intervals. The two must agree for every step the pool
+        can represent — ``[0, MAXS]`` — which is the whole of `blocked_py`'s domain: ``_add`` clips
+        ``s_lo`` to ``evicted_before`` before BOTH the ``block_range`` and the ``_record``, and the
+        kernel never queries past ``MAXS`` (``_plan_compiled`` box-guards on it). Above ``MAXS`` they
+        deliberately differ: ``_Pool.block_range`` drops those steps, ``_record`` keeps them."""
+        for packed in self._claims.get(key, ()):
+            if (packed >> _S0_SHIFT) <= s <= ((packed >> _SPAN_BITS) & _FIELD_MASK):
+                return True
+        return False
+
+    def blocked_py_claims(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
+        """:meth:`blocked_py`, answered from ``_claims`` instead of the interval pools.
+
+        This exists to be COMPARED, not yet to be used: dropping the pools (so that removing a flight
+        costs its own footprint instead of 12.2x it) rests entirely on the claim journal being a
+        faithful complement of what the pools hold, and that is checkable now, while both are
+        maintained, rather than after the pools are gone.
+
+        Requires ``track_removal`` — ``_add`` only journals in removal mode — which is itself one of
+        the decisions the pool-less design has to make."""
+        if not self.track_removal:
+            raise RuntimeError("blocked_py_claims needs track_removal=True (the claim journal is off)")
+        c = self.cell_id(q, r, L)
+        if c < 0:
+            return True
+        colb = self._claim_blocked((c << 1) | 1, s) or bool(self.static_col[c])
+        if colb and (own_cells is None or c not in own_cells):
+            return True
+        return self._claim_blocked(c << 1, s)
+
     def blocked_py(self, q: int, r: int, L: int, s: int, own_cells=None) -> bool:
         """Point query reproducing the kernel ``_blocked`` (and thus ``HexOccupancyService.is_blocked``).
 

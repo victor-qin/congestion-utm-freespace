@@ -77,7 +77,7 @@ _WINDOW_BYTES = 8 << 20
 # covers the reroute fan around it. `probe_window_oracle.py` measured the SPEED question at 1.011x —
 # a window built from each plan's own recorded read set beats these bounds by only that — so this is
 # sized for COVERAGE, which is the property that matters once nothing else can answer a probe.
-_WINDOW_MARGIN_HEX = 24
+_WINDOW_MARGIN_HEX = 32
 # How far `_build_window` may widen when a plan probes outside its window. Each step doubles the
 # lateral margin and the step tail, so three steps is a 8x box in each axis — past the point where
 # the box clips to the global one, which is where the loop terminates anyway.

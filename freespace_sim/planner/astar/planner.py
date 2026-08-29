@@ -77,6 +77,10 @@ _WINDOW_BYTES = 8 << 20
 # covers the reroute fan around it. `probe_window_oracle.py` measured the SPEED question at 1.011x —
 # a window built from each plan's own recorded read set beats these bounds by only that — so this is
 # sized for COVERAGE, which is the property that matters once nothing else can answer a probe.
+#
+# 32 rather than 24 because a widen DOUBLES the box, so being slightly too tight is paid for twice:
+# at 24, 1.2% of plans widen and the peak window reaches 6.2 MB; at 32, none widen and the peak is
+# 4.7 MB. A more generous first guess is both more reliable and smaller here.
 _WINDOW_MARGIN_HEX = 32
 # How far `_build_window` may widen when a plan probes outside its window. Each step doubles the
 # lateral margin and the step tail, so three steps is a 8x box in each axis — past the point where
@@ -136,12 +140,52 @@ def _deny(req, reason):
     )
 
 
-def _absorb(svc, ledger):
-    """Feed already-committed reservations into the occupancy service grouped BY FLIGHT (volumes of one
-    flight are committed contiguously), so the per-flight own-column drop in ``on_commit`` applies to
-    pre-existing flights exactly as it does to live commits — not volume-by-volume."""
+def _absorb_many(services, ledger):
+    """Feed already-committed reservations into EVERY service in ONE pass, grouped BY FLIGHT (volumes
+    of one flight are committed contiguously — ``ledger.iter_committed`` guarantees this and points
+    back here), so the per-flight own-column drop in ``on_commit`` applies to pre-existing flights
+    exactly as it does to live commits — not volume-by-volume.
+
+    One pass, not one per service, because ``hexgrid.rasterize_ranges`` memoizes the geometry sweep by
+    ``id(vol)`` behind a 1024-entry LRU precisely so a commit's several occupancy consumers share it —
+    its own comment says the cap "must exceed the reuse WINDOW". Absorbing each service in its own
+    full pass makes that window the whole ledger (426,756 volumes at density_faa), so every consumer
+    after the first misses and re-sweeps. Interleaving restores the window to one flight: measured
+    24.0 s -> 20.9 s, with byte-identical state.
+
+    Each service still sees the same flights, whole, in the same order, and the services never read
+    each other — so this is an equivalence, not an approximation."""
     for _fid, grp in itertools.groupby(ledger.iter_committed(), key=lambda fv: fv[0]):
-        svc.on_commit(_fid, [v for _, v in grp])
+        vols = [v for _, v in grp]
+        for svc in services:
+            svc.on_commit(_fid, vols)
+
+
+def _absorb(svc, ledger):
+    """One service's absorb. Kept as the single-service spelling of :func:`_absorb_many` — the
+    reference plan path binds alone, and ``.context/perf`` probes plus ``prof_lns_loop`` import or
+    monkeypatch this name."""
+    _absorb_many((svc,), ledger)
+
+
+class _BindBatch:
+    """Collects the occupancy services bound during ONE ``plan()`` so they absorb in one pass.
+
+    ``after`` holds the steps that today run immediately after a service's own absorb — its
+    ``subscribe_static`` and its eviction. Deferring them together preserves each service's internal
+    order (absorb -> static -> evict); only the order BETWEEN services changes, which is safe for the
+    same reason the interleave is: no service reads another's state. Eviction in particular must stay
+    after absorb, because ``add_volume`` clamps ``s_lo`` against ``evicted_before`` as it writes."""
+
+    def __init__(self):
+        self.services: list = []
+        self.after: list = []
+
+    def run(self, ledger) -> None:
+        if self.services:
+            _absorb_many(self.services, ledger)
+        for fn in self.after:
+            fn()
 
 
 def _perimeter(center_xy, toward, radius, z):
@@ -327,10 +371,22 @@ class AStarPlanner:
             self._tele.on_deny(req.flight_id, reason.value, volumes, hits)
         return _deny(req, reason)
 
-    def _occupancy(self, req, ledger, cfg) -> HexOccupancyService:
+    def _watermark(self, req) -> float:
+        """The eviction clock. ``evict_floor`` (Track A): a parallel worker's assignments are NOT
+        monotone (eager re-speculation re-dispatches an earlier flight after a later one), so it caps
+        the watermark at the coordinator's commit-frontier clock — evicting LESS, which is always safe
+        (see the tightness note in ``_occupancy``). None → the bare request clock."""
+        return req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
+
+    def _occupancy(self, req, ledger, cfg, _batch: "_BindBatch | None" = None) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
         publish hook (ASTM-subscription style). First use subscribes and absorbs any pre-existing
-        volumes; a ledger shrink (release) trips a from-scratch rebuild + warning (add-only)."""
+        volumes; a ledger shrink (release) trips a from-scratch rebuild + warning (add-only).
+
+        ``_batch`` (compiled path only) defers this service's absorb, ``subscribe_static`` and
+        eviction into a :class:`_BindBatch` so it can share ONE pass over the ledger with the compiled
+        image — see :func:`_absorb_many`. ``None`` is the caller-visible default and takes the
+        original code path verbatim, which is what keeps ``_plan_reference`` byte-identical."""
         svc = self._svc
         if svc is not None and self._svc_ledger is ledger and self._svc_epoch != ledger.epoch:
             svc = None      # detached mid-life: re-subscribe and re-absorb (the shrink tripwire below
@@ -351,11 +407,16 @@ class AStarPlanner:
             if self.incremental_release:                     # removal hook: release_many un-absorbs
                 ledger.subscribe_release(svc.on_release)
                 ledger.subscribe_release(self._tcap.on_release)
-            _absorb(svc, ledger)                             # absorb anything already committed
-            _absorb(self._tcap, ledger)
-            ledger.subscribe_static(svc._on_static)          # derive always-active routing walls from the
-            #                                                  ledger's permanent terminal volumes (replays
-            #                                                  all already-registered hubs; no-op if none)
+            # `subscribe_static` derives always-active routing walls from the ledger's permanent
+            # terminal volumes (replays all already-registered hubs; no-op if none). It both APPENDS a
+            # subscriber and replays, so it belongs to first-bind only — see the shrink branch below.
+            if _batch is None:
+                _absorb(svc, ledger)                         # absorb anything already committed
+                _absorb(self._tcap, ledger)
+                ledger.subscribe_static(svc._on_static)
+            else:
+                _batch.services += [svc, self._tcap]
+                _batch.after.append(lambda: ledger.subscribe_static(svc._on_static))
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
@@ -364,8 +425,15 @@ class AStarPlanner:
             )
             svc.reset()
             self._tcap.reset()
-            _absorb(svc, ledger)
-            _absorb(self._tcap, ledger)
+            # Deliberately NO `subscribe_static` here: this branch never had one, and adding it would
+            # append a duplicate subscriber and re-replay every hub on each LNS release cycle —
+            # unbounded growth in `ledger._static_subs` and `_static_terms`, answer-neutral but not
+            # state-identical. `reset()` already re-walks the hubs this service recorded.
+            if _batch is None:
+                _absorb(svc, ledger)
+                _absorb(self._tcap, ledger)
+            else:
+                _batch.services += [svc, self._tcap]
         # Evict state older than the request clock. Requests arrive in non-decreasing time, and with
         # ``t_departure >= t_request`` enforced (types) + ``base = ceil(t_depart/dt)``, the earliest
         # step/time any plan reads is ``base >= floor(t_request/dt)`` — so the bare request-clock
@@ -375,10 +443,17 @@ class AStarPlanner:
         # re-speculation re-dispatches an earlier flight after a later one), so it caps the watermark
         # at the coordinator's commit-frontier clock — evicting LESS, which is always safe (the
         # tightness note above warns against evicting MORE). None → today's behavior byte-identically.
-        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
-        svc.evict_before(int(wm // cfg.dt_s))
-        self._tcap.evict_before(wm)
-        return svc
+        wm = self._watermark(req)
+
+        def _evict():
+            svc.evict_before(int(wm // cfg.dt_s))
+            self._tcap.evict_before(wm)
+
+        if _batch is None:
+            _evict()
+        else:
+            _batch.after.append(_evict)     # strictly after the batched absorb: `add_volume` clamps
+        return svc                          # `s_lo` against `evicted_before` as it writes
 
     def capacity_authority(self, ledger) -> TerminalCapacity | None:
         """The pad-capacity authority already current for ``ledger``, or None (see the ``Planner``
@@ -832,11 +907,14 @@ class AStarPlanner:
     # ==================================================================================================
     # Compiled (numba) path — reproduces `_plan_reference` EXACTLY, ~multiple-x faster.
     # ==================================================================================================
-    def _compiled_occ(self, req, ledger, cfg):
+    def _compiled_occ(self, req, ledger, cfg, _batch: "_BindBatch | None" = None):
         """The flat-array occupancy (corridor + column pools), kept in lockstep with the ledger exactly
         as ``_occupancy`` keeps ``HexOccupancyService`` (first-use subscribe+absorb, shrink→rebuild,
         evict to the request clock). Coexists with ``_occupancy`` — the host still needs the reference
-        service for ``pad_clear`` (non-terminal takeoff/landing gate)."""
+        service for ``pad_clear`` (non-terminal takeoff/landing gate).
+
+        ``_batch``: see ``_occupancy``. Sharing one absorb pass with the reference service is the
+        whole point of the batch — they rasterize the same volumes with the same inflations."""
         cocc = self._cocc
         if cocc is not None and self._cocc_ledger is ledger and self._cocc_epoch != ledger.epoch:
             cocc = None                                  # detached mid-life — rebind (see _occupancy)
@@ -848,16 +926,30 @@ class AStarPlanner:
             ledger.subscribe(cocc.on_commit)
             if self.incremental_release:                     # removal hook: release_many un-absorbs
                 ledger.subscribe_release(cocc.on_release)
-            _absorb(cocc, ledger)
-            ledger.subscribe_static(cocc._on_static)         # derive the compiled routing walls from the
-            #                                                  ledger's permanent terminal volumes (replays
-            #                                                  all already-registered hubs; no-op if none)
+            # `subscribe_static` derives the compiled routing walls from the ledger's permanent
+            # terminal volumes (replays all already-registered hubs; no-op if none) — first-bind only.
+            if _batch is None:
+                _absorb(cocc, ledger)
+                ledger.subscribe_static(cocc._on_static)
+            else:
+                _batch.services.append(cocc)
+                _batch.after.append(lambda: ledger.subscribe_static(cocc._on_static))
         elif ledger.n_volumes < cocc.n_added:
             cocc.reset()
-            _absorb(cocc, ledger)
+            if _batch is None:                  # no `subscribe_static`: see the same branch in
+                _absorb(cocc, ledger)           # `_occupancy` for why adding one here would leak
+            else:
+                _batch.services.append(cocc)
         # same frontier-clock floor as _occupancy (out-of-order re-dispatch safety; evicts LESS)
-        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
-        cocc.evict_before(int(wm // cfg.dt_s))
+        wm = self._watermark(req)
+
+        def _evict():
+            cocc.evict_before(int(wm // cfg.dt_s))
+
+        if _batch is None:
+            _evict()
+        else:
+            _batch.after.append(_evict)
         return cocc
 
     def _kernel_state(self, cocc, log2: int):
@@ -1125,9 +1217,21 @@ class AStarPlanner:
         # own hub column, so the centres are not a distance it could ever achieve (issue #50).
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
-        svc = self._occupancy(req, ledger, cfg)
+        # Bind both occupancy images, then absorb them in ONE pass over the ledger (see `_absorb_many`
+        # — separate passes blow past the rasterizer memo's reuse window and re-sweep the geometry).
+        batch = _BindBatch()
+        svc = self._occupancy(req, ledger, cfg, _batch=batch)
         tcap = self._tcap
-        cocc = self._compiled_occ(req, ledger, cfg)
+        cocc = self._compiled_occ(req, ledger, cfg, _batch=batch)
+        try:
+            batch.run(ledger)
+        except BaseException:
+            # Both services are already assigned to `self` and to this ledger BEFORE their absorb, and
+            # none of the rebind guards can see a partially-fed service (`n_added` only ever
+            # under-counts, so the shrink tripwire stays silent). Drop the ledger identities so the
+            # next `plan()` takes the first-bind branch and rebuilds from scratch.
+            self._svc_ledger = self._cocc_ledger = None
+            raise
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)
 

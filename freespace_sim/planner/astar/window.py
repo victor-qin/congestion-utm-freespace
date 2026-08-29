@@ -210,9 +210,18 @@ def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, n_gsteps,
     allowance the two-phase mask already bounds; ``tail_steps`` covers the takeoff climb, the lane
     traverse and the flight itself.
 
-    Returns 0 — window off, every probe takes the pool walk — when the box degenerates or would
-    exceed ``max_bytes``. Both are pure performance decisions: a plan with the window off is
-    byte-identical to one with it on."""
+    Two failure returns, and they are NOT interchangeable — the caller can recover from one:
+
+    * ``0``  the box degenerated (clipped to nothing). Nothing to build at any size.
+    * ``-n`` the box would need ``n`` bytes, more than ``max_bytes``. The caller may grow its buffer
+      and ask again; ``_build_window`` does exactly that.
+
+    The distinction exists because a window failure is no longer cheap. This function once documented
+    returning 0 as "window off, every probe takes the pool walk … byte-identical to one with it on",
+    and that was true while the interval pools existed. They were deleted with the pool-less
+    occupancy: no window now means no answers, so the whole plan falls to the pure-Python reference.
+    A 9% overshoot was measured costing 19.3 s of an 88 s LNS loop, which is why the size is reported
+    back rather than collapsed into a single "off"."""
     q0 = int(min(q_cells)) - lateral_margin
     q1 = int(max(q_cells)) + lateral_margin
     r0 = int(min(r_cells)) - lateral_margin
@@ -228,7 +237,7 @@ def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, n_gsteps,
     row_bytes = (s1 - s0 + 1 + 7) // 8
     nbytes = (q1 - q0 + 1) * (r1 - r0 + 1) * cocc.n_levels * row_bytes
     if nbytes > max_bytes:
-        return 0
+        return -nbytes              # recoverable: this is how big a buffer would have to be
     wbox[W_Q0] = q0; wbox[W_Q1] = q1
     wbox[W_R0] = r0; wbox[W_R1] = r1
     wbox[W_S0] = s0; wbox[W_S1] = s1

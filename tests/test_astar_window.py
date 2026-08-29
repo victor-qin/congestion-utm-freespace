@@ -278,3 +278,38 @@ def test_window_survives_the_mask_widen_rerun():
     blocker = Volume4D(CylinderSpec(0, 0, 120, 0, 200), 0.0, 1500.0)
     p = _assert_window_exact([_req(dx=1500.0)], [(99, [blocker])], cfg=cfg)
     assert p._remask > 0, "the search never reached past the tight mask — this test proves nothing"
+
+
+def test_window_grows_its_buffer_instead_of_falling_back():
+    """A box that does not fit the bitmap buffer must GROW it, not surrender the plan.
+
+    Since the interval pools were deleted a window failure is not a slower window — nothing else can
+    answer a probe, so `_plan_compiled` hands the whole plan to the pure-Python reference. Measured
+    at density_faa: one box overshooting the 8 MB budget by 9% cost 19.3 s of an 88 s LNS loop, most
+    of it `enable_blocked` re-deriving the map and the spurious shrink rebuild that follows.
+
+    The budget is DERIVED from what this plan actually needs (measured with a default planner, then
+    halved) rather than hard-coded, so the test forces exactly one growth instead of accidentally
+    landing past `_WINDOW_GROW_MAX` — where the correct behaviour is the fallback, not a grow."""
+    need = _assert_window_exact([_req(dx=1500.0)], [])._win_bytes_peak
+    assert need > 0
+    p = _assert_window_exact([_req(dx=1500.0)], [], window_bytes=max(1, need // 2))
+    assert p._win_grown > 0, "the buffer never grew — this test proves nothing"
+    assert p._win_off == 0, "a plan was surrendered to the reference instead of growing"
+    assert len(p._ks["win"]) >= need, "the grown buffer was not retained for reuse"
+
+
+def test_window_growth_stops_at_the_ceiling():
+    """Growth is bounded by ``_WINDOW_GROW_MAX``, or a pathological plan could allocate without
+    limit. Past the ceiling the behaviour is the old one — no window, reference dispatch — so the
+    ceiling is a safety valve, not a correctness boundary. Pinned with a budget so small that even
+    8x it cannot hold a box."""
+    from freespace_sim.planner.astar import planner as P
+
+    p = AStarPlanner(window_bytes=8)
+    assert p.compiled
+    led = ReservationLedger(CFG)
+    it = p.plan(_req(dx=1500.0), led, CFG)
+    assert p._win_off > 0, "expected the plan to give up past the growth ceiling"
+    assert len(p._ks["win"]) <= 8 * P._WINDOW_GROW_MAX, "grew past the ceiling"
+    assert it.accepted, "the reference dispatch must still produce a plan"

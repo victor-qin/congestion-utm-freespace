@@ -89,6 +89,13 @@ _WINDOW_MARGIN_HEX = 24
 # the box clips to the global one, which is where the loop terminates anyway.
 _WINDOW_WIDEN_MAX = 3
 
+# How far `_build_window` may GROW its bitmap buffer past `window_bytes` when a box does not fit.
+# The buffer is allocated once per planner and held for the run, so sizing it for the worst plan
+# taxes every worker forever; growing on demand pays only where a plan needs it. 8x because each
+# widen level costs ~8x the bytes (it doubles q, r AND the step tail), so this covers exactly one
+# escalation past the budget — beyond that the plan takes the reference, as it did before.
+_WINDOW_GROW_MAX = 8
+
 
 class _RecordingOcc:
     """Occupancy shim for the pure-Python reference search: forwards ``is_blocked``/``pad_clear`` to
@@ -301,6 +308,13 @@ class AStarPlanner:
         self._win_painted = 0                           # window cells that held a claim (build cost)
         self._win_widen = 0                             # plans that had to grow their window and re-run
         self._win_exhausted = 0                         # plans still missing at the widen ceiling
+        self._win_grown = 0                             # times the bitmap BUFFER was grown to fit a box
+        # Shrink-tripwire rebuilds. Under `incremental_release` these should NEVER happen —
+        # `on_release` keeps `n_added` in lockstep with the ledger precisely so the tripwire stays
+        # silent — so a nonzero count is a bug signal, not a statistic. It is a counter rather than
+        # the warning because LNS filters that warning (a genuine non-incremental release would
+        # raise it every iteration), which is how a 9.98 s rebuild per run went unnoticed.
+        self.n_shrink_rebuilds = 0
         # LNS destroy support: derive occupancy/capacity services in removal mode (per-owner row
         # tracking) and subscribe them to `ledger.subscribe_release`, so a `release_many` is
         # un-absorbed in O(released volumes) instead of tripping the O(everything) shrink rebuild.
@@ -425,6 +439,7 @@ class AStarPlanner:
                 "the incremental occupancy service assumes add-only commits.",
                 stacklevel=2,
             )
+            self.n_shrink_rebuilds += 1
             svc.reset()
             self._tcap.reset()
             # Deliberately NO `subscribe_static` here: this branch never had one, and adding it would
@@ -937,6 +952,7 @@ class AStarPlanner:
                 _batch.services.append(cocc)
                 _batch.after.append(lambda: ledger.subscribe_static(cocc._on_static))
         elif ledger.n_volumes < cocc.n_added:
+            self.n_shrink_rebuilds += 1
             cocc.reset()
             if _batch is None:                  # no `subscribe_static`: see the same branch in
                 _absorb(cocc, ledger)           # `_occupancy` for why adding one here would leak
@@ -1032,9 +1048,10 @@ class AStarPlanner:
         climb, the lane traverse (issue #52) and the flight itself at the same 3x detour budget the
         bounded mask uses, so the window spans the same reach the search is allowed to use.
 
-        Everything here is a performance decision: ``window_bytes = 0``, a box that clips to nothing, or
-        a window over the cap all leave ``wbox`` disabled and the kernel on its original pool walk, which
-        returns the same answers. That is what makes the bounds tunable from measurement instead of proof.
+        A window that cannot be built is NOT a slower window — since the interval pools were deleted
+        nothing else can answer a probe, so the whole plan goes to the pure-Python reference. That
+        makes the byte budget a cliff rather than a dial, which is why an over-budget box grows the
+        buffer and retries instead of giving up (see ``_WINDOW_GROW_MAX``).
 
         Return ``False`` only when the separately compiled window kernel fails. That permanently disables
         the compiled planner, and the caller re-runs this flight through the reference path.
@@ -1046,17 +1063,29 @@ class AStarPlanner:
             return True
         scale = 1 << widen                     # each widen level doubles both extents
         tail = (int(tks.max()) + int(lane_stp.max()) + 3 * n_hops + 2 * climb_span + 8) * scale
-        nbytes = W.window_bounds(
-            cocc, wbox,
+        bounds = dict(
             q_cells=(oq, int(lane_q.min()), int(lane_q.max()), int(goal_q.min()), int(goal_q.max())),
             r_cells=(orr, int(lane_r.min()), int(lane_r.max()), int(goal_r.min()), int(goal_r.max())),
             base=base, max_step=max_step, n_gsteps=n_gsteps,
             lateral_margin=_WINDOW_MARGIN_HEX * scale, tail_steps=tail,
-            max_bytes=cap if widen == 0 else len(ks["win"]),
         )
-        if nbytes == 0:
-            # No window means no answers, so this is now a REFERENCE dispatch rather than a slower
-            # in-kernel path. `_plan_compiled` checks `wbox` and hands over.
+        nbytes = W.window_bounds(cocc, wbox, max_bytes=cap if widen == 0 else len(ks["win"]),
+                                 **bounds)
+        if nbytes < 0:
+            # Over budget, and `window_bounds` reported by how much. Grow to fit and re-ask — the
+            # same grow-and-retry discipline the kernel's FB_HASH/FB_HEAP already use, and for the
+            # same reason: a buffer sized for the worst plan is carried by every worker on every
+            # plan, while one sized for the common plan turns a rare overshoot into a reference
+            # dispatch. Measured: a 9% overshoot cost 19.3 s of an 88 s LNS loop. The grown buffer
+            # is cached in `ks`, so a hot spot pays the growth once.
+            need = -nbytes
+            if need <= self.window_bytes * _WINDOW_GROW_MAX:
+                ks["win"] = np.zeros(need, np.uint8)
+                self._win_grown += 1
+                nbytes = W.window_bounds(cocc, wbox, max_bytes=len(ks["win"]), **bounds)
+        if nbytes <= 0:
+            # Degenerate box, or past the growth ceiling. No window means no answers, so this is a
+            # REFERENCE dispatch rather than a slower in-kernel path — `_plan_compiled` hands over.
             self._win_off += 1
             W.disable(wbox)
             return True

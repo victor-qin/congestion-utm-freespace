@@ -1179,3 +1179,42 @@ def test_sim_run_records_the_anchor_mode_it_flew():
     assert run(cfg, return_anchor="realized").return_anchor == "realized"
 
 
+
+
+def test_reference_fallback_does_not_trigger_a_shrink_rebuild():
+    """`enable_blocked` replays the whole ledger through `add_volume` to re-derive `blocked`. That is
+    a re-derive, not an absorb — but `n_added` used to be incremented inside `add_volume`, so the
+    replay doubled it (measured 852,570 against a 426,285-volume ledger). From then on
+    `ledger.n_volumes < svc.n_added` held forever, so the NEXT plan took the shrink branch and
+    re-absorbed the entire schedule: 9.98 s of an 88 s LNS loop.
+
+    It was invisible because `run_lns` filters the "ReservationLedger shrank" warning (a genuine
+    non-incremental release would raise it every iteration), which is why the guard here is the
+    counter rather than `pytest.warns`.
+
+    The reference dispatch is forced directly rather than by contriving a fallback, because which of
+    the six routes reaches `_plan_reference` is irrelevant to the invariant: after ANY of them,
+    `n_added` must still equal the ledger."""
+    from freespace_sim.planner.astar import AStarPlanner
+
+    res = run(SimConfig(planner="astar", flight_levels_m=(75.0,), airspace_ceiling_m=125.0,
+                        lam_per_hour=700.0, horizon_s=360.0, region_size_m=(3000.0, 3000.0),
+                        seed=1, max_ground_delay_s=300.0))
+    led = ReservationLedger(res.config)
+    for it in res.intents:
+        if it.accepted and it.volumes:
+            led.commit(it.request.flight_id, it.volumes)
+
+    p = AStarPlanner(incremental_release=True)
+    movable = [it for it in res.intents if it.accepted and it.volumes]
+    p.plan(movable[0].request, led, res.config)              # bind + absorb
+    assert p._svc.n_added == led.n_volumes, "absorb miscounted before any fallback"
+
+    p._plan_reference(movable[1].request, led, res.config)   # arms `enable_blocked`
+    assert p._svc._blocked_live, "the fallback did not arm the blocked map"
+    assert p._svc.n_added == led.n_volumes, (
+        f"`enable_blocked` counted its re-derive as an absorb: {p._svc.n_added} vs "
+        f"{led.n_volumes} committed volumes")
+
+    p.plan(movable[2].request, led, res.config)              # the plan that used to rebuild
+    assert p.n_shrink_rebuilds == 0, "a spurious shrink rebuild fired after a reference fallback"

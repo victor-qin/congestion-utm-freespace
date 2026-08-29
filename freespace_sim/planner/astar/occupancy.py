@@ -230,7 +230,6 @@ class HexOccupancyService:
                 else:
                     for s in range(s_lo, s_hi + 1):
                         self.term_cells.setdefault(s, {}).setdefault(cell, set()).add(tid)
-        self.n_added += 1
 
     def _intern(self, cell: tuple[int, int, int]) -> tuple[tuple[int, int, int], int]:
         """``(canonical_cell, cell_id)``, registering the cell if new. Returning the canonical TUPLE
@@ -252,6 +251,17 @@ class HexOccupancyService:
         rows = [] if self.track_removal else None
         for v in volumes:
             self.add_volume(v, own_cols=own_cols, _rows=rows)
+        # Counted HERE, not in `add_volume`. `n_added` means "committed volumes absorbed from the
+        # ledger" — it is one operand of the shrink tripwire, against `ledger.n_volumes`. But
+        # `enable_blocked` also replays the whole ledger through `add_volume` (deliberately: a second
+        # loop would have to re-derive the own-column skip, the refcount branch and the eviction
+        # clamp), and that replay is not an absorb. Counting it there doubled `n_added` — measured
+        # 852,570 against a 426,285-volume ledger — which made `ledger.n_volumes < svc.n_added`
+        # permanently true, so the very next plan took the shrink branch and re-absorbed the entire
+        # schedule: 9.98 s of an 88 s LNS loop, silent because LNS filters the shrink warning.
+        # `CompiledHexOccupancy.on_commit` has always counted at this level, which is exactly why its
+        # tripwire never fired on the same ledger.
+        self.n_added += len(volumes)
         if self.track_removal:
             entry = self._rows.get(flight_id)
             if entry is None:

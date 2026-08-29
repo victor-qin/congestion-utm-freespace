@@ -78,10 +78,12 @@ _WINDOW_BYTES = 8 << 20
 # a window built from each plan's own recorded read set beats these bounds by only that — so this is
 # sized for COVERAGE, which is the property that matters once nothing else can answer a probe.
 #
-# 32 rather than 24 because a widen DOUBLES the box, so being slightly too tight is paid for twice:
-# at 24, 1.2% of plans widen and the peak window reaches 6.2 MB; at 32, none widen and the peak is
-# 4.7 MB. A more generous first guess is both more reliable and smaller here.
-_WINDOW_MARGIN_HEX = 32
+# 24, NOT a more generous guess. A wider margin does cut misses (45 -> 11 over a 774-plan LNS run at
+# density_faa), but `_build_window` multiplies it by `1 << widen`, so it also doubles the size of the
+# RETRY -- and a retry that exceeds `_WINDOW_BYTES` is not a slower window, it is a pure-Python
+# reference plan. At 32 one such plan cost 19.3 s of an 88 s loop. Measure this knob on a workload
+# that actually widens; at `scale == 1` a bigger margin looks free and is not.
+_WINDOW_MARGIN_HEX = 24
 # How far `_build_window` may widen when a plan probes outside its window. Each step doubles the
 # lateral margin and the step tail, so three steps is a 8x box in each axis — past the point where
 # the box clips to the global one, which is where the loop terminates anyway.

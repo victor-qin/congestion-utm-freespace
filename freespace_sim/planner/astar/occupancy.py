@@ -161,14 +161,16 @@ class HexOccupancyService:
         # eviction clamp — three chances to drift from the original.
         blk_live, floor = self._blocked_live, self.evicted_before
         pad_b, blk_b = self.pad, self.blocked
+        # Own-column membership is loop-INVARIANT (`own_cols` is fixed for the flight), so resolve it
+        # to a hex set once instead of running `hex_center` + a disc test per rasterized cell.
+        own_hexes = hg.column_hexes(own_cols, self.R) if own_cols else None
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if floor is not None and s_lo < floor:
                 s_lo = floor                 # guard: never resurrect an already-evicted past step
             if not is_column:
-                own = own_cols and self._inside_a_column(q, r, own_cols)
-                if own:
+                if own_hexes is not None and (q, r) in own_hexes:
                     continue             # the committing flight's own terminal interior — unreserved
                 cell = (q, r, L)
                 # `_bump`/`setdefault(s, <new container>)` inlined over the step run: this is the
@@ -240,10 +242,6 @@ class HexOccupancyService:
             self._cells.append(cell)
             return cell, cid
         return self._cells[cid], cid
-
-    def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
-        c = hg.hex_center(q, r, self.R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
     def on_commit(self, flight_id, volumes) -> None:
         """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes,

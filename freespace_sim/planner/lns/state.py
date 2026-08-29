@@ -375,6 +375,9 @@ class LNSState:
         # where no conflict can exist.
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        # Resolved once per flight, and shared with the two occupancy services through the memo in
+        # `hg.column_hexes` — this index is the third consumer of the identical test.
+        own_hexes = hg.column_hexes(own_cols, self._R) if own_cols else None
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 continue  # capacity-gated own column, not a blocked cell
@@ -383,7 +386,7 @@ class LNSState:
             ):
                 if not in_blk:
                     continue
-                if own_cols and self._inside_own_column(q, r, own_cols):
+                if own_hexes is not None and (q, r) in own_hexes:
                     continue
                 cell = (q, r, level)
                 entries = self._claims.get(cell)
@@ -398,12 +401,6 @@ class LNSState:
                     rows.add(cell)
                     if refresh:
                         self._refresh_contention(cell)
-
-    def _inside_own_column(self, q: int, r: int, cols) -> bool:
-        """Same test as the occupancy services' ``_inside_a_column`` — hex centre inside any of the
-        flight's own terminal column discs."""
-        c = hg.hex_center(q, r, self._R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
     def _index_remove(self, fid: int) -> None:
         for cell in self._cells_of.pop(fid, ()):

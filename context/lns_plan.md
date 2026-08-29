@@ -1052,3 +1052,60 @@ into pool internals.
 cells per plan. `_absorb` is still 24.0 s one-time, now almost entirely that service plus
 `TerminalCapacity`. And the arena holds ~99 MB of allocation for 34 MB of live claims; sizing slabs
 exactly during a bulk load is the obvious next lever.
+
+### Phases 4 and 5: the absorb pass and the own-column test (2026-08-29) — 1.88x bind, 1.43x total
+
+Two findings from re-profiling `_absorb` per call. Both are on the commit path, both are
+mechanism-only, and neither was touched by #119-#123.
+
+**The measurement that started it.** Both occupancy images absorb the SAME ledger with the SAME call
+counts — 4,636 `on_commit`, 426,756 volume calls, 4,327,758 rasterizer rows each — so the gap between
+them (16.09 s vs 12.02 s) is cost per row, not call count. The rasterizer emits 7.36 steps per row;
+the reference expands that to per-step dict entries (31.9 M writes, 66.1 M `dict.get`), the compiled
+one stores 4.29 M packed spans.
+
+**Phase 4 — `_absorb` defeats the memo it was designed around.** `hexgrid.rasterize_ranges` memoizes
+geometry by `id(vol)` behind a 1024-entry LRU precisely so a commit's several consumers share one
+sweep; its comment says the cap "must exceed the reuse WINDOW", and SIPP's `_add` states the same
+intent for three consumers. That holds on the LIVE commit path, where `ledger.commit` fans out to
+every subscriber back to back. It does NOT hold in `_absorb`, which ran each service as its own full
+pass — reuse window 426,756 volumes against a 1024 cap, so every consumer after the first missed and
+re-swept. `_absorb_many` feeds each flight to every service before moving on. **1.118x** through the
+real `plan()` bind path.
+
+Absorb is an LNS-only cost: in a plain FCFS run the planner binds while the ledger is still empty
+(measured: 3 `_absorb` calls, 0 volumes), and everything after arrives through the subscribe hook.
+
+**Phase 5 — the own-column test was loop-invariant and computed per cell.** `_inside_a_column` existed
+in three textually identical copies (both occupancy images and `LNSState._inside_own_column`, a fourth
+via `enable_blocked`), each called per rasterized cell — 4.2 M times per consumer, every one
+allocating a numpy array inside `hex_center`. The answer depends only on `(cols, R)`, both fixed for a
+flight. `hg.column_hexes` resolves it to a frozenset once per flight, memoized across all consumers;
+the three methods are deleted. **1.609x**.
+
+    phase                          bind        loop       total
+    before (per-service, per-cell) 25.62 s     21.33 s    46.95 s
+    after  (one pass, per-flight)  13.61 s     19.12 s    32.73 s
+                                   1.882x      1.116x     1.434x
+
+Identical bind fingerprint (15 fields, both images plus `TerminalCapacity`) and identical repair
+trajectory across all six alternating passes.
+
+**Two things measurement corrected.** cProfile put `_inside_a_column` at 15-24% of each absorb, which
+would cap Phase 5 near 1.3x; it measured 1.609x, because the profiler bills the predicate's own frames
+but not the `np.array` allocation inside `hex_center` — 12.6 M allocations across three consumers.
+And the two phases were expected to be sub-additive, since Phase 5 shrinks the same work whose
+duplicate pass Phase 4 removes; the direct combined measurement (1.882x) slightly EXCEEDS their
+product (1.799x), so the interaction runs the other way.
+
+**Two traps caught in review, both real.** Applying the batch uniformly would have added a
+`subscribe_static` to the shrink-rebuild branch, which never had one — it both appends a subscriber
+and replays every hub, so each LNS release cycle would leak one, answer-neutral but not
+state-identical. And both services are assigned to `self` and to the ledger BEFORE their absorb, while
+no rebind guard can see a partially-fed service (`n_added` only under-counts, so the shrink tripwire
+stays silent) — a raise inside the batched absorb would leave a hollow, permanently-bound occupancy.
+`_plan_compiled` now drops both ledger identities on failure so the next `plan()` rebuilds.
+
+The `column_hexes` cache settled at exactly 182 entries on `density_faa_wing_zipline`, which is that
+scenario's `wing_hubs` — the key is per-HUB, not per-flight, so the cap is sized against
+`density_future_wing_zipline`'s 476.

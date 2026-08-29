@@ -229,13 +229,12 @@ class CompiledHexOccupancy:
                                np.ascontiguousarray(flat[:, 1]))
         self.n_added -= self._nvol.pop(flight_id)
 
-    def _inside_a_column(self, q, r, cols) -> bool:
-        c = hg.hex_center(q, r, self.R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
-
     def _add(self, vol, own_cols, fid=None, _rows: list | None = None) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
+        # Loop-invariant own-column membership, resolved once per flight and shared with the reference
+        # service through `column_hexes`' memo (see there).
+        own_hexes = hg.column_hexes(own_cols, self.R) if own_cols else None
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -251,7 +250,7 @@ class CompiledHexOccupancy:
                     self.col_owners.setdefault(c, set()).add(tid)
                     self._record(1, c, int(s_lo), int(s_hi), fid, _rows)
             else:                                       # → corridor pool (minus committing own interior)
-                if own_cols and self._inside_a_column(q, r, own_cols):
+                if own_hexes is not None and (q, r) in own_hexes:
                     continue
                 if c < 0:                               # outside the box → skip (never crash on commit);
                     if not self._warned_oob:            # a query to this cell gets cell_id<0 → kernel FB_OOB.

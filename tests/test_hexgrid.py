@@ -390,3 +390,43 @@ def test_rasteriser_falls_back_when_kernel_is_absent(monkeypatch):
     hg._RANGE_CACHE.clear()
     assert got == list(hg.rasterize_volume_ranges(vol, CFG, R, infl_b, infl_p))
     assert hg._compiled_warned                       # warned, once
+
+
+def test_column_hexes_matches_the_per_cell_predicate_it_replaced():
+    """``column_hexes`` resolves the own-terminal-column test once per flight instead of once per
+    rasterized cell. It is only sound if its SET agrees exactly with the per-cell predicate it
+    replaced — `hex_center` inside any disc — including at the boundary, where a superset bug in the
+    enumeration would silently drop cells that A* must then never deconflict in.
+
+    Swept over a q/r grid covering each disc plus a two-hex margin, so a missing edge hex fails here
+    rather than as a wrong plan. Radii straddle the hex size (R) deliberately: below it a disc may
+    contain NO centre at all, which is the case an "enumerate the box" bug gets wrong."""
+    R = 69.28
+    for cols in (
+        ((0.0, 0.0, 180.0),),                                     # one disc at the origin
+        ((1234.5, -987.6, 90.0),),                                # off-lattice centre
+        ((0.0, 0.0, 30.0),),                                      # smaller than R — may contain none
+        ((500.0, 500.0, 180.0), (560.0, 470.0, 125.0)),           # overlapping pair
+    ):
+        got = hg.column_hexes(cols, R)
+        for cx, cy, rad in cols:
+            q0, r0 = hg.enu_to_axial(cx - rad, cy - rad, R)
+            q1, r1 = hg.enu_to_axial(cx + rad, cy + rad, R)
+            for q in range(min(q0, q1) - 2, max(q0, q1) + 3):
+                for r in range(min(r0, r1) - 2, max(r0, r1) + 3):
+                    c = hg.hex_center(q, r, R)
+                    want = any((c[0] - ax) ** 2 + (c[1] - ay) ** 2 <= ar * ar for ax, ay, ar in cols)
+                    assert ((q, r) in got) is want, f"{cols} hex {(q, r)}"
+    assert hg.column_hexes((), R) == frozenset(), "no columns ⇒ nothing is inside one"
+
+
+def test_column_hexes_cache_is_bounded_and_answer_stable():
+    """The memo is what makes the per-flight resolve free across the four consumers. Evicting must
+    never change an answer — pin that by overflowing the cap and re-asking the evicted key."""
+    R = 69.28
+    key = ((0.0, 0.0, 180.0),)
+    first = hg.column_hexes(key, R)
+    for i in range(hg._COL_HEX_CACHE_CAP + 16):
+        hg.column_hexes(((float(i) * 1000.0, 0.0, 90.0),), R)
+    assert len(hg._COL_HEX_CACHE) <= hg._COL_HEX_CACHE_CAP
+    assert hg.column_hexes(key, R) == first, "a recomputed entry disagreed with the cached one"

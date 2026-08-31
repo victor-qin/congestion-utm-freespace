@@ -1045,3 +1045,46 @@ per replica, and a DROP worker holds a full one — roughly a third on top of th
 whether m=8 fits, and it should be re-measured before anyone raises `search_workers` on a SIPP arm.
 The `_sidx` journal is almost exactly the size of `_svc`'s, which is expected: both are 4-slot
 per-(cell, span) row journals over the same rasterization.
+
+---
+
+## 12. Post-rebase verification (2026-08-29)
+
+The branch was rebased onto main after #118 merged. #118 had been refactored in review, so the LNS
+glue was re-integrated by hand (§11.4's files carried over byte-identical; `state.py`, `solver.py`,
+`parallel.py` and the two analysis scripts were re-applied). This re-runs the headline to confirm
+the re-integration is behaviour-preserving.
+
+### 12.1 Sequential, full `density_faa_wing_zipline`, seed 0, N=8, 300 iterations
+
+| arm | schedule cost | accepted | pre-rebase cost | pre-rebase accepted |
+|---|---|---|---|---|
+| astar | 1,343,277 | 86/300 | 1,343,277 | 86/300 |
+| sipp | 1,342,247 | 88/300 | 1,342,247 | 88/300 |
+
+**Both arms reproduced their pre-rebase schedules EXACTLY** — same cost to the unit, same accept
+count. That is the real verification: the re-integration changed no answer.
+
+Wall moved, and in the direction that says "machine", not "code": astar 294.8 → 332.1 s (+13%),
+sipp 275.6 → 284.9 s (+3%). The measured speedup therefore reads **1.17x here against 1.07x
+pre-rebase**, and the honest reading is still the §10.3 one — SIPP's loop time is the stable
+quantity (σ ~1-3% across five runs now), A*'s drifts, so **carry ~1.1x** rather than either
+endpoint. Split: plan 1.18x, ledger 1.15x, `fb 0`, `subs 3` vs `4`, both `verified=True`.
+
+### 12.2 DROP m=4, full `density_faa_wing_zipline`, N=8, 600 tasks
+
+| arm | loop s | improvement | accepted | clean-merge | dirty rate | discarded-stale |
+|---|---|---|---|---|---|---|
+| **sipp** | **253** | 0.62% | 131/600 | 27 | **63.0%** | **24** |
+| astar | 279 | 0.66% | 121/600 | 26 | 66.7% | 30 |
+
+SIPP is **1.10x** on loop wall with a lower dirty rate and fewer discarded results, both arms
+`verified=True`. `clean-merge 27` confirms the read envelope survived the rebase and is doing work —
+without it this arm reads 100% dirty (§7).
+
+These numbers are NOT expected to match §11.3 exactly and do not: DROP is non-deterministic, and the
+merged #118 is a different engine from the one §11.3 ran against (its review refactor changed the
+coordinator, and `parallel_mode` now defaults to `"drop"`). The quality ordering flipped
+(sipp 0.62% vs astar 0.66%, against 0.71% vs 0.62% before) — which is exactly the 0.18 pp seed band
+§10.1 measured, and the reason that column should not be read as a result. The wall and the merge
+statistics are the stable signals, and both reproduce.

@@ -650,28 +650,65 @@ differently); costs may not.
 matching `astar/planner.py:392`. That single line closes G2's silent-stale-merge bug. It costs
 nothing and depends on nothing else in this phase.
 
-**Optional, and explicitly deferred:** a real SIPP read-set envelope. It needs a `read_bbox`
-accumulator threaded through `sipp_kernel._search` (the A* kernel's is `astar/kernel.py:149-179`),
-plus a `_mk_envelope` call on the SIPP compiled path. Deferred because:
+**BUILT (2026-08-28), not deferred after all.** `sipp_kernel._search` now takes a `read_bbox`
+accumulator and `_splan_compiled` builds a real `PlanEnvelope`, so SIPP merges stale DROP results
+exactly as A* does. Three things about it are worth writing down, because they are where SIPP
+differs from A* and where the first two test designs failed.
 
-- `record_envelope` is only ever set for `parallel_mode == "drop" and search_workers > 1`
-  (`parallel.py:794`). SYNC and the sequential loop never read it.
-- #118's own conclusion is that `search_workers` stays 1 pending a crossover measurement, so DROP
-  is not the arm anyone is running yet.
-- Until it exists, SIPP + DROP is **correct but degenerate**: every result reads as dirty, so DROP
-  discards stale work instead of merging it. That is a performance floor, not a wrong answer —
-  which is only true once the `last_envelope = None` reset above is in.
+**The read-set unit is a CELL, not a `(cell, step)` probe.** A*'s `_blocked` answers one
+blocked-at-step question, so recording that point is exact. SIPP instead walks a cell's whole
+free-interval CHAIN, whose shape is derived from every commit that ever touched that cell — a commit
+at some *other* step in the same cell splits an interval and changes what the walk finds. So touching
+a chain reads the cell across the plan's entire step window. Slots 6-7 are filled once by the host
+from `[base, max_step]` for the same reason. Recording the arrival step alone would UNDER-report, and
+an under-reporting envelope is worse than none: it reads clean and the coordinator merges a stale
+repair, whose symptom is a worse cost rather than a conflict — invisible to `verify`.
 
-Consequently: allow `repair_planner="sipp"` with `parallel_mode="drop"`, but **log a warning once**
-naming the degradation, rather than raising. Raising would make the honest combination inexpressible
-for measurement.
+**Two probe sites, not three.** Site A (takeoff seeding) and site B (lateral reroute successors)
+cover it. A vertical-rung site was written, measured, and REMOVED: a rung's target is the same
+`(q, r)` at an adjacent level, and both are already in the bbox because the cell was recorded when
+its own label was created and a rung can only be taken from a cell that was expanded. Across 83
+envelopes on a 3-level congested scenario it widened **none** of them. An accumulator line no test
+can distinguish from its absence is one nobody can maintain.
 
-**Emit it in `_validate_lns_config` (`solver.py:116`), guarded on
-`lns.repair_planner.startswith("sipp") and lns.parallel_mode == "drop" and search_workers > 1`.**
-The obvious home — `_new_repair_planner` — is the wrong process: it runs inside `LNSState.replica`
-in a spawned worker (`parallel.py:241-251`), whose stderr is not the coordinator's log stream. A
-warning nobody reads, fired once per worker, is functionally silent — which defeats the only reason
-this warning exists.
+**Cost: 0.7%** (3.408 s vs 3.382 s over 240 congested plans), with bit-identical expansion counts
+(1,106,282 both ways) — write-only w.r.t. the search, as A*'s is.
+
+`sipp_ref` still records nothing (the pure-Python reference has no accumulator), so
+`_validate_lns_config`'s DROP warning is now scoped to *that* arm only.
+
+**Measured under DROP** — 1,526-leg cut, N=8, 200 tasks, `--search-workers 4 --parallel-mode drop`,
+every arm `verified=True`:
+
+| arm | clean-merge | dirty | dirty rate | improvement |
+|---|---|---|---|---|
+| sipp, envelope build disabled (the old behaviour) | **0** | 59 | **100.0%** | 0.93% |
+| **sipp, with the envelope** | **20** | 32 | **61.5%** | **1.05%** |
+| astar (reference) | 10 | 37 | 78.7% | 1.06% |
+
+The envelope recovers 20 of 52 stale-eligible results and closes the quality gap to A*
+(0.93% -> 1.05% against A*'s 1.06%). SIPP's dirty rate is *lower* than A*'s — its read set is
+genuinely tighter, because the interval collapse prunes cells A* has to probe.
+
+### How the soundness gate was built, and two designs that were not gates
+
+The contract is: *a commit that does not intersect the envelope cannot change the plan.* Testing it
+took three attempts, and the two failures are the instructive part.
+
+1. A coarse region-wide candidate grid. Passed with the envelope artificially shrunk by two cells —
+   nothing landed in the band between the true and reported edge.
+2. A fine sweep across the envelope's edge. Also passed under the same mutation, and even with the
+   kernel's dominant probe site DELETED — because the sample points were anchored to `env.xy`, so
+   shrinking the envelope moved the samples with it, and they always straddled the *reported* edge
+   where by construction nothing changes.
+3. Candidates fixed in WORLD coordinates, plus an explicit anchor asserting that an on-corridor wall
+   is reported dirty AND does change the plan. This one bites.
+
+Even (3) has a floor: `env_pad_m` is ~190 m (`corridor_width/2 + R`), which absorbs a whole ring of
+cells, so no behavioural test can resolve a one-ring under-report. That is what the **cell-exact**
+structural test is for — the pure-Python reference's probe log, taken through `SafeIntervalIndex`
+(monkeypatchable, unlike the kernel's raw numpy pools), asserted against `cell_bbox` directly rather
+than the padded `xy`. Deleting either surviving probe site fails it.
 
 ---
 
@@ -801,3 +838,210 @@ Quote gains against the 19.3% that is actually delay, not against total cost
 (`[[density-faa-delay-is-19pct]]`).
 
 **Default stays `astar` unless SIPP wins on iterations/s at equal improvement-per-iteration.**
+
+---
+
+## 10. Measured (2026-08-28) — built, integrated, and gated on density_faa
+
+Everything in §3-§7 is implemented and merged into the branch. `LNSConfig.repair_planner` defaults
+to `"astar"`; this section is the evidence for whether that should change.
+
+**Full suite: 1174 passed, 2 skipped, 0 failures.** `tests/test_lns_sipp.py` adds 21 gates —
+every numbered gate in §9. Two were mutation-tested rather than assumed:
+
+* **static walls** — with the `_static_cells` branch disabled, the walled cell reads back
+  `[0, MAXS]` (fully free) and the gate fails.
+* **validate-before-takeover** — with the `_validate_lns_config` name check disabled, a bad name
+  reaches `_new_repair_planner` *after* `detach_subscribers`, and the gate catches the stripped
+  ledger and bumped epoch.
+
+Gate 7 (`incremental_release=True` byte-identical to `=False` under a SIPP repair) is the one that
+actually pins Phase 1, since SIPP breaks cost ties differently and there is no byte-parity gate
+against the A* LNS run. It passes: identical trajectory, identical final schedule.
+
+§7's read-set envelope was subsequently BUILT (see that section): `sipp` now records a real
+`PlanEnvelope` from its kernel and merges stale DROP results as A* does, at 0.7% search cost with
+bit-identical expansion counts. Only `sipp_ref` still records nothing, so the DROP degradation
+warning is scoped to that arm. Nothing from the plan remains unbuilt.
+
+### 10.1 The headline: full `density_faa_wing_zipline`, 4,636 legs, N=8, 300 iterations
+
+Paired per seed (one FCFS A* baseline, cost 1,349,506, re-derived per arm because LNS mutates the
+ledger in place), arms strictly sequential in one process. Every arm `verified=True`.
+
+| seed | arm | loop s | it/s | plan s | ledger s | impr % | accepted | release-subs | kernel fallbacks |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | astar | 294.8 | 1.02 | 151.4 | 136.8 | 0.46 | 86 | 3 | — |
+| 0 | **sipp** | **275.6** | 1.09 | 142.9 | 125.9 | 0.54 | 88 | 4 | 0 |
+| 1 | astar | 316.0 | 0.95 | 165.6 | 142.3 | 0.55 | 96 | 3 | — |
+| 1 | **sipp** | **278.2** | 1.08 | 143.4 | 126.7 | 0.53 | 97 | 4 | 0 |
+| 2 | astar | 321.6 | 0.93 | 167.6 | 145.9 | 0.64 | 95 | 3 | — |
+| 2 | **sipp** | **270.7** | 1.11 | 141.6 | 121.7 | 0.64 | 103 | 4 | 0 |
+
+**SIPP is 1.07x / 1.14x / 1.19x faster on loop wall — mean 1.13x — and quality is a wash**
+(+0.08 / −0.02 / −0.00 pp). The seed-to-seed spread in improvement is 0.18 pp, **nine times** the
+largest arm delta, so the honest reading is: *the same schedule quality, reached in 13% less wall.*
+Anyone quoting a quality win off one seed is quoting noise.
+
+**Zero SIPP kernel fallbacks in all three arms**, so the plan-side number is genuine safe-interval
+search and not A* wearing SIPP's `planner` label.
+
+### 10.2 Two predictions in §0 and §8 were wrong, and the second one matters
+
+**(a) SIPP's SafeIntervalIndex binds only for TERMINAL flights.** The compiled path gates it on
+`fixed and (o_term or d_term)` — the index exists to build the own-column transparency overlay. So
+the structure count is flight-dependent: 4 on a hub scenario like density_faa (every leg has a
+terminal), and **3 — the same as A* — on point-to-point traffic**. `release-subs 4` above is the
+measured confirmation; `tests/test_lns_sipp.py` asserts both branches.
+
+**(b) The commit side was supposed to be SIPP's headwind. It is not — SIPP is FASTER there too**
+(1.09x / 1.12x / 1.20x). §0's framing of "four structures against three" counted structures instead
+of work. The difference is not one extra structure; it is:
+
+```
+A*    _cocc   = CompiledHexOccupancy  — TWO flat pools (corr + col) + col_owners
+SIPP  _scocc  = CompiledOccupancy     — ONE flat pool
+      _sidx   = SafeIntervalIndex     — two step-keyed dicts
+```
+
+Both planners also carry `_svc` + `_tcap`, identically. So the real comparison is *two pool walks
+per row* against *one pool walk plus two dict updates*, which is at worst a wash — and measured, a
+win. **The 4:3 ratio was the right count and the wrong model.**
+
+The 1,526-leg cut (`--demand-duration 600 --horizon 6000`, seed 0) is where the predicted headwind
+does show, and it is small: loop 145.9 -> 128.6 s (**1.13x**), plan 1.26x, ledger **0.93x** — SIPP's
+ledger side 7% *more* expensive there. So the headwind is real but scale-dependent and never large.
+
+### 10.3 A caveat on the wall-clock, and the control that bounds it
+
+Arms run astar-then-sipp inside one invocation, and the A* arm's loop time grew monotonically across
+invocations (294.8 -> 316.0 -> 321.6 s) while SIPP's did not (275.6 / 278.2 / 270.7, sigma 1.4%).
+That pattern is consistent with machine drift between invocations rather than within one, and its
+direction inside an invocation penalises the SECOND arm — SIPP.
+
+**The order-reversed control settles it** (seed 0, `--arms sipp,astar`):
+
+| order | sipp loop s | astar loop s | speedup |
+|---|---|---|---|
+| astar then sipp | 275.6 | 294.8 | 1.07x |
+| **sipp then astar** | **272.0** | **296.4** | **1.09x** |
+
+Arm order moves each arm by ~1% and the ratio by 0.02x, so the within-invocation effect is not the
+story. Both arms also reproduced their costs and accept counts EXACTLY across the swap (sipp
+1,342,247 / 88 accepted; astar 1,343,277 / 86) — determinism is independent of arm order, which is
+what makes the pairing legitimate.
+
+**So quote ~1.1x.** Seed 0 measured twice gives 1.07-1.09x; seeds 1 and 2 gave 1.14x and 1.19x on
+later invocations where A* had visibly drifted (SIPP's own loop time held at 270.7-278.2 s across
+all four runs, sigma 1.2%). The conservative floor is the right number to carry.
+
+### 10.4 Verdict
+
+SIPP is **integrable and slightly better**: same schedule quality, ~1.1x less wall, conflict-free,
+zero fallbacks, no regressions. That is not enough to move the default. `repair_planner` stays
+`"astar"` because a ~1.1x wall win with indistinguishable quality does not justify making the
+less-exercised planner the one every run depends on — but it is now a one-flag A/B for anyone whose
+bottleneck is LNS wall clock, and the interesting follow-up is whether the gap widens with
+`neighborhood_size` (repair is the only term that scales with N) or under `search_workers > 1`,
+where the plan-side saving is per-worker and the ledger saving is per-replica.
+
+---
+
+## 11. Follow-ups closed, and a codebase review (2026-08-29)
+
+### 11.1 §6's follow-up: SIPP baselines are now licensed
+
+`_REPRODUCIBLE_PLANNERS` gained `sipp`/`sipp_ref`, on the evidence of the two cost-parity gates §6
+asked for (empty ruler world to 1e-9, congested A*-committed ledger to 1e-6). Before this the guard
+refused a `planner="sipp"` baseline outright while silently permitting the opposite mixing, which was
+backwards: both directions are legitimate for the same reason — A* and SIPP are exact optimizers of
+the same weighted cost, so an A* unimpeded ruler measures a SIPP incumbent's delay correctly. The
+error message no longer claims the repair planner is "plain A*", which stopped being true in §5.
+
+### 11.2 §10.4's first question: does the gap widen with `neighborhood_size`? **No — it inverts.**
+
+1,526-leg cut, 200 iterations, seed 0, paired:
+
+| N | astar loop | sipp loop | speedup | plan | ledger | improvement Δ |
+|---|---|---|---|---|---|---|
+| 2 | 41.9 s | 41.4 s | 1.01x | 1.03x | 0.96x | +0.00 pp |
+| 8 | 100.8 s | 99.3 s | 1.01x | 1.10x | 0.88x | −0.17 pp |
+| 16 | 135.6 s | **139.7 s** | **0.97x** | 1.07x | **0.82x** | −0.06 pp |
+
+The hypothesis was that repair is the only term scaling with N, so a faster repair should compound.
+The split says otherwise, and mechanistically: **SIPP's plan-side advantage is flat (1.03/1.10/1.07x)
+while its ledger-side penalty grows monotonically (0.96 → 0.88 → 0.82x).** Larger N releases and
+re-commits more victims per iteration, so the commit side takes a larger share of the loop — and that
+is the side where the fourth structure costs. By N=16 the ledger penalty outweighs the plan gain.
+
+This is *scale-dependent*, not universal: at 4,636 legs SIPP's ledger side was 1.09-1.20x **faster**
+(§10.1), so the crossover moves with instance size exactly as
+`[[lns-neighborhood-size-is-scale-dependent]]` warns. **Do not quote an N recommendation from one
+cut.**
+
+### 11.3 §10.4's second question: under `search_workers > 1`
+
+Full `density_faa_wing_zipline`, 4,636 legs, N=8, 600 tasks, `--search-workers 4 --parallel-mode
+drop`, both arms `verified=True`:
+
+| arm | loop s | improvement | accepted | clean-merge | dirty rate | discarded-stale |
+|---|---|---|---|---|---|---|
+| astar | 272 | 0.62% | 126/600 | 27 | 69.7% | 36 |
+| **sipp** | **262** | **0.71%** | 135/600 | 26 | **66.2%** | **30** |
+
+1.04x on loop wall with a slightly better schedule and a lower dirty rate. The improvement delta
+(+0.09 pp) sits inside the 0.18 pp seed spread measured in §10.1, so read the wall and the merge
+statistics, not the quality number. **SIPP's DROP behaviour is now equivalent to A*'s** — which is
+only true because §7's envelope landed; without it this arm reads 100% dirty.
+
+### 11.4 Codebase review — four integration issues, all fixed
+
+**(a) The SIPP kernel was never JIT-warmed, and the LNS worker pool's stampede argument did not cover
+it.** `AStarPlanner.__init__` calls `_warm_jit()`; `SIPPPlanner` only *imported* its kernel, which
+does not compile. `LNSWorkerPool.start` pre-imports `astar.kernel` reasoning that "the schedule being
+improved came out of an in-process A* run, so the on-disk `cache=True` artifact exists and the
+workers load it instead of racing to compile it". **The LNS baseline is A*, so that argument does not
+extend to SIPP** — every spawned worker would have met an uncompiled safe-interval kernel on its
+first repair, simultaneously. Fixed with `SIPPPlanner._swarm_jit()`, which the coordinator's own
+(never-used) repair planner triggers in `_build_lns_state` *before* the pool spawns. Measured 2.89 s
+for the first construction, 0.00 s thereafter. The stale comment in `start()` now names both reasons.
+
+**(b) `worker_kernel_log2` is a silent no-op on a SIPP arm.** It sizes A*'s *adaptive* g-hash/heap,
+which grows x4 and re-runs on overflow. SIPP's best-g table is fixed at `1 << 21` (67 MB of its
+334 MB of kernel work arrays) and has no grow path — it reports `FB_HASH` and falls back to A*. A
+knob that quietly does nothing on one arm of an A/B is how you conclude the wrong thing: tune it
+down, watch A* speed up and SIPP not, and read it as SIPP scaling worse under concurrency.
+`_validate_lns_config` now warns. (For reference the default footprints are **A\* 739 MB, SIPP
+334 MB** — SIPP is *smaller*, it simply cannot be shrunk. Making it adaptive is the follow-up.)
+
+**(c) `analysis/sweep_lns_workers.py` could not select the repair planner**, so a worker sweep and a
+planner A/B could not be run as one experiment. Added, and recorded in every output row so the two
+cannot later be confused for each other.
+
+**(d) Envelope coverage was unmeasured.** Over a congested replay, **every accepted plan reports a
+read set** (83/83, then 120-flight gate) and every filed corridor lies inside it. Denials can leave
+`None`: SIPP has host-side early exits (no feasible takeoff step, every terminal lane out of box)
+that return before the kernel runs. That is safe and loses nothing — `try_repair` populates
+`RepairOutcome.envelopes` only on the accept return, so a denied repair carries no envelope for a
+coordinator to test. `sipp_shortcut`'s hull lemma is now pinned too.
+
+### 11.5 Memory: the removal journals cost 1.55x A*'s, ~27 KB/flight
+
+Measured on hub traffic (216 flights, 18,912 volumes), where `SafeIntervalIndex` actually binds:
+
+| structure | rows | claims |
+|---|---|---|
+| sipp `_svc` | 6.10 MB | — |
+| sipp `_scocc` | 2.92 MB | 1.46 MB |
+| sipp `_sidx` | 6.09 MB | — |
+| **sipp total** | | **16.57 MB** |
+| astar `_svc` | 6.10 MB | — |
+| astar `_cocc` | 3.04 MB | 1.52 MB |
+| **astar total** | | **10.67 MB** |
+
+**1.55x, i.e. ~27 KB per flight extra.** Extrapolating to density_faa's 4,636 legs that is ~127 MB
+per replica, and a DROP worker holds a full one — roughly a third on top of the ~350 MB/worker PR
+#118 measured. Not a blocker at m=4 (the run above completed), but it is the term that decides
+whether m=8 fits, and it should be re-measured before anyone raises `search_workers` on a SIPP arm.
+The `_sidx` journal is almost exactly the size of `_svc`'s, which is expected: both are 4-slot
+per-(cell, span) row journals over the same rasterization.

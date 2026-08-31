@@ -161,6 +161,70 @@ def test_compiled_occupancy_matches_is_blocked():
     assert checked > 1000 and blocked > 0
 
 
+def test_claims_journal_is_a_faithful_complement_of_the_pools():
+    """The gate for dropping the interval pools: does ``_claims`` hold the same information?
+
+    ``_Pool`` stores FREE intervals, which can absorb a block but cannot subtract one — so removing a
+    flight means rebuilding each touched cell from its survivors, measured at 12.2x the released
+    flight's own footprint and growing with congestion. ``_claims`` stores the BLOCKED spans directly,
+    where removal is a list removal. Making it the source of truth is only sound if the two agree
+    everywhere the pools can answer, and that is checkable NOW, while both are maintained, rather
+    than after the pools are gone.
+
+    Uses a real committed schedule so the pools are fragmented (a cell with one interval would
+    exercise nothing), and releases part of it first so the comparison also covers the state
+    ``on_release`` leaves behind — split intervals, empty ``lo > hi`` slots, and claim lists that have
+    had entries removed from the middle."""
+    from freespace_sim.demand import HubRadiusDemand
+    from freespace_sim.dss import DSS
+    from freespace_sim.mechanism import FCFSMechanism
+    from freespace_sim.uss import USS
+
+    cfg = SimConfig(region_size_m=(20000.0, 15000.0), lam_per_hour=3000.0, horizon_s=300.0,
+                    planner="astar", seed=0)
+    reqs = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 6, "stripmall_uss": 30},
+                           radius_m={"walmart_uss": 6000.0, "stripmall_uss": 3000.0},
+                           terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                           pads_per_hub=8, return_flights=True).generate(
+        cfg, np.random.default_rng(cfg.seed))
+    led = ReservationLedger(cfg)
+    dss = DSS(ledger=led, mechanism=FCFSMechanism())
+    astar = get_planner("astar_ref")
+    usses = {u: USS(u, dss, cfg, astar) for u in {r.uss_id for r in reqs}}
+    for ev in reqs[:400]:
+        usses[ev.uss_id].handle_request(ev)
+
+    cocc = CompiledHexOccupancy(cfg, track_removal=True)
+    led.subscribe(cocc.on_commit)
+    led.subscribe_release(cocc.on_release)
+    fids = []
+    for fid, grp in itertools.groupby(led.iter_committed(), key=lambda fv: fv[0]):
+        cocc.on_commit(fid, [v for _, v in grp])
+        fids.append(fid)
+    assert cocc.corr.nslots > cocc.NC, "pools unfragmented — the comparison would be trivial"
+    led.release_many(fids[: max(1, len(fids) // 4)])          # fires on_release: splits + removals
+    assert cocc.corr.nslots > cocc.NC
+
+    cells = {key >> 1 for key in cocc._claims}
+    assert len(cells) > 500
+    import random
+    random.seed(0)
+    own = {c for c in sorted(cells)[::11]}                    # exercise the own-column fold too
+    checked = blocked = 0
+    for c in random.sample(sorted(cells), min(400, len(cells))):
+        iq, rem = divmod(c, cocc.rspan * cocc.n_levels)
+        ir, L = divmod(rem, cocc.n_levels)
+        q, r = iq + cocc.qmin, ir + cocc.rmin
+        for s in range(0, cocc.MAXS, 7):
+            a = cocc.blocked_py(q, r, L, s, own_cells=own)
+            b = cocc.blocked_py_claims(q, r, L, s, own_cells=own)
+            assert a == b, f"pool={a} claims={b} at (q={q},r={r},L={L},s={s})"
+            checked += 1
+            blocked += a
+    assert checked > 10_000
+    assert 0 < blocked < checked, "sample is all-free or all-blocked — constants would pass this"
+
+
 def test_compiled_own_foreign_shared_cell_falls_back_exact():
     """Issue #3: when the flight's OWN hub column shares a rasterized cell with a FOREIGN hub's committed
     column, the single-boolean overlay cannot represent it — the host detects it via `col_owners` and falls

@@ -475,30 +475,127 @@ def test_sipp_repair_is_conflict_free_under_continuous_verification():
     assert out.verified and out.n_accepted > 0
 
 
-@pytest.mark.slow
-def test_sipp_one_worker_parallel_matches_sequential():
-    """#118's parity gate on the new arm. It is also what catches a worker that silently repaired
-    with A* because `WorkerSpec.repair_planner` was not forwarded into `LNSState.replica` —
-    `verify` checks 4D conflicts only, so such a run would still report itself verified."""
-    from analysis.ab_column_clear import _intent_digest
-    from freespace_sim.planner.lns import LNSConfig, run_lns
+def test_the_repair_planner_reaches_a_parallel_worker():
+    """Pins the config -> WorkerSpec -> LNSState.replica chain, because a worker that builds A* while
+    the coordinator believes it is running SIPP differs SILENTLY: `verify` checks 4D conflicts only,
+    so such a run still reports itself verified.
+
+    Deliberately a chain test rather than an end-to-end parity gate, and the reason is worth writing
+    down. The obvious gate — run parallel and sequential with the same seed and compare — only works
+    where the parallel engine is deterministic, i.e. at `search_workers=1`. But the merged
+    `run_lns_parallel` DELEGATES to the sequential engine below an effective width of two ("a private
+    replica cannot add concurrency in that case"), so at m=1 it compares the sequential loop with
+    itself and never spawns a worker at all. At m>=2 there is no byte-parity to assert against. An
+    earlier version of this test papered over that by comparing the parallel run to a sequential A*
+    run — which differ for engine reasons whatever planner the worker used, so it passed against a
+    build with the forward deleted entirely. Each link is checked directly instead."""
+    from freespace_sim.planner.lns import LNSConfig
+    from freespace_sim.planner.lns.parallel import WorkerSpec
+    from freespace_sim.planner.lns.solver import _validate_lns_config
+    from freespace_sim.planner.lns.state import LNSState
+    from freespace_sim.sim import run
+
+    # link 1: the knob survives normalization
+    assert _validate_lns_config(LNSConfig(repair_planner="sipp")).repair_planner == "sipp"
+
+    # link 2: WorkerSpec carries it, and is picklable with it (a planner OBJECT would not be)
+    import pickle
+
+    spec = WorkerSpec(
+        neighborhood_size=4, accept_epsilon=0.0, repair_order="premium", max_walks=10,
+        map_max_cells=4096, turnaround_s=None, frozen_flight_ids=frozenset(),
+        movable_uss_ids=None, incremental_release=True, kernel_log2_min=None,
+        repair_planner="sipp",
+    )
+    assert pickle.loads(pickle.dumps(spec)).repair_planner == "sipp"
+
+    # link 3: replica builds what the spec names — the link whose absence is invisible at runtime
+    res = run(_congested(lam=200.0, horizon=120.0))
+    movable = [i.request.flight_id for i in res.intents if i.accepted]
+    replica = LNSState.replica(
+        res.config, res.intents,
+        static_terms=res.ledger.static_terminals(),
+        unimpeded_cost=dict.fromkeys(movable, 0.0),
+        repair_planner_name=spec.repair_planner,
+    )
+    assert type(replica.repair_planner).__name__ == "SIPPPlanner"
+    assert replica.repair_planner.evict_floor == 0.0
+    # and the default still builds A*, so the forward is what selects it — not a global flip
+    default = LNSState.replica(
+        res.config, res.intents,
+        static_terms=res.ledger.static_terminals(),
+        unimpeded_cost=dict.fromkeys(movable, 0.0),
+    )
+    assert type(default.repair_planner).__name__ == "AStarPlanner"
+
+    # link 4: `_worker_main` actually PASSES the spec's name through. Links 1-3 all hold with this
+    # forward deleted — the test would be calling `replica` itself and never notice — so spy on the
+    # real call site rather than trust it.
+    from freespace_sim.planner.lns import parallel as lns_parallel
+
+    seen = {}
+    orig = LNSState.replica
+
+    class _StopHere(RuntimeError):
+        pass
+
+    def _spy(cls_cfg, cls_intents, **kw):
+        seen.update(kw)
+        raise _StopHere
+
+    class _Conn:
+        def send(self, _msg):
+            pass
+
+    lns_parallel.LNSState.replica = staticmethod(_spy)
+    try:
+        lns_parallel._worker_main(_Conn(), res.config, res.intents,
+                                  res.ledger.static_terminals(),
+                                  dict.fromkeys(movable, 0.0), spec, 0)
+    except _StopHere:
+        pass
+    finally:
+        lns_parallel.LNSState.replica = orig
+    assert seen.get("repair_planner_name") == "sipp", \
+        f"_worker_main did not forward the spec's repair planner (saw {seen.get('repair_planner_name')!r})"
+
+
+def test_the_coordinator_puts_the_repair_planner_in_the_worker_spec():
+    """Link 5, and the one the chain test above cannot reach: `run_lns_parallel` builds the
+    `WorkerSpec` itself, so deleting `repair_planner=lns.repair_planner` there leaves every other
+    link intact and the whole fleet silently runs A*.
+
+    Intercepted at the POOL boundary rather than by spying on `WorkerSpec` — the spec is pickled
+    into each spawned child, and a test double in that graph breaks spawn serialization. Stopping at
+    the pool also means no processes are created, so this stays a fast test."""
+    from freespace_sim.planner.lns import LNSConfig, parallel as lns_parallel
     from freespace_sim.planner.lns.parallel import run_lns_parallel
     from freespace_sim.sim import run
 
-    cfg = _congested(lam=400.0, horizon=240.0)
-    kw = dict(seed=7, neighborhood_size=4, log_every=0, max_iterations=40,
-              repair_planner="sipp")
+    seen = []
 
-    a = run(cfg)
-    seq = run_lns(a.config, a.ledger, a.intents, LNSConfig(**kw))
-    b = run(cfg)
-    par = run_lns_parallel(b.config, b.ledger, b.intents, LNSConfig(search_workers=1, **kw))
+    class _StopHere(RuntimeError):
+        pass
 
-    assert _traj_key(par) == _traj_key(seq)
-    assert [_intent_digest(i) for i in par.intents] == [_intent_digest(i) for i in seq.intents]
-    assert par.weights == seq.weights
-    assert par.n_accepted == seq.n_accepted and par.verified
-    assert seq.n_accepted > 0, "a vacuous run would make this gate meaningless"
+    def _capture(cfg, intents, static_terms, unimpeded_cost, spec, n_workers):
+        seen.append(spec)
+        raise _StopHere
+
+    res = run(_congested(lam=200.0, horizon=120.0))
+    orig = lns_parallel.LNSWorkerPool
+    lns_parallel.LNSWorkerPool = _capture
+    try:
+        run_lns_parallel(res.config, res.ledger, res.intents,
+                         LNSConfig(seed=7, neighborhood_size=4, log_every=0, max_iterations=4,
+                                   search_workers=2, parallel_mode="sync",
+                                   repair_planner="sipp"))
+    except _StopHere:
+        pass
+    finally:
+        lns_parallel.LNSWorkerPool = orig
+    assert seen, "the coordinator never reached the pool — the run did not go parallel"
+    assert seen[0].repair_planner == "sipp", \
+        f"coordinator shipped {seen[0].repair_planner!r} instead of 'sipp'"
 
 
 def test_bad_repair_planner_name_leaves_the_ledger_intact():

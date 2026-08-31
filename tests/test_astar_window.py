@@ -94,6 +94,39 @@ def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
         ab._paired_pass({"off": object(), "on": object()}, (), None, None)
 
 
+def test_ab_benchmark_disables_monotone_eviction(monkeypatch):
+    from analysis import ab_dense_window as ab
+
+    class FakePlanner:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.evict_floor = None
+
+    monkeypatch.setattr(ab, "AStarPlanner", FakePlanner)
+    arms = ab._make_arms(window_bytes=1234, kernel_log2=18)
+
+    assert arms["off"].kwargs == {"window_bytes": 0, "kernel_log2_min": 18}
+    assert arms["on"].kwargs == {"window_bytes": 1234, "kernel_log2_min": 18}
+    assert all(planner.evict_floor == 0.0 for planner in arms.values())
+
+
+def test_fanout_benchmark_synchronizes_each_arm_and_uses_medians(monkeypatch):
+    from analysis import ab_dense_window as ab
+
+    rows = [("same", 11)]
+    results = iter((duration, rows) for duration in (9.0, 5.0, 3.0, 7.0, 6.0, 1.0))
+    monkeypatch.setattr(ab, "_pass", lambda *_args: next(results))
+    barriers = []
+
+    elapsed = ab._timed_passes(
+        {"off": object(), "on": object()}, (), None, None, 3,
+        before_arm=lambda: barriers.append(True),
+    )
+
+    assert elapsed == {"off": 6.0, "on": 5.0}
+    assert len(barriers) == 6
+
+
 def _assert_window_exact(reqs, commits, cfg=CFG, statics=(), window_bytes=_ON, expect_window=True):
     """Plan every request twice against identically-built ledgers — window off, then on — and assert
     the two runs are indistinguishable: same accept/deny, same cost, same centerline, and the same
@@ -344,4 +377,4 @@ def test_window_survives_the_mask_widen_rerun():
     cfg = dc.replace(CFG, max_ground_delay_s=3600.0)
     blocker = Volume4D(CylinderSpec(0, 0, 120, 0, 200), 0.0, 1500.0)
     p = _assert_window_exact([_req(dx=1500.0)], [(99, [blocker])], cfg=cfg)
-    assert p._remask >= 0        # exercised when the search reaches past the tight mask
+    assert p._remask > 0, "the search never reached past the tight mask — this test proves nothing"

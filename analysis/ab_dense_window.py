@@ -77,11 +77,26 @@ def _pass(planner, requests, ledger, cfg):
     return time.perf_counter() - t, rows
 
 
-def _paired_pass(arms, requests, ledger, cfg):
+def _make_arms(window_bytes, kernel_log2):
+    arms = {
+        "off": AStarPlanner(window_bytes=0, kernel_log2_min=kernel_log2),
+        "on": AStarPlanner(window_bytes=window_bytes, kernel_log2_min=kernel_log2),
+    }
+    # A pass ends on the latest request and the next pass restarts at the earliest one. Occupancy,
+    # pad-capacity, and terminal-capacity eviction are monotone, so without a floor later passes
+    # silently plan against a partially-evicted schedule instead of repeating the same workload.
+    for planner in arms.values():
+        planner.evict_floor = 0.0
+    return arms
+
+
+def _paired_pass(arms, requests, ledger, cfg, *, before_arm=None):
     """Time both arms and reject the pass unless every plan is identical."""
     elapsed = {}
     rows = {}
     for name, planner in arms.items():
+        if before_arm is not None:
+            before_arm()
         elapsed[name], rows[name] = _pass(planner, requests, ledger, cfg)
 
     off = rows["off"]
@@ -98,6 +113,18 @@ def _paired_pass(arms, requests, ledger, cfg):
     return elapsed
 
 
+def _timed_passes(arms, requests, ledger, cfg, passes, *, before_arm=None):
+    """Run paired passes and return each arm's median, synchronizing before each arm if requested."""
+    samples = {name: [] for name in arms}
+    for _ in range(passes):
+        elapsed = _paired_pass(
+            arms, requests, ledger, cfg, before_arm=before_arm,
+        )
+        for name, duration in elapsed.items():
+            samples[name].append(duration)
+    return {name: statistics.median(durations) for name, durations in samples.items()}
+
+
 _BARRIER = None
 
 
@@ -107,9 +134,8 @@ def _init(barrier):
 
 
 def _child(job):
-    """One concurrent A/B. Everything before the barrier — unpickling the baseline, rebuilding the
-    ledger, and the untimed warm pass that absorbs it into each planner — is setup whose cost must
-    not land inside anyone's measurement, so the barrier sits after it."""
+    """One concurrent A/B. Unpickling, rebuilding, and warming happen before the first timed-arm
+    barrier; every later arm has its own barrier so all processes measure the same contention."""
     args, _rank = job
     warnings.filterwarnings("ignore")
     spec = with_overrides(get_scenario(args.scenario),
@@ -121,24 +147,18 @@ def _child(job):
     requests = [it.request for it in intents if it.accepted]
     if args.flights:
         requests = requests[:args.flights]
-    arms = {"off": AStarPlanner(window_bytes=0, kernel_log2_min=args.kernel_log2),
-            "on": AStarPlanner(window_bytes=args.window_bytes, kernel_log2_min=args.kernel_log2)}
+    arms = _make_arms(args.window_bytes, args.kernel_log2)
     for p in arms.values():
         _pass(p, requests[:1], ledger, cfg)
-    _BARRIER.wait()
-    # Alternating passes, reported as each arm's BEST. Under a fan-out the processes drift out of
-    # step as they finish, so late passes are progressively less contended; the minimum is the pass
-    # that ran with the fan-out most fully in flight, which is the regime being measured.
-    out = {name: float("inf") for name in arms}
-    for _ in range(args.passes):
-        elapsed = _paired_pass(arms, requests, ledger, cfg)
-        for name, duration in elapsed.items():
-            out[name] = min(out[name], duration)
-    return out
+    # A barrier before EVERY arm prevents faster children from starting a later arm after slower
+    # siblings have fallen behind or exited. Medians match the solo harness's stated methodology.
+    return _timed_passes(
+        arms, requests, ledger, cfg, args.passes, before_arm=_BARRIER.wait,
+    )
 
 
 def fanout(args, nprocs):
-    """Run the A/B in ``nprocs`` concurrent processes; return each one's per-arm best pass."""
+    """Run the A/B in ``nprocs`` concurrent processes; return each one's per-arm median pass."""
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(nprocs)
     with ctx.Pool(nprocs, initializer=_init, initargs=(barrier,)) as pool:
@@ -201,25 +221,19 @@ def main() -> None:
         if args.flights:
             requests = requests[:args.flights]
 
-        arms = {"off": AStarPlanner(window_bytes=0, kernel_log2_min=args.kernel_log2),
-                "on": AStarPlanner(window_bytes=args.window_bytes,
-                                   kernel_log2_min=args.kernel_log2)}
+        arms = _make_arms(args.window_bytes, args.kernel_log2)
         times = {k: [] for k in arms}
-        rows = {}
         # One untimed warm pass per arm: the first plan absorbs the whole ledger into that planner's
         # occupancy services, which is ledger-sized and has nothing to do with the window.
-        for name, p in arms.items():
+        for p in arms.values():
             _pass(p, requests[:1], ledger, cfg)
         for i in range(args.passes):
-            for name, p in arms.items():
-                dt, r = _pass(p, requests, ledger, cfg)
+            elapsed = _paired_pass(arms, requests, ledger, cfg)
+            for name, dt in elapsed.items():
                 times[name].append(dt)
-                rows[name] = r
                 print(f"  pass {i + 1} {name:>3}: {dt:8.2f}s  ({1e3 * dt / len(requests):6.1f} ms/plan)",
                       flush=True)
 
-        same = rows["off"] == rows["on"]
-        n_diff = sum(1 for a, b in zip(rows["off"], rows["on"]) if a != b)
         med = {k: statistics.median(v) for k, v in times.items()}
         p_on = arms["on"]
         st = p_on._ks["win_stats"] if p_on._ks is not None else np.zeros(2, np.int64)
@@ -228,15 +242,13 @@ def main() -> None:
         print(f"  window off : {med['off']:8.2f}s   ({1e3 * med['off'] / len(requests):6.2f} ms/plan)")
         print(f"  window on  : {med['on']:8.2f}s   ({1e3 * med['on'] / len(requests):6.2f} ms/plan)")
         print(f"  SPEEDUP    : {med['off'] / med['on']:8.3f}x")
-        print(f"  identical  : {same}   ({n_diff} of {len(rows['off'])} plans differ)")
+        print(f"  identical  : True   (0 of {len(requests)} plans differ)")
         print(f"  window     : hit {st[0]:,} / miss {st[1]:,} "
               f"({st[0] / max(1, st[0] + st[1]):.3%} hit), peak {p_on._win_bytes_peak / 1e3:,.0f} kB, "
               f"{p_on._win_off} plans with no window, {p_on._win_painted:,} cells painted")
         print(f"  pools      : corridor {arms['on']._cocc.corr.nslots:,} slots, "
               f"column {arms['on']._cocc.col.nslots:,} (NC={arms['on']._cocc.NC:,}) — "
               f"{(arms['on']._cocc.corr.iv.nbytes + arms['on']._cocc.col.iv.nbytes) / 1e6:.0f} MB")
-        if not same:
-            raise SystemExit("DIVERGENCE: the window changed a plan — this is a bug, not a result")
 
 
 if __name__ == "__main__":

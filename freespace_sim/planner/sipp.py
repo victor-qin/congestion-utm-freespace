@@ -242,6 +242,11 @@ def _nondominated(frontier, key, t, g, w):
 class SIPPPlanner(AStarPlanner):
     """Safe-interval cost-aware planner; inherits occupancy/terminal sync and corridor build from A*."""
 
+    # SIPP queries `HexOccupancyService.is_blocked` directly (its safe-interval index mirrors it, and
+    # the legacy-terminal path searches against it), so the map the compiled A* path switches off must
+    # stay maintained here.
+    needs_blocked_map = True
+
     def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True):
         # Default budget is aligned with the compiled kernel's label cap (``_k_max = 1<<21``): the
         # pure-Python reference is the kernel's correctness ORACLE, so it must be able to reach at least

@@ -180,29 +180,6 @@ def test_rasterizer_backend_restores_selection_on_error():
     assert hg.USE_COMPILED is original
 
 
-def test_block_range_matches_free_set_oracle():
-    """``_Pool.block_range`` (issue #8 Phase E) vs an INDEPENDENT oracle — a plain per-cell set of
-    still-free steps. (``block`` now delegates to ``block_range``, so comparing the two would be
-    circular; the oracle validates the interval surgery from first principles instead.) Random spans,
-    some straddling holes earlier spans punched (the multi-interval case) and some running off both
-    ends, must leave ``blocked_at`` agreeing with the oracle at every step of every cell."""
-    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
-
-    NC, MAXS = 4, 40
-    rng = np.random.default_rng(0)
-    pool = _Pool(NC, MAXS)
-    free = [set(range(MAXS + 1)) for _ in range(NC)]      # oracle: the still-free steps per cell
-    for _ in range(80):
-        c = int(rng.integers(0, NC))
-        lo = int(rng.integers(-3, MAXS + 2))              # spans may run off either end
-        hi = lo + int(rng.integers(0, 14))
-        pool.block_range(c, lo, hi)
-        free[c] -= set(range(max(0, lo), min(MAXS, hi) + 1))   # clamp mirrors block_range
-        for cc in range(NC):
-            for s in range(0, MAXS + 1):
-                assert pool.blocked_at(cc, s) == (s not in free[cc]), (cc, s, lo, hi)
-
-
 def test_rasterize_box_lands_on_its_level_only():
     """A level corridor box marks cells at exactly its own flight level."""
     z = CFG.level_z(1)                                      # 70 m

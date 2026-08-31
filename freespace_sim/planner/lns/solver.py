@@ -56,14 +56,6 @@ class LNSConfig:
     # implicit `spawn` can re-execute an unguarded caller's top-level code. Guarded applications may
     # explicitly pass None for min(8, cpu-2) automatic parallelism.
     unimpeded_workers: int | None = 1
-    # Byte cap on the repair planner's per-plan dense occupancy window (`astar.window`); None keeps
-    # AStarPlanner's default, 0 turns it off. ANSWER-NEUTRAL — the window caches the interval pools
-    # `_blocked` would otherwise walk, and anything outside it takes that walk — so this is a pure
-    # speed knob and the byte-parity gates hold at any value. Exposed because the LNS loop is the
-    # window's hardest case (destroy/repair re-fragments the same congested cells thousands of
-    # times, which is exactly the list-walk growth `analysis/prof_ledger_scaling.py` measures), so
-    # the A/B has to be runnable end to end: `analysis/ab_dense_window.py`.
-    window_bytes: int | None = None
     time_limit_s: float | None = None
     verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
     log_every: int = 200
@@ -75,6 +67,14 @@ class LNSConfig:
     worker_kernel_log2: int | None = None  # non-negative AStarPlanner.kernel_log2_min; oversized
     #                                        kernel arrays were measured to slow CONCURRENT plans
     #                                        ~1.75x at 8 workers while a lone worker matched serial
+    # Byte cap on the repair planner's per-plan dense occupancy window (`astar.window`); None keeps
+    # AStarPlanner's default, 0 turns it off. ANSWER-NEUTRAL — the window caches the interval pools
+    # `_blocked` would otherwise walk, and anything outside it takes that walk — so this is a pure
+    # speed knob and the byte-parity gates hold at any value. Exposed because the LNS loop is the
+    # window's hardest case (destroy/repair re-fragments the same congested cells thousands of
+    # times, which is exactly the list-walk growth `analysis/prof_ledger_scaling.py` measures), so
+    # the A/B has to be runnable end to end: `analysis/ab_dense_window.py`.
+    window_bytes: int | None = None
 
 
 @dataclass

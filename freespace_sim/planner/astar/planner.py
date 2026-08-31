@@ -288,6 +288,13 @@ def _warn_kernel_fallback() -> None:
 
 
 class AStarPlanner:
+
+    #: Subclasses that call ``HexOccupancyService.is_blocked`` themselves must set this. The compiled
+    #: A* path never does (it reads the dense window), which is why the map is off by default there —
+    #: but SIPP inherits ``_occupancy`` and DOES query it, and an unmaintained map raises rather than
+    #: answering stalely. False keeps the measured 1.052x for plain compiled A*.
+    needs_blocked_map: bool = False
+
     def __init__(self, max_expansions: int = 3_000_000, vertical_edges: bool = True,
                  compiled: bool = True, kernel_log2_min: int | None = None,
                  incremental_release: bool = False, window_bytes: int = _WINDOW_BYTES):
@@ -412,8 +419,9 @@ class AStarPlanner:
             # and `_plan_compiled` never calls it (measured: 62,537 `pad_clear` and ZERO `is_blocked`
             # over 20 LNS tasks), while 98.3% of `pad` bumps also bump `blocked`. `_plan_reference`
             # arms it before it searches, so a fallback still gets an exact map.
-            svc = self._svc = HexOccupancyService(cfg, track_removal=self.incremental_release,
-                                                  maintain_blocked=not self.compiled)
+            svc = self._svc = HexOccupancyService(
+                cfg, track_removal=self.incremental_release,
+                maintain_blocked=not self.compiled or self.needs_blocked_map)
             self._svc_epoch = ledger.epoch
             self._tcap = TerminalCapacity(cfg, ledger,       # temporal pad capacity, same ledger
                                           track_removal=self.incremental_release)

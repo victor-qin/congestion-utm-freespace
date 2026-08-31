@@ -22,6 +22,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+from array import array
 
 import numpy as np
 
@@ -45,7 +46,7 @@ from . import hexgrid as hg
 from .astar import AStarPlanner
 from .astar._packed import aligned_2d
 from .astar.compiled_hex_occupancy import ground_delay_steps, search_horizon
-from .astar.planner import _absorb, _committed_arrival
+from .astar.planner import _BBOX_HUGE, _absorb, _committed_arrival
 from .compiled_occupancy import CompiledOccupancy
 
 _EPS = 1e-6
@@ -84,32 +85,87 @@ class SafeIntervalIndex:
     NOTE: storage is not reclaimed on eviction yet — the search only ever reads steps >= the request
     clock (so this is correct), but memory reclaim for very long runs is a follow-up."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, track_removal: bool = False):
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
         self.infl_pad = cfg.effective_hover_radius_m + self.R
+        # Removal mode (LNS destroy): `corr`/`cols` hold per-step REFCOUNTS instead of sets — two
+        # flights' inflated rasters can legitimately cover the same (cell, step), so removing one must
+        # not free it — and each committed flight's applied rows are journaled so `on_release` can
+        # reverse them exactly, keeping `n_added` in lockstep with the ledger (the shrink tripwire in
+        # `_sipp_index` stays silent). The A* structural twin `HexOccupancyService` made the identical
+        # choice for the identical reason; this is a port of it, not a parallel invention.
+        #
+        # Reader-transparent by construction: every consumer of `corr`/`cols` uses `in`, iteration or
+        # truthiness (`cell_blocked`, `free_intervals`), all of which behave identically on a `set` and
+        # on a `dict`. Flag off => the original set-based structures, byte-for-byte.
+        #
+        # Journal layout (mode on): `_rows[fid]` is a FLAT int64 array of 4-slot rows
+        # `(cell_id, s_lo, s_hi, code)`, not a list of tuples — the tuple form was measured at ~185 B
+        # a row against 32 B here, and this structure is per-(cell, span) so it is linear in schedule
+        # size. `cell_id` indexes `_cells`, which interns each `(q, r, L)` ONCE and hands the SAME
+        # tuple object back to be used as the `corr`/`cols` key: that sharing is what keeps the cost
+        # 80 bytes per distinct cell rather than per row. `code`: -1 = corridor, >= 0 = terminal
+        # column whose hub id is `_tids[code]`.
+        self.track_removal = track_removal
+        self._rows: dict[int, array] = {}                          # fid -> flat 4-slot rows
+        self._cells: list[tuple[int, int, int]] = []               # cell_id -> (q, r, L)
+        self._cell_ids: dict[tuple[int, int, int], int] = {}
+        self._tids: list = []                                      # code -> terminal id
+        self._tid_ids: dict = {}
         self.corr: dict[tuple[int, int], set[int]] = {}          # cell -> corridor-blocked steps
         self.cols: dict[tuple[int, int], dict[int, set]] = {}    # cell -> step -> {hub_id}
         self.static_cols: dict[tuple[int, int], set] = {}        # always-active: cell -> {hub_id} (step-indep)
         self.n_added = 0
         self.evicted_before: int | None = None
 
-    def on_commit(self, _flight_id, volumes) -> None:
+    def _intern(self, cell):
+        """``(canonical_cell, cell_id)``, registering the cell if new — port of
+        ``HexOccupancyService._intern``. Returning the canonical TUPLE (not just its id) is the point:
+        the journal, the `corr` key and the `cols` key then share ONE tuple per distinct cell instead
+        of allocating a fresh one per row."""
+        cid = self._cell_ids.get(cell)
+        if cid is None:
+            cid = self._cell_ids[cell] = len(self._cells)
+            self._cells.append(cell)
+            return cell, cid
+        return self._cells[cid], cid
+
+    def _tid_code(self, tid) -> int:
+        """Small-int code for a hub id, so a journal row packs into int64."""
+        code = self._tid_ids.get(tid)
+        if code is None:
+            code = self._tid_ids[tid] = len(self._tids)
+            self._tids.append(tid)
+        return code
+
+    def on_commit(self, flight_id, volumes) -> None:
         hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        rows = [] if self.track_removal else None
         for v in volumes:
-            self._add(v, own_cols)
+            self._add(v, own_cols, rows)
         self.n_added += len(volumes)
+        if self.track_removal:
+            entry = self._rows.get(flight_id)
+            if entry is None:
+                self._rows[flight_id] = array("q", rows)   # 'q' = int64: cell ids, steps and codes
+                #                                            cannot overflow it, so packing stays total
+            else:
+                # NOT optional: `_absorb` groups by `itertools.groupby` over `iter_committed`, which
+                # yields a SECOND group for any fid whose volumes are non-contiguous in the ledger.
+                entry.extend(rows)
 
     def _inside_a_column(self, q, r, cols) -> bool:
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
-    def _add(self, vol, own_cols) -> None:
+    def _add(self, vol, own_cols, _rows=None) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
+        track = self.track_removal
         # Same shared range producer as `CompiledOccupancy._add` and `HexOccupancyService._add`
         # (issue #114) — identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per
         # commit instead of three. This index is step-keyed, so like the hex service it expands the
@@ -121,11 +177,70 @@ class SafeIntervalIndex:
                 continue                                        # is_blocked only consults in_blk cells
             cell = (q, r, L)
             if is_column:
-                d = self.cols.setdefault(cell, {})
-                for s in range(s_lo, s_hi + 1):
-                    d.setdefault(s, set()).add(tid)
+                if track:
+                    cell, cid = self._intern(cell)              # canonical tuple becomes the KEY too
+                    _rows.append(cid); _rows.append(s_lo); _rows.append(s_hi)
+                    _rows.append(self._tid_code(tid))
+                    d = self.cols.setdefault(cell, {})
+                    for s in range(s_lo, s_hi + 1):
+                        e = d.setdefault(s, {})
+                        e[tid] = e.get(tid, 0) + 1
+                else:
+                    d = self.cols.setdefault(cell, {})
+                    for s in range(s_lo, s_hi + 1):
+                        d.setdefault(s, set()).add(tid)
             elif not (own_cols and self._inside_a_column(q, r, own_cols)):
-                self.corr.setdefault(cell, set()).update(range(s_lo, s_hi + 1))  # (skip own terminal interior)
+                if track:                                       # (skip own terminal interior)
+                    cell, cid = self._intern(cell)
+                    _rows.append(cid); _rows.append(s_lo); _rows.append(s_hi); _rows.append(-1)
+                    d = self.corr.setdefault(cell, {})
+                    for s in range(s_lo, s_hi + 1):
+                        d[s] = d.get(s, 0) + 1
+                else:
+                    self.corr.setdefault(cell, set()).update(range(s_lo, s_hi + 1))
+
+    def on_release(self, flight_id, volumes) -> None:
+        """Ledger release subscriber (removal mode): reverse the flight's journaled rows so `corr`/`cols`
+        stay exact without a rebuild, and keep ``n_added`` in lockstep with the ledger so the shrink
+        tripwire stays silent.
+
+        DELIBERATELY NO ``evicted_before`` CLAMP, unlike ``HexOccupancyService.on_release``. That clamp
+        is sound there only because its ``evict_before`` physically DELETES the sub-floor buckets and
+        ``add_volume`` applies the identical clamp on insert — a matched pair. This structure's
+        ``evict_before`` deletes nothing (see its comment), so `_add` recorded the full span and a
+        clamped release would leave every step in ``[s_lo, evicted_before)`` permanently
+        un-decremented: phantom blocked steps outliving the flight. Record the full span, reverse the
+        full span. If reclaim ever lands here, clamp BOTH sides together or neither."""
+        rows = self._rows.pop(flight_id)
+        corr, cols, cells, tids = self.corr, self.cols, self._cells, self._tids
+        for i in range(0, len(rows), 4):                       # flat 4-slot rows; see `__init__`
+            cell = cells[rows[i]]
+            s_lo, s_hi, code = rows[i + 1], rows[i + 2], rows[i + 3]
+            if code < 0:                                        # corridor: cell -> {step: count}
+                d = corr[cell]
+                for s in range(s_lo, s_hi + 1):
+                    c = d[s] - 1                                # KeyError here IS the drift signal
+                    if c:
+                        d[s] = c
+                    else:
+                        del d[s]
+                if not d:
+                    del corr[cell]                              # keep `if not corr` exact
+            else:                                               # column: cell -> {step: {tid: count}}
+                tid = tids[code]
+                d = cols[cell]
+                for s in range(s_lo, s_hi + 1):
+                    e = d[s]
+                    c = e[tid] - 1
+                    if c:
+                        e[tid] = c
+                    else:
+                        del e[tid]
+                        if not e:
+                            del d[s]
+                if not d:
+                    del cols[cell]
+        self.n_added -= len(volumes)
 
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:
@@ -133,6 +248,11 @@ class SafeIntervalIndex:
 
     def reset(self) -> None:
         self.corr.clear(); self.cols.clear(); self.n_added = 0; self.evicted_before = None
+        # The journal describes the structures just cleared, so it MUST go with them: a surviving row
+        # would decrement a count the fresh `_absorb` is about to rebuild. `_cells`/`_tids` stay —
+        # pure interning pools, value-identical across a rebuild and never read except through a live
+        # row (the A* twin keeps its own for the same reason).
+        self._rows.clear()
         # static_cols intentionally preserved: always-active walls are infrastructure, not commit-derived
 
     def register_static_terminal(self, center, term) -> None:
@@ -247,7 +367,9 @@ class SIPPPlanner(AStarPlanner):
     # stay maintained here.
     needs_blocked_map = True
 
-    def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True):
+    def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True,
+                 kernel_log2_min: int | None = None, incremental_release: bool = False,
+                 **astar_kw):
         # Default budget is aligned with the compiled kernel's label cap (``_k_max = 1<<21``): the
         # pure-Python reference is the kernel's correctness ORACLE, so it must be able to reach at least
         # as far — a long multi-altitude flight can need ~700k expansions (3× the 2D count), which the old
@@ -256,7 +378,15 @@ class SIPPPlanner(AStarPlanner):
         # A* owns ``self.compiled`` for the kernel used by our safety fallback. SIPP's kernel needs an
         # independent flag: an A* warm-up failure must remain recorded so ``_fallback`` dispatches to
         # A*'s reference path rather than calling a missing ``self._kernel``.
-        super().__init__(max_expansions, compiled=compiled)
+        # `kernel_log2_min` and `incremental_release` are A*'s, and BOTH matter to SIPP: a parallel
+        # LNS worker passes the first (dropping it would silently run the A* fallback at the wrong
+        # array floor), and the second release-hooks the two structures SIPP inherits — `_svc` and
+        # `_tcap`, via `_occupancy`, which SIPP calls on its own hot path. SIPP's OWN two structures
+        # read `self.incremental_release` in `_sipp_index`/`_scompiled_occ` below.
+        # `**astar_kw` forwards A*-owned knobs SIPP does not interpret itself — today `window_bytes`
+        # (#124's dense-window budget), which the A* fallback inside SIPP still honours.
+        super().__init__(max_expansions, compiled=compiled, kernel_log2_min=kernel_log2_min,
+                         incremental_release=incremental_release, **astar_kw)
         self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
         self._sidx_ledger = None
         self._sidx_epoch = 0                           # ledger.epoch at bind (detach tripwire, #109)
@@ -282,6 +412,67 @@ class SIPPPlanner(AStarPlanner):
         self._sfb_hash = 0                              # of which: (cell, step) best-g table saturated
         self._n_expansions = 0                         # kernel expansions on the last compiled plan
         self._air = []                                  # last successful compiled path (diagnostics/tests)
+        if self.sipp_compiled:
+            self._swarm_jit()
+
+    def _swarm_jit(self):
+        """Compile the SIPP kernel once at construction with a tiny synthetic input, off the hot path —
+        the twin of ``AStarPlanner._warm_jit``, and NOT optional under LNS.
+
+        ``super().__init__`` warms the A* kernel (our safety fallback), but nothing warmed this one.
+        That matters most exactly where it is least visible: ``LNSWorkerPool.start`` pre-imports
+        ``astar.kernel`` on the argument that "the schedule being improved came out of an in-process A*
+        run, so the on-disk cache=True artifact exists and the workers load it instead of racing to
+        compile it". The LNS baseline is A*, so that argument does NOT extend to SIPP — with
+        ``repair_planner='sipp'`` every spawned worker would meet an uncompiled kernel on its FIRST
+        repair, all at once, which is the compile stampede that comment exists to prevent.
+
+        Shapes mirror the production call so the compiled signature is the one actually used; a
+        failure degrades to the pure-Python reference rather than propagating, as A*'s does."""
+        if self._skernel is None:
+            return
+        try:
+            cap, nlev, qspan, rspan = 9, 1, 3, 3
+            maxs, ovcap, ncap = 5, 4, 64
+            iv_lo = np.zeros(cap, np.int32)
+            iv_hi = np.full(cap, maxs, np.int32)
+            iv_nxt = np.full(cap, -1, np.int32)
+            gp = aligned_2d(ncap, 4)                      # same packed layout as production
+            gp[:, 1] = 0
+            self._skernel(
+                iv_lo, iv_hi, iv_nxt,
+                np.zeros(ovcap, np.int32), np.zeros(ovcap, np.int32), np.full(ovcap, -1, np.int32),
+                np.full(cap, -1, np.int64), np.zeros(cap, np.int64), cap,
+                0, 0, rspan, qspan, 0, maxs, nlev,
+                np.array([0], np.int64), np.array([0.0]), np.array([0], np.int64), 1,
+                np.ones(nlev, np.bool_), 1, 1.0,
+                np.array([0], np.int64), np.array([0.0]),
+                np.array([1], np.int64), np.array([0.0]),
+                np.zeros(cap, np.int64), np.zeros(cap, np.float64),
+                np.array([0], np.int64), np.array([maxs], np.int64), np.array([0, 1], np.int64),
+                3.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                1, np.full(cap + ovcap, -1, np.int64), np.full(cap + ovcap, -1, np.int64),
+                np.zeros(cap + ovcap, np.int64),
+                np.zeros(ncap, np.int64), np.zeros(ncap, np.int64), np.zeros(ncap, np.int64),
+                np.zeros(ncap, np.float64), np.full(ncap, -1, np.int64), np.full(ncap, -1, np.int64),
+                np.full(ncap, -1, np.int64), np.full(ncap, -1, np.int64), ncap,
+                np.zeros(ncap, np.float64), np.zeros(ncap, np.int64), np.zeros(ncap, np.int64), ncap,
+                gp, gp.view(np.float64), ncap, 6, maxs + 2,
+                np.zeros(32, np.int64), np.zeros(32, np.int64),
+                np.zeros(32, np.int64), np.zeros(32, np.int64),
+                np.zeros(8, np.int64),
+            )
+        except Exception as e:                            # compile failure → degrade to pure Python
+            import warnings as _w
+
+            _w.warn(
+                f"sipp numba kernel failed to warm/compile ({e!r}); falling back to the pure-Python "
+                f"SIPP reference for ALL plans. Install a compatible numba, or clear stale .nbi/.nbc "
+                f"caches after a kernel-signature change.",
+                RuntimeWarning, stacklevel=2,
+            )
+            self.sipp_compiled = False
+            self._skernel = None
 
     def _sipp_index(self, req, ledger, cfg) -> "SafeIntervalIndex":
         """Maintain the SafeIntervalIndex in lockstep with the ledger (mirrors ``_occupancy``): first use
@@ -292,16 +483,21 @@ class SIPPPlanner(AStarPlanner):
             sidx = None     # detached mid-life: re-subscribe and re-absorb (the shrink tripwire
             #                 below cannot see it — a release + re-commit nets to the same n_volumes)
         if sidx is None or self._sidx_ledger is not ledger:
-            sidx = self._sidx = SafeIntervalIndex(cfg)
+            sidx = self._sidx = SafeIntervalIndex(cfg, track_removal=self.incremental_release)
             self._sidx_ledger = ledger
             self._sidx_epoch = ledger.epoch
             ledger.subscribe(sidx.on_commit)
+            if self.incremental_release:               # removal hook: release_many un-absorbs
+                ledger.subscribe_release(sidx.on_release)
             _absorb(sidx, ledger)
             ledger.subscribe_static(sidx._on_static)   # replays every hub registered before we bound
         elif ledger.n_volumes < sidx.n_added:
             sidx.reset()                      # preserves static_cols (walls are infrastructure)
             _absorb(sidx, ledger)
-        sidx.evict_before(int(req.t_request // cfg.dt_s))
+        # `evict_floor` (Track A / LNS): out-of-order repair must evict to the COORDINATOR's clock,
+        # never this flight's — the floor only ever evicts LESS. Mirrors `AStarPlanner._occupancy`.
+        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
+        sidx.evict_before(int(wm // cfg.dt_s))
         return sidx
 
     def plan(self, req, ledger, cfg):
@@ -313,6 +509,12 @@ class SIPPPlanner(AStarPlanner):
         self.last_expansions = 0
         self._n_expansions = 0
         self._air = []
+        # Never leak a previous flight's read set to a consumer. NOT redundant with A*'s own reset:
+        # `_fallback` runs `AStarPlanner.plan`, which SETS `last_envelope`, and a subsequent NATIVE
+        # SIPP plan sets nothing — so without this line `try_repair` files the fallback flight's read
+        # set under the next flight's name, and a DROP coordinator merges a genuinely stale repair
+        # (a worse cost, not a conflict, so `verify` cannot catch it).
+        self.last_envelope = None
         if not self.sipp_compiled:
             return self._splan_reference(req, ledger, cfg)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
@@ -526,16 +728,19 @@ class SIPPPlanner(AStarPlanner):
         if cocc is not None and self._scocc_ledger is ledger and self._scocc_epoch != ledger.epoch:
             cocc = None     # detached mid-life — rebind (see _sipp_index)
         if cocc is None or self._scocc_ledger is not ledger:
-            cocc = self._scocc = CompiledOccupancy(cfg)
+            cocc = self._scocc = CompiledOccupancy(cfg, track_removal=self.incremental_release)
             self._scocc_ledger = ledger
             self._scocc_epoch = ledger.epoch
             ledger.subscribe(cocc.on_commit)
+            if self.incremental_release:               # removal hook: release_many un-absorbs
+                ledger.subscribe_release(cocc.on_release)
             _absorb(cocc, ledger)
             ledger.subscribe_static(cocc._on_static)   # replays every hub registered before we bound
         elif ledger.n_volumes < cocc.n_added:
             cocc.reset()                      # replays its own _static_hubs internally
             _absorb(cocc, ledger)
-        cocc.evict_before(int(req.t_request // cfg.dt_s))
+        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
+        cocc.evict_before(int(wm // cfg.dt_s))
         return cocc
 
     def share_occupancy_from(self, master) -> None:
@@ -569,6 +774,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_front_gen = np.zeros(tot, np.int64)
             self._k_goal_gen = np.zeros(cocc.cap, np.int64)        # per-cell goal flag (version-stamped)
             self._k_goal_cost = np.zeros(cocc.cap, np.float64)     # exact lane-cell→terminal-edge cost
+            self._k_read_bbox = np.zeros(8, np.int64)              # per-plan read set (Track A; reset per plan)
             self._k_ov_head = np.full(cocc.cap, -1, np.int64)      # per-cell overlay redirect (slot >= cap)
             self._k_ov_gen = np.zeros(cocc.cap, np.int64)          # version-stamped (own-cell transparency)
             self._k_ov_lo = np.empty(ovcap, np.int64)
@@ -792,6 +998,15 @@ class SIPPPlanner(AStarPlanner):
         if not lf_lo:
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
+        # Per-plan read-set reset. min > max means "never probed", which `_mk_envelope` reads as
+        # `cell_bbox=None`. Slots 6-7 are the STEP window, filled once here rather than per probe: a
+        # chain walk reads a cell across the whole window, not at a point (see `_note_cell`).
+        rb = self._k_read_bbox
+        rb[0] = rb[2] = rb[4] = _BBOX_HUGE
+        rb[1] = rb[3] = rb[5] = -_BBOX_HUGE
+        rb[6] = base
+        rb[7] = max_step
+
         # ---- call the kernel ----
         n, _cost, _n_exp, flag = self._skernel(
             cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt,
@@ -811,9 +1026,18 @@ class SIPPPlanner(AStarPlanner):
             self._k_heap_f, self._k_heap_c, self._k_heap_n, self._k_max,
             self._k_gpack, self._k_gpackf, self._k_hash_cap, self._k_hash_log2, max_step + 2,
             self._k_out_q, self._k_out_r, self._k_out_s, self._k_out_L,
+            rb,
         )
         self._n_expansions = int(_n_exp)
         self.last_expansions = self._n_expansions          # inherited public telemetry contract
+        if self.record_envelope and flag not in (FB_OOB, FB_CAP, FB_HASH):
+            # One build covering both remaining exits (NO_PATH deny + accept). A fallback is skipped
+            # deliberately: `_fallback` runs `AStarPlanner.plan`, which builds the AUTHORITATIVE
+            # envelope for the search that actually produced the answer — ours would describe an
+            # abandoned partial search. `unbounded=False` because every native exit here is a
+            # COMPLETE search: the kernel truncates only via FB_CAP/FB_HASH, which are fallbacks, so
+            # NO_PATH means the heap drained rather than the budget ran out.
+            self._mk_envelope(req, cfg, o_term, d_term, origin, dest, max_step, rb, unbounded=False)
         if flag == FB_OOB or flag == FB_CAP or flag == FB_HASH:
             self._sfb += 1
             if flag == FB_CAP:

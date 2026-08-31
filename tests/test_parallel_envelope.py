@@ -250,3 +250,210 @@ def test_evict_floor_evicts_less_and_is_noop():
             got.append((intent.cost, _clkey(intent), pl.last_expansions))
         outs.append(got)
     assert outs[0] == outs[1]
+
+
+# ======================================================================================
+# SIPP read envelope (context/sipp_lns_plan.md §7)
+#
+# SIPP's kernel accumulates its read set per CELL, not per (cell, step) probe as A*'s does, because
+# it walks a cell's whole free-interval chain rather than answering one blocked-at-step question. The
+# chain's shape is derived from every commit that ever touched that cell, so a commit at some other
+# step in the same cell can change what the walk finds. Recording the arrival step alone would
+# UNDER-report — and an under-reporting envelope is worse than no envelope, because it reads as clean
+# and a coordinator merges a stale repair. These tests exist to pin that it does not.
+# ======================================================================================
+
+def _sipp(record=True, compiled=True):
+    from freespace_sim.planner.sipp import SIPPPlanner
+
+    p = SIPPPlanner(compiled=compiled)
+    p.record_envelope = record
+    return p
+
+
+def test_sipp_recording_does_not_change_intents():
+    """Observer-only: the accumulator is write-only w.r.t. the search, so kernel parity is untouched."""
+    req = FlightRequest(1, vec(0, 0, 0), vec(2500, 400, 0), 0.0)
+    commits = [(9, [_wall()])]
+    off, on = _sipp(record=False), _sipp(record=True)
+    a, b = _plan(off, req, commits), _plan(on, req, commits)
+    assert a.status is b.status and a.denial_reason is b.denial_reason
+    assert off.last_expansions == on.last_expansions
+    assert abs(a.cost - b.cost) < 1e-12 and _clkey(a) == _clkey(b)
+    assert off.last_envelope is None                      # off → nothing built
+    assert isinstance(on.last_envelope, PlanEnvelope)
+    assert not on.last_envelope.unbounded
+
+
+def test_sipp_envelope_covers_the_filed_corridor():
+    """Cheap gross-under-reporting check: the corridor the plan committed must lie inside what it
+    read — it was routed through cells the search examined."""
+    p = _sipp()
+    intent = _plan(p, FlightRequest(1, vec(0, 0, 0), vec(2500, 0, 0), 0.0), [(9, [_wall()])])
+    assert intent.accepted
+    assert _corners_in_env(intent.volumes, p.last_envelope)
+
+
+def test_sipp_envelope_covers_the_reference_paths_probes(monkeypatch):
+    """Structural cross-check against an INDEPENDENT probe log.
+
+    The compiled kernel reads raw numpy pools, so it cannot be monkeypatched the way
+    `HexOccupancyService` can. The pure-Python SIPP reference searches the same lattice for the same
+    optimum through `SafeIntervalIndex`, which CAN be — so its probe set is an independent witness of
+    what a SIPP search of this flight reads."""
+    from freespace_sim.planner import hexgrid as hg
+    from freespace_sim.planner.sipp import SafeIntervalIndex
+
+    log: list[tuple] = []
+    orig_cb, orig_fi = SafeIntervalIndex.cell_blocked, SafeIntervalIndex.free_intervals
+
+    def cb(self, q, r, L, s, own, fixed_lanes):
+        log.append((q, r, L))
+        return orig_cb(self, q, r, L, s, own, fixed_lanes)
+
+    def fi(self, q, r, L, own, base, max_step, fixed_lanes):
+        log.append((q, r, L))
+        return orig_fi(self, q, r, L, own, base, max_step, fixed_lanes)
+
+    monkeypatch.setattr(SafeIntervalIndex, "cell_blocked", cb)
+    monkeypatch.setattr(SafeIntervalIndex, "free_intervals", fi)
+
+    req = FlightRequest(1, vec(0, 0, 0), vec(2500, 400, 0), 0.0)
+    commits = [(9, [_wall()])]
+    com = _sipp()
+    b = _plan(com, req, commits)
+    log.clear()                                    # drop the compiled run's own host-side overlay reads
+    ref = _sipp(record=False, compiled=False)
+    a = _plan(ref, req, commits)
+    assert a.status is b.status and abs(a.cost - b.cost) < 1e-9, "not the same search to compare"
+    assert log, "audit log empty — the scenario exercised no occupancy read"
+
+    env = com.last_envelope
+    b = env.cell_bbox
+    assert b is not None
+    # CELL-EXACT, deliberately — against `cell_bbox` rather than the padded `env.xy`. `env_pad_m` is
+    # ~190 m here (corridor_width/2 + R), which absorbs a whole ring of cells, so a padded check
+    # cannot see a one-ring under-report. This is the assertion with the resolution to catch one.
+    for (q, r, L) in log:
+        assert b[0] <= q <= b[1] and b[2] <= r <= b[3], \
+            f"reference probe cell ({q},{r}) outside the compiled envelope's cell_bbox {b}"
+        assert b[4] <= L <= b[5], f"reference probe level {L} outside {b}"
+    _ = hg.circumradius(CFG)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("planner", ["sipp", "astar"])
+def test_envelope_outside_commits_cannot_change_the_plan(planner):
+    """THE soundness gate, stated as the property the coordinator actually relies on:
+
+        if a commit does not intersect the envelope, replanning gives the identical answer.
+
+    Brute force rather than by construction — commit each candidate wall alone, replan, compare. A*
+    runs the same harness as a control: a harness bug fails both arms, an accumulator bug fails only
+    SIPP.
+
+    THE CANDIDATES ARE ANCHORED TO WORLD GEOMETRY, NOT TO `env.xy`, and that is the whole design.
+    Two earlier versions sampled positions relative to the envelope under test, which cannot fail:
+    shrink the envelope and the sample points move with it, so they always straddle the *reported*
+    edge where by construction nothing changes. Both a 2-cell shrink AND deleting the kernel's
+    dominant probe site passed that version. Fixing the candidates in world space instead makes the
+    test bite the way it must — a wall lying on the flight's corridor MUST be reported dirty, and if
+    an under-reporting envelope calls it clean, the replan changes the cost and this fails.
+    """
+    from freespace_sim.planner.astar import AStarPlanner
+
+    req = FlightRequest(1, vec(0, 0, 0), vec(1200, 0, 0), 0.0)
+    p = AStarPlanner() if planner == "astar" else _sipp()
+    p.record_envelope = True
+    ref = _plan(p, req, [])
+    assert ref.accepted
+    env = p.last_envelope
+    assert env is not None and not env.unbounded and env.xy is not None
+
+    # Short walls stepped out from the corridor centreline at three x stations, plus a sweep past the
+    # destination. Fixed in world coordinates, so the sample set does not move when the envelope does.
+    candidates = []
+    for x in (300.0, 600.0, 900.0):
+        for cy in range(0, 1400, 100):
+            candidates.append(Volume4D(
+                box_from_segment(vec(x, cy - 120, 150), vec(x, cy + 120, 150), 40, 400), 0.0, 1e6))
+    for x in range(1200, 2600, 100):
+        candidates.append(Volume4D(
+            box_from_segment(vec(float(x), -120, 150), vec(float(x), 120, 150), 40, 400), 0.0, 1e6))
+
+    clean, dirty = [], []
+    for v in candidates:
+        (clean if not envelope_intersects(env, [(v.flat_aabb(), v.t_start, v.t_end)])
+         else dirty).append(v)
+    assert len(clean) > 10 and len(dirty) > 3, \
+        f"vacuous split: {len(clean)} clean / {len(dirty)} dirty"
+
+    key = (round(ref.cost, 9), _clkey(ref))
+    for v in clean:
+        again = _plan(p, req, [(77, [v])])
+        assert again.accepted, f"a commit OUTSIDE the envelope denied the flight: {v.flat_aabb()}"
+        assert (round(again.cost, 9), _clkey(again)) == key, \
+            f"a commit OUTSIDE the envelope changed the plan: {v.flat_aabb()} — envelope under-reports"
+
+    # The harness is only a gate if SOME candidate is decision-relevant: a wall on the corridor must
+    # be reported dirty AND actually change the plan. Without this, an envelope covering the whole
+    # region would pass trivially.
+    on_path = Volume4D(box_from_segment(vec(600.0, -120, 150), vec(600.0, 120, 150), 40, 400), 0.0, 1e6)
+    assert envelope_intersects(env, [(on_path.flat_aabb(), on_path.t_start, on_path.t_end)])
+    blocked = _plan(p, req, [(77, [on_path])])
+    assert (round(blocked.cost, 9), _clkey(blocked)) != key, \
+        "the on-corridor wall changed nothing — the fixture cannot detect under-reporting"
+
+
+def test_every_accepted_sipp_plan_reports_a_read_set():
+    """The coverage number that decides whether the feature does anything.
+
+    A `None` envelope is SAFE — `_read_set_is_clean` reads it as always-dirty — but it merges
+    nothing, which is the degenerate behaviour this whole feature exists to remove. So the gate is
+    not "None is handled", it is "None does not happen on the path that matters". Over a congested
+    replay every ACCEPTED plan must carry one.
+
+    Denials are deliberately not covered: SIPP has host-side early exits (no feasible takeoff step,
+    every terminal lane out of box) that return before the kernel runs, and they legitimately leave
+    None. Nothing is lost — `try_repair` populates `RepairOutcome.envelopes` only on the accept
+    return, so a denied repair carries no envelope for a coordinator to test in the first place."""
+    import numpy as np
+
+    from freespace_sim.demand import UniformPoissonDemand
+    from freespace_sim.planner.sipp import SIPPPlanner
+
+    cfg = SimConfig(region_size_m=(6000.0, 6000.0), lam_per_hour=600.0, horizon_s=600.0, seed=3)
+    reqs = UniformPoissonDemand().generate(cfg, np.random.default_rng(cfg.seed))[:120]
+    led = ReservationLedger(cfg)
+    p = SIPPPlanner()
+    p.record_envelope = True
+    n_acc = 0
+    for rq in reqs:
+        it = p.plan(rq, led, cfg)
+        if not it.accepted:
+            continue
+        n_acc += 1
+        assert p.last_envelope is not None, f"accepted flight {rq.flight_id} reported no read set"
+        assert p.last_envelope.cell_bbox is not None
+        assert _corners_in_env(it.volumes, p.last_envelope)
+        led.commit(rq.flight_id, it.volumes)
+    assert n_acc > 40, f"only {n_acc} accepted — fixture too thin to be a coverage test"
+
+
+def test_sipp_shortcut_envelope_covers_the_refined_corridor():
+    """The hull lemma with SIPP inside the refiner: the shortcut only REMOVES knots, so the refined
+    centreline lies in the convex hull of the searched one, which the envelope already covers. A*
+    pins this for its own variants; SIPP is a registry planner (`sipp_shortcut`) and was not."""
+    from freespace_sim.planner.sipp import SIPPPlanner
+
+    req = FlightRequest(1, vec(0, 0, 0), vec(2400, 1400, 0), 0.0)   # diagonal ⇒ staircase ⇒ knots
+    sc = get_planner("sipp_shortcut")
+    inner = sc.inner
+    assert isinstance(inner, SIPPPlanner)
+    inner.record_envelope = True
+    refined = _plan(sc, req, [])
+    bare = _plan(_sipp(record=False), req, [])
+    assert refined.accepted and bare.accepted
+    assert len(refined.centerline) < len(bare.centerline), \
+        "shortcut removed no knots — hull lemma not exercised"
+    assert _corners_in_env(refined.volumes, inner.last_envelope)

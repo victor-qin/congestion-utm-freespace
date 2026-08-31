@@ -77,6 +77,27 @@ def _pass(planner, requests, ledger, cfg):
     return time.perf_counter() - t, rows
 
 
+def _paired_pass(arms, requests, ledger, cfg):
+    """Time both arms and reject the pass unless every plan is identical."""
+    elapsed = {}
+    rows = {}
+    for name, planner in arms.items():
+        elapsed[name], rows[name] = _pass(planner, requests, ledger, cfg)
+
+    off = rows["off"]
+    on = rows["on"]
+    if off != on:
+        n_plans = max(len(off), len(on))
+        n_diff = sum(
+            i >= len(off) or i >= len(on) or off[i] != on[i]
+            for i in range(n_plans)
+        )
+        raise RuntimeError(
+            f"DIVERGENCE: window changed {n_diff} of {n_plans} plans; timing is invalid"
+        )
+    return elapsed
+
+
 _BARRIER = None
 
 
@@ -110,8 +131,9 @@ def _child(job):
     # that ran with the fan-out most fully in flight, which is the regime being measured.
     out = {name: float("inf") for name in arms}
     for _ in range(args.passes):
-        for name, p in arms.items():
-            out[name] = min(out[name], _pass(p, requests, ledger, cfg)[0])
+        elapsed = _paired_pass(arms, requests, ledger, cfg)
+        for name, duration in elapsed.items():
+            out[name] = min(out[name], duration)
     return out
 
 

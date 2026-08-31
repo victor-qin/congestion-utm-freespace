@@ -533,6 +533,7 @@ def test_execution_config_is_validated_before_ledger_takeover():
         "incremental_release": (0, 1, "true"),
         "unimpeded_workers": (0, -1, True, 1.5, "1"),
         "worker_kernel_log2": (-1, True, 1.5, "1"),
+        "window_bytes": (-1, True, 1.5, "1"),
         "time_limit_s": (-1.0, -float("inf"), float("nan"), True, "1"),
         "verify_every": (-1, True, 1.5, "1"),
         "log_every": (-1, True, 1.5, "1"),
@@ -568,13 +569,15 @@ def test_lns_config_normalizes_compatible_numpy_scalars():
         incremental_release=np.bool_(False),
         unimpeded_workers=np.int64(2),
         worker_kernel_log2=np.int64(0),
+        window_bytes=np.int64(2048),
         time_limit_s=np.float32(10.0),
         verify_every=np.int64(1),
         log_every=np.int64(0),
     ))
     for name in (
         "seed", "max_iterations", "neighborhood_size", "search_workers", "max_walks",
-        "map_max_cells", "unimpeded_workers", "worker_kernel_log2", "verify_every", "log_every",
+        "map_max_cells", "unimpeded_workers", "worker_kernel_log2", "window_bytes",
+        "verify_every", "log_every",
     ):
         assert type(getattr(normalized, name)) is int
     for name in ("gamma", "accept_epsilon", "time_limit_s"):
@@ -590,17 +593,11 @@ def test_lns_config_normalizes_compatible_numpy_scalars():
     assert unlimited.accept_epsilon == unlimited.time_limit_s == float("inf")
 
 
-def test_lns_config_preserves_the_legacy_positional_tail():
+def test_lns_config_is_keyword_only():
     from freespace_sim.planner.lns import LNSConfig
 
-    config = LNSConfig(
-        7, 11, 4, ("random",), False, 0.25, 0.5, "random", 3, 99,
-        frozenset({1}), frozenset({"uss-a"}), False, 2, 12.5, 3, 4,
-    )
-    assert (config.time_limit_s, config.verify_every, config.log_every) == (12.5, 3, 4)
-    assert (config.search_workers, config.parallel_mode, config.worker_kernel_log2) == (
-        1, "drop", None,
-    )
+    with pytest.raises(TypeError, match="positional"):
+        LNSConfig(7)
 
 
 def test_auc_integrates_the_full_step_trajectory():

@@ -51,9 +51,8 @@ from ...volumes import (
 )
 from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
-from .compiled_hex_occupancy import ground_delay_steps, hover_tail_steps, search_horizon
 from . import window as W
-from .compiled_hex_occupancy import hover_tail_steps, search_horizon
+from .compiled_hex_occupancy import ground_delay_steps, hover_tail_steps, search_horizon
 from .occupancy import HexOccupancyService
 from ..terminal_capacity import TerminalCapacity
 

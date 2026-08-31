@@ -81,6 +81,19 @@ def _clkey(intent):
             for p, t in (intent.centerline or [])]
 
 
+def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
+    from analysis import ab_dense_window as ab
+
+    results = iter([
+        (1.0, [("same", 11)]),
+        (0.5, [("different", 11)]),
+    ])
+    monkeypatch.setattr(ab, "_pass", lambda *_args: next(results))
+
+    with pytest.raises(RuntimeError, match=r"DIVERGENCE: window changed 1 of 1 plans"):
+        ab._paired_pass({"off": object(), "on": object()}, (), None, None)
+
+
 def _assert_window_exact(reqs, commits, cfg=CFG, statics=(), window_bytes=_ON, expect_window=True):
     """Plan every request twice against identically-built ledgers — window off, then on — and assert
     the two runs are indistinguishable: same accept/deny, same cost, same centerline, and the same

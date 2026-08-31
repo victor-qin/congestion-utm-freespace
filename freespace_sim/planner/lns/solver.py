@@ -37,7 +37,7 @@ from freespace_sim.types import OperationalIntent
 log = logging.getLogger("freespace_sim.lns")
 
 
-@dataclass
+@dataclass(kw_only=True)
 class LNSConfig:
     seed: int = 0
     max_iterations: int = 2000           # non-negative task budget
@@ -220,7 +220,11 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         for name, minimum in integer_minima.items()
     }
     optional_integers = {}
-    for name, minimum in {"unimpeded_workers": 1, "worker_kernel_log2": 0}.items():
+    for name, minimum in {
+        "unimpeded_workers": 1,
+        "worker_kernel_log2": 0,
+        "window_bytes": 0,
+    }.items():
         value = getattr(lns, name)
         optional_integers[name] = (
             None if value is None

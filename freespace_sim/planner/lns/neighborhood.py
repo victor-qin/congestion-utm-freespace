@@ -135,12 +135,21 @@ def _random_walk(ctx: DestroyContext, fid: int, collected: set[int], n_target: i
 
 
 def agent_based_neighborhood(
-    ctx: DestroyContext, n: int, tabu: set[int], max_walks: int = 10
+    ctx: DestroyContext, n: int, tabu: set[int], max_walks: int = 10,
+    seed_fid: int | None = None,
 ) -> set[int]:
     """Algorithm 1: seed with the most delayed non-tabu flight, then random-walk
     from members of the growing set until ``n`` flights are collected (or
-    ``max_walks`` walks came up dry)."""
-    seed = _select_most_delayed(ctx, tabu)
+    ``max_walks`` walks came up dry).
+
+    ``seed_fid`` lets a PARALLEL coordinator own the seed choice. ``tabu`` is a serial
+    recurrence — ``_select_most_delayed`` mutates it — so m workers each holding their own copy
+    would every one of them pick the same most-delayed flight, and the pool would run m copies of
+    a single neighborhood while looking perfectly healthy. The coordinator instead advances one
+    tabu across its slots and passes the result down. ``_select_most_delayed`` is untouched, so
+    the selection and its reset semantics still have exactly one implementation.
+    """
+    seed = _select_most_delayed(ctx, tabu) if seed_fid is None else seed_fid
     if seed is None:
         return set()
     neighborhood = {seed}

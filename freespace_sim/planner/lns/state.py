@@ -17,18 +17,18 @@ context/lns_plan.md):
 * The repair planner runs with ``evict_floor = 0.0`` (the Track A out-of-order
   dispatch knob), so the eviction watermark never advances and victims can be
   replanned in ANY priority order — random PP orderings stay exact.
-* On reject/failure/exception the new plans are tombstoned and the old volumes re-committed
-  verbatim, one ``commit`` per flight (``_absorb`` needs each flight's volumes contiguous)
-  — see ``_rewind``. It runs on EVERY exit from the destroyed state, including an
-  exception thrown mid-repair: the ledger is the run's only copy of the schedule, so a
-  transaction that unwinds without it loses flights outright.
+* On reject/failure/exception—or a worker's report-only success—the new plans are tombstoned
+  and the old volumes re-committed verbatim, one ``commit`` per flight (``_absorb`` needs each
+  flight's volumes contiguous)—see ``_rewind``. It runs on EVERY non-adopting exit from the
+  destroyed state: the ledger is the run's only copy of the schedule, so a transaction that
+  unwinds without it loses flights outright.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -102,6 +102,15 @@ class RepairOutcome:
     cost_old: float
     cost_new: float  # inf when the repair never produced a complete candidate
     n_planned: int
+    # The repaired schedule, populated ONLY on the accept return: a parallel worker has to hand
+    # these back to the coordinator, which owns the incumbent. The reject path (79% of iterations)
+    # must stay free, so nothing is built for it.
+    new_intents: dict[int, OperationalIntent] = field(default_factory=dict)
+    # One `AStarPlanner.last_envelope` per repaired flight, in repair order, when the planner was
+    # built with `record_envelope`. Entries may be None (the planner resets it per plan and only
+    # `_mk_envelope` sets it, so a host-side early denial leaves it unset) — a consumer must treat
+    # None as "read set unknown", i.e. always dirty.
+    envelopes: tuple = ()
 
     @property
     def improvement(self) -> float:
@@ -125,6 +134,8 @@ class LNSState:
         incremental_release: bool = True,
         # Safe for direct construction too: None is an explicit opt-in to automatic multiprocessing.
         unimpeded_workers: int | None = 1,
+        unimpeded_cost: dict[int, float | None] | None = None,
+        maintain_claim_index: bool = True,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger
@@ -219,10 +230,25 @@ class LNSState:
         # Kept so the solver's verify replays the SAME world the unimpeded baseline was measured in —
         # one owner for "which walls is this run about", not two that can drift apart.
         self.static_terms = tuple(static_terms)
-        rows = unimpeded_costs(
-            cfg, self.static_terms, [self.incumbent[fid].request for fid in self._movable],
-            n_workers=resolve_workers(unimpeded_workers),
-        )
+        if unimpeded_cost is not None:
+            # Injected by a parallel replica: the ruler is a pure function of
+            # (request, cfg, static_terms), so it is computed ONCE by the coordinator and broadcast
+            # rather than re-planned per worker — which would also have each worker stand up a ruler
+            # pool of its own. `None` still means "denied" and falls through to the SAME fan-out
+            # below, so the injected and computed paths cannot disagree about `delay()`.
+            missing = [f for f in self._movable if f not in unimpeded_cost]
+            if missing:
+                # Silent otherwise: `delay()` would KeyError mid-walk, potentially an hour in.
+                raise ValueError(
+                    f"unimpeded_cost is missing {len(missing)} movable flight(s) (first: "
+                    f"{missing[:5]}) — it must cover every movable id, and the caller's movable "
+                    f"rule must match this state's (accepted, not frozen, uss-filtered)")
+            rows = [(fid, unimpeded_cost[fid], "upstream ruler") for fid in self._movable]
+        else:
+            rows = unimpeded_costs(
+                cfg, self.static_terms, [self.incumbent[fid].request for fid in self._movable],
+                n_workers=resolve_workers(unimpeded_workers),
+            )
         for fid, cost, denial in rows:
             if cost is not None:
                 self._unimp_cost[fid] = cost
@@ -245,7 +271,75 @@ class LNSState:
         self._contended: set[Cell] = set()
         self._contended_list: list[Cell] | None = None
         self._visits: dict[int, list[tuple[int, Cell]]] = {}
+        self._maintain_claim_index = maintain_claim_index
         self._rebuild_claim_index()
+
+    # ------------------------------------------------------------------ parallel replica
+    @classmethod
+    def replica(
+        cls,
+        cfg: SimConfig,
+        intents: list[OperationalIntent],
+        *,
+        static_terms: tuple,
+        unimpeded_cost: dict[int, float | None],
+        turnaround_s: float | None = None,
+        frozen_flight_ids: frozenset[int] = frozenset(),
+        movable_uss_ids: frozenset[str] | None = None,
+        incremental_release: bool = True,
+        kernel_log2_min: int | None = None,
+        record_envelope: bool = True,
+    ) -> "LNSState":
+        """A private copy of the incumbent for a parallel worker: own ledger, own planner.
+
+        The ledger is rebuilt by committing the intents' own ``Volume4D`` objects (the recipe
+        ``verify.find_interflight_conflict`` and ``parallel._worker_main`` both use), which also
+        keeps the constructor's object-identity schedule check happy.
+
+        **Every keyword here changes what a repair is ALLOWED to do**, so each must be forwarded
+        or the worker silently runs a different algorithm than the coordinator believes it does:
+
+        * ``turnaround_s`` builds ``_return_anchor``; without it ``try_repair``'s anchor guard is
+          disarmed, so a repair may re-time an outbound past its return's departure — and
+          ``verify.find_interflight_conflict`` checks 4D conflicts ONLY, so the run would still
+          report ``verified``.
+        * ``frozen_flight_ids`` / ``movable_uss_ids`` derive ``_movable``; without them the worker
+          treats every accepted flight as movable, the destroy operators may select frozen
+          flights, and ``try_repair``'s membership assert passes because it tests the worker's own
+          (wrong) set.
+        * ``incremental_release`` is the rebuild-path byte-parity reference (``--no-incremental``);
+          hardcoding it would make that A/B inexpressible under parallelism.
+
+        ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
+        SYNC skips that bookkeeping, and effective widths below two stay in-process.
+        ``unimpeded_workers=1`` is pinned because
+        this constructor runs INSIDE a search worker — the ruler's own pool would otherwise fan out
+        to m x m processes.
+        """
+        led = ReservationLedger(cfg)
+        for center, term in static_terms:
+            led.register_static_terminal(center, term)
+        for it in intents:
+            if it.accepted and it.volumes:
+                led.commit(it.request.flight_id, it.volumes)
+        planner = AStarPlanner(incremental_release=incremental_release,
+                               kernel_log2_min=kernel_log2_min)
+        planner.evict_floor = 0.0        # random/premium repair orders need the full-horizon occupancy
+        planner.record_envelope = record_envelope
+        return cls(
+            cfg, led, intents,
+            static_terms=static_terms,
+            frozen_flight_ids=frozen_flight_ids,
+            movable_uss_ids=movable_uss_ids,
+            turnaround_s=turnaround_s,
+            repair_planner=planner,
+            incremental_release=incremental_release,
+            unimpeded_cost=unimpeded_cost,
+            unimpeded_workers=1,   # NO NESTED POOLS: this runs INSIDE a search worker, and the
+            #                        ruler's own default (min(8, cpu-2)) would fan out again to
+            #                        m x m processes. Belt and braces — `unimpeded_cost` is
+            #                        supplied, so the ruler never runs at all.
+        )
 
     # ------------------------------------------------------------------ claim index
     def _rebuild_claim_index(self) -> None:
@@ -255,6 +349,8 @@ class LNSState:
         self._contended.clear()
         self._contended_list = None
         self._visits.clear()
+        if not self._maintain_claim_index:
+            return
         for fid in self._movable:
             self._index_add(fid, self.incumbent[fid].volumes, refresh=False)
         for cell in self._claims:  # one contention sweep instead of a refresh per row
@@ -394,11 +490,15 @@ class LNSState:
         rng: np.random.Generator,
         accept_epsilon: float = 0.0,
         order_mode: str = "premium",
+        *,
+        report_only: bool = False,
     ) -> RepairOutcome:
         """Release and PP-repair victims; accept only a strict weighted-cost improvement.
 
         ``premium`` repairs the most-delayed first with random ties; ``random`` retains the paper's
-        order for A/B comparisons. See ``context/lns_plan.md`` §4.
+        order for A/B comparisons. ``report_only`` returns an accepted candidate but restores the
+        incumbent ledger without adopting it; parallel workers use this because only the coordinator
+        may commit a result. See ``context/lns_plan.md`` §4.
         """
         victims = sorted(victims)
         assert all(f in self._movable_set for f in victims)
@@ -421,6 +521,12 @@ class LNSState:
         reason = "improved"
         cost_at_entry = self.total_cost
         applied: list[int] = []   # fids whose accept-side in-memory rewrite has started
+        # Read set per repaired flight, in repair order, for a parallel coordinator's staleness
+        # test. Only collected when the planner was asked to record it, so the sequential path
+        # builds nothing; `record_envelope` off leaves `last_envelope` None for every plan anyway.
+        rec_env = bool(getattr(self.repair_planner, "record_envelope", False))
+        envelopes: list = []
+        candidate: RepairOutcome | None = None
         # EVERYTHING that can leave the schedule half-destroyed lives inside this block — the destroy
         # itself included. `release_many` tombstones every victim volume BEFORE it notifies removal
         # subscribers, and each of those hooks can raise, so a destroy that dies part-way is exactly
@@ -434,6 +540,8 @@ class LNSState:
                     break
                 self.ledger.commit(fid, it.volumes)
                 new[fid] = it
+                if rec_env:
+                    envelopes.append(self.repair_planner.last_envelope)
 
             if reason == "improved" and self._turnaround_s is not None:
                 for fid, it in new.items():
@@ -447,21 +555,25 @@ class LNSState:
 
             cost_new = float(sum(it.cost for it in new.values())) if reason == "improved" else math.inf
             if reason == "improved" and cost_new < cost_old - accept_epsilon:
-                # Inside the try as well: this rewrites the incumbent, the running cost and the claim
-                # index, so a raise part-way (rasterize, MemoryError, a second SIGINT) would otherwise
-                # leave them describing a schedule the ledger does not hold, with `old` already gone.
-                for fid, it in new.items():
-                    applied.append(fid)
-                    self.total_cost += float(it.cost) - float(self.incumbent[fid].cost)
-                    self.incumbent[fid] = it
-                    self._index_remove(fid)
-                    self._index_add(fid, it.volumes)
-                    self._visits.pop(fid, None)
-                return RepairOutcome(True, "improved", cost_old, cost_new, len(new))
+                candidate = RepairOutcome(
+                    True, "improved", cost_old, cost_new, len(new),
+                    new_intents=dict(new), envelopes=tuple(envelopes),
+                )
+                if not report_only:
+                    # Inside the try as well: this rewrites the incumbent, running cost, and claim
+                    # index, so a raise part-way would otherwise leave them describing a schedule
+                    # the ledger does not hold. LEDGER-FREE: the loop already committed the plans.
+                    self._apply_in_memory(new, applied)
+                    return candidate
         except BaseException:
             self._rewind(victims, old, cost_at_entry, applied)
             raise
 
+        if candidate is not None:
+            # Leave in-memory state (including claim/visit indexes) untouched. Restore once outside
+            # the exception handler so a failed restore cannot trigger a second rewind and mask it.
+            self._rewind(victims, old, cost_at_entry)
+            return candidate
         if reason == "improved":
             reason = "no_improvement"
         self._rewind(victims, old, cost_at_entry)
@@ -493,6 +605,54 @@ class LNSState:
             raise RuntimeError(
                 f"LNS restore could not re-commit flight(s) {fids} — the ledger no longer holds the "
                 f"incumbent schedule for them") from failures[0][1]
+
+    # ------------------------------------------------------------------ incumbent moves
+    def _apply_in_memory(self, changes: dict[int, OperationalIntent], applied: list[int]) -> None:
+        """Move the incumbent, the running cost and the claim index onto ``changes``.
+
+        Assumes the LEDGER already holds them — true straight out of the repair loop, which
+        commits as it plans. ``applied`` is filled as it goes so a caller's rollback knows exactly
+        which fids had been rewritten when a raise landed part-way.
+        """
+        for fid, it in changes.items():
+            applied.append(fid)
+            self.total_cost += float(it.cost) - float(self.incumbent[fid].cost)
+            self.incumbent[fid] = it
+            if self._maintain_claim_index:
+                self._index_remove(fid)
+                self._index_add(fid, it.volumes)
+                self._visits.pop(fid, None)
+
+    def apply_delta(self, changes: dict[int, OperationalIntent]) -> None:
+        """Adopt someone else's accepted repair: move the LEDGER **and** the in-memory views.
+
+        The replica-sync counterpart of ``try_repair``'s accept branch. The difference is the
+        ledger: ``try_repair`` has already committed its own plans and only the in-memory views
+        are behind, while a worker told "the incumbent moved" still holds the old volumes and must
+        release them first. O(the changed flights), not O(the schedule) — which is what makes a
+        parallel worker's "take a private copy of P_min" affordable at all.
+
+        One ``commit`` per flight, because ``_absorb`` groups a flight's volumes by adjacent runs
+        and needs them contiguous. Any failure rewinds the whole delta before propagating.
+        """
+        # The CALLER's order, not sorted. `changes` comes out of a repair in PP priority order, and
+        # replaying it in that order lands the ledger's `_vols`/`_fids` in the same layout an
+        # in-process repair would have produced. Deterministic either way: every producer of this
+        # dict builds it from a seeded order.
+        fids = list(changes)
+        if not fids:
+            return
+        old = {f: self.incumbent[f] for f in fids}
+        cost_at_entry = self.total_cost
+        applied: list[int] = []
+        try:
+            self.ledger.release_many(fids)
+            for fid in fids:
+                self.ledger.commit(fid, changes[fid].volumes)
+            self._apply_in_memory(changes, applied)
+        except BaseException:
+            self._rewind(fids, old, cost_at_entry, applied)
+            raise
 
     # ---------------------------------------------------------------------- readout
     def final_intents(self) -> list[OperationalIntent]:

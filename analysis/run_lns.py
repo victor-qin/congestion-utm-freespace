@@ -50,6 +50,18 @@ def main() -> None:
                          "1 = in-process)")
     ap.add_argument("--repair-order", default="premium", choices=["premium", "random"],
                     help="PP priority order: premium = most-delayed first (default), random = paper's")
+    ap.add_argument("--search-workers", type=int, default=1, metavar="N",
+                    help="worker PROCESSES for the destroy/repair loop (DROP-LNS; default 1 = the "
+                         "in-process loop). Each worker holds a full private replica of the "
+                         "schedule, so memory is LINEAR in N. Distinct from the state build's own "
+                         "parallelism. The win INVERTS with scale: on FULL density_faa m=8 reaches "
+                         "the sequential schedule in 1.91x less wall, but on the 120 s cut m=4 is "
+                         "break-even and m=8 LOSES -- see context/lns_plan.md")
+    ap.add_argument("--parallel-mode", default="drop", choices=["sync", "drop"],
+                    help="sync: barrier per round, best of N applied -- DETERMINISTIC, and at "
+                         "--search-workers 1 byte-identical to the sequential loop. drop: "
+                         "asynchronous, every clean result merged -- faster, NOT reproducible "
+                         "(completion order is wall clock)")
     ap.add_argument("--out", default=None, help="JSON output path")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")  # surface lns progress
@@ -97,6 +109,8 @@ def main() -> None:
         incremental_release=not args.no_incremental,
         unimpeded_workers=args.unimpeded_workers,
         repair_order=args.repair_order,
+        search_workers=args.search_workers,
+        parallel_mode=args.parallel_mode,
         time_limit_s=args.time_limit,
         verify_every=args.verify_every,
         log_every=args.log_every,
@@ -111,6 +125,18 @@ def main() -> None:
           f"{s['n_accepted']}/{s['n_iterations']} accepted, verified={s['verified']}, "
           f"wall {s['wall_s']:.0f}s (init {s['init_wall_s']:.0f}s)", flush=True)
     print(f"weights: { {k: round(v, 3) for k, v in s['weights'].items()} }")
+    if s["parallel_mode"] != "sequential":
+        st = s["parallel_stats"]
+        requested_note = (
+            "" if s["search_workers"] == args.search_workers
+            else f", {args.search_workers} requested"
+        )
+        print(f"parallel[{s['parallel_mode']} x{s['search_workers']}{requested_note}]: spawn "
+              f"{s['pool_spawn_s']:.1f}s, accept {st.get('accept_rate', 0):.1%}, "
+              f"clean-merge {st.get('n_clean_merge', 0)}, dirty {st.get('n_dirty', 0)} "
+              f"(rate {st.get('dirty_rate', 0):.1%}), overwrite {st.get('n_overwrite', 0)}, "
+              f"discarded-stale {st.get('n_stale_victims', 0) + st.get('n_stale_cost', 0)}, "
+              f"not-selected {st.get('n_not_selected', 0)}")
 
     # anytime readout: incumbent cost at fractions of the iteration budget
     if out.trajectory:

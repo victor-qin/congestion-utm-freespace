@@ -148,6 +148,21 @@ class ReservationLedger:
         incremental hex-occupancy service to absorb new volumes without rebuilding from scratch."""
         self._observers.append(callback)
 
+    @staticmethod
+    def _unsubscribe(callbacks: list, callback) -> None:
+        """Remove every registration equal to ``callback`` without disturbing other subscribers.
+
+        Subscriber teardown is intentionally idempotent: a component may fail after appending its
+        callback but before finishing initialization, and rollback cannot safely infer which append
+        was the last successful operation. Bound methods compare by instance + function, so asking
+        for ``service.on_commit`` again removes the callback object registered earlier.
+        """
+        callbacks[:] = [registered for registered in callbacks if registered != callback]
+
+    def unsubscribe(self, callback) -> None:
+        """Idempotently remove a commit subscriber registered by :meth:`subscribe`."""
+        self._unsubscribe(self._observers, callback)
+
     def subscribe_release(self, callback) -> None:
         """Register ``callback(flight_id, volumes)``, fired by ``release_many`` for each removed
         flight — the removal analogue of ``subscribe``. Services that track per-owner rows use it
@@ -156,6 +171,10 @@ class ReservationLedger:
         predates this hook and delegates to ``release_many`` whenever such a subscriber exists — its
         own rebuild re-feeds commit observers volume-by-volume, which would desync per-owner rows."""
         self._release_subs.append(callback)
+
+    def unsubscribe_release(self, callback) -> None:
+        """Idempotently remove a release subscriber registered by :meth:`subscribe_release`."""
+        self._unsubscribe(self._release_subs, callback)
 
     def register_static_terminal(self, center, term) -> None:
         """File a hub's always-active terminal airspace as a PERMANENT ledger volume (whole horizon), so
@@ -180,6 +199,10 @@ class ReservationLedger:
         self._static_subs.append(callback)
         for center, term in self._static_terms:
             callback(center, term)
+
+    def unsubscribe_static(self, callback) -> None:
+        """Idempotently remove a static subscriber registered by :meth:`subscribe_static`."""
+        self._unsubscribe(self._static_subs, callback)
 
     # ----- internals -----
     def _steps(self, vol: Volume4D) -> range:

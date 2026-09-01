@@ -177,50 +177,6 @@ def test_incremental_release_compiled_matches_fresh_absorb():
     assert occ.n_added == fresh.n_added == 1
 
 
-def test_incremental_release_compiled_treats_identical_spans_as_a_multiset():
-    """The claim need not repeat its owner: equal spans are fungible, but their multiplicity is not."""
-    from freespace_sim.planner import hexgrid as hg
-    from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
-
-    wall = _wall()
-    occ = CompiledHexOccupancy(CFG, track_removal=True)
-    occ.on_commit(1, [wall])
-    occ.on_commit(2, [wall])
-    q, r, level, s_lo, _s_hi, _in_blk = next(
-        row for row in hg.rasterize_ranges(
-            wall, CFG, occ.R, occ.infl_blocked, occ.infl_pad
-        ) if row[-1]
-    )
-    step = max(0, s_lo)                                  # pools seed their query horizon at step 0
-    assert occ.blocked_py(q, r, level, step)
-
-    occ.on_release(1, [wall])
-    assert occ.blocked_py(q, r, level, step)          # the equal claim from flight 2 survives
-    occ.on_release(2, [wall])
-    assert not occ.blocked_py(q, r, level, step)
-    assert occ.n_added == 0
-
-
-def test_pool_reset_cell_reclaims_overflow_slots():
-    """`reset_cell` is called on the same hot cells every LNS iteration. Abandoning the old chain's
-    slots is harmless per call but unbounded per run: `_alloc` only bumps, so the pool would grow
-    (and `_grow` would double the array) for a working set that never grows."""
-    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
-
-    pool = _Pool(8, 1000)
-    base = pool.nslots
-    for _ in range(500):
-        pool.block_range(3, 100, 200)          # splits [0,1000] -> allocates an overflow slot
-        pool.block_range(3, 400, 500)          # splits the tail -> a second one
-        pool.reset_cell(3)
-        pool.block_range(3, 100, 200)          # what on_release does: re-seed, re-apply survivors
-        pool.reset_cell(3)
-    assert pool.nslots <= base + 4             # reused, not leaked (was base + 1500)
-    pool.block_range(3, 100, 200)              # and recycled slots still answer correctly
-    assert pool.blocked_at(3, 150)
-    assert not pool.blocked_at(3, 99) and not pool.blocked_at(3, 300)
-
-
 def _tcap(track_removal=True):
     from freespace_sim.planner.terminal_capacity import TerminalCapacity
 
@@ -1169,6 +1125,17 @@ def test_operator_validation_precedes_the_ledger_takeover():
         assert led._observers and led.epoch == 0      # ledger untouched by the rejected call
 
 
+def test_direct_lns_state_builds_its_planner_before_ledger_takeover():
+    """Direct construction has the same no-side-effects-on-constructor-error contract as run_lns."""
+    led = ReservationLedger(CFG)
+    led.subscribe(lambda fid, vols: None)
+
+    with pytest.raises(ValueError, match="window_bytes"):
+        LNSState(CFG, led, [], window_bytes=0)
+
+    assert led._observers and led.epoch == 0
+
+
 def test_run_lns_on_result_refuses_a_result_without_an_anchor_mode():
     """'nominal' is the value that DISARMS the paired-return guard, so defaulting to it on a result
     type that does not carry the field is the unsafe direction."""
@@ -1223,27 +1190,42 @@ def test_sim_run_records_the_anchor_mode_it_flew():
     assert run(cfg, return_anchor="realized").return_anchor == "realized"
 
 
-def test_pool_reset_clears_the_free_list():
-    """`reset()` restarts the bump allocator at NC, invalidating every previously-freed slot id.
-    Keeping them hands the same slot out twice — once from the free list, again as nslots climbs past
-    it — aliasing two cells' interval chains and silently corrupting blocked_at."""
-    from freespace_sim.planner.astar._packed import P_NXT
-    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
 
-    pool = _Pool(8, 1000)
-    pool.block_range(3, 100, 200)
-    pool.reset_cell(3)
-    assert pool._free                              # a slot really was reclaimed
 
-    pool.reset()
-    assert not pool._free and pool.nslots == pool.NC
+def test_reference_fallback_does_not_trigger_a_shrink_rebuild():
+    """`enable_blocked` replays the whole ledger through `add_volume` to re-derive `blocked`. That is
+    a re-derive, not an absorb — but `n_added` used to be incremented inside `add_volume`, so the
+    replay doubled it (measured 852,570 against a 426,285-volume ledger). From then on
+    `ledger.n_volumes < svc.n_added` held forever, so the NEXT plan took the shrink branch and
+    re-absorbed the entire schedule: 9.98 s of an 88 s LNS loop.
 
-    for c in range(pool.NC):                       # each split allocates one overflow slot
-        pool.block_range(c, 100, 200)
-    seen = set()
-    for c in range(pool.NC):
-        slot = int(pool.iv[c, P_NXT])
-        while slot != -1:
-            assert slot not in seen, f"slot {slot} aliased between two cell chains"
-            seen.add(slot)
-            slot = int(pool.iv[slot, P_NXT])
+    It was invisible because `run_lns` filters the "ReservationLedger shrank" warning (a genuine
+    non-incremental release would raise it every iteration), which is why the guard here is the
+    counter rather than `pytest.warns`.
+
+    The reference dispatch is forced directly rather than by contriving a fallback, because which of
+    the six routes reaches `_plan_reference` is irrelevant to the invariant: after ANY of them,
+    `n_added` must still equal the ledger."""
+    from freespace_sim.planner.astar import AStarPlanner
+
+    res = run(SimConfig(planner="astar", flight_levels_m=(75.0,), airspace_ceiling_m=125.0,
+                        lam_per_hour=700.0, horizon_s=360.0, region_size_m=(3000.0, 3000.0),
+                        seed=1, max_ground_delay_s=300.0))
+    led = ReservationLedger(res.config)
+    for it in res.intents:
+        if it.accepted and it.volumes:
+            led.commit(it.request.flight_id, it.volumes)
+
+    p = AStarPlanner(incremental_release=True)
+    movable = [it for it in res.intents if it.accepted and it.volumes]
+    p.plan(movable[0].request, led, res.config)              # bind + absorb
+    assert p._svc.n_added == led.n_volumes, "absorb miscounted before any fallback"
+
+    p._plan_reference(movable[1].request, led, res.config)   # arms `enable_blocked`
+    assert p._svc._blocked_live, "the fallback did not arm the blocked map"
+    assert p._svc.n_added == led.n_volumes, (
+        f"`enable_blocked` counted its re-derive as an absorb: {p._svc.n_added} vs "
+        f"{led.n_volumes} committed volumes")
+
+    p.plan(movable[2].request, led, res.config)              # the plan that used to rebuild
+    assert p.n_shrink_rebuilds == 0, "a spurious shrink rebuild fired after a reference fallback"

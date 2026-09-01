@@ -136,6 +136,7 @@ class LNSState:
         unimpeded_workers: int | None = 1,
         unimpeded_cost: dict[int, float | None] | None = None,
         maintain_claim_index: bool = True,
+        window_bytes: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger
@@ -194,6 +195,13 @@ class LNSState:
                 raise ValueError("repair_planner.evict_floor must be 0.0 — random/premium repair orders "
                                  "need the full-horizon occupancy, and the floor is the caller's to set "
                                  "(on the inner planner, for a wrapper)")
+        else:
+            # Construct before taking ownership of the caller's ledger. `run_lns` validates its
+            # config first, but LNSState is also directly constructible; an invalid window budget or
+            # a guarded JIT failure must not strip observers before the planner constructor reports it.
+            kw = {} if window_bytes is None else {"window_bytes": window_bytes}
+            repair_planner = AStarPlanner(incremental_release=incremental_release, **kw)
+            repair_planner.evict_floor = 0.0
 
         # LNS takes ownership of the ledger: the FCFS run's planner services stay subscribed
         # otherwise, silently absorbing (and retaining the memory of) every repair commit. The epoch
@@ -206,9 +214,6 @@ class LNSState:
         # rebuild (measured 94% of iteration wall) never happens. False keeps the rebuild path
         # (the byte-parity reference for A/Bs).
         self.repair_planner = repair_planner
-        if self.repair_planner is None:
-            self.repair_planner = AStarPlanner(incremental_release=incremental_release)
-            self.repair_planner.evict_floor = 0.0
 
         # Paired-return anchor guard (only when the baseline ran return_anchor="realized"):
         # outbound fid -> the committed return's desired departure. We never re-time returns, so
@@ -289,6 +294,7 @@ class LNSState:
         incremental_release: bool = True,
         kernel_log2_min: int | None = None,
         record_envelope: bool = True,
+        window_bytes: int | None = None,
     ) -> "LNSState":
         """A private copy of the incumbent for a parallel worker: own ledger, own planner.
 
@@ -309,6 +315,8 @@ class LNSState:
           (wrong) set.
         * ``incremental_release`` is the rebuild-path byte-parity reference (``--no-incremental``);
           hardcoding it would make that A/B inexpressible under parallelism.
+        * ``window_bytes`` controls per-planner bitmap allocation and fallback frequency, so a worker
+          that did not receive it would use a different resource policy from the coordinator.
 
         ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
         SYNC skips that bookkeeping, and effective widths below two stay in-process.
@@ -323,7 +331,8 @@ class LNSState:
             if it.accepted and it.volumes:
                 led.commit(it.request.flight_id, it.volumes)
         planner = AStarPlanner(incremental_release=incremental_release,
-                               kernel_log2_min=kernel_log2_min)
+                               kernel_log2_min=kernel_log2_min,
+                               **({} if window_bytes is None else {"window_bytes": window_bytes}))
         planner.evict_floor = 0.0        # random/premium repair orders need the full-horizon occupancy
         planner.record_envelope = record_envelope
         return cls(
@@ -368,6 +377,9 @@ class LNSState:
         # where no conflict can exist.
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        # Resolved once per flight, and shared with the two occupancy services through the memo in
+        # `hg.column_hexes` — this index is the third consumer of the identical test.
+        own_hexes = hg.column_hexes(own_cols, self._R) if own_cols else None
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 continue  # capacity-gated own column, not a blocked cell
@@ -376,7 +388,7 @@ class LNSState:
             ):
                 if not in_blk:
                     continue
-                if own_cols and self._inside_own_column(q, r, own_cols):
+                if own_hexes is not None and (q, r) in own_hexes:
                     continue
                 cell = (q, r, level)
                 entries = self._claims.get(cell)
@@ -391,12 +403,6 @@ class LNSState:
                     rows.add(cell)
                     if refresh:
                         self._refresh_contention(cell)
-
-    def _inside_own_column(self, q: int, r: int, cols) -> bool:
-        """Same test as the occupancy services' ``_inside_a_column`` — hex centre inside any of the
-        flight's own terminal column discs."""
-        c = hg.hex_center(q, r, self._R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
     def _index_remove(self, fid: int) -> None:
         for cell in self._cells_of.pop(fid, ()):

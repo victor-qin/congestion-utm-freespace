@@ -10,11 +10,9 @@ normalizes the search bucket by node expansions:
 That separates the two things that grow with the committed-flight count N — which is exactly the
 "per-flight time rises as flights increase" symptom under investigation:
 
-  * ``ns_per_expansion``  — rises with compiled-occupancy FRAGMENTATION (``_cocc.corr.nslots``): the
-    kernel's ``_blocked`` walk traverses each hot cell's free-interval list from step 0, past every
-    historical fragment the (watermark-only) compiled eviction never reclaimed. This is the
-    *later-in-run* slowdown and it is FIXABLE (make the compiled pool reclaim like the reference
-    ``HexOccupancyService`` does).
+  * ``ns_per_expansion`` — search plus per-plan window-build work normalized by expansions. The
+    compiled kernel now reads one bitmap bit per occupancy probe; the durable schedule image is a
+    ``ClaimArena``, whose claim/slab/allocation telemetry is reported beside this number.
   * ``expansions/flight`` — rises with airspace DENSITY (more traffic ⇒ more reroutes). This is the
     *higher-density* slowdown and it is largely INHERENT deconfliction cost.
 
@@ -43,7 +41,6 @@ from time import perf_counter
 
 import freespace_sim.sim as sim_mod
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.planner.astar._packed import P_NXT
 from freespace_sim.planner.terminal_capacity import TerminalCapacity
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run
@@ -94,33 +91,14 @@ print(f"scenario={SCENARIO} smoke={SMOKE} lam_scale={LAM_SCALE} window={WINDOW}\
       flush=True)
 
 
-# ---- free-interval list-length sampler (read-only; the walk we actually pay in the kernel) ----
-def _list_stats(pool, max_heads: int = 20000):
-    """(max, mean, n_fragmented) list length over a stride-sample of cell heads. nslots-NC already
-    gives TOTAL splits for free; this exposes the WORST single-cell walk, which is what a query pays."""
-    iv, nc = pool.iv, pool.NC
-    stride = max(1, nc // max_heads)
-    mx = tot = frag = seen = 0
-    for c in range(0, nc, stride):
-        n, slot = 0, c
-        while slot != -1 and n <= 1_000_000:
-            n += 1
-            slot = int(iv[slot, P_NXT])
-        mx = max(mx, n)
-        tot += n
-        frag += n > 1
-        seen += 1
-    return mx, tot / max(1, seen), frag
-
-
 # ---- capture the planner and scope counters to its plan() call (not commit or verification) ----
 captured: list = []
 _orig_get = sim_mod.get_planner
 SCOPE = {"plan": 0, "tcap": 0}
 
 
-def _capturing_get(name):
-    planner = _orig_get(name)
+def _capturing_get(name, params=None):
+    planner = _orig_get(name, params)
     original_plan = planner.plan
 
     @wraps(original_plan)
@@ -215,17 +193,22 @@ def _emit_window(done, total):
     exp = W["exp"] / n
     ns_exp = (search_ms / exp * 1e6) if exp > 0 else float("nan")
     cocc = p._cocc
-    corr_nslot, nc = cocc.corr.nslots, cocc.corr.NC
-    mx, _mean_len, _frag = _list_stats(cocc.corr)
+    arena = cocc._arena
+    n_claims = arena.n_claims
+    n_slabs = int((arena.length > 0).sum())
+    max_slab = int(arena.length.max()) if arena.length.size else 0
+    arena_mb = arena.nbytes() / 1e6
     row = {"done": done, "total_ms": total_ms, "ac_ms": ac_ms, "ac_pct": ac_ms / total_ms * 100.0,
            "cc_ms": cc_ms, "ec_ms": ec_ms, "search_ms": search_ms, "exp": exp, "ns_exp": ns_exp,
-           "corr_nslot": corr_nslot, "frag_cell": (corr_nslot - nc) / nc, "maxlist": mx,
+           "n_claims": n_claims, "n_slabs": n_slabs, "max_slab": max_slab,
+           "arena_mb": arena_mb, "arena_garbage": int(arena.garbage[0]),
            "n_added": cocc.n_added}
     windows.append(row)
     print(f"[{done:>5}/{total}] tot={total_ms:7.1f}ms ac={ac_ms:5.2f}({row['ac_pct']:4.1f}%) "
           f"colclr={cc_ms:6.2f} exitclr={ec_ms:5.2f} srch={search_ms:7.1f} exp={exp:7.0f} "
-          f"ns/exp={ns_exp:8.1f} corr_nslot={corr_nslot:>8} frag/cell={row['frag_cell']:5.2f} "
-          f"maxlist={mx:>5} n_add={cocc.n_added:>7} acc={W['acc']} den={W['den']} {dict(reasons)}",
+          f"ns/exp={ns_exp:8.1f} claims={n_claims:>9} slabs={n_slabs:>7} "
+          f"maxslab={max_slab:>4} arena={arena_mb:6.1f}MB garbage={int(arena.garbage[0]):>8} "
+          f"n_add={cocc.n_added:>7} acc={W['acc']} den={W['den']} {dict(reasons)}",
           flush=True)
     prev["ac_t"], prev["cc_t"], prev["ec_t"] = AC["t"], CC["t"], EC["t"]
     _reset_window()
@@ -290,12 +273,16 @@ if len(windows) >= 2:
         return y / x if x else float("nan")
     print("first→last window (the N-scaling curve):", flush=True)
     print(f"  ns_per_expansion : {a['ns_exp']:.1f} → {b['ns_exp']:.1f}  (×{_r(a['ns_exp'], b['ns_exp']):.2f})"
-          f"   [fragmentation term — fixable]", flush=True)
+          f"   [search + bitmap-build term]", flush=True)
     print(f"  expansions/flight: {a['exp']:.0f} → {b['exp']:.0f}  (×{_r(a['exp'], b['exp']):.2f})"
           f"   [congestion term — inherent]", flush=True)
     print(f"  column_clear ms  : {a['cc_ms']:.1f} → {b['cc_ms']:.1f}  (×{_r(a['cc_ms'], b['cc_ms']):.2f})"
           f"   [terminal-capacity gate]", flush=True)
-    print(f"  corr_nslots      : {a['corr_nslot']} → {b['corr_nslot']}  (×{_r(a['corr_nslot'], b['corr_nslot']):.2f})"
-          f"   maxlist {a['maxlist']} → {b['maxlist']}", flush=True)
+    print(f"  arena claims     : {a['n_claims']} → {b['n_claims']}  "
+          f"(×{_r(a['n_claims'], b['n_claims']):.2f})"
+          f"   slabs {a['n_slabs']} → {b['n_slabs']}, max {a['max_slab']} → {b['max_slab']}",
+          flush=True)
+    print(f"  arena allocation : {a['arena_mb']:.1f} → {b['arena_mb']:.1f} MB  "
+          f"garbage {a['arena_garbage']} → {b['arena_garbage']}", flush=True)
     print(f"  total ms/flight  : {a['total_ms']:.1f} → {b['total_ms']:.1f}  (×{_r(a['total_ms'], b['total_ms']):.2f})",
           flush=True)

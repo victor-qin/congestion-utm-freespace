@@ -105,6 +105,9 @@ class WorkerSpec:
     incremental_release: bool
     kernel_log2_min: int | None
     record_envelope: bool = True
+    # Answer-neutral (see LNSConfig.window_bytes), but still shipped: it is per-planner state, so a
+    # worker left on the default would run a different cache configuration than the one measured.
+    window_bytes: int | None = None
 
 
 @dataclass
@@ -256,6 +259,7 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
             incremental_release=spec.incremental_release,
             kernel_log2_min=spec.kernel_log2_min,
             record_envelope=spec.record_envelope,
+            window_bytes=spec.window_bytes,
         )
     except BaseException:                                       # noqa: BLE001 - reported home
         import traceback
@@ -824,6 +828,7 @@ def run_lns_parallel(
         incremental_release=lns.incremental_release,
         kernel_log2_min=lns.worker_kernel_log2,
         record_envelope=lns.parallel_mode == "drop" and pool_workers > 1,
+        window_bytes=lns.window_bytes,
     )
 
     selector = AdaptiveSelector(tuple(lns.operators), lns.gamma)

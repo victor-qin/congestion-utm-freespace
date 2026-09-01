@@ -37,7 +37,7 @@ from freespace_sim.types import OperationalIntent
 log = logging.getLogger("freespace_sim.lns")
 
 
-@dataclass
+@dataclass(kw_only=True)
 class LNSConfig:
     seed: int = 0
     max_iterations: int = 2000           # non-negative task budget
@@ -67,6 +67,11 @@ class LNSConfig:
     worker_kernel_log2: int | None = None  # non-negative AStarPlanner.kernel_log2_min; oversized
     #                                        kernel arrays were measured to slow CONCURRENT plans
     #                                        ~1.75x at 8 workers while a lone worker matched serial
+    # Starting byte budget for the repair planner's per-plan dense occupancy window (`astar.window`);
+    # None keeps AStarPlanner's default. The final pool-less compiled path requires a positive value:
+    # the bitmap IS its occupancy image, and `compiled=False` is the reference/off switch. Oversized
+    # plans may grow the retained buffer up to the planner's bounded ceiling.
+    window_bytes: int | None = None
 
 
 @dataclass
@@ -212,7 +217,11 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         for name, minimum in integer_minima.items()
     }
     optional_integers = {}
-    for name, minimum in {"unimpeded_workers": 1, "worker_kernel_log2": 0}.items():
+    for name, minimum in {
+        "unimpeded_workers": 1,
+        "worker_kernel_log2": 0,
+        "window_bytes": 1,
+    }.items():
         value = getattr(lns, name)
         optional_integers[name] = (
             None if value is None
@@ -344,6 +353,7 @@ def _build_lns_state(
         incremental_release=lns.incremental_release,
         unimpeded_workers=lns.unimpeded_workers,
         maintain_claim_index=maintain_claim_index,
+        window_bytes=lns.window_bytes,
     )
 
 

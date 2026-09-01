@@ -50,13 +50,51 @@ from ...volumes import (
     terminal_radius,
 )
 from .. import hexgrid as hg
-from ._packed import G_GEN, GEN_STEP, GEN_WRAP, P_HI, P_LO, P_NXT, aligned_2d
-from .compiled_hex_occupancy import ground_delay_steps, hover_tail_steps, search_horizon
+from ._packed import G_GEN, GEN_STEP, GEN_WRAP, aligned_2d
+from . import window as W
+from .compiled_hex_occupancy import (
+    _FIELD_MASK,
+    _S0_SHIFT,
+    _SPAN_BITS,
+    ground_delay_steps,
+    hover_tail_steps,
+    search_horizon,
+)
 from .occupancy import HexOccupancyService
 from ..terminal_capacity import TerminalCapacity
 
 _EPS = 1e-6
 _BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
+
+# ---- per-plan dense occupancy window (`window`) defaults ----
+# 8 MB / margin 24, chosen from the plan-level coverage sweep rather than from the window's typical
+# size. What matters once the window is the ONLY occupancy answer is not the hit RATE but the share of
+# plans with zero misses, since one miss forces a widen-and-rerun: at margin 12 / 2 MB that share is
+# 58.3% (79% of probes), and at margin 24 / 8 MB it is 100.0% with no plan left without a window.
+# Peak observed 3.9 MB; the median is far smaller.
+_WINDOW_BYTES = 8 << 20
+# Hexes of slack around the origin/lane/goal bbox. A* explores an ellipse between the endpoints; this
+# covers the reroute fan around it. `probe_window_oracle.py` measured the SPEED question at 1.011x —
+# a window built from each plan's own recorded read set beats these bounds by only that — so this is
+# sized for COVERAGE, which is the property that matters once nothing else can answer a probe.
+#
+# 24, NOT a more generous guess. A wider margin does cut misses (45 -> 11 over a 774-plan LNS run at
+# density_faa), but `_build_window` multiplies it by `1 << widen`, so it also doubles the size of the
+# RETRY -- and a retry that exceeds `_WINDOW_BYTES` is not a slower window, it is a pure-Python
+# reference plan. At 32 one such plan cost 19.3 s of an 88 s loop. Measure this knob on a workload
+# that actually widens; at `scale == 1` a bigger margin looks free and is not.
+_WINDOW_MARGIN_HEX = 24
+# How far `_build_window` may widen when a plan probes outside its window. Each step doubles the
+# lateral margin and the step tail, so three steps is a 8x box in each axis — past the point where
+# the box clips to the global one, which is where the loop terminates anyway.
+_WINDOW_WIDEN_MAX = 3
+
+# How far `_build_window` may GROW its bitmap buffer past `window_bytes` when a box does not fit.
+# The buffer is allocated once per planner and held for the run, so sizing it for the worst plan
+# taxes every worker forever; growing on demand pays only where a plan needs it. 8x because each
+# widen level costs ~8x the bytes (it doubles q, r AND the step tail), so this covers exactly one
+# escalation past the budget — beyond that the plan takes the reference, as it did before.
+_WINDOW_GROW_MAX = 8
 
 
 class _RecordingOcc:
@@ -111,12 +149,52 @@ def _deny(req, reason):
     )
 
 
-def _absorb(svc, ledger):
-    """Feed already-committed reservations into the occupancy service grouped BY FLIGHT (volumes of one
-    flight are committed contiguously), so the per-flight own-column drop in ``on_commit`` applies to
-    pre-existing flights exactly as it does to live commits — not volume-by-volume."""
+def _absorb_many(services, ledger):
+    """Feed already-committed reservations into EVERY service in ONE pass, grouped BY FLIGHT (volumes
+    of one flight are committed contiguously — ``ledger.iter_committed`` guarantees this and points
+    back here), so the per-flight own-column drop in ``on_commit`` applies to pre-existing flights
+    exactly as it does to live commits — not volume-by-volume.
+
+    One pass, not one per service, because ``hexgrid.rasterize_ranges`` memoizes the geometry sweep by
+    ``id(vol)`` behind a 1024-entry LRU precisely so a commit's several occupancy consumers share it —
+    its own comment says the cap "must exceed the reuse WINDOW". Absorbing each service in its own
+    full pass makes that window the whole ledger (426,756 volumes at density_faa), so every consumer
+    after the first misses and re-sweeps. Interleaving restores the window to one flight: measured
+    24.0 s -> 20.9 s, with byte-identical state.
+
+    Each service still sees the same flights, whole, in the same order, and the services never read
+    each other — so this is an equivalence, not an approximation."""
     for _fid, grp in itertools.groupby(ledger.iter_committed(), key=lambda fv: fv[0]):
-        svc.on_commit(_fid, [v for _, v in grp])
+        vols = [v for _, v in grp]
+        for svc in services:
+            svc.on_commit(_fid, vols)
+
+
+def _absorb(svc, ledger):
+    """One service's absorb. Kept as the single-service spelling of :func:`_absorb_many` — the
+    reference plan path binds alone, and ``.context/perf`` probes plus ``prof_lns_loop`` import or
+    monkeypatch this name."""
+    _absorb_many((svc,), ledger)
+
+
+class _BindBatch:
+    """Collects the occupancy services bound during ONE ``plan()`` so they absorb in one pass.
+
+    ``after`` holds the steps that today run immediately after a service's own absorb — its
+    ``subscribe_static`` and its eviction. Deferring them together preserves each service's internal
+    order (absorb -> static -> evict); only the order BETWEEN services changes, which is safe for the
+    same reason the interleave is: no service reads another's state. Eviction in particular must stay
+    after absorb, because ``add_volume`` clamps ``s_lo`` against ``evicted_before`` as it writes."""
+
+    def __init__(self):
+        self.services: list = []
+        self.after: list = []
+
+    def run(self, ledger) -> None:
+        if self.services:
+            _absorb_many(self.services, ledger)
+        for fn in self.after:
+            fn()
 
 
 def _perimeter(center_xy, toward, radius, z):
@@ -210,10 +288,38 @@ def _warn_kernel_fallback() -> None:
 
 
 class AStarPlanner:
+
+    #: Subclasses that call ``HexOccupancyService.is_blocked`` themselves must set this. The compiled
+    #: A* path never does (it reads the dense window), which is why the map is off by default there —
+    #: but SIPP inherits ``_occupancy`` and DOES query it, and an unmaintained map raises rather than
+    #: answering stalely. False keeps the measured 1.052x for plain compiled A*.
+    needs_blocked_map: bool = False
+
     def __init__(self, max_expansions: int = 3_000_000, vertical_edges: bool = True,
                  compiled: bool = True, kernel_log2_min: int | None = None,
-                 incremental_release: bool = False):
+                 incremental_release: bool = False, window_bytes: int = _WINDOW_BYTES):
         self.max_expansions = max_expansions
+        # Starting byte budget for the compiled path's per-plan dense occupancy bitmap. The bitmap
+        # is the only dynamic occupancy answer in the kernel; oversized plans may grow its retained
+        # buffer up to the bounded ceiling, and unresolved misses dispatch to the exact reference.
+        self.window_bytes = int(window_bytes)
+        if compiled and self.window_bytes <= 0:
+            # There is nothing behind the window any more: the interval pools are gone, so a disabled
+            # window means the kernel cannot answer a single probe. `compiled=False` is the off switch.
+            raise ValueError("AStarPlanner: window_bytes must be > 0 on the compiled path — the "
+                             "dense window IS the occupancy. Use compiled=False for the reference.")
+        self._win_bytes_peak = 0                        # largest window actually built (diagnostics)
+        self._win_off = 0                               # plans that got no window (too big / degenerate)
+        self._win_painted = 0                           # window cells that held a claim (build cost)
+        self._win_widen = 0                             # plans that had to grow their window and re-run
+        self._win_exhausted = 0                         # plans still missing at the widen ceiling
+        self._win_grown = 0                             # times the bitmap BUFFER was grown to fit a box
+        # Shrink-tripwire rebuilds. Under `incremental_release` these should NEVER happen —
+        # `on_release` keeps `n_added` in lockstep with the ledger precisely so the tripwire stays
+        # silent — so a nonzero count is a bug signal, not a statistic. It is a counter rather than
+        # the warning because LNS filters that warning (a genuine non-incremental release would
+        # raise it every iteration), which is how a 9.98 s rebuild per run went unnoticed.
+        self.n_shrink_rebuilds = 0
         # LNS destroy support: derive occupancy/capacity services in removal mode (per-owner row
         # tracking) and subscribe them to `ledger.subscribe_release`, so a `release_many` is
         # un-absorbed in O(released volumes) instead of tripping the O(everything) shrink rebuild.
@@ -286,40 +392,120 @@ class AStarPlanner:
             self._tele.on_deny(req.flight_id, reason.value, volumes, hits)
         return _deny(req, reason)
 
-    def _occupancy(self, req, ledger, cfg) -> HexOccupancyService:
+    def _watermark(self, req) -> float:
+        """The eviction clock. ``evict_floor`` (Track A): a parallel worker's assignments are NOT
+        monotone (eager re-speculation re-dispatches an earlier flight after a later one), so it caps
+        the watermark at the coordinator's commit-frontier clock — evicting LESS, which is always safe
+        (see the tightness note in ``_occupancy``). None → the bare request clock."""
+        return req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
+
+    def _unbind_reference_occupancy(self, ledger=None) -> None:
+        """Detach and forget the reference occupancy/capacity stack for ``ledger``.
+
+        Unlike :meth:`ReservationLedger.detach_subscribers`, this removes only this planner's bound
+        methods and does not bump the ledger epoch or disturb unrelated observers. It is therefore
+        safe both for a failed first bind and for replacing a planner-local service stack.
+        """
+        bound = self._svc_ledger
+        if bound is None or (ledger is not None and bound is not ledger):
+            return
+        svc, tcap = self._svc, self._tcap
+        if svc is not None:
+            bound.unsubscribe(svc.on_commit)
+            bound.unsubscribe_release(svc.on_release)
+            bound.unsubscribe_static(svc._on_static)
+        if tcap is not None:
+            bound.unsubscribe(tcap.on_commit)
+            bound.unsubscribe_release(tcap.on_release)
+        self._svc = None
+        self._tcap = None
+        self._svc_ledger = None
+        self._svc_epoch = 0
+
+    def _unbind_compiled_occupancy(self, ledger=None) -> None:
+        """Detach and forget this planner's packed occupancy service for ``ledger``."""
+        bound = self._cocc_ledger
+        if bound is None or (ledger is not None and bound is not ledger):
+            return
+        cocc = self._cocc
+        if cocc is not None:
+            bound.unsubscribe(cocc.on_commit)
+            bound.unsubscribe_release(cocc.on_release)
+            bound.unsubscribe_static(cocc._on_static)
+        self._cocc = None
+        self._cocc_ledger = None
+        self._cocc_epoch = 0
+
+    def _occupancy(self, req, ledger, cfg, _batch: "_BindBatch | None" = None) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
         publish hook (ASTM-subscription style). First use subscribes and absorbs any pre-existing
-        volumes; a ledger shrink (release) trips a from-scratch rebuild + warning (add-only)."""
+        volumes; a ledger shrink (release) trips a from-scratch rebuild + warning (add-only).
+
+        ``_batch`` (compiled path only) defers this service's absorb, ``subscribe_static`` and
+        eviction into a :class:`_BindBatch` so it can share ONE pass over the ledger with the compiled
+        image — see :func:`_absorb_many`. ``None`` is the caller-visible default and takes the
+        original code path verbatim, which is what keeps ``_plan_reference`` byte-identical."""
         svc = self._svc
         if svc is not None and self._svc_ledger is ledger and self._svc_epoch != ledger.epoch:
             svc = None      # detached mid-life: re-subscribe and re-absorb (the shrink tripwire below
             #                 cannot see this — a release + re-commit nets to the same n_volumes)
         if svc is None or self._svc_ledger is not ledger:
-            svc = self._svc = HexOccupancyService(cfg, track_removal=self.incremental_release)
-            self._svc_epoch = ledger.epoch
-            self._tcap = TerminalCapacity(cfg, ledger,       # temporal pad capacity, same ledger
-                                          track_removal=self.incremental_release)
+            # A planner is bound to one ledger at a time. Remove its callbacks from an older ledger
+            # before replacing the service objects, otherwise that ledger keeps feeding (and retaining)
+            # an unreachable occupancy stack.
+            self._unbind_reference_occupancy()
+            # `maintain_blocked=False` on the compiled path: `is_blocked` is the map's only reader
+            # and `_plan_compiled` never calls it (measured: 62,537 `pad_clear` and ZERO `is_blocked`
+            # over 20 LNS tasks), while 98.3% of `pad` bumps also bump `blocked`. `_plan_reference`
+            # arms it before it searches, so a fallback still gets an exact map.
+            svc = HexOccupancyService(
+                cfg, track_removal=self.incremental_release,
+                maintain_blocked=not self.compiled or self.needs_blocked_map)
+            tcap = TerminalCapacity(cfg, ledger,             # temporal pad capacity, same ledger
+                                    track_removal=self.incremental_release)
+            # Publish the identities only after both constructors succeed. The compiled caller's
+            # outer transaction can now always identify and tear down every callback it registered.
+            self._svc = svc
+            self._tcap = tcap
             self._svc_ledger = ledger
+            self._svc_epoch = ledger.epoch
             ledger.subscribe(svc.on_commit)                 # publish hook: future commits auto-feed
-            ledger.subscribe(self._tcap.on_commit)
+            ledger.subscribe(tcap.on_commit)
             if self.incremental_release:                     # removal hook: release_many un-absorbs
                 ledger.subscribe_release(svc.on_release)
-                ledger.subscribe_release(self._tcap.on_release)
-            _absorb(svc, ledger)                             # absorb anything already committed
-            _absorb(self._tcap, ledger)
-            ledger.subscribe_static(svc._on_static)          # derive always-active routing walls from the
-            #                                                  ledger's permanent terminal volumes (replays
-            #                                                  all already-registered hubs; no-op if none)
+                ledger.subscribe_release(tcap.on_release)
+            # `subscribe_static` derives always-active routing walls from the ledger's permanent
+            # terminal volumes (replays all already-registered hubs; no-op if none). It both APPENDS a
+            # subscriber and replays, so it belongs to first-bind only — see the shrink branch below.
+            if _batch is None:
+                try:
+                    _absorb(svc, ledger)                     # absorb anything already committed
+                    _absorb(tcap, ledger)
+                    ledger.subscribe_static(svc._on_static)
+                except BaseException:
+                    self._unbind_reference_occupancy(ledger)
+                    raise
+            else:
+                _batch.services += [svc, tcap]
+                _batch.after.append(lambda: ledger.subscribe_static(svc._on_static))
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
                 "ReservationLedger shrank (release?) — rebuilding A* hex-occupancy from scratch; "
                 "the incremental occupancy service assumes add-only commits.",
                 stacklevel=2,
             )
+            self.n_shrink_rebuilds += 1
             svc.reset()
             self._tcap.reset()
-            _absorb(svc, ledger)
-            _absorb(self._tcap, ledger)
+            # Deliberately NO `subscribe_static` here: this branch never had one, and adding it would
+            # append a duplicate subscriber and re-replay every hub on each LNS release cycle —
+            # unbounded growth in `ledger._static_subs` and `_static_terms`, answer-neutral but not
+            # state-identical. `reset()` already re-walks the hubs this service recorded.
+            if _batch is None:
+                _absorb(svc, ledger)
+                _absorb(self._tcap, ledger)
+            else:
+                _batch.services += [svc, self._tcap]
         # Evict state older than the request clock. Requests arrive in non-decreasing time, and with
         # ``t_departure >= t_request`` enforced (types) + ``base = ceil(t_depart/dt)``, the earliest
         # step/time any plan reads is ``base >= floor(t_request/dt)`` — so the bare request-clock
@@ -329,10 +515,17 @@ class AStarPlanner:
         # re-speculation re-dispatches an earlier flight after a later one), so it caps the watermark
         # at the coordinator's commit-frontier clock — evicting LESS, which is always safe (the
         # tightness note above warns against evicting MORE). None → today's behavior byte-identically.
-        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
-        svc.evict_before(int(wm // cfg.dt_s))
-        self._tcap.evict_before(wm)
-        return svc
+        wm = self._watermark(req)
+
+        def _evict():
+            svc.evict_before(int(wm // cfg.dt_s))
+            self._tcap.evict_before(wm)
+
+        if _batch is None:
+            _evict()
+        else:
+            _batch.after.append(_evict)     # strictly after the batched absorb: `add_volume` clamps
+        return svc                          # `s_lo` against `evicted_before` as it writes
 
     def capacity_authority(self, ledger) -> TerminalCapacity | None:
         """The pad-capacity authority already current for ``ledger``, or None (see the ``Planner``
@@ -438,6 +631,12 @@ class AStarPlanner:
         # hover_time_s + climb_time_s, so the search must not land where a later corridor sweeps
         # through mid-descent (else post-build CONFLICT_FILED). See occupancy.py.
         svc = self._occupancy(req, ledger, cfg)
+        # THIS is the search that reads `blocked`, and on a compiled planner the service was built not
+        # maintaining it. Arm it here — before any `is_blocked` — rather than lazily inside the query:
+        # the service holds no ledger, and a query that could not rebuild would have to choose between
+        # a wrong answer and a raise deep inside the oracle. Sticky, so a run that falls back repeatedly
+        # pays the O(schedule) rebuild once.
+        svc.enable_blocked(ledger)
         tcap = self._tcap
         # Track A read-set recording: wrap the occupancy in the accumulating shim so every search
         # probe (is_blocked / pad_clear, incl. the goal-gate pad check) lands in the bbox. Pure
@@ -780,32 +979,56 @@ class AStarPlanner:
     # ==================================================================================================
     # Compiled (numba) path — reproduces `_plan_reference` EXACTLY, ~multiple-x faster.
     # ==================================================================================================
-    def _compiled_occ(self, req, ledger, cfg):
-        """The flat-array occupancy (corridor + column pools), kept in lockstep with the ledger exactly
+    def _compiled_occ(self, req, ledger, cfg, _batch: "_BindBatch | None" = None):
+        """The packed claim-arena occupancy, kept in lockstep with the ledger exactly
         as ``_occupancy`` keeps ``HexOccupancyService`` (first-use subscribe+absorb, shrink→rebuild,
         evict to the request clock). Coexists with ``_occupancy`` — the host still needs the reference
-        service for ``pad_clear`` (non-terminal takeoff/landing gate)."""
+        service for ``pad_clear`` (non-terminal takeoff/landing gate).
+
+        ``_batch``: see ``_occupancy``. Sharing one absorb pass with the reference service is the
+        whole point of the batch — they rasterize the same volumes with the same inflations."""
         cocc = self._cocc
         if cocc is not None and self._cocc_ledger is ledger and self._cocc_epoch != ledger.epoch:
             cocc = None                                  # detached mid-life — rebind (see _occupancy)
         if cocc is None or self._cocc_ledger is not ledger:
+            self._unbind_compiled_occupancy()
             from .compiled_hex_occupancy import CompiledHexOccupancy
-            cocc = self._cocc = CompiledHexOccupancy(cfg, track_removal=self.incremental_release)
+            cocc = CompiledHexOccupancy(cfg, track_removal=self.incremental_release)
+            self._cocc = cocc
             self._cocc_ledger = ledger
             self._cocc_epoch = ledger.epoch
             ledger.subscribe(cocc.on_commit)
             if self.incremental_release:                     # removal hook: release_many un-absorbs
                 ledger.subscribe_release(cocc.on_release)
-            _absorb(cocc, ledger)
-            ledger.subscribe_static(cocc._on_static)         # derive the compiled routing walls from the
-            #                                                  ledger's permanent terminal volumes (replays
-            #                                                  all already-registered hubs; no-op if none)
+            # `subscribe_static` derives the compiled routing walls from the ledger's permanent
+            # terminal volumes (replays all already-registered hubs; no-op if none) — first-bind only.
+            if _batch is None:
+                try:
+                    _absorb(cocc, ledger)
+                    ledger.subscribe_static(cocc._on_static)
+                except BaseException:
+                    self._unbind_compiled_occupancy(ledger)
+                    raise
+            else:
+                _batch.services.append(cocc)
+                _batch.after.append(lambda: ledger.subscribe_static(cocc._on_static))
         elif ledger.n_volumes < cocc.n_added:
+            self.n_shrink_rebuilds += 1
             cocc.reset()
-            _absorb(cocc, ledger)
+            if _batch is None:                  # no `subscribe_static`: see the same branch in
+                _absorb(cocc, ledger)           # `_occupancy` for why adding one here would leak
+            else:
+                _batch.services.append(cocc)
         # same frontier-clock floor as _occupancy (out-of-order re-dispatch safety; evicts LESS)
-        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
-        cocc.evict_before(int(wm // cfg.dt_s))
+        wm = self._watermark(req)
+
+        def _evict():
+            cocc.evict_before(int(wm // cfg.dt_s))
+
+        if _batch is None:
+            _evict()
+        else:
+            _batch.after.append(_evict)
         return cocc
 
     def _kernel_state(self, cocc, log2: int):
@@ -832,6 +1055,11 @@ class AStarPlanner:
                 "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
                 "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
                 "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
+                # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
+                # counters. Reused across plans — `build_window` clears only the bytes it uses.
+                "win": np.zeros(max(1, self.window_bytes), np.uint8),
+                "wbox": W.empty_wbox(),
+                "win_stats": np.zeros(W.WSTATS_N, np.int64),
             }
         kc = self._ks_caps.get(log2)
         if kc is None:
@@ -871,10 +1099,83 @@ class AStarPlanner:
         flights — the ones that reach max_expansions — must fit here)."""
         return max(20, (self.max_expansions * 2 - 1).bit_length())
 
+    def _build_window(self, cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
+                      goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops,
+                      widen: int = 0) -> bool:
+        """Materialise this plan's dense occupancy bitmap, or disable it for reference dispatch.
+
+        Anchored on every cell the search STARTS or ENDS at — the origin hex, its exit lanes and the
+        landing lanes — because A* explores an ellipse between them. The step tail covers the takeoff
+        climb, the lane traverse (issue #52) and the flight itself at the same 3x detour budget the
+        bounded mask uses, so the window spans the same reach the search is allowed to use.
+
+        A window that cannot be built is NOT a slower window — since the interval pools were deleted
+        nothing else can answer a probe, so the whole plan goes to the pure-Python reference. That
+        makes the byte budget a cliff rather than a dial, which is why an over-budget box grows the
+        buffer and retries instead of giving up (see ``_WINDOW_GROW_MAX``).
+
+        Return ``False`` only when the separately compiled window kernel fails. That permanently disables
+        the compiled planner, and the caller re-runs this flight through the reference path.
+        """
+        wbox = ks["wbox"]
+        # A prior oversized plan may have grown the reusable buffer past the configured starting
+        # budget. Use that retained capacity on later plans; capping back to ``window_bytes`` made
+        # every identical hot-spot plan allocate the same grown array again. The configured value
+        # still governs the growth ceiling below, so retaining capacity cannot bypass the 8x guard.
+        cap = len(ks["win"])
+        if cap <= 0:
+            W.disable(wbox)
+            return True
+        scale = 1 << widen                     # each widen level doubles both extents
+        tail = (int(tks.max()) + int(lane_stp.max()) + 3 * n_hops + 2 * climb_span + 8) * scale
+        bounds = dict(
+            q_cells=(oq, int(lane_q.min()), int(lane_q.max()), int(goal_q.min()), int(goal_q.max())),
+            r_cells=(orr, int(lane_r.min()), int(lane_r.max()), int(goal_r.min()), int(goal_r.max())),
+            base=base, max_step=max_step, n_gsteps=n_gsteps,
+            lateral_margin=_WINDOW_MARGIN_HEX * scale, tail_steps=tail,
+        )
+        nbytes = W.window_bounds(cocc, wbox, max_bytes=cap, **bounds)
+        if nbytes < 0:
+            # Over budget, and `window_bounds` reported by how much. Grow to fit and re-ask — the
+            # same grow-and-retry discipline the kernel's FB_HASH/FB_HEAP already use, and for the
+            # same reason: a buffer sized for the worst plan is carried by every worker on every
+            # plan, while one sized for the common plan turns a rare overshoot into a reference
+            # dispatch. Measured: a 9% overshoot cost 19.3 s of an 88 s LNS loop. The grown buffer
+            # is cached in `ks`, so a hot spot pays the growth once.
+            need = -nbytes
+            if need <= self.window_bytes * _WINDOW_GROW_MAX:
+                ks["win"] = np.zeros(need, np.uint8)
+                self._win_grown += 1
+                nbytes = W.window_bounds(cocc, wbox, max_bytes=len(ks["win"]), **bounds)
+        if nbytes <= 0:
+            # Degenerate box, or past the growth ceiling. No window means no answers, so this is a
+            # REFERENCE dispatch rather than a slower in-kernel path — `_plan_compiled` hands over.
+            self._win_off += 1
+            W.disable(wbox)
+            return True
+        if nbytes > self._win_bytes_peak:
+            self._win_bytes_peak = nbytes
+        a = cocc._arena
+        try:
+            painted = W.build_window_claims(
+                a.arena, a.start, a.length, cocc.static_col, ks["ov_own_gen"], gen,
+                cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox, ks["win"],
+                _S0_SHIFT, _SPAN_BITS, _FIELD_MASK,
+            )
+        except Exception as e:
+            # ``build_window`` has its own @njit dispatcher. A cache/load failure can therefore
+            # surface here even after the search kernel warmed successfully. Fail closed into the
+            # reference planner for this and every later flight.
+            W.disable(wbox)
+            self._disable_compiled("dense-window kernel", e)
+            return False
+        self._win_painted += int(painted)
+        return True
+
     def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
         """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
         ``_blocked`` treats them as transparent (own column) instead of walls. Cheap: rasterize the 1–2
-        own hub columns (same rasterizer that built the column pool) and mark their in_blk cells — no
+        own hub columns (the same rasterizer that records column claims) and mark their in_blk cells — no
         per-step scan. Under ``terminal_airspace_always_active`` (#24) ALSO mark the hub's full
         ``terminal_cells`` (the wider flood-fill geometry the reference walls), so the permanent static wall
         is transparent to the hub that owns it — matching ``is_blocked``'s tid-based own-hub exemption.
@@ -925,20 +1226,36 @@ class AStarPlanner:
                         mark(cocc.cell_id(q, r, L))
         return overlap
 
+    def _disable_compiled(self, component: str, error: Exception) -> None:
+        """Permanently degrade this planner and dispose its failed compiled component."""
+        warnings.warn(
+            f"astar numba {component} failed ({error!r}); falling back to the pure-Python "
+            f"reference planner for ALL plans. Install a compatible numba, or clear stale "
+            f".nbi/.nbc caches after a kernel-signature change.",
+            RuntimeWarning, stacklevel=3,
+        )
+        # A runtime failure can happen after the packed image subscribed to a ledger. Leaving those
+        # hooks live would keep rasterizing every later commit/release into an arena no plan will ever
+        # read — and could make the supposedly-safe reference fallback fail in compiled-only packing.
+        self._unbind_compiled_occupancy()
+        self._ks = None
+        self._ks_caps.clear()
+        self._gen = 0
+        self.compiled = False
+        self._kernel = None
+
     def _warm_jit(self):
-        """Compile the kernel once at construction with a tiny synthetic input (off the hot path)."""
+        """Compile every independently-dispatched numba entry point with production signatures."""
         if self._kernel is None:
             return
+        component = "search kernel"
         try:
             NC, MAXS = 9, 5
-            _warm_iv = aligned_2d(NC, 4, np.int32); _warm_iv[:, P_LO] = 0
-            _warm_iv[:, P_HI] = MAXS; _warm_iv[:, P_NXT] = -1
-            _warm_cv = _warm_iv.copy()
             ng = 6
             _warm_gp = aligned_2d(64, 4)                   # same 2-D packed layout as production, so
             _warm_gp[:, G_GEN] = 0                        # this compiles the signature actually used
             self._kernel(
-                _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
+                np.zeros(NC, np.bool_), np.zeros(NC, np.int32),
                 0, 0, 3, 3, 1, 0, MAXS, MAXS,
                 1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]),
                 np.array([0], np.int64), 1,
@@ -951,16 +1268,49 @@ class AStarPlanner:
                 np.empty(64, np.float64), np.empty(64, np.int64), np.empty(64, np.int64), 64,
                 np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64), np.empty(16, np.int64),
                 1000, np.zeros(8, np.int64),
+                np.zeros(1, np.uint8), W.empty_wbox(), np.zeros(W.WSTATS_N, np.int64),
             )
+            # ``build_window`` is decorated separately from ``_search`` and owns a separate numba
+            # cache. Warm the production signature under this same fallback guard so a stale or
+            # incompatible cache cannot escape from the first real plan.
+            component = "dense-window kernel"
+            warm_wbox = W.empty_wbox()
+            warm_wbox[W.W_Q1] = warm_wbox[W.W_R1] = 0
+            warm_wbox[W.W_S1] = MAXS
+            warm_wbox[W.W_RSPAN] = 1
+            warm_wbox[W.W_STEPS] = MAXS + 1
+            warm_wbox[W.W_ROWB] = (MAXS + 8) // 8
+            W.build_window_claims(
+                np.zeros(1, np.int64), np.zeros(2 * NC, np.int64),
+                np.zeros(2 * NC, np.int64), np.zeros(NC, np.bool_),
+                np.zeros(NC, np.int32), 1,
+                0, 0, 3, 1, warm_wbox, np.zeros(warm_wbox[W.W_ROWB], np.uint8),
+                _S0_SHIFT, _SPAN_BITS, _FIELD_MASK,
+            )
+            # ClaimArena's mutation/oracle functions are separate @njit dispatchers too. In
+            # particular, add_many first runs while an existing ledger is being absorbed and
+            # remove_many first runs after LNS has already tombstoned victims. Warm all of them here
+            # so a stale/incompatible cache fails before this planner subscribes to any ledger.
+            component = "claim-arena kernels"
+            from . import claim_arena as CA
+            keys = np.array([0], np.int64)
+            claim = np.array([(1 << _S0_SHIFT) | (2 << _SPAN_BITS)], np.int64)
+            arena = np.zeros(4, np.int64)
+            start = np.zeros(1, np.int64)
+            length = np.zeros(1, np.int64)
+            slab_cap = np.zeros(1, np.int64)
+            tail = np.zeros(1, np.int64)
+            garbage = np.zeros(1, np.int64)
+            short = CA.add_many(
+                keys, claim, 1, arena, start, length, slab_cap, tail, garbage,
+            )
+            if short != 0:
+                raise RuntimeError(f"claim-arena warm add unexpectedly needs {short} slots")
+            CA.blocked_at(0, 1, arena, start, length, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+            CA.compact_into(arena, start, length, slab_cap, np.zeros(4, np.int64), 1, 4)
+            CA.remove_many(keys, claim, 1, arena, start, length)
         except Exception as e:                                # compile failure → degrade to pure Python
-            warnings.warn(
-                f"astar numba kernel failed to warm/compile ({e!r}); falling back to the pure-Python "
-                f"reference planner for ALL plans. Install a compatible numba, or clear stale "
-                f".nbi/.nbc caches after a kernel-signature change.",
-                RuntimeWarning, stacklevel=2,
-            )
-            self.compiled = False                             # dispatch every plan to _plan_reference
-            self._kernel = None
+            self._disable_compiled(component, e)
 
     def _plan_compiled(self, req, ledger, cfg):
         from . import kernel as K
@@ -991,9 +1341,22 @@ class AStarPlanner:
         # own hub column, so the centres are not a distance it could ever achieve (issue #50).
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
-        svc = self._occupancy(req, ledger, cfg)
-        tcap = self._tcap
-        cocc = self._compiled_occ(req, ledger, cfg)
+        # Bind both occupancy images, then absorb them in ONE pass over the ledger (see `_absorb_many`
+        # — separate passes blow past the rasterizer memo's reuse window and re-sweep the geometry).
+        batch = _BindBatch()
+        try:
+            # The transaction begins before either constructor/bind: `_compiled_occ` itself may fail
+            # after the reference stack has subscribed, and `batch.run` may fail after any subset of
+            # services absorbed the backlog or replayed static terminals. Every exit tears down only
+            # this planner's callbacks and identities, so a retry always starts from empty services.
+            svc = self._occupancy(req, ledger, cfg, _batch=batch)
+            tcap = self._tcap
+            cocc = self._compiled_occ(req, ledger, cfg, _batch=batch)
+            batch.run(ledger)
+        except BaseException:
+            self._unbind_compiled_occupancy(ledger)
+            self._unbind_reference_occupancy(ledger)
+            raise
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)
 
@@ -1084,6 +1447,7 @@ class AStarPlanner:
         rb = ks["read_bbox"]
         rb[0] = rb[2] = rb[4] = rb[6] = _BBOX_HUGE
         rb[1] = rb[3] = rb[5] = rb[7] = -_BBOX_HUGE
+        widen = 0                       # window escalation level; see the FB-style retry below
         while True:
             to_ok = np.zeros(n_gsteps * n_levels, np.bool_)
             if to_terminal:
@@ -1122,8 +1486,26 @@ class AStarPlanner:
                     RuntimeWarning, stacklevel=2,
                 )
                 return self._plan_reference(req, ledger, cfg)
+            # Dense occupancy window, built INSIDE the widen loop and after the overlay: it folds
+            # `ov_own_gen == gen` in, so it must be rebuilt whenever `gen` moves, and its step span is
+            # sized from `n_gsteps`, which the FB_MASK widen changes.
+            if not self._build_window(
+                cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
+                goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops,
+                widen=widen,
+            ):
+                self._ref_dispatch["window-jit"] += 1
+                return self._plan_reference(req, ledger, cfg)
+            if ks["wbox"][W.W_STEPS] == 0:
+                # The box degenerated or exceeded the cap even at the widen ceiling. With the pools
+                # gone the kernel has no fallback, so hand the whole plan to the reference search —
+                # the same exit FB_OOB has always used.
+                self._fb += 1
+                self._fb_reasons["window-exhausted"] += 1
+                self._win_exhausted += 1
+                return self._plan_reference(req, ledger, cfg)
+            ks["win_stats"][W.WS_MISSED] = 0     # per-plan sticky flag; read right after the kernel
             n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
-                cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step, ground_max_step,
                 oq, orr, lane_q, lane_r, lane_lat, lane_stp, len(lane_q),
@@ -1134,8 +1516,23 @@ class AStarPlanner:
                 gen, kc["g_pack"], kc["g_packf"], kc["cap"], kc["log2"],
                 kc["heap_f"], kc["heap_c"], kc["heap_n"], kc["mh"],
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
-                rb,
+                rb, ks["win"], ks["wbox"], ks["win_stats"],
             )
+            if ks["win_stats"][W.WS_MISSED]:
+                # A probe fell outside the window. Same exact-retry discipline as the FB_MASK widen:
+                # grow the box and re-run under a fresh `gen`, using no partial output. At the widen
+                # ceiling there is no larger exact bitmap to try, so discard that result too and run
+                # the reference planner. `_blocked` deliberately answered every missed probe as
+                # BLOCKED; consuming a normal accept/deny from that partial search can reject a legal
+                # detour or choose a more expensive route.
+                if widen < _WINDOW_WIDEN_MAX:
+                    self._win_widen += 1
+                    widen += 1
+                    continue
+                self._fb += 1
+                self._fb_reasons["window-exhausted"] += 1
+                self._win_exhausted += 1
+                return self._plan_reference(req, ledger, cfg)
             if status == K.FB_MASK and n_gsteps < full_ng:
                 self._remask += 1
                 n_gsteps = full_ng                       # widen to the full range and re-run (exact)

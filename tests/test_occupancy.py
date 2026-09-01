@@ -1,6 +1,8 @@
 """Incremental hex-occupancy service: it must stay byte-identical to a from-scratch rasterization
 (the property that lets A* trust the maintained cache instead of rebuilding every plan)."""
 
+import pytest
+
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
@@ -160,3 +162,88 @@ def test_pad_clear_blocked_by_corridor_at_any_level():
     q, r, L = next(iter(svc.pad[s]))
     assert L == 1                                            # the corridor sits at level 1
     assert not svc.pad_clear(q, r, s, 0)                     # but the pad's column spans all levels
+
+
+# ------------------------------------------------- the `blocked` map's deferred build (area 2)
+
+@pytest.mark.parametrize("track_removal", [False, True])
+def test_enable_blocked_matches_a_map_maintained_all_along(track_removal):
+    """A service built with ``maintain_blocked=False`` and armed later must hold EXACTLY the map a
+    service that maintained it throughout holds.
+
+    Three things a from-scratch rebuild loop would get wrong, and which routing through
+    ``add_volume`` inherits for free: the committing flight's own-column skip (so its 90 m terminal
+    interior stays passable), the refcount-dict-vs-set branch on ``track_removal`` (a set where
+    ``on_release`` expects counts raises ``TypeError`` on the next destroy), and the
+    ``evicted_before`` clamp. Parameterised over both container shapes for the second of those.
+
+    ``pad`` is asserted too: ``enable_blocked`` passes ``_pad=False``, so a slip there would
+    double-count the wider footprint rather than leave it alone."""
+    flights = _accepted_volumes()
+    assert flights, "no committed flights — the comparison would be vacuous"
+
+    eager = HexOccupancyService(CFG, track_removal=track_removal, maintain_blocked=True)
+    lazy = HexOccupancyService(CFG, track_removal=track_removal, maintain_blocked=False)
+    led = ReservationLedger(CFG)
+    for fid, vols in flights:
+        eager.on_commit(fid, vols)
+        lazy.on_commit(fid, vols)
+        led.commit(fid, vols)
+
+    assert not lazy.blocked, "maintain_blocked=False still wrote the map"
+    assert _flatten(lazy.pad) == _flatten(eager.pad), "pad must be unaffected either way"
+    lazy.enable_blocked(led)
+    assert _flatten(lazy.blocked) == _flatten(eager.blocked)
+    assert lazy.blocked == eager.blocked, "refcounts/sets differ, not just membership"
+    assert _flatten(lazy.pad) == _flatten(eager.pad), "enable_blocked touched pad"
+    assert _flatten(eager.blocked), "the map is empty — a rebuild of nothing would pass this"
+
+
+def test_enable_blocked_leaves_release_reversible():
+    """The ordering that could desync the two maps: commit while the map is OFF, arm, then release.
+    ``on_release`` guards on the CURRENT flag, and ``enable_blocked`` rebuilds from the ledger rather
+    than from rows, so the decrement finds the entry the rebuild put there."""
+    flights = _accepted_volumes()
+    svc = HexOccupancyService(CFG, track_removal=True, maintain_blocked=False)
+    led = ReservationLedger(CFG)
+    for fid, vols in flights:
+        svc.on_commit(fid, vols)
+        led.commit(fid, vols)
+    svc.enable_blocked(led)
+    assert svc.blocked
+    for fid, vols in flights:
+        svc.on_release(fid, vols)          # would KeyError/TypeError on a mismatched rebuild
+    assert not svc.blocked and not svc.pad, "release did not fully reverse the armed map"
+
+
+def test_enable_blocked_leaves_terminal_release_reversible():
+    """Arming the ordinary blocked map must not replay terminal state that stayed live while it was off.
+
+    In removal mode terminal cells are refcounted. Replaying the committed cylinder would raise each
+    count from one to two, while the existing release journal can decrement it only once, leaving a
+    ghost foreign-terminal wall after the flight is released.
+    """
+    vol = hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H")
+    svc = HexOccupancyService(CFG, track_removal=True, maintain_blocked=False)
+    led = ReservationLedger(CFG)
+    svc.on_commit(1, [vol])
+    led.commit(1, [vol])
+
+    step, cells = next(iter(svc.term_cells.items()))
+    cell, owners = next(iter(cells.items()))
+    assert owners == {"H": 1}
+
+    svc.enable_blocked(led)
+    assert svc.term_cells[step][cell] == {"H": 1}, "blocked-only replay duplicated terminal state"
+
+    svc.on_release(1, [vol])
+    assert not svc.term_cells
+    assert not svc.is_blocked(*cell, step)
+
+
+def test_is_blocked_refuses_an_unmaintained_map():
+    """Answering from a map nobody is maintaining would make the reference planner — the oracle every
+    compiled-path parity gate compares against — silently wrong. Raise instead."""
+    svc = HexOccupancyService(CFG, maintain_blocked=False)
+    with pytest.raises(RuntimeError, match="enable_blocked"):
+        svc.is_blocked(0, 0, 0, 0)

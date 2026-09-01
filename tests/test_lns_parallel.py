@@ -533,7 +533,7 @@ def test_execution_config_is_validated_before_ledger_takeover():
         "incremental_release": (0, 1, "true"),
         "unimpeded_workers": (0, -1, True, 1.5, "1"),
         "worker_kernel_log2": (-1, True, 1.5, "1"),
-        "window_bytes": (-1, True, 1.5, "1"),
+        "window_bytes": (0, -1, True, 1.5, "1"),
         "time_limit_s": (-1.0, -float("inf"), float("nan"), True, "1"),
         "verify_every": (-1, True, 1.5, "1"),
         "log_every": (-1, True, 1.5, "1"),

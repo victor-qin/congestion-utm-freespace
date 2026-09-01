@@ -1,29 +1,14 @@
-"""Dense per-(cell, level) free-interval pools for the compiled A* kernel (issue #8 Track B, A* port).
+"""Ledger-derived packed claims for the compiled A* occupancy window.
 
-The numba kernel (:mod:`kernel`) needs O(1) array reads to answer ``is (q, r, L) blocked at step
-s?`` — A*'s per-node obstacle test — reproducing :meth:`HexOccupancyService.is_blocked` exactly. The
-"cell" is a **(q, r, L)** triple (a hex at a flight level). Two flat interval pools, both maintained
-incrementally from the ledger commit hook via :func:`hexgrid.rasterize_volume_dual`:
+Every dynamic blocked span over a ``(q, r, level)`` cell is stored in a flat :class:`ClaimArena`,
+keyed separately as corridor or terminal-column occupancy. Before each compiled search,
+``window.build_window_claims`` paints those spans into the plan-local bitmap and folds in the
+flight's own-column overlay plus the permanent ``static_col`` walls. The kernel therefore performs
+one direct bit lookup; ``blocked_py`` remains the arena-backed reference used by parity tests.
 
-  * **corridor pool** (``corr``) — ordinary corridor cells (``in_blk`` from non-column volumes, minus the
-    committing flight's own-column interior). Equals ``HexOccupancyService.blocked`` cell-for-cell.
-  * **column pool** (``col``) — every terminal column's inner footprint. Equals ``term_cells`` (which
-    hubs, dropped — only presence matters; own/foreign is resolved per-flight).
-  * **static column** (``static_col``) — a per-cell bool for always-active terminals
-    (``cfg.terminal_airspace_always_active``, #24): a permanent, step- AND level-independent foreign wall.
-    Equals ``HexOccupancyService.static_term_cells``. NOT ledger-derived (survives ``reset()``); empty and
-    zero-overhead when the flag is off.
-
-``is_blocked(q,r,L,s,own)`` then folds to (kernel ``_blocked``):
-
-    colb = column-blocked(cell,s) OR static_col(cell);  corb = corridor-blocked(cell,s)
-    if colb and cell not in the flight's OWN-column footprint:  return True   # foreign column → wall
-    return corb                                                  # corridor / own-col fixed-lane sibling
-
-The flight's **own-column footprint** is a cheap per-cell mark (``ov_own_gen[cell] == gen``) the host sets
-per plan by rasterizing the flight's 1–2 own hub columns — O(footprint), no per-step scan. This is exact
-when own and foreign columns don't share a cell (hub spacing ≫ column radius); the node-count parity test
-guards the assumption.
+Per-flight row journals make release a swap-remove of exactly that flight's claims. Static terminal
+ownership, conservative own/foreign overlap detection, box guards, and step packing retain the same
+contracts the former interval representation exposed.
 
 Cells live in a box from the region corners + a reroute ``margin``. A committed corridor cell outside the
 box is skipped (counted in ``oob_corridor_cells``) — safe, because any *query* to that cell gets
@@ -110,7 +95,7 @@ _FIELD_MASK = _SPAN_LIMIT - 1
 
 
 class CompiledHexOccupancy:
-    """Two incremental flat pools (corridor + column) feeding the numba A* kernel. Commit-hook driven."""
+    """Commit-hook-driven packed claims feeding the compiled A* occupancy window."""
 
     def __init__(self, cfg, margin: int = 64, track_removal: bool = False):
         self.cfg = cfg

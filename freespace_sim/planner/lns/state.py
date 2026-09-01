@@ -195,6 +195,13 @@ class LNSState:
                 raise ValueError("repair_planner.evict_floor must be 0.0 — random/premium repair orders "
                                  "need the full-horizon occupancy, and the floor is the caller's to set "
                                  "(on the inner planner, for a wrapper)")
+        else:
+            # Construct before taking ownership of the caller's ledger. `run_lns` validates its
+            # config first, but LNSState is also directly constructible; an invalid window budget or
+            # a guarded JIT failure must not strip observers before the planner constructor reports it.
+            kw = {} if window_bytes is None else {"window_bytes": window_bytes}
+            repair_planner = AStarPlanner(incremental_release=incremental_release, **kw)
+            repair_planner.evict_floor = 0.0
 
         # LNS takes ownership of the ledger: the FCFS run's planner services stay subscribed
         # otherwise, silently absorbing (and retaining the memory of) every repair commit. The epoch
@@ -207,10 +214,6 @@ class LNSState:
         # rebuild (measured 94% of iteration wall) never happens. False keeps the rebuild path
         # (the byte-parity reference for A/Bs).
         self.repair_planner = repair_planner
-        if self.repair_planner is None:
-            kw = {} if window_bytes is None else {"window_bytes": window_bytes}
-            self.repair_planner = AStarPlanner(incremental_release=incremental_release, **kw)
-            self.repair_planner.evict_floor = 0.0
 
         # Paired-return anchor guard (only when the baseline ran return_anchor="realized"):
         # outbound fid -> the committed return's desired departure. We never re-time returns, so
@@ -312,9 +315,8 @@ class LNSState:
           (wrong) set.
         * ``incremental_release`` is the rebuild-path byte-parity reference (``--no-incremental``);
           hardcoding it would make that A/B inexpressible under parallelism.
-        * ``window_bytes`` is answer-neutral (the dense occupancy window is a cache of the pools),
-          but it is per-PLANNER state, so a worker that did not receive it would measure the
-          coordinator's default rather than the one under test.
+        * ``window_bytes`` controls per-planner bitmap allocation and fallback frequency, so a worker
+          that did not receive it would use a different resource policy from the coordinator.
 
         ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
         SYNC skips that bookkeeping, and effective widths below two stay in-process.

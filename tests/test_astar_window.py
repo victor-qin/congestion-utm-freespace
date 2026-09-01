@@ -1,19 +1,10 @@
 """Dense per-plan occupancy window (``planner.astar.window``) — truth and end-to-end parity.
 
-The window is a cache of the interval pools ``kernel._blocked`` otherwise walks, so it has exactly
-one contract: **every bit equals what the pools would have answered**. That is checked twice, at two
-different levels, because the two failure modes are different:
-
-* :func:`test_window_bit_matches_pool_truth` compares the bitmap cell-by-cell, step-by-step against
-  ``CompiledHexOccupancy.blocked_py`` — the same oracle ``test_compiled_occupancy_matches_is_blocked``
-  uses for the pools themselves. This is what catches a build bug (an off-by-one in the interval
-  merge, a mis-folded ``static_col``, a bit-packing slip) directly, at the bit.
-* the ``_assert_window_exact`` tests compare whole PLANS with the window on and off. This is what
-  catches a wiring bug — a window built under a stale ``gen``, or one whose bounds miss probes the
-  kernel then answers from the wrong place.
-
-The second kind needs the window to actually be in force, so every one of them asserts a non-zero
-hit count. A test whose window was silently disabled would pass while proving nothing.
+The window is the compiled path's dynamic occupancy image, painted from ``ClaimArena`` spans. Its
+contract is that compiled plans reproduce the independent pure-Python reference exactly: accept or
+deny, cost, volumes, and node expansions. The ``_assert_window_exact`` tests exercise that contract
+across empty, reroute, terminal-wall, release/recommit, retry, growth, and fallback paths. They also
+require a non-zero hit count, so a test cannot pass while silently exercising only the reference.
 """
 from __future__ import annotations
 
@@ -125,6 +116,27 @@ def test_window_jit_runtime_failure_replans_and_stays_disabled(monkeypatch):
     assert _clkey(again) == _clkey(expected)
 
 
+def test_claim_arena_jit_warms_under_the_compiled_fallback_guard(monkeypatch):
+    """The arena has independent numba caches which must fail before any ledger is subscribed."""
+    from freespace_sim.planner.astar import claim_arena as CA
+    from freespace_sim.planner.astar import kernel as K
+
+    calls = []
+    monkeypatch.setattr(K, "_search", lambda *_args: calls.append("search"))
+    monkeypatch.setattr(W, "build_window_claims", lambda *_args: calls.append("window"))
+
+    def fail_arena(*_args):
+        calls.append("arena")
+        raise RuntimeError("broken claim-arena cache")
+
+    monkeypatch.setattr(CA, "add_many", fail_arena)
+    with pytest.warns(RuntimeWarning, match="claim-arena kernels failed"):
+        planner = AStarPlanner(compiled=True)
+
+    assert calls == ["search", "window", "arena"]
+    assert planner.compiled is False and planner._kernel is None
+
+
 def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
     from analysis import ab_dense_window as ab
 
@@ -134,8 +146,8 @@ def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
     ])
     monkeypatch.setattr(ab, "_pass", lambda *_args: next(results))
 
-    with pytest.raises(RuntimeError, match=r"DIVERGENCE: window changed 1 of 1 plans"):
-        ab._paired_pass({"off": object(), "on": object()}, (), None, None)
+    with pytest.raises(RuntimeError, match=r"DIVERGENCE: compiled A\* changed 1 of 1 plans"):
+        ab._paired_pass({"reference": object(), "compiled": object()}, (), None, None)
 
 
 def test_ab_benchmark_disables_monotone_eviction(monkeypatch):
@@ -149,8 +161,8 @@ def test_ab_benchmark_disables_monotone_eviction(monkeypatch):
     monkeypatch.setattr(ab, "AStarPlanner", FakePlanner)
     arms = ab._make_arms(window_bytes=1234, kernel_log2=18)
 
-    assert arms["off"].kwargs == {"window_bytes": 0, "kernel_log2_min": 18}
-    assert arms["on"].kwargs == {"window_bytes": 1234, "kernel_log2_min": 18}
+    assert arms["reference"].kwargs == {"compiled": False}
+    assert arms["compiled"].kwargs == {"window_bytes": 1234, "kernel_log2_min": 18}
     assert all(planner.evict_floor == 0.0 for planner in arms.values())
 
 
@@ -163,11 +175,11 @@ def test_fanout_benchmark_synchronizes_each_arm_and_uses_medians(monkeypatch):
     barriers = []
 
     elapsed = ab._timed_passes(
-        {"off": object(), "on": object()}, (), None, None, 3,
+        {"reference": object(), "compiled": object()}, (), None, None, 3,
         before_arm=lambda: barriers.append(True),
     )
 
-    assert elapsed == {"off": 6.0, "on": 5.0}
+    assert elapsed == {"reference": 6.0, "compiled": 5.0}
     assert len(barriers) == 6
 
 
@@ -215,6 +227,27 @@ def test_window_parity_reroute_and_ground_delay():
     wall = Volume4D(box_from_segment(vec(1000, -200, 150), vec(1000, 200, 150), 40, 400), 0.0, 1e6)
     pad = Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)
     _assert_window_exact([_req()], [(98, [wall]), (99, [pad])])
+
+
+def test_window_miss_at_widen_ceiling_uses_reference(monkeypatch):
+    """A widest-window miss invalidates the whole kernel result, just like an earlier miss.
+
+    Force the initial bounds to the endpoint row and make that the only widening level. The wall
+    blocks the in-row route, so the reference takes an out-of-row detour while the partial kernel
+    search sees every such probe as blocked. Consuming that partial result rejects a feasible plan;
+    the exact behavior is to discard it and dispatch to the reference.
+    """
+    from freespace_sim.planner.astar import planner as P
+
+    monkeypatch.setattr(P, "_WINDOW_MARGIN_HEX", 0)
+    monkeypatch.setattr(P, "_WINDOW_WIDEN_MAX", 0)
+    wall = Volume4D(box_from_segment(vec(1000, -200, 150), vec(1000, 200, 150), 40, 400), 0.0, 1e6)
+
+    planner = _assert_window_exact([_req()], [(98, [wall])])
+
+    assert planner._ks["win_stats"][W.WS_MISSED] == 1
+    assert planner._win_exhausted == 1
+    assert planner._fb_reasons["window-exhausted"] == 1
 
 
 def test_window_parity_static_terminal_wall_and_own_hub():
@@ -297,6 +330,9 @@ def test_window_grows_its_buffer_instead_of_falling_back():
     assert p._win_grown > 0, "the buffer never grew — this test proves nothing"
     assert p._win_off == 0, "a plan was surrendered to the reference instead of growing"
     assert len(p._ks["win"]) >= need, "the grown buffer was not retained for reuse"
+    grown = p._win_grown
+    p.plan(_req(dx=1500.0), ReservationLedger(CFG), CFG)
+    assert p._win_grown == grown, "the retained buffer was reallocated for an identical plan"
 
 
 def test_window_growth_stops_at_the_ceiling():

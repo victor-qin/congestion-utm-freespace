@@ -299,11 +299,9 @@ class AStarPlanner:
                  compiled: bool = True, kernel_log2_min: int | None = None,
                  incremental_release: bool = False, window_bytes: int = _WINDOW_BYTES):
         self.max_expansions = max_expansions
-        # Per-plan dense occupancy bitmap (`window`): the byte ceiling for one, 0 = off. It replaces
-        # `_blocked`'s two free-interval list walks (mean chain 4.4 at density_faa, worse on hot
-        # cells) and its two per-cell array reads with one bit lookup. Measured 1.08-1.14x on plan
-        # wall and 1.075x on the LNS loop, FLAT in worker count. Answer-neutral: the window caches
-        # the pools it was built from, and anything outside it takes the original walk.
+        # Starting byte budget for the compiled path's per-plan dense occupancy bitmap. The bitmap
+        # is the only dynamic occupancy answer in the kernel; oversized plans may grow its retained
+        # buffer up to the bounded ceiling, and unresolved misses dispatch to the exact reference.
         self.window_bytes = int(window_bytes)
         if compiled and self.window_bytes <= 0:
             # There is nothing behind the window any more: the interval pools are gone, so a disabled
@@ -933,7 +931,7 @@ class AStarPlanner:
     # Compiled (numba) path — reproduces `_plan_reference` EXACTLY, ~multiple-x faster.
     # ==================================================================================================
     def _compiled_occ(self, req, ledger, cfg, _batch: "_BindBatch | None" = None):
-        """The flat-array occupancy (corridor + column pools), kept in lockstep with the ledger exactly
+        """The packed claim-arena occupancy, kept in lockstep with the ledger exactly
         as ``_occupancy`` keeps ``HexOccupancyService`` (first-use subscribe+absorb, shrink→rebuild,
         evict to the request clock). Coexists with ``_occupancy`` — the host still needs the reference
         service for ``pad_clear`` (non-terminal takeoff/landing gate).
@@ -1049,7 +1047,7 @@ class AStarPlanner:
     def _build_window(self, cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
                       goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops,
                       widen: int = 0) -> bool:
-        """Materialise this plan's dense occupancy bitmap (:mod:`window`), or leave it off.
+        """Materialise this plan's dense occupancy bitmap, or disable it for reference dispatch.
 
         Anchored on every cell the search STARTS or ENDS at — the origin hex, its exit lanes and the
         landing lanes — because A* explores an ellipse between them. The step tail covers the takeoff
@@ -1065,7 +1063,11 @@ class AStarPlanner:
         the compiled planner, and the caller re-runs this flight through the reference path.
         """
         wbox = ks["wbox"]
-        cap = min(self.window_bytes, len(ks["win"]))
+        # A prior oversized plan may have grown the reusable buffer past the configured starting
+        # budget. Use that retained capacity on later plans; capping back to ``window_bytes`` made
+        # every identical hot-spot plan allocate the same grown array again. The configured value
+        # still governs the growth ceiling below, so retaining capacity cannot bypass the 8x guard.
+        cap = len(ks["win"])
         if cap <= 0:
             W.disable(wbox)
             return True
@@ -1077,8 +1079,7 @@ class AStarPlanner:
             base=base, max_step=max_step, n_gsteps=n_gsteps,
             lateral_margin=_WINDOW_MARGIN_HEX * scale, tail_steps=tail,
         )
-        nbytes = W.window_bounds(cocc, wbox, max_bytes=cap if widen == 0 else len(ks["win"]),
-                                 **bounds)
+        nbytes = W.window_bounds(cocc, wbox, max_bytes=cap, **bounds)
         if nbytes < 0:
             # Over budget, and `window_bounds` reported by how much. Grow to fit and re-ask — the
             # same grow-and-retry discipline the kernel's FB_HASH/FB_HEAP already use, and for the
@@ -1119,7 +1120,7 @@ class AStarPlanner:
     def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
         """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
         ``_blocked`` treats them as transparent (own column) instead of walls. Cheap: rasterize the 1–2
-        own hub columns (same rasterizer that built the column pool) and mark their in_blk cells — no
+        own hub columns (the same rasterizer that records column claims) and mark their in_blk cells — no
         per-step scan. Under ``terminal_airspace_always_active`` (#24) ALSO mark the hub's full
         ``terminal_cells`` (the wider flood-fill geometry the reference walls), so the permanent static wall
         is transparent to the hub that owns it — matching ``is_blocked``'s tid-based own-hub exemption.
@@ -1182,7 +1183,7 @@ class AStarPlanner:
         self._kernel = None
 
     def _warm_jit(self):
-        """Compile both numba kernels at construction with tiny synthetic inputs."""
+        """Compile every independently-dispatched numba entry point with production signatures."""
         if self._kernel is None:
             return
         component = "search kernel"
@@ -1224,6 +1225,28 @@ class AStarPlanner:
                 0, 0, 3, 1, warm_wbox, np.zeros(warm_wbox[W.W_ROWB], np.uint8),
                 _S0_SHIFT, _SPAN_BITS, _FIELD_MASK,
             )
+            # ClaimArena's mutation/oracle functions are separate @njit dispatchers too. In
+            # particular, add_many first runs while an existing ledger is being absorbed and
+            # remove_many first runs after LNS has already tombstoned victims. Warm all of them here
+            # so a stale/incompatible cache fails before this planner subscribes to any ledger.
+            component = "claim-arena kernels"
+            from . import claim_arena as CA
+            keys = np.array([0], np.int64)
+            claim = np.array([(1 << _S0_SHIFT) | (2 << _SPAN_BITS)], np.int64)
+            arena = np.zeros(4, np.int64)
+            start = np.zeros(1, np.int64)
+            length = np.zeros(1, np.int64)
+            slab_cap = np.zeros(1, np.int64)
+            tail = np.zeros(1, np.int64)
+            garbage = np.zeros(1, np.int64)
+            short = CA.add_many(
+                keys, claim, 1, arena, start, length, slab_cap, tail, garbage,
+            )
+            if short != 0:
+                raise RuntimeError(f"claim-arena warm add unexpectedly needs {short} slots")
+            CA.blocked_at(0, 1, arena, start, length, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+            CA.compact_into(arena, start, length, slab_cap, np.zeros(4, np.int64), 1, 4)
+            CA.remove_many(keys, claim, 1, arena, start, length)
         except Exception as e:                                # compile failure → degrade to pure Python
             self._disable_compiled(component, e)
 
@@ -1432,14 +1455,21 @@ class AStarPlanner:
                 ks["out_q"], ks["out_r"], ks["out_L"], ks["out_s"], self.max_expansions,
                 rb, ks["win"], ks["wbox"], ks["win_stats"],
             )
-            if ks["win_stats"][W.WS_MISSED] and widen < _WINDOW_WIDEN_MAX:
+            if ks["win_stats"][W.WS_MISSED]:
                 # A probe fell outside the window. Same exact-retry discipline as the FB_MASK widen:
-                # grow the box and re-run under a fresh `gen`, using no partial output. Harmless while
-                # the interval pools still answer misses correctly — it is the ESCALATION PATH being
-                # exercised here, so that it is already proven by the time the pools are gone.
-                self._win_widen += 1
-                widen += 1
-                continue
+                # grow the box and re-run under a fresh `gen`, using no partial output. At the widen
+                # ceiling there is no larger exact bitmap to try, so discard that result too and run
+                # the reference planner. `_blocked` deliberately answered every missed probe as
+                # BLOCKED; consuming a normal accept/deny from that partial search can reject a legal
+                # detour or choose a more expensive route.
+                if widen < _WINDOW_WIDEN_MAX:
+                    self._win_widen += 1
+                    widen += 1
+                    continue
+                self._fb += 1
+                self._fb_reasons["window-exhausted"] += 1
+                self._win_exhausted += 1
+                return self._plan_reference(req, ledger, cfg)
             if status == K.FB_MASK and n_gsteps < full_ng:
                 self._remask += 1
                 n_gsteps = full_ng                       # widen to the full range and re-run (exact)

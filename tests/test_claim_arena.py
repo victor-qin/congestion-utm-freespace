@@ -108,6 +108,28 @@ def test_compact_reclaims_growth_garbage_without_changing_answers():
     assert {k: sorted(int(x) for x in a.slab(k)) for k in (2, 5, 11)} == before
 
 
+def test_sparse_batches_do_not_recompact_an_unimprovable_layout(monkeypatch):
+    """One-claim slabs necessarily retain more than 2x live slots even after compaction.
+
+    The automatic threshold must compare against that attainable layout, or each later sparse
+    commit performs another O(all claims) rewrite while producing the same tail/live ratio.
+    """
+    a = _arena(n_keys=128, capacity=512)
+    real = a.compact
+    calls = []
+
+    def counted():
+        calls.append(True)
+        real()
+
+    monkeypatch.setattr(a, "compact", counted)
+    for k in range(40):
+        a.add(np.array([k], np.int64), np.array([_pack(k, k + 1, k)], np.int64))
+
+    assert calls == []
+    assert a.n_claims == 40
+
+
 def test_blocked_membership_matches_a_plain_scan():
     a = _arena()
     spans = [(3, 9), (14, 17), (30, 33)]

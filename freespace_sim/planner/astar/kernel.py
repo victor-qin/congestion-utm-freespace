@@ -16,17 +16,11 @@ The priority queue is a hand-rolled binary min-heap keyed ``(f, insertion_counte
 to the host's ``heapq`` ``(priority, next(counter))`` tie-break, which is what makes the expansion
 order match.
 
-**Occupancy** is :class:`CompiledHexOccupancy`'s two interval pools (corridor + column, per-``(q,r,L)``
-free intervals) plus this flight's cheap per-cell own-column **mark** (``ov_own_gen``); ``_blocked`` folds
-them into ``is_blocked`` (foreign column → wall; own column → transparent unless a corridor covers it).
-Out-of-box neighbours / hash-full / heap-full return a distinct ``FB_*`` code so the host warns precisely
-and falls back to the pure-Python reference.
-
-Those pools are sized by the whole REGION, so probing them is a random access far past cache. When the
-host supplies one, ``_blocked`` answers instead from a per-plan dense **bitmap** over the small box the
-plan actually reads (:mod:`window`) — one byte read and a mask, out of a cache-resident buffer — and
-falls back to the pool walk for anything outside it. The window is a pure cache of those same pools, so
-it is answer-neutral by construction; ``win_stats`` counts which path each probe took.
+**Occupancy** is the per-plan dense bitmap built from :class:`CompiledHexOccupancy`'s packed claims.
+``_blocked`` performs one byte read and mask inside that local box. A probe outside it sets a sticky
+miss flag and is answered conservatively as blocked; the host discards the whole run, widens and
+retries, or takes the exact reference fallback at the ceiling. Out-of-global-box neighbours,
+hash-full, and heap-full likewise return distinct ``FB_*`` codes for exact host-side fallback.
 """
 from __future__ import annotations
 
@@ -258,7 +252,7 @@ def _search(
     out_q, out_r, out_L, out_s, max_expansions,
     # ---- read-set telemetry (Track A, issue #8): in/out int64[8] bbox over every in-box probe ----
     read_bbox,
-    # ---- per-plan dense occupancy bitmap (`window`); wbox[W_STEPS] == 0 ⇒ absent, pools only ----
+    # ---- per-plan dense occupancy bitmap (`window`); wbox[W_STEPS] == 0 ⇒ no compiled answer ----
     win, wbox, win_stats,
 ):
     step_span = max_step - base + 1

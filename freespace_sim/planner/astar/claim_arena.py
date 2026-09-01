@@ -1,10 +1,9 @@
 """Flat, numba-visible storage for the occupancy claim journal.
 
-``CompiledHexOccupancy`` records every committed (cell, step-span) as a packed int64 "claim", today
-in a ``dict[key, list[int]]``. That dict is the reason the interval pools still exist: the pools are
-a *query accelerator* derived from the claims, and removing a flight from them costs a rebuild of
-each touched cell from its SURVIVORS — measured at 12.2x the released flight's own footprint at
-``density_faa`` scale, and growing with congestion.
+``CompiledHexOccupancy`` records every committed (cell, step-span) as a packed int64 "claim". The
+predecessor stored those in ``dict[key, list[int]]`` and derived free-interval query pools; removing
+a flight then rebuilt each touched cell from its SURVIVORS — measured at 12.2x the released flight's
+own footprint at ``density_faa`` scale, and growing with congestion.
 
 The obvious fix is to answer occupancy from the claims directly and delete the pools. Phase 0
 measured what that needs (``context/lns_plan.md``):
@@ -133,8 +132,7 @@ def remove_many(keys, vals, n, arena, start, length):
 
 @njit(cache=True, nogil=True)
 def blocked_at(key, s, arena, start, length, s0_shift, span_bits, field_mask):
-    """Is ``key`` blocked at step ``s``? A membership scan over the cell's slab — the operation the
-    interval pools exist to accelerate, and which the per-plan window makes unnecessary."""
+    """Is ``key`` blocked at step ``s``? Diagnostic membership scan over the cell's claim slab."""
     base = start[key]
     for m in range(length[key]):
         packed = arena[base + m]
@@ -208,16 +206,21 @@ class ClaimArena:
     def _maybe_compact(self) -> None:
         """Reclaim when the arena has drifted well past the data it holds.
 
-        Two triggers, because they catch different things. GARBAGE past a third of the tail is
-        fragmentation from re-homed slabs. TAIL past twice the live claims is the subtler one: slab
-        capacities are powers of two, so a bulk load leaves every slab up to 2x its length even with
-        no garbage at all, and the buffer doubles on top of that — measured at 146 MB of allocation
-        holding 34 MB of claims, sitting just under a garbage-only threshold and never compacting.
+        Three triggers catch different waste: GARBAGE from re-homed slabs, TAIL capacity far beyond
+        what compaction can attain, and an overgrown backing buffer. The attainable size matters:
+        compaction deliberately keeps 25% per-slab headroom plus two slots per live key. Comparing
+        tail directly with live claims made a one-claim slab (post-compact cap == 3) permanently
+        satisfy ``tail > 2*live`` and rewrite the entire arena after every sparse commit.
 
         Checked after a SUCCESSFUL add, not only when one runs short, or the arena only ever reclaims
         under allocation pressure. Removals never fragment, so this is off the destroy path."""
         live = int(self.length.sum())
-        if self.garbage[0] > self.tail[0] // 3 or self.tail[0] > 2 * max(live, 1):
+        n_live_keys = int(np.count_nonzero(self.length))
+        attainable_tail = live + (live * _HEADROOM_NUM) // _HEADROOM_DEN + 2 * n_live_keys
+        attainable_buffer = max(attainable_tail + attainable_tail // 8, 1 << 16)
+        if (self.garbage[0] > self.tail[0] // 3
+                or self.tail[0] > 2 * max(attainable_tail, 1)
+                or self.arena.shape[0] > 2 * attainable_buffer):
             self.compact()
 
     def remove(self, keys: np.ndarray, vals: np.ndarray) -> None:

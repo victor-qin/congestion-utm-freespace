@@ -1,8 +1,10 @@
-"""Paired A/B for the per-plan dense occupancy window (``planner.astar.window``).
+"""Paired parity/throughput harness for final compiled A* and its independent reference oracle.
 
-The window is a pure cache of the interval pools ``kernel._blocked`` otherwise walks, so the only
-questions are *is it faster* and *is it still byte-identical*. This measures both, on real plans
-against a real committed schedule rather than a synthetic probe stream.
+The pool-less compiled planner cannot run with its dense window disabled: the window IS the dynamic
+occupancy image. The old interval-pool off arm therefore no longer exists. This harness now compares
+the pure-Python reference search with the final compiled-window search on real plans against a real
+committed schedule. It measures end-to-end compiled acceleration, not the window's isolated speedup;
+the value of retaining it is the paired identity gate under realistic single- and multi-process load.
 
 Method — the two things that make this comparison honest:
 
@@ -22,7 +24,7 @@ pickle the LNS probes build, which is what makes running this at ``density_faa``
 measurement that matters for parallel LNS: ``search_workers=8`` puts eight replicas on cores that
 share 12 MB of L2, and ``_packed`` measured that regime rewarding a cache-footprint fix far more
 than a solo run did (2.5x solo, 3.1x at 8 processes). Every process does the same work, so the
-window's speedup at N procs against its speedup at 1 is the contention-specific part of the win.
+  compiled speedup at N procs against its speedup at 1 is the contention-specific part of the win.
 
 Usage:
     uv run python analysis/ab_dense_window.py --scenario metro_2uss --demand-duration 600
@@ -63,7 +65,7 @@ def _rebuild(cfg, intents, static_terms) -> ReservationLedger:
 
 
 def _sig(it) -> tuple:
-    """Everything about a plan that a window could conceivably move."""
+    """Everything the compiled path must reproduce from the independent reference."""
     if not it.accepted:
         return (False, it.denial_reason if hasattr(it, "denial_reason") else None)
     return (True, round(float(it.cost), 12),
@@ -79,8 +81,8 @@ def _pass(planner, requests, ledger, cfg):
 
 def _make_arms(window_bytes, kernel_log2):
     arms = {
-        "off": AStarPlanner(window_bytes=0, kernel_log2_min=kernel_log2),
-        "on": AStarPlanner(window_bytes=window_bytes, kernel_log2_min=kernel_log2),
+        "reference": AStarPlanner(compiled=False),
+        "compiled": AStarPlanner(window_bytes=window_bytes, kernel_log2_min=kernel_log2),
     }
     # A pass ends on the latest request and the next pass restarts at the earliest one. Occupancy,
     # pad-capacity, and terminal-capacity eviction are monotone, so without a floor later passes
@@ -99,16 +101,16 @@ def _paired_pass(arms, requests, ledger, cfg, *, before_arm=None):
             before_arm()
         elapsed[name], rows[name] = _pass(planner, requests, ledger, cfg)
 
-    off = rows["off"]
-    on = rows["on"]
-    if off != on:
-        n_plans = max(len(off), len(on))
+    reference = rows["reference"]
+    compiled = rows["compiled"]
+    if reference != compiled:
+        n_plans = max(len(reference), len(compiled))
         n_diff = sum(
-            i >= len(off) or i >= len(on) or off[i] != on[i]
+            i >= len(reference) or i >= len(compiled) or reference[i] != compiled[i]
             for i in range(n_plans)
         )
         raise RuntimeError(
-            f"DIVERGENCE: window changed {n_diff} of {n_plans} plans; timing is invalid"
+            f"DIVERGENCE: compiled A* changed {n_diff} of {n_plans} plans; timing is invalid"
         )
     return elapsed
 
@@ -184,13 +186,14 @@ def main() -> None:
     if args.procs:
         if not args.cache or not os.path.exists(args.cache):
             raise SystemExit("--procs needs a prebuilt --cache: a child must not replan the baseline")
-        print(f"{'procs':>5} {'off s':>8} {'on s':>8} {'speedup':>8}   (median over processes)")
+        print(f"{'procs':>5} {'ref s':>8} {'jit s':>8} {'speedup':>8}   (median over processes)")
         print("-" * 42)
         for n in [int(x) for x in args.procs.split(",")]:
             rows = fanout(args, n)
-            off = statistics.median(r["off"] for r in rows)
-            on = statistics.median(r["on"] for r in rows)
-            print(f"{n:>5} {off:>8.2f} {on:>8.2f} {off / on:>7.3f}x", flush=True)
+            reference = statistics.median(r["reference"] for r in rows)
+            compiled = statistics.median(r["compiled"] for r in rows)
+            print(f"{n:>5} {reference:>8.2f} {compiled:>8.2f} "
+                  f"{reference / compiled:>7.3f}x", flush=True)
         return
 
     spec = with_overrides(get_scenario(args.scenario),
@@ -231,24 +234,32 @@ def main() -> None:
             elapsed = _paired_pass(arms, requests, ledger, cfg)
             for name, dt in elapsed.items():
                 times[name].append(dt)
-                print(f"  pass {i + 1} {name:>3}: {dt:8.2f}s  ({1e3 * dt / len(requests):6.1f} ms/plan)",
+                print(f"  pass {i + 1} {name:>9}: {dt:8.2f}s  "
+                      f"({1e3 * dt / len(requests):6.1f} ms/plan)",
                       flush=True)
 
         med = {k: statistics.median(v) for k, v in times.items()}
-        p_on = arms["on"]
-        st = p_on._ks["win_stats"] if p_on._ks is not None else np.zeros(2, np.int64)
+        p_compiled = arms["compiled"]
+        st = (p_compiled._ks["win_stats"] if p_compiled._ks is not None
+              else np.zeros(2, np.int64))
         print(f"\n{len(requests)} plans, {args.passes} passes, "
               f"scenario={args.scenario} @ {args.demand_duration:.0f}s demand")
-        print(f"  window off : {med['off']:8.2f}s   ({1e3 * med['off'] / len(requests):6.2f} ms/plan)")
-        print(f"  window on  : {med['on']:8.2f}s   ({1e3 * med['on'] / len(requests):6.2f} ms/plan)")
-        print(f"  SPEEDUP    : {med['off'] / med['on']:8.3f}x")
+        print(f"  reference  : {med['reference']:8.2f}s   "
+              f"({1e3 * med['reference'] / len(requests):6.2f} ms/plan)")
+        print(f"  compiled   : {med['compiled']:8.2f}s   "
+              f"({1e3 * med['compiled'] / len(requests):6.2f} ms/plan)")
+        print(f"  SPEEDUP    : {med['reference'] / med['compiled']:8.3f}x")
         print(f"  identical  : True   (0 of {len(requests)} plans differ)")
         print(f"  window     : hit {st[0]:,} / miss {st[1]:,} "
-              f"({st[0] / max(1, st[0] + st[1]):.3%} hit), peak {p_on._win_bytes_peak / 1e3:,.0f} kB, "
-              f"{p_on._win_off} plans with no window, {p_on._win_painted:,} cells painted")
-        print(f"  pools      : corridor {arms['on']._cocc.corr.nslots:,} slots, "
-              f"column {arms['on']._cocc.col.nslots:,} (NC={arms['on']._cocc.NC:,}) — "
-              f"{(arms['on']._cocc.corr.iv.nbytes + arms['on']._cocc.col.iv.nbytes) / 1e6:.0f} MB")
+              f"({st[0] / max(1, st[0] + st[1]):.3%} hit), "
+              f"peak {p_compiled._win_bytes_peak / 1e3:,.0f} kB, "
+              f"{p_compiled._win_off} plans with no window, "
+              f"{p_compiled._win_painted:,} cells painted")
+        arena = p_compiled._cocc._arena
+        live_keys = int(np.count_nonzero(arena.length))
+        print(f"  arena      : {arena.n_claims:,} claims in {live_keys:,} slabs, "
+              f"tail {int(arena.tail[0]):,}, garbage {int(arena.garbage[0]):,}, "
+              f"{arena.nbytes() / 1e6:.1f} MB allocated")
 
 
 if __name__ == "__main__":

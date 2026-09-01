@@ -15,13 +15,11 @@ Three couplings are easy to get wrong from the file names alone:
     it owns ``search_horizon`` / ``hover_tail_steps`` / ``schedulable_horizon_steps``, plain
     cfg-to-step arithmetic and the ONE definition (issue #5) shared by the reference path, the
     compiled path, and the ledger. Gating this module on numba would silently un-bound all three.
-  * ``window`` is ``@njit`` too, so ``kernel`` is no longer this family's only compiled module — and
-    unlike ``kernel`` it is imported at MODULE level by ``planner`` (for ``empty_wbox`` /
-    ``window_bounds`` / ``disable``, which are plain Python). ``AStarPlanner.__init__``'s numba
-    fallback is an ImportError guard around ``.kernel`` only, so it cannot catch that import;
-    ``window`` therefore carries its own guard, without which a numba-less install stops importing
-    the package instead of degrading to the reference search. Pinned by
-    ``test_window_module_imports_without_numba``.
+  * ``window`` and ``claim_arena`` have their own ``@njit`` dispatchers, so ``kernel`` is no longer
+    this family's only compiled module. Both are imported at module level through the occupancy
+    stack, while ``AStarPlanner.__init__``'s optional-numba guard sits around ``.kernel``; each leaf
+    therefore carries an import guard, and the planner warms every dispatcher before binding a
+    ledger. A numba-less install still imports cleanly and degrades to the reference search.
 
 What stayed at ``planner/`` level, owned by neither family: ``hexgrid`` (the lattice primitives —
 colgen, ``milp``, ``demand``, ``volumes``, ``viz_html`` and ``parallel`` all consume it, and it

@@ -1,40 +1,16 @@
-"""Per-plan DENSE occupancy window — MAPF-LNS's ``PathTable``, applied locally.
+"""Per-plan dense occupancy window — MAPF-LNS's ``PathTable``, applied locally.
 
-``kernel._blocked`` is the hottest read in the whole search (6 reroutes + a hover + the vertical
-rungs, once per expansion). It answers by walking two flat free-interval pools
-(:class:`compiled_hex_occupancy._Pool`) indexed by cell id: one list traversal per pool per probe,
-plus a read of ``static_col`` and one of ``ov_own_gen``. At ``density_faa`` scale those pools hold
-1.4M + 371k live interval slots over 323k cells — a mean chain of 4.4 and far longer on the hot
-cells — and ``analysis/prof_ledger_scaling.py`` names that chain growth as the run's later-in-run
-slowdown, since the (watermark-only) compiled eviction never reclaims historical fragments.
-
-**What the win is NOT.** The pools total ~52 MB, four times past the 12 MB this machine's P-cores
-share as L2, so the obvious argument is the ~137 ns DRAM latency measured on this box against ~2 ns
-for an L1-resident set. That argument is wrong, and measuring it is what showed why: one plan
-touches only ~5,550 cells (``.context/perf/probe_read_window.py``), i.e. ~180 KB of head slots,
-which is L2-resident after first touch. The saving is the list WALK and the two per-cell reads, not
-the latency of reaching the pool — and the measured speedup is correspondingly modest (~1.08-1.14x,
-flat in worker count) rather than the order of magnitude the latency framing suggests.
-
-MAPF-LNS's C++ ``PathTable`` has neither problem: its map is a ``vector<vector<int>>`` over
-``[location][timestep]`` and ``constrained()`` is 3–5 direct array reads. On their 32×32 Room map
-that table is ~0.8 MB and lives in L2. It does not generalise here — 144k hexes × 3 levels × ~1,800
-steps is ~777M space-time cells, so a dense global table is impossible.
-
-What IS possible is the same table over the region ONE plan reads. A repair replans a single flight
-between two hubs; its probes fall inside a small axial box over a short step window (the kernel's
-own ``read_bbox`` telemetry measures it — see ``.context/perf/probe_read_window.py``). So before the
-search, materialise a **bitmap**
+A global ``[cell, step]`` table is prohibitively large, but one flight reads a small axial box over
+a bounded step range. Before each compiled search, materialise that region as a bit-packed bitmap:
 
     bit k of win[wcell * row_bytes + (k >> 3)]      where k = s - ws0,
     wcell = (iq * wrspan + ir) * n_levels + L
 
-and ``_blocked`` inside the window becomes one byte read, a shift and a mask, out of a buffer that
-fits in cache — with each fragmented interval list walked ONCE at build time instead of once per
-probe. One bit is enough because everything ``_blocked`` returns 1 for is an OR:
+``_blocked`` then becomes one byte read, shift, and mask. One bit is enough because blocked state is
+the OR of corridor claims and foreign terminal-column occupancy:
 
-    blocked(cell, s) = corridor pool blocks it
-                    OR a FOREIGN column walls it — transient (column pool) or always-active
+    blocked(cell, s) = corridor claim covers it
+                    OR a FOREIGN column walls it — transient claim or always-active
                        (``static_col``) — with the flight not owning the cell (``ov_own_gen != gen``)
 
 Folding ``static_col`` in is exact because that wall is step-independent, and folding ``ov_own_gen``
@@ -42,21 +18,10 @@ is exact because the overlay is stamped per plan with the same ``gen`` the windo
 (``_plan_compiled`` rebuilds BOTH inside the FB_MASK/FB_HASH re-run loop, so a re-run can never read
 a window built under a stale generation).
 
-**The build is O(claims), not O(window).** Restating the definition above as its complement,
-``free = corridor-free AND (own OR column-free)``, makes the whole row a set operation: a cell
-nothing was ever committed to is one seed interval ``[0, MAXS]`` in both pools and writes nothing at
-all, and a claimed cell is filled blocked and then cleared over the INTERSECTION of the two free
-lists — a two-pointer merge, so the cost is the number of intervals plus the bits cleared, never the
-window's area. That intersection walk is the one thing here that relies on the pools' ascending-sort
-invariant, which ``_Pool.block_range``'s own early-exit already depends on.
-
-Rows are padded to whole bytes so those clears are byte and word operations; that wastes under 8
-bits per cell, against an 8x larger working set for a byte-per-entry table.
-
-**Why this cannot change an answer.** The window is a pure cache of the pools it was built from,
-which do not change during a search (commits happen between plans). Every probe outside it falls
-through to the original list walk. So an undersized window costs speed, never correctness — which
-is why the bounds below are a heuristic with telemetry (``win_stats``) rather than a proof.
+The build scans each in-box cell's contiguous claim slabs and ORs overlapping spans; claim order is
+irrelevant. Rows are byte-padded, wasting fewer than eight bits per cell. Any probe outside the
+heuristic bounds marks the run invalid: the host widens and rebuilds, then uses the pure-Python
+reference if misses remain at the ceiling. No partial-window result is consumed.
 """
 from __future__ import annotations
 
@@ -198,7 +163,7 @@ def build_window_claims(arena, slab_start, slab_len, static_col, ov_own_gen, gen
 
 def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, n_gsteps,
                   lateral_margin, tail_steps, max_bytes):
-    """Size the window around the cells a plan is anchored to; return its byte count, or 0 for off.
+    """Size the window around the cells a plan is anchored to; return bytes or 0 if degenerate.
 
     ``q_cells``/``r_cells`` are the origin hex, its exit lanes and the destination's landing lanes.
     A* explores an ellipse between them, so their bbox plus ``lateral_margin`` hexes covers the

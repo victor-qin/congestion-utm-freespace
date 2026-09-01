@@ -1125,6 +1125,17 @@ def test_operator_validation_precedes_the_ledger_takeover():
         assert led._observers and led.epoch == 0      # ledger untouched by the rejected call
 
 
+def test_direct_lns_state_builds_its_planner_before_ledger_takeover():
+    """Direct construction has the same no-side-effects-on-constructor-error contract as run_lns."""
+    led = ReservationLedger(CFG)
+    led.subscribe(lambda fid, vols: None)
+
+    with pytest.raises(ValueError, match="window_bytes"):
+        LNSState(CFG, led, [], window_bytes=0)
+
+    assert led._observers and led.epoch == 0
+
+
 def test_run_lns_on_result_refuses_a_result_without_an_anchor_mode():
     """'nominal' is the value that DISARMS the paired-return guard, so defaulting to it on a result
     type that does not carry the field is the unsafe direction."""

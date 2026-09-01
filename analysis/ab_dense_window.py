@@ -68,9 +68,10 @@ def _sig(it) -> tuple:
     """Everything the compiled path must reproduce from the independent reference."""
     if not it.accepted:
         return (False, it.denial_reason if hasattr(it, "denial_reason") else None)
-    return (True, round(float(it.cost), 12),
-            tuple((v.flat_aabb(), round(float(v.t_start), 12), round(float(v.t_end), 12),
-                   v.terminal_id) for v in it.volumes))
+    # ``Volume4D`` and both shape specs are frozen, value-comparable dataclasses. Keep the complete
+    # oriented geometry: an AABB is only a broadphase envelope, so opposite-diagonal corridor boxes
+    # can share it while representing different reserved airspace.
+    return (True, round(float(it.cost), 12), tuple(it.volumes))
 
 
 def _pass(planner, requests, ledger, cfg):

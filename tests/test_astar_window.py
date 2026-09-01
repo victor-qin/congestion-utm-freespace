@@ -89,31 +89,106 @@ def test_window_jit_warms_under_the_compiled_fallback_guard(monkeypatch):
 
 def test_window_jit_runtime_failure_replans_and_stays_disabled(monkeypatch):
     """A post-warm dispatcher failure must re-run this flight in Python and disable later JIT use."""
+    from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
+
     req = _req()
     reference = AStarPlanner(compiled=False)
     expected = reference.plan(req, ReservationLedger(CFG), CFG)
-    planner = AStarPlanner(compiled=True)
+    planner = AStarPlanner(compiled=True, incremental_release=True)
+    ledger = ReservationLedger(CFG)
     calls = []
+    abandoned = []
 
     def fail_window(*_args):
         calls.append(True)
+        abandoned.append(planner._cocc)
         raise RuntimeError("window dispatcher failed after warm-up")
 
     monkeypatch.setattr(W, "build_window_claims", fail_window)
     with pytest.warns(RuntimeWarning, match="dense-window kernel failed"):
-        got = planner.plan(req, ReservationLedger(CFG), CFG)
+        got = planner.plan(req, ledger, CFG)
 
     assert calls == [True], "the test never reached the window dispatcher"
     assert planner.compiled is False and planner._kernel is None
+    assert planner._cocc is None and planner._cocc_ledger is None
+    assert planner._ks is None and planner._ks_caps == {}
+    assert all(not isinstance(getattr(cb, "__self__", None), CompiledHexOccupancy)
+               for callbacks in (ledger._observers, ledger._release_subs, ledger._static_subs)
+               for cb in callbacks)
+    assert (len(ledger._observers), len(ledger._release_subs), len(ledger._static_subs)) == (2, 2, 1)
     assert planner._ref_dispatch["window-jit"] == 1
     assert got.status is expected.status and got.cost == expected.cost
     assert planner.last_expansions == reference.last_expansions
     assert _clkey(got) == _clkey(expected)
 
-    again = planner.plan(req, ReservationLedger(CFG), CFG)
+    again = planner.plan(req, ledger, CFG)
     assert calls == [True], "a disabled planner called the failing JIT again"
     assert again.status is expected.status and again.cost == expected.cost
     assert _clkey(again) == _clkey(expected)
+
+    # The abandoned packed image must stay inert after fallback; only the reference occupancy and
+    # capacity services remain subscribed to future ledger writes.
+    ledger.commit(99, [Volume4D(CylinderSpec(8000, 8000, 40, 0, 150), 0.0, 20.0)])
+    assert abandoned[0] is not None and abandoned[0].n_added == 0
+
+
+@pytest.mark.parametrize("failure_at", ["compiled-constructor", "backlog-absorb", "static-replay"])
+def test_failed_compiled_bind_removes_every_partial_subscription(monkeypatch, failure_at):
+    """Any failure in the dual-image bind must leave a clean, retryable ledger and planner."""
+    from freespace_sim.planner.astar import compiled_hex_occupancy as CH
+
+    ledger = ReservationLedger(CFG)
+    ledger.commit(99, [Volume4D(CylinderSpec(8000, 8000, 40, 0, 150), 0.0, 20.0)])
+    ledger.register_static_terminal(vec(9000, 9000, 0), Terminal("far-hub", 2, 60.0))
+    static_seen = []
+
+    def external_commit(_fid, _vols):
+        pass
+
+    def external_release(_fid, _vols):
+        pass
+
+    def external_static(_center, term):
+        static_seen.append(term.id)
+
+    ledger.subscribe(external_commit)
+    ledger.subscribe_release(external_release)
+    ledger.subscribe_static(external_static)
+    planner = AStarPlanner(compiled=True, incremental_release=True)
+
+    with monkeypatch.context() as m:
+        if failure_at == "compiled-constructor":
+            def fail_constructor(*_args, **_kwargs):
+                raise RuntimeError("injected compiled constructor failure")
+
+            m.setattr(CH, "CompiledHexOccupancy", fail_constructor)
+        elif failure_at == "backlog-absorb":
+            def fail_absorb(self, _fid, _volumes):
+                raise RuntimeError("injected backlog absorb failure")
+
+            m.setattr(CH.CompiledHexOccupancy, "on_commit", fail_absorb)
+        else:
+            def fail_static(self, _center, _term):
+                raise RuntimeError("injected static replay failure")
+
+            m.setattr(CH.CompiledHexOccupancy, "_on_static", fail_static)
+
+        with pytest.raises(RuntimeError, match="injected"):
+            planner.plan(_req(fid=2), ledger, CFG)
+
+    assert ledger._observers == [external_commit]
+    assert ledger._release_subs == [external_release]
+    assert ledger._static_subs == [external_static]
+    assert ledger.epoch == 0, "component rollback must not detach unrelated ledger subscribers"
+    assert planner._svc is None and planner._tcap is None and planner._svc_ledger is None
+    assert planner._cocc is None and planner._cocc_ledger is None
+
+    # Restoring the injected failure makes the same planner/ledger pair retry from empty services.
+    retried = planner.plan(_req(fid=2), ledger, CFG)
+    assert retried.accepted
+    assert (len(ledger._observers), len(ledger._release_subs), len(ledger._static_subs)) == (4, 4, 3)
+    ledger.release(99)  # no abandoned partial release subscriber may see this flight
+    assert static_seen == ["far-hub"]
 
 
 def test_claim_arena_jit_warms_under_the_compiled_fallback_guard(monkeypatch):
@@ -148,6 +223,24 @@ def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"DIVERGENCE: compiled A\* changed 1 of 1 plans"):
         ab._paired_pass({"reference": object(), "compiled": object()}, (), None, None)
+
+
+def test_benchmark_signature_includes_complete_oriented_geometry():
+    """Equal broadphase AABBs must not hide a different oriented corridor reservation."""
+    from types import SimpleNamespace
+    from analysis import ab_dense_window as ab
+
+    left = Volume4D(
+        box_from_segment(vec(-1, -1, 100), vec(1, 1, 100), 0.5, 1.0), 0.0, 1.0,
+    )
+    right = Volume4D(
+        box_from_segment(vec(-1, 1, 100), vec(1, -1, 100), 0.5, 1.0), 0.0, 1.0,
+    )
+    assert left.flat_aabb() == right.flat_aabb() and left.shape != right.shape
+
+    a = SimpleNamespace(accepted=True, cost=1.0, volumes=[left])
+    b = SimpleNamespace(accepted=True, cost=1.0, volumes=[right])
+    assert ab._sig(a) != ab._sig(b)
 
 
 def test_ab_benchmark_disables_monotone_eviction(monkeypatch):

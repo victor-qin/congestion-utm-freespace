@@ -399,6 +399,43 @@ class AStarPlanner:
         (see the tightness note in ``_occupancy``). None → the bare request clock."""
         return req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
 
+    def _unbind_reference_occupancy(self, ledger=None) -> None:
+        """Detach and forget the reference occupancy/capacity stack for ``ledger``.
+
+        Unlike :meth:`ReservationLedger.detach_subscribers`, this removes only this planner's bound
+        methods and does not bump the ledger epoch or disturb unrelated observers. It is therefore
+        safe both for a failed first bind and for replacing a planner-local service stack.
+        """
+        bound = self._svc_ledger
+        if bound is None or (ledger is not None and bound is not ledger):
+            return
+        svc, tcap = self._svc, self._tcap
+        if svc is not None:
+            bound.unsubscribe(svc.on_commit)
+            bound.unsubscribe_release(svc.on_release)
+            bound.unsubscribe_static(svc._on_static)
+        if tcap is not None:
+            bound.unsubscribe(tcap.on_commit)
+            bound.unsubscribe_release(tcap.on_release)
+        self._svc = None
+        self._tcap = None
+        self._svc_ledger = None
+        self._svc_epoch = 0
+
+    def _unbind_compiled_occupancy(self, ledger=None) -> None:
+        """Detach and forget this planner's packed occupancy service for ``ledger``."""
+        bound = self._cocc_ledger
+        if bound is None or (ledger is not None and bound is not ledger):
+            return
+        cocc = self._cocc
+        if cocc is not None:
+            bound.unsubscribe(cocc.on_commit)
+            bound.unsubscribe_release(cocc.on_release)
+            bound.unsubscribe_static(cocc._on_static)
+        self._cocc = None
+        self._cocc_ledger = None
+        self._cocc_epoch = 0
+
     def _occupancy(self, req, ledger, cfg, _batch: "_BindBatch | None" = None) -> HexOccupancyService:
         """Return the incremental occupancy service, kept in sync with the ledger via the commit
         publish hook (ASTM-subscription style). First use subscribes and absorbs any pre-existing
@@ -413,31 +450,43 @@ class AStarPlanner:
             svc = None      # detached mid-life: re-subscribe and re-absorb (the shrink tripwire below
             #                 cannot see this — a release + re-commit nets to the same n_volumes)
         if svc is None or self._svc_ledger is not ledger:
+            # A planner is bound to one ledger at a time. Remove its callbacks from an older ledger
+            # before replacing the service objects, otherwise that ledger keeps feeding (and retaining)
+            # an unreachable occupancy stack.
+            self._unbind_reference_occupancy()
             # `maintain_blocked=False` on the compiled path: `is_blocked` is the map's only reader
             # and `_plan_compiled` never calls it (measured: 62,537 `pad_clear` and ZERO `is_blocked`
             # over 20 LNS tasks), while 98.3% of `pad` bumps also bump `blocked`. `_plan_reference`
             # arms it before it searches, so a fallback still gets an exact map.
-            svc = self._svc = HexOccupancyService(
+            svc = HexOccupancyService(
                 cfg, track_removal=self.incremental_release,
                 maintain_blocked=not self.compiled or self.needs_blocked_map)
-            self._svc_epoch = ledger.epoch
-            self._tcap = TerminalCapacity(cfg, ledger,       # temporal pad capacity, same ledger
-                                          track_removal=self.incremental_release)
+            tcap = TerminalCapacity(cfg, ledger,             # temporal pad capacity, same ledger
+                                    track_removal=self.incremental_release)
+            # Publish the identities only after both constructors succeed. The compiled caller's
+            # outer transaction can now always identify and tear down every callback it registered.
+            self._svc = svc
+            self._tcap = tcap
             self._svc_ledger = ledger
+            self._svc_epoch = ledger.epoch
             ledger.subscribe(svc.on_commit)                 # publish hook: future commits auto-feed
-            ledger.subscribe(self._tcap.on_commit)
+            ledger.subscribe(tcap.on_commit)
             if self.incremental_release:                     # removal hook: release_many un-absorbs
                 ledger.subscribe_release(svc.on_release)
-                ledger.subscribe_release(self._tcap.on_release)
+                ledger.subscribe_release(tcap.on_release)
             # `subscribe_static` derives always-active routing walls from the ledger's permanent
             # terminal volumes (replays all already-registered hubs; no-op if none). It both APPENDS a
             # subscriber and replays, so it belongs to first-bind only — see the shrink branch below.
             if _batch is None:
-                _absorb(svc, ledger)                         # absorb anything already committed
-                _absorb(self._tcap, ledger)
-                ledger.subscribe_static(svc._on_static)
+                try:
+                    _absorb(svc, ledger)                     # absorb anything already committed
+                    _absorb(tcap, ledger)
+                    ledger.subscribe_static(svc._on_static)
+                except BaseException:
+                    self._unbind_reference_occupancy(ledger)
+                    raise
             else:
-                _batch.services += [svc, self._tcap]
+                _batch.services += [svc, tcap]
                 _batch.after.append(lambda: ledger.subscribe_static(svc._on_static))
         elif ledger.n_volumes < svc.n_added:
             warnings.warn(
@@ -942,8 +991,10 @@ class AStarPlanner:
         if cocc is not None and self._cocc_ledger is ledger and self._cocc_epoch != ledger.epoch:
             cocc = None                                  # detached mid-life — rebind (see _occupancy)
         if cocc is None or self._cocc_ledger is not ledger:
+            self._unbind_compiled_occupancy()
             from .compiled_hex_occupancy import CompiledHexOccupancy
-            cocc = self._cocc = CompiledHexOccupancy(cfg, track_removal=self.incremental_release)
+            cocc = CompiledHexOccupancy(cfg, track_removal=self.incremental_release)
+            self._cocc = cocc
             self._cocc_ledger = ledger
             self._cocc_epoch = ledger.epoch
             ledger.subscribe(cocc.on_commit)
@@ -952,8 +1003,12 @@ class AStarPlanner:
             # `subscribe_static` derives the compiled routing walls from the ledger's permanent
             # terminal volumes (replays all already-registered hubs; no-op if none) — first-bind only.
             if _batch is None:
-                _absorb(cocc, ledger)
-                ledger.subscribe_static(cocc._on_static)
+                try:
+                    _absorb(cocc, ledger)
+                    ledger.subscribe_static(cocc._on_static)
+                except BaseException:
+                    self._unbind_compiled_occupancy(ledger)
+                    raise
             else:
                 _batch.services.append(cocc)
                 _batch.after.append(lambda: ledger.subscribe_static(cocc._on_static))
@@ -1172,13 +1227,20 @@ class AStarPlanner:
         return overlap
 
     def _disable_compiled(self, component: str, error: Exception) -> None:
-        """Permanently degrade this planner after a requested numba component fails."""
+        """Permanently degrade this planner and dispose its failed compiled component."""
         warnings.warn(
             f"astar numba {component} failed ({error!r}); falling back to the pure-Python "
             f"reference planner for ALL plans. Install a compatible numba, or clear stale "
             f".nbi/.nbc caches after a kernel-signature change.",
             RuntimeWarning, stacklevel=3,
         )
+        # A runtime failure can happen after the packed image subscribed to a ledger. Leaving those
+        # hooks live would keep rasterizing every later commit/release into an arena no plan will ever
+        # read — and could make the supposedly-safe reference fallback fail in compiled-only packing.
+        self._unbind_compiled_occupancy()
+        self._ks = None
+        self._ks_caps.clear()
+        self._gen = 0
         self.compiled = False
         self._kernel = None
 
@@ -1282,17 +1344,18 @@ class AStarPlanner:
         # Bind both occupancy images, then absorb them in ONE pass over the ledger (see `_absorb_many`
         # — separate passes blow past the rasterizer memo's reuse window and re-sweep the geometry).
         batch = _BindBatch()
-        svc = self._occupancy(req, ledger, cfg, _batch=batch)
-        tcap = self._tcap
-        cocc = self._compiled_occ(req, ledger, cfg, _batch=batch)
         try:
+            # The transaction begins before either constructor/bind: `_compiled_occ` itself may fail
+            # after the reference stack has subscribed, and `batch.run` may fail after any subset of
+            # services absorbed the backlog or replayed static terminals. Every exit tears down only
+            # this planner's callbacks and identities, so a retry always starts from empty services.
+            svc = self._occupancy(req, ledger, cfg, _batch=batch)
+            tcap = self._tcap
+            cocc = self._compiled_occ(req, ledger, cfg, _batch=batch)
             batch.run(ledger)
         except BaseException:
-            # Both services are already assigned to `self` and to this ledger BEFORE their absorb, and
-            # none of the rebind guards can see a partially-fed service (`n_added` only ever
-            # under-counts, so the shrink tripwire stays silent). Drop the ledger identities so the
-            # next `plan()` takes the first-bind branch and rebuilds from scratch.
-            self._svc_ledger = self._cocc_ledger = None
+            self._unbind_compiled_occupancy(ledger)
+            self._unbind_reference_occupancy(ledger)
             raise
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)

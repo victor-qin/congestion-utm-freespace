@@ -34,7 +34,20 @@ import numpy as np
 from numba import njit
 
 from ._packed import GEN_MASK
-from .window import W_Q0, W_Q1, W_R0, W_R1, W_ROWB, W_RSPAN, W_S0, W_S1, W_STEPS, WS_HIT, WS_MISS
+from .window import (
+    W_Q0,
+    W_Q1,
+    W_R0,
+    W_R1,
+    W_ROWB,
+    W_RSPAN,
+    W_S0,
+    W_S1,
+    W_STEPS,
+    WS_HIT,
+    WS_MISS,
+    WS_MISSED,
+)
 
 _SQRT3 = 1.7320508075688772
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)          # Fibonacci hashing multiplier
@@ -153,23 +166,34 @@ def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
 
 @njit(cache=True, nogil=True)
 def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
-             iv, cv, static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats):
-    """0 = free, 1 = blocked, -1 = out-of-box. Reproduces ``occupancy.is_blocked`` via the corridor pool
-    (``iv_*``) + column pool (``cv_*``) + always-active static walls (``static_col``) + this flight's
-    own-column mark (``ov_own_gen[cell] == gen``): a FOREIGN column (transient OR always-active) is a wall;
-    an OWN column is transparent unless a corridor (fixed-lane sibling) also covers it; a plain cell is the
-    corridor pool.
+             static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats):
+    """0 = free, 1 = blocked, -1 = out-of-box. Answered from the per-plan dense window (:mod:`window`)
+    — one byte read, a shift and a mask.
+
+    The window is the ONLY source now. It used to be a cache in front of two free-interval pools, and
+    a probe outside it walked those instead; the pools are gone, because storing FREE intervals made
+    removing a flight cost a rebuild of every cell it touched from that cell's SURVIVORS (12.2x its
+    own footprint at density_faa scale, and growing with congestion). Occupancy is the claim arena
+    now, and the window is painted from it before each search.
+
+    So a probe outside the window cannot be answered here. It returns BLOCKED and raises the sticky
+    ``WS_MISSED`` flag; the host reads that flag once after the search, widens the window and re-runs
+    under a fresh ``gen``, using none of this run's output — the same exact-retry discipline as the
+    FB_MASK widen. Answering "blocked" rather than adding a new return code is deliberate: only one of
+    ``_search``'s five call sites inspects the value (the neighbour test, looking for the out-of-box
+    -1); the other four compare against zero, so a new negative code would be read as blocked at four
+    of them anyway — silently, without raising the flag that triggers the retry.
+
+    ``static_col`` and ``ov_own_gen`` are no longer read here at all: the window build folds the
+    always-active wall and this flight's own-column exemption in, which is why one bit per (cell,
+    step) suffices. They stay in the signature because the host still owns them and the overlay is
+    stamped per plan.
 
     ``read_bbox`` (int64[8]: qmin,qmax,rmin,rmax,Lmin,Lmax,smin,smax) accumulates every IN-BOX probe —
     the plan's read set, consumed by the Track-A exact-mode commit validation (``parallel.PlanEnvelope``).
-    Write-only w.r.t. the search: it cannot change any decision, so kernel==reference parity is untouched.
-    Out-of-box probes are excluded deliberately: the -1 answer is pure box geometry, independent of every
-    commit, so it can never be dirtied.
-
-    ``win``/``wbox`` are the optional per-plan dense bitmap (:mod:`window`). It holds ONE bit per
-    (cell, step) — set iff the three terms above say blocked — so an in-window probe skips the two list
-    walks AND the two per-cell arrays. ``wbox[W_STEPS] == 0`` means no window and the code below is the
-    pre-window path exactly."""
+    Write-only w.r.t. the search: it cannot change any decision. Out-of-box probes are excluded
+    deliberately: the -1 answer is pure box geometry, independent of every commit, so it can never be
+    dirtied."""
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
@@ -198,25 +222,7 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
             return 1
         return 0
     win_stats[WS_MISS] += 1
-    cell = (iq * rspan + ir) * n_levels + L
-    # column pool: is `cell` column-blocked at s? (blocked iff s is in no free interval)
-    colb = 1
-    slot = cell
-    while slot != -1:
-        if cv[slot, 0] <= s <= cv[slot, 1]:            # (lo, hi, nxt) share one 16 B row → one line
-            colb = 0
-            break
-        slot = cv[slot, 2]
-    if static_col[cell]:                               # always-active terminal: permanent column wall (all s)
-        colb = 1
-    if colb == 1 and ov_own_gen[cell] != gen:
-        return 1                                       # foreign column → wall
-    # corridor pool
-    slot = cell
-    while slot != -1:
-        if iv[slot, 0] <= s <= iv[slot, 1]:
-            return 0
-        slot = iv[slot, 2]
+    win_stats[WS_MISSED] = 1        # the host widens and re-runs; this answer is discarded
     return 1
 
 
@@ -233,8 +239,8 @@ def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb):
 
 @njit(cache=True, nogil=True)
 def _search(
-    # ---- occupancy pool + static walls + per-flight overlay (CompiledHexOccupancy) ----
-    iv, cv, static_col, ov_own_gen,
+    # ---- static walls + per-flight overlay (CompiledHexOccupancy); occupancy itself is the window ----
+    static_col, ov_own_gen,
     qmin, rmin, qspan, rspan, n_levels, base, max_step, ground_max_step,
     # ---- ground / takeoff-fan (host masks) ----
     oq, orr, lane_q, lane_r, lane_lat, lane_stp, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
@@ -344,7 +350,7 @@ def _search(
                         if not to_ok[gi * n_levels + Lv]:
                             continue
                         if _blocked(lq, lr, Lv, ts, qmin, rmin, qspan, rspan, n_levels,
-                                    iv, cv, static_col, ov_own_gen, gen,
+                                    static_col, ov_own_gen, gen,
                                     read_bbox, win, wbox, win_stats) != 0:
                             continue
                         liq = lq - qmin; lir = lr - rmin
@@ -384,7 +390,7 @@ def _search(
             else:
                 nq = q; nr = r + 1
             b = _blocked(nq, nr, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                         iv, cv, static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats)
+                         static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats)
             if b == -1:                                  # out-of-box stray → host reference
                 return 0, 0.0, n_exp, FB_OOB, (nq + 32768) * 65536 + (nr + 32768)
             if b == 1:
@@ -401,7 +407,7 @@ def _search(
                 return 0, 0.0, n_exp, FB_HEAP, -1
         # hover (same level)
         if _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                    iv, cv, static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats) == 0:
+                    static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt
             hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb)
@@ -425,10 +431,10 @@ def _search(
                 sk = step + 1
                 while sk <= ts:
                     if _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv, cv, static_col, ov_own_gen, gen,
+                                static_col, ov_own_gen, gen,
                                 read_bbox, win, wbox, win_stats) != 0 or \
                        _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
-                                iv, cv, static_col, ov_own_gen, gen,
+                                static_col, ov_own_gen, gen,
                                 read_bbox, win, wbox, win_stats) != 0:
                         clear = False
                         break

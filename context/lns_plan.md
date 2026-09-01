@@ -996,3 +996,116 @@ comes out ahead in the final design, which deletes **both** the 52 MB of pools *
 dict — but "the arena is smaller than the pools" (Phase 0's claim) is only true of the packed data,
 not of the allocator, and a bulk-load path that sizes slabs exactly during `_absorb` is the obvious
 next lever.
+
+### Steps 2 and 3: the pool-less occupancy (2026-08-27) — 1.51x, identical schedule
+
+**Goal.** Delete the free-interval pools, so that removing a flight costs its own footprint instead
+of a rebuild of every cell it touched from that cell's survivors (12.2x, growing with congestion).
+
+**Step 2 — the window becomes mandatory.** Bounds widened from margin 12 / 2 MB to **margin 24 /
+8 MB**, chosen from the plan-level coverage sweep rather than the window's typical size: what matters
+once the window is the only answer is not the hit RATE but the share of plans with ZERO misses (one
+miss forces a re-run), and that is 58.3% at the old bounds and 100.0% at the new. A probe outside the
+window raises a per-plan sticky flag; the host reads it once after the search, widens and re-runs
+under a fresh `gen`, using none of the previous output — the FB_MASK discipline.
+
+*Why a flag and not a new return code:* only one of `_search`'s five `_blocked` call sites inspects
+the returned value (the neighbour test, looking for the out-of-box -1). The other four compare
+against zero, so a new negative code would read as "blocked" at four of them — silently pruning a
+legal edge without raising anything. One branch per plan beats five per probe, and cannot be misread.
+
+**Step 3 — delete the pools, the claim dict, and #120's undo journal.** `build_window_claims` paints
+from the arena: a claim IS a blocked span, so it is `win |= span`, where the pool build had to fill
+each claimed row and clear back over a two-pointer merge of two free-interval lists. `_Pool` and its
+`chain`/`restore_cell`/`block_range`/`blocked_at`/`reset_cell` are gone, and with them the undo
+journal — which existed to make the pools' rebuild cheap on the reject path, and has nothing left to
+undo now that a release is O(own footprint).
+
+`window_bytes = 0` stops meaning "window off, same answers" and starts meaning "the kernel cannot
+answer a probe", so it now raises; `compiled=False` is the off switch. A window that cannot be built
+even at the widen ceiling dispatches to `_plan_reference` with `_fb_reasons["window-exhausted"]`.
+
+**Measured**, like-for-like (both `--sub`, 120 iterations, full `density_faa`, same seed):
+
+| bucket | with pools | pool-less |
+|---|---|---|
+| **loop** | 124.9 s | **82.5 s** |
+| `release.compiled` | 24.8 s (15.79 ms/call) | **0.1 s (0.06 ms/call)** — 263x |
+| `commit.compiled` | 23.2 s (3.73 ms) | 12.2 s (1.97 ms) |
+| one-time `_absorb` | 34.1 s | 24.0 s |
+| per task | 1041 ms | **688 ms** |
+
+End to end via `run_lns` at 200 iterations: **186.5 -> 119.0 s, 1.57x**, and the SCHEDULE IS
+IDENTICAL — 120/200 tasks, 35/65 accepted, cost 1,352,414 / 1,350,294 matching values recorded before
+the pools were deleted, both verified conflict-free.
+
+**What the parity gates became.** The window tests used to compare window-on against window-off;
+that arm no longer exists, so they now compare the compiled path against the pure-Python reference —
+strictly stronger, since the reference shares no occupancy structure with the window where the old
+off-arm shared the pools the window was built from. `test_compiled_occupancy_matches_is_blocked` is
+the external oracle for `blocked_py`, which is now an arena scan. Deleted: two `_Pool` unit tests,
+the `block_range` free-set oracle, the two #120 journal tests, and three window tests that reached
+into pool internals.
+
+**What is left.** `commit.reference` is now the largest occupancy bucket at 24.3% — the reference
+`HexOccupancyService`, which Phase A already halved and which exists to answer `pad_clear` at two
+cells per plan. `_absorb` is still 24.0 s one-time, now almost entirely that service plus
+`TerminalCapacity`. And the arena holds ~99 MB of allocation for 34 MB of live claims; sizing slabs
+exactly during a bulk load is the obvious next lever.
+
+### Phases 4 and 5: the absorb pass and the own-column test (2026-08-29) — 1.88x bind, 1.43x total
+
+Two findings from re-profiling `_absorb` per call. Both are on the commit path, both are
+mechanism-only, and neither was touched by #119-#123.
+
+**The measurement that started it.** Both occupancy images absorb the SAME ledger with the SAME call
+counts — 4,636 `on_commit`, 426,756 volume calls, 4,327,758 rasterizer rows each — so the gap between
+them (16.09 s vs 12.02 s) is cost per row, not call count. The rasterizer emits 7.36 steps per row;
+the reference expands that to per-step dict entries (31.9 M writes, 66.1 M `dict.get`), the compiled
+one stores 4.29 M packed spans.
+
+**Phase 4 — `_absorb` defeats the memo it was designed around.** `hexgrid.rasterize_ranges` memoizes
+geometry by `id(vol)` behind a 1024-entry LRU precisely so a commit's several consumers share one
+sweep; its comment says the cap "must exceed the reuse WINDOW", and SIPP's `_add` states the same
+intent for three consumers. That holds on the LIVE commit path, where `ledger.commit` fans out to
+every subscriber back to back. It does NOT hold in `_absorb`, which ran each service as its own full
+pass — reuse window 426,756 volumes against a 1024 cap, so every consumer after the first missed and
+re-swept. `_absorb_many` feeds each flight to every service before moving on. **1.118x** through the
+real `plan()` bind path.
+
+Absorb is an LNS-only cost: in a plain FCFS run the planner binds while the ledger is still empty
+(measured: 3 `_absorb` calls, 0 volumes), and everything after arrives through the subscribe hook.
+
+**Phase 5 — the own-column test was loop-invariant and computed per cell.** `_inside_a_column` existed
+in three textually identical copies (both occupancy images and `LNSState._inside_own_column`, a fourth
+via `enable_blocked`), each called per rasterized cell — 4.2 M times per consumer, every one
+allocating a numpy array inside `hex_center`. The answer depends only on `(cols, R)`, both fixed for a
+flight. `hg.column_hexes` resolves it to a frozenset once per flight, memoized across all consumers;
+the three methods are deleted. **1.609x**.
+
+    phase                          bind        loop       total
+    before (per-service, per-cell) 25.62 s     21.33 s    46.95 s
+    after  (one pass, per-flight)  13.61 s     19.12 s    32.73 s
+                                   1.882x      1.116x     1.434x
+
+Identical bind fingerprint (15 fields, both images plus `TerminalCapacity`) and identical repair
+trajectory across all six alternating passes.
+
+**Two things measurement corrected.** cProfile put `_inside_a_column` at 15-24% of each absorb, which
+would cap Phase 5 near 1.3x; it measured 1.609x, because the profiler bills the predicate's own frames
+but not the `np.array` allocation inside `hex_center` — 12.6 M allocations across three consumers.
+And the two phases were expected to be sub-additive, since Phase 5 shrinks the same work whose
+duplicate pass Phase 4 removes; the direct combined measurement (1.882x) slightly EXCEEDS their
+product (1.799x), so the interaction runs the other way.
+
+**Two traps caught in review, both real.** Applying the batch uniformly would have added a
+`subscribe_static` to the shrink-rebuild branch, which never had one — it both appends a subscriber
+and replays every hub, so each LNS release cycle would leak one, answer-neutral but not
+state-identical. And both services are assigned to `self` and to the ledger BEFORE their absorb, while
+no rebind guard can see a partially-fed service (`n_added` only under-counts, so the shrink tripwire
+stays silent) — a raise inside the batched absorb would leave a hollow, permanently-bound occupancy.
+`_plan_compiled` now drops both ledger identities on failure so the next `plan()` rebuilds.
+
+The `column_hexes` cache settled at exactly 182 entries on `density_faa_wing_zipline`, which is that
+scenario's `wing_hubs` — the key is per-HUB, not per-flight, so the cap is sized against
+`density_future_wing_zipline`'s 476.

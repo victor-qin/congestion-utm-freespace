@@ -161,14 +161,16 @@ class HexOccupancyService:
         # eviction clamp — three chances to drift from the original.
         blk_live, floor = self._blocked_live, self.evicted_before
         pad_b, blk_b = self.pad, self.blocked
+        # Own-column membership is loop-INVARIANT (`own_cols` is fixed for the flight), so resolve it
+        # to a hex set once instead of running `hex_center` + a disc test per rasterized cell.
+        own_hexes = hg.column_hexes(own_cols, self.R) if own_cols else None
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if floor is not None and s_lo < floor:
                 s_lo = floor                 # guard: never resurrect an already-evicted past step
             if not is_column:
-                own = own_cols and self._inside_a_column(q, r, own_cols)
-                if own:
+                if own_hexes is not None and (q, r) in own_hexes:
                     continue             # the committing flight's own terminal interior — unreserved
                 cell = (q, r, L)
                 # `_bump`/`setdefault(s, <new container>)` inlined over the step run: this is the
@@ -228,7 +230,6 @@ class HexOccupancyService:
                 else:
                     for s in range(s_lo, s_hi + 1):
                         self.term_cells.setdefault(s, {}).setdefault(cell, set()).add(tid)
-        self.n_added += 1
 
     def _intern(self, cell: tuple[int, int, int]) -> tuple[tuple[int, int, int], int]:
         """``(canonical_cell, cell_id)``, registering the cell if new. Returning the canonical TUPLE
@@ -241,10 +242,6 @@ class HexOccupancyService:
             return cell, cid
         return self._cells[cid], cid
 
-    def _inside_a_column(self, q: int, r: int, cols: tuple) -> bool:
-        c = hg.hex_center(q, r, self.R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
-
     def on_commit(self, flight_id, volumes) -> None:
         """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes,
         dropping the corridor cells inside its own terminal columns (the unreserved tactical interior)."""
@@ -254,6 +251,17 @@ class HexOccupancyService:
         rows = [] if self.track_removal else None
         for v in volumes:
             self.add_volume(v, own_cols=own_cols, _rows=rows)
+        # Counted HERE, not in `add_volume`. `n_added` means "committed volumes absorbed from the
+        # ledger" — it is one operand of the shrink tripwire, against `ledger.n_volumes`. But
+        # `enable_blocked` also replays the whole ledger through `add_volume` (deliberately: a second
+        # loop would have to re-derive the own-column skip, the refcount branch and the eviction
+        # clamp), and that replay is not an absorb. Counting it there doubled `n_added` — measured
+        # 852,570 against a 426,285-volume ledger — which made `ledger.n_volumes < svc.n_added`
+        # permanently true, so the very next plan took the shrink branch and re-absorbed the entire
+        # schedule: 9.98 s of an 88 s LNS loop, silent because LNS filters the shrink warning.
+        # `CompiledHexOccupancy.on_commit` has always counted at this level, which is exactly why its
+        # tripwire never fired on the same ledger.
+        self.n_added += len(volumes)
         if self.track_removal:
             entry = self._rows.get(flight_id)
             if entry is None:

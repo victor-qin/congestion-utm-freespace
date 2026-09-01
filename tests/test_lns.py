@@ -177,50 +177,6 @@ def test_incremental_release_compiled_matches_fresh_absorb():
     assert occ.n_added == fresh.n_added == 1
 
 
-def test_incremental_release_compiled_treats_identical_spans_as_a_multiset():
-    """The claim need not repeat its owner: equal spans are fungible, but their multiplicity is not."""
-    from freespace_sim.planner import hexgrid as hg
-    from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
-
-    wall = _wall()
-    occ = CompiledHexOccupancy(CFG, track_removal=True)
-    occ.on_commit(1, [wall])
-    occ.on_commit(2, [wall])
-    q, r, level, s_lo, _s_hi, _in_blk = next(
-        row for row in hg.rasterize_ranges(
-            wall, CFG, occ.R, occ.infl_blocked, occ.infl_pad
-        ) if row[-1]
-    )
-    step = max(0, s_lo)                                  # pools seed their query horizon at step 0
-    assert occ.blocked_py(q, r, level, step)
-
-    occ.on_release(1, [wall])
-    assert occ.blocked_py(q, r, level, step)          # the equal claim from flight 2 survives
-    occ.on_release(2, [wall])
-    assert not occ.blocked_py(q, r, level, step)
-    assert occ.n_added == 0
-
-
-def test_pool_reset_cell_reclaims_overflow_slots():
-    """`reset_cell` is called on the same hot cells every LNS iteration. Abandoning the old chain's
-    slots is harmless per call but unbounded per run: `_alloc` only bumps, so the pool would grow
-    (and `_grow` would double the array) for a working set that never grows."""
-    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
-
-    pool = _Pool(8, 1000)
-    base = pool.nslots
-    for _ in range(500):
-        pool.block_range(3, 100, 200)          # splits [0,1000] -> allocates an overflow slot
-        pool.block_range(3, 400, 500)          # splits the tail -> a second one
-        pool.reset_cell(3)
-        pool.block_range(3, 100, 200)          # what on_release does: re-seed, re-apply survivors
-        pool.reset_cell(3)
-    assert pool.nslots <= base + 4             # reused, not leaked (was base + 1500)
-    pool.block_range(3, 100, 200)              # and recycled slots still answer correctly
-    assert pool.blocked_at(3, 150)
-    assert not pool.blocked_at(3, 99) and not pool.blocked_at(3, 300)
-
-
 def _tcap(track_removal=True):
     from freespace_sim.planner.terminal_capacity import TerminalCapacity
 
@@ -1223,124 +1179,42 @@ def test_sim_run_records_the_anchor_mode_it_flew():
     assert run(cfg, return_anchor="realized").return_anchor == "realized"
 
 
-def test_pool_reset_clears_the_free_list():
-    """`reset()` restarts the bump allocator at NC, invalidating every previously-freed slot id.
-    Keeping them hands the same slot out twice — once from the free list, again as nslots climbs past
-    it — aliasing two cells' interval chains and silently corrupting blocked_at."""
-    from freespace_sim.planner.astar._packed import P_NXT
-    from freespace_sim.planner.astar.compiled_hex_occupancy import _Pool
-
-    pool = _Pool(8, 1000)
-    pool.block_range(3, 100, 200)
-    pool.reset_cell(3)
-    assert pool._free                              # a slot really was reclaimed
-
-    pool.reset()
-    assert not pool._free and pool.nslots == pool.NC
-
-    for c in range(pool.NC):                       # each split allocates one overflow slot
-        pool.block_range(c, 100, 200)
-    seen = set()
-    for c in range(pool.NC):
-        slot = int(pool.iv[c, P_NXT])
-        while slot != -1:
-            assert slot not in seen, f"slot {slot} aliased between two cell chains"
-            seen.add(slot)
-            slot = int(pool.iv[slot, P_NXT])
 
 
-# ---------------------------------------------------------------- reject-path undo journal
+def test_reference_fallback_does_not_trigger_a_shrink_rebuild():
+    """`enable_blocked` replays the whole ledger through `add_volume` to re-derive `blocked`. That is
+    a re-derive, not an absorb — but `n_added` used to be incremented inside `add_volume`, so the
+    replay doubled it (measured 852,570 against a 426,285-volume ledger). From then on
+    `ledger.n_volumes < svc.n_added` held forever, so the NEXT plan took the shrink branch and
+    re-absorbed the entire schedule: 9.98 s of an 88 s LNS loop.
 
-def _occ_answers(state, n=4000, seed=3):
-    """A sample of the compiled occupancy's ANSWERS, not its bytes.
+    It was invisible because `run_lns` filters the "ReservationLedger shrank" warning (a genuine
+    non-incremental release would raise it every iteration), which is why the guard here is the
+    counter rather than `pytest.warns`.
 
-    The journal's restore is deliberately CANONICAL rather than byte-identical — it drops the empty
-    `lo > hi` slots `block_range` leaves behind, so a restored chain can be shorter than a rebuilt
-    one while describing the same free-step set. `_Pool.reset_cell` already states the underlying
-    contract ("which slot holds an interval never affects an answer"), so the thing to pin is
-    `blocked_py`, which is exactly what the kernel reads."""
-    cocc = state.repair_planner._cocc
-    rng = np.random.default_rng(seed)
-    qs = rng.integers(cocc.qmin, cocc.qmin + cocc.qspan, n)
-    rs = rng.integers(cocc.rmin, cocc.rmin + cocc.rspan, n)
-    ss = rng.integers(0, cocc.MAXS, n)
-    return [cocc.blocked_py(int(q), int(r), 0, int(s)) for q, r, s in zip(qs, rs, ss)]
+    The reference dispatch is forced directly rather than by contriving a fallback, because which of
+    the six routes reaches `_plan_reference` is irrelevant to the invariant: after ANY of them,
+    `n_added` must still equal the ledger."""
+    from freespace_sim.planner.astar import AStarPlanner
 
-
-def _drive(res, journal, iters=25, n=4):
-    """Run the same LNS tasks with the journal on or off, returning what must not differ."""
-    led = ReservationLedger(res.config)
-    for c, t in res.ledger.static_terminals():
-        led.register_static_terminal(c, t)
-    for it in res.intents:
-        if it.accepted and it.volumes:
-            led.commit(it.request.flight_id, it.volumes)
-    st = LNSState(res.config, led, list(res.intents),
-                  static_terms=res.ledger.static_terminals(), undo_journal=journal)
-    rows = []
-    for i in range(iters):
-        rng = np.random.default_rng(np.random.SeedSequence([11, i]))
-        st.rng = rng
-        victims = random_neighborhood(st, n)
-        if not victims:
-            continue
-        out = st.try_repair(victims, rng, 0.0, "premium")
-        rows.append((sorted(victims), out.accepted, out.reason,
-                     round(float(out.cost_old), 9), round(float(out.cost_new), 9)))
-    return rows, _occ_answers(st), _ledger_multiset(led), st
-
-
-@pytest.mark.slow
-def test_undo_journal_is_answer_identical_to_release_and_recommit():
-    """The reject path's whole contract: rolling the occupancy back to a snapshot must leave it
-    answering exactly as releasing and re-committing does.
-
-    Both arms run the SAME victim sequence, so any divergence is the journal and nothing else. Three
-    things are compared, because they fail differently: the per-task outcomes (a wrong occupancy
-    makes a repair see a different world and take a different decision), the sampled occupancy
-    answers (a drift too small to move a decision yet), and the final committed schedule."""
-    res = run(_congested(lam=700.0, horizon=360.0))
-    a_rows, a_occ, a_dig, a_st = _drive(res, journal=False)
-    b_rows, b_occ, b_dig, b_st = _drive(res, journal=True)
-    assert a_rows == b_rows, "the journal changed a repair decision"
-    assert a_occ == b_occ, "the journal left the occupancy answering differently"
-    assert a_dig == b_dig, "the journal changed the committed schedule"
-    # Non-vacuous on both counts: some task must have REJECTED (that is the path under test), and
-    # the sample must contain both answers or comparing constants would pass.
-    assert any(not r[1] for r in b_rows), "no task rejected — the journal was never exercised"
-    assert 0 < sum(b_occ) < len(b_occ), "occupancy sample is all-free or all-blocked"
-    assert b_st.repair_planner.undo_journals(), "no journalling service — the arm was vacuous"
-
-
-@pytest.mark.slow
-def test_undo_journal_survives_a_repair_that_raises():
-    """`_rewind` runs on EVERY exit including an exception mid-repair, so the rollback has to too —
-    and `resume_undo` must fire even when `_rewind` itself raises, or the service would silently
-    ignore every later commit. Force a raise from `plan` and assert the schedule survives and the
-    service is neither suspended nor holding an open journal."""
-    res = run(_congested(lam=700.0, horizon=360.0))
+    res = run(SimConfig(planner="astar", flight_levels_m=(75.0,), airspace_ceiling_m=125.0,
+                        lam_per_hour=700.0, horizon_s=360.0, region_size_m=(3000.0, 3000.0),
+                        seed=1, max_ground_delay_s=300.0))
     led = ReservationLedger(res.config)
     for it in res.intents:
         if it.accepted and it.volumes:
             led.commit(it.request.flight_id, it.volumes)
-    st = LNSState(res.config, led, list(res.intents),
-                  static_terms=res.ledger.static_terminals(), undo_journal=True)
-    st.repair_planner.plan(res.intents[0].request, led, res.config)   # bind the service
-    before = _ledger_multiset(led)
-    occ_before = _occ_answers(st)
-    rng = np.random.default_rng(5)
-    st.rng = rng
-    victims = random_neighborhood(st, 4)
-    boom = RuntimeError("planner exploded mid-repair")
 
-    def explode(*a, **kw):
-        raise boom
+    p = AStarPlanner(incremental_release=True)
+    movable = [it for it in res.intents if it.accepted and it.volumes]
+    p.plan(movable[0].request, led, res.config)              # bind + absorb
+    assert p._svc.n_added == led.n_volumes, "absorb miscounted before any fallback"
 
-    st.repair_planner.plan = explode
-    with pytest.raises(RuntimeError) as ei:
-        st.try_repair(victims, rng, 0.0, "premium")
-    assert ei.value is boom
-    cocc = st.repair_planner._cocc
-    assert cocc._undo is None and not cocc._suspended, "journal left open or service left suspended"
-    assert _ledger_multiset(led) == before
-    assert _occ_answers(st) == occ_before, "occupancy not restored after a mid-repair raise"
+    p._plan_reference(movable[1].request, led, res.config)   # arms `enable_blocked`
+    assert p._svc._blocked_live, "the fallback did not arm the blocked map"
+    assert p._svc.n_added == led.n_volumes, (
+        f"`enable_blocked` counted its re-derive as an absorb: {p._svc.n_added} vs "
+        f"{led.n_volumes} committed volumes")
+
+    p.plan(movable[2].request, led, res.config)              # the plan that used to rebuild
+    assert p.n_shrink_rebuilds == 0, "a spurious shrink rebuild fired after a reference fallback"

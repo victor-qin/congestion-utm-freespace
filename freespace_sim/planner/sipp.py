@@ -179,8 +179,7 @@ class SafeIntervalIndex:
             if is_column:
                 if track:
                     cell, cid = self._intern(cell)              # canonical tuple becomes the KEY too
-                    _rows.append(cid); _rows.append(s_lo); _rows.append(s_hi)
-                    _rows.append(self._tid_code(tid))
+                    _rows += (cid, s_lo, s_hi, self._tid_code(tid))
                     d = self.cols.setdefault(cell, {})
                     for s in range(s_lo, s_hi + 1):
                         e = d.setdefault(s, {})
@@ -192,7 +191,7 @@ class SafeIntervalIndex:
             elif not (own_cols and self._inside_a_column(q, r, own_cols)):
                 if track:                                       # (skip own terminal interior)
                     cell, cid = self._intern(cell)
-                    _rows.append(cid); _rows.append(s_lo); _rows.append(s_hi); _rows.append(-1)
+                    _rows += (cid, s_lo, s_hi, -1)
                     d = self.corr.setdefault(cell, {})
                     for s in range(s_lo, s_hi + 1):
                         d[s] = d.get(s, 0) + 1

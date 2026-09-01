@@ -205,6 +205,41 @@ class _Pool:
             slot = int(iv[slot, P_NXT])
         return True
 
+    def chain(self, c: int) -> list:
+        """Cell ``c``'s LIVE free intervals, for the undo journal. Empty ``lo > hi`` slots are dropped:
+        they hold no steps, so a chain rebuilt without them answers ``blocked_at`` identically — the
+        restore is canonical, not byte-identical, which is the same contract ``reset_cell`` already
+        states (slot indices are pure storage)."""
+        out = []
+        slot = c
+        while slot != -1:
+            lo, hi = int(self.iv[slot, P_LO]), int(self.iv[slot, P_HI])
+            if lo <= hi:
+                out.append((lo, hi))
+            slot = int(self.iv[slot, P_NXT])
+        return out
+
+    def restore_cell(self, c: int, ivs) -> None:
+        """Re-seed cell ``c``'s chain to exactly ``ivs`` (from :meth:`chain`), in O(len(ivs)).
+
+        This is the whole point of the undo journal: getting a cell back to a known earlier state
+        costs one pass over ITS OWN intervals, where ``on_release``'s rebuild costs one
+        ``block_range`` per SURVIVING claim on that cell — measured 12.2x the released flight's own
+        footprint at density_faa scale, and growing with congestion.
+
+        ``self.iv`` is re-read after every ``_alloc`` because ``_grow`` REPLACES the array."""
+        self.reset_cell(c)                      # reclaims the old overflow slots onto `_free`
+        if not ivs:                             # nothing free ⇒ head marks empty (lo > hi)
+            self.iv[c, P_LO] = 1; self.iv[c, P_HI] = 0; self.iv[c, P_NXT] = -1
+            return
+        lo, hi = ivs[0]
+        self.iv[c, P_LO] = lo; self.iv[c, P_HI] = hi; self.iv[c, P_NXT] = -1
+        prev = c
+        for lo, hi in ivs[1:]:
+            nxt = self._alloc(lo, hi, -1)
+            self.iv[prev, P_NXT] = nxt
+            prev = nxt
+
     def reset_cell(self, c: int) -> None:
         """Re-seed cell ``c``'s list to the single free interval ``[0, MAXS]`` (removal-mode cell
         rebuild); callers re-apply the cell's surviving claims immediately after.
@@ -288,6 +323,9 @@ class CompiledHexOccupancy:
         # cell gets cell_id < 0 and the kernel falls back via FB_OOB. Non-zero ⇒ consider widening `margin`.
         self.oob_corridor_cells = 0
         self._warned_oob = False                        # warn ONCE per instance (persists across reset())
+        # ---- LNS reject-path undo journal (see `begin_undo`). None ⇒ off, zero overhead. ----
+        self._undo: dict | None = None
+        self._suspended = False
 
     def _box(self, cfg, margin):
         w, h = cfg.region_size_m
@@ -310,6 +348,9 @@ class CompiledHexOccupancy:
 
     # ---------- commit hook ----------
     def on_commit(self, flight_id, volumes) -> None:
+        if self._suspended:      # a rollback already put this service where these volumes belong
+            return
+        self._snap_owner(flight_id)
         hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
@@ -329,15 +370,20 @@ class CompiledHexOccupancy:
         exactly the cells it touched — reset each cell's interval list and re-apply the surviving
         claims (short per-cell lists). Keeps ``n_added`` in lockstep so the shrink tripwire stays
         silent. ``col_owners`` is deliberately NOT pruned (documented conservative superset)."""
+        if self._suspended:      # ditto — and `_rows` was restored, so the pop below would KeyError
+            return
+        self._snap_owner(flight_id)
         rows = self._rows.pop(flight_id)
         claims = self._claims
         touched: set[int] = set()
         for i in range(0, len(rows), 2):              # flat (key, claim) pairs; see `_claims`
             key = rows[i]
+            self._snap_cell(key)                      # snapshots the chain AND the claims list
             claims[key].remove(rows[i + 1])           # ValueError here IS the drift signal
             touched.add(key)
         pools = (self.corr, self.col)
         for key in touched:
+            self._snap_cell(key)
             pool = pools[key & 1]
             c = key >> 1
             pool.reset_cell(c)
@@ -369,6 +415,8 @@ class CompiledHexOccupancy:
             c = self.cell_id(q, r, L)
             if is_column:                               # → column pool (all columns; own/foreign per plan)
                 if c >= 0:
+                    if self._undo is not None:
+                        self._snap_cell((c << 1) | 1)
                     self.col.block_range(c, int(s_lo), int(s_hi))
                     self.col_owners.setdefault(c, set()).add(tid)
                     if track:
@@ -385,6 +433,8 @@ class CompiledHexOccupancy:
                         self._warned_oob = True
                     self.oob_corridor_cells += 1
                     continue
+                if self._undo is not None:
+                    self._snap_cell(c << 1)
                 self.corr.block_range(c, int(s_lo), int(s_hi))
                 if track:
                     self._record(0, c, int(s_lo), int(s_hi), _rows)
@@ -432,11 +482,97 @@ class CompiledHexOccupancy:
                     self.static_col[c] = True
                     self.col_owners.setdefault(c, set()).add(tid)
 
+    # ------------------------------------------------------------------ reject-path undo journal
+    #
+    # 79-90% of LNS iterations REJECT, and a rejected task ends with the ledger holding exactly the
+    # volumes it held at entry — so every byte of occupancy work it did was thrown away. Measured:
+    # `_rewind` is 15.2% of the LNS loop (284 ms per rejected task), and two thirds of that is
+    # `on_release` rebuilding cells from their survivors.
+    #
+    # The journal makes that undo O(the cells touched) instead: snapshot each cell's free-interval
+    # chain the FIRST time the transaction modifies it (copy-on-write), then `rollback_undo` writes
+    # the snapshots straight back. `_rewind` still restores the LEDGER — it is the source of truth —
+    # but this service ignores the callbacks that restore fires (`_suspended`), because rolling back
+    # already put it where those callbacks would have taken it.
+    #
+    # Deliberately NOT journalled, because none of them can differ after a rollback + rewind:
+    #   * `col_owners` — a documented conservative, time-collapsed SUPERSET that is never pruned, so
+    #     entries added during the transaction stay valid (they may only cause an extra own/foreign
+    #     overlap fallback, which is safe).
+    #   * `_fids` / `_fid_codes` — a monotone interning pool; codes are never reused or compared
+    #     across generations.
+    #   * `evicted_before` — the watermark only advances, and LNS pins `evict_floor = 0.0` so it
+    #     never moves during a transaction. Asserted in `begin_undo` rather than assumed.
+
+    def begin_undo(self) -> None:
+        """Open a copy-on-write journal. Idempotent-unsafe on purpose: a second open without a
+        matching close means a caller lost track of its transaction, which would silently roll back
+        to the wrong point."""
+        if self._undo is not None:
+            raise RuntimeError("CompiledHexOccupancy: undo journal already open")
+        self._undo = {"cells": {}, "claims": {}, "rows": {},
+                      "n_added": self.n_added, "evicted": self.evicted_before}
+
+    def discard_undo(self) -> None:
+        """Close the journal keeping the current state (the ACCEPT path)."""
+        self._undo = None
+
+    def rollback_undo(self) -> None:
+        """Restore every journalled cell and bookkeeping entry, then SUSPEND: the caller is about to
+        restore the ledger, and the callbacks that fires would re-do work already undone here."""
+        u = self._undo
+        self._undo = None                       # stop journalling before the restore mutates cells
+        if u is None:
+            raise RuntimeError("CompiledHexOccupancy: rollback without an open undo journal")
+        pools = (self.corr, self.col)
+        for key, ivs in u["cells"].items():
+            pools[key & 1].restore_cell(key >> 1, ivs)
+        claims = self._claims
+        for key, lst in u["claims"].items():
+            if lst is None:
+                claims.pop(key, None)
+            else:
+                claims[key] = lst
+        for fid, rows in u["rows"].items():
+            if rows is None:
+                self._rows.pop(fid, None)
+            else:
+                self._rows[fid] = rows
+        # No per-flight volume count to restore: `n_added` is snapshotted whole, and `on_release`
+        # subtracts the caller's `len(volumes)` (main's accounting), so nothing derives it per fid.
+        self.n_added = u["n_added"]
+        self.evicted_before = u["evicted"]
+        self._suspended = True
+
+    def resume_undo(self) -> None:
+        """Stop ignoring ledger callbacks. Pairs with ``rollback_undo`` in a ``finally``."""
+        self._suspended = False
+
+    def _snap_cell(self, key: int) -> None:
+        u = self._undo
+        if u is not None and key not in u["cells"]:
+            pool = (self.corr, self.col)[key & 1]
+            u["cells"][key] = pool.chain(key >> 1)
+            c = u["claims"]
+            if key not in c:
+                lst = self._claims.get(key)
+                c[key] = None if lst is None else list(lst)
+
+    def _snap_owner(self, fid) -> None:
+        u = self._undo
+        if u is not None and fid not in u["rows"]:
+            rows = self._rows.get(fid)
+            u["rows"][fid] = None if rows is None else array("q", rows)
+
     def evict_before(self, step) -> None:
         if self.evicted_before is None or step > self.evicted_before:
             self.evicted_before = step
 
     def reset(self) -> None:
+        # A rebuild-from-scratch has no earlier state to return to, and a journal that survived it
+        # would restore cells into a pool that no longer contains the rest of the schedule.
+        self._undo = None
+        self._suspended = False
         self.n_added = 0
         self.evicted_before = None
         self.col_owners.clear()

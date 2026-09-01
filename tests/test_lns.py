@@ -1247,3 +1247,100 @@ def test_pool_reset_clears_the_free_list():
             assert slot not in seen, f"slot {slot} aliased between two cell chains"
             seen.add(slot)
             slot = int(pool.iv[slot, P_NXT])
+
+
+# ---------------------------------------------------------------- reject-path undo journal
+
+def _occ_answers(state, n=4000, seed=3):
+    """A sample of the compiled occupancy's ANSWERS, not its bytes.
+
+    The journal's restore is deliberately CANONICAL rather than byte-identical — it drops the empty
+    `lo > hi` slots `block_range` leaves behind, so a restored chain can be shorter than a rebuilt
+    one while describing the same free-step set. `_Pool.reset_cell` already states the underlying
+    contract ("which slot holds an interval never affects an answer"), so the thing to pin is
+    `blocked_py`, which is exactly what the kernel reads."""
+    cocc = state.repair_planner._cocc
+    rng = np.random.default_rng(seed)
+    qs = rng.integers(cocc.qmin, cocc.qmin + cocc.qspan, n)
+    rs = rng.integers(cocc.rmin, cocc.rmin + cocc.rspan, n)
+    ss = rng.integers(0, cocc.MAXS, n)
+    return [cocc.blocked_py(int(q), int(r), 0, int(s)) for q, r, s in zip(qs, rs, ss)]
+
+
+def _drive(res, journal, iters=25, n=4):
+    """Run the same LNS tasks with the journal on or off, returning what must not differ."""
+    led = ReservationLedger(res.config)
+    for c, t in res.ledger.static_terminals():
+        led.register_static_terminal(c, t)
+    for it in res.intents:
+        if it.accepted and it.volumes:
+            led.commit(it.request.flight_id, it.volumes)
+    st = LNSState(res.config, led, list(res.intents),
+                  static_terms=res.ledger.static_terminals(), undo_journal=journal)
+    rows = []
+    for i in range(iters):
+        rng = np.random.default_rng(np.random.SeedSequence([11, i]))
+        st.rng = rng
+        victims = random_neighborhood(st, n)
+        if not victims:
+            continue
+        out = st.try_repair(victims, rng, 0.0, "premium")
+        rows.append((sorted(victims), out.accepted, out.reason,
+                     round(float(out.cost_old), 9), round(float(out.cost_new), 9)))
+    return rows, _occ_answers(st), _ledger_multiset(led), st
+
+
+@pytest.mark.slow
+def test_undo_journal_is_answer_identical_to_release_and_recommit():
+    """The reject path's whole contract: rolling the occupancy back to a snapshot must leave it
+    answering exactly as releasing and re-committing does.
+
+    Both arms run the SAME victim sequence, so any divergence is the journal and nothing else. Three
+    things are compared, because they fail differently: the per-task outcomes (a wrong occupancy
+    makes a repair see a different world and take a different decision), the sampled occupancy
+    answers (a drift too small to move a decision yet), and the final committed schedule."""
+    res = run(_congested(lam=700.0, horizon=360.0))
+    a_rows, a_occ, a_dig, a_st = _drive(res, journal=False)
+    b_rows, b_occ, b_dig, b_st = _drive(res, journal=True)
+    assert a_rows == b_rows, "the journal changed a repair decision"
+    assert a_occ == b_occ, "the journal left the occupancy answering differently"
+    assert a_dig == b_dig, "the journal changed the committed schedule"
+    # Non-vacuous on both counts: some task must have REJECTED (that is the path under test), and
+    # the sample must contain both answers or comparing constants would pass.
+    assert any(not r[1] for r in b_rows), "no task rejected — the journal was never exercised"
+    assert 0 < sum(b_occ) < len(b_occ), "occupancy sample is all-free or all-blocked"
+    assert b_st.repair_planner.undo_journals(), "no journalling service — the arm was vacuous"
+
+
+@pytest.mark.slow
+def test_undo_journal_survives_a_repair_that_raises():
+    """`_rewind` runs on EVERY exit including an exception mid-repair, so the rollback has to too —
+    and `resume_undo` must fire even when `_rewind` itself raises, or the service would silently
+    ignore every later commit. Force a raise from `plan` and assert the schedule survives and the
+    service is neither suspended nor holding an open journal."""
+    res = run(_congested(lam=700.0, horizon=360.0))
+    led = ReservationLedger(res.config)
+    for it in res.intents:
+        if it.accepted and it.volumes:
+            led.commit(it.request.flight_id, it.volumes)
+    st = LNSState(res.config, led, list(res.intents),
+                  static_terms=res.ledger.static_terminals(), undo_journal=True)
+    st.repair_planner.plan(res.intents[0].request, led, res.config)   # bind the service
+    before = _ledger_multiset(led)
+    occ_before = _occ_answers(st)
+    rng = np.random.default_rng(5)
+    st.rng = rng
+    victims = random_neighborhood(st, 4)
+    boom = RuntimeError("planner exploded mid-repair")
+
+    def explode(*a, **kw):
+        raise boom
+
+    st.repair_planner.plan = explode
+    with pytest.raises(RuntimeError) as ei:
+        st.try_repair(victims, rng, 0.0, "premium")
+    assert ei.value is boom
+    cocc = st.repair_planner._cocc
+    assert cocc._undo is None and not cocc._suspended, "journal left open or service left suspended"
+    assert _ledger_multiset(led) == before
+    assert _occ_answers(st) == occ_before, "occupancy not restored after a mid-repair raise"

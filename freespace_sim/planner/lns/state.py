@@ -137,7 +137,9 @@ class LNSState:
         unimpeded_cost: dict[int, float | None] | None = None,
         maintain_claim_index: bool = True,
         window_bytes: int | None = None,
+        undo_journal: bool = True,
     ) -> None:
+        self._undo_journal = bool(undo_journal)
         self.cfg = cfg
         self.ledger = ledger
         self.dt = cfg.dt_s
@@ -292,6 +294,7 @@ class LNSState:
         kernel_log2_min: int | None = None,
         record_envelope: bool = True,
         window_bytes: int | None = None,
+        undo_journal: bool = True,
     ) -> "LNSState":
         """A private copy of the incumbent for a parallel worker: own ledger, own planner.
 
@@ -314,7 +317,8 @@ class LNSState:
           hardcoding it would make that A/B inexpressible under parallelism.
         * ``window_bytes`` is answer-neutral (the dense occupancy window is a cache of the pools),
           but it is per-PLANNER state, so a worker that did not receive it would measure the
-          coordinator's default rather than the one under test.
+          coordinator's default rather than the one under test. ``undo_journal`` is the same shape:
+          answer-neutral, but per-REPLICA, so an unforwarded flag measures the wrong arm.
 
         ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
         SYNC skips that bookkeeping, and effective widths below two stay in-process.
@@ -342,6 +346,7 @@ class LNSState:
             repair_planner=planner,
             incremental_release=incremental_release,
             unimpeded_cost=unimpeded_cost,
+            undo_journal=undo_journal,
             unimpeded_workers=1,   # NO NESTED POOLS: this runs INSIDE a search worker, and the
             #                        ruler's own default (min(8, cpu-2)) would fan out again to
             #                        m x m processes. Belt and braces — `unimpeded_cost` is
@@ -534,6 +539,12 @@ class LNSState:
         rec_env = bool(getattr(self.repair_planner, "record_envelope", False))
         envelopes: list = []
         candidate: RepairOutcome | None = None
+        # Reject-path undo journal (see `CompiledHexOccupancy.begin_undo`). 79-90% of tasks reject,
+        # and a rejected task leaves the ledger exactly where it started — so the occupancy work
+        # `_rewind` does to get back there is pure waste. Opened here, closed on EVERY exit.
+        journals = self._undo_journals()
+        for j in journals:
+            j.begin_undo()
         # EVERYTHING that can leave the schedule half-destroyed lives inside this block — the destroy
         # itself included. `release_many` tombstones every victim volume BEFORE it notifies removal
         # subscribers, and each of those hooks can raise, so a destroy that dies part-way is exactly
@@ -571,9 +582,13 @@ class LNSState:
                     # index, so a raise part-way would otherwise leave them describing a schedule
                     # the ledger does not hold. LEDGER-FREE: the loop already committed the plans.
                     self._apply_in_memory(new, applied)
+                    for j in journals:      # AFTER the in-memory move: if that raises, the handler
+                        j.discard_undo()    # below still has a journal to roll back
                     return candidate
+                # report_only falls through to the `_rewind` below, so its journals stay OPEN — the
+                # rollback is precisely what they exist to serve.
         except BaseException:
-            self._rewind(victims, old, cost_at_entry, applied)
+            self._rollback_and_rewind(journals, victims, old, cost_at_entry, applied)
             raise
 
         if candidate is not None:
@@ -583,8 +598,35 @@ class LNSState:
             return candidate
         if reason == "improved":
             reason = "no_improvement"
-        self._rewind(victims, old, cost_at_entry)
+        self._rollback_and_rewind(journals, victims, old, cost_at_entry)
         return RepairOutcome(False, reason, cost_old, cost_new, len(new))
+
+    def _undo_journals(self) -> tuple:
+        """The repair planner's rollback-capable occupancy services, or () when the feature is off.
+
+        Read through the planner rather than reaching into ``_cocc``: which services are journallable
+        is the planner's business (it knows whether they were built in removal mode), and an
+        unbound planner correctly reports none."""
+        if not self._undo_journal:
+            return ()
+        fn = getattr(self.repair_planner, "undo_journals", None)
+        return fn() if fn is not None else ()
+
+    def _rollback_and_rewind(self, journals, victims, old, cost_at_entry, applied=()) -> None:
+        """Undo the transaction: roll the journalled services back, then restore the ledger.
+
+        Order matters. The rollback SUSPENDS those services, so the ``release_many`` + k ``commit``
+        calls ``_rewind`` makes to restore the ledger do not re-do work the rollback already undid —
+        and, for a suspended service, ``on_release``'s ``_rows.pop`` would raise, since the rollback
+        put those rows back. ``resume_undo`` is in a ``finally`` because ``_rewind`` raises when it
+        cannot re-commit, and a service left suspended would silently ignore every later commit."""
+        for j in journals:
+            j.rollback_undo()
+        try:
+            self._rewind(victims, old, cost_at_entry, applied)
+        finally:
+            for j in journals:
+                j.resume_undo()
 
     def _rewind(self, victims, old, cost_at_entry, applied=()) -> None:
         """Restore the ledger and any partially applied in-memory acceptance.

@@ -37,7 +37,7 @@ from freespace_sim.types import OperationalIntent
 log = logging.getLogger("freespace_sim.lns")
 
 
-@dataclass
+@dataclass(kw_only=True)
 class LNSConfig:
     seed: int = 0
     max_iterations: int = 2000           # non-negative task budget
@@ -56,6 +56,14 @@ class LNSConfig:
     # implicit `spawn` can re-execute an unguarded caller's top-level code. Guarded applications may
     # explicitly pass None for min(8, cpu-2) automatic parallelism.
     unimpeded_workers: int | None = 1
+    # Byte cap on the repair planner's per-plan dense occupancy window (`astar.window`); None keeps
+    # AStarPlanner's default, 0 turns it off. ANSWER-NEUTRAL — the window caches the interval pools
+    # `_blocked` would otherwise walk, and anything outside it takes that walk — so this is a pure
+    # speed knob and the byte-parity gates hold at any value. Exposed because the LNS loop is the
+    # window's hardest case (destroy/repair re-fragments the same congested cells thousands of
+    # times, which is exactly the list-walk growth `analysis/prof_ledger_scaling.py` measures), so
+    # the A/B has to be runnable end to end: `analysis/ab_dense_window.py`.
+    window_bytes: int | None = None
     time_limit_s: float | None = None
     verify_every: int = 0               # independent conflict replay every n accepted iterations (tests)
     log_every: int = 200
@@ -212,7 +220,11 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         for name, minimum in integer_minima.items()
     }
     optional_integers = {}
-    for name, minimum in {"unimpeded_workers": 1, "worker_kernel_log2": 0}.items():
+    for name, minimum in {
+        "unimpeded_workers": 1,
+        "worker_kernel_log2": 0,
+        "window_bytes": 0,
+    }.items():
         value = getattr(lns, name)
         optional_integers[name] = (
             None if value is None
@@ -344,6 +356,7 @@ def _build_lns_state(
         incremental_release=lns.incremental_release,
         unimpeded_workers=lns.unimpeded_workers,
         maintain_claim_index=maintain_claim_index,
+        window_bytes=lns.window_bytes,
     )
 
 

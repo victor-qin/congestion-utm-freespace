@@ -21,6 +21,12 @@ free intervals) plus this flight's cheap per-cell own-column **mark** (``ov_own_
 them into ``is_blocked`` (foreign column → wall; own column → transparent unless a corridor covers it).
 Out-of-box neighbours / hash-full / heap-full return a distinct ``FB_*`` code so the host warns precisely
 and falls back to the pure-Python reference.
+
+Those pools are sized by the whole REGION, so probing them is a random access far past cache. When the
+host supplies one, ``_blocked`` answers instead from a per-plan dense **bitmap** over the small box the
+plan actually reads (:mod:`window`) — one byte read and a mask, out of a cache-resident buffer — and
+falls back to the pool walk for anything outside it. The window is a pure cache of those same pools, so
+it is answer-neutral by construction; ``win_stats`` counts which path each probe took.
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ import numpy as np
 from numba import njit
 
 from ._packed import GEN_MASK
+from .window import W_Q0, W_Q1, W_R0, W_R1, W_ROWB, W_RSPAN, W_S0, W_S1, W_STEPS, WS_HIT, WS_MISS
 
 _SQRT3 = 1.7320508075688772
 _MAGIC = np.uint64(0x9E3779B97F4A7C15)          # Fibonacci hashing multiplier
@@ -146,7 +153,7 @@ def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
 
 @njit(cache=True, nogil=True)
 def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
-             iv, cv, static_col, ov_own_gen, gen, read_bbox):
+             iv, cv, static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats):
     """0 = free, 1 = blocked, -1 = out-of-box. Reproduces ``occupancy.is_blocked`` via the corridor pool
     (``iv_*``) + column pool (``cv_*``) + always-active static walls (``static_col``) + this flight's
     own-column mark (``ov_own_gen[cell] == gen``): a FOREIGN column (transient OR always-active) is a wall;
@@ -157,7 +164,12 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
     the plan's read set, consumed by the Track-A exact-mode commit validation (``parallel.PlanEnvelope``).
     Write-only w.r.t. the search: it cannot change any decision, so kernel==reference parity is untouched.
     Out-of-box probes are excluded deliberately: the -1 answer is pure box geometry, independent of every
-    commit, so it can never be dirtied."""
+    commit, so it can never be dirtied.
+
+    ``win``/``wbox`` are the optional per-plan dense bitmap (:mod:`window`). It holds ONE bit per
+    (cell, step) — set iff the three terms above say blocked — so an in-window probe skips the two list
+    walks AND the two per-cell arrays. ``wbox[W_STEPS] == 0`` means no window and the code below is the
+    pre-window path exactly."""
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
@@ -177,6 +189,15 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
         read_bbox[6] = s
     if s > read_bbox[7]:
         read_bbox[7] = s
+    if (wbox[W_STEPS] != 0 and wbox[W_Q0] <= q <= wbox[W_Q1] and wbox[W_R0] <= r <= wbox[W_R1]
+            and wbox[W_S0] <= s <= wbox[W_S1]):
+        k = s - wbox[W_S0]
+        wcell = ((q - wbox[W_Q0]) * wbox[W_RSPAN] + (r - wbox[W_R0])) * n_levels + L
+        win_stats[WS_HIT] += 1
+        if (win[wcell * wbox[W_ROWB] + (k >> 3)] & np.uint8(1 << (k & 7))) != 0:
+            return 1
+        return 0
+    win_stats[WS_MISS] += 1
     cell = (iq * rspan + ir) * n_levels + L
     # column pool: is `cell` column-blocked at s? (blocked iff s is in no free interval)
     colb = 1
@@ -231,6 +252,8 @@ def _search(
     out_q, out_r, out_L, out_s, max_expansions,
     # ---- read-set telemetry (Track A, issue #8): in/out int64[8] bbox over every in-box probe ----
     read_bbox,
+    # ---- per-plan dense occupancy bitmap (`window`); wbox[W_STEPS] == 0 ⇒ absent, pools only ----
+    win, wbox, win_stats,
 ):
     step_span = max_step - base + 1
     nlp1 = n_levels + 1
@@ -322,7 +345,7 @@ def _search(
                             continue
                         if _blocked(lq, lr, Lv, ts, qmin, rmin, qspan, rspan, n_levels,
                                     iv, cv, static_col, ov_own_gen, gen,
-                                    read_bbox) != 0:
+                                    read_bbox, win, wbox, win_stats) != 0:
                             continue
                         liq = lq - qmin; lir = lr - rmin
                         nkey = ((liq * rspan + lir) * nlp1 + (Lv + 1)) * step_span + (ts - base)
@@ -361,7 +384,7 @@ def _search(
             else:
                 nq = q; nr = r + 1
             b = _blocked(nq, nr, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                         iv, cv, static_col, ov_own_gen, gen, read_bbox)
+                         iv, cv, static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats)
             if b == -1:                                  # out-of-box stray → host reference
                 return 0, 0.0, n_exp, FB_OOB, (nq + 32768) * 65536 + (nr + 32768)
             if b == 1:
@@ -378,7 +401,7 @@ def _search(
                 return 0, 0.0, n_exp, FB_HEAP, -1
         # hover (same level)
         if _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
-                    iv, cv, static_col, ov_own_gen, gen, read_bbox) == 0:
+                    iv, cv, static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt
             hh = _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb)
@@ -403,10 +426,10 @@ def _search(
                 while sk <= ts:
                     if _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
                                 iv, cv, static_col, ov_own_gen, gen,
-                                read_bbox) != 0 or \
+                                read_bbox, win, wbox, win_stats) != 0 or \
                        _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
                                 iv, cv, static_col, ov_own_gen, gen,
-                                read_bbox) != 0:
+                                read_bbox, win, wbox, win_stats) != 0:
                         clear = False
                         break
                     sk += 1

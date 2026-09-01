@@ -900,7 +900,7 @@ class AStarPlanner:
         return max(20, (self.max_expansions * 2 - 1).bit_length())
 
     def _build_window(self, cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
-                      goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops) -> None:
+                      goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops) -> bool:
         """Materialise this plan's dense occupancy bitmap (:mod:`window`), or leave it off.
 
         Anchored on every cell the search STARTS or ENDS at — the origin hex, its exit lanes and the
@@ -911,12 +911,15 @@ class AStarPlanner:
         Everything here is a performance decision: ``window_bytes = 0``, a box that clips to nothing, or
         a window over the cap all leave ``wbox`` disabled and the kernel on its original pool walk, which
         returns the same answers. That is what makes the bounds tunable from measurement instead of proof.
+
+        Return ``False`` only when the separately compiled window kernel fails. That permanently disables
+        the compiled planner, and the caller re-runs this flight through the reference path.
         """
         wbox = ks["wbox"]
         cap = min(self.window_bytes, len(ks["win"]))
         if cap <= 0:
             W.disable(wbox)
-            return
+            return True
         tail = (int(tks.max()) + int(lane_stp.max()) + 3 * n_hops + 2 * climb_span + 8)
         nbytes = W.window_bounds(
             cocc, wbox,
@@ -928,12 +931,23 @@ class AStarPlanner:
         if nbytes == 0:
             self._win_off += 1
             W.disable(wbox)
-            return
+            return True
         if nbytes > self._win_bytes_peak:
             self._win_bytes_peak = nbytes
-        self._win_painted += int(W.build_window(
-            cocc.corr.iv, cocc.col.iv, cocc.static_col, ks["ov_own_gen"], gen,
-            cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox, ks["win"]))
+        try:
+            painted = W.build_window(
+                cocc.corr.iv, cocc.col.iv, cocc.static_col, ks["ov_own_gen"], gen,
+                cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox, ks["win"],
+            )
+        except Exception as e:
+            # ``build_window`` has its own @njit dispatcher. A cache/load failure can therefore
+            # surface here even after the search kernel warmed successfully. Fail closed into the
+            # reference planner for this and every later flight.
+            W.disable(wbox)
+            self._disable_compiled("dense-window kernel", e)
+            return False
+        self._win_painted += int(painted)
+        return True
 
     def _build_overlay(self, cocc, o_term, d_term, origin, dest, gen) -> bool:
         """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
@@ -989,14 +1003,28 @@ class AStarPlanner:
                         mark(cocc.cell_id(q, r, L))
         return overlap
 
+    def _disable_compiled(self, component: str, error: Exception) -> None:
+        """Permanently degrade this planner after a requested numba component fails."""
+        warnings.warn(
+            f"astar numba {component} failed ({error!r}); falling back to the pure-Python "
+            f"reference planner for ALL plans. Install a compatible numba, or clear stale "
+            f".nbi/.nbc caches after a kernel-signature change.",
+            RuntimeWarning, stacklevel=3,
+        )
+        self.compiled = False
+        self._kernel = None
+
     def _warm_jit(self):
-        """Compile the kernel once at construction with a tiny synthetic input (off the hot path)."""
+        """Compile both numba kernels at construction with tiny synthetic inputs."""
         if self._kernel is None:
             return
+        component = "search kernel"
         try:
             NC, MAXS = 9, 5
-            _warm_iv = aligned_2d(NC, 4, np.int32); _warm_iv[:, P_LO] = 0
-            _warm_iv[:, P_HI] = MAXS; _warm_iv[:, P_NXT] = -1
+            _warm_iv = aligned_2d(NC, 4, np.int32)
+            _warm_iv[:, P_LO] = 0
+            _warm_iv[:, P_HI] = MAXS
+            _warm_iv[:, P_NXT] = -1
             _warm_cv = _warm_iv.copy()
             ng = 6
             _warm_gp = aligned_2d(64, 4)                   # same 2-D packed layout as production, so
@@ -1017,15 +1045,22 @@ class AStarPlanner:
                 1000, np.zeros(8, np.int64),
                 np.zeros(1, np.uint8), W.empty_wbox(), np.zeros(W.WSTATS_N, np.int64),
             )
-        except Exception as e:                                # compile failure → degrade to pure Python
-            warnings.warn(
-                f"astar numba kernel failed to warm/compile ({e!r}); falling back to the pure-Python "
-                f"reference planner for ALL plans. Install a compatible numba, or clear stale "
-                f".nbi/.nbc caches after a kernel-signature change.",
-                RuntimeWarning, stacklevel=2,
+            # ``build_window`` is decorated separately from ``_search`` and owns a separate numba
+            # cache. Warm the production signature under this same fallback guard so a stale or
+            # incompatible cache cannot escape from the first real plan.
+            component = "dense-window kernel"
+            warm_wbox = W.empty_wbox()
+            warm_wbox[W.W_Q1] = warm_wbox[W.W_R1] = 0
+            warm_wbox[W.W_S1] = MAXS
+            warm_wbox[W.W_RSPAN] = 1
+            warm_wbox[W.W_STEPS] = MAXS + 1
+            warm_wbox[W.W_ROWB] = (MAXS + 8) // 8
+            W.build_window(
+                _warm_iv, _warm_cv, np.zeros(NC, np.bool_), np.zeros(NC, np.int32), 1,
+                0, 0, 3, 1, warm_wbox, np.zeros(warm_wbox[W.W_ROWB], np.uint8),
             )
-            self.compiled = False                             # dispatch every plan to _plan_reference
-            self._kernel = None
+        except Exception as e:                                # compile failure → degrade to pure Python
+            self._disable_compiled(component, e)
 
     def _plan_compiled(self, req, ledger, cfg):
         from . import kernel as K
@@ -1190,8 +1225,12 @@ class AStarPlanner:
             # Dense occupancy window, built INSIDE the widen loop and after the overlay: it folds
             # `ov_own_gen == gen` in, so it must be rebuilt whenever `gen` moves, and its step span is
             # sized from `n_gsteps`, which the FB_MASK widen changes.
-            self._build_window(cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
-                               goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops)
+            if not self._build_window(
+                cocc, ks, gen, oq, orr, lane_q, lane_r, lane_stp,
+                goal_q, goal_r, base, max_step, n_gsteps, tks, climb_span, n_hops,
+            ):
+                self._ref_dispatch["window-jit"] += 1
+                return self._plan_reference(req, ledger, cfg)
             n_out, _cost, n_exp, status, aux = self._kernel(   # kernel g-cost unused: intent.cost = trajectory_cost below
                 cocc.corr.iv, cocc.col.iv,
                 cocc.static_col, ks["ov_own_gen"],

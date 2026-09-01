@@ -81,6 +81,54 @@ def _clkey(intent):
             for p, t in (intent.centerline or [])]
 
 
+def test_window_jit_warms_under_the_compiled_fallback_guard(monkeypatch):
+    """The separately-decorated window dispatcher must fail closed during planner construction."""
+    from freespace_sim.planner.astar import kernel as K
+
+    calls = []
+    monkeypatch.setattr(K, "_search", lambda *_args: calls.append("search"))
+
+    def fail_window(*_args):
+        calls.append("window")
+        raise RuntimeError("broken window cache")
+
+    monkeypatch.setattr(W, "build_window", fail_window)
+    with pytest.warns(RuntimeWarning, match="dense-window kernel failed"):
+        planner = AStarPlanner(compiled=True)
+
+    assert calls == ["search", "window"]
+    assert planner.compiled is False and planner._kernel is None
+
+
+def test_window_jit_runtime_failure_replans_and_stays_disabled(monkeypatch):
+    """A post-warm dispatcher failure must re-run this flight in Python and disable later JIT use."""
+    req = _req()
+    reference = AStarPlanner(compiled=False)
+    expected = reference.plan(req, ReservationLedger(CFG), CFG)
+    planner = AStarPlanner(compiled=True)
+    calls = []
+
+    def fail_window(*_args):
+        calls.append(True)
+        raise RuntimeError("window dispatcher failed after warm-up")
+
+    monkeypatch.setattr(W, "build_window", fail_window)
+    with pytest.warns(RuntimeWarning, match="dense-window kernel failed"):
+        got = planner.plan(req, ReservationLedger(CFG), CFG)
+
+    assert calls == [True], "the test never reached the window dispatcher"
+    assert planner.compiled is False and planner._kernel is None
+    assert planner._ref_dispatch["window-jit"] == 1
+    assert got.status is expected.status and got.cost == expected.cost
+    assert planner.last_expansions == reference.last_expansions
+    assert _clkey(got) == _clkey(expected)
+
+    again = planner.plan(req, ReservationLedger(CFG), CFG)
+    assert calls == [True], "a disabled planner called the failing JIT again"
+    assert again.status is expected.status and again.cost == expected.cost
+    assert _clkey(again) == _clkey(expected)
+
+
 def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
     from analysis import ab_dense_window as ab
 

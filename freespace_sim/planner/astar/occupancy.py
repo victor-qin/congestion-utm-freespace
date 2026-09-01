@@ -209,10 +209,11 @@ class HexOccupancyService:
                             if d is None:
                                 d = blk_b[s] = set()
                             d.add(cell)
-            elif in_blk:
+            elif in_blk and _pad:
                 # shared terminal column: record `tid` over its inner (blocked-strength) footprint at
                 # level L — the cells A* queries for the own-hub cruise exemption (capacity lives in
-                # TerminalCapacity).
+                # TerminalCapacity). Terminal state stays live even while `blocked` is deferred, so
+                # the `_pad=False` blocked-only replay must not refcount these cells a second time.
                 cell = (q, r, L)
                 if track:
                     cell, cid = self._intern(cell)

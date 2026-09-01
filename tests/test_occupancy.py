@@ -216,6 +216,31 @@ def test_enable_blocked_leaves_release_reversible():
     assert not svc.blocked and not svc.pad, "release did not fully reverse the armed map"
 
 
+def test_enable_blocked_leaves_terminal_release_reversible():
+    """Arming the ordinary blocked map must not replay terminal state that stayed live while it was off.
+
+    In removal mode terminal cells are refcounted. Replaying the committed cylinder would raise each
+    count from one to two, while the existing release journal can decrement it only once, leaving a
+    ghost foreign-terminal wall after the flight is released.
+    """
+    vol = hover_reservation((1000.0, 1000.0, 0.0), 0.0, CFG, terminal_id="H")
+    svc = HexOccupancyService(CFG, track_removal=True, maintain_blocked=False)
+    led = ReservationLedger(CFG)
+    svc.on_commit(1, [vol])
+    led.commit(1, [vol])
+
+    step, cells = next(iter(svc.term_cells.items()))
+    cell, owners = next(iter(cells.items()))
+    assert owners == {"H": 1}
+
+    svc.enable_blocked(led)
+    assert svc.term_cells[step][cell] == {"H": 1}, "blocked-only replay duplicated terminal state"
+
+    svc.on_release(1, [vol])
+    assert not svc.term_cells
+    assert not svc.is_blocked(*cell, step)
+
+
 def test_is_blocked_refuses_an_unmaintained_map():
     """Answering from a map nobody is maintaining would make the reference planner — the oracle every
     compiled-path parity gate compares against — silently wrong. Raise instead."""

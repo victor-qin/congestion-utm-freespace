@@ -150,6 +150,29 @@ def test_astar_warm_failure_keeps_sipp_kernel_fallback_on_astar_reference(monkey
     assert got is reference and got.planner == "sipp"
 
 
+def test_sipp_warm_uses_the_production_overlay_signature():
+    """The warm-up must compile the signature a real plan uses, or every cold spawned worker
+    compiles a second specialization on its first repair."""
+    from types import SimpleNamespace
+
+    planner = SIPPPlanner(compiled=False)
+    calls = []
+    planner._skernel = lambda *args: calls.append(args)
+    planner._swarm_jit()
+    assert len(calls) == 1
+    warm_dtypes = tuple(a.dtype for a in calls[0][3:6])
+
+    # Avoid allocating the unrelated fixed 1<<21 label/hash tables; the overlay allocation is the
+    # occupancy-shaped first branch and is sufficient to witness the production kernel signature.
+    planner._k_lab_cell = np.empty(0, np.int64)
+    planner._skernel_state(SimpleNamespace(cap=9, MAXS=5))
+    production_dtypes = tuple(
+        a.dtype for a in (planner._k_ov_lo, planner._k_ov_hi, planner._k_ov_nxt)
+    )
+    expected = (np.dtype(np.int64),) * 3
+    assert warm_dtypes == production_dtypes == expected
+
+
 @pytest.mark.parametrize("planner_name", ("astar_ref", "astar", "sipp_ref", "sipp"))
 def test_ground_delay_budget_is_binding_for_every_lattice_path(planner_name):
     """The route horizon bounds arrival; it must not extend the legal ground-delay domain."""

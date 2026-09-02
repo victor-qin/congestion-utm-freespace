@@ -341,6 +341,36 @@ def test_sipp_envelope_covers_the_reference_paths_probes(monkeypatch):
     _ = hg.circumradius(CFG)
 
 
+@pytest.mark.parametrize("planner", ["astar", "sipp"])
+@pytest.mark.parametrize("t_end", [92.0, 100.0])
+def test_envelope_covers_occupancy_rasterization_before_the_request(planner, t_end):
+    """A stale DROP repair must be dirty when an interleaved volume changes the first occupancy
+    step, even if the raw volume ends at or before the request clock.
+
+    With the default 4 s step and 4 s time buffer, `_step_range` retains a volume ending at t=92
+    through the t=100 request's base step. The equality is load-bearing: the step range is inclusive
+    while `envelope_intersects` uses a half-open lower-time comparison.
+    """
+    from freespace_sim.planner.lns.parallel import _read_set_is_clean
+
+    req = FlightRequest(1, vec(0, 0, 0), vec(1200, 0, 0), 100.0)
+    stale_planner = AStarPlanner() if planner == "astar" else _sipp()
+    stale_planner.record_envelope = True
+    stale = _plan(stale_planner, req, [])
+    env = stale_planner.last_envelope
+
+    wall = _wall(x=0.0, t_end=t_end)
+    current_planner = AStarPlanner() if planner == "astar" else _sipp(record=False)
+    current = _plan(current_planner, req, [(77, [wall])])
+    boxes = [(wall.flat_aabb(), wall.t_start, wall.t_end)]
+
+    assert stale.accepted and current.accepted
+    assert stale.ground_delay_s == 0.0
+    assert current.ground_delay_s > stale.ground_delay_s, "fixture is not decision-relevant"
+    assert envelope_intersects(env, boxes)
+    assert not _read_set_is_clean((env,), boxes)
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("planner", ["sipp", "astar"])
 def test_envelope_outside_commits_cannot_change_the_plan(planner):

@@ -541,8 +541,11 @@ class AStarPlanner:
         the 8-slot probe accumulator (kernel ``read_bbox`` or ``_RecordingOcc.bbox``); the o/d hub discs
         cover the host-side reads no cell probe records: ``TerminalCapacity`` dwell/transit queries, the
         compiled path's takeoff/landing masks, and the own-column overlay's ``col_owners`` lookups. The
-        time window is the plan's recorded reach ``[t_request, max_step·dt + hover tail + worst egress
-        traverse]`` — every occupancy/capacity read falls inside it: queries are ≤ max_step, and a
+        time window is the plan's recorded reach ``[t_request − dt − time_buffer, max_step·dt +
+        hover tail + worst egress traverse]``. The lookback is required because
+        ``hexgrid._step_range`` keeps a committed volume through
+        ``floor((t_end + dt + time_buffer) / dt)``: a volume ending before the request clock can
+        therefore change the first step the planner reads. Queries are ≤ max_step, and a
         dwell/capacity probe at the last step reads ``hover + climb + lane traverse`` past it (issue
         #52). ``hover_tail_steps`` covers hover + max climb + buffer only, and at ≥300 m radii the
         traverse outruns the buffer (+3.67 s slack at 180 m, −4.33 s at 350 m) — so the traverse is
@@ -559,11 +562,15 @@ class AStarPlanner:
         cell_bbox = None
         if bbox is not None and bbox[0] <= bbox[1]:                      # any in-box probe happened
             cell_bbox = tuple(int(v) for v in bbox)
+        # `_step_range` includes its final step, while `envelope_intersects` treats `t_end <= t_lo`
+        # as disjoint. Nudge the mathematical bound outward so a volume ending exactly at
+        # `t_request - dt - time_buffer` is still revalidated instead of being certified clean.
+        raster_lo = float(req.t_request - cfg.dt_s - cfg.time_buffer_s)
         self.last_envelope = PlanEnvelope(
             cell_bbox=cell_bbox,
             xy=cell_bbox_to_aabb(cell_bbox, cfg) if cell_bbox is not None else None,
             hub_reads=tuple(hubs),
-            t_lo=float(req.t_request),
+            t_lo=math.nextafter(raster_lo, -math.inf),
             t_hi=float(max_step * cfg.dt_s + hover_tail_steps(cfg) * cfg.dt_s
                        + max(hg.max_lane_traverse_s(origin, o_term, cfg),
                              hg.max_lane_traverse_s(dest, d_term, cfg))),

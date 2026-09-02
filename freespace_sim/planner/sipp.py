@@ -440,7 +440,9 @@ class SIPPPlanner(AStarPlanner):
             gp[:, 1] = 0
             self._skernel(
                 iv_lo, iv_hi, iv_nxt,
-                np.zeros(ovcap, np.int32), np.zeros(ovcap, np.int32), np.full(ovcap, -1, np.int32),
+                # `_skernel_state` allocates the production overlay pool as int64. Dtype is part of
+                # a Numba specialization, so using int32 here warms a signature no real plan calls.
+                np.zeros(ovcap, np.int64), np.zeros(ovcap, np.int64), np.full(ovcap, -1, np.int64),
                 np.full(cap, -1, np.int64), np.zeros(cap, np.int64), cap,
                 0, 0, rspan, qspan, 0, maxs, nlev,
                 np.array([0], np.int64), np.array([0.0]), np.array([0], np.int64), 1,

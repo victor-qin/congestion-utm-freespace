@@ -133,13 +133,19 @@ def main() -> None:
     # The second is a direct read of the commit-side headwind the planner choice buys: compiled A*
     # keeps three, SIPP four on terminal legs (its SafeIntervalIndex binds only when a flight has a
     # terminal). Both come off the RESULT, not the ledger: `run_lns`'s `finally` detaches every
-    # subscriber, so reading `res.ledger` here would always report 0.
+    # subscriber, so reading `res.ledger` here would always report 0. Parallel subscribers are
+    # worker-local and therefore reported as unavailable instead of as the coordinator's false 0/0.
     loop_s = max(1e-9, s["wall_s"] - s["init_wall_s"])
     other_s = loop_s - s["t_plan_s"] - s["t_ledger_s"]
+    subscriber_split = (
+        "subscribers unavailable (worker-local)"
+        if s["n_release_subs"] is None
+        else f"release-subs {s['n_release_subs']}, commit-subs {s['n_commit_subs']}"
+    )
     print(f"split[{args.repair_planner}]: loop {loop_s:.0f}s = plan {s['t_plan_s']:.0f}s "
           f"({s['t_plan_s'] / loop_s:.0%}) + ledger {s['t_ledger_s']:.0f}s "
           f"({s['t_ledger_s'] / loop_s:.0%}) + other {other_s:.0f}s ({other_s / loop_s:.0%}); "
-          f"release-subs {s['n_release_subs']}, commit-subs {s['n_commit_subs']}")
+          f"{subscriber_split}")
     if s["parallel_mode"] != "sequential":
         st = s["parallel_stats"]
         requested_note = (

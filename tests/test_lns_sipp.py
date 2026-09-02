@@ -445,6 +445,20 @@ def _traj_key(out):
             for r in out.trajectory]
 
 
+@pytest.mark.parametrize("repair_planner", ("astar", "astar_ref", "sipp", "sipp_ref"))
+def test_result_preserves_the_repair_planner_registry_name(repair_planner):
+    """Compiled/reference arms share implementation classes, so the result must retain the
+    validated registry key rather than reverse-mapping the planner object's type."""
+    from freespace_sim.planner.lns import LNSConfig, run_lns
+
+    out = run_lns(
+        CFG, ReservationLedger(CFG), [],
+        LNSConfig(max_iterations=0, log_every=0, repair_planner=repair_planner),
+    )
+    assert out.repair_planner == repair_planner
+    assert out.summary()["repair_planner"] == repair_planner
+
+
 @pytest.mark.slow
 def test_sipp_incremental_release_matches_rebuild():
     """THE Phase 1 gate, and the direct analogue of `test_lns_incremental_release_matches_rebuild`.

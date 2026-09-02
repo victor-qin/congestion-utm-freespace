@@ -872,6 +872,7 @@ def run_lns_parallel(
 
         return _finalize_lns_result(
             state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
+            repair_planner_name=lns.repair_planner,
             search_workers=started_workers,
             parallel_mode=lns.parallel_mode,
             pool_spawn_s=pool_spawn_s,

@@ -697,12 +697,16 @@ def test_parallel_caps_pool_skips_coordinator_index_and_closes_before_verify(mon
     out = parallel.run_lns_parallel(
         cfg, ReservationLedger(cfg), [],
         LNSConfig(max_iterations=np.int64(2), log_every=0,
-                  search_workers=np.int64(4), parallel_mode="drop"),
+                  search_workers=np.int64(4), parallel_mode="drop",
+                  repair_planner="astar_ref"),
     )
     assert observed == {"closed": True, "workers": 2, "record_envelope": True}
     assert type(out.search_workers) is int
     assert out.search_workers == 2
     assert out.pool_spawn_s == 0.25
+    assert out.repair_planner == "astar_ref"
+    assert out.n_release_subs is None
+    assert out.n_commit_subs is None
     json.dumps(out.summary())
 
 

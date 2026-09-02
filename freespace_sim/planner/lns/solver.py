@@ -112,10 +112,12 @@ class LNSResult:
     t_plan_s: float = 0.0        # inside `repair_planner.plan`
     t_ledger_s: float = 0.0      # release_many + commit, including the rewind
     # How many ledger-subscribed structures the repair planner ended up keeping — the direct read of
-    # the commit-side headwind a planner choice buys. Captured INSIDE the run: `run_lns`'s `finally`
-    # detaches every subscriber, so a caller reading the ledger afterwards always sees 0.
-    n_release_subs: int = 0
-    n_commit_subs: int = 0
+    # the commit-side headwind a planner choice buys. Captured INSIDE the sequential run:
+    # `run_lns`'s `finally` detaches every subscriber, so a caller reading the ledger afterwards
+    # always sees 0. None on a parallel run whose subscriptions live in worker-local ledgers and
+    # cannot be observed after the pool closes.
+    n_release_subs: int | None = 0
+    n_commit_subs: int | None = 0
 
     @property
     def npo(self) -> int:
@@ -429,6 +431,7 @@ def _finalize_lns_result(
     init_s: float,
     selector: AdaptiveSelector,
     *,
+    repair_planner_name: str,
     search_workers: int = 1,
     parallel_mode: str = "sequential",
     pool_spawn_s: float = 0.0,
@@ -439,6 +442,7 @@ def _finalize_lns_result(
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
     wall_s = time.monotonic() - t0
+    worker_local_subscribers = search_workers > 1
     return LNSResult(
         intents=final,
         trajectory=trajectory,
@@ -450,11 +454,13 @@ def _finalize_lns_result(
         init_wall_s=init_s,
         weights=dict(selector.weights),
         verified=bad is None,
-        repair_planner=type(state.repair_planner).__name__,
+        repair_planner=repair_planner_name,
         t_plan_s=state.t_plan_s,
         t_ledger_s=state.t_ledger_s,
-        n_release_subs=len(state.ledger._release_subs),
-        n_commit_subs=len(state.ledger._observers),
+        n_release_subs=(None if worker_local_subscribers
+                        else len(state.ledger._release_subs)),
+        n_commit_subs=(None if worker_local_subscribers
+                       else len(state.ledger._observers)),
         search_workers=search_workers,
         parallel_mode=parallel_mode,
         auc=_trajectory_auc(trajectory, cost_before, wall_s),
@@ -567,6 +573,7 @@ def run_lns(
 
         return _finalize_lns_result(
             state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
+            repair_planner_name=lns.repair_planner,
         )
     except BaseException:
         log.exception("lns aborted; detaching repair-planner subscribers before propagating")

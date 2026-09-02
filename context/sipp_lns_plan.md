@@ -1088,3 +1088,55 @@ coordinator, and `parallel_mode` now defaults to `"drop"`). The quality ordering
 (sipp 0.62% vs astar 0.66%, against 0.71% vs 0.62% before) — which is exactly the 0.18 pp seed band
 §10.1 measured, and the reason that column should not be read as a result. The wall and the merge
 statistics are the stable signals, and both reproduce.
+
+---
+
+## 13. #124 INVERTS THE VERDICT (2026-09-02)
+
+Re-baselined after rebasing onto `83fd703` (#124, "astar: dense-window and pool-less occupancy").
+Same command, same seed, same scenario as §12.1.
+
+| arm | loop s | plan s | **ledger s** | impr % | accepted |
+|---|---|---|---|---|---|
+| astar | **181.0** | 148.2 | **25.3** | 0.46 | 86/300 |
+| sipp | 270.7 | 142.0 | **122.6** | 0.54 | 88/300 |
+
+**SIPP is now 0.67x — i.e. A\* is 1.50x FASTER.** The headline this whole branch was built on
+(~1.1x in SIPP's favour) is dead.
+
+### What happened, and why it was predictable in hindsight
+
+Compare the ledger column against §12.1, where the *same seed on the same scenario* gave astar 147.3 s
+and sipp 127.5 s:
+
+```
+                 pre-#124        post-#124
+  astar ledger     147.3 s          25.3 s     <- 5.8x cheaper
+  sipp  ledger     127.5 s         122.6 s     <- unchanged
+```
+
+**#124 rewrote A\*'s commit side and SIPP's structures were not part of that rewrite.** `_cocc`
+(`CompiledHexOccupancy`) became pool-less and dense-window; `_scocc` (`CompiledOccupancy`) and
+`_sidx` (`SafeIntervalIndex`) are still the flat interval pool and the step-keyed dicts this branch
+taught to un-absorb. So SIPP now pays a commit side that A* no longer pays.
+
+The plan side went to a wash too (1.04x, from 1.18x), because #124's dense window sped up A*'s search
+as well. With neither term in SIPP's favour, the 4:3 structure count finally costs what §0 originally
+feared — just for the opposite reason: not because SIPP's structures got more expensive, but because
+A*'s got cheaper.
+
+Both arms still reproduce their schedules EXACTLY (astar 1,343,277 / 86; sipp 1,342,247 / 88 — the
+same numbers as §12.1 and as the pre-rebase branch). **#124 is answer-preserving; it is
+cost-inverting.**
+
+### What this means for the branch
+
+The *correctness* work stands unchanged and is worth keeping: SIPP could not be an LNS repair planner
+at all before it (§2's four gaps are real, and two were latent bugs in shipped code). The
+*performance case* is gone at the default settings, and `repair_planner` stays `"astar"` — which it
+already did.
+
+Reviving it means giving `_scocc`/`_sidx` the #124 treatment — a dense-window, pool-less occupancy
+for the safe-interval kernel. That is a substantial piece of work on `sipp_kernel._search`'s
+interface, not a tuning pass, and it should not be attempted inside this branch. Until then, quote
+**A\* 1.50x faster**, not the superseded 1.1x.

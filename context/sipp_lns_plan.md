@@ -1140,3 +1140,26 @@ Reviving it means giving `_scocc`/`_sidx` the #124 treatment — a dense-window,
 for the safe-interval kernel. That is a substantial piece of work on `sipp_kernel._search`'s
 interface, not a tuning pass, and it should not be attempted inside this branch. Until then, quote
 **A\* 1.50x faster**, not the superseded 1.1x.
+
+### 13.1 DROP m=8, N=2, 600 s — the inversion holds, and widens
+
+Full `density_faa_wing_zipline`, `--search-workers 8 --parallel-mode drop --neighborhood 2
+--time-limit 600`. Both arms `verified=True`, equal wall by construction:
+
+| arm | tasks | accepted | improvement | clean-merge | dirty rate | discarded-stale |
+|---|---|---|---|---|---|---|
+| sipp | 12,486 | 1,567 (12.6%) | 2.71% | 734 | 39.2% | 315 |
+| **astar** | **26,684** | 2,673 (10.0%) | **4.31%** | 943 | 37.4% | 373 |
+
+**A\* runs 2.14x the tasks and reaches a 1.59x better schedule.** The sequential inversion is not a
+sequential artifact: under DROP the coordinator's serial commit path is the throughput limit, so a
+5.8x cheaper commit side converts directly into tasks, and tasks into quality.
+
+For scale, the same settings at m=4 gave sipp 7,372 tasks / 1.94% (§11-era). Raising m from 4 to 8
+helps both arms; it does not close the gap.
+
+**Memory was NOT measured.** The peak-RSS sampler used here was wrong twice over — it summed `rss`
+across processes (double-counting shared pages) and never reset its in-process peak between arms,
+which is why both rows printed the identical 72,697 MiB. Treat the m=8 memory question
+(§11.5 predicted ~127 MB/replica extra for SIPP) as still open; `analysis/prof_lns_replica_memory.py`
+is the instrument that actually measures it.

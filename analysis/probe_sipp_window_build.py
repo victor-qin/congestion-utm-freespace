@@ -10,9 +10,12 @@ Measured on the real thing, deliberately:
 
 * on `density_faa`, not a synthetic box — interval count is data-dependent, so a fixture with three
   walls in it measures nothing;
-* against the **same window bounds A* uses** (same anchors, same `_WINDOW_MARGIN_HEX`), by wrapping
-  `AStarPlanner._build_window` and rebuilding SIPP's intervals over its box — so this is the box
-  Phase 3 will actually ask for, not an approximation of one;
+* against the same window ANCHORS A* uses (same cells, same `_WINDOW_MARGIN_HEX`), by wrapping
+  `AStarPlanner._build_window` and rebuilding SIPP's intervals over its box. The lateral extent is
+  therefore identical; the STEP extent deliberately is not — A* clips to `s0 + n_gsteps +
+  tail_steps` and this spans `[base, max_step]` (see `sipp_window.window_bounds`), so SIPP's box is
+  the WIDER one and the 0.514 ms reference below is measured over a narrower span. The comparison is
+  indicative, not like-for-like, and it is the absolute gate that decides Phase 3;
 * with the njit **warm** (the first call compiles), and the compile discarded from the sample. A
   number taken inside pytest on a cold dispatcher would be dominated by LLVM.
 
@@ -119,21 +122,25 @@ def main() -> int:
 
     AP.AStarPlanner._build_window = probe
     t0 = time.monotonic()
-    sim.run(cfg, demand=demand, planner_name="astar", progress=False, return_anchor="nominal")
+    try:
+        sim.run(cfg, demand=demand, planner_name="astar", progress=False, return_anchor="nominal")
+    finally:
+        AP.AStarPlanner._build_window = orig      # a raising run must not leave the class patched
     wall = time.monotonic() - t0
-    AP.AStarPlanner._build_window = orig
 
-    if not samples:
-        print("no windows were built — nothing to report")
+    # Drop the first sample from ALL THREE lists together: it pays the njit compile, and reporting
+    # that as a build cost would be dishonest in the direction that kills the phase — but trimming
+    # only the timings would report shape statistics over a different sample set than the ms line.
+    if len(samples) < 2:
+        print(f"only {len(samples)} window(s) built — too few to report past the compile call")
         return 1
-    # Drop the first: it pays the njit compile, and reporting it as a build cost would be dishonest
-    # in the direction that kills the phase.
-    compile_ms, samples = samples[0], samples[1:]
+    compile_ms = samples[0]
+    samples, cells, slots = samples[1:], cells[1:], slots[1:]
     s = sorted(samples)
     p = lambda f: s[min(len(s) - 1, int(f * len(s)))]           # noqa: E731
     print(f"{len(s)} windows over {wall:.0f}s  (first call {compile_ms:.1f} ms = compile, dropped)")
-    c9 = sorted(cells)[int(.9 * len(cells))]
-    s9 = sorted(slots)[int(.9 * len(slots))]
+    c9 = sorted(cells)[min(len(cells) - 1, int(.9 * len(cells)))]
+    s9 = sorted(slots)[min(len(slots) - 1, int(.9 * len(slots)))]
     print(f"  window cells : p50 {st.median(cells):,.0f}  p90 {c9:,}")
     print(f"  slots used   : p50 {st.median(slots):,.0f}  p90 {s9:,}")
     print(f"  build ms     : p50 {st.median(s):.3f}  p90 {p(0.9):.3f}  p99 {p(0.99):.3f}  "

@@ -289,7 +289,13 @@ def _warn_kernel_fallback() -> None:
 
 class AStarPlanner:
 
-    #: Subclasses that call ``HexOccupancyService.is_blocked`` themselves must set this. The compiled
+    #: Subclasses calling ``HexOccupancyService.is_blocked`` from a path this class does not know
+    #: about must set this — but prefer arming the map where that path runs (``enable_blocked``, as
+    #: ``_plan_reference`` does) over declaring it here, which pays on every commit for a reader
+    #: that may never run. ``SIPPPlanner`` used to set it True and now overrides it as a PROPERTY
+    #: keyed on its own ``sipp_compiled``: this predicate reads ``self.compiled`` — A*'s kernel
+    #: flag — so a subclass with a SEPARATE kernel needs the map back when ITS kernel is gone.
+    #: The compiled
     #: A* path never does (it reads the dense window), which is why the map is off by default there —
     #: but SIPP inherits ``_occupancy`` and DOES query it, and an unmaintained map raises rather than
     #: answering stalely. False keeps the measured 1.052x for plain compiled A*.
@@ -495,7 +501,10 @@ class AStarPlanner:
                 stacklevel=2,
             )
             self.n_shrink_rebuilds += 1
-            svc.reset()
+            # `keep_blocked_live`: the `_absorb` below rebuilds `blocked` in the same pass, so
+            # dropping the armed flag here would only buy a second full ledger walk the next time a
+            # reference plan calls `enable_blocked`. See `HexOccupancyService.reset`.
+            svc.reset(keep_blocked_live=True)
             self._tcap.reset()
             # Deliberately NO `subscribe_static` here: this branch never had one, and adding it would
             # append a duplicate subscriber and re-replay every hub on each LNS release cycle —

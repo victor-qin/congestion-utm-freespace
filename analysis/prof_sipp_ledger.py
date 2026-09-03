@@ -10,8 +10,10 @@ Measures, per structure, over a warm ledger at density_faa scale:
   * for the interval pool, the RE-APPLY AMPLIFICATION -- how many survivor claims a release has to
     replay per claim it actually removes (A*'s predecessor measured 12.2x here, which is why #124
     replaced it with a swap-remove);
-  * for the hex service, the cost attributable to the `blocked` map alone (SIPP forces it on with
-    `needs_blocked_map`; compiled A* switches it off).
+  * for the hex service, the cost attributable to the `blocked` map alone. SIPP USED to force this
+    on via `needs_blocked_map`; Phase 1 (`f4be4f0`) removed that, so the "blocked ON" row is now the
+    HISTORICAL cost, not what a compiled SIPP pays. Both rows are kept because the delta between
+    them is what Phase 1 banked (-1.807 ms/flight, measured -10.0 s of a 124.1 s LNS ledger).
 
     uv run python analysis/prof_sipp_ledger.py [n_warm] [n_timed]
 """
@@ -69,10 +71,10 @@ def main() -> int:
     print(f"warm {len(warm)} flights / timed {len(timed)} flights, {n_vol_timed} volumes\n", flush=True)
 
     variants = [
-        ("sipp  _svc  (hex dicts, blocked ON )", lambda: HexOccupancyService(cfg, track_removal=True,
-                                                                            maintain_blocked=True)),
-        ("astar _svc  (hex dicts, blocked OFF)", lambda: HexOccupancyService(cfg, track_removal=True,
-                                                                            maintain_blocked=False)),
+        ("pre-#Ph1 _svc (hex dicts, blocked ON )", lambda: HexOccupancyService(
+            cfg, track_removal=True, maintain_blocked=True)),
+        ("both     _svc (hex dicts, blocked OFF)", lambda: HexOccupancyService(
+            cfg, track_removal=True, maintain_blocked=False)),
         ("sipp  _scocc (interval POOL)        ", lambda: CompiledOccupancy(cfg, track_removal=True)),
         ("astar _cocc  (claim ARENA)          ", lambda: CompiledHexOccupancy(cfg, track_removal=True)),
         ("sipp  _sidx  (step dicts)           ", lambda: SafeIntervalIndex(cfg, track_removal=True)),

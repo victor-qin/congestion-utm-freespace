@@ -116,12 +116,24 @@ def _wcells(cocc, wbox):
                 yield w, q, r, L
 
 
-def _congested(lam=400.0, horizon=600.0):
-    """A real committed schedule — the regime where cells actually fragment into many intervals."""
-    spec = with_overrides(get_scenario("metro_uniform"), lam_per_hour=lam,
+_CONGESTED: dict = {}
+
+
+def _congested(lam=3000.0, horizon=900.0):
+    """A real committed schedule on a HUB scenario — corridor claims AND terminal-column claims.
+
+    Deliberately not `metro_uniform`: it has no terminals, so `col_owners` and `static_col` are both
+    empty and the builder's `(cell << 1) | 1` column branch — the one this module calls the deleted
+    `_sbuild_overlay` — is never compared against the oracle. Every `density_faa` flight is
+    hub-to-hub, so a corridor-only fixture would leave the half of the fold that matters most in
+    production entirely unchecked. `_column_cells` below asserts the fixture actually produced some.
+    """
+    if (lam, horizon) in _CONGESTED:      # three tests share one schedule; rebuilding it per test
+        return _CONGESTED[(lam, horizon)]  # tripled the file's wall clock for identical state
+    spec = with_overrides(get_scenario("dallas_hub_2uss_large"), lam_per_hour=lam,
                           horizon_s=horizon, seed=0)
     cfg = spec.config()
-    dm = spec.demand_model() or UniformPoissonDemand()   # metro_uniform carries no model of its own
+    dm = spec.demand_model() or UniformPoissonDemand()
     reqs = dm.generate(cfg, np.random.default_rng(cfg.seed))
     sc = scenario_from_requests(reqs)
     led = ReservationLedger(cfg)
@@ -132,11 +144,20 @@ def _congested(lam=400.0, horizon=600.0):
     for ev in sc.events:
         usses[ev.request.uss_id].handle_request(ev.request)
     cocc = CompiledHexOccupancy(cfg)
+    led.subscribe_static(cocc._on_static)    # static walls too, when the scenario carries them
     # Deliberately no `evict_before`: `CompiledHexOccupancy._add` clips `s_lo` to `evicted_before`
     # and `CompiledOccupancy._add` does not, so an evicting fixture would desync the two structures
     # this file exists to compare.
     _absorb(cocc, led)
+    _CONGESTED[(lam, horizon)] = (cfg, led, cocc)
     return cfg, led, cocc
+
+
+def _column_cells(cocc):
+    """Cells carrying a terminal-COLUMN claim, asserting the fixture produced some."""
+    cells = [k >> 1 for k in range(1, 2 * cocc.NC, 2) if cocc._arena.length[k]]
+    assert cells, "fixture produced no column claims — the column branch would go unchecked"
+    return cells
 
 
 # --------------------------------------------------------------------------- the parity gate
@@ -149,10 +170,13 @@ def test_window_intervals_match_the_claim_oracle():
     order is storage, and asserting on it would pin an implementation detail the kernel never reads.
     """
     cfg, _led, cocc = _congested()
-    # A window over cells that were actually claimed, so this is not a test about empty space.
+    # Centre on a COLUMN cell, not just any claimed one: the window must contain terminal-column
+    # claims or the `(cell << 1) | 1` half of the fold goes unchecked (which it silently did while
+    # this fixture was `metro_uniform`).
     claimed = [k >> 1 for k in range(2 * cocc.NC) if cocc._arena.length[k]]
     assert len(claimed) > 200, f"fixture is not congested enough ({len(claimed)} claimed cells)"
-    mid = claimed[len(claimed) // 2]
+    cols = _column_cells(cocc)
+    mid = cols[len(cols) // 2]
     qr, L0 = divmod(mid, cocc.n_levels)
     iq, ir = divmod(qr, cocc.rspan)
     q0, r0 = iq + cocc.qmin, ir + cocc.rmin
@@ -168,6 +192,9 @@ def test_window_intervals_match_the_claim_oracle():
         if want != [(0, s1)]:
             n_nonempty += 1
     assert n_nonempty > 10, f"window held only {n_nonempty} claimed cells — the check was vacuous"
+    in_win = {(w) for w, q, r, L in _wcells(cocc, wbox)
+              if cocc.cell_id(q, r, L) in set(cols)}
+    assert len(in_win) > 3, f"only {len(in_win)} column cells in the window — column branch vacuous"
     assert tail > 0
 
 
@@ -268,8 +295,12 @@ def test_window_intervals_reproduce_the_overlay():
     _absorb(cocc, led); _absorb(sidx, led)
 
     own_tids = frozenset({"hub#1"})
-    col_cells = [c for c, owners in cocc.col_owners.items() if owners <= own_tids]
-    assert col_cells, "fixture committed no column cells to be own-transparent about"
+    # The cell must carry a CORRIDOR claim as well, or the invariant this test states — "the own
+    # fold must drop the column and KEEP the corridor" — is never exercised: `want` comes out as the
+    # trivial fully-free interval and a builder that reported every own cell free would pass.
+    col_cells = [c for c, owners in cocc.col_owners.items()
+                 if owners <= own_tids and cocc._arena.length[c << 1]]
+    assert col_cells, "no own column cell also carries a corridor claim — the test would be vacuous"
     c = col_cells[len(col_cells) // 2]
     qr, L = divmod(c, cocc.n_levels)
     iq, ir = divmod(qr, cocc.rspan)
@@ -342,3 +373,140 @@ def test_window_bounds_spans_the_whole_search_horizon():
     assert SW.window_bounds(cocc, wb2, q_cells=(0, 4), r_cells=(0, 4), base=900, max_step=12,
                             lateral_margin=3) == 0
     assert int(wb2[W_S1]) == 0, "a degenerate box wrote bounds anyway"
+
+
+# --------------------------------------------------------- buffer contracts (Phase-3 hazards)
+
+def test_window_intervals_terminate_every_chain():
+    """Build twice into ONE pre-dirtied buffer set: every chain must be terminated by the builder.
+
+    Allocating `iv_nxt` fresh as `np.full(n, -1)` per call — which every other test here does, and
+    which is the natural way to write a fixture — supplies the terminator the builder might have
+    failed to write. Buffer reuse is the intended pattern (held for the run, see the probe's
+    `_Buffers`), so plan k's head slot would keep plan k-1's `iv_nxt` and splice a previous plan's
+    overflow intervals onto this plan's chain: `_search` then walks into free runs belonging to a
+    different cell entirely.
+    """
+    cfg, _led, cocc = _congested()
+    cols = _column_cells(cocc)
+    boxes = []
+    for pick in (cols[len(cols) // 3], cols[2 * len(cols) // 3]):
+        qr, _L = divmod(pick, cocc.n_levels)
+        iq, ir = divmod(qr, cocc.rspan)
+        boxes.append(_wbox(cocc, iq + cocc.qmin - 4, iq + cocc.qmin + 4,
+                           ir + cocc.rmin - 4, ir + cocc.rmin + 4, 0, min(cocc.MAXS, 300)))
+    # one buffer set, sized for the larger box, pre-filled with values that are NOT valid links
+    n = max((int(b[W_Q1]) - int(b[W_Q0]) + 1) * (int(b[W_R1]) - int(b[W_R0]) + 1) * cocc.n_levels
+            for b in boxes)
+    size = n * 8 + 64
+    iv_lo = np.full(size, 999, np.int32)
+    iv_hi = np.full(size, 999, np.int32)
+    iv_nxt = np.full(size, 999, np.int32)          # 999, NOT -1: no free terminator
+    scr = np.zeros(size, np.int64)
+    ov = np.zeros(cocc.NC, np.int32)
+    for wbox in boxes:
+        for _ in range(4):                          # grow like a host would; keep the DIRTY fill
+            tail = SW.build_window_intervals(
+                cocc._arena.arena, cocc._arena.start, cocc._arena.length, cocc.static_col, ov, 1,
+                cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox,
+                iv_lo, iv_hi, iv_nxt, scr, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+            if tail >= 0:
+                break
+            size = -tail
+            iv_lo = np.full(size, 999, np.int32)
+            iv_hi = np.full(size, 999, np.int32)
+            iv_nxt = np.full(size, 999, np.int32)
+            scr = np.zeros(size, np.int64)
+        assert tail > 0
+        for w, q, r, L in _wcells(cocc, wbox):
+            slot, seen = int(w), 0
+            while slot != -1:
+                assert 0 <= slot < tail, f"wcell {w} walked to slot {slot} outside [0, {tail})"
+                seen += 1
+                assert seen <= 64, f"wcell {w} chain did not terminate: {seen} hops"
+                slot = int(iv_nxt[slot])
+            assert sorted(_chain(iv_lo, iv_hi, iv_nxt, w)) == \
+                _expected(cocc, q, r, L, int(wbox[W_S0]), int(wbox[W_S1]))
+
+
+def test_window_intervals_refuse_mismatched_buffers():
+    """Sizing only `iv_lo` must not licence writes past the end of `iv_hi` / `iv_nxt` / `scratch`.
+
+    numba runs with `boundscheck` off, so checking one array of the four and trusting the caller for
+    the rest is not a style question: it segfaults. Reproduced before the fix — a positive `tail`
+    return alongside ~1.6x-its-length of out-of-bounds int32 writes.
+    """
+    cfg, _led, cocc = _congested()
+    cols = _column_cells(cocc)
+    qr, _L = divmod(cols[len(cols) // 2], cocc.n_levels)
+    iq, ir = divmod(qr, cocc.rspan)
+    wbox = _wbox(cocc, iq + cocc.qmin - 4, iq + cocc.qmin + 4,
+                 ir + cocc.rmin - 4, ir + cocc.rmin + 4, 0, min(cocc.MAXS, 300))
+    n = (int(wbox[W_Q1]) - int(wbox[W_Q0]) + 1) * (int(wbox[W_R1]) - int(wbox[W_R0]) + 1) \
+        * cocc.n_levels
+    big = n * 8 + 64
+    ov = np.zeros(cocc.NC, np.int32)
+    for short in ("iv_hi", "iv_nxt", "scratch"):
+        bufs = {"iv_lo": np.zeros(big, np.int32), "iv_hi": np.zeros(big, np.int32),
+                "iv_nxt": np.full(big, -1, np.int32), "scratch": np.zeros(big, np.int64)}
+        bufs[short] = (np.zeros(n, np.int64) if short == "scratch"
+                       else np.zeros(n, np.int32))       # only the head slots
+        tail = SW.build_window_intervals(
+            cocc._arena.arena, cocc._arena.start, cocc._arena.length, cocc.static_col, ov, 1,
+            cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox,
+            bufs["iv_lo"], bufs["iv_hi"], bufs["iv_nxt"], bufs["scratch"],
+            _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+        assert tail < 0, f"a short `{short}` was accepted (tail={tail}) — that is an OOB write"
+
+
+def test_window_intervals_refuse_an_int32_scratch():
+    """`scratch` must be int64; an int32 one silently truncates every span's start to 0.
+
+    numba specialises on dtype, so an int32 scratch compiles a SECOND kernel in which
+    `(a << 32) | b` wraps to `b`. Every claim then unpacks as `(0, b)` and the complement sweep eats
+    all leading free runs — a strict SUBSET of the truth, so it never crashes and never files a
+    conflict; it just plans worse. A host allocating its four per-plan buffers in one loop is
+    exactly how this arises.
+    """
+    cfg, _led, cocc = _congested()
+    cols = _column_cells(cocc)
+    qr, _L = divmod(cols[len(cols) // 2], cocc.n_levels)
+    iq, ir = divmod(qr, cocc.rspan)
+    wbox = _wbox(cocc, iq + cocc.qmin - 3, iq + cocc.qmin + 3,
+                 ir + cocc.rmin - 3, ir + cocc.rmin + 3, 0, min(cocc.MAXS, 300))
+    n = (int(wbox[W_Q1]) - int(wbox[W_Q0]) + 1) * (int(wbox[W_R1]) - int(wbox[W_R0]) + 1) \
+        * cocc.n_levels
+    size = n * 8 + 64
+    ov = np.zeros(cocc.NC, np.int32)
+    tail = SW.build_window_intervals(
+        cocc._arena.arena, cocc._arena.start, cocc._arena.length, cocc.static_col, ov, 1,
+        cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wbox,
+        np.zeros(size, np.int32), np.zeros(size, np.int32), np.full(size, -1, np.int32),
+        np.zeros(size, np.int32),                        # <- int32 scratch
+        _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+    assert tail < 0, f"an int32 scratch was accepted (tail={tail}) — spans truncate silently"
+
+
+def test_window_bounds_disables_a_degenerate_box():
+    """A degenerate box must WRITE the off marker, and the builder must honour it.
+
+    `window_bounds` returning 0 without touching `wbox` leaves the previous plan's bounds in place,
+    and a host holding one wbox for the run (the intended pattern) would then build plan B's
+    intervals over plan A's geometry — planning against another flight's box with nothing to see it.
+    """
+    cfg, _led, cocc = _congested()
+    wb = SW.empty_wbox()
+    assert SW.window_bounds(cocc, wb, q_cells=(0, 4), r_cells=(0, 4), base=12, max_step=900,
+                            lateral_margin=3) > 0
+    good = wb.copy()
+    assert SW.window_bounds(cocc, wb, q_cells=(0, 4), r_cells=(0, 4), base=900, max_step=12,
+                            lateral_margin=3) == 0
+    assert not np.array_equal(wb, good), "degenerate box left the previous plan's bounds in wbox"
+
+    size = 4096
+    tail = SW.build_window_intervals(
+        cocc._arena.arena, cocc._arena.start, cocc._arena.length, cocc.static_col,
+        np.zeros(cocc.NC, np.int32), 1, cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels, wb,
+        np.zeros(size, np.int32), np.zeros(size, np.int32), np.full(size, -1, np.int32),
+        np.zeros(size, np.int64), _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+    assert tail == 0, "the builder ignored an OFF wbox"

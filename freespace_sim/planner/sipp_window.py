@@ -27,15 +27,41 @@ arena's slabs are indeed unordered because removal is a swap-remove. Hence the s
 of a sorted, merged span list is ascending by construction rather than by assertion.
 
 The own-column fold is A*'s, term for term — ``ov_own_gen[cell] == gen`` skips the column slab and
-the always-active wall. That single boolean **is** the overlay ``SIPPPlanner._sbuild_overlay`` used
-to build out of ``SafeIntervalIndex``, which is why this module replaces two structures rather than
-one.
+the always-active wall. That boolean reproduces the overlay ``SIPPPlanner._sbuild_overlay`` built
+out of ``SafeIntervalIndex``, which is why this replaces two structures rather than one — **but
+only on a cell no FOREIGN column also covers.** One boolean per cell cannot say "own AND
+foreign here", so on a mixed cell this reports the cell transparent and the foreign wall vanishes.
+``SafeIntervalIndex`` resolved ownership per ``(cell, step)`` and did not have that limit.
+
+That is A*'s trade, not a new one, and A* handles it the same way: ``_build_overlay`` returns True
+when ``col_owners`` shows a foreign owner on an own cell, and the caller dispatches to the exact
+pure-Python reference (issue #3). **A host calling this builder MUST do the same** — the builder
+cannot detect it, because ``col_owners`` is a dict and this is an njit kernel.
+
+Measured, so the guard's rarity is not assumed: on demand-generated layouts the case does not arise
+at all — ``density_faa`` (182 hubs, min centre separation 787.8 m) and ``dallas_hub_2uss``
+(26 hubs, 712.9 m) both have **zero** cells with more than one owning hub, and two hubs at the
+MINIMUM separation ``_scatter_hubs`` permits (670.0 m, i.e.
+``2*(exit_radius + sqrt3*R) + min_hub_gap_m``) share none. It takes ~55% of that legal separation
+to produce one.
+So the guard is for hand-built geometry and for scenarios that bypass ``_scatter_hubs``, not for the
+production ones.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from .astar.window import W_Q0, W_Q1, W_R0, W_R1, W_RSPAN, W_S0, W_S1, W_STEPS
+from .astar.window import (
+    WBOX_N,
+    W_Q0,
+    W_Q1,
+    W_R0,
+    W_R1,
+    W_RSPAN,
+    W_S0,
+    W_S1,
+    W_STEPS,
+)
 
 try:
     from numba import njit
@@ -50,8 +76,8 @@ except ImportError:                     # numba absent — same guard as `astar/
         return deco
 
 # Above this many claims in one cell, insertion sort's quadratic term would beat the library sort's
-# per-call setup. Measured claim counts per window cell at density_faa are single digits (p50 window:
-# 10,488 cells, ~24k overflow intervals), so this is a bound on the tail rather than a tuned knob.
+# per-call setup. Measured claim counts per window cell at density_faa are single digits (p50
+# window: 10,488 cells, ~24k overflow intervals), so this bounds the tail rather than tuning it.
 _INSERTION_MAX = 32
 
 
@@ -85,7 +111,8 @@ def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, lateral_margi
     s0 = max(0, int(base))
     s1 = min(int(max_step), int(cocc.MAXS))
     if q1 < q0 or r1 < r0 or s1 < s0:
-        return 0
+        disable(wbox)          # WRITE the off marker; a caller reusing one wbox would otherwise
+        return 0               # keep the PREVIOUS plan's bounds and build over its geometry
     wbox[W_Q0] = q0; wbox[W_Q1] = q1
     wbox[W_R0] = r0; wbox[W_R1] = r1
     wbox[W_S0] = s0; wbox[W_S1] = s1
@@ -114,11 +141,34 @@ def build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, 
         w    = ((q - wq0)  * wrspan * n_levels) + ...   sequential counter
         cell = ((q - qmin) * rspan  + (r - rmin)) * n_levels + L
     """
+    if wbox[W_STEPS] == 0:
+        # OFF, the same encoding `astar/window` uses and `kernel._blocked` gates on. Without this a
+        # host reusing one wbox across plans (which is the intended pattern — the buffers are held
+        # for the run) would silently build plan B's intervals over plan A's geometry after a
+        # degenerate `window_bounds`, because that path leaves the previous bounds in place.
+        return 0
     wq0 = wbox[W_Q0]; wq1 = wbox[W_Q1]; wr0 = wbox[W_R0]
     ws0 = wbox[W_S0]; ws1 = wbox[W_S1]
     wrspan = wbox[W_RSPAN]
     n_wcells = (wq1 - wq0 + 1) * wrspan * n_levels
+    # ALL FOUR buffers, not just `iv_lo`. numba has `boundscheck` off, so a caller that grew one
+    # array of the set gets silent out-of-bounds writes and a positive "success" return — reproduced
+    # as a SIGSEGV, and the quieter outcome is a neighbouring array rewritten with slot links.
     cap_slots = iv_lo.shape[0]
+    if iv_hi.shape[0] < cap_slots:
+        cap_slots = iv_hi.shape[0]
+    if iv_nxt.shape[0] < cap_slots:
+        cap_slots = iv_nxt.shape[0]
+    if scratch.shape[0] < cap_slots:
+        cap_slots = scratch.shape[0]
+    # `scratch` must be int64: the claim key is `(a << 32) | b`. numba specialises on dtype, so an
+    # int32 scratch compiles a SECOND kernel where that shift wraps to `b`, every span unpacks as
+    # `(0, b)`, and the complement sweep eats every leading free run — measured 267 of 507 cells
+    # silently reduced to a strict SUBSET of the truth, no exception, no conflict, just worse plans.
+    # One store and one compare per call buys the whole class: a value that cannot survive 32 bits.
+    scratch[0] = 1 << 40
+    if scratch[0] != (1 << 40):
+        return -1                                        # host must pass an int64 scratch
 
     # ---- capacity pass. A cell whose K blocked spans merge has at most K+1 free intervals, one
     # of which is the head, so the overflow it can need is bounded by its claim count. Summing that
@@ -135,8 +185,12 @@ def build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, 
                 if ov_own_gen[cell] != gen:
                     total += slab_len[(cell << 1) | 1]
     needed = n_wcells + total
-    if needed > cap_slots or needed > scratch.shape[0]:
+    if needed > cap_slots:
         return -needed
+    # The capacity pass is the ONLY thing between this and an out-of-bounds write, and it is a
+    # SEPARATE piece of arithmetic from the loop it bounds — so the two emit sites re-check `tail`
+    # against `cap_slots` anyway. One compare per overflow interval, and it turns "the two disagree"
+    # from silent heap corruption into an ordinary shortfall the host already handles.
 
     # ---- build pass
     tail = n_wcells
@@ -218,6 +272,8 @@ def build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, 
                             iv_lo[wcell] = lo; iv_hi[wcell] = a - 1
                             prev = wcell
                         else:
+                            if tail >= cap_slots:
+                                return -(tail + 1)       # capacity under-count (see the tripwire)
                             iv_lo[tail] = lo; iv_hi[tail] = a - 1
                             iv_nxt[prev] = tail
                             prev = tail
@@ -231,6 +287,8 @@ def build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, 
                         iv_lo[wcell] = lo; iv_hi[wcell] = ws1
                         prev = wcell
                     else:
+                        if tail >= cap_slots:
+                            return -(tail + 1)           # capacity under-count (see the tripwire)
                         iv_lo[tail] = lo; iv_hi[tail] = ws1
                         iv_nxt[prev] = tail
                         prev = tail
@@ -242,6 +300,12 @@ def build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, 
     return tail
 
 
+def disable(wbox) -> None:
+    """Mark ``wbox`` off. ``W_STEPS == 0`` is :func:`build_window_intervals`'s enable test, so this
+    and that check are the only two places that must agree — as ``astar/window.disable``."""
+    wbox[W_STEPS] = 0
+
+
 def empty_wbox() -> np.ndarray:
     """An off window. ``W_STEPS == 0`` is the disabled test, shared with ``astar/window``."""
-    return np.zeros(9, np.int64)
+    return np.zeros(WBOX_N, np.int64)

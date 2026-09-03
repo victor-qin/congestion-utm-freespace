@@ -247,3 +247,41 @@ def test_is_blocked_refuses_an_unmaintained_map():
     svc = HexOccupancyService(CFG, maintain_blocked=False)
     with pytest.raises(RuntimeError, match="enable_blocked"):
         svc.is_blocked(0, 0, 0, 0)
+
+
+def test_reset_keeps_an_armed_map_live_for_the_shrink_rebuild():
+    """`reset(keep_blocked_live=True)` must leave the map armed AND correct after the re-absorb.
+
+    The shrink-rebuild branch re-absorbs immediately, so dropping the armed flag there costs a
+    second full ledger walk the next time a reference plan calls `enable_blocked` — a 1.37x
+    regression on that path. Keeping it is only safe because `on_commit` writes `blocked` while the
+    map is live, so the very same `_absorb` rebuilds it; this pins BOTH halves, since a version that
+    kept the flag without rebuilding would leave a map that claims to be live and is empty.
+    """
+    from freespace_sim.geometry import box_from_segment
+    from freespace_sim.planner.astar.planner import _absorb
+    from freespace_sim.types import vec
+    from freespace_sim.volumes import Volume4D
+
+    cfg = SimConfig()
+    led = ReservationLedger(cfg)
+    for fid, x in ((1, 800.0), (2, 1600.0)):
+        led.commit(fid, [Volume4D(box_from_segment(vec(x, -200, 150), vec(x, 200, 150), 40, 400),
+                                  0.0, 90.0)])
+    svc = HexOccupancyService(cfg, maintain_blocked=False)
+    _absorb(svc, led)
+    assert not svc._blocked_live and not svc.blocked
+    svc.enable_blocked(led)
+    armed = {s: set(c) for s, c in svc.blocked.items()}
+    assert armed
+
+    svc.reset(keep_blocked_live=True)
+    assert svc._blocked_live, "the shrink rebuild disarmed a map that was already armed"
+    assert not svc.blocked, "reset must still clear"
+    _absorb(svc, led)
+    assert {s: set(c) for s, c in svc.blocked.items()} == armed, \
+        "the re-absorb did not rebuild the map it kept claiming to hold"
+
+    # ...and the default is unchanged: an unarmed-by-policy service goes back to off.
+    svc.reset()
+    assert not svc._blocked_live

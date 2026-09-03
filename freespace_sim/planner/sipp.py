@@ -361,14 +361,26 @@ def _nondominated(frontier, key, t, g, w):
 class SIPPPlanner(AStarPlanner):
     """Safe-interval cost-aware planner; inherits occupancy/terminal sync and corridor build from A*."""
 
-    # `needs_blocked_map` is deliberately NOT set (so it inherits False, and `_occupancy`
-    # builds the service with `maintain_blocked=False`). SIPP does call
-    # `HexOccupancyService.is_blocked` — but only from `_succ`, the pure-Python REFERENCE
-    # successor generator, never from `_splan_compiled`, whose kernel answers the obstacle
-    # test out of the interval pool. Declaring the flag therefore bought a map written on
-    # every commit and read only on a fallback: measured 1.807 ms/flight at density_faa
-    # scale (5.562 against 3.755), where the fallback rate is zero. `_splan_reference` arms
-    # it via `enable_blocked` instead — A*'s existing lazy, sticky re-arm.
+    @property
+    def needs_blocked_map(self) -> bool:
+        """Keyed on ``sipp_compiled``, NOT on the inherited ``compiled``.
+
+        SIPP does call ``HexOccupancyService.is_blocked`` — but only from ``_succ``, the pure-Python
+        REFERENCE successor generator, never from ``_splan_compiled``, whose kernel answers the
+        obstacle test out of the interval pool. So on the compiled path the map is written on every
+        commit and read never: measured **1.807 ms/flight** at density_faa scale (5.562 against
+        3.755), at a fallback rate of zero. ``_splan_reference`` arms it with ``enable_blocked``
+        instead — A*'s existing lazy, sticky re-arm.
+
+        A property rather than a class attribute because ``AStarPlanner._occupancy`` derives
+        ``maintain_blocked`` from ``self.compiled``, which is **A*'s fallback-kernel flag**; SIPP
+        dispatches on ``self.sipp_compiled``, and ``_swarm_jit``'s failure handler clears only the
+        latter. A plain ``False`` would therefore make a JIT-degraded SIPP — every plan on the
+        reference — turn the map off AND pay an O(schedule) ``enable_blocked`` replay on its first
+        plan, then maintain it anyway: strictly more work than before this was touched, for no
+        saving. Reading ``sipp_compiled`` gives the map back to exactly the planner that needs it.
+        """
+        return not self.sipp_compiled
 
     def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True,
                  kernel_log2_min: int | None = None, incremental_release: bool = False,

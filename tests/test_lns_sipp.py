@@ -13,6 +13,8 @@ from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.planner import _absorb
 from freespace_sim.planner.compiled_occupancy import CompiledOccupancy
 from freespace_sim.planner.sipp import SIPPPlanner, SafeIntervalIndex
 from freespace_sim.types import FlightRequest, vec
@@ -382,26 +384,55 @@ def test_sipp_reference_arms_the_blocked_map():
     """`_splan_reference` searches through `_succ`, which calls `svc.is_blocked`, and an
     unmaintained map RAISES (`HexOccupancyService.is_blocked`). So the reference arms it.
 
-    The gate is the second assertion, not the first: a build that armed the map but armed it WRONG
-    would still flip `_blocked_live`. Comparing against a planner whose map was eager from the very
-    first commit is what makes this a test — `enable_blocked` replays the ledger, and replaying it
-    incorrectly (double-counting refcounts, missing the own-column skip) is the plausible bug."""
+    The gate is the map comparison, not the flag: a build that armed the map WRONG would still flip
+    `_blocked_live`. Three properties of the fixture are load-bearing, and without any one of them
+    the comparison is decorative:
+
+    * `incremental_release=True`, so `blocked` holds REFCOUNTS. With the default set-valued map a
+      replay that added every volume twice is idempotent and invisible.
+    * TERMINAL flights, so `own_cols` is non-empty and `enable_blocked`'s own-column skip is
+      actually exercised. Point-to-point requests make that branch a no-op.
+    * a comparator built `maintain_blocked=True` from construction — NOT another compiled
+      SIPPPlanner, whose service is also built with the map off and would be filled by the very same
+      replay, comparing `enable_blocked` against itself.
+    """
     led = ReservationLedger(CFG)
-    lazy = SIPPPlanner()
-    seed = lazy.plan(_req(1), led, CFG)
-    assert seed.accepted
-    led.commit(1, seed.volumes)
+    lazy = SIPPPlanner(incremental_release=True)
+    for fid in (1, 2):
+        seed = lazy.plan(_hub_req(fid, y=400.0 * fid), led, CFG)
+        if seed.accepted:
+            led.commit(fid, seed.volumes)
+    assert led.n_volumes, "fixture committed nothing"
 
-    eager = SIPPPlanner()
-    eager._occupancy(_req(2, y=300.0), led, CFG).enable_blocked(led)   # armed BEFORE planning
-    assert eager._svc._blocked_live
-
-    got = lazy._splan_reference(_req(2, y=300.0), led, CFG)
-    want = eager._splan_reference(_req(2, y=300.0), led, CFG)
+    got = lazy._splan_reference(_hub_req(3, y=300.0), led, CFG)
     assert lazy._svc._blocked_live, "the reference search did not arm the map"
-    assert lazy._svc.blocked == eager._svc.blocked, "armed map differs from an eager one"
-    assert got.accepted == want.accepted
-    assert got.cost == pytest.approx(want.cost, abs=1e-12)
+    assert got is not None
+
+    # Mirror the planner's eviction floor BEFORE absorbing: `add_volume` clamps `s_lo` to
+    # `evicted_before` at insert time, so a comparator without it keeps steps the planner's service
+    # clamped away and the test fails on eviction rather than on the thing it is about.
+    eager = HexOccupancyService(CFG, track_removal=True, maintain_blocked=True)
+    eager.evicted_before = lazy._svc.evicted_before
+    _absorb(eager, led)
+    assert eager._blocked_live and eager.blocked
+    assert lazy._svc.blocked == eager.blocked, "armed map differs from one maintained all along"
+
+
+def test_degraded_sipp_keeps_the_blocked_map():
+    """`needs_blocked_map` reads `sipp_compiled`, not the inherited `compiled`.
+
+    `AStarPlanner._occupancy` derives `maintain_blocked` from `self.compiled` — A*'s FALLBACK-kernel
+    flag — while `SIPPPlanner.plan` dispatches on `self.sipp_compiled`, and `_swarm_jit`'s failure
+    handler clears only the latter. Key the map off the wrong one and a JIT-degraded SIPP (every
+    plan on the reference) turns the map off AND pays an O(schedule) `enable_blocked` replay on its
+    plan, then maintains it regardless: strictly more work than before Phase 1, for no saving.
+    """
+    led = ReservationLedger(CFG)
+    sipp = SIPPPlanner()
+    sipp.sipp_compiled = False                 # what `_swarm_jit` does on a kernel that won't warm
+    sipp.plan(_req(1), led, CFG)
+    assert sipp._svc._maintain_blocked, "a degraded SIPP built the service without the map"
+    assert sipp._svc._blocked_live
 
 
 def test_sipp_honors_evict_floor_for_its_own_structures():

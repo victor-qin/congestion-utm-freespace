@@ -483,3 +483,41 @@ only part that is pure removal of work nothing consumes.
 * Zero-miss window coverage at margin 24 comes in materially under A\*'s 100% → SIPP's read set is
   wider than measured and the widen path becomes hot rather than rare; re-calibrate the margin on the
   coverage sweep, not on the miss rate.
+
+---
+
+## 6. Phase 1 result (`f4be4f0`)
+
+Shipped: `needs_blocked_map` deleted, `svc.enable_blocked(ledger)` added to `_splan_reference`.
+
+Paired against §2's baseline, same harness, same seed, full `density_faa` (4,636 legs, N=8, 300 iters):
+
+| | `4c81255` | Phase 1 | delta |
+| --- | ---: | ---: | ---: |
+| loop s | 276.8 | **265.0** | −11.8 (−4.3%) |
+| plan s | 146.3 | 144.8 | −1.5 |
+| **ledger s** | **124.1** | **114.1** | **−10.0 (−8.1%)** |
+| cost after | 1342247 | 1342247 | **identical** |
+| accepted | 88/300 | 88/300 | identical |
+| release subs | 4 | 4 | (Phase 3 drops this) |
+
+§1 predicted −9.6% on the ledger side (1.807 of 18.84 ms/flight); measured −8.1%. The schedule is
+**bit-identical** — same cost, same accept count, same improvement, zero kernel fallbacks, verified.
+That is the property the change was designed for: it removes work, not information.
+
+Against A\*'s 165.8 s loop, SIPP moves **1.67x → 1.60x slower**. The remaining 90.6 s of ledger gap is
+the interval pool (§1.1) and the inverse index (§1.3), i.e. Phases 2-3.
+
+Two things worth keeping from the implementation:
+
+* **The obvious test is not a gate.** Asserting `needs_blocked_map` is gone, or that `_blocked_live` is
+  False, passes against a build that plans wrong. The gate is comparing a lazily-armed planner's
+  `blocked` map against one maintained eagerly from the first commit — `enable_blocked` REPLAYS the
+  ledger, and replaying it wrong (double-counted refcounts, missed own-column skip) is the plausible
+  bug. Both new tests were mutation-verified: restoring the flag fails one, deleting the
+  `enable_blocked` call fails the other.
+* **One existing test was silently at risk.**
+  `test_compiled_terminal_path_never_routes_through_blocked` probes `sipp._svc.is_blocked` directly as
+  an occupancy oracle. Post-change it would either raise, or pass because a stray fallback inside its
+  1,200-event warm loop had armed the map stickily — a coin flip between the two. Pinned with an
+  explicit `enable_blocked`.

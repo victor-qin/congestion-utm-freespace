@@ -1,0 +1,427 @@
+# Making SIPP's LNS runtime competitive again — profiling and PR plan
+
+Branch: `victor-qin/sipp-runtime-profiling` (measurement + this record), off `4c81255` (#125 merged).
+Prior record: `context/sipp_lns_plan.md` (the integration; §13 records the inversion this plan answers).
+
+## 0. The question
+
+`#125` shipped SIPP as a selectable LNS repair planner. When it was written it was ~1.1x *less* wall
+than A\* at the same schedule quality. `#124` then rewrote A\*'s occupancy and the verdict inverted:
+A\* is now **1.50x faster** (loop 181.0 s / ledger 25.3 s against SIPP's 270.7 s / 122.6 s at full
+`density_faa`, N=8, 300 iterations).
+
+Nothing about SIPP got slower. **A\*'s ledger side got cheaper and SIPP's structures were not in the
+rewrite.** This document re-measures that from scratch on the merged code, finds the term that
+dominates, and proposes the PR series that removes it.
+
+## 1. Measurement
+
+`analysis/prof_sipp_ledger.py` (new). It absorbs a real `density_faa` schedule into each ledger
+structure *individually*, then times `on_commit` and `on_release` over a held-out block of flights.
+Per-structure rather than per-planner, because the two planners share `_svc` and the question is
+which of the *differences* pays.
+
+Full `density_faa` (4,636 flights / 426,773 volumes; 2,400 warm, 150 timed):
+
+| structure | commit ms/fl | release ms/fl | total |
+| --- | ---: | ---: | ---: |
+| sipp `_svc` — hex dicts, `blocked` **ON** | 3.413 | 2.150 | 5.562 |
+| astar `_svc` — hex dicts, `blocked` OFF | 2.529 | 1.226 | 3.755 |
+| sipp `_scocc` — free-interval **POOL** | 3.577 | **5.995** | 9.572 |
+| astar `_cocc` — claim **ARENA** | 1.720 | **0.034** | 1.753 |
+| sipp `_sidx` — step-keyed dicts | 2.881 | 0.824 | 3.706 |
+| **SIPP total** (3 structures) | 9.871 | 8.969 | **18.840** |
+| **A\* total** (2 structures) | 4.249 | 1.260 | **5.509** |
+| ratio | 2.32x | **7.12x** | **3.42x** |
+
+All three structures bind on **every** plan at `density_faa` (`fixed_exit_lanes=True`, every flight
+hub-to-hub): 1,526/1,526 calls to each of `_occupancy`, `_scompiled_occ`, `_sipp_index` and
+`_sbuild_overlay`. None of this is a terminal-only tail.
+
+### 1.1 The release term is O(congestion), not O(footprint)
+
+A free-interval pool cannot be un-split in place, so `CompiledOccupancy.on_release` resets each
+touched cell and **re-applies the survivors**. That multiplier is how many *other* flights share the
+released cells, so it grows with the schedule:
+
+| warm flights | own claims | cells | re-applied | amplification | release ms/fl |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 150 | 122,831 | 37,174 | 231,439 | 1.88x | 0.611 |
+| 300 | 129,188 | 39,075 | 285,687 | 2.21x | 0.879 |
+| 600 | 138,208 | 41,766 | 403,455 | 2.92x | 1.496 |
+| 1,200 | 129,404 | 39,141 | 576,066 | 4.45x | 2.772 |
+| 2,400 | 132,573 | 40,071 | 931,928 | **7.03x** | **6.105** |
+
+Dead linear in congestion, and 2,400 is still only half of `density_faa`. A\*'s arena over the same
+releases is **0.034 ms and flat** — a swap-remove costs the flight's own footprint, so there is no
+multiplier to grow.
+
+This is not an analogy to A\*'s old design. **It is the same algorithm.** `claim_arena.py`'s header
+records what `#124` deleted: *"removing a flight then rebuilt each touched cell from its SURVIVORS —
+measured at 12.2x the released flight's own footprint at density_faa scale, and growing with
+congestion."* `CompiledOccupancy.on_release` is a deliberate port of that predecessor, made when it
+was still A\*'s shipped design and its structural twin `_Pool.reset_cell` still existed. The twin is
+gone; the port is not.
+
+### 1.2 A plan reads 1.4% of what the pool maintains
+
+Instrumenting `_splan_compiled`'s recorded read bbox over a full 1,526-flight SIPP run:
+
+```
+global box      : 741 x 386 q,r x 1 level = 286,026 cells, MAXS 4,106, pool 654,266 slots
+read bbox cells : p50 3,910   p90 12,690   max 20,655
+read steps      : p50 1,172   p90 1,284    max 1,317   (of 4,106)
+COVERAGE        : p50 1.367% of cells x 28.5% of steps = 0.39% of the (cell, step) box
+```
+
+This is exactly the observation `#124` acted on for A\*: the global derived structure is maintained
+in full so that each plan can read a thousandth of it. `window.py` already contains the answer —
+materialise the region a plan actually reads, from claims, per plan.
+
+### 1.3 `_sidx` maintains a global index to answer ten cells
+
+`SafeIntervalIndex` costs 3.706 ms/flight and has exactly one consumer on the compiled path:
+`_sbuild_overlay` calls `free_intervals(q, r, L, own, base, max_step, fixed)` for the flight's own
+terminal lane cells — `o_lanes + d_lanes`, order ten cells per plan. A global step-keyed inverse
+index, maintained on every commit and released on every destroy, to answer ten per-cell queries.
+
+### 1.4 `needs_blocked_map` pays for a map nothing reads
+
+`SIPPPlanner.needs_blocked_map = True` forces `HexOccupancyService` to maintain the `blocked` map
+that compiled A\* switches off. Its only reader is `is_blocked`, and the only SIPP call sites are in
+`_succ` — the **pure-Python reference** successor generator — plus the A\* fallback. `_splan_compiled`
+never calls it; measured fallbacks on `density_faa` are zero. Cost of the map alone: **1.807 ms/flight**
+(5.562 against 3.755).
+
+A\* had the identical problem and solved it: build the service with `maintain_blocked=False` and call
+`svc.enable_blocked(ledger)` at the top of the reference search — a sticky, one-shot O(schedule)
+rebuild that arms the map before any `is_blocked` can run. SIPP declared the flag instead.
+
+## 2. Where this leaves the end-to-end picture
+
+SIPP's *plan* side is already competitive — 148.1 s against A\*'s 155.7 s of non-ledger loop time in
+the recorded baseline, i.e. 1.05x **faster**. The whole 1.50x deficit is the ledger side. Bringing
+SIPP's ledger cost to A\*'s (18.840 -> 5.509 ms/flight) is the entire fix, and it is not a tuning
+exercise: it is adopting the structure `#124` built.
+
+## 3. The PR series
+
+Three PRs, stacked. Each is independently measurable and independently revertible; **PR 1 ships on
+its own** and pays 9.6% of the ledger side for ~20 lines.
+
+### PR 1 — `sipp: stop maintaining the write-only `blocked` map`
+
+*The point:* delete the one cost SIPP pays purely because it declared a flag instead of reusing A\*'s
+lazy re-arm. Nothing about the compiled path changes; the reference path arms the map itself.
+
+**`freespace_sim/planner/sipp.py`**
+
+* `SIPPPlanner.needs_blocked_map` — **REMOVED** (class attribute; inherits `False` from `AStarPlanner`).
+* `SIPPPlanner._splan_reference` — **MODIFIED**. One line after the service is bound:
+
+  ```python
+  svc = self._occupancy(req, ledger, cfg)
+  svc.enable_blocked(ledger)      # this search reads `blocked` via _succ; arm it before any probe.
+                                  # Sticky (see HexOccupancyService.enable_blocked): a run that falls
+                                  # back once pays the O(schedule) rebuild once, not per plan.
+  ```
+
+* `SIPPPlanner._fallback` — **UNCHANGED**. It delegates to `AStarPlanner.plan`, whose
+  `_plan_reference` already calls `enable_blocked`.
+
+**`tests/test_lns_sipp.py`**
+
+* `test_sipp_does_not_maintain_the_blocked_map_on_the_compiled_path` — **ADDED**. Plan a compiled
+  SIPP flight against a committed ledger; assert `planner._svc._blocked_live is False` and
+  `planner._svc.blocked == {}` while the plan is still exact against the reference.
+* `test_sipp_reference_arms_the_blocked_map` — **ADDED**. Force `_splan_reference` directly, assert
+  `_blocked_live` flips to `True` and the resulting intent is byte-identical to one planned with the
+  map maintained from the start. *This is the assertion that actually gates the change* — a test that
+  only checks the flag is off would pass against a build that silently plans wrong.
+
+*Expected:* `_svc` 5.562 -> 3.755 ms/flight; SIPP ledger 18.840 -> 17.033 (-9.6%). No plan-side change,
+zero answer change.
+
+### PR 2 — `sipp: build safe intervals per plan, from A*'s claim arena`
+
+*The point:* delete the global free-interval pool and the global inverse index, and derive both from
+the claim arena over the window a plan actually reads. This is `#124` applied to SIPP's side of the
+house: it removes the O(congestion) release term, the `_sidx` maintenance, and the static-wall trap
+in one move, and leaves SIPP maintaining exactly the two structures A\* maintains.
+
+Split in two so the new kernel input is provable before anything is deleted.
+
+#### PR 2a — the builder, gated against the current pool as an oracle
+
+*The point:* a numba builder that turns arena claim slabs into the interval-chain layout the SIPP
+kernel already consumes, verified byte-exact against the structure it will replace. Pure addition —
+no planner touched, nothing deleted, so a parity failure is a red test rather than a wrong schedule.
+
+**`freespace_sim/planner/sipp_window.py`** — **NEW FILE**.
+
+* `window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, lateral_margin, max_slots)`
+  — **ADDED**. Mirrors `astar/window.window_bounds` with one deliberate difference: the step span is
+  `[base, max_step]` **exactly**, not a heuristic tail.
+
+  ```python
+  # A* clips steps to base + n_gsteps + tail_steps because a bit outside the span is one probe.
+  # A SIPP interval's `hi` answers "how long may I wait here", so a short span does not miss a
+  # probe -- it silently shortens a wait and changes the plan. max_step already bounds the search
+  # (the kernel skips arr > max_step), so clipping there is exact and removes a widen axis.
+  q0, q1 = min(q_cells) - lateral_margin, max(q_cells) + lateral_margin
+  r0, r1 = min(r_cells) - lateral_margin, max(r_cells) + lateral_margin
+  clip to cocc's global box; s0, s1 = max(0, base), min(max_step, cocc.MAXS)
+  n_wcells = (q1-q0+1) * (r1-r0+1) * n_levels
+  return -needed if n_wcells + slack > max_slots else n_wcells   # recoverable, like A*'s -nbytes
+  ```
+
+* `build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, gen, qmin, rmin,
+  rspan, n_levels, wbox, iv_lo, iv_hi, iv_nxt, s0_shift, span_bits, field_mask)` — **ADDED**, `@njit`.
+  Argument-for-argument `astar/window.build_window_claims`'s signature (same arena accessors
+  `cocc._arena.arena/.start/.length`, same `key = (c << 1) | pool_idx`, same packing constants), with
+  the bitmap output swapped for the interval chain. One pass per in-window cell; the head slot of
+  window-cell `w` IS slot `w`, overflow appended after `n_wcells` — the layout `sipp_kernel._search`
+  already walks. Ownership is resolved per CELL by `ov_own_gen`, exactly as A* does, which is what
+  §4.1 is about.
+
+  ```python
+  for w in range(n_wcells):
+      iv_lo[w], iv_hi[w], iv_nxt[w] = s0, s1, -1        # start fully free over [base, max_step]
+      c = global_cell_of(w)
+      if static_col[c] and ov_own_gen[c] != gen:
+          iv_lo[w], iv_hi[w] = 1, 0                     # foreign always-active wall: no free interval
+          continue
+      own = ov_own_gen[c] == gen
+      for pool_idx in (0, 1):                            # 0 = corridor, 1 = column
+          if pool_idx == 1 and own:
+              continue                                   # own column is transparent (== the deleted overlay)
+          k = (c << 1) | pool_idx
+          for j in range(slab_start[k], slab_start[k] + slab_len[k]):
+              s_lo, s_hi = unpack(arena[j])
+              subtract [s_lo, s_hi] from cell w's chain   # same splice `block_range` does today
+  ```
+
+  Subtraction is the existing `block_range` logic, moved into numba and operating on a window-local
+  chain. Claim order is irrelevant (subtraction commutes), which is what makes reading the arena's
+  slabs directly sound.
+
+**`tests/test_sipp_window.py`** — **NEW FILE**. The oracle gate:
+
+* `test_window_intervals_match_the_global_pool` — **ADDED**. Commit a congested `density_faa` cut into
+  BOTH `CompiledOccupancy` and `CompiledHexOccupancy`; for a sample of window boxes, assert every
+  in-window cell's interval chain from `build_window_intervals` is **set-equal** to the global pool's
+  chain clipped to `[s0, s1]`. Chains are compared as sorted `(lo, hi)` lists, not slot-by-slot: slot
+  order is storage, and asserting on it would pin an implementation detail the kernel does not read.
+* `test_window_intervals_handle_the_static_wall` — **ADDED**. A hub with
+  `terminal_airspace_always_active`: assert the wall's cells are empty for a foreign flight and fully
+  free for the owning hub. *This is the case `CompiledOccupancy` could only express by writing the
+  wall into the same array as commit-derived blocks — the trap that bit twice in #125.*
+* `test_window_intervals_own_column_matches_the_overlay` — **ADDED**. Assert the built chain for an own
+  lane cell equals `SafeIntervalIndex.free_intervals(...)` for the same flight — i.e. the builder
+  reproduces `_sbuild_overlay` before the overlay is deleted.
+
+*Expected:* no runtime change (nothing calls it yet); the parity evidence PR 2b needs.
+
+#### PR 2b — flip the planner, delete the two global structures
+
+*The point:* make the window-local pool the kernel's only occupancy input, so the global pool and the
+global index have no readers and can go.
+
+**`freespace_sim/planner/sipp.py`**
+
+* `SIPPPlanner._scompiled_occ` — **REMOVED**. Replaced by the inherited `AStarPlanner._compiled_occ`,
+  which binds `CompiledHexOccupancy` (the arena) to the ledger. SIPP and its own A\* fallback then
+  share one instance instead of maintaining two structures for the same claims.
+* `SIPPPlanner._sipp_index`, `_sbuild_overlay`, `_overlay_slot` — **REMOVED**, along with the
+  `_k_ov_*` overlay arrays in `_skernel_state`. Own-column transparency moves into the window build's
+  `ov_own_gen` argument, which is A\*'s existing per-plan stamp.
+* `SIPPPlanner._skernel_state` — **MODIFIED**. Work arrays size to the **window**, not `cocc.cap`:
+  `front_head/tail/gen`, `goal_gen`, `goal_cost` become `max_window_slots`-sized. Grow-on-demand with
+  the same `if self._k_cap < needed` guard.
+* `SIPPPlanner._splan_compiled` — **MODIFIED**. The overlay build and the `cocc.cap` frontier give way
+  to a widen loop that mirrors `AStarPlanner._plan_compiled`'s:
+
+  ```python
+  cocc = self._compiled_occ(req, ledger, cfg)          # the shared arena
+  widen = 0
+  while True:
+      self._sgen += 1                                   # FRESH gen per attempt (see risk 3)
+      self._mark_own_cells(cocc, gen, o_term, d_term)   # A*'s _stamp_own_overlay, reused verbatim
+      n_slots = SW.window_bounds(cocc, wbox, lateral_margin=_MARGIN << widen, ...)
+      if n_slots <= 0: return self._splan_reference(...)
+      SW.build_window_intervals(cocc.arena, ..., wbox, ...)
+      code, ... = sipp_kernel.search(iv_lo, iv_hi, iv_nxt, wbox, ...)
+      if code != FB_WINDOW or widen == _WIDEN_MAX: break
+      widen += 1
+  ```
+
+* `SafeIntervalIndex` — **KEPT**. It is still the pure-Python reference's occupancy (`_splan_reference`
+  builds `_SafeIntervals` over it) and PR 2a's oracle. What goes away is its **ledger subscription**:
+  it binds lazily on the first reference dispatch and absorbs from the ledger then, exactly as
+  `enable_blocked` does for the `blocked` map. On a run with zero fallbacks it is never built.
+
+**`freespace_sim/planner/compiled_occupancy.py`** — **FILE DELETED**. `CompiledOccupancy`,
+`reset_cell`, `on_release`, `_record`, `_claims`, `_rows`, `_static_cells`, `_free` all go with it.
+
+**`freespace_sim/planner/sipp_kernel.py`**
+
+* `_search` — **MODIFIED**. Cell ids become window-local; `iv_*` are the window pool and the
+  `ov_*`/`cap` parameters are dropped (the overlay is folded into the build). A probe outside the
+  window returns the new `FB_WINDOW` instead of reading a cell that does not exist.
+* `_note_cell` — **MODIFIED**. Takes the window origin so the recorded read bbox stays in **world**
+  axial coordinates — the DROP envelope contract from `#125` must not silently become window-local.
+* `FB_WINDOW` — **ADDED** constant.
+
+**Tests**
+
+* `tests/test_lns_sipp.py` — **MODIFIED**. `test_sipp_subscriber_counts` drops from three release
+  subscribers to two; the `CompiledOccupancy` refcount/journal/static-wall/slot-reclaim tests are
+  **DELETED** with the structure they gate (their intent survives in `tests/test_sipp_window.py`).
+* `tests/test_parallel_envelope.py` — **UNCHANGED and load-bearing**. The world-anchored soundness
+  gate and the cell-exact `cell_bbox` test are what prove `_note_cell`'s coordinate change is right.
+* `tests/test_sipp_window.py` — **MODIFIED**. Add `test_window_miss_widens_and_stays_exact`: force a
+  deliberately undersized window, assert the plan widens and lands byte-identical to the unwidened
+  reference.
+
+*Expected:* SIPP's ledger structures become `_svc` (3.755) + shared `_cocc` (1.753) = **5.508 ms/flight**,
+down from 18.840 — and the release term stops growing with congestion. New per-plan cost: one window
+build, bounded by A\*'s measured 0.514 ms paint over the same box. Against 2 releases + 2 commits per
+plan at LNS's ~4% accept rate, that trades ~19 ms/plan of ledger work for ~1 ms/plan of build.
+
+Kernel memory falls with it: the frontier arrays are sized to `cocc.cap` = 654,266 slots today and to
+a window (order 10-40k slots) after, which is the term `#125` flagged as deciding whether DROP m=8 fits.
+
+## 4. Critical review of this plan
+
+### 4.1 Own-column ownership: A\*'s model is *less* exact than SIPP's, and this plan adopts it
+
+`SafeIntervalIndex.cell_blocked` resolves column ownership **per (cell, step)** — a cell may be under
+an own column at step 10 and a foreign one at step 50, and SIPP gets both right. A\*'s `ov_own_gen` is
+one boolean **per cell**, so it cannot express that; `_stamp_own_overlay` detects the own-∩-foreign
+overlap via `col_owners` and falls back to the pure-Python reference for exactness (issue #3).
+
+Adopting the arena means adopting that collapse. **This is a real behaviour change and must not be
+buried.** Three things make it the right call anyway:
+
+1. It makes SIPP *equally* exact to A\*, which is the shipped production default — not less exact
+   than the thing it is being compared against.
+2. The fallback is a fallback to the exact reference, not an approximation. No wrong answer is
+   possible; the cost is wall-clock on the affected plans.
+3. `demand.py` reject-samples hub spacing (#27, and #24 on the wider `exit_radius` extent), so the
+   overlap is rare by construction.
+
+**Required, not optional:** PR 2b must instrument the overlap rate on `density_faa` and report it. If
+it is above ~1% of plans the trade is off, and the fix is to widen the arena's column claims to carry
+the owning `tid` per claim (a parallel `int32` array beside the arena, or 8 bits stolen from the
+20-bit `fid_code` field) so ownership stays per-(cell, step). Cheaper than it sounds, but it is
+`#124`'s data structure being changed for SIPP's benefit, so do it only if measured necessary.
+
+### 4.2 A window miss is not one wrong bit for SIPP
+
+For A\* a probe outside the window is one `blocked` query. For SIPP the kernel **walks a cell's whole
+interval chain**, so a cell outside the window has no chain at all and the search would silently see
+it as free — a conflicting plan, not a slow one. The widen path is therefore load-bearing in a way
+A\*'s is not.
+
+*Resolution, and it is three things, not one:*
+
+* `FB_WINDOW` is returned on the **first** out-of-window cell touch, before the chain is read. Never a
+  partial result — same discipline as `FB_MASK`.
+* The widen ceiling falls through to `_splan_reference`, which is unbounded. Correctness never depends
+  on the window being big enough.
+* `tests/test_sipp_window.py::test_window_miss_widens_and_stays_exact` deliberately undersizes the
+  window and asserts byte-identical output. **A test that merely checks "no exception" would pass
+  against a build that plans through phantom-free cells** — this is precisely the failure mode that
+  made two envelope tests in `#125` non-gates.
+
+Margin: A\* uses 24 hexes for 100% zero-miss plan coverage. SIPP's measured read set is *tighter*
+(dirty rate 61.5% against A\*'s 78.7% at 4 workers, because the interval collapse probes fewer cells),
+so 24 should cover it — but "should" is not a measurement. PR 2b runs the same plan-level coverage
+sweep A\* was calibrated with and reports the zero-miss share before picking the constant.
+
+### 4.3 Step span: A\*'s heuristic tail would be a silent wrong answer here
+
+A\*'s `window_bounds` clips steps to `base + n_gsteps + tail_steps`. Copying that would truncate SIPP
+interval `hi` values, and `hi` is what answers "may I wait here that long" — the plan would come back
+*feasible but worse*, with no fallback triggered and no test failing. The plan therefore fixes the
+span at exactly `[base, max_step]`. Because intervals store endpoints rather than a dense time axis,
+this costs essentially nothing in memory (unlike A\*'s bitmap, where the step span *is* the row size)
+— which is why the two structures can honestly make opposite choices here.
+
+### 4.4 Version stamps under window-local cell ids
+
+`front_gen` / `goal_gen` give an O(1) per-plan reset by stamping `gen`. Window-local cell ids **change
+meaning between plans**, so a stale `stamp == gen` would be a wrong answer rather than a stale one.
+This is safe only because `gen` is bumped per attempt — and the widen re-run must bump it too, which
+is why the pseudocode in PR 2b puts `self._sgen += 1` **inside** the loop. `AStarPlanner._plan_compiled`
+already established this discipline for its FB_MASK re-run ("fresh `gen`, no partial output is ever
+consumed"); the risk is copying the loop without copying that line.
+
+### 4.5 The plan side could get slower and the ledger win could be eaten
+
+The window build is new per-plan work that does not exist today, and SIPP's plan side is currently
+*ahead* of A\*'s (148.1 s against 155.7 s). If the build costs more than A\*'s 0.514 ms paint —
+plausible, since it emits chains rather than bits — the net could be smaller than section 3 projects.
+
+*Resolution:* PR 2a's oracle test doubles as the cost gate. Time `build_window_intervals` over the
+sampled boxes and require it under 1.5 ms p90 before PR 2b flips anything. If it is over, the fallback
+design is the reference's own: build **lazily per cell on first probe** and memoise, which is exactly
+what `_SafeIntervals` does in `_splan_reference`. That keeps the arena and kills the global structures
+either way — only the build strategy changes.
+
+### 4.6 A cheaper alternative I considered and rejected
+
+**Lazy release: mark released cells dirty, rebuild on first read.** Attractive because it keeps the
+pool and touches ~50 lines. Rejected on the workload's own shape: LNS destroys N flights and then
+re-commits repaired versions whose routes are *near the originals*, so `block_range` touches almost
+exactly the cells the release dirtied, immediately. The rebuild is deferred by microseconds and the
+O(congestion) term survives intact.
+
+**Arena-backed re-apply: keep reset-and-re-apply, but read survivors from a flat arena in numba.**
+This is a genuinely smaller PR and would cut the constant, plausibly 5-10x (6.105 -> ~0.8 ms/flight at
+2,400 warm). It is the right move *only if* PR 2 proves too invasive: it leaves the multiplier in
+place, so the gap re-opens as scenarios grow, and it keeps both the global index and the static-wall
+trap. Recorded here as the fallback, not the plan.
+
+### 4.7 What this plan does not fix
+
+SIPP would reach parity on the ledger side, not a win. The recorded baseline puts SIPP's non-ledger
+loop at 148.1 s against A\*'s 155.7 s, so full ledger parity projects to roughly **1.04x faster than
+A\***, not 1.5x. That is enough to make SIPP the better repair planner and to make the DROP numbers
+worth re-running, but anyone expecting the pre-`#124` 1.1-1.2x story to return at a larger multiple
+should not read it here. The plan-side lever is separate and untouched.
+
+## 5. Branch and review mechanics
+
+| branch | contents | reviewable in isolation? |
+| --- | --- | --- |
+| `victor-qin/sipp-runtime-profiling` | this document, `analysis/prof_sipp_ledger.py`, `analysis/probe_sipp_read_window.py` | yes — measurement only, no planner change |
+| `victor-qin/sipp-blocked-map` (off main) | PR 1 | yes — ~20 lines, 2 tests |
+| `victor-qin/sipp-window-intervals` (off PR 1) | PR 2a | yes — new file + oracle tests, nothing wired |
+| `victor-qin/sipp-arena-occupancy` (off PR 2a) | PR 2b | the deletions land here; parity comes from 2a |
+
+PR 1 does not depend on PR 2 and should go first regardless of whether PR 2 is approved — it is the
+only part that is pure removal of work nothing consumes.
+
+### Gates every PR in the series must clear
+
+1. **Full suite green** (`uv run pytest -q`; 1,307 passed / 2 skipped on `4c81255`).
+2. **Exactness**: SIPP compiled output byte-identical to the SIPP reference on a congested cut, and
+   zero kernel fallbacks on `density_faa` (`_sfb == 0`). A speedup with a nonzero fallback rate is
+   measuring A\*, not SIPP.
+3. **Paired A/B** via `analysis/ab_lns_repair_planner.py` at full `density_faa`, arms strictly
+   sequential, baselines asserted identical. Report the `plan_s` / `ledger_s` split, not just the loop.
+4. **Per-structure re-run** of `analysis/prof_sipp_ledger.py` at 2,400 warm, so the ledger claim is
+   attributable rather than inferred from the loop.
+5. **DROP re-check** at m=8 / N=2, since `#125`'s parallel numbers were taken against the structures
+   PR 2 deletes and the envelope contract runs through `_note_cell`.
+
+### What would falsify the plan
+
+* PR 2a's build measures over ~1.5 ms p90 per window → the projected net win shrinks; take the lazy
+  per-cell build in §4.5 or the arena-backed re-apply in §4.6 instead.
+* The own-∩-foreign overlap rate (§4.1) exceeds ~1% of plans → the per-cell ownership collapse is too
+  lossy; widen the arena's column claims to carry `tid` before proceeding.
+* Zero-miss window coverage at margin 24 comes in materially under A\*'s 100% → SIPP's read set is
+  wider than measured and the widen path becomes hot rather than rare; re-calibrate the margin on the
+  coverage sweep, not on the miss rate.

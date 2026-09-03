@@ -521,3 +521,81 @@ Two things worth keeping from the implementation:
   an occupancy oracle. Post-change it would either raise, or pass because a stray fallback inside its
   1,200-event warm loop had armed the map stickily — a coin flip between the two. Pinned with an
   explicit `enable_blocked`.
+
+---
+
+## 7. Phase 3 result (`459a0c1`) — and the §4.7 projection was wrong
+
+Shipped: `compiled_occupancy.py` deleted (407 lines), SIPP's compiled path builds safe intervals per
+plan from A\*'s claim arena, `SafeIntervalIndex` unsubscribed, the own-lane overlay replaced by A\*'s
+`ov_own_gen` stamp.
+
+Paired A/B, same harness and seed, idle machine, full `density_faa` (4,636 legs, N=8, 300 iters):
+
+| arm | loop s | plan s | **ledger s** | other s | improvement | accepted | release subs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| astar | 156.3 | 127.1 | **22.7** | 6.4 | 0.46% | 86/300 | 3 |
+| sipp | **126.3** | **97.8** | **22.3** | 6.2 | 0.54% | 88/300 | 3 |
+
+**SIPP is 1.24x FASTER than A\***, from 1.67x slower at `4c81255`. The schedule is **bit-identical**
+to the pre-Phase-3 SIPP arm — same cost 1342247, same 0.54%, same 88 accepted, `_sfb == 0`, verified —
+so this is a pure speedup, not a different answer.
+
+| | `4c81255` | Phase 1 | Phase 3 |
+| --- | ---: | ---: | ---: |
+| loop s | 276.8 | 265.0 | **126.3** |
+| plan s | 146.3 | 144.8 | **97.8** |
+| ledger s | 124.1 | 114.1 | **22.3** |
+| vs A\* | 1.67x slower | 1.60x slower | **1.24x faster** |
+
+**Ledger parity landed exactly as designed** (22.3 against A\*'s 22.7, both maintaining the same two
+structures), and the O(congestion) release term is not reduced but *gone* — there is no global
+free-interval pool left to un-build.
+
+### §4.7 was wrong, and in an instructive direction
+
+§4.7 projected ~178.6 s, i.e. **still ~1.08x slower**, on the reasoning that "ledger parity is the
+CEILING of this work" and "the remaining gap is plan-side and this plan does not touch it." The plan
+side went **146.3 -> 97.8 s**, from 7.8% slower than A\* to 1.30x faster. The error was modelling
+Phase 3 as a pure ledger change when the same rewrite also changes what the *kernel* reads.
+
+**What I have not established is which term did it.** Three candidates, and only the first is
+measured:
+
+1. **Working set** — the version-stamped arrays fell 36.58 -> 22.13 MB (1.7x), because the frontier
+   and goal arrays now size to a window rather than to `cocc.cap`, and the overlay's two `cap`-sized
+   arrays are gone entirely. Measured — and much *smaller* than the 20x I guessed before checking,
+   so on its own it does not look like enough.
+2. **Chain length.** The old pool's chains spanned `[0, MAXS]` = 4,106 steps and accumulated a split
+   from every commit that ever touched the cell; the per-plan chains are clipped to
+   `[base, max_step]`, and the read-window probe measures that at **28.5% of the step axis**. The
+   kernel walks chains constantly, so shorter chains would show up directly. Unmeasured.
+3. **Overlay indirection.** Three hot sites lost `ov_head[cell] if ov_gen[cell] == gen else cell` —
+   two random reads and a branch per chain walk — plus an `sj >= cap` test per interval *inside* the
+   walk. Unmeasured.
+
+Isolating this needs the deleted structure back (check out `d19eb49` and instrument chain lengths on
+the same flights). Worth doing before anyone cites a mechanism: right now the *result* is solid and
+the *explanation* is a hypothesis.
+
+### Gates
+
+* **Exactness:** cost bit-identical to the pre-Phase-3 arm at full scale; `test_sipp.py`,
+  `test_compiled_replay_exact_metro`, `::_dallas_terminal` and `test_sipp_incremental_release_matches_rebuild`
+  all green.
+* **Fallbacks:** `_sfb`, `_sfb_oob`, `_sfb_overlap` all **0** on 1,526 compiled plans; zero window
+  widens, zero buffer grows, zero reference dispatches, `_sidx` never bound. Margin 24 gives SIPP the
+  same 100% zero-miss coverage A\* was calibrated to — so §4.2's worry about SIPP needing a wider
+  window than A\* was unfounded.
+* **Structure count:** 3 release subscribers for A\*, 3 for point-to-point SIPP, 3 for terminal SIPP.
+  Was 3/3/4.
+* **Suites:** 1,321 passed / 2 skipped, 71 under `-m slow`. Exactly 9 below the pre-Phase-3 1,330,
+  matching the 9 deleted pool tests.
+
+### Still outstanding
+
+* **DROP re-check at m=8 / N=2.** `#125`'s parallel numbers were taken against structures this
+  deletes, and the envelope contract runs through `_note_cell`.
+* `build_window_intervals` is in neither `_warm_jit` nor `_swarm_jit` — a ~0.92 s cold compile that a
+  spawned DROP worker would pay on its first repair. It matters for the DROP run above, not for the
+  sequential one measured here.

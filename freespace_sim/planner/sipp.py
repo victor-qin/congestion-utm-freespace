@@ -484,6 +484,24 @@ class SIPPPlanner(AStarPlanner):
                 np.zeros(32, np.int64), np.zeros(32, np.int64),
                 np.zeros(8, np.int64),
             )
+            # `build_window_intervals` is decorated separately from `_search` and owns its own numba
+            # cache, so it needs its own warm call under this same guard — measured ~0.92 s cold and
+            # ~132 ms even off a warm on-disk cache, against ~5 us hot. Without it every spawned DROP
+            # worker pays that on its FIRST repair, all at once, which is precisely the compile
+            # stampede this method exists to prevent. Mirrors `AStarPlanner._warm_jit`'s
+            # `build_window_claims` call.
+            warm_wbox = SW.empty_wbox()
+            warm_wbox[SW.W_Q1] = warm_wbox[SW.W_R1] = 0
+            warm_wbox[SW.W_S1] = maxs
+            warm_wbox[SW.W_RSPAN] = 1
+            warm_wbox[SW.W_STEPS] = maxs + 1
+            SW.build_window_intervals(
+                np.zeros(1, np.int64), np.zeros(2 * cap, np.int64), np.zeros(2 * cap, np.int64),
+                np.zeros(cap, np.bool_), np.zeros(cap, np.int32), 1,
+                0, 0, 3, 1, warm_wbox,
+                np.zeros(cap, np.int32), np.zeros(cap, np.int32), np.full(cap, -1, np.int32),
+                np.zeros(cap, np.int64), _S0_SHIFT, _SPAN_BITS, _FIELD_MASK,
+            )
         except TypeError:
             # Arity/dtype drift between this call and `_search`'s signature is a BUG, not a
             # numba-availability problem. Swallowing it into `sipp_compiled = False` would route

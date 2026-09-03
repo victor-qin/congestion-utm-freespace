@@ -152,6 +152,33 @@ def test_astar_warm_failure_keeps_sipp_kernel_fallback_on_astar_reference(monkey
     assert got is reference and got.planner == "sipp"
 
 
+def test_sipp_warm_compiles_the_window_builder_too():
+    """`build_window_intervals` owns a numba cache separate from `_search`, so it needs its own warm
+    call — measured ~0.92 s cold and ~132 ms off a warm on-disk cache, against ~5 us hot.
+
+    Without it every spawned DROP worker meets an uncompiled builder on its FIRST repair,
+    simultaneously: the compile stampede `_swarm_jit` exists to prevent, and one that would be billed
+    to SIPP in any parallel measurement. Asserting the CALL rather than a timing keeps this a gate
+    rather than a flake.
+    """
+    from freespace_sim.planner import sipp as sipp_mod
+    from freespace_sim.planner import sipp_window
+
+    calls = []
+    real = sipp_window.build_window_intervals
+    try:
+        sipp_mod.SW.build_window_intervals = lambda *a, **k: calls.append(a)
+        planner = SIPPPlanner(compiled=False)
+        planner._skernel = lambda *args: None
+        planner._swarm_jit()
+    finally:
+        sipp_mod.SW.build_window_intervals = real
+    assert len(calls) == 1, "the warm-up never compiled the window builder"
+    iv_lo, iv_hi, iv_nxt, scratch = calls[0][11:15]
+    assert (iv_lo.dtype, iv_hi.dtype, iv_nxt.dtype) == (np.dtype(np.int32),) * 3
+    assert scratch.dtype == np.dtype(np.int64), "warmed a scratch dtype no real plan uses"
+
+
 def test_sipp_warm_uses_the_production_kernel_signature():
     """The warm-up must compile the signature a real plan uses — and this is the ONLY thing standing
     between a signature change and a silent all-reference run.

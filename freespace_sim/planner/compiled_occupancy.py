@@ -26,18 +26,28 @@ The margin therefore only needs to cover realistic edge-skirting detours.
 from __future__ import annotations
 
 import warnings
+from array import array
 
 import numpy as np
 
 from ..geometry import CylinderSpec
 from . import hexgrid as hg
-from .astar.compiled_hex_occupancy import schedulable_horizon_steps
+# `_FIELD_MASK`/`_SPAN_BITS`/`_SPAN_LIMIT` are SHARED with the A* twin's removal journal rather than
+# redefined here: two journals with independently-declared packing widths is a silent-corruption bug
+# waiting for someone to widen one of them. That module is already a dependency of this one and does
+# not import back, so this adds no cycle.
+from .astar.compiled_hex_occupancy import (
+    _FIELD_MASK,
+    _SPAN_BITS,
+    _SPAN_LIMIT,
+    schedulable_horizon_steps,
+)
 
 
 class CompiledOccupancy:
     """Incremental flat-pool free-interval store feeding the numba SIPP kernel. Commit-hook driven."""
 
-    def __init__(self, cfg, margin: int = 48):
+    def __init__(self, cfg, margin: int = 48, track_removal: bool = False):
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
@@ -45,12 +55,37 @@ class CompiledOccupancy:
         self.n_added = 0
         self.evicted_before: int | None = None
         self._static_hubs: list = []   # always-active hubs, replayed after reset (statics survive a rebuild)
+        # Removal mode (LNS destroy): a flat interval pool cannot be un-split in place — two flights
+        # blocking the same step produce ONE split and the second `block_range` is a no-op — so the
+        # only exact reversal is reset-the-cell and re-apply the survivors. That needs a per-cell claim
+        # multiset plus a per-owner journal saying how many of each to drop. This is a port of
+        # `CompiledHexOccupancy`'s, minus its pool index (it has two pools; we have one, so the key is
+        # just the cell id). Flag off => zero bookkeeping.
+        #     _claims[c]   = [packed, ...]           packed = s0 << _SPAN_BITS | s1
+        #     _rows[fid]   = flat (c, packed) pairs  — 16 B/row against ~120 for the tuple form
+        # Equal spans are a fungible MULTISET: the owner journal says how many identical spans to
+        # remove, and which instance is removed cannot affect the rebuilt pool.
+        self.track_removal = track_removal
+        self._claims: dict[int, list[int]] = {}
+        self._rows: dict[int, array] = {}
+        # Cells carrying an always-active wall. This structure is the ONLY one in the repo that stores
+        # such walls in the same array as commit-derived blocks (A* keeps a `static_col` bool array,
+        # `SafeIntervalIndex` a `static_cols` dict) — and it has no choice: `sipp_kernel._search` takes
+        # the interval pool and the overlay and NO static array, so the pool is the only channel
+        # through which the kernel can learn about a wall. See `on_release` for what that costs.
+        self._static_cells: set[int] = set()
 
         self.nlevels = cfg.n_levels                  # flight-level axis (multi-altitude): cell = (q, r, L)
         qmin, rmin, qspan, rspan, maxs = self._box(cfg, margin)
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
         self.NC = qspan * rspan * self.nlevels        # one pre-seeded slot per (q, r, L) cell
         self.MAXS = maxs
+        if track_removal and maxs >= _SPAN_LIMIT:    # see `_claims`: s0/s1 get _SPAN_BITS each.
+            # The SINGLE bound on the packing, because `_record` clamps to MAXS before packing (the
+            # A* twin records raw spans and therefore needs a second, per-row check).
+            raise ValueError(
+                f"CompiledOccupancy: horizon of {maxs} steps exceeds the removal journal's "
+                f"{_SPAN_LIMIT}-step packing limit")
         self._init_pool()
         # Keep the same observable safety diagnostic as compiled A*: skipped cells are safe because every
         # query is bounds-checked, but a non-zero count signals that ``margin`` may be too narrow.
@@ -73,6 +108,9 @@ class CompiledOccupancy:
         return qmin, rmin, qmax - qmin + 1, rmax - rmin + 1, maxs
 
     def _init_pool(self):
+        # Freed overflow slots, refilled by `reset_cell`. `reset()` calls this, so `_free` needs no
+        # separate clear there.
+        self._free: list[int] = []
         cap = max(2 * self.NC, 1 << 18)
         self.cap = cap
         self.iv_lo = np.empty(cap, np.int32)
@@ -92,12 +130,34 @@ class CompiledOccupancy:
         self.cap = cap
 
     def _alloc(self, lo, hi, nxt) -> int:
-        if self.nslots >= self.cap:
-            self._grow()
-        s = self.nslots
+        if self._free:                  # reuse a slot freed by reset_cell before bumping
+            s = self._free.pop()
+        else:
+            if self.nslots >= self.cap:
+                self._grow()
+            s = self.nslots
+            self.nslots += 1
         self.iv_lo[s] = lo; self.iv_hi[s] = hi; self.iv_nxt[s] = nxt
-        self.nslots += 1
         return s
+
+    def reset_cell(self, c: int) -> None:
+        """Re-seed cell ``c``'s list to the single free interval ``[0, MAXS]`` (removal-mode cell
+        rebuild); callers re-apply the cell's surviving claims immediately after.
+
+        The old chain's overflow slots are RECLAIMED onto the free list. Abandoning them is harmless
+        per call but not per run: `_alloc` is otherwise a pure bump allocator, so under LNS — which
+        resets and re-applies the same hot cells every iteration — `nslots` would grow without bound
+        and drag `cap` through repeated doubling for a working set that never grows. Slot indices are
+        pure storage (every reader walks the chain), so which slot holds an interval never affects an
+        answer."""
+        free = self._free
+        slot = int(self.iv_nxt[c])
+        while slot != -1:                      # walk only the overflow tail; head slot `c` is re-seeded
+            free.append(slot)
+            slot = int(self.iv_nxt[slot])
+        self.iv_lo[c] = 0
+        self.iv_hi[c] = self.MAXS
+        self.iv_nxt[c] = -1
 
     def cell_id(self, q: int, r: int, L: int) -> int:
         iq, ir = q - self.qmin, r - self.rmin
@@ -114,19 +174,26 @@ class CompiledOccupancy:
         return iq * self.rspan + ir
 
     # ---------- commit hook (mirrors SafeIntervalIndex) ----------
-    def on_commit(self, _flight_id, volumes) -> None:
+    def on_commit(self, flight_id, volumes) -> None:
         hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
+        rows = [] if self.track_removal else None
         for v in volumes:
-            self._add(v, own_cols)
+            self._add(v, own_cols, rows)
         self.n_added += len(volumes)
+        if self.track_removal:
+            entry = self._rows.get(flight_id)
+            if entry is None:
+                self._rows[flight_id] = array("q", rows)
+            else:
+                entry.extend(rows)     # `_absorb`'s groupby can yield a second group for one fid
 
     def _inside_a_column(self, q, r, cols) -> bool:
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
-    def _add(self, vol, own_cols) -> None:
+    def _add(self, vol, own_cols, _rows=None) -> None:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         # Range-blocked, and deliberately the SHARED producer (issue #114): `rasterize_ranges` memoizes
@@ -158,6 +225,77 @@ class CompiledOccupancy:
                 self.oob_corridor_cells += 1
                 continue
             self.block_range(c, int(s_lo), int(s_hi))
+            if self.track_removal and c not in self._static_cells:
+                # A walled cell is never rebuilt from claims (see `on_release`), so journaling one
+                # would only cost memory. Necessary but NOT sufficient on its own — `_scompiled_occ`
+                # binds as subscribe -> _absorb -> subscribe_static, so `_absorb` records claims on
+                # cells that only become walled a moment later. `on_release` handles those.
+                self._record(c, int(s_lo), int(s_hi), _rows)
+
+    def _record(self, c: int, s0: int, s1: int, _rows: list | None) -> None:
+        """Journal one applied span. Port of ``CompiledHexOccupancy._record`` with two deliberate
+        differences: no pool index (this structure has one pool, so the key is the cell id), and the
+        span is clamped to what ``block_range`` will ACTUALLY apply.
+
+        The clamp is what makes the journal exactly reversible — what was applied is what is
+        replayed — and it is also why there is no per-row ``_SPAN_LIMIT`` raise here, unlike the A*
+        twin. A* records the RAW span, so a volume that outlives the box (a late return commits past
+        MAXS and box-guards to the reference) can carry ``s1 >= _SPAN_LIMIT`` past the constructor's
+        check and corrupt the packing; its per-row raise is load-bearing. Post-clamp,
+        ``0 <= s0 <= s1 <= MAXS < _SPAN_LIMIT`` holds by construction (the constructor rejects a
+        horizon that deep), so the same guard could never fire."""
+        if s0 < 0:
+            s0 = 0
+        if s1 > self.MAXS:
+            s1 = self.MAXS
+        if s0 > s1:
+            return
+        packed = (s0 << _SPAN_BITS) | s1
+        lst = self._claims.get(c)
+        if lst is None:
+            self._claims[c] = [packed]
+        else:
+            lst.append(packed)
+        if _rows is not None:
+            _rows.append(c)
+            _rows.append(packed)
+
+    def on_release(self, flight_id, volumes) -> None:
+        """Ledger release subscriber (removal mode): drop the flight's recorded claims and rebuild
+        exactly the cells it touched — reset each cell's interval list and re-apply the surviving
+        claims (short per-cell lists) — in O(released rows) instead of a whole-pool reset+reabsorb.
+        Keeps ``n_added`` in lockstep so the shrink tripwire stays silent.
+
+        THE STATIC-WALL BRANCH IS NOT AN OPTIMISATION. ``reset_cell``'s blank slate is ``[0, MAXS]``
+        — fully FREE — while a statically walled cell's correct blank slate is ``[0, -1]``, fully
+        blocked. The claim journal only ever describes commit-derived blocks, so rebuilding a walled
+        cell from it silently UNWALLS the hub for the rest of the run, and repairs then route foreign
+        traffic through its terminal airspace. (`verify` would catch it, but `verify_every` defaults
+        to 0.) Note the asymmetry that lets it hide: `block_range` on an already-walled cell reads
+        head ``a=0, b=-1``, tests ``b < s0``, follows ``nxt == -1`` and returns — blocking is
+        idempotent against a wall; un-blocking is not."""
+        rows = self._rows.pop(flight_id)
+        claims = self._claims
+        touched: set[int] = set()
+        for i in range(0, len(rows), 2):              # flat (cell, claim) pairs; see `__init__`
+            c = rows[i]
+            claims[c].remove(rows[i + 1])             # ValueError here IS the drift signal
+            touched.add(c)
+        for c in touched:
+            self.reset_cell(c)                        # reclaims the overflow tail onto `_free`
+            survivors = claims.get(c)
+            if not survivors:
+                claims.pop(c, None)                   # drop the empty list, both branches
+            if c in self._static_cells:
+                # Re-wall rather than rebuild. The `survivors` are deliberately KEPT (only an empty
+                # list is dropped above): other flights still hold journal rows pointing at this cell,
+                # and discarding their claims here would KeyError when THEY are released. A walled
+                # cell simply never reads them.
+                self.iv_lo[c] = 0; self.iv_hi[c] = -1; self.iv_nxt[c] = -1
+                continue                              # a replay would also leak the slots it allocs
+            for packed in survivors or ():
+                self.block_range(c, packed >> _SPAN_BITS, packed & _FIELD_MASK)
+        self.n_added -= len(volumes)
 
     def block_range(self, c: int, s0: int, s1: int) -> None:
         """Remove the whole contiguous span ``[s0, s1]`` from cell ``c``'s free intervals in one pass.
@@ -222,6 +360,12 @@ class CompiledOccupancy:
         self.n_added = 0
         self.evicted_before = None
         self.oob_corridor_cells = 0
+        # The journal describes the pool `_init_pool` is about to discard, so it goes with it —
+        # otherwise `_claims[c].remove(...)` on the next release either raises (misread as drift) or
+        # succeeds and re-blocks spans the fresh `_absorb` has already applied. `_static_cells` is
+        # repopulated by the `_static_hubs` replay below; `_free` by `_init_pool`.
+        self._claims.clear()
+        self._rows.clear()
         self._init_pool()
         for center, term in self._static_hubs:      # _init_pool cleared the walls; re-wall each hub
             self._wall_static_terminal(center, term)
@@ -243,6 +387,7 @@ class CompiledOccupancy:
                 c = self.cell_id(q, r, L)
                 if c >= 0:
                     self.iv_lo[c] = 0; self.iv_hi[c] = -1; self.iv_nxt[c] = -1   # empty (lo>hi) ⇒ blocked
+                    self._static_cells.add(c)            # `on_release` must re-wall, not rebuild
 
     # ---------- pure-Python reader (kernel parity oracle + tests) ----------
     def free_intervals_py(self, q: int, r: int, L: int, base: int, max_step: int):

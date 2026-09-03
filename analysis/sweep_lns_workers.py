@@ -103,6 +103,10 @@ def main() -> None:
                     help="comma-separated workers:mode:iterations")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--neighborhood", type=int, default=8)
+    ap.add_argument("--repair-planner", default="astar",
+                    choices=["astar", "astar_ref", "sipp", "sipp_ref"],
+                    help="planner that repairs a destroyed neighborhood; recorded in every row so a "
+                         "worker sweep and a planner A/B cannot be confused for each other")
     ap.add_argument("--time-limit", type=float, default=None,
                     help="wall budget per arm. The paper's way to make arms comparable (fixed T); "
                          "costs reproducibility, so iterations stay the default")
@@ -126,6 +130,7 @@ def main() -> None:
                       f"{res.ledger.n_volumes} volumes", flush=True)
             static_terms = res.ledger.static_terminals()
             lns = LNSConfig(seed=args.seed, neighborhood_size=args.neighborhood, log_every=0,
+                            repair_planner=args.repair_planner,
                             max_iterations=iters, search_workers=m, parallel_mode=mode,
                             time_limit_s=args.time_limit)
             out = run_lns(res.config, res.ledger, res.intents, lns)
@@ -136,6 +141,9 @@ def main() -> None:
             st = dict(out.parallel_stats)
             row = {
                 **_worker_metadata(m, out), "iterations": iters,
+                # Recorded per row so a worker sweep and a planner A/B can never be confused for
+                # each other after the fact. Off the RESULT, i.e. what actually repaired.
+                "repair_planner": out.repair_planner,
                 "n_accepted": out.n_accepted, "n_iterations": out.n_iterations,
                 "cost_before": out.cost_before, "cost_after": out.cost_after,
                 "improvement_pct": 100.0 * (out.cost_before - out.cost_after)

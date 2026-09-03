@@ -48,6 +48,9 @@ def main() -> None:
     ap.add_argument("--unimpeded-workers", type=int, default=None,
                     help="processes for the unimpeded delay ruler (default: automatic in this guarded CLI; "
                          "1 = in-process)")
+    ap.add_argument("--repair-planner", default="astar",
+                    choices=["astar", "astar_ref", "sipp", "sipp_ref"],
+                    help="planner that repairs a destroyed neighborhood (default: astar)")
     ap.add_argument("--repair-order", default="premium", choices=["premium", "random"],
                     help="PP priority order: premium = most-delayed first (default), random = paper's")
     ap.add_argument("--search-workers", type=int, default=1, metavar="N",
@@ -109,6 +112,7 @@ def main() -> None:
         incremental_release=not args.no_incremental,
         unimpeded_workers=args.unimpeded_workers,
         repair_order=args.repair_order,
+        repair_planner=args.repair_planner,
         search_workers=args.search_workers,
         parallel_mode=args.parallel_mode,
         time_limit_s=args.time_limit,
@@ -125,6 +129,23 @@ def main() -> None:
           f"{s['n_accepted']}/{s['n_iterations']} accepted, verified={s['verified']}, "
           f"wall {s['wall_s']:.0f}s (init {s['init_wall_s']:.0f}s)", flush=True)
     print(f"weights: { {k: round(v, 3) for k, v in s['weights'].items()} }")
+    # Where the loop's wall went, and how many ledger-subscribed structures the repair planner kept.
+    # The second is a direct read of the commit-side headwind the planner choice buys: compiled A*
+    # keeps three, SIPP four on terminal legs (its SafeIntervalIndex binds only when a flight has a
+    # terminal). Both come off the RESULT, not the ledger: `run_lns`'s `finally` detaches every
+    # subscriber, so reading `res.ledger` here would always report 0. Parallel subscribers are
+    # worker-local and therefore reported as unavailable instead of as the coordinator's false 0/0.
+    loop_s = max(1e-9, s["wall_s"] - s["init_wall_s"])
+    other_s = loop_s - s["t_plan_s"] - s["t_ledger_s"]
+    subscriber_split = (
+        "subscribers unavailable (worker-local)"
+        if s["n_release_subs"] is None
+        else f"release-subs {s['n_release_subs']}, commit-subs {s['n_commit_subs']}"
+    )
+    print(f"split[{args.repair_planner}]: loop {loop_s:.0f}s = plan {s['t_plan_s']:.0f}s "
+          f"({s['t_plan_s'] / loop_s:.0%}) + ledger {s['t_ledger_s']:.0f}s "
+          f"({s['t_ledger_s'] / loop_s:.0%}) + other {other_s:.0f}s ({other_s / loop_s:.0%}); "
+          f"{subscriber_split}")
     if s["parallel_mode"] != "sequential":
         st = s["parallel_stats"]
         requested_note = (

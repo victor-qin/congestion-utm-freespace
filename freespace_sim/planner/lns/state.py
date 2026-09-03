@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -48,7 +49,48 @@ Cell = tuple[int, int, int]
 # Baselines whose per-flight costs a plain ``AStarPlanner`` reproduces, so the unimpeded ruler and the
 # incumbent are denominated in the same currency. ``astar_ref`` is the same search without the compiled
 # kernel (byte-identical by contract); the shortcut/MILP/colgen families are NOT — see LNSState.
-_REPRODUCIBLE_PLANNERS = frozenset({"astar", "astar_ref"})
+#
+# The SIPP pair is here on measured evidence, not by analogy. A* and SIPP are exact optimizers of the
+# SAME weighted cost over the same lattice, so they must agree on the optimum even though they break
+# ties differently and file different routes — and `tests/test_lns_sipp.py` pins that both on the
+# empty ruler world (1e-9) and on a congested A*-committed ledger (1e-6), which is the check that was
+# missing when this set was written. What that buys: a `planner="sipp"` baseline may be repaired and
+# ruled by A*, and vice versa, without the delay premium comparing two currencies.
+_REPRODUCIBLE_PLANNERS = frozenset({"astar", "astar_ref", "sipp", "sipp_ref"})
+#: Planners LNS may construct as its repair planner. Deliberately a small ALLOWLIST rather than
+#: `get_planner`: that registry also holds `ShortcutRefiner` wrappers (a wrapper has no `evict_floor`
+#: of its own — see the vet block below) and the whole-schedule `colgen`, neither of which meets the
+#: repair contract. An explicit list fails loudly on `astar_shortcut` instead of three frames later.
+LNS_REPAIR_PLANNERS = ("astar", "astar_ref", "sipp", "sipp_ref")
+
+
+def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
+                        record_envelope=False, window_bytes=None):
+    """The ONE construction site for an LNS repair planner, so the sequential path, `LNSState`'s
+    default and `LNSState.replica` cannot drift.
+
+    `evict_floor = 0.0` is set HERE because this constructor is the owner: `LNSState`'s vet block
+    only runs for a BORROWED planner, so a constructed one is never checked. Callers must validate
+    `name` BEFORE the ledger is taken over (`solver._validate_lns_config`) — see `LNSState.__init__`.
+    """
+    # `window_bytes` is the #124 dense-window budget; omitted rather than passed as None so each
+    # planner keeps its own default.
+    kw = {} if window_bytes is None else {"window_bytes": window_bytes}
+    if name in ("astar", "astar_ref"):
+        planner = AStarPlanner(compiled=name == "astar", kernel_log2_min=kernel_log2_min,
+                               incremental_release=incremental_release, **kw)
+    elif name in ("sipp", "sipp_ref"):
+        from freespace_sim.planner.sipp import SIPPPlanner
+
+        planner = SIPPPlanner(compiled=name == "sipp", kernel_log2_min=kernel_log2_min,
+                              incremental_release=incremental_release, **kw)
+    else:
+        raise ValueError(
+            f"repair_planner {name!r} is not a supported LNS repair planner "
+            f"(want one of {LNS_REPAIR_PLANNERS})")
+    planner.evict_floor = 0.0   # random/premium repair orders need the full-horizon occupancy
+    planner.record_envelope = record_envelope
+    return planner
 _MISSING = object()
 
 
@@ -131,6 +173,7 @@ class LNSState:
         movable_uss_ids: frozenset[str] | None = None,
         turnaround_s: float | None = None,
         repair_planner: AStarPlanner | None = None,
+        repair_planner_name: str = "astar",
         incremental_release: bool = True,
         # Safe for direct construction too: None is an explicit opt-in to automatic multiprocessing.
         unimpeded_workers: int | None = 1,
@@ -172,10 +215,10 @@ class LNSState:
         # premiums and acceptance comparisons use different currencies.
         if repair_planner is None and cfg.planner not in _REPRODUCIBLE_PLANNERS:
             raise ValueError(
-                f"LNS cannot measure a {cfg.planner!r} baseline: its unimpeded ruler and its repair "
-                f"planner are plain A*, so delay premiums would compare two different planners. Pass "
-                f"repair_planner= a planner that reproduces {cfg.planner!r}, or re-run the baseline "
-                f"with planner='astar'.")
+                f"LNS cannot measure a {cfg.planner!r} baseline: its unimpeded ruler is a plain A*, "
+                f"and the repair planner is one of {sorted(_REPRODUCIBLE_PLANNERS)}, so delay premiums "
+                f"would compare two different planners. Pass repair_planner= a planner object that "
+                f"reproduces {cfg.planner!r}, or re-run the baseline with a planner in that set.")
 
         # Vet a borrowed planner BEFORE taking the ledger over: a constructor that raises must not
         # leave the caller's ledger stripped of its subscribers.
@@ -199,9 +242,9 @@ class LNSState:
             # Construct before taking ownership of the caller's ledger. `run_lns` validates its
             # config first, but LNSState is also directly constructible; an invalid window budget or
             # a guarded JIT failure must not strip observers before the planner constructor reports it.
-            kw = {} if window_bytes is None else {"window_bytes": window_bytes}
-            repair_planner = AStarPlanner(incremental_release=incremental_release, **kw)
-            repair_planner.evict_floor = 0.0
+            repair_planner = _new_repair_planner(
+                repair_planner_name, incremental_release=incremental_release,
+                window_bytes=window_bytes)
 
         # LNS takes ownership of the ledger: the FCFS run's planner services stay subscribed
         # otherwise, silently absorbing (and retaining the memory of) every repair commit. The epoch
@@ -275,6 +318,13 @@ class LNSState:
         self._cells_of: dict[int, set[Cell]] = {}
         self._contended: set[Cell] = set()
         self._contended_list: list[Cell] | None = None
+        # Where an iteration's wall goes, split the only two ways that matter for choosing a repair
+        # planner: SEARCH (what SIPP makes cheaper) against LEDGER MAINTENANCE (what SIPP makes more
+        # expensive, by keeping a fourth subscribed structure on terminal legs). Two counters over a
+        # whole run, read once at the end — deliberately NOT per-flight attribution, which
+        # `analysis/ab_column_clear.py` showed is dominated by the `perf_counter` calls themselves.
+        self.t_plan_s = 0.0
+        self.t_ledger_s = 0.0
         self._visits: dict[int, list[tuple[int, Cell]]] = {}
         self._maintain_claim_index = maintain_claim_index
         self._rebuild_claim_index()
@@ -295,6 +345,7 @@ class LNSState:
         kernel_log2_min: int | None = None,
         record_envelope: bool = True,
         window_bytes: int | None = None,
+        repair_planner_name: str = "astar",
     ) -> "LNSState":
         """A private copy of the incumbent for a parallel worker: own ledger, own planner.
 
@@ -330,11 +381,13 @@ class LNSState:
         for it in intents:
             if it.accepted and it.volumes:
                 led.commit(it.request.flight_id, it.volumes)
-        planner = AStarPlanner(incremental_release=incremental_release,
-                               kernel_log2_min=kernel_log2_min,
-                               **({} if window_bytes is None else {"window_bytes": window_bytes}))
-        planner.evict_floor = 0.0        # random/premium repair orders need the full-horizon occupancy
-        planner.record_envelope = record_envelope
+        # `repair_planner_name` is as load-bearing as every other keyword in this docstring: a worker
+        # that builds A* while the coordinator believes it is running SIPP differs silently, and
+        # `verify` (4D conflicts only) would still report the run as verified.
+        planner = _new_repair_planner(repair_planner_name, incremental_release=incremental_release,
+                                      kernel_log2_min=kernel_log2_min,
+                                      record_envelope=record_envelope,
+                                      window_bytes=window_bytes)
         return cls(
             cfg, led, intents,
             static_terms=static_terms,
@@ -538,13 +591,19 @@ class LNSState:
         # subscribers, and each of those hooks can raise, so a destroy that dies part-way is exactly
         # the "ledger missing k flights" state the handler exists to undo.
         try:
+            t0 = time.perf_counter()
             self.ledger.release_many(victims)
+            self.t_ledger_s += time.perf_counter() - t0
             for fid in order:
+                t0 = time.perf_counter()
                 it = self.repair_planner.plan(old[fid].request, self.ledger, self.cfg)
+                self.t_plan_s += time.perf_counter() - t0
                 if not it.accepted:
                     reason = "denied"
                     break
+                t0 = time.perf_counter()
                 self.ledger.commit(fid, it.volumes)
+                self.t_ledger_s += time.perf_counter() - t0
                 new[fid] = it
                 if rec_env:
                     envelopes.append(self.repair_planner.last_envelope)
@@ -594,6 +653,7 @@ class LNSState:
         incumbent; that exceptional O(all claims) path also heals partial index mutations while the
         ordinary rejection path remains one release plus k commits.
         """
+        t0 = time.perf_counter()
         self.ledger.release_many(victims)
         failures = []
         for fid in victims:
@@ -601,6 +661,8 @@ class LNSState:
                 self.ledger.commit(fid, old[fid].volumes)
             except BaseException as exc:            # noqa: BLE001 - re-raised below, after the rest
                 failures.append((fid, exc))
+        self.t_ledger_s += time.perf_counter() - t0    # the rewind is ledger work too, and on the
+        #                                                rejection path (79%) it is HALF of it
         if applied:
             self.total_cost = cost_at_entry
             for fid in applied:

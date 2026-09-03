@@ -31,7 +31,7 @@ from freespace_sim.planner.lns.neighborhood import (
     map_based_neighborhood,
     random_neighborhood,
 )
-from freespace_sim.planner.lns.state import LNSState
+from freespace_sim.planner.lns.state import LNS_REPAIR_PLANNERS, LNSState
 from freespace_sim.types import OperationalIntent
 
 log = logging.getLogger("freespace_sim.lns")
@@ -66,12 +66,26 @@ class LNSConfig:
     parallel_mode: str = "drop"          # "drop": async throughput | "sync": deterministic barrier
     worker_kernel_log2: int | None = None  # non-negative AStarPlanner.kernel_log2_min; oversized
     #                                        kernel arrays were measured to slow CONCURRENT plans
-    #                                        ~1.75x at 8 workers while a lone worker matched serial
+    #                                        ~1.75x at 8 workers while a lone worker matched serial.
+    #                                        A*-ONLY: it sizes A*'s ADAPTIVE g-hash/heap, which grows
+    #                                        x4 and re-runs on overflow. SIPP's best-g table is fixed
+    #                                        at 1<<21 with no grow path — it reports FB_HASH and falls
+    #                                        back to A*. So this is a NO-OP on a sipp arm;
+    #                                        `_validate_lns_config` warns rather than let an A/B read
+    #                                        that as SIPP scaling worse under concurrency.
     # Starting byte budget for the repair planner's per-plan dense occupancy window (`astar.window`);
     # None keeps AStarPlanner's default. The final pool-less compiled path requires a positive value:
     # the bitmap IS its occupancy image, and `compiled=False` is the reference/off switch. Oversized
     # plans may grow the retained buffer up to the planner's bounded ceiling.
     window_bytes: int | None = None
+    # Which planner repairs a destroyed neighborhood. A registry NAME, not an object: a parallel
+    # worker builds its own inside a spawned process, so this has to survive `WorkerSpec`'s
+    # picklability contract. "sipp" collapses the per-step axis into safe intervals and wins in
+    # congestion; it also maintains one more ledger-subscribed structure than A* on terminal legs.
+    # See context/sipp_lns_plan.md. APPENDED AT THE TAIL deliberately — `LNSConfig` is constructed
+    # positionally by `test_lns_config_preserves_the_legacy_positional_tail`, so a field inserted
+    # mid-dataclass silently re-binds every argument after it.
+    repair_planner: str = "astar"
 
 
 @dataclass
@@ -92,6 +106,18 @@ class LNSResult:
     auc: float = 0.0        # paper §5.2 AUC: best-known cost integrated over WALL CLOCK
     pool_spawn_s: float = 0.0
     parallel_stats: dict = field(default_factory=dict)   # mode counters + dirty/accept rates
+    # Loop wall split into the two terms a repair-planner choice trades against each other. Zero on
+    # the parallel path, where the search happens in workers the coordinator does not time.
+    repair_planner: str = "astar"
+    t_plan_s: float = 0.0        # inside `repair_planner.plan`
+    t_ledger_s: float = 0.0      # release_many + commit, including the rewind
+    # How many ledger-subscribed structures the repair planner ended up keeping — the direct read of
+    # the commit-side headwind a planner choice buys. Captured INSIDE the sequential run:
+    # `run_lns`'s `finally` detaches every subscriber, so a caller reading the ledger afterwards
+    # always sees 0. None on a parallel run whose subscriptions live in worker-local ledgers and
+    # cannot be observed after the pool closes.
+    n_release_subs: int | None = 0
+    n_commit_subs: int | None = 0
 
     @property
     def npo(self) -> int:
@@ -100,6 +126,11 @@ class LNSResult:
 
     def summary(self) -> dict:
         return {
+            "repair_planner": self.repair_planner,
+            "t_plan_s": self.t_plan_s,
+            "t_ledger_s": self.t_ledger_s,
+            "n_release_subs": self.n_release_subs,
+            "n_commit_subs": self.n_commit_subs,
             "search_workers": self.search_workers,
             "parallel_stats": dict(self.parallel_stats),
             "parallel_mode": self.parallel_mode,
@@ -201,6 +232,13 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     if lns.repair_order not in ("premium", "random"):
         raise ValueError(
             f"unknown LNSConfig.repair_order {lns.repair_order!r} (want 'premium' or 'random')")
+    # HERE and not in `state._new_repair_planner`, which runs AFTER `ledger.detach_subscribers()`: a
+    # typo'd name must not first strip the caller's ledger of every subscriber and bump its
+    # (irreversible) epoch. Same rule as the borrowed-planner vet block in `LNSState.__init__`.
+    if lns.repair_planner not in LNS_REPAIR_PLANNERS:
+        raise ValueError(
+            f"LNSConfig.repair_planner {lns.repair_planner!r} is not a supported LNS repair planner "
+            f"(want one of {LNS_REPAIR_PLANNERS})")
 
     integer_minima = {
         "seed": 0,
@@ -265,6 +303,31 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     if lns.parallel_mode not in ("sync", "drop"):
         raise ValueError(
             f"unknown LNSConfig.parallel_mode {lns.parallel_mode!r} (want 'sync' or 'drop')")
+
+    # Two coordinator-side diagnostics, deliberately not raised in a worker: a warning from a spawned
+    # process goes to a stream nobody is reading.
+    #
+    # A knob that silently does nothing on one arm of an A/B is how you conclude the wrong thing —
+    # tune `worker_kernel_log2` down, watch A* speed up and SIPP not, and read it as SIPP scaling
+    # worse under concurrency. Say so instead. (Default footprints: A* 739 MB, SIPP 334 MB of kernel
+    # work arrays; SIPP is smaller, it just cannot be shrunk — its best-g table is fixed at 1<<21
+    # with no grow path, where A*'s g-hash/heap grows x4 and re-runs.)
+    if lns.worker_kernel_log2 is not None and lns.repair_planner.startswith("sipp"):
+        log.warning(
+            "lns: worker_kernel_log2=%r has NO effect with repair_planner=%r — it sizes A*'s "
+            "adaptive g-hash/heap, and SIPP's best-g table is fixed at 1<<21 with no grow path. "
+            "The A* fallback inside SIPP still honours it.",
+            lns.worker_kernel_log2, lns.repair_planner)
+    # `sipp` proper records a read envelope from its kernel, so it merges stale DROP results exactly
+    # as A* does. `sipp_ref` does not: the pure-Python reference has no probe accumulator, leaves
+    # `last_envelope` None, and `_read_set_is_clean` reads None as always-dirty.
+    if (lns.repair_planner == "sipp_ref" and lns.parallel_mode == "drop"
+            and search_workers > 1):
+        log.warning(
+            "lns: repair_planner='sipp_ref' with parallel_mode='drop' — the pure-Python SIPP "
+            "reference records no read envelope, so every stale result is discarded rather than "
+            "merged (DROP degrades toward SYNC). Correct, just less parallel-efficient; use 'sipp' "
+            "if you want the read-set test to do any work. See context/sipp_lns_plan.md §7.")
     return replace(
         lns,
         operators=operators,
@@ -351,6 +414,7 @@ def _build_lns_state(
         movable_uss_ids=lns.movable_uss_ids,
         turnaround_s=turnaround_s,
         incremental_release=lns.incremental_release,
+        repair_planner_name=lns.repair_planner,
         unimpeded_workers=lns.unimpeded_workers,
         maintain_claim_index=maintain_claim_index,
         window_bytes=lns.window_bytes,
@@ -367,6 +431,7 @@ def _finalize_lns_result(
     init_s: float,
     selector: AdaptiveSelector,
     *,
+    repair_planner_name: str,
     search_workers: int = 1,
     parallel_mode: str = "sequential",
     pool_spawn_s: float = 0.0,
@@ -377,6 +442,7 @@ def _finalize_lns_result(
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
     wall_s = time.monotonic() - t0
+    worker_local_subscribers = search_workers > 1
     return LNSResult(
         intents=final,
         trajectory=trajectory,
@@ -388,6 +454,13 @@ def _finalize_lns_result(
         init_wall_s=init_s,
         weights=dict(selector.weights),
         verified=bad is None,
+        repair_planner=repair_planner_name,
+        t_plan_s=state.t_plan_s,
+        t_ledger_s=state.t_ledger_s,
+        n_release_subs=(None if worker_local_subscribers
+                        else len(state.ledger._release_subs)),
+        n_commit_subs=(None if worker_local_subscribers
+                       else len(state.ledger._observers)),
         search_workers=search_workers,
         parallel_mode=parallel_mode,
         auc=_trajectory_auc(trajectory, cost_before, wall_s),
@@ -500,6 +573,7 @@ def run_lns(
 
         return _finalize_lns_result(
             state, trajectory, cost_before, n_iter, n_accepted, t0, init_s, selector,
+            repair_planner_name=lns.repair_planner,
         )
     except BaseException:
         log.exception("lns aborted; detaching repair-planner subscribers before propagating")

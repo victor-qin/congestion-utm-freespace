@@ -66,6 +66,9 @@ def _block(iv_lo, iv_hi, iv_nxt, state, c, s):
         slot = int(iv_nxt[slot])
 
 
+_HUGE = 1 << 62      # empty-bbox sentinel, matching astar.planner._BBOX_HUGE
+
+
 def run(*, nlevels, base=0, max_step=20,
         lane_qr, lane_lat, n_to, to_ok, c_gd,
         takeoff_steps, takeoff_cost, rung_steps, rung_cost,
@@ -146,6 +149,11 @@ def run(*, nlevels, base=0, max_step=20,
     heap_c = np.zeros(max_heap, np.int64)
     heap_n = np.zeros(max_heap, np.int64)
 
+    # Read-set accumulator (Track A): min slots start +HUGE, max slots -HUGE, so min > max reads as
+    # "never probed". The kernel only widens it — it cannot change a search decision — but it is a
+    # required argument, so the harness supplies one and the assertions below check it was filled.
+    read_bbox = np.array([_HUGE, -_HUGE, _HUGE, -_HUGE, _HUGE, -_HUGE, base, max_step], np.int64)
+
     out_q = np.zeros(maxpath, np.int64)
     out_r = np.zeros(maxpath, np.int64)
     out_s = np.zeros(maxpath, np.int64)
@@ -164,16 +172,41 @@ def run(*, nlevels, base=0, max_step=20,
         heap_f, heap_c, heap_n, max_heap,
         g_pack, g_packf, hash_cap, hash_log2, max_step + 2,   # (cell, step) best-g dedup table
         out_q, out_r, out_s, out_L,
+        read_bbox,
     )
     path = [(int(out_q[i]), int(out_r[i]), int(out_L[i]), int(out_s[i])) for i in range(m)][::-1] if m > 0 else []
-    return m, g, n_exp, status, path
+    return m, g, n_exp, status, path, read_bbox
+
+
+def test_read_bbox_covers_every_cell_the_search_touched():
+    """The Track-A read set (context/sipp_lns_plan.md §7). The kernel widens it per CELL — SIPP walks
+    a cell's whole interval chain, so a commit anywhere in the plan's step window can change what the
+    walk finds, and a per-(cell, step) record would under-report. Here: the returned path must lie
+    inside the recorded box, and the box must extend at least one ring past it (the search probes
+    neighbours it does not take)."""
+    R = 100.0
+    gx, gy = hex_center(3, 0, R)
+    m, _g, _n, status, path, rb = run(
+        nlevels=1,
+        lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1], c_gd=1.0,
+        takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],
+        goal_cells=[qr_of(3, 0)], lf_lo=[0], lf_hi=[20],
+        c_hold=3.0, c_lat=1.0, pitch=R * SQRT3, dt=1.0, gx=gx, gy=gy, R=R, h_off=0.0,
+    )
+    assert status == 0 and m > 0
+    assert rb[0] <= rb[1] and rb[2] <= rb[3], "nothing recorded — the accumulator never fired"
+    for (q, r, L, _s) in path:
+        assert rb[0] <= q <= rb[1] and rb[2] <= r <= rb[3], f"path cell ({q},{r}) outside bbox {rb}"
+        assert rb[4] <= L <= rb[5]
+    qs = [q for q, _r, _L, _s in path]
+    assert rb[0] < min(qs) or rb[1] > max(qs), "bbox hugs the path — neighbour probes went unrecorded"
 
 
 def test_single_level_straight_shot():
     """Compile gate + takeoff → 6-neighbour reroute → goal accept → reconstruction, empty airspace."""
     R = 100.0
     gx, gy = hex_center(3, 0, R)
-    m, g, _n, status, path = run(
+    m, g, _n, status, path, rb = run(
         nlevels=1,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1], c_gd=1.0,
         takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],
@@ -189,7 +222,7 @@ def test_terminal_goal_scoring_includes_lane_distance():
     """Equal-hop landing lanes are not equal-cost when their terminal-edge tails differ."""
     R = 100.0
     expensive, cheap = qr_of(2, 0), qr_of(0, 2)
-    m, _g, _n, status, path = run(
+    m, _g, _n, status, path, rb = run(
         nlevels=1,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1], c_gd=1.0,
         takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],
@@ -205,7 +238,7 @@ def test_vertical_rung_climb():
     """NEW 3D path: takeoff only at L0, goal at L2 (same q,r) ⇒ forced climb L0→L1→L2 via rungs."""
     R = 100.0
     gx, gy = hex_center(0, 0, R)                        # goal at origin column ⇒ heuristic dist 0
-    m, g, _n, status, path = run(
+    m, g, _n, status, path, rb = run(
         nlevels=3,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1, 0, 0], c_gd=1.0,
         takeoff_steps=[0, 1, 2], takeoff_cost=[0.0, 10.0, 20.0],
@@ -222,7 +255,7 @@ def test_vertical_rung_descend():
     """NEW 3D path (the ``dL==0`` branch): takeoff only at L2, goal at L0 ⇒ forced descent L2→L1→L0."""
     R = 100.0
     gx, gy = hex_center(0, 0, R)
-    m, g, _n, status, path = run(
+    m, g, _n, status, path, rb = run(
         nlevels=3,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[0, 0, 1], c_gd=1.0,
         takeoff_steps=[0, 1, 2], takeoff_cost=[0.0, 10.0, 20.0],
@@ -241,7 +274,7 @@ def test_interval_fragmentation_hover():
     R = 100.0
     gx, gy = hex_center(2, 0, R)
     c10 = qr_of(1, 0)
-    m, g, _n, status, path = run(
+    m, g, _n, status, path, rb = run(
         nlevels=1,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1], c_gd=1.0,
         takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],
@@ -261,7 +294,7 @@ def test_ground_delay_fan():
     R = 100.0
     gx, gy = hex_center(2, 0, R)
     c00 = qr_of(0, 0)
-    m, g, _n, status, path = run(
+    m, g, _n, status, path, rb = run(
         nlevels=1,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=2, to_ok=[1, 1], c_gd=1.0,
         takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],
@@ -281,7 +314,7 @@ def test_no_path_when_walled_in():
     R = 100.0
     gx, gy = hex_center(3, 0, R)
     neighbours = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1)]
-    m, _g, _n, status, _path = run(
+    m, _g, _n, status, _path, rb = run(
         nlevels=1,
         lane_qr=[qr_of(0, 0)], lane_lat=[0.0], n_to=1, to_ok=[1], c_gd=1.0,
         takeoff_steps=[0], takeoff_cost=[0.0], rung_steps=[0], rung_cost=[0.0],

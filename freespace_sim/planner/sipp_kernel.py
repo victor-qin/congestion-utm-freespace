@@ -63,6 +63,39 @@ def _gslot(g_pack, gen, key, cap, log2cap):
     return -1
 
 
+@njit(cache=True, nogil=True)
+def _note_cell(read_bbox, q, r, L):
+    """Widen the read bbox to cover hex cell ``(q, r, L)`` — one entry in the plan's READ SET, consumed
+    by the Track-A staleness test (``parallel.PlanEnvelope``) so a coordinator can tell whether anything
+    committed since this plan started could have changed its answer.
+
+    Write-only w.r.t. the search: it cannot change a decision, so kernel==reference parity is untouched.
+
+    WHY THE UNIT IS A CELL, NOT A ``(cell, step)`` PROBE — this is where SIPP differs from A*, and
+    getting it wrong under-reports the read set, which is the one error mode the envelope exists to
+    prevent. A*'s ``_blocked`` answers ONE ``(cell, step)`` question, so recording that point is exact.
+    SIPP instead walks a cell's whole free-interval CHAIN, whose shape is derived from every commit that
+    ever touched that cell: a commit at some *other* step in the same cell splits an interval and changes
+    what the walk finds. So touching a chain reads the cell across the plan's entire step window, and the
+    honest record is the cell. (Slots 6-7, the step range, are filled ONCE by the host from
+    ``[base, max_step]`` for the same reason.)
+
+    Callers pass WORLD ``(q, r)``, not box indices — ``envelope_intersects`` converts slots 0-3 through
+    ``cell_bbox_to_aabb``, which assumes world axial coordinates."""
+    if q < read_bbox[0]:
+        read_bbox[0] = q
+    if q > read_bbox[1]:
+        read_bbox[1] = q
+    if r < read_bbox[2]:
+        read_bbox[2] = r
+    if r > read_bbox[3]:
+        read_bbox[3] = r
+    if L < read_bbox[4]:
+        read_bbox[4] = L
+    if L > read_bbox[5]:
+        read_bbox[5] = L
+
+
 @njit(cache=True, nogil=True)   # nogil: release the GIL so a batch of plans runs on real threads (#8 Track A)
 def _search(
     iv_lo, iv_hi, iv_nxt,                                            # global interval pool (slot < cap)
@@ -77,6 +110,7 @@ def _search(
     heap_f, heap_c, heap_n, max_heap,                                # binary heap
     g_pack, g_packf, hash_cap, log2cap, nsteps,                      # (cell,step) best-g dedup table
     out_q, out_r, out_s, out_L,                                      # output path buffers (+ flight level)
+    read_bbox,                       # in/out int64[8]: read-set summary (see `_note_cell`)
 ):
     nlab = 0
     size = 0
@@ -102,6 +136,8 @@ def _search(
                 if ts > max_step:
                     continue
                 cell = qr * nlevels + Lk
+                iq0 = qr // rspan                        # world (q, r) for the read set (see `_note_cell`)
+                _note_cell(read_bbox, iq0 + qmin, qr - iq0 * rspan + rmin, Lk)
                 sj = ov_head[cell] if ov_gen[cell] == gen else cell   # own-lane overlay, else the global pool
                 slot = -1
                 while sj != -1:                         # the interval (slot) whose free run contains ts
@@ -215,6 +251,7 @@ def _search(
             if niq < 0 or niq >= qspan or nir < 0 or nir >= rspan:
                 return -1, 0.0, n_exp, FB_OOB           # out-of-box stray → host fallback
             ncell = (niq * rspan + nir) * nlevels + Lc   # reroute stays in-level (same Lc)
+            _note_cell(read_bbox, nq, nr, Lc)            # nq/nr are already world coords — free
             ngoal = goal_gen[ncell] == gen
             sj = ov_head[ncell] if ov_gen[ncell] == gen else ncell   # neighbour interval chain (overlay/pool)
             while sj != -1:
@@ -330,6 +367,13 @@ def _search(
                 if arr + rsteps > hi_c:                 # current level not free through even a zero-hover climb
                     continue
                 rcost = rung_cost[rung]
+                # No `_note_cell` here. A rung's target is the SAME (q, r) at an adjacent level, and
+                # both are already in the bbox: the cell was recorded when its own label was created
+                # (site A seeds every level of each takeoff lane, site B records every reroute
+                # neighbour), and a rung can only be taken from a cell that was expanded, i.e.
+                # pushed. Measured across 83 envelopes on a 3-level congested scenario: recording
+                # here widened NONE of them. Left out rather than kept "for safety" — an accumulator
+                # line no test can distinguish from its absence is one nobody can maintain.
                 ncell = qr * nlevels + tlv              # same (q, r), adjacent level
                 ngoal = goal_gen[ncell] == gen
                 sj = ov_head[ncell] if ov_gen[ncell] == gen else ncell

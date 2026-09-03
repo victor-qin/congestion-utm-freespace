@@ -575,14 +575,40 @@ measured and DEAD.
    if anything LONGER. The populations differ (the old sample spans the whole box including empty
    regions, the new spans one busy window), so this is suggestive rather than decisive, but it does
    not support the hypothesis.
-3. **Overlay indirection.** Still untested, and now the leading candidate by elimination. Three hot
-   sites lost `ov_head[cell] if ov_gen[cell] == gen else cell` — two random reads and a branch per
-   chain walk — plus an `sj >= cap` test per interval *inside* the walk. With a mean chain of ~2
-   intervals, that per-walk preamble is comparable in size to the walk itself, which is the shape
-   that would explain a large kernel-wide effect.
+3. **Overlay indirection.** **CONFIRMED as a real term — and it is not big enough.** Isolated by
+   running the OLD kernel (`d19eb49`) over the NEW window chains with an inert overlay (`ov_gen` all
+   zero while `gen` is never 0, `cap` above every slot id): identical chains, identical answer
+   (accepted cost `419509.191602` both ways), but it still pays the two random reads + branch per
+   chain walk and the `sj >= cap` test per interval. Cost: **18.26 against 15.62 ms/plan, i.e. 2.64
+   ms = 14.5% of kernel time.**
 
-So: the *result* is solid and the *explanation* is still open, but narrower. Anyone citing a
-mechanism should test (3) by re-adding the indirection behind a flag.
+### The three hypotheses explain the SEQUENTIAL gain, not the LNS one
+
+Profiling the old code end to end on the same 1,526-plan `sim.run` workload:
+
+| | OLD | NEW | delta |
+| --- | ---: | ---: | ---: |
+| `_splan_compiled` | 24.02 ms | 22.07 ms | **−8.1%** |
+| kernel | 17.24 | 15.16 | −2.08 |
+| host | 6.79 | 6.49 | −0.30 |
+| of which `_sbuild_overlay` | 0.34 | 0 | −0.34 |
+
+So on a sequential run the whole plan-side gain is **8.1%**, and the overlay indirection accounts for
+essentially all of it. **The LNS A/B showed −33%** (146.3 -> 97.8 s). Those are different numbers on
+different workloads, and the gap between them is unexplained by anything measured so far.
+
+The leading candidate is one I never listed: **the old pool's chains fragment with CONGESTION.** Its
+free intervals accumulated a split from every commit that ever touched a cell, over the full
+`[0, MAXS]` range; LNS runs against a 4,636-flight ledger where this cut holds 1,526, and it churns
+that ledger continuously. The per-plan window is clipped to `[base, max_step]` and rebuilt from
+claims each time, so it does not accumulate. The earlier chain-length sample (1.824 old vs 2.262 new)
+does not contradict this — it compared different cell populations at ONE congestion level, which is
+exactly the wrong experiment for a congestion-scaling claim.
+
+**This matters beyond curiosity.** If the mechanism is congestion-scaling, the 1.24x headline is
+scale-dependent *in SIPP's favour*, and would understate on larger scenarios. Test: repeat the
+old-kernel/new-kernel comparison at increasing `--demand-duration` and see whether the gap widens.
+Until then, quote the 1.24x as measured at 4,636 legs and not as a general factor.
 
 ### Gates
 

@@ -7,8 +7,8 @@ Prior record: `context/sipp_lns_plan.md` (the integration; §13 records the inve
 
 `#125` shipped SIPP as a selectable LNS repair planner. When it was written it was ~1.1x *less* wall
 than A\* at the same schedule quality. `#124` then rewrote A\*'s occupancy and the verdict inverted:
-A\* is now **1.50x faster** (loop 181.0 s / ledger 25.3 s against SIPP's 270.7 s / 122.6 s at full
-`density_faa`, N=8, 300 iterations).
+A\* is now **1.67x faster** (§2 re-measures this on the merged code; `#125` §13 recorded 1.50x, from
+a run whose A\* arm had drifted high).
 
 Nothing about SIPP got slower. **A\*'s ledger side got cheaper and SIPP's structures were not in the
 rewrite.** This document re-measures that from scratch on the merged code, finds the term that

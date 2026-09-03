@@ -5,8 +5,18 @@ air lattice — lifted into a ``@njit`` function over flat arrays. The pure-Pyth
 the reference oracle (and the fallback); this kernel must reproduce its exact optimal weighted cost.
 Everything terminal/geometry/commit stays in the Python host.
 
-**Occupancy** is the linked-list interval pool of :class:`CompiledOccupancy`: a cell's free intervals
-are slots walked from slot ``cell`` along ``iv_nxt``; each slot is a unique frontier node id.
+**Occupancy** is a PER-PLAN interval pool over the window this flight reads, built from the A* claim
+arena by :func:`~freespace_sim.planner.sipp_window.build_window_intervals`: a cell's free intervals are
+slots walked from slot ``cell`` along ``iv_nxt``, and each slot is a unique frontier node id. Cell ids
+are therefore WINDOW-local — ``qmin``/``rmin``/``rspan``/``qspan`` are the window's bounds, not the
+global box's — which is why an out-of-box stray returns ``FB_OOB`` for the host to widen on rather
+than fall back on. World ``(q, r)`` is reconstructed as ``iq + qmin`` at every site that needs it, so
+the recorded read set and the output path stay in world coordinates.
+
+There is no own-lane OVERLAY any more. The window build skips a cell's terminal-column claims when the
+planning flight owns it (A*'s ``ov_own_gen`` stamp), so what used to be a redirect to a second slot
+space is now just the chain this kernel already walks. The global free-interval pool it replaced could
+not do that: it stored columns foreign-to-everyone and needed the overlay to make them transparent.
 
 **Multi-label, not single-best.** Because the objective is weighted cost (``c_hold != c_gd``), a
 ``(cell, interval)`` is reached at several non-dominating ``(arrival, cost)`` labels (e.g. the origin via
@@ -98,9 +108,8 @@ def _note_cell(read_bbox, q, r, L):
 
 @njit(cache=True, nogil=True)   # nogil: release the GIL so a batch of plans runs on real threads (#8 Track A)
 def _search(
-    iv_lo, iv_hi, iv_nxt,                                            # global interval pool (slot < cap)
-    ov_lo, ov_hi, ov_nxt, ov_head, ov_gen, cap,                      # per-flight overlay (slot >= cap)
-    qmin, rmin, rspan, qspan, base, max_step, nlevels,              # box + step window + flight-level axis
+    iv_lo, iv_hi, iv_nxt,                        # per-plan WINDOW interval pool; head of cell c IS slot c
+    qmin, rmin, rspan, qspan, base, max_step, nlevels,   # WINDOW box + step window + flight-level axis
     lane_qr, lane_lat, lane_st, n_lanes, to_ok, n_to, c_gd,         # takeoff lanes + egress steps + gd mask
     takeoff_steps, takeoff_cost, rung_steps, rung_cost,            # per-level takeoff + per-rung vertical edges
     goal_gen, goal_cost, lf_lo, lf_hi, lf_off,                       # goal flags/cost + landing intervals
@@ -138,13 +147,10 @@ def _search(
                 cell = qr * nlevels + Lk
                 iq0 = qr // rspan                        # world (q, r) for the read set (see `_note_cell`)
                 _note_cell(read_bbox, iq0 + qmin, qr - iq0 * rspan + rmin, Lk)
-                sj = ov_head[cell] if ov_gen[cell] == gen else cell   # own-lane overlay, else the global pool
-                slot = -1
+                sj = cell                           # head slot IS the window cell (see `sipp_window`);
+                slot = -1                           # own-lane transparency is baked into the build
                 while sj != -1:                         # the interval (slot) whose free run contains ts
-                    if sj >= cap:
-                        jj = sj - cap; lo = ov_lo[jj]; hi = ov_hi[jj]; nxt = ov_nxt[jj]
-                    else:
-                        lo = iv_lo[sj]; hi = iv_hi[sj]; nxt = iv_nxt[sj]
+                    lo = iv_lo[sj]; hi = iv_hi[sj]; nxt = iv_nxt[sj]
                     if lo <= ts <= hi:
                         slot = sj; break
                     sj = nxt
@@ -231,7 +237,7 @@ def _search(
                     break
 
         n_exp += 1
-        hh = ov_hi[slot - cap] if slot >= cap else iv_hi[slot]
+        hh = iv_hi[slot]
         hi_c = hh if hh < max_step else max_step        # current cell free-until (how long we may hover)
 
         for d in range(6):                              # reroute: one successor per neighbour interval
@@ -253,12 +259,9 @@ def _search(
             ncell = (niq * rspan + nir) * nlevels + Lc   # reroute stays in-level (same Lc)
             _note_cell(read_bbox, nq, nr, Lc)            # nq/nr are already world coords — free
             ngoal = goal_gen[ncell] == gen
-            sj = ov_head[ncell] if ov_gen[ncell] == gen else ncell   # neighbour interval chain (overlay/pool)
-            while sj != -1:
-                if sj >= cap:
-                    jj = sj - cap; lo = ov_lo[jj]; hi = ov_hi[jj]; nxts = ov_nxt[jj]
-                else:
-                    lo = iv_lo[sj]; hi = iv_hi[sj]; nxts = iv_nxt[sj]
+            sj = ncell                           # neighbour chain; own-lane transparency is
+            while sj != -1:                      # baked into the window build, not redirected
+                lo = iv_lo[sj]; hi = iv_hi[sj]; nxts = iv_nxt[sj]
                 if lo < base:
                     lo = base
                 if hi > max_step:
@@ -376,12 +379,9 @@ def _search(
                 # line no test can distinguish from its absence is one nobody can maintain.
                 ncell = qr * nlevels + tlv              # same (q, r), adjacent level
                 ngoal = goal_gen[ncell] == gen
-                sj = ov_head[ncell] if ov_gen[ncell] == gen else ncell
-                while sj != -1:
-                    if sj >= cap:
-                        jj = sj - cap; lo = ov_lo[jj]; hi = ov_hi[jj]; nxts = ov_nxt[jj]
-                    else:
-                        lo = iv_lo[sj]; hi = iv_hi[sj]; nxts = iv_nxt[sj]
+                sj = ncell                           # neighbour chain; own-lane transparency is
+                while sj != -1:                      # baked into the window build, not redirected
+                    lo = iv_lo[sj]; hi = iv_hi[sj]; nxts = iv_nxt[sj]
                     if lo < base:
                         lo = base
                     if hi > max_step:

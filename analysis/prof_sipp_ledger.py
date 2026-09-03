@@ -7,9 +7,6 @@ term that dominates instead of the one that is easiest to see.
 
 Measures, per structure, over a warm ledger at density_faa scale:
   * commit  (`on_commit`) and release (`on_release`) wall, per flight;
-  * for the interval pool, the RE-APPLY AMPLIFICATION -- how many survivor claims a release has to
-    replay per claim it actually removes (A*'s predecessor measured 12.2x here, which is why #124
-    replaced it with a swap-remove);
   * for the hex service, the cost attributable to the `blocked` map alone. SIPP USED to force this
     on via `needs_blocked_map`; Phase 1 (`f4be4f0`) removed that, so the "blocked ON" row is now the
     HISTORICAL cost, not what a compiled SIPP pays. Both rows are kept because the delta between
@@ -29,7 +26,6 @@ from freespace_sim import sim                                   # noqa: E402
 from freespace_sim.scenarios import get_scenario, with_overrides  # noqa: E402
 from freespace_sim.planner.astar.occupancy import HexOccupancyService  # noqa: E402
 from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy  # noqa: E402
-from freespace_sim.planner.compiled_occupancy import CompiledOccupancy  # noqa: E402
 from freespace_sim.planner.sipp import SafeIntervalIndex        # noqa: E402
 
 N_WARM = int(sys.argv[1]) if len(sys.argv) > 1 else 600
@@ -75,9 +71,8 @@ def main() -> int:
             cfg, track_removal=True, maintain_blocked=True)),
         ("both     _svc (hex dicts, blocked OFF)", lambda: HexOccupancyService(
             cfg, track_removal=True, maintain_blocked=False)),
-        ("sipp  _scocc (interval POOL)        ", lambda: CompiledOccupancy(cfg, track_removal=True)),
-        ("astar _cocc  (claim ARENA)          ", lambda: CompiledHexOccupancy(cfg, track_removal=True)),
-        ("sipp  _sidx  (step dicts)           ", lambda: SafeIntervalIndex(cfg, track_removal=True)),
+        ("both  _cocc  (claim ARENA)          ", lambda: CompiledHexOccupancy(cfg, track_removal=True)),
+        ("pre-Ph3 _sidx (step dicts)          ", lambda: SafeIntervalIndex(cfg, track_removal=True)),
     ]
 
     print(f"{'structure':38} {'commit ms/fl':>13} {'release ms/fl':>14} {'total':>8}")
@@ -97,37 +92,11 @@ def main() -> int:
         rows[label.strip()] = (c, r)
         print(f"{label:38} {c:13.3f} {r:14.3f} {c + r:8.3f}", flush=True)
 
-    # The re-apply amplification is the whole reason #124 exists on the A* side, and it GROWS with
-    # congestion (the multiplier is how many OTHER flights share the released cells). One number at
-    # one schedule size would under-state the fix, so sweep the warm set.
-    print("\n--- interval-pool release: re-apply amplification vs congestion ---", flush=True)
-    print(f"  {'warm flights':>13} {'own claims':>11} {'cells':>8} {'re-applied':>11} "
-          f"{'amplif':>8} {'rel ms/fl':>10}")
-    for n_warm in [w for w in (150, 300, 600, 1200, 2400, 4800) if w <= len(items) - N_TIMED] or [N_WARM]:
-        st = CompiledOccupancy(cfg, track_removal=True)
-        _absorb(st, items[:n_warm], statics)
-        tset = items[n_warm:n_warm + N_TIMED]
-        for fid, vols in tset:
-            st.on_commit(fid, vols)
-        n_own = n_survivor = n_cells = n_static = 0
-        for fid, _vols in tset:
-            rows_j = st._rows.get(fid)
-            if not rows_j:
-                continue
-            cells = {rows_j[i] for i in range(0, len(rows_j), 2)}
-            n_own += len(rows_j) // 2
-            n_cells += len(cells)
-            for c in cells:
-                if c in st._static_cells:
-                    n_static += 1
-                else:
-                    n_survivor += len(st._claims.get(c, ()))
-        t0 = time.perf_counter()
-        for fid, vols in reversed(tset):
-            st.on_release(fid, vols)
-        rel = (time.perf_counter() - t0) / len(tset) * 1e3
-        print(f"  {n_warm:>13} {n_own:>11} {n_cells:>8} {n_survivor:>11} "
-              f"{n_survivor / max(1, n_own):>7.2f}x {rel:>10.3f}", flush=True)
+    # The re-apply amplification sweep that used to run here measured `CompiledOccupancy`, which
+    # Phase 3 deleted (`context/sipp_runtime_plan.md`). Its finding is preserved there: release cost
+    # ran 0.611 -> 6.105 ms/flight as the warm set went 150 -> 2,400 flights, an amplification of
+    # 1.88x -> 7.03x, because a free-interval pool can only be un-built by re-applying every OTHER
+    # flight's claims. The arena's swap-remove has no such term, which is what the rows above show.
     return 0
 
 

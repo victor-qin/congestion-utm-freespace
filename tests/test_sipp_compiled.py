@@ -4,8 +4,9 @@ The pure-Python ``SIPPPlanner`` (``sipp_ref``) is the oracle — already proven 
 (see ``test_sipp.py``). The compiled ``sipp`` must reproduce it **exactly**, including fixed-terminal
 lane choice. These tests assert
 ``compiled == reference`` (cost + accept + centerline), that the kernel actually runs (low fallback),
-that the dense interval pool matches ``SafeIntervalIndex``, and that absent numba degrades to the
-reference. If numba is unavailable every plan falls back, so equivalence still holds trivially.
+and that absent numba degrades to the reference. The pool-vs-index parity test that used to live here
+went with the global interval pool (`context/sipp_runtime_plan.md` Phase 3); its successor is
+``tests/test_sipp_window.py``, which compares the per-plan build against ``blocked_py``. If numba is unavailable every plan falls back, so equivalence still holds trivially.
 """
 import numpy as np
 import pytest
@@ -18,10 +19,11 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
-from freespace_sim.planner.astar.compiled_hex_occupancy import schedulable_horizon_steps
-from freespace_sim.planner.astar.planner import _absorb
-from freespace_sim.planner.compiled_occupancy import CompiledOccupancy
-from freespace_sim.planner.sipp import SIPPPlanner, SafeIntervalIndex
+from freespace_sim.planner.astar.compiled_hex_occupancy import (
+    CompiledHexOccupancy,
+    schedulable_horizon_steps,
+)
+from freespace_sim.planner.sipp import SIPPPlanner
 from freespace_sim.scenario import scenario_from_requests
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run
@@ -84,7 +86,7 @@ def test_compiled_long_route_is_not_truncated_by_occupancy_horizon():
     got = compiled.plan(req, ReservationLedger(cfg), cfg)
     want = reference.plan(req, ReservationLedger(cfg), cfg)
 
-    assert CompiledOccupancy(cfg).MAXS == schedulable_horizon_steps(cfg)
+    assert CompiledHexOccupancy(cfg).MAXS == schedulable_horizon_steps(cfg)
     assert got.accepted and want.accepted
     assert got.cost == pytest.approx(want.cost, abs=1e-9)
     assert len(got.centerline) == len(want.centerline)
@@ -99,7 +101,7 @@ def test_compiled_late_departure_past_pool_horizon_uses_reference():
         vec(200, 500, 0),
         vec(800, 500, 0),
         0.0,
-        t_departure=(CompiledOccupancy(cfg).MAXS + 20) * cfg.dt_s,
+        t_departure=(CompiledHexOccupancy(cfg).MAXS + 20) * cfg.dt_s,
     )
     compiled = get_planner("sipp")
     got = compiled.plan(req, ReservationLedger(cfg), cfg)
@@ -150,27 +152,35 @@ def test_astar_warm_failure_keeps_sipp_kernel_fallback_on_astar_reference(monkey
     assert got is reference and got.planner == "sipp"
 
 
-def test_sipp_warm_uses_the_production_overlay_signature():
-    """The warm-up must compile the signature a real plan uses, or every cold spawned worker
-    compiles a second specialization on its first repair."""
-    from types import SimpleNamespace
+def test_sipp_warm_uses_the_production_kernel_signature():
+    """The warm-up must compile the signature a real plan uses — and this is the ONLY thing standing
+    between a signature change and a silent all-reference run.
 
+    `_swarm_jit` calls `_search` POSITIONALLY. Change the kernel's parameter list and the call raises
+    `TypeError`, which its own handler would otherwise swallow into `sipp_compiled = False`: every
+    plan then routes to the pure-Python reference, the run stays exact, every parity gate passes, and
+    the only symptom is that it got much slower. `_swarm_jit` re-raises `TypeError` for that reason;
+    this test pins the other half, that warm and production agree on ARITY and DTYPE.
+    """
     planner = SIPPPlanner(compiled=False)
     calls = []
     planner._skernel = lambda *args: calls.append(args)
     planner._swarm_jit()
     assert len(calls) == 1
-    warm_dtypes = tuple(a.dtype for a in calls[0][3:6])
+    warm = calls[0]
+    warm_dtypes = tuple(a.dtype for a in warm[:3])          # the window pool: iv_lo / iv_hi / iv_nxt
 
-    # Avoid allocating the unrelated fixed 1<<21 label/hash tables; the overlay allocation is the
-    # occupancy-shaped first branch and is sufficient to witness the production kernel signature.
-    planner._k_lab_cell = np.empty(0, np.int64)
-    planner._skernel_state(SimpleNamespace(cap=9, MAXS=5))
+    planner._k_lab_cell = np.empty(0, np.int64)   # skip the unrelated fixed 1<<21 label/hash tables
+    planner._skernel_state(CompiledHexOccupancy(CFG), 9)
     production_dtypes = tuple(
-        a.dtype for a in (planner._k_ov_lo, planner._k_ov_hi, planner._k_ov_nxt)
-    )
-    expected = (np.dtype(np.int64),) * 3
-    assert warm_dtypes == production_dtypes == expected
+        a.dtype for a in (planner._k_iv_lo, planner._k_iv_hi, planner._k_iv_nxt))
+    assert warm_dtypes == production_dtypes == (np.dtype(np.int32),) * 3
+
+    # Arity, against the live kernel rather than a hand-maintained number.
+    from freespace_sim.planner import sipp_kernel
+
+    n_params = sipp_kernel._search.py_func.__code__.co_argcount
+    assert len(warm) == n_params, f"warm-up passes {len(warm)} args, `_search` takes {n_params}"
 
 
 @pytest.mark.parametrize("planner_name", ("astar_ref", "astar", "sipp_ref", "sipp"))
@@ -273,60 +283,6 @@ def test_sipp_reference_compute_truncation_stays_search_exhausted():
 
 # ---- dense interval pool == SafeIntervalIndex oracle ----
 
-def test_compiled_occupancy_matches_safe_interval_index():
-    spec = with_overrides(get_scenario("metro_uniform"), lam_per_hour=400.0, horizon_s=600.0, seed=0)
-    cfg = spec.config()
-    reqs = spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed)) \
-        if spec.demand_model() else UniformPoissonDemand().generate(cfg, np.random.default_rng(0))
-    sc = scenario_from_requests(reqs)
-    led = ReservationLedger(cfg)
-    dss = DSS(ledger=led, mechanism=FCFSMechanism())
-    from freespace_sim.uss import USS
-    usses = {u: USS(u, dss, cfg, get_planner("astar")) for u in sc.uss_ids}
-    for ev in sc.events:
-        usses[ev.request.uss_id].handle_request(ev.request)
-
-    sidx = SafeIntervalIndex(cfg); _absorb(sidx, led)
-    cocc = CompiledOccupancy(cfg); _absorb(cocc, led)
-    own = frozenset()
-    checked = 0
-    for (q, r, L) in list(sidx.corr.keys())[:1500]:    # every committed (non-terminal) cell, per flight level
-        ref = sidx.free_intervals(q, r, L, own, 0, cocc.MAXS, False)
-        got = cocc.free_intervals_py(q, r, L, 0, cocc.MAXS)
-        assert got is not None and ref == got, f"interval mismatch at ({q},{r},{L}): {ref} vs {got}"
-        checked += 1
-    assert checked > 50
-
-
-def test_compiled_occupancy_skips_out_of_box_committed_corridor():
-    """A fallback flight may commit outside the finite SIPP box without crashing every subscriber."""
-    cfg = SimConfig()
-    cocc = CompiledOccupancy(cfg, margin=0)
-    far = Volume4D(
-        box_from_segment(vec(-5000, -5000, 150), vec(-4400, -5000, 150), 40, 400),
-        0.0,
-        5.0,
-    )
-
-    with pytest.warns(RuntimeWarning, match="outside the kernel box"):
-        cocc.on_commit(7, [far])                 # must skip, not raise from the ledger commit hook
-    assert cocc.oob_corridor_cells > 0
-    assert cocc._warned_oob
-
-    cocc.reset()
-    assert cocc.oob_corridor_cells == 0          # current-pool diagnostic resets; warn-once state persists
-    assert cocc._warned_oob
-
-    near = Volume4D(
-        box_from_segment(vec(3000, 3000, 150), vec(3600, 3000, 150), 40, 400),
-        0.0,
-        5.0,
-    )
-    ok = CompiledOccupancy(cfg)
-    ok.on_commit(8, [near])
-    assert ok.oob_corridor_cells == 0
-
-
 def test_shared_sipp_occupancy_preserves_nonzero_ledger_epoch():
     """A worker must reuse the master's frozen caches instead of rebuilding them after a handoff."""
     ledger = ReservationLedger(CFG)
@@ -336,14 +292,14 @@ def test_shared_sipp_occupancy_preserves_nonzero_ledger_epoch():
     worker = SIPPPlanner(compiled=False)
     svc = master._occupancy(req, ledger, CFG)
     sidx = master._sipp_index(req, ledger, CFG)
-    cocc = master._scompiled_occ(req, ledger, CFG)
+    cocc = master._compiled_occ(req, ledger, CFG)
 
     worker.share_occupancy_from(master)
 
-    assert worker._svc_epoch == worker._sidx_epoch == worker._scocc_epoch == ledger.epoch
+    assert worker._svc_epoch == worker._sidx_epoch == worker._cocc_epoch == ledger.epoch
     assert worker._occupancy(req, ledger, CFG) is svc
     assert worker._sipp_index(req, ledger, CFG) is sidx
-    assert worker._scompiled_occ(req, ledger, CFG) is cocc
+    assert worker._compiled_occ(req, ledger, CFG) is cocc
 
 
 # ---- replay equivalence (headline): compiled vs reference against the SAME A*-committed ledger ----
@@ -516,42 +472,18 @@ def test_compiled_full_run_verified_and_matches_reference():
 # ---- issue #114: the range-blocked commit path ----
 
 
-def test_block_range_matches_free_step_set():
-    """Random spans leave exactly the free steps predicted by an independent set oracle."""
-    cfg = SimConfig(region_size_m=(2000.0, 2000.0), horizon_s=300.0, seed=0)
-    rng = np.random.default_rng(12345)
-    pool = CompiledOccupancy(cfg)
-    coords = ((0, 0), (1, 0), (0, 1), (2, -1))
-    cells = [pool.cell_id(q, r, 0) for q, r in coords]
-    assert all(c >= 0 for c in cells)
-    free = {c: set(range(pool.MAXS + 1)) for c in cells}
+def test_commit_hook_shares_one_geometry_sweep_across_every_subscriber(monkeypatch):
+    """A flight longer than the base LRU still gets one geometry sweep shared by all subscribers.
 
-    for _ in range(400):
-        c = cells[int(rng.integers(len(cells)))]
-        s0 = int(rng.integers(-2, 60))
-        s1 = s0 + int(rng.integers(0, 12))
-        pool.block_range(c, s0, s1)
-        free[c].difference_update(range(max(0, s0), min(pool.MAXS, s1) + 1))
-
-    for (q, r), c in zip(coords, cells):
-        actual = {s for lo, hi in pool.free_intervals_py(q, r, 0, 0, pool.MAXS)
-                  for s in range(lo, hi + 1)}
-        assert actual == free[c], f"cell {c} diverged"
-
-    # A span past MAXS is clipped, not an IndexError, and a fully-consumed cell reads as empty.
-    c = cells[0]
-    pool.block_range(c, 0, pool.MAXS + 500)
-    assert pool.free_intervals_py(0, 0, 0, 0, 80) == []
-
-
-def test_commit_hook_shares_one_geometry_sweep_across_all_three_structures(monkeypatch):
-    """A flight longer than the base LRU still gets one geometry sweep shared by all subscribers."""
+    Two structures now, not three: SIPP's global interval pool is gone. They still share the sweep
+    because `CompiledHexOccupancy` and `HexOccupancyService` derive identical `infl_blocked` /
+    `infl_pad` radii, which is what `rasterize_ranges`' memo keys on."""
     from freespace_sim.geometry import CylinderSpec
     from freespace_sim.planner import hexgrid as hg
     from freespace_sim.planner.astar.occupancy import HexOccupancyService
 
     cfg = SimConfig(region_size_m=(2000.0, 2000.0), horizon_s=300.0, seed=0)
-    svc, cocc, sidx = HexOccupancyService(cfg), CompiledOccupancy(cfg), SafeIntervalIndex(cfg)
+    svc, cocc = HexOccupancyService(cfg), CompiledHexOccupancy(cfg)
     nvol = hg._RANGE_CACHE_MIN_CAP + 1
     shape = CylinderSpec(500.0, 500.0, 30.0, 0.0, cfg.airspace_ceiling_m)
     volumes = [Volume4D(shape, 8.0, 12.0, terminal_id="hub") for _ in range(nvol)]
@@ -573,7 +505,7 @@ def test_commit_hook_shares_one_geometry_sweep_across_all_three_structures(monke
     hg._RANGE_CACHE.clear()
     try:
         ledger = ReservationLedger(cfg)
-        for structure in (svc, cocc, sidx):
+        for structure in (svc, cocc):
             ledger.subscribe(structure.on_commit)
         ledger.commit(1, volumes)
         assert calls == nvol, f"expected one geometry sweep per volume, got {calls}/{nvol}"

@@ -43,31 +43,34 @@ from ..volumes import (
     terminal_radius,
 )
 from . import hexgrid as hg
+from . import sipp_window as SW
 from .astar import AStarPlanner
 from .astar._packed import aligned_2d
-from .astar.compiled_hex_occupancy import ground_delay_steps, search_horizon
-from .astar.planner import _BBOX_HUGE, _absorb, _committed_arrival
-from .compiled_occupancy import CompiledOccupancy
+from .astar.compiled_hex_occupancy import (
+    _FIELD_MASK,
+    _S0_SHIFT,
+    _SPAN_BITS,
+    ground_delay_steps,
+    search_horizon,
+)
+from .astar.planner import _BBOX_HUGE, _BindBatch, _absorb, _committed_arrival
 
 _EPS = 1e-6
+
+# ---- per-plan interval window (`sipp_window`) ----
+# The same 24 hexes A* calibrated its dense window on. That number sizes for plan-level COVERAGE —
+# the share of plans with ZERO misses, 100.0% there — not for the typical box, because one miss
+# forces a widen-and-rerun. SIPP's measured read set is TIGHTER than A*'s (dirty rate 61.5% against
+# 78.7% at 4 DROP workers; the interval collapse probes fewer cells), so this errs wide.
+_SWINDOW_MARGIN_HEX = 24
+_SWINDOW_WIDEN_MAX = 3      # each level doubles the lateral margin; past this, the reference
+_SWINDOW_GROW_MAX = 4       # buffer regrowths per plan before giving up on the window
 
 
 def _deny(req, reason):
     return OperationalIntent(
         request=req, status=IntentStatus.REJECTED, denial_reason=reason, planner="sipp"
     )
-
-
-def _iv_index_global(cocc, cell, step):
-    """Pool slot id of ``cell``'s interval containing ``step`` (the kernel's frontier node id); ``-1`` if
-    the step is blocked (no interval contains it). Walks the cell's interval chain from slot ``cell``."""
-    lo, hi, nxt = cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt
-    slot = cell
-    while slot != -1:
-        if lo[slot] <= step <= hi[slot]:
-            return slot
-        slot = int(nxt[slot])
-    return -1
 
 
 class SafeIntervalIndex:
@@ -166,7 +169,7 @@ class SafeIntervalIndex:
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         track = self.track_removal
-        # Same shared range producer as `CompiledOccupancy._add` and `HexOccupancyService._add`
+        # Same shared range producer as `CompiledHexOccupancy._add` and `HexOccupancyService._add`
         # (issue #114) — identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per
         # commit instead of three. This index is step-keyed, so like the hex service it expands the
         # span back out; the saving here is the sweep and the per-row dispatch, not the storage shape.
@@ -414,16 +417,17 @@ class SIPPPlanner(AStarPlanner):
                 self._skernel = _search
             except ImportError:
                 self.sipp_compiled = False              # SIPP kernel absent → pure-Python SIPP
-        self._scocc: CompiledOccupancy | None = None    # interval pool (per ledger)
-        self._scocc_ledger = None
-        self._scocc_epoch = 0                          # ledger.epoch at bind (detach tripwire, #109)
-        self._sgen = 0                                  # version stamp for reused kernel state
+        self._k_iv_lo = self._k_iv_hi = self._k_iv_nxt = self._k_scratch = None
+        self._k_wbox = SW.empty_wbox()  # per-plan window geometry; W_STEPS == 0 is OFF
+        self._swin_widen = 0            # plans that grew their window and re-ran (diagnostics)
+        self._swin_grown = 0            # plans that grew the interval buffers
         self._k_cap = -1                               # frontier size the kernel arrays are sized to
         self._k_lab_cell = None                        # kernel work arrays (allocated lazily)
         self._k_out_q = None
         self._sfb = 0                                   # kernel→A* fallbacks (diagnostics/tests)
         self._sfb_cap = 0                               # of which: label/heap overflow (hard/infeasible flight)
-        self._sfb_oob = 0                               # of which: reroute strayed outside the kernel box
+        self._sfb_oob = 0                               # of which: window miss at the widen ceiling
+        self._sfb_overlap = 0                           # of which: own-foreign column (issue #3)
         self._sfb_hash = 0                              # of which: (cell, step) best-g table saturated
         self._n_expansions = 0                         # kernel expansions on the last compiled plan
         self._air = []                                  # last successful compiled path (diagnostics/tests)
@@ -448,7 +452,12 @@ class SIPPPlanner(AStarPlanner):
             return
         try:
             cap, nlev, qspan, rspan = 9, 1, 3, 3
-            maxs, ovcap, ncap = 5, 4, 64
+            maxs, ncap = 5, 64
+            # int32 deliberately: `_skernel_state` allocates the production window pool as int32,
+            # and
+            # dtype is part of a numba specialization, so warming int64 here would compile a
+            # signature
+            # no real plan calls.
             iv_lo = np.zeros(cap, np.int32)
             iv_hi = np.full(cap, maxs, np.int32)
             iv_nxt = np.full(cap, -1, np.int32)
@@ -456,10 +465,6 @@ class SIPPPlanner(AStarPlanner):
             gp[:, 1] = 0
             self._skernel(
                 iv_lo, iv_hi, iv_nxt,
-                # `_skernel_state` allocates the production overlay pool as int64. Dtype is part of
-                # a Numba specialization, so using int32 here warms a signature no real plan calls.
-                np.zeros(ovcap, np.int64), np.zeros(ovcap, np.int64), np.full(ovcap, -1, np.int64),
-                np.full(cap, -1, np.int64), np.zeros(cap, np.int64), cap,
                 0, 0, rspan, qspan, 0, maxs, nlev,
                 np.array([0], np.int64), np.array([0.0]), np.array([0], np.int64), 1,
                 np.ones(nlev, np.bool_), 1, 1.0,
@@ -468,8 +473,8 @@ class SIPPPlanner(AStarPlanner):
                 np.zeros(cap, np.int64), np.zeros(cap, np.float64),
                 np.array([0], np.int64), np.array([maxs], np.int64), np.array([0, 1], np.int64),
                 3.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-                1, np.full(cap + ovcap, -1, np.int64), np.full(cap + ovcap, -1, np.int64),
-                np.zeros(cap + ovcap, np.int64),
+                1, np.full(cap, -1, np.int64), np.full(cap, -1, np.int64),
+                np.zeros(cap, np.int64),
                 np.zeros(ncap, np.int64), np.zeros(ncap, np.int64), np.zeros(ncap, np.int64),
                 np.zeros(ncap, np.float64), np.full(ncap, -1, np.int64), np.full(ncap, -1, np.int64),
                 np.full(ncap, -1, np.int64), np.full(ncap, -1, np.int64), ncap,
@@ -479,6 +484,13 @@ class SIPPPlanner(AStarPlanner):
                 np.zeros(32, np.int64), np.zeros(32, np.int64),
                 np.zeros(8, np.int64),
             )
+        except TypeError:
+            # Arity/dtype drift between this call and `_search`'s signature is a BUG, not a
+            # numba-availability problem. Swallowing it into `sipp_compiled = False` would route
+            # every
+            # plan to the pure-Python reference: the run stays exact, passes every parity gate, and
+            # merely reports a massive slowdown — the least detectable failure this file can have.
+            raise
         except Exception as e:                            # compile failure → degrade to pure Python
             import warnings as _w
 
@@ -746,64 +758,57 @@ class SIPPPlanner(AStarPlanner):
         return intent
 
     # ================= compiled (numba) air-cruise path (Phase 1: non-terminal) =================
-    def _scompiled_occ(self, req, ledger, cfg) -> CompiledOccupancy:
-        """Maintain the dense interval table in lockstep with the ledger (mirrors ``_sipp_index``)."""
-        cocc = self._scocc
-        if cocc is not None and self._scocc_ledger is ledger and self._scocc_epoch != ledger.epoch:
-            cocc = None     # detached mid-life — rebind (see _sipp_index)
-        if cocc is None or self._scocc_ledger is not ledger:
-            cocc = self._scocc = CompiledOccupancy(cfg, track_removal=self.incremental_release)
-            self._scocc_ledger = ledger
-            self._scocc_epoch = ledger.epoch
-            ledger.subscribe(cocc.on_commit)
-            if self.incremental_release:               # removal hook: release_many un-absorbs
-                ledger.subscribe_release(cocc.on_release)
-            _absorb(cocc, ledger)
-            ledger.subscribe_static(cocc._on_static)   # replays every hub registered before we bound
-        elif ledger.n_volumes < cocc.n_added:
-            cocc.reset()                      # replays its own _static_hubs internally
-            _absorb(cocc, ledger)
-        wm = req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
-        cocc.evict_before(int(wm // cfg.dt_s))
-        return cocc
-
     def share_occupancy_from(self, master) -> None:
         """Plan against MASTER's committed occupancy (``cocc``/``svc``/``tcap``/``sidx``) without
         subscribing the ledger hook or re-absorbing — for optimistic-batch worker threads (#8 Track A).
         The caller must keep the ledger FROZEN (no commits) while workers plan in parallel; each worker
-        keeps its OWN kernel state (``_k_*``), so the only shared mutation is the benign
-        ``evict_before`` watermark. With the ``nogil`` kernel, N workers search on N real threads."""
+        keeps its OWN kernel state (``_k_*``), so the shared mutations are the benign ``evict_before``
+        watermark and — since a worker's reference dispatch arms the map — ``enable_blocked`` on the
+        master's ``_svc``. That second one is a real (if one-shot, sticky) cost leaked worker-to-master;
+        it is not a race today because both runners use ``spawn`` and ``PARALLEL_PLANNERS`` excludes
+        every ``sipp*`` name, so no two of these share a service in-process."""
         self._svc = master._svc
         self._svc_ledger = master._svc_ledger
         self._tcap = master._tcap
         self._svc_epoch = master._svc_epoch
-        self._scocc = master._scocc
-        self._scocc_ledger = master._scocc_ledger
-        self._scocc_epoch = master._scocc_epoch
-        self._sidx = master._sidx
+        self._cocc = master._cocc                  # A*'s claim arena, shared with its own fallback
+        self._cocc_ledger = master._cocc_ledger
+        self._cocc_epoch = master._cocc_epoch
+        self._sidx = master._sidx                  # only bound if the master ever took the reference
         self._sidx_ledger = master._sidx_ledger
         self._sidx_epoch = master._sidx_epoch
 
-    def _skernel_state(self, cocc) -> None:
-        """(Re)allocate version-stamped kernel work arrays. The frontier is sized to the interval pool
-        (grows with the ledger); labels/heap are fixed-cap (overflow → fallback); both are reused across
-        plans — reset is a ``self._sgen`` bump, not an O(N) clear."""
-        if self._k_cap < cocc.cap:                       # frontier: one slot per pool interval
-            self._k_cap = cocc.cap
-            ovcap = 1 << 14                              # overlay interval pool (own terminal lane cells)
-            self._k_ovcap = ovcap
-            tot = cocc.cap + ovcap                       # frontier covers pool slots [0,cap) + overlay [cap,..)
-            self._k_front_head = np.full(tot, -1, np.int64)
-            self._k_front_tail = np.full(tot, -1, np.int64)   # sorted-by-arr staircase per slot
-            self._k_front_gen = np.zeros(tot, np.int64)
-            self._k_goal_gen = np.zeros(cocc.cap, np.int64)        # per-cell goal flag (version-stamped)
-            self._k_goal_cost = np.zeros(cocc.cap, np.float64)     # exact lane-cell→terminal-edge cost
-            self._k_read_bbox = np.zeros(8, np.int64)              # per-plan read set (Track A; reset per plan)
-            self._k_ov_head = np.full(cocc.cap, -1, np.int64)      # per-cell overlay redirect (slot >= cap)
-            self._k_ov_gen = np.zeros(cocc.cap, np.int64)          # version-stamped (own-cell transparency)
-            self._k_ov_lo = np.empty(ovcap, np.int64)
-            self._k_ov_hi = np.empty(ovcap, np.int64)
-            self._k_ov_nxt = np.empty(ovcap, np.int64)
+    def _skernel_state(self, cocc, n_slots: int):
+        """Work arrays for one plan, sized to the WINDOW rather than to the whole box.
+
+        Returns A*'s ``(ks, kc)`` pair, EXTENDED with SIPP's own arrays rather than replacing it.
+        That is not tidiness: ``AStarPlanner._build_overlay`` — which this planner now reuses verbatim
+        for own-column transparency — reads ``self._ks["ov_own_gen"]`` directly, and the A* fallback
+        reaches ``_kernel_state``/``_build_window``, which read ``ks["NC"]``, ``ks["out_q"]``,
+        ``ks["win"]``, ``ks["wbox"]`` and ``ks["win_stats"]``. Assigning a dict with only SIPP's keys
+        would ``KeyError`` on the first terminal plan and again on the first ``FB_CAP``.
+
+        ``n_slots`` is what the window build needs (head slot per window cell + overflow intervals).
+        The frontier is per-SLOT and the goal arrays per-CELL, but both are grown against the same
+        number: over-allocating the goal arrays by the overflow count is a rounding error next to the
+        ``cocc.cap`` (654,266 slots) they used to be sized from, and one growth trigger cannot drift.
+        """
+        ks, kc = super()._kernel_state(cocc, self._log2_cap_max)
+        if self._k_cap < n_slots:
+            self._k_cap = max(n_slots, 2 * self._k_cap)   # amortise: a widen doubles the window
+            self._k_front_head = np.full(self._k_cap, -1, np.int64)
+            self._k_front_tail = np.full(self._k_cap, -1, np.int64)   # sorted-by-arr staircase per slot
+            self._k_front_gen = np.zeros(self._k_cap, np.int64)
+            self._k_goal_gen = np.zeros(self._k_cap, np.int64)        # per-cell goal flag (stamped)
+            self._k_goal_cost = np.zeros(self._k_cap, np.float64)     # lane-cell → terminal-edge cost
+            self._k_iv_lo = np.zeros(self._k_cap, np.int32)           # the per-plan window pool
+            self._k_iv_hi = np.zeros(self._k_cap, np.int32)
+            self._k_iv_nxt = np.full(self._k_cap, -1, np.int32)
+            # `build_window_intervals` requires `scratch` at least as long as `iv_lo`: its capacity
+            # pass bounds the window's TOTAL claim count, and one cell cannot exceed the total, so a
+            # single sizing rule covers both and there is only ever one shortfall to report.
+            self._k_scratch = np.zeros(self._k_cap, np.int64)
+        self._k_read_bbox = ks["read_bbox"]           # shared with A*: `_mk_envelope` is inherited
         if self._k_lab_cell is None:                     # labels + heap: allocate once
             ml = 1 << 21
             self._k_max = ml
@@ -825,7 +830,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_hash_log2 = 21
             self._k_hash_cap = 1 << self._k_hash_log2
             gp = aligned_2d(self._k_hash_cap, 4)
-            gp[:, 1] = 0                               # gen 0 = empty; self._sgen starts at 1
+            gp[:, 1] = 0                               # gen 0 = empty; the stamp starts above it
             self._k_gpack = gp
             self._k_gpackf = gp.view(np.float64)
         if self._k_out_q is None or self._k_out_q.shape[0] < cocc.MAXS + 8:
@@ -833,44 +838,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_r = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_s = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_L = np.empty(cocc.MAXS + 8, np.int64)      # flight level per output waypoint
-
-    def _sbuild_overlay(self, cocc, sidx, cells, own, base, max_step, fixed) -> bool:
-        """Fill the overlay interval pool with the OWN-exempt (transparent) free-intervals of ``cells`` —
-        the flight's own terminal lane cells, which the global pool blocks as foreign columns. Overlay
-        slots live at ``cap + idx``; ``ov_head[cell]``/``ov_gen[cell]`` (version-stamped) redirect the
-        kernel there. Returns False on overlay overflow (caller falls back)."""
-        cap = cocc.cap
-        gen = self._sgen
-        n = 0
-        for (cq, cr) in cells:
-            for L in range(cocc.nlevels):                # own lane cells are transparent at EVERY level
-                c = cocc.cell_id(cq, cr, L)
-                if c < 0 or self._k_ov_gen[c] == gen:    # out of box, or already built this plan
-                    continue
-                head = prev = -1
-                for lo, hi in sidx.free_intervals(cq, cr, L, own, base, max_step, fixed):
-                    if n >= self._k_ovcap:
-                        return False
-                    self._k_ov_lo[n] = lo; self._k_ov_hi[n] = hi; self._k_ov_nxt[n] = -1
-                    slot = cap + n
-                    if prev < 0:
-                        head = slot
-                    else:
-                        self._k_ov_nxt[prev - cap] = slot
-                    prev = slot; n += 1
-                self._k_ov_head[c] = head; self._k_ov_gen[c] = gen
-        return True
-
-    def _overlay_slot(self, cocc, cell, step):
-        """Overlay slot (``>= cap``) of ``cell``'s transparent interval containing ``step``; -1 if none."""
-        cap = cocc.cap
-        slot = self._k_ov_head[cell]
-        while slot >= 0:
-            j = slot - cap
-            if self._k_ov_lo[j] <= step <= self._k_ov_hi[j]:
-                return slot
-            slot = self._k_ov_nxt[j]
-        return -1
+        return ks, kc
 
     def _fallback(self, req, ledger, cfg):
         """Fallback when the compiled kernel bails (``FB_OOB``/``FB_CAP``): run **A\\*** — the superclass
@@ -919,8 +887,18 @@ class SIPPPlanner(AStarPlanner):
         # so SIPP's air_detour_m/cost cannot drift from A*'s.
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
-        svc = self._occupancy(req, ledger, cfg)
-        cocc = self._scompiled_occ(req, ledger, cfg)
+        # ONE bind transaction for both occupancy images, as `AStarPlanner._plan_compiled` does: a
+        # failure in either constructor tears down both rather than leaving a half-subscribed
+        # ledger.
+        batch = _BindBatch()
+        try:
+            svc = self._occupancy(req, ledger, cfg, _batch=batch)
+            cocc = self._compiled_occ(req, ledger, cfg, _batch=batch)
+            batch.run(ledger)
+        except BaseException:
+            self._unbind_compiled_occupancy(ledger)
+            self._unbind_reference_occupancy(ledger)
+            raise
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)              # per-level dwell (hover + actual climb to that level)
         o_term, d_term = as_terminal(req.origin_terminal), as_terminal(req.dest_terminal)
@@ -943,115 +921,173 @@ class SIPPPlanner(AStarPlanner):
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
 
-        oqr, gqr = cocc.qr_index(oq, orr), cocc.qr_index(gq, grr)   # level-less lane/goal indices
-        if oqr < 0 or gqr < 0 or max_step > cocc.MAXS:
-            # A demand endpoint / route outside the cfg-only box, or a late/oversized-terminal flight
-            # beyond its cfg-only time bound, must use the unbounded reference rather than letting the
-            # finite interval pool make every cell look blocked past MAXS.
+        if cocc.cell_id(oq, orr, 0) < 0 or cocc.cell_id(gq, grr, 0) < 0 or max_step > cocc.MAXS:
+            # A demand endpoint outside the cfg-only box, or a late/oversized-terminal flight beyond
+            # its cfg-only time bound: take the unbounded reference rather than let a finite window
+            # make every cell look blocked. Mirrors `AStarPlanner._plan_compiled`'s box guard.
+            self._ref_dispatch["box-guard"] += 1
             return self._splan_reference(req, ledger, cfg)
 
-        # ---- per-plan kernel state + own-lane transparency overlay (pool blocks columns foreign-to-all) ----
-        self._skernel_state(cocc)
-        self._sgen += 1
-        if fixed and (o_term is not None or d_term is not None):
-            sidx = self._sipp_index(req, ledger, cfg)
-            lanes = [L.cell for L in o_lanes] + [L.cell for L in d_lanes]
-            if not self._sbuild_overlay(cocc, sidx, lanes, own, base, max_step, fixed):
-                return self._splan_reference(req, ledger, cfg)      # overlay overflow → reference
-
-        # ---- takeoff lanes + ground-delay feasibility mask; the KERNEL folds the `for s: for lane:`
-        # enumeration (dwell_ok/pad_clear precomputed here per step, the lane free-interval lookup in njit).
-        # Terminal: the exit lanes (own-transparent via the overlay). Non-terminal: the origin cell itself
-        # (climb-in-place; the kernel's pool lookup reproduces `is_blocked`, so only pad_clear stays here). ----
+        # ---- HOISTED out of the widen loop: neither depends on the window or on `gen`. `to_ok`
+        # spans
+        # [base, base + ground_delay_steps] and the landing runs span [base, max_step]; rebuilding
+        # the
+        # latter per iteration is ~12k Python `tcap.dwell_ok` calls for a value that cannot
+        # change. ----
         smax = base + ground_delay_steps(cfg)
         n_to = smax - base + 1                                 # ground-delay steps; to_ok is per (step, level)
         to_ok = []                                             # flat mask, indexed [si*nlev + L]
-        if fixed and o_term is not None:                       # exit lanes (level-less qr; kernel adds L)
-            lane_qr, lane_lat, lane_st = [], [], []
-            for lane in o_lanes:
-                lq = cocc.qr_index(lane.cell[0], lane.cell[1])
-                if lq >= 0:
-                    lane_qr.append(lq); lane_lat.append(c_lat * (lane.dist - o_r))
-                    lane_st.append(lane.steps)               # issue #52: climb, THEN translate out
-            for s in range(base, smax + 1):                    # per-(step, level) dwell/column, lane-independent
-                lv = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
+        if fixed and o_term is not None:
+            for s_ in range(base, smax + 1):                   # per-(step, level) dwell, lane-independent
+                lv = tcap.dwell_ok_levels(o_term, origin, s_ * dt, o_cap, levels)
                 to_ok.extend(bool(lv[L]) for L in range(nlev))
-        else:                                                  # non-terminal: origin cell, per-level pad-clear
-            lane_qr, lane_lat, lane_st = [oqr], [0.0], [0]   # non-terminal: climb in place, no egress
-            for s in range(base, smax + 1):
-                to_ok.extend(svc.pad_clear(oq, orr, s, dwell_steps[L]) for L in range(nlev))
-        if not lane_qr:
-            return self._splan_reference(req, ledger, cfg)          # every terminal lane fell outside the box
+        else:                                                  # non-terminal: origin cell, per-level pad
+            for s_ in range(base, smax + 1):
+                to_ok.extend(svc.pad_clear(oq, orr, s_, dwell_steps[L]) for L in range(nlev))
         if not any(to_ok):
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
-        # ---- goal cell(s) at EVERY level + PER-LEVEL landing-feasible step intervals (lf_off[L]:lf_off[L+1]) ----
-        if fixed and d_term is not None:                      # dest exit-lane cells; column-capacity landing
-            goal_pairs = [(q, c_lat * (lane.dist - d_r)) for lane in d_lanes
-                          if (q := cocc.qr_index(lane.cell[0], lane.cell[1])) >= 0]
-            goal_qr = [q for q, _ in goal_pairs]
-            if not goal_qr:
-                return self._splan_reference(req, ledger, cfg)
-
-            def _land(s, L):
-                return tcap.dwell_ok(d_term, dest, s * dt, d_cap, z=levels[L])
-        else:                                                 # single dest hex; pad-clear landing
-            goal_qr = [gqr]
-            goal_pairs = [(gqr, 0.0)]
-
-            def _land(s, L):
-                return svc.pad_clear(gq, grr, s, dwell_steps[L])
-        goal_cost_lb = min((cost for _, cost in goal_pairs), default=0.0)
-        for q, goal_cost in goal_pairs:                        # land from ANY level ⇒ mark at all levels
-            for L in range(nlev):
-                cell = q * nlev + L
-                self._k_goal_gen[cell] = self._sgen
-                self._k_goal_cost[cell] = goal_cost
-        lf_lo, lf_hi, lf_off = [], [], [0]                    # per-level landing runs, concatenated
+        if fixed and d_term is not None:                       # column-capacity landing
+            def _land(s_, L):
+                return tcap.dwell_ok(d_term, dest, s_ * dt, d_cap, z=levels[L])
+        else:                                                  # single dest hex; pad-clear landing
+            def _land(s_, L):
+                return svc.pad_clear(gq, grr, s_, dwell_steps[L])
+        lf_lo, lf_hi, lf_off = [], [], [0]                     # per-level landing runs, concatenated
         for L in range(nlev):
             lo = -1
-            for s in range(base, max_step + 1):
-                if _land(s, L):
+            for s_ in range(base, max_step + 1):
+                if _land(s_, L):
                     if lo < 0:
-                        lo = s
+                        lo = s_
                 elif lo >= 0:
-                    lf_lo.append(lo); lf_hi.append(s - 1); lo = -1
+                    lf_lo.append(lo); lf_hi.append(s_ - 1); lo = -1
             if lo >= 0:
                 lf_lo.append(lo); lf_hi.append(max_step)
             lf_off.append(len(lf_lo))
         if not lf_lo:
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
-        # Per-plan read-set reset. min > max means "never probed", which `_mk_envelope` reads as
-        # `cell_bbox=None`. Slots 6-7 are the STEP window, filled once here rather than per probe: a
+        # Per-plan read-set reset, OUTSIDE the loop: a widen re-run ACCUMULATES onto the same read
+        # set
+        # (A* does the same). min > max means "never probed", which `_mk_envelope` reads as
+        # `cell_bbox=None`. Slots 6-7 are the STEP window, filled ONCE here rather than per probe: a
         # chain walk reads a cell across the whole window, not at a point (see `_note_cell`).
-        rb = self._k_read_bbox
+        # `read_bbox` lives in A*'s `_ks` (shared, because `_mk_envelope` is inherited), so bind
+        # that
+        # dict before the loop — the SIPP arrays inside it are sized per widen, this one is not.
+        rb = super()._kernel_state(cocc, self._log2_cap_max)[0]["read_bbox"]
         rb[0] = rb[2] = rb[4] = _BBOX_HUGE
         rb[1] = rb[3] = rb[5] = -_BBOX_HUGE
         rb[6] = base
         rb[7] = max_step
 
-        # ---- call the kernel ----
-        n, _cost, _n_exp, flag = self._skernel(
-            cocc.iv_lo, cocc.iv_hi, cocc.iv_nxt,
-            self._k_ov_lo, self._k_ov_hi, self._k_ov_nxt, self._k_ov_head, self._k_ov_gen, cocc.cap,
-            cocc.qmin, cocc.rmin, cocc.rspan, cocc.qspan, base, max_step, nlev,
-            np.asarray(lane_qr, np.int64), np.asarray(lane_lat, np.float64),
-            np.asarray(lane_st, np.int64), len(lane_qr),
-            np.asarray(to_ok, np.bool_), n_to, c_gd,
-            np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
-            np.asarray(rung_steps, np.int64), np.asarray(rung_cost, np.float64),
-            self._k_goal_gen, self._k_goal_cost, np.asarray(lf_lo, np.int64), np.asarray(lf_hi, np.int64),
-            np.asarray(lf_off, np.int64),
-            c_hold, c_lat, pitch, dt, gx, gy, R, h_off, goal_cost_lb,
-            self._sgen, self._k_front_head, self._k_front_tail, self._k_front_gen,
-            self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
-            self._k_lab_next, self._k_lab_prev, self._k_lab_dead, self._k_max,
-            self._k_heap_f, self._k_heap_c, self._k_heap_n, self._k_max,
-            self._k_gpack, self._k_gpackf, self._k_hash_cap, self._k_hash_log2, max_step + 2,
-            self._k_out_q, self._k_out_r, self._k_out_s, self._k_out_L,
-            rb,
-        )
+        lane_cells = ([ln.cell for ln in o_lanes] if fixed and o_term is not None else [(oq, orr)])
+        lane_lat = ([c_lat * (ln.dist - o_r) for ln in o_lanes]
+                    if fixed and o_term is not None else [0.0])
+        lane_st = ([ln.steps for ln in o_lanes] if fixed and o_term is not None else [0])
+        goal_cells = ([ln.cell for ln in d_lanes] if fixed and d_term is not None else [(gq, grr)])
+        goal_lat = ([c_lat * (ln.dist - d_r) for ln in d_lanes]
+                    if fixed and d_term is not None else [0.0])
+        anchor_q = [oq, gq] + [c[0] for c in lane_cells] + [c[0] for c in goal_cells]
+        anchor_r = [orr, grr] + [c[1] for c in lane_cells] + [c[1] for c in goal_cells]
+
+        widen = 0
+        while True:
+            # `gen` INSIDE the loop, and this line is load-bearing: it stamps `ov_own_gen`, the
+            # frontier, the goal flags AND the kernel's g-hash, so hoisting it makes a widen re-run
+            # reuse the previous pass's closed set and return a spurious NO_PATH. Same discipline as
+            # `AStarPlanner._plan_compiled`'s FB_MASK re-run.
+            gen = self._bump_gen()
+            if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
+                # A cell under BOTH our column and a foreign hub's. One boolean per cell cannot say
+                # that, so take the exact reference — A*'s issue-#3 exit, reused verbatim. Measured
+                # unreachable on demand-generated layouts (see `sipp_window`'s header).
+                self._sfb += 1
+                self._sfb_overlap += 1
+                return self._splan_reference(req, ledger, cfg)
+
+            n_wcells = SW.window_bounds(
+                cocc, self._k_wbox, q_cells=anchor_q, r_cells=anchor_r, base=base,
+                max_step=max_step, lateral_margin=_SWINDOW_MARGIN_HEX * (1 << widen))
+            if n_wcells <= 0:                       # box clipped to nothing at this widen level
+                return self._splan_reference(req, ledger, cfg)
+
+            # WINDOW-LOCAL indices, recomputed per widen because the window moved. The kernel
+            # reconstructs world (q, r) as `iq + qmin`, so every index handed to it must be in the
+            # same frame as the bounds it is given.
+            wq0, wr0 = int(self._k_wbox[SW.W_Q0]), int(self._k_wbox[SW.W_R0])
+            wrspan = int(self._k_wbox[SW.W_RSPAN])
+            wqspan = int(self._k_wbox[SW.W_Q1]) - wq0 + 1
+
+            def _wqr(qc, rc, wq0=wq0, wr0=wr0, wrspan=wrspan, wqspan=wqspan):
+                iq, ir = qc - wq0, rc - wr0
+                return iq * wrspan + ir if 0 <= iq < wqspan and 0 <= ir < wrspan else -1
+
+            lane_qr = [(w, lat, st) for (qc, rc), lat, st in zip(lane_cells, lane_lat, lane_st)
+                       if (w := _wqr(qc, rc)) >= 0]
+            goal_pairs = [(w, lat) for (qc, rc), lat in zip(goal_cells, goal_lat)
+                          if (w := _wqr(qc, rc)) >= 0]
+            if not lane_qr or not goal_pairs:
+                if widen < _SWINDOW_WIDEN_MAX:      # an endpoint fell outside: widen before giving up
+                    self._swin_widen += 1
+                    widen += 1
+                    continue
+                return self._splan_reference(req, ledger, cfg)
+
+            ks, _kc = self._skernel_state(cocc, n_wcells)
+            for _ in range(_SWINDOW_GROW_MAX):
+                tail = SW.build_window_intervals(
+                    cocc._arena.arena, cocc._arena.start, cocc._arena.length, cocc.static_col,
+                    ks["ov_own_gen"], gen, cocc.qmin, cocc.rmin, cocc.rspan, cocc.n_levels,
+                    self._k_wbox, self._k_iv_lo, self._k_iv_hi, self._k_iv_nxt, self._k_scratch,
+                    _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
+                if tail >= 0:
+                    break
+                self._swin_grown += 1
+                self._skernel_state(cocc, -tail)   # grow to exactly what the builder asked for
+            else:
+                return self._splan_reference(req, ledger, cfg)   # would not fit even after growing
+
+            goal_cost_lb = min((cost for _, cost in goal_pairs), default=0.0)
+            for w, goal_cost in goal_pairs:        # land from ANY level ⇒ mark at all levels
+                for L in range(nlev):
+                    cell = w * nlev + L
+                    self._k_goal_gen[cell] = gen
+                    self._k_goal_cost[cell] = goal_cost
+
+            n, _cost, _n_exp, flag = self._skernel(
+                self._k_iv_lo, self._k_iv_hi, self._k_iv_nxt,
+                wq0, wr0, wrspan, wqspan, base, max_step, nlev,
+                np.asarray([w for w, _, _ in lane_qr], np.int64),
+                np.asarray([lat for _, lat, _ in lane_qr], np.float64),
+                np.asarray([st for _, _, st in lane_qr], np.int64), len(lane_qr),
+                np.asarray(to_ok, np.bool_), n_to, c_gd,
+                np.asarray(takeoff_steps, np.int64), np.asarray(takeoff_cost, np.float64),
+                np.asarray(rung_steps, np.int64), np.asarray(rung_cost, np.float64),
+                self._k_goal_gen, self._k_goal_cost, np.asarray(lf_lo, np.int64),
+                np.asarray(lf_hi, np.int64), np.asarray(lf_off, np.int64),
+                c_hold, c_lat, pitch, dt, gx, gy, R, h_off, goal_cost_lb,
+                gen, self._k_front_head, self._k_front_tail, self._k_front_gen,
+                self._k_lab_cell, self._k_lab_slot, self._k_lab_arr, self._k_lab_g, self._k_lab_par,
+                self._k_lab_next, self._k_lab_prev, self._k_lab_dead, self._k_max,
+                self._k_heap_f, self._k_heap_c, self._k_heap_n, self._k_max,
+                self._k_gpack, self._k_gpackf, self._k_hash_cap, self._k_hash_log2, max_step + 2,
+                self._k_out_q, self._k_out_r, self._k_out_s, self._k_out_L,
+                rb,
+            )
+            # FB_OOB is now a WINDOW miss, not a global-box stray: `window_bounds` already clipped
+            # to
+            # the global box, so a cell outside the window is recoverable by widening. The kernel
+            # returns it on the FIRST touch, before reading any chain, so no partial result exists
+            # to
+            # discard. At the ceiling this falls through to the unbounded reference like any other.
+            if flag == FB_OOB and widen < _SWINDOW_WIDEN_MAX:
+                self._swin_widen += 1
+                widen += 1
+                continue
+            break
+
         self._n_expansions = int(_n_exp)
         self.last_expansions = self._n_expansions          # inherited public telemetry contract
         if self.record_envelope and flag not in (FB_OOB, FB_CAP, FB_HASH):

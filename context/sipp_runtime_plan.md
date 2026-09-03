@@ -99,10 +99,35 @@ rebuild that arms the map before any `is_blocked` can run. SIPP declared the fla
 
 ## 2. Where this leaves the end-to-end picture
 
-SIPP's *plan* side is already competitive — 148.1 s against A\*'s 155.7 s of non-ledger loop time in
-the recorded baseline, i.e. 1.05x **faster**. The whole 1.50x deficit is the ledger side. Bringing
-SIPP's ledger cost to A\*'s (18.840 -> 5.509 ms/flight) is the entire fix, and it is not a tuning
-exercise: it is adopting the structure `#124` built.
+Fresh paired A/B on `4c81255` (`analysis/ab_lns_repair_planner.py`, full `density_faa`, 4,636 legs,
+N=8, 300 iterations, arms strictly sequential, baselines asserted identical):
+
+| arm | loop s | plan s | ledger s | other s | improvement | accepted | release subs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| astar | 165.8 | 135.7 | **23.5** | 6.6 | 0.46% | 86/300 | 3 |
+| sipp | 276.8 | 146.3 | **124.1** | 6.4 | 0.54% | 88/300 | 4 |
+
+SIPP is **1.67x slower** on the loop, and the ledger is 44.8% of it against A\*'s 14.2%. Quality is a
+wash (+0.08 pp against a recorded 0.18 pp seed-to-seed spread), zero kernel fallbacks, both verified.
+
+**Two corrections to the story as previously recorded.**
+
+*First*, the ledger ratio here is 124.1 / 23.5 = **5.28x**, higher than the 3.42x §1 measures. The two
+agree: §1's warm set is 2,400 flights and the real LNS state is 4,636, and §1.1 shows the release term
+is linear in congestion. Extrapolating the amplification (7.03x at 2,400) to full scale puts SIPP's
+release near 12 ms/flight and its total near 24.8 against A\*'s 5.5 — 4.5x, and the remainder is the
+rejected-iteration release/recommit that both arms pay. **§1's numbers under-state the gap** because
+they were taken at half the congestion; they are the conservative bound.
+
+*Second, and it cuts against this plan:* SIPP's plan side is **not** ahead. `context/sipp_lns_plan.md`
+§13 reported it as 1.05x faster, derived by subtracting ledger from loop. This run has an explicit
+`t_plan_s` timer and it says 146.3 s against A\*'s 135.7 — SIPP's plan side is **7.8% slower**. The
+older figure folded `other` into "plan" and compared against an A\* loop that had drifted high
+(181.0 s then, 165.8 s here; A\*'s loop time is known to drift across invocations). Section 4.7 is
+re-derived from these numbers, not those.
+
+The ledger is still the whole *actionable* deficit — 100.6 s of the 111.0 s gap — and bringing it to
+A\*'s cost is not a tuning exercise: it is adopting the structure `#124` built.
 
 ## 3. The PR series
 
@@ -263,14 +288,24 @@ global index have no readers and can go.
 **`freespace_sim/planner/compiled_occupancy.py`** — **FILE DELETED**. `CompiledOccupancy`,
 `reset_cell`, `on_release`, `_record`, `_claims`, `_rows`, `_static_cells`, `_free` all go with it.
 
-**`freespace_sim/planner/sipp_kernel.py`**
+**`freespace_sim/planner/sipp_kernel.py`** — **far smaller than it looks**, and worth checking before
+budgeting for it. The kernel's cell encoding is already fully parameterised by
+`qmin, rmin, rspan, qspan, nlevels` (`cell = ((q - qmin) * rspan + (r - rmin)) * nlevels + L`), so
+"window-local" is *passing the window's bounds instead of the global box's*. Three consequences:
 
-* `_search` — **MODIFIED**. Cell ids become window-local; `iv_*` are the window pool and the
-  `ov_*`/`cap` parameters are dropped (the overlay is folded into the build). A probe outside the
-  window returns the new `FB_WINDOW` instead of reading a cell that does not exist.
-* `_note_cell` — **MODIFIED**. Takes the window origin so the recorded read bbox stays in **world**
-  axial coordinates — the DROP envelope contract from `#125` must not silently become window-local.
-* `FB_WINDOW` — **ADDED** constant.
+* `_search` — **MODIFIED**, but only in its parameter list: `ov_lo/ov_hi/ov_nxt/ov_head/ov_gen/cap`
+  are dropped (the overlay folds into the build, so the `sj >= cap` branch is dead) and `iv_*` become
+  the window pool. The traversal, dominance, heap and cost code is untouched.
+* **`FB_WINDOW` is not needed.** `_search` already returns `FB_OOB` on the *first* touch of a cell
+  outside `[qmin, qmin+qspan) x [rmin, rmin+rspan)`, before reading any chain — exactly the
+  "never a partial result" discipline §4.2 asks for, already implemented and already tested. A window
+  miss reuses it verbatim; only the host's response changes, from "fall to the reference" to "widen,
+  then fall to the reference at the ceiling".
+* `_note_cell` — **UNCHANGED**. It is called with world `(q, r)` at every site (`_note_cell(read_bbox,
+  nq, nr, Lc)`; the takeoff site reconstructs `iq0 + qmin` first), and the path output does the same
+  (`out_r[m] = ccqr - ci * rspan + rmin`). The DROP envelope contract from `#125` therefore survives
+  the change with no code touched — which is the one thing here worth verifying by test rather than
+  by reading, and `tests/test_parallel_envelope.py` already does.
 
 **Tests**
 
@@ -323,10 +358,12 @@ interval chain**, so a cell outside the window has no chain at all and the searc
 it as free — a conflicting plan, not a slow one. The widen path is therefore load-bearing in a way
 A\*'s is not.
 
-*Resolution, and it is three things, not one:*
+*Resolution, and the first part is already built:*
 
-* `FB_WINDOW` is returned on the **first** out-of-window cell touch, before the chain is read. Never a
-  partial result — same discipline as `FB_MASK`.
+* The kernel returns `FB_OOB` on the **first** out-of-box cell touch, before any chain is read
+  (`sipp_kernel._search` line 252). Pointing it at a window box rather than the global box makes that
+  the window-miss signal for free — no new code, no partial result. This is the single fact that
+  makes PR 2b tractable.
 * The widen ceiling falls through to `_splan_reference`, which is unbounded. Correctness never depends
   on the window being big enough.
 * `tests/test_sipp_window.py::test_window_miss_widens_and_stays_exact` deliberately undersizes the
@@ -383,13 +420,34 @@ This is a genuinely smaller PR and would cut the constant, plausibly 5-10x (6.10
 place, so the gap re-opens as scenarios grow, and it keeps both the global index and the static-wall
 trap. Recorded here as the fallback, not the plan.
 
-### 4.7 What this plan does not fix
+### 4.7 What this plan does not fix — and the projection is parity, not a win
 
-SIPP would reach parity on the ledger side, not a win. The recorded baseline puts SIPP's non-ledger
-loop at 148.1 s against A\*'s 155.7 s, so full ledger parity projects to roughly **1.04x faster than
-A\***, not 1.5x. That is enough to make SIPP the better repair planner and to make the DROP numbers
-worth re-running, but anyone expecting the pre-`#124` 1.1-1.2x story to return at a larger multiple
-should not read it here. The plan-side lever is separate and untouched.
+Ledger parity is the ceiling of this work, and §2's corrected numbers put that ceiling *below* A\*:
+
+```
+sipp today      276.8 = plan 146.3 + ledger 124.1 + other 6.4
+sipp at parity  176.2 = plan 146.3 + ledger  23.5 + other 6.4
+              + ~2.4   the new per-plan window build (~1 ms x 2,400 plans)
+              = ~178.6  against A*'s 165.8   ->  still ~1.08x SLOWER
+```
+
+So the honest projection is **SIPP lands within ~8% of A\*, not ahead of it.** The remaining gap is
+plan-side (146.3 against 135.7) and this plan does not touch it.
+
+That is still worth doing, for three reasons that do not depend on winning the wall-clock race:
+
+1. It removes a term that **grows with scenario size**. At parity the two planners scale together; today
+   the gap widens with every flight added, which makes every SIPP measurement scenario-specific.
+2. It deletes two structures, ~570 lines, the static-wall trap that bit twice during `#125`, and the
+   ~334 MB of kernel arrays sized to `cocc.cap` — the term `#125` flagged as deciding whether DROP m=8
+   fits in memory.
+3. SIPP's quality edge is real if small and consistent in sign (+0.08 pp here, and it accepted 88
+   against 86). At 1.67x the wall that is not a trade anyone would take; at 1.08x it becomes a live
+   question, and at parity-plus-a-plan-side-fix it becomes the default.
+
+**Anyone hoping this restores a 1.1-1.2x SIPP win should not read that here.** If the goal is to beat
+A\*, this plan is a prerequisite, not the answer — the answer needs a plan-side lever as well, and
+`context/sipp_lns_plan.md` has no candidate for one.
 
 ## 5. Branch and review mechanics
 

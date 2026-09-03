@@ -361,10 +361,14 @@ def _nondominated(frontier, key, t, g, w):
 class SIPPPlanner(AStarPlanner):
     """Safe-interval cost-aware planner; inherits occupancy/terminal sync and corridor build from A*."""
 
-    # SIPP queries `HexOccupancyService.is_blocked` directly (its safe-interval index mirrors it, and
-    # the legacy-terminal path searches against it), so the map the compiled A* path switches off must
-    # stay maintained here.
-    needs_blocked_map = True
+    # `needs_blocked_map` is deliberately NOT set (so it inherits False, and `_occupancy`
+    # builds the service with `maintain_blocked=False`). SIPP does call
+    # `HexOccupancyService.is_blocked` — but only from `_succ`, the pure-Python REFERENCE
+    # successor generator, never from `_splan_compiled`, whose kernel answers the obstacle
+    # test out of the interval pool. Declaring the flag therefore bought a map written on
+    # every commit and read only on a fallback: measured 1.807 ms/flight at density_faa
+    # scale (5.562 against 3.755), where the fallback rate is zero. `_splan_reference` arms
+    # it via `enable_blocked` instead — A*'s existing lazy, sticky re-arm.
 
     def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True,
                  kernel_log2_min: int | None = None, incremental_release: bool = False,
@@ -551,6 +555,13 @@ class SIPPPlanner(AStarPlanner):
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         svc = self._occupancy(req, ledger, cfg)
+        # THIS is the search that reads `blocked` (via `_succ`), and on a compiled planner
+        # the service was built not maintaining it. Arm it here — before any `is_blocked` —
+        # rather than lazily inside the query: the service holds no ledger, so a query that
+        # could not rebuild would have to choose between a wrong answer and a raise deep
+        # inside the oracle. Sticky, so a run that falls back repeatedly pays the
+        # O(schedule) rebuild once. Mirrors `AStarPlanner._plan_reference`.
+        svc.enable_blocked(ledger)
         sidx = self._sipp_index(req, ledger, cfg)
         tcap = self._tcap
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))

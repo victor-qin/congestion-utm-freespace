@@ -488,6 +488,13 @@ def test_compiled_terminal_path_never_routes_through_blocked():
         if not c.accepted or sipp._sfb != fb0:        # skip denied / fell-back-to-A* plans
             continue
         own, svc = sipp._own, sipp._svc
+        # The compiled path builds `_svc` with `maintain_blocked=False` (the map's only
+        # reader is the pure-Python reference), so this oracle has to arm it. Explicitly,
+        # and NOT relying on a stray fallback in the warm loop having armed it stickily:
+        # `enable_blocked` is idempotent, and without this the test either raises deep
+        # inside `is_blocked` or passes for a reason it does not state. Outside the loop
+        # would be wrong too — the map must be current for THIS commit.
+        svc.enable_blocked(led)
         for (q, r, L, s) in sipp._air:                 # the per-step compiled search path (per flight level)
             if svc.is_blocked(q, r, L, s, own):
                 violations.append((rq.flight_id, q, r, L, s))

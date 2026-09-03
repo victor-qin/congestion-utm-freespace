@@ -356,6 +356,54 @@ def test_sipp_record_envelope_off_leaves_none():
     assert sipp.last_envelope is None
 
 
+def test_sipp_compiled_does_not_maintain_the_blocked_map():
+    """SIPP used to declare `needs_blocked_map = True`, which kept `HexOccupancyService`
+    maintaining a map whose ONLY reader is `is_blocked` — called from `_succ`, i.e. the
+    pure-Python reference, never from the compiled path. Measured 1.807 ms/flight at
+    density_faa scale (5.562 against 3.755) for a structure written on every commit and
+    read on a fallback that does not happen.
+
+    Asserting the flag alone would be worthless (it is a class attribute); assert the
+    OBSERVABLE — the service is not writing the map after a compiled plan committed."""
+    if not SIPPPlanner().sipp_compiled:
+        pytest.skip("numba unavailable; every plan takes the reference, which arms the map")
+    led = ReservationLedger(CFG)
+    sipp = SIPPPlanner()
+    intent = sipp.plan(_req(1), led, CFG)
+    assert intent.accepted
+    led.commit(1, intent.volumes)
+    sipp.plan(_req(2, y=600.0), led, CFG)          # a second plan, against a non-empty ledger
+    assert sipp._svc._blocked_live is False, "compiled SIPP is still maintaining `blocked`"
+    assert not sipp._svc.blocked, f"`blocked` has {len(sipp._svc.blocked)} steps written into it"
+    assert sipp._svc.pad, "the pad map must still be live — `pad_clear` is on the compiled path"
+
+
+def test_sipp_reference_arms_the_blocked_map():
+    """`_splan_reference` searches through `_succ`, which calls `svc.is_blocked`, and an
+    unmaintained map RAISES (`HexOccupancyService.is_blocked`). So the reference arms it.
+
+    The gate is the second assertion, not the first: a build that armed the map but armed it WRONG
+    would still flip `_blocked_live`. Comparing against a planner whose map was eager from the very
+    first commit is what makes this a test — `enable_blocked` replays the ledger, and replaying it
+    incorrectly (double-counting refcounts, missing the own-column skip) is the plausible bug."""
+    led = ReservationLedger(CFG)
+    lazy = SIPPPlanner()
+    seed = lazy.plan(_req(1), led, CFG)
+    assert seed.accepted
+    led.commit(1, seed.volumes)
+
+    eager = SIPPPlanner()
+    eager._occupancy(_req(2, y=300.0), led, CFG).enable_blocked(led)   # armed BEFORE planning
+    assert eager._svc._blocked_live
+
+    got = lazy._splan_reference(_req(2, y=300.0), led, CFG)
+    want = eager._splan_reference(_req(2, y=300.0), led, CFG)
+    assert lazy._svc._blocked_live, "the reference search did not arm the map"
+    assert lazy._svc.blocked == eager._svc.blocked, "armed map differs from an eager one"
+    assert got.accepted == want.accepted
+    assert got.cost == pytest.approx(want.cost, abs=1e-12)
+
+
 def test_sipp_honors_evict_floor_for_its_own_structures():
     """Out-of-order LNS repair needs the full-horizon occupancy; the floor must reach SIPP's two."""
     led = ReservationLedger(CFG)

@@ -421,7 +421,9 @@ class SIPPPlanner(AStarPlanner):
         self._k_wbox = SW.empty_wbox()  # per-plan window geometry; W_STEPS == 0 is OFF
         self._swin_widen = 0            # plans that grew their window and re-ran (diagnostics)
         self._swin_grown = 0            # plans that grew the interval buffers
-        self._k_cap = -1                               # frontier size the kernel arrays are sized to
+        self._k_cap = -1        # per-SLOT arrays (frontier + goal), sized from the build's tail
+        self._k_cap_iv = -1     # interval buffers, sized from the build's capacity ESTIMATE
+        self._n_frontier_allocs = 0                     # reallocations (diagnostics)
         self._k_lab_cell = None                        # kernel work arrays (allocated lazily)
         self._k_out_q = None
         self._sfb = 0                                   # kernel→A* fallbacks (diagnostics/tests)
@@ -796,7 +798,7 @@ class SIPPPlanner(AStarPlanner):
         self._sidx_ledger = master._sidx_ledger
         self._sidx_epoch = master._sidx_epoch
 
-    def _skernel_state(self, cocc, n_slots: int):
+    def _skernel_state(self, cocc, n_iv: int):
         """Work arrays for one plan, sized to the WINDOW rather than to the whole box.
 
         Returns A*'s ``(ks, kc)`` pair, EXTENDED with SIPP's own arrays rather than replacing it.
@@ -806,26 +808,26 @@ class SIPPPlanner(AStarPlanner):
         ``ks["win"]``, ``ks["wbox"]`` and ``ks["win_stats"]``. Assigning a dict with only SIPP's keys
         would ``KeyError`` on the first terminal plan and again on the first ``FB_CAP``.
 
-        ``n_slots`` is what the window build needs (head slot per window cell + overflow intervals).
-        The frontier is per-SLOT and the goal arrays per-CELL, but both are grown against the same
-        number: over-allocating the goal arrays by the overflow count is a rounding error next to the
-        ``cocc.cap`` (654,266 slots) they used to be sized from, and one growth trigger cannot drift.
+        ``n_iv`` sizes the INTERVAL buffers only, and it is the window build's capacity ESTIMATE —
+        conservative by construction, since it bounds a cell's free intervals by its claim count
+        and merged claims collapse. Measured 2-4x loose.
+
+        The frontier and goal arrays are sized separately, by :meth:`_sfrontier_state`, from the
+        tail the build actually returned. Sizing them from the estimate instead — what this method
+        used to do, with a doubling ratchet on top — left them **5.7x** over-allocated: 553,152
+        slots against a measured max usage of 97,228, i.e. 22.1 MB where 3.9 MB does. That is a
+        MEMORY win and not a speed one; see `_sfrontier_state` for the measurement.
         """
         ks, kc = super()._kernel_state(cocc, self._log2_cap_max)
-        if self._k_cap < n_slots:
-            self._k_cap = max(n_slots, 2 * self._k_cap)   # amortise: a widen doubles the window
-            self._k_front_head = np.full(self._k_cap, -1, np.int64)
-            self._k_front_tail = np.full(self._k_cap, -1, np.int64)   # sorted-by-arr staircase per slot
-            self._k_front_gen = np.zeros(self._k_cap, np.int64)
-            self._k_goal_gen = np.zeros(self._k_cap, np.int64)        # per-cell goal flag (stamped)
-            self._k_goal_cost = np.zeros(self._k_cap, np.float64)     # lane-cell → terminal-edge cost
-            self._k_iv_lo = np.zeros(self._k_cap, np.int32)           # the per-plan window pool
-            self._k_iv_hi = np.zeros(self._k_cap, np.int32)
-            self._k_iv_nxt = np.full(self._k_cap, -1, np.int32)
+        if self._k_cap_iv < n_iv:
+            self._k_cap_iv = n_iv
+            self._k_iv_lo = np.zeros(n_iv, np.int32)                  # the per-plan window pool
+            self._k_iv_hi = np.zeros(n_iv, np.int32)
+            self._k_iv_nxt = np.full(n_iv, -1, np.int32)
             # `build_window_intervals` requires `scratch` at least as long as `iv_lo`: its capacity
             # pass bounds the window's TOTAL claim count, and one cell cannot exceed the total, so a
             # single sizing rule covers both and there is only ever one shortfall to report.
-            self._k_scratch = np.zeros(self._k_cap, np.int64)
+            self._k_scratch = np.zeros(n_iv, np.int64)
         self._k_read_bbox = ks["read_bbox"]           # shared with A*: `_mk_envelope` is inherited
         if self._k_lab_cell is None:                     # labels + heap: allocate once
             ml = 1 << 21
@@ -857,6 +859,38 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_s = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_L = np.empty(cocc.MAXS + 8, np.int64)      # flight level per output waypoint
         return ks, kc
+
+    def _sfrontier_state(self, n_slots: int) -> None:
+        """Size the kernel's per-slot arrays to the tail the build ACTUALLY produced.
+
+        Split from :meth:`_skernel_state` because these are indexed by real slot ids — the frontier
+        staircase by slot, the goal flags by window cell, and ``tail >= n_wcells`` covers both — so
+        they never needed the interval buffers' conservative capacity estimate. Sizing them from it
+        (and then doubling) held 22.1 MB where 3.9 MB suffices, on the five arrays the kernel probes
+        most randomly.
+
+        Grows to exactly what is asked, with no doubling ratchet. A ratchet is the right shape when
+        reallocation is frequent; here it is not — measured **12** reallocations over 1,526 plans,
+        because one only happens when a plan sets a new maximum — and its cost is permanent, since
+        the arrays are held for the run and never shrink.
+
+        **This did NOT make the kernel faster, and that is worth recording.** It was done to test
+        whether the 33% plan-side gain in `context/sipp_runtime_plan.md` §7 came from working-set
+        locality. Shrinking these five arrays 22.1 -> 3.9 MB moved kernel time 15.28 -> 15.16
+        ms/plan, i.e. nothing. In hindsight that is what the design predicts: they are
+        VERSION-STAMPED, so the kernel touches only the slots it actually visits and the allocation
+        size never determined which cache lines were read. The win here is 18.2 MB per planner,
+        which is a DROP concern (m=8 workers hold their own kernel state), not a latency one.
+        """
+        if self._k_cap >= n_slots:
+            return
+        self._k_cap = n_slots
+        self._k_front_head = np.full(n_slots, -1, np.int64)
+        self._k_front_tail = np.full(n_slots, -1, np.int64)   # sorted-by-arr staircase per slot
+        self._k_front_gen = np.zeros(n_slots, np.int64)
+        self._k_goal_gen = np.zeros(n_slots, np.int64)        # per-cell goal flag (version-stamped)
+        self._k_goal_cost = np.zeros(n_slots, np.float64)     # lane-cell → terminal-edge cost
+        self._n_frontier_allocs += 1
 
     def _fallback(self, req, ledger, cfg):
         """Fallback when the compiled kernel bails (``FB_OOB``/``FB_CAP``): run **A\\*** — the superclass
@@ -1066,6 +1100,10 @@ class SIPPPlanner(AStarPlanner):
                 self._skernel_state(cocc, -tail)   # grow to exactly what the builder asked for
             else:
                 return self._splan_reference(req, ledger, cfg)   # would not fit even after growing
+
+            # Now that the build has reported its real tail, size the per-slot arrays to IT rather
+            # than to the estimate the interval buffers had to assume.
+            self._sfrontier_state(tail)
 
             goal_cost_lb = min((cost for _, cost in goal_pairs), default=0.0)
             for w, goal_cost in goal_pairs:        # land from ANY level ⇒ mark at all levels

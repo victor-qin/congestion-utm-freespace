@@ -559,24 +559,30 @@ CEILING of this work" and "the remaining gap is plan-side and this plan does not
 side went **146.3 -> 97.8 s**, from 7.8% slower than A\* to 1.30x faster. The error was modelling
 Phase 3 as a pure ledger change when the same rewrite also changes what the *kernel* reads.
 
-**What I have not established is which term did it.** Three candidates, and only the first is
-measured:
+**What I have not established is which term did it** — and two of the three candidates are now
+measured and DEAD.
 
-1. **Working set** — the version-stamped arrays fell 36.58 -> 22.13 MB (1.7x), because the frontier
-   and goal arrays now size to a window rather than to `cocc.cap`, and the overlay's two `cap`-sized
-   arrays are gone entirely. Measured — and much *smaller* than the 20x I guessed before checking,
-   so on its own it does not look like enough.
-2. **Chain length.** The old pool's chains spanned `[0, MAXS]` = 4,106 steps and accumulated a split
-   from every commit that ever touched the cell; the per-plan chains are clipped to
-   `[base, max_step]`, and the read-window probe measures that at **28.5% of the step axis**. The
-   kernel walks chains constantly, so shorter chains would show up directly. Unmeasured.
-3. **Overlay indirection.** Three hot sites lost `ov_head[cell] if ov_gen[cell] == gen else cell` —
-   two random reads and a branch per chain walk — plus an `sj >= cap` test per interval *inside* the
-   walk. Unmeasured.
+1. ~~**Working set.**~~ **FALSIFIED.** The per-slot arrays were still 5.7x over-allocated after
+   Phase 3 (553,152 slots / 22.1 MB against a measured max usage of 97,228), because the frontier
+   and goal arrays were sized from the interval build's conservative capacity ESTIMATE and then
+   doubled. Sizing them from the build's actual tail took them to 3.9 MB — and moved kernel time
+   **15.28 -> 15.16 ms/plan, i.e. nothing.** In hindsight that is what the design predicts: those
+   arrays are version-stamped, so the kernel touches only the slots it visits and the allocation
+   size never determined which cache lines were read. Kept anyway, as an 18.2 MB/planner memory win
+   that matters under DROP (`299901c`'s sibling commit).
+2. **Chain length.** UNSUPPORTED, not conclusive. Sampled mean intervals per cell: old global pool
+   over `[0, MAXS]` **1.824**, new window pool over `[base, max_step]` **2.262** — the new chains are
+   if anything LONGER. The populations differ (the old sample spans the whole box including empty
+   regions, the new spans one busy window), so this is suggestive rather than decisive, but it does
+   not support the hypothesis.
+3. **Overlay indirection.** Still untested, and now the leading candidate by elimination. Three hot
+   sites lost `ov_head[cell] if ov_gen[cell] == gen else cell` — two random reads and a branch per
+   chain walk — plus an `sj >= cap` test per interval *inside* the walk. With a mean chain of ~2
+   intervals, that per-walk preamble is comparable in size to the walk itself, which is the shape
+   that would explain a large kernel-wide effect.
 
-Isolating this needs the deleted structure back (check out `d19eb49` and instrument chain lengths on
-the same flights). Worth doing before anyone cites a mechanism: right now the *result* is solid and
-the *explanation* is a hypothesis.
+So: the *result* is solid and the *explanation* is still open, but narrower. Anyone citing a
+mechanism should test (3) by re-adding the indirection behind a flag.
 
 ### Gates
 

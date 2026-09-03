@@ -599,3 +599,35 @@ the *explanation* is a hypothesis.
 * `build_window_intervals` is in neither `_warm_jit` nor `_swarm_jit` — a ~0.92 s cold compile that a
   spawned DROP worker would pay on its first repair. It matters for the DROP run above, not for the
   sequential one measured here.
+
+### 7.1 DROP re-check (m=8, N=2, 600 s)
+
+`#125`'s parallel numbers were taken against the structures Phase 3 deletes, and the DROP staleness
+test runs through `_note_cell`, so this had to be re-run rather than assumed. Full `density_faa`,
+`--search-workers 8 --parallel-mode drop --neighborhood 2 --time-limit 600`, arms sequential:
+
+| | astar | sipp |
+| --- | ---: | ---: |
+| cost | 1349506 → 1293940 | 1349506 → **1291433** |
+| improvement | 4.12% | **4.30%** |
+| **tasks** | 27,791 | **31,983 (1.15x)** |
+| accepted | 2,572 | 3,002 |
+| accept rate | 9.3% | 9.4% |
+| clean-merge | 830 | **1,056** |
+| dirty rate | 40.8% | **39.3%** |
+| verified | True | True |
+
+**15% more tasks in the same wall clock, both conflict-free.** The read envelope survived the
+window-local rewrite — the specific risk in re-running this — and in fact got *tighter*: dirty rate
+below A\*'s and clean-merges up 830 → 1,056, consistent with `#125`'s measurement that SIPP's
+interval collapse probes fewer cells (61.5% against 78.7% at 4 workers).
+
+**The quality delta is ONE SAMPLE per arm and should not be quoted as a win.** +0.18 pp is exactly
+the seed-to-seed spread the sequential A/B recorded, and the adaptive operator weights diverged
+sharply between the two runs (`agent` 6.195 for astar against 0.296 for sipp), so they explored
+materially different trajectories. The **throughput** figure is the robust one: it is mechanical.
+
+This run also depends on `299901c`, which warms `build_window_intervals` in `_swarm_jit`. Without it
+every spawned worker meets an uncompiled builder on its first repair — ~0.92 s cold, simultaneously,
+billed to SIPP. That is the compile stampede `_swarm_jit` exists to prevent, and the measurement
+above would have carried it.

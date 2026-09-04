@@ -68,6 +68,7 @@ from freespace_sim.planner.lns.neighborhood import (
 )
 from freespace_sim.planner.lns.state import LNSState
 from freespace_sim.planner.lns.solver import (
+    assert_incumbent_ok,
     _build_lns_state,
     _effective_search_workers,
     _finalize_lns_result,
@@ -104,6 +105,7 @@ class WorkerSpec:
     movable_uss_ids: frozenset | None
     incremental_release: bool
     kernel_log2_min: int | None
+    pair_closed_neighborhood: bool = False
     record_envelope: bool = True
     # Answer-neutral (see LNSConfig.window_bytes), but still shipped: it is per-planner state, so a
     # worker left on the default would run a different cache configuration than the one measured.
@@ -307,6 +309,8 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
             else:
                 victims = random_neighborhood(state, spec.neighborhood_size)
 
+            if spec.pair_closed_neighborhood:
+                victims = state.close_over_pairs(victims)
             if not victims:
                 # The sequential loop short-circuits here with reason="empty" and never calls
                 # try_repair. Falling through would compute cost_new = 0.0, fail the strict
@@ -749,10 +753,7 @@ def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
     list, and no worker holds the blessed incumbent."""
     if not (just_applied and lns.verify_every and n_accepted % lns.verify_every == 0):
         return
-    bad = verify.find_interflight_conflict(
-        state.final_intents(), state.cfg, static_terminals=state.static_terms)
-    if bad is not None:
-        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+    assert_incumbent_ok(state)
 
 
 def _maybe_log(
@@ -829,6 +830,7 @@ def run_lns_parallel(
         movable_uss_ids=lns.movable_uss_ids,
         incremental_release=lns.incremental_release,
         kernel_log2_min=lns.worker_kernel_log2,
+        pair_closed_neighborhood=lns.pair_closed_neighborhood,
         record_envelope=lns.parallel_mode == "drop" and pool_workers > 1,
         window_bytes=lns.window_bytes,
         repair_planner=lns.repair_planner,

@@ -23,7 +23,9 @@ from freespace_sim.planner.lns.neighborhood import (
     random_neighborhood,
 )
 from freespace_sim.planner.lns import state as lns_state
+from freespace_sim.planner.lns.solver import run_lns_on_result
 from freespace_sim.planner.lns.state import LNSState
+from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.sim import run
 from freespace_sim.types import FlightRequest, vec
 from freespace_sim.volumes import Volume4D
@@ -1072,8 +1074,8 @@ def test_run_lns_defaults_unimpeded_ruler_to_in_process(monkeypatch):
     """A public API caller must opt into spawn; its top-level module may not have a main guard."""
     seen = []
 
-    def capture(_cfg, _static_terms, _requests, *, n_workers, log_every=1000):
-        seen.append(n_workers)
+    def capture(_cfg, _static_terms, _requests, *, n_workers, log_every=1000, shortcut=False):
+        seen.append((n_workers, shortcut))
         return []
 
     monkeypatch.setattr(lns_state, "unimpeded_costs", capture)
@@ -1082,7 +1084,14 @@ def test_run_lns_defaults_unimpeded_ruler_to_in_process(monkeypatch):
     run_lns(CFG, ReservationLedger(CFG), [],
             LNSConfig(max_iterations=0, log_every=0))
     LNSState(CFG, ReservationLedger(CFG), [])       # direct construction is safe by default too
-    assert seen == [1, 1]
+    # The ruler stays BARE for the default arm: wrapping it would change every delay premium, so
+    # this pins that a plain run is untouched by the shortcut arms existing.
+    assert seen == [(1, False), (1, False)]
+
+    seen.clear()
+    run_lns(CFG, ReservationLedger(CFG), [],
+            LNSConfig(max_iterations=0, log_every=0, shortcut_arm="deferred"))
+    assert seen == [(1, True)], "a shortcut arm must refine the ruler or premiums go negative"
 
 
 def test_run_lns_defaults_its_walls_to_the_ledgers(monkeypatch):
@@ -1229,3 +1238,158 @@ def test_reference_fallback_does_not_trigger_a_shrink_rebuild():
 
     p.plan(movable[2].request, led, res.config)              # the plan that used to rebuild
     assert p.n_shrink_rebuilds == 0, "a spurious shrink rebuild fired after a reference fallback"
+
+def _shortcut_repair_planner():
+    from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.shortcut import ShortcutRefiner
+
+    inner = AStarPlanner()
+    inner.evict_floor = 0.0
+    return ShortcutRefiner(inner)
+
+
+def test_a_wrapper_repair_planner_is_accepted_when_its_inner_floor_is_zero():
+    """The floor lives on the SEARCH planner; reading it off the wrapper refused every correctly
+    configured refiner, which is why no shortcut arm could be constructed at all."""
+    LNSState(CFG, ReservationLedger(CFG), [], repair_planner=_shortcut_repair_planner())
+
+
+def test_a_wrapper_repair_planner_is_refused_when_its_inner_floor_is_not_zero():
+    from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.shortcut import ShortcutRefiner
+
+    bad = ShortcutRefiner(AStarPlanner())        # inner keeps its default non-zero floor
+    with pytest.raises(ValueError, match="evict_floor must be 0.0"):
+        LNSState(CFG, ReservationLedger(CFG), [], repair_planner=bad)
+
+
+def test_a_bad_shortcut_arm_is_refused_before_the_ledger_is_taken_over():
+    """A typo'd arm must not first strip the caller's ledger and bump its (irreversible) epoch.
+
+    Same rule the borrowed-planner vet block and `solver._validate_lns_config` follow. The check
+    used to sit AFTER `detach_subscribers()`, so a misspelling cost the caller their subscriptions.
+    """
+    led = ReservationLedger(CFG)
+    seen = []
+    led.subscribe(lambda fid, vols: seen.append(fid))
+    epoch = led.epoch
+    with pytest.raises(ValueError, match="unknown shortcut_repair"):
+        LNSState(CFG, led, [], shortcut_repair="defered")       # sic
+    assert led.epoch == epoch, "a rejected arm bumped the epoch"
+    led.commit(0, ())
+    assert seen == [0], "a rejected arm detached the caller's subscribers"
+
+
+def test_a_shortcut_arm_demands_a_refined_ruler_before_the_state_build():
+    """The deferred arms refine AFTER the build, so the negative-premium invariant cannot see the
+    mismatch at all — at build time the incumbent is still the unrefined baseline. The cheap string
+    check is the only thing standing between a bare ruler and a silently clamped `delay()`."""
+    with pytest.raises(ValueError, match="shortcut_ruler=False"):
+        LNSState(CFG, ReservationLedger(CFG), [], shortcut_repair="deferred")
+    LNSState(CFG, ReservationLedger(CFG), [], shortcut_repair="deferred", shortcut_ruler=True)
+
+
+def test_a_deferred_arm_is_refused_on_the_rebuild_release_path():
+    """`incremental_release=False` builds the capacity authority with `track_removal=False`, whose
+    `on_release` subtracts nothing — so the arm's release/refine/commit cycle leaves the flight's own
+    pad dwell counting against it. The arm never calls `plan`, so no shrink tripwire repairs it."""
+    with pytest.raises(ValueError, match="needs incremental_release=True"):
+        LNSState(CFG, ReservationLedger(CFG), [], shortcut_repair="post_accept",
+                 shortcut_ruler=True, incremental_release=False)
+
+
+def test_a_planner_attribute_is_read_through_the_wrapper_chain_not_off_the_wrapper():
+    """A wrapper carries none of the search planner's knobs, so a `getattr` default turns "absent"
+    into a plausible answer: `evict_floor` read as a configured 0.0, `record_envelope` as an opt-out.
+    The latter is the sharp one — it yields an EMPTY `envelopes` tuple, and `_read_set_is_clean`
+    returns True for an empty one, so "recorded nothing" reads as "read nothing" and every stale
+    parallel repair is accepted as clean."""
+    from freespace_sim.planner import chain_attr
+    from freespace_sim.planner.lns.parallel import _read_set_is_clean
+
+    box = [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]
+    assert _read_set_is_clean((), box) is True            # the trap
+    assert _read_set_is_clean((None,), box) is False      # what "unknown" must look like
+
+    wrapper = _shortcut_repair_planner()
+    wrapper.inner.record_envelope = True
+    assert getattr(wrapper, "record_envelope", False) is False    # the bug, if read off the wrapper
+    assert chain_attr(wrapper, "record_envelope") == [True]
+    assert chain_attr(wrapper, "evict_floor") == [0.0]
+
+
+def test_a_negative_delay_premium_raises_instead_of_clamping_to_zero():
+    """`delay()` clamps at 0, so a refined incumbent measured against a bare-A* ruler silently reads
+    as perfectly unimpeded — invisible to the agent-based seed, last in the premium repair order."""
+    spec = with_overrides(get_scenario("dallas_hub_2uss"), lam_per_hour=240.0, horizon_s=600.0, seed=1)
+    cfg = spec.config()
+    res = run(cfg, demand=spec.demand_model(), planner_name="astar_shortcut")
+    with pytest.raises(ValueError, match="NEGATIVE delay premium"):
+        LNSState(cfg, res.ledger, res.intents,
+                 static_terms=tuple(res.ledger.static_terminals()), unimpeded_workers=1)
+
+
+def test_shortcut_arms_verify_and_never_raise_the_incumbent():
+    """Each placement keeps the monotone-improvement contract and an interflight-clean schedule."""
+    spec = with_overrides(get_scenario("dallas_hub_2uss"), lam_per_hour=240.0, horizon_s=600.0, seed=1)
+    cfg = spec.config()
+    for arm in ("interleaved", "deferred", "post_accept"):
+        res = run(cfg, demand=spec.demand_model(), planner_name="astar")
+        out = run_lns_on_result(res, spec.demand_model(),
+                                LNSConfig(max_iterations=12, neighborhood_size=4, log_every=0,
+                                          unimpeded_workers=1, shortcut_arm=arm))
+        assert out.cost_after <= out.cost_before + 1e-6, arm
+        assert out.verified, arm
+
+
+def test_a_rare_negative_premium_is_clamped_not_raised():
+    """A greedy refiner in the currency makes the unimpeded ruler stop being a lower bound.
+
+    A* returns equal-cost geodesics of different SHAPE in the empty and the congested world, and
+    `shortcut_corners` is a shape-dependent greedy fixpoint, so a flight's SOLO plan can refine
+    worse than its plan in traffic (measured on density_faa: flight 112, zero ground delay and zero
+    air hold, identical level and altitude change, air_detour_m 58.6 m against 201.0 m alone). That
+    is not a currency bug and must not raise — prevalence is what separates the two.
+    """
+    led = ReservationLedger(CFG)
+    reqs = [FlightRequest(i, vec(0, 0, 0), vec(3000 + 200 * i, 0, 0), 0.0) for i in range(6)]
+    intents = [AStarPlanner().plan(r, led, CFG) for r in reqs]
+    for it in intents:
+        led.commit(it.request.flight_id, it.volumes)
+
+    # One flight's ruler is reported ABOVE its incumbent — the artifact's signature.
+    real = lns_state.unimpeded_costs
+
+    def one_inflated(*a, **kw):
+        rows = real(*a, **kw)
+        return [(f, (c + 25.0 if f == rows[0][0] else c), d) for f, c, d in rows]
+
+    st = None
+    try:
+        lns_state.unimpeded_costs = one_inflated
+        st = LNSState(CFG, led, intents, unimpeded_workers=1)
+    finally:
+        lns_state.unimpeded_costs = real
+    assert st.delay(intents[0].request.flight_id) == 0.0        # clamped to the incumbent, not negative
+    assert all(st.delay(i.request.flight_id) >= 0.0 for i in intents)
+
+
+def test_many_negative_premiums_still_raise():
+    """Prevalence is the signal: a systemic mismatch must not be clamped away as noise."""
+    led = ReservationLedger(CFG)
+    reqs = [FlightRequest(i, vec(0, 0, 0), vec(3000 + 200 * i, 0, 0), 0.0) for i in range(6)]
+    intents = [AStarPlanner().plan(r, led, CFG) for r in reqs]
+    for it in intents:
+        led.commit(it.request.flight_id, it.volumes)
+
+    real = lns_state.unimpeded_costs
+
+    def all_inflated(*a, **kw):
+        return [(f, c + 25.0, d) for f, c, d in real(*a, **kw)]
+
+    try:
+        lns_state.unimpeded_costs = all_inflated
+        with pytest.raises(ValueError, match="NEGATIVE delay premium"):
+            LNSState(CFG, led, intents, unimpeded_workers=1)
+    finally:
+        lns_state.unimpeded_costs = real

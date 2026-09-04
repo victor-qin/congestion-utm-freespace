@@ -1047,6 +1047,29 @@ class AStarPlanner:
             _batch.after.append(_evict)
         return cocc
 
+    def _kernel_occupancy_state(self, cocc):
+        """Return the occupancy-shaped kernel arrays without allocating search capacity.
+
+        Native SIPP shares the compiled occupancy image, own-column overlay and read envelope with
+        A*, but has its own frontier/hash. Keeping this allocation separate lets that path reuse the
+        common spatial state without materialising an otherwise-unused A* capacity bucket.
+        """
+        NC = cocc.NC
+        ks = self._ks
+        if ks is None or ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
+            self._ks = ks = {
+                "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
+                "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
+                "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
+                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
+                # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
+                # counters. Reused across plans — `build_window` clears only the bytes it uses.
+                "win": np.zeros(max(1, self.window_bytes), np.uint8),
+                "wbox": W.empty_wbox(),
+                "win_stats": np.zeros(W.WSTATS_N, np.int64),
+            }
+        return ks
+
     def _kernel_state(self, cocc, log2: int):
         """The version-stamped kernel work arrays, reused across plans (gen bump → O(1) reset), split in
         two pools:
@@ -1063,20 +1086,7 @@ class AStarPlanner:
           used), so results are byte-identical at ANY sufficient size. Only at the ceiling (the old
           max_expansions-derived size, headroom unchanged) does overflow still mean the reference
           fallback. Grown sizes are cached per planner, so a hot spot pays the growth once."""
-        NC = cocc.NC
-        ks = self._ks
-        if ks is None or ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
-            self._ks = ks = {
-                "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
-                "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
-                "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
-                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
-                # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
-                # counters. Reused across plans — `build_window` clears only the bytes it uses.
-                "win": np.zeros(max(1, self.window_bytes), np.uint8),
-                "wbox": W.empty_wbox(),
-                "win_stats": np.zeros(W.WSTATS_N, np.int64),
-            }
+        ks = self._kernel_occupancy_state(cocc)
         kc = self._ks_caps.get(log2)
         if kc is None:
             cap = 1 << log2

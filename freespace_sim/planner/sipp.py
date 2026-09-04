@@ -801,12 +801,12 @@ class SIPPPlanner(AStarPlanner):
     def _skernel_state(self, cocc, n_iv: int):
         """Work arrays for one plan, sized to the WINDOW rather than to the whole box.
 
-        Returns A*'s ``(ks, kc)`` pair, EXTENDED with SIPP's own arrays rather than replacing it.
-        That is not tidiness: ``AStarPlanner._build_overlay`` — which this planner now reuses verbatim
-        for own-column transparency — reads ``self._ks["ov_own_gen"]`` directly, and the A* fallback
-        reaches ``_kernel_state``/``_build_window``, which read ``ks["NC"]``, ``ks["out_q"]``,
-        ``ks["win"]``, ``ks["wbox"]`` and ``ks["win_stats"]``. Assigning a dict with only SIPP's keys
-        would ``KeyError`` on the first terminal plan and again on the first ``FB_CAP``.
+        Initialises A*'s occupancy-shaped ``ks`` alongside SIPP's own arrays rather than replacing
+        it. That is not tidiness: ``AStarPlanner._build_overlay`` — which this planner now reuses
+        verbatim for own-column transparency — reads ``self._ks["ov_own_gen"]`` directly, and the A*
+        fallback reads ``ks["NC"]``, ``ks["out_q"]``, ``ks["win"]``, ``ks["wbox"]`` and
+        ``ks["win_stats"]``. The capacity-shaped A* state is deliberately NOT allocated here;
+        ``_fallback`` creates it lazily if native SIPP actually trips a safety valve.
 
         ``n_iv`` sizes the INTERVAL buffers only, and it is the window build's capacity ESTIMATE —
         conservative by construction, since it bounds a cell's free intervals by its claim count
@@ -818,7 +818,7 @@ class SIPPPlanner(AStarPlanner):
         slots against a measured max usage of 97,228, i.e. 22.1 MB where 3.9 MB does. That is a
         MEMORY win and not a speed one; see `_sfrontier_state` for the measurement.
         """
-        ks, kc = super()._kernel_state(cocc, self._log2_cap_max)
+        ks = super()._kernel_occupancy_state(cocc)
         if self._k_cap_iv < n_iv:
             self._k_cap_iv = n_iv
             self._k_iv_lo = np.zeros(n_iv, np.int32)                  # the per-plan window pool
@@ -858,7 +858,7 @@ class SIPPPlanner(AStarPlanner):
             self._k_out_r = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_s = np.empty(cocc.MAXS + 8, np.int64)
             self._k_out_L = np.empty(cocc.MAXS + 8, np.int64)      # flight level per output waypoint
-        return ks, kc
+        return ks
 
     def _sfrontier_state(self, n_slots: int) -> None:
         """Size the kernel's per-slot arrays to the tail the build ACTUALLY produced.
@@ -1028,7 +1028,7 @@ class SIPPPlanner(AStarPlanner):
         # `read_bbox` lives in A*'s `_ks` (shared, because `_mk_envelope` is inherited), so bind
         # that
         # dict before the loop — the SIPP arrays inside it are sized per widen, this one is not.
-        rb = super()._kernel_state(cocc, self._log2_cap_max)[0]["read_bbox"]
+        rb = super()._kernel_occupancy_state(cocc)["read_bbox"]
         rb[0] = rb[2] = rb[4] = _BBOX_HUGE
         rb[1] = rb[3] = rb[5] = -_BBOX_HUGE
         rb[6] = base
@@ -1087,7 +1087,7 @@ class SIPPPlanner(AStarPlanner):
                     continue
                 return self._splan_reference(req, ledger, cfg)
 
-            ks, _kc = self._skernel_state(cocc, n_wcells)
+            ks = self._skernel_state(cocc, n_wcells)
             for _ in range(_SWINDOW_GROW_MAX):
                 tail = SW.build_window_intervals(
                     cocc._arena.arena, cocc._arena.start, cocc._arena.length, cocc.static_col,

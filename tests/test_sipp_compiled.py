@@ -210,6 +210,24 @@ def test_sipp_warm_uses_the_production_kernel_signature():
     assert len(warm) == n_params, f"warm-up passes {len(warm)} args, `_search` takes {n_params}"
 
 
+def test_native_sipp_state_does_not_allocate_astar_search_capacity():
+    """Native SIPP shares A*'s occupancy arrays, but its independent search must not pay for A*'s
+    max-capacity hash and heap unless it actually falls back to A*."""
+    planner = SIPPPlanner(compiled=False)
+    planner._k_lab_cell = np.empty(0, np.int64)   # isolate the shared state from SIPP's fixed arrays
+    cocc = CompiledHexOccupancy(CFG)
+
+    ks = planner._skernel_state(cocc, 9)
+
+    assert ks is planner._ks
+    assert planner._ks_caps == {}
+
+    astar_ks, kc = planner._kernel_state(cocc, 8)
+    assert astar_ks is ks
+    assert list(planner._ks_caps) == [8]
+    assert planner._ks_caps[8] is kc
+
+
 @pytest.mark.parametrize("planner_name", ("astar_ref", "astar", "sipp_ref", "sipp"))
 def test_ground_delay_budget_is_binding_for_every_lattice_path(planner_name):
     """The route horizon bounds arrival; it must not extend the legal ground-delay domain."""

@@ -37,8 +37,10 @@ def test_corridor_consecutive_boxes_overlap_contiguity():
 
 def test_corridor_time_windows_buffered():
     vols = build_corridor(_straight_centerline(), CFG)
-    # first segment spans [0, dt] before buffering
-    assert np.isclose(vols[0].t_start, -CFG.time_buffer_s)
+    # First segment spans [0, dt] before buffering. The pad is LEADING-ONLY: the trailing edge stays
+    # exactly on the discrete clock, so the enforced gap between two conflicting transits is the sum
+    # of their facing pads == one time_buffer_s (4 s at defaults), not two. See corridor_segment_volume.
+    assert np.isclose(vols[0].t_start, 0.0)
     assert np.isclose(vols[0].t_end, CFG.dt_s + CFG.time_buffer_s)
 
 

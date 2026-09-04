@@ -69,8 +69,22 @@ def corridor_segment_volume(
     what makes per-edge checking equivalent to whole-corridor checking.
 
     Geometry: configured width/height, extended longitudinally at each end so consecutive boxes overlap
-    (ASTM §4.3.5 contiguity); time window buffered by ``time_buffer_s`` on both sides so neighbours
-    overlap in time too. The extension is **anisotropic** — half the box's footprint *in the travel
+    (ASTM §4.3.5 contiguity); the time window is ``[t0, t1 + time_buffer_s)`` — the pad is **leading
+    only**, so the trailing edge sits exactly on the discrete clock. Neighbours still overlap in time
+    (box ``i``'s leading pad covers box ``i+1``'s start).
+
+    *Why leading-only.* Ledger conflict is pure window overlap, so the separation enforced between two
+    conflicting transits is the **sum** of their facing pads — invariant to how that sum is split. The
+    discrete capacity footprint is not: rows are anchored at ``k*dt``, so a trailing ``-buf`` drops the
+    box into the *previous* period and smears one cell visit across four rows. All-pad-in-front is the
+    unique split yielding a three-period footprint ``(-1, +1)`` (measured, not assumed, by
+    :func:`~freespace_sim.planner.colgen.windows.derive_cell_window`), which is what bounds the colgen
+    pricing state's revisit history. The accepted trade: the pairwise gap between conflicting transits
+    is one ``dt`` rather than two, and a flight running *early* is uncovered by design (the pad covers
+    late-running). **Conservation law** — restoring the old gap via ``time_buffer_s = 2*dt`` re-widens
+    the footprint back to four periods; you cannot have both at this clock.
+
+    The extension is **anisotropic** — half the box's footprint *in the travel
     direction*: ``corridor_width/2`` in the horizontal plane, ``corridor_height/2`` in the vertical. This
     matters for a mid-route layer change (a fixed-xy segment moving in z): a flat ``corridor_width/2``
     would balloon the box in z past the levels it traverses (and above the ceiling); the vertical term
@@ -91,7 +105,7 @@ def corridor_segment_volume(
     a = (p0x - ux * ext, p0y - uy * ext, p0z - uz * ext)           # extend behind the start
     b = (p1x + ux * ext, p1y + uy * ext, p1z + uz * ext)           # and beyond the end → overlap neighbours
     spec = box_from_segment(a, b, cfg.corridor_width_m, cfg.corridor_height_m)
-    return Volume4D(spec, t0 - cfg.time_buffer_s, t1 + cfg.time_buffer_s, terminal_id=terminal_id)
+    return Volume4D(spec, t0, t1 + cfg.time_buffer_s, terminal_id=terminal_id)
 
 
 def build_corridor(centerline: list[TimedPoint], cfg: SimConfig) -> list[Volume4D]:

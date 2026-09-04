@@ -239,7 +239,10 @@ def test_the_objective_steers_the_ground_air_trade_in_the_search_itself():
     1:3 config never showed it -- and inverts the moment it does not.
 
     Measured on this fixture with ground priced above air, the raw-seconds score returned
-    a column costing 48.0 where 32.0 was available.
+    a column costing 48.0 where 32.0 was available.  (That pair was measured under the
+    4-period reservation footprint; leading-only pads made the optimum 28.0.  The gap is
+    the finding, not the constants -- what is asserted below is the DIRECTION each
+    weighting steers, which is what the raw-seconds score got wrong.)
     """
 
     air_heavy = _weighted_probe(ground_weight=1.0, air_weight=3.0)
@@ -252,7 +255,7 @@ def test_the_objective_steers_the_ground_air_trade_in_the_search_itself():
     # Ground expensive: leave immediately and absorb the same congestion in the air.
     assert ground_heavy.departure_step == 0
     assert len(ground_heavy.cell_path) - 1 > 3
-    assert ground_heavy.delay_s == pytest.approx(32.0, abs=1e-9)
+    assert ground_heavy.delay_s == pytest.approx(28.0, abs=1e-9)
 
 
 def test_the_shipped_weighting_is_unchanged_by_that_currency():

@@ -597,18 +597,49 @@ So on a sequential run the whole plan-side gain is **8.1%**, and the overlay ind
 essentially all of it. **The LNS A/B showed −33%** (146.3 -> 97.8 s). Those are different numbers on
 different workloads, and the gap between them is unexplained by anything measured so far.
 
-The leading candidate is one I never listed: **the old pool's chains fragment with CONGESTION.** Its
-free intervals accumulated a split from every commit that ever touched a cell, over the full
-`[0, MAXS]` range; LNS runs against a 4,636-flight ledger where this cut holds 1,526, and it churns
-that ledger continuously. The per-plan window is clipped to `[base, max_step]` and rebuilt from
-claims each time, so it does not accumulate. The earlier chain-length sample (1.824 old vs 2.262 new)
-does not contradict this — it compared different cell populations at ONE congestion level, which is
-exactly the wrong experiment for a congestion-scaling claim.
+### The mechanism: the old pool's kernel cost grew with CONGESTION
 
-**This matters beyond curiosity.** If the mechanism is congestion-scaling, the 1.24x headline is
-scale-dependent *in SIPP's favour*, and would understate on larger scenarios. Test: repeat the
-old-kernel/new-kernel comparison at increasing `--demand-duration` and see whether the gap widens.
-Until then, quote the 1.24x as measured at 4,636 legs and not as a general factor.
+Two things were then measured, in the right order.
+
+**First, is the LNS effect real?** The 146.3 s came from the `4c81255` run and the 97.8 s from a run
+hours later, and A\*'s loop drifted 6% between them, so an unknown slice was machine state. Re-ran
+the A/B on `d19eb49` (pre-Phase-3) and HEAD back to back, **both arms**, using A\* as the drift control
+since Phase 3 did not touch it:
+
+| | OLD `d19eb49` | NEW HEAD |
+| --- | ---: | ---: |
+| astar plan s | 132.9 | 127.1 (−4.4%, drift) |
+| **sipp plan s** | **142.9** | **97.8** (−31.6%) |
+| sipp ledger s | 117.6 | 22.3 |
+| sipp release subs | 4 | 3 |
+
+Normalised by the A\* control: **−28.4%**. Real, and comfortably beyond drift.
+
+**Second, why does the sequential harness say −8.1% and LNS say −28.4%?** Because the effect scales
+with ledger congestion. Sequential profile, old against new, at two scales:
+
+| flights | OLD kernel | NEW kernel | OLD plan | NEW plan | delta plan |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,526 | 17.24 ms | 15.16 ms | 24.02 | 22.07 | −8.1% |
+| 4,636 | **20.94 ms** | **15.85 ms** | 28.31 | 23.67 | **−16.4%** |
+| growth | **+21.5%** | **+4.6%** | | | |
+
+**The old kernel's per-plan cost grows 4.7x faster with congestion than the new one.** The old pool's
+free intervals accumulated a split from every commit that ever touched a cell, across the full
+`[0, MAXS]` range, so its chains fragment as the ledger fills; the per-plan window is rebuilt from
+claims over `[base, max_step]` and does not accumulate.
+
+That closes the sequential/LNS gap without special pleading: a `sim.run` over N flights has MEAN
+congestion ~N/2 (the first flight sees an empty ledger), while LNS plans every repair against the
+full 4,636. The measured progression −8.1% → −16.4% → −28.4% tracks effective congestion
+~763 → ~2,318 → 4,636.
+
+The earlier chain-length sample (1.824 old against 2.262 new) does not contradict this: it compared
+different cell populations at ONE congestion level, which is the wrong experiment for a scaling claim.
+
+**Consequence for how to quote the headline.** The 1.24x is **scale-dependent in SIPP's favour**. It
+was measured at 4,636 legs; a larger scenario should widen it, and a smaller one narrow it. Quote it
+with the scale attached, never as a general factor.
 
 ### Gates
 

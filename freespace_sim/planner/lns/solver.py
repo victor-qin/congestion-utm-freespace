@@ -87,9 +87,13 @@ class LNSConfig:
     # mid-dataclass silently re-binds every argument after it.
     repair_planner: str = "astar"
 
+    # Where the shortcut refiner runs inside a destroy/repair transaction.
+    #
     # APPENDED, not inserted: `test_lns_config_preserves_the_legacy_positional_tail` pins the
-    # positional order, and callers construct this positionally. Where the shortcut refiner runs inside a destroy/repair transaction. "none" is the historical
-    # behaviour (bare A* repairs; refine the final incumbent yourself if you want the geometry win).
+    # positional order, and callers construct this positionally.
+    #
+    # "none" is the historical behaviour (bare A* repairs; refine the final incumbent yourself if
+    # you want the geometry win).
     # "interleaved" cuts each victim before it is committed, so the NEXT victim plans around the
     # tightened corridor; "deferred" cuts all k after the PP loop but before the accept test;
     # "post_accept" accepts on un-cut cost and polishes only the winner. Everything but "none"
@@ -253,9 +257,8 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         raise ValueError(
             f"unknown LNSConfig.shortcut_arm {lns.shortcut_arm!r} (want 'none', 'interleaved', "
             "'deferred' or 'post_accept')")
-    # Refusing here rather than in LNSState: by then the ruler has already been planned, which is
-    # the whole state build. A shortcut arm with a bare ruler is the negative-premium failure the
-    # state's own invariant raises on — this just makes the mistake cheap instead of expensive.
+    # Not covered by `LNSState`'s own version of this check: "interleaved" reaches it as
+    # shortcut_repair="none" plus a wrapper, so the state cannot see that the pipeline refines.
     if lns.shortcut_arm != "none" and lns.shortcut_ruler is False:
         raise ValueError(
             f"shortcut_arm={lns.shortcut_arm!r} with shortcut_ruler=False: the repaired incumbent "

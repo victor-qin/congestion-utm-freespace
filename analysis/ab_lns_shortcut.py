@@ -39,7 +39,7 @@ from freespace_sim import sim, verify
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.lns import LNSConfig
 from freespace_sim.planner.lns.solver import run_lns_on_result
-from freespace_sim.planner.shortcut import _terminal_capacity_for, refine_intent
+from freespace_sim.planner.shortcut import can_refine, refine_intent, terminal_capacity_for
 from freespace_sim.scenarios import get_scenario
 from freespace_sim.scenarios.spec import with_overrides
 
@@ -61,16 +61,20 @@ def _polish(intents, ledger, cfg) -> tuple[list, int, float]:
     (intents, n_shortened, seconds).
     """
     t0 = time.perf_counter()
-    planner = AStarPlanner()
+    # `incremental_release=True` is load-bearing, not a speed knob: only `track_removal=True` lets
+    # `release_many` subtract the released flight's own pad dwell. On the rebuild path that dwell
+    # survives, so `reservation_admitted` counts the flight against itself and refuses its own
+    # shortcut at a capacity-1 pad — and this post-pass never calls `plan` to trip the rebuild.
+    planner = AStarPlanner(incremental_release=True)
     planner.evict_floor = 0.0
     first = next((it.request for it in intents if it.accepted), None)
     if first is None:
         return list(intents), 0, time.perf_counter() - t0
     planner.plan(first, ledger, cfg)                 # bind the occupancy + capacity services only
-    tcap = _terminal_capacity_for(planner, ledger)
+    tcap = terminal_capacity_for(planner, ledger)
     out, n = [], 0
     for it in intents:
-        if not it.accepted or len(it.centerline) <= 3:
+        if not can_refine(it):
             out.append(it)
             continue
         fid = it.request.flight_id
@@ -86,14 +90,13 @@ def _polish(intents, ledger, cfg) -> tuple[list, int, float]:
     return out, n, time.perf_counter() - t0
 
 
-def _row(arm, res, lns_res, cfg, static_terms, polish=None):
-    acc = [i for i in (polish[0] if polish else lns_res.intents) if i.accepted]
+def _row(arm, lns_res, cfg, static_terms, polish=None):
+    intents, n_cut, polish_s = polish if polish else (lns_res.intents, 0, 0.0)
+    acc = [i for i in intents if i.accepted]
     cost_final = float(sum(i.cost for i in acc))
-    bad = verify.find_interflight_conflict(
-        polish[0] if polish else lns_res.intents, cfg, static_terminals=static_terms)
+    bad = verify.find_interflight_conflict(intents, cfg, static_terminals=static_terms)
     return {
         "arm": arm,
-        "cost_final_abs": cost_final,
         "cost_baseline": lns_res.cost_before,
         "cost_lns": lns_res.cost_after,
         "cost_final": cost_final,
@@ -103,8 +106,8 @@ def _row(arm, res, lns_res, cfg, static_terms, polish=None):
         "n_accepted": lns_res.n_accepted,
         "wall_s": lns_res.wall_s,
         "init_wall_s": lns_res.init_wall_s,
-        "polish_s": polish[2] if polish else 0.0,
-        "polish_shortened": polish[1] if polish else 0,
+        "polish_s": polish_s,
+        "polish_shortened": n_cut,
         "mean_detour_m": float(np.mean([i.air_detour_m for i in acc])),
         "conflict_free": bad is None,
         "reasons": _reason_counts(lns_res.trajectory),
@@ -181,7 +184,7 @@ def main() -> None:
         # in-loop arms had reached 13%. Polishing all arms makes the comparison about PLACEMENT
         # (does cutting during the search help the search?) instead of about coverage.
         polish = _polish(out.intents, res.ledger, cfg)
-        row = _row(arm, res, out, cfg, out_static(res), polish)
+        row = _row(arm, out, cfg, tuple(res.ledger.static_terminals()), polish)
         row["arm_wall_s"] = time.perf_counter() - t
         rows.append(row)
         print(f"{arm:<12} base {row['cost_baseline']:>11,.0f} -> lns {row['cost_lns']:>11,.0f} "
@@ -197,11 +200,6 @@ def main() -> None:
                        "iterations": args.iterations, "neighborhood": args.neighborhood,
                        "seed": args.seed, "rows": rows}, fh)
         print(f"wrote {args.out}")
-
-
-def out_static(res):
-    return tuple(res.ledger.static_terminals())
-
 
 if __name__ == "__main__":
     main()

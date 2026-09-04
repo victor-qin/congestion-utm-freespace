@@ -1263,6 +1263,61 @@ def test_a_wrapper_repair_planner_is_refused_when_its_inner_floor_is_not_zero():
         LNSState(CFG, ReservationLedger(CFG), [], repair_planner=bad)
 
 
+def test_a_bad_shortcut_arm_is_refused_before_the_ledger_is_taken_over():
+    """A typo'd arm must not first strip the caller's ledger and bump its (irreversible) epoch.
+
+    Same rule the borrowed-planner vet block and `solver._validate_lns_config` follow. The check
+    used to sit AFTER `detach_subscribers()`, so a misspelling cost the caller their subscriptions.
+    """
+    led = ReservationLedger(CFG)
+    seen = []
+    led.subscribe(lambda fid, vols: seen.append(fid))
+    epoch = led.epoch
+    with pytest.raises(ValueError, match="unknown shortcut_repair"):
+        LNSState(CFG, led, [], shortcut_repair="defered")       # sic
+    assert led.epoch == epoch, "a rejected arm bumped the epoch"
+    led.commit(0, ())
+    assert seen == [0], "a rejected arm detached the caller's subscribers"
+
+
+def test_a_shortcut_arm_demands_a_refined_ruler_before_the_state_build():
+    """The deferred arms refine AFTER the build, so the negative-premium invariant cannot see the
+    mismatch at all — at build time the incumbent is still the unrefined baseline. The cheap string
+    check is the only thing standing between a bare ruler and a silently clamped `delay()`."""
+    with pytest.raises(ValueError, match="shortcut_ruler=False"):
+        LNSState(CFG, ReservationLedger(CFG), [], shortcut_repair="deferred")
+    LNSState(CFG, ReservationLedger(CFG), [], shortcut_repair="deferred", shortcut_ruler=True)
+
+
+def test_a_deferred_arm_is_refused_on_the_rebuild_release_path():
+    """`incremental_release=False` builds the capacity authority with `track_removal=False`, whose
+    `on_release` subtracts nothing — so the arm's release/refine/commit cycle leaves the flight's own
+    pad dwell counting against it. The arm never calls `plan`, so no shrink tripwire repairs it."""
+    with pytest.raises(ValueError, match="needs incremental_release=True"):
+        LNSState(CFG, ReservationLedger(CFG), [], shortcut_repair="post_accept",
+                 shortcut_ruler=True, incremental_release=False)
+
+
+def test_a_planner_attribute_is_read_through_the_wrapper_chain_not_off_the_wrapper():
+    """A wrapper carries none of the search planner's knobs, so a `getattr` default turns "absent"
+    into a plausible answer: `evict_floor` read as a configured 0.0, `record_envelope` as an opt-out.
+    The latter is the sharp one — it yields an EMPTY `envelopes` tuple, and `_read_set_is_clean`
+    returns True for an empty one, so "recorded nothing" reads as "read nothing" and every stale
+    parallel repair is accepted as clean."""
+    from freespace_sim.planner import chain_attr
+    from freespace_sim.planner.lns.parallel import _read_set_is_clean
+
+    box = [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]
+    assert _read_set_is_clean((), box) is True            # the trap
+    assert _read_set_is_clean((None,), box) is False      # what "unknown" must look like
+
+    wrapper = _shortcut_repair_planner()
+    wrapper.inner.record_envelope = True
+    assert getattr(wrapper, "record_envelope", False) is False    # the bug, if read off the wrapper
+    assert chain_attr(wrapper, "record_envelope") == [True]
+    assert chain_attr(wrapper, "evict_floor") == [0.0]
+
+
 def test_a_negative_delay_premium_raises_instead_of_clamping_to_zero():
     """`delay()` clamps at 0, so a refined incumbent measured against a bare-A* ruler silently reads
     as perfectly unimpeded — invisible to the agent-based seed, last in the premium repair order."""

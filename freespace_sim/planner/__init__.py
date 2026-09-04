@@ -28,7 +28,11 @@ class Planner(Protocol):
     #       The pad-capacity authority this planner has ALREADY brought current for ``ledger``, or
     #       None if it holds none bound to that ledger. Lets a post-pass reuse the authority the
     #       inner plan just built instead of paying a second ledger subscription + index. A*
-    #       and the MILP implement it; ``shortcut._terminal_capacity_for`` is the consumer.
+    #       and the MILP implement it; ``shortcut.terminal_capacity_for`` is the consumer.
+
+
+#: "No planner in the chain carries this attribute" — distinct from any value one could carry.
+_MISSING = object()
 
 
 def iter_planner_chain(planner):
@@ -41,7 +45,7 @@ def iter_planner_chain(planner):
     worker's planner, and ``shortcut`` to find a capacity authority. Those four had drifted into four
     identical copies (``parallel``'s even documented itself as one), which is a silent-divergence
     risk: add a fifth wrapper attribute, miss one copy, and that caller quietly sees no planners
-    rather than raising. Order is load-bearing — ``_terminal_capacity_for`` returns the FIRST match —
+    rather than raising. Order is load-bearing — ``terminal_capacity_for`` returns the FIRST match —
     so this reproduces the copies exactly: LIFO, ``warm_planner`` visited before ``inner``.
     """
     seen: set[int] = set()
@@ -53,6 +57,19 @@ def iter_planner_chain(planner):
         seen.add(id(p))
         yield p
         stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
+
+
+def chain_attr(planner, name) -> list:
+    """Every value of ``name`` carried by a planner in ``planner``'s chain, in chain order.
+
+    An EMPTY list is the answer "nobody in this chain has that attribute", which is a real third
+    state a `getattr` default silently destroys: a wrapper holds none of the search planner's knobs,
+    so `getattr(wrapper, "evict_floor", 0.0)` reads as a correctly configured floor and
+    `getattr(wrapper, "record_envelope", False)` as a deliberate opt-out. Both bugs shipped. Callers
+    decide what an empty list means — usually "refuse", never "the default".
+    """
+    return [v for v in (getattr(pl, name, _MISSING) for pl in iter_planner_chain(planner))
+            if v is not _MISSING]
 
 
 #: Planners that solve every flight at once, so `sim.run` routes them to `colgen.run_batch` and they

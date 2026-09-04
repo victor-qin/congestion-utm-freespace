@@ -379,7 +379,19 @@ def _shortcut_turn_seeded(corners, had_holds: bool,
             return state
 
 
-def _terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
+def can_refine(intent: OperationalIntent, strategy: _ShortcutStrategy = "single_knot") -> bool:
+    """Could :func:`refine_intent` do anything but hand ``intent`` straight back?
+
+    The three-point floor keeps the legacy wrapper's exact behavior; ``batched_turns`` fixes the
+    E-F-G blind spot at two, without silently changing ``astar_shortcut``'s A/B baseline. Public
+    because a caller that must RELEASE a flight before refining it wants to skip that round trip —
+    and a hardcoded ``<= 3`` at its end both duplicates this rule and omits ``batched_turns``.
+    """
+    return bool(intent.accepted and intent.centerline
+                and len(intent.centerline) > (2 if strategy == "batched_turns" else 3))
+
+
+def terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
     """Find a capacity authority already brought current by the inner A*/MILP plan.
 
     Reuse avoids a second ledger subscription/index. Asks each planner in the wrapper chain via the
@@ -423,7 +435,7 @@ class ShortcutRefiner:
 
     def plan(self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig) -> OperationalIntent:
         intent = self.inner.plan(req, ledger, cfg)
-        return refine_intent(intent, ledger, cfg, tcap=_terminal_capacity_for(self.inner, ledger),
+        return refine_intent(intent, ledger, cfg, tcap=terminal_capacity_for(self.inner, ledger),
                              strategy=self.strategy, label=self.label)
 
 
@@ -438,13 +450,9 @@ def refine_intent(intent: OperationalIntent, ledger: ReservationLedger, cfg: Sim
     geometry is what was conflict-checked. ``tcap`` is the caller's, because only the caller knows
     which planner already brought a capacity authority current for this ledger.
     """
-    req = intent.request
-    # Keep the legacy wrapper's exact three-point behavior. The experimental strategy fixes the
-    # E-F-G blind spot without silently changing astar_shortcut's A/B baseline.
-    min_centerline = 2 if strategy == "batched_turns" else 3
-    if (not intent.accepted or not intent.centerline
-            or len(intent.centerline) <= min_centerline):
+    if not can_refine(intent, strategy):
         return intent
+    req = intent.request
 
     corners: list[np.ndarray] = []
     for p, _ in intent.centerline:                 # collapse repeated positions (holds)

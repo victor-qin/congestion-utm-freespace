@@ -55,11 +55,19 @@ def _new_ruler(cfg, static_terms, shortcut: bool = False):
     incumbent being ruled was itself refined: ``delay()`` subtracts this cost from the incumbent's,
     so a bare-A* ruler against a shortcut schedule makes the premium NEGATIVE (measured on
     dallas_hub_2uss x1800: 76/451 flights) and ``max(0.0, ...)`` then clamps them to a silent 0 —
-    invisible to the agent-based destroy seed, last in the ``premium`` repair order. The refiner only
-    ever READS the ledger (``any_conflict``), so the shard-purity that lets this parallelise holds. One planner per ledger (the A* services
-    bind to whichever ledger they first see), and ``evict_floor = 0.0`` freezes the eviction
-    watermark so the flights may be planned in any order — which is what lets a worker take an
-    arbitrary shard."""
+    invisible to the agent-based destroy seed, last in the ``premium`` repair order.
+
+    Always A*, even under ``repair_planner="sipp"``: the ruler must match the INCUMBENT, which at
+    build time is the FCFS baseline (`LNSState` pins that with ``_REPRODUCIBLE_PLANNERS``). SIPP
+    repairs arrive later and are exact for the same cost function, so an A* ruler stays a lower
+    bound for them — while a SIPP ruler would put the ruler and the baseline in different
+    currencies, which is the failure above.
+
+    One planner per ledger (the A* services bind to whichever ledger they first see). The refiner
+    only ever READS the ledger (``any_conflict``), so the shard-purity that lets this parallelise
+    holds, and ``evict_floor = 0.0`` freezes the eviction watermark so the flights may be planned in
+    any order — which is what lets a worker take an arbitrary shard.
+    """
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.astar import AStarPlanner
 

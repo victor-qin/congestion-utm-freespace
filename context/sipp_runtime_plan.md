@@ -694,3 +694,72 @@ This run also depends on `299901c`, which warms `build_window_intervals` in `_sw
 every spawned worker meets an uncompiled builder on its first repair — ~0.92 s cold, simultaneously,
 billed to SIPP. That is the compile stampede `_swarm_jit` exists to prevent, and the measurement
 above would have carried it.
+
+---
+
+## 8. Re-baselined on `return_anchor="realized"`
+
+Everything in §2, §6, §7 and §7.1 is **nominal-anchor**. The nominal anchor keeps whatever the demand
+model set for a round-trip return's desired departure — a straight-line, undelayed estimate of when
+the outbound lands — so under congestion it schedules a return *before its aircraft is back* and
+books the difference as delay. `"realized"` re-anchors each return to
+`realized_release_s(outbound) + turnaround`, the arrival that actually happened.
+
+`analysis/ab_lns_repair_planner.py` gained `--return-anchor` (it hardcoded `"nominal"` in two places).
+`sim.run` refuses `realized` with its speculative planner; neither harness uses that, and LNS DROP
+threads `turnaround_s` through, so both are fine.
+
+### Sequential A/B, full `density_faa`, 4,636 legs, N=8, 300 iterations
+
+| arm | loop s | plan s | ledger s | improvement | accepted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| astar | 159.8 | 129.1 | 23.5 | 0.28% | 59/300 |
+| **sipp** | **133.1** | **101.9** | 23.7 | 0.29% | 59/300 |
+
+**The speed verdict holds: 1.20x faster loop, 1.27x plan, ledger parity (0.99x)** — against 1.24x /
+1.30x / 1.02x nominal. Same story, marginally smaller.
+
+**Three things the anchor changes, and they matter more than the ratio:**
+
+1. **The baseline is 10.1% cheaper** — 1,349,506 -> 1,213,063. That difference is delay the nominal
+   anchor invented by scheduling returns ahead of their aircraft.
+2. **LNS's headroom collapses** — improvement 0.46/0.54% -> **0.28/0.29%**, accepted 86/88 -> 59/59.
+   So a large share of what LNS appeared to recover under the nominal anchor was slack the anchor had
+   created. Any "LNS finds X%" number from this repo should say which anchor it was measured on.
+3. **The quality gap goes to exactly +0.00 pp**, from +0.08. That retires the question §7.1 flagged
+   as "one sample, equal to the seed-to-seed spread": it was noise, and the realized anchor says so
+   without needing more seeds.
+
+The ledger parity and the throughput story are anchor-independent, which is what the branch is
+actually about. The *improvement* numbers are not, and §7.1's DROP figures are restated below.
+
+### 8.1 DROP re-check on the realized anchor (m=8, N=2, 600 s)
+
+| | astar | sipp | (nominal, §7.1) |
+| --- | ---: | ---: | --- |
+| cost | 1,213,063 → **1,180,039** | 1,213,063 → 1,182,694 | |
+| **improvement** | **2.72%** | 2.50% | was sipp 4.30 / astar 4.12 |
+| tasks | 34,841 | **36,247 (1.04x)** | was **1.15x** |
+| accepted | 1,995 | 2,006 | was 2,572 / 3,002 |
+| accept rate | 5.7% | 5.5% | was 9.3 / 9.4% |
+| dirty rate | **30.8%** | 36.8% | was 40.8 / 39.3 |
+| verified | True | True | |
+
+**A\* produces the better schedule here (2.72% against 2.50%)**, reversing the nominal anchor's
++0.18 pp for SIPP, and SIPP's throughput edge narrows from 1.15x to 1.04x.
+
+**Read the quality columns as noise, and treat that as settled.** They flipped SIGN between anchors on
+single samples per arm. §7.1 already flagged +0.18 pp as equal to the seed-to-seed spread; the sign
+flip is stronger evidence than another seed would have been, and the sequential A/B agreeing at
+exactly +0.00 pp makes three independent readings that say the same thing. **Neither planner produces
+a better schedule than the other on this scenario.**
+
+**The throughput narrowing is probably real, and it is what §7 predicts.** The realized anchor halves
+the accept rate (9.3/9.4% -> 5.7/5.5%) and both arms run ~25% MORE iterations, because there is less
+invented slack to recover. SIPP's speed advantage is congestion-scaling, so a regime with less delay
+to search around should shrink it. Consistent, not surprising — but it does mean the DROP throughput
+figure, like the 1.24x, travels with its measurement conditions.
+
+**What is anchor-independent:** ledger parity (23.7 against 23.5 s, 0.99x), the structure count
+(3 subscribers each), the bit-identical schedule, and the sequential speed verdict (1.20x loop /
+1.27x plan realized, against 1.24x / 1.30x nominal). Those are what this branch is about.

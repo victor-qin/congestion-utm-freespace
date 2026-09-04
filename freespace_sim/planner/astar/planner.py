@@ -289,7 +289,13 @@ def _warn_kernel_fallback() -> None:
 
 class AStarPlanner:
 
-    #: Subclasses that call ``HexOccupancyService.is_blocked`` themselves must set this. The compiled
+    #: Subclasses calling ``HexOccupancyService.is_blocked`` from a path this class does not know
+    #: about must set this — but prefer arming the map where that path runs (``enable_blocked``, as
+    #: ``_plan_reference`` does) over declaring it here, which pays on every commit for a reader
+    #: that may never run. ``SIPPPlanner`` used to set it True and now overrides it as a PROPERTY
+    #: keyed on its own ``sipp_compiled``: this predicate reads ``self.compiled`` — A*'s kernel
+    #: flag — so a subclass with a SEPARATE kernel needs the map back when ITS kernel is gone.
+    #: The compiled
     #: A* path never does (it reads the dense window), which is why the map is off by default there —
     #: but SIPP inherits ``_occupancy`` and DOES query it, and an unmaintained map raises rather than
     #: answering stalely. False keeps the measured 1.052x for plain compiled A*.
@@ -495,7 +501,10 @@ class AStarPlanner:
                 stacklevel=2,
             )
             self.n_shrink_rebuilds += 1
-            svc.reset()
+            # `keep_blocked_live`: the `_absorb` below rebuilds `blocked` in the same pass, so
+            # dropping the armed flag here would only buy a second full ledger walk the next time a
+            # reference plan calls `enable_blocked`. See `HexOccupancyService.reset`.
+            svc.reset(keep_blocked_live=True)
             self._tcap.reset()
             # Deliberately NO `subscribe_static` here: this branch never had one, and adding it would
             # append a duplicate subscriber and re-replay every hub on each LNS release cycle —
@@ -1038,6 +1047,29 @@ class AStarPlanner:
             _batch.after.append(_evict)
         return cocc
 
+    def _kernel_occupancy_state(self, cocc):
+        """Return the occupancy-shaped kernel arrays without allocating search capacity.
+
+        Native SIPP shares the compiled occupancy image, own-column overlay and read envelope with
+        A*, but has its own frontier/hash. Keeping this allocation separate lets that path reuse the
+        common spatial state without materialising an otherwise-unused A* capacity bucket.
+        """
+        NC = cocc.NC
+        ks = self._ks
+        if ks is None or ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
+            self._ks = ks = {
+                "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
+                "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
+                "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
+                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
+                # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
+                # counters. Reused across plans — `build_window` clears only the bytes it uses.
+                "win": np.zeros(max(1, self.window_bytes), np.uint8),
+                "wbox": W.empty_wbox(),
+                "win_stats": np.zeros(W.WSTATS_N, np.int64),
+            }
+        return ks
+
     def _kernel_state(self, cocc, log2: int):
         """The version-stamped kernel work arrays, reused across plans (gen bump → O(1) reset), split in
         two pools:
@@ -1054,20 +1086,7 @@ class AStarPlanner:
           used), so results are byte-identical at ANY sufficient size. Only at the ceiling (the old
           max_expansions-derived size, headroom unchanged) does overflow still mean the reference
           fallback. Grown sizes are cached per planner, so a hot spot pays the growth once."""
-        NC = cocc.NC
-        ks = self._ks
-        if ks is None or ks["NC"] < NC or len(ks["out_q"]) < cocc.MAXS + 8:
-            self._ks = ks = {
-                "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
-                "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
-                "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
-                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
-                # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
-                # counters. Reused across plans — `build_window` clears only the bytes it uses.
-                "win": np.zeros(max(1, self.window_bytes), np.uint8),
-                "wbox": W.empty_wbox(),
-                "win_stats": np.zeros(W.WSTATS_N, np.int64),
-            }
+        ks = self._kernel_occupancy_state(cocc)
         kc = self._ks_caps.get(log2)
         if kc is None:
             cap = 1 << log2

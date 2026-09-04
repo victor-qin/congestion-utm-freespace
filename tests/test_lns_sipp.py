@@ -1,8 +1,11 @@
-"""SIPP as an LNS repair planner: incremental release for SIPP's two ledger structures, the
-static-wall trap that removal introduces, and the A*/SIPP cost-currency gates.
+"""SIPP as an LNS repair planner: incremental release for its ledger structures, the ledger wiring,
+and the A*/SIPP cost-currency gates.
 
-Design record: `context/sipp_lns_plan.md`. Structure of the file mirrors the phases there —
-§4.1/§4.2 removal gates first (they fail legibly), then the wiring, then the currency tests.
+Design record: `context/sipp_lns_plan.md`, then `context/sipp_runtime_plan.md` for the occupancy
+rewrite. The `CompiledOccupancy` removal gates that used to sit here went with the structure: SIPP
+no longer maintains a global free-interval pool, and the properties they pinned (release exactness,
+the static-wall trap, claim multiplicity) are now properties of the A* claim arena
+(`tests/test_claim_arena.py`) and of the per-plan build (`tests/test_sipp_window.py`).
 """
 
 import numpy as np
@@ -13,7 +16,8 @@ from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
-from freespace_sim.planner.compiled_occupancy import CompiledOccupancy
+from freespace_sim.planner.astar.occupancy import HexOccupancyService
+from freespace_sim.planner.astar.planner import _absorb
 from freespace_sim.planner.sipp import SIPPPlanner, SafeIntervalIndex
 from freespace_sim.types import FlightRequest, vec
 from freespace_sim.volumes import Volume4D
@@ -137,157 +141,17 @@ def test_sidx_track_removal_off_is_the_original_set_shape():
     assert not sidx._rows
 
 
-# ------------------------------------------------------------------ §4.2 CompiledOccupancy
+# ------------------------------------------------------------------ wiring
 
-def test_cocc_release_matches_fresh_absorb():
-    """The pool cannot be un-split in place, so removal resets each touched cell and re-applies the
-    survivors. Every query must match a fresh pool that only saw the survivor."""
-    keep, drop = _wall(3000.0), _wall(1000.0)
-    cocc = CompiledOccupancy(CFG, track_removal=True)
-    cocc.on_commit(1, [drop])
-    cocc.on_commit(2, [keep])
-    cocc.on_release(1, [drop])
+def test_sipp_subscribes_the_same_structures_as_astar():
+    """SIPP now binds exactly what compiled A* binds: `_svc`, `_tcap` and the shared claim arena.
 
-    fresh = CompiledOccupancy(CFG)
-    fresh.on_commit(2, [keep])
-
-    R = hg.circumradius(CFG)
-    for x in (1000.0, 3000.0):
-        q, r = hg.enu_to_axial(x, 0.0, R)
-        for dq in (-1, 0, 1):
-            for level in range(CFG.n_levels):
-                assert (cocc.free_intervals_py(q + dq, r, level, 0, cocc.MAXS)
-                        == fresh.free_intervals_py(q + dq, r, level, 0, cocc.MAXS)), (x, dq, level)
-    assert cocc.n_added == fresh.n_added == 1
-
-
-def test_cocc_release_treats_identical_spans_as_a_multiset():
-    """Equal spans are fungible; their multiplicity is not."""
-    wall = _wall()
-    cocc = CompiledOccupancy(CFG, track_removal=True)
-    cocc.on_commit(1, [wall])
-    cocc.on_commit(2, [wall])
-    q, r, level, s_lo, _s_hi = _rows_of(cocc, wall)[0]
-    c = cocc.cell_id(q, r, level)
-    step = max(0, s_lo)
-    assert not any(lo <= step <= hi for lo, hi in cocc.free_intervals_py(q, r, level, 0, cocc.MAXS))
-
-    cocc.on_release(1, [wall])
-    assert not any(lo <= step <= hi                     # the equal claim from flight 2 survives
-                   for lo, hi in cocc.free_intervals_py(q, r, level, 0, cocc.MAXS))
-    cocc.on_release(2, [wall])
-    assert any(lo <= step <= hi for lo, hi in cocc.free_intervals_py(q, r, level, 0, cocc.MAXS))
-    assert cocc.n_added == 0
-    assert c not in cocc._claims                        # empty claim lists are cleaned up
-
-
-def test_cocc_release_does_not_unwall_a_static_terminal():
-    """THE trap. `reset_cell`'s blank slate is fully FREE, but a walled cell's is fully BLOCKED, and
-    the claim journal only describes commit-derived blocks. The bind order makes it unavoidable:
-    `_absorb` records claims BEFORE `subscribe_static` replays the hubs, so walled cells carry
-    claims no "skip walled cells" guard can prevent."""
-    from freespace_sim.types import Terminal
-
-    center, term = vec(1000.0, 0.0, 0.0), Terminal("hub#0", radius=180.0)
-    wall = _wall(1000.0)
-    cocc = CompiledOccupancy(CFG, track_removal=True)
-    cocc.on_commit(1, [wall])                     # claims recorded first — as `_absorb` does
-    cocc.register_static_terminal(center, term)   # ...and the hub walled afterwards
-    walled = [c for c in (cocc.cell_id(q, r, L) for (q, r) in hg.terminal_cells(center, term, CFG)
-                          for L in range(cocc.nlevels)) if c >= 0]
-    assert walled
-    touched = [c for c in walled if c in cocc._claims]
-    assert touched, "the fixture must overlap the hub, or it is not exercising the trap"
-
-    cocc.on_commit(2, [wall])                     # a SECOND owner of the same walled cells
-    cocc.on_release(1, [wall])
-    for c in touched:
-        assert cocc.iv_lo[c] > cocc.iv_hi[c], f"cell {c} was silently unwalled by the rebuild"
-
-    # And the re-wall must not discard the OTHER owner's claims: flight 2 still holds journal rows
-    # pointing at these cells, so dropping them here KeyErrors when flight 2 is released. (This is
-    # not hypothetical — it is what the first implementation did, and it died on the first
-    # density_faa iteration.)
-    cocc.on_release(2, [wall])
-    for c in touched:
-        assert cocc.iv_lo[c] > cocc.iv_hi[c]
-    assert cocc.n_added == 0
-
-
-def test_cocc_reset_cell_reclaims_overflow_slots():
-    """`_alloc` is otherwise a pure bump allocator, so under LNS — which resets and re-applies the
-    same hot cells every iteration — the pool would grow without bound for a static working set."""
-    cocc = CompiledOccupancy(CFG, track_removal=True)
-    base = cocc.nslots
-    for _ in range(500):
-        cocc.block_range(3, 100, 200)
-        cocc.block_range(3, 400, 500)
-        cocc.reset_cell(3)
-        cocc.block_range(3, 100, 200)
-        cocc.reset_cell(3)
-    assert cocc.nslots <= base + 4                 # reused, not leaked
-    cocc.block_range(3, 100, 200)                  # and recycled slots still answer correctly
-    assert not any(lo <= 150 <= hi for lo, hi in _chain(cocc, 3))
-    assert any(lo <= 99 <= hi for lo, hi in _chain(cocc, 3))
-
-
-def _chain(cocc, c):
-    """Cell ``c``'s live (lo, hi) free intervals, walked straight off the pool. `free_intervals_py`
-    takes (q, r, L) and this test blocks a raw slot id, so the chain walk is the honest reader."""
-    out, slot = [], c
-    while slot != -1:
-        lo, hi = int(cocc.iv_lo[slot]), int(cocc.iv_hi[slot])
-        if lo <= hi:
-            out.append((lo, hi))
-        slot = int(cocc.iv_nxt[slot])
-    return out
-
-
-def test_cocc_reset_drops_the_journal():
-    """Same defensive gate as the SafeIntervalIndex one: a journal surviving `reset()` would
-    re-block spans the fresh absorb already applied."""
-    keep, drop = _wall(3000.0), _wall(1000.0)
-    cocc = CompiledOccupancy(CFG, track_removal=True)
-    cocc.on_commit(1, [drop])
-    cocc.reset()
-    assert not cocc._rows and not cocc._claims
-    cocc.on_commit(1, [drop])
-    cocc.on_commit(2, [keep])
-    cocc.on_release(1, [drop])
-
-    fresh = CompiledOccupancy(CFG)
-    fresh.on_commit(2, [keep])
-    R = hg.circumradius(CFG)
-    q, r = hg.enu_to_axial(1000.0, 0.0, R)
-    assert (cocc.free_intervals_py(q, r, 0, 0, cocc.MAXS)
-            == fresh.free_intervals_py(q, r, 0, 0, cocc.MAXS))
-
-
-def test_cocc_records_the_clamped_span_so_release_is_exact():
-    """`_record` journals what `block_range` will ACTUALLY apply, not the raw rasterized span. A
-    volume can outlive the pool horizon; recording it raw would pack a too-large `s_hi` and replay
-    every SURVIVING claim in that cell at a garbage span."""
-    cocc = CompiledOccupancy(CFG, track_removal=True)
-    cocc._claims.clear()
-    cocc._record(7, -5, cocc.MAXS + 1000, None)
-    packed = cocc._claims[7][0]
-    from freespace_sim.planner.compiled_occupancy import _FIELD_MASK, _SPAN_BITS
-    assert (packed >> _SPAN_BITS, packed & _FIELD_MASK) == (0, cocc.MAXS)
-
-
-# ------------------------------------------------------------------ §4.3 wiring
-
-def test_sipp_subscribes_release_hooks_for_every_structure_it_binds():
-    """The count §0 of the plan turns on — and it is FLIGHT-DEPENDENT, which the plan did not say.
-
-    Compiled A* always binds three release-hooked structures. SIPP binds three for a point-to-point
-    flight and a fourth (`_sidx`) only for a TERMINAL one, because the SafeIntervalIndex exists to
-    build the own-column transparency overlay (`sipp.py`'s `if fixed and (o_term or d_term)`). So
-    SIPP's commit-side headwind is 4:3 on a hub scenario like density_faa, where every leg has a
-    terminal, and 3:3 — i.e. none — on point-to-point traffic.
-
-    Before this branch every one of these was 0 for SIPP's own two, and each destroy rebuilt them
-    from the whole ledger."""
+    This assertion used to read 3 for A*, 3 for a point-to-point SIPP and FOUR for a terminal one —
+    the "4:3 commit-side headwind" the old docstring narrated. Both extra structures are gone: the
+    global free-interval pool was replaced by a per-plan build over A*'s arena, and the
+    `SafeIntervalIndex` it needed for the own-column overlay is no longer ledger-subscribed at all.
+    A terminal flight and a point-to-point one must now agree, which is the point of the third case.
+    """
     astar = AStarPlanner(incremental_release=True)
     led_a = ReservationLedger(CFG)
     astar.plan(_req(), led_a, CFG)
@@ -295,11 +159,13 @@ def test_sipp_subscribes_release_hooks_for_every_structure_it_binds():
 
     led_p2p = ReservationLedger(CFG)
     SIPPPlanner(incremental_release=True).plan(_req(), led_p2p, CFG)
-    assert len(led_p2p._release_subs) == 3         # _svc, _tcap, _scocc — no overlay needed
+    assert len(led_p2p._release_subs) == 3
 
     led_hub = ReservationLedger(CFG)
-    SIPPPlanner(incremental_release=True).plan(_hub_req(), led_hub, CFG)
-    assert len(led_hub._release_subs) == 4         # ...plus _sidx
+    hub = SIPPPlanner(incremental_release=True)
+    hub.plan(_hub_req(), led_hub, CFG)
+    assert len(led_hub._release_subs) == 3, "a terminal flight still binds a fourth structure"
+    assert hub._sidx is None, "SafeIntervalIndex was bound on a compiled plan"
 
 
 def test_sipp_release_keeps_n_added_in_lockstep_so_no_rebuild_fires():
@@ -312,10 +178,10 @@ def test_sipp_release_keeps_n_added_in_lockstep_so_no_rebuild_fires():
         it = sipp.plan(_hub_req(fid, y=400.0 * fid), led, CFG)   # hub legs, so `_sidx` binds too
         assert it.accepted
         led.commit(fid, it.volumes)
-    assert sipp._sidx.n_added == sipp._scocc.n_added == led.n_volumes
+    assert sipp._cocc.n_added == led.n_volumes
 
     led.release_many([2])
-    assert sipp._sidx.n_added == sipp._scocc.n_added == led.n_volumes, "tripwire would fire"
+    assert sipp._cocc.n_added == led.n_volumes, "tripwire would fire"
 
 
 def test_sipp_plan_never_reports_a_previous_flights_read_set():
@@ -356,6 +222,83 @@ def test_sipp_record_envelope_off_leaves_none():
     assert sipp.last_envelope is None
 
 
+def test_sipp_compiled_does_not_maintain_the_blocked_map():
+    """SIPP used to declare `needs_blocked_map = True`, which kept `HexOccupancyService`
+    maintaining a map whose ONLY reader is `is_blocked` — called from `_succ`, i.e. the
+    pure-Python reference, never from the compiled path. Measured 1.807 ms/flight at
+    density_faa scale (5.562 against 3.755) for a structure written on every commit and
+    read on a fallback that does not happen.
+
+    Asserting the flag alone would be worthless (it is a class attribute); assert the
+    OBSERVABLE — the service is not writing the map after a compiled plan committed."""
+    if not SIPPPlanner().sipp_compiled:
+        pytest.skip("numba unavailable; every plan takes the reference, which arms the map")
+    led = ReservationLedger(CFG)
+    sipp = SIPPPlanner()
+    intent = sipp.plan(_req(1), led, CFG)
+    assert intent.accepted
+    led.commit(1, intent.volumes)
+    sipp.plan(_req(2, y=600.0), led, CFG)          # a second plan, against a non-empty ledger
+    assert sipp._svc._blocked_live is False, "compiled SIPP is still maintaining `blocked`"
+    assert not sipp._svc.blocked, f"`blocked` has {len(sipp._svc.blocked)} steps written into it"
+    assert sipp._svc.pad, "the pad map must still be live — `pad_clear` is on the compiled path"
+
+
+def test_sipp_reference_arms_the_blocked_map():
+    """`_splan_reference` searches through `_succ`, which calls `svc.is_blocked`, and an
+    unmaintained map RAISES (`HexOccupancyService.is_blocked`). So the reference arms it.
+
+    The gate is the map comparison, not the flag: a build that armed the map WRONG would still flip
+    `_blocked_live`. Three properties of the fixture are load-bearing, and without any one of them
+    the comparison is decorative:
+
+    * `incremental_release=True`, so `blocked` holds REFCOUNTS. With the default set-valued map a
+      replay that added every volume twice is idempotent and invisible.
+    * TERMINAL flights, so `own_cols` is non-empty and `enable_blocked`'s own-column skip is
+      actually exercised. Point-to-point requests make that branch a no-op.
+    * a comparator built `maintain_blocked=True` from construction — NOT another compiled
+      SIPPPlanner, whose service is also built with the map off and would be filled by the very same
+      replay, comparing `enable_blocked` against itself.
+    """
+    led = ReservationLedger(CFG)
+    lazy = SIPPPlanner(incremental_release=True)
+    for fid in (1, 2):
+        seed = lazy.plan(_hub_req(fid, y=400.0 * fid), led, CFG)
+        if seed.accepted:
+            led.commit(fid, seed.volumes)
+    assert led.n_volumes, "fixture committed nothing"
+
+    got = lazy._splan_reference(_hub_req(3, y=300.0), led, CFG)
+    assert lazy._svc._blocked_live, "the reference search did not arm the map"
+    assert got is not None
+
+    # Mirror the planner's eviction floor BEFORE absorbing: `add_volume` clamps `s_lo` to
+    # `evicted_before` at insert time, so a comparator without it keeps steps the planner's service
+    # clamped away and the test fails on eviction rather than on the thing it is about.
+    eager = HexOccupancyService(CFG, track_removal=True, maintain_blocked=True)
+    eager.evicted_before = lazy._svc.evicted_before
+    _absorb(eager, led)
+    assert eager._blocked_live and eager.blocked
+    assert lazy._svc.blocked == eager.blocked, "armed map differs from one maintained all along"
+
+
+def test_degraded_sipp_keeps_the_blocked_map():
+    """`needs_blocked_map` reads `sipp_compiled`, not the inherited `compiled`.
+
+    `AStarPlanner._occupancy` derives `maintain_blocked` from `self.compiled` — A*'s FALLBACK-kernel
+    flag — while `SIPPPlanner.plan` dispatches on `self.sipp_compiled`, and `_swarm_jit`'s failure
+    handler clears only the latter. Key the map off the wrong one and a JIT-degraded SIPP (every
+    plan on the reference) turns the map off AND pays an O(schedule) `enable_blocked` replay on its
+    plan, then maintains it regardless: strictly more work than before Phase 1, for no saving.
+    """
+    led = ReservationLedger(CFG)
+    sipp = SIPPPlanner()
+    sipp.sipp_compiled = False                 # what `_swarm_jit` does on a kernel that won't warm
+    sipp.plan(_req(1), led, CFG)
+    assert sipp._svc._maintain_blocked, "a degraded SIPP built the service without the map"
+    assert sipp._svc._blocked_live
+
+
 def test_sipp_honors_evict_floor_for_its_own_structures():
     """Out-of-order LNS repair needs the full-horizon occupancy; the floor must reach SIPP's two."""
     led = ReservationLedger(CFG)
@@ -364,8 +307,7 @@ def test_sipp_honors_evict_floor_for_its_own_structures():
     from dataclasses import replace
 
     sipp.plan(replace(_hub_req(1), t_request=900.0, t_departure=900.0), led, CFG)
-    assert sipp._sidx.evicted_before == 0
-    assert sipp._scocc.evicted_before == 0
+    assert sipp._cocc.evicted_before == 0
 
 
 # ------------------------------------------------------------------ §6 currency

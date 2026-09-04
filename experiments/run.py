@@ -82,7 +82,7 @@ def _kernel_status(planner_name: str) -> str:
     if family == "A*":
         from freespace_sim.planner.astar import kernel  # noqa: F401
     else:
-        from freespace_sim.planner import sipp_kernel  # noqa: F401
+        from freespace_sim.planner.sipp import kernel  # noqa: F401
     return f"compiled ({family} numba kernel active)"
 
 

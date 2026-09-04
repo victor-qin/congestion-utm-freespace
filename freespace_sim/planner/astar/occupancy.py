@@ -337,13 +337,21 @@ class HexOccupancyService:
                 del bucket[s]
         self.evicted_before = step
 
-    def reset(self) -> None:
+    def reset(self, keep_blocked_live: bool = False) -> None:
         # Back to the construction-time policy: a rebuild-from-shrink re-absorbs through `on_commit`,
         # which writes `blocked` only while the map is live — so a reset that KEPT a rebuilt-live flag
         # would be fine, but one that kept it live without re-absorbing would not. Resetting the flag
         # makes the invariant "live ⇒ every committed flight is in `blocked`" hold by construction;
         # the next reference dispatch re-arms it.
-        self._blocked_live = self._maintain_blocked
+        #
+        # `keep_blocked_live=True` is for the ONE caller that re-absorbs immediately (`_occupancy`'s
+        # shrink-rebuild branch), and it exists because dropping the flag there is a measured
+        # regression, not a style choice: the re-absorb walks the ledger without writing `blocked`,
+        # then the next reference dispatch's `enable_blocked` walks it AGAIN to rebuild the map —
+        # two full passes per shrink where the pre-`enable_blocked` design did one. Only pass it
+        # where the very next statement is an `_absorb`; anywhere else it leaves a map that claims
+        # to be live and is empty.
+        self._blocked_live = self._maintain_blocked or (keep_blocked_live and self._blocked_live)
         self.blocked.clear()
         self.pad.clear()
         self.term_cells.clear()

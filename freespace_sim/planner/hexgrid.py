@@ -614,7 +614,7 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     ~98% of the coordinator's serial commit floor is these per-commit rasterizations (issue #8 Phase
     E), and the geometry is identical between them, so it is computed once here and reused. Consumers
     are A*'s ``HexOccupancyService`` + ``CompiledHexOccupancy``, LNS's claim index, and on a SIPP plan
-    additionally ``CompiledOccupancy`` + ``SafeIntervalIndex`` (issue #114) — all derive ``R``/
+    additionally ``SafeIntervalIndex`` on a reference dispatch (issue #114) — all derive ``R``/
     ``infl_blocked``/``infl_pad`` identically from ``cfg``, and within a commit they share the ``cfg``
     object and the backend flag too, which is what makes them share a key.
 

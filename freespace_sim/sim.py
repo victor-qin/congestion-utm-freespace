@@ -510,6 +510,24 @@ def run(
                 report(done, total, intent)
 
     verified = verify.find_interflight_conflict(intents, cfg, static_terminals=static_terms) is None
+    # Precedence is a SEPARATE property from separation, and `verified` deliberately keeps meaning
+    # the latter: a return that departs before its outbound lands holds a disjoint window at the same
+    # pad, so it is not a conflict and folding it into `verified` would retroactively relabel every
+    # nominal-anchor run ever archived. Report it instead, and name the supported fix.
+    # Re-derived here, not read from the branch above: `turnaround_s` is bound inside the per-flight
+    # FCFS path only, so a batch-planner run would raise NameError. `demand_turnaround_s` is the one
+    # owner of the value, so this cannot disagree with what the coupling used.
+    n_bad, short_s = verify.count_paired_precedence_violations(
+        intents, cfg,
+        turnaround_s=(demand_turnaround_s(demand)
+                      if return_anchor == "realized" and demand is not None else 0.0))
+    if n_bad:
+        log.warning(
+            "%d/%d paired return(s) depart before their outbound's pad clears (%.0fs total shortfall) "
+            "— the aircraft has not arrived. Their filed departure is a NOMINAL estimate the outbound's "
+            "real trip overran; return_anchor='realized' re-anchors each return off the measured "
+            "arrival. This is a precedence violation, not a conflict, so `verified` does not see it.",
+            n_bad, sum(1 for i in intents if i.request.paired_outbound_id is not None), short_s)
     # Carry the planner that ACTUALLY flew: a planner_name= override must be reflected in the stored
     # config, or downstream metrics/aggregate (which key on cfg.planner — e.g. the altitude baseline)
     # and the reported planner label would describe cfg.planner, not the planner that ran.

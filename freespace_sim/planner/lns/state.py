@@ -262,6 +262,23 @@ class LNSState:
         # outbound fid -> the committed return's desired departure. We never re-time returns, so
         # an outbound repair must keep its realized release <= anchor - turnaround.
         self._turnaround_s = turnaround_s
+        # Paired-return PRECEDENCE, which is a different property from the anchor guard below and
+        # from `verify`'s separation check: a return that departs before its outbound lands holds a
+        # DISJOINT window at the same pad, so it is not a conflict and nothing else sees it. The
+        # baseline count is recorded because a nominal-anchor schedule can arrive with violations
+        # already in it — LNS is answerable for not ADDING any, not for the schedule it was handed.
+        from freespace_sim import verify as _verify
+        self._precedence_baseline = _verify.count_paired_precedence_violations(
+            intents, cfg, turnaround_s=float(turnaround_s or 0.0))[0]
+        # Round-trip partners, BOTH directions, so a destroy operator can close its victim set over
+        # pairs (`LNSConfig.pair_closed_neighborhood`). Built from the requests, not the anchor guard's
+        # dict, because that one is keyed by outbound id only and is empty under nominal anchoring.
+        self._pair_of: dict[int, int] = {}
+        for it in intents:
+            pid = it.request.paired_outbound_id
+            if pid is not None:
+                self._pair_of[it.request.flight_id] = pid
+                self._pair_of[pid] = it.request.flight_id
         self._return_anchor: dict[int, float] = {}
         if turnaround_s is not None:
             for it in intents:
@@ -486,6 +503,26 @@ class LNSState:
 
     def is_movable(self, fid: int) -> bool:
         return fid in self._movable_set
+
+    def close_over_pairs(self, victims):
+        """Add each victim's round-trip partner, when it exists and is movable.
+
+        The two legs of a round trip share one customer pad and one aircraft, so repairing an
+        outbound without its return leaves the return planned against a world that moved. Closing the
+        set costs neighborhood size — at N=2 this is up to N=4 — which is why it is opt-in and
+        measured rather than assumed: this repo has already seen a causally-motivated neighborhood
+        enrichment (the blocker-ranking operator) lose end to end on throughput.
+
+        It does NOT by itself keep precedence: a return's `t_departure` is fixed at plan time, so
+        re-planning both legs cannot stop an outbound landing after its return was due out. That
+        remains the anchor guard's job.
+        """
+        out = set(victims)
+        for fid in tuple(out):
+            partner = self._pair_of.get(fid)
+            if partner is not None and partner in self._movable_set:
+                out.add(partner)
+        return out
 
     def delay(self, fid: int) -> float:
         return max(0.0, float(self.incumbent[fid].cost) - self._unimp_cost[fid])

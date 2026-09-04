@@ -49,6 +49,10 @@ class LNSConfig:
     repair_order: str = "premium"       # PP priority: "premium" (most-delayed first) | "random" (paper)
     max_walks: int = 10                 # agent-based: walk restarts before giving up on size N
     map_max_cells: int = 4096           # map-based: BFS exploration bound
+    # Pull each victim's round-trip partner into the destroy set (see LNSState.close_over_pairs).
+    # Off by default: it raises the EFFECTIVE neighborhood size, and size is the throughput lever at
+    # density (N=2 beats N=8 by 2x there), so this has to earn its place in an A/B.
+    pair_closed_neighborhood: bool = False
     frozen_flight_ids: frozenset = frozenset()      # never destroyed (USS-restriction hook)
     movable_uss_ids: frozenset | None = None        # None -> system operator may move every USS's intents
     incremental_release: bool = True     # O(victims) occupancy removal; False = rebuild path (parity ref)
@@ -267,7 +271,7 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         )
     booleans = {
         name: _boolean_config_value(name, getattr(lns, name))
-        for name in ("adaptive", "incremental_release")
+        for name in ("adaptive", "incremental_release", "pair_closed_neighborhood")
     }
     frozen_flight_ids = frozenset(
         _integer_config_value("frozen_flight_ids", fid, minimum=0)
@@ -340,6 +344,29 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         **optional_integers,
         **booleans,
     )
+
+
+def assert_incumbent_ok(state) -> None:
+    """Both LNS invariants over the current incumbent — separation AND paired-leg precedence.
+
+    Shared by the sequential loop and the parallel coordinator so the two engines cannot check
+    different things. Precedence is compared against the count the state was BUILT with: the
+    schedule may already contain violations (a nominal-anchor baseline does), and failing on those
+    would make `verify_every` unusable on exactly the runs that need watching."""
+    final = state.final_intents()
+    bad = verify.find_interflight_conflict(
+        final, state.cfg, static_terminals=state.static_terms)
+    if bad is not None:
+        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+    n_bad, short_s = verify.count_paired_precedence_violations(
+        final, state.cfg, turnaround_s=float(state._turnaround_s or 0.0))
+    if n_bad > state._precedence_baseline:
+        example = verify.find_paired_precedence_violation(
+            final, state.cfg, turnaround_s=float(state._turnaround_s or 0.0))
+        raise AssertionError(
+            f"LNS introduced {n_bad - state._precedence_baseline} paired-return precedence "
+            f"violation(s) (now {n_bad}, {short_s:.0f}s total shortfall); e.g. return {example[0]} "
+            f"departs {example[2]:.1f}s before outbound {example[1]} releases its pad")
 
 
 def _effective_search_workers(lns: LNSConfig) -> int:
@@ -538,6 +565,8 @@ def run_lns(
                 else:
                     name = lns.operators[int(rng_i.integers(len(lns.operators)))]
                 victims = ops[name](state, lns.neighborhood_size)
+                if lns.pair_closed_neighborhood:
+                    victims = state.close_over_pairs(victims)
                 if not victims:
                     if lns.adaptive:
                         selector.update(name, 0.0)
@@ -558,11 +587,7 @@ def run_lns(
                     state.total_cost, time.monotonic() - t0,
                 ))
                 if out.accepted and lns.verify_every and n_accepted % lns.verify_every == 0:
-                    bad = verify.find_interflight_conflict(
-                        state.final_intents(), cfg, static_terminals=static_terms
-                    )
-                    if bad is not None:
-                        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+                    assert_incumbent_ok(state)
                 if lns.log_every and (i + 1) % lns.log_every == 0:
                     log.info(
                         "lns %d/%d: cost %.0f (%.2f%% below start), %d accepted, weights %s",

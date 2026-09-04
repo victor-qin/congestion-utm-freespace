@@ -38,6 +38,7 @@ from freespace_sim.geometry import CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner import iter_planner_chain
 from freespace_sim.planner.lns.unimpeded import resolve_workers, unimpeded_costs
 from freespace_sim.sim import realized_release_s
 from freespace_sim.types import OperationalIntent
@@ -92,6 +93,11 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
     planner.record_envelope = record_envelope
     return planner
 _MISSING = object()
+#: Premium slack absorbing cost-accumulation float noise, well below one dt of ground delay.
+_PREMIUM_TOL = 1e-6
+#: Share of movable flights that may go negative from refiner tie-break noise before it reads as a
+#: currency mismatch. Measured regimes are 0.3% (artifact) against 17-85% (bug) — nothing in between.
+_PREMIUM_ARTIFACT_FRAC = 0.02
 
 
 def _same_committed_schedule(
@@ -180,6 +186,8 @@ class LNSState:
         unimpeded_cost: dict[int, float | None] | None = None,
         maintain_claim_index: bool = True,
         window_bytes: int | None = None,
+        shortcut_repair: str = "none",
+        shortcut_ruler: bool = False,
     ) -> None:
         self.cfg = cfg
         self.ledger = ledger
@@ -212,13 +220,21 @@ class LNSState:
         self.total_cost = float(sum(it.cost for it in intents if it.accepted))
 
         # Baseline, unimpeded, and repaired costs must come from compatible planners; otherwise delay
-        # premiums and acceptance comparisons use different currencies.
-        if repair_planner is None and cfg.planner not in _REPRODUCIBLE_PLANNERS:
+        # premiums and acceptance comparisons use different currencies. `repair_planner is None` is
+        # NOT on its own evidence of a bare repair: the deferred arms keep the default A* and refine
+        # after the PP loop, so they reproduce a refined baseline just as a wrapper does. Testing
+        # only the planner slot refused `astar_shortcut` + shortcut_repair, which is the one
+        # configuration where an in-loop cut is being asked a fair question. This stays a cheap
+        # string pre-check either way; the authority is the numeric premium invariant below, which
+        # reads the actual costs and cannot be fooled by a planner name.
+        if (repair_planner is None and shortcut_repair == "none"
+                and cfg.planner not in _REPRODUCIBLE_PLANNERS):
             raise ValueError(
                 f"LNS cannot measure a {cfg.planner!r} baseline: its unimpeded ruler is a plain A*, "
                 f"and the repair planner is one of {sorted(_REPRODUCIBLE_PLANNERS)}, so delay premiums "
                 f"would compare two different planners. Pass repair_planner= a planner object that "
-                f"reproduces {cfg.planner!r}, or re-run the baseline with a planner in that set.")
+                f"reproduces {cfg.planner!r}, set a shortcut_repair arm, or re-run the baseline with "
+                f"a planner in that set.")
 
         # Vet a borrowed planner BEFORE taking the ledger over: a constructor that raises must not
         # leave the caller's ledger stripped of its subscribers.
@@ -232,11 +248,18 @@ class LNSState:
             # in ANY priority order (a later victim planned first must not evict an earlier one's
             # obstacles). Required, never written here: silently rewriting a caller's planner would
             # outlive this state and change that planner's behavior everywhere else it is used.
-            # `getattr` because a planner WRAPPER (ShortcutRefiner) has no such attribute of its own —
-            # the floor belongs to the inner planner, and the caller has to have set it there.
-            if getattr(repair_planner, "evict_floor", None) != 0.0:
-                raise ValueError("repair_planner.evict_floor must be 0.0 — random/premium repair orders "
-                                 "need the full-horizon occupancy, and the floor is the caller's to set "
+            # The floor belongs to the SEARCH planner, so a wrapper (ShortcutRefiner) never carries
+            # one — walk the chain. Reading it off the wrapper made every correctly-configured
+            # wrapper raise, which is why no shortcut repair arm could be constructed at all.
+            # Demand it of every planner in the chain that has the attribute: a diamond
+            # (astar_milp_shortcut) holds several searches and ANY of them advancing the watermark
+            # would evict an earlier victim's obstacles out from under a later one.
+            floors = [getattr(pl, "evict_floor", _MISSING) for pl in iter_planner_chain(repair_planner)]
+            present = [f for f in floors if f is not _MISSING]
+            if not present or any(f != 0.0 for f in present):
+                raise ValueError("repair_planner.evict_floor must be 0.0 on every search planner in "
+                                 "its wrapper chain — random/premium repair orders need the "
+                                 "full-horizon occupancy, and the floor is the caller's to set "
                                  "(on the inner planner, for a wrapper)")
         else:
             # Construct before taking ownership of the caller's ledger. `run_lns` validates its
@@ -256,6 +279,11 @@ class LNSState:
         # `release_many` and un-absorb victims in O(their volumes), so the per-iteration shrink
         # rebuild (measured 94% of iteration wall) never happens. False keeps the rebuild path
         # (the byte-parity reference for A/Bs).
+        if shortcut_repair not in ("none", "deferred", "post_accept"):
+            raise ValueError(f"unknown shortcut_repair {shortcut_repair!r} (want 'none', 'deferred' "
+                             "or 'post_accept'; the INTERLEAVED arm is a ShortcutRefiner passed as "
+                             "repair_planner, not a mode)")
+        self.shortcut_repair = shortcut_repair
         self.repair_planner = repair_planner
 
         # Paired-return anchor guard (only when the baseline ran return_anchor="realized"):
@@ -295,7 +323,7 @@ class LNSState:
         else:
             rows = unimpeded_costs(
                 cfg, self.static_terms, [self.incumbent[fid].request for fid in self._movable],
-                n_workers=resolve_workers(unimpeded_workers),
+                n_workers=resolve_workers(unimpeded_workers), shortcut=shortcut_ruler,
             )
         for fid, cost, denial in rows:
             if cost is not None:
@@ -303,6 +331,43 @@ class LNSState:
             else:  # can't even place it alone (cap artifact): treat as undelayed, never seed a walk
                 self._unimp_cost[fid] = float(self.incumbent[fid].cost)
                 log.warning("lns: unimpeded plan denied for flight %d (%s)", fid, denial)
+        # A premium below zero means the incumbent beat a flight's own ALONE plan. Two very different
+        # things produce that, and `delay()`'s `max(0.0, ...)` used to hide both — the flight then
+        # reads as perfectly unimpeded and drops out of the agent-based destroy seed AND the
+        # `premium` repair order.
+        #
+        # (1) CURRENCY MISMATCH — the ruler and the incumbent came from different planners. Systemic:
+        #     measured 34/40 flights (85%) on a dallas_hub_2uss x240 `astar_shortcut` baseline ruled
+        #     by bare A*, 76/451 (17%) at x1800. This is a bug and must raise.
+        # (2) TIE-BREAK ARTIFACT — both sides ARE the same planner, but a greedy refiner is in the
+        #     currency and the ruler is no longer a lower bound. A* returns equal-cost geodesics of
+        #     different SHAPE in the empty and the congested world, and `shortcut_corners` is a
+        #     shape-dependent greedy fixpoint, so the solo plan can refine WORSE. Measured on
+        #     density_faa: flight 112, zero ground delay and zero air hold, identical flight level
+        #     and altitude change, `air_detour_m` 58.6 m in traffic against 201.0 m alone. Rare:
+        #     1/290. This is not a bug and must not raise.
+        #
+        # Prevalence separates them cleanly (85% / 17% against 0.3%), so that is what is tested.
+        # The residual is then clamped by taking the MINIMUM rather than by `max(0.0, ...)` on the
+        # difference: the flight demonstrably achieved `incumbent.cost` in a world holding traffic,
+        # so its true solo optimum is at most that. Tightening a bound with evidence already in
+        # hand, not a fudge — and unlike the old clamp it leaves `delay()` monotone.
+        premium = {fid: float(self.incumbent[fid].cost) - self._unimp_cost[fid]
+                   for fid in self._movable}
+        negative = sorted((f for f, d in premium.items() if d < -_PREMIUM_TOL),
+                          key=lambda f: premium[f])
+        if negative and len(negative) > max(1, int(_PREMIUM_ARTIFACT_FRAC * len(self._movable))):
+            raise ValueError(
+                f"{len(negative)} of {len(self._movable)} movable flights "
+                f"({100.0 * len(negative) / len(self._movable):.1f}%) have a NEGATIVE delay premium "
+                f"(worst {premium[negative[0]]:.2f} on flight {negative[0]}, first ids "
+                f"{negative[:5]}) — too many to be refiner tie-break noise, so the incumbent and the "
+                f"unimpeded ruler were built by different planners. Pass shortcut_ruler=True when "
+                f"the schedule was refined, or rebuild the baseline with the ruler's planner.")
+        for fid in negative:
+            log.warning("lns: flight %d beat its own unimpeded plan by %.2f (refiner tie-break); "
+                        "clamping its ruler to the incumbent", fid, -premium[fid])
+            self._unimp_cost[fid] = float(self.incumbent[fid].cost)
 
         # Claim index for the destroy heuristics: cell -> [(s_lo, s_hi, fid)] over the same
         # inflated corridor/pad raster A* deconflicts against (blocked rows only; the
@@ -542,6 +607,40 @@ class LNSState:
                 out.append((s, (q, r, level)))
         return out
 
+    # ------------------------------------------------------------------- shortcut arms
+    def _shortcut_repaired(self, new: dict, order) -> int:
+        """Refine each freshly-repaired flight against the OTHER repaired plans; mutate ``new``.
+
+        A committed flight conflicts with itself, so each one is released, refined, and re-committed
+        in repair order. The refiner's own contract does the rest: it re-verifies the rebuilt geometry
+        against this ledger and returns the original when the splice does not hold, so a failure here
+        costs a probe, never feasibility. Returns how many flights actually shortened.
+        """
+        from freespace_sim.planner.shortcut import _terminal_capacity_for, refine_intent
+
+        tcap = _terminal_capacity_for(self.repair_planner, self.ledger)
+        n = 0
+        for fid in order:
+            it = new.get(fid)
+            if it is None or len(it.centerline) <= 3:
+                continue
+            self.ledger.release_many([fid])
+            # Commit SOMETHING for this flight on every path. Between the release and the commit the
+            # ledger is a flight short, and `_rewind` re-commits the OLD plan for every victim — over
+            # a hole, that is still correct, but a raise from `refine_intent` would otherwise leave
+            # this flight's slot doubly written on the rewind. Restoring the unrefined plan first
+            # keeps the invariant "every victim has exactly one live commit" true at every yield.
+            try:
+                keep = refine_intent(it, self.ledger, self.cfg, tcap=tcap)
+            except BaseException:
+                self.ledger.commit(fid, it.volumes)
+                raise
+            self.ledger.commit(fid, keep.volumes)
+            if keep is not it:
+                new[fid] = keep
+                n += 1
+        return n
+
     # ------------------------------------------------------------------- transaction
     def try_repair(
         self,
@@ -618,8 +717,22 @@ class LNSState:
                         reason = "anchor"
                         break
 
+            # A2: tighten the whole neighborhood BEFORE the accept test, so the geometry the test
+            # weighs is the geometry that would be adopted. The anchor guard above ran on the
+            # unrefined plans; a refine only shortens the path, so it can only pull the realized
+            # release EARLIER, and an anchor that held cannot be broken by it.
+            if reason == "improved" and self.shortcut_repair == "deferred":
+                self._shortcut_repaired(new, order)
+
             cost_new = float(sum(it.cost for it in new.values())) if reason == "improved" else math.inf
             if reason == "improved" and cost_new < cost_old - accept_epsilon:
+                # A3: the test has already passed on un-refined cost — polish only the winner, so a
+                # rejected repair never pays for a cut. `cost_new` is then RESTATED from the refined
+                # plans; leaving the pre-cut figure would make `total_cost` disagree with the sum of
+                # the incumbent's own costs, which is the number every later accept test reads.
+                if self.shortcut_repair == "post_accept":
+                    self._shortcut_repaired(new, order)
+                    cost_new = float(sum(it.cost for it in new.values()))
                 candidate = RepairOutcome(
                     True, "improved", cost_old, cost_new, len(new),
                     new_intents=dict(new), envelopes=tuple(envelopes),

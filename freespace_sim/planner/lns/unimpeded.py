@@ -48,8 +48,15 @@ def resolve_workers(n_workers: int | None) -> int:
     return min(8, max(1, (os.cpu_count() or 4) - 2))
 
 
-def _new_ruler(cfg, static_terms):
-    """A planner + the walls-only ledger it rules against. One planner per ledger (the A* services
+def _new_ruler(cfg, static_terms, shortcut: bool = False):
+    """A planner + the walls-only ledger it rules against.
+
+    ``shortcut=True`` wraps the ruler in a :class:`ShortcutRefiner`, which is REQUIRED whenever the
+    incumbent being ruled was itself refined: ``delay()`` subtracts this cost from the incumbent's,
+    so a bare-A* ruler against a shortcut schedule makes the premium NEGATIVE (measured on
+    dallas_hub_2uss x1800: 76/451 flights) and ``max(0.0, ...)`` then clamps them to a silent 0 —
+    invisible to the agent-based destroy seed, last in the ``premium`` repair order. The refiner only
+    ever READS the ledger (``any_conflict``), so the shard-purity that lets this parallelise holds. One planner per ledger (the A* services
     bind to whichever ledger they first see), and ``evict_floor = 0.0`` freezes the eviction
     watermark so the flights may be planned in any order — which is what lets a worker take an
     arbitrary shard."""
@@ -66,13 +73,17 @@ def _new_ruler(cfg, static_terms):
     # hash tables for searches that expand a few hundred nodes.
     planner = AStarPlanner(kernel_log2_min=_RULER_LOG2)
     planner.evict_floor = 0.0
+    if shortcut:
+        from freespace_sim.planner.shortcut import ShortcutRefiner
+
+        return ShortcutRefiner(planner, label="astar_sc"), free
     return planner, free
 
 
-def _plan_shard(cfg, static_terms, requests, planner=None, free=None):
+def _plan_shard(cfg, static_terms, requests, planner=None, free=None, shortcut: bool = False):
     """``[(flight_id, cost | None, denial_reason | None), ...]`` — cost is None on a denial."""
     if planner is None:
-        planner, free = _new_ruler(cfg, static_terms)
+        planner, free = _new_ruler(cfg, static_terms, shortcut)
     out = []
     for req in requests:
         u = planner.plan(req, free, cfg)
@@ -81,10 +92,10 @@ def _plan_shard(cfg, static_terms, requests, planner=None, free=None):
     return out
 
 
-def _worker_main(conn, cfg, static_terms, requests):
+def _worker_main(conn, cfg, static_terms, requests, shortcut=False):
     """Worker process: build a private ruler, plan the shard, send it back, exit."""
     try:
-        conn.send(_plan_shard(cfg, static_terms, requests))
+        conn.send(_plan_shard(cfg, static_terms, requests, shortcut=shortcut))
     finally:
         conn.close()
 
@@ -112,7 +123,8 @@ def _finish_processes(procs, timeout=5.0) -> None:
         proc.join()
 
 
-def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000):
+def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000,
+                    shortcut: bool = False):
     """Unimpeded cost per request, as ``[(flight_id, cost | None, denial_reason | None), ...]`` in
     the order ``requests`` was given — regardless of how the work was sharded, so a caller's log
     lines and warnings stay in flight order.
@@ -124,12 +136,12 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
     n = len(requests)
     if n == 0:
         return []
-    planner, free = _new_ruler(cfg, static_terms)
+    planner, free = _new_ruler(cfg, static_terms, shortcut)
     if n_workers <= 1:
         return _sequential(cfg, static_terms, requests, planner, free, log_every, 0)
 
     t0 = time.monotonic()
-    probe = _plan_shard(cfg, static_terms, requests[:_PROBE_N], planner, free)
+    probe = _plan_shard(cfg, static_terms, requests[:_PROBE_N], planner, free, shortcut)
     rate = (time.monotonic() - t0) / max(1, len(probe))
     rest = requests[len(probe):]
     projected = rate * len(rest)
@@ -153,7 +165,7 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
             conns.append(parent)
             try:
                 proc = ctx.Process(target=_worker_main,
-                                   args=(child, cfg, static_terms, shard), daemon=True)
+                                   args=(child, cfg, static_terms, shard, shortcut), daemon=True)
                 procs.append(proc)
                 proc.start()
             finally:
@@ -189,7 +201,7 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
         if rows is None:
             log.warning("lns: unimpeded worker %d died (exit %s) — replanning its %d flights "
                         "in-process", w, procs[w].exitcode, len(shards[w]))
-            by_worker[w] = _plan_shard(cfg, static_terms, shards[w], planner, free)
+            by_worker[w] = _plan_shard(cfg, static_terms, shards[w], planner, free, shortcut)
 
     out = probe + [None] * len(rest)                # un-stripe back into request order
     for w, rows in enumerate(by_worker):

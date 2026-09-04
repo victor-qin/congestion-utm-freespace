@@ -13,7 +13,7 @@ Measured on the real thing, deliberately:
 * against the same window ANCHORS A* uses (same cells, same `_WINDOW_MARGIN_HEX`), by wrapping
   `AStarPlanner._build_window` and rebuilding SIPP's intervals over its box. The lateral extent is
   therefore identical; the STEP extent deliberately is not — A* clips to `s0 + n_gsteps +
-  tail_steps` and this spans `[base, max_step]` (see `sipp_window.window_bounds`), so SIPP's box is
+  tail_steps` and this spans `[base, max_step]` (see `sipp.window.window_bounds`), so SIPP's box is
   the WIDER one and the 0.514 ms reference below is measured over a narrower span. The comparison is
   indicative, not like-for-like, and it is the absolute gate that decides Phase 3;
 * with the njit **warm** (the first call compiles), and the compile discarded from the sample. A
@@ -33,7 +33,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from freespace_sim import sim                                     # noqa: E402
-from freespace_sim.planner import sipp_window as SW               # noqa: E402
+from freespace_sim.planner.sipp import window as SW               # noqa: E402
 from freespace_sim.planner.astar import planner as AP             # noqa: E402
 from freespace_sim.planner.astar.compiled_hex_occupancy import (  # noqa: E402
     _FIELD_MASK,

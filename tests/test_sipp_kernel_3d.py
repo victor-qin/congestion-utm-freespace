@@ -1,6 +1,6 @@
 """Multi-altitude (3D) njit SIPP kernel: isolated compile + per-path correctness.
 
-These are *kernel-level* unit tests — they drive :func:`freespace_sim.planner.sipp_kernel._search`
+These are *kernel-level* unit tests — they drive :func:`freespace_sim.planner.sipp.kernel._search`
 directly on hand-built flat arrays, no planner host. That serves two purposes the host-level
 ``test_sipp_compiled`` equivalence tests can't:
 
@@ -26,7 +26,7 @@ import pytest
 
 pytest.importorskip("numba")  # kernel import does ``from numba import njit`` — skip the module if absent
 
-from freespace_sim.planner.sipp_kernel import FB_OOB, NO_PATH, OK, _search  # noqa: E402
+from freespace_sim.planner.sipp.kernel import FB_OOB, NO_PATH, OK, _search  # noqa: E402
 
 SQRT3 = math.sqrt(3.0)
 
@@ -86,14 +86,14 @@ def run(*, nlevels, base=0, max_step=20,
     iv_nxt = np.full(cap, -1, np.int64)
     iv_lo[:NC] = base
     for c in walled:                                   # permanently empty (lo>hi) ⇒ no free interval,
-        iv_lo[c] = 1; iv_hi[c] = 0; iv_nxt[c] = -1     # the degenerate head `sipp_window` writes for a
+        iv_lo[c] = 1; iv_hi[c] = 0; iv_nxt[c] = -1     # the degenerate head `sipp.window` writes for a
         #                                                foreign always-active wall (`static_col`)
     state = {"n": NC}                                  # next free split slot (mirrors nslots)
     for c, s in blocked:
         _block(iv_lo, iv_hi, iv_nxt, state, c, s)
 
     # No overlay arguments any more: own-lane transparency is baked into the window build
-    # (`sipp_window.build_window_intervals` skips an own cell's column claims), so the kernel walks
+    # (`sipp.window.build_window_intervals` skips an own cell's column claims), so the kernel walks
     # one chain per cell with the head at slot `cell`.
 
     lane_qr = np.asarray(lane_qr, np.int64)

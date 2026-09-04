@@ -26,38 +26,38 @@ from array import array
 
 import numpy as np
 
-from ..cost import endpoint_altitude_change_m, trajectory_cost
-from ..types import (
+from ...cost import endpoint_altitude_change_m, trajectory_cost
+from ...types import (
     DenialReason,
     IntentStatus,
     OperationalIntent,
     TimedPoint,
     as_terminal,
 )
-from ..geometry import CylinderSpec
-from ..volumes import (
+from ...geometry import CylinderSpec
+from ...volumes import (
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
     exit_radius,
     terminal_radius,
 )
-from . import hexgrid as hg
-from . import sipp_window as SW
-from .astar import AStarPlanner
-from .astar._packed import aligned_2d
-from .astar.compiled_hex_occupancy import (
+from .. import hexgrid as hg
+from . import window as SW
+from ..astar import AStarPlanner
+from ..astar._packed import aligned_2d
+from ..astar.compiled_hex_occupancy import (
     _FIELD_MASK,
     _S0_SHIFT,
     _SPAN_BITS,
     ground_delay_steps,
     search_horizon,
 )
-from .astar.planner import _BBOX_HUGE, _BindBatch, _absorb, _committed_arrival
+from ..astar.planner import _BBOX_HUGE, _BindBatch, _absorb, _committed_arrival
 
 _EPS = 1e-6
 
-# ---- per-plan interval window (`sipp_window`) ----
+# ---- per-plan interval window (`sipp.window`) ----
 # The same 24 hexes A* calibrated its dense window on. That number sizes for plan-level COVERAGE —
 # the share of plans with ZERO misses, 100.0% there — not for the typical box, because one miss
 # forces a widen-and-rerun. SIPP's measured read set is TIGHTER than A*'s (dirty rate 61.5% against
@@ -413,7 +413,7 @@ class SIPPPlanner(AStarPlanner):
         self._skernel = None
         if compiled:
             try:
-                from .sipp_kernel import _search
+                from .kernel import _search
                 self._skernel = _search
             except ImportError:
                 self.sipp_compiled = False              # SIPP kernel absent → pure-Python SIPP
@@ -915,7 +915,7 @@ class SIPPPlanner(AStarPlanner):
         return intent
 
     def _splan_compiled(self, req, ledger, cfg):
-        from .sipp_kernel import FB_CAP, FB_HASH, FB_OOB, NO_PATH
+        from .kernel import FB_CAP, FB_HASH, FB_OOB, NO_PATH
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
         R = hg.circumradius(cfg)
@@ -1054,7 +1054,7 @@ class SIPPPlanner(AStarPlanner):
             if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
                 # A cell under BOTH our column and a foreign hub's. One boolean per cell cannot say
                 # that, so take the exact reference — A*'s issue-#3 exit, reused verbatim. Measured
-                # unreachable on demand-generated layouts (see `sipp_window`'s header).
+                # unreachable on demand-generated layouts (see `sipp.window`'s header).
                 self._sfb += 1
                 self._sfb_overlap += 1
                 return self._splan_reference(req, ledger, cfg)

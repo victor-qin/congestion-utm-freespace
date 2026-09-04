@@ -139,7 +139,7 @@ its own** and pays 9.6% of the ledger side for ~20 lines.
 *The point:* delete the one cost SIPP pays purely because it declared a flag instead of reusing A\*'s
 lazy re-arm. Nothing about the compiled path changes; the reference path arms the map itself.
 
-**`freespace_sim/planner/sipp.py`**
+**`freespace_sim/planner/sipp/planner.py`**
 
 * `SIPPPlanner.needs_blocked_map` — **REMOVED** (class attribute; inherits `False` from `AStarPlanner`).
 * `SIPPPlanner._splan_reference` — **MODIFIED**. One line after the service is bound:
@@ -182,7 +182,7 @@ Split in two so the new kernel input is provable before anything is deleted.
 kernel already consumes, verified byte-exact against the structure it will replace. Pure addition —
 no planner touched, nothing deleted, so a parity failure is a red test rather than a wrong schedule.
 
-**`freespace_sim/planner/sipp_window.py`** — **NEW FILE**.
+**`freespace_sim/planner/sipp/window.py`** — **NEW FILE**.
 
 * `window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, lateral_margin, max_slots)`
   — **ADDED**. Mirrors `astar/window.window_bounds` with one deliberate difference: the step span is
@@ -205,7 +205,7 @@ no planner touched, nothing deleted, so a parity failure is a red test rather th
   Argument-for-argument `astar/window.build_window_claims`'s signature (same arena accessors
   `cocc._arena.arena/.start/.length`, same `key = (c << 1) | pool_idx`, same packing constants), with
   the bitmap output swapped for the interval chain. One pass per in-window cell; the head slot of
-  window-cell `w` IS slot `w`, overflow appended after `n_wcells` — the layout `sipp_kernel._search`
+  window-cell `w` IS slot `w`, overflow appended after `n_wcells` — the layout `sipp.kernel._search`
   already walks. Ownership is resolved per CELL by `ov_own_gen`, exactly as A* does, which is what
   §4.1 is about.
 
@@ -252,7 +252,7 @@ no planner touched, nothing deleted, so a parity failure is a red test rather th
 *The point:* make the window-local pool the kernel's only occupancy input, so the global pool and the
 global index have no readers and can go.
 
-**`freespace_sim/planner/sipp.py`**
+**`freespace_sim/planner/sipp/planner.py`**
 
 * `SIPPPlanner._scompiled_occ` — **REMOVED**. Replaced by the inherited `AStarPlanner._compiled_occ`,
   which binds `CompiledHexOccupancy` (the arena) to the ledger. SIPP and its own A\* fallback then
@@ -275,7 +275,7 @@ global index have no readers and can go.
       n_slots = SW.window_bounds(cocc, wbox, lateral_margin=_MARGIN << widen, ...)
       if n_slots <= 0: return self._splan_reference(...)
       SW.build_window_intervals(cocc.arena, ..., wbox, ...)
-      code, ... = sipp_kernel.search(iv_lo, iv_hi, iv_nxt, wbox, ...)
+      code, ... = sipp.kernel._search(iv_lo, iv_hi, iv_nxt, wbox, ...)
       if code != FB_WINDOW or widen == _WIDEN_MAX: break
       widen += 1
   ```
@@ -288,7 +288,7 @@ global index have no readers and can go.
 **`freespace_sim/planner/compiled_occupancy.py`** — **FILE DELETED**. `CompiledOccupancy`,
 `reset_cell`, `on_release`, `_record`, `_claims`, `_rows`, `_static_cells`, `_free` all go with it.
 
-**`freespace_sim/planner/sipp_kernel.py`** — **far smaller than it looks**, and worth checking before
+**`freespace_sim/planner/sipp/kernel.py`** — **far smaller than it looks**, and worth checking before
 budgeting for it. The kernel's cell encoding is already fully parameterised by
 `qmin, rmin, rspan, qspan, nlevels` (`cell = ((q - qmin) * rspan + (r - rmin)) * nlevels + L`), so
 "window-local" is *passing the window's bounds instead of the global box's*. Three consequences:
@@ -361,7 +361,7 @@ A\*'s is not.
 *Resolution, and the first part is already built:*
 
 * The kernel returns `FB_OOB` on the **first** out-of-box cell touch, before any chain is read
-  (`sipp_kernel._search` line 252). Pointing it at a window box rather than the global box makes that
+  (`sipp.kernel._search` line 252). Pointing it at a window box rather than the global box makes that
   the window-miss signal for free — no new code, no partial result. This is the single fact that
   makes PR 2b tractable.
 * The widen ceiling falls through to `_splan_reference`, which is unbounded. Correctness never depends

@@ -161,18 +161,17 @@ def test_sipp_warm_compiles_the_window_builder_too():
     to SIPP in any parallel measurement. Asserting the CALL rather than a timing keeps this a gate
     rather than a flake.
     """
-    from freespace_sim.planner import sipp as sipp_mod
-    from freespace_sim.planner import sipp_window
+    from freespace_sim.planner.sipp import window
 
     calls = []
-    real = sipp_window.build_window_intervals
+    real = window.build_window_intervals
     try:
-        sipp_mod.SW.build_window_intervals = lambda *a, **k: calls.append(a)
+        window.build_window_intervals = lambda *a, **k: calls.append(a)
         planner = SIPPPlanner(compiled=False)
         planner._skernel = lambda *args: None
         planner._swarm_jit()
     finally:
-        sipp_mod.SW.build_window_intervals = real
+        window.build_window_intervals = real
     assert len(calls) == 1, "the warm-up never compiled the window builder"
     iv_lo, iv_hi, iv_nxt, scratch = calls[0][11:15]
     assert (iv_lo.dtype, iv_hi.dtype, iv_nxt.dtype) == (np.dtype(np.int32),) * 3
@@ -204,9 +203,9 @@ def test_sipp_warm_uses_the_production_kernel_signature():
     assert warm_dtypes == production_dtypes == (np.dtype(np.int32),) * 3
 
     # Arity, against the live kernel rather than a hand-maintained number.
-    from freespace_sim.planner import sipp_kernel
+    from freespace_sim.planner.sipp import kernel
 
-    n_params = sipp_kernel._search.py_func.__code__.co_argcount
+    n_params = kernel._search.py_func.__code__.co_argcount
     assert len(warm) == n_params, f"warm-up passes {len(warm)} args, `_search` takes {n_params}"
 
 
@@ -285,7 +284,7 @@ def test_sipp_bounded_infeasibility_is_budget_exceeded(planner_name):
 
 @pytest.mark.skipif(not _COMPILED, reason="requires the compiled SIPP kernel")
 def test_compiled_kernel_no_path_is_budget_exceeded(monkeypatch):
-    from freespace_sim.planner.sipp_kernel import NO_PATH
+    from freespace_sim.planner.sipp.kernel import NO_PATH
 
     planner = SIPPPlanner(compiled=True)
     monkeypatch.setattr(planner, "_skernel", lambda *_: (-1, 0.0, 17, NO_PATH))
@@ -299,7 +298,7 @@ def test_compiled_kernel_no_path_is_budget_exceeded(monkeypatch):
 
 @pytest.mark.skipif(not _COMPILED, reason="requires the compiled SIPP kernel")
 def test_compiled_diagnostics_use_sipp_fallback_counter_and_clear_old_path(monkeypatch):
-    from freespace_sim.planner.sipp_kernel import FB_CAP
+    from freespace_sim.planner.sipp.kernel import FB_CAP
 
     planner = SIPPPlanner(compiled=True)
     first = planner.plan(_req(), ReservationLedger(CFG), CFG)

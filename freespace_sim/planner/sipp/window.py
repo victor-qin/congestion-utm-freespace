@@ -11,7 +11,7 @@ flights, 7.03x at 2,400).
 
 So: keep the claims, derive the intervals. One pass per in-window cell reads that cell's claim slabs
 out of the arena and emits the complement of them over ``[ws0, ws1]``, into the exact chain layout
-``sipp_kernel._search`` already walks:
+``sipp.kernel._search`` already walks:
 
     slot s:  iv_lo[s], iv_hi[s], iv_nxt[s]        head of window-cell ``w`` IS slot ``w``
     overflow intervals live at [n_wcells, tail) and are linked from the head via ``iv_nxt``
@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .astar.window import (
+from ..astar.window import (
     WBOX_N,
     W_Q0,
     W_Q1,
@@ -67,7 +67,7 @@ try:
     from numba import njit
 except ImportError:                     # numba absent — same guard as `astar/window`: this module
     def njit(*_args, **_kwargs):        # is imported at module level by `sipp`, whose own numba
-        def deco(fn):                   # is an ImportError guard around `.sipp_kernel`.
+        def deco(fn):                   # is an ImportError guard around `.kernel`.
             def _needs_numba(*_a, **_kw):
                 raise RuntimeError(
                     f"{fn.__name__} is a numba kernel and numba is not installed; the per-plan "

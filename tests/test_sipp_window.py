@@ -1,6 +1,6 @@
 """Per-plan safe-interval window: does it reproduce the global pool it replaces?
 
-`sipp_window.build_window_intervals` derives a plan-local free-interval chain from the A* claim
+`sipp.window.build_window_intervals` derives a plan-local free-interval chain from the A* claim
 arena, replacing `CompiledOccupancy`'s globally-maintained pool. Phase 3 deletes that pool, so these
 tests are the whole parity argument — written now, against the live pool, so that a failure is
 a red test rather than a wrong schedule. Design record: `context/sipp_runtime_plan.md`.
@@ -23,7 +23,7 @@ from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.mechanism import FCFSMechanism
 from freespace_sim.planner import get_planner
-from freespace_sim.planner import sipp_window as SW
+from freespace_sim.planner.sipp import window as SW
 from freespace_sim.planner.astar.compiled_hex_occupancy import (
     _FIELD_MASK,
     _S0_SHIFT,
@@ -201,7 +201,7 @@ def test_window_intervals_match_the_claim_oracle():
 def test_window_intervals_are_ascending():
     """The chain must ascend, and this is the ONLY thing checking it.
 
-    `sipp_kernel._search` abandons a chain walk on "the chain ascends, so a later interval starts
+    `sipp.kernel._search` abandons a chain walk on "the chain ascends, so a later interval starts
     later still" — twice (`if a - 1 > hi_c: break` in the lateral block, `if ap > hi_c - rsteps:
     break` in the rung block). An unordered chain does not crash; it silently drops legal successors
     and returns a worse plan. The arena's slabs ARE unordered, because removal is a swap-remove, so

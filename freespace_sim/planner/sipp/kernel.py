@@ -6,7 +6,7 @@ the reference oracle (and the fallback); this kernel must reproduce its exact op
 Everything terminal/geometry/commit stays in the Python host.
 
 **Occupancy** is a PER-PLAN interval pool over the window this flight reads, built from the A* claim
-arena by :func:`~freespace_sim.planner.sipp_window.build_window_intervals`: a cell's free intervals are
+arena by :func:`~freespace_sim.planner.sipp.window.build_window_intervals`: a cell's free intervals are
 slots walked from slot ``cell`` along ``iv_nxt``, and each slot is a unique frontier node id. Cell ids
 are therefore WINDOW-local — ``qmin``/``rmin``/``rspan``/``qspan`` are the window's bounds, not the
 global box's — which is why an out-of-box stray returns ``FB_OOB`` for the host to widen on rather
@@ -147,7 +147,7 @@ def _search(
                 cell = qr * nlevels + Lk
                 iq0 = qr // rspan                        # world (q, r) for the read set (see `_note_cell`)
                 _note_cell(read_bbox, iq0 + qmin, qr - iq0 * rspan + rmin, Lk)
-                sj = cell                           # head slot IS the window cell (see `sipp_window`);
+                sj = cell                           # head slot IS the window cell (see `sipp.window`);
                 slot = -1                           # own-lane transparency is baked into the build
                 while sj != -1:                         # the interval (slot) whose free run contains ts
                     lo = iv_lo[sj]; hi = iv_hi[sj]; nxt = iv_nxt[sj]

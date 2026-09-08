@@ -56,7 +56,6 @@ from multiprocessing import connection as mp_connection
 
 import numpy as np
 
-from freespace_sim import verify
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner.lns.neighborhood import (
@@ -68,6 +67,7 @@ from freespace_sim.planner.lns.neighborhood import (
 )
 from freespace_sim.planner.lns.state import LNSState
 from freespace_sim.planner.lns.solver import (
+    assert_incumbent_ok,
     _build_lns_state,
     _effective_search_workers,
     _finalize_lns_result,
@@ -749,10 +749,7 @@ def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
     list, and no worker holds the blessed incumbent."""
     if not (just_applied and lns.verify_every and n_accepted % lns.verify_every == 0):
         return
-    bad = verify.find_interflight_conflict(
-        state.final_intents(), state.cfg, static_terminals=state.static_terms)
-    if bad is not None:
-        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+    assert_incumbent_ok(state)
 
 
 def _maybe_log(

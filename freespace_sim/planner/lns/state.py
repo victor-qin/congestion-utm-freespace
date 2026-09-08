@@ -39,7 +39,7 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.lns.unimpeded import resolve_workers, unimpeded_costs
-from freespace_sim.sim import realized_release_s
+from freespace_sim.verify import pair_precedence_shortfall
 from freespace_sim.types import OperationalIntent
 
 log = logging.getLogger("freespace_sim.lns")
@@ -258,16 +258,29 @@ class LNSState:
         # (the byte-parity reference for A/Bs).
         self.repair_planner = repair_planner
 
-        # Paired-return anchor guard (only when the baseline ran return_anchor="realized"):
-        # outbound fid -> the committed return's desired departure. We never re-time returns, so
-        # an outbound repair must keep its realized release <= anchor - turnaround.
+        # Paired-return PRECEDENCE: a return cannot depart before the aircraft flying it has landed.
+        # This is a different property from `verify`'s separation check and invisible to it — the two
+        # legs hold DISJOINT windows at the same pad, so there is no 4D overlap to find. `try_repair`
+        # is the only place it can be PREVENTED, because by the time a whole-schedule replay sees it
+        # the repair has already been accepted.
         self._turnaround_s = turnaround_s
-        self._return_anchor: dict[int, float] = {}
-        if turnaround_s is not None:
-            for it in intents:
-                pid = it.request.paired_outbound_id
-                if pid is not None and it.accepted:
-                    self._return_anchor[pid] = float(it.request.t_departure)
+        from freespace_sim import verify as _verify
+        # Per-pair, not a count. A nominal-anchor schedule arrives with violations already in it, so
+        # the rule is "no pair gets worse", not "no pair is bad" — and a COUNT cannot express that:
+        # LNS can repair pair A and break pair B in one iteration with the count unchanged.
+        self._pair_shortfall = _verify.pair_shortfalls(intents, float(turnaround_s or 0.0))
+        self._precedence_baseline = sum(1 for v in self._pair_shortfall.values() if v > 1e-6)
+        # Round-trip partners, BOTH directions: the guard has to reach the leg this repair did NOT
+        # touch. Built from the requests, so it is populated under nominal anchoring too.
+        self._pair_of: dict[int, int] = {}
+        self._outbound_of_pair: dict[int, int] = {}   # either leg's fid -> the OUTBOUND leg's fid
+        for it in intents:
+            pid = it.request.paired_outbound_id
+            if pid is not None:
+                fid = it.request.flight_id
+                self._pair_of[fid] = pid
+                self._pair_of[pid] = fid
+                self._outbound_of_pair[fid] = self._outbound_of_pair[pid] = pid
 
         # Unimpeded weighted cost per movable flight — the paper's d(s_i, g_i) analogue, so
         # delay(fid) = incumbent cost - unimpeded cost. One plan per flight on a static-walls-only
@@ -356,10 +369,10 @@ class LNSState:
         **Every keyword here changes what a repair is ALLOWED to do**, so each must be forwarded
         or the worker silently runs a different algorithm than the coordinator believes it does:
 
-        * ``turnaround_s`` builds ``_return_anchor``; without it ``try_repair``'s anchor guard is
-          disarmed, so a repair may re-time an outbound past its return's departure — and
-          ``verify.find_interflight_conflict`` checks 4D conflicts ONLY, so the run would still
-          report ``verified``.
+        * ``turnaround_s`` arms ``try_repair``'s paired-leg precedence guard; without it a repair
+          may land an outbound after its return has already departed, or shed a return's hold until
+          it lifts off before its own aircraft is back — and ``verify.find_interflight_conflict``
+          checks 4D conflicts ONLY, so the run would still report ``verified``.
         * ``frozen_flight_ids`` / ``movable_uss_ids`` derive ``_movable``; without them the worker
           treats every accepted flight as movable, the destroy operators may select frozen
           flights, and ``try_repair``'s membership assert passes because it tests the worker's own
@@ -609,12 +622,24 @@ class LNSState:
                     envelopes.append(self.repair_planner.last_envelope)
 
             if reason == "improved" and self._turnaround_s is not None:
-                for fid, it in new.items():
-                    anchor = self._return_anchor.get(fid)
-                    if anchor is None:
+                # One predicate over the PAIR, not two branches keyed by which leg moved. Whichever
+                # leg this repair touched, the pair is re-scored the same way `verify` scores it, and
+                # the partner is read from `new` when the same transaction moved it too — so the
+                # verdict does not depend on repair order, and a pair with both legs repaired is
+                # judged once, from both new plans.
+                seen: set[int] = set()
+                for fid in new:
+                    out_fid = self._outbound_of_pair.get(fid)
+                    if out_fid is None or out_fid in seen:
                         continue
-                    rel = realized_release_s(it)
-                    if rel is not None and rel + self._turnaround_s > anchor + 1e-6:
+                    seen.add(out_fid)
+                    ret_fid = self._pair_of[out_fid]
+                    outbound = new.get(out_fid) or self.incumbent.get(out_fid)
+                    ret = new.get(ret_fid) or self.incumbent.get(ret_fid)
+                    if outbound is None or ret is None:
+                        continue          # partner denied or not in this state: nothing to preserve
+                    short = pair_precedence_shortfall(outbound, ret, self._turnaround_s)
+                    if short > self._pair_shortfall.get((out_fid, ret_fid), 0.0) + 1e-6:
                         reason = "anchor"
                         break
 

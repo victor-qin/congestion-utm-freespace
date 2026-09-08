@@ -171,8 +171,7 @@ class ColGenParams:
     bootstrap_ranking: str = "bound"
 
     def __post_init__(self) -> None:
-        """***
-        Normalize and validate every field after construction, raising on bad input.
+        """Normalize and validate every field after construction, raising on bad input.
 
         Parameters
         ------------
@@ -182,7 +181,7 @@ class ColGenParams:
         --------
         - output (None): coerces fields via ``object.__setattr__``; raises ``TypeError`` on a
           wrong-typed field or ``ValueError`` on an out-of-range one.
-        ***"""
+        """
         if isinstance(self.max_air_overrun_hops, bool):
             raise TypeError("max_air_overrun_hops must be an integer")
         try:

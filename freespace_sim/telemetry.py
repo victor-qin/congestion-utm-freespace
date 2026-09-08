@@ -1,20 +1,21 @@
-"""Permanent run telemetry — the non-recoverable congestion streams (issue: run-instrumentation).
+"""Permanent run telemetry — the non-recoverable congestion streams.
 
-`save_run` already archives everything about *accepted* flights (reservations, trajectories, per-flight
-outcomes) and is reproducible from `config.json` + `scenario.parquet`. Three things it can NOT recover
-post-hoc are captured here, live, by an **observer-only** collector (zero behaviour change — telemetry-off
-is byte-identical):
+`save_run` already archives everything about ACCEPTED flights (reservations, trajectories,
+per-flight outcomes) and is reproducible from `config.json` + `scenario.parquet`. Three things it
+can NOT recover post-hoc are captured here, live, by an OBSERVER-ONLY collector (zero behaviour
+change — telemetry-off is byte-identical):
 
-  * **`conflict_filed` / detour-`budget_exceeded` filed volumes** — the rejected corridor A* built then had
-    to deny (`_deny` discards it). Answers "track the volumes filed, at least for errors".
-  * **conflict culprits** — the committed volume(s) a `conflict_filed` collided with (`ledger.conflicts`).
-  * **per-hub terminal metadata** — a run-time snapshot of every placed hub (incl. zero-traffic ones),
-    since `save_run` only receives a demand *string*, not the model.
+  * `conflict_filed` / detour-`budget_exceeded` filed volumes — the rejected corridor A* built
+    then had to deny (`_deny` discards it); kept so filed volumes survive at least for errors.
+  * conflict culprits — the committed volume(s) a `conflict_filed` collided with
+    (`ledger.conflicts`).
+  * per-hub terminal metadata — a run-time snapshot of every placed hub (incl. zero-traffic ones),
+    since `save_run` only receives a demand string, not the model.
 
-Per-hub **dwell occupancy** is NOT here — it is recoverable post-hoc from `reservations.parquet` (the
+Per-hub dwell occupancy is NOT here — it is recoverable post-hoc from `reservations.parquet` (the
 ledger is append-only; committed columns are persisted), so :func:`terminal_frame` sweep-lines them.
-**Gate attribution** (pad/air/lane) and **kernel byte-exactness parity** (tracked in issue #35) are
-deferred follow-ups — not emitted here, and not carried as empty columns.
+Gate attribution (pad/air/lane) and kernel byte-exactness parity are deferred follow-ups — not
+emitted here, and not carried as empty columns.
 
 See :func:`freespace_sim.runs.save_run` for how these streams are persisted.
 """
@@ -40,10 +41,20 @@ if TYPE_CHECKING:
 
 
 def _vol_row(v: "Volume4D") -> dict:
-    """A single `Volume4D`'s analytical geometry + time window as a flat dict — the schema
-    ``runs.reservation_frame`` persists (box: center/rot/extents; cylinder: cx/cy/radius/z_lo/z_hi), minus
-    the caller-supplied ``flight_id``. Shared so filed volumes round-trip through ``runs._volume_from_row``
-    exactly like committed reservations."""
+    """One ``Volume4D``'s analytical geometry + time window as a flat dict row.
+
+    Matches the schema ``runs.reservation_frame`` persists (box: center/rot/extents; cylinder:
+    cx/cy/radius/z_lo/z_hi), minus the caller-supplied ``flight_id``. Shared so filed volumes
+    round-trip through ``runs._volume_from_row`` exactly like committed reservations.
+
+    Parameters
+    ------------
+    - v (Volume4D): the volume to serialise; ``v.shape`` is a ``BoxSpec`` or ``CylinderSpec``.
+
+    Return
+    --------
+    - output (dict): geometry + ``t_start``/``t_end``/``terminal_id`` columns (no ``flight_id``).
+    """
     s = v.shape
     row = {"t_start": v.t_start, "t_end": v.t_end,
            "terminal_id": None if v.terminal_id is None else str(v.terminal_id)}
@@ -59,8 +70,11 @@ def _vol_row(v: "Volume4D") -> dict:
 
 @dataclass
 class TelemetryCollector:
-    """Observer-only capture of the non-recoverable congestion streams. Lives on a planner as ``_tele``
-    (set by ``sim.run`` when telemetry is on); its hooks only read + append, never change control flow."""
+    """Observer-only capture of the non-recoverable congestion streams.
+
+    Lives on a planner as ``_tele`` (set by ``sim.run`` when telemetry is on); its hooks only
+    read + append, never change control flow.
+    """
 
     enabled: bool = True
     # per-hub metadata snapshot, filled at sim.run setup (the one place the demand model is in scope)
@@ -69,8 +83,22 @@ class TelemetryCollector:
     filed_volumes: list[dict] = field(default_factory=list)         # the REJECTED corridor's own volumes
 
     def on_deny(self, flight_id: int, reason: str, volumes, hits=None) -> None:
-        """Record a denial that BUILT a corridor: the filed (rejected) volumes always, and the culprit(s)
-        for a conflict. Called from the planner's ``_file_deny`` at every corridor-building deny site."""
+        """Record a denial that BUILT a corridor: its filed (rejected) volumes, plus any culprits.
+
+        Called from the planner's ``_file_deny`` at every corridor-building deny site. Appends one
+        ``filed_volumes`` row per rejected volume and one ``conflict_events`` row per culprit.
+
+        Parameters
+        ------------
+        - flight_id (int): the denied flight.
+        - reason (str): denial reason tag (e.g. conflict_filed, budget_exceeded).
+        - volumes (Iterable[Volume4D] | None): the rejected corridor's own volumes.
+        - hits (Iterable[tuple] | None): ``(culprit_fid, Volume4D)`` pairs it collided with.
+
+        Return
+        --------
+        - output (None): appends to ``filed_volumes`` / ``conflict_events``; no control-flow change.
+        """
         for j, v in enumerate(volumes or []):
             self.filed_volumes.append({"flight_id": int(flight_id), "reason": reason,
                                        "vol_idx": j, **_vol_row(v)})
@@ -82,9 +110,21 @@ class TelemetryCollector:
 
 
 def build_terminal_snapshot(cfg, demand, events) -> dict:
-    """Snapshot every placed hub's metadata (id → cx/cy/capacity/radius) at run time. Prefers the demand
-    model's full placed-hub set (so zero-traffic hubs are included); else harvests the hubs that carry a
-    flight from the scenario events. Empty for non-hub demands."""
+    """Snapshot every placed hub's metadata (id → cx/cy/capacity/radius) at run time.
+
+    Prefers the demand model's full placed-hub set (so zero-traffic hubs are included); else
+    harvests the hubs that carry a flight from the scenario events. Empty for non-hub demands.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): source of per-terminal radius resolution.
+    - demand: demand model or ``None``; used when it exposes ``.terminals(cfg)``, else ignored.
+    - events (Iterable[DemandEvent]): scanned for origin/dest terminals when demand has none.
+
+    Return
+    --------
+    - output (dict): ``term.id → {cx, cy, capacity, radius}`` for every placed hub.
+    """
     if demand is not None and hasattr(demand, "terminals"):
         pairs = list(demand.terminals(cfg))
     else:
@@ -106,8 +146,19 @@ def build_terminal_snapshot(cfg, demand, events) -> dict:
 
 
 def _peak_overlap(intervals: list[tuple[float, float]]) -> int:
-    """Max number of simultaneously-active ``[t_start, t_end)`` intervals — a sweep-line over start/end
-    events (start=+1 before end=-1 at a tie, half-open)."""
+    """Max number of simultaneously-active ``[t_start, t_end)`` intervals.
+
+    A sweep-line over start (+1) / end (-1) events; at equal times the end (-1) sorts before the
+    start (+1), so the intervals are treated as half-open [t_start, t_end).
+
+    Parameters
+    ------------
+    - intervals (list[tuple[float, float]]): ``(t_start, t_end)`` pairs; order does not matter.
+
+    Return
+    --------
+    - output (int): the peak simultaneous count, or 0 for no intervals.
+    """
     if not intervals:
         return 0
     events: list[tuple[float, int]] = []
@@ -123,10 +174,21 @@ def _peak_overlap(intervals: list[tuple[float, float]]) -> int:
 
 
 def terminal_frame(result: "SimResult") -> pd.DataFrame:
-    """Per-hub congestion rollup — one row per placed hub. ``peak_pad_occupancy`` is a sweep-line over the
-    accepted terminal-tagged **cylinder** dwells (from the persisted reservations, NOT a live hook);
-    departures/arrivals and ground-delay stats come from the accepted flights' terminal membership;
-    metadata (pads/radius/center) from the run-time snapshot so zero-traffic hubs still appear."""
+    """Per-hub congestion rollup — one row per placed hub.
+
+    ``peak_pad_occupancy`` is a sweep-line over the accepted terminal-tagged CYLINDER dwells (from
+    the persisted reservations, NOT a live hook); departures/arrivals and ground-delay stats come
+    from the accepted flights' terminal membership; metadata (pads/radius/center) from the run-time
+    snapshot so zero-traffic hubs still appear.
+
+    Parameters
+    ------------
+    - result (SimResult): finished run; reads ``config``, ``accepted``, and ``telemetry``.
+
+    Return
+    --------
+    - output (pd.DataFrame): one row per hub with counts, delay stats, and peak pad occupancy.
+    """
     cfg = result.config
     tele = getattr(result, "telemetry", None)
     terms = dict(tele.terminals) if tele else {}
@@ -166,9 +228,20 @@ def terminal_frame(result: "SimResult") -> pd.DataFrame:
 
 
 def conflict_frame(result: "SimResult") -> pd.DataFrame:
-    """One row per culprit of a `conflict_filed`, with ``culprit_kind`` classified: ``static_wall`` for the
-    always-active wall sentinel (fid == -1), ``sibling`` if the culprit is the filed flight's own hub, else
-    ``foreign``. Empty frame (stable columns) when no conflicts were captured."""
+    """One row per culprit of a ``conflict_filed``, with ``culprit_kind`` classified.
+
+    ``culprit_kind`` is ``static_wall`` for the always-active wall sentinel (fid == -1),
+    ``sibling`` if the culprit is the filed flight's own hub, else ``foreign``. Returns an empty
+    frame with stable columns when no conflicts were captured.
+
+    Parameters
+    ------------
+    - result (SimResult): finished run; reads ``telemetry.conflict_events`` and ``intents``.
+
+    Return
+    --------
+    - output (pd.DataFrame): conflict rows plus the derived ``culprit_kind`` column.
+    """
     from .ledger import ReservationLedger
 
     tele = getattr(result, "telemetry", None)
@@ -195,9 +268,19 @@ def conflict_frame(result: "SimResult") -> pd.DataFrame:
 
 
 def filed_volume_frame(result: "SimResult") -> pd.DataFrame:
-    """The rejected-corridor geometry for every built-then-denied flight (error forensics), same geometry
-    schema as `reservations.parquet` + ``flight_id``/``reason``/``vol_idx``. Joinable to
-    :func:`conflict_frame` on ``flight_id``."""
+    """Rejected-corridor geometry for every built-then-denied flight (error forensics).
+
+    Same geometry schema as ``reservations.parquet`` plus ``flight_id`` / ``reason`` / ``vol_idx``.
+    Joinable to :func:`conflict_frame` on ``flight_id``.
+
+    Parameters
+    ------------
+    - result (SimResult): finished run; reads ``telemetry.filed_volumes``.
+
+    Return
+    --------
+    - output (pd.DataFrame): one row per filed (rejected) volume, with stable columns.
+    """
     tele = getattr(result, "telemetry", None)
     rows = list(tele.filed_volumes) if tele else []
     cols = ["flight_id", "reason", "vol_idx", "kind", "cx", "cy", "cz", "rot", "ext",

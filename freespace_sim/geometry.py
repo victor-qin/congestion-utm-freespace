@@ -1,11 +1,11 @@
 """3D geometry primitives backed by python-fcl.
 
 Two shapes carry every reservation:
-- an **oriented Box** for a corridor segment (ASTM trajectory-based volume), and
-- a vertical **Cylinder** for a hover reservation (ASTM area-based volume).
+- an oriented ``Box`` for a corridor segment (ASTM trajectory-based volume), and
+- a vertical ``Cylinder`` for a hover reservation (ASTM area-based volume).
 
-Each shape is stored as a small, immutable *spec* of plain floats (so `Volume4D` stays
-hashable/serialisable) and builds an `fcl.CollisionObject` on demand. Specs also expose a
+Each shape is stored as a small, immutable spec of plain floats (so ``Volume4D`` stays
+hashable / serialisable) and builds an ``fcl.CollisionObject`` on demand. Specs also expose a
 world-frame axis-aligned bounding box (AABB) for the ledger's cheap broadphase prune.
 """
 
@@ -21,25 +21,28 @@ WORLD_UP = np.array([0.0, 0.0, 1.0])
 
 
 def _cross3(a, b):
-    """3-vector cross product as plain scalars — bit-for-bit identical to ``np.cross`` for length-3
-    inputs, but without numpy's per-call ufunc dispatch (``moveaxis`` / ``normalize_axis_tuple``), which
-    dominates the cost on length-3 arrays. Same scalar-hot-path idiom as the ledger's ``_aabb_miss`` and
-    A*'s ``h_air``."""
+    """3-vector cross product returned as plain scalars.
+
+    Bit-for-bit identical to ``np.cross`` on length-3 inputs, but skips numpy's per-call ufunc
+    dispatch (``moveaxis`` / ``normalize_axis_tuple``), which dominates the cost at this size. Same
+    scalar hot-path idiom as the ledger's ``_aabb_miss`` and A*'s ``h_air``.
+    """
     return (a[1] * b[2] - a[2] * b[1],
             a[2] * b[0] - a[0] * b[2],
             a[0] * b[1] - a[1] * b[0])
 
 
 def _segment_frame_scalars(p0, p1) -> tuple[tuple[float, ...], float]:
-    """Scalar core of :func:`segment_frame`: the 9 row-major rotation floats (local→world, columns x/y/z)
-    plus the segment length, computed with plain scalars — no ``np.array`` build.
+    """Scalar core of :func:`segment_frame`: the 9 row-major rotation floats (local→world, columns
+    x/y/z) plus the segment length, computed with plain scalars and no ``np.array`` build.
 
-    :func:`segment_frame` wraps these into the 3x3 ``np.ndarray`` its matrix consumers + the frozen
-    byte-identity oracle expect; :func:`box_from_segment` (which stores ``rot`` FLAT anyway) consumes the
-    tuple directly, skipping a per-sub-box array build + ``flatten().tolist()`` round-trip. Bit-for-bit
-    identical to the numpy form — the same scalar idiom already pinned for the axes here and for
-    ``aabb`` / ``segment_overlaps_column`` (issue #30). The degenerate (near-zero length) case returns the
-    identity frame flattened + length ``0.0``, exactly as the numpy original did (``np.eye(3), 0.0``)."""
+    :func:`segment_frame` wraps these into the 3x3 ``np.ndarray`` its matrix consumers and the
+    frozen byte-identity oracle expect; :func:`box_from_segment` (which stores ``rot`` flat anyway)
+    consumes the tuple directly, skipping a per-sub-box array build and ``flatten().tolist()``
+    round-trip. Bit-for-bit identical to the numpy form and pinned to it in
+    ``tests/test_geometry.py``. The degenerate near-zero-length case returns the identity frame
+    flattened plus length ``0.0`` (exactly the numpy original's ``np.eye(3), 0.0``).
+    """
     dx = float(p1[0]) - float(p0[0])
     dy = float(p1[1]) - float(p0[1])
     dz = float(p1[2]) - float(p0[2])
@@ -60,14 +63,24 @@ def _segment_frame_scalars(p0, p1) -> tuple[tuple[float, ...], float]:
 def segment_frame(p0: np.ndarray, p1: np.ndarray) -> tuple[np.ndarray, float]:
     """Orthonormal rotation whose local x-axis runs p0→p1 (length returned separately).
 
-    Columns are the local axes expressed in world coordinates (local→world), which is exactly
-    what ``fcl.Transform`` wants. The lateral (y) axis is chosen perpendicular to both the segment
-    and world-up so a level corridor is "flat"; for a (near-)vertical segment we fall back to
-    world-x as the reference to avoid a degenerate cross product.
+    Columns are the local axes expressed in world coordinates (local→world), exactly what
+    ``fcl.Transform`` wants. The lateral (y) axis is perpendicular to both the segment and world-up
+    so a level corridor is "flat"; for a (near-)vertical segment we fall back to world-x as the
+    reference to avoid a degenerate cross product.
 
-    Thin ``np.ndarray`` wrapper over :func:`_segment_frame_scalars` (the scalar core), kept for its matrix
-    consumers + the frozen-numpy byte-identity oracle in ``tests/test_geometry.py``. The scalar axes shed
-    numpy's per-call ufunc dispatch; ``box_from_segment`` bypasses this wrapper entirely on the hot path.
+    Thin ``np.ndarray`` wrapper over :func:`_segment_frame_scalars`, kept for its matrix consumers
+    and the frozen-numpy byte-identity oracle in ``tests/test_geometry.py``; ``box_from_segment``
+    bypasses this wrapper on the hot path.
+
+    Parameters
+    ------------
+    - p0 (np.ndarray): segment start point in world coordinates (length-3).
+    - p1 (np.ndarray): segment end point in world coordinates (length-3).
+
+    Return
+    --------
+    - output (tuple[np.ndarray, float]): the 3x3 local→world rotation and the segment length; a
+      near-zero-length segment returns ``(np.eye(3), 0.0)``.
     """
     rot, length = _segment_frame_scalars(p0, p1)
     if length == 0.0:                                      # degenerate (near-zero length) → identity frame
@@ -87,18 +100,23 @@ class BoxSpec:
     extents: tuple[float, float, float]     # full lengths L, W, H
 
     def rotation(self) -> np.ndarray:
+        """Return ``rot`` as a 3x3 ``np.ndarray`` (local→world) for the matrix consumers."""
         return np.array(self.rot, float).reshape(3, 3)
 
     def to_fcl(self) -> fcl.CollisionObject:
+        """Realise this spec as a posed ``fcl.CollisionObject`` for exact collision tests."""
         L, W, H = self.extents
         tf = fcl.Transform(self.rotation(), np.array(self.center, float))
         return fcl.CollisionObject(fcl.Box(L, W, H), tf)
 
     def aabb(self) -> tuple[np.ndarray, np.ndarray]:
-        # world half-extent |R| @ half, from the flat rot tuple with scalars — bit-for-bit identical to the
-        # numpy matmul (verified) but without rebuilding a 3x3 array + ufunc dispatch on every call (aabb
-        # runs >1e6 times per refined plan via the ledger broadphase). rotation() is left intact for its
-        # matrix consumers (hexgrid / opt / milp / viz).
+        """World-frame AABB as ``(min_corner, max_corner)`` numpy arrays.
+
+        The world half-extent ``|R| @ half`` is computed from the flat ``rot`` tuple with scalars:
+        bit-for-bit identical to the numpy matmul (verified) but without rebuilding a 3x3 array or
+        paying ufunc dispatch on every call (this runs >1e6 times per refined plan via the ledger
+        broadphase). :meth:`rotation` stays intact for its matrix consumers (hexgrid/opt/milp/viz).
+        """
         r = self.rot
         h0, h1, h2 = self.extents[0] / 2.0, self.extents[1] / 2.0, self.extents[2] / 2.0   # == extents / 2
         ext = np.array([abs(r[0]) * h0 + abs(r[1]) * h1 + abs(r[2]) * h2,
@@ -134,12 +152,14 @@ class CylinderSpec:
     z_hi: float
 
     def to_fcl(self) -> fcl.CollisionObject:
+        """Realise this spec as a posed ``fcl.CollisionObject`` for exact collision tests."""
         height = self.z_hi - self.z_lo
         cz = (self.z_lo + self.z_hi) / 2.0
         tf = fcl.Transform(np.eye(3), np.array([self.cx, self.cy, cz], float))
         return fcl.CollisionObject(fcl.Cylinder(self.radius, height), tf)
 
     def aabb(self) -> tuple[np.ndarray, np.ndarray]:
+        """World-frame AABB as ``(min_corner, max_corner)`` numpy arrays."""
         return (
             np.array([self.cx - self.radius, self.cy - self.radius, self.z_lo], float),
             np.array([self.cx + self.radius, self.cy + self.radius, self.z_hi], float),
@@ -155,10 +175,22 @@ class CylinderSpec:
 def box_from_segment(p0: np.ndarray, p1: np.ndarray, width: float, height: float) -> BoxSpec:
     """Build an oriented box bounding the segment p0→p1 with the given lateral width and height.
 
-    Consumes :func:`_segment_frame_scalars` (flat rot floats) and builds the center with scalars, so the
-    hot per-sub-box path (hundreds of thousands of BoxSpecs per refined plan) allocates no intermediate
-    ``np.ndarray``. The ``rot`` / ``center`` tuples are byte-identical to the prior
-    ``tuple(R.flatten().tolist())`` / ``tuple(((p0 + p1) / 2).tolist())`` (pinned in ``tests/test_geometry.py``).
+    Consumes :func:`_segment_frame_scalars` (flat rot floats) and builds the center with scalars, so
+    the hot per-sub-box path (hundreds of thousands of BoxSpecs per refined plan) allocates no
+    intermediate ``np.ndarray``. The ``rot`` and ``center`` tuples are byte-identical to the prior
+    ``tuple(R.flatten().tolist())`` / ``tuple(((p0 + p1) / 2).tolist())``, pinned in
+    ``tests/test_geometry.py``.
+
+    Parameters
+    ------------
+    - p0 (np.ndarray): segment start point in world coordinates (length-3).
+    - p1 (np.ndarray): segment end point in world coordinates (length-3).
+    - width (float): full lateral width of the box.
+    - height (float): full vertical extent of the box.
+
+    Return
+    --------
+    - output (BoxSpec): oriented box whose local x-axis spans the segment (length floored at 1e-6).
     """
     rot, length = _segment_frame_scalars(p0, p1)
     cx = (float(p0[0]) + float(p1[0])) / 2.0

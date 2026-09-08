@@ -1,9 +1,9 @@
 """4D volumes and the two ASTM operational-intent builders.
 
-A `Volume4D` (ASTM §3.2.2) is a 3D shape + a time window. A **corridor** (trajectory-based intent,
-§4.3.5) is a chain of oriented boxes — one per timestep — that overlap in space and time. A
-**hover reservation** (area-based intent, §4.3.5) is a single vertical cylinder covering the
-takeoff/landing climb/descent.
+A ``Volume4D`` (ASTM §3.2.2) is a 3D shape + a time window. A corridor (trajectory-based intent,
+§4.3.5) is a chain of oriented boxes — one per timestep — that overlap in space and time. A hover
+reservation (area-based intent, §4.3.5) is a single vertical cylinder covering the takeoff/landing
+climb/descent.
 """
 
 from __future__ import annotations
@@ -38,9 +38,11 @@ class Volume4D:
     terminal_id: Hashable = None
 
     def to_fcl(self):
+        """Delegate to the underlying shape's ``to_fcl`` serialization."""
         return self.shape.to_fcl()
 
     def aabb(self) -> tuple[np.ndarray, np.ndarray]:
+        """The underlying shape's axis-aligned bounding box (delegates to ``shape.aabb``)."""
         return self.shape.aabb()
 
     def flat_aabb(self) -> tuple[float, float, float, float, float, float]:
@@ -49,10 +51,12 @@ class Volume4D:
         return self.shape.flat_aabb()
 
     def time_overlaps(self, other: "Volume4D") -> bool:
+        """True if this volume's half-open time window overlaps ``other``'s."""
         return self.t_start < other.t_end and other.t_start < self.t_end
 
     @property
     def z_range(self) -> tuple[float, float]:
+        """The volume's vertical extent ``(z_min, z_max)`` in metres."""
         lo, hi = self.shape.aabb()
         return float(lo[2]), float(hi[2])
 
@@ -60,26 +64,40 @@ class Volume4D:
 def corridor_segment_volume(
     p0: Vec, t0: float, p1: Vec, t1: float, cfg: SimConfig, *, terminal_id: Hashable = None,
 ) -> Volume4D:
-    """Build the single corridor box for one segment (p0,t0)→(p1,t1).
+    """Build the single corridor box for one segment ``(p0, t0)`` → ``(p1, t1)``.
 
-    **This is the contract between the planners and the ledger.** A planner (A* per edge, or the
-    straight-line planner via :func:`build_corridor`) checks *this exact* box against the ledger and
-    commits *this exact* box — there is no separate post-hoc inflation that could reintroduce a
-    conflict. The box is purely segment-local (depends only on its own endpoints + cfg), which is
+    This is the contract between the planners and the ledger: a planner (A* per edge, or the
+    straight-line planner via :func:`build_corridor`) checks this exact box against the ledger and
+    commits this exact box — there is no separate post-hoc inflation that could reintroduce a
+    conflict. The box is purely segment-local (depends only on its own endpoints and cfg), which is
     what makes per-edge checking equivalent to whole-corridor checking.
 
-    Geometry: configured width/height, extended longitudinally at each end so consecutive boxes overlap
-    (ASTM §4.3.5 contiguity); time window buffered by ``time_buffer_s`` on both sides so neighbours
-    overlap in time too. The extension is **anisotropic** — half the box's footprint *in the travel
-    direction*: ``corridor_width/2`` in the horizontal plane, ``corridor_height/2`` in the vertical. This
-    matters for a mid-route layer change (a fixed-xy segment moving in z): a flat ``corridor_width/2``
-    would balloon the box in z past the levels it traverses (and above the ceiling); the vertical term
-    keeps its z-extent at ``[z0, z1] ± corridor_height/2`` — the drone's real vertical footprint.
+    Geometry: configured width/height, extended longitudinally at each end so consecutive boxes
+    overlap (ASTM §4.3.5 contiguity); the time window is buffered by ``time_buffer_s`` on both sides
+    so neighbours overlap in time too. The extension is anisotropic — half the box's footprint in
+    the travel direction: ``corridor_width/2`` in the horizontal plane, ``corridor_height/2`` in the
+    vertical. This matters for a mid-route layer change (a fixed-xy segment moving in z): a flat
+    ``corridor_width/2`` would balloon the box in z past the levels it traverses (and above the
+    ceiling); the vertical term keeps its z-extent at ``[z0, z1] ± corridor_height/2`` — the drone's
+    real vertical footprint.
+
+    Parameters
+    ------------
+    - p0 (Vec): segment start position (metres, ENU).
+    - t0 (float): time (s) the flight is at ``p0``.
+    - p1 (Vec): segment end position (metres, ENU).
+    - t1 (float): time (s) the flight is at ``p1``.
+    - cfg (SimConfig): supplies corridor width/height and ``time_buffer_s``.
+    - terminal_id (Hashable): tags the box as part of a shared terminal column, or ``None``.
+
+    Return
+    --------
+    - output (Volume4D): the buffered, longitudinally extended corridor box for this segment.
     """
-    # Scalar hot path (one box per ≤120 m sub-box, hundreds of thousands per refined plan): plain floats,
-    # no per-box np.asarray / np.linalg.norm / vector alloc. Bit-for-bit identical to the numpy form —
-    # math.sqrt(dx²+dy²+dz²) == float(np.linalg.norm(p1-p0)) is the same fact the segment_frame oracle pins,
-    # and box_from_segment takes the (a, b) tuples via float() indexing (issue #30; see tests + scenario A/B).
+    # Scalar hot path (one box per ≤120 m sub-box, hundreds of thousands per refined plan): plain
+    # floats, no per-box np.asarray / np.linalg.norm / vector alloc. Bit-for-bit identical to the
+    # numpy form — math.sqrt(dx²+dy²+dz²) == float(np.linalg.norm(p1-p0)) is the same fact the
+    # segment_frame oracle pins, and box_from_segment takes the (a, b) tuples via float() indexing.
     p0x, p0y, p0z = float(p0[0]), float(p0[1]), float(p0[2])
     p1x, p1y, p1z = float(p1[0]), float(p1[1]), float(p1[2])
     dx, dy, dz = p1x - p0x, p1y - p0y, p1z - p0z
@@ -95,10 +113,19 @@ def corridor_segment_volume(
 
 
 def build_corridor(centerline: list[TimedPoint], cfg: SimConfig) -> list[Volume4D]:
-    """Chop a timed 3D polyline into one oriented-box Volume4D per segment (ASTM §4.3.5).
+    """Chop a timed 3D polyline into one oriented-box :class:`Volume4D` per segment (ASTM §4.3.5).
 
-    A thin loop over :func:`corridor_segment_volume` — so the whole-path corridor is exactly the
+    A thin loop over :func:`corridor_segment_volume`, so the whole-path corridor is exactly the
     concatenation of the per-edge boxes a planner checks during search.
+
+    Parameters
+    ------------
+    - centerline (list[TimedPoint]): timed waypoints; each consecutive pair becomes one box.
+    - cfg (SimConfig): corridor geometry, forwarded to :func:`corridor_segment_volume`.
+
+    Return
+    --------
+    - output (list[Volume4D]): one corridor box per centreline segment (empty if < 2 points).
     """
     return [
         corridor_segment_volume(p0, t0, p1, t1, cfg)
@@ -112,39 +139,63 @@ def terminal_radius(term, cfg: SimConfig) -> float:
 
 
 def exit_radius(term, cfg: SimConfig) -> float:
-    """A hub's exit-lane inner edge — flush with the column edge by default (``corridor_overlap = 0``).
+    """A hub's exit-lane inner edge — flush with the column edge when ``corridor_overlap`` is 0.
 
-    Inner edge = R − overlap, so the reserved lane/fold starts FLUSH with the column edge; the exit-lane box
-    is tagged with the hub and the column-involved exemption (:func:`conflict.volumes_conflict`) makes it
-    transparent to same-hub COLUMNS, while two same-hub *corridor* boxes still contend (box↔box stays
-    strict), so divergent lanes need the column wide enough not to crowd (``cfg.terminal_radius_m`` 90 m
-    default). ``overlap > 0`` penetrates the column; ``< 0`` leaves a clearance gap. (Issue #10.)
+    Inner edge = ``R − overlap``, so the reserved lane/fold starts FLUSH with the column edge; the
+    exit-lane box is tagged with the hub and the column-involved exemption
+    (:func:`conflict.volumes_conflict`) makes it transparent to same-hub COLUMNS, while two same-hub
+    corridor boxes still contend (box↔box stays strict), so divergent lanes need the column wide
+    enough not to crowd (``cfg.terminal_radius_m`` 90 m default). ``overlap > 0`` penetrates the
+    column; ``< 0`` leaves a clearance gap.
 
     The single source of truth for the fold/lane radius — used by the A* head/tail fold
-    (:func:`planner.astar.planner._fold_path`, which drives both the commit and the landing gate) and
+    (:func:`planner.astar.planner._fold_path`, driving both the commit and the landing gate) and
     :meth:`planner.terminal_capacity.TerminalCapacity.exit_clear` — so the gate, the commit, and the
-    exit-lane check all root the lane at the same edge and cannot drift."""
+    exit-lane check all root the lane at the same edge and cannot drift.
+
+    Parameters
+    ------------
+    - term (Terminal): the hub, read for ``radius`` and ``corridor_overlap``.
+    - cfg (SimConfig): supplies the default column radius and ``corridor_width_m``.
+
+    Return
+    --------
+    - output (float): the lane inner-edge radius, ``terminal_radius + corridor_width/2 − overlap``.
+    """
     ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
     return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
 
 
 def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool:
-    """Does the corridor box for segment ``a→b`` reach into the disk of ``radius`` at ``center`` (xy)?
+    """Does segment ``a→b``'s corridor box reach into the disk of ``radius`` at ``center`` (xy)?
 
-    Accounts for the box geometry corridor_segment_volume builds: the centerline is extended by half
-    the corridor width at each end, and the box has a half-width of ``corridor_width/2``. So the box
-    overlaps the column iff the distance from ``center`` to the *extended* centerline is below
+    Accounts for the box geometry :func:`corridor_segment_volume` builds: the centreline is extended
+    by half the corridor width at each end, and the box has a half-width of ``corridor_width/2``. So
+    the box overlaps the column iff the distance from ``center`` to the extended centreline is below
     ``radius + corridor_width/2``.
 
-    Used to tag EVERY near-hub box that reaches into a flight's own column — not just box[0]/box[-1].
-    The count of such boxes is geometry-dependent (radius × exit angle), so a fixed "tag the first N"
-    rule is unsound (e.g. a 500 m column can need boxes [1] and [2] tagged); this geometric test scales.
+    Used to tag EVERY near-hub box reaching into a flight's own column — not just box[0]/box[-1].
+    The box count is geometry-dependent (radius × exit angle), so a fixed "tag the first N" rule is
+    unsound (e.g. a 500 m column can need boxes [1] and [2] tagged); this geometric test scales.
     Far cruise boxes stay untagged, so foreign/same-hub overflight still deconflicts.
 
-    The xy point-to-segment distance is computed with scalars (norm via ``math.sqrt``, dot as a scalar sum)
-    — bit-for-bit identical to the numpy form but without its per-call ufunc dispatch, since this runs once
-    per corridor sub-box during every rebuild (issue #30 lever #8; same idiom as ``geometry.segment_frame``
-    and ``astar.h_air``). See ``tests/test_volumes.py`` for the frozen-numpy byte-identity oracle."""
+    The xy point-to-segment distance is computed with scalars (norm via ``math.sqrt``, dot as a
+    scalar sum) — bit-for-bit identical to the numpy form but without its per-call ufunc dispatch,
+    since this runs once per corridor sub-box during every rebuild. See ``tests/test_volumes.py``
+    for the frozen-numpy byte-identity oracle.
+
+    Parameters
+    ------------
+    - a (Vec): segment start (only xy is used).
+    - b (Vec): segment end (only xy is used).
+    - center (Vec): column centre (only xy is used).
+    - radius (float): column radius to test against.
+    - cfg (SimConfig): supplies ``corridor_width_m`` for the extension and half-width.
+
+    Return
+    --------
+    - output (bool): True if the extended corridor box overlaps the column disk.
+    """
     ax, ay = float(a[0]), float(a[1])
     bx, by = float(b[0]), float(b[1])
     cx, cy = float(center[0]), float(center[1])
@@ -165,26 +216,33 @@ def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool
 def column_dwell_s(center, term, cfg: SimConfig, z: float) -> float:
     """How long a flight occupies its terminal column above the pad: climb, then egress traverse.
 
-    THE SINGLE SOURCE OF TRUTH for the column window, in the style of :func:`exit_radius`. Every site
-    that books, gates, or clocks a terminal column must call this — ``astar._build``,
+    THE SINGLE SOURCE OF TRUTH for the column window, in the style of :func:`exit_radius`. Every
+    site that books, gates, or clocks a terminal column must call this — ``astar._build``,
     :func:`build_reservation_from_corners`, and every ``TerminalCapacity`` window — so the gate, the
-    commit, and the corridor start cannot drift apart.
+    commit, and the corridor start cannot drift apart. It exists because callers that assembled the
+    window themselves DID drift: a booked column shorter than the one it was gated against, then a
+    corridor starting before the egress was flown (implying cruise speeds above the limit).
 
-    It exists because they DID drift, twice, in successive review rounds: first the rebuild path
-    booked a column 12 s shorter than the one it was gated against, then (after that was patched) the
-    same path still started its corridor before the egress was flown, so ``astar_shortcut`` / ``milp``
-    / ``astar_milp`` implied 42-54 m/s against a 30 m/s limit while bare ``astar`` was correct. Both
-    were one caller assembling the window itself instead of asking.
-
-    Returns the portion AFTER the pad hover — i.e. exactly what ``hover_reservation`` takes as
+    Returns the portion AFTER the pad hover — i.e. exactly what :func:`hover_reservation` takes as
     ``climb_time_s``, and exactly how long after takeoff the corridor may begin.
+
+    Parameters
+    ------------
+    - center (Vec): the hub centre (pad location).
+    - term (Terminal): the terminal, for its exit-lane traverse geometry.
+    - cfg (SimConfig): supplies the climb rate and lane traverse timing.
+    - z (float): the flight's cruise altitude, setting the climb time.
+
+    Return
+    --------
+    - output (float): seconds after takeoff hover before the corridor may begin (climb + egress).
     """
     from .planner.hexgrid import max_lane_traverse_s   # local: hexgrid imports this module
 
     return cfg.climb_time_to(z) + max_lane_traverse_s(center, term, cfg)
 
 
-# --- The three en-route rulers (issue #50) -------------------------------------------------------
+# --- The three en-route rulers ----------------------------------------------------------------
 #
 #     ORIGIN HUB                                                             DEST HUB
 #    ╭─────────╮                                                           ╭─────────╮
@@ -201,13 +259,13 @@ def column_dwell_s(center, term, cfg: SimConfig, z: float) -> float:
 # Both rulers start and end on the SAME circles (exit_radius), so their difference is pure en-route
 # detour. Nothing inside a hub column counts — terminal flying consumes that hub's CAPACITY (tagged
 # column + pad gate), not en-route distance or delay — and there is no phantom shortcut from
-# mismatched endpoints (the #50 bug: flown was lane→lane while the baseline was centre→centre, so
-# refined flights measured stretch 0.9886, "shorter than a straight line"). Every planner gate and
-# metrics._flown/_straight go through these three functions, so the gate enforces exactly the ratio
-# stretch later reports and planner-vs-metrics drift is structurally impossible. The reference is
-# deliberately lane-AGNOSTIC — the minimum over every lane choice, which is what makes stretch >= 1
-# a triangle-inequality theorem — while the flown side reflects the lane actually taken, so a bad or
-# traffic-forced lane choice reads as detour (in lattice_overhead_m) instead of inflating the baseline.
+# mismatched endpoints, which would let a refined flight read stretch < 1 ("shorter than a
+# straight line"). Every planner gate and metrics._flown/_straight go through these three
+# functions, so the gate enforces exactly the ratio stretch later reports and planner-vs-metrics
+# drift is structurally impossible. The reference is deliberately lane-AGNOSTIC — the minimum over
+# every lane choice, which is what makes stretch >= 1 a triangle-inequality theorem — while the
+# flown side reflects the lane actually taken, so a bad or traffic-forced lane choice reads as
+# detour (in lattice_overhead_m) instead of inflating the baseline.
 
 
 def enroute_reference_m(origin, dest, origin_term, dest_term, cfg: SimConfig) -> float:
@@ -216,11 +274,21 @@ def enroute_reference_m(origin, dest, origin_term, dest_term, cfg: SimConfig) ->
     LATENT EDGE — the 0-clamp (columns covering the whole trip) is NOT benign: every caller's
     ``straight > _EPS`` guard then skips the ``max_detour_factor`` gate and :func:`enroute_detour_m`
     books 0, so the flight escapes the only length term in ``trajectory_cost`` and ``stretch`` goes
-    NaN. Unreached in shipped scenarios (``HubRadiusDemand``'s ``min_r``; measured minimum reference
-    66.10 m on ``dallas_hub_2uss_large`` at its own seed/lambda/horizon) — but ``min_r`` does not
-    scale with ``corridor_overlap``, so ``--corridor-overlap <= -60`` reaches it (at -100: 18/8046
-    generated requests clamp to 0). Short flights are geometry-dominated either way — read
-    ``stretch``/``delay_pct`` with care there.
+    NaN. Unreached in shipped scenarios (``HubRadiusDemand``'s ``min_r``), but ``min_r`` does not
+    scale with ``corridor_overlap``, so ``--corridor-overlap <= -60`` reaches it. Short flights are
+    geometry-dominated either way — read ``stretch``/``delay_pct`` with care there.
+
+    Parameters
+    ------------
+    - origin (Vec): origin position (xy used).
+    - dest (Vec): destination position (xy used).
+    - origin_term (Terminal | tuple | None): origin terminal, normalized via :func:`as_terminal`.
+    - dest_term (Terminal | tuple | None): destination terminal, normalized via :func:`as_terminal`.
+    - cfg (SimConfig): supplies the exit-lane radii.
+
+    Return
+    --------
+    - output (float): edge-to-edge straight-line reference distance (m), floored at 0.
     """
     o = np.asarray(origin, float)[:2]
     d = np.asarray(dest, float)[:2]
@@ -232,36 +300,59 @@ def enroute_reference_m(origin, dest, origin_term, dest_term, cfg: SimConfig) ->
 
 
 def enroute_detour_m(flown_m: float, reference_m: float) -> float:
-    """The verdict (diagram above): flown minus reference, floored at 0 — and 0 when the reference is 0.
+    """The verdict (diagram above): flown minus reference, floored at 0; 0 when the reference is 0.
 
     The 0-reference guard is the point: without it ``max(0.0, flown - 0.0)`` books the ENTIRE path
-    of a flight that never left terminal airspace as detour — real cost and delay (measured: 250 m
-    at ``--corridor-overlap -100``). No en-route segment means no en-route detour. Callers still
-    guard ``reference > _EPS`` for ``stretch``, which stays NaN — undefined is the honest answer.
+    of a flight that never left terminal airspace as detour. No en-route segment means no en-route
+    detour. Callers still guard ``reference > _EPS`` for ``stretch``, which stays NaN — undefined is
+    the honest answer.
+
+    Parameters
+    ------------
+    - flown_m (float): actual en-route distance flown (m), from :func:`enroute_flown_m`.
+    - reference_m (float): ideal reference distance (m), from :func:`enroute_reference_m`.
+
+    Return
+    --------
+    - output (float): detour ``max(0, flown − reference)`` m, or 0 when the reference is 0.
     """
     return 0.0 if reference_m <= 1e-9 else max(0.0, flown_m - reference_m)
 
 
 def enroute_flown_m(points, origin, dest, origin_term, dest_term, cfg: SimConfig) -> float:
-    """ACTUAL ruler (diagram above): the path folded to both column edges — through the SAME
-    :func:`fold_corners_to_columns` every reservation uses — then summed in the horizontal plane.
-    Single owner: every planner's ``air_detour_m``/gate and ``metrics._flown_horizontal_m`` call
-    this, so the two layers cannot drift (issue #50).
+    """ACTUAL ruler (diagram above): the path folded to both column edges, then summed in the plane.
+
+    Folds through the SAME :func:`fold_corners_to_columns` every reservation uses, then sums the
+    segment lengths in the horizontal plane. Single owner: every planner's ``air_detour_m``/gate and
+    ``metrics._flown_horizontal_m`` call this, so the two layers cannot drift.
 
     Three contracts:
 
     - An endpoint with NO terminal extends to the true ``origin``/``dest`` — otherwise A*'s endpoint
-      snap onto a hex centre reads as a phantom shortcut (measured ``stretch`` 0.9946). The snap
-      (~80 m/flight) therefore stays on A*'s bill, wholly in ``lattice_overhead_m``, never in the
-      traffic band — see ``metrics.flight_row``.
+      snap onto a hex centre reads as a phantom shortcut (``stretch`` < 1). The snap therefore stays
+      on A*'s bill, wholly in ``lattice_overhead_m``, never in the traffic band — see
+      ``metrics.flight_row``.
     - Re-folding an already-folded path is NEARLY idempotent, not exactly: the edge point re-roots
-      toward a different first waypoint (measured 2.93 m shorter on a hub->hub MILP flight).
+      toward a different first waypoint (a few metres shorter on a hub->hub MILP flight).
       Conservative direction, but do not rely on a second fold being free.
     - Fold bail-outs pass through unfolded (whole path inside the origin ring). Contained: every
       bail reachable with the shipped planners (under ``fixed_exit_lanes``) and shipped demand has
       ``enroute_reference_m == 0``, where detour books 0 and ``stretch`` is NaN. If a guard is ever
       added, fall back to the reference length (stretch -> 1, detour -> 0), NOT NaN — NaN would flow
       into ``air_detour_m`` -> cost -> ``total_delay_s``.
+
+    Parameters
+    ------------
+    - points (Sequence[Vec]): centreline waypoints to measure (consumed via ``list``).
+    - origin (Vec): origin position, appended when there is no origin terminal.
+    - dest (Vec): destination position, appended when there is no dest terminal.
+    - origin_term (Terminal | tuple | None): origin terminal, normalized via :func:`as_terminal`.
+    - dest_term (Terminal | tuple | None): destination terminal, normalized via :func:`as_terminal`.
+    - cfg (SimConfig): supplies the exit-lane radii for the fold.
+
+    Return
+    --------
+    - output (float): horizontal en-route distance (m) of the folded path (0 if < 2 points).
     """
     pts = list(fold_corners_to_columns(list(points), origin, dest, origin_term, dest_term, cfg))
     if as_terminal(origin_term) is None:
@@ -273,7 +364,7 @@ def enroute_flown_m(points, origin, dest, origin_term, dest_term, cfg: SimConfig
 
 
 def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: SimConfig):
-    """Drop in-column head/tail corners and re-root the polyline at the column edge (``exit_radius``).
+    """Drop in-column head/tail corners and re-root polyline at the column edge (``exit_radius``).
 
     The centre→edge leg is flown but UNRESERVED — the tagged hover column covers it. This is the
     continuous planners' analogue of A*'s boundary-lane rooting: a strict corridor rooted at the hub
@@ -283,15 +374,31 @@ def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: 
     Degenerate flights bail out UNFOLDED (returned as given): the whole path inside a column, a
     perimeter direction that is undefined (waypoint at the hub centre), or fewer than two surviving
     points. Bailing is safe — tags still apply, only same-hub concurrency degrades for that flight.
+
+    Parameters
+    ------------
+    - corners (list[Vec]): the polyline to fold (head/tail corners may sit inside a column).
+    - origin (Vec): origin hub centre.
+    - dest (Vec): destination hub centre.
+    - origin_term (Terminal | tuple | None): origin terminal, normalized via :func:`as_terminal`.
+    - dest_term (Terminal | tuple | None): destination terminal, normalized via :func:`as_terminal`.
+    - cfg (SimConfig): supplies the exit-lane radii.
+
+    Return
+    --------
+    - output (list[Vec]): the polyline re-rooted at the column edge(s), or ``corners`` unchanged on
+      a degenerate bail.
     """
     pts = [np.asarray(p, float) for p in corners]
     o_term, d_term = as_terminal(origin_term), as_terminal(dest_term)
 
     def _outside(p, center, r):
+        """True if ``p`` lies on or outside the radius-``r`` circle at ``center`` (xy)."""
         dx, dy = float(p[0]) - float(center[0]), float(p[1]) - float(center[1])
         return math.sqrt(dx * dx + dy * dy) >= r
 
     def _edge_point(center, toward, r):
+        """The radius-``r`` point on ``center`` toward ``toward`` (``None`` if degenerate)."""
         dx, dy = float(toward[0]) - float(center[0]), float(toward[1]) - float(center[1])
         n = math.sqrt(dx * dx + dy * dy)
         if n < 1e-9:
@@ -328,23 +435,41 @@ def build_reservation_from_corners(
 ) -> tuple[list[Volume4D], list[TimedPoint], float, float]:
     """Resample a corner polyline to ≤segment-length boxes, time at nominal speed, assemble.
 
-    Shared by the MILP planner and the shortcut refiner so they all emit the
-    *same* contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are
-    given, the hub **hover column** is tagged shared (sized to the terminal's radius) AND **every corridor
-    box that reaches into that column** (``segment_overlaps_column`` — not just the first/last) is tagged
-    with the hub, so the column-involved exemption lets the near-hub corridor pass through the shared
-    column; every box clear of the column stays strict (untagged). Returns (volumes, centerline, horiz, dz).
+    Shared by the MILP planner and the shortcut refiner so they all emit the same
+    contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are given,
+    the hub hover column is tagged shared (sized to the terminal's radius) AND every corridor box
+    that reaches into that column (:func:`segment_overlaps_column` — not just the first/last) is
+    tagged with the hub, so the column-involved exemption lets the near-hub corridor pass through
+    the shared column; every box clear of the column stays strict (untagged).
+
+    Parameters
+    ------------
+    - corners (list[Vec]): the corner polyline to resample.
+    - origin (Vec): origin hub centre.
+    - dest (Vec): destination hub centre.
+    - t_depart (float): filed departure time (s).
+    - g_delay (float): ground delay held on the pad before departure (s).
+    - cfg (SimConfig): supplies geometry, speeds, and timing.
+    - origin_term: origin terminal (``Terminal`` or ``(id, capacity, ...)`` tuple), or ``None``.
+    - dest_term: destination terminal, or ``None``.
+    - corridor_t0 (float | None): verified corridor start stamp; overrides the derived start.
+
+    Return
+    --------
+    - output (tuple[list[Volume4D], list[TimedPoint], float, float]): the reservation volumes
+      (origin column, corridor boxes, dest column), the timed centreline, cumulative horizontal
+      distance (m), and cumulative altitude change (m).
     """
     origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
     # the corner z is the source of truth for climb timing: cruise starts after the climb to the
     # FIRST corner's altitude (its flight level), not a fixed preferred-level climb.
     z_takeoff = float(np.asarray(corners[0], float)[2])
     z_land = float(np.asarray(corners[-1], float)[2])
-    # The corridor may not start until the climb AND the egress traverse are flown (issue #52).
-    # ``corridor_t0`` overrides the derivation with a VERIFIED stamp: a refiner re-timing a path must
-    # anchor the corridor exactly where the inner planner's ledger-checked centerline starts —
+    # The corridor may not start until the climb AND the egress traverse are flown.
+    # ``corridor_t0`` overrides the derivation with a VERIFIED stamp: a refiner re-timing a path
+    # must anchor the corridor exactly where the inner planner's ledger-checked centerline starts —
     # re-deriving here mixes this CONTINUOUS clock (climb_time_to + WORST lane) with A*'s QUANTISED
-    # stamp (climb_steps*dt + CHOSEN lane's steps) and shifted every rebuilt volume by -3..+1 s.
+    # stamp (climb_steps*dt + CHOSEN lane's steps) and drifts every rebuilt volume by a few seconds.
     t = corridor_t0 if corridor_t0 is not None else (
         t_depart + g_delay + column_dwell_s(origin, origin_term, cfg, z_takeoff))
     centerline: list[TimedPoint] = [(np.asarray(corners[0], float).copy(), t)]
@@ -361,7 +486,7 @@ def build_reservation_from_corners(
     # Bit-for-bit identical to the numpy form: math.sqrt(Σd²) == float(np.linalg.norm(·)) is the same fact
     # the segment_frame (3-vector) and segment_overlaps_column (2-vector) frozen oracles pin, and the
     # interpolation sa/sb reuse the exact `a + (k/nsub)·d` operands. centerline keeps its np.ndarray points
-    # (built once per sub-box, == the old sb.copy()). Backstopped by the scenario A/B SHA256.
+    # (built once per sub-box). Backstopped by the scenario A/B SHA256.
     for a, b in zip(corners, corners[1:]):
         ax, ay, az = float(a[0]), float(a[1]), float(a[2])
         bx, by, bz = float(b[0]), float(b[1]), float(b[2])
@@ -417,14 +542,29 @@ def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Ha
                       climb_time_s: float | None = None) -> Volume4D:
     """A vertical hover cylinder at ``center`` (ASTM area-based intent, §4.3.5).
 
-    ``radius`` (default ``effective_hover_radius_m``) lets a multi-pad vertiport size its shared column
-    bigger than a single pad. Altitude band [ground, ``z_hi``] — ``z_hi`` defaults to
-    ``airspace_ceiling_m`` so the column spans the full regulated tube (a vertiport owns its vertical
-    column of regulated airspace). Active for ``hover_time_s + climb_time_s`` from ``t0``; pass
-    ``climb_time_s`` (e.g. :meth:`SimConfig.climb_time_to` of the flight's cruise level) to size the
-    window to the actual climb instead of the preferred-level default. When ``terminal_id`` is set this
-    cylinder is a shared terminal column — transparent to its own hub's flights, opaque to everyone else
-    (see :func:`conflict.volumes_conflict`).
+    Altitude band [ground, ``z_hi``]; ``z_hi`` defaults to ``airspace_ceiling_m`` so the column
+    spans the full regulated tube (a vertiport owns its vertical column of regulated airspace).
+    Active for ``hover_time_s + climb_time_s`` from ``t0``. When ``terminal_id`` is set this
+    cylinder is a shared terminal column — transparent to its own hub's flights, opaque to everyone
+    else (see :func:`conflict.volumes_conflict`).
+
+    Parameters
+    ------------
+    - center (Vec): cylinder centre (xy); z spans [ground, ``z_hi``].
+    - t0 (float): time (s) the reservation becomes active.
+    - cfg (SimConfig): supplies default radius, ground level, ceiling, and hover/climb times.
+    - terminal_id (Hashable): shared-terminal tag, or ``None`` for ordinary airspace.
+    - radius (float | None): column radius; ``None`` ⇒ ``effective_hover_radius_m`` (lets a
+      multi-pad vertiport size its shared column bigger than a single pad).
+    - z_hi (float | None): band top; ``None`` ⇒ ``airspace_ceiling_m``.
+    - climb_time_s (float | None): climb time added to the window; ``None`` ⇒ the preferred-level
+      default (pass e.g. :meth:`SimConfig.climb_time_to` of the cruise level to match the real
+      climb).
+
+    Return
+    --------
+    - output (Volume4D): the hover-cylinder reservation, active over
+      ``[t0, t0 + hover_time_s + climb_time_s)``.
     """
     center = np.asarray(center, float)
     z_hi = cfg.airspace_ceiling_m if z_hi is None else float(z_hi)
@@ -447,36 +587,49 @@ _WALL_T_END_S = 1e12
 
 
 def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4D:
-    """A hub's whole-horizon terminal-airspace reservation — the ledger volume that makes an
-    ``cfg.terminal_airspace_always_active`` wall a first-class part of the committed airspace (visible to
-    ``ledger.any_conflict`` / ``verify`` / the ledger-only refiners) instead of an off-ledger occupancy
-    side-structure.
+    """A hub's whole-horizon terminal-airspace reservation — the ledger volume that makes a
+    ``cfg.terminal_airspace_always_active`` wall a first-class part of the committed airspace
+    (visible to ``ledger.any_conflict`` / ``verify`` / the ledger-only refiners) instead of an
+    off-ledger occupancy side-structure.
 
-    Spans the full ``[ground, ceiling]`` tube for the whole horizon and is tagged with ``terminal_id`` so
-    the column-involved exemption in :func:`conflict.volumes_conflict` keeps it transparent to its own
-    hub's flights while walling foreign cruise.
+    Spans the full ``[ground, ceiling]`` tube for the whole horizon and is tagged with
+    ``terminal_id`` so the column-involved exemption in :func:`conflict.volumes_conflict` keeps it
+    transparent to its own hub's flights while walling foreign cruise.
 
-    **Radius = ``terminal_radius`` — the reserved column, exactly what the per-flight dwell column reserves
-    (:func:`hover_reservation` in ``build_reservation_from_corners`` / ``AStarPlanner._build``).** The ledger
-    records only the *safety-critical reserved volume* (the hover column where drones actually are); it does
-    NOT include the ``+corridor_width/2`` of ``exit_radius`` (that is exit-LANE geometry — where lanes start
-    flush with the column edge — a routing/lane concern, not a reservation) nor the wider ``terminal_cells``
-    flood-fill (A*'s discrete keep-out, for search margin). So the permanent wall is byte-identical to the
-    transient dwell column, just permanent — the "active ⟺ on the ledger" model applied to the *same* volume
-    (built by reusing :func:`hover_reservation`, so the two cannot drift). Because ``terminal_radius ⊂
-    terminal_cells``, any corridor A* routes around ``terminal_cells`` also clears this column with margin (no
-    spurious commit-time denials).
+    Radius = :func:`terminal_radius` — the reserved column, exactly what the per-flight dwell column
+    reserves (:func:`hover_reservation` in :func:`build_reservation_from_corners` /
+    ``AStarPlanner._build``). The ledger records only the safety-critical reserved volume (the hover
+    column where drones actually are); it does NOT include the ``+corridor_width/2`` of
+    :func:`exit_radius` (exit-LANE geometry, a routing concern, not a reservation) nor the wider
+    ``terminal_cells`` flood-fill (A*'s discrete keep-out, for search margin). So the permanent wall
+    is byte-identical to the transient dwell column, just permanent — built by reusing
+    :func:`hover_reservation`, so the two cannot drift. Because ``terminal_radius ⊂
+    terminal_cells``, any corridor A* routes around ``terminal_cells`` also clears this column with
+    margin (no spurious commit-time denials).
 
-    **Time-invariant — active for ALL time, mirroring the occupancy routing wall.** The A* occupancy
-    ``static_col`` blocks these cells at EVERY queried step (it has no time dimension), so the ledger wall
-    must too. Any finite, ``cfg``-derived ``t_end`` has a hole: a committed corridor can land after it — most
-    sharply a return flight departing at ``t_request + est_trip + turnaround_s > horizon_s`` (``turnaround_s``
-    is a demand-model field, invisible here) — and then a foreign crossing in that window would escape
-    ``any_conflict`` / ``verify``. So ``t_end`` is a large sentinel (:data:`_WALL_T_END_S`): effectively
-    unbounded, but FINITE (not ``inf``) as belt-and-suspenders. It is safe because a static wall is never
-    committed, so it never reaches the step-range/bucketing arithmetic (``ledger._steps`` /
-    ``hexgrid.rasterize_volume``); it surfaces only via ``ledger.conflicts`` (the ``-1`` sentinel), where the
-    sole arithmetic reader — ``straight``'s jump-to-gap ``min(cv.t_end)`` — is refused under always-active."""
+    Time-invariant — active for ALL time, mirroring the occupancy routing wall. The A* occupancy
+    ``static_col`` blocks these cells at EVERY queried step (no time dimension), so the ledger
+    wall must too. Any finite, ``cfg``-derived ``t_end`` has a hole: a committed corridor can land
+    after it — notably a return departing at ``t_request + est_trip + turnaround_s > horizon_s``
+    (``turnaround_s`` is a demand-model field, invisible here) — and a foreign crossing in that
+    window would escape ``any_conflict`` / ``verify``. So ``t_end`` is a large sentinel
+    (:data:`_WALL_T_END_S`): effectively unbounded, but FINITE (not ``inf``) as belt-and-suspenders.
+    Safe because a static wall is never committed, so it never reaches the step-range/bucketing
+    arithmetic (``ledger._steps`` / ``hexgrid.rasterize_volume``); it surfaces only via
+    ``ledger.conflicts`` (the ``-1`` sentinel), where the sole arithmetic reader — ``straight``'s
+    jump-to-gap ``min(cv.t_end)`` — is refused under always-active.
+
+    Parameters
+    ------------
+    - center (Vec): the hub centre (column location).
+    - term (Terminal | tuple): the terminal, normalized via :func:`as_terminal`; sets the tag and
+      radius.
+    - cfg (SimConfig): supplies the column radius, ground level, and ceiling.
+
+    Return
+    --------
+    - output (Volume4D): the tagged hover column with ``t_end`` set to :data:`_WALL_T_END_S`.
+    """
     term = as_terminal(term)
     return replace(
         hover_reservation(center, 0.0, cfg, terminal_id=term.id, radius=terminal_radius(term, cfg)),

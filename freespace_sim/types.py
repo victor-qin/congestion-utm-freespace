@@ -122,6 +122,17 @@ class FlightRequest:
     paired_outbound_id: "int | None" = None
 
     def __post_init__(self):
+        """Default and validate ``t_departure`` after construction.
+
+        Parameters
+        ------------
+        - none: reads and, if unset, fills ``t_departure`` on ``self``.
+
+        Return
+        --------
+        - output (None): sets ``t_departure = t_request`` when it is ``None``; raises ``ValueError``
+          if a given ``t_departure`` precedes ``t_request``.
+        """
         # Single source of truth for the file/departure relationship: a flight departs no earlier than
         # it is filed. ``None`` means "depart as soon as filed". Enforced here, not per-planner, so every
         # consumer can rely on ``t_departure`` being set and ``>= t_request`` — A*'s ``ceil(t_depart/dt)``
@@ -135,6 +146,7 @@ class FlightRequest:
             )
 
     def sort_key(self) -> tuple[float, int]:
+        """FCFS sort key: ``(t_request, flight_id)``."""
         return (self.t_request, self.flight_id)
 
 
@@ -153,7 +165,7 @@ class OperationalIntent:
     centerline: list[TimedPoint] | None = None
     ground_delay_s: float = 0.0       # time held on the pad before departure
     air_hold_s: float = 0.0           # time loitering/hovering mid-route
-    # EN-ROUTE detour (issue #50): flown minus reference, BOTH measured exit lane -> exit lane via
+    # EN-ROUTE detour: flown minus reference, BOTH measured exit lane -> exit lane via
     # volumes.enroute_flown_m / enroute_reference_m — never hub centre -> hub centre. Terminal-column
     # flying is in neither side (capacity-only); a terminal-free endpoint extends to the true
     # origin/dest, so A* pays its endpoint snap here while continuous planners don't (deliberate —
@@ -175,6 +187,17 @@ class OperationalIntent:
     solve_time_s: float = 0.0         # wall time the planner spent on this flight's plan() call
 
     def __post_init__(self):
+        """Default ``denial_reason`` from ``status`` when it was not given explicitly.
+
+        Parameters
+        ------------
+        - none: reads ``status`` / ``denial_reason`` on ``self``.
+
+        Return
+        --------
+        - output (None): leaves an explicit ``denial_reason`` untouched; otherwise sets ``NONE`` for
+          a non-rejected intent and ``BUDGET_EXCEEDED`` for a rejected one.
+        """
         if self.denial_reason is None:
             self.denial_reason = (
                 DenialReason.NONE if self.status is not IntentStatus.REJECTED
@@ -183,6 +206,7 @@ class OperationalIntent:
 
     @property
     def accepted(self) -> bool:
+        """True when the intent is committed or in flight (ACCEPTED or ACTIVATED)."""
         return self.status in (IntentStatus.ACCEPTED, IntentStatus.ACTIVATED)
 
 

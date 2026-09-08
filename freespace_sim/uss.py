@@ -17,12 +17,23 @@ from .types import FlightRequest, OperationalIntent
 
 
 def _warn_if_terminal_dropped(req: FlightRequest, intent: OperationalIntent) -> None:
-    """Make it *loud* when a planner ignores multi-pad terminal airspace.
+    """Warn loudly when an accepted plan dropped the terminal tag it asked for.
 
     A*-based geometry and the terminal-aware MILP family tag a hub flight's terminal column; a
-    planner that rebuilds corridors without threading the terminal (straight) drops the tag, which silently disables the
-    shared-terminal exemption and pad capacity. If an accepted flight asked for a terminal but its
-    committed volumes don't carry it, warn — better an obvious RuntimeWarning than a wrong result.
+    planner that rebuilds corridors without threading the terminal (e.g. ``straight``) drops the
+    tag, silently disabling the shared-terminal exemption and pad capacity. A visible
+    ``RuntimeWarning`` is preferred to a quietly wrong result.
+
+    Parameters
+    ------------
+    - req (FlightRequest): the request, whose ``origin_terminal`` / ``dest_terminal`` name any
+      terminals the committed volumes must carry.
+    - intent (OperationalIntent): the planned intent; only accepted intents are checked.
+
+    Return
+    --------
+    - output (None): emits a ``RuntimeWarning`` when an expected terminal tag is missing; returns
+      nothing and mutates nothing.
     """
     if not intent.accepted:
         return
@@ -41,12 +52,33 @@ def _warn_if_terminal_dropped(req: FlightRequest, intent: OperationalIntent) -> 
 
 @dataclass
 class USS:
+    """UAS Service Supplier: owns an identity and a planner, and submits plans to the DSS.
+
+    World state lives in the DSS/ledger, not here; a USS only plans a conflict-free reservation for
+    a request and hands it to the DSS to commit.
+    """
+
     uss_id: str
     dss: DSS
     cfg: SimConfig
     planner: Planner
 
     def handle_request(self, req: FlightRequest) -> OperationalIntent:
+        """Plan a conflict-free reservation for ``req`` and submit it to the DSS to commit.
+
+        Records planner wall time on the intent (``solve_time_s``, before commit) and warns if the
+        planner dropped requested terminal airspace. The DSS commit flips an accepted intent to
+        committed, or to rejected on a commit-time conflict.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight request to plan and commit.
+
+        Return
+        --------
+        - output (OperationalIntent): the planned intent, with ``solve_time_s`` set and its status
+          resolved by the DSS commit.
+        """
         t0 = time.monotonic()
         intent = self.planner.plan(req, self.dss.ledger, self.cfg)
         intent.solve_time_s = time.monotonic() - t0   # planner time only, before commit

@@ -1,8 +1,8 @@
 """Run capture — freeze a `SimResult` to a self-contained, replayable folder under ``results/``.
 
 Mirrors the sibling project's run tracking, adapted to continuous free space. Every run writes a
-timestamped folder ``results/{ISO}_{label}_{hash}/`` holding **everything needed to reproduce,
-analyse, or replay it without re-running the sim**:
+timestamped folder ``results/{ISO}_{label}_{hash}/`` holding everything needed to reproduce,
+analyse, or replay it without re-running the sim:
 
     config.json          the exact SimConfig used
     scenario_spec.json   the resolved post-override ScenarioSpec recipe (when supplied)
@@ -64,12 +64,21 @@ log = logging.getLogger(__name__)
 def _config_hash(cfg: SimConfig, scenario_spec: dict | None = None) -> str:
     """Short digest of everything that makes a run a DIFFERENT run.
 
-    ``SimConfig`` alone is not enough. Two scenarios can share a byte-identical SimConfig and still be
-    different worlds, because the whole demand recipe — operator mix, per-USS rates, service radii, and
-    the scheduling leads the lead arms vary — lives in ``DemandSpec``, which SimConfig never sees. The
-    five FAA lead arms all hashed to a246cd5e, so under one ``--tag`` their run folders differed only by
-    a second-granularity timestamp and same-second finishers merged into one directory. Fold the
-    archived scenario recipe in when there is one.
+    ``SimConfig`` alone is not enough: two scenarios can share a byte-identical SimConfig and
+    still be different worlds, because the whole demand recipe — operator mix, per-USS rates,
+    service radii, the scheduling leads — lives in ``DemandSpec``, which SimConfig never sees.
+    Without folding the recipe in, runs that differ only in demand hash identically, so under one
+    ``--tag`` their folders collide to a second-granularity timestamp and same-second finishers
+    merge into one directory.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): the config being hashed.
+    - scenario_spec (dict | None): the resolved scenario recipe; folded in when present.
+
+    Return
+    --------
+    - output (str): 8-char SHA-1 hex digest of the ``config`` (plus ``scenario_spec``) payload.
     """
     payload = {"config": dataclasses.asdict(cfg)}
     if scenario_spec is not None:
@@ -79,6 +88,7 @@ def _config_hash(cfg: SimConfig, scenario_spec: dict | None = None) -> str:
 
 
 def _git_info() -> dict:
+    """Best-effort ``{available, commit, dirty}`` for HEAD; ``{available: False}`` if git fails."""
     try:
         sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, timeout=2)
@@ -92,6 +102,7 @@ def _git_info() -> dict:
 
 
 def _env_info() -> dict:
+    """Toolchain snapshot: Python + platform + each optional dependency's version (or None)."""
     versions = {}
     for mod in ("numpy", "fcl", "pandas", "pulp", "trimesh"):
         try:
@@ -131,9 +142,20 @@ def _opt_int(v) -> int | None:
 
 
 def scenario_frame(result: SimResult) -> pd.DataFrame:
-    """Every generated flight request — the scenario, independent of what got accepted. Carries each
-    endpoint's terminal (hub) membership so a saved run — including its denied flights — records which hub
-    each flight used (round-tripped by :func:`load_run`)."""
+    """Every generated flight request — the scenario, independent of what got accepted.
+
+    Carries each endpoint's terminal (hub) membership so a saved run — including its denied
+    flights — records which hub each flight used (round-tripped by :func:`load_run`).
+
+    Parameters
+    ------------
+    - result (SimResult): the finished run; reads ``result.intents`` (accepted or not).
+
+    Return
+    --------
+    - output (pd.DataFrame): one row per request — ids, filing/departure time, origin/dest, hub
+      membership, and the return-leg link.
+    """
     rows = []
     for i in result.intents:
         r = i.request
@@ -146,18 +168,27 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
             "origin_terminal": _term_to_json(r.origin_terminal),
             "dest_terminal": _term_to_json(r.dest_terminal),
-            # Round-trip link (return leg → its outbound). Without it a reloaded run cannot tell which
-            # legs were paired, so nothing downstream could re-derive the schedule slip or re-anchor a
+            # Round-trip link (return leg → its outbound). Without it a reloaded run cannot tell
+            # which legs were paired, so nothing can re-derive the schedule slip or re-anchor a
             # return post-hoc — the coupled t_departure above is the OUTCOME, not the relationship.
-            # pandas has no nullable-int dtype by default, so an unlinked leg stores NaN and
-            # load_run reads it back as None.
+            # pandas has no nullable-int dtype by default, so an unlinked leg stores NaN; load_run
+            # reads it back as None.
             "paired_outbound_id": r.paired_outbound_id,
         })
     return pd.DataFrame(rows)
 
 
 def trajectory_frame(result: SimResult) -> pd.DataFrame:
-    """What was actually flown: one row per timed centerline waypoint (v0: flown == reserved)."""
+    """What was actually flown: one row per timed centerline waypoint (v0: flown == reserved).
+
+    Parameters
+    ------------
+    - result (SimResult): the finished run; reads ``result.accepted`` and each intent's centerline.
+
+    Return
+    --------
+    - output (pd.DataFrame): columns ``flight_id, t, x, y, z`` — empty-safe (fixed columns).
+    """
     rows = []
     for i in result.accepted:
         for p, t in i.centerline or []:
@@ -172,6 +203,15 @@ def reservation_frame(result: SimResult) -> pd.DataFrame:
 
     ``rot``/``ext`` are JSON-encoded for boxes; ``radius``/``z_lo``/``z_hi`` carry cylinders. This is
     enough to rebuild the exact `Volume4D` (see :func:`load_run`) and to drive the replay.
+
+    Parameters
+    ------------
+    - result (SimResult): the finished run; reads each accepted intent's ``volumes``.
+
+    Return
+    --------
+    - output (pd.DataFrame): one row per reserved Volume4D with the geometry columns above;
+      empty-safe (fixed columns).
     """
     rows = [{"flight_id": i.request.flight_id, **_vol_row(v)}
             for i in result.accepted for v in (i.volumes or [])]
@@ -181,10 +221,21 @@ def reservation_frame(result: SimResult) -> pd.DataFrame:
 
 
 def _ledger_end_frame(result: SimResult) -> pd.DataFrame:
-    """The always-active terminal WALLS (``ledger._static_vols``) — the part of the end-of-run ledger that
-    ``reservation_frame`` (accepted intents only) doesn't capture. Same geometry schema; empty when the run
-    used no always-active walls. ``reservations.parquet`` ∪ this == the full end-of-run ledger (see the
-    telemetry design §10)."""
+    """The always-active terminal WALLS (``ledger._static_vols``) that ``reservation_frame``
+    (accepted intents only) doesn't capture.
+
+    Same geometry schema as ``reservation_frame``; empty when the run used no always-active walls.
+    ``reservations.parquet`` ∪ this == the full end-of-run ledger.
+
+    Parameters
+    ------------
+    - result (SimResult): the finished run; reads ``result.ledger`` (static walls and terminals).
+
+    Return
+    --------
+    - output (pd.DataFrame): one row per static wall (geometry + ``exit_radius``); empty-safe (fixed
+      columns), and empty when the run has no always-active walls.
+    """
     ledger = getattr(result, "ledger", None)
     vols = list(getattr(ledger, "_static_vols", []) or [])
     # Static terminals need not appear on a request (a scenario may place an unused hub), so persist
@@ -210,12 +261,19 @@ def _ledger_end_frame(result: SimResult) -> pd.DataFrame:
 
 
 def _json_finite(value):
-    """Replace non-finite floats with ``None`` so the payload is real JSON.
+    """Recursively replace non-finite floats with ``None`` so the payload is real JSON.
 
-    ``json.dumps`` emits bare ``Infinity``/``NaN``, which RFC 8259 does not allow: strict
-    parsers reject the file outright, and ``jq`` silently clamps to 1.8e308 — turning "no
-    bound was ever computed" into a plausible-looking finite bound. ``null`` says the same
-    thing without inviting either failure.
+    ``json.dumps`` emits bare ``Infinity``/``NaN``, which RFC 8259 forbids: strict parsers reject
+    the file outright, and ``jq`` silently clamps to 1.8e308 — turning "no bound was ever computed"
+    into a plausible-looking finite bound. ``null`` says the same thing, inviting neither failure.
+
+    Parameters
+    ------------
+    - value (Any): a scalar or a nested dict/list/tuple to sanitise.
+
+    Return
+    --------
+    - output (Any): the same structure with every non-finite float replaced by ``None``.
     """
 
     if isinstance(value, float):
@@ -243,18 +301,39 @@ def save_run(
 ) -> Path:
     """Write the full self-contained run folder and return its path.
 
-    Captures config/env/git, the experiment identity + args, the resolved scenario, the flown trajectories,
-    the reserved 4D volumes, per-flight metrics, and (by default) the standalone replay HTML. Everything
-    is parquet + json — deliberately NOT pickle: portable, inspectable, safe to sync to the run store,
-    and Python-version-independent. The analytical geometry stored in reservations/ledger_end is enough
-    to rebuild every ``Volume4D`` on load (see :func:`load_run` / :func:`_volume_from_row`).
+    Captures config/env/git, the experiment identity + args, the resolved scenario, the flown
+    trajectories, the reserved 4D volumes, per-flight metrics, and (by default) the standalone
+    replay HTML. Everything is parquet + json, deliberately NOT pickle: portable, inspectable, safe
+    to sync to the run store, and Python-version-independent. The analytical geometry in
+    reservations/ledger_end is enough to rebuild every ``Volume4D`` on load (see :func:`load_run` /
+    :func:`_volume_from_row`).
 
-    ``summary.json`` carries the whole-run headline numbers **and** their steady-state twin (metrics
-    over the representative density plateau — issue #25) in a nested ``steady_state`` block; ``window_frac``
-    tunes the plateau threshold. The replay spans the REALIZED operation — first reservation through last
-    to clear (:func:`metrics.simulation_window`) — so the post-horizon return tail these scenarios exist
-    to produce stays visible, and an early-finishing run no longer scrubs through an empty sky out to
-    ``horizon_s``.
+    ``summary.json`` carries the whole-run headline numbers and their steady-state twin (metrics
+    over the representative density plateau) in a nested ``steady_state`` block. The replay spans
+    the REALIZED operation — first reservation through last to clear
+    (:func:`metrics.simulation_window`) — so the post-horizon return tail these scenarios exist to
+    produce stays visible, instead of scrubbing an empty sky out to ``horizon_s``.
+
+    Parameters
+    ------------
+    - result (SimResult): the finished run to freeze.
+    - root (Path | str): results root the run folder is created under.
+    - label (str): human tag; also the folder name segment, the default experiment name, and the
+      index ``tag``.
+    - experiment (str | None): experiment identity in ``experiment.json`` (defaults to label).
+    - experiment_args (dict | None): the experiment's arguments, recorded verbatim.
+    - scenario_spec (dict | None): resolved scenario recipe; when present it is archived and folded
+      into the folder hash so demand-only variants get distinct folders.
+    - wall_seconds (float | None): measured solve wall clock, recorded and indexed.
+    - scenario (str | None): scenario name, a cross-run index join key.
+    - demand (str | None): demand name, a cross-run index join key.
+    - write_replay (bool): write ``replay.html`` (default True).
+    - index (bool): append this run to the shared cross-run index (default True).
+    - window_frac (float): plateau threshold for the steady-state metrics twin.
+
+    Return
+    --------
+    - output (Path): the created run folder (a ``__N`` suffix is added on a name collision).
     """
     cfg = result.config
     agg = metrics.aggregate_with_steady(result, frac=window_frac)
@@ -262,10 +341,10 @@ def save_run(
     # Seed in the name as well as the hash: a sweep's folders are read by eye far more often than they
     # are parsed, and `_s0/_s1/_s2` is the axis one actually scans for. The hash still carries it.
     base_name = f"{stamp}_{label}_s{cfg.seed}_{_config_hash(cfg, scenario_spec)}"
-    # exist_ok=False in a claim loop, NOT exist_ok=True. Two runs landing on one name used to merge
-    # their parquet into a single directory — a silent corruption, and the likeliest way to hit it is a
-    # Slurm array whose tasks share a tag and finish inside the same second. Suffixing keeps both runs
-    # (losing a finished multi-hour run to a raise would be worse) and says so.
+    # exist_ok=False in a claim loop, NOT exist_ok=True. Two runs landing on one name would merge
+    # their parquet into a single directory — a silent corruption, likeliest under a Slurm array
+    # whose tasks share a tag and finish inside the same second. Suffixing keeps both runs (losing a
+    # finished multi-hour run to a raise would be worse) and logs that it did.
     folder = Path(root) / base_name
     for attempt in range(2, 1000):
         try:
@@ -325,8 +404,8 @@ def save_run(
         walls.to_parquet(folder / "ledger_end.parquet", index=False, compression="zstd")
 
     if result.telemetry is not None:
-        # observer-only congestion telemetry (issue: run instrumentation) — the streams post-hoc can't
-        # recover: rejected-corridor geometry + conflict culprits + per-hub metadata.
+        # Observer-only congestion telemetry the streams can't recover post-hoc: rejected-corridor
+        # geometry + conflict culprits + per-hub metadata.
         terminal_frame(result).to_parquet(folder / "terminal_telemetry.parquet", index=False, compression="zstd")
         conflict_frame(result).to_parquet(folder / "conflict_events.parquet", index=False, compression="zstd")
         filed_volume_frame(result).to_parquet(folder / "filed_volumes.parquet", index=False, compression="zstd")
@@ -338,11 +417,10 @@ def save_run(
     if index:
         row_df = _index_row(result, folder, wall_seconds, scenario=scenario,
                             scenario_description=scenario_description, tag=label, demand=demand, agg=agg)
-        # Own copy first, and deliberately OUTSIDE the guard below: it is the only thing
-        # `rebuild_index` can put this row back from, so swallowing its failure would lose the run
-        # from every readout silently. A folder that refuses a write this late (a filling disk) also
-        # casts doubt on the artifacts written above it, which are themselves unguarded — that is a
-        # real failure and must still raise.
+        # Own copy first, deliberately OUTSIDE the guard below: it is the only thing rebuild_index
+        # can restore this row from, so swallowing its failure would drop the run from every readout
+        # silently. A folder that refuses a write this late (a filling disk) casts doubt on the
+        # artifacts above it, which are themselves unguarded — a real failure that must still raise.
         row_df.to_parquet(folder / INDEX_ROW_FILENAME, index=False)
         try:
             _append_index(row_df, Path(root))
@@ -364,9 +442,23 @@ def _index_row(result: SimResult, folder: Path, wall_seconds: float | None,
 
     The ``scenario`` / ``tag`` / ``demand`` columns are the join keys cross-run readouts filter on:
     a batch sweep stamps every run with the same ``tag`` so a readout can select exactly its runs.
-    ``agg`` may be a precomputed :func:`metrics.aggregate_with_steady` (avoids recomputing it); the
-    ``steady_*`` / ``window_*`` columns carry the steady-state twin of the headline metrics so a
-    cross-run curve can plot the de-biased trend alongside the whole-run one (issue #25).
+    The ``steady_*`` / ``window_*`` columns carry the steady-state twin of the headline metrics so
+    a cross-run curve can plot the de-biased trend alongside the whole-run one.
+
+    Parameters
+    ------------
+    - result (SimResult): the finished run.
+    - folder (Path): the run's folder, stored as the row's ``path`` (its primary key).
+    - wall_seconds (float | None): measured solve wall clock.
+    - scenario (str | None): scenario join key.
+    - tag (str | None): sweep/tag join key.
+    - demand (str | None): demand join key.
+    - agg (dict | None): a precomputed :func:`metrics.aggregate_with_steady`; computed here if None.
+    - scenario_description (str | None): human description carried alongside the join keys.
+
+    Return
+    --------
+    - output (pd.DataFrame): a single-row frame — the run's row for the shared index.
     """
     cfg = result.config
     if agg is None:
@@ -391,16 +483,12 @@ def _index_row(result: SimResult, folder: Path, wall_seconds: float | None,
            "simulation_end_s": agg["simulation_end_s"],
            "simulation_duration_s": agg["simulation_duration_s"],
            "region_w": cfg.region_size_m[0], "region_h": cfg.region_size_m[1],
-           # None for per-flight planners, which have neither. For a whole-schedule solver these
-           # are what separates "we have six colgen runs" from "we have six colgen runs, five of
-           # which stopped at iteration 1" -- without them that needs opening every folder.
-           #
-           # They also mark the rows whose `*_solve_time_s` columns are not comparable with the
-           # rest: a whole-schedule planner has no per-flight solve, so `colgen` files the SAME
-           # amortized share (solve wall / n_flights) on every intent. Its mean is the amortized
-           # share, its p95 and max are that share again, and its total is the solve. Against an
-           # FCFS run those columns describe a different quantity, so filter on
-           # `planner_termination.isna()` before comparing them.
+           # None for per-flight planners, which have neither. For a whole-schedule solver they
+           # separate a converged run from one that stopped at iteration 1 — otherwise that means
+           # opening every folder. They also flag the rows whose `*_solve_time_s` are not comparable
+           # with a per-flight planner's: colgen has no per-flight solve, so it files one amortized
+           # share (solve wall / n_flights) on every intent — mean, p95 and max are that share and
+           # total is the whole solve. Filter on `planner_termination.isna()` before comparing.
            "planner_termination": planner_stats.get("termination_reason"),
            "planner_iterations": planner_stats.get("iterations"),
            "wall_seconds": wall_seconds,
@@ -422,6 +510,16 @@ def _append_index(row_df: pd.DataFrame, root: Path) -> None:
 
     The caller has already written the row to the run's own folder, so anything lost here — a race,
     an unreadable file, a filesystem that will not lock — is recoverable by :func:`rebuild_index`.
+
+    Parameters
+    ------------
+    - row_df (pd.DataFrame): the single-row frame from :func:`_index_row`.
+    - root (Path): results root holding ``index.parquet``.
+
+    Return
+    --------
+    - output (None): rewrites ``index.parquet`` in place; sidelines and rebuilds it if it is
+      unreadable.
     """
     path = root / INDEX_FILENAME
     rebuild = False
@@ -477,10 +575,18 @@ def _index_lock(root: Path):
 def _sideline_corrupt_index(path: Path, exc: Exception) -> Path | None:
     """Rename an unreadable ``index.parquet`` out of the way, keeping its bytes for salvage.
 
-    Rename rather than delete: rows of runs archived before ``index_row.parquet`` existed live
-    only in this file, and the sidelined copy is the single remaining artifact a manual repair
-    could recover them from. Returns the quarantine path, or ``None`` if the rename failed too
-    (a read-only or misbehaving filesystem), in which case the file is left untouched.
+    Rename rather than delete: rows of runs archived before ``index_row.parquet`` existed live only
+    in this file, so the sidelined copy is the single artifact a manual repair could recover them.
+
+    Parameters
+    ------------
+    - path (Path): the unreadable ``index.parquet`` to quarantine.
+    - exc (Exception): the read error, logged to explain the sideline.
+
+    Return
+    --------
+    - output (Path | None): the quarantine path, or ``None`` if the rename failed (a read-only or
+      misbehaving filesystem), in which case ``path`` is left untouched.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
@@ -508,15 +614,23 @@ def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
     """Reconstitute ``index.parquet`` from each run folder's own ``index_row.parquet``, and return it.
 
     A dropped index row is invisible — a cross-run readout just reports one run fewer, with no error
-    and no gap to notice. Call this after a batch array (having every task call it means whichever
+    and no gap to notice. Call this after a batch array (every task calling it means whichever
     finishes last leaves a complete index, whatever the shared filesystem did with the lock).
 
     Non-destructive and idempotent: index rows whose folder has no copy (runs archived before this
-    file existed, or folders since deleted) are KEPT; where both exist the folder's copy wins.
-    The one exception: an index that cannot be read at all is sidelined to
+    file existed, or folders since deleted) are KEPT; where both exist the folder's copy wins. The
+    one exception: an index that cannot be read at all is sidelined to
     ``index.parquet.corrupt-<stamp>`` and the rebuild proceeds from the folder rows alone, so its
-    orphan rows are NOT kept — unreadable bytes cannot be merged, and they survive only in the
-    sidelined file, for a manual salvage.
+    orphan rows are NOT kept — unreadable bytes cannot be merged and survive only in the sidelined
+    file, for a manual salvage.
+
+    Parameters
+    ------------
+    - root (Path | str): results root to scan and rewrite.
+
+    Return
+    --------
+    - output (pd.DataFrame): the rebuilt index (also written to ``index.parquet``); may be empty.
     """
     root = Path(root)
     rows = []
@@ -548,19 +662,38 @@ def rebuild_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
 def load_index(root: Path | str = DEFAULT_ROOT) -> pd.DataFrame:
     """Load the cross-run index (one row per saved run), or an empty frame if none exists yet.
 
-    This is the interface for cross-run readouts (curve, compare): read it, filter by
-    ``scenario`` / ``tag`` / ``planner``, and plot — no re-simulation."""
+    The interface for cross-run readouts (curve, compare): read it, filter by
+    ``scenario`` / ``tag`` / ``planner``, and plot — no re-simulation.
+
+    Parameters
+    ------------
+    - root (Path | str): results root holding ``index.parquet``.
+
+    Return
+    --------
+    - output (pd.DataFrame): the index, or an empty frame if it does not exist yet.
+    """
     path = Path(root) / INDEX_FILENAME
     return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
 
 def sweep_dir(label: str, root: Path | str = DEFAULT_ROOT) -> Path:
-    """Folder that groups a *run set's* cross-run readout artifacts (curve / histograms / compare).
+    """Folder that groups a run set's cross-run readout artifacts (curve / histograms / compare).
 
-    A cross-run readout describes a *set* of runs (the ``--tag``/``--scenario`` it filtered on), not a
-    single run, so its artifacts don't belong in any one run folder nor loose in the results root —
-    they live here, under ``<root>/sweeps/<label>/``. Stable per label, so re-running a readout
-    refreshes its artifacts in place instead of scattering timestamped copies."""
+    A cross-run readout describes a SET of runs (the ``--tag``/``--scenario`` it filtered on), not a
+    single run, so its artifacts belong neither in any one run folder nor loose in the results
+    root — they live here, under ``<root>/sweeps/<label>/``. Stable per label, so re-running a
+    readout refreshes its artifacts in place instead of scattering timestamped copies.
+
+    Parameters
+    ------------
+    - label (str): the run set's name; the stable subfolder under ``sweeps/``.
+    - root (Path | str): results root.
+
+    Return
+    --------
+    - output (Path): the created ``<root>/sweeps/<label>/`` directory.
+    """
     d = Path(root) / "sweeps" / label
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -580,26 +713,38 @@ class LoadedRun:
 
     @property
     def accepted(self) -> list[OperationalIntent]:
+        """The intents that were accepted (flown)."""
         return [i for i in self.intents if i.accepted]
 
     @property
     def denied(self) -> list[OperationalIntent]:
+        """The intents that were rejected."""
         return [i for i in self.intents if i.status is IntentStatus.REJECTED]
 
     def summary(self) -> dict:
+        """Whole-run and steady-state aggregate metrics for this loaded run."""
         return metrics.aggregate_with_steady(self)  # type: ignore[arg-type]
 
 
 def load_scenario_spec(folder: Path | str):
     """Rebuild the ``ScenarioSpec`` a run was launched from, or ``None`` if the folder has none.
 
-    Complements :func:`load_run`, which reconstructs the *result*. This reconstructs the *recipe* —
-    the resolved post-override world — so a run can be re-executed (at a new seed, planner, or λ)
-    from the folder alone instead of by remembering the command line.
+    Complements :func:`load_run`, which reconstructs the RESULT. This reconstructs the RECIPE — the
+    resolved post-override world — so a run can be re-executed (at a new seed, planner, or λ) from
+    the folder alone instead of from a remembered command line.
 
     ``None`` is expected, not exceptional: ``scenario_spec.json`` is written only when the caller
     supplies one (``experiments.run`` does; ``analysis/altitude_benchmark.py`` does not), and no run
     archived before the file existed has it.
+
+    Parameters
+    ------------
+    - folder (Path | str): a saved run folder.
+
+    Return
+    --------
+    - output (ScenarioSpec | None): the reconstructed recipe, or ``None`` if the folder has no
+      ``scenario_spec.json``.
     """
     from .scenarios.spec import ScenarioSpec
 
@@ -613,7 +758,18 @@ def load_run(folder: Path | str) -> LoadedRun:
     """Rebuild a `SimResult`-shaped object from a saved run folder (the reverse of `save_run`).
 
     Reconstructs each flight's exact `Volume4D` reservation and flown centerline so a replay or
-    analysis can run entirely from disk — no re-simulation needed.
+    analysis can run entirely from disk — no re-simulation needed. Tolerant of schema drift:
+    fields dropped or renamed since the run was archived are back-converted or ignored so old
+    folders still load.
+
+    Parameters
+    ------------
+    - folder (Path | str): a saved run folder.
+
+    Return
+    --------
+    - output (LoadedRun): config + reconstructed intents (accepted with volumes/centerlines, denied
+      without) + any always-active static walls.
     """
     folder = Path(folder)
     cfg_payload = json.loads((folder / "config.json").read_text())
@@ -698,6 +854,7 @@ def load_run(folder: Path | str) -> LoadedRun:
 
 
 def _volume_from_row(r) -> Volume4D:
+    """Reconstruct one ``Volume4D`` from a reservations/ledger_end parquet row (box or cylinder)."""
     if r.kind == "box":
         spec: Any = BoxSpec(center=(r.cx, r.cy, r.cz),
                             rot=tuple(json.loads(r.rot)), extents=tuple(json.loads(r.ext)))
@@ -711,7 +868,19 @@ def _volume_from_row(r) -> Volume4D:
 
 def save_sweep(rows: list[dict], *, root: Path | str = DEFAULT_ROOT, label: str = "sweep",
                experiment_args: dict | None = None) -> Path:
-    """Persist a parameter sweep's aggregate rows as one parquet table + metadata."""
+    """Persist a parameter sweep's aggregate rows as one parquet table + metadata.
+
+    Parameters
+    ------------
+    - rows (list[dict]): one aggregate row per sweep point; ``denials_by_reason`` is JSON-encoded.
+    - root (Path | str): results root the sweep folder is created under.
+    - label (str): sweep name; the folder's name segment.
+    - experiment_args (dict | None): the sweep's arguments, recorded in ``experiment.json``.
+
+    Return
+    --------
+    - output (Path): the created sweep folder.
+    """
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
     folder = Path(root) / f"{stamp}_{label}"
     folder.mkdir(parents=True, exist_ok=True)

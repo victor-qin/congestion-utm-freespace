@@ -13,6 +13,14 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SimConfig:
+    """Every modelling knob for one simulation, as a frozen dataclass.
+
+    Physical and geometry parameters are stored fields; derived quantities (per-metre cost
+    weights, the cruise / z-band, climb times) are ``@property`` so ``flight_levels_m`` and the
+    per-second cost dials stay the single sources of truth. The four ``cost_*_per_s`` weights are
+    the FCFS trade-off dials: wait on the pad, fly a detour, hover, or change altitude.
+    """
+
     # --- dimensionality & altitude (full 3D, regulated band [ground_level_m, airspace_ceiling_m]) ---
     dims: int = 3
     ground_level_m: float = 0.0
@@ -54,32 +62,21 @@ class SimConfig:
 
     # --- COST MODEL (shared by every planner; the FCFS trade-off knobs) ---
     # ONE currency: cost per SECOND. Every A* edge advances the clock by an integer number of dt
-    # steps, so seconds are the only basis on which the four levers are comparable. The per-METRE
-    # weights the planners actually multiply by are DERIVED (see the DERIVED section), which keeps
-    # the ratios below invariant under any dt_s / nominal_speed_mps / climb_rate_mps.
-    # Storing lateral/altitude per-metre (as this did before) silently scaled them by pitch=120 m
-    # and climb_rate*dt=24 m while ground/hold were scaled by dt=4 s, so the advertised 1:3:3:4
-    # was really 1:90:3:24 — one hex step cost as much as 360 s of ground delay and no detour or
-    # climb was ever rational. Per step, these now read exactly 1 : 3 : 3 : 4.
-    # LOWERING `cost_air_lateral_per_s` IS A PRICING-TIME DECISION AS WELL AS AN ECONOMIC
-    # ONE, and the coupling is violent.  Colgen's completion bound terminates its envelope
-    # when `benefit - pi_f - delay_lb[hops]` falls below the incumbent, and `delay_lb`
-    # accumulates at `cost_air_lateral_per_s * dt_s` per hop -- so the envelope's LENGTH is
-    # ~1/air-weight, and the label count scales with the volume that length admits rather
-    # than with the length itself.  Measured on `density_faa_wing_zipline` x12, 2 iterations,
-    # sequential, with only this dial moving (issue #91):
+    # steps, so seconds are the only basis on which the four levers are commensurable. The
+    # per-METRE weights planners actually multiply by are DERIVED (see the DERIVED section), which
+    # keeps the step ratio below invariant under any dt_s / nominal_speed_mps / climb_rate_mps;
+    # storing per-metre instead silently rescales lateral/altitude by pitch and climb-per-step
+    # while ground/hold scale by dt, so the advertised ratio would not hold. Per step these read
+    # exactly 1 : 3 : 3 : 4.
     #
-    #     ratio    WALL        fell_back   peak labels
-    #     1:1.0    1075.58 s       2       67,108,864  <- exhausts the 2^26 ceiling
-    #     1:1.5     383.72 s       1       67,108,864  <- still exhausts it
-    #     1:2.0      82.77 s       0       51,206,411
-    #     1:3.0      27.19 s       0       14,936,161  <- shipped
-    #
-    # 39.6x across a factor of 3, roughly `w_air^-3.35`.  Below ~1:2 the compiled search
-    # cannot complete on a density instance AT ANY CEILING and falls back to the pure-Python
-    # reference, so this is not a knob that trades accuracy for speed -- it decides whether
-    # the compiled path works at all.  It also moves the SCHEDULES, not merely the runtime:
-    # the ratio sets how much ground delay an optimum will buy to dodge a congestion dual.
+    # LOWERING `cost_air_lateral_per_s` IS A PRICING-TIME DECISION, not only an economic one, and
+    # the coupling is violent: colgen's completion envelope terminates when
+    # `benefit - pi_f - delay_lb[hops]` falls below the incumbent, and `delay_lb` grows at
+    # `cost_air_lateral_per_s * dt_s` per hop, so the envelope LENGTH is ~1/air-weight and the
+    # label count scales with the volume that length admits. Below a ~1:2 ground:air ratio the
+    # compiled search cannot complete on a density instance at any ceiling and falls back to the
+    # pure-Python reference -- so this decides whether the compiled path works at all, and it
+    # moves the SCHEDULES (how much ground delay an optimum buys to dodge a dual), not just runtime.
     cost_ground_delay_per_s: float = 1.0        # wait on the pad          (1x, the numeraire)
     cost_air_lateral_per_s: float = 3.0         # cruise flight            (3x)
     cost_air_hold_per_s: float = 3.0            # loiter/hover mid-route   (3x)
@@ -88,7 +85,7 @@ class SimConfig:
     # --- denial budgets ---
     max_ground_delay_s: float = 3600.0
     # Deny if the EN-ROUTE ratio flown/reference exceeds this — both sides exit lane -> exit lane
-    # (volumes.enroute_*, issue #50), the same ratio metrics reports as `stretch`. Short hub flights
+    # (volumes.enroute_*), the same ratio metrics reports as `stretch`. Short hub flights
     # have a small lane->lane reference, so tight budgets bind on fixed geometry (snap/staircase)
     # before traffic — the shipped 100.0 is effectively "off".
     max_detour_factor: float = 100.0
@@ -107,11 +104,11 @@ class SimConfig:
     # ``astar_batched_shortcut`` is the route-changing turn-seeded/maximal-run arm.
     planner: str = "astar"  # "straight"|"astar"|"astar_shortcut"|"astar_heading_shortcut"|...|"milp"
 
-    # --- fixed terminal exit lanes (issue #18); A* only ---
+    # --- fixed terminal exit lanes; A* only ---
     # When True, A* (and its shortcut refiners) routes shared-terminal takeoff/landing through the hub's
     # boundary-hex lanes and deconflicts same-hub launches by exact cell occupancy (is_blocked), killing
     # same-hub exit-lane CONFLICT_FILED. False ⇒ the legacy A* fold/exit_clear path. Other planners
-    # (milp/straight) don't route through lanes — the flag only tags their hub boxes. Default on (#18).
+    # (milp/straight) don't route through lanes — the flag only tags their hub boxes. Default on.
     fixed_exit_lanes: bool = True
 
     # --- always-active terminal airspace (foreign-transit isolation); A* only ---
@@ -222,10 +219,21 @@ class SimConfig:
         return tuple(z_lo + step * i for i in range(n))
 
     def __post_init__(self) -> None:
-        """Validate the flight-level ladder (frozen dataclass — raise only, never mutate).
+        """Validate the config after construction; raise on an inconsistent ladder or geometry.
 
-        ``flight_levels_m`` is the single source of truth for altitude; the single-plane planners' cruise +
-        sampling band are DERIVED from it (the ``cruise_level_m`` / ``z_min_m`` / ``z_max_m`` properties).
+        Frozen dataclass, so this only ever raises -- it never mutates. ``flight_levels_m`` is the
+        single source of truth for altitude; the single-plane cruise and sampling band derive from
+        it via the ``cruise_level_m`` / ``z_min_m`` / ``z_max_m`` properties.
+
+        Parameters
+        ------------
+        - none: reads the constructed fields on ``self``.
+
+        Return
+        --------
+        - output (None): raises ``ValueError`` if ``demand_duration_s`` exceeds the horizon, the
+          flight-level ladder is empty / not strictly ascending / overlaps in z / leaves the
+          [ground, ceiling] band, or ``nominal_speed_mps`` / ``climb_rate_mps`` is non-positive.
         """
         if self.demand_duration_s is not None:
             if self.demand_duration_s <= 0.0:

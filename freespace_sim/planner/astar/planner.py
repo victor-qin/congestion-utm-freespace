@@ -542,7 +542,7 @@ class AStarPlanner:
         planner has just planned against this ledger and a post-pass can reuse the authority instead
         of building a second one. A public accessor because ``shortcut`` is a DIFFERENT module
         reading it: leaving it to sniff ``_tcap``/``_svc_ledger`` made a rename here degrade the
-        refiner to a no-op silently — see ``shortcut._terminal_capacity_for``."""
+        refiner to a no-op silently — see ``shortcut.terminal_capacity_for``."""
         return self._tcap if self._svc_ledger is ledger else None
 
     def _mk_envelope(self, req, cfg, o_term, d_term, origin, dest, max_step, bbox, unbounded):

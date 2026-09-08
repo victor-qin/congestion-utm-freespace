@@ -643,8 +643,8 @@ def test_parallel_state_build_honors_unimpeded_workers(monkeypatch):
 
     seen = []
 
-    def fake_unimpeded_costs(_cfg, _static_terms, requests, *, n_workers):
-        seen.append((list(requests), n_workers))
+    def fake_unimpeded_costs(_cfg, _static_terms, requests, *, n_workers, shortcut=False):
+        seen.append((list(requests), n_workers, shortcut))
         return []
 
     monkeypatch.setattr(state_module, "unimpeded_costs", fake_unimpeded_costs)
@@ -653,7 +653,10 @@ def test_parallel_state_build_honors_unimpeded_workers(monkeypatch):
         cfg, ReservationLedger(cfg), [],
         LNSConfig(max_iterations=0, log_every=0, search_workers=2, unimpeded_workers=3),
     )
-    assert seen == [([], 3)]
+    # shortcut=False is not incidental: a shortcut arm is refused on the parallel path (the DROP
+    # workers build their own LNSState and would repair with bare A*), so the coordinator's ruler
+    # must stay bare too or its premiums would not match what the workers actually produce.
+    assert seen == [([], 3, False)]
     assert out.n_iterations == out.npo == 0
     assert out.pool_spawn_s == 0.0
 

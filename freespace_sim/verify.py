@@ -58,6 +58,25 @@ def realized_takeoff_s(intent: OperationalIntent) -> float | None:
     return float(min(v.t_start for v in intent.volumes))
 
 
+def pair_precedence_shortfall(outbound, ret, turnaround_s: float = 0.0) -> float:
+    """Seconds by which ``ret`` departs BEFORE the aircraft flying it is available. >0 is a violation.
+
+    THE one definition of the paired-leg precedence property. Both the whole-schedule replay in this
+    module and the LNS repair guard (`LNSState.try_repair`) call it, because keeping two copies of
+    this arithmetic is exactly how they drifted: the guard used to compare an outbound's release
+    against the return's FILED `t_departure`, which every pair of a nominal-anchor schedule is
+    already behind (measured p50 -58 s over 2,318 pairs), so it vetoed all 2,318 to protect the 85
+    that actually violate. Returns <=0, not None, when either leg never flew: "no aircraft, no
+    precedence to break" is the same answer as "there is slack".
+    """
+    from .sim import realized_release_s          # sim imports THIS module; one owner of the release
+
+    release, takeoff = realized_release_s(outbound), realized_takeoff_s(ret)
+    if release is None or takeoff is None:
+        return 0.0
+    return (release + turnaround_s) - takeoff
+
+
 def find_paired_precedence_violation(
     intents: list[OperationalIntent], cfg: SimConfig, turnaround_s: float = 0.0, tol: float = 1e-6
 ) -> tuple[int, int, float] | None:
@@ -80,24 +99,27 @@ def find_paired_precedence_violation(
     ``turnaround_s`` is the ground time the demand model budgeted between the legs — the same value
     the LNS paired-return guard uses, so the two cannot disagree about what "available" means.
     """
-    from .sim import realized_release_s          # sim imports THIS module; keep one owner of the
+    for intent, outbound in _accepted_pairs(intents):
+        short = pair_precedence_shortfall(outbound, intent, turnaround_s)
+        if short > tol:
+            return (intent.request.flight_id, outbound.request.flight_id, short)
+    return None
 
-    by = {i.request.flight_id: i for i in intents}       # release definition rather than a copy
+
+def _accepted_pairs(intents: list[OperationalIntent]):
+    """Yield ``(return, outbound)`` for every round trip whose BOTH legs were accepted.
+
+    A denied outbound is skipped rather than reported: there is no aircraft for the return to wait
+    for, so precedence is vacuous rather than violated."""
+    by = {i.request.flight_id: i for i in intents}
     for intent in intents:
         outbound_id = intent.request.paired_outbound_id
         if outbound_id is None or not intent.accepted:
             continue
         outbound = by.get(outbound_id)
         if outbound is None or not outbound.accepted:
-            continue                                     # denied outbound: no aircraft to wait for
-        release = realized_release_s(outbound)
-        takeoff = realized_takeoff_s(intent)
-        if release is None or takeoff is None:
             continue
-        available = release + turnaround_s
-        if takeoff < available - tol:
-            return (intent.request.flight_id, outbound_id, available - takeoff)
-    return None
+        yield intent, outbound
 
 
 def count_paired_precedence_violations(
@@ -105,26 +127,25 @@ def count_paired_precedence_violations(
 ) -> tuple[int, float]:
     """``(n_violations, total_shortfall_s)`` — the reporting counterpart of
     :func:`find_paired_precedence_violation`, for callers that want the scale rather than an example."""
-    from .sim import realized_release_s
-
-    by = {i.request.flight_id: i for i in intents}
     n, total = 0, 0.0
-    for intent in intents:
-        outbound_id = intent.request.paired_outbound_id
-        if outbound_id is None or not intent.accepted:
-            continue
-        outbound = by.get(outbound_id)
-        if outbound is None or not outbound.accepted:
-            continue
-        release = realized_release_s(outbound)
-        takeoff = realized_takeoff_s(intent)
-        if release is None or takeoff is None:
-            continue
-        short = release + turnaround_s - takeoff
+    for intent, outbound in _accepted_pairs(intents):
+        short = pair_precedence_shortfall(outbound, intent, turnaround_s)
         if short > tol:
             n += 1
             total += short
     return n, total
+
+
+def pair_shortfalls(intents: list[OperationalIntent],
+                    turnaround_s: float = 0.0) -> dict[tuple[int, int], float]:
+    """``(outbound_id, return_id) -> shortfall`` for every accepted round trip, clipped at 0.
+
+    The per-pair baseline an incremental check ratchets against. A COUNT is not enough: LNS can
+    repair one pair and break another in the same iteration and the count never moves, so a
+    count-based ratchet is blind to the identities that changed."""
+    return {(outbound.request.flight_id, intent.request.flight_id):
+            max(0.0, pair_precedence_shortfall(outbound, intent, turnaround_s))
+            for intent, outbound in _accepted_pairs(intents)}
 
 
 def assert_no_paired_precedence_violation(intents: list[OperationalIntent], cfg: SimConfig,

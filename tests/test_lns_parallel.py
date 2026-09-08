@@ -87,9 +87,9 @@ def test_replica_forwards_the_movable_filters():
 
 @pytest.mark.slow
 def test_replica_forwards_the_anchor_guard():
-    """turnaround_s builds _return_anchor. Dropping it disarms try_repair's anchor rejection
-    SILENTLY: verify.find_interflight_conflict checks 4D conflicts only, so a schedule that
-    re-times an outbound past its return's departure still reports verified."""
+    """turnaround_s arms try_repair's paired-leg precedence guard. Dropping it disarms the anchor
+    rejection SILENTLY: verify.find_interflight_conflict checks 4D conflicts only, so a schedule
+    that re-times an outbound past its return's departure still reports verified."""
     res = run(_congested(lam=400.0, horizon=240.0))
     base = LNSState(res.config, res.ledger, res.intents,
                     static_terms=res.ledger.static_terminals())

@@ -750,8 +750,14 @@ def test_paired_return_anchor_guard_rejects_and_reverts(monkeypatch):
     res = run(_congested(lam=400.0, horizon=240.0))
     state = LNSState(res.config, res.ledger, res.intents, turnaround_s=60.0)
     victim = state.movable_ids()[0]
-    state._return_anchor[victim] = 0.0                      # committed return departs at t=0
-    monkeypatch.setattr(lns_state, "realized_release_s", lambda intent: 1e9)
+    # Make the victim one leg of a pair with zero baseline shortfall, then have the predicate report
+    # a violation for it. What the predicate MEANS is pinned in tests/test_paired_precedence.py; this
+    # test is about the transaction — a guard rejection must leave the ledger byte-identical.
+    partner = state.movable_ids()[1]
+    state._pair_of[victim], state._pair_of[partner] = partner, victim
+    state._outbound_of_pair[victim] = state._outbound_of_pair[partner] = victim
+    state._pair_shortfall[(victim, partner)] = 0.0
+    monkeypatch.setattr(lns_state, "pair_precedence_shortfall", lambda o, r, t: 1e9)
     before = _ledger_multiset(res.ledger)
     out = state.try_repair([victim], np.random.default_rng(0))
     assert not out.accepted and out.reason == "anchor"

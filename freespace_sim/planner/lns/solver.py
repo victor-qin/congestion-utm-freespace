@@ -49,10 +49,6 @@ class LNSConfig:
     repair_order: str = "premium"       # PP priority: "premium" (most-delayed first) | "random" (paper)
     max_walks: int = 10                 # agent-based: walk restarts before giving up on size N
     map_max_cells: int = 4096           # map-based: BFS exploration bound
-    # Pull each victim's round-trip partner into the destroy set (see LNSState.close_over_pairs).
-    # Off by default: it raises the EFFECTIVE neighborhood size, and size is the throughput lever at
-    # density (N=2 beats N=8 by 2x there), so this has to earn its place in an A/B.
-    pair_closed_neighborhood: bool = False
     frozen_flight_ids: frozenset = frozenset()      # never destroyed (USS-restriction hook)
     movable_uss_ids: frozenset | None = None        # None -> system operator may move every USS's intents
     incremental_release: bool = True     # O(victims) occupancy removal; False = rebuild path (parity ref)
@@ -103,7 +99,12 @@ class LNSResult:
     wall_s: float
     init_wall_s: float                  # state build incl. the unimpeded baseline pass
     weights: dict[str, float]
-    verified: bool
+    verified: bool                      # SEPARATION only, like `SimResult.verified`
+    # Paired-leg PRECEDENCE, which `verified` deliberately excludes: a return departing before its
+    # outbound lands holds a DISJOINT pad window, so it is not a conflict and no separation replay
+    # can see it. Counts pairs this run made WORSE than the schedule it was handed — a nominal-anchor
+    # baseline arrives with violations already in it, and LNS is answerable only for adding to them.
+    n_precedence_worsened: int = 0
     # --- parallel only; defaulted so every existing construction site is untouched ---
     search_workers: int = 1
     parallel_mode: str = "sequential"
@@ -271,7 +272,7 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         )
     booleans = {
         name: _boolean_config_value(name, getattr(lns, name))
-        for name in ("adaptive", "incremental_release", "pair_closed_neighborhood")
+        for name in ("adaptive", "incremental_release")
     }
     frozen_flight_ids = frozenset(
         _integer_config_value("frozen_flight_ids", fid, minimum=0)
@@ -350,23 +351,33 @@ def assert_incumbent_ok(state) -> None:
     """Both LNS invariants over the current incumbent — separation AND paired-leg precedence.
 
     Shared by the sequential loop and the parallel coordinator so the two engines cannot check
-    different things. Precedence is compared against the count the state was BUILT with: the
-    schedule may already contain violations (a nominal-anchor baseline does), and failing on those
-    would make `verify_every` unusable on exactly the runs that need watching."""
+    different things. Precedence ratchets PER PAIR against the shortfalls the state was built with:
+    the schedule may already contain violations (a nominal-anchor baseline does), and failing on
+    those would make `verify_every` unusable on exactly the runs that need watching. Per pair, not
+    per count — LNS can repair one pair and break another in the same iteration, leaving the count
+    unmoved, so a count-based ratchet is blind to the identities that changed."""
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
     if bad is not None:
         raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
-    n_bad, short_s = verify.count_paired_precedence_violations(
-        final, state.cfg, turnaround_s=float(state._turnaround_s or 0.0))
-    if n_bad > state._precedence_baseline:
-        example = verify.find_paired_precedence_violation(
-            final, state.cfg, turnaround_s=float(state._turnaround_s or 0.0))
+    worse = _worsened_pairs(final, state)
+    if worse:
+        (out_fid, ret_fid), (was, now) = worse[0]
         raise AssertionError(
-            f"LNS introduced {n_bad - state._precedence_baseline} paired-return precedence "
-            f"violation(s) (now {n_bad}, {short_s:.0f}s total shortfall); e.g. return {example[0]} "
-            f"departs {example[2]:.1f}s before outbound {example[1]} releases its pad")
+            f"LNS worsened {len(worse)} paired-return precedence shortfall(s); e.g. return "
+            f"{ret_fid} now departs {now:.1f}s before outbound {out_fid} releases its pad "
+            f"(was {was:.1f}s)")
+
+
+def _worsened_pairs(final, state) -> list[tuple[tuple[int, int], tuple[float, float]]]:
+    """``[((outbound, return), (baseline, now))]`` for every pair this run made worse, worst first."""
+    turnaround = float(state._turnaround_s or 0.0)
+    now = verify.pair_shortfalls(final, turnaround)
+    base = state._pair_shortfall
+    worse = [(k, (base.get(k, 0.0), v)) for k, v in now.items() if v > base.get(k, 0.0) + 1e-6]
+    worse.sort(key=lambda kv: kv[1][0] - kv[1][1])
+    return worse
 
 
 def _effective_search_workers(lns: LNSConfig) -> int:
@@ -468,6 +479,19 @@ def _finalize_lns_result(
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
+    # Precedence was checked only under `verify_every`, which defaults to 0 — so every run ended
+    # with ZERO precedence verification. It is one O(pairs) pass at the end of a whole search; run
+    # it unconditionally. Reported, not raised, and kept out of `verified`: `verified` means
+    # separation everywhere else in the codebase, and folding this in would retroactively relabel
+    # every archived nominal-anchor run (see the same split in `sim.run`).
+    worse = _worsened_pairs(final, state)
+    if worse:
+        (out_fid, ret_fid), (was, now) = worse[0]
+        log.warning(
+            "lns worsened %d paired-return precedence shortfall(s); worst: return %d departs "
+            "%.0fs before outbound %d releases its pad (baseline %.0fs). This is a precedence "
+            "violation, not a conflict, so `verified` does not see it.",
+            len(worse), ret_fid, now, out_fid, was)
     wall_s = time.monotonic() - t0
     worker_local_subscribers = search_workers > 1
     return LNSResult(
@@ -481,6 +505,7 @@ def _finalize_lns_result(
         init_wall_s=init_s,
         weights=dict(selector.weights),
         verified=bad is None,
+        n_precedence_worsened=len(worse),
         repair_planner=repair_planner_name,
         t_plan_s=state.t_plan_s,
         t_ledger_s=state.t_ledger_s,
@@ -565,8 +590,6 @@ def run_lns(
                 else:
                     name = lns.operators[int(rng_i.integers(len(lns.operators)))]
                 victims = ops[name](state, lns.neighborhood_size)
-                if lns.pair_closed_neighborhood:
-                    victims = state.close_over_pairs(victims)
                 if not victims:
                     if lns.adaptive:
                         selector.update(name, 0.0)

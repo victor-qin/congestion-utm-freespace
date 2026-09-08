@@ -56,7 +56,6 @@ from multiprocessing import connection as mp_connection
 
 import numpy as np
 
-from freespace_sim import verify
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner.lns.neighborhood import (
@@ -105,7 +104,6 @@ class WorkerSpec:
     movable_uss_ids: frozenset | None
     incremental_release: bool
     kernel_log2_min: int | None
-    pair_closed_neighborhood: bool = False
     record_envelope: bool = True
     # Answer-neutral (see LNSConfig.window_bytes), but still shipped: it is per-planner state, so a
     # worker left on the default would run a different cache configuration than the one measured.
@@ -309,8 +307,6 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
             else:
                 victims = random_neighborhood(state, spec.neighborhood_size)
 
-            if spec.pair_closed_neighborhood:
-                victims = state.close_over_pairs(victims)
             if not victims:
                 # The sequential loop short-circuits here with reason="empty" and never calls
                 # try_repair. Falling through would compute cost_new = 0.0, fail the strict
@@ -830,7 +826,6 @@ def run_lns_parallel(
         movable_uss_ids=lns.movable_uss_ids,
         incremental_release=lns.incremental_release,
         kernel_log2_min=lns.worker_kernel_log2,
-        pair_closed_neighborhood=lns.pair_closed_neighborhood,
         record_envelope=lns.parallel_mode == "drop" and pool_workers > 1,
         window_bytes=lns.window_bytes,
         repair_planner=lns.repair_planner,

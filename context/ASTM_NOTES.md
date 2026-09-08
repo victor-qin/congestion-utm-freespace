@@ -33,6 +33,18 @@ We implement the spatial test with python-fcl (exact Box/Cylinder collision).
   → `corridor_width_m`, `corridor_height_m` (knobs).
 - Time buffer absorbs timing inaccuracy (wind, departure-time uncertainty) (§4.3.11).
   → `time_buffer_s` (makes consecutive boxes overlap in time, too).
+- **We file the pad LEADING-ONLY**: a transit box spans `[t0, t1 + time_buffer_s)`, not
+  `[t0 - buf, t1 + buf)`. Consequences, all deliberate:
+  - The enforced gap between two conflicting transits is the **sum of their facing pads** = one `dt`
+    (4 s at defaults), where symmetric filing gave two (8 s). Same-lane minimum headway through a cell
+    is 12 s, not 16 s. This is more capacity, and it is the trade that was signed off.
+  - A flight running **early** is uncovered by design; the pad protects *late*-running only.
+  - *Why*: the split of the pad sum is invisible to the ledger but not to the colgen capacity rows,
+    which are anchored at `k·dt`. A trailing pad drops a box into the previous period, making one cell
+    visit claim four rows; leading-only is the unique split giving three (`(-1, +1)`), which bounds the
+    pricing state's revisit history.
+  - **Conservation law**: restoring an 8 s gap via `time_buffer_s = 8` re-widens the footprint to four
+    periods. At `dt = 4` you cannot have both — do not "fix" the gap without reading this.
 
 ## Strategic Conflict Detection — method NOT prescribed (§4.2.4)
 > "The manner in which a USS finds a conflict-free route during planning or resolves a conflict

@@ -511,7 +511,8 @@ def prepare_rows(fg: FlightGraph, cfg: SimConfig, topology: PreparedTopology) ->
     # TWO independent sources widen it, and counting only the first was a real bug. The
     # endpoint dwell is one. The other is the intermediate-cell window, which every visit
     # claims through and which `derive_cell_window` grows with `time_buffer_s`: the default
-    # 4.0 s yields (-2, 1), but 100 s yields (-26, 25). At the default the `+8` slack
+    # 4.0 s yields (-1, 1), but 100 s yields (-1, 25). (The pad is leading-only, so the buffer
+    # widens the window's HIGH end only; the low end stays at -1.) At the default the `+8` slack
     # happened to cover it, which is exactly why no shipped scenario exhibited this and why
     # raising the buffer would have started dropping forbidden rows instead of failing.
     #

@@ -112,7 +112,7 @@ def test_real_crossing_batch_files_every_selected_column():
     assert len(intents) == len(requests)
     assert all(intent.accepted for intent in intents)
     assert all(intent.denial_reason is DenialReason.NONE for intent in intents)
-    assert sorted(total_delay_s(intent, cfg) for intent in intents) == pytest.approx([0.0, 16.0])
+    assert sorted(total_delay_s(intent, cfg) for intent in intents) == pytest.approx([0.0, 12.0])
     assert verify.find_interflight_conflict(intents, cfg) is None
 
 

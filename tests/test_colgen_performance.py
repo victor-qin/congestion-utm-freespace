@@ -319,7 +319,11 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
     cfg = _cfg()
     graph, params = _graph(cfg)
     graph = with_air_hops(graph, graph.shortest_hops + 64)
-    credited = RowKey.cell((-2, 0), 0, 5)
+    # Step 6, not 5: a visit at step v claims rows [v-1, v+1] since the move to leading-only
+    # reservation pads (it was [v-2, v+1]), so the row this route can actually reach shifted up
+    # by one.  Everything asserted below -- the column, its cost, the reduced cost -- is
+    # unchanged; only which row the dual has to be parked on moved.
+    credited = RowKey.cell((-2, 0), 0, 6)
     assert credited not in seed_column(graph, cfg, model=cost_model(cfg, params)).claims
 
     reduced_cost, column = price_flight(
@@ -650,7 +654,7 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
 
     The label score is the dominance currency: score two labels in the wrong units and
     the survivor is whichever the tie-break reached first, not the one the objective
-    prefers. This fixture has the substitution in it -- 567 columns over 2..9 hops and 7
+    prefers. This fixture has the substitution in it -- 2269 columns over 2..9 hops and 7
     departure steps, so ground and air genuinely trade -- and the oracle re-costs every
     one of them from its filed intent, sharing nothing with pricing but the geometry.
 
@@ -679,9 +683,11 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
     # The oracle enumerates every W-valid column; the search is bounded by
     # `max_air_hops`, so compare over the domain the search is actually allowed to reach.
     # Enumerating first and filtering second keeps the count assertion honest about what
-    # the cap removes: 567 columns exist, and the search may choose among those within it.
+    # the cap removes: 2269 columns exist, and the search may choose among those within it.
+    # (567 before the move to leading-only reservation pads: the revisit ban reads W-1 recent
+    # cells, so W 4 -> 3 legalises a whole tier of tighter loops and the universe grows 4x.)
     all_columns = _exhaustive_columns(graph, cfg)
-    assert len(all_columns) == 567, "a shrunken universe would hide a miss rather than fail"
+    assert len(all_columns) == 2269, "a shrunken universe would hide a miss rather than fail"
     columns = [c for c in all_columns if len(c.cell_path) - 1 <= graph.max_air_hops]
     assert columns, "the air-time ceiling cannot rule out every column"
 

@@ -52,6 +52,19 @@ def _edge_point(center, toward, r: float) -> tuple[float, float]:
     return (center[0] + r * dx / n, center[1] + r * dy / n)
 
 
+def _hex_dist(a, b) -> int:
+    """Axial hex distance between ``(q, r)`` cells (cube metric)."""
+    aq, ar = a
+    bq, br = b
+    return (abs(aq - bq) + abs(ar - br) + abs(aq + ar - bq - br)) // 2
+
+
+def _box(ax, x, y, text, *, fc="white", ec=INK, tc=INK, fs=8.5, pad=0.5) -> None:
+    """Rounded text box centred at ``(x, y)`` — the shared flow-chart primitive."""
+    ax.text(x, y, text, ha="center", va="center", fontsize=fs, color=tc, zorder=5,
+            bbox=dict(boxstyle=f"round,pad={pad}", facecolor=fc, edgecolor=ec, linewidth=1.5))
+
+
 def fig_enroute_rulers() -> None:
     """volumes: the reference / flown / detour en-route rulers."""
     fig, ax = plt.subplots(figsize=(9.5, 4.8))
@@ -762,6 +775,486 @@ def fig_sipp_safe_intervals() -> None:
     _save(fig, "sipp_safe_intervals")
 
 
+def fig_lns_anytime_loop() -> None:
+    """lns.solver.run_lns + state.try_repair: destroy→repair→accept-iff-cheaper, monotone curve."""
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(11.6, 5.2), gridspec_kw={"width_ratios": [1.05, 1]})
+
+    axl.set_title("One iteration = one ledger transaction", fontsize=10.5, color=INK)
+    axl.axis("off")
+    axl.set_xlim(0, 10)
+    axl.set_ylim(0, 10)
+    _box(axl, 5, 9.2, "pick operator  (adaptive weights)", fc="#ebf3fb", ec=BLUE)
+    _box(axl, 5, 7.4, "DESTROY: tombstone victims\n(release_many)", fc="#fdf0e6", ec=ORANGE)
+    _box(axl, 5, 5.6, "REPAIR: replan victims in order\n(shortcut / A* / SIPP)", fc="#fdf0e6", ec=ORANGE)
+    _box(axl, 5, 3.8, "conflict-free  AND  cheaper?", ec=INK)
+    _box(axl, 2.1, 1.7, "ADOPT\n(commit repair)", fc="#f0fff4", ec=GREEN, tc=GREEN)
+    _box(axl, 7.9, 1.7, "REVERT\n(rewind: re-commit\nold volumes)", fc="#fff5f5", ec=RED, tc=RED)
+    for y0, y1 in ((8.7, 8.0), (6.9, 6.2), (5.1, 4.4)):
+        axl.annotate("", xy=(5, y1), xytext=(5, y0), arrowprops=dict(arrowstyle="->", color=INK, lw=1.4))
+    axl.annotate("", xy=(2.6, 2.3), xytext=(4.2, 3.3),
+                 arrowprops=dict(arrowstyle="->", color=GREEN, lw=1.4))
+    axl.text(2.6, 3.0, "yes", fontsize=8, color=GREEN, ha="center")
+    axl.annotate("", xy=(7.4, 2.3), xytext=(5.8, 3.3),
+                 arrowprops=dict(arrowstyle="->", color=RED, lw=1.4))
+    axl.text(7.4, 3.0, "no", fontsize=8, color=RED, ha="center")
+    axl.annotate("", xy=(5.2, 8.9), xytext=(2.1, 2.4),
+                 arrowprops=dict(arrowstyle="->", color=GRID, lw=1.2,
+                                 connectionstyle="arc3,rad=-0.42"))
+    axl.text(0.7, 6.0, "next iteration\n(seed = new\nSeedSequence)", fontsize=7.5, color=GRID,
+             ha="center", rotation=90, va="center")
+
+    axr.set_title("Anytime incumbent — monotone, stoppable at any iteration", fontsize=10.5, color=INK)
+    rng = np.random.default_rng(5)
+    cost = [100.0]
+    accepted = []
+    for i in range(46):
+        if rng.random() < 0.32:
+            cost.append(cost[-1] - rng.uniform(1.0, 7.0))
+            accepted.append(i + 1)
+        else:
+            cost.append(cost[-1])
+    axr.step(range(len(cost)), cost, where="post", color=BLUE, lw=2.0, zorder=2)
+    axr.plot(accepted, [cost[i] for i in accepted], "o", color=GREEN, ms=5, zorder=3,
+             label="accepted (cost drops)")
+    axr.plot([i for i in range(1, len(cost)) if i not in accepted],
+             [cost[i] for i in range(1, len(cost)) if i not in accepted], "x", color=RAW, ms=5,
+             zorder=3, label="rejected (revert; flat)")
+    axr.set_xlabel("iteration", fontsize=9, color=INK)
+    axr.set_ylabel("incumbent cost", fontsize=9, color=INK)
+    axr.legend(loc="upper right", fontsize=8.5, frameon=True, framealpha=0.95)
+    axr.text(1, cost[-1] + 1.5, "never increases — a rejected repair leaves the ledger untouched",
+             fontsize=8.5, color=INK)
+    axr.grid(True, color=HEXGRID, lw=0.6, zorder=0)
+
+    fig.suptitle("LNS anytime loop — accept only a conflict-free, strictly cheaper repair",
+                 fontsize=11.5, color=INK, y=1.0)
+    _save(fig, "lns_anytime_loop")
+
+
+def fig_lns_destroy_operators() -> None:
+    """lns.neighborhood: agent-based virtual-timeline walk vs map-based hex BFS destroy operators."""
+    R = 1.0
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.0, 5.4))
+
+    axl.set_title("agent_based — random walk on one flight, restricted to\n"
+                  "moves that can still beat the incumbent arrival", fontsize=10, color=INK)
+    axl.set_aspect("equal")
+    axl.axis("off")
+    goal = (6, 0)
+    for q in range(-1, 8):
+        for r in range(-2, 3):
+            cx, cy = _axial_to_xy(q, r, R)
+            if _hex_dist((q, r), goal) > 7:
+                continue
+            axl.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                         facecolor="white", edgecolor=HEXGRID, lw=0.8, zorder=0))
+    walk = [(0, 0), (1, 0), (2, -1), (3, -1), (4, 0), (5, 0)]
+    arrival = 8
+    for k, cell in enumerate(walk):
+        cx, cy = _axial_to_xy(*cell, R)
+        # a move is legal only while t+1 + steps_to(goal) < arrival_step (shrinking budget cone)
+        slack = arrival - (k + _hex_dist(cell, goal))
+        fc = "#ebf3fb" if slack > 0 else "#fff5f5"
+        axl.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                     facecolor=fc, edgecolor=BLUE, lw=1.3, zorder=1))
+        axl.text(cx, cy + 0.32, f"t={k}", ha="center", fontsize=7, color=INK)
+    wx = [_axial_to_xy(*c, R)[0] for c in walk]
+    wy = [_axial_to_xy(*c, R)[1] for c in walk]
+    axl.plot(wx, wy, color=BLUE, lw=2.2, marker="o", ms=4, zorder=2)
+    sx, sy = _axial_to_xy(*walk[0], R)
+    axl.annotate("seed\n(most-delayed flight)", xy=(sx, sy + 0.5), xytext=(sx - 0.4, sy + 2.2),
+                 ha="center", fontsize=7.5, color=BLUE,
+                 arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.1))
+    gx, gy = _axial_to_xy(*goal, R)
+    axl.add_patch(RegularPolygon((gx, gy), numVertices=6, radius=R, orientation=0,
+                                 facecolor="#edf2f7", edgecolor=INK, lw=1.4, zorder=1))
+    axl.text(gx, gy, "goal", ha="center", va="center", fontsize=7.5, color=INK)
+    for cell, col in (((2, -1), ORANGE), ((4, 0), GREEN)):
+        cx, cy = _axial_to_xy(*cell, R)
+        axl.plot([cx + 0.28], [cy - 0.28], "*", color=col, ms=12, zorder=4)
+    axl.text((sx + gx) / 2, -4.0, "walk start ∈ [unimpeded launch, arrival); each move must keep "
+             "t+1+dist(goal) < arrival\n★ = owner of a claim the walk hits → collected as a victim",
+             ha="center", va="top", fontsize=7.5, color=INK)
+    axl.set_ylim(-5.0, 4.2)
+
+    axr.set_title("map_based — BFS outward from a random contention cell,\n"
+                  "collecting claimants of each contended cell reached", fontsize=10, color=INK)
+    axr.set_aspect("equal")
+    axr.axis("off")
+    start = (3, 1)
+    contended = {(3, 1), (4, 0), (2, 2), (5, 1), (1, 2)}
+    for q in range(0, 7):
+        for r in range(-1, 4):
+            cx, cy = _axial_to_xy(q, r, R)
+            ring = _hex_dist((q, r), start)
+            if ring > 3:
+                continue
+            fc = ("#dbeafe", "#e8f0fb", "#f2f6fc", "white")[min(ring, 3)]
+            if (q, r) in contended:
+                fc = "#fdf0e6"
+            axr.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                         facecolor=fc, edgecolor=HEXGRID, lw=0.8, zorder=1))
+            if (q, r) in contended:
+                axr.plot([cx], [cy], "*", color=ORANGE, ms=13, zorder=3)
+    scx, scy = _axial_to_xy(*start, R)
+    axr.add_patch(RegularPolygon((scx, scy), numVertices=6, radius=R, orientation=0,
+                                 facecolor="none", edgecolor=RED, lw=2.2, zorder=2))
+    axr.text(scx, scy - 1.5, "start = random\ncontention cell", ha="center", va="top", fontsize=7.5,
+             color=RED)
+    for ring, lbl in ((1, "BFS ring 1"), (2, "ring 2"), (3, "ring 3")):
+        ex, ey = _axial_to_xy(start[0] + ring, start[1], R)
+        axr.text(ex, ey + 0.75, lbl, ha="center", fontsize=7, color=BLUE)
+    axr.text(scx, scy + 2.55, "★ contended cell → outward-in-time sweep (δ = 0, ±1, …)\n"
+             "collects every movable claimant", ha="center", fontsize=7.5, color=INK)
+    axr.set_ylim(-2.8, 4.6)
+
+    fig.suptitle("LNS destroy operators — how each grows a neighborhood to re-plan",
+                 fontsize=11.5, color=INK, y=1.0)
+    _save(fig, "lns_destroy_operators")
+
+
+def fig_lns_drop_vs_sync() -> None:
+    """lns.parallel: SYNC per-round barrier (idle lanes) vs DROP apply-on-arrival (no idle)."""
+    fig, (axt, axb) = plt.subplots(2, 1, figsize=(11.2, 6.2), sharex=True)
+    m = 3
+    lanes = [2.5, 1.5, 0.5]
+
+    def task(ax, lane, x0, dur, color, edge=INK):
+        ax.add_patch(Rectangle((x0, lane - 0.28), dur, 0.56, facecolor=color, alpha=0.75,
+                               edgecolor=edge, lw=1.2, zorder=2))
+
+    axt.set_title("SYNC — barrier per round: dispatch m, wait all, apply best-of-m, discard m−1",
+                  fontsize=10.5, color=INK)
+    rounds = [(0.0, [1.4, 2.6, 1.9]), (2.9, [2.2, 1.6, 2.0]), (5.2, [1.7, 2.3, 1.5])]
+    for r0, durs in rounds:
+        barrier = r0 + max(durs) + 0.1
+        best = int(np.argmax(durs)) if False else int(np.argmin(durs))  # pick one "winner"
+        best = 1
+        for j, dur in enumerate(durs):
+            task(axt, lanes[j], r0, dur, BLUE if j == best else RAW)
+            if r0 + dur < barrier:  # idle wait until the barrier
+                axt.add_patch(Rectangle((r0 + dur, lanes[j] - 0.28), barrier - (r0 + dur), 0.56,
+                                        facecolor="none", edgecolor=GRID, lw=0.9, ls=":", zorder=1,
+                                        hatch="///"))
+            if j == best:
+                axt.plot([r0 + dur], [lanes[j]], "*", color=GREEN, ms=13, zorder=4)
+            else:
+                axt.text(r0 + dur - 0.2, lanes[j], "✕", color=RED, ha="center", va="center",
+                         fontsize=9, zorder=4)
+        axt.axvline(barrier, color=INK, lw=1.4, ls="--", zorder=3)
+    axt.text(0.05, 3.35, "hatched = worker idle at the barrier   ★ applied best   ✕ discarded",
+             fontsize=8, color=INK)
+    axt.set_ylim(0, 3.6)
+    axt.set_yticks(lanes)
+    axt.set_yticklabels([f"w{w}" for w in range(m)], fontsize=8)
+
+    axb.set_title("DROP — no barrier: apply on arrival, re-dispatch immediately (no lane idles)",
+                  fontsize=10.5, color=INK)
+    schedule = [(0, 0.0, 1.4, "clean"), (1, 0.0, 2.6, "overwrite"), (2, 0.0, 1.9, "clean"),
+                (0, 1.4, 1.8, "discard"), (2, 1.9, 1.5, "clean"), (1, 2.6, 1.7, "clean"),
+                (0, 3.2, 2.1, "clean"), (2, 3.4, 1.9, "overwrite"), (1, 4.3, 1.6, "clean")]
+    verdict_col = {"clean": GREEN, "overwrite": ORANGE, "discard": RED}
+    for w, x0, dur, verdict in schedule:
+        task(axb, lanes[w], x0, dur, "#cbd5e0")
+        axb.plot([x0 + dur], [lanes[w]], "o", color=verdict_col[verdict], ms=6, zorder=4)
+    axb.text(0.05, 3.35, "result arrives against a STALE base_version → "
+             "clean (merge) · overwrite (whole soln still wins) · discard",
+             fontsize=8, color=INK)
+    axb.set_ylim(0, 3.6)
+    axb.set_yticks(lanes)
+    axb.set_yticklabels([f"w{w}" for w in range(m)], fontsize=8)
+    axb.set_xlabel("wall clock  →", fontsize=9, color=INK)
+    axb.set_xlim(-0.15, 8.2)
+
+    fig.suptitle("Parallel LNS scheduling — SYNC buys wall clock, DROP converts it to accepts",
+                 fontsize=11.5, color=INK, y=0.99)
+    _save(fig, "lns_drop_vs_sync")
+
+
+def fig_od_hop_ellipse() -> None:
+    """colgen network/dp_kernel/pricing: the O-D hop-ellipse corridor.
+
+    A priced route stays within ``shortest + overrun`` summed hops, so the reachable cells are
+    exactly ``hex_dist(o, c) + hex_dist(c, d) <= shortest + overrun`` — the hop budget IS the
+    corridor radius. ``overrun`` = ``params.max_air_overrun_hops`` (0 pins the geodesic band).
+    """
+    R = 1.0
+    origin, dest = (0, 0), (6, 0)
+    overrun = 2
+    shortest = _hex_dist(origin, dest)
+    radius = shortest + overrun
+    fig, ax = plt.subplots(figsize=(10.0, 5.6))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    for q in range(-3, 10):
+        for r in range(-5, 6):
+            if _hex_dist(origin, (q, r)) > radius:
+                continue
+            cx, cy = _axial_to_xy(q, r, R)
+            d = _hex_dist(origin, (q, r)) + _hex_dist((q, r), dest)
+            if d <= shortest:
+                fc = "#fdf0e6"          # geodesic band (d == shortest)
+            elif d <= radius:
+                fc = "#ebf3fb"          # inside the overrun corridor
+            else:
+                fc = "white"
+            ax.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                        facecolor=fc, edgecolor=HEXGRID, lw=0.8, zorder=1))
+    for cell, name, col in ((origin, "O", BLUE), (dest, "D", ORANGE)):
+        cx, cy = _axial_to_xy(*cell, R)
+        ax.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                    facecolor=col, edgecolor=INK, lw=1.6, zorder=3))
+        ax.text(cx, cy, name, ha="center", va="center", fontsize=12, color="white", weight="bold",
+                zorder=4)
+    ax.plot([], [], "s", color="#fdf0e6", markeredgecolor=HEXGRID,
+            label="geodesic cells  (d = shortest)")
+    ax.plot([], [], "s", color="#ebf3fb", markeredgecolor=HEXGRID,
+            label=f"overrun corridor  (shortest < d ≤ shortest+{overrun})")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=2, fontsize=8.5, frameon=False)
+    ax.set_title("O-D hop-ellipse — priced cells satisfy hex_dist(O,c) + hex_dist(c,D) ≤ "
+                 "shortest + overrun\n(the hop budget IS the corridor radius; foreign keep-out is "
+                 "removed separately)", fontsize=10.5, color=INK, pad=8)
+    _save(fig, "od_hop_ellipse")
+
+
+def fig_pricing_dag() -> None:
+    """colgen dp_kernel._price_dag / network: layered cell×step space-time DAG, parity-swapped tables."""
+    fig, ax = plt.subplots(figsize=(10.6, 5.8))
+    ax.axis("off")
+    n_steps, cells = 6, [3.0, 2.0, 1.0, 0.0]
+    dx = 1.9
+    # parity bands: even steps use table A, odd steps table B (swapped once per step)
+    for s in range(n_steps):
+        band = "#ebf3fb" if s % 2 == 0 else "#fdf0e6"
+        ax.add_patch(Rectangle((s * dx - 0.55, -0.7), 1.1, 4.4, facecolor=band, alpha=0.5,
+                               edgecolor="none", zorder=0))
+        ax.text(s * dx, 3.95, f"step {s}\ntbl {'A' if s % 2 == 0 else 'B'}", ha="center",
+                fontsize=7.5, color=INK)
+    reach = {0: [1], 1: [1, 2], 2: [1, 2], 3: [1, 2], 4: [1, 2], 5: [1]}
+    for s, rows in reach.items():
+        for c in rows:
+            x, y = s * dx, cells[c]
+            ax.add_patch(Circle((x, y), 0.16, facecolor="white", edgecolor=INK, lw=1.2, zorder=3))
+    def arc(s0, c0, c1, color, lw=1.2, z=2):
+        ax.annotate("", xy=(s0 * dx + dx, cells[c1]), xytext=(s0 * dx, cells[c0]),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=lw, shrinkA=6, shrinkB=6),
+                    zorder=z)
+    # first arcs (origin/root → layer 1) in red; internal in grey; last arcs (→ dest) in green
+    arc(0, 1, 1, RED, 1.8)
+    arc(0, 1, 2, RED, 1.8)
+    for s, (c0, c1) in ((1, (1, 1)), (1, (1, 2)), (1, (2, 1)), (1, (2, 2)),
+                        (2, (1, 1)), (2, (2, 2)), (3, (1, 1)), (3, (2, 2))):
+        arc(s, c0, c1, GRID)
+    arc(4, 1, 1, GREEN, 1.8)
+    arc(4, 2, 1, GREEN, 1.8)
+    ax.plot([0], [cells[1]], "o", color=RED, ms=9, zorder=4)
+    ax.text(-0.35, cells[1], "root\n(origin,\nseeded at\nstep start)", ha="right", va="center",
+            fontsize=7.5, color=RED)
+    dxp, dyp = 5 * dx, cells[1]
+    ax.add_patch(RegularPolygon((dxp, dyp), numVertices=6, radius=0.22, orientation=0,
+                                facecolor=GREEN, edgecolor=INK, lw=1.2, zorder=4))
+    ax.text(dxp + 0.35, dyp, "sink\n(dest)", ha="left", va="center", fontsize=7.5, color=GREEN)
+    ax.plot([], [], color=RED, lw=1.8, label="first arc (origin role)")
+    ax.plot([], [], color=GRID, lw=1.2, label="internal arc")
+    ax.plot([], [], color=GREEN, lw=1.8, label="last arc (dest role)")
+    ax.legend(loc="lower center", ncol=3, fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.06))
+    ax.set_title("Pricing DAG — cell×step nodes, hop arcs by role; two dominance tables swap by\n"
+                 "step parity (never compare labels at different steps); roots seeded before arcs "
+                 "write s+1", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim(-1.8, 11.0)
+    ax.set_ylim(-0.9, 4.4)
+    _save(fig, "pricing_dag")
+
+
+def fig_label_dp_dominance() -> None:
+    """colgen dp_kernel: coexisting labels per (cell, hop) keyed by the `recent` tail; window = depth."""
+    R = 1.0
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.0, 5.2), gridspec_kw={"width_ratios": [1.15, 1]})
+
+    axl.set_title("`recent` = last min(hop+1, depth) cells of the path\n"
+                  "(depth = revisit window width − 1)", fontsize=10, color=INK)
+    axl.set_aspect("equal")
+    axl.axis("off")
+    for q in range(-1, 8):
+        for r in range(-2, 3):
+            cx, cy = _axial_to_xy(q, r, R)
+            axl.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                         facecolor="white", edgecolor=HEXGRID, lw=0.7, zorder=0))
+    depth = 3
+    path = [(0, 0), (1, 0), (2, -1), (3, 0), (4, 1), (5, 1), (6, 1)]
+    xs = [_axial_to_xy(*c, R)[0] for c in path]
+    ys = [_axial_to_xy(*c, R)[1] for c in path]
+    axl.plot(xs, ys, color=BLUE, lw=2.0, marker="o", ms=4, zorder=2)
+    for c in path[-depth:]:              # the recent tail: last `depth` cells, part of the key
+        cx, cy = _axial_to_xy(*c, R)
+        axl.add_patch(RegularPolygon((cx, cy), numVertices=6, radius=R, orientation=0,
+                                     facecolor="#ebf3fb", edgecolor=BLUE, lw=1.8, zorder=1))
+    tx, ty = _axial_to_xy(*path[-1], R)
+    axl.text(tx, ty + 0.85, "(cell c, hop k)", ha="center", fontsize=8, color=INK)
+    hx, hy = _axial_to_xy(*path[-2], R)
+    axl.text((hx + tx) / 2, ty - 1.7, f"shaded = recent tail (last {depth} cells)\n"
+             "→ this label's dominance key", ha="center", va="top", fontsize=8, color=BLUE)
+    ox, oy = _axial_to_xy(*path[0], R)
+    axl.text(ox, oy - 1.4, "origin", ha="center", va="top", fontsize=7.5, color=INK)
+
+    axr.set_title("Dominance key splits one (cell, hop) into many labels", fontsize=10, color=INK)
+    axr.axis("off")
+    axr.set_xlim(0, 10)
+    axr.set_ylim(0, 10)
+    _box(axr, 5, 8.8, "key = (cell, recent[0:depth], origin_paid_rows, first_hop)",
+         fc="#edf2f7", fs=8)
+    chips = [("recent=(c, e0, d0)", BLUE, 7.0), ("recent=(c, e1, d1)", ORANGE, 5.6),
+             ("recent=(c, e2, d2)", GREEN, 4.2)]
+    for txt, col, y in chips:
+        _box(axr, 5, y, txt + "  first_hop=…", ec=col, tc=col, fs=8)
+    axr.annotate("", xy=(5, 7.6), xytext=(5, 8.35), arrowprops=dict(arrowstyle="->", color=INK, lw=1.2))
+    axr.text(5, 2.9, "distinct keys ⇒ none dominates the others\n"
+             "≈ 34 labels per (cell, hop)  (LABEL_MULTIPLICITY)\n"
+             "wider revisit window ⇒ deeper key ⇒ more labels",
+             ha="center", va="top", fontsize=8.5, color=INK)
+
+    fig.suptitle("Label-DP dominance — window width IS the dominance-key depth",
+                 fontsize=11.5, color=INK, y=1.0)
+    _save(fig, "label_dp_dominance")
+
+
+def fig_completion_envelope() -> None:
+    """colgen pricing.completion_envelope / can_compete: keep a label if SOME hop count could win."""
+    fig, ax = plt.subplots(figsize=(9.8, 5.4))
+    hops = np.arange(1, 22)
+    max_air_hops = 16
+    # optimistic best reduced cost achievable at each hop count:
+    #   benefit - pi_f - delay_lb(hops) + max_negative_credit   (delay_lb rises with hops)
+    delay_lb = 0.7 * (hops - 1)
+    optimistic = 9.0 - delay_lb + 2.0 * np.exp(-0.25 * (hops - 6) ** 2)
+    incumbent = 3.0
+    inside = hops <= max_air_hops
+    ax.axhline(incumbent, color=RED, lw=1.6, ls="--", zorder=2)
+    ax.text(21, incumbent + 0.15, "incumbent RC", ha="right", va="bottom", fontsize=8.5, color=RED)
+    ax.bar(hops[inside], optimistic[inside], width=0.7, color="#cbd5e0", edgecolor=INK, lw=0.6,
+           zorder=1)
+    can = inside & (optimistic >= incumbent)
+    ax.bar(hops[can], optimistic[can], width=0.7, color=GREEN, alpha=0.75, edgecolor=INK, lw=0.6,
+           zorder=3, label="can compete (kept)")
+    ax.bar(hops[~inside], optimistic[~inside], width=0.7, color="white", edgecolor=GRID, lw=0.6,
+           ls=":", zorder=1)
+    ax.axvline(max_air_hops + 0.5, color=ORANGE, lw=1.6, zorder=4)
+    ax.text(max_air_hops + 0.6, optimistic.max() * 0.92, "cap at max_air_hops\n"
+            "(entries past the ceiling\ndescribe completions the\nsearch cannot make)",
+            ha="left", va="top", fontsize=8, color=ORANGE)
+    ax.set_xlabel("total hops of the completion", fontsize=9, color=INK)
+    ax.set_ylabel("optimistic reduced cost", fontsize=9, color=INK)
+    ax.set_xticks(hops[::2])
+    ax.legend(loc="upper right", fontsize=8.5, frameon=True, framealpha=0.95)
+    ax.set_title("Completion envelope — a label stays alive as soon as ANY hop count in range\n"
+                 "could beat the incumbent; the whole label is pruned only when none can",
+                 fontsize=10.5, color=INK, pad=8)
+    ax.set_ylim(0, optimistic.max() + 1.5)
+    _save(fig, "completion_envelope")
+
+
+def fig_cg_loop() -> None:
+    """colgen solver.solve: seed/ladder/bootstrap init, then master LP → price → add columns loop."""
+    fig, ax = plt.subplots(figsize=(11.4, 5.8))
+    ax.axis("off")
+    ax.set_xlim(0, 14)
+    ax.set_ylim(0, 10)
+
+    ax.text(2.0, 9.4, "INITIAL POOL", ha="center", fontsize=9, color=INK, weight="bold")
+    _box(ax, 2.0, 8.3, "geodesic seed per flight", fc="#ebf3fb", ec=BLUE, fs=8)
+    _box(ax, 2.0, 6.9, "departure ladder\n(pure clock shifts —\narithmetic, no DP)", fc="#ebf3fb",
+         ec=BLUE, fs=8)
+    _box(ax, 2.0, 5.2, "bootstrap variants\n(rank roots by score)", fc="#ebf3fb", ec=BLUE, fs=8)
+    for y0, y1 in ((7.9, 7.5), (6.2, 5.9)):
+        ax.annotate("", xy=(2.0, y1), xytext=(2.0, y0), arrowprops=dict(arrowstyle="->", color=BLUE,
+                    lw=1.3))
+    ax.annotate("", xy=(5.5, 6.1), xytext=(3.5, 5.2), arrowprops=dict(arrowstyle="->", color=INK,
+                lw=1.4))
+
+    _box(ax, 6.6, 6.3, "master LP\n→ duals π", fc="#fdf0e6", ec=ORANGE)
+    _box(ax, 10.0, 6.3, "price sweep over\nper-flight DAGs\n(‖ workers)", fc="#fdf0e6", ec=ORANGE)
+    _box(ax, 10.0, 3.3, "add columns with\nreduced cost < 0", fc="#fdf0e6", ec=ORANGE)
+    _box(ax, 6.6, 3.3, "update UB & gap", fc="#fdf0e6", ec=ORANGE)
+    ax.annotate("", xy=(8.7, 6.3), xytext=(8.0, 6.3), arrowprops=dict(arrowstyle="->", color=INK,
+                lw=1.4))
+    ax.annotate("", xy=(10.0, 4.0), xytext=(10.0, 5.7), arrowprops=dict(arrowstyle="->", color=INK,
+                lw=1.4))
+    ax.annotate("", xy=(8.0, 3.3), xytext=(9.0, 3.3), arrowprops=dict(arrowstyle="->", color=INK,
+                lw=1.4))
+    ax.annotate("", xy=(6.6, 5.7), xytext=(6.6, 4.0), arrowprops=dict(arrowstyle="->", color=INK,
+                lw=1.4))
+    ax.text(5.9, 4.85, "gap > tol\n& time left", fontsize=7.5, color=INK, ha="right")
+
+    _box(ax, 12.6, 3.3, "final restricted-\nmaster IP + repair\n(ip_reserve_s tail)", fc="#f0fff4",
+         ec=GREEN, tc=GREEN)
+    ax.annotate("", xy=(11.4, 3.3), xytext=(11.0, 3.3), arrowprops=dict(arrowstyle="->",
+                color=GREEN, lw=1.4))
+    ax.text(11.2, 4.15, "converged /\nbound / timeout", fontsize=7.5, color=GREEN, ha="center")
+
+    ax.text(7.0, 0.9, "A finished sweep is answer-identical serial or parallel; a sweep that hits "
+            "pricing_deadline is not\n(a pool gets further through pricing_order — more pricing in "
+            "the same budget, not the same answer)", ha="center", va="top", fontsize=8, color=INK)
+    ax.set_title("Column-generation loop — build a warm pool, then price against LP duals until the "
+                 "gap closes", fontsize=10.5, color=INK, pad=8)
+    _save(fig, "cg_loop")
+
+
+def fig_pricing_pool_schedule() -> None:
+    """colgen pricing_pool: longest-completed-prefix (index order) and the serial W(W-1)/2 launch ramp."""
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.0, 5.0), gridspec_kw={"width_ratios": [1.25, 1]})
+
+    axl.set_title("Accepted set = longest completed PREFIX of pricing_order\n"
+                  "(keep the contiguous prefix; discard everything at/after the first timeout)",
+                  fontsize=9.5, color=INK)
+    deadline = 6.0
+    n = 9
+    finish = [1.2, 2.0, 2.7, 3.1, 6.8, 4.0, 4.5, 7.4, 5.2]   # completion time by index
+    first_gap = next(i for i, f in enumerate(finish) if f > deadline)
+    for i, f in enumerate(finish):
+        kept = i < first_gap
+        color = GREEN if kept else RED
+        axl.barh(n - 1 - i, min(f, deadline + 0.9), height=0.62,
+                 color=color, alpha=0.35 if not kept else 0.7, edgecolor=INK, lw=0.8, zorder=2)
+        axl.plot([f], [n - 1 - i], "o", color=color, ms=6, zorder=3)
+        tag = "kept" if kept else ("first timeout" if i == first_gap else "discarded (after gap)")
+        axl.text(0.1, n - 1 - i, f"flight {i}", va="center", ha="left", fontsize=7.5, color=INK,
+                 zorder=4)
+        axl.text(min(f, deadline + 0.9) + 0.15, n - 1 - i, tag, va="center", fontsize=7,
+                 color=color)
+    axl.axvline(deadline, color=INK, lw=1.6, ls="--", zorder=1)
+    axl.text(deadline, n + 0.1, "pricing_deadline\n(one absolute wall clock)", ha="center",
+             va="bottom", fontsize=8, color=INK)
+    axl.text(0.1, -0.9, "flight 5 finished early but sits AFTER the first gap → discarded "
+             "(never a set with holes)", fontsize=7.5, color=RED)
+    axl.set_ylim(-1.4, n + 1.2)
+    axl.set_xlim(0, deadline + 2.6)
+    axl.set_yticks([])
+    axl.set_xlabel("wall clock  →", fontsize=8.5, color=INK)
+
+    axr.set_title("Worker launch is parent-SERIAL:\nidle worker-seconds grow as W(W−1)/2",
+                  fontsize=9.5, color=INK)
+    W = 5
+    spawn = 1.0
+    for w in range(W):
+        axr.add_patch(Rectangle((0, W - 1 - w - 0.3), w * spawn, 0.6, facecolor="none",
+                                edgecolor=GRID, lw=1.0, ls=":", hatch="///", zorder=1))
+        axr.add_patch(Rectangle((w * spawn, W - 1 - w - 0.3), 3.0, 0.6, facecolor=BLUE, alpha=0.6,
+                                edgecolor=INK, lw=1.0, zorder=2))
+        axr.text(-0.15, W - 1 - w, f"w{w}", ha="right", va="center", fontsize=8, color=INK)
+    axr.text(W * spawn * 0.5, -0.7, "hatched = waiting for earlier spawns\n"
+             "Σ idle = 0+1+…+(W−1) = W(W−1)/2 spawn-costs", ha="center", va="top", fontsize=8,
+             color=INK)
+    axr.plot([], [], color=BLUE, lw=6, alpha=0.6, label="pricing")
+    axr.set_xlim(-0.6, W * spawn + 3.4)
+    axr.set_ylim(-1.6, W)
+    axr.set_yticks([])
+    axr.set_xlabel("wall clock  →", fontsize=8.5, color=INK)
+
+    fig.suptitle("Parallel pricing pool — determinism (index-order prefix) and the serial-launch "
+                 "cost", fontsize=11.0, color=INK, y=1.01)
+    _save(fig, "pricing_pool_schedule")
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,
@@ -769,6 +1262,9 @@ FIGURES = (
     fig_search_window, fig_hex_layout, fig_rasterisation_coverage, fig_cell_blocking,
     fig_takeoff_fan, fig_batched_turns, fig_milp_obstacles, fig_hover_tail_steps,
     fig_sipp_safe_intervals,
+    fig_lns_anytime_loop, fig_lns_destroy_operators, fig_lns_drop_vs_sync,
+    fig_od_hop_ellipse, fig_pricing_dag, fig_label_dp_dominance, fig_completion_envelope,
+    fig_cg_loop, fig_pricing_pool_schedule,
 )
 
 

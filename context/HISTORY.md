@@ -41,3 +41,10 @@ Durable record of mistakes likely to recur between PRs. Format follows `.agent/C
   built `centerline[0][1] == volumes[0].t_start`, so `x < x + 1e-9` passed for any implementation.
   Build the fixture so the two CAN differ, and pin the regime a behavioural test needs. Files:
   `tests/test_paired_precedence.py`.
+
+- 2026-09-09T01:35Z `[USER]` A replacement that keeps the thing it replaces is not a replacement.
+  The itinerary model landed +634/-203 because the two-request path was kept "so archived runs load"
+  — but archived runs load fine without it, as the two independent flights they always were, and
+  nothing outside the deleted code read the link. Check what actually depends on a legacy path before
+  paying to keep it. Files: `freespace_sim/sim.py`, `freespace_sim/verify.py`,
+  `freespace_sim/planner/lns/{state,solver,parallel}.py`, `freespace_sim/types.py`.

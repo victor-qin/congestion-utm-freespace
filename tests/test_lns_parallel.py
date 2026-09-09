@@ -86,24 +86,6 @@ def test_replica_forwards_the_movable_filters():
 
 
 @pytest.mark.slow
-def test_replica_forwards_the_anchor_guard():
-    """turnaround_s arms try_repair's paired-leg precedence guard. Dropping it disarms the anchor
-    rejection SILENTLY: verify.find_interflight_conflict checks 4D conflicts only, so a schedule
-    that re-times an outbound past its return's departure still reports verified."""
-    res = run(_congested(lam=400.0, horizon=240.0))
-    base = LNSState(res.config, res.ledger, res.intents,
-                    static_terms=res.ledger.static_terminals())
-    intents = base.final_intents()
-    unimp = dict(base._unimp_cost)
-
-    armed = LNSState.replica(res.config, intents, static_terms=base.static_terms,
-                             unimpeded_cost=unimp, turnaround_s=60.0)
-    disarmed = LNSState.replica(res.config, intents, static_terms=base.static_terms,
-                                unimpeded_cost=unimp)
-    assert armed._turnaround_s == 60.0
-    assert disarmed._turnaround_s is None
-
-
 def test_replica_spawns_no_child_processes():
     """Coexistence rule: a replica is constructed INSIDE a worker, so it must never stand up a
     pool of its own — m search workers x m ruler workers is a fork bomb, not a speedup."""
@@ -436,7 +418,7 @@ def test_a_dead_worker_fails_loudly_rather_than_hanging():
     base = LNSState(res.config, res.ledger, res.intents,
                     static_terms=res.ledger.static_terminals())
     spec = WorkerSpec(neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
-                      max_walks=10, map_max_cells=4096, turnaround_s=None,
+                      max_walks=10, map_max_cells=4096,
                       frozen_flight_ids=frozenset(), movable_uss_ids=None,
                       incremental_release=True, kernel_log2_min=None, window_bytes=None)
     pool = LNSWorkerPool(res.config, base.final_intents(), base.static_terms,
@@ -457,7 +439,7 @@ def test_worker_exit_during_startup_is_cleaned_up(monkeypatch):
     monkeypatch.setattr(parallel, "_worker_main", _exit_before_ready)
     spec = parallel.WorkerSpec(
         neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
-        max_walks=10, map_max_cells=4096, turnaround_s=None,
+        max_walks=10, map_max_cells=4096,
         frozen_flight_ids=frozenset(), movable_uss_ids=None,
         incremental_release=True, kernel_log2_min=None,
     )
@@ -485,7 +467,7 @@ def test_pool_start_preserves_optional_kernel_fallback(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", numba_free_import)
     spec = WorkerSpec(
         neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
-        max_walks=10, map_max_cells=4096, turnaround_s=None,
+        max_walks=10, map_max_cells=4096,
         frozen_flight_ids=frozenset(), movable_uss_ids=None,
         incremental_release=True, kernel_log2_min=None,
     )

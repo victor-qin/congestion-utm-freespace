@@ -6,8 +6,11 @@
   itinerary; remove `_est_trip_s`. Sequenced after PR #128 so #128 acts as the acceptance test.
 - 2026-09-08T22:10Z `[USER]` Turnaround is a held pad reservation: full cylinder for the descent and
   the climb, LOW ground box for the dwell between them.
-- UNCONFIRMED — deleting the legacy two-request path (`paired_outbound_id`, `return_anchor`, and
-  #128's anchor guard, now redundant). Deliberately left for a separate change.
+- 2026-09-09T01:30Z `[USER]` SUPERSEDES the deferral: the legacy two-request path is DELETED, not
+  kept for archived runs. `paired_outbound_id`, `return_anchor` (both modes, the CLI flag, the
+  coupling loop), `demand_turnaround_s`, the LNS anchor guard and every paired-precedence check in
+  `verify` are gone. Archived runs still load — as two independent one-way flights, which is what
+  they were; only the link is lost, and nothing outside the deleted code read it.
 
 ## [DECISIONS]
 
@@ -50,6 +53,10 @@
   planned return leg departs after its own arrival. Added four, plus a fixture assertion pinning the
   congested regime (29/29 returns held past service, up to 185.5 s); without it the test would pass
   vacuously the moment the fixture stopped congesting.
+
+- 2026-09-09T01:35Z `[TOOL]` The itinerary change was +634/-203 before this: the model was added
+  while the scheme it replaces was kept alive. Deleting it takes the branch to +610/-1200, a net
+  -590. `realized_takeoff_s` survives — `ItineraryPlanner` uses it to size the ground box.
 
 ## [OUTCOMES]
 

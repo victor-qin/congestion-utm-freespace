@@ -89,8 +89,7 @@ class WorkerSpec:
 
     Every field that changes what a repair is ALLOWED to do lives here, because a worker that
     silently differs from the coordinator's belief is the failure mode with no symptom: dropping
-    ``turnaround_s`` disarms the paired-return anchor guard, and ``verify`` checks 4D conflicts
-    only, so the run still reports ``verified``.
+    ``    only, so the run still reports ``verified``.
     """
 
     neighborhood_size: int
@@ -98,7 +97,6 @@ class WorkerSpec:
     repair_order: str
     max_walks: int
     map_max_cells: int
-    turnaround_s: float | None
     frozen_flight_ids: frozenset
     movable_uss_ids: frozenset | None
     incremental_release: bool
@@ -275,7 +273,6 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
             cfg, intents,
             static_terms=static_terms,
             unimpeded_cost=unimpeded_cost,
-            turnaround_s=spec.turnaround_s,
             frozen_flight_ids=spec.frozen_flight_ids,
             movable_uss_ids=spec.movable_uss_ids,
             incremental_release=spec.incremental_release,
@@ -992,7 +989,6 @@ def run_lns_parallel(
     lns,
     *,
     static_terms: tuple | None = None,
-    turnaround_s: float | None = None,
 ):
     """DROP-LNS over a committed schedule; same contract as ``run_lns`` (ledger/intents are a
     completed run's, the ledger is mutated in place, and the returned intents supersede the input).
@@ -1019,14 +1015,12 @@ def run_lns_parallel(
     if pool_workers <= 1:
         return run_lns(
             cfg, ledger, intents, replace(lns, search_workers=1),
-            static_terms=static_terms, turnaround_s=turnaround_s,
-        )
+            static_terms=static_terms,        )
 
     t0 = time.monotonic()
     state = _build_lns_state(
         cfg, ledger, intents, lns,
-        static_terms=static_terms, turnaround_s=turnaround_s,
-        maintain_claim_index=False,
+        static_terms=static_terms,        maintain_claim_index=False,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0
@@ -1038,7 +1032,6 @@ def run_lns_parallel(
         repair_order=lns.repair_order,
         max_walks=lns.max_walks,
         map_max_cells=lns.map_max_cells,
-        turnaround_s=turnaround_s,
         frozen_flight_ids=lns.frozen_flight_ids,
         movable_uss_ids=lns.movable_uss_ids,
         incremental_release=lns.incremental_release,

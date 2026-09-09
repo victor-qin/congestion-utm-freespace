@@ -24,7 +24,6 @@ import numpy as np
 from freespace_sim import verify
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.sim import demand_turnaround_s
 from freespace_sim.planner.lns.neighborhood import (
     AdaptiveSelector,
     agent_based_neighborhood,
@@ -114,12 +113,7 @@ class LNSResult:
     wall_s: float
     init_wall_s: float                  # state build incl. the unimpeded baseline pass
     weights: dict[str, float]
-    verified: bool                      # SEPARATION only, like `SimResult.verified`
-    # Paired-leg PRECEDENCE, which `verified` deliberately excludes: a return departing before its
-    # outbound lands holds a DISJOINT pad window, so it is not a conflict and no separation replay
-    # can see it. Counts pairs this run made WORSE than the schedule it was handed — a nominal-anchor
-    # baseline arrives with violations already in it, and LNS is answerable only for adding to them.
-    n_precedence_worsened: int = 0
+    verified: bool
     # --- parallel only; defaulted so every existing construction site is untouched ---
     search_workers: int = 1
     parallel_mode: str = "sequential"
@@ -404,38 +398,15 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
 
 
 def assert_incumbent_ok(state) -> None:
-    """Both LNS invariants over the current incumbent — separation AND paired-leg precedence.
+    """Separation over the current incumbent.
 
     Shared by the sequential loop and the parallel coordinator so the two engines cannot check
-    different things. Precedence ratchets PER PAIR against the shortfalls the state was built with:
-    the schedule may already contain violations (a nominal-anchor baseline does), and failing on
-    those would make `verify_every` unusable on exactly the runs that need watching. Per pair, not
-    per count — LNS can repair one pair and break another in the same iteration, leaving the count
-    unmoved, so a count-based ratchet is blind to the identities that changed."""
+    different things."""
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
     if bad is not None:
         raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
-    worse = _worsened_pairs(final, state)
-    if worse:
-        (out_fid, ret_fid), (was, now) = worse[0]
-        raise AssertionError(
-            f"LNS worsened {len(worse)} paired-return precedence shortfall(s); e.g. return "
-            f"{ret_fid} now departs {now:.1f}s before outbound {out_fid} releases its pad "
-            f"(was {was:.1f}s)")
-
-
-def _worsened_pairs(final, state) -> list[tuple[tuple[int, int], tuple[float, float]]]:
-    """``[((outbound, return), (baseline, now))]`` for every pair this run made worse, worst first."""
-    turnaround = float(state._turnaround_s or 0.0)
-    now = verify.pair_shortfalls(final, turnaround)
-    base = state._pair_shortfall
-    worse = [(k, (base.get(k, 0.0), v)) for k, v in now.items() if v > base.get(k, 0.0) + 1e-6]
-    worse.sort(key=lambda kv: kv[1][0] - kv[1][1])
-    return worse
-
-
 def _effective_search_workers(lns: LNSConfig) -> int:
     """Processes that can receive work under this configuration's task budget."""
     return min(lns.search_workers, lns.max_iterations)
@@ -529,7 +500,6 @@ def _build_lns_state(
     lns: LNSConfig,
     *,
     static_terms: tuple | None,
-    turnaround_s: float | None,
     maintain_claim_index: bool = True,
 ) -> LNSState:
     """One construction path for the sequential runner and the parallel coordinator.
@@ -542,7 +512,6 @@ def _build_lns_state(
     - lns (LNSConfig): controls read here (frozen/movable ids, incremental_release, repair
       planner, unimpeded workers, window bytes).
     - static_terms (tuple | None): permanent terminal walls; None uses the ledger's own.
-    - turnaround_s (float | None): paired-return turnaround; None disables the precedence guard.
     - maintain_claim_index (bool): build the destroy-heuristic claim index (skipped when no
       iterations will run).
 
@@ -557,7 +526,6 @@ def _build_lns_state(
         static_terms=ledger.static_terminals() if static_terms is None else static_terms,
         frozen_flight_ids=lns.frozen_flight_ids,
         movable_uss_ids=lns.movable_uss_ids,
-        turnaround_s=turnaround_s,
         incremental_release=lns.incremental_release,
         repair_planner_name=lns.repair_planner,
         unimpeded_workers=lns.unimpeded_workers,
@@ -613,19 +581,6 @@ def _finalize_lns_result(
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
-    # Precedence was checked only under `verify_every`, which defaults to 0 — so every run ended
-    # with ZERO precedence verification. It is one O(pairs) pass at the end of a whole search; run
-    # it unconditionally. Reported, not raised, and kept out of `verified`: `verified` means
-    # separation everywhere else in the codebase, and folding this in would retroactively relabel
-    # every archived nominal-anchor run (see the same split in `sim.run`).
-    worse = _worsened_pairs(final, state)
-    if worse:
-        (out_fid, ret_fid), (was, now) = worse[0]
-        log.warning(
-            "lns worsened %d paired-return precedence shortfall(s); worst: return %d departs "
-            "%.0fs before outbound %d releases its pad (baseline %.0fs). This is a precedence "
-            "violation, not a conflict, so `verified` does not see it.",
-            len(worse), ret_fid, now, out_fid, was)
     wall_s = time.monotonic() - t0
     worker_local_subscribers = search_workers > 1
     return LNSResult(
@@ -639,7 +594,6 @@ def _finalize_lns_result(
         init_wall_s=init_s,
         weights=dict(selector.weights),
         verified=bad is None,
-        n_precedence_worsened=len(worse),
         repair_planner=repair_planner_name,
         t_plan_s=state.t_plan_s,
         t_ledger_s=state.t_ledger_s,
@@ -662,7 +616,6 @@ def run_lns(
     lns: LNSConfig,
     *,
     static_terms: tuple | None = None,
-    turnaround_s: float | None = None,
 ) -> LNSResult:
     """Improve a committed schedule in place, returning the improved schedule and its telemetry.
 
@@ -674,10 +627,8 @@ def run_lns(
     no always-active terminal airspace", a different claim that makes the unimpeded baseline
     wall-free (inflating every delay premium — the ranking that picks victims and orders the
     repair) and makes the closing ``verify`` replay a world the schedule was never planned against
-    (so ``verified`` can come back True for an infeasible schedule). ``turnaround_s=None`` likewise
-    disables the paired-return guard; supply it whenever the baseline ran
-    ``return_anchor="realized"``. ``run_lns_on_result`` derives both correctly. Dispatches to the
-    parallel runner when the config enables parallel search.
+    (so ``verified`` can come back True for an infeasible schedule). ``run_lns_on_result`` derives
+    it correctly. Dispatches to the parallel runner when the config enables parallel search.
 
     Parameters
     ------------
@@ -686,7 +637,6 @@ def run_lns(
     - intents (list[OperationalIntent]): the completed run's schedule to improve.
     - lns (LNSConfig): the LNS controls, validated before anything is mutated.
     - static_terms (tuple | None): permanent terminal walls; ``None`` uses the ledger's own.
-    - turnaround_s (float | None): paired-return turnaround; ``None`` disables the return guard.
 
     Return
     --------
@@ -701,14 +651,11 @@ def run_lns(
         # while parallel.py can import the shared solver helpers only after this module is loaded.
         from freespace_sim.planner.lns.parallel import run_lns_parallel
 
-        return run_lns_parallel(cfg, ledger, intents, lns,
-                                static_terms=static_terms, turnaround_s=turnaround_s)
-
+        return run_lns_parallel(cfg, ledger, intents, lns, static_terms=static_terms)
     t0 = time.monotonic()
     state = _build_lns_state(
         cfg, ledger, intents, lns,
-        static_terms=static_terms, turnaround_s=turnaround_s,
-        maintain_claim_index=lns.max_iterations > 0,
+        static_terms=static_terms, maintain_claim_index=lns.max_iterations > 0,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0
@@ -783,57 +730,28 @@ def run_lns(
         ledger.detach_subscribers()
 
 
-def run_lns_on_result(res, demand, lns: LNSConfig, *, return_anchor: str | None = None) -> LNSResult:
-    """Convenience entry over a ``sim.run`` result: reads the static terminals and the return-anchor
-    mode from the RESULT (what the baseline actually flew), and, when that mode was ``"realized"``,
-    the turnaround the paired-return guard must respect from the demand model, then calls
-    ``run_lns``.
+def run_lns_on_result(res, demand, lns: LNSConfig) -> LNSResult:
+    """Convenience entry over a ``sim.run`` result: reads the static terminals from the RESULT (what
+    the baseline actually flew) rather than re-deriving them, then calls ``run_lns``.
 
-    Both are read off the result rather than re-derived, because both are silent when wrong:
-
-    * ``ledger.static_terminals()`` is the set of permanent walls the run really filed. Re-deriving
-      it as ``demand.terminals(cfg)`` invents walls whenever ``terminal_airspace_always_active`` is
-      off (the unimpeded baseline then over-charges every flight, distorting delay premiums, and the
-      final ``verify`` replays a world the schedule was never planned against), crashes outright on a
-      demand model without a ``terminals`` method, and misses ``sim.run``'s scenario-collected
-      fallback for those models.
-    * ``res.return_anchor`` decides whether the paired-return guard runs at all. Defaulting it to
-      ``"nominal"`` disables the guard for exactly the runs that need it, with no error and no log
-      line — the LNS would happily re-time an outbound past its return's departure. Pass
-      ``return_anchor=`` only to assert the mode; disagreeing with the result is an error, not an
-      override.
+    ``ledger.static_terminals()`` is the set of permanent walls the run really filed. Re-deriving
+    it as ``demand.terminals(cfg)`` invents walls whenever ``terminal_airspace_always_active`` is
+    off (the unimpeded baseline then over-charges every flight, distorting delay premiums, and the
+    final ``verify`` replays a world the schedule was never planned against), crashes outright on a
+    demand model without a ``terminals`` method, and misses ``sim.run``'s scenario-collected
+    fallback for those models.
 
     Parameters
     ------------
-    - res (SimResult): a ``sim.run`` result, read for ``config``, ``ledger``, ``intents``, and
-      ``return_anchor``.
-    - demand: the demand model, used only to derive the turnaround when the anchor is
-      ``"realized"``; may be ``None``.
+    - res (SimResult): a ``sim.run`` result, read for ``config``, ``ledger`` and ``intents``.
+    - demand: unused; kept so existing call sites are unchanged.
     - lns (LNSConfig): the LNS controls forwarded to ``run_lns``.
-    - return_anchor (str | None): if given, asserts the result's anchor mode; a mismatch raises.
 
     Return
     --------
     - output (LNSResult): the result of the underlying ``run_lns`` call.
     """
-    try:
-        recorded = res.return_anchor
-    except AttributeError:                     # never default: "nominal" is the value that DISARMS
-        raise TypeError(                       # the guard, so guessing it is the unsafe direction
-            f"{type(res).__name__} carries no return_anchor — run_lns_on_result needs the anchor mode "
-            "the baseline actually flew. Pass a sim.run() SimResult, or call run_lns directly with an "
-            "explicit turnaround_s.") from None
-    if return_anchor is not None and return_anchor != recorded:
-        raise ValueError(
-            f"return_anchor={return_anchor!r} contradicts the baseline's {recorded!r} — the anchor mode "
-            "is a property of the schedule being improved, not a knob of the improvement pass")
-    turnaround_s = None
-    if recorded == "realized":
-        if demand is None:
-            log.warning("lns: return_anchor='realized' without a demand model — assuming turnaround_s=0 "
-                        "(the paired-return guard then only enforces release <= the return's departure)")
-        turnaround_s = demand_turnaround_s(demand)
     return run_lns(
         res.config, res.ledger, res.intents, lns,
-        static_terms=res.ledger.static_terminals(), turnaround_s=turnaround_s,
+        static_terms=res.ledger.static_terminals(),
     )

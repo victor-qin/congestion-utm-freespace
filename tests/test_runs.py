@@ -303,14 +303,6 @@ def test_scenario_parquet_round_trips_the_itinerary(tmp_path):
     assert all(not i.request.return_to_origin for i in runs.load_run(folder).intents)
 
 
-def test_load_run_tolerates_runs_archived_before_the_pairing_column(tmp_path):
-    folder = runs.save_run(_small(), root=tmp_path, label="legacy_pairing", wall_seconds=0.1)
-    sdf = pd.read_parquet(folder / "scenario.parquet").drop(columns=["paired_outbound_id"])
-    sdf.to_parquet(folder / "scenario.parquet", index=False)
-    loaded = runs.load_run(folder)                                # must NOT raise
-    assert all(i.request.paired_outbound_id is None for i in loaded.intents)
-
-
 def test_run_folders_of_different_lead_arms_do_not_collide(tmp_path):
     """Arms share a byte-identical SimConfig and differ only in DemandSpec, so hashing the config
     alone would collide. Under one --tag their folders would then differ only by a

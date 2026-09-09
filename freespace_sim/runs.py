@@ -172,9 +172,6 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             # is the customer either way, so the loss is invisible in the geometry.
             "return_to_origin": bool(r.return_to_origin),
             "service_time_s": float(r.service_time_s),
-            # LEGACY link (return leg → its outbound). Nothing emits it now; kept so archived runs
-            # load. pandas has no nullable-int dtype, so an unlinked leg stores NaN → None on load.
-            "paired_outbound_id": r.paired_outbound_id,
         })
     return pd.DataFrame(rows)
 
@@ -826,8 +823,7 @@ def load_run(folder: Path | str) -> LoadedRun:
                             # the attribute nor a value, and reads back as one-way — which it was.
                             return_to_origin=bool(getattr(s, "return_to_origin", False)),
                             service_time_s=float(getattr(s, "service_time_s", 0.0) or 0.0),
-                            # An unlinked leg stores NaN either way.
-                            paired_outbound_id=_opt_int(getattr(s, "paired_outbound_id", None)))
+                            )
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(
             request=req,

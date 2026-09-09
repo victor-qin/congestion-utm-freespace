@@ -120,9 +120,6 @@ class FlightRequest:
     # that bracket it — those come from the column geometry (``volumes.column_dwell_s``), so a
     # scenario cannot budget a turnaround that physics contradicts.
     service_time_s: float = 0.0
-    # LEGACY two-request round trips: on a RETURN leg, the flight_id of the outbound it waits on.
-    # No demand model emits this; kept so archived scenarios and ``sim.run(return_anchor=...)`` load.
-    paired_outbound_id: "int | None" = None
 
     def __post_init__(self):
         """Default and validate ``t_departure`` after construction.
@@ -147,10 +144,6 @@ class FlightRequest:
                 f"t_departure ({self.t_departure}) < t_request ({self.t_request}): "
                 "a flight cannot depart before it is filed"
             )
-        if self.return_to_origin and self.paired_outbound_id is not None:
-            raise ValueError(
-                f"flight {self.flight_id}: return_to_origin itinerary cannot also carry "
-                "paired_outbound_id — one round trip is either ONE flight or two, never both")
         if self.service_time_s < 0.0:
             raise ValueError(f"flight {self.flight_id}: service_time_s must be >= 0")
 

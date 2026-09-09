@@ -17,7 +17,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from matplotlib.patches import Circle, Polygon, Rectangle, RegularPolygon  # noqa: E402
+from matplotlib.patches import Circle, Ellipse, Polygon, Rectangle, RegularPolygon  # noqa: E402
 
 OUT = "context/figures"
 SQRT3 = 3.0 ** 0.5
@@ -448,10 +448,285 @@ def fig_read_envelope() -> None:
     _save(fig, "read_envelope")
 
 
+def fig_search_window() -> None:
+    """astar window_bounds / planner._build_window: the reroute ellipse + padded search window."""
+    fig, ax = plt.subplots(figsize=(9.2, 5.6))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    o, d = np.array([2.0, 2.5]), np.array([10.0, 5.0])
+    for c, angs, col, name in ((o, (40, 90, 140), BLUE, "origin"), (d, (220, 270, 320), ORANGE, "dest")):
+        ax.add_patch(Circle(c, 0.55, facecolor="#edf2f7", edgecolor=col, lw=1.6, zorder=3))
+        ax.plot([c[0]], [c[1]], "o", color=col, ms=5, zorder=4)
+        for a in angs:
+            e = c + 1.2 * np.array([np.cos(np.deg2rad(a)), np.sin(np.deg2rad(a))])
+            ax.plot([c[0], e[0]], [c[1], e[1]], color=col, lw=1.2, zorder=2)
+            ax.plot([e[0]], [e[1]], "o", color=col, ms=3, zorder=2)
+        ax.text(c[0], c[1] - 1.0, f"{name} + lanes", ha="center", va="top", fontsize=8.5, color=col)
+    lo, hi = np.minimum(o, d) - 1.3, np.maximum(o, d) + 1.3
+    ax.add_patch(Rectangle(lo, *(hi - lo), facecolor="none", edgecolor=GRID, lw=1.4))
+    m = 0.8
+    ax.add_patch(Rectangle(lo - m, *(hi - lo + 2 * m), facecolor="none", edgecolor=INK, lw=1.4, ls="--"))
+    mid = (o + d) / 2
+    L = float(np.hypot(*(d - o)))
+    ang = float(np.degrees(np.arctan2(d[1] - o[1], d[0] - o[0])))
+    ax.add_patch(Ellipse(mid, L + 1.8, 3.2, angle=ang, facecolor=BLUE, alpha=0.12, edgecolor=BLUE, lw=1.2, zorder=1))
+    ax.text(mid[0], mid[1] + 0.35, "A* reroute ellipse", fontsize=8.5, color=BLUE, ha="center")
+    ax.text((lo - m)[0], (hi + m)[1] + 0.2, "search window = anchor bbox + lateral_margin ring", fontsize=9, color=INK, va="bottom")
+    ax.set_title("A* search window — anchor bbox + lateral_margin must contain the reroute ellipse", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim((lo - m)[0] - 0.8, (hi + m)[0] + 0.8)
+    ax.set_ylim((lo - m)[1] - 0.8, (hi + m)[1] + 0.9)
+    _save(fig, "search_window")
+
+
+def fig_hex_layout() -> None:
+    """hexgrid: pointy-top axial (q, r) layout and the six neighbour directions."""
+    R = 1.0
+    fig, ax = plt.subplots(figsize=(8.8, 5.6))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    for q in range(-1, 4):
+        for r in range(-1, 3):
+            hx, hy = _axial_to_xy(q, r, R)
+            ax.add_patch(RegularPolygon((hx, hy), numVertices=6, radius=R, orientation=0, facecolor="white", edgecolor=HEXGRID, lw=1.0))
+            ax.text(hx, hy, f"{q},{r}", ha="center", va="center", fontsize=7, color=GRID)
+    c = (1, 1)
+    ccx, ccy = _axial_to_xy(*c, R)
+    ax.add_patch(RegularPolygon((ccx, ccy), numVertices=6, radius=R, orientation=0, facecolor="#ebf3fb", edgecolor=BLUE, lw=1.8, zorder=2))
+    ax.text(ccx, ccy, f"{c[0]},{c[1]}", ha="center", va="center", fontsize=8, color=INK, weight="bold")
+    for dq, dr in ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)):
+        nx, ny = _axial_to_xy(c[0] + dq, c[1] + dr, R)
+        ax.annotate("", xy=(nx, ny), xytext=(ccx, ccy), arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.5))
+        ax.text((ccx + nx) / 2, (ccy + ny) / 2, f"({dq:+d},{dr:+d})", fontsize=6.5, color=ORANGE, ha="center", va="center")
+    ax.text((ccx), -3.0, "x = R√3(q + r/2),   y = 1.5R·r    (pointy-top axial)", ha="center", fontsize=9, color=INK)
+    ax.set_title("Hex axial (q, r) layout and the six neighbour directions", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim(-3.2, 8.0)
+    ax.set_ylim(-3.4, 4.2)
+    _save(fig, "hex_layout")
+
+
+def fig_rasterisation_coverage() -> None:
+    """hexgrid/occupancy: a volume dilated by the hex circumradius blocks every hex whose centre it covers."""
+    R = 1.0
+    fig, ax = plt.subplots(figsize=(9.4, 5.6))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    cy = _axial_to_xy(0, 2, R)[1]
+    x0, x1 = _axial_to_xy(0, 2, R)[0], _axial_to_xy(4, 2, R)[0]
+    hw = 0.9
+    infl = hw + R
+    blocked = []
+    for q in range(-1, 7):
+        for r in range(0, 5):
+            hx, hy = _axial_to_xy(q, r, R)
+            inside = (x0 - infl <= hx <= x1 + infl) and abs(hy - cy) <= infl
+            ax.add_patch(RegularPolygon((hx, hy), numVertices=6, radius=R, orientation=0,
+                         facecolor="#ebf3fb" if inside else "white", edgecolor=HEXGRID, lw=1.0, zorder=1))
+            if inside:
+                blocked.append((hx, hy))
+    ax.add_patch(Rectangle((x0, cy - hw), x1 - x0, 2 * hw, facecolor="none", edgecolor=INK, lw=1.8, zorder=3))
+    ax.add_patch(Rectangle((x0 - infl, cy - infl), (x1 - x0) + 2 * infl, 2 * infl, facecolor="none", edgecolor=ORANGE, lw=1.4, ls="--", zorder=3))
+    for hx, hy in blocked:
+        ax.plot([hx], [hy], "o", color=BLUE, ms=3, zorder=4)
+    ax.text((x0 + x1) / 2, cy + infl + 0.55, "inflation halo = corridor_width/2 + circumradius R (dashed)", ha="center", fontsize=9, color=ORANGE)
+    ax.text((x0 + x1) / 2, cy - infl - 0.7, "blocked = hex whose CENTRE (dot) lies in the halo — over-block by up to a hex is safe", ha="center", va="top", fontsize=8.5, color=INK)
+    ax.set_title("Conservative rasterisation — a volume dilated by R decides hex-cell membership", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim(x0 - infl - 1.5, x1 + infl + 1.5)
+    ax.set_ylim(cy - infl - 1.7, cy + infl + 1.5)
+    _save(fig, "rasterisation_coverage")
+
+
+def fig_cell_blocking() -> None:
+    """astar occupancy is_blocked: own-hub flights pass the shared column, foreign cruise is walled."""
+    fig, ax = plt.subplots(figsize=(8.8, 5.8))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.add_patch(Circle((0, 0), 90, facecolor="#edf2f7", edgecolor=BLUE, lw=1.8, zorder=2))
+    ax.add_patch(Circle((0, 0), 120, facecolor="none", edgecolor=GRID, lw=1.3, ls="--", zorder=2))
+    ax.add_patch(Circle((0, 0), 205, facecolor="none", edgecolor=GRID, lw=1.0, ls=":", zorder=2))
+    ax.plot([0], [0], "o", color=INK, ms=5, zorder=3)
+    ax.text(0, -14, "hub column\n(terminal_radius 90 m)", ha="center", va="top", fontsize=8.5, color=BLUE)
+    ax.text(126, 60, "exit-lane edge ~120 m", fontsize=7.5, color=GRID)
+    ax.text(150, -150, "inflated keep-out\n(terminal_cells ~205 m)", fontsize=7.5, color=GRID)
+    ax.annotate("", xy=(-45, 55), xytext=(-255, 195), arrowprops=dict(arrowstyle="->", color=RED, lw=2.0))
+    ax.plot([-45], [55], "x", color=RED, ms=11, mew=2, zorder=5)
+    ax.text(-255, 205, "foreign cruise → BLOCKED", color=RED, fontsize=9, ha="left", weight="bold")
+    ax.annotate("", xy=(235, 120), xytext=(60, 25), arrowprops=dict(arrowstyle="->", color=GREEN, lw=2.0))
+    ax.text(120, 150, "own-hub exit lane → exempt", color=GREEN, fontsize=9, ha="left", weight="bold")
+    ax.text(0, -235, "but an own-only cell still carrying a committed SIBLING corridor stays blocked (fixed_exit_lanes)", ha="center", va="top", fontsize=8, color=INK)
+    ax.set_title("Cell blocking — own-hub exemption vs foreign walling", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim(-285, 285)
+    ax.set_ylim(-265, 230)
+    _save(fig, "cell_blocking")
+
+
+def fig_takeoff_fan() -> None:
+    """astar kernel: takeoff successors — climb straight up at the pad, then translate out to a lane × level."""
+    fig, ax = plt.subplots(figsize=(8.8, 5.4))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.add_patch(Circle((0, 0), 0.5, facecolor="#edf2f7", edgecolor=BLUE, lw=1.6, zorder=3))
+    ax.plot([0], [0], "o", color=INK, ms=6, zorder=4)
+    ax.annotate("↑ climb (z) at the pad", xy=(0, 0), xytext=(0.2, 0.5), fontsize=8, color=INK)
+    ax.text(0, -0.8, "pad / column", ha="center", va="top", fontsize=8.5, color=BLUE)
+    for a in range(0, 360, 60):
+        e = 2.6 * np.array([np.cos(np.deg2rad(a)), np.sin(np.deg2rad(a))])
+        ax.annotate("", xy=e, xytext=(0, 0), arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.6))
+        ax.plot([e[0]], [e[1]], "o", color=ORANGE, ms=4)
+    ax.text(0, 3.1, "then translate out to one of N exit lanes at cruise level", ha="center", fontsize=9, color=ORANGE)
+    ax.text(0, -3.0, "successor order: for lane × for level", ha="center", va="top", fontsize=8.5, color=INK)
+    ax.set_title("A* takeoff fan — climb at the pad, then lane × level successors", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim(-3.4, 3.4)
+    ax.set_ylim(-3.6, 3.6)
+    _save(fig, "takeoff_fan")
+
+
+def fig_batched_turns() -> None:
+    """shortcut batched_turns: seed one turn, then probe maximal straight runs on each side."""
+    fig, ax = plt.subplots(figsize=(9.6, 5.0))
+    ax.set_aspect("equal")
+    ax.axis("off")
+    pts = {"A": (0, 0), "B": (1.5, 0.12), "C": (3, 0.05), "D": (4.5, 0.12), "E": (6, 0),
+           "F": (6.9, 1.1), "G": (8, 2.2), "H": (9.4, 2.85), "I": (10.8, 3.4)}
+    xs = [p[0] for p in pts.values()]
+    ys = [p[1] for p in pts.values()]
+    ax.plot(xs, ys, color=GRID, lw=1.2, ls=":", marker="o", ms=4, zorder=1)
+    for k, (x, y) in pts.items():
+        ax.text(x, y + 0.2, k, fontsize=8, color=INK, ha="center")
+    ax.plot([pts["A"][0], pts["E"][0]], [pts["A"][1], pts["E"][1]], color=BLUE, lw=2.4, zorder=2)
+    ax.text(3, -0.55, "incoming run A…E", color=BLUE, fontsize=8.5, ha="center")
+    ax.plot([pts["G"][0], pts["I"][0]], [pts["G"][1], pts["I"][1]], color=ORANGE, lw=2.4, zorder=2)
+    ax.text(9.6, 3.0, "outgoing run G…I", color=ORANGE, fontsize=8.5, ha="left")
+    ax.annotate("", xy=pts["G"], xytext=pts["E"], arrowprops=dict(arrowstyle="->", color=RED, lw=1.8))
+    ax.text(6.5, 1.05, "seed turn E→G", color=RED, fontsize=8.5, ha="left")
+    ax.text(5.4, -1.3, "probe order: seed E→G, batch A→G, fallbacks D/C/B→G, then A→I with →H fallbacks", ha="center", va="top", fontsize=8, color=INK)
+    ax.set_title("Batched turns — one seed turn, then probe maximal straight runs on each side", fontsize=10.5, color=INK, pad=8)
+    ax.set_xlim(-1, 12.2)
+    ax.set_ylim(-1.9, 4.2)
+    _save(fig, "batched_turns")
+
+
+def fig_milp_obstacles() -> None:
+    """MILP: reachability-lens obstacle pruning (left) and per-segment half-space keep-out by convexity (right)."""
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(11.0, 4.9))
+    axl.set_aspect("equal")
+    axl.axis("off")
+    s, g = np.array([0.0, 0.0]), np.array([8.0, 0.0])
+    cap, k, n = 2.2, 2, 5
+    axl.add_patch(Circle(s, k * cap, facecolor=BLUE, alpha=0.10, edgecolor=BLUE, lw=1.2))
+    axl.add_patch(Circle(g, (n - 1 - k) * cap, facecolor=ORANGE, alpha=0.10, edgecolor=ORANGE, lw=1.2))
+    axl.plot([s[0]], [s[1]], "o", color=INK, ms=6)
+    axl.plot([g[0]], [g[1]], "o", color=INK, ms=6)
+    axl.text(s[0], s[1] - 0.6, "start", ha="center", va="top", fontsize=8.5, color=INK)
+    axl.text(g[0], g[1] - 0.6, "goal", ha="center", va="top", fontsize=8.5, color=INK)
+    axl.plot([2.0], [3.0], "s", color=GREEN, ms=9)
+    axl.text(2.0, 3.4, "in BOTH lenses → kept", ha="center", fontsize=7.5, color=GREEN)
+    axl.plot([6.8], [4.6], "x", color=RED, ms=11, mew=2)
+    axl.text(6.8, 5.0, "outside both → pruned", ha="center", fontsize=7.5, color=RED)
+    axl.text(4, -3.0, "segment k: disk k·cap at start, (N−1−k)·cap at goal", ha="center", fontsize=8.5, color=INK)
+    axl.set_title("Reachability-lens pruning", fontsize=10, color=INK)
+    axl.set_xlim(-6, 14)
+    axl.set_ylim(-3.8, 6)
+    axr.set_aspect("equal")
+    axr.axis("off")
+    axr.add_patch(Rectangle((3, -0.5), 3, 4, facecolor="#f0f0f0", edgecolor=GRID, lw=1.2))
+    axr.text(4.5, 1.5, "obstacle", ha="center", fontsize=8, color=GRID)
+    axr.plot([3, 3], [-2, 5], color=RED, lw=1.6, ls="--")
+    axr.text(3.15, 4.7, "face half-space", color=RED, fontsize=8)
+    axr.plot([0, 2], [0, 3], color=BLUE, lw=2.4, marker="o", ms=6)
+    axr.text(0.2, 1.4, "segment\n(both endpoints\nbeyond the face)", fontsize=7.5, color=BLUE)
+    axr.text(2.5, -3.0, "both endpoints on the outer side ⇒ by convexity the whole segment is outside", ha="center", fontsize=8, color=INK)
+    axr.set_title("Per-segment half-space keep-out", fontsize=10, color=INK)
+    axr.set_xlim(-2.5, 7)
+    axr.set_ylim(-3.8, 5.5)
+    fig.suptitle("MILP obstacle handling", fontsize=11.5, color=INK, y=1.0)
+    _save(fig, "milp_obstacles")
+
+
+def fig_hover_tail_steps() -> None:
+    """compiled_hex_occupancy.hover_tail_steps: why the landing-column tail is ``ceil(...) + 2``.
+
+    A committed landing column is marked by ``hexgrid._step_range`` as ``floor((t_end + dt +
+    time_buffer_s)/dt)``. Two discretisation effects push the number of tail steps ABOVE the naive
+    ``ceil((hover+climb+buffer)/dt)``: ``_step_range``'s own ``+dt`` widening, and the floor slip when
+    the arrival lands mid-step. The ``+2`` is integer headroom that dominates both, so ``MAXS`` (which
+    only sizes the box) is always a safe upper bound. Schematic, dt := one drawing cell."""
+    fig, ax = plt.subplots(figsize=(11.0, 4.4))
+    ax.axis("off")
+
+    s_a = 2                       # arrival step (integer boundary on the ruler)
+    f = 0.55                      # arrival lands MID-step (fraction past the boundary)
+    t_a = s_a + f
+    H = 3.2                       # hover + max climb, in dt units
+    b = 0.45                      # time_buffer_s, in dt units (the ASTM buffer — already counted)
+    widen = 1.0                   # _step_range's explicit + dt
+    t_end = t_a + H
+    top = t_end + b + widen       # the continuous value _step_range floors
+    s1 = int(np.floor(top))       # top blocked step
+    y, hbar = 1.0, 0.46
+
+    x0, x1 = 0, 9
+    for s in range(x0, x1 + 1):                       # step boundaries
+        ax.axvline(s, color=HEXGRID, lw=0.8, zorder=0)
+        ax.text(s, -0.16, str(s), ha="center", va="top", fontsize=7.5, color=GRID)
+    ax.plot([x0, x1], [0, 0], color=INK, lw=1.0, zorder=1)
+    ax.text((x0 + x1) / 2, -0.52, "time  →   (each cell = one dt)", ha="center", va="top",
+            fontsize=8.5, color=INK)
+
+    def seg(a, c, color, hatch):
+        ax.add_patch(Rectangle((a, y), c - a, hbar, facecolor=color, edgecolor=INK,
+                               lw=1.0, hatch=hatch, alpha=0.85, zorder=2))
+    seg(t_a, t_end, BLUE, None)
+    seg(t_end, t_end + b, GREEN, "///")
+    seg(t_end + b, top, ORANGE, "xxx")
+    ax.text((t_a + t_end) / 2, y + hbar / 2, "hover + climb", ha="center", va="center",
+            fontsize=8.5, color="white", weight="bold", zorder=3)
+
+    # legend for the two narrow tail segments (keeps the timeline uncluttered)
+    lx = 0.2
+    for color, hatch, txt in ((GREEN, "///", "+ time_buffer_s  (ASTM; already counted)"),
+                              (ORANGE, "xxx", "+ dt  (_step_range widening)")):
+        ax.add_patch(Rectangle((lx, 2.28), 0.30, 0.22, facecolor=color, edgecolor=INK,
+                               hatch=hatch, alpha=0.85))
+        ax.text(lx + 0.42, 2.39, txt, ha="left", va="center", fontsize=8, color=INK)
+        lx += 4.5
+
+    ax.plot([t_a], [y], "o", color=INK, ms=6, zorder=4)                  # arrival, mid-step
+    ax.plot([t_a, t_a], [0, y], ls="--", color=INK, lw=1.0, zorder=1)
+    ax.text(t_a, y + hbar + 0.16, "arrival  (mid-step ⇒ floor slip)", ha="center",
+            va="bottom", fontsize=8, color=INK)
+
+    ys = y + hbar + 0.18                                                  # floor-snap, above the bar
+    ax.plot([top], [ys], "o", color=ORANGE, ms=5, zorder=4)
+    ax.annotate("", xy=(s1, ys), xytext=(top, ys),
+                arrowprops=dict(arrowstyle="->", color=RED, lw=1.3))
+    ax.text(top + 0.08, ys, "⌊·/dt⌋", ha="left", va="center", fontsize=8, color=RED)
+    ax.plot([s1, s1], [0, y], ls=":", color=RED, lw=1.2, zorder=1)
+    ax.text(s1, 0.10, "s1", ha="center", va="bottom", fontsize=8.5, color=RED, weight="bold")
+
+    ceil_steps = int(np.ceil(H + b))     # ceil((hover+climb+buffer)/dt)  — the numerator
+    tail = s1 - s_a                      # steps actually marked past arrival
+    box = ceil_steps + 2                 # hover_tail_steps
+
+    def bracket(depth, end, color, label):
+        yb = -0.98 - depth * 0.60
+        ax.annotate("", xy=(end, yb), xytext=(s_a, yb),
+                    arrowprops=dict(arrowstyle="|-|", color=color, lw=1.4))
+        ax.text((s_a + end) / 2, yb - 0.10, label, ha="center", va="top", fontsize=8, color=color)
+    bracket(0, s_a + ceil_steps, GRID, f"ceil((hover+climb+buffer)/dt) = {ceil_steps}   ← undercounts")
+    bracket(1, s_a + tail, RED, f"marked tail = s1 − s_a = {tail}")
+    bracket(2, s_a + box, GREEN, f"hover_tail_steps = ceil + 2 = {box}   (box depth: always ≥ tail)")
+
+    ax.set_xlim(-0.4, 9.4)
+    ax.set_ylim(-3.1, 2.65)
+    _save(fig, "hover_tail_steps")
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,
     fig_hex_lattice_overhead, fig_read_envelope,
+    fig_search_window, fig_hex_layout, fig_rasterisation_coverage, fig_cell_blocking,
+    fig_takeoff_fan, fig_batched_turns, fig_milp_obstacles, fig_hover_tail_steps,
 )
 
 

@@ -90,6 +90,7 @@ def get_planner(name: str, params=None) -> Planner:
     ``return_to_origin`` request into one intent covering both legs and the pad between them. The
     wrapper forwards one-way requests untouched, so this is invisible to every flight that is not a
     round trip. Whole-schedule planners are NOT wrapped: they receive the schedule, not a request.
+    Reach an inner planner through :func:`iter_planner_chain`, never by assuming a wrapper depth.
 
     Parameters
     ------------

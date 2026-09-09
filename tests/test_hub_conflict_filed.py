@@ -34,12 +34,9 @@ from freespace_sim.uss import USS
 
 # Flights extracted from dallas_hub_2uss_large @ seed 0, pads_per_hub=4. Replaying just these in FCFS
 # order reproduces each denial exactly (the demand is deterministic for a fixed seed).
-#
-# RENUMBERED when a round trip became ONE itinerary rather than two filed flights: the demand used to
-# consume two ids per delivery (outbound 2k, return 2k+1) and now consumes one (k). Verified as a pure
-# renumbering, not a different demand — all 53 deliveries match old fid 2k on (t_request, origin, dest),
-# because this scenario sets no `departure_offset_s` and so the deleted return-lead draw consumed no
-# randomness. The originals were 46, 4, 58, 8 / 4, 8, 86 / 44, 92.
+# Ids are HALF their pre-itinerary values: the demand consumed two per delivery (outbound 2k, return
+# 2k+1) and now consumes one. Verified a pure renumbering — all 53 deliveries match old fid 2k on
+# (t_request, origin, dest), this scenario setting no `departure_offset_s` to perturb the RNG.
 LAZY_SKIP = (23, 2, 29, 4)    # walmart#4 deliveries + fid 29's hub-crossing corridor; pre-fix denied 2 & 4
 CRUISE_CLIP = (2, 4, 43)      # walmart#4 deliveries; fid 43's first cruise box clips fid 2/4 columns
 EXIT_COLLISION = (22, 46)     # stripmall#5 deliveries; their exit lanes collide inside the shared column

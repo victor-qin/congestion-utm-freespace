@@ -31,8 +31,7 @@ def _wall_led():
 
 
 def test_get_planner_registers_shortcut_variants():
-    # `.inner` unwraps the round-trip itinerary wrapper `get_planner` puts on every per-flight
-    # planner; what this test is about is the refiner underneath it.
+    # `.inner` unwraps the itinerary wrapper; the refiner underneath is what this test is about.
     legacy = get_planner("astar_shortcut").inner
     heading = get_planner("astar_heading_shortcut").inner
     batched = get_planner("astar_batched_shortcut").inner

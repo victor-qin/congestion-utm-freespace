@@ -168,16 +168,12 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
             "origin_terminal": _term_to_json(r.origin_terminal),
             "dest_terminal": _term_to_json(r.dest_terminal),
-            # Round trip as ONE itinerary: this flight is hub → customer → hub, holding the customer
-            # pad for `service_time_s` between the legs. Without these two a reloaded run is a
-            # ONE-WAY delivery whose return silently vanished — and `dest` is the customer, so the
-            # loss is invisible in the geometry.
+            # Without these a reloaded run is a ONE-WAY delivery whose return vanished — and `dest`
+            # is the customer either way, so the loss is invisible in the geometry.
             "return_to_origin": bool(r.return_to_origin),
             "service_time_s": float(r.service_time_s),
-            # LEGACY round-trip link (return leg → its outbound), for runs archived when a round trip
-            # was two separately filed flights. Nothing emits it now; kept so those runs still load
-            # and can still be told apart from one-way traffic. pandas has no nullable-int dtype by
-            # default, so an unlinked leg stores NaN and load_run reads it back as None.
+            # LEGACY link (return leg → its outbound). Nothing emits it now; kept so archived runs
+            # load. pandas has no nullable-int dtype, so an unlinked leg stores NaN → None on load.
             "paired_outbound_id": r.paired_outbound_id,
         })
     return pd.DataFrame(rows)
@@ -826,9 +822,8 @@ def load_run(folder: Path | str) -> LoadedRun:
                             t_departure=t_dep, uss_id=str(s.uss_id),
                             origin_terminal=_term_from_json(getattr(s, "origin_terminal", None)),
                             dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)),
-                            # getattr defaults: runs archived before a column existed have neither the
-                            # attribute nor a value. A pre-itinerary run reads back as one-way, which
-                            # is exactly what it was — its return was a separate flight of its own.
+                            # getattr defaults: a run archived before a column existed has neither
+                            # the attribute nor a value, and reads back as one-way — which it was.
                             return_to_origin=bool(getattr(s, "return_to_origin", False)),
                             service_time_s=float(getattr(s, "service_time_s", 0.0) or 0.0),
                             # An unlinked leg stores NaN either way.

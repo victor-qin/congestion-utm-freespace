@@ -176,23 +176,19 @@ def test_customer_within_per_uss_radius():
 
 
 def test_return_flights_makes_each_delivery_one_round_trip_itinerary():
-    """`return_flights` no longer adds a second request. Each delivery becomes ONE itinerary that
-    flies hub -> customer -> hub, so the request count is the delivery count, not twice it, and the
-    return leg is implied by `return_to_origin` rather than filed."""
+    """`return_flights` makes each delivery ONE itinerary rather than adding a second request."""
     cfg = _radius_cfg()
     one_way = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=False).generate(
         cfg, np.random.default_rng(0))
     rs = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=True, turnaround_s=90.0).generate(
         cfg, np.random.default_rng(0))
-    assert len(rs) == len(one_way)                                # SAME count: the return is a leg
+    assert len(rs) == len(one_way)                                # the return is a leg, not a flight
     assert all(r.return_to_origin for r in rs)
     assert all(r.service_time_s == 90.0 for r in rs)
     assert all(not r.return_to_origin for r in one_way)
 
-    # Every itinerary leaves from a hub column and delivers to a plain customer pad; the return leg
-    # is the reverse of the same two points, so no second request is needed to express it.
     assert all(r.origin_terminal is not None and r.dest_terminal is None for r in rs)
-    # ...and turning returns on changes nothing else about the demand: same flights, same timing.
+    # Turning returns on changes nothing else about the demand: same flights, same timing.
     assert [r.flight_id for r in rs] == [r.flight_id for r in one_way]
     assert all(np.allclose(a.origin, b.origin) and np.allclose(a.dest, b.dest)
                and a.t_request == b.t_request and a.t_departure == b.t_departure
@@ -533,15 +529,10 @@ def test_invalid_timing_mode_raises():
 def _as_legacy_pairs(reqs, cfg):
     """Re-file round-trip itineraries as the LEGACY two linked requests.
 
-    `HubRadiusDemand` emits one itinerary per delivery now, so nothing in production produces a
-    `paired_outbound_id` any more — but `sim.run(return_anchor=...)` still supports it, because
-    archived scenarios contain it and must keep loading. These tests exercise that path, so they
-    build its input directly instead of asking a demand model that no longer speaks it.
-
-    The return's departure is the estimate the old demand model used and the itinerary model deleted:
-    straight-line distance at nominal speed, two climbs, one pad dwell, plus the turnaround. Being a
-    *fixture* is the right place for it — it is a guess about a flight nobody has planned yet, which
-    is exactly why it was wrong in production.
+    No demand model emits `paired_outbound_id` any more, but `sim.run(return_anchor=...)` still
+    supports it for archived scenarios, so these tests build its input directly. The return's
+    departure is the straight-line, empty-sky estimate that path was built around — a fixture is the
+    right place for a guess about a flight nobody has planned yet.
     """
     from dataclasses import replace
     out, fid = [], 0
@@ -572,12 +563,11 @@ def _roundtrip_world(**kw):
 
 
 class _LegacyPairModel:
-    """A demand model that emits the LEGACY two linked requests per delivery.
+    """A demand model emitting the LEGACY two linked requests per delivery.
 
-    Wraps the real one and splits each itinerary via :func:`_as_legacy_pairs`. It keeps
-    ``turnaround_s`` visible because ``sim.run(return_anchor="realized")`` reads it off the demand
-    model (``sim.demand_turnaround_s``) to re-anchor with the same turnaround the requests were built
-    with — passing bare requests instead would silently assume 0."""
+    Keeps ``turnaround_s`` visible: ``sim.run(return_anchor="realized")`` reads it off the demand
+    model, and passing bare requests instead would silently assume 0.
+    """
 
     def __init__(self, inner):
         self.inner = inner

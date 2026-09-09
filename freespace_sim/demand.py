@@ -347,16 +347,14 @@ class HubRadiusDemand:
     - radius service areas (``radius_m``, ``float`` or per-USS ``dict``): a customer is drawn
       uniformly in the disk of that radius about a hub. Overlapping disks create crossing traffic
       and bound flight length directly.
-    - **return flights** (``return_flights``): each delivery is a round-trip ITINERARY — hub →
-      customer → the same hub — filed as ONE ``FlightRequest`` (``return_to_origin``) and flown by one
-      aircraft. ``ItineraryPlanner`` reads the return leg's departure off the outbound leg it actually
-      planned, so a return cannot precede its own arrival. Both landings consume a pad, counted
-      against the hub's N, and the aircraft holds the customer pad for ``turnaround_s`` in between.
+    - **return flights** (``return_flights``): each delivery is a round-trip itinerary — hub →
+      customer → the same hub — filed as ONE ``FlightRequest`` (``return_to_origin``). Both landings
+      consume a pad, counted against the hub's N, and the aircraft holds the customer pad for
+      ``turnaround_s`` in between.
 
-    ``lam_per_hour`` counts *deliveries*, and with returns on each delivery is ONE flight that flies
-    two legs — so the realised flight count equals the delivery count (it was ~2× when the return was
-    filed separately, and archived runs from that era are not leg-comparable). Hubs are placed once
-    under ``hub_seed`` (stable infrastructure); only demand varies with ``cfg.seed``.
+    ``lam_per_hour`` counts *deliveries*, and each is one flight whether or not it returns, so the
+    realised flight count equals the delivery count. Hubs are placed once under ``hub_seed`` (stable
+    infrastructure); only demand varies with ``cfg.seed``.
     """
 
     n_hubs_per_uss: dict[str, int] = field(
@@ -366,12 +364,10 @@ class HubRadiusDemand:
     pads_per_hub: "int | dict[str, int]" = 1         # terminal capacity N per hub (scalar, or per-USS)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
-    # Each delivery is a round-trip ITINERARY (hub → customer → hub) flown as ONE flight, not a
-    # delivery plus a separately filed return. False ⇒ one-way deliveries only.
+    # Each delivery is a round-trip itinerary (hub → customer → hub) flown as ONE flight.
     return_flights: bool = True
-    # Ground time the aircraft spends at the customer pad between the legs — the delivery itself.
-    # The descent and climb that bracket it are NOT included: those come from the column geometry,
-    # so a scenario cannot budget a turnaround that physics contradicts.
+    # Ground time at the customer pad between the legs. Excludes the descent and climb that bracket
+    # it: those come from the column geometry, so this cannot budget a turnaround physics contradicts.
     turnaround_s: float = 0.0
     uss_share: dict[str, float] | None = None
     # Per-USS delivery Poisson rate (/hr). When set it REPLACES the global cfg.lam_per_hour × uss_share
@@ -595,14 +591,9 @@ class HubRadiusDemand:
                 # own column is transparent — drop (both legs) only if a FOREIGN terminal walls the hex
                 drop = walls is not None and any(tid != terminal.id for tid in walls)
             if not drop:
-                # ONE request per delivery. With `return_flights` it is a round-trip ITINERARY —
-                # hub -> customer -> hub, flown by one aircraft — not two separately filed legs.
-                # The return's departure is therefore never estimated here: `ItineraryPlanner` reads
-                # it off the outbound leg it actually planned. The estimate this replaces
-                # (`_est_trip_s`: straight line / nominal speed, plus climbs and one dwell) knew
-                # nothing about ground hold, lattice overhead or detour, so it ran short on every
-                # round trip of density_faa — 85 of 2,318 were filed to depart before their aircraft
-                # could land, and the median survivor had 9.3 s of slack.
+                # ONE request per delivery: with `return_flights` it is a round-trip itinerary, so
+                # the return's departure is never estimated here — `ItineraryPlanner` reads it off
+                # the outbound leg it actually planned.
                 requests.append(FlightRequest(
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
                     t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal,

@@ -35,8 +35,7 @@ def test_colgen_test_registered_with_density_miniature_parameters():
     assert demand.terminal_radius_m == {COLGEN_USS: 180.0}
     assert demand.lam_per_uss == {COLGEN_USS: 600.0}
     assert demand.departure_offset_s == {COLGEN_USS: (120.0, 30.0)}
-    # ONE-WAY: colgen prices one path per flight and `run_batch` refuses a round-trip itinerary
-    # rather than dropping its return leg silently, so this scenario cannot use `return_flights`.
+    # ONE-WAY: `run_batch` refuses a round-trip itinerary, so this scenario cannot use it.
     assert demand.return_flights is False
     assert demand.turnaround_s == 0.0
     assert demand.timing_mode == "departure"
@@ -48,9 +47,8 @@ def test_colgen_test_seed_zero_generates_calibrated_one_way_load():
     demand = spec.demand_model()
     requests = demand.generate(cfg, np.random.default_rng(cfg.seed))
 
-    # 600 deliveries/hour over five minutes has expectation 50; the pinned seed realizes 49. One-way
-    # (see above), and one request per delivery either way now — the load is HALF what it was when a
-    # round trip was two filed flights, so pre-itinerary colgen numbers are not comparable.
+    # 600 deliveries/hour over five minutes has expectation 50; the pinned seed realizes 49. One-way,
+    # so the load is HALF the pre-itinerary scenario's and its numbers are not comparable.
     assert len(requests) == 49
     assert not any(r.return_to_origin for r in requests)
     assert all(r.origin_terminal is not None and r.dest_terminal is None for r in requests)

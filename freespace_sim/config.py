@@ -55,11 +55,10 @@ class SimConfig:
     # --- hover cylinder (own radius knob; defaults to corridor width) ---
     hover_radius_m: float | None = None   # None ⇒ effective_hover_radius_m = corridor_width_m
     hover_time_s: float = 30.0         # dwell at takeoff/landing (climb time added on top)
-    # Height of the box an aircraft holds while SITTING on a pad between the legs of a round-trip
-    # itinerary. Deliberately NOT the full column: the aircraft is on the ground, so claiming
-    # [ground, airspace_ceiling_m] for the whole delivery would spend airspace nothing occupies and
-    # consume TerminalCapacity that already binds at density. The full column is still held for the
-    # descent and the climb that bracket the dwell — those DO sweep the column.
+    # Height of the box held while an aircraft SITS on a pad between the legs of a round trip; the
+    # full column is still held for the descent and climb that bracket it. Not the full column
+    # throughout, because that would reserve airspace nothing occupies and consume TerminalCapacity.
+    # See context/figures/itinerary_reservation.png.
     ground_box_height_m: float = 5.0
     # default shared-terminal COLUMN radius when a Terminal doesn't set its own (per-hub Terminal.radius
     # overrides). 90 m (> corridor_width) gives divergent same-hub exit lanes enough angular spread to

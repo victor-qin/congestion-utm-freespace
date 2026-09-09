@@ -271,9 +271,9 @@ def test_a_per_flight_run_writes_no_planner_stats(tmp_path):
     assert index["planner_termination"].isna().all()
 
 def test_scenario_parquet_round_trips_the_itinerary(tmp_path):
-    """A round trip is a PROPERTY of one request now, not a link between two rows. Without it
-    persisted, a reloaded run is a one-way delivery whose return silently vanished — and since `dest`
-    is the customer either way, the loss is invisible in the geometry."""
+    """A round trip is a property of one request, not a link between two rows. Unpersisted, a
+    reloaded run is a one-way delivery whose return vanished — invisibly, since `dest` is the
+    customer either way."""
     from freespace_sim.demand import HubRadiusDemand
     from freespace_sim.sim import run as sim_run
 

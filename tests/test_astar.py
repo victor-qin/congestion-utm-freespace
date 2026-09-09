@@ -38,8 +38,7 @@ def _wall():
 
 
 def test_get_planner_astar():
-    # `get_planner` wraps every per-flight planner so it can fly round-trip itineraries; the
-    # requested planner is the one inside, reachable by the documented `inner` chain.
+    # `get_planner` wraps every per-flight planner for round trips; the requested one is inside.
     p = get_planner("astar")
     assert isinstance(p, ItineraryPlanner) and isinstance(p.inner, AStarPlanner)
 

@@ -58,59 +58,67 @@ from ..astar.planner import _BBOX_HUGE, _BindBatch, _absorb, _committed_arrival
 _EPS = 1e-6
 
 # ---- per-plan interval window (`sipp.window`) ----
-# The same 24 hexes A* calibrated its dense window on. That number sizes for plan-level COVERAGE —
-# the share of plans with ZERO misses, 100.0% there — not for the typical box, because one miss
-# forces a widen-and-rerun. SIPP's measured read set is TIGHTER than A*'s (dirty rate 61.5% against
-# 78.7% at 4 DROP workers; the interval collapse probes fewer cells), so this errs wide.
+# 24 hexes = A*'s dense-window calibration. Sizes for plan-level COVERAGE (the share of plans with
+# ZERO misses), not the typical box, because one miss forces a widen-and-rerun. SIPP's read set is
+# TIGHTER than A*'s (the interval collapse probes fewer cells), so this errs wide.
 _SWINDOW_MARGIN_HEX = 24
 _SWINDOW_WIDEN_MAX = 3      # each level doubles the lateral margin; past this, the reference
 _SWINDOW_GROW_MAX = 4       # buffer regrowths per plan before giving up on the window
 
 
 def _deny(req, reason):
+    """A REJECTED :class:`OperationalIntent` for ``req`` carrying ``reason``, attributed to sipp."""
     return OperationalIntent(
         request=req, status=IntentStatus.REJECTED, denial_reason=reason, planner="sipp"
     )
 
 
 class SafeIntervalIndex:
-    """Cell-keyed inverse of the committed occupancy — the v2 engine behind SIPP's speedup.
+    """Cell-keyed inverse of the committed occupancy — the structure behind SIPP's speedup
+    (see context/figures/sipp_safe_intervals.png).
 
     ``HexOccupancyService`` maps ``step -> {cells}``; to build a cell's safe intervals SIPP needs the
-    OPPOSITE (``cell -> occupied steps``). v1 recovered it by scanning ``is_blocked`` over the full
-    ``[base, max_step]`` horizon PER CELL (dominated by the empty ground-delay tail) — which made SIPP
-    slower than A*. This index instead records, per hex cell, the corridor-blocked steps and the
+    OPPOSITE (``cell -> occupied steps``). Recovering that by scanning ``is_blocked`` over the full
+    ``[base, max_step]`` horizon PER CELL is dominated by the empty ground-delay tail and makes SIPP
+    slower than A*, so instead this index records, per hex cell, the corridor-blocked steps and the
     per-step column hub-coverage, fed incrementally by the ledger commit hook (the same dual-sweep
     rasterization ``HexOccupancyService`` uses). A cell's safe intervals are then built in
     O(#occupied steps of that cell) — O(1) for the common never-touched cell — and :meth:`cell_blocked`
-    exactly replicates ``HexOccupancyService.is_blocked`` (pinned by a test).
+    exactly replicates ``HexOccupancyService.is_blocked`` (a parity contract pinned by a test).
 
-    NOTE: storage is not reclaimed on eviction yet — the search only ever reads steps >= the request
-    clock (so this is correct), but memory reclaim for very long runs is a follow-up."""
+    Storage is not reclaimed on eviction: the search only ever reads steps >= the request clock, so
+    this is correct, but memory reclaim for very long runs is a follow-up.
+    """
 
     def __init__(self, cfg, track_removal: bool = False):
+        """Build an empty inverse index; the ledger commit hook fills it incrementally.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): lattice and inflation geometry used to size the index.
+        - track_removal (bool): LNS destroy mode. Store per-step REFCOUNTS and journal each flight's
+          applied rows so :meth:`on_release` can reverse a commit exactly, keeping ``n_added`` in
+          lockstep with the ledger. Off ⇒ the set-based structures, byte-for-byte.
+
+        Return
+        --------
+        - output (None): initialises the corridor/column stores, interning pools, and journal.
+        """
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
         self.infl_pad = cfg.effective_hover_radius_m + self.R
-        # Removal mode (LNS destroy): `corr`/`cols` hold per-step REFCOUNTS instead of sets — two
-        # flights' inflated rasters can legitimately cover the same (cell, step), so removing one must
-        # not free it — and each committed flight's applied rows are journaled so `on_release` can
-        # reverse them exactly, keeping `n_added` in lockstep with the ledger (the shrink tripwire in
-        # `_sipp_index` stays silent). The A* structural twin `HexOccupancyService` made the identical
-        # choice for the identical reason; this is a port of it, not a parallel invention.
-        #
-        # Reader-transparent by construction: every consumer of `corr`/`cols` uses `in`, iteration or
-        # truthiness (`cell_blocked`, `free_intervals`), all of which behave identically on a `set` and
-        # on a `dict`. Flag off => the original set-based structures, byte-for-byte.
+        # Refcounts (not sets) because two flights' inflated rasters can legitimately cover the same
+        # (cell, step): removing one must not free it. Reader-transparent — every consumer uses
+        # `in`, iteration or truthiness (`cell_blocked`, `free_intervals`), identical on a `set` and
+        # a `dict`, so the flag-off path stays byte-for-byte the set-based structures. Ported from
+        # the A* twin `HexOccupancyService`, the same choice for the same reason.
         #
         # Journal layout (mode on): `_rows[fid]` is a FLAT int64 array of 4-slot rows
-        # `(cell_id, s_lo, s_hi, code)`, not a list of tuples — the tuple form was measured at ~185 B
-        # a row against 32 B here, and this structure is per-(cell, span) so it is linear in schedule
-        # size. `cell_id` indexes `_cells`, which interns each `(q, r, L)` ONCE and hands the SAME
-        # tuple object back to be used as the `corr`/`cols` key: that sharing is what keeps the cost
-        # 80 bytes per distinct cell rather than per row. `code`: -1 = corridor, >= 0 = terminal
-        # column whose hub id is `_tids[code]`.
+        # `(cell_id, s_lo, s_hi, code)`, not tuples (~32 B/row vs ~185 B, and this is linear in
+        # schedule size). `cell_id` indexes `_cells`, which interns each `(q, r, L)` ONCE and hands
+        # the SAME tuple back as the `corr`/`cols` key, so the cost is ~80 B per distinct cell, not
+        # per row. `code`: -1 = corridor, >= 0 = terminal column whose hub id is `_tids[code]`.
         self.track_removal = track_removal
         self._rows: dict[int, array] = {}                          # fid -> flat 4-slot rows
         self._cells: list[tuple[int, int, int]] = []               # cell_id -> (q, r, L)
@@ -144,6 +152,17 @@ class SafeIntervalIndex:
         return code
 
     def on_commit(self, flight_id, volumes) -> None:
+        """Ledger commit subscriber: rasterize a flight's volumes into the inverse index.
+
+        Parameters
+        ------------
+        - flight_id (int): the committing flight; keys its journal rows in removal mode.
+        - volumes (Sequence): the flight's committed volumes (corridor + terminal columns).
+
+        Return
+        --------
+        - output (None): updates ``corr``/``cols``; in removal mode, appends the flight's journal.
+        """
         hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
@@ -162,17 +181,19 @@ class SafeIntervalIndex:
                 entry.extend(rows)
 
     def _inside_a_column(self, q, r, cols) -> bool:
+        """True if hex ``(q, r)``'s center lies inside any ``(cx, cy, radius)`` column disc."""
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
     def _add(self, vol, own_cols, _rows=None) -> None:
+        """Rasterize one volume into ``corr``/``cols`` (and the journal in removal mode)."""
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         track = self.track_removal
-        # Same shared range producer as `CompiledHexOccupancy._add` and `HexOccupancyService._add`
-        # (issue #114) — identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per
-        # commit instead of three. This index is step-keyed, so like the hex service it expands the
-        # span back out; the saving here is the sweep and the per-row dispatch, not the storage shape.
+        # Same shared range producer as `CompiledHexOccupancy._add` and `HexOccupancyService._add`:
+        # identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per commit, not 3.
+        # This index is step-keyed, so like the hex service it expands the span back out; the saving
+        # here is the sweep and the per-row dispatch, not the storage shape.
         for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -202,17 +223,29 @@ class SafeIntervalIndex:
                     self.corr.setdefault(cell, set()).update(range(s_lo, s_hi + 1))
 
     def on_release(self, flight_id, volumes) -> None:
-        """Ledger release subscriber (removal mode): reverse the flight's journaled rows so `corr`/`cols`
-        stay exact without a rebuild, and keep ``n_added`` in lockstep with the ledger so the shrink
-        tripwire stays silent.
+        """Reverse a flight's journaled rows so ``corr``/``cols`` stay exact without a rebuild.
 
-        DELIBERATELY NO ``evicted_before`` CLAMP, unlike ``HexOccupancyService.on_release``. That clamp
-        is sound there only because its ``evict_before`` physically DELETES the sub-floor buckets and
-        ``add_volume`` applies the identical clamp on insert — a matched pair. This structure's
-        ``evict_before`` deletes nothing (see its comment), so `_add` recorded the full span and a
-        clamped release would leave every step in ``[s_lo, evicted_before)`` permanently
-        un-decremented: phantom blocked steps outliving the flight. Record the full span, reverse the
-        full span. If reclaim ever lands here, clamp BOTH sides together or neither."""
+        Removal mode only. Keeps ``n_added`` in lockstep with the ledger so the shrink tripwire
+        stays silent. DELIBERATELY NO ``evicted_before`` CLAMP, unlike
+        ``HexOccupancyService.on_release``: that clamp is sound there only because its
+        ``evict_before`` physically DELETES the sub-floor buckets and ``add_volume`` applies the
+        identical clamp on insert — a matched pair. This structure's ``evict_before`` deletes
+        nothing, so ``_add`` recorded the full span, and a clamped release would leave every step
+        in ``[s_lo, evicted_before)`` permanently un-decremented: phantom blocked steps outliving
+        the flight. Record the full span, reverse the full span; if reclaim ever lands here, clamp
+        BOTH sides together or neither.
+
+        Parameters
+        ------------
+        - flight_id (int): flight whose journal rows are popped and reversed.
+        - volumes (Sequence): the released volumes; only ``len(volumes)`` is used, to decrement
+          ``n_added``.
+
+        Return
+        --------
+        - output (None): mutates ``corr``/``cols``/``_rows`` in place. A ``KeyError`` mid-loop is
+          the drift signal that the journal and the stores disagree.
+        """
         rows = self._rows.pop(flight_id)
         corr, cols, cells, tids = self.corr, self.cols, self._cells, self._tids
         for i in range(0, len(rows), 4):                       # flat 4-slot rows; see `__init__`
@@ -245,10 +278,23 @@ class SafeIntervalIndex:
         self.n_added -= len(volumes)
 
     def evict_before(self, step) -> None:
+        """Advance the eviction watermark monotonically; the search never reads below it.
+
+        Parameters
+        ------------
+        - step (int): request-clock step below which stored intervals are no longer queried.
+
+        Return
+        --------
+        - output (None): raises ``evicted_before``. Storage is NOT reclaimed — queries only ever
+          read steps >= the request clock, so the sub-floor rows are inert.
+        """
         if self.evicted_before is None or step > self.evicted_before:
-            self.evicted_before = step   # queries read steps >= request clock; storage reclaim is TODO
+            self.evicted_before = step
 
     def reset(self) -> None:
+        """Clear the commit-derived stores for a full re-absorb, preserving the interning pools and
+        the always-active walls."""
         self.corr.clear(); self.cols.clear(); self.n_added = 0; self.evicted_before = None
         # The journal describes the structures just cleared, so it MUST go with them: a surviving row
         # would decrement a count the fresh `_absorb` is about to rebuild. `_cells`/`_tids` stay —
@@ -258,9 +304,20 @@ class SafeIntervalIndex:
         # static_cols intentionally preserved: always-active walls are infrastructure, not commit-derived
 
     def register_static_terminal(self, center, term) -> None:
-        """Permanently wall a hub's terminal airspace (column + exit lanes) off from FOREIGN traffic
-        (``cfg.terminal_airspace_always_active``) — the SafeIntervalIndex twin of
-        ``HexOccupancyService.register_static_terminal``. Step-independent; idempotent per hub."""
+        """Permanently wall a hub's terminal airspace (column + lanes) off from FOREIGN traffic.
+
+        The SafeIntervalIndex twin of ``HexOccupancyService.register_static_terminal``
+        (``cfg.terminal_airspace_always_active``); step-independent and idempotent per hub.
+
+        Parameters
+        ------------
+        - center (np.ndarray): hub ENU center, used to enumerate the hub's terminal cells.
+        - term (Terminal): the hub whose airspace is walled; its id marks the cells.
+
+        Return
+        --------
+        - output (None): adds the hub id to ``static_cols`` for every terminal cell of the hub.
+        """
         tid = as_terminal(term).id
         for cell in hg.terminal_cells(center, term, self.cfg):
             self.static_cols.setdefault(cell, set()).add(tid)
@@ -268,10 +325,25 @@ class SafeIntervalIndex:
     _on_static = register_static_terminal   # ledger.subscribe_static hook name (main's A* contract)
 
     def cell_blocked(self, q, r, L, s, own, fixed_lanes) -> bool:
-        """Exact replica of ``HexOccupancyService.is_blocked(q, r, L, s, own)`` — per-level ``cols``/``corr``
-        plus the always-active ``static_cols`` walls, which are level-INDEPENDENT (a foreign hub column
-        walls (q, r) at every flight level). Foreign in EITHER the per-step column OR the static set ⇒
-        blocked."""
+        """Is hex ``(q, r)`` at level ``L`` an obstacle at step ``s``? Exact replica of
+        ``HexOccupancyService.is_blocked`` (a parity contract; see
+        context/figures/cell_blocking.png).
+
+        Foreign in EITHER the per-step column OR the always-active ``static_cols`` set ⇒ blocked;
+        the static walls are level-INDEPENDENT (foreign column walls ``(q, r)`` at all levels).
+
+        Parameters
+        ------------
+        - q (int), r (int), L (int): axial cell and flight level.
+        - s (int): step to test.
+        - own (Collection): terminal ids this flight owns (its own column is passable).
+        - fixed_lanes (bool): whether an own-only column cell that also carries a sibling corridor
+          counts as blocked.
+
+        Return
+        --------
+        - output (bool): True if the cell is an obstacle for this flight at that step and level.
+        """
         cc = self.cols.get((q, r, L))
         hubs = cc.get(s) if cc else None
         stat = self.static_cols.get((q, r)) if self.static_cols else None   # level-independent
@@ -283,8 +355,24 @@ class SafeIntervalIndex:
         return s in self.corr.get((q, r, L), ())
 
     def free_intervals(self, q, r, L, own, base, max_step, fixed_lanes):
-        """Maximal free ``[lo,hi]`` step-runs in ``[base,max_step]`` for cell ``(q, r, L)`` — complement of
-        its blocked steps. O(#occupied steps of the cell); O(1) for a never-occupied cell (the common case)."""
+        """Maximal free ``[lo, hi]`` step-runs in ``[base, max_step]`` for cell ``(q, r, L)`` — the
+        complement of its blocked steps, and the safe intervals SIPP searches over.
+
+        O(#occupied steps of the cell); O(1) for a never-occupied cell (the common case).
+
+        Parameters
+        ------------
+        - q (int), r (int), L (int): axial cell and flight level.
+        - own (Collection): terminal ids this flight owns.
+        - base (int): first step of the search domain.
+        - max_step (int): last step of the search domain.
+        - fixed_lanes (bool): passed through to :meth:`cell_blocked`.
+
+        Return
+        --------
+        - output (list[tuple[int, int]]): free ``(lo, hi)`` intervals, ascending. ``[]`` when the
+          cell is a foreign always-active wall at every step.
+        """
         stat = self.static_cols.get((q, r)) if self.static_cols else None
         if stat is not None and any(t not in own for t in stat):
             return []                            # always-active FOREIGN wall ⇒ blocked at EVERY step/level
@@ -321,6 +409,7 @@ class _SafeIntervals:
         self._cache: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
 
     def intervals(self, q, r, L):
+        """Free intervals of cell ``(q, r, L)`` for this flight, memoised for the plan."""
         iv = self._cache.get((q, r, L))
         if iv is None:
             iv = self.sidx.free_intervals(q, r, L, self.own, self.base, self.max_step, self.fixed_lanes)
@@ -328,6 +417,7 @@ class _SafeIntervals:
         return iv
 
     def index_of(self, q, r, L, step):
+        """Index of ``step``'s free interval in cell ``(q, r, L)``, or ``-1`` if blocked."""
         for i, (lo, hi) in enumerate(self.intervals(q, r, L)):
             if lo <= step <= hi:
                 return i
@@ -366,48 +456,59 @@ class SIPPPlanner(AStarPlanner):
 
     @property
     def needs_blocked_map(self) -> bool:
-        """Keyed on ``sipp_compiled``, NOT on the inherited ``compiled``.
+        """Whether the reference blocked-map must be maintained; keyed on ``sipp_compiled``, NOT the
+        inherited ``compiled``.
 
-        SIPP does call ``HexOccupancyService.is_blocked`` — but only from ``_succ``, the pure-Python
-        REFERENCE successor generator, never from ``_splan_compiled``, whose kernel answers the
-        obstacle test out of the interval pool. So on the compiled path the map is written on every
-        commit and read never: measured **1.807 ms/flight** at density_faa scale (5.562 against
-        3.755), at a fallback rate of zero. ``_splan_reference`` arms it with ``enable_blocked``
-        instead — A*'s existing lazy, sticky re-arm.
+        SIPP calls ``HexOccupancyService.is_blocked`` only from ``_succ``, the pure-Python REFERENCE
+        successor generator, never from ``_splan_compiled`` (whose kernel answers the obstacle test
+        out of the interval pool). So on the compiled path the map is written on every commit and
+        read never — pure cost. ``_splan_reference`` arms it with ``enable_blocked`` instead (A*'s
+        lazy, sticky re-arm).
 
         A property rather than a class attribute because ``AStarPlanner._occupancy`` derives
-        ``maintain_blocked`` from ``self.compiled``, which is **A*'s fallback-kernel flag**; SIPP
-        dispatches on ``self.sipp_compiled``, and ``_swarm_jit``'s failure handler clears only the
-        latter. A plain ``False`` would therefore make a JIT-degraded SIPP — every plan on the
-        reference — turn the map off AND pay an O(schedule) ``enable_blocked`` replay on its first
-        plan, then maintain it anyway: strictly more work than before this was touched, for no
-        saving. Reading ``sipp_compiled`` gives the map back to exactly the planner that needs it.
+        ``maintain_blocked`` from ``self.compiled`` — A*'s fallback-kernel flag — while SIPP
+        dispatches on ``self.sipp_compiled`` and ``_swarm_jit``'s failure handler clears only the
+        latter. A plain ``False`` would make a JIT-degraded SIPP (every plan on the reference) turn
+        the map off AND pay an O(schedule) ``enable_blocked`` replay on its first plan, then
+        maintain it anyway — strictly more work for no saving. Reading ``sipp_compiled`` gives the
+        map back to exactly the planner that needs it.
         """
         return not self.sipp_compiled
 
     def __init__(self, max_expansions: int = 1 << 21, compiled: bool = True,
                  kernel_log2_min: int | None = None, incremental_release: bool = False,
                  **astar_kw):
-        # Default budget is aligned with the compiled kernel's label cap (``_k_max = 1<<21``): the
-        # pure-Python reference is the kernel's correctness ORACLE, so it must be able to reach at least
-        # as far — a long multi-altitude flight can need ~700k expansions (3× the 2D count), which the old
-        # 600k default truncated while the kernel (bigger cap) found the identical optimum. Only affects
-        # ``_plan_reference`` / the A* ``_fallback``; the compiled path caps on ``_k_max`` directly.
-        # A* owns ``self.compiled`` for the kernel used by our safety fallback. SIPP's kernel needs an
-        # independent flag: an A* warm-up failure must remain recorded so ``_fallback`` dispatches to
-        # A*'s reference path rather than calling a missing ``self._kernel``.
-        # `kernel_log2_min` and `incremental_release` are A*'s, and BOTH matter to SIPP: a parallel
-        # LNS worker passes the first (dropping it would silently run the A* fallback at the wrong
-        # array floor), and the second release-hooks the two structures SIPP inherits — `_svc` and
-        # `_tcap`, via `_occupancy`, which SIPP calls on its own hot path. SIPP's OWN two structures
-        # read `self.incremental_release` in `_sipp_index`/`_scompiled_occ` below.
-        # `**astar_kw` forwards A*-owned knobs SIPP does not interpret itself — today `window_bytes`
-        # (#124's dense-window budget), which the A* fallback inside SIPP still honours.
+        """Construct the planner and JIT-warm the SIPP kernel (unless numba is absent).
+
+        Parameters
+        ------------
+        - max_expansions (int): reference / A*-fallback search budget. Aligned with the compiled
+          kernel's label cap (``_k_max = 1<<21``) because the pure-Python reference is the kernel's
+          correctness ORACLE and must reach at least as far — a long multi-altitude flight can need
+          ~700k expansions (3x the 2D count). Only affects ``_splan_reference`` / the A*
+          ``_fallback``; the compiled path caps on ``_k_max`` directly.
+        - compiled (bool): use the numba SIPP kernel. Recorded in ``sipp_compiled``, kept
+          INDEPENDENT of A*'s ``self.compiled`` because an A* warm-up failure must stay recorded so
+          ``_fallback`` dispatches to A*'s reference path rather than a missing ``self._kernel``;
+          cleared to pure-Python SIPP if the kernel import or warm-up fails.
+        - kernel_log2_min (int | None): A*'s array-floor knob, forwarded so a parallel LNS
+          worker's A* fallback runs at the right floor (dropping it would silently mis-size it).
+        - incremental_release (bool): enable removal/journaling. Release-hooks both A*'s inherited
+          ``_svc``/``_tcap`` (via ``_occupancy``) and SIPP's own structures (read in
+          ``_sipp_index``).
+        - astar_kw: A*-owned knobs SIPP does not interpret itself (e.g. ``window_bytes``, the
+          dense-window budget), still honoured by the A* fallback inside SIPP.
+
+        Return
+        --------
+        - output (None): initialises the inverse index, kernel work-array handles, and
+          fallback/diagnostic counters.
+        """
         super().__init__(max_expansions, compiled=compiled, kernel_log2_min=kernel_log2_min,
                          incremental_release=incremental_release, **astar_kw)
         self._sidx: SafeIntervalIndex | None = None    # cell-keyed inverse index (per ledger)
         self._sidx_ledger = None
-        self._sidx_epoch = 0                           # ledger.epoch at bind (detach tripwire, #109)
+        self._sidx_epoch = 0                           # ledger.epoch at bind (detach tripwire)
         # --- compiled (numba) air-cruise kernel; falls back to the pure-Python reference ---
         self.sipp_compiled = compiled
         self._skernel = None
@@ -429,7 +530,7 @@ class SIPPPlanner(AStarPlanner):
         self._sfb = 0                                   # kernel→A* fallbacks (diagnostics/tests)
         self._sfb_cap = 0                               # of which: label/heap overflow (hard/infeasible flight)
         self._sfb_oob = 0                               # of which: window miss at the widen ceiling
-        self._sfb_overlap = 0                           # of which: own-foreign column (issue #3)
+        self._sfb_overlap = 0                           # of which: own-foreign column
         self._sfb_hash = 0                              # of which: (cell, step) best-g table saturated
         self._n_expansions = 0                         # kernel expansions on the last compiled plan
         self._air = []                                  # last successful compiled path (diagnostics/tests)
@@ -456,10 +557,8 @@ class SIPPPlanner(AStarPlanner):
             cap, nlev, qspan, rspan = 9, 1, 3, 3
             maxs, ncap = 5, 64
             # int32 deliberately: `_skernel_state` allocates the production window pool as int32,
-            # and
-            # dtype is part of a numba specialization, so warming int64 here would compile a
-            # signature
-            # no real plan calls.
+            # and dtype is part of a numba specialization, so warming int64 here would compile a
+            # signature no real plan calls.
             iv_lo = np.zeros(cap, np.int32)
             iv_hi = np.full(cap, maxs, np.int32)
             iv_nxt = np.full(cap, -1, np.int32)
@@ -487,11 +586,10 @@ class SIPPPlanner(AStarPlanner):
                 np.zeros(8, np.int64),
             )
             # `build_window_intervals` is decorated separately from `_search` and owns its own numba
-            # cache, so it needs its own warm call under this same guard — measured ~0.92 s cold and
-            # ~132 ms even off a warm on-disk cache, against ~5 us hot. Without it every spawned DROP
-            # worker pays that on its FIRST repair, all at once, which is precisely the compile
-            # stampede this method exists to prevent. Mirrors `AStarPlanner._warm_jit`'s
-            # `build_window_claims` call.
+            # cache, so it needs its own warm call under this same guard: it is expensive even off a
+            # warm on-disk cache (~0.9 s cold, ~130 ms cached), so without it every spawned DROP
+            # worker pays it on its FIRST repair at once — the compile stampede it prevents.
+            # Mirrors `AStarPlanner._warm_jit`'s `build_window_claims` call.
             warm_wbox = SW.empty_wbox()
             warm_wbox[SW.W_Q1] = warm_wbox[SW.W_R1] = 0
             warm_wbox[SW.W_S1] = maxs
@@ -507,9 +605,8 @@ class SIPPPlanner(AStarPlanner):
         except TypeError:
             # Arity/dtype drift between this call and `_search`'s signature is a BUG, not a
             # numba-availability problem. Swallowing it into `sipp_compiled = False` would route
-            # every
-            # plan to the pure-Python reference: the run stays exact, passes every parity gate, and
-            # merely reports a massive slowdown — the least detectable failure this file can have.
+            # every plan to the pure-Python reference: the run stays exact, passes every gate,
+            # and merely reports a massive slowdown — the least detectable failure it can have.
             raise
         except Exception as e:                            # compile failure → degrade to pure Python
             import warnings as _w
@@ -550,9 +647,24 @@ class SIPPPlanner(AStarPlanner):
         return sidx
 
     def plan(self, req, ledger, cfg):
-        """Dispatch to the compiled safe-interval kernel, with the pure-Python reference as the fallback
-        when numba is absent, legacy terminal folding is requested, a flight strays out of the kernel
-        box, or a capacity valve trips."""
+        """Plan one flight: dispatch to the compiled safe-interval kernel, else the reference.
+
+        Falls back to the pure-Python reference when numba is absent, legacy-terminal folding is
+        requested (needs ``_committed_arrival``), a flight strays out of the kernel box, or a
+        capacity valve trips.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): the shared reservation ledger to deconflict against; the
+          caller commits the accepted corridor.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
+          REJECTED intent carrying the :class:`DenialReason`.
+        """
         # Per-plan diagnostics must never leak a previous compiled flight through an early host denial,
         # a reference dispatch, or a kernel fallback. Cumulative fallback counters remain cumulative.
         self.last_expansions = 0
@@ -572,7 +684,11 @@ class SIPPPlanner(AStarPlanner):
         return self._splan_compiled(req, ledger, cfg)
 
     def _splan_reference(self, req, ledger, cfg):
-        # ---- setup: identical to AStarPlanner.plan (so cost/terminals/output match exactly) ----
+        """Pure-Python cost-aware safe-interval search — the compiled kernel's correctness ORACLE
+        and the fallback when the compiled path declines. Setup, cost model, terminal gating and
+        output mirror ``AStarPlanner.plan`` exactly, so the accept/deny verdict and reported metrics
+        match."""
+        # ---- setup: mirrors AStarPlanner.plan (cost/terminals/output parity) ----
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
         R = hg.circumradius(cfg)
@@ -594,8 +710,8 @@ class SIPPPlanner(AStarPlanner):
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
         gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
-        # lane->lane reference: the SAME ruler main's A* gates and reports against (issue #50),
-        # so SIPP's air_detour_m/cost cannot drift from A*'s.
+        # lane->lane reference: the SAME ruler main's A* gates and reports against, so SIPP's
+        # air_detour_m/cost cannot drift from A*'s.
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         svc = self._occupancy(req, ledger, cfg)
@@ -684,9 +800,10 @@ class SIPPPlanner(AStarPlanner):
             if gst > g.get(st, math.inf):
                 continue                                   # stale (a cheaper label for this AS won)
             if st[0] == "a" and is_goal_cell(st[1], st[2]) and goal_ok(st):
-                # The lane-cell→terminal-edge segment is not a lattice edge, but it is part of the
-                # reported en-route distance. Score it here and keep searching until the open-set lower
-                # bound proves the best feasible lane exact; equal-hop lanes can have different radii.
+                # The lane-cell→terminal-edge segment is not a lattice edge but is part of the
+                # reported en-route distance (see context/figures/exit_radius.png). Score it here
+                # and keep searching until the open-set lower bound proves the best feasible lane
+                # exact; equal-hop lanes can have different radii.
                 score = gst + takeoff_cost[st[3]] + goal_cost_by_cell.get((st[1], st[2]), 0.0)
                 if score < goal_score:
                     goal_state, goal_score = st, score
@@ -739,8 +856,9 @@ class SIPPPlanner(AStarPlanner):
                     expanded.append((cur[0], cur[1], cur[2], cur[3], cur[4] + k))
         air = [s for s in expanded if s[0] == "a"]
         lane_steps = {ln.cell: ln.steps for ln in o_lanes}
+        # ground-delay steps = first air step, net of takeoff climb, base, and lane translation.
         ground_steps = (air[0][4] - takeoff_steps[air[0][3]] - base
-                        - lane_steps.get((air[0][1], air[0][2]), 0))   # issue #52
+                        - lane_steps.get((air[0][1], air[0][2]), 0))
         delay = ground_steps * dt
 
         cruise_wps: list[TimedPoint] = [
@@ -777,16 +895,28 @@ class SIPPPlanner(AStarPlanner):
         intent.cost = trajectory_cost(intent, cfg)
         return intent
 
-    # ================= compiled (numba) air-cruise path (Phase 1: non-terminal) =================
+    # ================= compiled (numba) air-cruise path =================
     def share_occupancy_from(self, master) -> None:
-        """Plan against MASTER's committed occupancy (``cocc``/``svc``/``tcap``/``sidx``) without
-        subscribing the ledger hook or re-absorbing — for optimistic-batch worker threads (#8 Track A).
-        The caller must keep the ledger FROZEN (no commits) while workers plan in parallel; each worker
-        keeps its OWN kernel state (``_k_*``), so the shared mutations are the benign ``evict_before``
-        watermark and — since a worker's reference dispatch arms the map — ``enable_blocked`` on the
-        master's ``_svc``. That second one is a real (if one-shot, sticky) cost leaked worker-to-master;
-        it is not a race today because both runners use ``spawn`` and ``PARALLEL_PLANNERS`` excludes
-        every ``sipp*`` name, so no two of these share a service in-process."""
+        """Borrow MASTER's committed occupancy without subscribing the ledger hook or re-absorbing.
+
+        For optimistic-batch worker threads (Track A). The caller MUST keep the ledger FROZEN (no
+        commits) while workers plan in parallel; each worker keeps its OWN kernel state (``_k_*``),
+        so the shared mutations are the benign ``evict_before`` watermark and — since a worker's
+        reference dispatch arms the map — ``enable_blocked`` on the master's ``_svc``. That second
+        one is a real (if one-shot, sticky) cost leaked worker-to-master; it is not a race today
+        because both runners use ``spawn`` and ``PARALLEL_PLANNERS`` excludes every ``sipp*`` name,
+        so no two share a service in-process.
+
+        Parameters
+        ------------
+        - master (SIPPPlanner): the planner whose ``cocc``/``svc``/``tcap``/``sidx`` images and
+          their ledger/epoch bindings are copied by reference.
+
+        Return
+        --------
+        - output (None): rebinds this planner's occupancy handles to ``master``'s; subscribes
+          nothing.
+        """
         self._svc = master._svc
         self._svc_ledger = master._svc_ledger
         self._tcap = master._tcap
@@ -802,21 +932,18 @@ class SIPPPlanner(AStarPlanner):
         """Work arrays for one plan, sized to the WINDOW rather than to the whole box.
 
         Initialises A*'s occupancy-shaped ``ks`` alongside SIPP's own arrays rather than replacing
-        it. That is not tidiness: ``AStarPlanner._build_overlay`` — which this planner now reuses
-        verbatim for own-column transparency — reads ``self._ks["ov_own_gen"]`` directly, and the A*
-        fallback reads ``ks["NC"]``, ``ks["out_q"]``, ``ks["win"]``, ``ks["wbox"]`` and
-        ``ks["win_stats"]``. The capacity-shaped A* state is deliberately NOT allocated here;
-        ``_fallback`` creates it lazily if native SIPP actually trips a safety valve.
+        it: not tidiness — ``AStarPlanner._build_overlay`` (reused verbatim for own-column
+        transparency) reads ``self._ks["ov_own_gen"]`` directly, and the A* fallback reads
+        ``ks["NC"]``, ``ks["out_q"]``, ``ks["win"]``, ``ks["wbox"]`` and ``ks["win_stats"]``. The
+        capacity-shaped A* state is deliberately NOT allocated here; ``_fallback`` creates it lazily
+        if native SIPP actually trips a safety valve.
 
-        ``n_iv`` sizes the INTERVAL buffers only, and it is the window build's capacity ESTIMATE —
-        conservative by construction, since it bounds a cell's free intervals by its claim count
-        and merged claims collapse. Measured 2-4x loose.
-
-        The frontier and goal arrays are sized separately, by :meth:`_sfrontier_state`, from the
-        tail the build actually returned. Sizing them from the estimate instead — what this method
-        used to do, with a doubling ratchet on top — left them **5.7x** over-allocated: 553,152
-        slots against a measured max usage of 97,228, i.e. 22.1 MB where 3.9 MB does. That is a
-        MEMORY win and not a speed one; see `_sfrontier_state` for the measurement.
+        ``n_iv`` sizes the INTERVAL buffers only; it is the window build's capacity ESTIMATE —
+        conservative, since it bounds a cell's free intervals by its claim count and merged claims
+        collapse (measured 2-4x loose). The frontier and goal arrays are sized separately by
+        :meth:`_sfrontier_state`, from the tail the build actually returned; sizing them from this
+        estimate instead over-allocated the per-slot arrays ~5.7x for no speed gain (see
+        :meth:`_sfrontier_state`).
         """
         ks = super()._kernel_occupancy_state(cocc)
         if self._k_cap_iv < n_iv:
@@ -861,26 +988,19 @@ class SIPPPlanner(AStarPlanner):
         return ks
 
     def _sfrontier_state(self, n_slots: int) -> None:
-        """Size the kernel's per-slot arrays to the tail the build ACTUALLY produced.
+        """Size the kernel's per-slot arrays (frontier staircase, goal flags/costs) to the tail the
+        build ACTUALLY produced.
 
-        Split from :meth:`_skernel_state` because these are indexed by real slot ids — the frontier
-        staircase by slot, the goal flags by window cell, and ``tail >= n_wcells`` covers both — so
-        they never needed the interval buffers' conservative capacity estimate. Sizing them from it
-        (and then doubling) held 22.1 MB where 3.9 MB suffices, on the five arrays the kernel probes
-        most randomly.
+        Split from :meth:`_skernel_state` because these are indexed by real slot ids (``tail >=
+        n_wcells`` covers both), so they never needed the interval buffers' conservative capacity
+        estimate. Grows to exactly what is asked, with no doubling ratchet: reallocation is rare
+        (one only when a plan sets a new maximum) and its cost is permanent (held for the run, never
+        shrunk).
 
-        Grows to exactly what is asked, with no doubling ratchet. A ratchet is the right shape when
-        reallocation is frequent; here it is not — measured **12** reallocations over 1,526 plans,
-        because one only happens when a plan sets a new maximum — and its cost is permanent, since
-        the arrays are held for the run and never shrink.
-
-        **This did NOT make the kernel faster, and that is worth recording.** It was done to test
-        whether the 33% plan-side gain in `context/sipp_runtime_plan.md` §7 came from working-set
-        locality. Shrinking these five arrays 22.1 -> 3.9 MB moved kernel time 15.28 -> 15.16
-        ms/plan, i.e. nothing. In hindsight that is what the design predicts: they are
-        VERSION-STAMPED, so the kernel touches only the slots it actually visits and the allocation
-        size never determined which cache lines were read. The win here is 18.2 MB per planner,
-        which is a DROP concern (m=8 workers hold their own kernel state), not a latency one.
+        These arrays are VERSION-STAMPED — the kernel touches only the slots it actually visits — so
+        the allocation size never determined which cache lines were read. Sizing them from the tail
+        rather than the estimate is therefore a MEMORY win (~18 MB per planner, a DROP concern when
+        workers hold their own kernel state), NOT a speed one.
         """
         if self._k_cap >= n_slots:
             return
@@ -893,15 +1013,15 @@ class SIPPPlanner(AStarPlanner):
         self._n_frontier_allocs += 1
 
     def _fallback(self, req, ledger, cfg):
-        """Fallback when the compiled kernel bails (``FB_OOB``/``FB_CAP``): run **A\\*** — the superclass
-        search — rather than the pure-Python SIPP reference.
+        """Fallback when the compiled kernel bails (``FB_OOB``/``FB_CAP``/``FB_HASH``): run
+        **A\\*** — the superclass search — rather than the pure-Python SIPP reference.
 
-        The flights that overflow the kernel are the hard / near-infeasible ones (e.g. always-active
-        walled-in hubs), i.e. SIPP's *worst* regime: no early goal to terminate on, so the cost-aware
-        Pareto search fans out (the ~``max_ground_delay/dt``-deep ground-delay fan × fragmented intervals)
-        until the label cap. The pure-Python SIPP reference re-does that same explosion in interpreted
-        Python (~38 s measured); A\\* reaches the identical accept/deny verdict ~9× faster (~4 s) because
-        its per-node is C-level and it has no ground-delay Pareto fan. A\\* shares this planner's
+        Flights that overflow the kernel are the hard / near-infeasible ones (e.g. always-active
+        walled-in hubs), SIPP's *worst* regime: no early goal to terminate on, so the cost-aware
+        Pareto search fans out (the ~``max_ground_delay/dt``-deep ground-delay fan × fragmented
+        intervals) until the label cap. The pure-Python SIPP reference re-does that same explosion
+        in interpreted Python; A\\* reaches the identical accept/deny verdict ~9× faster because its
+        per-node work is C-level and it has no ground-delay Pareto fan. A\\* shares this planner's
         ``self._svc``/``self._tcap`` (inherited ``_occupancy``), so there is no occupancy re-sync."""
         intent = AStarPlanner.plan(self, req, ledger, cfg)
         if intent is not None:
@@ -915,6 +1035,14 @@ class SIPPPlanner(AStarPlanner):
         return intent
 
     def _splan_compiled(self, req, ledger, cfg):
+        """Compiled (numba) safe-interval search with a widen-and-retry window; the production path.
+
+        Builds both occupancy images in one bind transaction, derives the per-plan takeoff/landing
+        gates and the interval pool for the current window, runs the kernel, and widens the window
+        on a box miss. Falls back to the reference on a box-guard miss or an own/foreign column
+        overlap, and to A* (``_fallback``) on a kernel capacity/hash/OOB bail. Output mirrors
+        ``_splan_reference``.
+        """
         from .kernel import FB_CAP, FB_HASH, FB_OOB, NO_PATH
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
@@ -935,8 +1063,8 @@ class SIPPPlanner(AStarPlanner):
         gq, grr = hg.enu_to_axial(dest[0], dest[1], R)
         gx, gy = R * hg.SQRT3 * (gq + grr / 2.0), R * 1.5 * grr
         straight = float(np.linalg.norm(dest[:2] - origin[:2]))
-        # lane->lane reference: the SAME ruler main's A* gates and reports against (issue #50),
-        # so SIPP's air_detour_m/cost cannot drift from A*'s.
+        # lane->lane reference: the SAME ruler main's A* gates and reports against, so SIPP's
+        # air_detour_m/cost cannot drift from A*'s.
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         # ONE bind transaction for both occupancy images, as `AStarPlanner._plan_compiled` does: a
@@ -981,11 +1109,9 @@ class SIPPPlanner(AStarPlanner):
             return self._splan_reference(req, ledger, cfg)
 
         # ---- HOISTED out of the widen loop: neither depends on the window or on `gen`. `to_ok`
-        # spans
-        # [base, base + ground_delay_steps] and the landing runs span [base, max_step]; rebuilding
-        # the
-        # latter per iteration is ~12k Python `tcap.dwell_ok` calls for a value that cannot
-        # change. ----
+        # spans [base, base + ground_delay_steps] and the landing runs span [base, max_step];
+        # rebuilding the latter per iteration is ~12k Python `tcap.dwell_ok` calls for a value that
+        # cannot change. ----
         smax = base + ground_delay_steps(cfg)
         n_to = smax - base + 1                                 # ground-delay steps; to_ok is per (step, level)
         to_ok = []                                             # flat mask, indexed [si*nlev + L]
@@ -1021,13 +1147,11 @@ class SIPPPlanner(AStarPlanner):
             return _deny(req, DenialReason.BUDGET_EXCEEDED)
 
         # Per-plan read-set reset, OUTSIDE the loop: a widen re-run ACCUMULATES onto the same read
-        # set
-        # (A* does the same). min > max means "never probed", which `_mk_envelope` reads as
+        # set (A* does the same). min > max means "never probed", which `_mk_envelope` reads as
         # `cell_bbox=None`. Slots 6-7 are the STEP window, filled ONCE here rather than per probe: a
         # chain walk reads a cell across the whole window, not at a point (see `_note_cell`).
         # `read_bbox` lives in A*'s `_ks` (shared, because `_mk_envelope` is inherited), so bind
-        # that
-        # dict before the loop — the SIPP arrays inside it are sized per widen, this one is not.
+        # that dict up front — the SIPP arrays inside it are sized per widen, this one is not.
         rb = super()._kernel_occupancy_state(cocc)["read_bbox"]
         rb[0] = rb[2] = rb[4] = _BBOX_HUGE
         rb[1] = rb[3] = rb[5] = -_BBOX_HUGE
@@ -1053,8 +1177,8 @@ class SIPPPlanner(AStarPlanner):
             gen = self._bump_gen()
             if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
                 # A cell under BOTH our column and a foreign hub's. One boolean per cell cannot say
-                # that, so take the exact reference — A*'s issue-#3 exit, reused verbatim. Measured
-                # unreachable on demand-generated layouts (see `sipp.window`'s header).
+                # that, so take the exact reference — A*'s own/foreign-column exit, reused verbatim.
+                # Measured unreachable on demand-generated layouts (see `sipp.window`'s header).
                 self._sfb += 1
                 self._sfb_overlap += 1
                 return self._splan_reference(req, ledger, cfg)
@@ -1132,11 +1256,9 @@ class SIPPPlanner(AStarPlanner):
                 self._k_out_q, self._k_out_r, self._k_out_s, self._k_out_L,
                 rb,
             )
-            # FB_OOB is now a WINDOW miss, not a global-box stray: `window_bounds` already clipped
-            # to
+            # FB_OOB is now a WINDOW miss, not a box stray: `window_bounds` already clipped to
             # the global box, so a cell outside the window is recoverable by widening. The kernel
-            # returns it on the FIRST touch, before reading any chain, so no partial result exists
-            # to
+            # returns it on the FIRST touch, before reading a chain, so no partial result exists to
             # discard. At the ceiling this falls through to the unbounded reference like any other.
             if flag == FB_OOB and widen < _SWINDOW_WIDEN_MAX:
                 self._swin_widen += 1
@@ -1181,8 +1303,9 @@ class SIPPPlanner(AStarPlanner):
                     air.append((q, r, L, k))
         self._air = air            # last compiled per-step search path [(q,r,L,step)] (diagnostics + tests)
         lane_steps = {ln.cell: ln.steps for ln in o_lanes}
+        # ground-delay steps = first air step, net of takeoff climb, base, and lane translation.
         ground_steps = (air[0][3] - takeoff_steps[air[0][2]] - base
-                        - lane_steps.get((air[0][0], air[0][1]), 0))   # issue #52
+                        - lane_steps.get((air[0][0], air[0][1]), 0))
         delay = ground_steps * dt
         cruise_wps: list[TimedPoint] = [
             (np.array([*hg.hex_center(q, r, R), levels[L]]), a * dt) for (q, r, L, a) in air]
@@ -1212,8 +1335,9 @@ class SIPPPlanner(AStarPlanner):
               dwell_steps, own, o_cap, o_term, origin, tcap, dest, o_lanes, o_r, fixed_lanes,
               ground_max_step, max_step, is_goal_cell):
         """Successors as ``(AS, edge_cost, wait_steps, interval_index)`` — the multi-altitude safe-interval
-        collapse. ``iv`` is the popped state's interval index (carried in the heap → no ``index_of`` scan in
-        the hot loop); each air successor carries its OWN interval index (``-1`` for ground). Ground →
+        collapse (see context/figures/sipp_safe_intervals.png). ``iv`` is the popped state's
+        interval index (carried in the heap → no ``index_of`` scan in the hot loop); each air
+        successor carries its OWN interval index (``-1`` for ground). Ground →
         ground-wait ray + a per-level takeoff at the current step (per-step pad/dwell gates match A*). Air →
         same-level reroute (one successor per reachable neighbour interval, folding pre-move hover) + vertical
         rungs to L±1 (folding pre-rung hover; both levels clear across the climb window — the interval-collapse
@@ -1232,7 +1356,7 @@ class SIPPPlanner(AStarPlanner):
                 level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
                 for lane in o_lanes:
                     lq, lr = lane.cell
-                    lane_st = lane.steps                     # issue #52: climb, THEN translate out
+                    lane_st = lane.steps                     # climb, THEN translate out
                     for L in range(len(levels)):
                         ts = s + takeoff_steps[L] + lane_st
                         if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):

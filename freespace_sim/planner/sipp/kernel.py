@@ -1,4 +1,4 @@
-"""Compiled (numba) air-cruise kernel for cost-aware SIPP (issue #8, Track B).
+"""Compiled (numba) air-cruise kernel for cost-aware SIPP (Safe Interval Path Planning).
 
 This is the hot path of :class:`~freespace_sim.planner.sipp.SIPPPlanner` — the safe-interval A* over the
 air lattice — lifted into a ``@njit`` function over flat arrays. The pure-Python ``SIPPPlanner`` stays
@@ -6,17 +6,17 @@ the reference oracle (and the fallback); this kernel must reproduce its exact op
 Everything terminal/geometry/commit stays in the Python host.
 
 **Occupancy** is a PER-PLAN interval pool over the window this flight reads, built from the A* claim
-arena by :func:`~freespace_sim.planner.sipp.window.build_window_intervals`: a cell's free intervals are
-slots walked from slot ``cell`` along ``iv_nxt``, and each slot is a unique frontier node id. Cell ids
+arena by :func:`~freespace_sim.planner.sipp.window.build_window_intervals` (see
+context/figures/sipp_safe_intervals.png): a cell's free intervals are slots walked from slot
+``cell`` along ``iv_nxt``, and each slot is a unique frontier node id. Cell ids
 are therefore WINDOW-local — ``qmin``/``rmin``/``rspan``/``qspan`` are the window's bounds, not the
 global box's — which is why an out-of-box stray returns ``FB_OOB`` for the host to widen on rather
 than fall back on. World ``(q, r)`` is reconstructed as ``iq + qmin`` at every site that needs it, so
 the recorded read set and the output path stay in world coordinates.
 
-There is no own-lane OVERLAY any more. The window build skips a cell's terminal-column claims when the
-planning flight owns it (A*'s ``ov_own_gen`` stamp), so what used to be a redirect to a second slot
-space is now just the chain this kernel already walks. The global free-interval pool it replaced could
-not do that: it stored columns foreign-to-everyone and needed the overlay to make them transparent.
+Own-lane transparency is baked into the chain this kernel walks: the window build skips a cell's
+terminal-column claims when the planning flight owns it (A*'s ``ov_own_gen`` stamp). There is no
+separate overlay or redirect to a second slot space — the successor loops walk one chain per cell.
 
 **Multi-label, not single-best.** Because the objective is weighted cost (``c_hold != c_gd``), a
 ``(cell, interval)`` is reached at several non-dominating ``(arrival, cost)`` labels (e.g. the origin via
@@ -26,8 +26,8 @@ linked list** of labels (unbounded — a fixed cap would overflow at the origin 
 dominance on insert. No eviction (a since-dominated label only adds a cheap compare). A per-``(cell, step)``
 **best-g table** (``_gslot``, open-addressing, version-stamped) and the matching **stale-skip** at pop
 mirror the reference's ``g`` dict: both are optimality-preserving, but they are NOT optional — without
-them the kernel expanded 3.2x more labels than the reference for the same answer (the interval frontier
-prunes ~17% of successors, this table ~58%).
+them the kernel expands ~3.2x more labels for the identical answer (the interval frontier alone
+prunes far fewer successors than the (cell, step) table does).
 
 Dominance (matches ``sipp._nondominated``): stored ``(t2,g2)`` dominates new ``(t,g)`` iff
 ``t2 <= t and g2 + (t - t2)*c_hold <= g``. Goal cells are frontier-EXEMPT (their per-step landing gate
@@ -56,10 +56,7 @@ def _gslot(g_pack, gen, key, cap, log2cap):
     """Linear-probe the open-addressing best-g table for ``key``; return the slot holding it OR the
     first empty (stale-generation) slot; -1 if the table is full.
 
-    This is the per-``(cell, step)`` dedup the pure-Python reference gets free from its ``g`` dict and
-    that this kernel used to omit (see the module docstring's old 'no per-(cell,step) dedup' note).
-    Measured: that omission cost 3.2x more labels than the reference for the identical answer, because
-    the interval frontier only prunes ~17% of successors while the (cell, step) check prunes ~58%.
+    This is the per-``(cell, step)`` dedup the pure-Python reference gets free from its ``g`` dict.
     Key and stamp share one 32 B record, so a probe step touches one cache line (see ``_packed``)."""
     h = np.uint64(key) * _MAGIC
     i = np.int64(h >> np.uint64(64 - log2cap))      # high log2cap bits → well-mixed slot
@@ -76,8 +73,9 @@ def _gslot(g_pack, gen, key, cap, log2cap):
 @njit(cache=True, nogil=True)
 def _note_cell(read_bbox, q, r, L):
     """Widen the read bbox to cover hex cell ``(q, r, L)`` — one entry in the plan's READ SET, consumed
-    by the Track-A staleness test (``parallel.PlanEnvelope``) so a coordinator can tell whether anything
-    committed since this plan started could have changed its answer.
+    by the staleness test (``parallel.PlanEnvelope``, see context/figures/read_envelope.png) so a
+    coordinator can tell whether anything committed since this plan started could have changed its
+    answer.
 
     Write-only w.r.t. the search: it cannot change a decision, so kernel==reference parity is untouched.
 
@@ -121,6 +119,14 @@ def _search(
     out_q, out_r, out_s, out_L,                                      # output path buffers (+ flight level)
     read_bbox,                       # in/out int64[8]: read-set summary (see `_note_cell`)
 ):
+    """Run the compiled safe-interval A* over the per-plan interval pool; see the module docstring
+    for the algorithm, occupancy layout, and the kernel==reference parity contract.
+
+    Returns ``(n, cost, n_exp, status)``: on ``OK``, ``n`` path points are written to ``out_*``
+    (goal→start order) and ``cost`` is the total weighted cost; on a fallback
+    (``FB_OOB``/``FB_CAP``/``FB_HASH``) or ``NO_PATH``, ``n`` is -1 and the host branches on
+    ``status``.
+    """
     nlab = 0
     size = 0
     ctr = 0
@@ -132,8 +138,8 @@ def _search(
     # ---- takeoff enumeration (folded), per flight level: ground-step si × lane li × level Lk. A start
     # label at level Lk arrives ts = base+si+takeoff_steps[Lk] (per-level climb) at cell
     # lane_qr[li]*nlevels+Lk, with g = si*c_gd*dt + takeoff_cost[Lk] + lane_lat[li]. Heap + dominance
-    # order the search, so seeding order is free (unlike the single-level fold, this need not be byte-
-    # ordered). ``lane_qr`` is the level-less (iq*rspan+ir) index the kernel completes with Lk. ----
+    # order the search, so seeding order is free. ``lane_qr`` is the level-less (iq*rspan+ir) index
+    # the kernel completes with Lk. ----
     for si in range(n_to):
         g_gd = si * c_gd * dt                           # ground-delay cost (per-level climb + lane added below)
         for li in range(n_lanes):
@@ -141,7 +147,7 @@ def _search(
             for Lk in range(nlevels):
                 if not to_ok[si * nlevels + Lk]:        # per-(ground-step, level) dwell/pad gate
                     continue
-                ts = base + si + takeoff_steps[Lk] + lane_st[li]   # climb, THEN translate out (issue #52)
+                ts = base + si + takeoff_steps[Lk] + lane_st[li]   # climb, THEN translate out
                 if ts > max_step:
                     continue
                 cell = qr * nlevels + Lk
@@ -271,7 +277,7 @@ def _search(
                     if a < lo:
                         a = lo
                     if a > hi:
-                        sj = nxts                   # next interval in THIS chain (overlay or pool)
+                        sj = nxts                   # next interval in THIS chain
                         continue
                     if a - 1 > hi_c:                     # cannot hover here long enough (chain ascends)
                         break
@@ -374,9 +380,9 @@ def _search(
                 # both are already in the bbox: the cell was recorded when its own label was created
                 # (site A seeds every level of each takeoff lane, site B records every reroute
                 # neighbour), and a rung can only be taken from a cell that was expanded, i.e.
-                # pushed. Measured across 83 envelopes on a 3-level congested scenario: recording
-                # here widened NONE of them. Left out rather than kept "for safety" — an accumulator
-                # line no test can distinguish from its absence is one nobody can maintain.
+                # pushed. Measured to widen no envelope on a 3-level congested scenario. Left out,
+                # not kept "for safety" — an accumulator line no test can distinguish from its
+                # absence is one nobody can maintain.
                 ncell = qr * nlevels + tlv              # same (q, r), adjacent level
                 ngoal = goal_gen[ncell] == gen
                 sj = ncell                           # neighbour chain; own-lane transparency is

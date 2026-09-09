@@ -72,8 +72,21 @@ class Column:
     claims: frozenset[RowKey] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        # Pricing naturally reconstructs paths as lists.  Canonical immutable containers make
-        # columns safe dictionary values and ensure claim coefficients cannot contain duplicates.
+        """Coerce every field to its canonical immutable form, raising on bad input.
+
+        Pricing reconstructs paths as lists; freezing the cells to a tuple and the claims to a
+        frozenset makes a column a safe dict key and stops a claim coefficient from carrying a
+        duplicate.
+
+        Parameters
+        ------------
+        - none: reads and rewrites the frozen dataclass fields in place.
+
+        Return
+        --------
+        - output (None): rewrites fields via ``object.__setattr__``; raises ``TypeError`` on a
+          non-integer field or cell, ``ValueError`` on a path shorter than two cells.
+        """
         object.__setattr__(self, "flight_id", _index_field(self.flight_id, "flight_id"))
         object.__setattr__(
             self,
@@ -135,6 +148,20 @@ def column_to_corners(
     ``build_g_delay`` anchors the takeoff cylinder at ``departure_step * dt``; the reported delay
     counts only ground-hold steps after ``ceil(t_departure / dt)``.  ``corridor_t0`` includes the
     quantised climb and, for a hub origin, the chosen lane's quantised traverse.
+
+    Parameters
+    ------------
+    - col (Column): the discrete route to expand; its cells, level, and departure step are read.
+    - req (FlightRequest): the flight this column serves, checked to match ``col.flight_id``.
+    - cfg (SimConfig): supplies the clock, flight levels, and lattice/terminal geometry.
+
+    Return
+    --------
+    - output (tuple[list[Vec], float, float, float, Terminal | None, Terminal | None]): the
+      hex-centre corner polyline, build-anchor ground delay (s), reported ground delay (s),
+      corridor start stamp (s), and the origin/destination terminals (``None`` for a customer
+      endpoint).  Raises ``ValueError`` when the column does not match the request or lattice,
+      and ``NotImplementedError`` for terminal endpoints without the required colgen-v1 flags.
     """
     flight_id = _index_field(col.flight_id, "flight_id")
     departure_step = _index_field(col.departure_step, "departure_step")
@@ -308,7 +335,21 @@ def column_to_intent(
     cfg: SimConfig,
     solve_share_s: float = 0.0,
 ) -> OperationalIntent:
-    """Build the exact reservation and reported metrics represented by ``col``."""
+    """Build the exact reservation and reported metrics represented by ``col``.
+
+    Parameters
+    ------------
+    - col (Column): the route to realise.
+    - req (FlightRequest): the flight this column serves.
+    - cfg (SimConfig): supplies geometry, clock, and cost weights.
+    - solve_share_s (float): this column's share of solve wall time, recorded on the intent.
+
+    Return
+    --------
+    - output (OperationalIntent): an ACCEPTED intent carrying the reservation volumes, timed
+      centreline, delays, and cost; or a REJECTED intent (``BUDGET_EXCEEDED``) when the ground
+      hold exceeds ``max_ground_delay_s`` or the detour exceeds ``max_detour_factor``.
+    """
     (
         corners,
         build_g_delay,

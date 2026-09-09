@@ -13,6 +13,12 @@ compiled or parallel pricing path would have to agree with.  It is also the whol
 cost of a solve -- pricing dominates the LP by orders of magnitude -- so expect
 minutes per iteration at scenario scale.  See :func:`price_flight` for the entry
 point and the module-level constants for the pruning envelopes.
+
+The cutoff a pricing call could assemble for free is not merely weak, it is
+**structurally 0.0** -- free to the LP.  Every column reachable for free is already in
+the master's pool, LP optimality forces those reduced costs ``<= 0``, and complementary
+slackness pins the basic one at exactly ``0``; the only route to a positive cutoff is to
+SEARCH for one (see :func:`_bootstrap_incumbent`).
 """
 
 from __future__ import annotations
@@ -61,10 +67,8 @@ from .windows import (
 
 _SCORE_EPS = 1e-12
 # A column has to beat zero reduced cost by this much to count as improving.  Mirrors
-# ``solver._REDUCED_COST_TOL``; the two are the same threshold read from opposite sides of
-# the call.  This used to be probed off ``params.reduced_cost_tol`` / ``params.pricing_tol``,
-# neither of which ``ColGenParams`` has -- so it was always this value behind a lookup that
-# read like a knob.
+# ``solver._REDUCED_COST_TOL`` -- the same threshold read from opposite sides of the call,
+# so the two must stay equal.
 _IMPROVING_RC_TOL = 1e-9
 _RECOMPUTE_EPS = 1e-8
 _EMPTY_ROWS: frozenset[RowKey] = frozenset()
@@ -134,6 +138,18 @@ class DualView:
         duals: Mapping[RowKey | tuple[Any, ...], float],
         cfg: SimConfig,
     ) -> None:
+        """Normalize duals to per-resource prefix sums for O(1) window queries.
+
+        Parameters
+        ------------
+        - duals (Mapping[RowKey | tuple, float]): raw master-row dual prices; non-``RowKey``
+          keys are coerced and duplicate keys summed.
+        - cfg (SimConfig): supplies the geometry-derived visit-window offsets.
+
+        Return
+        --------
+        - output (None): builds the indexed view; raises ``ValueError`` on a non-finite dual.
+        """
         normalized: dict[RowKey, float] = {}
         cell_values: dict[tuple[Cell, int], dict[int, float]] = {}
         terminal_values: dict[Hashable, dict[int, float]] = {}
@@ -159,16 +175,15 @@ class DualView:
         self._terminal = {
             terminal_id: _prefix_series(values) for terminal_id, values in terminal_values.items()
         }
-        # The same buckets, kept rather than discarded, so a per-flight consumer can
-        # enumerate the resources IT owns instead of scanning every global row.  See
-        # `dp_prepare.prepare_duals`, which is called once per flight and whose old loop was
-        # therefore O(flights x rows) -- a cost that grows with the master's materialized
-        # row count while the flight stays the same size.
+        # The same buckets, kept rather than discarded, so a per-flight consumer
+        # (`dp_prepare.prepare_duals`) can enumerate the resources IT owns instead of scanning
+        # every global row -- an O(flights x rows) cost that grows with the master while each
+        # flight stays the same size.
         #
         # These are the accumulated values, not a recomputation: `prefix[k+1] - prefix[k]`
-        # would recover a DIFFERENT float, which is the thing `prepare_duals`' docstring
-        # forbids.  Tuples rather than the dicts because they are smaller and immutable, and
-        # pricing reads one view from several flights concurrently.
+        # would recover a DIFFERENT float, which `prepare_duals`' docstring forbids.  Tuples
+        # rather than dicts because they are smaller and immutable, and pricing reads one view
+        # from several flights concurrently.
         self._cell_steps = {
             resource: tuple(sorted(values.items())) for resource, values in cell_values.items()
         }
@@ -204,22 +219,27 @@ class DualView:
     ) -> tuple[tuple[tuple[Any, ...], int], ...]:
         """Pre-resolve a claim set for repeated integer-clock translation.
 
-        Returns ``(key_prefix, base_step)`` pairs, where ``key_prefix + (step,)`` is
-        a lookup key for :attr:`_duals`.  Two facts make this exact rather than
-        merely close:
+        Returns ``(key_prefix, base_step)`` pairs, where ``key_prefix + (step,)`` is a lookup
+        key for ``_duals``.  Two facts make this exact rather than merely close:
 
-        * ``RowKey`` is a plain ``tuple`` subclass built by
-          ``tuple.__new__(cls, ("cell", q, r, level, step))``, so an ordinary tuple
-          with those contents has the same hash and compares equal -- the dict
-          lookup is identical, it just skips ``RowKey.__new__``'s validation and its
-          four ``operator.index`` calls.
-        * Rows whose *resource* carries no dual at any step are dropped.  They would
-          contribute exactly ``0.0`` at every translation, and adding exact zeros
-          cannot change an ``fsum``.
+        * ``RowKey`` is a plain ``tuple`` subclass, so the bare tuple written here hashes and
+          compares equal to it -- the dict lookup is identical, it just skips
+          ``RowKey.__new__``'s validation and its four ``operator.index`` calls.
+        * Rows whose resource carries no dual at any step are dropped: they would contribute
+          exactly ``0.0`` at every translation, and adding exact zeros cannot change an
+          ``fsum``.
 
-        Translating a claim set is injective (every row's step moves by the same
-        delta), so no two rows can collide into one and summing the terms is exactly
-        summing the translated set.
+        Translation is injective (every row's step moves by the same delta), so no two rows
+        collide into one and summing the terms is exactly summing the translated set.
+
+        Parameters
+        ------------
+        - claims (Iterable[RowKey]): the canonical claim set to pre-resolve.
+
+        Return
+        --------
+        - output (tuple[tuple[tuple, int], ...]): ``(key_prefix, base_step)`` pairs consumed
+          by :meth:`shifted_claim_cost`.
         """
 
         terms: list[tuple[tuple[Any, ...], int]] = []
@@ -256,7 +276,18 @@ class DualView:
         return self._max_negative_credit
 
     def visit_cost(self, cell: Cell, level: int, visit_step: int) -> float:
-        """Return all cell-row duals charged by a centre visit in O(1)."""
+        """Sum every cell-row dual charged by a centre visit at ``visit_step``, in O(1).
+
+        Parameters
+        ------------
+        - cell (Cell): the visited cell.
+        - level (int): the visit's flight level.
+        - visit_step (int): integer clock step of the centre visit.
+
+        Return
+        --------
+        - output (float): summed dual over the visit window, or 0.0 if the cell carries none.
+        """
 
         series = self._cell.get((cell, level))
         if series is None:
@@ -397,16 +428,12 @@ def _endpoint_claims(
     """Dwell rows one endpoint occupies, memoized on the graph.
 
     A pure function of ``(fg, origin, step, timing_steps)``, which is what makes the cache
-    answer-neutral rather than a heuristic: the body below reads only the request's two
-    endpoints, the two terminals, ``fg.levels`` and ``cfg`` scalars, all fixed for the
-    graph's life -- and every caller reaches this through :func:`price_flight` or
-    :func:`find_feasible_column`, which refuse a ``cfg`` that is not ``fg._cfg``.
-
-    Worth the machinery because the redundancy is extreme rather than marginal: one sink
-    proposal per ``(arrival step, hop count)`` pair means the reachable key space is far
-    smaller than the number of sinks reaching it.  Measured on ``colgen_test``'s first 12
-    flights over three iterations -- 286,705 calls, **1,511 distinct**, 99.5% redundant,
-    and the solve went 38.85 s to 12.28 s with a bit-identical objective and column set.
+    answer-neutral rather than a heuristic: the body reads only the request's two endpoints,
+    the two terminals, ``fg.levels`` and ``cfg`` scalars, all fixed for the graph's life --
+    and every caller reaches this through :func:`price_flight` or
+    :func:`find_feasible_column`, which refuse a ``cfg`` that is not ``fg._cfg``.  The
+    redundancy it exploits is extreme: one sink proposal per ``(arrival step, hop count)``
+    pair, so the reachable key space is far smaller than the number of sinks reaching it.
     """
 
     key = (origin, step, timing_steps)
@@ -548,8 +575,7 @@ def _path_claims(
     * ``endpoint_cache`` -- the two endpoint row sets depend only on
       ``(origin, step, timing_steps)``, of which a batch has very few distinct values.
     * ``visit_cache`` -- sink proposals share path prefixes and corridor start steps,
-      so ``(cell, visit_step)`` repeats heavily.  Measured at 90% redundant (1106
-      calls, 114 distinct) on one ranking pass.
+      so ``(cell, visit_step)`` repeats heavily.
     """
 
     del dest_lane_idx  # The selected destination lane changes geometry, not dwell row membership.
@@ -764,10 +790,10 @@ def _shifted_seed_incumbent(
     for departure_step in range(seed.departure_step + 1, latest_departure + 1):
         _check_deadline(deadline)
         delta_steps = departure_step - seed.departure_step
-        # Row exclusions used to force this scan back onto `_shift_claims` + `claim_cost`,
-        # rebuilding a frozenset of RowKeys per translation purely to answer a disjointness
-        # question.  That fallback was the dominant cost of the greedy heuristic, which always
-        # supplies `forbidden_rows` (its saturated set).  Both halves are now set-free.
+        # Both halves are set-free: `_rows_hit_forbidden` answers the disjointness question
+        # without building a translated frozenset, and `shifted_claim_cost` sums the pre-
+        # resolved terms.  The greedy heuristic always supplies `forbidden_rows` (its saturated
+        # set), so this is the hot path.
         if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
             continue
         dual_cost = duals.shifted_claim_cost(terms, delta_steps)
@@ -803,10 +829,10 @@ def _shifted_seed_incumbent(
 def _root_bounds(topology, variants, envelopes, benefit: float, pi_f: float, dual_view):
     """``completion_can_compete``'s ``hop_rc_bound`` per root, for ranking.
 
-    The gate (``dp_prepare.py:1228``) already evaluates this expression for every surviving
-    root; this reads out the NUMBER where ``can_compete`` returns only the verdict.  Nothing
-    here is a new bound and nothing prunes: the value orders the bootstrap's root allowlist
-    and has no effect on what any search explores, so it cannot discard a column.
+    The gate already evaluates this expression for every surviving root; this reads out the
+    NUMBER where ``can_compete`` returns only the verdict.  Nothing here is a new bound and
+    nothing prunes: the value orders the bootstrap's root allowlist and has no effect on what
+    any search explores, so it cannot discard a column.
 
     ``-inf`` for a root the envelope's own LENGTH rejects, which sorts it last.
     """
@@ -856,31 +882,19 @@ def _bootstrap_incumbent(
     here.  ``seed_column``, ``_shifted_seed_incumbent`` and the master's ``known_column``
     are all columns the master's pool already holds, and LP optimality over that pool forces
     every pool column's reduced cost ``<= 0`` -- complementary slackness pins the basic one
-    at exactly ``0``.  Measured on ``density_faa_wing_zipline`` x12: the incumbent handed to
-    the search scores ``0.0000`` for all twelve flights in both sweeps, against optima of
-    8.5-20.5, and a flight's own previous priced column re-scored under the next duals gives
-    ``0.0`` or negative.  **So no reuse of anything already known can produce a positive
-    cutoff; the only source is a search.**
-
-    Cutoff quality is then the dominant lever on this search, which the tree measures from
-    several sides: 439x on one captured subproblem (:func:`price_flight`), 2.17x from
-    capping the completion envelope's length alone (:func:`_best_column`), and 98x on a
-    whole sweep under a perfect cutoff (``analysis/ab_colgen_oracle_cutoff.py``).
+    at exactly ``0``.  So no reuse of anything already known can produce a positive cutoff;
+    the only source is a search, and cutoff quality is then the dominant lever on it.
 
     **Only the incumbent escapes.**  What comes back is fed to the real search as a cutoff
     and nothing else; no bootstrap candidate reaches ``_certify_candidates``.  That
     separation is load-bearing rather than tidy: a restricted search's labels compete for
     dominance slots, and one of them evicting a survivor the unrestricted search would have
-    kept is how a prune stops being answer-neutral (``[[pruning-not-neutral-under-dominance]]``).
+    kept is how a prune stops being answer-neutral.
 
     **Ranked, not truncated.**  Taking the earliest N departures misses an optimum that
-    departs late: measured, a 4- and an 8-step prefix both returned rc 4.4590 against an
-    8.4590 optimum on the second sweep and the main search declined anyway.
-    ``PreparedVariants.score`` is the root's own upper bound, so it puts the promising start
-    option first whenever it is, and it costs ``roots`` roots instead of
-    ``N * n_origin_lanes`` (240 at N=16 on the density straggler).  This is PR #76's rule
-    (``pr76:pricing.py:1253``); the score expressions agree term for term except that ours
-    weights the ground term into the objective's currency, which #76's predates.
+    departs late.  ``PreparedVariants.score`` is the root's own upper bound, so it puts the
+    promising start option first whenever it is, and it costs ``roots`` roots instead of
+    ``N * n_origin_lanes``.
 
     **It re-uses the two real searches rather than writing a third**, which is where its
     safety comes from.  Every column either returns has already passed
@@ -902,15 +916,12 @@ def _bootstrap_incumbent(
     if not (topology.ok and rows.ok):
         # Both searches decline this graph too, so skipping here keeps them symmetric.
         return incumbent
-    # WITH `envelopes`, which is not optional and was the first thing this got wrong.  The
-    # ranking has to happen over the same gated set the restricted search will see, or the
-    # top-scoring root can be one `completion_can_compete` rejects -- the allowlist then
-    # names a root the search immediately discards, `prepare_variants` returns EMPTY, and the
-    # bootstrap silently does nothing while still costing its own setup.  Measured on
-    # `colgen_test` flight 0: the gate takes 13,515 roots to 97, and the highest-scoring root
-    # of the ungated 13,515 is not among them.  The failure is invisible -- no crash, a
-    # successful `(-inf, None)`, the incumbent handed straight back -- which is why
-    # `prof_colgen_cutoff`'s `bt_lab` column exists to show it as zero labels.
+    # WITH `envelopes`, which is not optional.  The ranking has to happen over the same gated
+    # set the restricted search will see, or the top-scoring root can be one
+    # `completion_can_compete` rejects -- the allowlist then names a root the search
+    # immediately discards, `prepare_variants` returns EMPTY, and the bootstrap silently does
+    # nothing while still costing its own setup.  The failure is invisible -- no crash, a
+    # successful `(-inf, None)`, the incumbent handed straight back.
     envelopes = dp_prepare.CompletionEnvelopes(
         fg,
         cfg,
@@ -946,22 +957,17 @@ def _bootstrap_incumbent(
     # `ranking` picks WHAT to sort on, and the two options are `g` versus `g + h`:
     #
     #   "score"  `variants.score` = -w_ground*ground_delay - w_air*origin_leg
-    #                               - start_dual_cost.  Cost already incurred at the root,
-    #            with the whole-route air term truncated to the origin fold leg and the
-    #            whole-column dual sum truncated to the origin claims.  No lookahead.
-    #   "bound"  `_root_bound` below: `completion_can_compete`'s own `hop_rc_bound` at the
+    #                               - start_dual_cost.  Cost already incurred at the root, with
+    #            no lookahead.
+    #   "bound"  `_root_bounds` below: `completion_can_compete`'s own `hop_rc_bound` at the
     #            root's minimum feasible hop count -- an UPPER bound on what the root can
     #            ACHIEVE, already computed for every surviving root by the gate above.
     #
-    # They rank identically whenever every root shares one lane geometry, because then the
-    # only thing separating roots is departure time and both collapse to "depart earlier"
-    # (measured: correlation exactly 1.000 on 7 of 8 density flights).  They diverge on
-    # multi-lane flights, and there the difference is not marginal -- on `density_faa` x50
-    # flight 16, `score` finds NO positive cutoff at any K (-48.56 at K=1, -9.60 at K=4,
-    # both worse than no incumbent) while `bound` finds +24.00 at K=1.  `score` charges
-    # `-w_air*origin_leg`, so it demotes long lanes outright; `bound` charges
-    # `-delay_lbs[h0]` with `h0 = hex_remaining[root cell]`, so it accounts for where the
-    # lane LEAVES you relative to the destination.
+    # They rank identically whenever every root shares one lane geometry, because then the only
+    # thing separating roots is departure time and both collapse to "depart earlier".  They
+    # diverge on multi-lane flights: `score` charges `-w_air*origin_leg`, so it demotes long
+    # lanes outright; `bound` charges `-delay_lbs[h0]` with `h0 = hex_remaining[root cell]`, so
+    # it accounts for where the lane LEAVES you relative to the destination.
     if ranking == "bound":
         key = _root_bounds(topology, variants, envelopes, benefit, pi_f, dual_view)
     else:
@@ -1164,12 +1170,9 @@ def _shortest_seed_columns(
     canonical seed beats the remaining bounds, no further spatial path is
     generated.  Exact ties are still explored for deterministic tie-breaking.
 
-    The result is cached on the graph, keyed on ``model``.  It used to assume one model
-    per graph -- true inside a solve, since the objective is fixed and graphs are built
-    per solve -- but the assumption was enforced only by convention, and violating it
-    returned the first model's seed with no error.  Anything comparing two objectives on
-    one graph, which is the natural way to write such a comparison, silently got the same
-    answer twice.
+    The result is cached on the graph, keyed on ``model`` -- not one seed per graph.  The key
+    matters because comparing two objectives on one graph (the natural way to write such a
+    comparison) would otherwise silently get the first model's seed twice, with no error.
     """
 
     cache = fg._search_cache
@@ -1641,18 +1644,15 @@ def _best_column(
 
         lane_steps = 0 if lane_idx is None else fg.origin_lanes[lane_idx].steps
         corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
-        # The horizon term is ~920 hops for an early colgen_test departure against a ceiling of
-        # ~20, and every entry past the ceiling describes a completion the search cannot make.
-        #
-        # THE COST OF THOSE ENTRIES IS NOT THE POINT, and measuring it is how you talk yourself
-        # out of this line.  Building one costs an `_endpoint_claims` call, and the `break`
-        # below already contains THAT to `max_air_hops + 1`, so construction waste is one call
-        # per (departure, lane).  The length of the result is what matters: it bounds
+        # Per-hop delay/dual bound vs the incumbent; a label lives while ANY hop in range could
+        # still win (see context/figures/completion_envelope.png).
+        # Cap the envelope at `max_air_hops`: the horizon term can run to hundreds of hops
+        # against a ceiling of tens, and every entry past the ceiling describes a completion
+        # the search cannot make.  The length of the result is what matters (not the cost of
+        # building it, which the `break` below already bounds to `max_air_hops + 1`): it bounds
         # `completion_can_compete`'s scan (`range(first_hops, len(delay_lbs))`), which keeps a
-        # label alive as soon as SOME hop count in range could beat the incumbent.  Entries past
-        # the ceiling let a label survive on the strength of a completion the ceiling forbids.
-        # Measured on the 50-flight harness in `ColGenParams`: 36.3M labels -> 16.7M, 2.17x, at
-        # a byte-identical schedule and objective.
+        # label alive as soon as SOME hop count in range could beat the incumbent.  Entries
+        # past the ceiling would let a label survive on a completion the ceiling forbids.
         #
         # Exact, not a heuristic.  A completion above `max_air_hops` cannot occur, so a label
         # that only competes there could never have won; `completion_can_compete` reading a
@@ -1930,11 +1930,10 @@ def _best_column(
                 # the same decomposition recovers them exactly -- which is why the two
                 # weights below must track the ones the score was built with.
                 # Term by term, NOT `air_weight * (origin_leg + hops * dt)`: the grouped
-                # form changes the association and so is not bit-identical to the
-                # unweighted expression it replaced (measured: 62,673 of 200,000 random
-                # draws differ by ~1e-13).  This function is the oracle any compiled
-                # pricing path gets certified against, so its arithmetic has to be
-                # reproducible exactly, not just to within a tolerance.
+                # form changes the association and so is not bit-identical to the unweighted
+                # expression it replaced.  This function is the oracle any compiled pricing
+                # path gets certified against, so its arithmetic has to be reproducible
+                # exactly, not just to within a tolerance.
                 paid_duals = (
                     -label.score
                     - ground_weight * ground_delay
@@ -1985,12 +1984,11 @@ def _best_column(
                 if _visit_hits_forbidden(neighbour, 0, next_step, offsets, forbidden_rows):
                     continue
                 # Price the visit window from ``DualView``'s prefix sums instead of
-                # materializing its ``RowKey`` set.  Building that set to sum it was
-                # measured at ~44% of this search (718k ``RowKey.__new__`` calls, each
-                # running ``operator.index`` four times, for one number).  Rows the
-                # origin endpoint already paid must not be charged twice; that overlap
-                # is confined to the endpoint's own cells, so the guard below is a
-                # miss on essentially every arc.
+                # materializing its ``RowKey`` set, which cost one ``RowKey.__new__`` (four
+                # ``operator.index`` calls) per row purely to sum them.  Rows the origin
+                # endpoint already paid must not be charged twice; that overlap is confined to
+                # the endpoint's own cells, so the guard below is a miss on essentially every
+                # arc.
                 visit_cost = dual_view.visit_cost(neighbour, 0, next_step)
                 if neighbour in paid_cells:
                     visit_cost -= math.fsum(
@@ -2055,11 +2053,10 @@ _kernel_high_water_warned: set = set()
 
 # Per-process tally of exact-pricing calls and how many fell back out of the kernel.
 #
-# A fallback is a 3-4.5x slowdown that produces the RIGHT answer, so nothing downstream can
-# notice it: the objective, the columns and the tests are all identical, only the clock
-# moves.  `[[run-astar-with-compiled-extra]]` records the same failure mode costing a whole
-# issue on the A* side.  Counting it is the only way a production run can report "the
-# compiled path served 100% of pricing" rather than assume it.
+# A fallback is slower but produces the RIGHT answer, so nothing downstream can notice it:
+# the objective, the columns and the tests are all identical, only the clock moves.  Counting
+# it is the only way a production run can report "the compiled path served 100% of pricing"
+# rather than assume it.
 #
 # Per PROCESS, deliberately: under a worker pool each worker keeps its own tally and
 # `pricing_pool` returns the delta per task, because a parent-side counter would report zero
@@ -2123,25 +2120,20 @@ def clear_search_record() -> None:
 class Declined(enum.Enum):
     """Why the compiled search did not run. Members are the reasons the reference is used.
 
-    This replaces a boolean named ``proved``, which was a **capability** flag with the name
-    of a **safety** one -- and the name caused real misreadings. ``proved=True`` could never
-    detect divergence: if the kernel explored a different set than ``_best_column``, it
-    returned ``True`` beside a plausible wrong column and nothing raised. The inference from
-    "ran to completion" to "therefore this is the reference's column" is carried entirely by
-    the test suite at build time; there is no runtime cross-check anywhere, by design.
+    There is NO runtime cross-check that the kernel explored the same set as ``_best_column``:
+    a completing kernel returns ``(reduced_cost, column)`` and the inference from "ran to
+    completion" to "this is the reference's column" is carried entirely by the test suite at
+    build time, by design. So the return value must distinguish "ran" from "declined, run the
+    reference", and say WHY -- the reasons warrant opposite responses ("numba isn't installed"
+    is a shrug; a saturated partial expansion means the numeric machinery the parity argument
+    rests on hit a wall). Only the budget members vary at runtime with the instance and that
+    iteration's duals, which is why this cannot be a startup check and the reason has to ride
+    on the return value.
 
-    It was also lossy in a way that cost debugging time. "numba isn't installed" and "a
-    Shewchuk partial expansion saturated on real data" were the same value, and they warrant
-    opposite responses: one is a shrug, the other means the numeric machinery the whole
-    parity argument rests on hit a wall. Only the budget members vary at runtime with the
-    instance and that iteration's duals, which is why this cannot be a startup check and why
-    the reason has to ride on the return value.
-
-    **An ``Enum`` because it pickles by name.** The ``object()`` sentinel this also replaces
-    (``_UNPROVED``) pickles happily and arrives in a pool worker as a *different instance*,
-    so ``result is _UNPROVED`` is always False across a process boundary. The sequential path
-    could never have caught that -- nothing is pickled there -- so it would have surfaced
-    first on a production timeout under a pool.
+    An ``Enum`` because it pickles by name. A plain ``object()`` sentinel pickles happily but
+    arrives in a pool worker as a *different instance*, so ``result is sentinel`` is always
+    False across a process boundary -- a bug the sequential path (nothing pickled) could never
+    catch, so it would surface first on a production timeout under a pool.
     """
 
     NO_NUMBA = "numba_unavailable"
@@ -2175,7 +2167,7 @@ def _status_reason(kernel, status) -> Declined:
         kernel.STATUS_LABEL_LIMIT: Declined.LABEL_BUDGET,
         kernel.STATUS_STATE_LIMIT: Declined.STATE_BUDGET,
         # `feasible_dag`'s heap, which `price_dag` never raises: the two searches share the
-        # status code, and only the feasible one grows a heap (`dp_kernel.py:2334-2338`).
+        # status code, and only the feasible one grows a heap.
         kernel.STATUS_CANDIDATE_LIMIT: Declined.HEAP_BUDGET,
         kernel.STATUS_FSUM_OVERFLOW: Declined.FSUM_OVERFLOW,
     }.get(status, Declined.KERNEL_STATUS)
@@ -2190,13 +2182,11 @@ def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
     * **Restarts.** ``result.attempts > 1`` means a budget filled and the search re-ran from
       its first layer, throwing away every sink certification the previous attempt had
       already paid for.  The answer is unchanged -- a budget bounds work, never the search --
-      so this is invisible except as a slow flight, which is exactly the shape
-      ``[[run-astar-with-compiled-extra]]`` records costing a whole issue on the A* side.
-      ``DagResult.attempts`` has always carried this ("the number to read when a flight is
-      unexpectedly expensive"); nothing read it.
+      so this is invisible except as a slow flight (``DagResult.attempts`` is the number to
+      read when a flight is unexpectedly expensive).
     * **Declines.** The search stopped without finishing, so this flight fell back to the
-      Python reference -- same column, 3-4.5x the time.  The advice is split by cause,
-      because the two that land here are opposites: a budget status means the pool hit
+      Python reference -- same column, slower.  The advice is split by cause, because the two
+      that land here are opposites: a budget status means the pool hit
       :data:`~.dp_kernel.MAX_LABEL_CAPACITY`, which is a knob and not a wall, while
       ``FSUM_OVERFLOW`` means a partial expansion saturated and a SCORE would have been
       wrong -- telling someone to raise a ceiling in that case would be worse than saying
@@ -2210,11 +2200,11 @@ def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
 
     global _kernel_restart_warned, _kernel_budget_warned
 
-    # A search that FILLED past the old ceiling is one that would have declined to the
-    # pure-Python reference before `MAX_LABEL_CAPACITY` was raised to 1<<26.  It succeeded,
-    # so nothing here is wrong -- but its headroom is gone, and the decline warning below
-    # only fires once it is too late.  This is the one that fires while there is still time
-    # to act (a bootstrap cutoff, a narrower objective, fewer flights per batch).
+    # A search that FILLED past `LABEL_HIGH_WATER_WARN` is one that would have declined to the
+    # pure-Python reference under the previous, lower ceiling.  It succeeded, so nothing here
+    # is wrong -- but its headroom is gone, and the decline warning below only fires once it is
+    # too late.  This is the one that fires while there is still time to act (a bootstrap
+    # cutoff, a narrower objective, fewer flights per batch).
     #
     # Gated on STATUS_OK, and not merely to be tidy: a search that DECLINED already gets a
     # more specific warning below, and saying "no headroom left" about a search that
@@ -2275,10 +2265,9 @@ def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
 def _dp_kernel():
     """The compiled kernel module, or ``None`` when numba is unavailable.
 
-    Warns once per process rather than per flight. The warning exists because the failure
-    is silent and expensive: a sweep that quietly ran the reference everywhere looks
-    exactly like a slow sweep, and ``[[run-astar-with-compiled-extra]]`` records the same
-    lesson from the A* side, where a 5-7x regression stayed invisible for a whole issue.
+    Warns once per process rather than per flight. The warning exists because the failure is
+    silent and expensive: a sweep that quietly ran the reference everywhere looks exactly like
+    a slow sweep.
     """
 
     global _kernel_fallback_warned
@@ -2318,8 +2307,8 @@ def _dag_candidates(
     Two memos that the reference declines and this is entitled to, both answer-identical:
 
     * ``_path_claims``' own ``endpoint_cache``/``visit_cache`` parameters, which exist for
-      exactly this caller. Sink proposals share path prefixes and corridor start steps;
-      measured 90% redundant (1106 calls, 114 distinct) on one ranking pass.
+      exactly this caller. Sink proposals share path prefixes and corridor start steps, so
+      ``(cell, visit_step)`` repeats heavily.
     * the provisional reduced cost itself, per LABEL rather than per lane. Neither
       ``_path_claims`` (which opens with ``del dest_lane_idx``) nor ``_path_delay_s`` takes
       the destination lane, so the reference recomputes an identical number once per lane
@@ -2408,9 +2397,9 @@ def _best_column_compiled(
     the reference's column. A :class:`Declined` means the caller must run ``_best_column``,
     and says which of the eight reachable causes applied.
 
-    Note what completing is NOT: a residual-bound argument over a superset search. PR #76
-    needed one because its kernel searched more than the reference and certified
-    separately. This one does not, which is why there is no ``label_limit`` ladder here --
+    Note what completing is NOT: a residual-bound argument over a superset search. This
+    kernel reproduces the reference's explored set exactly rather than searching more and
+    certifying separately, which is why there is no ``label_limit`` ladder here --
     ``price_dag`` grows its own budgets and either finishes or says it did not. (A
     *bootstrap* round is a different thing and does exist, in ``price_flight``, where both
     searches receive its result; see :func:`_bootstrap_incumbent`.)
@@ -2478,8 +2467,8 @@ def _best_column_compiled(
     # `record_budget=False` skips BOTH halves of the graph's budget memo, and it has to be
     # both.  A restricted search shares this cache with the unrestricted one that follows it,
     # and would corrupt it in each direction: reading, a 4-departure bootstrap would allocate
-    # the FULL search's pool (up to `MAX_LABEL_CAPACITY`, ~2.68 GB) for a search that needs a
-    # sliver of it; writing, the memo would end up holding the bootstrap's tiny budget, and
+    # the FULL search's pool (up to `MAX_LABEL_CAPACITY`) for a search that needs a sliver of
+    # it; writing, the memo would end up holding the bootstrap's tiny budget, and
     # since the write below sits past the `status != OK` guard, a declining flight -- the one
     # this is all for -- would keep that number and make every later iteration re-climb the
     # ladder from it.  Answer-neutral either way; the cost is entirely in wasted work.
@@ -2614,13 +2603,13 @@ def _feasible_compiled(
 
     The **start loop stays in Python** and the kernel gets its result. That is not laziness:
     the guards need ``_endpoint_claims`` sets and the reference's own ``break`` on the
-    incumbent's delay, and the loop runs a few hundred times against the search's hundreds
-    of thousands of arc relaxations. Measured on a density flight: 141,553 arcs against 491
-    endpoint-claim calls.
+    incumbent's delay, and the loop runs a few hundred times against the search's hundreds of
+    thousands of arc relaxations.
 
     Every sink still goes back to Python, because ``_canonical_candidate`` is the exact gate
-    that judges them and it reaches the whole geometry stack. 115 of those against the same
-    141,553 arcs is what makes pausing per sink affordable.
+    that judges them and it reaches the whole geometry stack. There are a few hundred sinks
+    against those same hundreds of thousands of arcs, which is what makes pausing per sink
+    affordable.
     """
 
     kernel = _dp_kernel()
@@ -2699,7 +2688,7 @@ def _feasible_compiled(
     state: dict[str, Any] = {"best": best_column}
 
     def certify(departure_step, origin_lane, dest_lane, step, hops, path):
-        """``find_feasible_column``'s per-sink block, arm for arm (pricing.py:2337-2369)."""
+        """``find_feasible_column``'s per-sink block, arm for arm."""
 
         _check_deadline(deadline)
         label = _Label(0.0, departure_step, origin_lane, path, _EMPTY_ROWS)
@@ -2769,14 +2758,29 @@ def find_feasible_column(
 ) -> Column | None:
     """Best-first incumbent search over the lazy space-time topology.
 
-    This is deliberately an incumbent heuristic, not the reduced-cost oracle:
-    it runs only after the first LP and therefore cannot contribute to a global
-    pricing bound.  Static adjacency and the certified seed are reused, while
-    row exclusions and labels remain call-local.  A raw-hex delay lower bound
-    orders the frontier; the exact canonical gate judges every sink.  When
-    ``improve_below_delay_s`` is supplied, the first certified strict
-    improvement may be returned.  That early exit is useful for incumbent
-    construction but is intentionally unavailable to formal pricing.
+    Deliberately an incumbent heuristic, not the reduced-cost oracle: it runs only after the
+    first LP and therefore cannot contribute to a global pricing bound.  Static adjacency and
+    the certified seed are reused, while row exclusions and labels remain call-local.  A
+    raw-hex delay lower bound orders the frontier; the exact canonical gate judges every sink.
+    The ``improve_below_delay_s`` early exit is useful for incumbent construction but is
+    intentionally unavailable to formal pricing.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's space-time graph; must have been built with ``cfg``.
+    - cfg (SimConfig): the config used to build ``fg``; a mismatch raises ``ValueError``.
+    - forbidden_rows (AbstractSet[RowKey]): rows a feasible column may not claim (the repair
+      seam's saturated set).
+    - improve_below_delay_s (float | None): when set, return the first certified column whose
+      delay is strictly below this; ``None`` searches for the best feasible column.
+    - deadline (float | None): monotonic wall-clock cutoff; reaching it raises
+      :class:`PricingTimeout`.
+    - model (CostModel): objective the delay lower bound and canonical gate use.
+
+    Return
+    --------
+    - output (Column | None): the best (or first-improving) feasible column, or ``None`` when
+      the flight has none.
     """
 
     _check_deadline(deadline)
@@ -2791,11 +2795,9 @@ def find_feasible_column(
     if not destination_options:
         return None
     destination_cells = frozenset(destination_options)
-    # ``_best_column`` has memoized this since it was written; this search never got the
-    # same treatment and paid for it: measured at 3,940,131 calls driving 24,760,154
-    # ``hex_distance`` calls (6.3 destination lanes each), ~9s of a 32s stage.  The value
-    # depends only on the cell and the fixed destination set, and the corridor holds a few
-    # thousand cells against millions of arc relaxations, so this is nearly all hits.
+    # Memoized like ``_best_column``'s: the value depends only on the cell and the fixed
+    # destination set, and the corridor holds a few thousand cells against millions of arc
+    # relaxations, so this is nearly all hits.
     distance_cache: dict[Cell, int] = {}
 
     def remaining_distance(cell: Cell) -> int:
@@ -3097,8 +3099,7 @@ def find_feasible_column(
                 continue
             if hops + 1 + remaining > fg.max_air_hops:
                 continue
-            # Once per relaxed arc, and the set was built only to be tested: measured at
-            # 3,764,765 calls and 11.76s of this search's 37.72s.
+            # Once per relaxed arc, and the set was built only to be tested.
             if _visit_hits_forbidden(neighbour, 0, next_step, offsets, forbidden):
                 continue
             next_path = (*path, neighbour)
@@ -3168,28 +3169,39 @@ def price_flight(
 ) -> tuple[float, Column | None]:
     """Return the best positive-reduced-cost column for one flight.
 
-    ``known_column`` is a column the caller already holds for this flight -- the
-    restricted master's current selection.  Its reduced cost under the current duals is
-    a *proven achievable* score, so it is a valid pruning cutoff, and a far better one
-    than the shortest-path seed this function otherwise builds for itself.  That matters
-    enormously: on a captured 500-flight subproblem the seed gave a cutoff of rc=112
-    against an optimum of rc=144, and closing that 32-unit gap collapsed the search from
-    **32,274,881 labels to 73,541** -- 439x -- with the departure-variant prefilter going
-    from 503 surviving variants to 1.  Cutoff quality dominates every other lever in this
-    search, so this argument is the one to preserve when changing anything below.
+    ``known_column`` is a column the caller already holds -- the restricted master's current
+    selection.  Its reduced cost under the current duals is a *proven achievable* score, so it
+    is a valid pruning cutoff and a far better one than the shortest-path seed this function
+    otherwise builds for itself.  Cutoff quality dominates every other lever in this search, so
+    this is the argument to preserve when changing anything below.  Passing it never changes
+    the answer, only the work: pruning against an attainable score cannot discard anything
+    strictly better.  A column equal to the one supplied is reported as no column at all, so
+    the caller cannot mistake what it already holds for pricing progress.
 
-    Passing it never changes the answer, only the work: pruning against a score that is
-    actually attainable cannot discard anything strictly better.  A column equal to the
-    one supplied is reported as no column at all, so the caller is not handed back what
-    it already has and cannot mistake it for pricing progress.
+    ``forbidden_rows`` is the repair seam: touching one of those already-saturated rows makes
+    an origin, visit, arrival, or final canonical column infeasible rather than merely
+    expensive.  Repair also sets ``require_improving=False`` because it needs the best feasible
+    trajectory even when a user-supplied benefit ``M`` is smaller than that trajectory's delay.
+    The returned reduced cost is always recomputed from the canonical de-duplicated claim set.
 
-    ``forbidden_rows`` is the repair seam: touching one of those already
-    saturated rows makes an origin, visit, arrival, or final canonical column
-    infeasible rather than merely expensive.  Repair also sets
-    ``require_improving=False`` because it needs the best feasible trajectory
-    even when a user-supplied benefit ``M`` is smaller than that trajectory's
-    delay.  The returned reduced cost is always recomputed from the canonical
-    de-duplicated claim set.
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's space-time graph; must have been built with ``cfg``.
+    - duals (Mapping[RowKey | tuple, float] | DualView): current master-row duals.
+    - pi_f (float): the flight-row dual; must be finite.
+    - cfg (SimConfig): the config used to build ``fg``; a mismatch raises ``ValueError``.
+    - params (Any): colgen params; supplies ``M`` (benefit), the objective, and the bootstrap.
+    - forbidden_rows (AbstractSet[RowKey]): rows a returned column may not claim.
+    - require_improving (bool): when True, return no column unless its reduced cost clears
+      ``_IMPROVING_RC_TOL``.
+    - known_column (Column | None): the caller's current column, used as a cutoff.
+    - deadline (float | None): monotonic wall-clock cutoff; reaching it raises
+      :class:`PricingTimeout`.
+
+    Return
+    --------
+    - output (tuple[float, Column | None]): the reduced cost and the best improving column, or
+      ``(reduced_cost, None)`` when none improves or the best equals ``known_column``.
     """
 
     if not isinstance(require_improving, bool):
@@ -3316,17 +3328,17 @@ def price_flight(
         model=model,
     )
     # Split here rather than timing the whole call, because on a flight that DECLINES the
-    # two halves want opposite fixes and a combined number cannot tell them apart: a
-    # decomposition of one such straggler put 91.5% of it in the pure-Python fallback and
-    # only 8.5% in the compiled ladder that triggered it. Raising the label ceiling attacks
-    # the smaller half. Both are written unconditionally so a flight that never fell back
-    # still reports `fallback_s = 0.0` rather than a missing key.
+    # two halves want opposite fixes and a combined number cannot tell them apart: most of a
+    # declining straggler's wall is the pure-Python fallback, not the compiled ladder that
+    # triggered it, and raising the label ceiling attacks only the smaller half. Both are
+    # written unconditionally so a flight that never fell back still reports `fallback_s = 0.0`
+    # rather than a missing key.
     _LAST_SEARCH["compiled_s"] = time.perf_counter() - _compiled_started
     _LAST_SEARCH["fallback_s"] = 0.0
     _LAST_SEARCH["declined"] = isinstance(outcome, Declined)
-    # The bootstrap is a SEPARATE `_best_column_compiled` call at the seam above, so it is
-    # not inside `compiled_s` and was previously unattributed -- 94% of one straggler's
-    # wall on a 500-flight sweep landed in neither field.
+    # The bootstrap is a SEPARATE `_best_column_compiled` call at the seam above, so it is not
+    # inside `compiled_s`; timed on its own so a straggler's bootstrap wall is not lost between
+    # the two fields.
     _LAST_SEARCH["bootstrap_s"] = _bootstrap_s
     _LAST_SEARCH["bootstrap_labels"] = _bootstrap_labels
     # What the main search actually ENTERS with, which is the number that separates the two
@@ -3399,11 +3411,23 @@ def seed_column(
 ) -> Column:
     """Return a deterministic, dual-free shortest-delay feasible seed.
 
-    Only the nominal departure is considered.  With zero row prices the DAG
-    minimizes ground hold, lateral hops, and endpoint fold/snap legs; shortest
-    paths never exercise the short-revisit restriction, so this is the plan's
-    unconstrained shortest-path seed while retaining the canonical wall and
-    detour gates.
+    Only the nominal departure is considered.  With zero row prices the DAG minimizes ground
+    hold, lateral hops, and endpoint fold/snap legs; shortest paths never exercise the
+    short-revisit restriction, so this is the plan's unconstrained shortest-path seed while
+    retaining the canonical wall and detour gates.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's space-time graph; must have been built with ``cfg``.
+    - cfg (SimConfig): the config used to build ``fg``; a mismatch raises ``ValueError``.
+    - deadline (float | None): monotonic wall-clock cutoff; reaching it raises
+      :class:`PricingTimeout`.
+    - model (CostModel): objective the seed's delay is scored under (the cache is keyed on it).
+
+    Return
+    --------
+    - output (Column): the seed column; raises ``ValueError`` when the flight has no feasible
+      seed.
     """
 
     if cfg != fg._cfg:

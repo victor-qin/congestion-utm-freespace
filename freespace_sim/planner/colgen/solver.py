@@ -151,20 +151,17 @@ def _shift_column(
 def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     """Offer the master `steps` pure clock translations of one flight's seed.
 
-    Pricing spends its early iterations rediscovering exactly these: measured over a
-    converged 100-flight solve, 91% of the columns added in iterations 2-11 were time
-    shifts of a route already in the pool.  A shift is a `_shift_column` translation --
-    arithmetic, no DP -- so handing them over up front converts search into addition.
+    One rung of the warm pool's init (see context/figures/cg_loop.png).
+    Pricing otherwise spends its early iterations rediscovering exactly these (most of the
+    columns a converged solve adds after the first are time shifts of a route already in
+    the pool).  A shift is a `_shift_column` translation -- arithmetic, no DP -- so handing
+    them over up front converts that search into addition.
 
-    Depth is a real dial with a knee, not "more is better".  Measured at 20 iterations on
-    density_faa/100, cost-scale LP gap: k=4 5.1e-3, k=10 4.2e-3, k=20 3.8e-4, k=50 4.3e-3.
-    k=20 is 13x tighter than k=4 for 18% more wall; k=50 REGRESSES to k=10's quality while
-    carrying 2.3x the columns.  The reason is that the optimum here never delays a flight
-    more than 14 steps, so a ladder past that adds departures no schedule wants, and tied
-    columns feed the master's degeneracy instead of resolving it.  The useful depth is set
-    by the solution's slip, not by `max_ground_delay_s` -- which allows 900 steps here.
-
-    Denser traffic slips further and moves the knee, so 20 is calibrated, not universal.
+    Depth has a knee; more is not better.  Past the largest delay any optimal schedule
+    actually uses, extra rungs add departures no schedule wants and tied columns feed the
+    master's degeneracy instead of resolving it.  So the useful depth is set by the
+    solution's slip, not by `max_ground_delay_s` (which permits far more).  Denser traffic
+    slips further and moves the knee, so the shipped depth is calibrated, not universal.
     """
 
     if steps <= 0:
@@ -414,10 +411,9 @@ def _relative_revenue_gap(upper_bound: float, rmp_value: float) -> float:
 
     Measured on the maximize objective, whose scale includes ``n * M``.  That
     normalization is the whole difference from :func:`_relative_cost_gap`: the same
-    absolute slack of ~90,000 units reads as 0.009% here (against a revenue of ~1e9) and
-    as 63% there (against a total cost of ~141,000).  Both describe the identical
-    solution; the paper's thresholds -- 0.01% for the LP, 0.1% for the heuristic -- are
-    calibrated against this one.
+    absolute slack reads as a tiny fraction of revenue here but a large fraction of cost
+    there, for the identical solution.  The paper's thresholds (0.01% for the LP, 0.1% for
+    the heuristic) are calibrated against this revenue scale.
     """
 
     if not math.isfinite(upper_bound) or not math.isfinite(rmp_value):
@@ -491,11 +487,10 @@ def _backend_name(master: RestrictedMaster) -> str:
 def _dual_regime_stats(backend_name: str) -> dict[str, int | None]:
     """WHICH DUAL VECTOR PRICED THIS RUN, keyed off the backend that ACTUALLY ran.
 
-    Recorded because these are answer-affecting and were, until now, environment variables
-    nothing wrote down: the same pool under simplex and under barrier gave 196,332.8 and
-    184,729.0 at x1500.  An archived run without them cannot be compared to anything.
-    ``lp_method`` ``-1`` is Gurobi's automatic choice; ``2 / 0`` is barrier without
-    crossover, the default.
+    Recorded because these are answer-affecting: the same pool priced under simplex and
+    under barrier reaches materially different objectives, so an archived run without them
+    cannot be compared to anything.  ``lp_method`` ``-1`` is Gurobi's automatic choice;
+    ``2 / 0`` is barrier without crossover, the default.
 
     Keyed on the RESOLVED backend rather than on ``params.solver``, and the difference is
     the whole point: ``solver="auto"`` falls back to HiGHS whenever gurobipy is missing, so
@@ -668,30 +663,45 @@ class ColGenSolver:
     ) -> ColGenResult:
         """Run the column-generation loop to convergence, a bound, or a time limit.
 
+        The loop shape (warm pool → master LP → price against duals → add columns → repeat,
+        then a final restricted-master IP) is in context/figures/cg_loop.png.
+
         Pricing is a sweep over the flights: each subproblem is independent given the
         iteration's duals, so the loop order affects only which columns a timed-out sweep
-        managed to reach, never their value.
+        managed to reach, never their value.  A sweep that FINISHES is therefore
+        answer-identical whether run in-process or across worker processes; a sweep that
+        hits ``pricing_deadline`` is not, because the deadline is a wall clock and a pool
+        gets further through ``pricing_order`` before it, keeping a longer accepted prefix
+        (more pricing inside the same budget, not the same answer -- see
+        :mod:`.pricing_pool`).  Parallelism is configured only through
+        ``params.n_pricing_workers``; there is no separate ``parallel=`` argument.
 
-        ``params.n_pricing_workers`` fans that sweep across worker processes; 0 keeps it
-        in-process.  :func:`pricing_pool.price_sweep` reproduces the sequential loop's
-        prefix RULE and hands the reduced costs back in index order, so on a sweep that
-        FINISHES the columns and the objective are unchanged.  A sweep that hits
-        ``pricing_deadline`` is a different matter: the timeout is a wall clock rather than
-        a work budget, and a pool gets further through ``pricing_order`` before the same
-        absolute deadline than one core does, so it keeps a longer prefix.  More pricing
-        inside the same budget, but not the same answer -- see :mod:`.pricing_pool`.
+        Parameters
+        ------------
+        - requests (Sequence[FlightRequest]): the flights to schedule together; flight ids
+          must be unique.
+        - cfg (SimConfig): geometry, timestep, and cost configuration for the whole solve.
+        - static_terms: static terminal/wall catalogue (often a generator owned by the
+          simulation); snapshotted once so every flight graph sees the same walls.
+        - params (ColGenParams): network and solver controls (backend, gaps, time limits,
+          worker count, ladder/bootstrap depth).
+        - fixed_claims (Sequence[frozenset[RowKey]]): capacity claims already committed by
+          flights outside this batch (the rolling-horizon seam); their load is reserved
+          before this batch is placed.
+        - on_iteration: optional callback invoked once per iteration with a dict of that
+          iteration's master state (LP objective, global upper bound, gaps, column and
+          dual diagnostics).  Without it the per-iteration bound and gap surface only in
+          the final stats, so a killed or watched run discards them.
+        - seed_columns (Mapping[int, Sequence[Column]] | None): optional warm-start columns
+          per flight.  ORDER is load-bearing: element 0 is that flight's entry in the
+          candidate incumbent, elements 1.. are pool contents only.  Every column is
+          re-canonicalised through the same claim gate, so a warm start cannot introduce a
+          trajectory pricing could not have produced.
 
-        There is no ``parallel=`` keyword.  It used to take a separate
-        ``ParallelPricingConfig``, which duplicated a count ``params`` already carried and
-        let the two defaults disagree; the sweep reads ``params`` directly now.
-
-        ``on_iteration`` is called once per column-generation iteration with a dict of
-        that iteration's master state (LP objective, global upper bound, gaps, column
-        counts).  Without it a long solve is opaque until it returns: the bound and the
-        gap are computed every iteration but only surface in the final stats, so a run
-        that is killed -- or one you simply want to watch -- discards them.  Nothing else
-        in this package logs, so without a callback a solve is silent until `run_batch`
-        summarises it.
+        Return
+        --------
+        - output (ColGenResult): the selected column per placed flight plus a stats dict
+          (termination reason, bounds, gaps, IP diagnostics, and the denial partition).
         """
         started = time.monotonic()
         pricing_wall_s = 0.0
@@ -946,15 +956,15 @@ class ColGenSolver:
         # Every column still goes through the same canonical claim gate, so it cannot
         # introduce a trajectory pricing could not have produced.
         #
-        # IT IS NO LONGER A POOL-CONTENTS KNOB ONLY, and the ORDER of each flight's sequence
-        # is now load-bearing: element 0 is the flight's entry in the candidate INCUMBENT
-        # assembled below, and elements 1.. are pool contents alone.  `warm_start.build`
-        # relies on that -- it returns the repaired, mutually row-feasible column first and
-        # its departure-shifted alternatives after -- so a caller that re-orders a sequence
-        # silently changes which schedule is offered as the incumbent, not just which
-        # columns exist.  A caller with no incumbent to propose can pass any order it likes;
-        # the feasibility and improvement guards below reject a candidate that is not
-        # jointly claim-feasible or not better than the heuristic.
+        # The ORDER of each flight's sequence is load-bearing: element 0 is the flight's
+        # entry in the candidate INCUMBENT assembled below, and elements 1.. are pool
+        # contents alone.  `warm_start.build` relies on that -- it returns the repaired,
+        # mutually row-feasible column first and its departure-shifted alternatives after --
+        # so a caller that re-orders a sequence silently changes which schedule is offered
+        # as the incumbent, not just which columns exist.  A caller with no incumbent to
+        # propose can pass any order it likes; the feasibility and improvement guards below
+        # reject a candidate that is not jointly claim-feasible or not better than the
+        # heuristic.
         seeded_columns = 0
         seeded_first: dict[int, Column] = {}
         for flight_id, extras in (seed_columns or {}).items():
@@ -969,30 +979,28 @@ class ColGenSolver:
         # The seed columns are also a candidate INCUMBENT, not only pool contents.  Adding
         # them to the pool alone leaves them reachable exclusively through the final IP --
         # and when that IP is truncated the run returns the shifted-seed heuristic instead,
-        # so a caller who supplied a whole better schedule gets none of it.  Measured at
-        # 1,500 flights: the heuristic's 233,520 was reported while A*'s 211,440 sat unused
-        # in the pool.  Taking it as the incumbent makes the fallback the BETTER of the two.
+        # so a caller who supplied a whole better schedule gets none of it.  Taking it as
+        # the incumbent makes the truncated-IP fallback the BETTER of the two schedules.
         #
         # Guarded, not assumed: the seeds are only an incumbent if they are jointly claim
         # feasible (a caller's schedule need not be, and a warm start must never smuggle in
         # an infeasible selection) and only if they actually beat the heuristic.
         #
         # The flights the seeds do NOT name are re-picked around them rather than left on
-        # their shifted-seed columns.  Overlaying the seeds on the heuristic was the
-        # obvious reading and it does not work: at 1,500 flights the 7 routes the graph
-        # could not express kept heuristic columns that clashed with the 1,493 seeded
-        # ones, `is_claim_feasible` failed on the overlay, and the warm start was thrown
-        # away over 0.5% of the schedule.  `complete_selection` pins the seeds and fills
-        # the rest greedily, so a leftover flight can only cost what its own best
-        # compatible column costs.
+        # their shifted-seed columns.  Overlaying the seeds on the heuristic is the obvious
+        # reading and it does not work: the few routes the graph cannot express keep
+        # heuristic columns that clash with the seeded ones, `is_claim_feasible` fails on
+        # the overlay, and the whole warm start is thrown away.  `complete_selection` pins
+        # the seeds and fills the rest greedily, so a leftover flight can only cost what
+        # its own best compatible column costs.
         if seeded_first:
             seeds_feasible = master.is_claim_feasible(seeded_first)
             candidate = master.complete_selection(seeded_first) if seeds_feasible else {}
             # WHY a warm start was refused is not recoverable after the fact: a candidate
             # missing k flights loses on `k*M` while a clashing one never gets built at
             # all, and both surface only as `initial_heuristic_strategy == "shifted_seeds"`.
-            # Measured at 1,500 flights, the two differ by 155x in magnitude and point at
-            # completely different fixes, so the run has to say which one happened.
+            # The two point at completely different fixes, so the run has to log which one
+            # happened.
             log.info(
                 "  warm start: %d seeds, pins %s, completed to %d/%d flights, "
                 "objective %.1f vs heuristic %.1f",
@@ -1125,34 +1133,21 @@ class ColGenSolver:
                     master.set_heuristic(best_heuristic)
 
                 if iteration == 0:
-                    # The first LP has now established the real column-generation
-                    # cycle.  Build at most one route-aware incumbent column per
-                    # flight using the same lazy topology, bounded independently of
-                    # the pricing loop.
+                    # The first LP has established the real column-generation cycle.  Build
+                    # at most one route-aware incumbent column per flight using the same
+                    # lazy topology, bounded independently of the pricing loop.
                     #
-                    # "Independently" no longer means "as a share of the solve".  The
-                    # budget below is per FLIGHT and the old `0.55 * time_limit_s`
-                    # factor is gone, so the only thing keeping this stage away from
-                    # the whole budget is the absolute `pricing_deadline` clamp.
-                    #
-                    # The shipped rate is now 0, which disables the stage outright,
-                    # so none of that arithmetic runs by default -- see
-                    # `greedy_budget_s_per_flight` for why.  It still describes what
-                    # an ENABLED rate costs: at 0.7 s (the old default) against a
-                    # 1200 s limit, ~850 flights makes the greedy half of pricing's
-                    # budget and ~1700 makes it all of it.  A ceiling on batch size
-                    # rather than a guarantee, and the reason a very large batch
-                    # wants its rate chosen rather than copied.
+                    # The budget is per FLIGHT and clamped only by the absolute
+                    # `pricing_deadline`.  The shipped rate is 0, which disables the stage
+                    # outright (see `greedy_budget_s_per_flight` for why), so none of this
+                    # arithmetic runs by default.  An ENABLED rate's cost scales with batch
+                    # size, so a very large batch wants its rate chosen rather than copied.
                     greedy_started = time.monotonic()
                     # PER FLIGHT, because the stage divides its budget across candidates and a
-                    # fixed total therefore starves as the batch grows.  The old
-                    # `min(60.0, 0.55 * time_limit_s)` split 60 s across up to
-                    # `candidate_limit` = 256 candidates, giving each ~0.23 s at 500 flights --
-                    # far under one density search.  Measured there: 170 of 202 searches
-                    # entered the compiled kernel and 168 were cut off inside it, so the stage
-                    # spent its whole budget to improve about two flights.  It was also the
-                    # reason a solve stopped being reproducible above ~300 flights: when nearly
-                    # every candidate is decided by a stopwatch, machine load picks the winners.
+                    # fixed total therefore starves as the batch grows -- each search then gets
+                    # far less than one density search needs.  A fixed total also breaks
+                    # reproducibility above a few hundred flights: when nearly every candidate
+                    # is decided by a stopwatch, machine load picks the winners.
                     greedy_budget_s = params.greedy_budget_s_per_flight * len(flight_ids)
                     greedy_deadline = min(pricing_deadline, greedy_started + greedy_budget_s)
                     greedy_heuristic, greedy_completed = _greedy_feasible_selection(
@@ -1455,29 +1450,25 @@ class ColGenSolver:
             # hours (see ColGenParams.ip_time_limit_s).  Whichever binds first wins.
             # `ip_time_limit_s` is handed to `solve_ip` as a BUDGET rather than folded into
             # a deadline here, because eager row materialization happens inside `solve_ip`
-            # and is setup, not search.  Pre-shrinking the deadline charged that setup to
-            # the solver: at x1500 it is 272 s, so a 900 s cap delivered 628 s of MILP and
-            # a 300 s cap delivered ~28 s and returned the incumbent untouched.  The
-            # whole-solve `deadline` still binds and is still the hard wall.
+            # and is setup, not search: pre-shrinking the deadline would charge that setup
+            # to the solver and starve the MILP.  The whole-solve `deadline` still binds
+            # and is still the hard wall.
             master.backend.time_limit_s = max(1e-6, params.ip_time_limit_s)
             master.set_heuristic(incumbent)
             # Re-scale the MIP tolerance now that the incumbent's COST is known.
             # `create_backend` can only assume the worst case (cost -> 0) and so hands the
-            # backend `ip_gap / (n*M)` -- an ABSOLUTE tolerance of `ip_gap` revenue units.
-            # At 1,000 flights that is 1e-12 relative, i.e. "prove a cost of 129,000 to
-            # within 0.001": ~129,000x tighter than the 0.1% `ip_gap` reads as, and the
-            # measured cause of the final MILP's blow-up (round 5 of separation went 6.5 s
-            # to 39.1 s, round 6 11.7 s to 134.6 s, purely from this).  Here the incumbent
-            # gives a real cost scale, so the same user-facing tolerance can be expressed
-            # against it.  `max(..., 1.0)` keeps the conservative old value when cost is
-            # genuinely tiny, which is the case the original conversion was protecting.
+            # backend `ip_gap / (n*M)` -- an ABSOLUTE tolerance of `ip_gap` revenue units,
+            # orders of magnitude tighter than the user-facing `ip_gap` reads as and a
+            # measured cause of the final MILP blowing up.  Here the incumbent gives a real
+            # cost scale, so the same user-facing tolerance can be expressed against it.
+            # `max(..., 1.0)` keeps the conservative value when cost is genuinely tiny,
+            # which is the case the original conversion was protecting.
             incumbent_cost = total_benefit - _selection_objective(incumbent, params.M)
             revenue_scale = max(1.0, total_benefit)
             master.backend.ip_gap = params.ip_gap * max(incumbent_cost, 1.0) / revenue_scale
-            # Timed because it was the one unattributed block left in the solve.  Worth
-            # knowing precisely: on a 1,138-column 100-flight pool the whole solve took
-            # 643s and the IP was under a second of it, so "the IP is slow" is a
-            # hypothesis that needs a number before anyone acts on it.
+            # Timed because it was the one unattributed block left in the solve, and "the
+            # IP is slow" is a hypothesis that needs a number before anyone acts on it: a
+            # converged pool can spend nearly all its wall in pricing and almost none here.
             ip_started = time.monotonic()
             ip_selection = master.solve_ip(
                 deadline=deadline,

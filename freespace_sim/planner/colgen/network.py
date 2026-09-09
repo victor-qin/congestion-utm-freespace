@@ -54,21 +54,17 @@ _ARC_LAST = 1 << 2
 _ARC_FIRST_LAST = 1 << 3
 _ALL_ARC_ROLES = _ARC_INTERNAL | _ARC_FIRST | _ARC_LAST | _ARC_FIRST_LAST
 _MAX_CERTIFIED_COLUMNS = 2
-# Distinct `(origin, step, timing_steps)` endpoint claim sets kept per graph.  The
-# reachable key space is bounded by `2 * n_steps * (max_air_hops + 1)`, which grows with the
-# horizon, and each entry is a frozenset of freshly built `RowKey`s.  So this is a memory
-# bound, not a correctness one: an eviction only costs the recompute it was avoiding.
-#
-# The 1,511 distinct keys `pricing._endpoint_claims` quotes are NOT the figure to size this
-# against: that count is over `colgen_test`'s first twelve flights, so it spans twelve
-# graphs, while this cap is enforced on one graph's `_search_cache`.  The per-graph number
-# is far smaller there and larger on density, i.e. this constant is not yet calibrated
-# against the quantity it actually bounds.  Answer-neutral, so tuning it is free -- see
-# issue #87.
+# Distinct `(origin, step, timing_steps)` endpoint claim sets kept per graph.  The reachable
+# key space is bounded by `2 * n_steps * (max_air_hops + 1)` (grows with the horizon), each
+# entry a frozenset of freshly built `RowKey`s.  A memory bound, not a correctness one: an
+# eviction only costs the recompute it was avoiding, so this is answer-neutral and free to
+# tune.  Enforced per graph (on one graph's `_search_cache`) and not yet calibrated against
+# that per-graph key count -- smaller than any whole-sweep total, and larger on density.
 _MAX_ENDPOINT_CLAIMS = 2048
 
 
 def _aabbs_overlap(first: FlatAabb, second: FlatAabb) -> bool:
+    """True if two flat AABBs overlap on all three axes (separating-axis test)."""
     axmin, aymin, azmin, axmax, aymax, azmax = first
     bxmin, bymin, bzmin, bxmax, bymax, bzmax = second
     return not (
@@ -84,10 +80,9 @@ def _aabbs_overlap(first: FlatAabb, second: FlatAabb) -> bool:
 class _WallSpatialIndex:
     """Exact broad phase for immutable permanent terminal cylinders.
 
-    Each wall is inserted into every uniform XY bucket touched by its AABB.
-    Query AABBs therefore cannot miss a possible intersection; the final full
-    3-D AABB test and ``volumes_conflict`` remain authoritative.  The index is
-    A solve-scoped terminal catalog shares one instance across flight graphs;
+    Each wall is inserted into every uniform XY bucket its AABB touches, so a query AABB cannot
+    miss a possible intersection; the final full 3-D AABB test and ``volumes_conflict`` remain
+    authoritative.  A solve-scoped terminal catalog shares one instance across flight graphs;
     standalone graph construction still creates a self-contained instance.
     """
 
@@ -102,6 +97,17 @@ class _WallSpatialIndex:
     )
 
     def __init__(self, walls: tuple[Volume4D, ...], bucket_size: float) -> None:
+        """Bucket every wall's AABB into a uniform XY grid for later broad-phase queries.
+
+        Parameters
+        ------------
+        - walls (tuple[Volume4D, ...]): the permanent terminal cylinders to index.
+        - bucket_size (float): uniform XY bucket edge (m); must be finite and positive.
+
+        Return
+        --------
+        - output (None): populates the bucket grid; raises ``ValueError`` on a non-positive size.
+        """
         if not math.isfinite(bucket_size) or bucket_size <= 0.0:
             raise ValueError("wall-index bucket size must be finite and positive")
         self._walls = walls
@@ -129,6 +135,7 @@ class _WallSpatialIndex:
         self._lock = threading.RLock()
 
     def candidates(self, bound: FlatAabb) -> tuple[WallBound, ...]:
+        """Return indexed walls whose AABB overlaps ``bound`` (exact filter over bucket hits)."""
         xmin, ymin, _zmin, xmax, ymax, _zmax = bound
         indices: set[int] = set()
         for x_bucket in range(
@@ -182,6 +189,19 @@ class StaticTerminalCatalog:
     )
 
     def __init__(self, static_terms, cfg: SimConfig) -> None:
+        """Freeze the solve-wide static terminals: walls, keep-out cells, and broad-phase index.
+
+        Parameters
+        ------------
+        - static_terms (Iterable[tuple[Sequence[float], Terminal-like]]): ``(center, terminal)``
+          pairs; each center needs two or three coordinates and terminal metadata.
+        - cfg (SimConfig): geometry used to build the walls, keep-out cells, and bucket size.
+
+        Return
+        --------
+        - output (None): populates the catalog; raises ``ValueError`` on a missing terminal or a
+          malformed center.
+        """
         entries: list[tuple[tuple[float, ...], Terminal]] = []
         walls: list[Volume4D] = []
         cell_terminal_ids: dict[Cell, set[Hashable]] = {}
@@ -221,6 +241,7 @@ class StaticTerminalCatalog:
         return self._wall_index
 
     def terminal_ids_at(self, cell: Cell) -> frozenset[Hashable]:
+        """Terminal ids whose keep-out flood-fill covers ``cell`` (empty if none)."""
         return self._cell_terminal_ids.get(cell, frozenset())
 
     @property
@@ -310,6 +331,17 @@ class _ImmutableFlightRequest(FlightRequest):
     """A detached request whose geometry/terminal signature cannot drift."""
 
     def __post_init__(self) -> None:
+        """Freeze the snapshot's endpoint arrays onto immutable bytes after construction.
+
+        Parameters
+        ------------
+        - none: reads ``self.origin``/``self.dest`` and rebinds them to read-only buffers.
+
+        Return
+        --------
+        - output (None): rebinds the endpoint arrays and sets ``_colgen_frozen`` so that even
+          ``setflags(write=True)`` cannot make them writable.
+        """
         super().__post_init__()
         origin_source = np.asarray(self.origin, dtype=float)
         dest_source = np.asarray(self.dest, dtype=float)
@@ -376,6 +408,7 @@ class RowKey(tuple):
     __slots__ = ()
 
     def __new__(cls, *parts: Any) -> "RowKey":
+        """Normalize and validate parts into a canonical cell/term key, raising on bad input."""
         if len(parts) == 1 and isinstance(parts[0], (tuple, list, RowKey)):
             parts = tuple(parts[0])
         if not parts:
@@ -430,31 +463,37 @@ class RowKey(tuple):
 
     @property
     def kind(self) -> str:
+        """The row kind: ``"cell"`` or ``"term"``."""
         return tuple.__getitem__(self, 0)
 
     @property
     def step(self) -> int:
+        """The time step (tuple slot 4 for a cell row, slot 2 for a terminal row)."""
         return tuple.__getitem__(self, 4 if self.kind == "cell" else 2)
 
     @property
     def cell_coord(self) -> Cell:
+        """The ``(q, r)`` cell of a cell row; raises ``AttributeError`` on a terminal row."""
         if self.kind != "cell":
             raise AttributeError("terminal rows do not have a cell")
         return tuple.__getitem__(self, 1), tuple.__getitem__(self, 2)
 
     @property
     def level(self) -> int:
+        """The flight level of a cell row; raises ``AttributeError`` on a terminal row."""
         if self.kind != "cell":
             raise AttributeError("terminal rows do not have a flight level")
         return tuple.__getitem__(self, 3)
 
     @property
     def terminal_id(self) -> Hashable:
+        """The terminal id of a terminal row; raises ``AttributeError`` on a cell row."""
         if self.kind != "term":
             raise AttributeError("cell rows do not have a terminal id")
         return tuple.__getitem__(self, 1)
 
     def __getnewargs__(self) -> tuple[tuple[Any, ...]]:
+        """Round-trip through pickle by re-passing the flat tuple to :meth:`__new__`."""
         return (tuple(self),)
 
 
@@ -471,6 +510,17 @@ class RowIndex:
         self,
         terminal_capacities: Mapping[Hashable, int] | None = None,
     ) -> None:
+        """Create an empty row-key intern table, pre-registering any terminal capacities.
+
+        Parameters
+        ------------
+        - terminal_capacities (Mapping[Hashable, int] | None): terminal id -> pad count to
+          register up front, or ``None`` for none.
+
+        Return
+        --------
+        - output (None): initializes the intern maps and the terminal-capacity registry.
+        """
         self._key_to_index: dict[RowKey, int] = {}
         self._index_to_key: list[RowKey] = []
         self._terminal_capacities: dict[Hashable, int] = {}
@@ -482,7 +532,21 @@ class RowIndex:
         terminal_or_id: Terminal | Hashable,
         capacity: int | None = None,
     ) -> None:
-        """Register a terminal id/capacity, rejecting inconsistent duplicate metadata."""
+        """Register a terminal id and its pad capacity, rejecting inconsistent duplicates.
+
+        Accepts either a :class:`Terminal` (capacity read from it) or a bare id plus ``capacity``.
+
+        Parameters
+        ------------
+        - terminal_or_id (Terminal | Hashable): the terminal, or its hashable id.
+        - capacity (int | None): pad count; required with a bare id, and must match the Terminal's
+          own capacity when both are supplied.
+
+        Return
+        --------
+        - output (None): records the capacity; raises ``TypeError``/``ValueError`` on bad or
+          conflicting input.
+        """
         if isinstance(terminal_or_id, Terminal):
             terminal_id = terminal_or_id.id
             supplied_capacity = terminal_or_id.capacity
@@ -514,7 +578,16 @@ class RowIndex:
         self._terminal_capacities[terminal_id] = cap
 
     def intern(self, key: RowKey | tuple[Any, ...]) -> int:
-        """Return the stable dense id for ``key``, creating it on first use."""
+        """Return the stable dense id for ``key``, creating it on first use.
+
+        Parameters
+        ------------
+        - key (RowKey | tuple): the row key, normalized to :class:`RowKey` if needed.
+
+        Return
+        --------
+        - output (int): the dense id, newly assigned if ``key`` was not yet interned.
+        """
         normalized = key if isinstance(key, RowKey) else RowKey(key)
         existing = self._key_to_index.get(normalized)
         if existing is not None:
@@ -525,19 +598,48 @@ class RowIndex:
         return index
 
     def get(self, key: RowKey | tuple[Any, ...], default: Any = None) -> int | Any:
-        """Return an already-interned id without mutating the index."""
+        """Return an already-interned dense id without mutating the index.
+
+        Parameters
+        ------------
+        - key (RowKey | tuple): the row key to look up (normalized to :class:`RowKey`).
+        - default (Any): value returned when ``key`` has not been interned.
+
+        Return
+        --------
+        - output (int | Any): the dense id, or ``default`` if absent.
+        """
         normalized = key if isinstance(key, RowKey) else RowKey(key)
         return self._key_to_index.get(normalized, default)
 
     def key(self, index: int) -> RowKey:
-        """Resolve a dense id back to its tuple-compatible key."""
+        """Resolve a dense id back to its tuple-compatible :class:`RowKey`.
+
+        Parameters
+        ------------
+        - index (int): a dense id previously returned by :meth:`intern`.
+
+        Return
+        --------
+        - output (RowKey): the key for ``index``; raises ``IndexError`` if it is out of range.
+        """
         dense_id = operator.index(index)
         if not 0 <= dense_id < len(self._index_to_key):
             raise IndexError(f"row index {dense_id} is outside [0, {len(self._index_to_key)})")
         return self._index_to_key[dense_id]
 
     def cap(self, key_or_index: RowKey | tuple[Any, ...] | int) -> int:
-        """Return one for cell rows or the registered pad count for terminal rows."""
+        """Return the row's capacity: one for a cell row, the registered pad count for a terminal.
+
+        Parameters
+        ------------
+        - key_or_index (RowKey | tuple | int): a row key or an interned dense id.
+
+        Return
+        --------
+        - output (int): the capacity; raises ``KeyError`` if a terminal row's capacity was never
+          registered.
+        """
         if isinstance(key_or_index, (RowKey, tuple, list)):
             key = key_or_index if isinstance(key_or_index, RowKey) else RowKey(key_or_index)
         else:
@@ -560,9 +662,11 @@ class RowIndex:
     capacity = cap
 
     def __getitem__(self, key: RowKey | tuple[Any, ...]) -> int:
+        """Intern ``key`` and return its dense id (subscript sugar for :meth:`intern`)."""
         return self.intern(key)
 
     def __contains__(self, key: object) -> bool:
+        """True if ``key`` has been interned; a malformed key returns False rather than raising."""
         try:
             normalized = key if isinstance(key, RowKey) else RowKey(key)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -576,9 +680,11 @@ class RowIndex:
         return len(self._index_to_key)
 
     def keys(self) -> tuple[RowKey, ...]:
+        """All interned keys, in dense-id order."""
         return tuple(self._index_to_key)
 
     def items(self) -> tuple[tuple[RowKey, int], ...]:
+        """All ``(key, dense_id)`` pairs, in dense-id order."""
         return tuple((key, index) for index, key in enumerate(self._index_to_key))
 
 
@@ -612,6 +718,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         own_interiors: frozenset[Cell],
         explicit_lanes: frozenset[Cell],
     ) -> None:
+        """Store the O-D ellipse parameters; membership stays lazy until first materialized."""
         self._origin = origin
         self._dest = dest
         self._overrun = overrun
@@ -623,6 +730,9 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         self._lock = threading.RLock()
 
     def __contains__(self, raw_cell: object) -> bool:
+        """True if ``raw_cell`` is in the O-D ellipse: within ``shortest + overrun`` summed hops
+        of both endpoints, minus foreign exclusions and own interiors, plus explicit lanes
+        (see context/figures/od_hop_ellipse.png)."""
         if not isinstance(raw_cell, tuple) or len(raw_cell) != 2:
             return False
         try:
@@ -641,6 +751,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         )
 
     def _cells(self) -> frozenset[Cell]:
+        """Materialize (once, under lock) the frozenset the lazy membership test implies."""
         materialized = self._materialized
         if materialized is not None:
             return materialized
@@ -664,7 +775,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         return len(self._cells())
 
     def isdisjoint(self, other) -> bool:
-        # Terminal exclusion tests are normally much smaller than the ellipse.
+        """True if no cell of ``other`` lies in the ellipse (``other`` is normally far smaller)."""
         return all(cell not in self for cell in other)
 
     @property
@@ -672,6 +783,7 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         return self._materialized is not None
 
     def _signature(self) -> tuple[Any, ...]:
+        """The identity tuple used for cheap equality and pickling."""
         return (
             self._origin,
             self._dest,
@@ -711,6 +823,7 @@ class _FlightSearchCache:
     )
 
     def __init__(self) -> None:
+        """Initialize an empty, answer-neutral per-flight search cache."""
         self.lock = threading.RLock()
         # `(PreparedTopology, PreparedRows)` for the compiled pricing path, built on first
         # use.  Both are pure functions of the graph and its `SimConfig`, so this is a
@@ -719,9 +832,9 @@ class _FlightSearchCache:
         # compiled search's own time on a cheap density flight.  See `dp_prepare.prepared_for`.
         self.prepared: Any | None = None
         # `(label_capacity, log2cap, candidate_capacity)` the last completed compiled search
-        # actually needed.  A density flight builds 13.3M labels against a 65,536 default,
-        # and re-discovering that by restarting costs ~1.7x on every iteration after the
-        # first.  Answer-neutral: a budget only bounds work, never the search.
+        # actually needed.  A density flight can far exceed the 65,536 label default, and
+        # re-discovering that by restarting costs ~1.7x on every iteration after the first.
+        # Answer-neutral: a budget only bounds work, never the search.
         self.dag_budget: tuple[int, int, int] | None = None
         self.certified_claims: OrderedDict[
             tuple[Any, ...], frozenset[RowKey]
@@ -799,7 +912,17 @@ class FlightGraph:
     )
 
     def outgoing_neighbors(self, source: Cell) -> tuple[Cell, ...]:
-        """Generate/cache all admissible directed arcs leaving ``source``."""
+        """Generate/cache all admissible directed arcs leaving ``source``.
+
+        Parameters
+        ------------
+        - source (Cell): the axial ``(q, r)`` cell to expand.
+
+        Return
+        --------
+        - output (tuple[Cell, ...]): the in-corridor neighbours reachable by a non-forbidden hop
+          (empty if ``source`` lies outside the corridor).
+        """
 
         lazy = self.forbidden_hops
         if isinstance(lazy, _LazyForbiddenHops):
@@ -827,7 +950,20 @@ class FlightGraph:
         first: bool,
         last: bool,
     ) -> bool:
-        """Return whether the arc is safe with its actual path-position tags."""
+        """Return whether the arc is safe with its actual path-position tags.
+
+        Parameters
+        ------------
+        - source (Cell): the arc's start cell.
+        - target (Cell): the arc's end cell.
+        - first (bool): whether the arc is the path's first hop (origin-lane tag).
+        - last (bool): whether the arc is the path's last hop (dest-lane tag).
+
+        Return
+        --------
+        - output (bool): True if the arc, tagged for that role, clears every permanent wall with
+          both cells in the corridor.
+        """
 
         lazy = self.forbidden_hops
         if isinstance(lazy, _LazyForbiddenHops):
@@ -856,6 +992,7 @@ class FlightGraph:
 
     @property
     def arc_cache_stats(self) -> Mapping[str, int]:
+        """Arc-expansion diagnostics from the lazy hop cache (eager hops report zeros)."""
         lazy = self.forbidden_hops
         if isinstance(lazy, _LazyForbiddenHops):
             return lazy.stats
@@ -890,7 +1027,7 @@ def _ellipse_cells(origin: Cell, dest: Cell, overrun: int) -> set[Cell]:
 
     ``overrun`` is ``params.max_air_overrun_hops``: the hop budget IS the corridor radius,
     because a route within ``shortest + overrun`` hops cannot touch a cell outside the
-    ellipse of that radius.  See :class:`ColGenParams`.
+    ellipse of that radius (see context/figures/od_hop_ellipse.png).  See :class:`ColGenParams`.
     """
     shortest = hg.hex_distance(origin, dest)
     radius = shortest + overrun
@@ -915,21 +1052,14 @@ def _graph_max_step(
 ) -> int:
     """Budget-preserving final air-state bound.
 
-    The abbreviated expression this replaced omitted the climb and origin-lane traverse even
-    though those advance the same integer clock before the first cell visit.  Include both so
-    neither silently consumes the ground-delay or route budget.
+    Includes the climb and origin-lane traverse, not just the route: both advance the same
+    integer clock before the first cell visit, so omitting either would let it silently consume
+    the ground-delay or route budget.
 
-    The route term is ``max_air_hops`` -- the ceiling itself.  The clock has to reach the LATEST
-    legal departure plus that departure's longest legal route, so anything smaller in this slot
-    becomes the binding constraint for late departures only, reinstating exactly the
-    departure-dependent cap the ceiling exists to remove.
-
-    Historically this slot held ``shortest_hops + detour_slack_hops``, from a separate corridor
-    knob since removed (issue #78).  The two agreed at the shipped pairing and parted whenever
-    the knobs did: measured at slack=3/overrun=9, 26 hops were advertised and 20 reachable at
-    the last departure (``9816f61``).  With one knob they cannot part, but the term still has to
-    be ``max_air_hops`` rather than any re-derivation of it -- that is what this docstring
-    exists to say.
+    The route term must be ``max_air_hops`` -- the ceiling itself, not a re-derivation of it.
+    The clock has to reach the LATEST legal departure plus that departure's longest legal route;
+    anything smaller here becomes the binding constraint for late departures only, reinstating
+    exactly the departure-dependent cap the ceiling exists to remove.
     """
     return (
         latest_departure_step
@@ -1234,6 +1364,7 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         cfg: SimConfig,
         wall_index: _WallSpatialIndex | None = None,
     ) -> None:
+        """Store the corridor, walls, and endpoint geometry; arc verdicts stay lazy per source."""
         self._corridor = corridor
         self._walls = walls
         self._wall_index = (
@@ -1331,9 +1462,8 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
             if last
             else _ARC_INTERNAL
         )
-        # ``role_mask`` subsumes the old ``target not in self.outgoing(source)``
-        # membership test, which rescanned a <=6-tuple on every one of the two
-        # calls the pricing DP makes per arc.
+        # ``role_mask`` subsumes a ``target not in self.outgoing(source)`` membership test that
+        # would rescan a <=6-tuple on each of the two calls the pricing DP makes per arc.
         return bool(self.role_mask(source, target) & role)
 
     def __contains__(self, raw_hop: object) -> bool:
@@ -1430,6 +1560,20 @@ def build_flight_graph(
     The domain is the hex-distance O-D ellipse, with every foreign terminal's full
     ``terminal_cells`` wall removed.  A flight's own terminal interior is also removed; only the
     canonical boundary lanes are added back, preserving A*'s fixed-lane geometry.
+
+    Parameters
+    ------------
+    - req (FlightRequest): the flight to build a graph for (origin/dest and terminals).
+    - cfg (SimConfig): lattice, timing, and terminal geometry; must match the static catalog.
+    - static_terms (StaticTerminalCatalog | Iterable): the solve-wide static terminals, either a
+      prebuilt catalog or ``(center, terminal)`` pairs to build one from.
+    - params (ColGenParams): supplies ``max_air_overrun_hops``, which sizes the corridor and caps
+      route length.
+
+    Return
+    --------
+    - output (FlightGraph): the frozen flight domain (corridor cells, lanes, timing bounds, and
+      lazy answer-neutral caches); raises on a degenerate/excluded endpoint or a config mismatch.
     """
     if cfg.n_levels != 1:
         raise NotImplementedError(
@@ -1609,6 +1753,7 @@ def build_flight_graph(
 
 
 def _selected_lane(lanes: tuple[hg.Lane, ...], index: int | None, endpoint: str) -> hg.Lane:
+    """Return ``lanes[index]``, raising ``ValueError`` if ``index`` is missing or out of range."""
     if index is None:
         raise ValueError(f"{endpoint}_lane_idx is required for a terminal endpoint")
     try:
@@ -1630,9 +1775,27 @@ def column_claims(
 ) -> frozenset[RowKey]:
     """Return the de-duplicated capacity rows claimed by ``column``.
 
+    Validates the column against the graph, certifies it against the exact permanent-wall
+    geometry, then collects its cell-visit and terminal/endpoint dwell rows.  The result is
+    memoized on the graph's search cache.
+
     ``W`` is retained as a compatibility/checking argument for the formulation's window-width
     notation.  The actual offsets always come from :func:`derive_cell_window`; a scalar width alone
     cannot describe the shifted ``(-1, 0)`` footprint used when ``time_buffer_s == 0``.
+
+    Parameters
+    ------------
+    - column (Column): the candidate schedule (cell path, departure step, level, lane indices).
+    - fg (FlightGraph): the graph the column was priced over; supplies geometry and caches.
+    - cfg (SimConfig): must equal the config the graph was built with.
+    - W (int | tuple[int, int] | None): optional cell-window width or ``(lo, hi)`` offsets, checked
+      against :func:`derive_cell_window`; ``None`` skips the check.
+    - _intent: optional pre-built intent to reuse instead of re-translating the column.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): the capacity rows the column claims; raises ``ValueError`` if the
+      column is invalid, out of budget, or overlaps permanent static terminal airspace.
     """
     if cfg != fg._cfg:
         raise ValueError("column claims require the SimConfig used to build the flight graph")

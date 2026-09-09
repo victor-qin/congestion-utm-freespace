@@ -1,10 +1,9 @@
 """Turn another planner's schedule into a column-generation warm start.
 
 Colgen's own opening move is one geodesic per flight in ``seed_ladder_steps + 1``
-departure-shifted copies, and the incumbent it rounds out of that is weak: measured on
-``density_faa_wing_zipline`` x1500, ten iterations of `round_heuristic` against a growing
-pool never once beat a schedule A* produced in 64 seconds.  Since every run at that scale
-ends on a truncated MILP, the incumbent is also the floor the answer falls back to.
+departure-shifted copies, and the incumbent it rounds out of that is weak; since a run at
+scale ends on a truncated MILP, that incumbent is also the floor the answer falls back to.
+Seeding from an accepted A* schedule gives the master a stronger start.
 
 This module converts an accepted schedule into master columns that are **mutually
 row-feasible**, which is what `solve` needs before it will take them as an incumbent
@@ -33,10 +32,6 @@ Exhausting it drops the flight from the warm start entirely (counted as
 ``dropped (no feasible shift)``, and logged by `batch._build_warm_start`), which costs
 warm-start QUALITY and not correctness: `RestrictedMaster.complete_selection` re-picks
 every dropped flight around the ones that placed.
-
-What survives at x1500: 1,493 of 1,500 placed, 0 rows over capacity.  The 7 that do not
-are the genuinely inexpressible ones, and `RestrictedMaster.complete_selection` re-picks
-those around the pins rather than leaving them on columns chosen for a different schedule.
 """
 
 from __future__ import annotations
@@ -56,14 +51,27 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
     """Rebuild the canonical column carrying an intent's route at its departure time.
 
-    Returns ``(column, None)`` or ``(None, reason)``.  Rejection is deliberate: a route
-    that does not land on the lattice is not approximated, because a column that claims
-    cells the aircraft does not fly is worse than no column.
+    Rejection is deliberate: a route that does not land on the lattice is not approximated,
+    because a column that claims cells the aircraft does not fly is worse than no column.
 
-    ``model`` fills ``Column.delay_s``, which is **the master's objective coefficient**.
-    Leaving it at 0.0 makes the LP take every seeded column for free, drives the master's
-    cost to 0 and closes the gap at iteration 1 -- measured, not hypothesised.  Pass the
-    solve's cost model whenever the column is going anywhere near a warm start.
+    ``model`` fills ``Column.delay_s``, the master's objective coefficient; leaving it at 0.0
+    makes the LP take every seeded column for free, drives the master's cost to 0 and closes
+    the gap at iteration 1.  Pass the solve's cost model whenever the column is headed for a
+    warm start.
+
+    Parameters
+    ------------
+    - intent (OperationalIntent): the accepted schedule entry whose centreline and ground
+      delay are rasterised onto the lattice.
+    - graph (FlightGraph): the flight's pricing graph, supplying the lattice cells, lane
+      cells, and legal departure window.
+    - cfg (SimConfig): supplies the clock and lattice geometry.
+    - model (CostModel | None): cost weights used to fill ``delay_s``; ``None`` leaves it 0.0.
+
+    Return
+    --------
+    - output (tuple[Column | None, str | None]): ``(column, None)`` on success, or
+      ``(None, reason)`` naming why the route could not be expressed as a column.
     """
 
     radius = hg.circumradius(cfg)
@@ -132,17 +140,10 @@ def _column_at(intent, graph, cfg: "SimConfig", model, delta: int, base=None):
 
     ``base`` is the UNSHIFTED column, which does not depend on ``delta``.  `build` builds it
     once per flight and hands it to every shift, because the repair loop asks for up to
-    ``max_shift + 1`` of them and the ladder several more -- recomputing it per delta re-ran
-    the centreline rasterisation, `column_to_intent` and `model.evaluate` for a
-    byte-identical result.  Passing ``None`` rebuilds it, which is what a caller outside
-    that loop wants.
-
-    This is a clarity change, NOT a measured speedup, and the number is here so nobody
-    over-credits it later: `intent_to_column` is 0.18 ms on a 16-hop O-D, so the repeat cost
-    only ~1.4 ms per HELD OR DROPPED flight (about 2 s if all 1,500 were held) and exactly
-    nothing for a flight that places at delta 0, which is most of them.  What it actually
-    buys is that the loop's cost no longer scales with ``max_shift`` -- which matters
-    because that constant is the one worth RAISING (see the shared-origin threshold test).
+    ``max_shift + 1`` of them and the ladder several more, and recomputing it per delta would
+    re-run the centreline rasterisation, `column_to_intent` and `model.evaluate` for a
+    byte-identical result.  Passing ``None`` rebuilds it, which is what a caller outside that
+    loop wants; reusing it keeps the loop's cost from scaling with ``max_shift``.
     """
 
     if base is None:
@@ -158,14 +159,10 @@ def _column_at(intent, graph, cfg: "SimConfig", model, delta: int, base=None):
         # Recomputed, never carried: `delay_s` is the objective coefficient and a held
         # column is strictly more expensive than the one it was shifted from.
         #
-        # Guarded for the same reason the delta-0 call inside `intent_to_column` is.  Today
-        # the only departure-dependent rejection is the ground-delay cap, and the window
-        # check above is exactly equivalent to it (`build_flight_graph` sets
-        # `latest_departure_step = base_step + max_ground_steps`, the same bound
-        # `column_to_intent` re-derives) -- so this cannot currently fire.  It is guarded
-        # anyway because those two bounds live in different modules with no shared
-        # constant, and an uncaught ValueError here does not drop one flight, it aborts the
-        # whole solve from inside the repair loop.
+        # The window check above cannot currently fire -- `latest_departure_step` equals the
+        # ground-delay cap `column_to_intent` re-derives -- but it is guarded anyway: the two
+        # bounds live in different modules with no shared constant, and an uncaught ValueError
+        # here would abort the whole solve from inside the repair loop, not just drop a flight.
         try:
             translated = column_to_intent(column, graph.request, cfg)
         except ValueError as exc:
@@ -196,38 +193,38 @@ def build(
     """Return ``(seed_columns, stats)`` -- a mutually row-feasible warm start.
 
     Flights are repaired in flight-id order, which is FCFS order, so the pass mirrors the
-    priority the source planner itself used: an earlier flight keeps its slot and a later
-    one holds.
+    priority the source planner itself used: an earlier flight keeps its slot and a later one
+    holds.  ``max_shift`` is how DEEP that hold may search, not how long a flight may legally
+    be held -- each flight is offered ``max_shift + 1`` departures (its translated one, then
+    that many successive ``cfg.dt_s`` steps later) and takes the first whose claims fit under
+    the running counter.  The legal bound is the graph's ``latest_departure_step`` (from
+    ``cfg.max_ground_delay_s``), enforced separately and far more loosely.
 
-    ``max_shift`` is how DEEP that hold may search, not how long a flight may legally be
-    held.  Each flight is offered ``max_shift + 1`` departures -- its translated one, then
-    that many successive ``cfg.dt_s`` steps later -- and takes the first whose claims fit
-    under the running counter; the legal bound is the graph's ``latest_departure_step``
-    (from ``cfg.max_ground_delay_s``) and is enforced separately and far more loosely.
+    The pattern is corridor overlap: a column's claims span roughly twenty steps, so the
+    default 8 clears a crossing pair (in contact only near the intersection, ~4 steps) but not
+    two flights sharing an origin (in contact until one clears most of the span, ~13 steps).
+    Hub-and-spoke demand is made of shared origins, so the default is expected to drop flights
+    exactly where the warm start matters most
+    (`test_warm_start_max_shift_is_below_the_shared_origin_threshold` pins it).  A dropped
+    flight costs warm-start QUALITY, not correctness: the master's `complete_selection`
+    re-picks it around the survivors.
 
-    At the shipped 8 that is 32 s of hold to choose from at a 4 s timestep, and the measured
-    thresholds on a two-flight instance say which conflicts that clears:
+    Parameters
+    ------------
+    - accepted (Mapping[int, OperationalIntent]): flight id -> accepted schedule entry.
+    - graphs (Mapping[int, FlightGraph]): flight id -> pricing graph.
+    - cfg (SimConfig): supplies the clock and geometry.
+    - model (CostModel): cost weights for each column's ``delay_s``.
+    - row_index (RowIndex): supplies each capacity row's ``cap`` during repair.
+    - max_shift (int): search depth for the hold, in ``dt`` steps (NOT a delay limit).
+    - ladder (int): extra departure-shifted copies of each placed column added to the pool.
+      Deliberately NOT checked against the claim counter -- they are LP alternatives, not
+      members of the feasible set, so counting them would reserve capacity twice.
 
-        crossing paths        4 steps (16 s)  -- inside the default
-        shared origin        13 steps (52 s)  -- outside it
-        identical path       15 steps (60 s)  -- outside it
-
-    The pattern is corridor overlap: a column's claims span roughly twenty steps, so two
-    flights leaving the SAME cell stay in contact until one clears most of that span, while
-    a crossing pair shares only the cells near the intersection.  Hub-and-spoke scenarios
-    are made of shared origins, so the default is expected to drop flights exactly where the
-    warm start matters most --
-    `test_warm_start_max_shift_is_below_the_shared_origin_threshold` pins it.
-
-    A flight no offered departure fits is dropped rather than forced, counted as
-    ``dropped (no feasible shift)`` and logged; the master's `complete_selection` re-picks
-    it around the survivors, which is why this bound costs warm-start QUALITY rather than
-    correctness.
-
-    ``ladder`` adds that many extra departure-shifted copies of each placed column to the
-    pool.  They are deliberately NOT checked against the claim counter -- they are
-    alternatives the LP may pick instead of the placed one, not members of the feasible
-    set being constructed, so counting them would reserve capacity twice.
+    Return
+    --------
+    - output (tuple[dict[int, list[Column]], Counter]): the seed columns per placed flight,
+      and a stats counter (placed, holds, drops, ladder columns, rows over cap, cost).
     """
 
     if max_shift < 0:

@@ -82,9 +82,9 @@ STATUS_FSUM_OVERFLOW = 5    # a partial expansion saturated -- scores would be w
 STATUS_IMPROVING_SINK = 6   # a sink may beat the cutoff -- host certifies, then resumes
 STATUS_NEED_ENVELOPE = 7    # the gate needs a variant's envelope -- host builds, resumes
 # The candidate buffer is an OUTPUT, not a search structure, so a full one is drained and
-# refilled rather than grown.  Growing it meant re-running the whole search: a real flight
-# registers ~27,000 sinks against a 4,096 default, so that was three restarts, each
-# throwing away every certification the previous one had paid for.
+# refilled rather than grown.  Growing it would mean re-running the whole search -- a real
+# flight registers ~27,000 sinks against a 4,096 default -- and every restart discards every
+# certification the previous attempt had paid for.
 STATUS_CANDIDATE_FULL = 8
 
 # For diagnostics only -- nothing branches on this, and the kernel never sees it (numba has
@@ -122,32 +122,25 @@ FSUM_MAX_PARTIALS = 64
 # Sized from measurement rather than a round number.  Labels cost 40 bytes each across the
 # nine parallel arrays (one float64 plus eight int32); a dominance slot costs 32 bytes
 # across the four tables plus the two layer buffers, so `1 << MAX_LOG2CAP` slots is ~2.1 GB.
-#
-# RAISED 1<<25 -> 1<<26.  The old value was sized against a 13.3M worst case; the shipped
-# `objective=total_cost` regime puts `density_faa_wing_zipline` x50 flight 14 at **30.78M
-# labels, 91.7% of 1<<25**, one doubling from a fallback.  1<<26 is 67.1M labels at
-# **2.68 GB**, and the pair (arena + state table) peaks near 4.83 GB per search.
+# 1<<26 is 67.1M labels at ~2.68 GB, and the arena + state-table pair peaks near 4.83 GB
+# per search.
 #
 # THAT IS PER PROCESS, and `pricing_pool` gives every worker its own -- so a 4-worker pool
 # is ~19 GB worst case and this ceiling is the thing that forecloses it on a 4 GB/core node.
 # It is a ceiling, not an allocation: nothing reaches it unless a flight genuinely needs it,
 # and `LABEL_HIGH_WATER_WARN` below exists so you learn which flights are approaching it
 # while they still SUCCEED, rather than from the decline after they stop.
-#
-# The 1<<25 this replaced was justified as "~2.5x the worst measured need", and the note
-# that it sat just under -- not equal to -- the "roughly 1.5 GB on density" `pricing_pool`
-# quotes per worker (that figure is the whole worker including its rebuilt graphs, not the
-# label pool alone) is still the right way to read those two numbers against each other.
 MAX_LABEL_CAPACITY = 1 << 26
 MAX_LOG2CAP = 26
 
-# Warn once per search whose final pool reaches this.  Deliberately the OLD ceiling: a
-# search past 1<<25 is one that would have declined to the pure-Python reference before this
-# module was retuned, so the warning marks exactly the flights whose headroom is gone.
+# Warn once per search whose final pool reaches this -- 1<<25, one doubling below the
+# `MAX_LABEL_CAPACITY` ceiling, so the warning marks exactly the flights whose headroom is
+# nearly gone while they still SUCCEED, rather than from the decline after they stop.
 # Diagnostic only -- it reads a count and emits to stderr, and cannot move an answer.
 LABEL_HIGH_WATER_WARN = 1 << 25
 
-# Labels that coexist at one `(root, cell, hop)` point of the space-time ellipsoid.
+# Labels that coexist at one `(root, cell, hop)` point of the space-time ellipsoid
+# (see context/figures/label_dp_dominance.png).
 #
 # The DP keeps one label per DOMINANCE KEY, not one per cell-hop, and the key carries
 # `recent[0..state_history_depth-1]` plus `first_hop` (`_state_hash`).  So a point is split
@@ -174,20 +167,12 @@ FLAT_LABEL_ARENA = True
 # table holds one slot per live dominance key in a LAYER (the frontier), not one per label,
 # and is double-buffered across two layers.
 #
-# 14, and the ladder is KEPT here even though the label arena's was removed.  Oversizing
-# this table is not free and that is measured twice, both on `colgen_test` x4 against a
-# 0.52 s baseline:
-#
-#     log2cap  with the scalar clear   without it
-#        25            56.29 s              --
-#        26              --              104.85 s
-#
-# Removing `_price_dag`'s redundant scalar clear (the host already `np.full(-1)`s these
-# inside its attempt loop) was necessary and NOT sufficient, so something else in the kernel
-# is still O(cap) per search -- `layer_items` / `layer_buffer` are also sized `cap` and are
-# the obvious suspects.  Until that is found and fixed, the state dimension pays for what it
-# ASKS for, not what it uses, and climbing a ladder is strictly better than starting high.
-# The label arena is the opposite case: lazily mapped, so a flat ceiling costs nothing.
+# The ladder is KEPT here even though the label arena's was removed, because oversizing this
+# table is NOT free: something in the kernel is still O(cap) per search whether or not the
+# slots are used (`layer_items` / `layer_buffer` are also sized `cap` -- the obvious
+# suspects), so the state dimension pays for what it ASKS for, not what it uses, and climbing
+# a ladder is strictly better than starting high.  The label arena is the opposite case:
+# lazily mapped, so a flat ceiling costs nothing.
 INITIAL_LOG2CAP = 16
 
 
@@ -522,8 +507,9 @@ def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
 def _fill_recent(label, depth, label_parent, label_cell, out):
     """Write the reference's ``recent`` tuple for one label; return its length.
 
-    ``recent`` is the last ``min(hops + 1, depth)`` cells of the path, most-recent first --
-    the reference builds it as ``(neighbour, *recent[:depth - 1])``.  Its LENGTH is part of
+    ``recent`` is the last ``min(hops + 1, depth)`` cells of the path, most-recent first
+    (see context/figures/label_dp_dominance.png) -- the reference builds it as
+    ``(neighbour, *recent[:depth - 1])``.  Its LENGTH is part of
     the identity: a label two hops out has a two-cell history, and Python tuples of
     different lengths never compare equal, so a fixed-width buffer would merge states the
     reference keeps apart if the length were dropped.
@@ -1069,9 +1055,10 @@ def _price_dag(
     ``STATUS_NEED_ENVELOPE`` are pauses to be resumed, and every other code is a budget the
     host must widen, or a fallback to the reference.
 
-    **Layer discipline.**  Two tables are swapped rather than one keyed by step, because the
-    reference keys ``layers[step][key]`` and therefore never compares labels at different
-    steps; a flat table would merge them.  Roots for layer ``s + 1`` are seeded at the START
+    **Layer discipline** (see context/figures/pricing_dag.png).  Two tables are swapped
+    rather than one keyed by step, because the reference keys ``layers[step][key]`` and
+    therefore never compares labels at different steps; a flat table would merge them.  Roots
+    for layer ``s + 1`` are seeded at the START
     of step ``s``, before any arc can write there -- the reference inserts every root before
     any arc runs, and ``_prefer`` is non-transitive inside its epsilon band, so
     roots-before-arcs is part of the answer rather than an implementation detail.
@@ -1126,11 +1113,10 @@ def _price_dag(
         nxt_from = -1
         # The two dominance tables arrive already -1-filled: `price_dag` allocates them
         # with `np.full(cap, -1)` INSIDE its attempt loop, so every entry into mode 0 is
-        # entry onto a freshly allocated pair.  Clearing them again here was a SCALAR numba
-        # loop over `cap`, which made the state table's cost O(cap) per search whether or
-        # not the slots were used -- measured at ~12 s per flight at `log2cap = 25`, taking
-        # `colgen_test` x4 from 0.40 s to 56.29 s.  The host's `np.full` is a vectorised
-        # memset doing the identical job at memory bandwidth.
+        # entry onto a freshly allocated pair.  Do NOT re-clear them here: a scalar numba
+        # loop over `cap` makes the state table's cost O(cap) per search whether or not the
+        # slots are used, where the host's `np.full` is a vectorised memset doing the
+        # identical job at memory bandwidth.
         #
         # Mode 0 is the only path that would need it, and it cannot be reached on a reused
         # table: a pause sets `resume[0]` to 1, 2 or 3, and only a fresh allocation leaves
@@ -1949,6 +1935,7 @@ class DagResult:
 
     @property
     def ok(self) -> bool:
+        """Whether the search ran to completion (``status == STATUS_OK``)."""
         return self.status == STATUS_OK
 
 
@@ -2004,6 +1991,7 @@ def _next_label_capacity(capacity, step_reached, min_step, max_step):
 def ellipsoid_volume(topology, variants) -> int:
     """``(root, cell, hop)`` points the search can legally occupy.  Exact, no constants.
 
+    The cell footprint is the O-D hop-ellipse (see context/figures/od_hop_ellipse.png).
     A label sits at cell ``c`` after ``h`` hops only if it could get there,
     ``d_origin(c) <= h``, and can still finish inside the budget,
     ``h + d_dest(c) <= air_hop_limit``.  Summing the admissible ``h`` per cell collapses to
@@ -2016,10 +2004,21 @@ def ellipsoid_volume(topology, variants) -> int:
     where ``excess = d_origin + d_dest - shortest_hops`` is how far off-geodesic it lies, so
     shrinking ``max_air_overrun_hops`` shrinks the count linearly per cell and cells outside
     the ellipse contribute exactly zero.  ``d_dest`` is ``hex_remaining``, already on the
-    topology; ``d_origin`` is axial hex distance in the same metric.
+    topology; ``d_origin`` is axial hex distance in the same metric.  Counted per DISTINCT
+    origin cell rather than per root: roots sharing a lane share an origin, and ~64 roots
+    collapse to a handful of cells.
 
-    Per DISTINCT origin cell rather than per root: roots sharing a lane share an origin, and
-    ~64 roots collapse to a handful of cells.
+    Parameters
+    ------------
+    - topology (PreparedTopology): supplies ``air_hop_limit``, ``hex_remaining`` (``d_dest``),
+      the cell axial coordinates (``cell_q`` / ``cell_r``), and ``n_cells``.
+    - variants (PreparedVariants): the root variants; their distinct origin ``cell`` values
+      and multiplicities weight the sum.
+
+    Return
+    --------
+    - output (int): the exact number of legally occupiable ``(root, cell, hop)`` points, or
+      0 when there are no variants or no hop budget.
     """
 
     if variants is None or int(variants.departure_step.size) <= 0:
@@ -2046,18 +2045,29 @@ def estimate_label_capacity(topology, variants) -> int:
     """Size the FIRST rung from the DAG's shape, instead of climbing to it from 1<<16.
 
     A cold search climbs 2^16, 2^17, ... and RE-RUNS FROM LAYER 0 at every rung, discarding
-    everything the previous attempt computed.  Measured on ``density_faa_wing_zipline`` x50
-    flight 14, that was **8 attempts**, so roughly half of its 39.5 s was re-derivation.
-    Sweep 2 shows what the right first rung is worth: every flight is ``att = 1`` there,
-    because ``_search_cache.dag_budget`` remembered.  This is that memo computed rather than
-    learned, so the FIRST sweep gets it too.
-
-    ``ellipsoid_volume`` supplies the geometry exactly; ``LABEL_MULTIPLICITY`` supplies the
+    everything the previous attempt computed -- a cold flight can spend roughly half its wall
+    on that re-derivation.  A warm ``_search_cache.dag_budget`` avoids it by remembering the
+    right rung; this is that memo computed rather than learned, so the FIRST sweep gets it
+    too.  ``ellipsoid_volume`` supplies the geometry exactly; ``LABEL_MULTIPLICITY`` is the
     one factor that cannot be derived from geometry, and is calibrated rather than reasoned.
+
+    With ``FLAT_LABEL_ARENA`` (the shipped default) the lazily-mapped arena makes the ladder
+    unnecessary and this returns ``MAX_LABEL_CAPACITY`` outright; ``ellipsoid_volume`` stays
+    the honest way to REPORT a flight's DAG size either way.
 
     Answer-neutral, like every budget on this path: it changes how much is allocated, never
     which labels are explored or which column comes back.  Being wrong is bounded both ways
     -- the ladder doubles when it reads low, arena is the only cost when it reads high.
+
+    Parameters
+    ------------
+    - topology (PreparedTopology): the DAG shape, forwarded to :func:`ellipsoid_volume`.
+    - variants (PreparedVariants): the root variants, forwarded to :func:`ellipsoid_volume`.
+
+    Return
+    --------
+    - output (int): the label-pool size for the first attempt, in ``[1<<16,
+      MAX_LABEL_CAPACITY]`` (or ``MAX_LABEL_CAPACITY`` when ``FLAT_LABEL_ARENA`` is set).
     """
 
     if FLAT_LABEL_ARENA:
@@ -2111,6 +2121,44 @@ def price_dag(
     Budgets are grown rather than guessed because label counts vary by orders of magnitude
     between flights; an exact fit would re-allocate on nearly every one, which is the waste
     ``[[colgen-parallel-pricing-pool]]`` measured at 82%.
+
+    Raises ``ValueError`` if ``certify`` is passed without ``envelopes``: a certifier updates
+    the cutoff mid-sweep, and the completion gate cannot be evaluated against a cutoff it has
+    no envelopes for.
+
+    Parameters
+    ------------
+    - topology (PreparedTopology): the flat space-time DAG (arcs, hop limits, step range,
+      destination lanes).
+    - rows (PreparedRows): the row numbering (``n_steps`` / ``step0``) the forbidden bitset
+      indexes.
+    - duals (PreparedDuals): the current dual prices as prefix-sum series, plus
+      ``max_negative_credit``.
+    - variants (PreparedVariants): the root variants (origin cell, start score, departure,
+      lane, paid rows).
+    - forbidden (PreparedForbidden): the excluded-row bitset (``.bits``).
+    - air_weight (float): weight on air time in the objective currency.
+    - dt_s (float): seconds per hop/step.
+    - benefit (float): the flight's serve benefit ``M`` in reduced cost
+      ``benefit - delay - dual - pi_f``.
+    - pi_f (float): the flight's assignment (row) dual.
+    - envelopes (CompletionEnvelopes | None): completion-bound envelopes and the incumbent;
+      REQUIRED when ``certify`` is given.
+    - certify (callable | None): host-side per-sink certifier (reaches ``column_to_intent``);
+      ``None`` disables mid-sweep incumbent updates.
+    - label_capacity (int | None): first-attempt label-pool size; ``None`` ⇒
+      :func:`estimate_label_capacity`.
+    - log2cap (int): initial log2 of each dominance table's capacity.
+    - candidate_capacity (int): sink output-buffer size; drained and refilled when full.
+    - cancel (np.ndarray | None): 1-element ``uint8`` cooperative-cancel flag; ``None`` ⇒
+      never cancelled.
+    - max_attempts (int): ceiling on budget-growth restarts.
+
+    Return
+    --------
+    - output (DagResult): the search outcome -- status, label count, certified candidates and
+      their paths, the mid-sweep incumbent, attempt count, and the settled
+      ``(label_capacity, log2cap, candidate_capacity)`` budget to hand the next call.
     """
 
     if certify is not None and envelopes is None:
@@ -2143,15 +2191,12 @@ def price_dag(
     # tie-break on different values.  That reaches `_prefix_le`'s four-field comparison, so
     # the compiled search could certify a different -- equally optimal -- column while still
     # returning normally rather than a `Declined`, which is the one failure this path is not
-    # allowed to have.  (Written when that signal was a `proved=True` boolean; the boolean
-    # is gone because it conflated "ran to completion" with "was checked", but the hazard it
-    # named is unchanged -- nothing downstream can tell the substituted column apart.)
+    # allowed to have; nothing downstream can tell the substituted column apart.
     #
-    # Measured: the filter drops nothing across 260 flights on five scenarios
-    # (`colgen_test` and the four density arms), so this is latent rather than live -- but
-    # "not reproduced" is not the same as "cannot happen", and taking the reference's own
-    # number costs nothing and removes the question.  The packed min stays as the fallback
-    # for the envelope-less call, where there is no incumbent and `_can_compete`
+    # The filter is measured to drop nothing across the shipped scenarios, so this is latent
+    # rather than live -- but "not reproduced" is not "cannot happen", and taking the
+    # reference's own number costs nothing and removes the question.  The packed min stays as
+    # the fallback for the envelope-less call, where there is no incumbent and `_can_compete`
     # short-circuits on `inc_state[0] == 0` before the tie is ever read.
     destination_lane_tie = (
         int(envelopes.destination_lane_tie)
@@ -2209,12 +2254,12 @@ def price_dag(
 
     for attempt in range(max_attempts):
         cap = 1 << log2cap
-        # `np.empty`, not `np.full(-1)`, for the three that used to be -1-filled.  This is
-        # what makes over-allocating the arena FREE: `np.zeros` is calloc and `np.empty` is
-        # malloc, so both hand back lazily-mapped pages that cost no physical RAM until
-        # touched, whereas `np.full(-1)` writes every page up front -- 12 bytes x capacity,
-        # which at the 1<<26 ceiling is 805 MB paid on EVERY search including a trivial one,
-        # and paid again per pricing worker.
+        # `np.empty`, not `np.full(-1)`, for the three arrays that carry no sentinel pre-fill.
+        # This is what makes over-allocating the arena FREE: `np.zeros` is calloc and
+        # `np.empty` is malloc, so both hand back lazily-mapped pages that cost no physical
+        # RAM until touched, whereas `np.full(-1)` writes every page up front -- 12 bytes x
+        # capacity, which at the 1<<26 ceiling is 805 MB paid on EVERY search including a
+        # trivial one, and paid again per pricing worker.
         #
         # Safe because every allocated slot is fully written before it can be read: root
         # labels set all three explicitly (the `-1` sentinels below), children set all three
@@ -2403,8 +2448,40 @@ def feasible_dag(
     :mod:`.pricing` because it is the reference's semantics; the kernel only decides *when*
     to ask.
 
-    Returns ``(status, stopped_early)``. ``status == STATUS_OK`` means the frontier drained
-    or the bound cut it off, which is what licenses using the result.
+    Parameters
+    ------------
+    - topology (PreparedTopology): the flat DAG (arcs, hop limits, ``max_step``, destination
+      lanes).
+    - rows (PreparedRows): the row numbering the forbidden bitset indexes.
+    - forbidden (PreparedForbidden): the excluded-row bitset.
+    - roots (list[tuple]): the reference's evaluated start states, in its order, each
+      ``(cell, step, departure_step, lane, delay_bound, remaining_hops)``.
+    - lane_fold_s (Sequence[float]): per-lane origin-fold time (s), indexed ``lane + 1``
+      (slot 0 is the laneless start).
+    - lane_fold_exact (Sequence[int]): per-lane flag, same indexing; nonzero means the fold
+      decomposition is exact.
+    - destination_fold_lb (float): destination fold lower bound (s).
+    - reference_time_s (float): the en-route reference time (s) detour is measured against.
+    - dt_s (float): seconds per hop/step.
+    - ground_weight (float): weight on ground delay.
+    - air_weight (float): weight on air time / detour.
+    - base_step (int): the step ground delay is measured from.
+    - offsets (tuple[int, int]): the visit-window ``(lo, hi)`` step offsets.
+    - incumbent_delay (float | None): starting incumbent delay bound; ``None`` ⇒ no bound.
+    - certify (callable | None): per-sink certifier
+      ``(departure_step, origin_lane, dest_lane, step, hops, path) -> (new_delay_or_None,
+      stop)``.
+    - label_capacity (int): first-attempt label-pool size.
+    - log2cap (int): initial log2 of the dominance-table capacity.
+    - heap_capacity (int): frontier (priority-queue) array size.
+    - cancel (np.ndarray | None): 1-element ``uint8`` cancel flag; ``None`` ⇒ never cancelled.
+    - max_attempts (int): ceiling on budget-growth restarts.
+
+    Return
+    --------
+    - output (tuple[int, bool]): ``(status, stopped_early)``; ``status == STATUS_OK`` means
+      the frontier drained or the bound cut it off (which licenses using the result), and
+      ``stopped_early`` is True when a certified improvement met the greedy early-exit.
     """
 
     root_cell = np.asarray([r[0] for r in roots], np.int32)

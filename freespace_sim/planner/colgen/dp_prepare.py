@@ -25,9 +25,8 @@ Two consequences worth stating outright, because they are the reason for the sha
   the only dense array is the de-duplication stamp, which lives in the per-**thread**
   workspace and is sized to the largest single flight.
 * **The kernel allocates nothing.** Every mutable buffer is owned by the caller and passed
-  in, so threads reuse arenas instead of churning them -- the allocator residue that forced
-  PR #76's process pool to recycle workers is a property of allocating per flight, not of
-  the search.
+  in, so threads reuse arenas instead of churning them -- the allocator residue a per-flight
+  allocate-and-free leaves behind is a property of allocating per flight, not of the search.
 
 Row numbering, which the kernel and :func:`prepare_forbidden` both depend on::
 
@@ -122,10 +121,10 @@ class PreparedTopology:
     max_step: int = 0
     takeoff_steps0: int = 0
     shortest_hops: int = 0
-    # The ONLY route-length bound the search has, post-#78.  Read from ``fg.max_air_hops``
-    # rather than rebuilt from ``shortest_hops + overrun``: the graph resolves the ceiling
-    # at build time so both searches over the domain agree on it, and reconstructing it
-    # here would reintroduce exactly the second, drifting copy #78 removed.
+    # The ONLY route-length bound the search has.  Read from ``fg.max_air_hops`` rather than
+    # rebuilt from ``shortest_hops + overrun``: the graph resolves the ceiling at build time
+    # so both searches over the domain agree on it, and reconstructing it here would
+    # reintroduce exactly the second, drifting copy the single source exists to prevent.
     air_hop_limit: int = 0
     revisit_depth: int = 0
     # Two different widths, deliberately.  ``revisit_depth`` bans re-entering a recently
@@ -140,10 +139,12 @@ class PreparedTopology:
 
     @property
     def ok(self) -> bool:
+        """True when the flight has a compiled representation (no ``unsupported_reason``)."""
         return self.unsupported_reason is None
 
     @property
     def n_cells(self) -> int:
+        """Number of interned cells."""
         return int(self.cell_q.shape[0])
 
 
@@ -270,6 +271,16 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
     Draining is also what makes the graph **read-only for the rest of the solve**, which
     is the precondition for pricing flights on threads: after this call the search touches
     only arrays, so no lock is contended and no lazy cache is mutated concurrently.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's lazy graph; its arc oracle and endpoints are drained.
+    - cfg (SimConfig): supplies the hover radius for endpoint claim-only cells.
+
+    Return
+    --------
+    - output (PreparedTopology): the dense mirror, or one carrying ``unsupported_reason``
+      when the flight is multi-level or has no reachable destination.
     """
 
     # Imported here, not at module scope: pricing imports this module.
@@ -289,10 +300,9 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
 
     # An endpoint's hover cylinder CLAIMS cells that no route can ever VISIT -- the disc
     # spreads around the origin/destination point, and its rim regularly falls outside the
-    # forward-reachable set.  Measured on `density_faa_wing_zipline`: 4 of the first 12
-    # flights have exactly one such cell.  Those cells still need row ids, or the endpoint
-    # dwell would go partly unpriced, so they are interned here as claim-only: no arcs, and
-    # `rev_remaining` leaves them UNREACHABLE, so the search cannot enter them.
+    # forward-reachable set.  Those cells still need row ids, or the endpoint dwell would go
+    # partly unpriced, so they are interned here as claim-only: no arcs, and `rev_remaining`
+    # leaves them UNREACHABLE, so the search cannot enter them.
     claim_only: set[Cell] = set()
     for is_origin in (True, False):
         if (fg.origin_terminal if is_origin else fg.dest_terminal) is not None:
@@ -404,8 +414,7 @@ class PreparedRows:
     step0: int = 0
     n_steps: int = 0
 
-    # Endpoint discs, resolved once per graph.  ``endpoint_claim_cells`` was measured at
-    # 202,044 calls per 12-flight solve before this.
+    # Endpoint discs, resolved once per graph rather than recomputed per query.
     origin_disc: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
     dest_disc: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int32))
     origin_is_terminal: bool = False
@@ -423,14 +432,26 @@ class PreparedRows:
 
     @property
     def ok(self) -> bool:
+        """True when the row numbering was built (no ``unsupported_reason``)."""
         return self.unsupported_reason is None
 
     @property
     def n_rows(self) -> int:
+        """Total number of row ids: ``(n_cells + n_terminals) * n_steps``."""
         return (self.n_cells + self.n_terminals) * self.n_steps
 
     def row_of_cell(self, cell_index: int, step: int) -> int:
-        """Row id for a cell visit, or -1 when the step is outside the numbering."""
+        """Closed-form row id for one cell visit — no table lookup.
+
+        Parameters
+        ------------
+        - cell_index (int): interned cell index in ``[0, n_cells)``.
+        - step (int): absolute clock step.
+
+        Return
+        --------
+        - output (int): the row id, or -1 when ``step`` or ``cell_index`` is out of range.
+        """
 
         offset = step - self.step0
         if offset < 0 or offset >= self.n_steps or not 0 <= cell_index < self.n_cells:
@@ -438,7 +459,17 @@ class PreparedRows:
         return cell_index * self.n_steps + offset
 
     def row_of_term(self, term_slot: int, step: int) -> int:
-        """Row id for a terminal dwell period, or -1 when outside the numbering."""
+        """Closed-form row id for one terminal dwell step — no table lookup.
+
+        Parameters
+        ------------
+        - term_slot (int): terminal slot in ``[0, n_terminals)``.
+        - step (int): absolute clock step.
+
+        Return
+        --------
+        - output (int): the row id, or -1 when ``step`` or ``term_slot`` is out of range.
+        """
 
         offset = step - self.step0
         if offset < 0 or offset >= self.n_steps or not 0 <= term_slot < self.n_terminals:
@@ -460,6 +491,17 @@ def prepare_rows(fg: FlightGraph, cfg: SimConfig, topology: PreparedTopology) ->
 
     Origin and destination choose independently, so all four combinations occur --
     and terminal endpoints are the density-scenario shape, not an edge case.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's graph, for its endpoints and level.
+    - cfg (SimConfig): supplies the hover radius, dt, and cell-window offsets.
+    - topology (PreparedTopology): the drained topology whose cell set the discs index into.
+
+    Return
+    --------
+    - output (PreparedRows): the row numbering, or one carrying ``unsupported_reason`` when
+      the topology is unsupported or an endpoint disc cell was not interned.
     """
 
     if not topology.ok:
@@ -508,12 +550,11 @@ def prepare_rows(fg: FlightGraph, cfg: SimConfig, topology: PreparedTopology) ->
     # Bound the clock generously: claims pad outside [min_step, max_step], and a row id that
     # does not exist would silently drop one.
     #
-    # TWO independent sources widen it, and counting only the first was a real bug. The
-    # endpoint dwell is one. The other is the intermediate-cell window, which every visit
-    # claims through and which `derive_cell_window` grows with `time_buffer_s`: the default
-    # 4.0 s yields (-2, 1), but 100 s yields (-26, 25). At the default the `+8` slack
-    # happened to cover it, which is exactly why no shipped scenario exhibited this and why
-    # raising the buffer would have started dropping forbidden rows instead of failing.
+    # TWO independent sources widen it, and both must be counted. The endpoint dwell is one.
+    # The other is the intermediate-cell window, which every visit claims through and which
+    # `derive_cell_window` grows with `time_buffer_s`: the default 4.0 s yields (-2, 1), 100 s
+    # yields (-26, 25). At the default the `+8` slack covers the window alone, so only a raised
+    # buffer exercises the second source -- drop it and forbidden rows silently go unmapped.
     #
     # `max` rather than a sum because these are alternative furthest-out claims from one
     # visit, not a stack: the clock has to reach past whichever is larger.
@@ -556,6 +597,16 @@ def prepared_for(fg: FlightGraph, cfg: SimConfig) -> tuple[PreparedTopology, Pre
 
     An unsupported flight is cached too, so a graph the kernel cannot handle is diagnosed
     once rather than on every iteration.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's graph; carries the ``_search_cache`` this memoizes on.
+    - cfg (SimConfig): forwarded to the two builders.
+
+    Return
+    --------
+    - output (tuple[PreparedTopology, PreparedRows]): the cached pair (either may carry an
+      ``unsupported_reason``).
     """
 
     cache = fg._search_cache
@@ -584,6 +635,18 @@ def endpoint_row_ids(
     Kept in Python beside the packing rather than inlined into the kernel so a test can
     compare it against :func:`pricing._endpoint_claims_uncached` directly, key for key.
     The kernel reimplements this arithmetic; this is what pins it.
+
+    Parameters
+    ------------
+    - rows (PreparedRows): the row numbering to resolve ids in.
+    - cfg (SimConfig): supplies ``dt_s`` and the claim-step geometry.
+    - origin (bool): choose the origin endpoint (True) or the destination endpoint (False).
+    - step (int): the endpoint's start clock step.
+    - timing_steps (int): total-hop count the bare-point claim's outward rounding scales with.
+
+    Return
+    --------
+    - output (list[int]): the claimed row ids; entries may be -1 where a step is unnumbered.
     """
 
     t0 = step * cfg.dt_s
@@ -603,10 +666,10 @@ def endpoint_row_ids(
 class PreparedForbidden:
     """Saturated rows, as a bitset over row ids.
 
-    A bitset rather than PR #76's Fibonacci hash because rows are already interned to a
-    dense range here: ``n_rows / 8`` bytes, O(1) membership, no collisions and no probe
-    loop in the innermost test. Rows outside this flight's universe simply do not map,
-    which is correct -- the flight cannot claim them.
+    A bitset rather than a hash because rows are already interned to a dense range here:
+    ``n_rows / 8`` bytes, O(1) membership, no collisions and no probe loop in the innermost
+    test. Rows outside this flight's universe simply do not map, which is correct -- the
+    flight cannot claim them.
 
     This is a first-class input rather than a fallback trigger: repair runs once per
     flight in the greedy, so routing it to the Python reference would be a scaling cliff
@@ -621,6 +684,7 @@ class PreparedForbidden:
 
     @property
     def any(self) -> bool:
+        """True when at least one row is forbidden."""
         return self.n_set > 0
 
 
@@ -630,7 +694,21 @@ def prepare_forbidden(
     rows: PreparedRows,
     topology: PreparedTopology,
 ) -> PreparedForbidden:
-    """Map an exclusion set into this flight's row numbering."""
+    """Map an exclusion set into this flight's row numbering, as a row-id bitset.
+
+    Parameters
+    ------------
+    - forbidden_rows (Iterable[RowKey | Any]): rows excluded from this repair; each is
+      coerced to a :class:`RowKey`.
+    - fg (FlightGraph): the flight's graph, for its terminal endpoint ids.
+    - rows (PreparedRows): the row numbering that maps each key to a row id.
+    - topology (PreparedTopology): supplies the cell interning for ``cell`` keys.
+
+    Return
+    --------
+    - output (PreparedForbidden): the bitset plus ``n_set`` and ``n_unmapped`` counts; a
+      non-zero ``n_unmapped`` means the caller must refuse the compiled path.
+    """
 
     n_words = (rows.n_rows + 63) // 64
     bits = np.zeros(max(1, n_words), dtype=np.uint64)
@@ -700,13 +778,10 @@ class PreparedDuals:
       ``(a + v) - a != v`` in floating point, and ``claim_cost`` sums precisely these
       values. A dense array is not an option: 5M rows would be 40 MB per flight.
 
-    Rebuilt once per **flight**, not once per sweep. This said the opposite until it was
-    measured, and the error was not harmless: the duals it restates are global to an
-    iteration, so "one per sweep" reads as a fair description of the *inputs* -- but
-    :func:`prepare_duals` is called from ``pricing._best_column_compiled`` on every pricing
-    task, and its old body scanned the whole global mapping each time. That made it
-    O(flights x materialized rows) while looking, in the docstring, like O(rows). It now
-    walks the resources this flight owns; see the loop for why that is bit-identical.
+    Rebuilt once per **flight**, not once per sweep: :func:`prepare_duals` is called from
+    ``pricing._best_column_compiled`` on every pricing task. It walks the resources this
+    flight owns, so its cost is O(this flight's rows), not O(flights x materialized rows);
+    see the loop for why that stays bit-identical to the global scan it replaces.
     """
 
     row_id: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.int64))
@@ -731,7 +806,19 @@ class PreparedDuals:
     n_out_of_range: int = 0
 
     def range_sum(self, series: int, start: int, stop: int) -> float:
-        """Sum over ``[start, stop)`` — the literal arithmetic of ``_PrefixSeries``."""
+        """Sum a prefix series over ``[start, stop)`` — the arithmetic of ``_PrefixSeries``.
+
+        Parameters
+        ------------
+        - series (int): series slot, or negative for "no dual on this resource".
+        - start (int): inclusive lower step of the half-open range.
+        - stop (int): exclusive upper step of the half-open range.
+
+        Return
+        --------
+        - output (float): the summed dual price, clamped to the series' own step span; 0.0
+          when ``series`` is negative or the range is empty.
+        """
 
         if series < 0:
             return 0.0
@@ -751,7 +838,17 @@ class PreparedDuals:
         )
 
     def visit_cost(self, cell_index: int, visit_step: int) -> float:
-        """All cell-row duals charged by one centre visit, in O(1)."""
+        """All cell-row duals charged by one centre visit, in O(1).
+
+        Parameters
+        ------------
+        - cell_index (int): interned cell index of the visited centre.
+        - visit_step (int): clock step of the visit; the window spans ``offsets`` around it.
+
+        Return
+        --------
+        - output (float): summed dual price over the visit window, 0.0 for an unknown cell.
+        """
 
         if not 0 <= cell_index < self.cell_series.shape[0]:
             return 0.0
@@ -762,7 +859,16 @@ class PreparedDuals:
         )
 
     def row_cost(self, row: int) -> float:
-        """Exact price of one row id, or zero when unpriced."""
+        """Exact price of one row id via binary search, mirroring ``DualView._duals``.
+
+        Parameters
+        ------------
+        - row (int): the row id to price.
+
+        Return
+        --------
+        - output (float): the exact per-row dual, or 0.0 when the row carries no dual.
+        """
 
         if row < 0 or self.row_id.shape[0] == 0:
             return 0.0
@@ -784,6 +890,18 @@ def prepare_duals(
     search actually consults, so copying them is what makes the compiled path bit-identical
     rather than merely close. Recomputing prefix sums here from the raw dual mapping would
     reintroduce the possibility of a different summation order.
+
+    Parameters
+    ------------
+    - view (DualView): the iteration's duals; its private series/step mappings are copied.
+    - fg (FlightGraph): the flight's graph, for its terminal endpoint ids.
+    - topology (PreparedTopology): supplies the cell interning.
+    - rows (PreparedRows): the row numbering the restated prices are keyed in.
+
+    Return
+    --------
+    - output (PreparedDuals): the per-flight duals (series table + sorted exact rows) with
+      an ``n_out_of_range`` count, expected zero.
     """
 
     cell_index = {
@@ -810,16 +928,16 @@ def prepare_duals(
         return slot
 
     # Driven from THIS FLIGHT'S resources, for the same reason the exact-row loop below is:
-    # both used to walk a global mapping and filter, which bounds a once-per-flight cost by
-    # the master's active-resource count instead of by the flight.  Fixing only one of them
-    # leaves the other paying it -- and `_cell`/`_terminal` are a separate mapping from
-    # `_cell_steps`/`_terminal_steps`, so a test that pins one says nothing about the other.
+    # walking a global mapping and filtering bounds a once-per-flight cost by the master's
+    # active-resource count instead of by the flight.  `_cell`/`_terminal` is a separate
+    # mapping from `_cell_steps`/`_terminal_steps`, so a test that pins one says nothing
+    # about the other -- both must be driven from the flight.
     #
-    # This also REORDERS slot assignment, from "whichever order the global dict happened to
-    # be in" to this flight's cell numbering. That is layout, not arithmetic: a slot is only
-    # ever reached through `cell_series[index]` / `term_series[slot]`, and each resource's
-    # prefix array is summed independently inside `_prefix_series`, so no float is added to
-    # a different float than before. The parity gate is what proves it.
+    # Slot assignment therefore follows this flight's cell numbering, not the global dict's
+    # order.  That is layout, not arithmetic: a slot is only ever reached through
+    # `cell_series[index]` / `term_series[slot]`, and each resource's prefix array is summed
+    # independently inside `_prefix_series`, so no float is added to a different float. The
+    # parity gate is what proves it.
     for cell, index in cell_index.items():
         prefix_series = view._cell.get((cell, 0))
         if prefix_series is not None:
@@ -833,12 +951,11 @@ def prepare_duals(
     # global.  This loop runs once per FLIGHT (`pricing._best_column_compiled` calls it per
     # pricing task), so anything global in it is multiplied by the flight count.
     #
-    # Iterating the global step buckets and filtering through `cell_index` -- the obvious
-    # first move, and what this did originally -- is NOT enough. It drops the row scan to a
-    # RESOURCE scan, which is smaller by the number of priced steps per resource, but the
-    # bound is still the master's active-resource count, so the cost still grows with the
-    # batch while the flight stays the same size. Driven from `cell_index` the bound is
-    # `topology.n_cells`: a property of this flight alone.
+    # Iterating the global step buckets and filtering through `cell_index` is NOT enough: it
+    # drops the row scan to a RESOURCE scan, but the bound is still the master's
+    # active-resource count, so the cost still grows with the batch while the flight stays
+    # the same size. Driven from `cell_index` the bound is `topology.n_cells`: a property of
+    # this flight alone.
     #
     # Same pairs, and therefore the same `PreparedDuals`: `DualView` accumulates its step
     # buckets in the same pass and the same order as the flat mapping, so the values are the
@@ -889,7 +1006,19 @@ def prepare_duals(
 
 
 def visit_row_ids(rows: PreparedRows, cell_index: int, visit_step: int, offsets) -> list[int]:
-    """Row ids one centre visit claims — the row-id image of ``pricing._visit_claims``."""
+    """Row ids one centre visit claims — the row-id image of ``pricing._visit_claims``.
+
+    Parameters
+    ------------
+    - rows (PreparedRows): the row numbering to resolve ids in.
+    - cell_index (int): interned index of the visited cell.
+    - visit_step (int): clock step of the visit.
+    - offsets (tuple[int, int]): inclusive ``(lo, hi)`` window applied around ``visit_step``.
+
+    Return
+    --------
+    - output (list[int]): the claimed row ids; entries may be -1 where a step is unnumbered.
+    """
 
     lo, hi = offsets
     return [rows.row_of_cell(cell_index, visit_step + o) for o in range(lo, hi + 1)]
@@ -901,12 +1030,11 @@ def visit_row_ids(rows: PreparedRows, cell_index: int, visit_step: int, offsets)
 class CompletionEnvelopes:
     """``_best_column``'s completion bound, lifted out of the search that owns it.
 
-    This is ``pricing._best_column``'s ``completion_envelope`` and
-    ``completion_can_compete`` (pricing.py:1247-1394) with their captured state made
-    explicit, so the compiled search can consult the same numbers the reference does.
-    The arithmetic is copied term for term rather than re-derived: it is a *pruning*
-    bound, and a bound that is a hair too tight discards the true optimum while the
-    search still reports that it proved optimality.
+    This is ``pricing._best_column``'s ``completion_envelope`` and ``completion_can_compete``
+    with their captured state made explicit, so the compiled search can consult the same
+    numbers the reference does. The arithmetic is copied term for term rather than
+    re-derived: it is a *pruning* bound, and a bound that is a hair too tight discards the
+    true optimum while the search still reports that it proved optimality.
 
     **Why this stays in Python.** The delay half is scalar arithmetic a kernel could do,
     but the destination half needs endpoint claim *sets* — the disc-times-steps rectangle
@@ -926,9 +1054,9 @@ class CompletionEnvelopes:
     The destination half is additionally memoized on ``(arrival_step, total_hops)``,
     which the reference does not do because it has no reason to: that pair is what the
     endpoint claims and the arrival visit window actually depend on, and many
-    ``(departure_step, lane)`` keys share a corridor start. Measured on a density flight,
-    13,515 variants collapse to ~901 distinct corridor starts. It is a cache over a pure
-    function of already-fixed state, so it cannot move an answer.
+    ``(departure_step, lane)`` keys share a corridor start (an order of magnitude fewer
+    distinct starts than variants on a density flight). It is a cache over a pure function
+    of already-fixed state, so it cannot move an answer.
     """
 
     __slots__ = (
@@ -968,6 +1096,26 @@ class CompletionEnvelopes:
         incumbent=None,
         deadline: float | None = None,
     ) -> None:
+        """Capture the per-flight state ``completion_envelope``/``can_compete`` close over.
+
+        Parameters
+        ------------
+        - fg (FlightGraph): the flight's graph, for endpoints, lanes, and geometry.
+        - cfg (SimConfig): supplies speeds and fold geometry for the delay bound.
+        - view (DualView): the iteration's duals, for row costs and the negative credit.
+        - benefit (float): the flight's master benefit ``M`` in the reduced-cost bound.
+        - pi_f (float): the flight's convexity dual.
+        - model: the objective's delay model; defaults to ``DELAY_MODEL``.
+        - forbidden_rows (frozenset): rows a completion may not claim.
+        - incumbent: the seed incumbent every envelope's length is first frozen against, or
+          ``None`` to acquire one mid-sweep.
+        - deadline (float | None): optional wall-clock deadline checked while building.
+
+        Return
+        --------
+        - output (None): precomputes the fold legs, reference time, and destination tie-break
+          used by the bound; sets up the (mutable) incumbent and the envelope memos.
+        """
         from ...volumes import enroute_reference_m
         from .objective import DELAY_MODEL
         from .pricing import (
@@ -996,7 +1144,7 @@ class CompletionEnvelopes:
         self._destination_options = destination_options
 
         # Endpoint fold legs, per lane and for the destination.  Copied from
-        # pricing.py:1164-1210; ``_terminal_fold_leg_s`` returns a "was the lane cell
+        # ``pricing._best_column``; ``_terminal_fold_leg_s`` returns a "was the lane cell
         # retained by folding" flag as well as the leg, and that flag is what enables the
         # arc form of the delay bound at all.
         self._origin_fold_lb_by_lane: dict[int | None, tuple[float, bool]] = {}
@@ -1043,6 +1191,7 @@ class CompletionEnvelopes:
 
     @property
     def incumbent(self):
+        """The incumbent envelopes are currently frozen against, or ``None``."""
         return self._incumbent
 
     def set_incumbent(self, incumbent) -> None:
@@ -1057,7 +1206,7 @@ class CompletionEnvelopes:
 
     @property
     def incumbent_prefix(self) -> tuple[int, int, int, int]:
-        """``completion_can_compete``'s four-field incumbent prefix (pricing.py:1351)."""
+        """``completion_can_compete``'s four-field incumbent prefix (hops, departure, lanes)."""
 
         assert self._incumbent is not None
         column = self._incumbent[1]
@@ -1073,7 +1222,20 @@ class CompletionEnvelopes:
     def delay_lower_bound(
         self, departure_step: int, lane_idx: int | None, hops: int, remaining_hops: int
     ) -> float:
-        """``_best_column``'s ``delay_lower_bound`` closure (pricing.py:1212)."""
+        """``_best_column``'s ``delay_lower_bound`` closure — the admissible delay floor.
+
+        Parameters
+        ------------
+        - departure_step (int): candidate departure clock step (ground delay from base).
+        - lane_idx (int | None): origin lane, or ``None`` for a bare origin.
+        - hops (int): air hops flown so far.
+        - remaining_hops (int): admissible hops still to fly to the destination.
+
+        Return
+        --------
+        - output (float): a lower bound on this route's weighted delay, in the objective's
+          currency.
+        """
 
         from .pricing import _arc_delay_lower_bound_s
 
@@ -1096,8 +1258,9 @@ class CompletionEnvelopes:
     def _destination_cost(self, arrival_step: int, total_hops: int) -> float:
         """Cheapest positive endpoint-plus-arrival price over the destination options.
 
-        pricing.py:1302-1318.  ``math.fsum`` is order-independent, so the memo cannot
-        perturb it even though the sets it sums are iterated in hash order.
+        Mirrors the destination scan in ``pricing._best_column``.  ``math.fsum`` is
+        order-independent, so the memo cannot perturb it even though the sets it sums are
+        iterated in hash order.
         """
 
         from .pricing import _endpoint_claims, _visit_claims
@@ -1130,11 +1293,8 @@ class CompletionEnvelopes:
         Split out of :meth:`envelope` because the reference's early ``break`` consults
         ``delay_lb`` alone and never the destination cost. The length is therefore settled
         before a single row set is built, and the length is what most of the gate's callers
-        actually need: measured on ``density_faa``, **69.2% of ``can_compete`` calls are
-        answered by ``first_hops >= len(delay_lbs)``**, and building the other half of the
-        envelope for them cost 135,449 of 193,852 destination-cost entries. The 30.8% that
-        do scan read a mean of 3.2 entries and never more than 7, against a mean envelope
-        length of 81.7.
+        actually need: measured on ``density_faa``, most ``can_compete`` calls are answered
+        by ``first_hops >= len(delay_lbs)`` alone, before any destination cost is built.
 
         **The incumbent is captured here, at first use, and reused for every later
         consultation.** That is what makes the split answer-identical rather than merely
@@ -1143,8 +1303,8 @@ class CompletionEnvelopes:
         strictly stronger prune -- which is the failure ``[[pruning-not-neutral-under-
         dominance]]`` describes.
 
-        ``min()`` rather than the ceiling alone, and the reasoning is pricing.py:1258-1284:
-        the horizon is a real bound even though the two are provably equal today.
+        ``min()`` rather than the ceiling alone: the horizon is a real bound even though the
+        two are provably equal today.
         """
 
         from .pricing import _RECOMPUTE_EPS, _check_deadline
@@ -1181,8 +1341,18 @@ class CompletionEnvelopes:
 
         Still the reference's own shape, because the compiled search needs the whole array:
         the kernel evaluates the gate per LABEL, not just per root, and cannot pause into
-        Python for one entry at a time. Only the roots that survive
-        ``prepare_variants`` ever reach here -- 69 of 2,402 on a density flight.
+        Python for one entry at a time. Only the roots that survive ``prepare_variants``
+        ever reach here.
+
+        Parameters
+        ------------
+        - departure_step (int): the root's departure clock step.
+        - lane_idx (int | None): the root's origin lane, or ``None`` for a bare origin.
+
+        Return
+        --------
+        - output (tuple[tuple[float, ...], tuple[float, ...]]): the delay lower bounds and
+          the matching positive destination costs, indexed by total hop count.
         """
 
         key = departure_step, lane_idx
@@ -1228,6 +1398,16 @@ class CompletionEnvelopes:
         The destination-cost memo deliberately survives. It is a pure function of the
         duals, the graph and the exclusion set, none of which move when the incumbent
         does, so keeping it makes the restart cheaper without making it different.
+
+        Parameters
+        ------------
+        - keys (Iterable[tuple[int, int | None]]): the ``(departure_step, lane_idx)`` roots
+          to re-freeze, in the order they should be rebuilt.
+
+        Return
+        --------
+        - output (None): resets the incumbent and envelope memos in place, then rebuilds
+          ``keys`` against the initial incumbent.
         """
 
         self._envelopes = {}
@@ -1247,7 +1427,21 @@ class CompletionEnvelopes:
         *,
         paid_duals_exact: bool,
     ) -> bool:
-        """``completion_can_compete`` — pricing.py:1330, arm for arm."""
+        """``completion_can_compete`` — the per-root gate, arm for arm with the reference.
+
+        Parameters
+        ------------
+        - departure_step (int): the root's departure clock step.
+        - lane_idx (int | None): the root's origin lane, or ``None`` for a bare origin.
+        - minimum_total_hops (int): fewest hops any completion of this root can take.
+        - paid_duals (float): dual price already paid by the root's origin claims.
+        - paid_duals_exact (bool): whether ``paid_duals`` is exact or a lower bound.
+
+        Return
+        --------
+        - output (bool): True if some completion could still beat the incumbent (or ties it
+          on the tie-break prefix); False prunes the root.
+        """
 
         from .pricing import _RECOMPUTE_EPS, _SCORE_EPS
 
@@ -1316,6 +1510,17 @@ class EnvelopeArena:
     __slots__ = ("delay", "dest", "length", "start", "_used")
 
     def __init__(self, n_variants: int) -> None:
+        """Allocate the per-variant index and a small, growable envelope backing store.
+
+        Parameters
+        ------------
+        - n_variants (int): number of root variants to reserve index slots for.
+
+        Return
+        --------
+        - output (None): initializes ``start`` (all -1, "not built"), ``length``, and the
+          doubling ``delay``/``dest`` backing arrays.
+        """
         self.start = np.full(max(n_variants, 1), -1, dtype=np.int32)
         self.length = np.zeros(max(n_variants, 1), dtype=np.int32)
         self.delay = np.zeros(64, dtype=np.float64)
@@ -1323,7 +1528,19 @@ class EnvelopeArena:
         self._used = 0
 
     def add(self, variant: int, delay_lbs, destination_positive_costs) -> None:
-        """Append one variant's frozen envelope; idempotent per variant."""
+        """Append one variant's frozen envelope; idempotent per variant.
+
+        Parameters
+        ------------
+        - variant (int): the variant id to record; a second call for it is a no-op.
+        - delay_lbs (Sequence[float]): the delay lower bounds, one per hop count.
+        - destination_positive_costs (Sequence[float]): the matching destination costs.
+
+        Return
+        --------
+        - output (None): copies both arrays into the backing store (doubling it if needed)
+          and records this variant's start offset and length.
+        """
 
         if self.start[variant] >= 0:
             return
@@ -1373,9 +1590,9 @@ class PreparedVariants:
     score: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
     ground_delay_s: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
     # ``air_weight * origin_leg``, the second term of the score.  Stored because the kernel
-    # recovers the duals a label has paid by inverting the score's decomposition
-    # (pricing.py:1548), and that inversion has to subtract the very same products the
-    # score was built from -- term by term, in the same order, or it is not exact.
+    # recovers the duals a label has paid by inverting the score's decomposition, and that
+    # inversion has to subtract the very same products the score was built from -- term by
+    # term, in the same order, or it is not exact.
     origin_leg_w_s: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0, np.float64))
     start_dual_cost: np.ndarray = field(
         repr=False, default_factory=lambda: np.empty(0, np.float64)
@@ -1396,10 +1613,12 @@ class PreparedVariants:
 
     @property
     def ok(self) -> bool:
+        """True when the variants were built (no ``unsupported_reason``)."""
         return self.unsupported_reason is None
 
     @property
     def n_variants(self) -> int:
+        """Number of root variants (one per surviving ``(departure_step, lane)``)."""
         return int(self.departure_step.shape[0])
 
 
@@ -1427,13 +1646,12 @@ def prepare_variants(
     whose ground delay alone cannot beat the incumbent can never win, whatever route
     follows.
 
-    ``envelopes`` supplies the second, sharper root gate: ``completion_can_compete``
-    (pricing.py:1435). Passing it is what makes the compiled search reproduce the
-    reference's *column* rather than merely its optimum. Omitting a prune costs work and
-    never an answer under pure enumeration, and that is false here — a pruned label's
-    DESCENDANTS still compete for dominance slots, and a better-scoring one evicts the
-    survivor the reference kept, losing its sinks. See
-    ``[[pruning-not-neutral-under-dominance]]``.
+    ``envelopes`` supplies the second, sharper root gate: ``completion_can_compete``.
+    Passing it is what makes the compiled search reproduce the reference's *column* rather
+    than merely its optimum. Omitting a prune costs work and never an answer under pure
+    enumeration, and that is false here — a pruned label's DESCENDANTS still compete for
+    dominance slots, and a better-scoring one evicts the survivor the reference kept,
+    losing its sinks. See ``[[pruning-not-neutral-under-dominance]]``.
 
     ``keep_roots`` restricts the root set to an explicit allowlist of
     ``(departure_step, lane_idx)`` pairs, with ``-1`` for a bare origin. This is what the
@@ -1448,6 +1666,26 @@ def prepare_variants(
     envelope's length against the *initial* incumbent, which is what the reference's memo
     does. Deferring it into the search would freeze some of them against a mid-sweep
     incumbent instead, and the length of an envelope is itself a prune.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's graph, for origin/destination options and geometry.
+    - cfg (SimConfig): supplies ``dt_s`` and endpoint claim geometry.
+    - view (DualView): the iteration's duals, for claim costs and the negative credit.
+    - topology (PreparedTopology): supplies cell interning and the air-hop limit.
+    - rows (PreparedRows): the row numbering (unused directly; carried for the ``ok`` gate).
+    - benefit (float): the flight's master benefit ``M`` in the score.
+    - pi_f (float): the flight's convexity dual, subtracted from every root's score.
+    - cost_cutoff (float | None): ground-delay prefilter threshold, or ``None`` to skip it.
+    - model: the objective's delay model; defaults to ``DELAY_MODEL``.
+    - forbidden_rows (frozenset): rows a root may not claim; such roots are dropped.
+    - envelopes (CompletionEnvelopes | None): the ``can_compete`` root gate, or ``None``.
+    - keep_roots (frozenset[tuple[int, int]] | None): allowlist of roots, or ``None`` for all.
+
+    Return
+    --------
+    - output (PreparedVariants): the surviving root labels as parallel arrays, or one
+      carrying ``unsupported_reason`` when the topology or rows are unsupported.
     """
 
     from .objective import DELAY_MODEL
@@ -1600,6 +1838,17 @@ def pricing_endpoint_claims(fg, cfg, *, origin: bool, step: int):
 
     Wrapped rather than imported at module scope because ``pricing`` imports this module;
     named so the call site reads as the reference function it is.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's graph, forwarded to the reference.
+    - cfg (SimConfig): the sim config, forwarded to the reference.
+    - origin (bool): claim the origin endpoint (True) or the destination endpoint (False).
+    - step (int): the endpoint's start clock step.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): the endpoint's dwell claim rows (``timing_steps=0``).
     """
 
     from .pricing import _endpoint_claims
@@ -1613,18 +1862,18 @@ class PricingWorkspace:
     **Owned by the caller, never allocated inside the kernel.** That is the single
     decision that makes flight-parallel pricing cheap: one workspace per thread, reused
     across every flight it prices, so the per-flight allocate-and-free churn that leaves
-    a large allocator residue never happens. PR #76 measured 2.5 GB surviving
-    ``gc.collect()`` with every graph unreachable, and answered it by recycling worker
-    *processes*; not allocating is the cheaper answer.
+    a large allocator residue never happens -- cheaper than recycling worker *processes*
+    to shed that residue after the fact.
 
-    Growth is **geometric**, never exact-fit: a ladder of powers of two was measured to
-    remove 82% of resize waste, and an exact-fit policy re-allocates on nearly every
-    flight because label counts vary by orders of magnitude between them.
+    Growth is **geometric**, never exact-fit: a powers-of-two ladder removes most resize
+    waste, whereas an exact-fit policy re-allocates on nearly every flight because label
+    counts vary by orders of magnitude between them.
     """
 
     __slots__ = ("stamp", "stamp_gen", "claim_scratch", "_n_rows", "_n_claims")
 
     def __init__(self) -> None:
+        """Start empty; :meth:`ensure` sizes the buffers on first use."""
         self.stamp = np.zeros(0, dtype=np.int32)
         # Generation stamping instead of clearing: a claim set is a few hundred rows out
         # of millions, so zeroing the array per sink would dominate the sink itself.
@@ -1635,13 +1884,25 @@ class PricingWorkspace:
 
     @staticmethod
     def _grow(current: int, needed: int) -> int:
+        """Smallest doubling of ``current`` (floored at 1024) that reaches ``needed``."""
         size = max(current, 1024)
         while size < needed:
             size <<= 1
         return size
 
     def ensure(self, n_rows: int, n_claims: int) -> None:
-        """Size the buffers for one flight, keeping whatever is already large enough."""
+        """Size the buffers for one flight, keeping whatever is already large enough.
+
+        Parameters
+        ------------
+        - n_rows (int): row count this flight needs the de-duplication stamp to cover.
+        - n_claims (int): largest claim-set size this flight needs scratch for.
+
+        Return
+        --------
+        - output (None): grows ``stamp``/``claim_scratch`` in place when too small; a grown
+          stamp resets ``stamp_gen`` to 0 since the fresh array reads as all-unseen.
+        """
 
         if n_rows > self._n_rows:
             self._n_rows = self._grow(self._n_rows, n_rows)
@@ -1664,4 +1925,5 @@ class PricingWorkspace:
 
     @property
     def n_rows_capacity(self) -> int:
+        """Current allocated row capacity of the de-duplication stamp."""
         return self._n_rows

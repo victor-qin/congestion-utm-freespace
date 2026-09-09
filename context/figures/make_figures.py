@@ -721,12 +721,54 @@ def fig_hover_tail_steps() -> None:
     _save(fig, "hover_tail_steps")
 
 
+def fig_sipp_safe_intervals() -> None:
+    """sipp: per-cell safe intervals (left) and safe-interval successor expansion (right)."""
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(11.5, 4.6))
+
+    axl.set_title("Safe intervals for one hex cell", fontsize=10.5, color=INK)
+    axl.axis("off")
+    w0, w1 = 0.0, 14.0
+    axl.plot([w0, w1], [2.0, 2.0], color=INK, lw=1.0, zorder=1)
+    for s in range(int(w0), int(w1) + 1):
+        axl.plot([s, s], [1.95, 2.05], color=GRID, lw=0.8)
+    axl.text((w0 + w1) / 2, 1.5, "step →   over the window [ws0, ws1]", ha="center", va="top", fontsize=8.5, color=INK)
+    for a, b in ((3, 5), (9, 11)):
+        axl.add_patch(Rectangle((a, 2.12), b - a, 0.5, facecolor=RED, alpha=0.6, edgecolor=INK, lw=1.0))
+    axl.text(3, 2.78, "blocked spans (committed corridor + column claims)", fontsize=8.5, color=RED, va="bottom")
+    for a, b in ((0, 3), (5, 9), (11, 14)):
+        axl.add_patch(Rectangle((a, 1.28), b - a, 0.45, facecolor=GREEN, alpha=0.4, edgecolor=GREEN, lw=1.2))
+    axl.text(0, 0.98, "free intervals SIPP searches — the complement over the window", fontsize=8.5, color=GREEN, va="top")
+    axl.set_xlim(-0.6, 14.8)
+    axl.set_ylim(0.4, 3.2)
+
+    axr.set_title("Safe-interval successor expansion", fontsize=10.5, color=INK)
+    axr.axis("off")
+    sx, sy = 0.0, 2.0
+    axr.add_patch(Rectangle((sx - 0.7, sy - 0.35), 1.7, 0.7, facecolor="#ebf3fb", edgecolor=BLUE, lw=1.6))
+    axr.text(sx + 0.15, sy, "state\n(cell, interval)", ha="center", va="center", fontsize=8, color=BLUE)
+    for i, ny in enumerate((3.0, 2.0, 1.0)):
+        axr.add_patch(Rectangle((3.6, ny - 0.22), 1.4, 0.44, facecolor="#f0fff4", edgecolor=GREEN, lw=1.2))
+        axr.text(4.3, ny, f"nbr {i + 1} free iv", ha="center", va="center", fontsize=7, color=GREEN)
+        axr.annotate("", xy=(3.6, ny), xytext=(sx + 1.0, sy), arrowprops=dict(arrowstyle="->", color=INK, lw=1.1))
+    axr.text(4.3, 3.6, "one successor per reachable neighbour interval\n(pre-move hover folded in)", ha="center", fontsize=7.5, color=INK)
+    axr.annotate("", xy=(sx + 0.15, sy + 1.35), xytext=(sx + 0.15, sy + 0.4), arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.4))
+    axr.annotate("", xy=(sx + 0.15, sy - 1.35), xytext=(sx + 0.15, sy - 0.4), arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.4))
+    axr.text(sx + 0.35, sy + 1.4, "L+1 rung", fontsize=7.5, color=ORANGE, va="bottom")
+    axr.text(sx + 0.35, sy - 1.4, "L−1 rung (both levels clear across the climb window)", fontsize=7.5, color=ORANGE, va="top")
+    axr.set_xlim(-1.4, 6.4)
+    axr.set_ylim(0.2, 4.0)
+
+    fig.suptitle("SIPP — safe intervals from the claim arena, expanded interval-by-interval", fontsize=11.5, color=INK, y=1.0)
+    _save(fig, "sipp_safe_intervals")
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,
     fig_hex_lattice_overhead, fig_read_envelope,
     fig_search_window, fig_hex_layout, fig_rasterisation_coverage, fig_cell_blocking,
     fig_takeoff_fan, fig_batched_turns, fig_milp_obstacles, fig_hover_tail_steps,
+    fig_sipp_safe_intervals,
 )
 
 

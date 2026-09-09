@@ -9,11 +9,10 @@ Two things make the port here different from the paper, and both are simplificat
 
 **1. The private copy is a persistent replica synced by delta.** The paper's ``P`` is a list of
 paths, so copying it is free. Ours is a ``ReservationLedger`` plus an occupancy service stack
-plus a claim index — building one from scratch is the O(schedule) rebuild that PR #109 measured
-at 3.74 s, 94% of an iteration, and then eliminated. So a worker builds its replica ONCE and is
-afterwards told "the incumbent moved" by a compacted diff, which costs O(the flights that
-changed). ``LNSState.apply_delta`` is that operation; it rides the ``release_many`` /
-``subscribe_release`` machinery #109 already built.
+plus a claim index — building one from scratch is an O(schedule) rebuild. So a worker builds its
+replica ONCE and is afterwards told "the incumbent moved" by a compacted diff, which costs O(the
+flights that changed). ``LNSState.apply_delta`` is that operation; it rides the ledger's
+``release_many`` / ``subscribe_release`` machinery.
 
 **2. There are no mutexes, because there is no shared memory.** A single-threaded coordinator IS
 ``M_main`` and ``M_task``. It owns the incumbent — as its own ``LNSState`` over the caller's
@@ -26,13 +25,13 @@ runtime and thread state; ``mp.Pool`` silently respawns a dead worker with the o
 detail: synchronization overhead is exactly what the paper measures degrading DROP at 16 threads.
 
 Processes rather than threads even though ``astar.kernel`` is ``@njit(nogil=True)``: the Python
-host around ``plan()`` was measured at ~31% of profiled self-time in the mask build alone, and
+host around ``plan()`` is ~31% of profiled self-time in the mask build alone, and
 ``hexgrid._RANGE_CACHE`` is a process-global ``OrderedDict`` with a check-then-act eviction.
 
 **The always-rewind rule.** A worker never keeps its own accept — it reports the repair and
 immediately restores its replica. So ``applied_version`` is always exactly a
 coordinator-blessed version and a sync diff is always well-defined, with no three-way merge
-anywhere. It costs one extra ``release_many`` plus k commits on the ~21% of tasks that accept.
+anywhere. It costs one extra ``release_many`` plus k commits on each task that accepts.
 
 Modes:
 
@@ -106,7 +105,7 @@ class WorkerSpec:
     kernel_log2_min: int | None
     record_envelope: bool = True
     # Answer-neutral (see LNSConfig.window_bytes), but still shipped: it is per-planner state, so a
-    # worker left on the default would run a different cache configuration than the one measured.
+    # worker left on the default would run a different cache configuration than the coordinator.
     window_bytes: int | None = None
     repair_planner: str = "astar"      # registry NAME; a planner object is not picklable
 
@@ -130,10 +129,12 @@ class TaskResult:
 
     @property
     def improved(self) -> bool:
+        """True when the worker accepted its repair (``reason == "improved"``)."""
         return self.reason == "improved"
 
     @property
     def improvement(self) -> float:
+        """Cost the repair removed against its base, or 0.0 when it was not accepted."""
         return self.cost_old - self.cost_new if self.improved else 0.0
 
 
@@ -148,8 +149,7 @@ class WorkerStartTimeout(WorkerLost):
 
 # ====================================================================== coordinator helpers
 # The coordinator holds ONE ``LNSState`` on the CALLER's ledger rather than a hand-rolled
-# incumbent dict plus a shim context. That is a deliberate departure from the first sketch of this
-# design, and it deletes three problems rather than solving them:
+# incumbent dict plus a shim context. This deletes three problems rather than solving them:
 #
 # * ``tabu`` is a serial recurrence that ``_select_most_delayed`` mutates, so the seeds must be
 #   chosen centrally (m workers with private tabus would all pick the same most-delayed flight and
@@ -178,15 +178,19 @@ class _Changelog:
     """
 
     def __init__(self) -> None:
+        """Start an empty changelog at version 0."""
         self.version = 0
         self._entries: list[tuple[int, dict, dict]] = []      # (version, new_by_fid, old_by_fid)
 
     def record(self, changes: dict, olds: dict) -> int:
+        """Append one accepted repair (its new intents and the intents it replaced) and return the
+        new incumbent version."""
         self.version += 1
         self._entries.append((self.version, dict(changes), dict(olds)))
         return self.version
 
     def diff_since(self, base_version: int) -> dict:
+        """The compacted new-intent-per-flight a worker at ``base_version`` needs to catch up."""
         out: dict = {}
         for v, changes, _olds in self._entries:
             if v > base_version:
@@ -199,6 +203,7 @@ class _Changelog:
         return out
 
     def touched_since(self, base_version: int) -> set:
+        """The set of flight ids changed by any commit after ``base_version``."""
         return {fid for v, changes, _ in self._entries if v > base_version for fid in changes}
 
     def boxes_since(self, base_version: int):
@@ -336,6 +341,7 @@ class LNSWorkerPool:
 
     def __init__(self, cfg: SimConfig, intents: list, static_terms: tuple, unimpeded_cost: dict,
                  spec: WorkerSpec, n_workers: int) -> None:
+        """Hold the blueprint every replica is built from; spawns nothing until :meth:`start`."""
         self._cfg = cfg
         self._intents = intents
         self._static_terms = static_terms
@@ -349,6 +355,22 @@ class LNSWorkerPool:
 
     # ---------------------------------------------------------------- lifecycle
     def start(self, *, deadline: float | None = None) -> "LNSWorkerPool":
+        """Spawn the workers and block until each reports a built replica.
+
+        Each worker is waited on together with its process sentinel, so a worker that dies during
+        startup surfaces as ``WorkerLost`` rather than an indefinite block; one that is not ready by
+        ``deadline`` raises ``WorkerStartTimeout``. Any failure tears the whole pool down first.
+
+        Parameters
+        ------------
+        - deadline (float | None): ``time.monotonic()`` instant after which startup is abandoned;
+          ``None`` waits without a wall-clock bound.
+
+        Return
+        --------
+        - output (LNSWorkerPool): ``self``, with ``n_workers`` replicas up and each
+          ``worker_version`` at 0.
+        """
         ctx = mp.get_context("spawn")   # never fork: it inherits the numba runtime + thread state
         t0 = time.monotonic()
         try:
@@ -402,6 +424,8 @@ class LNSWorkerPool:
             raise
 
     def close(self) -> None:
+        """Stop every worker, join within one shared grace window, kill stragglers, and close all
+        pipes; idempotent and safe after a partial start."""
         for conn in self._conns:
             try:
                 conn.send(("stop",))
@@ -435,7 +459,20 @@ class LNSWorkerPool:
 
     # ---------------------------------------------------------------- traffic
     def sync(self, worker: int, changelog: _Changelog) -> None:
-        """Bring one worker up to the current incumbent version, if it is behind."""
+        """Bring one worker's replica up to the current incumbent version, if it is behind.
+
+        Sends only the compacted diff since the worker's last-known version, so catch-up costs
+        O(flights changed) rather than O(schedule); a worker already current is a no-op.
+
+        Parameters
+        ------------
+        - worker (int): index of the worker to sync.
+        - changelog (_Changelog): the coordinator's record of accepted repairs.
+
+        Return
+        --------
+        - output (None): sends a ``sync`` message and advances ``worker_version[worker]``.
+        """
         base = self.worker_version[worker]
         if base == changelog.version:
             return
@@ -444,15 +481,39 @@ class LNSWorkerPool:
         self.worker_version[worker] = changelog.version
 
     def sync_all(self, changelog: _Changelog) -> None:
+        """Sync every worker to the current incumbent version (see :meth:`sync`).
+
+        Parameters
+        ------------
+        - changelog (_Changelog): the coordinator's record of accepted repairs.
+
+        Return
+        --------
+        - output (None): syncs each worker in turn.
+        """
         for w in range(self.n_workers):
             self.sync(w, changelog)
 
     def dispatch(self, worker: int, rnd: int, slot: int, op: str, seed_fid, rng_state) -> None:
+        """Hand one worker a destroy/repair task tagged with its round and slot."""
         self._conns[worker].send(("task", rnd, slot, op, seed_fid, rng_state))
 
     def collect(self, n: int, timeout: float | None = None) -> list[TaskResult]:
-        """Wait for ``n`` results. Waits on every worker's SENTINEL as well as its pipe, so a
-        worker that dies surfaces as ``WorkerLost`` instead of an indefinite block."""
+        """Wait for ``n`` task results, blocking until they arrive.
+
+        Waits on every worker's process SENTINEL as well as its pipe, so a worker that dies (an OOM
+        kill looks exactly like this) surfaces as ``WorkerLost`` instead of an indefinite block.
+
+        Parameters
+        ------------
+        - n (int): number of results to collect before returning.
+        - timeout (float | None): per-wait wall-clock bound; ``None`` waits indefinitely. Expiry
+          with fewer than ``n`` results raises ``WorkerLost``.
+
+        Return
+        --------
+        - output (list[TaskResult]): ``n`` results in arrival order.
+        """
         sentinels = {p.sentinel: i for i, p in enumerate(self._procs)}
         by_conn = {c: i for i, c in enumerate(self._conns)}
         out: list[TaskResult] = []
@@ -503,6 +564,7 @@ def _pick_task(state, lns, selector, tabu, i):
 
 
 def _out_of_budget(lns, t0) -> bool:
+    """True once a wall-clock ``time_limit_s`` is configured and has elapsed since ``t0``."""
     return lns.time_limit_s is not None and time.monotonic() - t0 > lns.time_limit_s
 
 
@@ -526,9 +588,10 @@ def _stale_overwrite(state, changelog, result, accept_epsilon):
 
 def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before):
     """SYNC-LNS: a barrier per round, then apply the single best of m results (paper Eq. 3).
+    See context/figures/lns_drop_vs_sync.png (top).
 
-    Deterministic — the slot order is fixed and every decision is a pure function of it — which is
-    keeps task selection deterministic for a fixed worker count and seed.
+    Deterministic — the slot order is fixed and every decision is a pure function of it — so task
+    selection is reproducible for a fixed worker count and seed.
 
     Note the shape this gives at a FIXED ITERATION budget: m workers consume m tasks per round and
     m-1 of them are discarded, so quality per iteration FALLS as m rises. That is the paper's own
@@ -594,15 +657,17 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
 def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost_before):
     """DROP-LNS: no barrier. A result is applied the moment it lands and its worker is
     re-dispatched, so no worker ever idles on another (paper Fig. 1a).
+    See context/figures/lns_drop_vs_sync.png (bottom).
 
     Results now arrive against a STALE ``base_version``, and the accept rule gains three cases
     beyond the sequential one:
 
     * **clean** — nothing committed since the worker's base touched its read set, so the plan is
       exactly the plan it would have produced against the current incumbent. MERGE it, keeping both
-      workers' improvements. The paper has no such case; it always discards or overwrites. Soundness
-      is Track A's argument: a repaired path that occupies (cell, step) must have READ it to confirm
-      it free, so it is inside the recorded envelope, and a non-intersecting commit cannot conflict.
+      workers' improvements. The paper has no such case; it always discards or overwrites.
+      Soundness: a repaired path that occupies (cell, step) must have READ it to confirm it free,
+      so it is inside the recorded envelope, and a non-intersecting commit cannot conflict (see
+      context/figures/read_envelope.png).
     * **overwrite** — dirty, but the worker's whole solution still beats the incumbent
       (paper Alg. 2 line 23). Walk the interleaved flights back to the worker's base and apply its
       repair; the result is exactly the worker's own replica, hence feasible by construction.
@@ -618,6 +683,7 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
     inflight: set[int] = set()
 
     def _dispatch(w: int) -> bool:
+        """Sync worker ``w`` and hand it the next task; False when out of budget or iterations."""
         nonlocal next_i
         if next_i >= lns.max_iterations or _out_of_budget(lns, t0):
             return False
@@ -731,8 +797,10 @@ def _finish_stats(stats: dict, n_iter: int) -> dict:
 def _read_set_is_clean(envelopes, boxes) -> bool:
     """Did anything committed since the worker's base touch what its repair READ?
 
-    A ``None`` envelope is ALWAYS dirty: the planner resets ``last_envelope`` per plan and only
-    ``_mk_envelope`` sets it, so None means "read set unknown", not "read nothing".
+    True iff no committed box intersects any recorded read envelope (see
+    context/figures/read_envelope.png). A ``None`` envelope is ALWAYS dirty: the planner resets
+    ``last_envelope`` per plan and only ``_mk_envelope`` sets it, so None means "read set unknown",
+    not "read nothing".
     """
     from freespace_sim.parallel import envelope_intersects
 
@@ -758,6 +826,7 @@ def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
 def _maybe_log(
     lns, mode, m, n_iter, n_accepted, state, selector, cost_before, *, previous_iter
 ) -> None:
+    """Emit a progress line when ``n_iter`` crosses a ``log_every`` boundary."""
     if (not lns.log_every
             or n_iter // lns.log_every == previous_iter // lns.log_every):
         return
@@ -794,11 +863,25 @@ def run_lns_parallel(
     static_terms: tuple | None = None,
     turnaround_s: float | None = None,
 ):
-    """DROP-LNS over a committed schedule. Same contract as ``run_lns``; see that docstring.
+    """DROP-LNS over a committed schedule; same contract as ``run_lns`` (ledger/intents are a
+    completed run's, the ledger is mutated in place, and the returned intents supersede the input).
 
-    ``sync`` runs a barrier per round and applies the best of m results (paper Eq. 3). An effective
-    width below two delegates to the sequential engine instead of building a replica that cannot
-    run concurrently.
+    ``sync`` runs a barrier per round and applies the best of m results (paper Eq. 3); ``drop``
+    applies each result as it lands. An effective width below two delegates to the sequential engine
+    instead of building a replica that cannot run concurrently.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): simulation config, forwarded to every replica.
+    - ledger (ReservationLedger): the caller's committed ledger; mutated in place to the result.
+    - intents (list[OperationalIntent]): the completed run's intents to improve.
+    - lns: the ``LNSConfig`` controlling operators, budget, ``parallel_mode``, and worker count.
+    - static_terms (tuple | None): always-active terminal walls; ``None`` reads them off the ledger.
+    - turnaround_s (float | None): paired-return spacing; ``None`` disables the return guard.
+
+    Return
+    --------
+    - output (LNSResult): the improved schedule with its trajectory and parallel statistics.
     """
     lns = _validate_lns_config(lns)
     pool_workers = _effective_search_workers(lns)

@@ -41,9 +41,13 @@ class DestroyContext(Protocol):
     rng: np.random.Generator
     n_levels: int
 
-    def movable_ids(self) -> Sequence[int]: ...
+    def movable_ids(self) -> Sequence[int]:
+        """Ids of the flights a destroy heuristic is allowed to remove."""
+        ...
 
-    def is_movable(self, fid: int) -> bool: ...
+    def is_movable(self, fid: int) -> bool:
+        """Whether flight ``fid`` is one the destroy heuristics may remove."""
+        ...
 
     def delay(self, fid: int) -> float:
         """Weighted premium of the incumbent plan over the unimpeded plan (>= 0)."""
@@ -71,6 +75,9 @@ class DestroyContext(Protocol):
 
 
 def _neighbor_cells(cell: Cell, n_levels: int, include_stay: bool) -> list[Cell]:
+    """The cells one step from ``cell``: its six in-plane hex neighbours plus one flight level
+    down and/or up (clamped to ``[0, n_levels)``), and ``cell`` itself when ``include_stay``.
+    This is the per-step move set the destroy walk and the map BFS both expand over."""
     q, r, level = cell
     out = [(q + dq, r + dr, level) for dq, dr in AXIAL_NEIGHBORS]
     if level > 0:
@@ -83,6 +90,7 @@ def _neighbor_cells(cell: Cell, n_levels: int, include_stay: bool) -> list[Cell]
 
 
 def _steps_to(cell: Cell, goal: Cell) -> int:
+    """Minimum steps from ``cell`` to ``goal``: in-plane hex distance plus level difference."""
     return hex_distance((cell[0], cell[1]), (goal[0], goal[1])) + abs(cell[2] - goal[2])
 
 
@@ -138,16 +146,28 @@ def agent_based_neighborhood(
     ctx: DestroyContext, n: int, tabu: set[int], max_walks: int = 10,
     seed_fid: int | None = None,
 ) -> set[int]:
-    """Algorithm 1: seed with the most delayed non-tabu flight, then random-walk
-    from members of the growing set until ``n`` flights are collected (or
-    ``max_walks`` walks came up dry).
+    """Algorithm 1: seed with the most-delayed non-tabu flight, then random-walk from members of
+    the growing set until ``n`` flights are collected (or ``max_walks`` walks come up dry).
+    See context/figures/lns_destroy_operators.png (left).
 
-    ``seed_fid`` lets a PARALLEL coordinator own the seed choice. ``tabu`` is a serial
-    recurrence — ``_select_most_delayed`` mutates it — so m workers each holding their own copy
-    would every one of them pick the same most-delayed flight, and the pool would run m copies of
-    a single neighborhood while looking perfectly healthy. The coordinator instead advances one
-    tabu across its slots and passes the result down. ``_select_most_delayed`` is untouched, so
-    the selection and its reset semantics still have exactly one implementation.
+    ``tabu`` is a serial recurrence — ``_select_most_delayed`` mutates it — so m workers each
+    holding their own copy would every one pick the same most-delayed flight, and the pool would
+    run m copies of a single neighborhood while looking healthy. A parallel coordinator instead
+    advances one tabu across its slots and passes the choice down via ``seed_fid``, leaving
+    ``_select_most_delayed`` the sole owner of the selection and its reset semantics.
+
+    Parameters
+    ------------
+    - ctx (DestroyContext): read view of the incumbent schedule.
+    - n (int): target neighborhood size to collect.
+    - tabu (set[int]): most-delayed seeds already tried; mutated in place (reset when exhausted).
+    - max_walks (int): random-walk restarts before giving up below size ``n``.
+    - seed_fid (int | None): explicit seed flight (parallel coordinator); ``None`` picks the
+      most-delayed non-tabu flight locally.
+
+    Return
+    --------
+    - output (set[int]): flight ids to destroy (just the seed when every walk comes up dry).
     """
     seed = _select_most_delayed(ctx, tabu) if seed_fid is None else seed_fid
     if seed is None:
@@ -178,9 +198,23 @@ def _collect_intersection_agents(ctx: DestroyContext, cell: Cell, n: int, out: s
 
 
 def map_based_neighborhood(ctx: DestroyContext, n: int, max_cells: int = 4096) -> set[int]:
-    """Algorithm 2: BFS over the lattice from a random contention cell, collecting
-    the claimants of every contention cell reached. ``max_cells`` bounds the BFS
-    (the paper explores the whole map; ours is 144k cells/level)."""
+    """Algorithm 2: BFS outward over the lattice from a random contention cell, collecting the
+    claimants of every contention cell it reaches.
+    See context/figures/lns_destroy_operators.png (right).
+
+    ``max_cells`` bounds the BFS: the paper explores the whole map, but ours is ~144k cells per
+    level, so the walk is capped rather than run to exhaustion.
+
+    Parameters
+    ------------
+    - ctx (DestroyContext): read view of the incumbent schedule.
+    - n (int): target neighborhood size; the BFS stops once this many flights are collected.
+    - max_cells (int): BFS exploration bound (cells popped) before giving up.
+
+    Return
+    --------
+    - output (set[int]): flight ids to destroy (empty when no cell is contended).
+    """
     contended = ctx.contention_cells()
     if not contended:
         return set()
@@ -203,7 +237,17 @@ def map_based_neighborhood(ctx: DestroyContext, n: int, max_cells: int = 4096) -
 
 
 def random_neighborhood(ctx: DestroyContext, n: int) -> set[int]:
-    """Uniform random subset of movable flights (Section 5.3)."""
+    """Uniform random subset of the movable flights (Section 5.3).
+
+    Parameters
+    ------------
+    - ctx (DestroyContext): read view of the incumbent schedule.
+    - n (int): target neighborhood size; capped at the number of movable flights.
+
+    Return
+    --------
+    - output (set[int]): flight ids to destroy (empty when no flight is movable).
+    """
     ids = np.asarray(list(ctx.movable_ids()), dtype=np.int64)
     if ids.size == 0:
         return set()
@@ -227,10 +271,33 @@ class AdaptiveSelector:
     weights: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Seed each heuristic's weight to the paper's uniform prior of 1.0.
+
+        Parameters
+        ------------
+        - none: reads ``names`` and back-fills ``weights``.
+
+        Return
+        --------
+        - output (None): mutates ``weights`` in place, adding any missing name at weight 1.0.
+        """
         for name in self.names:
             self.weights.setdefault(name, 1.0)
 
     def pick(self, rng: np.random.Generator) -> str:
+        """Sample one heuristic name with probability proportional to its weight.
+
+        Falls back to a uniform draw when every weight has decayed to zero, so a pick is always
+        returned.
+
+        Parameters
+        ------------
+        - rng (np.random.Generator): source of the weighted (or uniform-fallback) draw.
+
+        Return
+        --------
+        - output (str): the chosen heuristic name from ``names``.
+        """
         w = np.asarray([self.weights[name] for name in self.names], dtype=float)
         total = float(w.sum())
         if total <= 0.0:
@@ -238,4 +305,6 @@ class AdaptiveSelector:
         return self.names[int(rng.choice(len(self.names), p=w / total))]
 
     def update(self, name: str, improvement: float) -> None:
+        """Apply this iteration's ALNS reward (formula in the class docstring) to ``name``'s weight
+        from ``improvement`` (weighted seconds); a miss or non-improving move decays it."""
         self.weights[name] = self.gamma * max(improvement, 0.0) + (1.0 - self.gamma) * self.weights[name]

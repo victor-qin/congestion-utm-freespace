@@ -5,11 +5,12 @@ and orders the ``premium`` repair, so every movable flight needs one plan agains
 nothing but the run's always-active terminal walls. That is a few hundred to a few thousand A*
 searches, and it is the whole of ``LNSState``'s construction cost.
 
-**Why it parallelises exactly.** The ruler ledger is never committed to, so plan *i* cannot observe
-plan *j*: each is a pure function of ``(request, cfg, static_terms)``. Sharding it across processes
-therefore cannot change a single cost — unlike the speculative parallel sim (``freespace_sim.parallel``),
-which needs read-envelope validation precisely because its plans DO see each other's commits. The
-worker count is a pure throughput knob, pinned by ``tests/test_lns.py``.
+Why it parallelises exactly: the ruler ledger is never committed to, so plan ``i`` cannot observe
+plan ``j`` — each is a pure function of ``(request, cfg, static_terms)``. Sharding across
+processes therefore cannot change a single cost, unlike the speculative parallel sim
+(``freespace_sim.parallel``), which needs read-envelope validation precisely because its plans DO
+see each other's commits. The worker count is a pure throughput knob, pinned by
+``tests/test_lns.py``.
 
 The decision to spawn is made from a measured prefix rather than a flight-count threshold: worker
 startup is a fixed ~0.4 s (imports + the cached numba warm) while per-flight plan cost varies by an
@@ -37,11 +38,20 @@ _RULER_LOG2 = 18
 
 
 def resolve_workers(n_workers: int | None) -> int:
-    """``None`` -> a default pool size; anything else passes through (1 = in-process).
+    """Resolve the ruler pool size; ``None`` picks a default, anything else passes through.
 
     Capped like ``ParallelConfig.n_workers``, but for a different reason: there is no ordered-commit
     stall here and each worker's ruler ledger is empty, so the cap is about the ~130 MB of imports
     and occupancy pools a worker costs, not about contention.
+
+    Parameters
+    ------------
+    - n_workers (int | None): requested count; ``None`` picks the default, ``1`` stays in-process,
+      any other value is floored at 1 and passed through.
+
+    Return
+    --------
+    - output (int): the resolved worker count (>= 1).
     """
     if n_workers is not None:
         return max(1, int(n_workers))
@@ -113,13 +123,27 @@ def _finish_processes(procs, timeout=5.0) -> None:
 
 
 def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000):
-    """Unimpeded cost per request, as ``[(flight_id, cost | None, denial_reason | None), ...]`` in
-    the order ``requests`` was given — regardless of how the work was sharded, so a caller's log
-    lines and warnings stay in flight order.
+    """Cost of every request flown ALONE, returned in the order ``requests`` was given.
 
-    ``n_workers <= 1`` plans in-process. Otherwise a probe prefix is planned in-process first and
-    the pool is only spawned if the projected remainder justifies it; a worker that dies has its
-    shard replanned in-process, loudly, rather than leaving the ruler short a flight.
+    The result order is independent of how the work was sharded, so a caller's log lines and
+    warnings stay in flight order. ``n_workers <= 1`` plans in-process; otherwise a probe prefix
+    is planned in-process first and the pool is only spawned if the projected remainder justifies
+    it. A worker that dies has its shard replanned in-process, loudly, rather than leaving the
+    ruler short a flight.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): run config, forwarded to every ruler planner and its walls-only ledger.
+    - static_terms (tuple): ``(center, terminal)`` pairs registered as the ledger's static walls.
+    - requests (Sequence[FlightRequest]): flights to rule; each is read for ``flight_id``.
+    - n_workers (int): pool size; ``<= 1`` plans in-process (keyword-only).
+    - log_every (int): emit a progress line every this many in-process plans (keyword-only).
+
+    Return
+    --------
+    - output (list): one ``(flight_id, cost | None, denial_reason | None)`` per request, in
+      request order; ``cost`` is ``None`` and ``denial_reason`` set when the flight cannot be
+      placed even alone.
     """
     n = len(requests)
     if n == 0:
@@ -140,9 +164,9 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
     W = min(n_workers, len(rest))
     log.info("lns: unimpeded baseline on %d workers (%d flights, ~%.0fs sequential)",
              W, n, projected)
-    shards = [rest[w::W] for w in range(W)]         # round-robin: adjacent flights are the same
-    #                                                 delivery's legs, so a contiguous split would
-    #                                                 hand one worker a whole slow region
+    # Round-robin, not contiguous: adjacent flights are the same delivery's legs, so a contiguous
+    # split would hand one worker a whole slow region.
+    shards = [rest[w::W] for w in range(W)]
     conns, procs = [], []
     by_worker: list = [None] * W
     pool_error = None
@@ -198,6 +222,8 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
 
 
 def _sequential(cfg, static_terms, requests, planner, free, log_every, offset):
+    """Plan ``requests`` in-process on the given ruler, one ``(fid, cost, denial)`` row each;
+    ``offset`` continues the progress count so a pool's probe + remainder log as one sequence."""
     rows = []
     for k, req in enumerate(requests):
         u = planner.plan(req, free, cfg)

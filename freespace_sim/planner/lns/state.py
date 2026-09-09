@@ -50,12 +50,11 @@ Cell = tuple[int, int, int]
 # incumbent are denominated in the same currency. ``astar_ref`` is the same search without the compiled
 # kernel (byte-identical by contract); the shortcut/MILP/colgen families are NOT — see LNSState.
 #
-# The SIPP pair is here on measured evidence, not by analogy. A* and SIPP are exact optimizers of the
-# SAME weighted cost over the same lattice, so they must agree on the optimum even though they break
-# ties differently and file different routes — and `tests/test_lns_sipp.py` pins that both on the
-# empty ruler world (1e-9) and on a congested A*-committed ledger (1e-6), which is the check that was
-# missing when this set was written. What that buys: a `planner="sipp"` baseline may be repaired and
-# ruled by A*, and vice versa, without the delay premium comparing two currencies.
+# The SIPP pair belongs on measured evidence: A* and SIPP are exact optimizers of the same
+# weighted cost over the same lattice, so they agree on the optimum even though they break ties
+# differently and file different routes. `tests/test_lns_sipp.py` pins that agreement on the
+# empty ruler world and on a congested A*-committed ledger. So a `planner="sipp"` baseline may be
+# repaired and ruled by A* (and vice versa) without the delay premium comparing two currencies.
 _REPRODUCIBLE_PLANNERS = frozenset({"astar", "astar_ref", "sipp", "sipp_ref"})
 #: Planners LNS may construct as its repair planner. Deliberately a small ALLOWLIST rather than
 #: `get_planner`: that registry also holds `ShortcutRefiner` wrappers (a wrapper has no `evict_floor`
@@ -73,7 +72,7 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
     only runs for a BORROWED planner, so a constructed one is never checked. Callers must validate
     `name` BEFORE the ledger is taken over (`solver._validate_lns_config`) — see `LNSState.__init__`.
     """
-    # `window_bytes` is the #124 dense-window budget; omitted rather than passed as None so each
+    # `window_bytes` is the dense-window byte budget; omitted rather than passed as None so each
     # planner keeps its own default.
     kw = {} if window_bytes is None else {"window_bytes": window_bytes}
     if name in ("astar", "astar_ref"):
@@ -145,17 +144,19 @@ class RepairOutcome:
     cost_new: float  # inf when the repair never produced a complete candidate
     n_planned: int
     # The repaired schedule, populated ONLY on the accept return: a parallel worker has to hand
-    # these back to the coordinator, which owns the incumbent. The reject path (79% of iterations)
-    # must stay free, so nothing is built for it.
+    # these back to the coordinator, which owns the incumbent. The reject path is the common case
+    # and must stay free, so nothing is built for it.
     new_intents: dict[int, OperationalIntent] = field(default_factory=dict)
     # One `AStarPlanner.last_envelope` per repaired flight, in repair order, when the planner was
-    # built with `record_envelope`. Entries may be None (the planner resets it per plan and only
-    # `_mk_envelope` sets it, so a host-side early denial leaves it unset) — a consumer must treat
-    # None as "read set unknown", i.e. always dirty.
+    # built with `record_envelope` — the read set a parallel coordinator tests commits against (see
+    # context/figures/read_envelope.png). Entries may be None (the planner resets it per plan and
+    # only `_mk_envelope` sets it, so a host-side early denial leaves it unset) — a consumer must
+    # treat None as "read set unknown", i.e. always dirty.
     envelopes: tuple = ()
 
     @property
     def improvement(self) -> float:
+        """The weighted-cost drop this repair achieved, or 0.0 when it was not accepted."""
         return self.cost_old - self.cost_new if self.accepted else 0.0
 
 
@@ -181,6 +182,42 @@ class LNSState:
         maintain_claim_index: bool = True,
         window_bytes: int | None = None,
     ) -> None:
+        """Take ownership of ``ledger`` and build the incumbent, ruler, and destroy claim index.
+
+        Detaches the ledger's existing subscribers and bumps its epoch, so the repair planner
+        rebinds instead of planning against a frozen occupancy. Validates that ``intents`` and
+        ``ledger`` describe the same schedule before touching anything.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): sim config (planner, ``dt_s``, flight levels, corridor/pad geometry).
+        - ledger (ReservationLedger): the committed schedule LNS takes over (subscribers detached).
+        - intents (list[OperationalIntent]): the incumbent; must be the exact pair produced with
+          ``ledger`` by one run (an LNS pass mutates the ledger in place).
+        - static_terms (tuple): the (center, terminal) walls this run is about; kept so verify
+          replays the same world the ruler was measured in.
+        - frozen_flight_ids (frozenset[int]): flights excluded from the movable set.
+        - movable_uss_ids (frozenset[str] | None): if set, only these USS ids are movable.
+        - turnaround_s (float | None): enables the paired-return anchor guard when not None.
+        - repair_planner (AStarPlanner | None): a borrowed repair planner (must have
+          ``evict_floor == 0.0`` and not already be bound to this ledger); None constructs one.
+        - repair_planner_name (str): which planner to construct when ``repair_planner`` is None.
+        - incremental_release (bool): un-absorb victims incrementally (default), or take the
+          shrink-rebuild path (the byte-parity reference for A/Bs).
+        - unimpeded_workers (int | None): worker count for the unimpeded ruler; None opts into
+          automatic multiprocessing.
+        - unimpeded_cost (dict[int, float | None] | None): a precomputed ruler broadcast by a
+          coordinator; None computes it here, and a None entry means "denied".
+        - maintain_claim_index (bool): build the destroy-heuristic claim index (off for consumers
+          that never destroy by cell).
+        - window_bytes (int | None): dense-window byte budget forwarded to a constructed planner.
+
+        Return
+        --------
+        - output (None): builds the state in place; raises ValueError on a mismatched
+          ``(intents, ledger)`` pair, an unrepeatable baseline planner, or a borrowed planner that
+          fails the vet.
+        """
         self.cfg = cfg
         self.ledger = ledger
         self.dt = cfg.dt_s
@@ -254,7 +291,7 @@ class LNSState:
 
         # incremental_release=True: the planner's occupancy/capacity services subscribe to
         # `release_many` and un-absorb victims in O(their volumes), so the per-iteration shrink
-        # rebuild (measured 94% of iteration wall) never happens. False keeps the rebuild path
+        # rebuild (the dominant cost of an iteration) never happens. False keeps the rebuild path
         # (the byte-parity reference for A/Bs).
         self.repair_planner = repair_planner
 
@@ -311,18 +348,17 @@ class LNSState:
         self._infl_b = cfg.corridor_width_m / 2.0 + self._R
         self._infl_p = cfg.effective_hover_radius_m + self._R
         self._claims: dict[Cell, list[tuple[int, int, int]]] = {}
-        # fid -> the DISTINCT cells it claims. `_index_remove` filters each cell's row list by owner
-        # and re-derives its contention, both of which are per-cell — so a per-ROW list did the same
-        # work once per (cell, span) instead of once per cell, and stored a `(cell, s_lo, s_hi)`
-        # triple whose spans nothing ever read (measured 44 MB at 290 flights).
+        # fid -> the DISTINCT cells it claims. `_index_remove` and contention refresh are both
+        # per-cell, so storing distinct cells (not one entry per (cell, span)) is what keeps this
+        # index O(cells) rather than O(spans).
         self._cells_of: dict[int, set[Cell]] = {}
         self._contended: set[Cell] = set()
         self._contended_list: list[Cell] | None = None
         # Where an iteration's wall goes, split the only two ways that matter for choosing a repair
-        # planner: SEARCH (what SIPP makes cheaper) against LEDGER MAINTENANCE (what SIPP makes more
-        # expensive, by keeping a fourth subscribed structure on terminal legs). Two counters over a
-        # whole run, read once at the end — deliberately NOT per-flight attribution, which
-        # `analysis/ab_column_clear.py` showed is dominated by the `perf_counter` calls themselves.
+        # planner: SEARCH (what SIPP makes cheaper) vs LEDGER MAINTENANCE (what SIPP makes more
+        # expensive, keeping a fourth subscribed structure on terminal legs). Two whole-run counters
+        # read once at the end — deliberately NOT per-flight attribution, which is dominated by the
+        # `perf_counter` calls themselves.
         self.t_plan_s = 0.0
         self.t_ledger_s = 0.0
         self._visits: dict[int, list[tuple[int, Cell]]] = {}
@@ -353,27 +389,38 @@ class LNSState:
         ``verify.find_interflight_conflict`` and ``parallel._worker_main`` both use), which also
         keeps the constructor's object-identity schedule check happy.
 
-        **Every keyword here changes what a repair is ALLOWED to do**, so each must be forwarded
-        or the worker silently runs a different algorithm than the coordinator believes it does:
+        Every keyword below changes what a repair is ALLOWED to do, so each must be forwarded or
+        the worker silently runs a different algorithm than the coordinator believes it does — and
+        ``verify.find_interflight_conflict`` checks 4D conflicts ONLY, so such a run still reports
+        ``verified``.
 
-        * ``turnaround_s`` builds ``_return_anchor``; without it ``try_repair``'s anchor guard is
-          disarmed, so a repair may re-time an outbound past its return's departure — and
-          ``verify.find_interflight_conflict`` checks 4D conflicts ONLY, so the run would still
-          report ``verified``.
-        * ``frozen_flight_ids`` / ``movable_uss_ids`` derive ``_movable``; without them the worker
-          treats every accepted flight as movable, the destroy operators may select frozen
-          flights, and ``try_repair``'s membership assert passes because it tests the worker's own
-          (wrong) set.
-        * ``incremental_release`` is the rebuild-path byte-parity reference (``--no-incremental``);
+        Parameters
+        ------------
+        - cfg (SimConfig): sim config, shared with the coordinator.
+        - intents (list[OperationalIntent]): the incumbent to copy; accepted intents are committed
+          to the fresh ledger.
+        - static_terms (tuple): the (center, terminal) walls to re-register, so the worker measures
+          the same world as the ruler.
+        - unimpeded_cost (dict[int, float | None]): the broadcast ruler; a None entry means denied.
+        - turnaround_s (float | None): arms ``_return_anchor``; without it an outbound repair may
+          re-time past its return's departure undetected.
+        - frozen_flight_ids (frozenset[int]): non-movable flights; omitting them lets destroy pick
+          frozen flights while the membership assert still passes on the worker's own (wrong) set.
+        - movable_uss_ids (frozenset[str] | None): USS movability filter, forwarded for the same
+          reason as ``frozen_flight_ids``.
+        - incremental_release (bool): the rebuild-path byte-parity reference (``--no-incremental``);
           hardcoding it would make that A/B inexpressible under parallelism.
-        * ``window_bytes`` controls per-planner bitmap allocation and fallback frequency, so a worker
-          that did not receive it would use a different resource policy from the coordinator.
+        - kernel_log2_min (int | None): the repair planner's compiled-kernel size threshold.
+        - record_envelope (bool): record per-plan read envelopes; needed only when multiple DROP
+          workers can return stale repairs (SYNC and widths below two skip it).
+        - window_bytes (int | None): per-planner bitmap budget; without it a worker uses a
+          different resource policy from the coordinator.
+        - repair_planner_name (str): which planner to build; a worker building A* while the
+          coordinator believes it runs SIPP diverges silently.
 
-        ``record_envelope`` is needed only when multiple DROP workers can return stale repairs;
-        SYNC skips that bookkeeping, and effective widths below two stay in-process.
-        ``unimpeded_workers=1`` is pinned because
-        this constructor runs INSIDE a search worker — the ruler's own pool would otherwise fan out
-        to m x m processes.
+        Return
+        --------
+        - output (LNSState): a standalone state over a private ledger, ready to ``try_repair``.
         """
         led = ReservationLedger(cfg)
         for center, term in static_terms:
@@ -419,15 +466,16 @@ class LNSState:
             self._refresh_contention(cell)
 
     def _index_add(self, fid: int, volumes, refresh: bool = True) -> None:
+        """Index fid's blocked-cell claims (own-hub column interiors are skipped)."""
         rows = self._cells_of.get(fid)
         if rows is None:
             rows = self._cells_of[fid] = set()
-        # The flight's own terminal columns. A corridor cell INSIDE one of them is the vertiport's
-        # unreserved tactical interior — the occupancy services drop it (HexOccupancyService.add_volume
-        # / CompiledHexOccupancy._add), so A* never deconflicts there. Indexing it anyway would make
-        # every pair of same-hub flights look mutually contended at their shared hub, and the map-based
-        # destroy operator picks cells BY contention: it would spend its neighborhoods on hub interiors
-        # where no conflict can exist.
+        # A flight's own terminal-column interior is exempt from deconfliction — the occupancy
+        # services drop those cells (HexOccupancyService.add_volume / CompiledHexOccupancy._add), so
+        # A* never conflicts there (see context/figures/cell_blocking.png). Indexing them anyway
+        # would make same-hub flights look mutually contended at their shared hub, and
+        # the map destroy operator picks cells BY contention, spending neighborhoods on
+        # hub interiors where no conflict can exist.
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         # Resolved once per flight, and shared with the two occupancy services through the memo in
@@ -458,6 +506,7 @@ class LNSState:
                         self._refresh_contention(cell)
 
     def _index_remove(self, fid: int) -> None:
+        """Drop fid's claims from the index and refresh each freed cell's contention."""
         for cell in self._cells_of.pop(fid, ()):
             entries = self._claims.get(cell)
             if not entries:
@@ -470,6 +519,7 @@ class LNSState:
             self._refresh_contention(cell)
 
     def _refresh_contention(self, cell: Cell) -> None:
+        """Recompute whether cell is contended (2+ owners) and update the contended set."""
         entries = self._claims.get(cell, ())
         owners = {e[2] for e in entries}
         contended = len(owners) >= 2
@@ -482,21 +532,49 @@ class LNSState:
 
     # ------------------------------------------------------------ DestroyContext API
     def movable_ids(self):
+        """The sorted movable flight ids — the destroy operators' selection pool."""
         return self._movable
 
     def is_movable(self, fid: int) -> bool:
+        """Whether ``fid`` is movable (accepted, not frozen, and USS-allowed)."""
         return fid in self._movable_set
 
     def delay(self, fid: int) -> float:
+        """Flight ``fid``'s delay: incumbent cost minus its unimpeded ruler, floored at 0."""
         return max(0.0, float(self.incumbent[fid].cost) - self._unimp_cost[fid])
 
     def visits(self, fid: int):
+        """Cached per-step ``(step, cell)`` samples of ``fid``'s airborne centreline.
+
+        Memoizes :meth:`_extract_visits`; the cache entry is dropped whenever the flight is
+        re-planned.
+
+        Parameters
+        ------------
+        - fid (int): flight id to sample.
+
+        Return
+        --------
+        - output (list[tuple[int, Cell]]): airborne lateral samples (empty when the flight has no
+          centreline).
+        """
         cached = self._visits.get(fid)
         if cached is None:
             cached = self._visits[fid] = self._extract_visits(self.incumbent[fid])
         return cached
 
     def unimpeded_launch_step(self, fid: int) -> int:
+        """The step ``fid`` would first go airborne with its ground hold removed.
+
+        Parameters
+        ------------
+        - fid (int): flight id.
+
+        Return
+        --------
+        - output (int): first airborne step minus the held ground-delay steps (0 when the flight
+          has no visits).
+        """
         vis = self.visits(fid)
         if not vis:
             return 0
@@ -504,13 +582,25 @@ class LNSState:
         return vis[0][0] - hold
 
     def owners_over(self, cell: Cell, s_lo: int, s_hi: int):
+        """The flights whose claim on ``cell`` overlaps the step span ``[s_lo, s_hi]``."""
         return {f for a, b, f in self._claims.get(cell, ()) if a <= s_hi and b >= s_lo}
 
     def claim_span(self, cell: Cell) -> tuple[int, int]:
+        """The step span covered by every claim on ``cell``.
+
+        Parameters
+        ------------
+        - cell (Cell): a (q, r, level) cell that has at least one claim.
+
+        Return
+        --------
+        - output (tuple[int, int]): the earliest claim start and latest claim end over the cell.
+        """
         entries = self._claims[cell]
         return min(e[0] for e in entries), max(e[1] for e in entries)
 
     def contention_cells(self):
+        """The contended cells (2+ owners), sorted; cached until the index changes."""
         if self._contended_list is None:
             self._contended_list = sorted(self._contended)
         return self._contended_list
@@ -552,12 +642,27 @@ class LNSState:
         *,
         report_only: bool = False,
     ) -> RepairOutcome:
-        """Release and PP-repair victims; accept only a strict weighted-cost improvement.
+        """Release and PP-repair ``victims``; accept only a strict weighted-cost improvement.
 
-        ``premium`` repairs the most-delayed first with random ties; ``random`` retains the paper's
-        order for A/B comparisons. ``report_only`` returns an accepted candidate but restores the
-        incumbent ledger without adopting it; parallel workers use this because only the coordinator
-        may commit a result. See ``context/lns_plan.md`` §4.
+        The whole destroy->repair->accept/revert transaction: release the victims, replan them in
+        priority order, then adopt a strict improvement or rewind to the incumbent. Every
+        non-adopting exit restores the ledger, so a rejected or failed repair leaves the schedule
+        unchanged. See ``context/lns_plan.md`` §4.
+
+        Parameters
+        ------------
+        - victims (Iterable[int]): movable flight ids to destroy and replan (sorted internally).
+        - rng (np.random.Generator): source for the repair-order tie-break or permutation.
+        - accept_epsilon (float): minimum weighted-cost drop required to accept.
+        - order_mode (str): ``"premium"`` repairs the most-delayed first with random ties;
+          ``"random"`` uses the paper's random order (for A/Bs). Any other value raises.
+        - report_only (bool): when True, return an accepted candidate but restore the incumbent
+          ledger without adopting it — parallel workers use this; only the coordinator commits.
+
+        Return
+        --------
+        - output (RepairOutcome): the outcome; ``accepted``/``reason`` say what happened,
+          and ``new_intents``/``envelopes`` are populated only on an accepted return.
         """
         victims = sorted(victims)
         assert all(f in self._movable_set for f in victims)
@@ -661,8 +766,8 @@ class LNSState:
                 self.ledger.commit(fid, old[fid].volumes)
             except BaseException as exc:            # noqa: BLE001 - re-raised below, after the rest
                 failures.append((fid, exc))
-        self.t_ledger_s += time.perf_counter() - t0    # the rewind is ledger work too, and on the
-        #                                                rejection path (79%) it is HALF of it
+        self.t_ledger_s += time.perf_counter() - t0    # the rewind is ledger work too, and is a
+        #                                                big share of it on the rejection path
         if applied:
             self.total_cost = cost_at_entry
             for fid in applied:
@@ -692,16 +797,25 @@ class LNSState:
                 self._visits.pop(fid, None)
 
     def apply_delta(self, changes: dict[int, OperationalIntent]) -> None:
-        """Adopt someone else's accepted repair: move the LEDGER **and** the in-memory views.
+        """Adopt someone else's accepted repair: move the LEDGER and the in-memory views together.
 
         The replica-sync counterpart of ``try_repair``'s accept branch. The difference is the
         ledger: ``try_repair`` has already committed its own plans and only the in-memory views
         are behind, while a worker told "the incumbent moved" still holds the old volumes and must
-        release them first. O(the changed flights), not O(the schedule) — which is what makes a
-        parallel worker's "take a private copy of P_min" affordable at all.
+        release them first. One ``commit`` per flight, because ``_absorb`` groups a flight's
+        volumes by adjacent runs and needs them contiguous. Costs O(changed flights), not
+        O(schedule) — which is what makes a parallel worker's private copy of the incumbent
+        affordable at all.
 
-        One ``commit`` per flight, because ``_absorb`` groups a flight's volumes by adjacent runs
-        and needs them contiguous. Any failure rewinds the whole delta before propagating.
+        Parameters
+        ------------
+        - changes (dict[int, OperationalIntent]): fid -> its adopted intent, in the producer's PP
+          priority order (see below); an empty dict is a no-op.
+
+        Return
+        --------
+        - output (None): mutates the ledger and in-memory views in place; on any failed commit it
+          rewinds the whole delta and re-raises.
         """
         # The CALLER's order, not sorted. `changes` comes out of a repair in PP priority order, and
         # replaying it in that order lands the ledger's `_vols`/`_fids` in the same layout an

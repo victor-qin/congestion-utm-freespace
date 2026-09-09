@@ -35,3 +35,9 @@ Durable record of mistakes likely to recur between PRs. Format follows `.agent/C
 - 2026-09-09T00:10Z `[ASSUMPTION]` Run only the tests that pertain to a change; the full suite is
   ~25 min single-core, 71% of it in 25 tests (`test_demand_hub` alone is ~28%). Use
   `-m "not slow"` while iterating and the full suite only before merge. Files: `pyproject.toml`.
+
+- 2026-09-09T00:35Z `[TOOL]` A fixture that makes two definitions identical turns every test of their
+  difference into a tautology. `test_realized_takeoff_is_the_column_start_not_the_first_waypoint`
+  built `centerline[0][1] == volumes[0].t_start`, so `x < x + 1e-9` passed for any implementation.
+  Build the fixture so the two CAN differ, and pin the regime a behavioural test needs. Files:
+  `tests/test_paired_precedence.py`.

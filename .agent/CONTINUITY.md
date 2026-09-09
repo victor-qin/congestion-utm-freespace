@@ -46,6 +46,11 @@
   deconflicted against leg 1. Under the two-request scheme the ledger policed them against each
   other, which was never physically meaningful.
 
+- 2026-09-09T00:40Z `[TOOL]` The itinerary model's central claim was UNTESTED — no test asserted a
+  planned return leg departs after its own arrival. Added four, plus a fixture assertion pinning the
+  congested regime (29/29 returns held past service, up to 185.5 s); without it the test would pass
+  vacuously the moment the fixture stopped congesting.
+
 ## [OUTCOMES]
 
 - 2026-09-08T22:07Z `[TOOL]` PR #128 merged: one predicate for paired-leg precedence. Armed nominal

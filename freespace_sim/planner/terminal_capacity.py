@@ -81,11 +81,22 @@ class TerminalCapacity:
     """
 
     def __init__(self, cfg: SimConfig, ledger: ReservationLedger, track_removal: bool = False):
+        """Bind the authority to one ledger and initialize its dwell/foreign-transit indices.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies column radius, hover/climb timing, and the always-active flag.
+        - ledger (ReservationLedger): the ledger this authority observes (push) and queries (pull).
+        - track_removal (bool): when True, keep per-flight dwell rows so :meth:`on_release` can
+          subtract them exactly (a dwell is a counting structure, removed by value; LNS destroy);
+          off ⇒ zero bookkeeping, byte-identical behavior.
+
+        Return
+        --------
+        - output (None): builds the instance; subscribe :meth:`on_commit` separately.
+        """
         self.cfg = cfg
         self.ledger = ledger
-        # Removal mode (LNS destroy): each flight's recorded dwell rows are kept per owner so
-        # `on_release` can subtract them exactly (dwells are a counting structure — remove one
-        # instance by value). Flag off ⇒ zero bookkeeping, byte-identical behavior.
         self.track_removal = track_removal
         self._rows: dict[int, list] = {}                              # fid -> [count, (tid, t0, t1), ...]
         self.dwells: dict[Hashable, list[tuple[float, float]]] = {}   # tid -> [(t_start, t_end), ...]
@@ -105,9 +116,21 @@ class TerminalCapacity:
 
     # ----- maintenance (push, via ledger.subscribe) -----
     def on_commit(self, flight_id, volumes) -> None:
-        """Record every committed terminal-column cylinder as a per-hub dwell interval. A single flight
-        may contribute two (origin + dest). The column radius is a hub constant — asserted here so the
-        union-coverage skip in :meth:`column_clear` stays sound."""
+        """Record every committed terminal-column cylinder as a per-hub dwell interval.
+
+        A single flight may contribute two (origin + dest). The column radius is a hub constant —
+        asserted here so the union-coverage skip in :meth:`column_clear` stays sound.
+
+        Parameters
+        ------------
+        - flight_id: owner id of the committed volumes; keys the removal rows when tracking.
+        - volumes (Iterable[Volume4D]): committed volumes; tagged cylinders become dwells.
+
+        Return
+        --------
+        - output (None): appends to ``dwells``/``_rows`` and bumps ``_n_observed_volumes``; raises
+          ``ValueError`` if a hub's column radius is not constant.
+        """
         self._n_observed_volumes += len(volumes)
         rows = None
         if self.track_removal:
@@ -137,6 +160,16 @@ class TerminalCapacity:
         Rows absent at or before :attr:`evicted_before` were intentionally evicted; any other absence
         is drift. Never remove an arbitrary equal-valued dwell because it may belong to another
         committed flight. Keeps ``_n_observed_volumes`` aligned with the ledger.
+
+        Parameters
+        ------------
+        - flight_id: owner whose recorded dwell rows are subtracted (no-op if untracked or unknown).
+        - volumes: accepted for the subscriber signature; unused (recorded rows drive removal).
+
+        Return
+        --------
+        - output (None): mutates ``dwells``/``_rows`` and clears the foreign-transit index; raises
+          ``KeyError``/``ValueError`` on a drifted (missing) dwell row.
         """
         rows = self._rows.pop(flight_id, ())
         floor = self.evicted_before
@@ -156,9 +189,21 @@ class TerminalCapacity:
         self._ft_seen = 0
 
     def evict_before(self, t: float) -> None:
-        """Drop dwells ending at or before ``t`` (monotonic). The caller passes the request clock: with
-        ``t_departure >= t_request`` enforced and ``base = ceil(t_depart/dt)``, every future query window
-        starts at ``base*dt >= t_request``, so a dwell with ``t_end <= t_request`` can never overlap one."""
+        """Drop dwells (and foreign-transit intervals) ending at or before ``t`` (monotonic).
+
+        The caller passes the request clock. With ``t_departure >= t_request`` enforced and
+        ``base = ceil(t_depart/dt)``, every future query window starts at ``base*dt >= t_request``,
+        so a dwell with ``t_end <= t_request`` can never overlap one — safe to drop.
+
+        Parameters
+        ------------
+        - t (float): eviction watermark (s); dwells and intervals with ``t_end <= t`` are dropped.
+
+        Return
+        --------
+        - output (None): shrinks ``dwells``/``_ft`` and advances ``evicted_before``; no-op if ``t``
+          does not advance the watermark.
+        """
         if self.evicted_before is not None and t <= self.evicted_before:
             return
         for tid in list(self.dwells):
@@ -176,6 +221,7 @@ class TerminalCapacity:
         self.evicted_before = t
 
     def reset(self) -> None:
+        """Clear all dwells, radii, rows, and indices — return to the just-constructed state."""
         self.dwells.clear()
         self.radius.clear()
         self._rows.clear()
@@ -187,9 +233,22 @@ class TerminalCapacity:
 
     # ----- queries (plan time) -----
     def admits(self, terminal_id: Hashable, t0: float, t1: float, capacity: int) -> bool:
-        """Step 2 — capacity: fewer than ``capacity`` OTHER same-hub dwells overlap ``[t0, t1)``. The
-        planning flight has not committed, so it is not yet in ``dwells``; ``< capacity`` means "room
-        for me" (capacity 1 ⟺ the old exclusive pad)."""
+        """Step 2 — capacity: fewer than ``capacity`` OTHER same-hub dwells overlap ``[t0, t1)``.
+
+        The planning flight has not committed, so it is not yet in ``dwells``; ``< capacity`` means
+        "room for me" (capacity 1 ⟺ the old exclusive pad).
+
+        Parameters
+        ------------
+        - terminal_id (Hashable): the hub whose recorded dwells are counted.
+        - t0 (float): candidate dwell window start (s).
+        - t1 (float): candidate dwell window end (s); overlap is half-open (``a < t1 and t0 < b``).
+        - capacity (int): max concurrent same-hub dwells allowed.
+
+        Return
+        --------
+        - output (bool): True iff the overlapping-dwell count is below ``capacity``.
+        """
         n = sum(1 for (a, b) in self.dwells.get(terminal_id, ()) if a < t1 and t0 < b)
         return n < capacity
 
@@ -205,6 +264,17 @@ class TerminalCapacity:
         This is separate from geometric conflict checking: same-terminal columns are intentionally
         conflict-exempt, so ``ledger.any_conflict`` cannot detect pad over-subscription after a
         rebuild shortens a path and moves its destination dwell earlier.
+
+        Parameters
+        ------------
+        - volumes (Iterable[Volume4D]): a rebuilt reservation; only tagged cylinders are inspected.
+        - origin_term (Terminal | tuple | None): origin terminal, normalized via ``as_terminal``.
+        - dest_term (Terminal | tuple | None): destination terminal, normalized via ``as_terminal``.
+
+        Return
+        --------
+        - output (bool): True iff every dwell for a REQUESTED terminal fits capacity (True when the
+          request names no terminal); raises ``ValueError`` on inconsistent terminal capacity.
         """
         normalized = tuple(
             term for term in (as_terminal(origin_term), as_terminal(dest_term))
@@ -254,18 +324,34 @@ class TerminalCapacity:
         return self.cfg.climb_time_s if z is None else self.cfg.climb_time_to(z)
 
     def column_clear(self, term, center, t0: float, z: float | None = None) -> bool:
-        """Step 1 — column activation: is the hub's column free of FOREIGN transit over the dwell window
-        ``[t0, t0 + hover + climb_time_to(z))``? Reproduces ``not ledger.any_conflict([column at t0, z])`` over
-        the COMMITTED (transient) volumes (same-hub volumes exempt), served from the per-hub foreign-transit
-        index: bring the index current with any newly-committed volumes (each spatially AABB-pruned, then
-        confirmed by the SAME ``volumes_conflict`` the ledger uses — recorded as its ``[t_start, t_end)``
-        transit interval), then answer with an O(log) overlap query. The column footprint is level-independent,
-        so the index is z-independent; only the query window length uses ``z`` (per-level climb).
-        Order-independent, so (unlike the rejected 'already-deployed' shortcut, see class docstring) it never
-        misses a late-committed intruder or a same-hub cruise corridor. NOTE: it scans ``ledger._vols`` only,
-        NOT the always-active ``_static_vols`` walls — a foreign hub's permanent wall never overlaps this hub's
-        own column under the demand's hub spacing, and the commit-time ``any_conflict`` is the authoritative
-        backstop regardless, so at worst this diverges on the denial REASON, never admitting a real conflict."""
+        """Step 1 — column activation: is the hub's column free of FOREIGN transit over the dwell
+        window ``[t0, t0 + hover + climb_time_to(z))``?
+
+        Reproduces ``not ledger.any_conflict([column at t0, z])`` over the COMMITTED (transient)
+        volumes (same-hub volumes exempt), served from the per-hub foreign-transit index: bring
+        the index current with any newly-committed volumes (each spatially AABB-pruned, then
+        confirmed by the SAME ``volumes_conflict`` the ledger uses — recorded as its
+        ``[t_start, t_end)`` transit interval), then answer with an O(log) overlap query. The
+        column footprint is level-independent, so the index is z-independent; only the query
+        window length uses ``z`` (per-level climb). Order-independent, so (unlike the rejected
+        'already-deployed' shortcut, see class docstring) it never misses a late-committed
+        intruder or a same-hub cruise corridor. NOTE: it scans ``ledger._vols`` only, NOT the
+        always-active ``_static_vols`` walls — a foreign hub's permanent wall never overlaps this
+        hub's own column under the demand's hub spacing, and the commit-time ``any_conflict`` is
+        the authoritative backstop regardless, so at worst this diverges on the denial REASON,
+        never admitting a real conflict.
+
+        Parameters
+        ------------
+        - term (Terminal | tuple): the hub, normalized via ``as_terminal``; supplies id and radius.
+        - center (Vec): the hub centre (column location).
+        - t0 (float): dwell window start (s).
+        - z (float | None): cruise level setting the window length; None ⇒ preferred-plane climb.
+
+        Return
+        --------
+        - output (bool): True iff no foreign committed volume transits the column over the window.
+        """
         term = as_terminal(term)
         tid = term.id
         if (SKIP_FOREIGN_WHEN_WALLED
@@ -287,11 +373,12 @@ class TerminalCapacity:
             col_ref = hover_reservation(center, 0.0, self.cfg, terminal_id=tid, radius=r,
                                         climb_time_s=self._dwell_climb_s(None))
             col_bb = col_ref.flat_aabb()                      # column footprint (level-independent), flat floats
-            # Reuse the ledger's per-volume AABB (cached once at commit, index-aligned with _vols) + its OWN
-            # scalar broadphase, instead of recomputing v.aabb() here. This loop indexes each committed volume
-            # once per querying hub (O(vols × hubs)) and the miss test discards most — so the old per-idx
-            # v.aabb() was ~77% of all aabb() allocations in an astar_shortcut run. Same six comparisons in the
-            # same order ⇒ byte-identical result (see tests/test_terminal_capacity.py + test_geometry.py).
+            # Reuse the ledger's per-volume AABB (cached once at commit, index-aligned with
+            # _vols) + its OWN scalar broadphase, instead of recomputing v.aabb() here. This loop
+            # indexes each committed volume once per querying hub (O(vols × hubs)) and the miss
+            # test discards most — so the old per-idx v.aabb() dominated aabb() allocations. Same
+            # six comparisons in the same order ⇒ byte-identical result
+            # (see tests/test_terminal_capacity.py + test_geometry.py).
             ledger_aabb = self.ledger._aabb
             aabb_miss = self.ledger._aabb_miss
             new: list[tuple[float, float]] = []
@@ -312,25 +399,42 @@ class TerminalCapacity:
         return not _overlaps(self._ft.get(tid), t0, t1)
 
     def exit_clear(self, term, center, toward, t0: float, z: float | None = None) -> bool:
-        """Step 1b — exit/approach lane, LEGACY path only (``fixed_exit_lanes=False``): the corridor the
-        flight flies from the column EDGE toward ``toward`` (origin→dest on takeoff; dest←origin on
-        landing) is free of committed conflict over the dwell window ``[t0, t0 + hover + climb)``. Only
-        reached via ``dwell_ok(..., toward=...)``; the default fixed-lane path does the same job with
-        exact cell occupancy in :meth:`planner.astar.occupancy.HexOccupancyService.is_blocked` (issue #18) and
-        never calls this.
+        """Step 1b — exit/approach lane, LEGACY path only (``fixed_exit_lanes=False``): is the
+        corridor the flight flies from the column EDGE toward ``toward`` free of committed conflict
+        over the dwell window ``[t0, t0 + hover + climb)``? (origin→dest on takeoff; dest←origin
+        on landing.)
+
+        Only reached via ``dwell_ok(..., toward=...)``; the default fixed-lane path does the same
+        job with exact cell occupancy in
+        :meth:`planner.astar.occupancy.HexOccupancyService.is_blocked` and never calls this.
 
         It is the PRECISE (FCL) check: same-hub SIBLING exit lanes are box↔box — NOT column-exempt
-        (``conflict.volumes_conflict`` needs a cylinder) — so two flights launching the SAME direction at
-        once collide, while DIVERGENT lanes (spatially disjoint) do not. The *legacy* ``is_blocked``
-        could not draw that line (its ~corridor_half + R ≈ 129 m inflation exceeded the ~127 m spacing
-        between 90°-apart lanes off a 90 m column, so a grid check serialized concurrent launches too);
-        issue #18 fixed that for the default path by recording the sibling corridor as exact cell
-        occupancy, so a fixed-lane launch sees it without this box check.
+        (``conflict.volumes_conflict`` needs a cylinder) — so two flights launching the SAME
+        direction at once collide, while DIVERGENT lanes (spatially disjoint) do not. The legacy
+        ``is_blocked`` grid inflation cannot draw that line (its keep-out radius exceeds the spacing
+        between adjacent lanes off one column, serializing concurrent launches); the default path
+        instead records the sibling corridor as exact cell occupancy, so a fixed-lane launch sees
+        it without this box check.
 
-        The lane box is built EXACTLY as ``astar._build`` builds the exit lane — rooted flush at the
-        column edge (:func:`volumes.exit_radius`, the one fold radius the commit also uses), one segment
-        long toward ``toward``, over the column's lifetime — so this gate and the commit-time
-        ``any_conflict`` agree."""
+        The lane box is rooted flush at the column edge :func:`volumes.exit_radius` (the one fold
+        radius the commit also uses), one segment long toward ``toward``, over the column's
+        lifetime — built exactly as ``astar._build`` builds the exit lane
+        (see context/figures/exit_radius.png), so this gate and the commit-time ``any_conflict``
+        agree.
+
+        Parameters
+        ------------
+        - term (Terminal | tuple): the hub, normalized via ``as_terminal``.
+        - center (Vec): the hub centre (pad location); the lane roots at its column edge.
+        - toward (Vec): the other endpoint the lane points at (dest on takeoff, origin on landing).
+        - t0 (float): dwell window start (s).
+        - z (float | None): the lane's cruise level; None ⇒ ``cfg.cruise_level_m``.
+
+        Return
+        --------
+        - output (bool): True iff the exit-lane box has no committed conflict (True when degenerate,
+          origin == dest).
+        """
         cx, cy = float(center[0]), float(center[1])
         dx, dy = float(toward[0]) - cx, float(toward[1]) - cy
         n = math.hypot(dx, dy)
@@ -350,9 +454,26 @@ class TerminalCapacity:
 
     def dwell_ok(self, term, center, t0: float, capacity: int, toward=None, z: float | None = None) -> bool:
         """The takeoff/landing edge exists at ``t0`` iff capacity admits AND the column is deployable
-        over the dwell window ``[t0, t0 + hover + climb)`` AND — when ``toward`` (the other endpoint) is
-        given — the exit/approach lane toward it (at cruise level ``z``) is clear of committed sibling
-        lanes (:meth:`exit_clear`). ``toward=None`` skips the lane check (capacity/column only)."""
+        AND (when ``toward`` is given) the exit lane toward it is clear.
+
+        Conjoins :meth:`admits` (capacity), :meth:`column_clear` (foreign transit) over the dwell
+        window ``[t0, t0 + hover + climb)``, and — when ``toward`` (the other endpoint) is given —
+        :meth:`exit_clear` (committed sibling lanes at cruise level ``z``). ``toward=None`` skips
+        the lane check (capacity/column only).
+
+        Parameters
+        ------------
+        - term (Terminal | tuple): the hub, normalized via ``as_terminal``.
+        - center (Vec): the hub centre (pad location).
+        - t0 (float): candidate takeoff/landing time (s).
+        - capacity (int): max concurrent same-hub dwells (forwarded to :meth:`admits`).
+        - toward (Vec | None): the other endpoint for the lane check, or None to skip it.
+        - z (float | None): cruise level for the window length and lane check.
+
+        Return
+        --------
+        - output (bool): True iff capacity, column, and (optional) lane checks all pass.
+        """
         term = as_terminal(term)
         t1 = t0 + self.cfg.hover_time_s + self._window_s(term, center, z)
         return (self.admits(term.id, t0, t1, capacity)
@@ -373,7 +494,21 @@ class TerminalCapacity:
             case the top window has a foreign transit (a shorter window may still clear).
 
         Net: 1 ledger query + N cheap ``admits`` in the common case, instead of one FCL query per level
-        (the A* ground-state hot path)."""
+        (the A* ground-state hot path).
+
+        Parameters
+        ------------
+        - term (Terminal | tuple): the hub, normalized via ``as_terminal``.
+        - center (Vec): the hub centre (pad location).
+        - t0 (float): candidate takeoff/landing time (s).
+        - capacity (int): max concurrent same-hub dwells (forwarded to :meth:`admits`).
+        - zs (Sequence[float]): cruise levels to test, in caller order.
+        - toward (Vec | None): the other endpoint for the legacy per-level exit-lane check, or None.
+
+        Return
+        --------
+        - output (list[bool]): one feasibility flag per level in ``zs``, in the same order.
+        """
         term = as_terminal(term)
         hover = self.cfg.hover_time_s
         col_top_ok = self.column_clear(term, center, t0, max(zs))

@@ -67,22 +67,16 @@ _EPS = 1e-6
 _BBOX_HUGE = 1 << 62      # empty-bbox sentinel (min slots start +HUGE, max slots -HUGE); see parallel.py
 
 # ---- per-plan dense occupancy window (`window`) defaults ----
-# 8 MB / margin 24, chosen from the plan-level coverage sweep rather than from the window's typical
-# size. What matters once the window is the ONLY occupancy answer is not the hit RATE but the share of
-# plans with zero misses, since one miss forces a widen-and-rerun: at margin 12 / 2 MB that share is
-# 58.3% (79% of probes), and at margin 24 / 8 MB it is 100.0% with no plan left without a window.
-# Peak observed 3.9 MB; the median is far smaller.
+# Sized for COVERAGE, not hit rate: once the window is the ONLY occupancy answer, what matters is
+# the share of plans with ZERO misses (one miss forces a widen-and-rerun): margin 24 / 8 MB is
+# where that share reaches 100%, with no plan left without a window.
 _WINDOW_BYTES = 8 << 20
-# Hexes of slack around the origin/lane/goal bbox. A* explores an ellipse between the endpoints; this
-# covers the reroute fan around it. `probe_window_oracle.py` measured the SPEED question at 1.011x —
-# a window built from each plan's own recorded read set beats these bounds by only that — so this is
-# sized for COVERAGE, which is the property that matters once nothing else can answer a probe.
-#
-# 24, NOT a more generous guess. A wider margin does cut misses (45 -> 11 over a 774-plan LNS run at
-# density_faa), but `_build_window` multiplies it by `1 << widen`, so it also doubles the size of the
-# RETRY -- and a retry that exceeds `_WINDOW_BYTES` is not a slower window, it is a pure-Python
-# reference plan. At 32 one such plan cost 19.3 s of an 88 s loop. Measure this knob on a workload
-# that actually widens; at `scale == 1` a bigger margin looks free and is not.
+# Hexes of slack around the origin/lane/goal bbox: A* explores an ellipse between the endpoints and
+# this covers the reroute fan around it. Sized for COVERAGE, not speed — a window built from each
+# plan's own read set is barely faster. 24, NOT a more generous guess: a wider margin cuts misses,
+# but `_build_window` multiplies it by `1 << widen`, so a wider margin also doubles the RETRY box,
+# and a retry past `_WINDOW_BYTES` is not a slower window but a pure-Python reference plan. At
+# `scale == 1` a bigger margin looks free and is not; measure this knob on a workload that widens.
 _WINDOW_MARGIN_HEX = 24
 # How far `_build_window` may widen when a plan probes outside its window. Each step doubles the
 # lateral margin and the step tail, so three steps is a 8x box in each axis — past the point where
@@ -100,7 +94,7 @@ _WINDOW_GROW_MAX = 8
 class _RecordingOcc:
     """Occupancy shim for the pure-Python reference search: forwards ``is_blocked``/``pad_clear`` to
     the real service while accumulating the (q, r, L, s) read bbox — the reference-path analogue of the
-    kernel's ``read_bbox`` accumulation (Track A, issue #8). Pure forwarding: cannot change any answer.
+    kernel's ``read_bbox`` accumulation. Pure forwarding: cannot change any answer.
 
     ``pad_clear`` is a WINDOW read, not a point read — the service scans every level over
     ``[s0, s0 + dwell_steps]`` (occupancy.pad_clear) — so it marks that full step×level range; recording
@@ -158,9 +152,8 @@ def _absorb_many(services, ledger):
     One pass, not one per service, because ``hexgrid.rasterize_ranges`` memoizes the geometry sweep by
     ``id(vol)`` behind a 1024-entry LRU precisely so a commit's several occupancy consumers share it —
     its own comment says the cap "must exceed the reuse WINDOW". Absorbing each service in its own
-    full pass makes that window the whole ledger (426,756 volumes at density_faa), so every consumer
-    after the first misses and re-sweeps. Interleaving restores the window to one flight: measured
-    24.0 s -> 20.9 s, with byte-identical state.
+    full pass makes that reuse window the whole ledger, so every consumer after the first misses and
+    re-sweeps; interleaving restores it to one flight.
 
     Each service still sees the same flights, whole, in the same order, and the services never read
     each other — so this is an equivalence, not an approximation."""
@@ -191,6 +184,18 @@ class _BindBatch:
         self.after: list = []
 
     def run(self, ledger) -> None:
+        """Absorb every batched service in one ledger pass, then run the deferred ``after`` steps.
+
+        Parameters
+        ------------
+        - ledger (ReservationLedger): the ledger whose committed volumes the batched services
+          absorb.
+
+        Return
+        --------
+        - output (None): absorbs the services (if any), then runs each deferred hook in order; the
+          hooks (``subscribe_static``, eviction) must stay after the absorb.
+        """
         if self.services:
             _absorb_many(self.services, ledger)
         for fn in self.after:
@@ -207,11 +212,13 @@ def _perimeter(center_xy, toward, radius, z):
 
 
 def _fold_head_into_column(wps, center, exit_r, speed):
-    """Drop the leading waypoints that lie inside ``exit_r`` of ``center`` and re-root the corridor at
-    the column edge (the flight's "exit lane"). The folded centre→edge leg is flown but left
-    UNRESERVED — inside the terminal the vertiport deconflicts its own traffic tactically, so same-hub
-    flights may share that space; only the exit lane reaches the ledger. ``wps`` is a list of
-    ``[xyz, t]`` (mutable). Returns the trimmed list; a no-op if the whole cruise stays inside."""
+    """Drop the leading waypoints inside ``exit_r`` of ``center`` and re-root the corridor at the
+    column edge (the flight's "exit lane"); see context/figures/fold_corners.png.
+
+    The folded centre→edge leg is flown but left UNRESERVED — inside the terminal the vertiport
+    deconflicts its own traffic tactically, so same-hub flights may share that space; only the exit
+    lane reaches the ledger. ``wps`` is a list of ``[xyz, t]`` (mutable). Returns the trimmed list,
+    a no-op if the whole cruise stays inside."""
     k = next((i for i in range(1, len(wps))
               if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
     if k is None:
@@ -276,8 +283,8 @@ _kernel_fallback_warned = False
 def _warn_kernel_fallback() -> None:
     """One stderr line, once per process, when the compiled kernel was REQUESTED but numba won't
     import. The fallback is byte-exact so nothing downstream ever notices — which is exactly how a
-    ~5-7× slowdown stayed invisible across whole sweeps (issue #30). Explicit ``compiled=False``
-    (the ``astar_ref`` oracle) is a request for the reference and does not warn."""
+    large slowdown can stay invisible across a whole sweep. Explicit ``compiled=False`` (the
+    ``astar_ref`` oracle) is a request for the reference and does not warn."""
     global _kernel_fallback_warned
     if _kernel_fallback_warned:
         return
@@ -288,30 +295,53 @@ def _warn_kernel_fallback() -> None:
 
 
 class AStarPlanner:
+    """Space-time A* over the hex lattice: FCFS per-flight planning against a shared ledger.
 
-    #: Subclasses calling ``HexOccupancyService.is_blocked`` from a path this class does not know
-    #: about must set this — but prefer arming the map where that path runs (``enable_blocked``, as
-    #: ``_plan_reference`` does) over declaring it here, which pays on every commit for a reader
-    #: that may never run. ``SIPPPlanner`` used to set it True and now overrides it as a PROPERTY
-    #: keyed on its own ``sipp_compiled``: this predicate reads ``self.compiled`` — A*'s kernel
-    #: flag — so a subclass with a SEPARATE kernel needs the map back when ITS kernel is gone.
-    #: The compiled
-    #: A* path never does (it reads the dense window), which is why the map is off by default there —
-    #: but SIPP inherits ``_occupancy`` and DOES query it, and an unmaintained map raises rather than
-    #: answering stalely. False keeps the measured 1.052x for plain compiled A*.
+    Two interchangeable search paths that return byte-identical results: a compiled numba kernel
+    (``_plan_compiled``) and a pure-Python reference (``_plan_reference``). ``plan`` dispatches to
+    the kernel when it can reproduce the reference exactly and falls back otherwise. Occupancy and
+    terminal-pad capacity are maintained incrementally across plans via the ledger's commit/release
+    hooks. Subclassable: ``SIPPPlanner`` reuses this occupancy stack with its own kernel.
+    """
+
+    #: Whether commits must keep ``HexOccupancyService``'s ``is_blocked`` map live. Prefer arming
+    #: the map where its reader runs (``enable_blocked``, as ``_plan_reference`` does) over
+    #: declaring it here, which pays on every commit for a reader that may never run. This predicate
+    #: reads ``self.compiled`` — A*'s kernel flag — so a subclass with a SEPARATE kernel
+    #: (``SIPPPlanner`` overrides this as a PROPERTY keyed on its own ``sipp_compiled``) needs the
+    #: map back when ITS kernel is gone: it inherits ``_occupancy`` and queries the map, and an
+    #: unmaintained map raises rather than answering stalely. The compiled A* path reads the dense
+    #: window, not this map, so False is the right default there.
     needs_blocked_map: bool = False
 
     def __init__(self, max_expansions: int = 3_000_000, vertical_edges: bool = True,
                  compiled: bool = True, kernel_log2_min: int | None = None,
                  incremental_release: bool = False, window_bytes: int = _WINDOW_BYTES):
+        """Construct a planner; all knobs have byte-identical-to-baseline defaults.
+
+        Parameters
+        ------------
+        - max_expansions (int): A* node-expansion cap before a plan is denied SEARCH_EXHAUSTED; also
+          sizes the kernel g-hash/heap ceiling (see :attr:`_log2_cap_max`).
+        - vertical_edges (bool): generate mid-route climb/descend edges (see the field note below).
+        - compiled (bool): use the numba kernel, falling back to the reference if numba is absent;
+          ``compiled=False`` forces the reference for all plans.
+        - kernel_log2_min (int | None): starting log2 size of the kernel work arrays; ``None``
+          starts at the ceiling (see the field note below).
+        - incremental_release (bool): bind occupancy/capacity in removal mode for O(released) ledger
+          releases (LNS destroy); ``False`` is byte-identical to add-only behaviour.
+        - window_bytes (int): starting byte budget for the compiled path's dense occupancy
+          bitmap — the kernel's only dynamic occupancy answer; must be > 0 on the compiled path.
+
+        Return
+        --------
+        - output (None): initialises occupancy/kernel state and, when ``compiled``, warms the JIT.
+        """
         self.max_expansions = max_expansions
-        # Starting byte budget for the compiled path's per-plan dense occupancy bitmap. The bitmap
-        # is the only dynamic occupancy answer in the kernel; oversized plans may grow its retained
-        # buffer up to the bounded ceiling, and unresolved misses dispatch to the exact reference.
         self.window_bytes = int(window_bytes)
         if compiled and self.window_bytes <= 0:
-            # There is nothing behind the window any more: the interval pools are gone, so a disabled
-            # window means the kernel cannot answer a single probe. `compiled=False` is the off switch.
+            # The interval pools are gone, so a disabled window leaves the kernel unable to answer a
+            # single probe. `compiled=False` is the off switch.
             raise ValueError("AStarPlanner: window_bytes must be > 0 on the compiled path — the "
                              "dense window IS the occupancy. Use compiled=False for the reference.")
         self._win_bytes_peak = 0                        # largest window actually built (diagnostics)
@@ -321,10 +351,10 @@ class AStarPlanner:
         self._win_exhausted = 0                         # plans still missing at the widen ceiling
         self._win_grown = 0                             # times the bitmap BUFFER was grown to fit a box
         # Shrink-tripwire rebuilds. Under `incremental_release` these should NEVER happen —
-        # `on_release` keeps `n_added` in lockstep with the ledger precisely so the tripwire stays
-        # silent — so a nonzero count is a bug signal, not a statistic. It is a counter rather than
-        # the warning because LNS filters that warning (a genuine non-incremental release would
-        # raise it every iteration), which is how a 9.98 s rebuild per run went unnoticed.
+        # `on_release` keeps `n_added` in lockstep with the ledger so the tripwire stays silent, so
+        # a nonzero count is a bug signal, not a statistic. A counter rather than the warning
+        # because LNS filters that warning (a genuine non-incremental release would raise it every
+        # iteration).
         self.n_shrink_rebuilds = 0
         # LNS destroy support: derive occupancy/capacity services in removal mode (per-owner row
         # tracking) and subscribe them to `ledger.subscribe_release`, so a `release_many` is
@@ -334,8 +364,8 @@ class AStarPlanner:
         # starting g-hash/heap size (1 << kernel_log2_min slots): the ADAPTIVE floor of the kernel work
         # arrays — overflow grows ×4 and re-runs exactly (see _kernel_state). None (default) starts at
         # the ceiling = the old fixed sizing, so a lone sequential run is byte-identical in BEHAVIOR AND
-        # COST (no regrow re-runs on the big-search tail, measured ~+7% there). Parallel workers opt
-        # into a small floor (e.g. 18 ≈ ~15 MB hot set) to stay cache-resident under contention.
+        # COST (no regrow re-runs on the big-search tail). Parallel workers opt into a small floor
+        # (e.g. 18 ≈ ~15 MB hot set) to stay cache-resident under contention.
         self.kernel_log2_min = kernel_log2_min
         # mid-route layer-change edges (climb/descend en route). Generated at EVERY air state with an
         # all-levels column-clearance check, so they dominate the multi-altitude search cost; the
@@ -344,7 +374,7 @@ class AStarPlanner:
         self.vertical_edges = vertical_edges
         self.last_expansions = 0                        # nodes expanded by the most recent plan (telemetry)
         self._tele = None                               # TelemetryCollector | None (observer-only; sim.run sets it)
-        # ---- Track A (issue #8) read-envelope hooks: observer-only unless a parallel worker opts in ----
+        # ---- read-envelope hooks: observer-only unless a parallel worker opts in ----
         self.record_envelope = False                    # True → build parallel.PlanEnvelope per plan
         self.last_envelope = None                       # PlanEnvelope | None (most recent plan's read set)
         # Eviction floor (seconds). Parallel workers receive out-of-order re-dispatches, so they must
@@ -359,9 +389,10 @@ class AStarPlanner:
         self._svc_epoch = 0
         self._cocc_epoch = 0
         self._tcap: TerminalCapacity | None = None     # temporal pad-capacity authority (per ledger)
-        # Always-active terminal walls (cfg.terminal_airspace_always_active) are PERMANENT ledger volumes now
-        # (filed by sim.run via ledger.register_static_terminal); the occupancy services derive their routing
-        # walls from the ledger via subscribe_static in _occupancy/_compiled_occ. No planner-held list.
+        # Always-active terminal walls (cfg.terminal_airspace_always_active) are PERMANENT ledger
+        # volumes (filed by sim.run via ledger.register_static_terminal); the occupancy services
+        # derive their routing walls from the ledger via subscribe_static in
+        # _occupancy/_compiled_occ. No planner-held list.
         # ---- compiled (numba) air-search kernel: reproduces the pure-Python search EXACTLY, ~multiple-x
         # faster; auto-falls back to `_plan_reference` if numba is absent or a safety valve trips. ----
         self.compiled = compiled
@@ -399,9 +430,9 @@ class AStarPlanner:
         return _deny(req, reason)
 
     def _watermark(self, req) -> float:
-        """The eviction clock. ``evict_floor`` (Track A): a parallel worker's assignments are NOT
-        monotone (eager re-speculation re-dispatches an earlier flight after a later one), so it caps
-        the watermark at the coordinator's commit-frontier clock — evicting LESS, which is always safe
+        """The eviction clock. ``evict_floor``: a parallel worker's assignments are NOT monotone
+        (eager re-speculation re-dispatches an earlier flight after a later one), so it caps the
+        watermark at the coordinator's commit-frontier clock — evicting LESS, which is always safe
         (see the tightness note in ``_occupancy``). None → the bare request clock."""
         return req.t_request if self.evict_floor is None else min(req.t_request, self.evict_floor)
 
@@ -461,9 +492,9 @@ class AStarPlanner:
             # an unreachable occupancy stack.
             self._unbind_reference_occupancy()
             # `maintain_blocked=False` on the compiled path: `is_blocked` is the map's only reader
-            # and `_plan_compiled` never calls it (measured: 62,537 `pad_clear` and ZERO `is_blocked`
-            # over 20 LNS tasks), while 98.3% of `pad` bumps also bump `blocked`. `_plan_reference`
-            # arms it before it searches, so a fallback still gets an exact map.
+            # and `_plan_compiled` never calls it (it reads the dense window), so maintaining the
+            # map would be pure overhead. `_plan_reference` arms it before it searches, so a
+            # fallback still gets an exact map.
             svc = HexOccupancyService(
                 cfg, track_removal=self.incremental_release,
                 maintain_blocked=not self.compiled or self.needs_blocked_map)
@@ -520,7 +551,7 @@ class AStarPlanner:
         # step/time any plan reads is ``base >= floor(t_request/dt)`` — so the bare request-clock
         # watermark (no buffer) drops only un-readable state. EXACTLY TIGHT: it relies on that
         # ``base >= floor(t_request/dt)`` invariant, so don't loosen base/t_departure without re-checking.
-        # ``evict_floor`` (Track A): a parallel worker's assignments are NOT monotone (eager
+        # ``evict_floor``: a parallel worker's assignments are NOT monotone (eager
         # re-speculation re-dispatches an earlier flight after a later one), so it caps the watermark
         # at the coordinator's commit-frontier clock — evicting LESS, which is always safe (the
         # tightness note above warns against evicting MORE). None → today's behavior byte-identically.
@@ -546,20 +577,21 @@ class AStarPlanner:
         return self._tcap if self._svc_ledger is ledger else None
 
     def _mk_envelope(self, req, cfg, o_term, d_term, origin, dest, max_step, bbox, unbounded):
-        """Build ``last_envelope`` (Track A read-set summary) for the plan that just ran. ``bbox`` is
-        the 8-slot probe accumulator (kernel ``read_bbox`` or ``_RecordingOcc.bbox``); the o/d hub discs
-        cover the host-side reads no cell probe records: ``TerminalCapacity`` dwell/transit queries, the
-        compiled path's takeoff/landing masks, and the own-column overlay's ``col_owners`` lookups. The
-        time window is the plan's recorded reach ``[t_request − dt − time_buffer, max_step·dt +
-        hover tail + worst egress traverse]``. The lookback is required because
-        ``hexgrid._step_range`` keeps a committed volume through
+        """Build ``last_envelope`` (the read-set summary; see context/figures/read_envelope.png) for
+        the plan that just ran.
+
+        ``bbox`` is the 8-slot probe accumulator (kernel ``read_bbox`` or ``_RecordingOcc.bbox``);
+        the o/d hub discs cover the host-side reads no cell probe records: ``TerminalCapacity``
+        dwell/transit queries, the compiled path's takeoff/landing masks, and the own-column
+        overlay's ``col_owners`` lookups. The time window is the plan's recorded reach
+        ``[t_request − dt − time_buffer, max_step·dt + hover tail + worst egress traverse]``. The
+        lookback is required because ``hexgrid._step_range`` keeps a committed volume through
         ``floor((t_end + dt + time_buffer) / dt)``: a volume ending before the request clock can
         therefore change the first step the planner reads. Queries are ≤ max_step, and a
-        dwell/capacity probe at the last step reads ``hover + climb + lane traverse`` past it (issue
-        #52). ``hover_tail_steps`` covers hover + max climb + buffer only, and at ≥300 m radii the
-        traverse outruns the buffer (+3.67 s slack at 180 m, −4.33 s at 350 m) — so the traverse is
-        added explicitly, per terminal, or a concurrent commit in those last seconds would be
-        invisible to exact-mode revalidation."""
+        dwell/capacity probe at the last step reads ``hover + climb + lane traverse`` past it.
+        ``hover_tail_steps`` covers hover + max climb + buffer only, and at large terminal radii the
+        egress traverse outruns that buffer — so the traverse is added explicitly, per terminal, or
+        a concurrent commit in those last seconds would be invisible to exact-mode revalidation."""
         from ...parallel import PlanEnvelope, cell_bbox_to_aabb
 
         infl_pad = cfg.effective_hover_radius_m + hg.circumradius(cfg)   # occupancy pad inflation
@@ -589,15 +621,30 @@ class AStarPlanner:
     def plan(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
     ) -> OperationalIntent:
-        """Dispatch to the compiled kernel when it can reproduce the reference cost exactly; else the
-        pure-Python reference. The compiled path handles the default ``fixed_exit_lanes=True`` terminals,
-        all non-terminal flights, and **always-active terminals** (``cfg.terminal_airspace_always_active``,
-        #24): their permanent foreign-column walls are carried in ``CompiledHexOccupancy.static_col`` (the
-        same ``terminal_cells`` the reference walls), so the kernel deconflicts against them exactly and the
-        own hub's flights fly through their own terminal (the ``_build_overlay`` own-cell mark). **Legacy
-        terminals** (``fixed_exit_lanes=False`` with a terminal end) still route to the reference because
-        their landing gate is path-dependent (``_committed_arrival`` needs the search's ``came`` mid-flight),
-        which the flat-array kernel cannot serve."""
+        """Dispatch to the compiled kernel when it can reproduce the reference cost exactly, else
+        the pure-Python reference.
+
+        The compiled path handles the default ``fixed_exit_lanes=True`` terminals, all non-terminal
+        flights, and always-active terminals (``cfg.terminal_airspace_always_active``): their
+        permanent foreign-column walls are carried in ``CompiledHexOccupancy.static_col`` (the same
+        ``terminal_cells`` as the reference walls), so the kernel deconflicts against them exactly
+        while the own hub's flights fly through their own terminal (the ``_build_overlay`` own-cell
+        mark). Legacy terminals (``fixed_exit_lanes=False`` with a terminal end) still route to the
+        reference because their landing gate is path-dependent (``_committed_arrival`` needs the
+        search's ``came`` mid-flight), which the flat-array kernel cannot serve.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): the shared reservation ledger to deconflict against; the
+          caller commits the accepted corridor.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
+          REJECTED intent carrying the :class:`DenialReason`.
+        """
         self.last_envelope = None            # never leak a previous flight's read set to a consumer
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)
@@ -610,6 +657,10 @@ class AStarPlanner:
     def _plan_reference(
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
     ) -> OperationalIntent:
+        """Pure-Python space-time A* over the hex lattice: the reference planner the compiled kernel
+        reproduces byte-for-byte. Searches ground/air/hover/reroute/altitude edges under the
+        ledger's occupancy and terminal-pad capacity, then builds and returns the ACCEPTED (or
+        REJECTED) intent. See the module docstring for the state/edge model."""
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
         R = hg.circumradius(cfg)
@@ -636,7 +687,7 @@ class AStarPlanner:
         # Two baselines, deliberately different. `straight` (centre→centre) sizes the SEARCH horizon —
         # it is the larger of the two, so keeping it here can never shrink the budget. `straight_ref`
         # (lane→lane) is what the detour and its gate measure against: a flight may not fly through its
-        # own hub column, so the centres are not a distance it could ever achieve (issue #50).
+        # own hub column, so the centres are not a distance it could ever achieve.
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         # Incremental hex-occupancy service: holds the blocked (corridor footprint) and pad (wider
@@ -654,8 +705,8 @@ class AStarPlanner:
         # pays the O(schedule) rebuild once.
         svc.enable_blocked(ledger)
         tcap = self._tcap
-        # Track A read-set recording: wrap the occupancy in the accumulating shim so every search
-        # probe (is_blocked / pad_clear, incl. the goal-gate pad check) lands in the bbox. Pure
+        # Read-set recording: wrap the occupancy in the accumulating shim so every search probe
+        # (is_blocked / pad_clear, incl. the goal-gate pad check) lands in the bbox. Pure
         # forwarding — answers are byte-identical; zero overhead when recording is off.
         rec = _RecordingOcc(svc, cfg.n_levels) if self.record_envelope else None
         svc_q = rec if rec is not None else svc
@@ -663,7 +714,7 @@ class AStarPlanner:
         dwell_steps = tuple(max(1, int(math.ceil((cfg.hover_time_s + cfg.climb_time_to(z)) / dt)))
                             for z in levels)
 
-        # Shared-terminal context (Phase B). A flight owns its origin/dest vertiports: their columns are
+        # Shared-terminal context. A flight owns its origin/dest vertiports: their columns are
         # transparent to its search (``own``). A shared-hub takeoff/landing dwell is gated by
         # ``TerminalCapacity`` (the temporal authority: pad capacity + column activation); an ordinary
         # (no-terminal) pad still uses the binary ``svc.pad_clear``. No terminal ⇒ own=∅, old behavior.
@@ -672,15 +723,15 @@ class AStarPlanner:
         o_cap = o_term.capacity if o_term else 1
         d_cap = d_term.capacity if d_term else 1
 
-        # Fixed exit lanes (issue #18). A shared-terminal takeoff/landing routes through one of the hub's
-        # canonical boundary-hex lanes; same-hub launches are deconflicted by exact cell occupancy
-        # (``svc.is_blocked`` sees committed sibling exit corridors). ``o_lanes``/``d_lanes`` are the
-        # memoised boundary cells; empty when the flag is off or the end isn't a terminal, in which case
-        # the legacy fold/exit_clear path runs.
+        # Fixed exit lanes (see context/figures/exit_radius.png). A shared-terminal takeoff/landing
+        # routes through one of the hub's canonical boundary-hex lanes; same-hub launches are
+        # deconflicted by exact cell occupancy (``svc.is_blocked`` sees committed sibling exit
+        # corridors). ``o_lanes``/``d_lanes`` are the memoised boundary cells, empty when the flag
+        # is off or the end isn't a terminal, in which case the legacy fold/exit_clear path runs.
         fixed_lanes = cfg.fixed_exit_lanes
         o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
-        # Sequential egress (issue #52): the drone climbs inside the column, THEN translates out to its
-        # lane cell, so the corridor cannot start until both are done. ``Lane.steps`` carries the
+        # Sequential egress: the drone climbs inside the column, THEN translates out to its lane
+        # cell, so the corridor cannot start until both are done. ``Lane.steps`` carries the
         # per-lane traverse; this map inverts it to recover the ground delay from the goal step below.
         lane_steps = {ln.cell: ln.steps for ln in o_lanes}
         d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
@@ -703,7 +754,8 @@ class AStarPlanner:
         # admissible heuristic: straight dash at c_lat + the mandatory descent still to come.
         # h_air is evaluated for EVERY generated neighbour (the search hot path), so the hex centre is
         # computed inline as scalars and the distance via math.sqrt(dx*dx+dy*dy) — bit-for-bit the same
-        # value np.linalg.norm returns for a length-2 vector, but ~19x cheaper (no array alloc / ufunc).
+        # value np.linalg.norm returns for a length-2 vector, but far cheaper (no array alloc /
+        # ufunc).
         sqrt3, c_lat = hg.SQRT3, cfg.cost_air_lateral_per_m
         d_r = exit_radius(d_term, cfg) if d_lanes else 0.0
         goal_cost_by_cell = {lane.cell: c_lat * (lane.dist - d_r) for lane in d_lanes}
@@ -721,10 +773,10 @@ class AStarPlanner:
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        # The takeoff term must carry the worst ORIGIN lane traverse (issue #52): the takeoff edge
-        # lands at takeoff_steps[L] + lane.steps, and max_step caps delay + takeoff + path as ONE
-        # sum — without the lane term the traverse silently ate the tail of the ground-delay/detour
-        # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
+        # The takeoff term must carry the worst ORIGIN lane traverse: the takeoff edge lands at
+        # takeoff_steps[L] + lane.steps, and max_step caps delay + takeoff + path as ONE sum —
+        # without the lane term the traverse silently eats the tail of the ground-delay/detour
+        # budget (the accept/deny frontier shifts by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
         ground_max_step = base + ground_delay_steps(cfg)
@@ -752,7 +804,7 @@ class AStarPlanner:
                 if fixed_lanes and d_term is not None:
                     # Fixed exit lanes: the goal is reaching one of the dest's boundary-hex lanes (at any
                     # flight level st[3]), gated by capacity + column; same-hub siblings at this cell+level
-                    # were already seen by the approach corridor's is_blocked check (issue #18).
+                    # were already seen by the approach corridor's is_blocked check.
                     lane = d_lane_by_cell.get((st[1], st[2]))
                     if lane is not None:
                         # window uses THIS flight's descent-from-level time (st[3]), matching the commit
@@ -818,7 +870,7 @@ class AStarPlanner:
         path.reverse()
         air = [s for s in path if s[0] == "a"]
         ground_steps = (air[0][4] - takeoff_steps[air[0][3]] - base
-                        - lane_steps.get((air[0][1], air[0][2]), 0))   # issue #52
+                        - lane_steps.get((air[0][1], air[0][2]), 0))   # subtract egress traverse
         delay = ground_steps * dt
 
         cruise_wps: list[TimedPoint] = [
@@ -830,7 +882,7 @@ class AStarPlanner:
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
         # Both sides span lane → lane via the SAME helper metrics uses, so the gate enforces exactly
-        # the ratio `stretch` later reports and the two can never drift (issue #50).
+        # the ratio `stretch` later reports and the two can never drift.
         flown = enroute_flown_m([p for p, _ in centerline], origin, dest,
                                 req.origin_terminal, req.dest_terminal, cfg)
         if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
@@ -861,6 +913,12 @@ class AStarPlanner:
                dwell_steps, c_alt, c_lat, svc, max_step, ground_max_step=None, own=(), o_cap=1,
                o_term=None, origin=None,
                tcap=None, dest=None, o_lanes=()):
+        """Successors of state ``st``: the list of ``(neighbour_state, edge_cost)`` A* may relax.
+
+        Ground states expand to a ground-wait and per-level takeoff edges (fixed-lane or
+        legacy/pad); air states expand to reroute, hover, and (when ``vertical_edges``)
+        climb/descend rungs. Every edge is feasibility-checked against ``svc`` and the step horizon
+        before being emitted."""
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -868,19 +926,20 @@ class AStarPlanner:
             if ground_max_step is None or s + 1 <= ground_max_step:
                 out.append((("g", q, r, s + 1), cfg.cost_ground_delay_per_s * dt))   # ground wait
             if cfg.fixed_exit_lanes and o_term is not None:
-                # Fixed exit lanes × multi-altitude: one takeoff edge per (boundary-hex lane, flight
-                # level). The capacity/column dwell window is PER-LEVEL (the committed column lasts
-                # hover + climb_time_to(level); a top-level climb outlasts the preferred plane), so gate
-                # each level with its own window — computed once per level, reused across lanes. Same-hub
-                # siblings are deconflicted by exact cell occupancy at (lane cell, level): is_blocked sees
-                # committed sibling exit corridors, so divergent lanes / different levels stay concurrent
-                # while two launches into the same cell+level serialise (ground-wait). The lateral
-                # traverse out to the lane cell is folded into the edge cost.
+                # Fixed exit lanes × multi-altitude (see context/figures/exit_radius.png): one
+                # takeoff edge per (boundary-hex lane, flight level). The capacity/column dwell
+                # window is PER-LEVEL (the committed column lasts hover + climb_time_to(level); a
+                # top-level climb outlasts the preferred plane), so gate each level with its own
+                # window — computed once per level, reused across lanes. Same-hub siblings are
+                # deconflicted by exact cell occupancy at (lane cell, level): is_blocked sees
+                # committed sibling exit corridors, so divergent lanes / different levels stay
+                # concurrent while two launches into the same cell+level serialise (ground-wait).
+                # The lateral traverse out to the lane cell is folded into the edge cost.
                 o_r = terminal_radius(o_term, cfg)
                 level_ok = tcap.dwell_ok_levels(o_term, origin, s * dt, o_cap, levels)
                 for lane in o_lanes:
                     lq, lr = lane.cell
-                    lane_st = lane.steps                   # issue #52: climb, THEN translate out
+                    lane_st = lane.steps                   # egress: climb, THEN translate out
                     for L in range(len(levels)):
                         ts = s + takeoff_steps[L] + lane_st
                         if level_ok[L] and ts <= max_step and not svc.is_blocked(lq, lr, L, ts, own):
@@ -924,12 +983,21 @@ class AStarPlanner:
         return out
 
     def _build(self, cruise_wps, origin, dest, base, ground_steps, cfg, origin_term=None, dest_term=None):
-        # Shared-terminal hubs: the drone climbs in the tagged hover column, then its strategic corridor
-        # (the "exit lane") begins at the column EDGE. Waypoints inside the column are folded away — the
-        # centre→edge leg is flown but NOT reserved, because inside the terminal the vertiport handles
-        # its own traffic tactically (same-hub flights may share that space concurrently). Only the exit
-        # lane + cruise reach the ledger, where corridor boxes stay strict (untagged): two flights can't
-        # occupy the same exit lane at once, while divergent same-hub launches go concurrently.
+        """Assemble the reservation from an A* cruise path: fold the hub columns, tag near-hub
+        boxes, and emit the ASTM volumes + centreline.
+
+        Shared-terminal hubs: the drone climbs in the tagged hover column, then its corridor (the
+        "exit lane") begins at the column EDGE (see context/figures/fold_corners.png and
+        exit_radius.png). In-column waypoints are folded away — the centre→edge leg is flown but NOT
+        reserved, since the vertiport handles its own traffic tactically (same-hub flights may share
+        that space). Only the exit lane + cruise reach the ledger, where corridor boxes stay strict
+        (untagged): two flights can't occupy one exit lane at once, while divergent same-hub
+        launches go concurrently.
+
+        Returns ``(volumes, centerline, cum_horiz, n_hover)``: the ASTM reservation volumes (origin
+        column, corridor boxes, dest column), the timed centreline, cumulative horizontal distance
+        (m), and the count of genuine hover segments.
+        """
         origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
         wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
         if not cfg.fixed_exit_lanes:
@@ -946,13 +1014,14 @@ class AStarPlanner:
         o_r = terminal_radius(origin_term, cfg) if origin_term is not None else 0.0
         d_r = terminal_radius(dest_term, cfg) if dest_term is not None else 0.0
         for (a, ta), (b, tb) in zip(wps, wps[1:]):
-            # Tag EVERY box that reaches into its hub's OWN column (not just the first/last exit lane),
-            # so the column-involved exemption covers the whole in-column reach. An untagged cruise box
-            # grazing the shared column would otherwise conflict (different tid) at commit — the
-            # cruise-box-clip bug. The number of such boxes is geometry-dependent (radius × exit angle),
-            # so we test each box, not a fixed index. Far cruise boxes stay untagged; two same-hub boxes
-            # still conflict (box↔box), so same-direction launches contend — serialised by is_blocked
-            # cell occupancy under fixed lanes, or by exit_clear on the legacy path.
+            # Tag EVERY box that reaches into its hub's OWN column, not just the first/last exit
+            # lane (see context/figures/segment_overlaps_column.png), so the column-involved
+            # exemption covers the whole in-column reach; an untagged cruise box grazing the shared
+            # column would conflict (different tid) at commit. The number of such boxes is
+            # geometry-dependent (radius × exit angle), so we test each box, not a fixed index. Far
+            # cruise boxes stay untagged; two same-hub boxes still conflict (box↔box), so
+            # same-direction launches contend — serialised by is_blocked cell occupancy under fixed
+            # lanes, or by exit_clear on the legacy path.
             tid = (origin_term.id if origin_term is not None and segment_overlaps_column(a, b, o_xy, o_r, cfg)
                    else dest_term.id if dest_term is not None and segment_overlaps_column(a, b, d_xy, d_r, cfg)
                    else None)
@@ -1061,7 +1130,7 @@ class AStarPlanner:
                 "ov_own_gen": np.zeros(NC, np.int32), "NC": NC,
                 "out_q": np.empty(cocc.MAXS + 8, np.int64), "out_r": np.empty(cocc.MAXS + 8, np.int64),
                 "out_L": np.empty(cocc.MAXS + 8, np.int64), "out_s": np.empty(cocc.MAXS + 8, np.int64),
-                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (Track A; reset each plan)
+                "read_bbox": np.zeros(8, np.int64),      # per-plan probe bbox (reset each plan)
                 # dense occupancy window (`window`): the bitmap, its geometry, and the hit/miss
                 # counters. Reused across plans — `build_window` clears only the bytes it uses.
                 "win": np.zeros(max(1, self.window_bytes), np.uint8),
@@ -1076,16 +1145,15 @@ class AStarPlanner:
 
         * **occupancy-shaped** (``_ks``: overlay / out path / read bbox) — sized by the box, grown if a
           new ledger's box is bigger;
-        * **capacity-shaped** (``_ks_caps[log2]``: g-hash + frontier heap) — ADAPTIVE (issue #8 Track A).
-          The old fixed sizing (from ``max_expansions``: 1<<21 slots ≈ ~120 MB) made every plan randomly
-          probe a working set far past the shared cache — measured to slow CONCURRENT worker plans ~1.75×
-          at 8 workers while a lone worker matched sequential speed. Plans now start at
-          ``kernel_log2_min`` (~12 MB hot set, ample for the typical search) and a rare overflow returns
-          ``FB_HASH``/``FB_HEAP``, which ``_plan_compiled`` handles by growing ×4 and re-running — the
-          same exact-retry discipline as the FB_MASK widen (fresh ``gen``, no partial output is ever
-          used), so results are byte-identical at ANY sufficient size. Only at the ceiling (the old
-          max_expansions-derived size, headroom unchanged) does overflow still mean the reference
-          fallback. Grown sizes are cached per planner, so a hot spot pays the growth once."""
+        * **capacity-shaped** (``_ks_caps[log2]``: g-hash + frontier heap) — ADAPTIVE. Sizing the
+          arrays from ``max_expansions`` made every plan probe a working set far past the shared
+          cache, slowing CONCURRENT worker plans. Plans instead start at ``kernel_log2_min`` (a
+          small cache-resident hot set, ample for the typical search) and a rare overflow returns
+          ``FB_HASH``/``FB_HEAP``, which ``_plan_compiled`` handles by growing ×4 and re-running —
+          the same exact-retry discipline as the FB_MASK widen (fresh ``gen``, no partial output is
+          ever used), so results are byte-identical at ANY sufficient size. Only at the ceiling (the
+          ``max_expansions``-derived size) does overflow still mean the reference fallback. Grown
+          sizes are cached per planner, so a hot spot pays the growth once."""
         ks = self._kernel_occupancy_state(cocc)
         kc = self._ks_caps.get(log2)
         if kc is None:
@@ -1094,7 +1162,7 @@ class AStarPlanner:
             gp[:, G_GEN] = 0                            # 0 = "no generation" ⇒ every slot empty
             self._ks_caps[log2] = kc = {
                 "g_pack": gp, "g_packf": gp.view(np.float64), "cap": cap, "log2": log2,
-                # heap stays struct-of-arrays on purpose — packing it measured 21% SLOWER (see _hpop)
+                # heap stays struct-of-arrays on purpose — packing it measured slower (see _hpop)
                 "heap_f": np.empty(cap, np.float64), "heap_c": np.empty(cap, np.int64),
                 "heap_n": np.empty(cap, np.int64), "mh": cap,
             }
@@ -1131,9 +1199,10 @@ class AStarPlanner:
         """Materialise this plan's dense occupancy bitmap, or disable it for reference dispatch.
 
         Anchored on every cell the search STARTS or ENDS at — the origin hex, its exit lanes and the
-        landing lanes — because A* explores an ellipse between them. The step tail covers the takeoff
-        climb, the lane traverse (issue #52) and the flight itself at the same 3x detour budget the
-        bounded mask uses, so the window spans the same reach the search is allowed to use.
+        landing lanes — whose bbox plus the lateral margin must contain A*'s reroute ellipse (see
+        context/figures/search_window.png). The step tail covers the takeoff climb, the egress lane
+        traverse and the flight itself at the same 3x detour budget the bounded mask uses, so the
+        window spans the same reach the search is allowed to use.
 
         A window that cannot be built is NOT a slower window — since the interval pools were deleted
         nothing else can answer a probe, so the whole plan goes to the pure-Python reference. That
@@ -1166,8 +1235,7 @@ class AStarPlanner:
             # same grow-and-retry discipline the kernel's FB_HASH/FB_HEAP already use, and for the
             # same reason: a buffer sized for the worst plan is carried by every worker on every
             # plan, while one sized for the common plan turns a rare overshoot into a reference
-            # dispatch. Measured: a 9% overshoot cost 19.3 s of an 88 s LNS loop. The grown buffer
-            # is cached in `ks`, so a hot spot pays the growth once.
+            # dispatch. The grown buffer is cached in `ks`, so a hot spot pays the growth once.
             need = -nbytes
             if need <= self.window_bytes * _WINDOW_GROW_MAX:
                 ks["win"] = np.zeros(need, np.uint8)
@@ -1202,15 +1270,16 @@ class AStarPlanner:
         """Mark this flight's OWN terminal footprint cells (``ov_own_gen[cell] = gen``) so the kernel's
         ``_blocked`` treats them as transparent (own column) instead of walls. Cheap: rasterize the 1–2
         own hub columns (the same rasterizer that records column claims) and mark their in_blk cells — no
-        per-step scan. Under ``terminal_airspace_always_active`` (#24) ALSO mark the hub's full
-        ``terminal_cells`` (the wider flood-fill geometry the reference walls), so the permanent static wall
-        is transparent to the hub that owns it — matching ``is_blocked``'s tid-based own-hub exemption.
+        per-step scan. Under ``terminal_airspace_always_active`` ALSO mark the hub's full
+        ``terminal_cells`` (the wider flood-fill geometry of the reference walls), so the permanent
+        static wall is transparent to the hub that owns it — matching ``is_blocked``'s tid-based
+        own-hub exemption.
 
         Returns ``True`` if any own cell is ALSO covered by a FOREIGN hub's column (via ``col_owners``):
         the single-boolean overlay cannot distinguish "own here" from "own AND foreign here", so the
-        caller falls back to the reference for exactness (issue #3). ``demand.py`` reject-samples hub
-        spacing (#27, and #24 on the wider ``exit_radius`` extent for static walls), making this rare, but
-        detecting it keeps the kernel exact regardless of spacing rather than *assuming* separation."""
+        caller falls back to the reference for exactness. ``demand.py`` reject-samples hub spacing,
+        making this rare, but detecting it keeps the kernel exact regardless of spacing rather than
+        *assuming* separation."""
         ov = self._ks["ov_own_gen"]
         cfg = cocc.cfg
         z_hi = cfg.flight_levels_m[-1]
@@ -1237,7 +1306,7 @@ class AStarPlanner:
             ):
                 if in_blk:
                     mark(cocc.cell_id(q, r, L))
-            if cfg.terminal_airspace_always_active:      # the permanent static wall's wider geometry (#24)
+            if cfg.terminal_airspace_always_active:      # permanent static wall's wider geometry
                 # COUPLING: this own-hub exemption is GEOMETRIC (terminal_cells at `center`), whereas the
                 # reference is.blocked exempts by terminal ID (occupancy.is_blocked, geometry-independent).
                 # They agree only because `center` (the flight's terminal endpoint) is bit-identical to the
@@ -1339,6 +1408,12 @@ class AStarPlanner:
             self._disable_compiled(component, e)
 
     def _plan_compiled(self, req, ledger, cfg):
+        """Compiled (numba) twin of :meth:`_plan_reference`, returning byte-identical results.
+
+        Sets up the same search inputs, binds both occupancy images in one ledger pass, builds the
+        per-plan feasibility masks and dense window, then runs the kernel. Any safety-valve fallback
+        (out-of-box, hash/heap full, window exhausted, own∩foreign overlap, kernel anomaly) re-runs
+        the whole flight through :meth:`_plan_reference`."""
         from . import kernel as K
 
         # ---- setup: IDENTICAL to _plan_reference's head, so the kernel gets identical inputs ----
@@ -1364,7 +1439,7 @@ class AStarPlanner:
         # Two baselines, deliberately different. `straight` (centre→centre) sizes the SEARCH horizon —
         # it is the larger of the two, so keeping it here can never shrink the budget. `straight_ref`
         # (lane→lane) is what the detour and its gate measure against: a flight may not fly through its
-        # own hub column, so the centres are not a distance it could ever achieve (issue #50).
+        # own hub column, so the centres are not a distance it could ever achieve.
         straight_ref = enroute_reference_m(origin, dest, req.origin_terminal, req.dest_terminal, cfg)
 
         # Bind both occupancy images, then absorb them in ONE pass over the ledger (see `_absorb_many`
@@ -1392,8 +1467,8 @@ class AStarPlanner:
         d_cap = d_term.capacity if d_term else 1
         fixed_lanes = cfg.fixed_exit_lanes
         o_lanes = hg.terminal_lanes(origin, o_term, cfg) if fixed_lanes and o_term is not None else []
-        # Sequential egress (issue #52): the drone climbs inside the column, THEN translates out to its
-        # lane cell, so the corridor cannot start until both are done. ``Lane.steps`` carries the
+        # Sequential egress: the drone climbs inside the column, THEN translates out to its lane
+        # cell, so the corridor cannot start until both are done. ``Lane.steps`` carries the
         # per-lane traverse; this map inverts it to recover the ground delay from the goal step below.
         lane_steps = {ln.cell: ln.steps for ln in o_lanes}
         d_lanes = hg.terminal_lanes(dest, d_term, cfg) if fixed_lanes and d_term is not None else []
@@ -1409,10 +1484,10 @@ class AStarPlanner:
         n_hops = int(math.ceil(max(straight, pitch) / pitch))
         climb_span = (int(math.ceil((levels[-1] - levels[0]) / (cfg.climb_rate_mps * dt)))
                       if cfg.n_levels > 1 else 0)
-        # The takeoff term must carry the worst ORIGIN lane traverse (issue #52): the takeoff edge
-        # lands at takeoff_steps[L] + lane.steps, and max_step caps delay + takeoff + path as ONE
-        # sum — without the lane term the traverse silently ate the tail of the ground-delay/detour
-        # budget (measured: the accept/deny frontier shifted by exactly the lane's steps).
+        # The takeoff term must carry the worst ORIGIN lane traverse: the takeoff edge lands at
+        # takeoff_steps[L] + lane.steps, and max_step caps delay + takeoff + path as ONE sum —
+        # without the lane term the traverse silently eats the tail of the ground-delay/detour
+        # budget (the accept/deny frontier shifts by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
         ground_max_step = base + ground_delay_steps(cfg)
@@ -1434,7 +1509,7 @@ class AStarPlanner:
             lane_q = np.asarray([L.cell[0] for L in o_lanes], np.int64)
             lane_r = np.asarray([L.cell[1] for L in o_lanes], np.int64)
             lane_lat = np.asarray([c_lat * (L.dist - o_r) for L in o_lanes], np.float64)
-            lane_stp = np.asarray([L.steps for L in o_lanes], np.int64)   # issue #52 egress traverse
+            lane_stp = np.asarray([L.steps for L in o_lanes], np.int64)   # egress lane traverse
             to_terminal = True
         else:                                            # non-terminal origin (legacy-terminal fell back)
             lane_q = np.asarray([oq], np.int64)
@@ -1461,7 +1536,7 @@ class AStarPlanner:
         c_gd_dt, c_hold_dt, c_lat_pitch = (cfg.cost_ground_delay_per_s * dt,
                                            cfg.cost_air_hold_per_s * dt, c_lat * pitch)
 
-        # ---- two-phase BOUNDED mask. ``max_step`` (hence the full mask width) is blown up ~7x by the
+        # ---- two-phase BOUNDED mask. ``max_step`` (hence the full mask width) is inflated by the
         # ground-delay allowance, which flights almost never use. Build the per-(step, level) takeoff/
         # landing feasibility masks over a TIGHT window first (a full detour + a modest ground delay); if
         # the search reaches a ground/goal step beyond it the kernel returns FB_MASK, and we rebuild over
@@ -1500,7 +1575,7 @@ class AStarPlanner:
             # O(1) reset — a slot whose stamp != `gen` is empty). The FB_MASK widen re-run therefore needs a
             # FRESH gen; DO NOT hoist this above the loop, or the re-run reuses the tight pass's closed nodes
             # and returns a spurious NO_PATH. The overlay is window-independent (re-stamped cheaply on the
-            # rare widen); the overlap→reference check (issue #3) is identical each pass, so it aborts the
+            # rare widen); the overlap→reference check is identical each pass, so it aborts the
             # whole plan on the first iteration.
             gen = self._bump_gen()
             if own and self._build_overlay(cocc, o_term, d_term, origin, dest, gen):
@@ -1614,7 +1689,7 @@ class AStarPlanner:
             )
             return self._plan_reference(req, ledger, cfg)
         ground_steps = (air[0][3] - takeoff_steps[air[0][2]] - base
-                        - lane_steps.get((air[0][0], air[0][1]), 0))   # issue #52
+                        - lane_steps.get((air[0][0], air[0][1]), 0))   # subtract egress traverse
         cruise_wps: list[TimedPoint] = [
             (np.array([*hg.hex_center(q, r, R), levels[L]]), s * dt) for (q, r, L, s) in air
         ]
@@ -1622,7 +1697,7 @@ class AStarPlanner:
             cruise_wps, origin, dest, base, ground_steps, cfg,
             origin_term=req.origin_terminal, dest_term=req.dest_terminal,
         )
-        flown = enroute_flown_m([p for p, _ in centerline], origin, dest,      # issue #50
+        flown = enroute_flown_m([p for p, _ in centerline], origin, dest,      # lane → lane ruler
                                 req.origin_terminal, req.dest_terminal, cfg)
         if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
             return self._file_deny(req, DenialReason.BUDGET_EXCEEDED, volumes, ledger)

@@ -1,4 +1,4 @@
-"""Compiled (numba) space-time A* kernel for the multi-altitude hex planner (issue #8, Track B).
+"""Compiled (numba) space-time A* kernel for the multi-altitude hex planner.
 
 This is the hot path of :class:`~freespace_sim.planner.astar.AStarPlanner` — the ``while pq`` search loop
 + ``_edges`` + ``is_blocked`` (~95% of a dense plan) — lifted into a ``@njit`` function over flat arrays.
@@ -66,6 +66,7 @@ def _slot0(key, log2cap):
 
 @njit(cache=True, nogil=True)
 def _hpush(heap_f, heap_c, heap_n, size, f, c, node):
+    """Append ``(f, c, node)`` to the binary min-heap and sift it up; returns the new size."""
     heap_f[size] = f; heap_c[size] = c; heap_n[size] = node
     i = size
     while i > 0:
@@ -85,14 +86,13 @@ def _hpop(heap_f, heap_c, heap_n, size):
     """Pop the minimum. Deliberately still a **binary heap over three separate arrays** — the one hot
     structure in this kernel that the array-of-structs treatment does NOT help.
 
-    Measured (issue #8 memory plan): packing these three into 32 B records and going 4-ary — which
-    makes a node's four children one aligned cache line — was byte-exact but **21% slower end to end**
-    (64.4 → 78.1 ms/flight). The g-hash and the interval pools are accessed at random and thrash a
-    shared cluster L2; a heap is not. Its sift path concentrates on the top few levels, which stay
-    resident whatever the layout, and the one deep access per operation sits at index ``size``, which
-    moves by ±1 and prefetches perfectly. So packing bought no locality here, while the variable-bound
-    4-ary child loop and the int64/float64 aliasing (which blocks alias analysis across the swap) cost
-    real cycles. Do not "finish the job" by packing this one too."""
+    Packing these three into 32 B records and going 4-ary — which makes a node's four children one
+    aligned cache line — was byte-exact but 21% slower end to end. The g-hash is accessed at random
+    and thrashes a shared cluster L2; a heap is not. Its sift path concentrates on the top few
+    levels, which stay resident whatever the layout, and the one deep access per operation sits at
+    index ``size``, which moves by ±1 and prefetches perfectly. So packing bought no locality here,
+    while the variable-bound 4-ary child loop and the int64/float64 aliasing (which blocks alias
+    analysis across the swap) cost real cycles. Do not "finish the job" by packing this one too."""
     node = heap_n[0]
     size -= 1
     heap_f[0] = heap_f[size]; heap_c[0] = heap_c[size]; heap_n[0] = heap_n[size]
@@ -164,11 +164,8 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
     """0 = free, 1 = blocked, -1 = out-of-box. Answered from the per-plan dense window (:mod:`window`)
     — one byte read, a shift and a mask.
 
-    The window is the ONLY source now. It used to be a cache in front of two free-interval pools, and
-    a probe outside it walked those instead; the pools are gone, because storing FREE intervals made
-    removing a flight cost a rebuild of every cell it touched from that cell's SURVIVORS (12.2x its
-    own footprint at density_faa scale, and growing with congestion). Occupancy is the claim arena
-    now, and the window is painted from it before each search.
+    The window is the ONLY occupancy source: it is painted from the claim arena before each search
+    (see :mod:`window` and :mod:`claim_arena`).
 
     So a probe outside the window cannot be answered here. It returns BLOCKED and raises the sticky
     ``WS_MISSED`` flag; the host reads that flag once after the search, widens the window and re-runs
@@ -178,16 +175,16 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
     -1); the other four compare against zero, so a new negative code would be read as blocked at four
     of them anyway — silently, without raising the flag that triggers the retry.
 
-    ``static_col`` and ``ov_own_gen`` are no longer read here at all: the window build folds the
-    always-active wall and this flight's own-column exemption in, which is why one bit per (cell,
-    step) suffices. They stay in the signature because the host still owns them and the overlay is
-    stamped per plan.
+    ``static_col`` and ``ov_own_gen`` are not read here: the window build already folds in the
+    always-active wall and this flight's own-column exemption, which is why one bit per (cell, step)
+    suffices. They stay in the signature because the host still owns them and the overlay is stamped
+    per plan.
 
-    ``read_bbox`` (int64[8]: qmin,qmax,rmin,rmax,Lmin,Lmax,smin,smax) accumulates every IN-BOX probe —
-    the plan's read set, consumed by the Track-A exact-mode commit validation (``parallel.PlanEnvelope``).
-    Write-only w.r.t. the search: it cannot change any decision. Out-of-box probes are excluded
-    deliberately: the -1 answer is pure box geometry, independent of every commit, so it can never be
-    dirtied."""
+    ``read_bbox`` (int64[8]: qmin,qmax,rmin,rmax,Lmin,Lmax,smin,smax) accumulates every IN-BOX probe
+    into the plan's read set — the read envelope the exact-mode commit checks against
+    (``parallel.PlanEnvelope``; see context/figures/read_envelope.png). Write-only w.r.t. the
+    search: it cannot change any decision. Out-of-box probes are excluded deliberately: the -1
+    answer is pure box geometry, independent of every commit, so it can never be dirtied."""
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
@@ -222,6 +219,9 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
 
 @njit(cache=True, nogil=True)
 def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb):
+    """The air-state heuristic: lateral cost of the straight-line gap from cell ``(q, r)`` to the
+    goal ``(gx, gy)`` (minus ``h_off``, floored at 0), plus the level's ``takeoff_cost`` and
+    ``goal_cost_lb``."""
     dx = R * _SQRT3 * (q + r / 2.0) - gx
     dy = R * 1.5 * r - gy
     d = np.sqrt(dx * dx + dy * dy)
@@ -250,11 +250,20 @@ def _search(
     heap_f, heap_c, heap_n, max_heap,
     # ---- output ----
     out_q, out_r, out_L, out_s, max_expansions,
-    # ---- read-set telemetry (Track A, issue #8): in/out int64[8] bbox over every in-box probe ----
+    # ---- read-set bbox (parallel exact-mode): in/out int64[8] over every in-box probe ----
     read_bbox,
     # ---- per-plan dense occupancy bitmap (`window`); wbox[W_STEPS] == 0 ⇒ no compiled answer ----
     win, wbox, win_stats,
 ):
+    """Run the compiled space-time A* search; write the found path into ``out_*``.
+
+    Seeds at the ground state, expands with the reference's exact successor order and the
+    ``(f, counter)`` tie-break, and keeps the best feasible goal until the heap lower bound proves
+    it optimal. Parameters are grouped by the section comments in the signature above. Returns the
+    tuple ``(n_path, best_g, n_exp, status, extra)``: path length written to ``out_*``, its cost,
+    expansions performed, a status / ``FB_*`` code, and a code-specific ``extra`` (goal ``step`` for
+    ``FB_MASK``, the packed stray cell for ``FB_OOB``, else -1).
+    """
     step_span = max_step - base + 1
     nlp1 = n_levels + 1
     iq0 = oq - qmin; ir0 = orr - rmin
@@ -333,10 +342,12 @@ def _search(
                     return 0, 0.0, n_exp, FB_HASH, -1
                 if rc == -2:
                     return 0, 0.0, n_exp, FB_HEAP, -1
+            # Takeoff fan (see context/figures/takeoff_fan.png): climb at the pad, then translate
+            # out to one of N exit lanes at cruise level; successor order is lane, then level.
             if gi < n_gsteps:                           # takeoff fan: for lane: for level
                 for li in range(n_lanes):
                     lq = lane_q[li]; lr = lane_r[li]
-                    lst = lane_stp[li]              # issue #52: climb, THEN translate out to the lane
+                    lst = lane_stp[li]              # climb, THEN translate out to the lane
                     for Lv in range(n_levels):
                         ts = step + takeoff_steps[Lv] + lst
                         if ts > max_step:

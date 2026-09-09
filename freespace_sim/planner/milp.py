@@ -70,19 +70,42 @@ class MILPOptPlanner:
 
     def __init__(
         self,
-        warm_planner=None,           # candidate/fallback + (when fixed-delay) the delay source
-        optimize_delay: bool = True,  # False → pure spatial refiner at the warm planner's delay
-        lock_homotopy: bool = False,  # True → fix each obstacle's which-side binary to the warm path
-        n_dirs: int = 16,            # polyhedral-norm directions for horizontal length
-        cyl_faces: int = 8,          # polygon faces approximating a hover cylinder
-        detour_allow: float = 1.7,   # step budget = this × straight distance
+        warm_planner=None,
+        optimize_delay: bool = True,
+        lock_homotopy: bool = False,
+        n_dirs: int = 16,
+        cyl_faces: int = 8,
+        detour_allow: float = 1.7,
         keepout_margin_m: float = 4.0,
-        lock_margin_m: float = 80.0,  # only pin a knot's side when the warm path is this clearly outside
-        max_steps: int = 60,         # knot cap; floored by kinematic feasibility in _solve
+        lock_margin_m: float = 80.0,
+        max_steps: int = 60,
         max_obstacles: int = 40,
-        time_limit_s: float = 20.0,    # hard cap (backstop for genuinely hard MILPs the gap can't close)
-        gap_rel: float | None = 0.01,  # stop CBC once the incumbent is within 1% of optimal
+        time_limit_s: float = 20.0,
+        gap_rel: float | None = 0.01,
     ):
+        """Configure a MILP planner instance; the operating mode follows from the two flags.
+
+        Parameters
+        ------------
+        - warm_planner: candidate/fallback source (and, when delay is fixed, the delay); default
+          :class:`StraightLineTimeShift`.
+        - optimize_delay (bool): True solves for delay too; False is a pure spatial refiner at the
+          warm planner's delay.
+        - lock_homotopy (bool): True pins each obstacle's which-side binary to the warm path.
+        - n_dirs (int): polyhedral-norm directions approximating horizontal segment length.
+        - cyl_faces (int): polygon faces approximating a hover cylinder.
+        - detour_allow (float): knot budget = this × straight distance.
+        - keepout_margin_m (float): keep-out margin (m) added around every obstacle face.
+        - lock_margin_m (float): only pin a knot's side when the warm path is this clearly outside.
+        - max_steps (int): knot cap; floored by kinematic feasibility in :meth:`_solve`.
+        - max_obstacles (int): cap on obstacles admitted to the model (walls harvested first).
+        - time_limit_s (float): hard CBC wall cap (backstop for hard MILPs the gap can't close).
+        - gap_rel (float | None): stop CBC within this relative gap of optimal; None = prove exact.
+
+        Return
+        --------
+        - output (None): sets the config fields and the (lazily bound) ``TerminalCapacity`` state.
+        """
         self.warm_planner = warm_planner or StraightLineTimeShift()
         self.gap_rel = gap_rel
         self.optimize_delay = optimize_delay
@@ -108,6 +131,17 @@ class MILPOptPlanner:
         The warm planner gives a candidate, a fallback (if the MILP fails/denies), and — when the
         flags are set — the fixed delay and/or the reference path whose which-side choices pin the
         binaries. A locked LP that returns infeasible is retried once unlocked.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): committed airspace to deconflict against.
+        - cfg (SimConfig): geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): the cheaper accepted warm/MILP intent, or a REJECTED intent
+          carrying the denial reason when neither is admissible (``planner`` is always "milp").
         """
         warm = self.warm_planner.plan(req, ledger, cfg)   # candidate + fallback (+ delay if fixed)
         fixed = None if self.optimize_delay else (warm.ground_delay_s if warm.accepted else 0.0)
@@ -120,8 +154,8 @@ class MILPOptPlanner:
                 milp = self._solve(req, ledger, cfg, fixed, None, o_term, d_term, tcap)  # unlock
         except Exception as e:
             # Degrade to the warm candidate, but never SILENTLY: a swallowed bug in the solver /
-            # fold / capacity path looks exactly like a hard flight (warm fallback or denial), which
-            # is how two real defects stayed invisible. The warning is the tripwire.
+            # fold / capacity path is indistinguishable from a hard flight (warm fallback or
+            # denial), so the warning is the tripwire.
             warnings.warn(
                 f"milp _solve raised {type(e).__name__}: {e} — falling back to the warm candidate",
                 RuntimeWarning, stacklevel=2)
@@ -186,7 +220,7 @@ class MILPOptPlanner:
         # A subscription generation change means our commit hook was detached (another solver took the
         # ledger over — ReservationLedger.detach_subscribers) and commits happened we never saw, so we
         # must REBIND, not merely rebuild. The count tripwire below cannot see it: LNS restores every
-        # flight it releases, so n_volumes ends at or above the frozen count (measured 1287 vs 1280).
+        # flight it releases, so n_volumes ends at or above the frozen count.
         if self._tcap_ledger is not ledger or self._tcap_epoch != ledger.epoch:
             self._tcap = TerminalCapacity(cfg, ledger)
             ledger.subscribe(self._tcap.on_commit)
@@ -207,6 +241,7 @@ class MILPOptPlanner:
         return self._tcap if self._tcap_ledger is ledger else None
 
     def _absorb_committed(self, ledger) -> None:
+        """Replay the ledger's committed volumes into ``_tcap``, one ``on_commit`` per flight."""
         by_fid: dict = {}
         for fid, vol in ledger.iter_committed():
             by_fid.setdefault(fid, []).append(vol)
@@ -241,7 +276,7 @@ class MILPOptPlanner:
         start = np.array([origin[0], origin[1], z_lo])
         goal = np.array([dest[0], dest[1], z_lo])
         straight_horiz = float(np.linalg.norm(goal[:2] - start[:2]))
-        # centre→centre sizes N (the kinematic knot floor); lane→lane is the metric baseline (issue #50)
+        # centre→centre sizes N (the kinematic knot floor); lane→lane is the metric baseline
         straight_ref = enroute_reference_m(origin, dest, o_term, d_term, cfg)
         v_step = cfg.nominal_speed_mps * cfg.dt_s
         z_step = cfg.climb_rate_mps * cfg.dt_s
@@ -251,18 +286,17 @@ class MILPOptPlanner:
         N = min(self.max_steps, int(np.ceil(self.detour_allow * straight_horiz / v_step)) + 2)
         # the max_steps cap must never make the trip ITSELF infeasible: the speed polygon's inradius
         # is v_step, so (N−1)·v_step ≥ straight is the kinematic floor. A flight past the cap gets
-        # less DETOUR headroom (delay/altitude stay free) — never a vacuously infeasible model
-        # (pre-#36 this silently denied every >7 km flight once no spatial warm masked it).
+        # less DETOUR headroom (delay/altitude stay free) — never a vacuously infeasible model.
         N = max(N, int(np.ceil(straight_horiz / v_step)) + 2)
         # the warm path resampled to the MILP grid → tells us which side/when the homotopy goes
         ref_pos, ref_t = (None, None)
         if ref_path is not None and len(ref_path) >= 2:
             ref_pos, ref_t = self._resample(ref_path, N)
-        # The model's clock must match the REBUILD's (issue #52): build_reservation_from_corners
-        # stamps the corridor `column_dwell_s = climb + egress traverse` after takeoff, so the model
-        # carries the same constant or every temporal disjunction is evaluated one traverse early
-        # (12 s at a 180 m hub, 20 s at 350 m — d-invariant, so the delay-bump loop can never
-        # realign it) and the prefilter window misses obstacles in the true reach's last seconds.
+        # The model's clock must match the REBUILD's: build_reservation_from_corners stamps the
+        # corridor `column_dwell_s = climb + egress traverse` after takeoff, so the model carries
+        # the same constant or every temporal disjunction is evaluated one traverse early
+        # (d-invariant, so the delay-bump loop can never realign it) and the prefilter window
+        # misses obstacles in the true reach's last seconds.
         trav0 = max_lane_traverse_s(origin, o_term, cfg)
         # reachable absolute-time range across all delays in [0, max_ground_delay] AND all entry
         # levels in the band (the actual cruise start is the affine t_depart + d + climb(pz[0]) + trav0)
@@ -317,7 +351,7 @@ class MILPOptPlanner:
             cumL.append(cumL[-1] + L[k])
         # cruise-clock origin: the ENTRY climb is affine in the (free) entry altitude pz[0] — a
         # higher chosen level starts the cruise later — plus the egress traverse, exactly as the
-        # rebuild's `column_dwell_s(z0) = climb_time_to(z0) + max_lane_traverse_s` (issue #52)
+        # rebuild's `column_dwell_s(z0) = climb_time_to(z0) + max_lane_traverse_s`
         climb0 = (pz[0] - cfg.ground_level_m) / cfg.climb_rate_mps + trav0
 
         # big-M obstacle avoidance. SPATIAL faces are per SEGMENT and shared by both endpoints: a
@@ -332,6 +366,8 @@ class MILPOptPlanner:
         # speed polygon), so a pair whose obstacle lies outside either lens can never be violated —
         # its whole disjunction is omitted. Sound, and it kills the O(obstacles × segments) binary
         # blow-up that made CBC time out with no incumbent once committed traffic accumulated.
+        # Both mechanisms pictured: see context/figures/milp_obstacles.png (left = these lenses,
+        # right = the per-segment half-space keep-out in _add_spatial_keepout).
         cap = v_step / float(np.cos(np.pi / self.n_dirs)) + 1e-6
         sx, sy = float(start[0]), float(start[1])
         gx, gy = float(goal[0]), float(goal[1])
@@ -418,7 +454,7 @@ class MILPOptPlanner:
             ground_delay_s=d_final,
             air_detour_m=enroute_detour_m(
                 enroute_flown_m([p for p, _ in centerline], req.origin, req.dest, o_term, d_term, cfg),
-                straight_ref),                                                         # issue #50
+                straight_ref),
             altitude_change_m=endpoint_altitude_change_m(
                 float(corners[0][2]), float(corners[-1][2]), cum_dz, cfg),
             planner="milp",
@@ -445,7 +481,7 @@ class MILPOptPlanner:
             volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
                 corners, origin, dest, t_depart, d, cfg, origin_term=o_term, dest_term=d_term
             )
-            # Both sides span lane → lane via the same helper metrics uses (issue #50).
+            # Both sides span lane → lane via the same helper metrics uses.
             flown = enroute_flown_m([p for p, _ in centerline], origin, dest, o_term, d_term, cfg)
             if straight_ref > _EPS and flown / straight_ref > cfg.max_detour_factor:
                 return None
@@ -541,12 +577,13 @@ class MILPOptPlanner:
         """Spatial big-M faces for one SEGMENT (both endpoints share the binaries), OR'd with the
         segment's temporal faces.
 
-        The disjunction is: BOTH endpoints beyond the same spatial face — a face is a half-space, so
-        by convexity the whole straight segment is then outside the obstacle (no corner-cutting, no
-        hopping a thin obstacle mid-step) — OR the whole segment passes before/after the window (the
-        two `temporal` binaries). When ``ref_ends`` is given, the binaries are pinned to the warm
-        path's choice (which side / before-after) so CBC doesn't re-enumerate — the MILP becomes an
-        LP that tightens *within* that homotopy. Returns the number of binaries in the disjunction.
+        The disjunction is: BOTH endpoints beyond the same spatial face — a face is a half-space,
+        so by convexity the whole straight segment is then outside the obstacle (no corner-cutting,
+        no hopping a thin obstacle mid-step; see context/figures/milp_obstacles.png, right panel) —
+        OR the whole segment passes before/after the window (the two `temporal` binaries). When
+        ``ref_ends`` is given, the binaries are pinned to the warm path's choice (which side /
+        before-after) so CBC doesn't re-enumerate — the MILP becomes an LP that tightens *within*
+        that homotopy. Returns the number of binaries in the disjunction.
         """
         m = self.keepout_margin_m
         faces = list(temporal)

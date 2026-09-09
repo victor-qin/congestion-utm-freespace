@@ -10,10 +10,10 @@ The legacy strategy is a deterministic single-knot fixpoint sweep, so a hex stai
 (each removal re-enables the next) without depending on random shortcut draws. ``single_knot_heading``
 keeps that exact order and result, but skips a candidate rebuild when a same-heading knot can be
 proved to preserve every reservation sample bit-for-bit. The experimental ``batched_turns`` strategy
-instead seeds at a real 3-D heading change, jumps directly to the ends of the adjacent straight runs,
-and falls back through intermediate anchors only when a maximal jump fails. Every changed candidate
-still respects the *real committed obstacles*, not A*'s conservative inflated raster. Wrap a planner
-with :class:`ShortcutRefiner`.
+instead seeds at a real 3-D heading change, jumps directly to the ends of the adjacent straight
+runs, and falls back through intermediate anchors only when a maximal jump fails (see
+context/figures/batched_turns.png). Every changed candidate still respects the *real committed
+obstacles*, not A*'s conservative inflated raster. Wrap a planner with :class:`ShortcutRefiner`.
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ class _ShortcutContext:
     tcap: TerminalCapacity | None = None
 
     def rebuild(self, knots):
+        """Rebuild ``knots`` via :func:`_rebuild` with this context's shared arguments."""
         return _rebuild(
             [k.point for k in knots], self.origin, self.dest, self.t_depart, self.g_delay,
             self.cfg, self.ledger, self.straight_horiz, self.origin_term, self.dest_term,
@@ -97,8 +98,8 @@ def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_hor
         corners, origin, dest, t_depart, g_delay, cfg, origin_term=origin_term, dest_term=dest_term,
         corridor_t0=corridor_t0,
     )
-    # Both sides span lane → lane via the same helper metrics uses (issue #50), so the gate enforces
-    # exactly the ratio the caller will report as air_detour_m / stretch.
+    # Both sides span lane → lane via the same helper metrics uses, so the gate enforces the exact
+    # ratio the caller will report as air_detour_m / stretch.
     flown = enroute_flown_m([p for p, _ in centerline], origin, dest, origin_term, dest_term, cfg)
     if straight_horiz > _EPS and flown / straight_horiz > cfg.max_detour_factor:
         return None
@@ -119,9 +120,28 @@ def shortcut_corners(corners, origin, dest, t_depart, g_delay, cfg: SimConfig,
     Deterministic single-knot fixpoint: sweep interior knots front-to-back, remove any whose removal
     rebuilds conflict-free, and repeat full sweeps until one removes nothing. Endpoints (the climb-top
     and descent-top) are never dropped. If the input path is itself infeasible to rebuild, it is
-    returned unchanged (the caller keeps the planner's verified original). With
-    ``skip_exact_heading=True``, a same-heading knot is removed without a probe only when
-    :func:`_merge_preserves_resampling` proves the before/after subsegments are byte-identical.
+    returned unchanged (the caller keeps the planner's verified original).
+
+    Parameters
+    ------------
+    - corners (list[Vec]): the corner polyline to simplify.
+    - origin (Vec): origin hub centre.
+    - dest (Vec): destination hub centre.
+    - t_depart (float): filed departure time (s).
+    - g_delay (float): ground delay held before departure (s).
+    - cfg (SimConfig): geometry, speeds, and timing.
+    - ledger (ReservationLedger): committed reservations each rebuild is checked against.
+    - origin_term: origin terminal (``Terminal`` or tuple), or ``None``.
+    - dest_term: destination terminal, or ``None``.
+    - corridor_t0 (float | None): verified corridor start stamp passed through to the rebuild.
+    - tcap (TerminalCapacity | None): pad-capacity authority for the retimed rebuild, or ``None``.
+    - skip_exact_heading (bool): when True, drop a same-heading knot without a probe only when
+      :func:`_merge_preserves_resampling` proves the before/after subsegments are byte-identical.
+
+    Return
+    --------
+    - output (list[Vec]): the simplified corner polyline (``corners`` unchanged when nothing is
+      removable or the input cannot be rebuilt).
     """
     corners = [np.asarray(c, float) for c in corners]
     if len(corners) <= 2:
@@ -273,7 +293,8 @@ def _try_splice(state: _ShortcutState, left_id: int, right_id: int,
 
 def _grow_one_turn(state: _ShortcutState, turn_id: int,
                    context: _ShortcutContext) -> _ShortcutState:
-    """Seed E→G, batch A→G and A→I, then recover intermediate anchors on failures.
+    """Seed E→G, batch A→G and A→I, then recover intermediate anchors on failures (see
+    context/figures/batched_turns.png).
 
     Failed probes are deliberately non-pruning WITHIN a side: spatial and temporal feasibility are
     non-monotone in chord length (a shorter chord is differently oriented AND lands earlier, which
@@ -386,13 +407,14 @@ def _terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
     optional ``capacity_authority(ledger)`` member (see the ``Planner`` Protocol) and takes the first
     that answers; planners holding no authority simply do not implement it.
 
-    This used to reach into ``_tcap`` plus whichever of ``_tcap_ledger`` / ``_svc_ledger`` the family
-    happened to use. That was a silent-failure shape, not just a style one: renaming any of those
-    three private names — all of them internal to planners this module does not own — made every
-    lookup return None, and returning None here does not raise, it makes ``plan`` hand back the
-    UNREFINED inner intent for every terminal flight. ``astar_shortcut`` would quietly become bare
-    ``astar``. Named method ⇒ a rename is a grep away, and ``test_shortcut_reuses_the_inner_capacity_
-    authority`` pins that the reuse actually happens.
+    Uses that named member rather than reaching into private attributes (``_tcap`` plus whichever of
+    ``_tcap_ledger`` / ``_svc_ledger`` a family uses) because the private-attribute shape fails
+    silently: renaming one of those names — all internal to planners this module does not own —
+    makes every lookup return None, and None here does not raise; it makes ``plan`` hand back the
+    UNREFINED inner intent for terminal flights, so ``astar_shortcut`` quietly degrades to
+    bare ``astar``.
+    A named method makes a rename a grep away, and
+    ``test_shortcut_reuses_the_inner_capacity_authority`` pins that the reuse happens.
     """
     for p in iter_planner_chain(planner):
         get = getattr(p, "capacity_authority", None)
@@ -415,6 +437,19 @@ class ShortcutRefiner:
 
     def __init__(self, inner, label: str | None = None,
                  strategy: _ShortcutStrategy = "single_knot"):
+        """Wrap ``inner`` with a shortcut strategy, validating the strategy name.
+
+        Parameters
+        ------------
+        - inner (Planner): the planner whose output is post-processed.
+        - label (str | None): planner name stamped on a refined intent; ``None`` ⇒ ``<inner>+sc``.
+        - strategy (_ShortcutStrategy): ``single_knot`` (legacy fixpoint), ``single_knot_heading``
+          (byte-equivalent exact-heading skip), or ``batched_turns`` (experimental).
+
+        Return
+        --------
+        - output (None): sets the three fields; raises ``ValueError`` on an unknown strategy.
+        """
         if strategy not in ("single_knot", "single_knot_heading", "batched_turns"):
             raise ValueError(f"unknown shortcut strategy: {strategy!r}")
         self.inner = inner
@@ -422,6 +457,23 @@ class ShortcutRefiner:
         self.strategy = strategy
 
     def plan(self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig) -> OperationalIntent:
+        """Plan with ``inner``, then return the cheaper of that intent and a rebuilt shortcut.
+
+        The inner intent is always a valid fallback: a shortcut is accepted only when it rebuilds
+        conflict-free (ledger + terminal capacity) and its cost is ≤ the inner cost. A terminal
+        flight whose capacity authority cannot be found is returned unrefined.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): committed reservations the rebuild is re-checked against.
+        - cfg (SimConfig): geometry, speeds, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): the refined intent when it is feasible and no costlier,
+          otherwise the inner planner's intent unchanged.
+        """
         intent = self.inner.plan(req, ledger, cfg)
         # Keep the legacy wrapper's exact three-point behavior. The experimental strategy fixes the
         # E-F-G blind spot without silently changing astar_shortcut's A/B baseline.
@@ -440,18 +492,15 @@ class ShortcutRefiner:
             return intent
 
         g_delay = intent.ground_delay_s
-        # Read the takeoff time off the committed origin column rather than inverting the centerline.
-        # The old inverse subtracted only the climb, but issue #52 made centerline[0] land at
-        # `takeoff + climb + Lane.steps*dt`, so the recovered departure came out LATE by the traverse
-        # (measured 15 s on a 180 m hub: 12 s of lane traverse plus 3 s of pre-existing takeoff-step
-        # rounding, which the old inverse also dropped) and every rebuilt volume shifted with it —
-        # leaving the origin column unreserved while the drone was still in it. volumes[0].t_start IS
-        # the takeoff time in both builders, so this needs no knowledge of which lane was taken.
+        # Read takeoff off the committed origin column rather than inverting the centerline.
+        # ``volumes[0].t_start`` IS the takeoff time in both builders, so no lane knowledge is
+        # needed; inverting instead lands late by the egress traverse, leaving the origin column
+        # unreserved while the drone still occupies it.
         t_depart = intent.volumes[0].t_start - g_delay
         # Anchor the rebuilt corridor at the inner planner's VERIFIED first-cruise stamp: a refiner
-        # re-times splices, not the takeoff. Re-deriving the start inside the rebuild mixes its
+        # re-times splices, not the takeoff. Re-deriving the start inside the rebuild would mix its
         # continuous clock (climb_time_to + WORST lane) with A*'s quantised stamp (climb_steps*dt +
-        # CHOSEN lane's steps) — measured -3..+1 s on every rebuilt volume, lane-dependent.
+        # CHOSEN lane's steps) and drift every rebuilt volume by a lane-dependent amount.
         t_first = float(intent.centerline[0][1])
         ot, dt = req.origin_terminal, req.dest_terminal
         straight = enroute_reference_m(req.origin, req.dest, ot, dt, cfg)
@@ -500,7 +549,7 @@ class ShortcutRefiner:
             ground_delay_s=g_delay, air_hold_s=0.0,
             air_detour_m=enroute_detour_m(
                 enroute_flown_m([p for p, _ in centerline], req.origin, req.dest, ot, dt, cfg),
-                straight),                                                              # issue #50
+                straight),
             lattice_overhead_m=max(0.0, intent.lattice_overhead_m - removed),
             altitude_change_m=endpoint_altitude_change_m(
                 float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),

@@ -51,19 +51,42 @@ _EMPTY: dict = {}
 
 
 class HexOccupancyService:
+    """Incremental ``blocked``/``pad``/``term_cells`` maps derived from committed volumes.
+
+    Absorbs each committed volume exactly once (via the ledger commit hook) into step-bucketed cell
+    sets and evicts past steps to stay bounded. See the module docstring for the full design and the
+    two invariants (monotonic time, add-only) it relies on.
+    """
+
     def __init__(self, cfg: SimConfig, track_removal: bool = False,
                  maintain_blocked: bool = True):
+        """Build the empty maps and inflation radii; nothing is registered until a commit arrives.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies the hex circumradius and the corridor/hover inflation radii.
+        - track_removal (bool): enable the per-flight row journal + refcounted buckets so
+          ``on_release`` can reverse a flight exactly (LNS destroy); off ⇒ set-based buckets,
+          byte-for-byte the original.
+        - maintain_blocked (bool): keep the ``blocked`` map live. Default True; the one caller that
+          knows the compiled kernel answers the obstacle test instead passes False (see below).
+
+        Return
+        --------
+        - output (None): initializes the instance.
+        """
         self.cfg = cfg
-        # `blocked` has exactly ONE reader, `is_blocked`, and that is called only by the pure-Python
-        # reference search (`AStarPlanner._plan_reference`) and the envelope-recording shim around it.
-        # `_plan_compiled` never calls it: measured over 20 LNS tasks at density_faa scale, `pad_clear`
-        # 62,537 calls and `is_blocked` ZERO. Yet 98.3% of `pad` bumps also bump `blocked`, so on a
-        # compiled planner the map is half this service's dict traffic, written and never read.
+        # `blocked` has exactly ONE reader, `is_blocked`, called only by the pure-Python
+        # reference search (`AStarPlanner._plan_reference`) and the envelope-recording shim
+        # around it — never by `_plan_compiled`. Almost every `pad` bump also bumps `blocked`, so
+        # on a compiled planner this map is roughly half the service's dict traffic, written and
+        # never read; deferring it is the whole reason this flag exists.
         #
-        # DEFAULT TRUE on purpose. Every direct construction — the whole test suite, and anything that
-        # queries the service itself — keeps the map, so this parameter changes behaviour at exactly one
-        # call site: `AStarPlanner._occupancy`, which is the only place that knows the compiled kernel
-        # will answer the obstacle test instead. A reference dispatch re-arms it (`enable_blocked`).
+        # DEFAULT TRUE on purpose. Every direct construction — the whole test suite, and anything
+        # that queries the service itself — keeps the map, so this flag changes behaviour at
+        # exactly one call site: `AStarPlanner._occupancy`, the only place that knows the compiled
+        # kernel will answer the obstacle test instead. A reference dispatch re-arms it
+        # (`enable_blocked`).
         self._maintain_blocked = bool(maintain_blocked)
         self._blocked_live = self._maintain_blocked
         # Removal mode (LNS destroy): step buckets hold per-cell REFCOUNTS instead of sets (two
@@ -73,10 +96,10 @@ class HexOccupancyService:
         # dict keys); flag off ⇒ the original set-based structures, byte-for-byte.
         # Journal layout (mode on): `_rows[fid]` is a FLAT int64 array of 4-slot rows
         # ``(cell_id, s_lo, s_hi, code)`` rather than a list of ``(kind, cell, s_lo, s_hi, extra)``
-        # tuples — measured 185 B/row against 32 B here, and at ~900 rows per flight the tuple form
-        # cost 49 MB at 290 flights (linear in schedule size). ``cell_id`` indexes `_cells`, which
-        # interns each ``(q, r, L)`` ONCE, so a reversal reads back the very tuple it inserted with:
-        # no per-row allocation, unlike re-packing ``(q, r, L)`` out of three stored ints.
+        # tuples — far fewer bytes per row, and the journal is linear in schedule size, so the
+        # compact form matters at scale. ``cell_id`` indexes `_cells`, which interns each
+        # ``(q, r, L)`` ONCE, so a reversal reads back the very tuple it inserted with: no per-row
+        # allocation, unlike re-packing ``(q, r, L)`` out of three stored ints.
         # ``code``: -1 = corridor pad-only, -2 = corridor pad+blocked, >= 0 = terminal column whose
         # hub id is ``_tids[code]``. The release callback supplies the exact committed volumes.
         self.track_removal = track_removal
@@ -86,6 +109,8 @@ class HexOccupancyService:
         self._tids: list = []                                     # code -> terminal id
         self._tid_ids: dict = {}                                  # terminal id -> code
         self.R = hg.circumradius(cfg)
+        # Minkowski inflation by hex circumradius R: a cell blocks iff the dilated volume covers
+        # its centre — conservative rasterisation (see context/figures/rasterisation_coverage.png).
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R   # corridor footprint
         self.infl_pad = cfg.effective_hover_radius_m + self.R     # wider hover-cylinder footprint
         self.blocked: dict[int, set[tuple[int, int, int]]] = {}   # step -> {(q, r, L)}  (non-terminal)
@@ -137,18 +162,32 @@ class HexOccupancyService:
 
     def add_volume(self, vol: Volume4D, own_cols: tuple = (), _rows: list | None = None,
                    _pad: bool = True) -> None:
-        """Rasterize one committed volume (once). Ordinary corridor cells feed the binary blocked/pad
-        step-buckets; a shared terminal column instead records its hub id in the per-cell set.
+        """Rasterize one committed volume (once) into the occupancy maps.
 
-        ``own_cols`` is the committing flight's own terminal columns ``(cx, cy, radius)``. A corridor
-        cell falling INSIDE one of them is the vertiport's unreserved tactical interior (the flight's
-        exit lane proper lies outside the column and is still recorded), so it's skipped — leaving only
-        *foreign* corridors inside any hub's column for a launch to detect and wait out (see pad_clear).
+        Ordinary corridor cells feed the binary ``blocked``/``pad`` step-buckets; a shared terminal
+        column instead records its hub id in the per-cell ``term_cells`` set. A corridor cell inside
+        the committing flight's own column is the vertiport's unreserved tactical interior and is
+        skipped, leaving only *foreign* corridors inside any hub's column for a launch to wait out
+        (see :meth:`pad_clear`).
+
+        Parameters
+        ------------
+        - vol (Volume4D): the committed volume to rasterize.
+        - own_cols (tuple): the committing flight's own terminal columns ``(cx, cy, radius)``; a
+          corridor cell inside one is skipped (its exit lane proper lies outside and is still kept).
+        - _rows (list | None): when set, the flat 4-slot journal rows for this commit are appended
+          here (removal mode); ``None`` records nothing.
+        - _pad (bool): when False, re-derive ``blocked`` alone without touching
+          ``pad``/``term_cells`` (used by :meth:`enable_blocked`); True does the full absorb.
+
+        Return
+        --------
+        - output (None): mutates ``blocked``/``pad``/``term_cells`` (and ``_rows`` if given).
         """
         tid = vol.terminal_id
         # Only a tagged *column* (hover cylinder) feeds the per-cell hub set; a tagged *corridor*
         # box (an in-terminal exit lane) is still a corridor — it goes to blocked/pad like any other,
-        # so it is never mistaken for a column cell. ("column ⟺ cylinder"; stored kind is issue #11.)
+        # so it is never mistaken for a column cell (the "column ⟺ cylinder" invariant).
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         # The hex service is step-keyed (dict[s] → cell set), so it expands each cell's range back to
         # its steps; the shared geometry sweep is still done once (via rasterize_ranges' memo), which
@@ -244,8 +283,21 @@ class HexOccupancyService:
         return self._cells[cid], cid
 
     def on_commit(self, flight_id, volumes) -> None:
-        """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes,
-        dropping the corridor cells inside its own terminal columns (the unreserved tactical interior)."""
+        """Ledger commit subscriber (the publish hook): absorb a newly committed flight's volumes.
+
+        Drops the corridor cells inside the flight's own terminal columns (the unreserved tactical
+        interior) and, in removal mode, journals the flight's rows so ``on_release`` can reverse
+        them.
+
+        Parameters
+        ------------
+        - flight_id: the committing flight's id (keys the removal journal ``_rows``).
+        - volumes (Iterable[Volume4D]): the flight's committed volumes.
+
+        Return
+        --------
+        - output (None): absorbs the volumes into the maps and advances ``n_added``.
+        """
         hg.prepare_range_cache_for_commit(volumes)
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
@@ -253,15 +305,14 @@ class HexOccupancyService:
         for v in volumes:
             self.add_volume(v, own_cols=own_cols, _rows=rows)
         # Counted HERE, not in `add_volume`. `n_added` means "committed volumes absorbed from the
-        # ledger" — it is one operand of the shrink tripwire, against `ledger.n_volumes`. But
-        # `enable_blocked` also replays the whole ledger through `add_volume` (deliberately: a second
-        # loop would have to re-derive the own-column skip, the refcount branch and the eviction
-        # clamp), and that replay is not an absorb. Counting it there doubled `n_added` — measured
-        # 852,570 against a 426,285-volume ledger — which made `ledger.n_volumes < svc.n_added`
-        # permanently true, so the very next plan took the shrink branch and re-absorbed the entire
-        # schedule: 9.98 s of an 88 s LNS loop, silent because LNS filters the shrink warning.
-        # `CompiledHexOccupancy.on_commit` has always counted at this level, which is exactly why its
-        # tripwire never fired on the same ledger.
+        # ledger" — one operand of the shrink tripwire, against `ledger.n_volumes`. But
+        # `enable_blocked` also replays the whole ledger through `add_volume` (deliberately: a
+        # second loop would have to re-derive the own-column skip, the refcount branch and the
+        # eviction clamp), and that replay is NOT an absorb. Counting it inside `add_volume` would
+        # double `n_added`, drive `ledger.n_volumes < svc.n_added` permanently true, and make the
+        # next plan take the shrink branch and re-absorb the whole schedule — silent, because LNS
+        # filters the shrink warning. `CompiledHexOccupancy.on_commit` counts at this same level,
+        # which is why its tripwire never fires on the same ledger.
         self.n_added += len(volumes)
         if self.track_removal:
             entry = self._rows.get(flight_id)
@@ -272,10 +323,21 @@ class HexOccupancyService:
                 entry.extend(rows)
 
     def on_release(self, flight_id, volumes) -> None:
-        """Ledger release subscriber (removal mode): reverse the flight's recorded rows so the
-        maps stay exact without a rebuild — and keep ``n_added`` in lockstep with the ledger so
-        the shrink tripwire stays silent. Steps already evicted are skipped (eviction dropped
-        them; the same clamp `add_volume` applies on insert)."""
+        """Ledger release subscriber (removal mode): reverse a flight's recorded rows in place.
+
+        Keeps the maps exact without a rebuild and keeps ``n_added`` in lockstep with the ledger so
+        the shrink tripwire stays silent. Steps already evicted are skipped (the same clamp
+        ``add_volume`` applies on insert).
+
+        Parameters
+        ------------
+        - flight_id: the flight whose journalled rows are reversed and removed from ``_rows``.
+        - volumes (Sized): the released volumes; only ``len`` is used, to decrement ``n_added``.
+
+        Return
+        --------
+        - output (None): reverses the flight's rows out of ``blocked``/``pad``/``term_cells``.
+        """
         rows = self._rows.pop(flight_id)
         floor = self.evicted_before
         # Guard on the CURRENT state, not on whether the map was live when the row was written:
@@ -328,8 +390,19 @@ class HexOccupancyService:
             self.static_term_cells.setdefault(cell, set()).add(tid)
 
     def evict_before(self, step: int) -> None:
-        """Drop all cells at steps < ``step`` (cells the sim clock has passed; no future plan can
-        query them). Monotonic — calls with an earlier ``step`` are no-ops."""
+        """Drop every cell at a step < ``step`` and record the new floor.
+
+        Cells the sim clock has passed can never be queried again (the monotonic-time invariant).
+        The floor itself is monotonic — a call with an earlier ``step`` is a no-op.
+
+        Parameters
+        ------------
+        - step (int): the lowest step to retain; buckets below it are deleted.
+
+        Return
+        --------
+        - output (None): mutates ``blocked``/``pad``/``term_cells`` and sets ``evicted_before``.
+        """
         if self.evicted_before is not None and step <= self.evicted_before:
             return
         for bucket in (self.blocked, self.pad, self.term_cells):
@@ -338,26 +411,31 @@ class HexOccupancyService:
         self.evicted_before = step
 
     def reset(self, keep_blocked_live: bool = False) -> None:
-        # Back to the construction-time policy: a rebuild-from-shrink re-absorbs through `on_commit`,
-        # which writes `blocked` only while the map is live — so a reset that KEPT a rebuilt-live flag
-        # would be fine, but one that kept it live without re-absorbing would not. Resetting the flag
-        # makes the invariant "live ⇒ every committed flight is in `blocked`" hold by construction;
-        # the next reference dispatch re-arms it.
-        #
-        # `keep_blocked_live=True` is for the ONE caller that re-absorbs immediately (`_occupancy`'s
-        # shrink-rebuild branch), and it exists because dropping the flag there is a measured
-        # regression, not a style choice: the re-absorb walks the ledger without writing `blocked`,
-        # then the next reference dispatch's `enable_blocked` walks it AGAIN to rebuild the map —
-        # two full passes per shrink where the pre-`enable_blocked` design did one. Only pass it
-        # where the very next statement is an `_absorb`; anywhere else it leaves a map that claims
-        # to be live and is empty.
+        """Clear the maps back to empty for a from-scratch rebuild (e.g. on ledger shrink).
+
+        ``blocked`` returns to the construction-time policy: a rebuild re-absorbs through
+        ``on_commit``, which writes ``blocked`` only while the map is live, so resetting the flag
+        makes the invariant "live ⇒ every committed flight is in ``blocked``" hold by construction;
+        the next reference dispatch re-arms it. The interning pools ``_cells``/``_tids`` are
+        value-identical across a rebuild and kept, so cells are not re-interned.
+
+        Parameters
+        ------------
+        - keep_blocked_live (bool): keep ``blocked`` marked live across the reset. ONLY for the one
+          caller that re-absorbs immediately (``_occupancy``'s shrink-rebuild branch); dropping the
+          flag there costs a second full ledger pass (the re-absorb, then ``enable_blocked``).
+          Anywhere else it would leave a map that claims to be live but is empty.
+
+        Return
+        --------
+        - output (None): clears the maps and counters; preserves the interning pools.
+        """
         self._blocked_live = self._maintain_blocked or (keep_blocked_live and self._blocked_live)
         self.blocked.clear()
         self.pad.clear()
         self.term_cells.clear()
         self._rows.clear()
-        # `_cells` / `_tids` are pure interning pools — value-identical across a rebuild and never
-        # read except through a live row, so keeping them saves re-interning the same cells.
+        # `_cells` / `_tids` are pure interning pools — kept across a rebuild (see the docstring).
         self.n_added = 0
         self.evicted_before = None
 
@@ -367,14 +445,24 @@ class HexOccupancyService:
 
         One-way and sticky: a service that has answered one ``is_blocked`` will answer more (a run
         that falls back once tends to fall back again), so paying the O(schedule) rebuild repeatedly
-        would be worse than never having turned the map off.
+        would cost more than never having deferred the map. Routed through ``add_volume`` with
+        ``_pad=False`` rather than a fresh loop, because the three things a second loop would have
+        to re-derive are the three it would get wrong: the committing flight's own-column skip
+        (``add_volume``'s ``own`` test), the refcount-vs-set branch on ``track_removal``, and the
+        ``evicted_before`` clamp. ``own_cols`` is rebuilt per flight exactly as ``on_commit`` does,
+        which is why this groups the ledger itself rather than delegating to ``planner._absorb``
+        (that goes through ``on_commit``, which always writes ``pad``).
 
-        Routed through ``add_volume`` with ``_pad=False`` rather than a fresh loop, because the three
-        things a second loop would have to re-derive are the three it would get wrong: the committing
-        flight's own-column skip (`add_volume`'s ``own`` test), the refcount-vs-set branch on
-        ``track_removal``, and the ``evicted_before`` clamp. ``own_cols`` is rebuilt per flight exactly
-        as ``on_commit`` does, which is why this groups the ledger itself instead of calling
-        ``planner._absorb`` (that delegates to ``on_commit``, which always writes pad)."""
+        Parameters
+        ------------
+        - ledger: the reservation ledger; ``iter_committed`` yields ``(fid, volume)`` pairs, grouped
+          by flight so each flight's ``own_cols`` can be rebuilt.
+
+        Return
+        --------
+        - output (None): fills ``blocked`` and latches ``_blocked_live`` True; a no-op if already
+          live.
+        """
         if self._blocked_live:
             return
         self._blocked_live = True
@@ -389,22 +477,37 @@ class HexOccupancyService:
     def is_blocked(self, q: int, r: int, L: int, s: int, own: Collection[Hashable] = ()) -> bool:
         """Is hex (q, r) at flight level ``L`` an obstacle at step ``s``?
 
-        A flight owns its vertiports: a cell inside its **own** terminal column is passable — the flight
-        climbs/descends through its shared column. A cell under a *foreign* terminal column is a hard
-        wall (cruise reroutes around busy vertiports). Otherwise it's an ordinary corridor obstacle for
-        everyone.
+        A flight owns its vertiports: a cell inside its **own** terminal column is passable — the
+        flight climbs/descends through its shared column. A cell under a *foreign* terminal column
+        is a hard wall (cruise reroutes around busy vertiports). Otherwise it's an ordinary corridor
+        obstacle for everyone (see context/figures/cell_blocking.png).
 
-        **Same-hub exit lanes (issue #18, ``fixed_exit_lanes``).** A hub's own-column footprint inflates
-        ~99 m past the 90 m column, swallowing the exit-lane cells (120-205 m out). That own-column
-        transparency is what lets a hub's flights share their climb space — but it also hid *committed
-        sibling exit corridors* sitting in that footprint, so two same-hub launches into the same cruise
-        corridor only collided at commit (``conflict_filed``). The bearing graze-set could not express
-        that conflict (it conflated hub-bearing with cruise direction). So under the flag we do NOT
-        blanket-transparent the footprint: an own-only column cell that also carries a committed corridor
-        (a sibling's tagged exit lane, recorded in ``blocked`` outside the 90 m interior) still blocks —
-        the exact same-hub cell occupancy. The flight's own (uncommitted) corridor is absent during its
-        plan, so this never self-blocks; the 90 m interior is skipped from ``blocked`` (``add_volume``
-        ``own_cols``), so the climb stays clear. Flag off ⇒ ``False`` here, i.e. unchanged."""
+        **Same-hub exit lanes (``fixed_exit_lanes``).** A hub's own-column footprint inflates ~99 m
+        past the 90 m column, swallowing the exit-lane cells (120-205 m out). That own-column
+        transparency is what lets a hub's flights share their climb space — but it also hid
+        *committed sibling exit corridors* sitting in that footprint, so two same-hub launches into
+        the same cruise corridor only collided at commit (``conflict_filed``). The bearing graze-set
+        could not express that conflict (it conflated hub-bearing with cruise direction). So under
+        the flag we do NOT blanket-transparent the footprint: an own-only column cell that also
+        carries a committed corridor (a sibling's tagged exit lane, recorded in ``blocked`` outside
+        the 90 m interior) still blocks — the exact same-hub cell occupancy. The flight's own
+        (uncommitted) corridor is absent during its plan, so this never self-blocks; the 90 m
+        interior is skipped from ``blocked`` (``add_volume`` ``own_cols``), so the climb stays
+        clear. Flag off ⇒ ``False``.
+
+        Parameters
+        ------------
+        - q (int): axial hex column coordinate.
+        - r (int): axial hex row coordinate.
+        - L (int): flight level.
+        - s (int): time step.
+        - own (Collection[Hashable]): terminal ids the querying flight owns; its own columns are
+          transparent, every other hub's column is a wall.
+
+        Return
+        --------
+        - output (bool): True if the cell is an obstacle for this flight at this step.
+        """
         if not self._blocked_live:
             # Unreachable by construction: `_plan_reference` arms the map before it searches, and it
             # is the only caller. Raising beats answering — a silently stale oracle would be compared
@@ -429,14 +532,28 @@ class HexOccupancyService:
 
     def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int) -> bool:
         """Is the ordinary (non-terminal) pad at hex (q, r) free for the whole dwell window
-        [s0, s0 + dwell_steps]? The takeoff/landing hover column spans the full tube [ground, ceiling],
-        so the pad is clear iff NO committed corridor sweeps its cell at ANY flight level AND it does not
-        sit under any hub's shared column. Shared-terminal dwells are gated *temporally* by
-        :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, not here. (One level ⇒ the
-        legacy single-cell check.)"""
-        # Build the (q, r, L) column once and hoist the dict handles out of the window loop: n_levels was a
-        # per-step @property hit (the profile's 1.18M-call line) and (q, r, L) was rebuilt per step*level.
-        # Same k-major, level-ascending, pad-before-term short-circuit ⇒ byte-identical result.
+        ``[s0, s0 + dwell_steps]``?
+
+        The takeoff/landing hover column spans the full tube [ground, ceiling], so the pad is clear
+        iff NO committed corridor sweeps its cell at ANY flight level AND it does not sit under any
+        hub's shared column. Shared-terminal dwells are gated *temporally* by
+        :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`, not here.
+
+        Parameters
+        ------------
+        - q (int): axial hex column coordinate.
+        - r (int): axial hex row coordinate.
+        - s0 (int): first step of the dwell window.
+        - dwell_steps (int): window length in steps (the window includes ``s0 + dwell_steps``).
+
+        Return
+        --------
+        - output (bool): True if the pad column is free at every level for the whole window.
+        """
+        # Build the (q, r, L) column once and hoist the dict handles out of the window loop:
+        # `n_levels` is a @property and (q, r, L) would otherwise be rebuilt per step*level. Same
+        # k-major, level-ascending, pad-before-term short-circuit ⇒ byte-identical result (a parity
+        # contract).
         cells = [(q, r, L) for L in range(self.cfg.n_levels)]
         pad = self.pad
         term_cells = self.term_cells

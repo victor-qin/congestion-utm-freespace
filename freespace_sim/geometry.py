@@ -63,10 +63,9 @@ def _segment_frame_scalars(p0, p1) -> tuple[tuple[float, ...], float]:
 def segment_frame(p0: np.ndarray, p1: np.ndarray) -> tuple[np.ndarray, float]:
     """Orthonormal rotation whose local x-axis runs p0→p1 (length returned separately).
 
-    Columns are the local axes expressed in world coordinates (local→world), exactly what
-    ``fcl.Transform`` wants. The lateral (y) axis is perpendicular to both the segment and world-up
-    so a level corridor is "flat"; for a (near-)vertical segment we fall back to world-x as the
-    reference to avoid a degenerate cross product.
+    Columns are the local axes in world coordinates (local→world), exactly what ``fcl.Transform``
+    wants; a (near-)vertical segment falls back to a world-x reference to avoid a degenerate cross
+    product (see context/figures/segment_frame.png).
 
     Thin ``np.ndarray`` wrapper over :func:`_segment_frame_scalars`, kept for its matrix consumers
     and the frozen-numpy byte-identity oracle in ``tests/test_geometry.py``; ``box_from_segment``
@@ -173,7 +172,8 @@ class CylinderSpec:
 
 
 def box_from_segment(p0: np.ndarray, p1: np.ndarray, width: float, height: float) -> BoxSpec:
-    """Build an oriented box bounding the segment p0→p1 with the given lateral width and height.
+    """Build an oriented box bounding the segment p0→p1 with the given lateral width and height
+    (see context/figures/segment_frame.png).
 
     Consumes :func:`_segment_frame_scalars` (flat rot floats) and builds the center with scalars, so
     the hot per-sub-box path (hundreds of thousands of BoxSpecs per refined plan) allocates no

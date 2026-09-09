@@ -315,8 +315,8 @@ def delay_pct_histograms_by_lambda(per_flight_df, out=None):
 # The five levers of total_delay_s, in stack order: (key, label, colour, hatch). They sum exactly
 # to total_delay_s, so the stack must carry all five — a missing lever silently under-reports the
 # total. The detour is split into traffic vs lattice because on A*'s hex lattice most of it is
-# quantization, not congestion (an off-axis flight books up to 2/√3 − 1 ≈ 15.5% over the straight
-# line on geometry alone); the hatch marks that non-congestion band.
+# quantization, not congestion (see context/figures/hex_lattice_overhead.png); the hatch marks
+# that non-congestion band.
 _DELAY_SOURCES = [
     ("ground_delay_s", "ground delay", "#2563eb", None),          # waited on the pad (FCFS queueing)
     ("air_hold_s", "air hold", "#f59e0b", None),                  # loitered/hovered mid-route

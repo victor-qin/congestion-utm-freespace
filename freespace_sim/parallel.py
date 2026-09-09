@@ -115,7 +115,8 @@ def _disc_hits_aabb(cx: float, cy: float, radius: float, a) -> bool:
 
 
 def envelope_intersects(env: PlanEnvelope, commits) -> bool:
-    """True iff any committed volume in ``commits`` intersects the read envelope.
+    """True iff any committed volume in ``commits`` intersects the read envelope
+    (see context/figures/read_envelope.png).
 
     A hit means the speculation is DIRTY and exact mode must replan it serially. The time window
     is the plan's RECORDED reach (measured, not predicted — kept deliberately); within it, a volume

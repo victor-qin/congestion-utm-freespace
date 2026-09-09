@@ -30,10 +30,10 @@ class SimConfig:
     # ladder's floor→top. A single-level ladder collapses the band to that one plane.
     # Regulated airspace ceiling: every hover/terminal column spans [ground_level_m, airspace_ceiling_m].
     airspace_ceiling_m: float = 125.0
-    # A*'s discrete cruise levels — the SINGLE altitude knob (cruise / z-band derive from it). Strictly
-    # ascending; adjacent gaps must EXCEED corridor_height_m (so neighbouring level boxes don't touch in z
-    # and stay FCL-disjoint), and the top/bottom boxes (level ± corridor_height_m/2) must fit within
-    # [ground_level_m, airspace_ceiling_m]. Set ``flight_levels_m=(z,)`` (+ matching ceiling) for one plane.
+    # A*'s discrete cruise levels — the SINGLE altitude knob (cruise / z-band derive from it),
+    # strictly ascending. Adjacent gaps must EXCEED corridor_height_m and the top/bottom boxes must
+    # fit within [ground_level_m, airspace_ceiling_m] (see context/figures/altitude_ladder.png).
+    # Set ``flight_levels_m=(z,)`` (+ matching ceiling) for one plane.
     flight_levels_m: tuple[float, ...] = (30.0, 70.0, 110.0)
 
     # --- region (continuous horizontal free space), local ENU metres ---

@@ -17,7 +17,7 @@ from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.parallel import PlanEnvelope, envelope_intersects
-from freespace_sim.planner import get_planner
+from freespace_sim.planner import get_planner, iter_planner_chain
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.types import FlightRequest, Terminal, vec
@@ -206,8 +206,11 @@ def test_envelope_covers_filed_corridor_shortcut(planner_name):
     req = FlightRequest(1, vec(0, 0, 0), vec(2400, 1400, 0), 0.0)   # diagonal → staircase → knots removed
     is_sipp = planner_name == "sipp_shortcut"
     sc = get_planner(planner_name)
-    inner = sc.inner
-    assert isinstance(inner, SIPPPlanner if is_sipp else AStarPlanner)  # per-family: catch cross-wiring
+    # Walk the wrapper chain rather than peeling a fixed number of `.inner`s: `get_planner` now
+    # returns ItineraryPlanner(ShortcutRefiner(<leaf>)), and the depth is not this test's business.
+    want = SIPPPlanner if is_sipp else AStarPlanner
+    inner = next((p for p in iter_planner_chain(sc) if isinstance(p, want)), None)
+    assert inner is not None, f"{planner_name} has no {want.__name__} inside"  # catch cross-wiring
     inner.record_envelope = True
     refined = _plan(sc, req, [])
     bare = _plan(_sipp(record=False) if is_sipp else AStarPlanner(), req, [])

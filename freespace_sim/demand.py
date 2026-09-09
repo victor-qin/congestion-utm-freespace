@@ -347,14 +347,16 @@ class HubRadiusDemand:
     - radius service areas (``radius_m``, ``float`` or per-USS ``dict``): a customer is drawn
       uniformly in the disk of that radius about a hub. Overlapping disks create crossing traffic
       and bound flight length directly.
-    - return flights (``return_flights``): each delivery (hub → customer) is followed by a return
-      (customer → the same hub, landing on any open pad), filed at the delivery's estimated arrival
-      + ``turnaround_s`` in legacy mode. With ``paired_return_request`` both legs are filed
-      together and the return's desired departure follows the outbound's nominal arrival. The
-      return's landing also consumes a pad, counted against the hub's N.
+    - **return flights** (``return_flights``): each delivery is a round-trip ITINERARY — hub →
+      customer → the same hub — filed as ONE ``FlightRequest`` (``return_to_origin``) and flown by one
+      aircraft. ``ItineraryPlanner`` reads the return leg's departure off the outbound leg it actually
+      planned, so a return cannot precede its own arrival. Both landings consume a pad, counted
+      against the hub's N, and the aircraft holds the customer pad for ``turnaround_s`` in between.
 
-    ``lam_per_hour`` counts deliveries; with returns on, the realised flight count is ~2×. Hubs are
-    placed once under ``hub_seed`` (stable infrastructure); only demand varies with ``cfg.seed``.
+    ``lam_per_hour`` counts *deliveries*, and with returns on each delivery is ONE flight that flies
+    two legs — so the realised flight count equals the delivery count (it was ~2× when the return was
+    filed separately, and archived runs from that era are not leg-comparable). Hubs are placed once
+    under ``hub_seed`` (stable infrastructure); only demand varies with ``cfg.seed``.
     """
 
     n_hubs_per_uss: dict[str, int] = field(
@@ -364,8 +366,13 @@ class HubRadiusDemand:
     pads_per_hub: "int | dict[str, int]" = 1         # terminal capacity N per hub (scalar, or per-USS)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
-    return_flights: bool = True                      # each delivery → a return to its origin hub
-    turnaround_s: float = 0.0                      # delay before the return is filed (after est. arrival)
+    # Each delivery is a round-trip ITINERARY (hub → customer → hub) flown as ONE flight, not a
+    # delivery plus a separately filed return. False ⇒ one-way deliveries only.
+    return_flights: bool = True
+    # Ground time the aircraft spends at the customer pad between the legs — the delivery itself.
+    # The descent and climb that bracket it are NOT included: those come from the column geometry,
+    # so a scenario cannot budget a turnaround that physics contradicts.
+    turnaround_s: float = 0.0
     uss_share: dict[str, float] | None = None
     # Per-USS delivery Poisson rate (/hr). When set it REPLACES the global cfg.lam_per_hour × uss_share
     # path entirely: each USS is its own independent Poisson stream (Poisson thinning ⇒ a strict
@@ -375,15 +382,12 @@ class HubRadiusDemand:
     # Per-USS desired-departure lead as a Gaussian ``(mean_s, std_s)``: a leg filed at t is scheduled to
     # depart at ``t + max(0, N(mean, std))`` (floored at 0 so t_departure ≥ t_request always holds). Set
     # for some USSs to model per-operator scheduling lead / advance booking; absent USSs (or None) depart
-    # on filing exactly as today (and draw NO extra randomness). Legacy returns draw their own lead;
-    # strategically paired returns inherit their outbound filing and draw no second Gaussian.
+    # on filing exactly as today (and draw NO extra randomness). A round trip is ONE filing, so it draws
+    # exactly one lead — the return leg inherits it rather than sampling a second.
     departure_offset_s: "dict[str, tuple[float, float]] | None" = None
     # "request" samples filing times first (legacy behavior); "departure" samples every USS's outbound
     # desired departures over the common demand window, then dynamically pre-rolls filings to time zero.
     timing_mode: str = "request"
-    # When true, the outbound and its return are filed together. The return requests departure after the
-    # outbound's nominal arrival plus turnaround, with no second scheduling-lead draw.
-    paired_return_request: bool = False
     # timing_mode="departure" only: shift the whole clock by this FIXED constant instead of by the
     # realized preroll. Holding it constant across a family of runs that differ only in
     # departure_offset_s gives every arm byte-identical t_departure values, so delays can be compared
@@ -511,22 +515,6 @@ class HubRadiusDemand:
         mean, std = ms
         return max(0.0, float(rng.normal(mean, std)))
 
-    def _est_trip_s(self, o: np.ndarray, d: np.ndarray, cfg: SimConfig) -> float:
-        """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell.
-
-        Parameters
-        ------------
-        - o (np.ndarray): trip origin point.
-        - d (np.ndarray): trip destination point.
-        - cfg (SimConfig): supplies the cruise speed, climb time, and hover (pad dwell) time.
-
-        Return
-        --------
-        - output (float): nominal door-to-door time in seconds (cruise, climb, descent, dwell).
-        """
-        dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
-        return dist / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
-
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         """Emit deliveries (and optional returns) from each hub to customers in its service disk.
 
@@ -607,30 +595,20 @@ class HubRadiusDemand:
                 # own column is transparent — drop (both legs) only if a FOREIGN terminal walls the hex
                 drop = walls is not None and any(tid != terminal.id for tid in walls)
             if not drop:
-                requests.append(FlightRequest(                        # delivery: hub → customer
+                # ONE request per delivery. With `return_flights` it is a round-trip ITINERARY —
+                # hub -> customer -> hub, flown by one aircraft — not two separately filed legs.
+                # The return's departure is therefore never estimated here: `ItineraryPlanner` reads
+                # it off the outbound leg it actually planned. The estimate this replaces
+                # (`_est_trip_s`: straight line / nominal speed, plus climbs and one dwell) knew
+                # nothing about ground hold, lattice overhead or detour, so it ran short on every
+                # round trip of density_faa — 85 of 2,318 were filed to depart before their aircraft
+                # could land, and the median survivor had 9.3 s of slack.
+                requests.append(FlightRequest(
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
-                    t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal))
-            outbound_fid = fid
+                    t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal,
+                    return_to_origin=self.return_flights,
+                    service_time_s=self.turnaround_s if self.return_flights else 0.0))
             fid += 1
-            if self.return_flights:                                  # return: customer → same hub
-                trip_and_turnaround_s = (
-                    self._est_trip_s(hub, customer, cfg) + self.turnaround_s
-                )
-                if self.paired_return_request:
-                    t_ret = t_req
-                    t_ret_dep = t_dep + trip_and_turnaround_s
-                else:
-                    # Legacy request-first semantics: file the return after the nominal outbound arrival,
-                    # then give it its own independently sampled scheduling lead.
-                    t_ret = t_req + trip_and_turnaround_s
-                    return_lead_s = self._lead_for(uss_id, event_rng)
-                    t_ret_dep = t_ret + (0.0 if return_lead_s is None else return_lead_s)
-                if not drop:                                          # foreign-column filter drops both legs
-                    requests.append(FlightRequest(
-                        fid, vec(customer[0], customer[1], gl), vec(hub[0], hub[1], gl), t_ret,
-                        t_departure=t_ret_dep, uss_id=uss_id, dest_terminal=terminal,
-                        paired_outbound_id=outbound_fid))
-                fid += 1
 
         if self.lam_per_uss is None:
             # Legacy path: one global Poisson count, each flight's USS drawn from uss_share.

@@ -538,6 +538,30 @@ def build_reservation_from_corners(
     return volumes, centerline, cum_horiz, cum_dz
 
 
+def ground_dwell_reservation(center: Vec, t0: float, duration_s: float, cfg: SimConfig, *,
+                             terminal_id: Hashable = None, radius: float | None = None) -> Volume4D:
+    """The pad an aircraft occupies while SITTING on it, between the legs of a round trip.
+
+    A LOW box — ``[ground_level_m, ground_level_m + cfg.ground_box_height_m]`` — not the full column
+    :func:`hover_reservation` books. The aircraft is on the ground for this window; the descent that
+    put it there and the climb that takes it away each sweep the whole column and are reserved
+    separately, as ordinary landing/takeoff columns. Claiming the full column throughout would reserve
+    airspace nothing occupies, and would spend ``TerminalCapacity`` that already binds at density.
+
+    Same footprint radius as the hover column so the pad itself is genuinely held: another flight may
+    overfly at altitude, but none may land here while this aircraft is parked.
+    """
+    center = np.asarray(center, float)
+    spec = CylinderSpec(
+        cx=float(center[0]),
+        cy=float(center[1]),
+        radius=cfg.effective_hover_radius_m if radius is None else float(radius),
+        z_lo=cfg.ground_level_m,
+        z_hi=cfg.ground_level_m + cfg.ground_box_height_m,
+    )
+    return Volume4D(spec, t0, t0 + float(duration_s), terminal_id=terminal_id)
+
+
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,
                       radius: float | None = None, z_hi: float | None = None,
                       climb_time_s: float | None = None) -> Volume4D:

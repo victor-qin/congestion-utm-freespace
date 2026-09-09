@@ -150,7 +150,6 @@ def _density_scenario(
             lam_per_uss=lam_per_uss,
             departure_offset_s=departure_offset_s,
             timing_mode="departure",
-            paired_return_request=True,
             request_clock_offset_s=request_clock_offset_s,
         ),
     )

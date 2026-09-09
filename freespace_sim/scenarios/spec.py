@@ -48,9 +48,6 @@ class DemandSpec:
     # "request" samples filings then adds the lead; "departure" samples outbound desired departures
     # over the common demand window, subtracts the lead, then shifts the full clock nonnegative.
     timing_mode: str = "request"
-    # Strategic round-trip filing: return shares the outbound filing time and requests departure after
-    # the outbound's nominal arrival. False preserves the legacy independently-filed return behavior.
-    paired_return_request: bool = False
     # timing_mode="departure": pin the clock shift to this FIXED constant instead of the realized
     # preroll, so scenarios differing only in departure_offset_s share byte-identical desired departures
     # and differ solely in FCFS filing order. None → the legacy data-dependent shift.
@@ -84,7 +81,6 @@ class DemandSpec:
                 lam_per_uss=self.lam_per_uss,
                 departure_offset_s=self.departure_offset_s,
                 timing_mode=self.timing_mode,
-                paired_return_request=self.paired_return_request,
                 request_clock_offset_s=self.request_clock_offset_s,
                 min_hub_gap_m=self.min_hub_gap_m,
             )

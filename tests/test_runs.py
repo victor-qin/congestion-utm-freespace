@@ -270,29 +270,37 @@ def test_a_per_flight_run_writes_no_planner_stats(tmp_path):
     index = pd.read_parquet(tmp_path / "index.parquet")
     assert index["planner_termination"].isna().all()
 
-def test_scenario_parquet_round_trips_the_round_trip_link(tmp_path):
-    """The pairing is a RELATIONSHIP; the coupled t_departure is only its outcome. Without the link
-    persisted, a reloaded run cannot tell which legs were paired, so nothing downstream can re-derive
-    the schedule slip or re-anchor a return post-hoc."""
+def test_scenario_parquet_round_trips_the_itinerary(tmp_path):
+    """A round trip is a PROPERTY of one request now, not a link between two rows. Without it
+    persisted, a reloaded run is a one-way delivery whose return silently vanished — and since `dest`
+    is the customer either way, the loss is invisible in the geometry."""
     from freespace_sim.demand import HubRadiusDemand
     from freespace_sim.sim import run as sim_run
 
     cfg = SimConfig(region_size_m=(9000.0, 9000.0), horizon_s=1800.0, demand_duration_s=120.0,
                     planner="astar_shortcut")
     model = HubRadiusDemand(n_hubs_per_uss={"a": 3}, lam_per_uss={"a": 600.0}, radius_m=2000.0,
-                            pads_per_hub=2, terminal_radius_m=120.0, return_flights=True)
+                            pads_per_hub=2, terminal_radius_m=120.0, return_flights=True,
+                            turnaround_s=90.0)
     res = sim_run(cfg, demand=model)
-    folder = runs.save_run(res, root=tmp_path, label="pairing", experiment="unit", wall_seconds=0.1)
+    folder = runs.save_run(res, root=tmp_path, label="itinerary", experiment="unit", wall_seconds=0.1)
 
     sdf = pd.read_parquet(folder / "scenario.parquet")
-    assert "paired_outbound_id" in sdf.columns
-    original = {i.request.flight_id: i.request.paired_outbound_id for i in res.intents}
-    assert any(v is not None for v in original.values())          # the fixture really pairs legs
+    assert {"return_to_origin", "service_time_s"} <= set(sdf.columns)
+    original = {i.request.flight_id: (i.request.return_to_origin, i.request.service_time_s)
+                for i in res.intents}
+    assert any(rt for rt, _ in original.values())              # the fixture really flies round trips
 
-    back = {i.request.flight_id: i.request.paired_outbound_id for i in runs.load_run(folder).intents}
+    back = {i.request.flight_id: (i.request.return_to_origin, i.request.service_time_s)
+            for i in runs.load_run(folder).intents}
     assert back == original
-    # unlinked legs come back as None, not NaN or 0 — a 0 would alias flight_id 0's outbound
-    assert all(v is None or isinstance(v, int) for v in back.values())
+    assert all(isinstance(rt, bool) for rt, _ in back.values())   # not numpy.bool_ out of parquet
+
+    # A run archived before the columns existed loads as one-way, which is what it was: its return
+    # was a separate flight with its own row.
+    legacy = sdf.drop(columns=["return_to_origin", "service_time_s"])
+    legacy.to_parquet(folder / "scenario.parquet")
+    assert all(not i.request.return_to_origin for i in runs.load_run(folder).intents)
 
 
 def test_load_run_tolerates_runs_archived_before_the_pairing_column(tmp_path):

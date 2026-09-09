@@ -18,6 +18,7 @@ from freespace_sim.demand import (
     nearest_hub,
 )
 from freespace_sim.sim import run
+from freespace_sim.types import FlightRequest
 
 
 def _len(r):
@@ -174,22 +175,28 @@ def test_customer_within_per_uss_radius():
         assert dmin <= radius + 1e-6
 
 
-def test_return_flights_roundtrip_and_terminals():
+def test_return_flights_makes_each_delivery_one_round_trip_itinerary():
+    """`return_flights` no longer adds a second request. Each delivery becomes ONE itinerary that
+    flies hub -> customer -> hub, so the request count is the delivery count, not twice it, and the
+    return leg is implied by `return_to_origin` rather than filed."""
     cfg = _radius_cfg()
-    nd = len(HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=False).generate(
-        cfg, np.random.default_rng(0)))
-    rs = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=True).generate(
+    one_way = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=False).generate(
         cfg, np.random.default_rng(0))
-    assert len(rs) == 2 * nd                                      # one return per delivery
-    deliveries = [r for r in rs if r.origin_terminal is not None]
-    returns = [r for r in rs if r.dest_terminal is not None]
-    assert len(deliveries) == len(returns) == nd
-    # a return lands at a hub that some delivery launched from (same hub_id)
-    deliv_hubs = {r.origin_terminal[0] for r in deliveries}
-    assert all(r.dest_terminal[0] in deliv_hubs for r in returns)
-    # round trip: every (origin→dest) leg has its reverse among the flights
-    legs = {(tuple(np.round(_xy(r.origin), 2)), tuple(np.round(_xy(r.dest), 2))) for r in rs}
-    assert all((d, o) in legs for (o, d) in legs)
+    rs = HubRadiusDemand(n_hubs_per_uss={"a": 4}, return_flights=True, turnaround_s=90.0).generate(
+        cfg, np.random.default_rng(0))
+    assert len(rs) == len(one_way)                                # SAME count: the return is a leg
+    assert all(r.return_to_origin for r in rs)
+    assert all(r.service_time_s == 90.0 for r in rs)
+    assert all(not r.return_to_origin for r in one_way)
+
+    # Every itinerary leaves from a hub column and delivers to a plain customer pad; the return leg
+    # is the reverse of the same two points, so no second request is needed to express it.
+    assert all(r.origin_terminal is not None and r.dest_terminal is None for r in rs)
+    # ...and turning returns on changes nothing else about the demand: same flights, same timing.
+    assert [r.flight_id for r in rs] == [r.flight_id for r in one_way]
+    assert all(np.allclose(a.origin, b.origin) and np.allclose(a.dest, b.dest)
+               and a.t_request == b.t_request and a.t_departure == b.t_departure
+               for a, b in zip(rs, one_way))
 
 
 def test_terminal_airspace_filter_drops_foreign_column_customers():
@@ -281,20 +288,6 @@ def test_departure_offset_unset_departs_on_filing():
     m = HubRadiusDemand(n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 800.0})
     reqs = m.generate(cfg, np.random.default_rng(0))
     assert reqs and all(r.t_departure == r.t_request for r in reqs)
-
-
-def test_legacy_request_mode_departure_offset_applies_to_both_legs_with_distribution():
-    # Legacy, non-paired request-first mode gives BOTH delivery and return independent ~N(mean, std) leads.
-    cfg = SimConfig(region_size_m=(20000.0, 20000.0), horizon_s=3600.0)
-    m = HubRadiusDemand(n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 2000.0},
-                        departure_offset_s={"a": (450.0, 60.0)}, return_flights=True)
-    reqs = m.generate(cfg, np.random.default_rng(1))
-    deliveries = [r for r in reqs if r.origin_terminal is not None]
-    returns = [r for r in reqs if r.dest_terminal is not None]
-    assert deliveries and returns
-    for legs in (deliveries, returns):                        # each leg carries its own drawn lead
-        offs = np.array([r.t_departure - r.t_request for r in legs])
-        assert abs(offs.mean() - 450.0) < 25.0 and abs(offs.std() - 60.0) < 20.0
 
 
 def test_departure_offset_clamped_nonnegative():
@@ -488,33 +481,6 @@ def test_departure_mode_preserves_gaussian_outbound_leads():
     assert abs(leads.std() - 90.0) < 15.0
 
 
-def test_paired_return_shares_filing_time_and_follows_nominal_arrival():
-    cfg = SimConfig(
-        region_size_m=(20000.0, 20000.0),
-        horizon_s=3600.0,
-        demand_duration_s=600.0,
-    )
-    m = HubRadiusDemand(
-        n_hubs_per_uss={"a": 3},
-        lam_per_uss={"a": 600.0},
-        departure_offset_s={"a": (480.0, 90.0)},
-        return_flights=True,
-        turnaround_s=45.0,
-        timing_mode="departure",
-        paired_return_request=True,
-    )
-    reqs = m.generate(cfg, np.random.default_rng(4))
-    by_id = {r.flight_id: r for r in reqs}
-    outbounds = [r for r in reqs if r.origin_terminal is not None]
-    assert outbounds
-    for outbound in outbounds:
-        returned = by_id[outbound.flight_id + 1]
-        assert returned.dest_terminal == outbound.origin_terminal
-        assert returned.t_request == outbound.t_request
-        expected = m._est_trip_s(outbound.origin, outbound.dest, cfg) + m.turnaround_s
-        assert returned.t_departure - outbound.t_departure == pytest.approx(expected)
-
-
 def test_departure_stream_is_stable_when_second_uss_is_added():
     cfg = SimConfig(
         region_size_m=(20000.0, 20000.0),
@@ -564,17 +530,64 @@ def test_invalid_timing_mode_raises():
 
 # --- round-trip returns anchored to the REALIZED outbound arrival (two-pass) ----------------------
 
+def _as_legacy_pairs(reqs, cfg):
+    """Re-file round-trip itineraries as the LEGACY two linked requests.
+
+    `HubRadiusDemand` emits one itinerary per delivery now, so nothing in production produces a
+    `paired_outbound_id` any more — but `sim.run(return_anchor=...)` still supports it, because
+    archived scenarios contain it and must keep loading. These tests exercise that path, so they
+    build its input directly instead of asking a demand model that no longer speaks it.
+
+    The return's departure is the estimate the old demand model used and the itinerary model deleted:
+    straight-line distance at nominal speed, two climbs, one pad dwell, plus the turnaround. Being a
+    *fixture* is the right place for it — it is a guess about a flight nobody has planned yet, which
+    is exactly why it was wrong in production.
+    """
+    from dataclasses import replace
+    out, fid = [], 0
+    for r in reqs:
+        est = (float(np.linalg.norm(np.asarray(r.dest, float) - np.asarray(r.origin, float)))
+               / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
+               + float(r.service_time_s))
+        out.append(replace(r, flight_id=fid, return_to_origin=False, service_time_s=0.0))
+        out.append(FlightRequest(
+            fid + 1, r.dest, r.origin, r.t_request, t_departure=r.t_departure + est,
+            uss_id=r.uss_id, dest_terminal=r.origin_terminal, paired_outbound_id=fid))
+        fid += 2
+    return out
+
+
 def _roundtrip_world(**kw):
-    """A small congested round-trip world in the density scenarios' own timing mode: both legs filed
-    together, the return's departure anchored to the outbound's NOMINAL arrival."""
+    """A small congested round-trip world in the density scenarios' own timing mode. Legs are split
+    into the LEGACY two-request form by `_as_legacy_pairs`, because that is the scheme these tests
+    are about."""
     cfg = SimConfig(region_size_m=(12000.0, 12000.0), horizon_s=3600.0, demand_duration_s=300.0,
                     planner="astar_shortcut")
-    kw = {"timing_mode": "departure", "paired_return_request": True,
+    kw = {"timing_mode": "departure",
           "departure_offset_s": {"a": (480.0, 90.0)}, **kw}
     model = HubRadiusDemand(
         n_hubs_per_uss={"a": 4}, lam_per_uss={"a": 900.0}, radius_m=2500.0,
         pads_per_hub=2, terminal_radius_m=120.0, return_flights=True, **kw)
-    return cfg, model
+    return cfg, _LegacyPairModel(model)
+
+
+class _LegacyPairModel:
+    """A demand model that emits the LEGACY two linked requests per delivery.
+
+    Wraps the real one and splits each itinerary via :func:`_as_legacy_pairs`. It keeps
+    ``turnaround_s`` visible because ``sim.run(return_anchor="realized")`` reads it off the demand
+    model (``sim.demand_turnaround_s``) to re-anchor with the same turnaround the requests were built
+    with — passing bare requests instead would silently assume 0."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.turnaround_s = inner.turnaround_s
+
+    def generate(self, cfg, rng):
+        return _as_legacy_pairs(self.inner.generate(cfg, rng), cfg)
+
+    def terminals(self, cfg):
+        return self.inner.terminals(cfg)
 
 
 def test_return_leg_names_its_outbound():

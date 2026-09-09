@@ -113,12 +113,24 @@ class FlightRequest:
     # return sets dest_terminal. Plain ``(id, capacity)`` tuples are accepted (normalized by builders).
     origin_terminal: "Terminal | None" = None
     dest_terminal: "Terminal | None" = None
-    # Round-trip link: on a RETURN leg, the flight_id of the outbound whose arrival this leg waits on.
-    # Demand models anchor the return's desired departure to a NOMINAL estimate of that arrival, which
-    # ignores whatever ground delay / hold / detour the outbound actually took — so under congestion a
-    # return can want to depart before its aircraft has landed. Naming the dependency explicitly (rather
-    # than leaving it an implicit flight_id + 1 convention) lets ``sim.run(return_anchor="realized")``
-    # re-anchor the return to the arrival its outbound actually achieved.
+    # --- round trip as ONE itinerary -------------------------------------------------------------
+    # ``origin -> dest -> origin``, flown by one aircraft, planned and reserved as a single flight.
+    # The aircraft is on the ``dest`` pad for ``service_time_s`` between the two legs, and the return
+    # leg departs from the arrival that ACTUALLY happened, so a return cannot precede its own outbound
+    # — the property is structural rather than checked.
+    #
+    # This replaces a two-request scheme in which the return was a separate flight whose departure was
+    # a demand-time ESTIMATE of the outbound's arrival (straight-line, empty-sky). That estimate is
+    # systematically short: measured on density_faa, 85 of 2,318 round trips were filed to depart
+    # before their aircraft could land, and the median surviving pair had 9.3 s of slack.
+    return_to_origin: bool = False
+    # Ground time at ``dest`` between the legs: the delivery itself. The descent and the climb that
+    # bracket it are NOT counted here — they come from the column geometry (``volumes.column_dwell_s``),
+    # so a scenario cannot budget a turnaround that physics contradicts.
+    service_time_s: float = 0.0
+    # Round-trip link for the LEGACY two-request scheme: on a RETURN leg, the flight_id of the outbound
+    # whose arrival this leg waits on. Kept so archived scenarios and ``sim.run(return_anchor=...)``
+    # still load; new demand emits ``return_to_origin`` itineraries instead.
     paired_outbound_id: "int | None" = None
 
     def __post_init__(self):
@@ -144,6 +156,12 @@ class FlightRequest:
                 f"t_departure ({self.t_departure}) < t_request ({self.t_request}): "
                 "a flight cannot depart before it is filed"
             )
+        if self.return_to_origin and self.paired_outbound_id is not None:
+            raise ValueError(
+                f"flight {self.flight_id}: return_to_origin itinerary cannot also carry "
+                "paired_outbound_id — one round trip is either ONE flight or two, never both")
+        if self.service_time_s < 0.0:
+            raise ValueError(f"flight {self.flight_id}: service_time_s must be >= 0")
 
     def sort_key(self) -> tuple[float, int]:
         """FCFS sort key: ``(t_request, flight_id)``."""
@@ -183,6 +201,12 @@ class OperationalIntent:
     altitude_change_m: float = 0.0    # total vertical travel (climb + descent)
     cost: float = 0.0
     denial_reason: "DenialReason" = field(default=None)  # type: ignore[assignment]
+    # Centerline indices at which a NEW LEG begins, for a multi-leg itinerary; empty for the ordinary
+    # single-leg flight. The legs of a round trip are joined into one polyline, and the segment
+    # spanning that join is not flown — the aircraft is parked on the pad. It is zero-length in space,
+    # so anything summing distance or interpolating position is already right; anything that builds
+    # one corridor box PER SEGMENT is not, and must break the polyline here instead.
+    leg_starts: tuple[int, ...] = ()
     planner: str = ""                 # which planner produced this intent
     solve_time_s: float = 0.0         # wall time the planner spent on this flight's plan() call
 

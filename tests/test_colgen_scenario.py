@@ -35,36 +35,30 @@ def test_colgen_test_registered_with_density_miniature_parameters():
     assert demand.terminal_radius_m == {COLGEN_USS: 180.0}
     assert demand.lam_per_uss == {COLGEN_USS: 600.0}
     assert demand.departure_offset_s == {COLGEN_USS: (120.0, 30.0)}
-    assert demand.return_flights is True
+    # ONE-WAY: colgen prices one path per flight and `run_batch` refuses a round-trip itinerary
+    # rather than dropping its return leg silently, so this scenario cannot use `return_flights`.
+    assert demand.return_flights is False
     assert demand.turnaround_s == 0.0
     assert demand.timing_mode == "departure"
-    assert demand.paired_return_request is True
 
 
-def test_colgen_test_seed_zero_generates_calibrated_paired_load():
+def test_colgen_test_seed_zero_generates_calibrated_one_way_load():
     spec = get_scenario("colgen_test")
     cfg = spec.config()
     demand = spec.demand_model()
     requests = demand.generate(cfg, np.random.default_rng(cfg.seed))
 
-    # 600 deliveries/hour over five minutes has expectation 50; the pinned seed realizes 49,
-    # each with one strategically paired return.
-    assert len(requests) == 98
-    outbound = {r.flight_id: r for r in requests if r.origin_terminal is not None}
-    returns = {r.flight_id: r for r in requests if r.dest_terminal is not None}
-    assert len(outbound) == len(returns) == 49
+    # 600 deliveries/hour over five minutes has expectation 50; the pinned seed realizes 49. One-way
+    # (see above), and one request per delivery either way now — the load is HALF what it was when a
+    # round trip was two filed flights, so pre-itinerary colgen numbers are not comparable.
+    assert len(requests) == 49
+    assert not any(r.return_to_origin for r in requests)
+    assert all(r.origin_terminal is not None and r.dest_terminal is None for r in requests)
     assert {r.uss_id for r in requests} == {COLGEN_USS}
-    assert {(r.origin_terminal or r.dest_terminal).id for r in requests} == {
-        f"{COLGEN_USS}#{i}" for i in range(8)
-    }
+    assert {r.origin_terminal.id for r in requests} == {f"{COLGEN_USS}#{i}" for i in range(8)}
 
-    for outbound_id, delivery in outbound.items():
-        returned = returns[outbound_id + 1]
-        assert returned.t_request == delivery.t_request
-        assert returned.t_departure > delivery.t_departure
-        assert returned.dest_terminal == delivery.origin_terminal
-        assert np.array_equal(returned.origin, delivery.dest)
-        assert np.array_equal(returned.dest, delivery.origin)
+    assert all(r.service_time_s == 0.0 for r in requests)
+    assert all(r.paired_outbound_id is None for r in requests)
 
 
 def test_colgen_test_spec_round_trips_and_run_parser_accepts_it():

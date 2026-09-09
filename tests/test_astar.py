@@ -7,7 +7,9 @@ import pytest
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.planner import get_planner, hexgrid as hg
+from freespace_sim.planner import get_planner
+from freespace_sim.planner import hexgrid as hg
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.planner.astar.planner import _committed_arrival
@@ -36,7 +38,10 @@ def _wall():
 
 
 def test_get_planner_astar():
-    assert isinstance(get_planner("astar"), AStarPlanner)
+    # `get_planner` wraps every per-flight planner so it can fly round-trip itineraries; the
+    # requested planner is the one inside, reachable by the documented `inner` chain.
+    p = get_planner("astar")
+    assert isinstance(p, ItineraryPlanner) and isinstance(p.inner, AStarPlanner)
 
 
 def test_astar_empty_airspace_accepted_and_conflict_free():

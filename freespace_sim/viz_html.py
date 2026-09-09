@@ -122,6 +122,12 @@ def _footprint_xy(spec: BoxSpec) -> tuple[float, ...]:
             cx - ax - bx, cy - ay - by, cx - ax + bx, cy - ay + by)
 
 
+def _legs(centerline, leg_starts):
+    """Split a centerline at ``OperationalIntent.leg_starts``; a single-leg flight yields itself."""
+    bounds = [0, *leg_starts, len(centerline)]
+    return [centerline[a:b] for a, b in zip(bounds, bounds[1:]) if b - a >= 2]
+
+
 def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
     """True when the browser's reconstruction stays within ``tolerance_m`` of what was reserved.
 
@@ -149,7 +155,12 @@ def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
       tolerance; False makes this flight ship explicit polygons instead.
     """
     got = [v for v in (intent.volumes or []) if isinstance(v.shape, BoxSpec)]
-    want = volumes.build_corridor(quantised_centerline, cfg)
+    # A multi-leg itinerary is one polyline with a hole in it: the segment joining leg k's last
+    # waypoint to leg k+1's first spans a ground dwell nobody flies, and no corridor box was reserved
+    # for it. Building straight through would invent one and fail every round trip on a length
+    # mismatch, so break the path at the recorded leg starts and build each leg on its own.
+    want = [v for leg in _legs(quantised_centerline, intent.leg_starts)
+            for v in volumes.build_corridor(leg, cfg)]
     if len(got) != len(want):
         return False
     return all(

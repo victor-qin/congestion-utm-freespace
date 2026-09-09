@@ -29,12 +29,15 @@ SCENARIOS: dict[str, ScenarioSpec] = {
             radius_m={COLGEN_USS: 2_500.0},
             pads_per_hub={COLGEN_USS: 8},
             terminal_radius_m={COLGEN_USS: 180.0},
-            return_flights=True,
+            # ONE-WAY. Colgen prices one path per flight, so it cannot represent a round-trip
+            # itinerary and `run_batch` now refuses one rather than silently dropping the return leg.
+            # This halves the load relative to the pre-itinerary scenario (which filed a separate
+            # return per delivery), so colgen numbers from before that change are NOT comparable.
+            return_flights=False,
             turnaround_s=0.0,
             lam_per_uss={COLGEN_USS: 600.0},
             departure_offset_s={COLGEN_USS: (120.0, 30.0)},
             timing_mode="departure",
-            paired_return_request=True,
         ),
     ),
 }

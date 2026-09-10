@@ -16,7 +16,7 @@ import pytest
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.parallel import PlanEnvelope, envelope_intersects
+from freespace_sim.parallel import PlanEnvelope, cell_bbox_to_aabb, envelope_intersects
 from freespace_sim.planner import get_planner, iter_planner_chain
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.astar.occupancy import HexOccupancyService
@@ -500,3 +500,9 @@ def test_an_itinerarys_envelope_covers_every_leg_it_planned():
     for i, (w, o) in enumerate(zip(whole.cell_bbox, leg.cell_bbox)):   # alternating (min, max)
         assert (w <= o) if i % 2 == 0 else (w >= o), f"axis {i}: itinerary {w} misses leg {o}"
     assert whole.t_lo <= leg.t_lo and whole.t_hi >= leg.t_hi
+    # `xy` must stay `cell_bbox`'s conversion, not a separate union of the two legs' boxes: the
+    # axial->world map is a shear (x = R*sqrt3*(q + r/2)), so unioning the AABBs gives a DIFFERENT
+    # box than converting the unioned cell box, and `envelope_intersects` reads only `xy`.
+    assert whole.xy == pytest.approx(cell_bbox_to_aabb(whole.cell_bbox, cfg))
+    # a hub both legs consulted is carried once, not once per leg
+    assert len(whole.hub_reads) == len(set(whole.hub_reads))

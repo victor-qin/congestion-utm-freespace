@@ -28,6 +28,7 @@ from ..types import (
     vec,
 )
 from ..volumes import Volume4D, build_corridor, hover_reservation
+from .itinerary import reject_itinerary
 
 _EPS = 1e-6
 
@@ -125,6 +126,7 @@ def plan_timeshift(
     - output (OperationalIntent): ACCEPTED with the conflict-free volumes and ground delay, or
       REJECTED(BUDGET_EXCEEDED) when no gap fits the ground-delay budget.
     """
+    reject_itinerary(req, planner_name)
     speed = cfg.nominal_speed_mps * speed_factor
     base = req.t_departure if req.t_departure is not None else req.t_request
     delay = 0.0

@@ -301,8 +301,11 @@ def _flown_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
     """
     if not intent.centerline:
         return float("nan")
+    # `len(leg) >= 2` here and NOT in `_legs`: a leg with no segment contributes no flown distance,
+    # but its REFERENCE still counts — dropping it from both would shorten the ruler instead of
+    # reporting the leg as zero-length.
     return sum(enroute_flown_m([p[0] for p in leg], o, d, o_t, d_t, cfg)
-               for leg, o, d, o_t, d_t in _legs(intent))
+               for leg, o, d, o_t, d_t in _legs(intent) if len(leg) >= 2)
 
 
 def _straight_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
@@ -319,6 +322,10 @@ def _legs(intent: OperationalIntent):
     as en-route detour: measured 4,080 m against a true 160 m on one flight, 11.2x over a population.
     Splitting at ``leg_starts`` keeps flown and reference on the same ruler.
 
+    Every leg is returned, including one whose slice is too short to have a segment: the endpoints
+    are a property of the REQUEST, so a leg's reference distance exists whether or not its centerline
+    survived. Callers that need segments filter on their own.
+
     Parameters
     ------------
     - intent (OperationalIntent): the flight; ``leg_starts`` empty means a single leg
@@ -327,14 +334,10 @@ def _legs(intent: OperationalIntent):
     --------
     - legs (list): one tuple per leg, in flown order
     """
-    req, cl = intent.request, intent.centerline or []
-    if not intent.leg_starts:
-        return [(cl, req.origin, req.dest, req.origin_terminal, req.dest_terminal)]
-    bounds = [0, *intent.leg_starts, len(cl)]
+    req = intent.request
     ends = [(req.origin, req.dest, req.origin_terminal, req.dest_terminal),
             (req.dest, req.origin, req.dest_terminal, req.origin_terminal)]
-    return [(cl[a:b], *ends[k % 2]) for k, (a, b) in enumerate(zip(bounds, bounds[1:]))
-            if b - a >= 2]
+    return [(leg, *ends[k % 2]) for k, leg in enumerate(intent.leg_slices())]
 
 
 def _unimpeded_cruise_z(cfg: SimConfig) -> float:

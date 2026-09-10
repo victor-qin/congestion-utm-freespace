@@ -122,15 +122,6 @@ def _footprint_xy(spec: BoxSpec) -> tuple[float, ...]:
             cx - ax - bx, cy - ay - by, cx - ax + bx, cy - ay + by)
 
 
-def _legs(centerline, leg_starts):
-    """Split a centerline at ``OperationalIntent.leg_starts``; a single-leg flight yields itself.
-
-    Drops any run shorter than two points, which has no segment to build.
-    """
-    bounds = [0, *leg_starts, len(centerline)]
-    return [centerline[a:b] for a, b in zip(bounds, bounds[1:]) if b - a >= 2]
-
-
 def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
     """True when the browser's reconstruction stays within ``tolerance_m`` of what was reserved.
 
@@ -160,7 +151,7 @@ def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
     got = [v for v in (intent.volumes or []) if isinstance(v.shape, BoxSpec)]
     # Break at the leg starts: the segment joining two legs spans a ground dwell nobody flies and
     # reserved no box, so building straight through invents one and fails every round trip.
-    want = [v for leg in _legs(quantised_centerline, intent.leg_starts)
+    want = [v for leg in intent.leg_slices(quantised_centerline) if len(leg) >= 2
             for v in volumes.build_corridor(leg, cfg)]
     if len(got) != len(want):
         return False

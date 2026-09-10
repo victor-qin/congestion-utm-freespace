@@ -85,6 +85,22 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     with pytest.raises(ValueError, match="schema_version"):
         ScenarioSpec.from_json_dict(future)
 
+    # v1 filed a delivery's return as a SECOND request; v2 files one itinerary. The switch is
+    # `return_flights` — BOTH of v1's filing schemes doubled the request count, so keying the refusal
+    # on the retired `paired_return_request` would wave the legacy half of them through and replay
+    # half the flights under renumbered ids.
+    for legacy in ({"paired_return_request": True}, {"paired_return_request": False}, {}):
+        v1 = json.loads(json.dumps(spec.to_json_dict()))
+        v1["schema_version"] = 1
+        v1["demand"] = {**v1["demand"], "pattern": "hub_radius", "return_flights": True, **legacy}
+        with pytest.raises(ValueError, match="return_flights"):
+            ScenarioSpec.from_json_dict(v1)
+    # a one-way v1 recipe never doubled anything, so it still loads
+    v1_oneway = json.loads(json.dumps(spec.to_json_dict()))
+    v1_oneway["schema_version"] = 1
+    v1_oneway["demand"] = {**v1_oneway["demand"], "pattern": "hub_radius", "return_flights": False}
+    assert ScenarioSpec.from_json_dict(v1_oneway).demand.return_flights is False
+
 
 def test_scenario_frame_includes_every_request():
     res = _small()

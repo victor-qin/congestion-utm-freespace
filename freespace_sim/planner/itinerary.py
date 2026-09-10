@@ -122,7 +122,7 @@ class ItineraryPlanner:
         back = self.inner.plan(self._leg(req, req.dest, req.origin, req.dest_terminal,
                                          req.origin_terminal, float(landed) + dwell),
                                ledger, cfg)
-        self._absorb_envelopes(leg1_reads)
+        self._absorb_envelopes(leg1_reads, cfg)
         if not back.accepted:
             return OperationalIntent(
                 request=req, status=IntentStatus.REJECTED, volumes=[], centerline=[],
@@ -139,7 +139,7 @@ class ItineraryPlanner:
                 if getattr(p, "last_envelope", None) is not None]
 
     @staticmethod
-    def _absorb_envelopes(earlier) -> None:
+    def _absorb_envelopes(earlier, cfg: SimConfig) -> None:
         """Fold an earlier leg's read set into the one its planner holds now.
 
         A planner clears `last_envelope` per `plan` call, so without this an itinerary is summarised
@@ -148,25 +148,74 @@ class ItineraryPlanner:
         """
         for planner, env in earlier:
             now = getattr(planner, "last_envelope", None)
-            planner.last_envelope = env if now is None else now.union(env)
+            planner.last_envelope = env if now is None else now.union(env, cfg)
 
     @staticmethod
-    def _leg(req, origin, dest, o_term, d_term, t_departure) -> FlightRequest:
-        """One leg as an ordinary one-way request, keeping the itinerary's filing time."""
+    def _leg(req: FlightRequest, origin, dest, o_term, d_term,
+             t_departure: float) -> FlightRequest:
+        """
+        One leg as an ordinary one-way request, keeping the itinerary's filing time.
+
+        `t_request` is untouched so FCFS still orders the trip by when it was filed; only the
+        departure moves. `turnaround_s=0.0` because a leg has no pad dwell of its own — the dwell
+        belongs to the itinerary, between the legs.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the itinerary this leg is split off from
+        - origin (Vec): where this leg starts
+        - dest (Vec): where this leg ends
+        - o_term (Terminal | None): shared terminal at `origin`, or None
+        - d_term (Terminal | None): shared terminal at `dest`, or None
+        - t_departure (float): desired departure; for leg 2, the realized arrival plus the dwell
+
+        Return
+        --------
+        - leg (FlightRequest): a one-way request the inner planner can plan unchanged
+        """
         return replace(req, origin=origin, dest=dest, origin_terminal=o_term, dest_terminal=d_term,
                        t_departure=t_departure, return_to_origin=False, turnaround_s=0.0)
 
     @staticmethod
-    def _compose(req, out, back, landed, cfg, ledger) -> OperationalIntent:
-        """Join both legs and the pad dwell into one intent.
+    def _compose(req: FlightRequest, out: OperationalIntent, back: OperationalIntent,
+                 landed: float, cfg: SimConfig,
+                 ledger: ReservationLedger) -> OperationalIntent:
+        """
+        Join both legs and the pad dwell into one intent.
 
         The dwell spans arrival-column end -> departure-column start, not merely `turnaround_s`: a
         congested return can be held past its service and the aircraft is parked for all of it, so
         anything shorter leaves the pad reservable underneath a parked drone.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the itinerary both legs were split off from
+        - out (OperationalIntent): the accepted outbound leg
+        - back (OperationalIntent): the accepted return leg
+        - landed (float): `realized_release_s(out)` — when the arrival column clears
+        - cfg (SimConfig): supplies the ground-box height and the default pad radius
+        - ledger (ReservationLedger): committed traffic the synthesized dwell is checked against,
+          because no search ever saw it
+
+        Return
+        --------
+        - intent (OperationalIntent): both legs plus the dwell, or a `CONFLICT_FILED` rejection when
+          the pad is already claimed for part of the turnaround
         """
         from ..verify import realized_takeoff_s
         dwell = []
         leaves = realized_takeoff_s(back)
+        if leaves is not None and leaves < landed - 1e-9:
+            # Structural, not a denial: leg 2 was asked to depart at `landed + turnaround`, and a
+            # planner may only delay a departure. An earlier volume means the return is airborne
+            # before its own aircraft is down — the one thing this model exists to make
+            # inexpressible — and the branch below would file no pad hold, so nothing else catches
+            # it. `verify` cannot: both legs are one flight now, and it checks INTERflight overlap.
+            raise ValueError(
+                f"flight {req.flight_id}: the return leg's first volume starts {landed - leaves:.1f}s "
+                f"before the outbound's landing column clears ({leaves:.1f} < {landed:.1f}). A leg is "
+                "planned with t_departure = realized arrival + turnaround, and no planner may depart "
+                "earlier than asked, so this is a planner contract violation, not congestion.")
         if leaves is not None and leaves > landed + 1e-9:
             d_term = req.dest_terminal
             # NOT tagged with the terminal: `conflict.volumes_conflict` makes two same-hub volumes
@@ -179,7 +228,12 @@ class ItineraryPlanner:
             # it against the ledger here, where the answer is still a denial the caller can read.
             # `FCFSMechanism.commit` re-checks and would catch it, but reports it as a lost
             # commit-time race, and the LNS commit path (`lns/state.py`) re-checks nothing at all.
-            if ledger.any_conflict(dwell):
+            #
+            # FLIGHTS only, so `conflicting_flights` rather than `any_conflict`: being untagged makes
+            # the box opaque to permanent terminal walls too, and a wall over this pad is one the
+            # aircraft's own tagged columns already fly through — denying the parked interval for it
+            # would refuse a trip for its own hub's airspace.
+            if ledger.conflicting_flights(dwell):
                 return OperationalIntent(
                     request=req, status=IntentStatus.REJECTED, volumes=[], centerline=[],
                     denial_reason=DenialReason.CONFLICT_FILED, planner=out.planner,

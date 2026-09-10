@@ -110,6 +110,30 @@
 
 ## [OUTCOMES]
 
+- 2026-09-10T18:30Z `[TOOL]` xhigh review of #129 (10 angles + sweep) surfaced 13 findings; all 13
+  fixed. The two severe ones were both in the schema migration this PR ships: the v1 guard keyed on
+  `paired_return_request` when the field that changes the flight SET is `return_flights` (and it
+  defaults to True, so an absent key is a round-trip recipe), and `turnaround_s` survived the bump
+  as a live field with a CHANGED MEANING (v1 = when the return was filed, v2 = the pad dwell), so
+  every archived density spec's stored `0.0` would have replayed as a zero-second dwell.
+- 2026-09-10T18:30Z `[CODE]` `ledger.any_conflict` includes STATIC WALLS; `conflicting_flights`
+  excludes the `STATIC_WALL_FID` sentinel. `_compose` now uses the latter: the pad hold is untagged
+  so a same-hub flight cannot land on a parked aircraft, and untagged also made it opaque to the
+  wall its own tagged columns fly through — denying a trip for its own hub's airspace.
+- 2026-09-10T18:30Z `[CODE]` `OperationalIntent.leg_slices(seq=None)` is now the one owner of "split
+  at leg_starts" (was duplicated in `metrics` and `viz_html`, with a third ground-box variant in the
+  tests). It returns slices UNFILTERED: dropping a short leg from `_legs` had been shortening the
+  straight-line REFERENCE too, so `nominal_flight_time_s` / `delay_pct` / `trip_time_ratio` read off
+  half a ruler. The `>= 2` filter belongs to the flown sum only.
+- 2026-09-10T18:30Z `[CODE]` `PlanEnvelope.union` takes `cfg` and re-derives `xy` from the unioned
+  `cell_bbox`. Unioning the two AABBs separately is NOT the same box — the axial->world map is a
+  shear (`x = R*sqrt3*(q + r/2)`), so xmin depends jointly on q and r. `envelope_intersects` reads
+  only `xy`, so the union stayed a correct superset either way; what broke was the class invariant.
+- 2026-09-10T18:30Z `[CODE]` `reject_itinerary` now guards ALL five leaf planners: A*, SIPP, MILP,
+  and — via the shared `straight.plan_timeshift` — straight and decoupled. `SimConfig` validates
+  `turnaround_s >= 0` and `ground_box_height_m` fitting under the lowest level's band, and the demand
+  model forwards `turnaround_s` UNRESOLVED so `cfg` stays the one owner.
+
 - 2026-09-10T16:55Z `[TOOL]` PR #129 is MERGEABLE / CLEAN: rebased onto `ae797d2`, three commits
   added (rebase-scar repair, the remaining review findings, docs), force-pushed over `0ab5ac4`.
   53 files, +1221/-1320 vs main. Full suite green on the rebased tree: 1,225 passed / 2 skipped

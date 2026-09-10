@@ -271,6 +271,21 @@ class SimConfig:
                 raise ValueError(
                     f"levels {a},{b} gap {b - a} <= corridor_height_m {self.corridor_height_m}; "
                     "adjacent level boxes would overlap in z")
+        # The pad dwell is a DURATION the itinerary planner adds to a realized arrival to place the
+        # return's departure. Negative, and leg 2 is asked to depart before leg 1 has landed — the
+        # one thing the itinerary model exists to make inexpressible. `FlightRequest.turnaround_s`
+        # already guards the per-request override; this is the value it inherits from.
+        if self.turnaround_s < 0.0:
+            raise ValueError(f"turnaround_s ({self.turnaround_s}) must be >= 0")
+        # The parked-aircraft box must stay UNDER the lattice. Reaching the lowest level's band would
+        # make it rasterize into the hex occupancy, where a foreign column cell is a hard wall
+        # (`compiled_hex_occupancy.blocked`) — so a parked aircraft would close the airspace above
+        # itself for its whole turnaround, which is exactly what a low box exists to prevent.
+        if not 0.0 < self.ground_box_height_m <= lv[0] - half - self.ground_level_m + 1e-9:
+            raise ValueError(
+                f"ground_box_height_m {self.ground_box_height_m} must be > 0 and fit under the "
+                f"lowest flight level's band (at most {lv[0] - half - self.ground_level_m} here): a "
+                "taller box rasterizes into the lattice and walls off the airspace over a parked pad")
         # The per-metre cost weights and the climb-time properties divide by these, so a zero would
         # surface as a ZeroDivisionError deep in planner setup rather than here at construction.
         if self.nominal_speed_mps <= 0.0 or self.climb_rate_mps <= 0.0:

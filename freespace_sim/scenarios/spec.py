@@ -181,15 +181,21 @@ class ScenarioSpec:
             raise ValueError(
                 f"scenario_spec schema_version {version!r} is not readable by this code "
                 f"(understands integer versions <= {_SPEC_SCHEMA_VERSION}) — upgrade freespace_sim")
-        # v1 filed a round trip as TWO requests (`paired_return_request`); v2 files one itinerary.
-        # Replaying such a recipe under v2 silently halves the flight set and renumbers every id, so
-        # refuse it. A v1 recipe without paired returns is unaffected and still loads.
-        if version < _SPEC_SCHEMA_VERSION and (payload.get("demand") or {}).get("paired_return_request"):
+        # v1 filed a round trip as TWO requests, v2 as ONE itinerary, so replaying a v1 round-trip
+        # recipe under v2 halves the flight set and renumbers every id. The switch is
+        # `return_flights`, NOT `paired_return_request` — the latter only chose which of v1's two
+        # filing schemes ran, and BOTH emitted two requests per delivery. It also defaults to True,
+        # so an absent key is a round-trip recipe. Only `hub_radius` reads the field; the other
+        # patterns never emitted returns, so their recipes are unaffected and still load.
+        v1_demand = (payload.get("demand") or {}) if version < _SPEC_SCHEMA_VERSION else {}
+        if v1_demand.get("pattern") == "hub_radius" and v1_demand.get("return_flights", True):
             raise ValueError(
-                "scenario_spec is v1 with paired_return_request=True: v2 files a round trip as ONE "
-                "itinerary request, so replaying this recipe would produce half the flights under "
-                "different ids. Re-run it with the code that wrote it, or drop the flag to replay it "
-                "as one-way deliveries (which is not the world it recorded).")
+                "scenario_spec is v1 with return_flights=True: v1 filed each delivery's return as a "
+                "SECOND request, v2 files the round trip as one itinerary, so replaying this recipe "
+                "would produce half the flights under different ids. Its `turnaround_s` has also "
+                "changed meaning — v1 delayed when the return was FILED, v2 is the pad dwell between "
+                "the legs. Re-run it with the code that wrote it, or set return_flights=false to "
+                "replay it as one-way deliveries (which is not the world it recorded).")
 
         demand_payload = dict(payload.pop("demand", None) or {})
         demand_fields = DemandSpec.__dataclass_fields__

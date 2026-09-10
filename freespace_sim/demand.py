@@ -366,8 +366,9 @@ class HubRadiusDemand:
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     # Each delivery is a round-trip itinerary (hub → customer → hub) flown as ONE flight.
     return_flights: bool = True
-    # Ground time at the customer pad between the legs; ``None`` inherits ``cfg.turnaround_s``,
-    # which is the one owner of the number.
+    # Ground time at the customer pad between the legs. Forwarded to every request as-is; ``None``
+    # stays None and is resolved against ``cfg.turnaround_s``, the one owner of the number, when the
+    # itinerary is planned.
     turnaround_s: "float | None" = None
     uss_share: dict[str, float] | None = None
     # Per-USS delivery Poisson rate (/hr). When set it REPLACES the global cfg.lam_per_hour × uss_share
@@ -530,7 +531,6 @@ class HubRadiusDemand:
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
         demand_duration_s = cfg.effective_demand_duration_s
-        dwell_s = cfg.turnaround_s if self.turnaround_s is None else self.turnaround_s
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
 
         # foreign-column filter (cfg.terminal_airspace_always_active): a delivery whose customer's hex
@@ -599,7 +599,11 @@ class HubRadiusDemand:
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
                     t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal,
                     return_to_origin=self.return_flights,
-                    turnaround_s=dwell_s if self.return_flights else None))
+                    # Forwarded UNRESOLVED: None stays None so `SimConfig.turnaround_s` is read at
+                    # plan time by the one place that needs it. Baking the config value in here
+                    # would make the request the owner of a number the config claims to own, and
+                    # silently pin a replay to whatever the config held when demand was generated.
+                    turnaround_s=self.turnaround_s if self.return_flights else None))
             fid += 1
 
         if self.lam_per_uss is None:

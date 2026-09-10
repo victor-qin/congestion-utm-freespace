@@ -539,7 +539,7 @@ def build_reservation_from_corners(
 
 
 def ground_dwell_reservation(center: Vec, t0: float, duration_s: float, cfg: SimConfig, *,
-                             terminal_id: Hashable = None, radius: float | None = None) -> Volume4D:
+                             radius: float | None = None) -> Volume4D:
     """
     The pad an aircraft occupies while SITTING on it, between the legs of a round trip.
 
@@ -554,7 +554,6 @@ def ground_dwell_reservation(center: Vec, t0: float, duration_s: float, cfg: Sim
     - t0 (float): when the aircraft is down, i.e. the arrival column's ``t_end``
     - duration_s (float): how long it stays parked
     - cfg (SimConfig): supplies ``ground_box_height_m`` and the default footprint radius
-    - terminal_id (Hashable): shared-terminal tag, or None for an ordinary pad
     - radius (float): footprint radius; None uses ``effective_hover_radius_m``
 
     Return
@@ -569,7 +568,10 @@ def ground_dwell_reservation(center: Vec, t0: float, duration_s: float, cfg: Sim
         z_lo=cfg.ground_level_m,
         z_hi=cfg.ground_level_m + cfg.ground_box_height_m,
     )
-    return Volume4D(spec, t0, t0 + float(duration_s), terminal_id=terminal_id)
+    # Deliberately UNTAGGED, and no knob to tag it: `conflict.volumes_conflict` makes two same-hub
+    # volumes transparent whenever either is a cylinder, so a tagged box would let another flight of
+    # that hub land its column on top of the parked aircraft.
+    return Volume4D(spec, t0, t0 + float(duration_s))
 
 
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,

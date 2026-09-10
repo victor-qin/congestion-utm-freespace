@@ -115,3 +115,23 @@ Durable record of mistakes likely to recur between PRs. Format follows `.agent/C
   AND is registered in `FIGURES`. Three citations added here pointed at a PNG rendered by a throwaway
   script, so nobody but its author could produce it; the fix is to move the generator into
   `make_figures.py`, never to un-ignore the image. Files: `context/figures/make_figures.py`, `.gitignore`.
+
+- 2026-09-10T18:10Z `[CODE]` A schema-version bump that ENUMERATES the keys it knows changed will
+  miss the ones it does not. `_SPEC_SCHEMA_VERSION` 1->2 refused v1 payloads carrying
+  `paired_return_request`, but that flag only chose which of v1's two filing schemes ran — BOTH
+  emitted two requests per delivery, so the switch was `return_flights`, which also defaults to True
+  (an absent key is a round-trip recipe). A second key, `turnaround_s`, stayed a live dataclass field
+  while changing meaning (v1: when the return was FILED; v2: the pad dwell), so every archived spec's
+  stored `0.0` would have replayed as a zero-second dwell. Refuse on the VERSION plus the field that
+  changes the flight SET, and check what an absent key defaults to. Files:
+  `freespace_sim/scenarios/spec.py`.
+
+- 2026-09-10T18:12Z `[CODE]` Leaving a volume untagged to keep it OPAQUE to other flights also makes
+  it opaque to permanent terminal walls, which are not flights. `conflict.volumes_conflict` exempts a
+  pair only when both carry the same `terminal_id`, so the untagged pad hold — untagged precisely so
+  a same-hub flight cannot land on the parked aircraft — was checked against a wall its own tagged
+  columns fly straight through, denying a trip for its own hub's airspace. `ledger.any_conflict`
+  includes static walls; `ledger.conflicting_flights` excludes the `STATIC_WALL_FID` sentinel. Pick
+  the one that matches what the check is FOR. Files: `freespace_sim/planner/itinerary.py`,
+  `freespace_sim/ledger.py`, `freespace_sim/conflict.py`.
+

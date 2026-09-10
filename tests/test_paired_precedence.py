@@ -6,10 +6,12 @@ replaced a scheme that filed the return separately, on a straight-line estimate 
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from freespace_sim.config import SimConfig
-from freespace_sim.types import FlightRequest, IntentStatus, OperationalIntent, vec
+from freespace_sim.types import FlightRequest, IntentStatus, OperationalIntent, Terminal, vec
 
 HUB, CUST = vec(0, 0, 0), vec(3000, 0, 0)
 
@@ -177,6 +179,35 @@ def test_the_pad_hold_is_deconflicted_before_the_itinerary_is_accepted():
     assert out.denial_reason is DenialReason.CONFLICT_FILED
 
 
+def test_the_pad_hold_is_not_denied_by_its_own_terminals_permanent_wall():
+    """A permanent terminal wall is not another flight, and the aircraft is a member of that
+    terminal: its own tagged columns fly straight through the wall by the shared-terminal exemption.
+    The hold cannot be tagged (a tagged cylinder is transparent to same-hub columns, which is what
+    would let another flight land on the parked aircraft), so it is opaque to the wall as well —
+    and checking it against the wall would refuse the trip for its own hub's airspace."""
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0,
+                    terminal_airspace_always_active=True)
+    term = Terminal(id="cust-hub", capacity=4, radius=90.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0,
+                        dest_terminal=term)
+    led = ReservationLedger(cfg)
+    led.register_static_terminal(CUST, term)
+
+    out = get_planner("astar").plan(req, led, cfg)
+    assert out.accepted, f"denied {out.denial_reason} — the wall is its own terminal's"
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    hold = next(v for v in out.volumes
+                if isinstance(v.shape, CylinderSpec) and v.shape.z_hi <= top + 1e-9)
+    # The check only proves something if the wall really does overlap the hold: `any_conflict` sees
+    # it (untagged), while the flight-only test `_compose` runs does not.
+    assert led.any_conflict([hold])
+    assert not led.conflicting_flights([hold])
+
+
 def test_an_outbound_accepted_without_volumes_raises_rather_than_stranding_the_return():
     """`realized_release_s` is None for an accepted intent holding no volumes, and returning the
     outbound there would be the silent half-trip `reject_itinerary` exists to prevent: a round trip
@@ -215,6 +246,51 @@ def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
     assert type(copy.deepcopy(planner)) is type(planner)
     # Round-trips a planner this test just built — no external data is deserialised.
     assert type(pickle.loads(pickle.dumps(planner))) is type(planner)
+
+
+@pytest.mark.parametrize("name", ["astar", "sipp", "milp", "straight", "decoupled"])
+def test_every_leaf_planner_refuses_an_unwrapped_itinerary(name):
+    """`get_planner` wraps them all, so this guard exists for the sites that BYPASS it — and one
+    such site (`lns/unimpeded._new_ruler`) was already found by it. A leaf that plans the outbound
+    and drops the return costs about half a round trip, which a cost-comparing caller reads as an
+    improvement, so every leaf has to fail loudly rather than only the two searched ones."""
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import _get_planner
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    with pytest.raises(NotImplementedError, match="round-trip itinerary"):
+        _get_planner(name).plan(req, ReservationLedger(cfg), cfg)
+
+
+def test_a_return_that_starts_before_its_own_arrival_raises(monkeypatch):
+    """`_compose` files the pad hold only when the return leaves AFTER the outbound is down, so a
+    leg 2 that starts earlier would be composed with no hold and no ledger check — and `verify`
+    cannot see it, because both legs are one flight now and it checks INTERflight overlap. A planner
+    may only delay a departure, so this is a contract violation, not congestion."""
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.itinerary import ItineraryPlanner
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    inner = AStarPlanner()
+    real = inner.plan
+    calls = {"n": 0}
+
+    def leave_early(req, ledger, c):
+        calls["n"] += 1
+        it = real(req, ledger, c)
+        if calls["n"] != 2:
+            return it
+        # Same plan, shifted 1000 s earlier: an accepted return whose first volume predates the
+        # outbound's landing column.
+        return replace(it, volumes=[replace(v, t_start=v.t_start - 1000.0, t_end=v.t_end - 1000.0)
+                                    for v in it.volumes])
+
+    monkeypatch.setattr(inner, "plan", leave_early)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    with pytest.raises(ValueError, match="before the outbound's landing column clears"):
+        ItineraryPlanner(inner).plan(req, ReservationLedger(cfg), cfg)
 
 
 @pytest.mark.slow

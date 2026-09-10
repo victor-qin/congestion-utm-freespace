@@ -52,6 +52,23 @@ def test_validation_rejects_bad_ladder(bad_ladder, expected_match):
         SimConfig(flight_levels_m=bad_ladder)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected_match"),
+    [
+        # A negative dwell makes `ItineraryPlanner` ask leg 2 to depart BEFORE leg 1 lands, which is
+        # the one thing the itinerary model exists to make inexpressible.
+        pytest.param({"turnaround_s": -1.0}, "turnaround_s", id="negative_turnaround"),
+        pytest.param({"ground_box_height_m": 0.0}, "ground_box_height_m", id="flat_ground_box"),
+        # 20 + 0 reaches the lowest level's band (30 - 15 = 15), so the parked-aircraft box would
+        # rasterize into the lattice and wall off the airspace over its own pad.
+        pytest.param({"ground_box_height_m": 20.0}, "ground_box_height_m", id="box_reaches_lattice"),
+    ],
+)
+def test_validation_rejects_bad_round_trip_geometry(kwargs, expected_match):
+    with pytest.raises(ValueError, match=expected_match):
+        SimConfig(**kwargs)
+
+
 def test_cruise_and_band_derive_from_ladder():
     c = SimConfig(flight_levels_m=(30.0, 70.0, 110.0))   # derived, not settable
     assert c.cruise_level_m == 70.0                      # cruise = middle level (straight/decoupled)

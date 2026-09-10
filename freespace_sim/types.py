@@ -212,6 +212,29 @@ class OperationalIntent:
                 else DenialReason.BUDGET_EXCEEDED
             )
 
+    def leg_slices(self, seq=None) -> list:
+        """
+        ``seq`` cut at :attr:`leg_starts` — one slice per flown leg, in flown order.
+
+        The one owner of "split an itinerary into legs", so metrics, the viz payload and any future
+        consumer cannot drift apart on where a leg ends. Slices are returned UNFILTERED, including
+        empty ones, because dropping a short leg silently renumbers the rest — a caller that cannot
+        use a run shorter than two points must skip it itself and say so.
+
+        Parameters
+        ------------
+        - seq (Sequence | None): the per-waypoint sequence to cut, indexed like ``centerline``;
+          ``None`` uses this intent's own ``centerline``
+
+        Return
+        --------
+        - legs (list): ``len(leg_starts) + 1`` slices of ``seq``, covering it exactly once
+        """
+        if seq is None:
+            seq = self.centerline or []
+        bounds = [0, *self.leg_starts, len(seq)]
+        return [seq[a:b] for a, b in zip(bounds, bounds[1:])]
+
     @property
     def accepted(self) -> bool:
         """True when the intent is committed or in flight (ACCEPTED or ACTIVATED)."""

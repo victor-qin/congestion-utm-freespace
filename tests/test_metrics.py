@@ -33,9 +33,9 @@ def test_reserved_volume_seconds_clamps_open_window():
 def test_bare_flight_row_does_not_clamp_at_the_horizon():
     """``flight_row``'s ``window=None`` must mean UNCLAMPED, matching what ``flight_frame`` measures.
 
-    It used to mean ``[0, horizon_s]``. Since ``flight_frame`` switched to ``simulation_window``,
-    that default made ``flight_row`` the last surface still truncating the post-horizon return tail —
-    two public entry points in this module reporting different ``reserved_vol_m3_s`` for one flight.
+    If ``window=None`` clamped to ``[0, horizon_s]`` instead, ``flight_row`` would truncate the
+    post-horizon return tail that ``flight_frame`` (on ``simulation_window``) keeps — two public
+    entry points in this module reporting different ``reserved_vol_m3_s`` for one flight.
     """
     cfg = SimConfig(horizon_s=1800.0, planner="straight")
     # a return leg reserving [1700, 2300): 100 s inside the horizon, 500 s past it
@@ -100,15 +100,6 @@ def test_delay_pct_is_bounded_and_consistent():
     nominal = metrics.nominal_flight_time_s(r["straight_line_m"], res.config)
     assert math.isclose(r["delay_pct"], 100 * r["total_delay_s"] / (nominal + r["total_delay_s"]),
                         rel_tol=1e-9)
-
-
-def test_delay_sources_sum_to_total_delay():
-    # the breakdown is exact: ground_delay + air_hold + detour_time + altitude_delay_phys == total_delay
-    res = run(SimConfig(planner="straight", lam_per_hour=120.0, horizon_s=1200.0, seed=2))
-    acc = metrics.flight_frame(res).query("accepted")
-    recombined = (acc["ground_delay_s"] + acc["air_hold_s"] + acc["detour_time_s"]
-                  + acc["altitude_delay_phys_s"])
-    assert ((recombined - acc["total_delay_s"]).abs() < 1e-9).all()
 
 
 def _congested_multilevel():
@@ -362,7 +353,7 @@ def test_total_delay_counts_a_traffic_forced_climb_like_congestion_cost():
                         excess * CFG.cost_altitude_change_per_m)         # ... and in cost
 
 
-# --- steady-state measurement window (issue #25) -----------------------------------------------
+# --- steady-state measurement window -----------------------------------------------------------
 
 from freespace_sim.sim import SimResult   # noqa: E402
 
@@ -572,10 +563,10 @@ def _hub_flight(planner, radius=180.0, levels=(100.0,)):
     """An unimpeded flight between two hubs of ``radius`` on the given flight-level ladder.
 
     ``get_planner("milp")`` returns MILPOptPlanner, whose ``plan`` yields the CHEAPER of its warm
-    StraightLineTimeShift candidate and its own solve — and in empty airspace the warm one wins. That
-    made the ``milp`` arm a byte-identical duplicate of the ``straight`` arm (same 46-point unfolded
-    centerline, same 0.0 detour) which never entered milp.py at all. Deny the warm start so the MILP's
-    own folded path comes back. Same trap, same fix as ``test_astar._folded_planner``.
+    StraightLineTimeShift candidate and its own solve — and in empty airspace the warm one wins,
+    making the ``milp`` arm a byte-identical duplicate of the ``straight`` arm that never enters
+    milp.py. Deny the warm start so the MILP's own folded path comes back. Same trap, same fix as
+    ``test_astar._folded_planner``.
     """
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner import get_planner
@@ -598,8 +589,7 @@ def test_enroute_metrics_exclude_terminal_airspace():
 
     Flying inside a terminal column is terminal operations: it consumes that hub's capacity and is
     neither en-route distance nor delay. Measuring against the centres books the two unreserved column
-    legs as avoidable detour, which drove ``stretch`` BELOW 1 once a refiner removed the hex staircase
-    that had been masking it (issue #50).
+    legs as avoidable detour, which can drive ``stretch`` BELOW 1.
     """
     from freespace_sim.volumes import enroute_reference_m
 

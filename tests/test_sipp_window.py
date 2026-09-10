@@ -1,17 +1,17 @@
 """Per-plan safe-interval window: does it reproduce the global pool it replaces?
 
 `sipp.window.build_window_intervals` derives a plan-local free-interval chain from the A* claim
-arena, replacing `CompiledOccupancy`'s globally-maintained pool. Phase 3 deletes that pool, so these
-tests are the whole parity argument — written now, against the live pool, so that a failure is
-a red test rather than a wrong schedule. Design record: `context/sipp_runtime_plan.md`.
+arena, replacing `CompiledOccupancy`'s globally-maintained pool. These tests are the parity argument
+for that replacement, run against the still-live pool so a divergence is a red test rather than a
+wrong schedule. Design record: `context/sipp_runtime_plan.md`.
 
 **The oracle is `CompiledHexOccupancy.blocked_py`, deliberately not
 `CompiledOccupancy.free_intervals_py`.** The obvious choice is the wrong one twice over: it lives on
-the class Phase 3 deletes, so the gate would stop compiling exactly when it is needed; and the two
-structures use different boxes (`CompiledOccupancy` margin 48, `CompiledHexOccupancy` margin 64), so
-a window cell legal in the arena's box returns `None` from the pool's method. Building the expected
-complement from `blocked_py` needs one structure, has no box mismatch, and checks the same fold the
-kernel reads.
+`CompiledOccupancy`, the class being removed, so the gate would stop compiling exactly when it is
+needed; and the two structures use different boxes (`CompiledOccupancy` margin 48,
+`CompiledHexOccupancy` margin 64), so a window cell legal in the arena's box returns `None` from the
+pool's method. Building the expected complement from `blocked_py` needs one structure, has no box
+mismatch, and checks the same fold the kernel reads.
 """
 import numpy as np
 import pytest
@@ -123,13 +123,13 @@ def _congested(lam=3000.0, horizon=900.0):
     """A real committed schedule on a HUB scenario — corridor claims AND terminal-column claims.
 
     Deliberately not `metro_uniform`: it has no terminals, so `col_owners` and `static_col` are both
-    empty and the builder's `(cell << 1) | 1` column branch — the one this module calls the deleted
-    `_sbuild_overlay` — is never compared against the oracle. Every `density_faa` flight is
-    hub-to-hub, so a corridor-only fixture would leave the half of the fold that matters most in
-    production entirely unchecked. `_column_cells` below asserts the fixture actually produced some.
+    empty and the builder's `(cell << 1) | 1` column branch is never compared against the oracle.
+    Every `density_faa` flight is hub-to-hub, so a corridor-only fixture would leave the half of the
+    fold that matters most in production entirely unchecked. `_column_cells` below asserts the
+    fixture actually produced some.
     """
     if (lam, horizon) in _CONGESTED:      # three tests share one schedule; rebuilding it per test
-        return _CONGESTED[(lam, horizon)]  # tripled the file's wall clock for identical state
+        return _CONGESTED[(lam, horizon)]  # would repeat the same build for identical state
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"), lam_per_hour=lam,
                           horizon_s=horizon, seed=0)
     cfg = spec.config()
@@ -171,8 +171,7 @@ def test_window_intervals_match_the_claim_oracle():
     """
     cfg, _led, cocc = _congested()
     # Centre on a COLUMN cell, not just any claimed one: the window must contain terminal-column
-    # claims or the `(cell << 1) | 1` half of the fold goes unchecked (which it silently did while
-    # this fixture was `metro_uniform`).
+    # claims or the `(cell << 1) | 1` half of the fold goes unchecked.
     claimed = [k >> 1 for k in range(2 * cocc.NC) if cocc._arena.length[k]]
     assert len(claimed) > 200, f"fixture is not congested enough ({len(claimed)} claimed cells)"
     cols = _column_cells(cocc)
@@ -246,10 +245,10 @@ def test_window_intervals_handle_the_static_wall():
     """An always-active hub wall is empty for a foreign flight and fully free for its owner.
 
     This is the case `CompiledOccupancy` could only express by writing the wall into the same array
-    as commit-derived blocks — the trap that bit twice during #125 (a naive cell rebuild silently
-    un-walled a hub; the re-wall branch then dropped other owners' claims and raised on their
-    release). Here the wall lives in `static_col` and never touches a claim slab, so both bugs are
-    unrepresentable rather than guarded.
+    as commit-derived blocks, which invited two bugs (a naive cell rebuild silently un-walled a hub;
+    the re-wall branch then dropped other owners' claims and raised on their release). Here the wall
+    lives in `static_col` and never touches a claim slab, so both bugs are unrepresentable rather
+    than guarded.
     """
     cfg = SimConfig(terminal_airspace_always_active=True)
     cocc = CompiledHexOccupancy(cfg)
@@ -278,8 +277,8 @@ def test_window_intervals_reproduce_the_overlay():
 
     That method is what `_sbuild_overlay` built the kernel's own-lane overlay out of, and the whole
     reason `SafeIntervalIndex` was subscribed to the ledger. If the `ov_own_gen` branch reproduces
-    it, the overlay AND the index's subscription can both go — which is why this test is the licence
-    for Phase 3 deleting two structures rather than one.
+    it, the overlay AND the index's subscription can both go — this test is the licence for removing
+    both rather than one.
     """
     cfg = SimConfig()
     cocc = CompiledHexOccupancy(cfg)
@@ -433,8 +432,7 @@ def test_window_intervals_refuse_mismatched_buffers():
     """Sizing only `iv_lo` must not licence writes past the end of `iv_hi` / `iv_nxt` / `scratch`.
 
     numba runs with `boundscheck` off, so checking one array of the four and trusting the caller for
-    the rest is not a style question: it segfaults. Reproduced before the fix — a positive `tail`
-    return alongside ~1.6x-its-length of out-of-bounds int32 writes.
+    the rest is not a style question: it segfaults.
     """
     cfg, _led, cocc = _congested()
     cols = _column_cells(cocc)

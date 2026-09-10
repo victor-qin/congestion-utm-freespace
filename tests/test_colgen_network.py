@@ -223,7 +223,7 @@ def test_endpoint_claim_reach_covers_custom_large_hover_radius():
     that point is within one circumradius of it, hence inside both claim discs.  The
     witness here is a cell between the two, which neither endpoint sits in — pinning
     the stronger "claims the other's cell" property instead would demand a reach that
-    over-claims by 2.1x at defaults (GitHub issue #101).
+    over-claims.
     """
 
     cfg = replace(_cfg(), hover_radius_m=100.0)
@@ -287,10 +287,8 @@ def test_a_covering_endpoint_claim_must_forbid_a_pair_the_ledger_accepts():
     one then refuses a pair ``volumes_conflict`` passes.
 
     This is not hypothetical at the shipped reach, which tests centre distance and so
-    fires well inside the extreme: on ``density_faa_wing_zipline`` at 1,000 flights it
-    is 24 of the 30 residual over-capacity rows, and flights 1336 and 3170 are refused
-    while delivering 192.3 m apart (GitHub issue #101).  An exact disk/hexagon test
-    removes those but not this one --
+    fires well inside the extreme.  An exact disk/hexagon test removes those cases but
+    not this structural one --
     :func:`test_endpoint_claims_are_disjoint_beyond_twice_the_reach` is what bounds it.
     """
 
@@ -330,13 +328,11 @@ def test_endpoint_claims_are_disjoint_beyond_twice_the_reach(hover_radius_m):
     """How wrong the endpoint rows can be is bounded by twice their reach.
 
     Two endpoints share a claimed cell only if some hex centre is inside both claim
-    discs, so the coupling can never exceed ``2 * (radius + circumradius)`` -- 258.6 m
-    at defaults, against a 120 m true conflict distance.  That bound is what makes the
-    false positive in
+    discs, so the coupling can never exceed ``2 * (radius + circumradius)``.  That bound
+    is what makes the false positive in
     :func:`test_a_covering_endpoint_claim_must_forbid_a_pair_the_ledger_accepts` a
     known, bounded modelling cost rather than an open-ended one, and it is the first
-    thing a re-widened reach breaks: the ``footprint_reach`` term removed for GitHub
-    issue #101 pushed this cut-off from 258.6 m out to 378.6 m.
+    thing a re-widened endpoint reach breaks.
 
     The bound is also checked tight, so it cannot pass by being vacuously generous.
     """
@@ -911,14 +907,13 @@ def test_graph_max_step_preserves_takeoff_and_origin_lane_time_budget(overrun):
 
 
 def test_graph_max_step_route_term_is_the_ceiling_not_a_re_derivation():
-    """`9816f61`, pinned where one knob cannot express it any more.
+    """The route term must be `max_air_hops`, not a re-derivation from `shortest_hops`.
 
     The bug was `_graph_max_step` carrying `shortest_hops + detour_slack_hops` where it needed
-    `max_air_hops`: at slack=3/overrun=9 the horizon advertised 26 hops and only 20 were
-    reachable at the last departure. With the corridor knob deleted (issue #78) the two can no
-    longer disagree through `ColGenParams`, so the regression has to be pinned on the function
-    itself -- with a budget deliberately unrelated to any ellipse radius, so a future
-    re-derivation from `shortest_hops` plus anything cannot pass.
+    `max_air_hops`, so the advertised horizon exceeded what was reachable at the last
+    departure. One knob can no longer express that disagreement through `ColGenParams`, so the
+    regression is pinned on the function itself -- with a budget deliberately unrelated to any
+    ellipse radius, so a future re-derivation from `shortest_hops` plus anything cannot pass.
     """
 
     lanes = (hg.Lane(cell=(1, 0), bearing=0.0, dist=0.0, steps=5),)

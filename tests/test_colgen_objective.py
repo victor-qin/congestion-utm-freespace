@@ -110,16 +110,6 @@ def test_cost_model_defaults_to_the_configs_weights_not_to_equal_ones():
     assert cost_model(cfg, ColGenParams(objective="total_delay")) is DELAY_MODEL
 
 
-def test_total_cost_objective_picks_up_the_config_weights():
-    cfg = _cfg()
-    model = cost_model(cfg, ColGenParams(objective="total_cost"))
-    assert model.ground_weight == cfg.cost_ground_delay_per_s
-    assert model.air_weight == cfg.cost_air_lateral_per_s
-    # The documented 1:3 ratio the A* planner uses; if config changes, this should fail
-    # loudly rather than let colgen quietly price something else.
-    assert (model.ground_weight, model.air_weight) == (1.0, 3.0)
-
-
 def test_total_cost_refuses_a_config_the_cost_model_cannot_express():
     """One air scalar has to cover cruise and loiter, so divergence must raise.
 

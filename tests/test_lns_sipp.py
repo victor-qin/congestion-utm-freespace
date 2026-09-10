@@ -2,10 +2,9 @@
 and the A*/SIPP cost-currency gates.
 
 Design record: `context/sipp_lns_plan.md`, then `context/sipp_runtime_plan.md` for the occupancy
-rewrite. The `CompiledOccupancy` removal gates that used to sit here went with the structure: SIPP
-no longer maintains a global free-interval pool, and the properties they pinned (release exactness,
-the static-wall trap, claim multiplicity) are now properties of the A* claim arena
-(`tests/test_claim_arena.py`) and of the per-plan build (`tests/test_sipp_window.py`).
+rewrite. SIPP no longer maintains a global free-interval pool; release exactness, the static-wall
+trap, and claim multiplicity are now properties of the A* claim arena (`tests/test_claim_arena.py`)
+and of the per-plan build (`tests/test_sipp_window.py`).
 """
 
 import numpy as np
@@ -146,11 +145,10 @@ def test_sidx_track_removal_off_is_the_original_set_shape():
 def test_sipp_subscribes_the_same_structures_as_astar():
     """SIPP now binds exactly what compiled A* binds: `_svc`, `_tcap` and the shared claim arena.
 
-    This assertion used to read 3 for A*, 3 for a point-to-point SIPP and FOUR for a terminal one —
-    the "4:3 commit-side headwind" the old docstring narrated. Both extra structures are gone: the
-    global free-interval pool was replaced by a per-plan build over A*'s arena, and the
-    `SafeIntervalIndex` it needed for the own-column overlay is no longer ledger-subscribed at all.
-    A terminal flight and a point-to-point one must now agree, which is the point of the third case.
+    A terminal flight and a point-to-point one must agree — that is the point of the third case.
+    They agree because the global free-interval pool was replaced by a per-plan build over A*'s
+    arena, and the `SafeIntervalIndex` it needed for the own-column overlay is no longer
+    ledger-subscribed at all.
     """
     astar = AStarPlanner(incremental_release=True)
     led_a = ReservationLedger(CFG)
@@ -190,7 +188,7 @@ def test_sipp_plan_never_reports_a_previous_flights_read_set():
     — and a DROP coordinator would test the wrong region, read clean, and merge a genuinely stale
     repair. `verify` cannot catch that: the symptom is a worse cost, not a conflict.
 
-    Now that SIPP records its own envelope this is no longer "None vs not-None"; the envelope must
+    SIPP records its own envelope, so the check is not merely "None vs not-None": the envelope must
     describe THIS flight. Two far-apart corridors make that checkable by geometry."""
     led = ReservationLedger(CFG)
     sipp = SIPPPlanner()
@@ -223,11 +221,9 @@ def test_sipp_record_envelope_off_leaves_none():
 
 
 def test_sipp_compiled_does_not_maintain_the_blocked_map():
-    """SIPP used to declare `needs_blocked_map = True`, which kept `HexOccupancyService`
-    maintaining a map whose ONLY reader is `is_blocked` — called from `_succ`, i.e. the
-    pure-Python reference, never from the compiled path. Measured 1.807 ms/flight at
-    density_faa scale (5.562 against 3.755) for a structure written on every commit and
-    read on a fallback that does not happen.
+    """Compiled SIPP must NOT keep `HexOccupancyService` maintaining `blocked`, whose ONLY reader is
+    `is_blocked` — called from `_succ`, i.e. the pure-Python reference, not the compiled path.
+    Maintaining it writes the map on every commit for a fallback read that does not happen.
 
     Asserting the flag alone would be worthless (it is a class attribute); assert the
     OBSERVABLE — the service is not writing the map after a compiled plan committed."""
@@ -441,10 +437,10 @@ def test_the_repair_planner_reaches_a_parallel_worker():
     where the parallel engine is deterministic, i.e. at `search_workers=1`. But the merged
     `run_lns_parallel` DELEGATES to the sequential engine below an effective width of two ("a private
     replica cannot add concurrency in that case"), so at m=1 it compares the sequential loop with
-    itself and never spawns a worker at all. At m>=2 there is no byte-parity to assert against. An
-    earlier version of this test papered over that by comparing the parallel run to a sequential A*
-    run — which differ for engine reasons whatever planner the worker used, so it passed against a
-    build with the forward deleted entirely. Each link is checked directly instead."""
+    itself and never spawns a worker at all. At m>=2 there is no byte-parity to assert against.
+    Comparing the parallel run to a sequential A* run would not work either — they differ for engine
+    reasons whatever planner the worker used, so such a gate passes even with the forward deleted
+    entirely. Each link is checked directly instead."""
     from freespace_sim.planner.lns import LNSConfig
     from freespace_sim.planner.lns.parallel import WorkerSpec
     from freespace_sim.planner.lns.solver import _validate_lns_config

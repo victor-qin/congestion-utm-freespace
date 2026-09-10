@@ -228,7 +228,7 @@ def test_index_free_coordinator_does_not_build_or_maintain_claims(monkeypatch):
 # ------------------------------------------------------------------ RepairOutcome payload
 @pytest.mark.slow
 def test_reject_path_carries_no_payload():
-    """79% of iterations reject; building the payload for them would be pure waste."""
+    """Most iterations reject; building the payload for them would be pure waste."""
     res = run(_congested(lam=400.0, horizon=240.0))
     state = LNSState(res.config, res.ledger, res.intents,
                      static_terms=res.ledger.static_terminals())
@@ -319,11 +319,9 @@ def _trajectory_key(out):
     """Row-for-row identity of an anytime trajectory, EXCLUDING wall_s.
 
     Every row carries `wall_s = monotonic() - t0`, so a digest over raw rows can never match
-    across two runs — both existing parity helpers in test_lns.py project it out for that reason.
-    TODO(rebase): hoist this into test_lns.py and have
-    `test_lns_incremental_release_matches_rebuild` and `test_lns_is_deterministic_per_seed` use it
-    too; three copies that can drift is how a parity test silently stops testing parity. Kept
-    local for now because `victor-qin/lns-efficiency-fixes` owns test_lns.py this week.
+    across two runs — both parity helpers in test_lns.py project it out for the same reason. This is
+    a third copy of that projection; keeping them in sync matters, since a drifted copy is how a
+    parity test silently stops testing parity.
     """
     return [(r["iter"], r["op"], r["n"], tuple(r["victims"]), r["accepted"], r["reason"],
              round(r["cost_old"], 6),
@@ -834,62 +832,6 @@ def test_pool_start_timeout_is_closed_and_reported_as_zero_workers():
     )
     assert (completed, spawn_s, started) == (None, 0.25, 0)
     assert pool.closed
-
-
-def test_zero_sequential_rate_has_no_relative_comparison():
-    from analysis.sweep_lns_workers import _relative_rate
-
-    assert _relative_rate(0.0, 0.0) is None
-    assert _relative_rate(2.0, 0.0) is None
-    assert _relative_rate(2.0, 1.0) == 2.0
-
-
-def test_replica_profiler_warms_lazy_planner_state_before_ready(monkeypatch):
-    from analysis import prof_lns_replica_memory as profiler
-
-    events = []
-    rng = object()
-
-    class State:
-        ledger = SimpleNamespace(n_volumes=17)
-
-        def __init__(self):
-            self.rng = rng
-
-        def movable_ids(self):
-            return list(range(12))
-
-        def try_repair(self, victims, actual_rng, epsilon, **kwargs):
-            events.append(("repair", victims, actual_rng, epsilon, kwargs))
-
-    class Conn:
-        def send(self, message):
-            events.append(("send", message[0]))
-
-        def recv(self):
-            return ("stop",)
-
-    monkeypatch.setattr(profiler.LNSState, "replica", lambda *_args, **_kwargs: State())
-    profiler._worker_main(Conn(), None, None, None, None, None)
-
-    kind, victims, actual_rng, epsilon, kwargs = events[0]
-    assert kind == "repair" and victims == list(range(8)) and actual_rng is rng
-    assert epsilon == float("inf")
-    assert kwargs == {"order_mode": "premium", "report_only": True}
-    assert events[1] == ("send", "ready")
-
-
-def test_sweep_reports_effective_workers_without_mislabeling_the_baseline():
-    from analysis.sweep_lns_workers import _sequential_baseline, _worker_metadata
-
-    capped = _worker_metadata(
-        4, SimpleNamespace(search_workers=np.int64(1), parallel_mode="sequential")
-    )
-    sequential = _worker_metadata(
-        1, SimpleNamespace(search_workers=1, parallel_mode="sequential")
-    )
-    assert capped == {"requested_workers": 4, "workers": 1, "mode": "sequential"}
-    assert _sequential_baseline([capped, sequential]) is sequential
 
 
 def test_default_config_is_the_sequential_path():

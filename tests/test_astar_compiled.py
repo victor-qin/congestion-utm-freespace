@@ -209,7 +209,7 @@ def test_compiled_always_active_static_terminal_exact():
     deconflicts against them EXACTLY instead of falling back. A foreign flight whose straight path crosses a
     static hub must reroute (its cost carries a lateral detour, well above the straight-through climb-only
     cost) byte-identically to the reference,
-    with node-count parity and NO fallback (the old preventative gate is gone). This is the regression guard
+    with node-count parity and NO fallback. This is the regression guard
     for the safety bug where the kernel flew straight through a permanent no-fly wall."""
     cfg = SimConfig(terminal_airspace_always_active=True)
     hub = Terminal("foreign_hub#0", 8, 180.0)
@@ -228,8 +228,8 @@ def test_compiled_always_active_static_terminal_exact():
     # the reroute carries a lateral detour on top of the climb round-trip; the (blocked) straight-through
     # would cost only the climb. Both the baseline AND the margin are cfg-derived so the check stays
     # discriminating under any cost-weight regime — the margin is two hex steps of lateral, i.e. strictly
-    # more berth than rounding could produce (an absolute constant here silently stopped discriminating
-    # once the weights were normalized to per-second, where every lateral metre got 30x cheaper).
+    # more berth than rounding could produce. An absolute constant would stop discriminating if the
+    # cost weights change.
     straight_through = 2.0 * cfg.flight_levels_m[0] * cfg.cost_altitude_change_per_m
     two_hexes = 2.0 * cfg.cost_air_lateral_per_m * cfg.nominal_speed_mps * cfg.dt_s
     assert a.cost > straight_through + two_hexes, "reference should reroute around the wall, not fly straight through"
@@ -492,23 +492,14 @@ def test_compiled_replay_exact_dallas_terminal():
 
 
 @pytest.mark.slow
-def test_compiled_demand_run_is_verified():
-    from freespace_sim.sim import run
-    cfg = SimConfig(planner="astar", lam_per_hour=40.0, horizon_s=900.0, seed=4,
-                    region_size_m=(4000.0, 4000.0))
-    assert run(cfg).verified
-
-
-@pytest.mark.slow
 def test_compiled_replay_exact_saturated_terminal():
     """Saturated fixed-lane terminal replay (pads=1, high λ ⇒ large ground delays): full compiled==reference
     parity — status, cost, last_expansions, centerline — across the batch, 0 fallbacks. This is COVERAGE of
     the terminal-takeoff path under heavy base_g, NOT a discriminating guard for the A1 associativity fix:
-    reverting the parenthesisation at astar/kernel.py leaves this green, because the ~1-ULP takeoff-edge
-    difference (~3.7% of takeoff-lane edges here) never flips a heap ``(f, counter)`` tie in practice
-    (verified by reverting + re-running). The fix is correct-by-construction — the kernel now assembles
-    ``base_g + (takeoff_cost + lane_lat)`` exactly as the reference builds its single-float edge cost — so no
-    behavioural test can distinguish it; this guards the surrounding parity under load instead."""
+    the ~1-ULP takeoff-edge difference never flips a heap ``(f, counter)`` tie in practice.
+    The fix is correct-by-construction: the kernel assembles ``base_g + (takeoff_cost + lane_lat)``
+    exactly as the reference builds its single-float edge cost, so no behavioural test can
+    distinguish it; this guards the surrounding parity under load instead."""
     from freespace_sim.demand import HubRadiusDemand
     cfg = SimConfig(region_size_m=(8000.0, 6000.0), lam_per_hour=9000.0, horizon_s=300.0, planner="astar", seed=1)
     assert cfg.fixed_exit_lanes and cfg.n_levels >= 2

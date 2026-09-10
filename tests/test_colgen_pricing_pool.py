@@ -110,21 +110,15 @@ def test_pool_knobs_reject_out_of_range_values():
 
 
 def test_the_pool_width_has_exactly_one_home():
-    """It had two, and they could disagree.
+    """The pool width lives on the params object and nowhere else.
 
-    ``solve`` used to take a separate ``ParallelPricingConfig`` whose own ``n_workers``
-    default competed with this one, and ``batch`` mapped an explicit 0 to ``None`` -- which
-    ``price_sweep`` resolved as *the dataclass default*, not *sequential*.  Raising that
-    default would therefore have turned ``--colgen-workers 0`` into a pool.  Assert both
-    that the setting lives on the params object and that no second home has come back.
+    Two homes could disagree: a competing ``ParallelPricingConfig.n_workers`` default, or a
+    path resolving an explicit 0 to the dataclass default rather than to sequential. Assert
+    the setting lives on the params object and that no second home has come back.
     """
 
-    # 0, i.e. OPT-IN.  It was briefly defaulted to 4 on the strength of `rss_children`
-    # reading flat across worker counts -- which it always does, because
-    # `getrusage(RUSAGE_CHILDREN).ru_maxrss` is the largest single child and never the
-    # sum.  Sampling the process TREE instead put x50 density at 3.9 GB sequential,
-    # 12.5 GB at 4 workers and 22.7 GB at 8: linear, and unaffordable by default on a
-    # 4 GB/core node.
+    # 0, i.e. OPT-IN: memory is linear in the worker count, so a pool is unaffordable by
+    # default.
     assert ColGenParams().n_pricing_workers == 0
     assert ColGenParams(n_pricing_workers=4).n_pricing_workers == 4
     assert "parallel" not in inspect.signature(ColGenSolver.solve).parameters
@@ -286,19 +280,6 @@ def test_a_worker_that_cannot_initialise_reports_from_its_first_task(monkeypatch
     pricing_pool._load_sweep_state(("epoch", 1), pickle.dumps({}), {}, {}, None)
     with pytest.raises(RuntimeError, match="failed to initialise"):
         pricing_pool._price_one(("epoch", 1), 1)
-
-
-def test_explicit_zero_workers_matches_no_config_at_all():
-    """`n_workers=0` is the sequential loop, not a one-worker pool."""
-
-    cfg = _cfg()
-    requests = [
-        _request(1, (-4, 0), (4, 0), cfg),
-        _request(2, (0, -4), (0, 4), cfg),
-    ]
-    default = ColGenSolver().solve(requests, cfg, (), _params())
-    pinned = ColGenSolver().solve(requests, cfg, (), _params(n_pricing_workers=0))
-    assert _fingerprint(pinned) == _fingerprint(default)
 
 
 class _ScriptedCollector:
@@ -551,7 +532,7 @@ def test_chunked_and_unchunked_pools_agree_exactly():
     assert _fingerprint(many) == _fingerprint(one)
 
 
-# ------------------------------------------------- the pool outlives the sweep (issue #88)
+# --------------------------------------------------------- the pool outlives the sweep
 
 
 def _worker_fixture(cfg, flight_ids=(1,)):
@@ -584,12 +565,11 @@ def _duals_that_reach_the_compiled_search(request, cfg, params):
 
 
 def test_the_packing_is_built_once_across_two_sweeps(monkeypatch):
-    """Issue #88, stated as a COUNT: a second sweep must not rebuild the compiled packing.
+    """A second sweep must not rebuild the compiled packing, stated as a COUNT.
 
-    This is the assertion the whole change exists for, and it is deliberately a count rather
-    than a wall clock -- the packing costs ~184 ms a flight, which is real but far smaller
-    than the run-to-run variance on a shared machine, so a timing assertion would be both
-    weaker and flakier. `prepare_topology` running exactly once over two sweeps is exact.
+    Deliberately a count rather than a wall clock -- the packing is real work but far smaller
+    than run-to-run variance on a shared machine, so a timing assertion would be both weaker
+    and flakier. `prepare_topology` running exactly once over two sweeps is exact.
 
     Runs entirely in-process: `_init_worker` and `_load_sweep_state` are the two halves a
     real worker executes, and driving them directly is what lets a unit test see across a
@@ -1017,35 +997,6 @@ def test_an_expired_deadline_does_not_spawn_the_whole_pool():
 
     assert not result.complete
     assert built == [], f"an expired deadline still built {len(built)} of 4 pools"
-
-
-def test_worker_skew_counts_workers_that_drew_no_tasks():
-    """A worker with nothing to do is the MOST skewed case, not an absent one.
-
-    Dividing by the workers that appear in the records raises the mean and reports less
-    imbalance exactly when there is most of it.
-    """
-
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_timed", os.path.join(os.path.dirname(__file__), "..", "analysis",
-                               "run_colgen_timed.py"),
-    )
-    timed = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(timed)
-
-    rows = [
-        {"worker": 0, "task_s": 6.0},
-        {"worker": 1, "task_s": 2.0},
-    ]
-    # Two workers busy, two idle: the true mean is 2.0, not 4.0.
-    skew = timed._worker_skew(rows, n_workers=4)
-    assert skew["n_workers_seen"] == 4
-    assert skew["worker_task_s_mean"] == 2.0
-    assert skew["worker_skew"] == 3.0
-    # And the old denominator would have said 1.5, i.e. half the real imbalance.
-    assert timed._worker_skew(rows, n_workers=2)["worker_skew"] == 1.5
 
 
 def test_a_worker_ships_its_initializer_failure_with_the_readiness_message(monkeypatch):

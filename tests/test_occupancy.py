@@ -65,7 +65,7 @@ def test_evict_drops_past_keeps_future():
 
 
 # --- shared terminal columns — per-cell hub-id set for the cruise own-hub exemption ------------
-# (pad capacity is NOT here anymore — it's gated temporally by TerminalCapacity; see test_terminal_capacity)
+# (pad capacity is NOT here — gated temporally by TerminalCapacity; see test_terminal_capacity)
 
 from freespace_sim.volumes import corridor_segment_volume, hover_reservation   # noqa: E402
 
@@ -253,10 +253,10 @@ def test_reset_keeps_an_armed_map_live_for_the_shrink_rebuild():
     """`reset(keep_blocked_live=True)` must leave the map armed AND correct after the re-absorb.
 
     The shrink-rebuild branch re-absorbs immediately, so dropping the armed flag there costs a
-    second full ledger walk the next time a reference plan calls `enable_blocked` — a 1.37x
-    regression on that path. Keeping it is only safe because `on_commit` writes `blocked` while the
-    map is live, so the very same `_absorb` rebuilds it; this pins BOTH halves, since a version that
-    kept the flag without rebuilding would leave a map that claims to be live and is empty.
+    second full ledger walk the next time a reference plan calls `enable_blocked`. Keeping it is
+    safe only because `on_commit` writes `blocked` while the map is live, so the very same `_absorb`
+    rebuilds it; this pins BOTH halves, since a version that kept the flag without rebuilding would
+    leave a map that claims to be live and is empty.
     """
     from freespace_sim.geometry import box_from_segment
     from freespace_sim.planner.astar.planner import _absorb

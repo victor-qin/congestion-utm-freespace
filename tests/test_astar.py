@@ -135,7 +135,7 @@ def test_committed_arrival_gates_at_the_folded_dest_column_time_not_the_goal_ste
     # — the tail-folded column-edge arrival — not the goal-hex step time st[3]*dt. _committed_arrival
     # rebuilds the candidate path and folds it through the SAME _fold_path _build uses, so the gate time
     # and the committed dest-column t_start agree bit-for-bit; and that time is strictly earlier than the
-    # goal-hex step (proving we no longer gate at st[3]*dt, which over-subscribed pads on 7/8 dallas seeds).
+    # goal-hex step (proving we no longer gate at st[3]*dt, which over-subscribed pads).
     # Legacy path only: fixed exit lanes root the corridor at the boundary cell (no tail fold), so
     # _committed_arrival / _fold_path are the fixed_exit_lanes=False landing gate.
     cfg = SimConfig(fixed_exit_lanes=False)
@@ -312,7 +312,7 @@ def _air_edges(planner, cfg, svc, st, max_step=999):
 def test_vertical_edge_checks_only_traversed_levels_not_all():
     """A 0→1 layer-change edge must require clearance only on the levels it traverses ({0, 1}): an
     obstacle on the UNtraversed level 2 over the same column must NOT block it, while one on the
-    destination level 1 must. (Before the fix the edge required ALL levels clear.)"""
+    destination level 1 must."""
     planner = AStarPlanner()
     q, r, s = 0, 0, 5
     vsteps = max(1, math.ceil((CFG.level_z(1) - CFG.level_z(0)) / (CFG.climb_rate_mps * CFG.dt_s)))
@@ -346,8 +346,7 @@ def _folded_planner(name):
     ``StraightLineTimeShift`` candidate and its own solve, and in empty airspace the warm one wins.
     That candidate is never folded to the terminal columns — its centerline starts exactly at
     ``req.origin`` — so the milp.py detour site never executes and every assertion below would pass
-    vacuously (reverting the milp.py hunk left this test green). Denying the warm start forces the
-    MILP's own folded path to come back.
+    vacuously. Denying the warm start forces the MILP's own folded path to come back.
 
     ``intent.planner == "milp"`` would NOT be a usable guard: ``MILPOptPlanner.plan`` relabels
     whichever candidate wins, including the warm one.
@@ -373,16 +372,14 @@ def test_stretch_never_below_one_leaving_a_terminal(planner):
 
     Under ``fixed_exit_lanes`` the air path starts on a hub boundary lane cell, so the centerline
     spans lane→lane while ``straight_line_m`` spans hub-centre→hub-centre. Comparing them directly
-    books a phantom shortcut (mean 210.0 m/flight on density_test, 172.9 on
-    dallas_hub_2uss_large) and drives ``stretch`` below 1.
-    Bare A*'s hex staircase used to mask it; ``astar_shortcut`` removes the staircase and exposes it
-    on ~71% of flights, so both are checked here — as is the continuous MILP.
+    books a phantom shortcut and drives ``stretch`` below 1. Bare A*'s hex staircase masks it;
+    ``astar_shortcut`` removes the staircase and exposes it, so both are checked here — as is the
+    continuous MILP.
 
-    Which arms actually carry the regression: reverting ``_flown_horizontal_m`` fails ONLY
-    ``astar_shortcut`` (measured stretch 0.9739). ``astar`` passes at 1.1130 because its staircase
-    still covers the fold — the very masking described above — and ``milp`` passes at 1.0007 because
-    it folds to a continuous column edge and barely leaves the ideal line. Both are kept as guards
-    against future drift, not as proof; do not read three green arms as three independent checks.
+    Only ``astar_shortcut`` actually carries the regression: ``astar`` passes because its staircase
+    still covers the fold — the very masking described above — and ``milp`` passes because it folds
+    to a continuous column edge and barely leaves the ideal line. Both are kept as guards against
+    future drift, not as proof; do not read three green arms as three independent checks.
     """
     from freespace_sim import metrics
     from freespace_sim.volumes import enroute_reference_m
@@ -404,10 +401,9 @@ def test_stretch_never_below_one_leaving_a_terminal(planner):
 def test_accepted_stretch_respects_the_detour_budget():
     """The ``max_detour_factor`` gate and the reported ``stretch`` must measure the SAME ratio.
 
-    Issue #50's first cut corrected only the readout, leaving every gate comparing the lane->lane
-    ``cum_horiz`` against the centre->centre straight line. A terminal flight could then pass a
-    ``max_detour_factor`` gate and report a stretch above it — measured 1.1400 against a 1.07 budget.
-    Invisible at the default factor of 100.0, so pin it at a value the fold can actually breach.
+    The bug this guards: a gate comparing the lane->lane ``cum_horiz`` against the centre->centre
+    straight line, so a terminal flight passes the ``max_detour_factor`` gate yet reports a stretch
+    above it. Invisible at the default factor of 100.0, so pin it at a value the fold can breach.
 
     NOT parametrized, deliberately. Once the gate is correct the two refiners simply DENY at this
     budget (no path can shrink the unreserved fold), so as separate params they would be silent
@@ -434,16 +430,11 @@ def test_accepted_stretch_respects_the_detour_budget():
 def test_takeoff_clock_includes_the_egress_traverse(planner):
     """Issue #52: the corridor starts after climb AND the traverse out to the lane cell.
 
-    Parametrized over EVERY planner, not just astar. The first version tested astar alone, and the
-    refiners kept the bug for two more review rounds: astar read a feasible 13.60 m/s while
-    astar_shortcut implied 54.42 and the MILP family 42.00, because they build through
-    ``volumes.build_reservation_from_corners`` rather than ``astar._build`` and that path started the
-    corridor before the egress was flown.
-
-    A* used to advance the clock by the climb alone, so the drone teleported sideways out of its own
-    column — 272 m in 8 s on a 180 m hub at the 30 m ladder floor, i.e. 34.0 m/s against a 30 m/s
-    limit (40.1 m/s is the worst bearing on the same hub; this flight's is 34.0). Nothing in the suite caught the whole change being reverted, so pin the physics directly:
-    the implied ground speed of the egress must not exceed nominal_speed_mps.
+    Parametrized over EVERY planner, not just astar: the refiners build through
+    ``volumes.build_reservation_from_corners`` rather than ``astar._build``, and that path is what
+    started the corridor before the egress was flown. If the clock advances by the climb alone the
+    drone teleports sideways out of its own column, so pin the physics directly: the implied ground
+    speed of the egress must not exceed nominal_speed_mps.
     """
     cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), airspace_ceiling_m=135.0,
                     region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0)
@@ -471,9 +462,8 @@ def test_column_window_covers_the_actual_traverse():
 
     Asserting only ``window == max(steps)*dt`` would be a TAUTOLOGY — that is what the implementation
     says. It has to be pinned against the PHYSICAL traverse instead: with a tautological assertion,
-    changing ``math.ceil`` to ``int`` in ``Lane.steps`` yields an 8.000 s window against a 10.583 s
-    traverse (2.583 s of unreserved occupancy, worse than the 1.417 s defect this was written for)
-    and still passes.
+    changing ``math.ceil`` to ``int`` in ``Lane.steps`` would leave the window short of the traverse
+    (unreserved occupancy) and still pass.
     """
     cfg = SimConfig(terminal_radius_m=180.0)
     hub = Terminal("hub#0", 8, 180.0)
@@ -496,11 +486,10 @@ def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines(stra
 
     Two independent regressions hid here, both invisible to every other test:
       * ``ShortcutRefiner`` recovered ``t_depart`` by subtracting only the climb from centerline[0],
-        but #52 put ``Lane.steps*dt`` in there too — so the whole rebuilt reservation started 15 s
-        LATE, leaving the origin column unreserved while the drone was still inside it;
+        omitting the ``Lane.steps*dt`` egress — so the rebuilt reservation started LATE, leaving the
+        origin column unreserved while the drone was still inside it;
       * ``build_reservation_from_corners`` sized both columns ``hover + climb`` with no egress, so the
-        rebuilt column was 12 s SHORTER than the one the flight had been gated against.
-    Together the refined flight's column was [15, 50] where the planner's was [0, 47].
+        rebuilt column was SHORTER than the one the flight had been gated against.
     """
     cfg = SimConfig(terminal_radius_m=180.0)
     hub = Terminal("hub#0", 8, 180.0)
@@ -520,8 +509,8 @@ def test_refiner_commits_the_same_terminal_column_as_the_planner_it_refines(stra
         "t_depart recovery lost the egress traverse")
     # ... and the CORRIDOR too: the refiner re-times splices, never the takeoff. The rebuild's own
     # clock is continuous (climb_time_to + WORST lane) while A* stamps quantised (climb_steps*dt +
-    # CHOSEN lane's steps), so re-deriving the start shifted every rebuilt volume by -3..+1 s,
-    # lane-dependent; corridor_t0 anchors the rebuild at the stamp the inner planner verified.
+    # CHOSEN lane's steps), so re-deriving the start would shift every rebuilt volume;
+    # corridor_t0 anchors the rebuild at the stamp the inner planner verified.
     assert refined.centerline[0][1] == bare.centerline[0][1], (
         f"refined corridor starts {refined.centerline[0][1] - bare.centerline[0][1]:+.1f}s off the "
         "stamp the inner planner verified against the ledger")
@@ -541,9 +530,8 @@ def test_capacity_gate_probes_the_full_column_window_not_the_climb():
     The binding case is a prober sitting just BEFORE an already-committed dwell: FCFS-ordered probes
     never expose a short gate window, because the RECORDED dwell interval carries the commit-side
     tail regardless. Here A is committed with a delayed takeoff and B probes from t=0 underneath it:
-    with the gate reverted to a climb-only window, B is admitted at t=0 and its committed column
-    overlaps A's by 7.00 s at pad capacity 1 (measured) — the oversubscription the gate exists to
-    prevent.
+    with a climb-only gate window B is admitted at t=0 and its committed column overlaps A's at pad
+    capacity 1 — the oversubscription the gate exists to prevent.
     """
     cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), airspace_ceiling_m=135.0,
                     region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0)
@@ -573,17 +561,16 @@ def test_read_envelope_covers_the_landing_dwell_traverse():
     """Track A: a commit inside the LAST traverse seconds of a landing-dwell read must read as DIRTY.
 
     A dwell/capacity probe at the plan's final step reads ``hover + climb + lane traverse`` past it,
-    but ``hover_tail_steps`` covers hover + max climb + buffer only — at 350 m radius the traverse
-    (20 s) outruns the buffer by 4.33 s, and pre-fix a commit in that sliver reported
-    ``envelope_intersects == False``: exact-mode revalidation would silently miss a real conflict.
+    but ``hover_tail_steps`` covers hover + max climb + buffer only — at a wide radius the traverse
+    outruns the buffer, and a commit in that sliver would report ``envelope_intersects == False``:
+    exact-mode revalidation would silently miss a real conflict.
 
     Load-bearing anchor: for a fixed request the radius enters ``t_hi`` through exactly TWO terms —
-    ``search_horizon``'s takeoff term now carries the worst origin-lane steps (one traverse), and
+    ``search_horizon``'s takeoff term carries the worst origin-lane steps (one traverse), and
     ``_mk_envelope`` adds the worst-end traverse again for the dwell read past the last step — so
-    ``t_hi(350) - t_hi(90) == 2 * (traverse(350) - traverse(90))``. Reverting EITHER widening drops
+    ``t_hi(350) - t_hi(90) == 2 * (traverse(350) - traverse(90))``. Dropping EITHER widening drops
     the difference to one traverse (or zero for both) and fails this. Anchoring a sliver on
-    ``env.t_hi`` alone slides WITH the fix and passes with it reverted — measured, the first
-    version of this test did exactly that.
+    ``env.t_hi`` alone would slide WITH the fix and pass with it reverted, so it is not used here.
     """
     from freespace_sim.parallel import envelope_intersects
     from freespace_sim.planner.astar.compiled_hex_occupancy import hover_tail_steps

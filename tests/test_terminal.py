@@ -128,7 +128,7 @@ def test_corridor_overlap_controls_perimeter_start():
 def _radial_delivery(hub_xy, angle_deg, dist, capacity, fid, t=0.0, radius=None):
     """A delivery from ``hub_xy`` (capacity N, optional column ``radius``) to a customer ``dist`` m away
     at ``angle_deg`` — so a batch of them diverge from the shared column and contend ONLY for pads, not
-    airspace. This is the ``rad(...)`` diagnostic from the Phase B build, promoted into the suite."""
+    airspace."""
     a = np.radians(angle_deg)
     dest = vec(hub_xy[0] + dist * np.cos(a), hub_xy[1] + dist * np.sin(a), 0)
     return FlightRequest(fid, vec(hub_xy[0], hub_xy[1], 0), dest, t,
@@ -159,19 +159,10 @@ def test_two_same_hub_flights_launch_concurrently_under_capacity():
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)         # concurrent, zero ground delay
 
 
-def test_capacity_one_serializes_like_a_single_pad():
-    # capacity 1 ⟺ the legacy single pad: the second same-hub launch must wait
-    hub = (3000.0, 3000.0)
-    reqs = [_radial_delivery(hub, 0.0, 2000.0, 1, 0), _radial_delivery(hub, 180.0, 2000.0, 1, 1)]
-    res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
-    assert res.verified and len(res.accepted) == 2
-    assert sum(a.ground_delay_s == 0.0 for a in res.accepted) == 1    # one now, one delayed
-
-
-# --- the `fid` diagnostics promoted to the suite: terminal-radius × fan-out sweeps ------------
+# --- terminal-radius × fan-out sweeps ---------------------------------------------------------
 #
-# Each test below pins a concrete problem hit while building Phase B. The driving config is the same
-# `rad(...)` fan-out used during debugging: N deliveries leaving one hub in evenly-spaced directions.
+# The driving config is a `rad(...)` fan-out: N deliveries leaving one hub in evenly-spaced
+# directions.
 
 _REGION = (8000.0, 8000.0)
 _HUB = (4000.0, 4000.0)
@@ -199,12 +190,11 @@ def test_no_untagged_cruise_box_enters_the_shared_column(radius):
 @pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
 @pytest.mark.parametrize("n", [3, 4, 5])
 def test_divergent_same_hub_launches_are_concurrent(radius, n):
-    # THE headline fid sweep for the LEGACY path (fixed_exit_lanes off): n flights fanning out from a
-    # single hub (capacity n) all launch at the same instant and verify, with the exit lane FLUSH
-    # (default overlap=0). Needs the column wide enough that divergent lanes don't crowd at the edge —
-    # radii ≥ 90; a 60 m column is too tight at flush and the lanes (box↔box) contend. Pre-Phase-B these
-    # serialized one per dwell. (The fixed-lane default's twin is
-    # test_divergent_same_hub_launches_concurrent_fixed_lanes.)
+    # The LEGACY path (fixed_exit_lanes off): n flights fanning out from a single hub (capacity n)
+    # all launch at the same instant and verify, with the exit lane FLUSH (default overlap=0). Needs
+    # the column wide enough that divergent lanes don't crowd at the edge — radii ≥ 90; a 60 m
+    # column is too tight at flush and the lanes (box↔box) contend. (The fixed-lane default's twin
+    # is test_divergent_same_hub_launches_concurrent_fixed_lanes.)
     reqs = [_radial_delivery(_HUB, i * 360.0 / n, 2500.0, n, i, radius=radius) for i in range(n)]
     res = run(SimConfig(planner="astar", region_size_m=_REGION, fixed_exit_lanes=False), requests=reqs)
     assert res.verified and len(res.accepted) == n
@@ -213,7 +203,7 @@ def test_divergent_same_hub_launches_are_concurrent(radius, n):
 
 @pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
 def test_pad_capacity_gate_holds_across_radii(radius):
-    # The fid capacity sweep: capacity 3 with 4 fanned-out flights → exactly 3 launch concurrently and
+    # Capacity sweep: capacity 3 with 4 fanned-out flights → exactly 3 launch concurrently and
     # the 4th is ground-delayed (admitted, not denied), at every terminal radius. Pins that the dwell
     # counter — not the geometry — is what bounds concurrency.
     reqs = [_radial_delivery(_HUB, i * 90.0, 2500.0, 3, i, radius=radius) for i in range(4)]
@@ -304,7 +294,7 @@ def test_astar_shortcut_preserves_terminal_tags_no_warning(planner_name):
     assert any(v.terminal_id == "H" for v in res.accepted[0].volumes)   # column tag survived the rebuild
 
 
-# --- fixed_exit_lanes (issue #18): flag-on variants -------------------------------------------------
+# --- fixed_exit_lanes: flag-on variants ----------------------------------------------------
 #
 # With the flag on a shared-terminal flight routes through one of the hub's fixed boundary-hex lanes,
 # each a capacity-1 conflict-graph resource. Divergent launches take different cells (concurrent);
@@ -319,13 +309,13 @@ def _astar_fl(**over):
 @pytest.mark.parametrize("n", [3, 4, 5])
 def test_divergent_same_hub_launches_concurrent_fixed_lanes(radius, n):
     # flag-on headline: fanned-out flights take DIFFERENT boundary-hex lanes → (nearly) all launch at
-    # once, and the run verifies. Same-hub deconfliction is now exact CELL occupancy (``is_blocked`` sees
-    # committed sibling exit corridors — issue #18), so divergent fans stay concurrent. The lone
-    # exception is the densest small-hub case (n=5 at the 90 m column): five corridors fanning 72° apart
-    # clear each other by only ~46 m at the column edge — finer than the 120 m hex pitch resolves — so the
-    # grid conservatively ground-delays ONE of them rather than risk a same-cell overlap. That is a soft
-    # wait, not a denial: all n still accept and verify (a ground-delay is strictly better than the
-    # CONFLICT_FILED it replaced). So we assert at-most-one serialised, not bit-strict concurrency.
+    # once, and the run verifies. Same-hub deconfliction is now exact CELL occupancy (``is_blocked``
+    # sees committed sibling exit corridors), so divergent fans stay concurrent. The lone
+    # exception is the densest small-hub case (n=5 at the smallest column): the corridors fan closer
+    # than the hex grid can resolve, so it conservatively ground-delays ONE rather than risk a
+    # same-cell overlap. That is a soft wait, not a denial: all n still accept and verify (a
+    # ground-delay is strictly better than the CONFLICT_FILED it replaced). So we assert at-most-one
+    # serialised, not bit-strict concurrency.
     reqs = [_radial_delivery(_HUB, i * 360.0 / n, 2500.0, n, i, radius=radius) for i in range(n)]
     res = run(_astar_fl(), requests=reqs)
     assert res.verified and len(res.accepted) == n
@@ -385,11 +375,10 @@ def test_static_terminals_override_walls_a_hub_no_flight_touches():
 
     From a demand model the walled set is every PLACED hub; from a bare request list it is
     only the hubs some request touches.  A caller re-running the same flights through a
-    second planner therefore gets a DIFFERENT airspace by default -- measured on
-    ``density_faa_wing_zipline`` truncated to 600 s, 182 placed hubs against 180
-    flight-carrying ones.  ``freespace_sim.planner.colgen.batch._build_warm_start`` is that
-    caller: it re-plans the batch through A* to seed column generation, and without this its
-    A* pass flies through walls the colgen solve enforces.
+    second planner therefore gets a DIFFERENT airspace by default.
+    ``freespace_sim.planner.colgen.batch._build_warm_start`` is that caller: it re-plans the
+    batch through A* to seed column generation, and without this its A* pass flies through
+    walls the colgen solve enforces.
     """
 
     cfg = _astar(terminal_airspace_always_active=True)

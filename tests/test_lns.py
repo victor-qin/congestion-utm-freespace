@@ -1194,10 +1194,9 @@ def test_sim_run_records_the_anchor_mode_it_flew():
 
 def test_reference_fallback_does_not_trigger_a_shrink_rebuild():
     """`enable_blocked` replays the whole ledger through `add_volume` to re-derive `blocked`. That is
-    a re-derive, not an absorb — but `n_added` used to be incremented inside `add_volume`, so the
-    replay doubled it (measured 852,570 against a 426,285-volume ledger). From then on
-    `ledger.n_volumes < svc.n_added` held forever, so the NEXT plan took the shrink branch and
-    re-absorbed the entire schedule: 9.98 s of an 88 s LNS loop.
+    a re-derive, not an absorb, so it must NOT increment `n_added` — a replay that double-counts
+    leaves `ledger.n_volumes < svc.n_added` forever, so the NEXT plan takes the shrink branch and
+    re-absorbs the entire schedule.
 
     It was invisible because `run_lns` filters the "ReservationLedger shrank" warning (a genuine
     non-incremental release would raise it every iteration), which is why the guard here is the

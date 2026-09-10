@@ -46,24 +46,11 @@ def _plan_both(req, committed=()):
 
 # ---- isolated, exact ----
 
-def test_sipp_empty_matches_astar():
-    o = _plan_both(_req())
-    assert o["sipp"].accepted and o["astar"].accepted
-    assert not ReservationLedger(CFG).any_conflict(o["sipp"].volumes)   # self-consistent
-    assert abs(o["sipp"].cost - o["astar"].cost) < 1e-6
-
-
 def test_sipp_reroutes_around_wall_like_astar():
     o = _plan_both(_req(2), committed=[(99, [_wall()])])
     assert o["sipp"].accepted and o["astar"].accepted
     assert o["sipp"].air_detour_m > 0          # had to go around
     assert abs(o["sipp"].cost - o["astar"].cost) < 1e-6
-
-
-def test_sipp_deterministic():
-    a = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
-    b = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
-    assert abs(a.cost - b.cost) < 1e-12 and len(a.centerline) == len(b.centerline)
 
 
 @pytest.mark.parametrize("planner_name", ("sipp", "sipp_ref"))

@@ -91,9 +91,7 @@ class LNSConfig:
     # worker builds its own inside a spawned process, so this has to survive `WorkerSpec`'s
     # picklability contract. "sipp" collapses the per-step axis into safe intervals and wins in
     # congestion; it also maintains one more ledger-subscribed structure than A* on terminal legs.
-    # See context/sipp_lns_plan.md. APPENDED AT THE TAIL deliberately — `LNSConfig` is constructed
-    # positionally by `test_lns_config_preserves_the_legacy_positional_tail`, so a field inserted
-    # mid-dataclass silently re-binds every argument after it.
+    # See context/sipp_lns_plan.md.
     repair_planner: str = "astar"
 
 

@@ -299,7 +299,7 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
     # The air-time ceiling is lifted: replacing terminal fold distance with an extra hop is
     # itself an air-time overrun, and this test is about the delay accounting rather than
     # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic. Lifted at
-    # the graph so the corridor stays where the fixture put it (issue #78: one knob sizes both).
+    # the graph so the corridor stays where the fixture put it (one knob sizes both).
     #
     # `objective` is pinned to `total_delay` rather than left at the shipped `total_cost`,
     # and this is the one test in the file where that is the right call rather than a dodge.
@@ -437,10 +437,10 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
 
     That contract is about the ELLIPSE and the revisit window, so the air-time ceiling is
     lifted out of the way with `with_air_hops`: the loop below is 6 hops for a 2-hop flight,
-    so a small hop budget -- not the geometry under test -- would decide the answer. Since
-    issue #78 one knob sizes both, so lifting the ceiling through `ColGenParams` would widen
-    the corridor with it and change the instance; the graph-level override holds the corridor
-    at 2 and moves only the budget.
+    so a small hop budget -- not the geometry under test -- would decide the answer. One knob
+    sizes both, so lifting the ceiling through `ColGenParams` would widen the corridor with it
+    and change the instance; the graph-level override holds the corridor at 2 and moves only
+    the budget.
     `test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows` pins that side.
     """
 
@@ -469,9 +469,7 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
         (2, 0),
     )
     assert len(column.cell_path) - 1 > graph.shortest_hops + corridor
-    # 4 excess hops x dt(4 s) x w_air(3) under the config's 1:3 weighting.  The COLUMN is
-    # the same one this test has always asserted -- the path equality above is unchanged --
-    # and only the currency it is priced in moved, from 16 s to 48 cost.
+    # 4 excess hops x dt(4 s) x w_air(3) under the config's 1:3 weighting.
     assert column.delay_s == pytest.approx(48.0)
     assert reduced_cost == pytest.approx(params.M - 48.0)
     assert column.claims.isdisjoint(duals)
@@ -856,11 +854,10 @@ def test_hand_checked_detour_beats_hold():
         _params(max_air_overrun_hops=1, gap_metric="cost"),
     )
 
-    # The claim is unchanged and is the name of the test: a one-hop detour still beats a
-    # four-step hold.  Only the margin moved.  Under the config's 1:3 weighting the hold
-    # costs 16 (16 ground seconds, w_ground = 1, the numeraire) and the detour costs 12
-    # (1 hop x dt(4 s) x w_air(3)) -- so the detour wins by 4 where it used to win by 12.
-    # That narrowing is the point of the weighting, and a ratio above 4:1 would flip it.
+    # The claim is the name of the test: a one-hop detour still beats a four-step hold.
+    # Under the config's 1:3 weighting the hold costs 16 (16 ground seconds, w_ground = 1,
+    # the numeraire) and the detour costs 12 (1 hop x dt(4 s) x w_air(3)) -- so the detour
+    # wins by 4, and a ratio above 4:1 would flip it.
     assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
     assert with_detour.stats["objective"] == pytest.approx(12.0, abs=1e-8)
     assert with_detour.stats["objective"] < no_detour.stats["objective"]
@@ -900,24 +897,21 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
         cfg,
         (),
         # M pinned, because this test IS the demonstration that the revenue scale goes
-        # degenerate when M dwarfs cost -- so it cannot ride on whatever M ships.  The
-        # shipped default is now 1e4, where the same absolute gap reads ~1.2e-4 instead of
-        # ~1.2e-6 and no longer closes: the denominator is `n*M - cost`, so shrinking M by
-        # 100 grows the ratio by 100.  That is precisely why the default moved, and pinning
-        # 1e6 here keeps the pathology on the record rather than deleting the evidence.
+        # degenerate when M dwarfs cost -- so it cannot ride on whatever M ships.  At the
+        # shipped default the same absolute gap no longer closes: the denominator is
+        # `n*M - cost`, so shrinking M grows the ratio in proportion.  Pinning 1e6 here keeps
+        # the pathology on the record rather than deleting the evidence.
         _params(max_air_overrun_hops=1, gap_metric="revenue", M=1_000_000.0),
     )
 
     assert revenue.stats["termination_reason"] == "lp_gap"
     assert revenue.stats["iterations"] == 1
-    # Optimal solution ... (12 = 1 detour hop x dt(4 s) x w_air(3); the same column as
-    # before the objective default moved to the config's 1:3 weighting, repriced)
+    # Optimal solution ... (12 = 1 detour hop x dt(4 s) x w_air(3))
     assert revenue.stats["objective"] == pytest.approx(12.0, abs=1e-8)
     assert revenue.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
     # ... reached while the two scales disagree by orders of magnitude.  Asserted as the
-    # RATIO between them rather than as a floor on the cost gap: `lp_gap_cost` normalises
-    # the same absolute gap by total cost, so repricing the optimum from 4 to 12 divides it
-    # by three (0.75 -> 0.25) without changing anything this test is about.  The ratio is
+    # RATIO between them rather than as a floor on the cost gap: `lp_gap_cost` normalises the
+    # absolute gap by total cost, so the floor would depend on the currency.  The ratio is
     # the claim -- the revenue scale closes while the cost scale is nowhere near closing.
     assert revenue.stats["lp_gap_revenue"] < 1e-4
     assert revenue.stats["lp_gap_cost"] > 0.2
@@ -1115,9 +1109,9 @@ def test_first_master_has_only_bounded_shortest_path_initialization(monkeypatch)
     assert set(first_lp_counts) == {1, 2}
     # The contract is "no ROUTE alternatives before the first LP", and a departure
     # ladder is not one: every pre-LP column for a flight is the same cell path at a
-    # different clock.  Asserting that directly is stronger than the old <=2 column
-    # count, which was a proxy that the ladder (seed_ladder_steps) invalidated without
-    # touching the invariant.
+    # different clock.  Asserting route uniqueness directly is stronger than a column-count
+    # proxy, which the ladder (seed_ladder_steps) would invalidate without touching the
+    # invariant.
     assert max(first_lp_counts.values()) <= 1 + _params().seed_ladder_steps
     assert all(len(routes) == 1 for routes in first_lp_routes.values()), (
         f"pre-LP pool holds route alternatives: {first_lp_routes}"
@@ -1369,10 +1363,9 @@ def test_seed_columns_warm_start_the_pool_without_changing_the_answer():
 
     solver.py keeps initialization deliberately small on the bet that route alternatives
     are cheaper to discover by reduced-cost pricing than to enumerate up front.  This
-    parameter exists so that bet can be measured instead of assumed -- forensics on a
-    100-flight solve found ~95% of early additions were time shifts of a route already
-    in the pool, which `_shift_column` produces arithmetically while a pricing sweep
-    costs 15-17s.
+    parameter exists so that bet can be measured instead of assumed -- most early additions
+    are time shifts of a route already in the pool, which `_shift_column` produces
+    arithmetically while a pricing sweep is far more expensive.
 
     Whatever seeding does to iteration count, it must not move the objective: every
     seeded column goes through the same canonical claim gate, so it cannot introduce a
@@ -1418,10 +1411,9 @@ def test_seed_columns_warm_start_the_pool_without_changing_the_answer():
 def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
     """The final IP was the last unattributed block in the solve.
 
-    It matters because the intuition is wrong by orders of magnitude: on a 1,138-column
-    100-flight pool the whole solve took 643s and the IP was under a second of it, the
-    rest being pricing.  Without a number, "the IP is slow" is an unfalsifiable
-    explanation for any slow run.
+    It matters because the intuition is wrong by orders of magnitude: the IP is a tiny part
+    of the solve and pricing dominates.  Without a number, "the IP is slow" is an
+    unfalsifiable explanation for any slow run.
     """
 
     cfg = _cfg(max_ground_delay_s=32.0)
@@ -1430,13 +1422,9 @@ def test_ip_solve_is_timed_separately_from_the_rest_of_the_solve():
         _request(2, (0, -4), (0, 4), cfg),
     ]
 
-    # ladder off so the heuristic cannot prove the gap and skip the MILP outright.
-    # `max_iterations=1` is what keeps this fixture reaching the IP at all.  Under the
-    # shipped `gap_metric="cost"` the loop runs to convergence on a two-flight instance
-    # (3 iterations, terminating on `lp_gap`), the heuristic reaches the optimum,
-    # `heuristic_gap_cost` is exactly 0.0, and the solver correctly SKIPS the MILP --
-    # there is nothing left for it to close.  A test about IP mechanics has to stop the
-    # loop short of that, so it is asserting on an IP that actually ran.
+    # `max_iterations=1` and the ladder off are what keep this fixture reaching the IP:
+    # otherwise the loop converges, the heuristic reaches the optimum, and the solver
+    # correctly SKIPS the MILP.  A test about IP mechanics has to stop the loop short of that.
     result = ColGenSolver().solve(
         requests, cfg, (), _params(seed_ladder_steps=0, max_iterations=1)
     )
@@ -1453,8 +1441,7 @@ def test_a_row_only_one_flight_can_claim_is_never_bindable():
     """The filter's whole premise: one flight cannot overfill a capacity-one row.
 
     The flight rows are ``sum(x_c for c in flight) <= 1``, so however many columns a single
-    flight has on a row, at most one of them is ever selected.  Measured consequence on
-    ``density_faa_wing_zipline`` x1000: 95.3% of the 2,184,200 touched rows are in this
+    flight has on a row, at most one of them is ever selected.  Most touched rows are in this
     class and need never be materialized at all.
     """
 
@@ -1509,9 +1496,8 @@ def test_a_row_already_full_of_committed_load_binds_on_its_first_claimant():
 def test_eager_materialization_removes_the_separation_rounds():
     """The payoff: the loop should confirm feasibility, not search for it.
 
-    Measured motivation — at 1000 flights the lazy loop ran 16 rounds in 900 s and still
-    returned ``time_limit_separation``, having materialized 59,843 rows of the ~95,000 that
-    can bind.
+    The lazy loop could time out running separation rounds and still return
+    ``time_limit_separation`` without materializing every bindable row.
     """
 
     cfg = _cfg(max_ground_delay_s=32.0)
@@ -1519,12 +1505,8 @@ def test_eager_materialization_removes_the_separation_rounds():
         _request(1, (-4, 0), (4, 0), cfg),
         _request(2, (0, -4), (0, 4), cfg),
     ]
-    # `max_iterations=1` is what keeps this fixture reaching the IP at all.  Under the
-    # shipped `gap_metric="cost"` the loop runs to convergence on a two-flight instance
-    # (3 iterations, terminating on `lp_gap`), the heuristic reaches the optimum,
-    # `heuristic_gap_cost` is exactly 0.0, and the solver correctly SKIPS the MILP --
-    # there is nothing left for it to close.  A test about IP mechanics has to stop the
-    # loop short of that, so it is asserting on an IP that actually ran.
+    # `max_iterations=1` and the ladder off keep this fixture reaching the IP: otherwise the
+    # loop converges to the optimum and the solver SKIPS the MILP, leaving nothing to assert.
     result = ColGenSolver().solve(
         requests, cfg, (), _params(seed_ladder_steps=0, max_iterations=1)
     )
@@ -1598,9 +1580,8 @@ def test_max_eager_rows_is_all_or_nothing():
 def test_a_better_seed_schedule_becomes_the_incumbent_not_just_pool_contents():
     """A supplied schedule must be reachable when the IP is truncated, not only through it.
 
-    Pool-only seeding leaves the caller's schedule behind a final MILP that may never
-    finish: measured at 1,500 flights, the run reported the shifted-seed heuristic's
-    233,520 while A*'s 211,440 sat unused in the pool.  Taking a feasible, better seed
+    Pool-only seeding leaves the caller's schedule behind a final MILP that may never finish,
+    so a better seed selection can sit unused in the pool.  Taking a feasible, better seed
     selection as the INCUMBENT makes the fallback the better of the two.
     """
 
@@ -1640,9 +1621,9 @@ def test_an_infeasible_seed_selection_is_never_taken_as_the_incumbent():
 def test_completion_repicks_the_flights_the_pins_leave_out():
     """A flight the warm start misses takes its best COMPATIBLE column, not its cheapest.
 
-    The 1,500-flight failure in miniature.  Overlaying seeds onto another heuristic keeps
-    that heuristic's column for every uncovered flight, and one clash there discards the
-    whole warm start -- measured as 7 leftovers sinking 1,493 good columns.
+    Overlaying seeds onto another heuristic keeps that heuristic's column for every uncovered
+    flight, and one clash there discards the whole warm start -- a few leftovers can sink many
+    good columns.
     """
 
     pinned_row = RowKey.cell((0, 0), 0, 0)
@@ -1805,9 +1786,7 @@ def test_ip_gets_its_own_budget_not_the_whole_solve_remainder(monkeypatch):
 
     Without this the IP inherits ``deadline - now``, which is unbounded from the IP's
     point of view exactly when the loop went WELL — a solve that converges early hands
-    the MILP every remaining second.  Measured on ``density_faa_wing_zipline`` x1000
-    with ``time_limit_s=10800``: pricing finished in ~21 minutes, then the IP ran 30+
-    minutes with ~2 hours of budget still to burn.
+    the MILP every remaining second.
 
     Asserted on the budget the backend is actually given rather than on wall time, so
     the test pins the arithmetic instead of racing a real MILP.
@@ -1869,9 +1848,8 @@ def test_iteration_payload_carries_both_gap_scales_and_the_master():
 
     Both scales, because with an artificial big-M the revenue gap reads as converged
     while the cost gap is still enormous.  The master itself, because the rounding
-    heuristic and the restricted IP over the same columns are different numbers --
-    measured 13,266.8 vs 13,099.3 on one pool -- so only holding the master lets an
-    analysis run ask what the IP would have said at that iteration.
+    heuristic and the restricted IP over the same columns are different numbers, so only
+    holding the master lets an analysis run ask what the IP would have said at that iteration.
     """
 
     cfg = _cfg(max_ground_delay_s=32.0)
@@ -2312,9 +2290,9 @@ def test_the_air_time_ceiling_forbids_the_loop_the_ellipse_allows():
     have detoured around. Suboptimal by construction.
 
     Both arms share ONE graph, so the corridor is identical by reference and only the budget
-    moves. That is stronger than the two-graph form this replaced: with the corridor knob
-    deleted (issue #78) two `build_flight_graph` calls at different budgets would differ in
-    corridor too, and the comparison would no longer isolate the ceiling.
+    moves. That is stronger than a two-graph form: with one knob sizing both, two
+    `build_flight_graph` calls at different budgets would differ in corridor too, and the
+    comparison would no longer isolate the ceiling.
     """
 
     cfg = _cfg(max_ground_delay_s=16.0)
@@ -2431,8 +2409,7 @@ def test_warm_start_planner_defaults_off_and_validates_its_name():
 
     A silent no-op warm start is invisible in the output: the run looks like an ordinary
     unseeded solve, so the seeded and unseeded arms of an experiment become impossible to
-    tell apart afterwards.  Off by default because turning it on changes what "colgen"
-    means -- unaided colgen is +11.3% against A* at x1500, A*-seeded is -7.1%.
+    tell apart afterwards.  Off by default because turning it on changes what "colgen" means.
     """
 
     assert ColGenParams().max_eager_ip_rows is None
@@ -2467,9 +2444,8 @@ def test_the_warm_start_plans_against_the_batch_s_walls_not_its_own(monkeypatch)
     demand model it is every PLACED hub, from a bare request list only the hubs some flight
     touches.  `_build_warm_start` re-runs the batch's flights as a bare request list, so a
     hub drawing no flight this horizon is SOLID for the colgen solve and OPEN for the A*
-    pass seeding it.  Measured on ``density_faa_wing_zipline`` truncated to 600 s: 182
-    placed hubs against 180 flight-carrying ones, so A* routes through two walls colgen
-    enforces and the columns carrying them are rejected in translation and booked as drops.
+    pass seeding it -- A* then routes through walls colgen enforces, and the columns carrying
+    them are rejected in translation and booked as drops.
 
     Asserted on what reaches ``sim.run`` rather than on a routing outcome, because the
     divergence needs a zero-flight hub to be observable and building one here would test
@@ -2671,12 +2647,6 @@ def test_warm_start_max_shift_is_below_the_shared_origin_threshold():
     leaves the departure window far wider than any shift tried, so this measures the search
     and nothing else.  That separation is the whole point -- raising ``max_shift`` buys more
     SEARCH, not more legal delay, and the two are easy to conflate.
-
-    Measured thresholds on this fixture shape, which is why the default lands where it does:
-
-        crossing paths        4 steps (16 s)  -- inside the default 8
-        shared origin        13 steps (52 s)  -- outside it, asserted here
-        identical path       15 steps (60 s)  -- outside it
 
     A column's claims span roughly twenty steps of corridor, so two flights leaving the SAME
     cell stay in contact until one clears most of that span, whereas a crossing pair shares

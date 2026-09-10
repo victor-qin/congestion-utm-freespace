@@ -33,8 +33,8 @@ except ImportError:                     # numba absent — this module must stil
     # `planner` imports it at module level (for `empty_wbox`/`window_bounds`/`disable`, which are
     # plain Python), while its numba fallback is an ImportError guard around `.kernel` inside
     # `AStarPlanner.__init__`. A hard import here would turn "degrade to the reference search" into
-    # "the package will not import" — which is exactly what it did before this guard existed, and
-    # what `tests/test_astar_window.py::test_window_module_imports_without_numba` now pins.
+    # "the package will not import"; that it still imports without numba is pinned by
+    # `tests/test_astar_window.py::test_window_module_imports_without_numba`.
     #
     # The stand-in binds a body that RAISES rather than a pure-Python one that works. Nothing can
     # reach it — without a kernel every plan goes to `_plan_reference`, which never builds a window —
@@ -69,7 +69,18 @@ WSTATS_N = 3
 @njit(cache=True, nogil=True)
 def _fill_row(win, row, wsteps):
     """Mark every in-window step of ``row`` blocked. Padding bits past ``wsteps`` stay 0 — the kernel
-    never reads them, and leaving them clear keeps the row's meaning unambiguous."""
+    never reads them, and leaving them clear keeps the row's meaning unambiguous.
+
+    Parameters
+    ------------
+    - win (np.ndarray): bit-packed occupancy bitmap (uint8), mutated in place.
+    - row (int): byte offset of this row's first byte within ``win``.
+    - wsteps (int): number of active steps in the window; bits ``0..wsteps-1`` are set.
+
+    Return
+    --------
+    - output (None): no return value; sets this row's step bits in ``win`` in place.
+    """
     full = wsteps >> 3
     for i in range(full):
         win[row + i] = np.uint8(0xFF)
@@ -80,8 +91,19 @@ def _fill_row(win, row, wsteps):
 
 @njit(cache=True, nogil=True)
 def _set_range(win, row, k0, k1):
-    """Set bits ``k0..k1`` inclusive — the blocked side of a claim paint, and the exact mirror of
-    :func:`_clear_range`."""
+    """Set bits ``k0..k1`` inclusive in ``row`` — paints one claim's steps blocked.
+
+    Parameters
+    ------------
+    - win (np.ndarray): bit-packed occupancy bitmap (uint8), mutated in place.
+    - row (int): byte offset of this row's first byte within ``win``.
+    - k0 (int): first bit index within the row to set (inclusive).
+    - k1 (int): last bit index within the row to set (inclusive).
+
+    Return
+    --------
+    - output (None): no return value; sets bits ``k0..k1`` of the row in ``win`` in place.
+    """
     b0 = k0 >> 3
     b1 = k1 >> 3
     if b0 == b1:
@@ -99,16 +121,34 @@ def build_window_claims(arena, slab_start, slab_len, static_col, ov_own_gen, gen
                         s0_shift, span_bits, field_mask):
     """Fill the ``win`` bitmap from the flat claim arena (:mod:`claim_arena`).
 
-    Simpler than the pool build it replaces, and measured 2.81x faster, for one reason: a claim IS a
-    blocked span, so this is ``win |= span``. The pools store the COMPLEMENT, so building from them
-    means filling each claimed row and then clearing back over a two-pointer merge of two free-interval
-    lists — and that merge is the only thing in either build that depends on the pools' ascending-sort
-    invariant. Nothing here does; the paint is an OR, so slab order is free (which is what lets a
-    release swap-remove).
+    A claim IS a blocked span, so the build is ``win |= span`` per cell; claim and slab order are
+    therefore irrelevant, which is what lets a release swap-remove from the arena. The fold matches
+    ``kernel._blocked`` term for term: a corridor claim always blocks; a column claim or an
+    always-active wall blocks only when the flight does not own the cell; a static wall covers every
+    step, so it subsumes that cell's column claims and they are skipped.
 
-    The fold matches ``kernel._blocked`` term for term: a corridor claim always blocks; a column claim
-    or an always-active wall blocks only when the flight does not own the cell. A static wall covers
-    every step, so it subsumes that cell's column claims and they are skipped."""
+    Parameters
+    ------------
+    - arena (np.ndarray): flat claim store; each entry packs a start/end step span.
+    - slab_start (np.ndarray): per-key start offset into ``arena``.
+    - slab_len (np.ndarray): per-key slab length (claims for that key).
+    - static_col (np.ndarray): per-cell always-active wall flag.
+    - ov_own_gen (np.ndarray): per-cell owning generation of the plan overlay.
+    - gen (int): this plan's generation; a cell is owned when ``ov_own_gen[cell] == gen``.
+    - qmin (int): global minimum q, mapping a window q index to an arena cell.
+    - rmin (int): global minimum r, mapping a window r index to an arena cell.
+    - rspan (int): global r-span, the cell-index stride for q.
+    - n_levels (int): altitude levels, the cell-index stride for a ``(q, r)`` pair.
+    - wbox (np.ndarray): window geometry (the ``W_*`` fields).
+    - win (np.ndarray): output bitmap; zeroed over the active region then OR-painted.
+    - s0_shift (int): right shift yielding a claim's start step.
+    - span_bits (int): right shift for a claim's end-step field.
+    - field_mask (int): mask isolating the end step after the ``span_bits`` shift.
+
+    Return
+    --------
+    - output (int): number of window cells that received at least one blocked span.
+    """
     wq0 = wbox[W_Q0]; wq1 = wbox[W_Q1]; wr0 = wbox[W_R0]
     ws0 = wbox[W_S0]; ws1 = wbox[W_S1]
     wrspan = wbox[W_RSPAN]; wsteps = wbox[W_STEPS]; row_bytes = wbox[W_ROWB]
@@ -163,30 +203,36 @@ def build_window_claims(arena, slab_start, slab_len, static_col, ov_own_gen, gen
 
 def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, n_gsteps,
                   lateral_margin, tail_steps, max_bytes):
-    """Size the window around the cells a plan is anchored to; return bytes or 0 if degenerate.
+    """Size the window around the cells a plan is anchored to; return bytes, or 0 if degenerate.
 
-    ``q_cells``/``r_cells`` are the origin hex, its exit lanes and the destination's landing lanes.
-    A* explores an ellipse between them, so their bbox plus ``lateral_margin`` hexes covers the
-    reroute fan; the margin is set from the measured read bboxes in
-    ``.context/perf/probe_read_window.py``, not from a bound.
+    The window is the anchor-cell bbox padded by ``lateral_margin`` hexes, sized to contain A*'s
+    reroute ellipse (see context/figures/search_window.png); the margin is set from the measured
+    read bboxes in ``.context/perf/probe_read_window.py``, not from a bound. Steps run from
+    ``base`` (nothing is probed earlier — the ground state starts there) to
+    ``base + n_gsteps + tail_steps``, clipped to ``max_step``.
 
-    Steps run from ``base`` — nothing is probed earlier, the ground state starts there — to
-    ``base + n_gsteps + tail_steps``, clipped to ``max_step``. ``n_gsteps`` is the ground-delay
-    allowance the two-phase mask already bounds; ``tail_steps`` covers the takeoff climb, the lane
-    traverse and the flight itself.
+    The two failure returns are NOT interchangeable: a window failure is not cheap — no window
+    means no answers, so the whole plan falls to the pure-Python reference. That is why an
+    over-budget box reports the size it needs rather than collapsing to a single "off".
 
-    Two failure returns, and they are NOT interchangeable — the caller can recover from one:
+    Parameters
+    ------------
+    - cocc (CompiledHexOccupancy): supplies the global cell bounds (qmin/rmin, spans, levels).
+    - wbox (np.ndarray): window-geometry array, filled in place with the sized box on success only.
+    - q_cells (Sequence[int]): anchor q indices — origin hex, its exit lanes, dest landing lanes.
+    - r_cells (Sequence[int]): anchor r indices, paired with ``q_cells``.
+    - base (int): first step the window covers; nothing is probed before it.
+    - max_step (int): global last step, clipping the window's step span.
+    - n_gsteps (int): ground-delay allowance (the two-phase mask already bounds it).
+    - lateral_margin (int): hexes added around the anchor bbox to cover the reroute fan.
+    - tail_steps (int): steps for the takeoff climb, lane traverse and flight itself.
+    - max_bytes (int): buffer ceiling; a box needing more is reported as ``-n`` for a retry.
 
-    * ``0``  the box degenerated (clipped to nothing). Nothing to build at any size.
-    * ``-n`` the box would need ``n`` bytes, more than ``max_bytes``. The caller may grow its buffer
-      and ask again; ``_build_window`` does exactly that.
-
-    The distinction exists because a window failure is no longer cheap. This function once documented
-    returning 0 as "window off, every probe takes the pool walk … byte-identical to one with it on",
-    and that was true while the interval pools existed. They were deleted with the pool-less
-    occupancy: no window now means no answers, so the whole plan falls to the pure-Python reference.
-    A 9% overshoot was measured costing 19.3 s of an 88 s LNS loop, which is why the size is reported
-    back rather than collapsed into a single "off"."""
+    Return
+    --------
+    - output (int): window size in bytes with ``wbox`` filled; ``0`` if the box degenerated
+      (clipped to nothing); ``-n`` if it needs ``n`` > ``max_bytes`` bytes (``wbox`` untouched).
+    """
     q0 = int(min(q_cells)) - lateral_margin
     q1 = int(max(q_cells)) + lateral_margin
     r0 = int(min(r_cells)) - lateral_margin

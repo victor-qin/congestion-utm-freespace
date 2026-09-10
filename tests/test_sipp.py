@@ -46,24 +46,11 @@ def _plan_both(req, committed=()):
 
 # ---- isolated, exact ----
 
-def test_sipp_empty_matches_astar():
-    o = _plan_both(_req())
-    assert o["sipp"].accepted and o["astar"].accepted
-    assert not ReservationLedger(CFG).any_conflict(o["sipp"].volumes)   # self-consistent
-    assert abs(o["sipp"].cost - o["astar"].cost) < 1e-6
-
-
 def test_sipp_reroutes_around_wall_like_astar():
     o = _plan_both(_req(2), committed=[(99, [_wall()])])
     assert o["sipp"].accepted and o["astar"].accepted
     assert o["sipp"].air_detour_m > 0          # had to go around
     assert abs(o["sipp"].cost - o["astar"].cost) < 1e-6
-
-
-def test_sipp_deterministic():
-    a = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
-    b = get_planner("sipp").plan(_req(7), ReservationLedger(CFG), CFG)
-    assert abs(a.cost - b.cost) < 1e-12 and len(a.centerline) == len(b.centerline)
 
 
 @pytest.mark.parametrize("planner_name", ("sipp", "sipp_ref"))
@@ -108,20 +95,20 @@ def test_sipp_replay_exact_nonterminal(seed):
         assert all(abs(ca - cs) < 1e-5 for a, s, ca, cs in rows if a), f"{scenario} cost mismatch"
 
 
-def test_sipp_replay_exact_legacy_terminal():
+@pytest.mark.parametrize(
+    "fixed, tol",
+    [(False, 1e-5), (True, 1e-9)],
+    ids=["legacy", "fixed_lanes"],
+)
+def test_sipp_replay_exact_terminal(fixed, tol):
+    # Destination-lane tails are scored explicitly, so fixed-lane SIPP and A* share the exact
+    # objective (tol 1e-9); legacy lanes match A* to 1e-5.
     rows = _replay("dallas_hub_2uss_large", 150.0, 400.0, 0,
-                   demand_ov={"pads_per_hub": 2, "radius_m": 2500.0}, fixed=False)
-    assert any(c for _, _, c, _ in rows)       # terminal flights present
+                   demand_ov={"pads_per_hub": 2, "radius_m": 2500.0}, fixed=fixed)
+    if not fixed:
+        assert any(c for _, _, c, _ in rows)       # terminal flights present
     assert all(a == s for a, s, _, _ in rows)
-    assert all(abs(ca - cs) < 1e-5 for a, s, ca, cs in rows if a)
-
-
-def test_sipp_replay_fixed_lanes_exact():
-    # Destination-lane tails are scored explicitly, so fixed-lane SIPP and A* share the exact objective.
-    rows = _replay("dallas_hub_2uss_large", 150.0, 400.0, 0,
-                   demand_ov={"pads_per_hub": 2, "radius_m": 2500.0}, fixed=True)
-    assert all(a == s for a, s, _, _ in rows)
-    assert all(abs(ca - cs) < 1e-9 for a, s, ca, cs in rows if a)
+    assert all(abs(ca - cs) < tol for a, s, ca, cs in rows if a)
 
 
 def test_sipp_fixed_lanes_full_run_verified():

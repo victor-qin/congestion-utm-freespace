@@ -200,19 +200,6 @@ def test_kernel_dual_queries_are_bit_identical_to_the_prepared_view():
 # --------------------------------------------------- prepare_duals scans its OWN resources
 
 
-def _terminal_graph(cfg: SimConfig, *, overrun: int = 4):
-    """A graph with both endpoints in terminal airspace, so terminal rows exist to price."""
-
-    origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
-    o_term, d_term = Terminal("dual-A", 1, radius=90.0), Terminal("dual-B", 1, radius=90.0)
-    request = FlightRequest(
-        12, origin, dest, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term
-    )
-    params = ColGenParams(solver="highs", max_air_overrun_hops=overrun)
-    graph = build_flight_graph(request, cfg, [(origin, o_term), (dest, d_term)], params)
-    return graph, params
-
-
 def _mixed_duals(graph, cfg, seed):
     """This flight's rows, plus every category of row it does NOT own.
 
@@ -776,6 +763,7 @@ def _kernel_candidates(
 
 
 def _terminal_graph(cfg, *, overrun: int = 4):
+    """A graph with both endpoints in terminal airspace, so terminal rows exist to price."""
     origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
     o_term, d_term = Terminal("kern-A", 1, radius=90.0), Terminal("kern-B", 1, radius=90.0)
     request = FlightRequest(
@@ -835,12 +823,10 @@ def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch
     """The kernel's sink set EQUALS the reference's, on both endpoint shapes.
 
     Equality, not inclusion, and the difference is the whole of Phase 2d. Missing a sink
-    was always a correctness failure. **Extra** sinks used to be the accepted cost of not
-    applying `completion_can_compete` -- and they are not free: a looser search does not
-    merely explore a superset, because its extra labels win dominance slots and evict the
-    reference's survivors, whose sinks are then never generated at all. This fixture used
-    to lose 12 that way, with every guard correct and every label score bit-identical to
-    the reference's at every prefix. `[[pruning-not-neutral-under-dominance]]`.
+    was always a correctness failure. **Extra** sinks are not free either: a looser search
+    does not merely explore a superset, because its extra labels win dominance slots and
+    evict the reference's survivors, whose sinks are then never generated at all -- so a
+    kernel that skips `completion_can_compete` returns a different, equally optimal column.
 
     The terminal shape is the one that matters: a terminal origin turns on
     `track_first_hop`, so the dominance key grows a field that is inert on the plain
@@ -929,9 +915,9 @@ def test_the_bootstrap_selects_only_roots_that_survive_the_full_gate():
 
     HONEST LIMIT: neither fixture here gates hard enough to reproduce that on its own -- the
     top ungated root survives on both, checked. The real reproduction is `colgen_test`'s
-    flight 0, where the gate takes 13,515 roots to 97 and the ungated winner is not among
-    them. So this pins the property, and `prof_colgen_cutoff`'s `bt_lab` column (zero labels
-    against a nonzero `boot_s`) is what catches it in the field.
+    flight 0, where the gate prunes almost every root and the ungated winner is not among the
+    survivors. So this pins the property, and `prof_colgen_cutoff`'s `bt_lab` column (zero
+    labels against a nonzero `boot_s`) is what catches it in the field.
     """
 
     cfg = _cfg()
@@ -1025,8 +1011,7 @@ def test_kernel_and_reference_restrict_roots_identically(monkeypatch):
     # But that is an observation about one fixture and not a property anyone has proved, so
     # `_bootstrap_incumbent` may still only ever return an INCUMBENT: a bootstrap candidate
     # flowing into `_certify_candidates` could otherwise put a sink into the real ranking
-    # that the reference would never have generated
-    # (`[[pruning-not-neutral-under-dominance]]`).
+    # that the reference would never have generated.
 
 
 def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monkeypatch):
@@ -1373,10 +1358,10 @@ def test_destination_lane_tie_comes_from_the_envelopes_not_the_packed_lanes(monk
     `_prefix_le`'s four-field comparison -- so the compiled search could certify a
     different, equally optimal column while still reporting `proved=True`.
 
-    Measured: the filter drops nothing across 260 flights on `colgen_test` and the four
-    density arms, so no natural fixture exhibits it. Rather than wait for one, this pins
-    the SOURCE: the envelope's value is what reaches the kernel even when the packed array
-    disagrees, which is what makes the divergence unreachable instead of merely unobserved.
+    The filter drops nothing on `colgen_test` or the density arms, so no natural fixture
+    exhibits it. Rather than wait for one, this pins the SOURCE: the envelope's value is
+    what reaches the kernel even when the packed array disagrees, which is what makes the
+    divergence unreachable instead of merely unobserved.
     """
 
     cfg = _cfg()
@@ -1819,53 +1804,20 @@ def test_kernel_paid_correction_matches_the_references_fsum_expression():
 # -------------------------------------------------------------- the production entry point
 
 
-def test_price_flight_takes_the_compiled_path_and_returns_the_reference_column():
-    """`price_flight` proves the compiled search and returns exactly what the oracle does.
+def _seed_incumbent(graph, cfg, model, view):
+    """Case ``returns_reference_column``'s warm start: the seed column priced at benefit 100."""
 
-    The end-to-end shape of Phase 2c, and the one that would otherwise ship silently wrong:
-    every earlier test drives `price_dag` directly, so none of them notices if
-    `_best_column_compiled` falls back on every flight -- which reads as a correct, slow
-    solve rather than as a failure. Hence `_compiled_or_fail`, which fails on a `Declined`,
-    as well as the assertion on the column.
-    """
-
-    cfg = _cfg()
-    graph, params = _terminal_graph(cfg)
-    model = cost_model(cfg, params)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
     seed = pricing.seed_column(graph, cfg, model=model)
-    incumbent = (
+    return (
         model.reduced_cost(
             benefit=100.0, cost=seed.delay_s, dual_cost=view.claim_cost(seed.claims), pi_f=0.0
         ),
         seed,
     )
 
-    rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model
-    )
-    assert column is not None
 
-    ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False,
-        incumbent=incumbent, model=model,
-    )
-    assert column == ref_column
-    assert rc == ref_rc
-
-
-def test_compiled_path_honours_forbidden_rows_without_falling_back():
-    """Repair runs INSIDE the kernel; a non-empty exclusion set is not a fallback trigger.
-
-    Required rather than optional: the sweep always passes `_EMPTY_ROWS` (solver.py), so
-    without this the whole repair path ships untested, and routing repair to Python was
-    rejected because it is O(flights) inside the greedy.
-    """
-
-    cfg = _cfg()
-    graph, params = _terminal_graph(cfg)
-    model = cost_model(cfg, params)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
+def _forbidden_random(graph):
+    """Case ``forbidden_rows``'s exclusion set: a non-trivial slice of corridor rows."""
 
     rng = random.Random(4242)
     forbidden = frozenset(
@@ -1875,17 +1827,75 @@ def test_compiled_path_honours_forbidden_rows_without_falling_back():
         if rng.random() < 0.25
     )
     assert len(forbidden) > 10
+    return forbidden
+
+
+def _check_returns_column(column, forbidden):
+    # The warm-started compiled path must return a real column, not silently fall through.
+    assert column is not None
+
+
+def _check_disjoint_from_forbidden(column, forbidden):
+    # Repair runs INSIDE the kernel: the returned column avoids every excluded row.
+    if column is not None:
+        assert column.claims.isdisjoint(forbidden)
+
+
+@pytest.mark.parametrize(
+    ("make_model", "make_incumbent", "make_forbidden", "check"),
+    [
+        (
+            lambda cfg, params: cost_model(cfg, params),
+            _seed_incumbent,
+            lambda graph: frozenset(),
+            _check_returns_column,
+        ),
+        (
+            lambda cfg, params: cost_model(cfg, params),
+            lambda graph, cfg, model, view: None,
+            _forbidden_random,
+            _check_disjoint_from_forbidden,
+        ),
+        (
+            lambda cfg, params: CostModel(ground_weight=9.0, air_weight=1.0),
+            lambda graph, cfg, model, view: None,
+            lambda graph: frozenset(),
+            lambda column, forbidden: None,
+        ),
+    ],
+    ids=["returns_reference_column", "forbidden_rows", "label_score_currency"],
+)
+def test_compiled_path_returns_the_reference_column(
+    make_model, make_incumbent, make_forbidden, check
+):
+    """`price_flight`'s compiled search returns exactly the oracle's column and reduced cost.
+
+    Every earlier test drives `price_dag` directly, so none notices if `_best_column_compiled`
+    falls back on every flight -- which reads as a correct, slow solve rather than a failure;
+    `_compiled_or_fail` turns a `Declined` into a test failure. The cases sweep the three
+    inputs that can silently change the answer: a warm incumbent (the seed case also asserts a
+    real column comes back), a non-empty forbidden set (repair runs inside the kernel, so the
+    column must avoid every excluded row -- the sweep always passes it via `_EMPTY_ROWS`), and
+    an asymmetric `CostModel` (only a ground-heavy model separates the objective currency from
+    raw seconds).
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = make_model(cfg, params)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    incumbent = make_incumbent(graph, cfg, model, view)
+    forbidden = make_forbidden(graph)
 
     rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, forbidden, incumbent=None, model=model
+        graph, view, 0.0, cfg, 100.0, forbidden, incumbent=incumbent, model=model
     )
     ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, forbidden, seed=False, incumbent=None, model=model
+        graph, view, 0.0, cfg, 100.0, forbidden, seed=False, incumbent=incumbent, model=model
     )
     assert column == ref_column
     assert rc == ref_rc
-    if column is not None:
-        assert column.claims.isdisjoint(forbidden)
+    check(column, forbidden)
 
 
 def test_compiled_path_respects_the_pricing_deadline():
@@ -1910,40 +1920,14 @@ def test_compiled_path_respects_the_pricing_deadline():
         )
 
 
-def test_compiled_path_weights_the_label_score_in_the_objective_currency():
-    """A ground-heavy `CostModel` must still return the reference's column.
-
-    `[[colgen-label-score-currency]]`: at unit weights `ground + flown` is invariant within
-    a time layer, so the objective and raw seconds coincide and a mis-weighted score is
-    dormant. Under `total_cost` they diverge -- trading one step of ground for one hop of
-    air is free in seconds and worth `2*dt` in cost -- so only an asymmetric model can tell
-    the two apart.
-    """
-
-    cfg = _cfg()
-    graph, params = _terminal_graph(cfg)
-    model = CostModel(ground_weight=9.0, air_weight=1.0)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
-
-    rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
-    )
-    ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
-    )
-    assert column == ref_column
-    assert rc == ref_rc
-
-
 @pytest.mark.parametrize("overrun", [0, 1, 3, 9])
 def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
     """The route-length bound is the only knob shaping the corridor, so sweep it.
 
     `max_air_overrun_hops` sizes `max_air_hops`, which is simultaneously the ceiling, the
-    per-arc lookahead that truncates weaving, and (post-#78) the corridor. A kernel that
-    read the ceiling correctly but reconstructed the lookahead would pass at the shipped
-    value and fail everywhere else, which is what `[[colgen-ceiling-pairs-with-slack]]`
-    describes from the other direction.
+    per-arc lookahead that truncates weaving, and the corridor. A kernel that read the
+    ceiling correctly but reconstructed the lookahead would pass at the shipped value and
+    fail everywhere else.
     """
 
     cfg = _cfg()
@@ -2033,10 +2017,9 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
 
     Randomized over the axes that reshape the search rather than merely rescale it:
     geometry (so `shortest_hops` and the corridor move), the hop ceiling (the only
-    route-length bound post-#78, which is simultaneously ceiling, per-arc lookahead and
-    corridor), the endpoint shape (terminal turns on `track_first_hop` and the unpadded
-    `term`-row span rule), the objective weights (`[[colgen-label-score-currency]]`), and
-    the duals.
+    route-length bound, which is simultaneously ceiling, per-arc lookahead and corridor),
+    the endpoint shape (terminal turns on `track_first_hop` and the unpadded `term`-row
+    span rule), the objective weights, and the duals.
 
     Run with the bootstrap off and on. On, BOTH searches receive its cutoff -- the same
     object, from `price_flight`'s single call -- so the equality claim is unchanged and the
@@ -2046,15 +2029,14 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
 
     # FIVE cases by default, not the forty this swept originally.  Each case runs the
     # PYTHON REFERENCE as well as the kernel -- that is the whole point, and the reference
-    # is the 41-79x slower half -- so the sweep cost 925 s of a 1,190 s colgen suite, 78%
-    # of it for one test.  Five keeps the everyday loop usable.
+    # is far the slower half -- so a wide sweep dominates the colgen suite's wall time.
+    # Five keeps the everyday loop usable.
     #
     # WHAT THE FIRST FIVE COVER, checked rather than assumed: both endpoint shapes
     # (`terminal` alternates on `index % 2`, so 5 cases always give both), ground budgets
     # 48 and 96, and hop ceilings 0, 1 and 3.  What they do NOT draw is **ceiling 9** --
-    # which is exactly why they run in 1.9 s against the full sweep's 925 s, since that
-    # ceiling is what explodes the search space.  Speed and big-ceiling fuzz are the same
-    # dial here; you cannot keep both.
+    # the ceiling that explodes the search space, and the reason a wide sweep is slow.
+    # Speed and big-ceiling fuzz are the same dial here; you cannot keep both.
     #
     # That gap is covered deterministically by
     # `test_compiled_path_matches_the_reference_across_hop_ceilings[9]`, so ceiling 9 is

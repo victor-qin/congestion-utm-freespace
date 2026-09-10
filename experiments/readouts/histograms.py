@@ -35,7 +35,7 @@ def _steady_subset(folder, acc, window_frac):
     density plateau) as ``(subset, (t_lo, t_hi))``. ``None`` when there is no window, no ``t_occupancy``
     column, or the window trims nothing (no plateau ⇒ identical to the whole run, so an overlay would be
     redundant). Default reads the window ``save_run`` stored in ``summary.json``; ``window_frac``
-    recomputes it from the reloaded run's reservations (issue #25).
+    recomputes it from the reloaded run's reservations.
 
     Membership must use ``t_occupancy``, the same clock ``metrics.flight_frame`` uses and the same one
     the window is derived from. Filtering on ``t_request`` here silently produced an EMPTY subset on
@@ -64,6 +64,8 @@ def _steady_subset(folder, acc, window_frac):
 
 
 def main() -> None:
+    """Load one run's ``flights.parquet`` and write its delay, delay-%, trip-ratio, and
+    delay-sources distribution figures, optionally overlaying the steady-state window."""
     p = argparse.ArgumentParser(description="Delay-distribution plots for one saved run (per-run).")
     p.add_argument("folder", help="a results/ run folder written by experiments.run")
     p.add_argument("--out-dir", default=None,
@@ -88,7 +90,7 @@ def main() -> None:
     lam = json.loads((folder / "config.json").read_text()).get("lam_per_hour")
     lam_title = f" — λ={lam:g}/h" if lam is not None else ""
 
-    # steady-state window (issue #25): overlay the density-plateau distribution on the whole-run one so
+    # steady-state window: overlay the density-plateau distribution on the whole-run one so
     # the leftward ramp-tail bias reads off directly. Default reads the window save_run stored in
     # summary.json; --window-frac recomputes it from the reloaded run's reservations.
     steady = _steady_subset(folder, acc, args.window_frac)
@@ -97,16 +99,17 @@ def main() -> None:
         acc_steady, (lo, hi) = steady
         win_note = f"  ·  steady [{lo:.0f},{hi:.0f}]s"
 
-    def ov(col):   # the windowed twin of `col`, or None when no plateau trimmed anything
+    def ov(col):
+        """The windowed (steady-state) twin of ``col``, or None when no plateau trimmed anything."""
         return acc_steady[col].dropna() if acc_steady is not None else None
 
     viz.delay_histogram(acc["total_delay_s"].dropna(), out=out / f"{prefix}delay_hist.png",
                         title=f"Total delay{lam_title}{win_note}", overlay=ov("total_delay_s"))
     viz.delay_pct_histogram(acc["delay_pct"].dropna(), out=out / f"{prefix}delay_pct_hist.png",
                             title=f"Delay % of trip{lam_title}{win_note}", overlay=ov("delay_pct"))
-    # trip-time inflation = (straight-line time + delay) / straight-line time (≥ 1, unbounded). Newer
-    # runs store it directly; for older flights.parquet derive it from delay_pct (== 100/(100-pct)).
     def _ratio(frame):
+        """Per-flight trip-time inflation (straight-line+delay over straight-line), from the stored
+        ``trip_time_ratio`` column or, for older runs, ``delay_pct`` via 100/(100-pct)."""
         return (frame["trip_time_ratio"] if "trip_time_ratio" in frame.columns
                 else 100.0 / (100.0 - frame["delay_pct"])).dropna()
     viz.trip_ratio_histogram(_ratio(acc), out=out / f"{prefix}trip_ratio_hist.png",

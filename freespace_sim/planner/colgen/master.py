@@ -66,12 +66,12 @@ class LpBackend(Protocol):
     name: str
     flight_ids: tuple[int, ...]
     time_limit_s: float
-    # Both of these are RE-SET by the caller between construction and the final IP, so they
-    # are part of the contract rather than constructor trivia.  `time_limit_s` has always
-    # been; `ip_gap` joined it when the solver started re-scaling the MIP tolerance against
-    # the incumbent's cost -- `create_backend` can only assume the worst case (cost -> 0),
-    # which is ~n*M times too tight once a real incumbent exists.  Declared here so a new
-    # backend satisfying only this Protocol cannot silently lack the attribute.
+    # Both are RE-SET by the caller between construction and the final IP, so they are part
+    # of the contract, not constructor trivia. `ip_gap` must be re-settable because the
+    # solver re-scales the MIP tolerance against the incumbent's cost, and `create_backend`
+    # can only assume the worst case (cost -> 0), ~n*M times too tight once a real incumbent
+    # exists. Declared here so a new backend satisfying only this Protocol cannot silently
+    # lack the attribute.
     ip_gap: float
 
     def add_column(
@@ -114,55 +114,37 @@ def _env_int(name: str, default: int) -> int:
 
 
 def gurobi_threads() -> int:
-    """``Threads`` for the master's Gurobi model.  **One by default.**
+    """``Threads`` for the master's Gurobi model, one by default.
 
-    Reported in ``stats`` for the same reason :func:`gurobi_lp_method` is: it is
-    answer-affecting and it lives in an environment variable nothing else writes down.
-    Measured here, everything else fixed, 4 / 8 / 16 threads return an IDENTICAL objective
-    and 1 is fine, but **2 is reproducibly ~10% worse** -- which was misread as MILP noise
-    until the thread count was the thing being varied.  An archived run that does not record
-    this cannot be compared with one that ran at a different count.
+    Reported in ``stats`` because it is answer-affecting and lives in an environment variable
+    nothing else writes down, so an archived run that omits it cannot be compared with one
+    that ran at a different count. 4/8/16 threads return an identical objective and 1 is fine,
+    but 2 is reproducibly ~10% worse.
     """
 
     return _env_int("COLGEN_GUROBI_THREADS", 1)
 
 
 def gurobi_lp_method() -> tuple[int, int]:
-    """``(Method, Crossover)`` for the master LP.  **Barrier without crossover by default.**
+    """``(Method, Crossover)`` for the master LP, barrier without crossover by default.
 
     The master is a cap-1 set-packing LP, so it is severely degenerate and its optimal DUAL
-    set is a polyhedron rather than a point.  Simplex stops at an arbitrary extreme vertex
-    of that set -- sparse, with most rows priced at zero -- and pricing then chases whatever
-    corner the pivot rule happened to land on.  Barrier without crossover stops near the
-    analytic centre instead, which spreads price across the rows that are actually competing
-    and varies CONTINUOUSLY with the column pool, so each round's columns stay relevant to
-    the next.
+    set is a polyhedron rather than a point. Simplex stops at an arbitrary extreme vertex of
+    that set -- sparse, most rows priced at zero -- so pricing chases whatever corner the
+    pivot rule landed on and its target moves each iteration. Barrier without crossover stops
+    near the analytic centre instead, which spreads price across the rows actually competing
+    and varies CONTINUOUSLY with the column pool, so each round's columns stay relevant to the
+    next. ``COLGEN_GUROBI_LP_METHOD=-1`` restores simplex; both values are reported in
+    ``stats`` so archived runs on different dual regimes can be told apart.
 
-    Measured on `density_faa_wing_zipline`, one instance each, everything else fixed:
+    Correctness is untouched: the Lagrangian bound ``z + sum_f max(0, rc_f)`` is valid for
+    ANY optimal dual vector, so this changes the convergence rate, not validity.
 
-        x600,  8 iterations, both arms PROVED optimality (so the objective is exact)
-            simplex   lp_gap 0.0154    objective 72,706.4   wall 2,773 s
-            barrier   lp_gap 0.00346   objective 72,045.4   wall 1,151 s
-        x1500, 10 iterations, both truncated at 900 s (so both objectives are floors)
-            simplex   lp_gap 0.0176    196,332.8  (-7.1% vs A*)   pricing 2,350 s
-            barrier   lp_gap 0.00924   184,729.0  (-12.6% vs A*)  pricing 1,686 s
-
-    **Correctness is untouched.**  The Lagrangian bound `z + sum_f max(0, rc_f)` is valid
-    for ANY optimal dual vector, so this changes the convergence rate, not validity.
-
-    **The default was `-1`, and flipping it is deliberate.**  Leaving it opt-in meant every
-    analysis script had to remember two environment variables, and the ones that forgot
-    measured simplex while being compared against barrier baselines -- which is how a
-    headline plateau measurement and a ladder ablation ended up on different dual regimes
-    from the runs they were quoted beside.  `COLGEN_GUROBI_LP_METHOD=-1` restores the old
-    behaviour, and both values are reported in `stats` so archived runs can be told apart.
-
-    **One risk remains untested rather than cleared.**  Barrier without crossover returns a
-    non-basic primal -- fractional almost everywhere -- and `round_heuristic` rounds exactly
-    that.  In every run measured so far `round_heuristic` never beat the A* incumbent under
-    EITHER regime, so the two arms were identical to the decimal and the risk was never
-    exercised.  On an instance where the rounding heuristic actually contributes, watch
-    `heuristic_objective` and not only the final number.
+    One risk is untested rather than cleared: barrier without crossover returns a non-basic
+    primal -- fractional almost everywhere -- and ``round_heuristic`` rounds exactly that. In
+    every run measured so far the rounding heuristic never beat the A* incumbent under either
+    regime, so the risk was never exercised. On an instance where it actually contributes,
+    watch ``heuristic_objective``, not only the final number.
     """
 
     return (
@@ -172,6 +154,7 @@ def gurobi_lp_method() -> tuple[int, int]:
 
 
 def _flight_tuple(flight_ids: Iterable[int]) -> tuple[int, ...]:
+    """Normalize an iterable of flight ids to a unique int tuple, raising on non-int/dupes."""
     normalized: list[int] = []
     for flight_id in flight_ids:
         try:
@@ -184,6 +167,7 @@ def _flight_tuple(flight_ids: Iterable[int]) -> tuple[int, ...]:
 
 
 def _validate_column_indices(indices: Sequence[int], n_columns: int) -> tuple[int, ...]:
+    """Normalize column indices to a unique int tuple, raising if any is out of range."""
     normalized: list[int] = []
     for index in indices:
         try:
@@ -216,6 +200,20 @@ class HighsBackend:
         time_limit_s: float = 120.0,
         seed: int = 0,
     ) -> None:
+        """Build an empty HiGHS LP/MIP backend that owns the given flight rows.
+
+        Parameters
+        ------------
+        - flight_ids (Iterable[int]): flights whose ``<= 1`` rows the backend owns from
+          construction; must be unique.
+        - ip_gap (float): relative MIP gap passed to HiGHS in :meth:`solve_ip`.
+        - time_limit_s (float): per-solve wall budget handed to HiGHS.
+        - seed (int): retained for the deterministic-backend contract; HiGHS exposes no seed.
+
+        Return
+        --------
+        - output (None): initializes empty column and row stores.
+        """
         self.flight_ids = _flight_tuple(flight_ids)
         self._flight_pos = {flight_id: i for i, flight_id in enumerate(self.flight_ids)}
         self._objectives: list[float] = []
@@ -235,6 +233,19 @@ class HighsBackend:
         flight_id: int,
         column_rows: Sequence[RowKey],
     ) -> None:
+        """Register one trajectory column claiming ``column_rows`` for ``flight_id``.
+
+        Parameters
+        ------------
+        - objective (float): the column's maximize-sense value ``M - delay_s`` (finite).
+        - flight_id (int): the owning flight; must be one of this backend's flights.
+        - column_rows (Sequence[RowKey]): already-materialized capacity rows the column
+          claims (coefficient 1; must be unique and previously added via :meth:`add_row`).
+
+        Return
+        --------
+        - output (None): appends the column and records it against each claimed row.
+        """
         if flight_id not in self._flight_pos:
             raise KeyError(f"unknown flight id {flight_id}")
         value = float(objective)
@@ -257,6 +268,19 @@ class HighsBackend:
         rhs: float,
         column_indices: Sequence[int],
     ) -> None:
+        """Materialize one capacity row ``row <= rhs`` claimed by ``column_indices``.
+
+        Parameters
+        ------------
+        - row (RowKey): the capacity row's key; must not already be materialized.
+        - rhs (float): the row's capacity (finite and non-negative).
+        - column_indices (Sequence[int]): dense indices of the columns claiming this row
+          (unique, each in ``[0, n_columns)``).
+
+        Return
+        --------
+        - output (None): records the row and the columns that claim it.
+        """
         if row in self._row_rhs:
             raise ValueError(f"capacity row {row!r} is already materialized")
         bound = float(rhs)
@@ -268,6 +292,18 @@ class HighsBackend:
         self._row_columns[row] = set(indices)
 
     def _matrix(self) -> tuple[csc_matrix, np.ndarray]:
+        """Assemble the sparse constraint matrix and rhs (flight rows then capacity rows).
+
+        Parameters
+        ------------
+        - none: reads ``flight_ids`` / ``_objectives`` / ``_column_flights`` / ``_rows`` /
+          ``_row_columns`` / ``_row_rhs`` / ``_flight_pos``.
+
+        Return
+        --------
+        - output (tuple[csc_matrix, np.ndarray]): the constraint matrix (flight rows then
+          capacity rows) and the rhs vector.
+        """
         n_flights = len(self.flight_ids)
         n_columns = len(self._objectives)
         row_indices: list[int] = []
@@ -293,6 +329,7 @@ class HighsBackend:
         return matrix, rhs
 
     def solve_lp(self) -> BackendLpResult:
+        """Solve the LP relaxation and return maximize-sense duals/values (empty pool -> zeros)."""
         if not self._objectives:
             return BackendLpResult(
                 0.0,
@@ -332,6 +369,19 @@ class HighsBackend:
         return BackendLpResult(float(-result.fun), flight_duals, row_duals, x)
 
     def solve_ip(self, warm_start: np.ndarray | None = None) -> BackendIpResult:
+        """Solve the binary MIP cold (SciPy/HiGHS has no MIP start) and return the incumbent.
+
+        Parameters
+        ------------
+        - warm_start (np.ndarray | None): validated for shape only, then ignored --
+          ``scipy.optimize.milp`` takes no incumbent.
+
+        Return
+        --------
+        - output (BackendIpResult): the integer incumbent, bound, and status in maximize
+          sense; the all-zero solution with an ``inf`` bound when a tight cap yields no
+          incumbent.
+        """
         # scipy.optimize.milp deliberately has no incumbent parameter.  Validate
         # shape for a common backend contract, then run cold.
         if warm_start is not None and np.asarray(warm_start).shape != (len(self._objectives),):
@@ -396,6 +446,23 @@ class GurobiBackend:
         time_limit_s: float = 120.0,
         seed: int = 0,
     ) -> None:
+        """Build a persistent native-maximize Gurobi model owning the given flight rows.
+
+        Raises :class:`_GurobiUnavailable` if gurobipy is missing or the model/license
+        cannot start.
+
+        Parameters
+        ------------
+        - flight_ids (Iterable[int]): flights whose ``<= 1`` rows the model owns (unique).
+        - ip_gap (float): relative MIP gap for :meth:`solve_ip`.
+        - time_limit_s (float): per-solve wall budget.
+        - seed (int): Gurobi ``Seed``; determinism is also governed by ``Threads`` (see
+          :func:`gurobi_threads`).
+
+        Return
+        --------
+        - output (None): creates the model, flight rows, and empty column/capacity stores.
+        """
         self.flight_ids = _flight_tuple(flight_ids)
         self.ip_gap = float(ip_gap)
         self.time_limit_s = float(time_limit_s)
@@ -412,14 +479,14 @@ class GurobiBackend:
             raise _GurobiUnavailable(f"Gurobi could not start: {exc}") from exc
         self._model = model
         model.Params.OutputFlag = 0
-        # ONE thread by default, and it is a determinism choice rather than a performance
-        # one: parallel Gurobi breaks ties by whichever worker got there first, so a threaded
+        # ONE thread by default, and it is a determinism choice, not a performance one:
+        # parallel Gurobi breaks ties by whichever worker got there first, so a threaded
         # solve is not reproducible even at a fixed `Seed`, and this repo pins objectives and
-        # column sets across runs.  The cost is real -- at 1,500 flights the final IP is the
-        # binding stage and burns its whole budget on one core while the rest sit idle
-        # (`ip_status status_9` at 900.1 s of a 900 s cap) -- so `COLGEN_GUROBI_THREADS`
-        # exists to measure that trade.  0 means "every core Gurobi can see".  Reported in
-        # `stats` as `gurobi_threads`, because it changes the answer (see `gurobi_threads`).
+        # column sets across runs. The cost is real -- at scale the final IP is the binding
+        # stage and burns its budget on one core while the rest sit idle -- so
+        # `COLGEN_GUROBI_THREADS` exists to measure that trade; 0 means every core Gurobi can
+        # see. Reported in `stats` as `gurobi_threads` because it changes the answer (see
+        # `gurobi_threads`).
         model.Params.Threads = gurobi_threads()
         model.Params.Seed = self.seed
         model.ModelSense = gp.GRB.MAXIMIZE
@@ -438,6 +505,21 @@ class GurobiBackend:
         flight_id: int,
         column_rows: Sequence[RowKey],
     ) -> None:
+        """Add one trajectory variable claiming ``column_rows`` for ``flight_id``.
+
+        Deliberately does NOT call ``model.update()`` (see :meth:`add_row`).
+
+        Parameters
+        ------------
+        - objective (float): the column's maximize-sense value ``M - delay_s`` (finite).
+        - flight_id (int): the owning flight; must be one of this backend's flights.
+        - column_rows (Sequence[RowKey]): already-materialized capacity rows the variable
+          claims (coefficient 1; must be unique).
+
+        Return
+        --------
+        - output (None): appends the variable to the model and the objective store.
+        """
         if flight_id not in self._flight_rows:
             raise KeyError(f"unknown flight id {flight_id}")
         value = float(objective)
@@ -470,21 +552,37 @@ class GurobiBackend:
         rhs: float,
         column_indices: Sequence[int],
     ) -> None:
+        """Add one capacity constraint ``row <= rhs`` over ``column_indices``.
+
+        Deliberately does NOT call ``model.update()``; see the inline note on why per-row
+        updates would make materialization quadratic.
+
+        Parameters
+        ------------
+        - row (RowKey): the row key; must not already be materialized.
+        - rhs (float): the row's capacity (finite and non-negative).
+        - column_indices (Sequence[int]): dense indices of the claiming variables (unique,
+          each in range).
+
+        Return
+        --------
+        - output (None): adds the constraint to the model.
+        """
         if row in self._capacity_rows:
             raise ValueError(f"capacity row {row!r} is already materialized")
         bound = float(rhs)
         if not math.isfinite(bound) or bound < 0.0:
             raise ValueError("capacity-row rhs must be finite and non-negative")
         indices = _validate_column_indices(column_indices, len(self._variables))
-        # NO `self._model.update()` here, in either position.  `update()` flushes the whole
+        # NO `self._model.update()` here, in either position. `update()` flushes the whole
         # pending-modification queue, so calling it per row makes materialization quadratic
-        # in the number of rows: measured 30 us/row at 2k rows, 53 at 8k, 89 at 20k, and
-        # 897 s for the 495,574 rows of a 1,500-flight IP.  Batched it is ~7.5 us/row flat.
+        # in the number of rows instead of flat -- prohibitive for the hundreds of thousands
+        # of rows a large IP adds.
         #
         # Safe because Gurobi's lazy update mode (the default since v7) permits referencing
         # objects created since the last update inside EXPRESSIONS, which is all this does --
         # and `add_column` above already relies on exactly that, adding variables with no
-        # update at all.  Nothing reads a constraint ATTRIBUTE until after `optimize()`, and
+        # update at all. Nothing reads a constraint ATTRIBUTE until after `optimize()`, and
         # both `solve_lp` and `solve_ip` call `update()` before optimizing.
         expression = self._gp.quicksum(self._variables[index] for index in indices)
         constraint = self._model.addConstr(
@@ -494,25 +592,23 @@ class GurobiBackend:
         self._capacity_rows[row] = constraint
 
     def solve_lp(self) -> BackendLpResult:
+        """Solve the LP relaxation (barrier without crossover by default) and return duals."""
         for variable in self._variables:
             variable.VType = self._gp.GRB.CONTINUOUS
             variable.UB = self._gp.GRB.INFINITY
         self._model.Params.TimeLimit = self.time_limit_s
         # WHICH optimal dual vector the LP returns is answer-affecting, because pricing
-        # maximises `(M - d_c) - pi_f - sum_r a_rc mu_r` and the argmax depends on mu.  On a
+        # maximises `(M - d_c) - pi_f - sum_r a_rc mu_r` and the argmax depends on mu. On a
         # degenerate master -- and cap-1 rows plus one-column-per-flight make this one very
         # degenerate -- the optimal dual SET is a polyhedron with many extreme points, all
-        # giving the same LP objective and different pricing targets.  Simplex returns a
+        # giving the same LP objective and different pricing targets. Simplex returns a
         # vertex, and a different vertex each iteration, so pricing chases a moving target.
         # `Method=2, Crossover=0` stops at the analytic centre instead, which moves
-        # continuously with the pool.
-        #
-        # Already observed here: HiGHS and Gurobi agree on the LP optimum but hand back
-        # different dual vertices, and HiGHS runs 17 iterations where Gurobi stops at 1 --
-        # for a 34% worse schedule.  Same LP, same optimum, different vertex.
+        # continuously with the pool. (HiGHS and Gurobi agree on the LP optimum yet return
+        # different dual vertices, one far worse for the downstream schedule.)
         #
         # Correctness is untouched: the Lagrangian bound `z + sum_f max(0, rc_f)` holds for
-        # ANY optimal dual, so this changes the convergence rate, not validity.  The cost is
+        # ANY optimal dual, so this changes the convergence rate, not validity. The cost is
         # that an interior primal is fractional almost everywhere, which is what
         # `round_heuristic` rounds -- watch `heuristic_objective`, not just the final number.
         method, crossover = gurobi_lp_method()
@@ -532,6 +628,19 @@ class GurobiBackend:
         return BackendLpResult(float(self._model.ObjVal), flight_duals, row_duals, x)
 
     def solve_ip(self, warm_start: np.ndarray | None = None) -> BackendIpResult:
+        """Solve the binary MIP with the recorded warm start and return the incumbent.
+
+        Parameters
+        ------------
+        - warm_start (np.ndarray | None): per-column MIP start; ``None`` leaves starts
+          undefined.
+
+        Return
+        --------
+        - output (BackendIpResult): the integer incumbent, bound, and status in maximize
+          sense; the all-zero solution with an ``inf`` bound when a tight cap yields no
+          incumbent.
+        """
         if warm_start is not None:
             warm_start = np.asarray(warm_start, dtype=float)
             if warm_start.shape != (len(self._variables),):
@@ -546,7 +655,7 @@ class GurobiBackend:
         self._model.Params.TimeLimit = self.time_limit_s
         # Restored to automatic: the LP phase may have pinned barrier-without-crossover to
         # get centred duals, and those settings would otherwise also govern the MILP's root
-        # relaxation -- a different question, and one this experiment is not asking.
+        # relaxation, which is a different question.
         self._model.Params.Method = -1
         self._model.Params.Crossover = -1
         self._model.update()
@@ -582,7 +691,23 @@ def create_backend(
     *,
     seed: int = 0,
 ) -> LpBackend:
-    """Select the requested backend, falling back only for ``solver='auto'``."""
+    """Build the LP/MIP backend named by ``params.solver``.
+
+    ``'gurobi'`` raises if Gurobi is unavailable; ``'highs'`` builds HiGHS directly; ``'auto'``
+    tries Gurobi and silently falls back to HiGHS. The user-facing ``ip_gap`` is converted to
+    a conservative absolute-revenue tolerance for the native relative-gap API.
+
+    Parameters
+    ------------
+    - flight_ids (Iterable[int]): flights the backend will own (snapshotted once, so an
+      ``auto`` retry cannot consume a spent generator).
+    - params (ColGenParams): supplies ``solver``, ``ip_gap``, ``time_limit_s``, and ``M``.
+    - seed (int): forwarded to the backend for reproducibility.
+
+    Return
+    --------
+    - output (LpBackend): the constructed backend.
+    """
 
     # Snapshot once: an auto attempt that consumes a generator must not leave
     # the HiGHS fallback with an empty flight catalogue.
@@ -612,10 +737,12 @@ def create_backend(
 
 
 def _row_sort_key(row: RowKey) -> tuple[str, ...]:
+    """A deterministic sort key for a capacity row (the repr of each of its parts)."""
     return tuple(repr(part) for part in row)
 
 
 def _column_sort_key(column: Column) -> tuple[object, ...]:
+    """A deterministic tie-break key over a column's identifying fields."""
     return (
         column.flight_id,
         column.delay_s,
@@ -640,6 +767,23 @@ class RestrictedMaster:
         fixed_loads: Mapping[RowKey | tuple[object, ...], int] | None = None,
         backend: LpBackend | None = None,
     ) -> None:
+        """Build the restricted master over ``flight_ids`` with lazily materialized rows.
+
+        Parameters
+        ------------
+        - flight_ids (Iterable[int]): the flights this master schedules (unique).
+        - row_index (RowIndex): capacity/metadata registry consulted for every row's ``cap``.
+        - params (ColGenParams): objective (``M``), gaps, and solver selection.
+        - seed (int): forwarded to :func:`create_backend` when no ``backend`` is injected.
+        - fixed_loads (Mapping | None): committed integer loads per row; a row already at
+          capacity is seeded bindable.
+        - backend (LpBackend | None): an injected backend; ``None`` builds one via
+          :func:`create_backend`.
+
+        Return
+        --------
+        - output (None): initializes the backend, column pool, row trackers, and diagnostics.
+        """
         self.flight_ids = _flight_tuple(flight_ids)
         self.row_index = row_index
         self.params = params
@@ -671,32 +815,28 @@ class RestrictedMaster:
         self._objectives: list[float] = []
         self._materialized: dict[RowKey, float] = {}
         # Transpose of the pool's claim sets: row -> dense indices of every column claiming
-        # it, ascending.  `materialize_rows` needs one row of this to hand the backend a
-        # constraint, and rebuilding it by scanning `_columns` was 99.8% of that method and
-        # 33% of the serial tail at 500 flights (issue #92).
+        # it, ascending. `materialize_rows` reads one row of this to hand the backend a
+        # constraint, replacing an O(pool) rescan of `_columns` per materialization.
         #
         # NOT filtered by `_materialized`, unlike `materialized_claims` in `add_column` and
-        # unlike the backend's own `_row_columns`.  The query is "which columns claim this
+        # unlike the backend's own `_row_columns`. The query is "which columns claim this
         # row" at the instant the row is FIRST materialized -- exactly the row a
-        # materialization-filtered map has never seen.  Ignoring materialization is what
-        # lets this answer without a back-fill, and is why the cheaper-looking variant that
-        # reuses `materialized_claims` cannot work.
+        # materialization-filtered map has never seen. Ignoring materialization is what lets
+        # this answer without a back-fill, and is why the cheaper-looking variant that reuses
+        # `materialized_claims` cannot work.
         #
         # Correctness requires `_columns` to stay APPEND-ONLY: an index recorded here must
-        # never move.  Trimming the pool would silently corrupt every entry.
+        # never move. Trimming the pool would silently corrupt every entry.
         self._columns_by_row: dict[RowKey, list[int]] = {}
         # --- bindability ---------------------------------------------------------------
         # A row can only ever be violated if columns from MORE THAN `cap` DISTINCT flights
-        # claim it, because the flight rows are `sum(x_c for c in flight) <= 1` and so at
-        # most one column per flight is ever selected.  Measured on `density_faa_wing_zipline`
-        # x1000 with the shipped 20-step ladder: 2,184,200 rows are touched by some column and
-        # **95.3% of them only one flight can reach**, leaving 95,136 that can bind.  Tracking
-        # that lets the final IP materialize the bindable rows up front instead of discovering
-        # them a selection at a time (16 separation rounds and 900 s reached only 59,843).
+        # claim it, because the flight rows are `sum(x_c for c in flight) <= 1` and so at most
+        # one column per flight is ever selected. Tracking that lets the final IP materialize
+        # the bindable rows up front instead of discovering them one selection at a time.
         #
-        # NOT `dict[RowKey, set[int]]`: a set per row over 2.18M rows is ~470 MB.  A cap-1 row
-        # only needs the FIRST flight that claimed it -- a second distinct one promotes it --
-        # and both trackers drop their entry on promotion, so the memory is transient.
+        # NOT `dict[RowKey, set[int]]`: a set per row is prohibitive at pool scale. A cap-1
+        # row only needs the FIRST flight that claimed it -- a second distinct one promotes
+        # it -- and both trackers drop their entry on promotion, so the memory is transient.
         self._row_first_flight: dict[RowKey, int] = {}
         self._row_flight_sets: dict[RowKey, set[int]] = {}   # cap > 1 rows only (terminals)
         self._bindable: set[RowKey] = set()
@@ -718,26 +858,30 @@ class RestrictedMaster:
         # bindability filter missed something and is worth investigating, not ignoring.
         self.last_ip_eager_rows = 0
         self.last_ip_rounds = 0
-        # Setup is reported, not absorbed: at x1500 it is 272 s, and an IP "elapsed" that
-        # silently includes it makes a 900 s cap look spent when 628 s reached the solver.
+        # Setup is reported, not absorbed: an IP "elapsed" that silently included
+        # materialization would make a wall cap look spent long before the solver ran.
         self.last_ip_setup_s = 0.0
         self._warm_start: np.ndarray | None = None
         self._heuristic_selection: dict[int, Column] = {}
 
     @property
     def backend(self) -> LpBackend:
+        """The LP/MIP backend this master drives."""
         return self._backend
 
     @property
     def backend_name(self) -> str:
+        """The backend's name (``"highs"`` or ``"gurobi"``)."""
         return self._backend.name
 
     @property
     def columns(self) -> tuple[Column, ...]:
+        """The current column pool as a tuple, in insertion order."""
         return tuple(self._columns)
 
     @property
     def materialized_rows(self) -> frozenset[RowKey]:
+        """The capacity rows materialized into the backend so far."""
         return frozenset(self._materialized)
 
     @property
@@ -747,7 +891,21 @@ class RestrictedMaster:
         return dict(self.last_flight_duals)
 
     def add_column(self, column: Column) -> int:
-        """Add a trajectory variable, returning its stable dense column index."""
+        """Add a trajectory variable, returning its stable dense column index.
+
+        Idempotent: a column already in the pool returns its existing index without a second
+        backend variable. Maintains the row->columns transpose and the bindability trackers.
+
+        Parameters
+        ------------
+        - column (Column): the trajectory to add; its ``delay_s`` must be finite and
+          non-negative, and its claims are canonicalized to ``RowKey`` coefficient-1 entries.
+
+        Return
+        --------
+        - output (int): the column's stable dense index (its existing index if already
+          present).
+        """
 
         if column.flight_id not in self.flight_ids:
             raise KeyError(f"column belongs to unknown flight {column.flight_id}")
@@ -847,16 +1005,22 @@ class RestrictedMaster:
         return frozenset(self._bindable)
 
     def materialize_bindable_rows(self, *, max_rows: int | None = None) -> int:
-        """Materialize every row that could ever bind, and return how many were added.
+        """Materialize every row that could ever bind, returning how many were added.
 
-        This is the alternative to discovering violations one IP solution at a time.  The
-        separation loop in :meth:`solve_ip` remains, but with these rows already present it
-        should confirm feasibility in a single round instead of dozens.
+        The alternative to discovering violations one IP solution at a time: with these rows
+        present, the separation loop in :meth:`solve_ip` confirms feasibility in a single
+        round instead of dozens. All-or-nothing under ``max_rows`` -- a partially materialized
+        set looks eager but still needs separation, the worst of both -- so over the bound
+        this adds nothing and the loop behaves exactly as before.
 
-        ``max_rows`` bounds the damage if a pool is denser than the 95,136 measured on
-        ``density_faa_wing_zipline`` x1000: over that, this does nothing and the loop behaves
-        exactly as before.  Silent truncation would be worse than either -- a partially
-        materialized set looks eager but still needs separation -- so it is all or nothing.
+        Parameters
+        ------------
+        - max_rows (int | None): ceiling on rows to add; ``None`` for no ceiling. Over it,
+          returns 0 and materializes nothing.
+
+        Return
+        --------
+        - output (int): the number of rows materialized (0 if truncated by ``max_rows``).
         """
 
         pending = [row for row in self._bindable if row not in self._materialized]
@@ -865,7 +1029,17 @@ class RestrictedMaster:
         return self.materialize_rows(pending)
 
     def materialize_rows(self, rows: Iterable[RowKey | tuple[object, ...]]) -> int:
-        """Materialize previously implicit rows in deterministic key order."""
+        """Materialize previously implicit rows in deterministic key order.
+
+        Parameters
+        ------------
+        - rows (Iterable[RowKey | tuple]): rows to materialize; already-materialized rows are
+          skipped, and each is handed the snapshot of columns that currently claim it.
+
+        Return
+        --------
+        - output (int): the number of newly materialized rows.
+        """
 
         normalized: set[RowKey] = set()
         for raw_row in rows:
@@ -878,8 +1052,7 @@ class RestrictedMaster:
             rhs = float(cap - self.fixed_loads.get(row, 0))
             if rhs < 0.0:
                 raise ValueError(f"fixed load exceeds capacity for row {row!r}")
-            # A lookup, not a pool scan.  Identical to what the `enumerate(self._columns)`
-            # comprehension built -- ascending and unique, because `index` strictly
+            # A lookup, not a pool scan: ascending and unique, because `index` strictly
             # increases across commits and `add_column` commits each distinct column once.
             # The default covers a `fixed_loads` row that no column claims.
             #
@@ -887,9 +1060,8 @@ class RestrictedMaster:
             # `LpBackend` is a public exported seam and `RestrictedMaster` takes an injected
             # backend, so a backend that retains the sequence it is handed would observe the
             # row gain coefficients afterwards -- duplicating any column it also processed
-            # through its own `add_column`.  The comprehension this replaced yielded a fresh
-            # list every call, so isolation was a property callers already had.  Both shipped
-            # backends copy immediately and neither needs this; the contract does.
+            # through its own `add_column`. Both shipped backends copy immediately and neither
+            # needs this; the contract requires it regardless.
             indices = tuple(self._columns_by_row.get(row, ()))
             self._backend.add_row(row, rhs, indices)
             self.row_index.intern(row)
@@ -910,7 +1082,17 @@ class RestrictedMaster:
         return self.last_lp_objective, dict(self.last_row_duals), self.last_lp_x.copy()
 
     def fractional_loads(self, x: Sequence[float]) -> dict[RowKey, float]:
-        """Return fixed plus fractional loads over every claim in the support."""
+        """Return fixed plus fractional loads over every claim in the support.
+
+        Parameters
+        ------------
+        - x (Sequence[float]): per-column LP values (length must match the pool; all finite).
+
+        Return
+        --------
+        - output (dict[RowKey, float]): total load per claimed row -- fixed loads plus the
+          fractional contribution of every column with a positive value.
+        """
 
         values = np.asarray(x, dtype=float)
         if values.shape != (len(self._columns),):
@@ -928,7 +1110,19 @@ class RestrictedMaster:
         return dict(loads)
 
     def add_violated_rows(self, x: Sequence[float], tol: float = 1e-7) -> int:
-        """Materialize implicit capacity rows violated by one LP/IP solution."""
+        """Materialize implicit capacity rows violated by one LP/IP solution.
+
+        Parameters
+        ------------
+        - x (Sequence[float]): per-column values whose induced loads are tested against
+          capacity.
+        - tol (float): slack above capacity tolerated before a row counts as violated (finite
+          and non-negative).
+
+        Return
+        --------
+        - output (int): the number of previously implicit rows now materialized.
+        """
 
         if tol < 0.0 or not math.isfinite(tol):
             raise ValueError("tol must be finite and non-negative")
@@ -942,11 +1136,22 @@ class RestrictedMaster:
 
     @staticmethod
     def upper_bound(objective: float, best_reduced_costs: Iterable[float]) -> float:
-        """Paper bound in the module's normative maximize sense."""
+        """The Lagrangian upper bound ``objective + sum max(0, reduced_cost)`` (maximize sense)."""
 
         return float(objective) + sum(max(0.0, float(value)) for value in best_reduced_costs)
 
     def objective_of(self, selection: Mapping[int, Column] | Iterable[Column]) -> float:
+        """Total maximize-sense value ``sum(M - delay_s)`` of a selection's columns.
+
+        Parameters
+        ------------
+        - selection (Mapping[int, Column] | Iterable[Column]): the chosen columns (a mapping's
+          values are used).
+
+        Return
+        --------
+        - output (float): the summed column value.
+        """
         columns = selection.values() if isinstance(selection, Mapping) else selection
         return float(sum(self.params.M - column.delay_s for column in columns))
 
@@ -954,7 +1159,18 @@ class RestrictedMaster:
         self,
         selection: Mapping[int, Column] | Iterable[Column],
     ) -> dict[RowKey, int]:
-        """Return fixed plus integral loads, including unmaterialized rows."""
+        """Return fixed plus integral loads, including unmaterialized rows.
+
+        Parameters
+        ------------
+        - selection (Mapping[int, Column] | Iterable[Column]): the chosen columns; naming one
+          flight twice raises ``ValueError``.
+
+        Return
+        --------
+        - output (dict[RowKey, int]): total integer load per claimed row -- fixed loads plus
+          one per selecting column.
+        """
 
         columns = selection.values() if isinstance(selection, Mapping) else selection
         loads: Counter[RowKey] = Counter(self.fixed_loads)
@@ -971,6 +1187,17 @@ class RestrictedMaster:
         self,
         selection: Mapping[int, Column] | Iterable[Column],
     ) -> frozenset[RowKey]:
+        """The rows a selection loads beyond their capacity.
+
+        Parameters
+        ------------
+        - selection (Mapping[int, Column] | Iterable[Column]): the chosen columns.
+
+        Return
+        --------
+        - output (frozenset[RowKey]): every row whose integral load exceeds its ``cap``
+          (empty when the selection is claim-feasible).
+        """
         loads = self.claim_loads(selection)
         return frozenset(row for row, load in loads.items() if load > self.row_index.cap(row))
 
@@ -980,12 +1207,20 @@ class RestrictedMaster:
     ) -> bool:
         """Whether every row this selection claims stays within its capacity.
 
-        Only `ValueError` is answered with ``False``: `claim_loads` raises it for a selection
-        naming one flight twice, which is a malformed selection rather than an over-capacity
-        one, and the caller wants a verdict either way.  `KeyError` deliberately propagates --
-        `RowIndex.cap` raises it for an unregistered terminal, a configuration error whose own
-        message names the fix.  Swallowing it reported that as "violates a capacity claim",
-        sending the reader to the schedule when the terminal registry is what is wrong.
+        Only ``ValueError`` is answered with ``False``: ``claim_loads`` raises it for a
+        selection naming one flight twice, a malformed selection rather than an over-capacity
+        one, and the caller wants a verdict either way. ``KeyError`` deliberately propagates --
+        ``RowIndex.cap`` raises it for an unregistered terminal, a configuration error whose
+        own message names the fix; swallowing it would report that as "violates a capacity
+        claim", sending the reader to the schedule when the terminal registry is what is wrong.
+
+        Parameters
+        ------------
+        - selection (Mapping[int, Column] | Iterable[Column]): the chosen columns.
+
+        Return
+        --------
+        - output (bool): True iff no claimed row exceeds its capacity.
         """
 
         try:
@@ -994,6 +1229,7 @@ class RestrictedMaster:
             return False
 
     def _can_add(self, column: Column, loads: Mapping[RowKey, int]) -> bool:
+        """True if adding ``column`` keeps every row it claims within capacity given ``loads``."""
         return all(loads.get(row, 0) + 1 <= self.row_index.cap(row) for row in column.claims)
 
     def _greedy_order(self) -> list[int]:
@@ -1009,19 +1245,27 @@ class RestrictedMaster:
         )
 
     def complete_selection(self, pinned: Mapping[int, Column]) -> dict[int, Column]:
-        """Keep `pinned` exactly, and fill every flight it does not name around it.
+        """Keep ``pinned`` exactly, and fill every flight it does not name around it.
 
-        A caller's warm start need not cover the batch -- `astar_warm_start` drops routes
-        the flight graph cannot express -- and the flights it leaves out must not simply
-        keep whatever column some other heuristic gave them.  Measured on
-        ``density_faa_wing_zipline`` x1500: 7 such leftovers clashed with the 1,493 seeded
-        columns, the combined selection failed `is_claim_feasible`, and the entire warm
-        start was discarded over 0.5% of the schedule.  Re-picking the leftovers AROUND
-        the pins is what makes it usable.
+        A caller's warm start need not cover the batch -- ``astar_warm_start`` drops routes
+        the flight graph cannot express -- and the flights it leaves out must not simply keep
+        whatever column some other heuristic gave them: a handful of such leftovers can clash
+        with the seeded columns and fail ``is_claim_feasible``, discarding the whole warm
+        start. Re-picking those leftovers AROUND the pins is what keeps it usable.
 
-        Raises `ValueError` when `pinned` is not itself feasible.  This completes a warm
-        start, it does not repair one: quietly dropping offending pins would report a
+        Raises ``ValueError`` when ``pinned`` is not itself feasible: this completes a warm
+        start, it does not repair one, and quietly dropping offending pins would report a
         caller's infeasible schedule as an adopted incumbent.
+
+        Parameters
+        ------------
+        - pinned (Mapping[int, Column]): flights to keep exactly; each key must equal its
+          column's ``flight_id`` and each column must belong to this master.
+
+        Return
+        --------
+        - output (dict[int, Column]): the pinned columns plus a claim-feasible greedy fill for
+          the remaining flights, keyed by flight id in this master's order.
         """
 
         pinned_columns: dict[int, Column] = {}
@@ -1061,7 +1305,23 @@ class RestrictedMaster:
         rng: np.random.Generator,
         n_tries: int | None = None,
     ) -> dict[int, Column]:
-        """Randomized rounding followed by a claim-aware greedy fill."""
+        """Randomized rounding followed by a claim-aware greedy fill.
+
+        Runs ``n_tries`` independent rounding restarts and keeps the best claim-feasible
+        selection, breaking ties by objective then a canonical signature so the result is
+        deterministic.
+
+        Parameters
+        ------------
+        - x (Sequence[float]): per-column LP values used as rounding probabilities (finite;
+          length matches the pool).
+        - rng (np.random.Generator): source of randomness for the restarts.
+        - n_tries (int | None): number of restarts; ``None`` uses ``params.n_heuristic_tries``.
+
+        Return
+        --------
+        - output (dict[int, Column]): the best selection found, keyed by flight id.
+        """
 
         values = np.asarray(x, dtype=float)
         if values.shape != (len(self._columns),):
@@ -1124,7 +1384,18 @@ class RestrictedMaster:
         return {flight_id: best[flight_id] for flight_id in self.flight_ids if flight_id in best}
 
     def set_heuristic(self, selection: Mapping[int, Column]) -> None:
-        """Record a globally claim-feasible incumbent and backend warm-start vector."""
+        """Record a globally claim-feasible incumbent and backend warm-start vector.
+
+        Parameters
+        ------------
+        - selection (Mapping[int, Column]): the incumbent; each key must equal its column's
+          ``flight_id``, each column must belong to this master, and the whole selection must
+          be claim-feasible (else ``ValueError``).
+
+        Return
+        --------
+        - output (None): stores the incumbent and its 0/1 warm-start vector.
+        """
 
         canonical: dict[int, Column] = {}
         warm = np.zeros(len(self._columns), dtype=float)
@@ -1150,6 +1421,7 @@ class RestrictedMaster:
         self._warm_start = warm
 
     def _selection_from_x(self, x: Sequence[float]) -> dict[int, Column]:
+        """Decode a backend IP vector into one column per flight (raises on a double pick)."""
         values = np.asarray(x, dtype=float)
         if values.shape != (len(self._columns),):
             raise RuntimeError("backend returned an IP vector with the wrong shape")
@@ -1180,25 +1452,35 @@ class RestrictedMaster:
         """Solve the current binary RMP, separating claim rows until it is clean.
 
         ``eager`` materializes every bindable row FIRST (see
-        :meth:`materialize_bindable_rows`), which is what turns the separation loop from a
-        search into a confirmation.  Pass ``eager=False`` for a per-iteration call: these
-        rows persist in ``_materialized``, so carrying ~95k of them through the
-        column-generation loop would slow every subsequent LP.  The solver's single
-        end-of-run call is the intended user.
+        :meth:`materialize_bindable_rows`), which turns the separation loop from a search into
+        a confirmation. Pass ``eager=False`` for a per-iteration call: these rows persist in
+        ``_materialized``, so carrying the ~95k bindable rows through the column-generation
+        loop would slow every subsequent LP -- the solver's single end-of-run call is the
+        intended user.
 
-        Two different clocks, and conflating them cost 30% of every IP budget:
+        Two different clocks, kept separate because materializing is setup, not search:
+        ``deadline`` is a hard absolute wall (the whole solve's) that never moves, and
+        ``budget_s`` counts seconds of SOLVING, started only after materialization. Eager
+        materialization is not cheap at scale (hundreds of thousands of rows, hundreds of
+        seconds) and scales WITH the pool, so charging it to the solver's budget both starves
+        the MILP and confounds any experiment varying pool size; ``last_ip_setup_s`` reports
+        it instead of hiding it in the caller's elapsed time.
 
-        ``deadline``  a hard absolute wall (the whole solve's), which never moves.
-        ``budget_s``  seconds of SOLVING, started after materialization -- because
-                      materializing is setup, not search.
+        Parameters
+        ------------
+        - heuristic (Mapping[int, Column] | None): if given, recorded as the incumbent and
+          warm start via :meth:`set_heuristic` before solving.
+        - deadline (float | None): absolute monotonic wall clock the solve must not cross.
+        - budget_s (float | None): seconds of solving allowed after materialization, further
+          clipped by ``deadline``.
+        - eager (bool): materialize all bindable rows up front (default); ``False`` for the
+          per-iteration calls inside the column-generation loop.
+        - max_eager_rows (int | None): ceiling forwarded to :meth:`materialize_bindable_rows`.
 
-        Eager materialization is not cheap at scale: 495,574 rows took **272 s** on
-        ``density_faa_wing_zipline`` x1500.  Charging that to the solver's budget made a
-        900 s cap deliver 628 s of MILP and a 300 s cap deliver ~28 s, which returned the
-        incumbent untouched and read as "the MILP found nothing in 300 s".  It also scales
-        WITH the pool, so any experiment varying pool size was confounded by a setup cost
-        that grew alongside the variable under test.  ``last_ip_setup_s`` reports it rather
-        than hiding it inside the caller's elapsed time.
+        Return
+        --------
+        - output (dict[int, Column]): the selected column per flight; the recorded heuristic
+          incumbent when the deadline is hit during separation.
         """
 
         if heuristic is not None:

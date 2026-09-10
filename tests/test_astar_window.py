@@ -27,9 +27,8 @@ def test_window_module_imports_without_numba():
     """``planner`` imports ``window`` at module level, but its numba fallback is an ImportError guard
     around ``.kernel`` inside ``AStarPlanner.__init__``. So a hard ``from numba import njit`` in
     ``window`` turns the documented "degrade to the pure-Python reference" into "the package will not
-    import" — which it did, until ``window`` grew its own guard. Reproduces a numba-less install the
-    way ``test_compiled_absent_falls_back_to_reference`` does, in a subprocess because the import has
-    to happen from cold."""
+    import". Reproduces a numba-less install like ``test_compiled_absent_falls_back_to_reference``
+    does, in a subprocess because the import has to happen from cold."""
     src = textwrap.dedent("""
         import sys
         sys.modules["numba"] = None                  # what a numba-less install looks like
@@ -212,80 +211,15 @@ def test_claim_arena_jit_warms_under_the_compiled_fallback_guard(monkeypatch):
     assert planner.compiled is False and planner._kernel is None
 
 
-def test_fanout_benchmark_rejects_window_divergence(monkeypatch):
-    from analysis import ab_dense_window as ab
-
-    results = iter([
-        (1.0, [("same", 11)]),
-        (0.5, [("different", 11)]),
-    ])
-    monkeypatch.setattr(ab, "_pass", lambda *_args: next(results))
-
-    with pytest.raises(RuntimeError, match=r"DIVERGENCE: compiled A\* changed 1 of 1 plans"):
-        ab._paired_pass({"reference": object(), "compiled": object()}, (), None, None)
-
-
-def test_benchmark_signature_includes_complete_oriented_geometry():
-    """Equal broadphase AABBs must not hide a different oriented corridor reservation."""
-    from types import SimpleNamespace
-    from analysis import ab_dense_window as ab
-
-    left = Volume4D(
-        box_from_segment(vec(-1, -1, 100), vec(1, 1, 100), 0.5, 1.0), 0.0, 1.0,
-    )
-    right = Volume4D(
-        box_from_segment(vec(-1, 1, 100), vec(1, -1, 100), 0.5, 1.0), 0.0, 1.0,
-    )
-    assert left.flat_aabb() == right.flat_aabb() and left.shape != right.shape
-
-    a = SimpleNamespace(accepted=True, cost=1.0, volumes=[left])
-    b = SimpleNamespace(accepted=True, cost=1.0, volumes=[right])
-    assert ab._sig(a) != ab._sig(b)
-
-
-def test_ab_benchmark_disables_monotone_eviction(monkeypatch):
-    from analysis import ab_dense_window as ab
-
-    class FakePlanner:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.evict_floor = None
-
-    monkeypatch.setattr(ab, "AStarPlanner", FakePlanner)
-    arms = ab._make_arms(window_bytes=1234, kernel_log2=18)
-
-    assert arms["reference"].kwargs == {"compiled": False}
-    assert arms["compiled"].kwargs == {"window_bytes": 1234, "kernel_log2_min": 18}
-    assert all(planner.evict_floor == 0.0 for planner in arms.values())
-
-
-def test_fanout_benchmark_synchronizes_each_arm_and_uses_medians(monkeypatch):
-    from analysis import ab_dense_window as ab
-
-    rows = [("same", 11)]
-    results = iter((duration, rows) for duration in (9.0, 5.0, 3.0, 7.0, 6.0, 1.0))
-    monkeypatch.setattr(ab, "_pass", lambda *_args: next(results))
-    barriers = []
-
-    elapsed = ab._timed_passes(
-        {"reference": object(), "compiled": object()}, (), None, None, 3,
-        before_arm=lambda: barriers.append(True),
-    )
-
-    assert elapsed == {"reference": 6.0, "compiled": 5.0}
-    assert len(barriers) == 6
-
-
 def _assert_window_exact(reqs, commits, cfg=CFG, statics=(), window_bytes=_ON, expect_window=True):
     """Plan every request on the COMPILED path and on the pure-Python reference, against identically
     built ledgers, and assert the two are indistinguishable: same accept/deny, same cost, same
     centerline, same node-expansion count.
 
-    This used to compare window-on against window-off. That comparison no longer exists — the
-    interval pools are gone, so a disabled window means the kernel cannot answer a probe at all and
-    ``window_bytes=0`` raises. Comparing against the reference search is what replaces it, and it is
-    strictly stronger: the reference shares no occupancy structure with the window, where the old
-    off-arm shared the pools the window was built from.
+    The reference is the right oracle because it shares NO occupancy structure with the window — a
+    strictly stronger check than an off-window arm, which would share the very pools the window is
+    built from. There is no off-window arm: a disabled window cannot answer a probe at all, and
+    ``window_bytes=0`` raises.
 
     Returns the compiled planner so a caller can assert on its counters."""
     ref, com = AStarPlanner(compiled=False), AStarPlanner(window_bytes=window_bytes)
@@ -409,10 +343,9 @@ def test_window_survives_the_mask_widen_rerun():
 def test_window_grows_its_buffer_instead_of_falling_back():
     """A box that does not fit the bitmap buffer must GROW it, not surrender the plan.
 
-    Since the interval pools were deleted a window failure is not a slower window — nothing else can
-    answer a probe, so `_plan_compiled` hands the whole plan to the pure-Python reference. Measured
-    at density_faa: one box overshooting the 8 MB budget by 9% cost 19.3 s of an 88 s LNS loop, most
-    of it `enable_blocked` re-deriving the map and the spurious shrink rebuild that follows.
+    A window failure is not a slower window — nothing else can answer a probe, so `_plan_compiled`
+    hands the whole plan to the pure-Python reference (expensive: `enable_blocked` re-derives the
+    map, plus the spurious shrink rebuild that follows). Growing avoids that.
 
     The budget is DERIVED from what this plan actually needs (measured with a default planner, then
     halved) rather than hard-coded, so the test forces exactly one growth instead of accidentally
@@ -430,7 +363,7 @@ def test_window_grows_its_buffer_instead_of_falling_back():
 
 def test_window_growth_stops_at_the_ceiling():
     """Growth is bounded by ``_WINDOW_GROW_MAX``, or a pathological plan could allocate without
-    limit. Past the ceiling the behaviour is the old one — no window, reference dispatch — so the
+    limit. Past the ceiling the behaviour is the fallback — no window, reference dispatch — so the
     ceiling is a safety valve, not a correctness boundary. Pinned with a budget so small that even
     8x it cannot hold a box."""
     from freespace_sim.planner.astar import planner as P

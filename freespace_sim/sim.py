@@ -44,6 +44,7 @@ class ConsoleProgress:
     """
 
     def __init__(self, total: int, every_s: float = 2.0, stream=None, window: int = 100):
+        """Set up the reporter over ``total`` flights; ticks at most every ``every_s`` seconds."""
         self.total = total
         self.every_s = every_s
         self.stream = stream if stream is not None else sys.stderr
@@ -55,6 +56,7 @@ class ConsoleProgress:
         self.rate = RollingRate(window)
 
     def __call__(self, done: int, total: int, intent: OperationalIntent) -> None:
+        """Accrue this flight's outcome and wall time, reprinting the status line when due."""
         if intent.accepted:
             self.acc += 1
         elif intent.status is IntentStatus.REJECTED:
@@ -102,6 +104,7 @@ class _MilestoneLog:
 
     def __init__(self, total: int, horizon_s: float, every_n: int = 1000, every_frac: float = 0.05,
                  roll_window: int = 100):
+        """Set up milestone counters, the plan-time tracker, and the horizon marks."""
         self.total = total
         self.every_n = every_n
         self.t0 = time.monotonic()
@@ -120,6 +123,7 @@ class _MilestoneLog:
         self.mi = 0                                     # next un-recorded horizon mark
 
     def __call__(self, done: int, req: FlightRequest, intent: OperationalIntent) -> None:
+        """Accrue this flight's plan time; log any horizon marks it crosses and the every-N line."""
         if intent.accepted:
             self.acc += 1
         elif intent.status is IntentStatus.REJECTED:
@@ -138,10 +142,11 @@ class _MilestoneLog:
                      self._perf(done))
 
     def _perf(self, done: int) -> str:
-        """This milestone's plan-time readout — cumulative avg always, plus the rolling mean and ETA once
-        the window fills (``n/a`` while warming up). Built from the shared :class:`~freespace_sim.progress.RollingRate`, so it
-        mirrors the live ConsoleProgress ticker; it's solve-time based, so its ETA slightly undershoots the
-        wall clock by the per-flight commit overhead the ticker's wall-based ETA does capture."""
+        """Plan-time readout: cumulative avg always, plus the rolling mean and ETA once the window
+        fills (``n/a`` while warming up). Shares :class:`~freespace_sim.progress.RollingRate` with
+        the live ConsoleProgress ticker, but is solve-time based, so its ETA slightly undershoots
+        the wall clock by the per-flight commit overhead the ticker's wall-based ETA does capture.
+        """
         roll, eta = self.plan.roll_ms(), self.plan.eta_s(done, self.total)
         if roll is None:
             return f"solve/flight avg={self.plan.avg_ms(done):.0f}ms roll[{self.plan.window}]=n/a ETA=n/a"
@@ -151,31 +156,39 @@ class _MilestoneLog:
 
 @dataclass
 class SimResult:
+    """Outcome of one :func:`run`: the config that flew, every intent, the ledger, and whether the
+    committed set verified conflict-free. Optional fields carry observer-only telemetry,
+    whole-schedule solver stats, and the return-anchor mode.
+    """
+
     config: SimConfig
     intents: list[OperationalIntent]
     ledger: ReservationLedger
     verified: bool
     telemetry: TelemetryCollector | None = None   # observer-only congestion capture (default off)
-    # Whole-schedule solver diagnostics (colgen), or None for per-flight planners. Carried on the
-    # result rather than only logged because the intents cannot answer "did this solve converge":
-    # a run that stopped at iteration 1 files a complete, feasible, ordinary-looking accepted set.
-    # `runs.save_run` persists this as planner_stats.json.
+    # Whole-schedule solver diagnostics (colgen), else None for per-flight planners. Carried on the
+    # result, not just logged, because the intents cannot answer "did this solve converge": a run
+    # that stopped at iteration 1 still files a complete, feasible, ordinary-looking accepted set.
+    # `runs.save_run` persists it as planner_stats.json.
     planner_stats: dict | None = None
-    # The `return_anchor` mode this run flew ("nominal" | "realized"). Carried because it is a property
-    # of the SCHEDULE that the intents cannot answer: under "realized" a paired return's departure was
-    # anchored to its outbound's realized arrival, so any post-hoc re-timing of that outbound (LNS) must
-    # respect the turnaround — and a re-timer that defaults to "nominal" would silently skip the guard.
+    # The `return_anchor` mode this run flew ("nominal" | "realized"). Carried because it is a
+    # SCHEDULE property the intents cannot answer: under "realized" a paired return was anchored to
+    # its outbound's realized arrival, so any post-hoc re-timing of that outbound (LNS) must respect
+    # the turnaround — a re-timer defaulting to "nominal" would silently skip that guard.
     return_anchor: str = "nominal"
 
     @property
     def accepted(self) -> list[OperationalIntent]:
+        """The accepted intents."""
         return [i for i in self.intents if i.accepted]
 
     @property
     def denied(self) -> list[OperationalIntent]:
+        """The rejected intents."""
         return [i for i in self.intents if i.status == IntentStatus.REJECTED]
 
     def summary(self) -> dict:
+        """Counts, denial reasons, mean/max ground delay, and mean air detour, as a plain dict."""
         from collections import Counter
 
         acc = self.accepted
@@ -197,14 +210,15 @@ class SimResult:
 
 
 def _wall_aware(planner) -> bool:
-    """True if ``planner``'s committed corridor is wall-aware under always-active terminal airspace:
-    it TAGS its terminal columns and gates pad capacity itself (A*, or any planner declaring
-    ``plans_terminal_airspace`` — the MILP family), or it reaches such a planner through its
-    ``inner``/``warm_planner`` chain and so rebuilds or falls back to a tagged intent. Walks the chain
-    (the A* shortcut variants → inner, astar_milp → warm_planner,
-    astar_milp_shortcut → both). Used only to gate
-    ``terminal_airspace_always_active`` (see ``run``): tagged columns are exempt from their own hub's
-    permanent wall, whereas a planner that builds untagged near-hub columns would collide with it."""
+    """True if ``planner`` is wall-aware under always-active terminal airspace.
+
+    Wall-aware means it TAGS its terminal columns and gates pad capacity itself (A*, or any planner
+    declaring ``plans_terminal_airspace`` — the MILP family), or it reaches such a planner through
+    its ``inner`` / ``warm_planner`` chain and so rebuilds or falls back to a tagged intent. Walking
+    the chain is why refiners and warm-start wrappers qualify. Used only to gate
+    ``terminal_airspace_always_active`` (see :func:`run`): tagged columns are exempt from their own
+    hub's permanent wall, whereas untagged near-hub columns would collide with it.
+    """
     from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
     return any(isinstance(p, AStarPlanner) or getattr(p, "plans_terminal_airspace", False)
@@ -212,9 +226,11 @@ def _wall_aware(planner) -> bool:
 
 
 def _astar_planners(planner) -> list:
-    """Every ``AStarPlanner`` reachable from ``planner`` via the inner/warm_planner chain — so telemetry
-    attaches to the A* inside any shortcut refiner or a warm-start wrapper (astar_milp, …), not just
-    a bare top-level planner."""
+    """Every ``AStarPlanner`` reachable from ``planner`` via the inner / warm_planner chain.
+
+    Lets telemetry attach to the A* inside a shortcut refiner or a warm-start wrapper (astar_milp),
+    not just a bare top-level planner.
+    """
     from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
     return [p for p in iter_planner_chain(planner) if isinstance(p, AStarPlanner)]
@@ -226,23 +242,40 @@ RETURN_ANCHORS = ("nominal", "realized")
 def demand_turnaround_s(demand) -> float:
     """The ground turnaround a demand model budgeted between an outbound and its paired return.
 
-    One reader, because two would be worse than none: the realized-anchor coupling in :func:`run` uses
-    it to place each return, and the LNS paired-return guard uses it to decide whether a re-timed
-    outbound still lands in time for that return. If those two disagreed, the guard would either reject
-    valid repairs or — the dangerous direction — admit an outbound that lands after its return has
-    already departed, with no error and no log line. Models without the attribute budget nothing."""
+    Single source of truth on purpose: the realized-anchor coupling in :func:`run` uses it to place
+    each return, and the LNS paired-return guard uses it to decide whether a re-timed outbound still
+    lands in time for that return. If the two disagreed the guard would reject valid repairs, or —
+    worse — admit an outbound that lands after its return has already departed, silently.
+
+    Parameters
+    ------------
+    - demand: the demand model; a model without a ``turnaround_s`` attribute budgets nothing.
+
+    Return
+    --------
+    - output (float): the budgeted ground turnaround in seconds, or 0.0 when unset.
+    """
     return float(getattr(demand, "turnaround_s", 0.0) or 0.0)
 
 
 def realized_release_s(intent: OperationalIntent) -> float | None:
     """When an accepted flight's landing column clears (touchdown + pad dwell) — the earliest its
     aircraft can leave again, before turnaround. That is the destination cylinder's ``t_end``, hence
-    the largest the intent holds. ``None`` if nothing landed: denied, or no volumes reserved.
+    the largest ``t_end`` the intent holds.
 
     NOT ``centerline[-1]``: the corridor stops at the column's EDGE at cruise altitude because the
-    descent inside is flown but unreserved (``astar._build``), so the last waypoint precedes touchdown
-    by ``climb_time_to(z_land)`` — 16.7 s at the density scenarios' 100 m. Anchoring returns there
-    launched them mid-descent, and the shared pad cylinder billed the overlap back as ground delay.
+    descent inside is flown but unreserved (``astar._build``), so the last waypoint precedes
+    touchdown by ``climb_time_to(z_land)``. Anchoring a return there would launch it mid-descent,
+    and the shared pad cylinder would bill the overlap back as ground delay.
+
+    Parameters
+    ------------
+    - intent (OperationalIntent): the flight whose realized release time is wanted.
+
+    Return
+    --------
+    - output (float | None): the largest volume ``t_end``, or ``None`` if nothing landed (denied,
+      or the intent holds no volumes).
     """
     if not intent.accepted or not intent.volumes:
         return None
@@ -264,59 +297,69 @@ def run(
     return_anchor: str = "nominal",
     static_terminals: list | None = None,
 ) -> SimResult:
-    """Run one strategic-layer simulation. Provide a scenario, an explicit request list, a `demand`
-    model, or none (a default `UniformPoissonDemand` is then generated from `cfg`).
+    """Run one strategic-layer simulation and return its :class:`SimResult`.
 
-    ``static_terminals`` overrides the walled-hub set derived below, and exists because that
-    derivation is NOT a function of the requests alone: with a `demand` model it is every
-    PLACED hub, and without one it is only the hubs some request actually touches. A caller
-    re-running the same flights through a second planner therefore gets a DIFFERENT airspace
-    unless it says otherwise -- measured on `density_faa_wing_zipline` truncated to 600 s,
-    182 placed hubs against 180 flight-carrying ones, so two hubs are solid for one run and
-    open for the other. Pass the set the first run used to keep the two comparable.
+    Inputs are resolved in precedence order: an explicit ``scenario``; else an explicit
+    ``requests`` list; else a ``demand`` model; else a default ``UniformPoissonDemand`` built from
+    ``cfg``. The world (ledger, DSS, one USS per id) is assembled, demand events are planned in
+    FCFS order, and the core no-conflict invariant is verified before returning. Independent of
+    ``progress``, :class:`_MilestoneLog` emits INFO milestones (every 1000 planned flights and each
+    5% of the horizon), visible only when the host configures logging (``experiments.run`` does).
 
-    ``progress`` gives live feedback through long runs: ``True`` prints a throttled status line
-    (done/total, accepted/denied, elapsed, ETA); a callable is invoked as ``progress(done, total,
-    intent)`` after each flight; ``None``/``False`` (default) stays silent. Independent of it,
-    :class:`_MilestoneLog` emits INFO status milestones (every 1000 planned flights + each 5% of the
-    horizon) via ``logging`` — visible when the host configures logging (``experiments.run`` does),
-    silent otherwise.
+    Parameters
+    ------------
+    - cfg (SimConfig): every modelling knob; the ledger and each planner are built from it.
+    - scenario (Scenario | None): a pre-built scenario; when given, ``requests`` and ``demand`` are
+      ignored.
+    - requests (list[FlightRequest] | None): an explicit request list, used only when ``scenario``
+      is None.
+    - demand (DemandModel | None): generates requests when neither ``scenario`` nor ``requests`` is
+      given, and also supplies the placed-hub wall set and the realized-anchor turnaround.
+    - planner_name (str | None): planner to build; overrides ``cfg.planner``. The stored
+      ``SimResult.config`` reflects whichever planner actually flew.
+    - planner_params: configuration object for the selected planner (today only ``colgen``'s
+      :class:`~freespace_sim.planner.colgen.ColGenParams` — solver backend, iteration cap,
+      whole-solve time budget, objective); None keeps that planner's own defaults.
+    - mechanism (Mechanism | None): the DSS arbitration mechanism; defaults to
+      :class:`FCFSMechanism`.
+    - progress (bool | ProgressCallback | None): True prints a throttled status line (done/total,
+      accept/deny, elapsed, ETA); a callable is invoked as ``progress(done, total, intent)`` after
+      each flight; None/False (default) is silent.
+    - telemetry (bool | TelemetryCollector): attach an observer-only
+      :class:`~freespace_sim.telemetry.TelemetryCollector` capturing the non-recoverable congestion
+      streams (rejected corridors, ``conflict_filed`` culprits, per-hub metadata) onto
+      ``SimResult.telemetry`` for ``save_run`` to persist. Default off is byte-identical to omitting
+      it; pass True or a preexisting collector.
+    - parallel: run the speculative worker-pool sim instead of the serial FCFS loop — a
+      :class:`~freespace_sim.parallel.ParallelConfig`, or an int ``n_workers`` shorthand. Default
+      off is the serial loop. ``mode="exact"`` is byte-identical to serial; ``mode="relaxed"`` is a
+      documented FCFS-class relaxation. Needs an envelope-recording planner (``astar`` /
+      ``astar_ref`` and the shortcut variants), and composes with ``telemetry`` (worker streams
+      merged in commit order).
+    - return_anchor (str): what a round-trip return's desired departure waits on, one of
+      ``RETURN_ANCHORS``. ``"nominal"`` (default, byte-identical to omitting it) keeps the demand
+      model's value — only ever a straight-line, undelayed estimate of when the outbound lands, so
+      under congestion it can schedule the return before its aircraft is back. ``"realized"``
+      re-anchors each return to ``realized_release_s(outbound) + turnaround``: exact and free (FCFS
+      plans the outbound first, so its arrival is in hand) and non-disruptive (filing times never
+      move, so FCFS order and the monotonic-``t_request`` eviction are untouched). A return whose
+      outbound was denied keeps its nominal anchor, so the flight set never depends on congestion;
+      the return still pays the ordinary pad-reuse separation on top. ``turnaround_s`` comes from
+      the demand model, matching the turnaround the nominal anchor budgeted for.
+    - static_terminals (list | None): overrides the walled-hub set derived here (used only under
+      ``terminal_airspace_always_active``). That derivation is not a function of the requests
+      alone: with a ``demand`` model it is every placed hub, without one only the hubs some request
+      touches, so re-running the same flights through a second planner yields a different airspace
+      unless this is passed. Pass the first run's set to keep the two comparable.
 
-    ``telemetry`` (default off → byte-identical to today) attaches an observer-only
-    :class:`~freespace_sim.telemetry.TelemetryCollector` capturing the non-recoverable congestion streams
-    (filed-but-rejected corridors, `conflict_filed` culprits, per-hub metadata) onto ``SimResult.telemetry``
-    for `save_run` to persist. Pass ``True`` or a preexisting collector.
-
-    ``planner_params`` configures the selected planner where it takes a configuration object —
-    today only ``colgen`` (a :class:`~freespace_sim.planner.colgen.ColGenParams`, carrying the solver
-    backend, iteration cap, whole-solve time budget and objective). ``None`` keeps that planner's
-    own defaults.
-
-    ``parallel`` (default off → the serial FCFS loop, byte-identical to today) runs the speculative
-    worker-pool sim (issue #8 Track A): a :class:`~freespace_sim.parallel.ParallelConfig`, or an int
-    as an ``n_workers`` shorthand. ``mode="exact"`` (default) is byte-identical to the serial run;
-    ``mode="relaxed"`` is a documented FCFS-class relaxation. Needs an envelope-recording planner
-    (``astar``/``astar_ref``/``astar_shortcut``/``astar_heading_shortcut``/
-    ``astar_batched_shortcut``). Composes with ``telemetry`` (worker streams are
-    merged in commit order).
-
-    ``return_anchor`` decides what a round-trip return's desired departure waits on:
-
-    - ``"nominal"`` (default → byte-identical to today) keeps whatever the demand model set. Demand is
-      materialized before anything is planned, so that can only ever be a straight-line, undelayed
-      estimate of when the outbound lands — under congestion it schedules the return before its
-      aircraft is back.
-    - ``"realized"`` re-anchors each return to ``realized_release_s(outbound) + turnaround`` — the
-      arrival that actually happened. Exact and free: FCFS already plans the outbound first (a paired
-      return shares its filing time and takes the next flight_id), so the arrival is always in hand.
-      Filing times never move, so FCFS order and the monotonic-``t_request`` eviction are untouched.
-      A return whose outbound was DENIED keeps its nominal anchor — dropping it would make the flight
-      set depend on congestion and break paired comparisons across runs. The return still pays the
-      ordinary pad-reuse separation on top (~8 s: ASTM buffer + ``dt`` rounding), as any flight taking
-      over that pad would; the anchor says when the aircraft is ready, not who gets the pad.
-
-    ``turnaround_s`` comes from the demand model, so the realized anchor uses exactly the turnaround
-    the nominal one budgeted for.
+    Return
+    --------
+    - output (SimResult): the config that flew, all intents, the ledger, the verification flag, and
+      any telemetry / planner stats. Raises ``ValueError`` on an unknown ``return_anchor``; on
+      ``return_anchor="realized"`` combined with ``parallel`` or a whole-schedule planner; on mixing
+      whole-schedule and per-flight planners (or whole-schedule planners with differing params); on
+      ``parallel`` with a non-envelope planner; or on ``terminal_airspace_always_active`` with a
+      planner that is not wall-aware.
     """
     if return_anchor not in RETURN_ANCHORS:
         raise ValueError(f"unknown return_anchor {return_anchor!r} (want one of {RETURN_ANCHORS})")
@@ -367,20 +410,15 @@ def run(
         # discrete routing walls from the ledger (subscribe_static).
         for center, term in static_terms:
             ledger.register_static_terminal(center, term)
-        # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its own hub's
-        # wall only if it too is tagged (conflict.volumes_conflict same-tid+cylinder). Wall-aware planners:
-        #   • astar and all shortcut variants TAG their terminal columns
-        #     (astar._build / shortcut pass the terminal id),
-        #     so they refine fully under always-active.
-        #   • the MILP family (plans_terminal_airspace) folds its corners to the column edge, TAGS the rebuilt
-        #     columns/near-hub boxes, and gates pad capacity through its own TerminalCapacity — tagging is safe
-        #     for it for the same reason it is for astar: the capacity authority serialises the pad, so the
-        #     same-tid exemption cannot pull a flight into a same-hub pad overlap.
-        #   • refiners/warm-start wrappers qualify through their chain (they rebuild or fall back to a tagged
-        #     intent).
-        # A planner that is none of these (bare straight / decoupled) has no wall-respecting geometry, so it
-        # would commit untagged near-hub columns that collide with the wall (or ignore it) and deny / mis-plan
-        # every hub flight — refused LOUDLY below rather than allowed to silently mis-plan.
+        # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its
+        # own hub's wall only if it too is tagged (conflict.volumes_conflict, same-tid + cylinder).
+        # Wall-aware planners all produce tagged columns: astar and its shortcut variants tag
+        # directly; the MILP family (plans_terminal_airspace) folds corners to the column edge, tags
+        # the rebuilt columns, and serialises the pad through its own TerminalCapacity (so the
+        # same-tid exemption cannot pull a flight into a same-hub pad overlap); refiners and
+        # warm-start wrappers qualify through their chain. A planner that is none of these (bare
+        # straight / decoupled) would commit untagged near-hub columns that collide with the wall
+        # and deny or mis-plan every hub flight — refused LOUDLY below rather than silently.
         for u in usses.values():
             if not _wall_aware(u.planner):
                 raise ValueError(
@@ -491,12 +529,11 @@ def run(
             if couple and req.paired_outbound_id is not None:
                 released = anchors.pop(req.paired_outbound_id, None)
                 if released is not None:               # None ⇒ outbound denied; keep the nominal anchor
-                    # `replace`, NOT in-place: `requests` may be caller-owned, and mutating it leaks the
-                    # coupled departures into any later run over the same list — corrupting exactly the
-                    # anchor A/B this option invites. It also re-validates t_departure >= t_request via
-                    # __post_init__, which the max() keeps satisfied (unreachable for both shipped return
-                    # modes, but a future one that filed later would otherwise violate it silently).
-                    # Only turnaround is added: `released` already includes the pad dwell.
+                    # `replace`, NOT in-place: `requests` may be caller-owned, and mutating it
+                    # would leak coupled departures into any later run over the same list,
+                    # corrupting the very anchor A/B this option invites. It also re-validates
+                    # t_departure >= t_request via __post_init__, which the max() keeps satisfied.
+                    # Only turnaround is added; `released` already includes the pad dwell.
                     req = replace(req, t_departure=max(req.t_request, released + turnaround_s))
             uss = usses.get(req.uss_id, default_uss)
             intent = uss.handle_request(req)

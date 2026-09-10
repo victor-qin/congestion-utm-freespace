@@ -25,6 +25,8 @@ _COLS = ["uss_id", "n_requests", "n_accepted", "denial_rate", "mean_total_delay_
 
 
 def main() -> None:
+    """Load a run's ``per_uss.parquet``, print the per-operator table, and write a two-panel bar
+    chart of accepted flights and mean delay by USS."""
     p = argparse.ArgumentParser(description="Per-USS breakdown table + bar chart from a saved run.")
     p.add_argument("folder", help="a results/ run folder written by experiments.run")
     args = p.parse_args()

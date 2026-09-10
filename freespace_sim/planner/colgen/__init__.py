@@ -10,8 +10,9 @@ from importlib import import_module
 
 from .params import ColGenParams
 
-# The solver and batch integration stay lazy so importing the geometry surface
-# does not eagerly import SciPy.
+# Names ``__getattr__`` resolves lazily are still listed here, so the public surface (``dir``,
+# ``from ... import *``) is complete without importing the solver/batch modules -- and thus
+# SciPy -- at import time.
 __all__ = [
     "ColGenParams",
     "ColGenResult",
@@ -22,6 +23,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    """Import the solver/batch module on first access and return the requested export."""
     if name in {"ColGenResult", "ColGenSolver"}:
         solver = import_module(f"{__name__}.solver")
         return getattr(solver, name)

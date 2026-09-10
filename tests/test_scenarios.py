@@ -340,17 +340,24 @@ def test_lead_arm_departures_stay_inside_the_horizon(base, arm):
     assert max(r.t_departure for r in reqs) < cfg.horizon_s
 
 
-def test_density_mixed_scenarios_use_two_distinct_uss():
-    for name in (
-        "density_faa_wing_zipline_amazon",
-        "density_future_wing_zipline_amazon",
-    ):
-        assert SCENARIOS[name].demand.uss == (WING_ZIPLINE_USS, AMAZON_USS)
-
-
-def test_density_single_scenarios_use_only_wing_zipline_uss():
-    for name in ("density_faa_wing_zipline", "density_future_wing_zipline"):
-        assert SCENARIOS[name].demand.uss == (WING_ZIPLINE_USS,)
+@pytest.mark.parametrize(
+    ("names", "expected_uss"),
+    [
+        pytest.param(
+            ("density_faa_wing_zipline_amazon", "density_future_wing_zipline_amazon"),
+            (WING_ZIPLINE_USS, AMAZON_USS),
+            id="mixed",
+        ),
+        pytest.param(
+            ("density_faa_wing_zipline", "density_future_wing_zipline"),
+            (WING_ZIPLINE_USS,),
+            id="single",
+        ),
+    ],
+)
+def test_density_scenarios_use_expected_uss(names, expected_uss):
+    for name in names:
+        assert SCENARIOS[name].demand.uss == expected_uss
 
 
 @pytest.mark.parametrize(

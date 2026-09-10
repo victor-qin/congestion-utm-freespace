@@ -39,6 +39,15 @@ log = logging.getLogger("freespace_sim.lns")
 
 @dataclass(kw_only=True)
 class LNSConfig:
+    """Controls for one anytime LNS run: the search budget, the destroy-operator mix and its
+    tuning, the accept rule, and the parallel / repair-planner execution knobs.
+
+    ``max_iterations`` (not ``time_limit_s``) is the reproducible budget; the incumbent stays
+    ledger-feasible with monotone non-increasing cost after every iteration, so a run may be
+    stopped at any point. ``_validate_lns_config`` validates and normalizes every field before a
+    run mutates anything.
+    """
+
     seed: int = 0
     max_iterations: int = 2000           # non-negative task budget
     neighborhood_size: int = 8          # paper N in {2,4,8,16}; larger favors less-congested instances
@@ -82,14 +91,20 @@ class LNSConfig:
     # worker builds its own inside a spawned process, so this has to survive `WorkerSpec`'s
     # picklability contract. "sipp" collapses the per-step axis into safe intervals and wins in
     # congestion; it also maintains one more ledger-subscribed structure than A* on terminal legs.
-    # See context/sipp_lns_plan.md. APPENDED AT THE TAIL deliberately — `LNSConfig` is constructed
-    # positionally by `test_lns_config_preserves_the_legacy_positional_tail`, so a field inserted
-    # mid-dataclass silently re-binds every argument after it.
+    # See context/sipp_lns_plan.md.
     repair_planner: str = "astar"
 
 
 @dataclass
 class LNSResult:
+    """Outcome of an LNS run: the improved schedule, the per-iteration anytime trajectory, and the
+    cost / timing / verification telemetry.
+
+    The parallel- and repair-planner-only fields default so every existing construction site stays
+    valid; several are ``None`` on a parallel run whose subscribers live in worker-local ledgers
+    the coordinator cannot observe after the pool closes.
+    """
+
     intents: list[OperationalIntent]    # incumbent schedule, original request order
     trajectory: list[dict]              # one row per iteration (anytime curve)
     cost_before: float
@@ -130,6 +145,7 @@ class LNSResult:
         return self.n_iterations
 
     def summary(self) -> dict:
+        """Flatten the result into a JSON-serializable dict of run metrics for archival."""
         return {
             "repair_planner": self.repair_planner,
             "t_plan_s": self.t_plan_s,
@@ -156,7 +172,22 @@ class LNSResult:
 
 
 def _integer_config_value(name: str, value, *, minimum: int) -> int:
-    """Normalize an integer config value without truncating floats or parsing strings."""
+    """Normalize an integer config value without truncating floats or parsing strings.
+
+    Rejects booleans (including NumPy) and anything ``operator.index`` cannot convert, so a float
+    or string never silently becomes an int.
+
+    Parameters
+    ------------
+    - name (str): field name, used only in the ``ValueError`` message.
+    - value: the value to validate; must be integer-like via ``operator.index`` and not a bool.
+    - minimum (int): smallest allowed value (keyword-only); a smaller value raises.
+
+    Return
+    --------
+    - output (int): the normalized value; raises ``ValueError`` if it is not an int
+      >= ``minimum``.
+    """
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"LNSConfig.{name} must be an int >= {minimum}, got {value!r}")
     try:
@@ -177,7 +208,22 @@ def _float_config_value(
     maximum: float | None = None,
     allow_positive_infinity: bool = False,
 ) -> float:
-    """Normalize a bounded real config value without accepting booleans or NaNs."""
+    """Normalize a bounded real config value without accepting booleans or NaNs.
+
+    Parameters
+    ------------
+    - name (str): field name, used only in the ``ValueError`` message.
+    - value: the value to validate; must be a real number and not a bool.
+    - minimum (float | None): lower bound (keyword-only); ``None`` leaves it unbounded below.
+    - maximum (float | None): upper bound (keyword-only); ``None`` leaves it unbounded above.
+    - allow_positive_infinity (bool): when True, ``+inf`` is accepted (keyword-only); otherwise
+      any infinity raises.
+
+    Return
+    --------
+    - output (float): the value as a float; raises ``ValueError`` if it is not a real number
+      within the bounds (NaN and disallowed infinities also raise).
+    """
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise ValueError(f"LNSConfig.{name} must be a real number, got {value!r}")
     normalized = float(value)
@@ -217,7 +263,18 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     """Validate and normalize arguments before ``LNSState`` takes over the ledger.
 
     Normalized execution-control fields use ordinary Python scalars so pool widths and result
-    summaries remain JSON-serializable when callers supplied compatible NumPy scalar types.
+    summaries remain JSON-serializable when callers supplied compatible NumPy scalar types. Two
+    coordinator-side warnings are logged here (never in a worker, whose stream nobody reads) for
+    knobs that would silently do nothing.
+
+    Parameters
+    ------------
+    - lns (LNSConfig): the caller-supplied config to validate.
+
+    Return
+    --------
+    - output (LNSConfig): a new config (via ``dataclasses.replace``) with every field validated
+      and normalized; raises ``ValueError`` on any invalid field.
     """
     if isinstance(lns.operators, str) or not isinstance(lns.operators, (tuple, list)):
         raise ValueError(
@@ -314,9 +371,8 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     #
     # A knob that silently does nothing on one arm of an A/B is how you conclude the wrong thing —
     # tune `worker_kernel_log2` down, watch A* speed up and SIPP not, and read it as SIPP scaling
-    # worse under concurrency. Say so instead. (Default footprints: A* 739 MB, SIPP 334 MB of kernel
-    # work arrays; SIPP is smaller, it just cannot be shrunk — its best-g table is fixed at 1<<21
-    # with no grow path, where A*'s g-hash/heap grows x4 and re-runs.)
+    # worse under concurrency. Say so instead. (SIPP cannot be shrunk this way: its best-g table is
+    # fixed at 1<<21 with no grow path, where A*'s g-hash/heap grows x4 and re-runs on overflow.)
     if lns.worker_kernel_log2 is not None and lns.repair_planner.startswith("sipp"):
         log.warning(
             "lns: worker_kernel_log2=%r has NO effect with repair_planner=%r — it sizes A*'s "
@@ -399,7 +455,27 @@ def _trajectory_row(
     incumbent_before=None,
     audit: dict | None = None,
 ) -> dict:
-    """Build the common trajectory schema without coupling it to an execution mode."""
+    """Build the common trajectory schema without coupling it to an execution mode.
+
+    Parameters
+    ------------
+    - i (int): iteration index recorded as ``iter``.
+    - op (str): destroy-operator name used this iteration.
+    - victims (Sequence[int]): destroyed flight ids; stored as a list, with ``n`` its length.
+    - accepted (bool): whether the repaired schedule was accepted.
+    - reason (str): human-readable accept/reject reason.
+    - cost_old (float): incumbent cost before this iteration.
+    - cost_new (float | None): repaired cost; stored as ``None`` when it is ``None`` or infinite.
+    - incumbent_cost (float): incumbent cost after this iteration.
+    - wall_s (float): wall-clock seconds elapsed when the row was recorded.
+    - incumbent_before (float | None): incumbent before the iteration (keyword-only); when given,
+      adds ``realized_improvement = incumbent_before - incumbent_cost``.
+    - audit (dict | None): extra fields merged into the row (keyword-only).
+
+    Return
+    --------
+    - output (dict): one trajectory row with the schema above.
+    """
     row = dict(
         iter=i, op=op, n=len(victims), victims=list(victims),
         accepted=accepted, reason=reason, cost_old=cost_old,
@@ -414,7 +490,21 @@ def _trajectory_row(
 
 
 def _trajectory_auc(trajectory: list[dict], cost_before: float, horizon_s: float) -> float:
-    """Integrate the best-known cost as a right-continuous step function over ``[0, horizon]``."""
+    """Integrate the best-known cost as a right-continuous step function over ``[0, horizon]``.
+
+    Timestamps are clamped monotone and to the horizon so telemetry can never manufacture negative
+    area or integrate past the reported run horizon.
+
+    Parameters
+    ------------
+    - trajectory (list[dict]): iteration rows, each read for ``wall_s`` and ``incumbent_cost``.
+    - cost_before (float): incumbent cost at time 0, held until the first row's timestamp.
+    - horizon_s (float): integration horizon in seconds; negative values are treated as 0.
+
+    Return
+    --------
+    - output (float): the area under the best-known-cost step curve over ``[0, horizon]``.
+    """
     horizon = max(0.0, float(horizon_s))
     area = 0.0
     previous_t = 0.0
@@ -442,7 +532,24 @@ def _build_lns_state(
     turnaround_s: float | None,
     maintain_claim_index: bool = True,
 ) -> LNSState:
-    """One construction path for the sequential runner and the parallel coordinator."""
+    """One construction path for the sequential runner and the parallel coordinator.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): sim config for the state and its repair planner.
+    - ledger (ReservationLedger): the ledger the state owns and mutates.
+    - intents (list[OperationalIntent]): the incumbent schedule to load.
+    - lns (LNSConfig): controls read here (frozen/movable ids, incremental_release, repair
+      planner, unimpeded workers, window bytes).
+    - static_terms (tuple | None): permanent terminal walls; None uses the ledger's own.
+    - turnaround_s (float | None): paired-return turnaround; None disables the precedence guard.
+    - maintain_claim_index (bool): build the destroy-heuristic claim index (skipped when no
+      iterations will run).
+
+    Return
+    --------
+    - output (LNSState): the constructed state, ready to repair.
+    """
     return LNSState(
         cfg,
         ledger,
@@ -475,7 +582,34 @@ def _finalize_lns_result(
     pool_spawn_s: float = 0.0,
     parallel_stats: dict | None = None,
 ) -> LNSResult:
-    """Verify and build the common sequential/parallel result without metric drift."""
+    """Verify and build the common sequential/parallel result without metric drift.
+
+    Runs the closing inter-flight conflict check so ``verified`` reflects the final schedule.
+
+    Parameters
+    ------------
+    - state (LNSState): finished search state; read for the final intents, config, static walls,
+      costs, plan/ledger timings, and ledger subscriber counts.
+    - trajectory (list[dict]): the anytime trajectory rows; also integrated into ``auc``.
+    - cost_before (float): incumbent cost before the search.
+    - n_iter (int): number of iterations run.
+    - n_accepted (int): number of accepted iterations.
+    - t0 (float): ``time.monotonic`` at run start; the total wall time is measured from it.
+    - init_s (float): construction (ruler + state) wall seconds.
+    - selector (AdaptiveSelector): operator selector, read for its final weights.
+    - repair_planner_name (str): repair planner name recorded on the result (keyword-only).
+    - search_workers (int): search worker count (keyword-only); when > 1 the subscriber counts
+      are reported as ``None`` because they live in worker-local ledgers.
+    - parallel_mode (str): execution mode label (keyword-only).
+    - pool_spawn_s (float): seconds spent spawning the worker pool (keyword-only).
+    - parallel_stats (dict | None): parallel coordinator telemetry (keyword-only); ``None``
+      becomes an empty dict.
+
+    Return
+    --------
+    - output (LNSResult): the assembled result with schedule, trajectory, costs, timings, and
+      verification flag.
+    """
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
@@ -530,16 +664,34 @@ def run_lns(
     static_terms: tuple | None = None,
     turnaround_s: float | None = None,
 ) -> LNSResult:
-    """Improve a committed schedule in place. ``ledger``/``intents`` are a completed run's
-    (the ledger is mutated; the returned intents supersede the input list).
+    """Improve a committed schedule in place, returning the improved schedule and its telemetry.
 
-    ``static_terms`` defaults to the walls the LEDGER actually holds. Passing ``()`` explicitly means
-    "a world with no always-active terminal airspace", which is a different claim: it makes the
-    unimpeded baseline free of walls (so every delay premium — the ranking that picks victims and
-    orders the repair — is inflated) and it makes the closing ``verify`` replay a world the schedule
-    was never planned against, so ``verified`` can come back True for an infeasible schedule.
-    ``turnaround_s=None`` likewise disables the paired-return guard; supply it whenever the baseline
-    ran ``return_anchor="realized"``. ``run_lns_on_result`` derives both correctly."""
+    Each iteration is destroy → repair → accept iff conflict-free and strictly cheaper, giving a
+    monotone incumbent readable at any point (see context/figures/lns_anytime_loop.png).
+
+    ``ledger`` is mutated and the returned intents supersede the input list. ``static_terms``
+    defaults to the walls the LEDGER actually holds; passing ``()`` explicitly means "a world with
+    no always-active terminal airspace", a different claim that makes the unimpeded baseline
+    wall-free (inflating every delay premium — the ranking that picks victims and orders the
+    repair) and makes the closing ``verify`` replay a world the schedule was never planned against
+    (so ``verified`` can come back True for an infeasible schedule). ``turnaround_s=None`` likewise
+    disables the paired-return guard; supply it whenever the baseline ran
+    ``return_anchor="realized"``. ``run_lns_on_result`` derives both correctly. Dispatches to the
+    parallel runner when the config enables parallel search.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): simulation config the repair planner and verifier read.
+    - ledger (ReservationLedger): the completed run's ledger; mutated in place.
+    - intents (list[OperationalIntent]): the completed run's schedule to improve.
+    - lns (LNSConfig): the LNS controls, validated before anything is mutated.
+    - static_terms (tuple | None): permanent terminal walls; ``None`` uses the ledger's own.
+    - turnaround_s (float | None): paired-return turnaround; ``None`` disables the return guard.
+
+    Return
+    --------
+    - output (LNSResult): the improved schedule plus the anytime trajectory and telemetry.
+    """
     # Validate BEFORE constructing LNSState: it detaches the caller's subscribers and may spend
     # minutes building the unimpeded ruler, so an argument error must not cost either.
     lns = _validate_lns_config(lns)
@@ -632,9 +784,10 @@ def run_lns(
 
 
 def run_lns_on_result(res, demand, lns: LNSConfig, *, return_anchor: str | None = None) -> LNSResult:
-    """Convenience entry over a ``sim.run`` result: takes the static terminals and the return-anchor
+    """Convenience entry over a ``sim.run`` result: reads the static terminals and the return-anchor
     mode from the RESULT (what the baseline actually flew), and, when that mode was ``"realized"``,
-    the turnaround the paired-return guard must respect from the demand model.
+    the turnaround the paired-return guard must respect from the demand model, then calls
+    ``run_lns``.
 
     Both are read off the result rather than re-derived, because both are silent when wrong:
 
@@ -645,10 +798,23 @@ def run_lns_on_result(res, demand, lns: LNSConfig, *, return_anchor: str | None 
       demand model without a ``terminals`` method, and misses ``sim.run``'s scenario-collected
       fallback for those models.
     * ``res.return_anchor`` decides whether the paired-return guard runs at all. Defaulting it to
-      ``"nominal"`` disabled the guard for exactly the runs that need it, with no error and no log
+      ``"nominal"`` disables the guard for exactly the runs that need it, with no error and no log
       line — the LNS would happily re-time an outbound past its return's departure. Pass
       ``return_anchor=`` only to assert the mode; disagreeing with the result is an error, not an
       override.
+
+    Parameters
+    ------------
+    - res (SimResult): a ``sim.run`` result, read for ``config``, ``ledger``, ``intents``, and
+      ``return_anchor``.
+    - demand: the demand model, used only to derive the turnaround when the anchor is
+      ``"realized"``; may be ``None``.
+    - lns (LNSConfig): the LNS controls forwarded to ``run_lns``.
+    - return_anchor (str | None): if given, asserts the result's anchor mode; a mismatch raises.
+
+    Return
+    --------
+    - output (LNSResult): the result of the underlying ``run_lns`` call.
     """
     try:
         recorded = res.return_anchor

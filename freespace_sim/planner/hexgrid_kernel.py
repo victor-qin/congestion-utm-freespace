@@ -1,25 +1,23 @@
 """Compiled (numba) footprint sweeps for :mod:`freespace_sim.planner.hexgrid`.
 
 Rasterisation turns a committed ``Volume4D`` into the hex cells it blocks. It is not on the path
-*into* the ledger — ``commit()`` stores the continuous volume verbatim — it runs in the ledger's
+into the ledger — ``commit()`` stores the continuous volume verbatim — it runs in the ledger's
 subscribers (``HexOccupancyService`` / ``CompiledHexOccupancy``), rebuilding the discrete obstacle
-map the next A* search reads. Under LNS that map is rebuilt constantly: every iteration re-commits
-a neighbourhood, and a *rejected* iteration commits twice (the repair, then the restored incumbent).
+map the next A* search reads. Under LNS that map is rebuilt constantly: every iteration re-commits a
+neighbourhood, and a rejected iteration commits twice (the repair, then the restored incumbent).
 
-**Why this is compiled.** The reference sweep (``hexgrid._candidate_slack`` + a mask) enumerates the
-axial bounding rectangle of the inflated AABB and evaluates every candidate with numpy — measured
-at **62 candidates per volume of which 10 are kept**, for ~10 ufunc/BLAS calls on 62-element arrays.
-At that size the arithmetic is free and the call overhead is everything (~3.4 us per numpy entry,
-33.9 us per volume total). Tightening the enumeration instead is measured dead: the exact per-row
-``q`` interval only removes 11% of the candidates, because the waste is the inflated AABB against
-the oriented box, not the axial rectangle against the AABB. So the fix is to make each candidate
-cheap rather than to have fewer of them — and to **emit only the cells that pass**, so the host
+Why this is compiled. The reference sweep (``hexgrid._candidate_slack`` + a mask) enumerates the
+axial bounding rectangle of the inflated AABB and evaluates every candidate with numpy — dozens of
+tiny-array candidates per volume, only a handful kept, so the ufunc/BLAS call overhead dwarfs the
+arithmetic. Tightening the enumeration is a dead end: the waste is the inflated AABB against the
+oriented box, not the axial rectangle against the AABB, so a tighter rectangle removes little.
+The fix is instead to make each candidate cheap AND to emit only the cells that pass, so the host
 never materialises the ~84% that don't.
 
-**Relationship to the reference.** ``_candidate_slack`` / ``_footprint_slack`` stay in ``hexgrid``
-unchanged and remain the oracle. The scalar box arithmetic is not bit-identical to numpy's matrix
+Relationship to the reference. ``_candidate_slack`` / ``_footprint_slack`` stay in ``hexgrid``
+unchanged and remain the oracle. The scalar box arithmetic is NOT bit-identical to numpy's matrix
 multiply, so this kernel marks cells close enough to either inflation threshold for the host to
-re-evaluate with that oracle. It also emits near-pad cells just outside the scalar threshold, since
+re-evaluate with that oracle; it also emits near-pad cells just outside the scalar threshold, since
 rounding may put the numpy result just inside. Ordinary cells stay entirely in compiled code; the
 boundary repair makes the public result decision-identical for every finite input rather than
 depending on a measured scenario margin. The cylinder path is already bit-identical (numba's
@@ -47,18 +45,36 @@ _ROUND_GUARD = 64.0 * np.finfo(np.float64).eps
 def sweep_box(q0, q1, r0, r1, R,
               ox, oy, oz, m0, m1, m2, m3, m4, m5, m6, m7, m8, h0, h1, h2,
               z, infl_pad, infl_blk, out_q, out_r, out_b, out_ambiguous):
-    """Kept cells of an oriented box's footprint at altitude probe ``z``. Returns the count.
+    """Kept cells of an oriented box's footprint at altitude probe ``z``.
 
-    ``m0..m8`` is ``BoxSpec.rot`` row-major, ``h*`` the half-extents. Mirrors ``_footprint_slack``:
-    for a box, ``all(|local_d| <= half_d + x)`` iff ``max_d(|local_d| - half_d) <= x``, and
-    ``rot^T . v`` (column) equals ``v . rot`` (row), so column ``j`` of ``(p - centre) @ rot`` is
-    ``dx*m[j] + dy*m[3+j] + dz*m[6+j]``.
+    Mirrors ``_footprint_slack``: for a box, ``all(|local_d| <= half_d + x)`` iff
+    ``max_d(|local_d| - half_d) <= x``, and ``rot^T . v`` (column) equals ``v . rot`` (row), so
+    column ``j`` of ``(p - centre) @ rot`` is ``dx*m[j] + dy*m[3+j] + dz*m[6+j]``.
 
-    The loop nest is **q outer, r inner** because that is the order
+    The loop nest is q outer, r inner because that is the order
     ``meshgrid(..., indexing="ij").ravel()`` produces in the reference. Transposing it would still
-    emit every correct cell, but in a different sequence — which silently reorders
+    emit every correct cell, but in a different SEQUENCE — which silently reorders
     ``HexOccupancyService._rows``, ``CompiledHexOccupancy._claims`` and the interval pool's
     ``block_range`` applications. Nothing would raise, so the parity test compares ORDERED rows.
+
+    Parameters
+    ------------
+    - q0, q1, r0, r1 (int): inclusive axial candidate rectangle (computed host-side; the module
+      docstring explains why rounding stays in Python).
+    - R (float): hex circumradius (m).
+    - ox, oy, oz (float): box centre in ENU (m).
+    - m0..m8 (float): ``BoxSpec.rot`` row-major.
+    - h0, h1, h2 (float): box half-extents (m).
+    - z (float): altitude probe (m).
+    - infl_pad, infl_blk (float): pad and blocked inflation (m), ``infl_pad >= infl_blk``.
+    - out_q, out_r (int[]): caller-allocated output arrays receiving the kept cells' axial coords.
+    - out_b (bool[]): output flag per kept cell — inside the blocked (narrower) footprint.
+    - out_ambiguous (bool[]): output flag per kept cell — within the roundoff guard of a threshold,
+      so the host must re-check it against the numpy oracle.
+
+    Return
+    --------
+    - output (int): the number of kept cells written to the head of each output array.
     """
     n = 0
     dz = z - oz
@@ -107,13 +123,29 @@ def sweep_box(q0, q1, r0, r1, R,
 @njit(cache=True, nogil=True)
 def sweep_cyl(q0, q1, r0, r1, R, ccx, ccy, rad, z_lo, z_hi,
               z, infl_pad, infl_blk, out_q, out_r, out_b):
-    """Kept cells of a vertical cylinder's footprint at altitude probe ``z``. Returns the count.
+    """Kept cells of a vertical cylinder's footprint at altitude probe ``z``.
 
     Mirrors ``_footprint_slack``'s cylinder branch: the radial margin ``hypot(dx, dy) - radius`` and
     the altitude-band margin ``max(z_lo - z, z - z_hi)``, combined with ``maximum``. ``np.hypot`` is
     deliberate and not interchangeable with ``sqrt(dx*dx + dy*dy)`` — hypot is correctly rounded and
-    overflow-safe, and the naive form differs in the last ULP. numba's ``np.hypot`` measures
+    overflow-safe, and the naive form differs in the last ULP; numba's ``np.hypot`` measures
     bit-identical to numpy's over every committed cylinder in a density cut.
+
+    Parameters
+    ------------
+    - q0, q1, r0, r1 (int): inclusive axial candidate rectangle (computed host-side).
+    - R (float): hex circumradius (m).
+    - ccx, ccy (float): cylinder centre in ENU (m).
+    - rad (float): cylinder radius (m).
+    - z_lo, z_hi (float): cylinder altitude band (m).
+    - z (float): altitude probe (m).
+    - infl_pad, infl_blk (float): pad and blocked inflation (m), ``infl_pad >= infl_blk``.
+    - out_q, out_r (int[]): caller-allocated output arrays receiving the kept cells' axial coords.
+    - out_b (bool[]): output flag per kept cell — inside the blocked (narrower) footprint.
+
+    Return
+    --------
+    - output (int): the number of kept cells written to the head of each output array.
     """
     n = 0
     zs = z_lo - z

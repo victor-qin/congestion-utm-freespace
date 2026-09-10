@@ -4,9 +4,9 @@ The pure-Python ``SIPPPlanner`` (``sipp_ref``) is the oracle — already proven 
 (see ``test_sipp.py``). The compiled ``sipp`` must reproduce it **exactly**, including fixed-terminal
 lane choice. These tests assert
 ``compiled == reference`` (cost + accept + centerline), that the kernel actually runs (low fallback),
-and that absent numba degrades to the reference. The pool-vs-index parity test that used to live here
-went with the global interval pool (`context/sipp_runtime_plan.md` Phase 3); its successor is
-``tests/test_sipp_window.py``, which compares the per-plan build against ``blocked_py``. If numba is unavailable every plan falls back, so equivalence still holds trivially.
+and that absent numba degrades to the reference. Per-plan window parity lives in
+``tests/test_sipp_window.py``, which compares the per-plan build against ``blocked_py``. If numba is
+unavailable every plan falls back, so equivalence still holds trivially.
 """
 import numpy as np
 import pytest
@@ -154,7 +154,7 @@ def test_astar_warm_failure_keeps_sipp_kernel_fallback_on_astar_reference(monkey
 
 def test_sipp_warm_compiles_the_window_builder_too():
     """`build_window_intervals` owns a numba cache separate from `_search`, so it needs its own warm
-    call — measured ~0.92 s cold and ~132 ms off a warm on-disk cache, against ~5 us hot.
+    call.
 
     Without it every spawned DROP worker meets an uncompiled builder on its FIRST repair,
     simultaneously: the compile stampede `_swarm_jit` exists to prevent, and one that would be billed
@@ -430,23 +430,17 @@ def test_compiled_replay_exact_big_dense_short_flights():
 # ---- the ground-state fold's exit-lane path: compiled == reference on terminal flights ----
 
 
-def test_compiled_replay_dallas_terminal_accept_set():
-    """Terminal (exit-lane) flights: the compiled kernel and the pure-Python reference must agree on
-    WHO FLIES and must not lean on the A* fallback. Cost equality is asserted separately."""
+def test_compiled_replay_dallas_terminal():
+    """Terminal (exit-lane) flights, one replay checking BOTH properties: the compiled kernel and the
+    pure-Python reference must agree on WHO FLIES (accept set) without leaning on the A* fallback, and
+    exact destination-lane scoring must keep their terminal costs identical."""
     rows, fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
     assert rows
     assert all(ca == ra for ca, ra, _, _, _, _ in rows), "accept-set mismatch vs reference"
     assert sum(1 for r in rows if r[0]) > 20, "too few accepted flights to exercise the exit-lane fold"
+    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
     if _COMPILED:
         assert fb < 0.15 * len(rows), f"kernel fell back too often ({fb}/{len(rows)})"
-
-
-@pytest.mark.slow
-def test_compiled_replay_exact_dallas_terminal():
-    """Exact destination-lane scoring keeps compiled and reference terminal costs identical."""
-    rows, _fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
-    assert rows
-    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
 
 
 # ---- saturation regression: kernel must respect the own-lane overlay intervals ----
@@ -519,9 +513,8 @@ def test_compiled_full_run_verified_and_matches_reference():
 def test_commit_hook_shares_one_geometry_sweep_across_every_subscriber(monkeypatch):
     """A flight longer than the base LRU still gets one geometry sweep shared by all subscribers.
 
-    Two structures now, not three: SIPP's global interval pool is gone. They still share the sweep
-    because `CompiledHexOccupancy` and `HexOccupancyService` derive identical `infl_blocked` /
-    `infl_pad` radii, which is what `rasterize_ranges`' memo keys on."""
+    The subscribers share the sweep because `CompiledHexOccupancy` and `HexOccupancyService` derive
+    identical `infl_blocked` / `infl_pad` radii, which is what `rasterize_ranges`' memo keys on."""
     from freespace_sim.geometry import CylinderSpec
     from freespace_sim.planner import hexgrid as hg
     from freespace_sim.planner.astar.occupancy import HexOccupancyService
@@ -534,9 +527,9 @@ def test_commit_hook_shares_one_geometry_sweep_across_every_subscriber(monkeypat
 
     calls = 0
     # `_sweep_kept` is "the single place the compiled/reference choice is made", so counting here is
-    # backend-independent. It replaced `_candidate_slack` as the sweep entry point in #115, which
-    # silently zeroed this counter (0/1025) rather than changing the answer — the assert below is what
-    # catches that class of drift, so keep it counting the funnel, not either backend's leaf.
+    # backend-independent. A change that zeroed this counter rather than the answer is exactly the
+    # class of drift the assert below catches, so keep it counting the funnel, not either backend's
+    # leaf.
     real = hg._sweep_kept
 
     def counting(*args, **kwargs):

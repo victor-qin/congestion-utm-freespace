@@ -1,10 +1,13 @@
-
+## Conversation
+- Limit the usage of terms to describe code or functionality of features that you have not defined to the user. Work with the user to come up with terms.
+- Be smart with token usage. Use subagents with lower reasoning where it won't affect quality of responses, such as for diagnostics and profiling work.
 
 ## Planning and Testing
 - When writing or planning for a new feature, comprehensively clarify uncertainty in the functionality of the feature with the user.
 - Write or plan clearly the tests that are clearly linked back to the functionality of a feature.
 - Prefer extending or parametrizing existing tests over adding new tests. A few strong tests beat many narrow ones.
-- Every test must trace to a functional requirement; delete tests that only pin an implementation detail or duplicate existing coverage.
+- Every test must trace to a functional requirement; avoid writing tests that pin implementation details or duplicate existing coverage.
+- When running the test suite, run limited sets of tests that pertain to the changes only; run the whole suite only when it's needed, like on PRs before merge.
 
 ## Editing files
 
@@ -14,9 +17,9 @@
 - After making changes, run the project’s standard checks when feasible (format/lint, unit tests, build/typecheck).
 
 ## Documentation (REQUIRED)
-- For major functions, the docstring should be standardized as:
+- For major functions (both public and private), the docstring should be standardized as:
 ```
-***
+"""
 [Description]
 
 Parameters
@@ -26,11 +29,14 @@ Parameters
 Return
 --------
 - output (Type): description
-***
+"""
 ```
 - Classes should include a description at the top before parameters are defined.
+- Major functions should annotate every parameter and the return type in the signature
 - Minor functions include at least a sentence long description, depending on how complex the function is.
-- Comments should succintly explain why non-obvious code is the way it is, or state a constraint future edits must preserve (ordering, parity, byte-exactness). Comments do not serve as changelog
+- Comments should succintly explain why non-obvious code is the way it is, or state a constraint future edits must preserve (ordering, parity, byte-exactness). Comments do not serve as changelog.
+- Avoid comments that try to describe the spatial or temporal functionality of a function, where a figure would be more illustrative. Instead, make a PNG and place it in `/context/figures/` and cite that figure as a comment.
+- Put the code for figures in `/context/figures/make_figures.py`. Try to reuse code as much as possible.
 
 ## CONTINUITY.md (REQUIRED)
 
@@ -68,4 +74,6 @@ There is an extremely high-bar for transferring things from `.agent/CONTINUITY.m
 - In addition to following the format of `CONTINUITY.md`, note the file(s) that are relevant to the recorded comment.
 - `HISTORY.md` will only be updated when a PR is created, or when it is merged.
 
-
+## Repository
+- Files in `context/` and `analysis/` do not need to be maintained.
+- If reusing a script from `context/` and `analysis/`, double check for correcteness before using them, especially with files in `freespace_sim/`.

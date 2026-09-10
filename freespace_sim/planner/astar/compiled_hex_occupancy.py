@@ -43,22 +43,24 @@ def ground_delay_steps(cfg) -> int:
 
 
 def search_horizon(base: int, takeoff_steps_max: int, n_hops: int, climb_span: int, cfg) -> int:
-    """The largest ``step`` an A* plan can reach: takeoff + a 3× lateral detour budget + a full ground-
-    delay allowance + the mid-route climb span. ONE definition (issue #5) — ``_plan_reference``,
+    """The largest ``step`` an A* plan can reach: takeoff + a 3× lateral detour budget + a full
+    ground-delay allowance + the mid-route climb span. ONE definition — ``_plan_reference``,
     ``_plan_compiled``, and ``CompiledHexOccupancy._box`` (with worst-case args) all call it, so the
-    kernel's search bound, the box guard, and ``MAXS`` cannot drift apart. Monotone in ``base``/``n_hops``,
-    so ``_box``'s worst-case value bounds every per-flight one."""
+    kernel's search bound, the box guard, and ``MAXS`` cannot drift apart. Monotone in
+    ``base``/``n_hops``, so ``_box``'s worst-case value bounds every per-flight one."""
     return (base + takeoff_steps_max + ground_delay_steps(cfg)
             + 3 * n_hops + 2 * climb_span + 6)
 
 
 def hover_tail_steps(cfg) -> int:
-    """Extra steps a committed landing column occupies PAST the arrival step — hover dwell + climb to the
-    top level + the ASTM time buffer, in dt units (mirrors ``volumes.hover_reservation`` /
-    ``hexgrid._step_range``). ``MAXS`` adds this so the box covers every committed step;
-    query correctness never needs it (every query is ``≤ max_step ≤ MAXS``), but it removes the old
-    hand-tuned ``+16`` slack that only happened to cover the tail on default numbers (issue #1)."""
+    """Extra steps a committed landing column occupies PAST the arrival step — the hover dwell,
+    the climb to the top level, and the ASTM time buffer, in dt units (mirrors
+    ``volumes.hover_reservation`` / ``hexgrid._step_range``). ``MAXS`` adds this so the box covers
+    every committed step; query correctness never needs it (every query ``≤ max_step ≤ MAXS``)."""
     max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
+    # +2 is discretisation headroom OVER the ceil count (see context/figures/hover_tail_steps.png):
+    # `_step_range`'s own +dt widening and a mid-step arrival's floor slip each add a step, and MAXS
+    # only sizes the box, so a safe over-count costs nothing while an undercount would clip the tail.
     return int(math.ceil((cfg.hover_time_s + max_climb + cfg.time_buffer_s) / cfg.dt_s)) + 2
 
 
@@ -70,9 +72,9 @@ def schedulable_horizon_steps(cfg) -> int:
     step past ``MAXS``. Hence this need NOT cover late departures — unlike the permanent terminal WALL, which
     is time-invariant and uses its own sentinel ``t_end`` (see ``volumes.permanent_terminal_reservation``).
 
-    Nor need it cover the origin lane traverse the per-flight horizon now adds (issue #52): lanes come
-    from DEMAND terminals whose radii can exceed ``cfg.terminal_radius_m``, so no cfg-only bound exists —
-    a flight whose lane steps push ``max_step`` past ``MAXS`` box-guards to the reference the same way."""
+    Nor need it cover the origin lane traverse the per-flight horizon adds: lanes come from DEMAND
+    terminals whose radii can exceed ``cfg.terminal_radius_m``, so no cfg-only bound exists; a
+    flight whose lane steps push ``max_step`` past ``MAXS`` box-guards to the reference likewise."""
     w, h = cfg.region_size_m
     dt = cfg.dt_s
     pitch = cfg.nominal_speed_mps * dt
@@ -98,6 +100,23 @@ class CompiledHexOccupancy:
     """Commit-hook-driven packed claims feeding the compiled A* occupancy window."""
 
     def __init__(self, cfg, margin: int = 64, track_removal: bool = False):
+        """Build the occupancy box, the empty claim arena, and the static-wall array.
+
+        Parameters
+        ------------
+        - cfg: simulation config; supplies the region size, hex geometry, level count, and the
+          horizon that sizes ``MAXS``.
+        - margin (int): extra hex rings around the region corners so a rerouted corridor cell still
+          lands inside the box (a committed cell outside it is skipped, counted in
+          ``oob_corridor_cells``).
+        - track_removal (bool): accepted for caller compatibility; the per-owner row stream is now
+          unconditional (it is how the arena is fed), so this flag no longer gates anything.
+
+        Return
+        --------
+        - output (None): initializes the instance; raises ``ValueError`` if the horizon is too deep
+          to pack into the 20-bit step fields.
+        """
         self.cfg = cfg
         self.R = hg.circumradius(cfg)
         self.infl_blocked = cfg.corridor_width_m / 2.0 + self.R
@@ -105,17 +124,17 @@ class CompiledHexOccupancy:
         self.n_levels = cfg.n_levels
         self.n_added = 0
         self.evicted_before: int | None = None
-        # Kept for compatibility with callers that still pass it; the per-owner row stream it used to
-        # gate is now unconditional, because it is how the arena is fed rather than an opt-in journal.
+        # Accepted for caller compatibility; the row stream it once gated is now unconditional (it
+        # is how the arena is fed, not an opt-in journal). See the constructor docstring.
         self.track_removal = track_removal
         # THE occupancy. One claim is one int64, in a flat arena (see `claim_arena`) constructed below
         # once NC is known:
         #     key    = c << 1 | pool_idx                 (corridor or column, which cell)
         #     claim  = s0 << 40 | s1 << 20 | fid_code    (`_fids[fid_code]` recovers the owner)
-        # Packed because it is per-claim and therefore linear in schedule size (the tuple form
-        # measured 68 MB at 290 flights). Ranges are checked in `_record`; the constructor rejects a
-        # horizon too deep to pack. `_rows[fid]` is the same pairs per owner, which is what makes a
-        # release O(the flight's own footprint).
+        # Packed because it is per-claim and therefore linear in schedule size (a tuple form costs
+        # far more per claim). Ranges are checked in `_record`; the constructor rejects a horizon
+        # too deep to pack. `_rows[fid]` is the same pairs per owner, which is what makes a release
+        # O(the flight's own footprint).
         self._arena: ClaimArena
         self._rows: dict[int, array] = {}            # fid -> flat int64 (key, claim) pairs
         self._nvol: dict[int, int] = {}              # fid -> volumes absorbed
@@ -126,26 +145,27 @@ class CompiledHexOccupancy:
         self.qmin, self.rmin, self.qspan, self.rspan = qmin, rmin, qspan, rspan
         self.NC = qspan * rspan * self.n_levels
         self.MAXS = maxs
-        if maxs >= _SPAN_LIMIT:       # see the packed-claim layout: s0/s1 get 20 bits each. No longer
-            #                           `track_removal`-gated: every mode records claims now, so a
-            #                           too-deep horizon must fail HERE, with a readable message,
-            #                           rather than mid-commit inside `_record`.
+        if maxs >= _SPAN_LIMIT:       # see the packed-claim layout: s0/s1 get 20 bits each. Every
+            #                           mode records claims, so a too-deep horizon must fail HERE
+            #                           with a readable message, not mid-commit inside `_record`.
             raise ValueError(
                 f"CompiledHexOccupancy: horizon of {maxs} steps exceeds the removal journal's "
                 f"{_SPAN_LIMIT}-step packing limit")
         self._arena = ClaimArena(2 * self.NC, _S0_SHIFT, _SPAN_BITS, _FIELD_MASK)
-        # cell → {terminal ids whose column EVER covers it, across all steps}. Lets the host detect an
-        # own∩foreign shared cell (issue #3) and fall back to the reference, instead of the overlay boolean
-        # silently treating a foreign column as transparent. Deliberately TIME-COLLAPSED and NOT pruned by
-        # evict_before: it's a conservative SUPERSET of live columns, so the overlap check may fall back for
-        # a temporally-past foreign column — safe (the reference is exact), and bounded by the hub layout
-        # (distinct column cells × owning hubs, not per-flight), so it does not grow unboundedly.
+        # cell → {terminal ids whose column EVER covers it, across all steps}. Lets the host detect
+        # an own∩foreign shared cell and fall back to the reference, instead of the overlay boolean
+        # silently treating a foreign column as transparent. Deliberately TIME-COLLAPSED and NOT
+        # pruned by evict_before: it's a conservative SUPERSET of live columns, so the overlap check
+        # may fall back for a temporally-past foreign column — safe (the reference is exact), and
+        # bounded by the hub layout (distinct column cells × owning hubs, not per-flight), so it
+        # does not grow unboundedly.
         self.col_owners: dict[int, set] = {}
-        # Always-active terminals (cfg.terminal_airspace_always_active, #24): permanent FOREIGN column walls,
-        # step- AND level-independent (the [ground, ceiling] tube). A per-cell bool over the SAME (q,r,L) index
-        # as the pools — a static cell reads as column-blocked at EVERY step (the kernel folds it into `colb`).
-        # NOT ledger-derived, so reset() re-applies it from `_static_terms` (the hub set doesn't change); the
-        # array itself is never cleared. Empty unless `_on_static` fires (ledger subscribe_static hook) ⇒ off = free.
+        # Always-active terminals (cfg.terminal_airspace_always_active): permanent FOREIGN column
+        # walls, step- AND level-independent (the [ground, ceiling] tube). A per-cell bool over the
+        # SAME (q,r,L) index as the pools — a static cell reads as column-blocked at EVERY step (the
+        # kernel folds it into `colb`). NOT ledger-derived, so reset() re-applies it from
+        # `_static_terms` (the hub set doesn't change); the array itself is never cleared. Empty
+        # unless `_on_static` fires (ledger subscribe_static hook) ⇒ off = free.
         self.static_col = np.zeros(self.NC, np.bool_)
         self._static_terms: list = []                   # (center, term) per walled hub, for reset() re-apply
         # committed corridor cells that fell outside the box: skipped (never a crash); any query to such a
@@ -155,6 +175,19 @@ class CompiledHexOccupancy:
 
 
     def _box(self, cfg, margin):
+        """Occupancy box ``(qmin, rmin, qspan, rspan, MAXS)`` from the region corners + margin.
+
+        Parameters
+        ------------
+        - cfg: simulation config; supplies the region size and hex geometry, plus the horizon that
+          ``schedulable_horizon_steps`` turns into ``MAXS``.
+        - margin (int): extra hex rings around the region corners so a rerouted cell stays in box.
+
+        Return
+        --------
+        - output (tuple[int, int, int, int, int]): ``(qmin, rmin, qspan, rspan, MAXS)`` — the box
+          origin, its q- and r-spans, and the step depth ``MAXS``.
+        """
         w, h = cfg.region_size_m
         R = self.R
         qs, rs = [], []
@@ -167,6 +200,19 @@ class CompiledHexOccupancy:
         return qmin, rmin, qmax - qmin + 1, rmax - rmin + 1, maxs
 
     def cell_id(self, q: int, r: int, L: int) -> int:
+        """Flat index of hex (q, r) at level ``L`` in the box, or ``-1`` if it falls outside.
+
+        Parameters
+        ------------
+        - q (int): axial hex column coordinate.
+        - r (int): axial hex row coordinate.
+        - L (int): flight level.
+
+        Return
+        --------
+        - output (int): the packed cell id ``(iq * rspan + ir) * n_levels + L``, or ``-1`` when out
+          of the box (any query to such a cell makes the kernel fall back via ``FB_OOB``).
+        """
         iq, ir = q - self.qmin, r - self.rmin
         if iq < 0 or iq >= self.qspan or ir < 0 or ir >= self.rspan or L < 0 or L >= self.n_levels:
             return -1
@@ -176,12 +222,21 @@ class CompiledHexOccupancy:
     def on_commit(self, flight_id, volumes) -> None:
         """Ledger commit subscriber: rasterize the flight's volumes into claims and add them.
 
-        The per-owner row stream is no longer optional. It was `track_removal`-gated when it existed
-        only to let `on_release` un-absorb; now it is how the arena — the occupancy itself — is fed,
-        so every mode records. `rows` is exactly THIS commit's pairs, where `_rows[fid]` accumulates
-        across commits for the same flight, so the arena must be fed from the former."""
-        hg.prepare_range_cache_for_commit(volumes)   # main (#117): size the shared raster LRU so
-        #                                              every observer of THIS commit reuses one sweep
+        The per-owner row stream is not optional: it is how the arena — the occupancy itself — is
+        fed, so every mode records. ``rows`` is exactly THIS commit's ``(key, claim)`` pairs, while
+        ``_rows[fid]`` accumulates across commits for the same flight.
+
+        Parameters
+        ------------
+        - flight_id: the committing flight's id (keys ``_rows``/``_nvol`` for release).
+        - volumes (Iterable[Volume4D]): the flight's committed volumes.
+
+        Return
+        --------
+        - output (None): records the flight's claims in the arena and advances ``n_added``.
+        """
+        hg.prepare_range_cache_for_commit(volumes)   # size the shared raster LRU so every observer
+        #                                              of THIS commit reuses one geometry sweep
         own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
                          if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         rows: list = []
@@ -201,12 +256,22 @@ class CompiledHexOccupancy:
     def on_release(self, flight_id, volumes) -> None:
         """Ledger release subscriber: drop the flight's claims. O(ITS OWN footprint).
 
-        This is the whole point of the pool-less occupancy. The interval pools stored FREE intervals,
-        which can absorb a block but cannot subtract one, so this method used to reset every cell the
-        flight touched and re-apply all the SURVIVING claims on it — measured at 12.2x the flight's
-        own footprint at density_faa scale, and growing with congestion, because the multiplier is how
-        many OTHER flights share those cells. A claim is a blocked span, so removing one is removing
-        one. ``col_owners`` is still deliberately NOT pruned (documented conservative superset)."""
+        This is the whole point of the pool-less occupancy: a claim is a blocked span, so removing
+        one is removing one. The former interval pools stored FREE intervals, which can absorb a
+        block but cannot subtract one, so release had to reset every cell the flight touched and
+        re-apply every SURVIVING claim — cost growing with congestion (the multiplier is how many
+        OTHER flights share those cells). ``col_owners`` is still deliberately NOT pruned (a
+        conservative superset).
+
+        Parameters
+        ------------
+        - flight_id: the flight whose claims are removed from the arena and ``_rows``/``_nvol``.
+        - volumes: accepted for the subscriber signature; the released count comes from ``_nvol``.
+
+        Return
+        --------
+        - output (None): removes the flight's claims from the arena and decrements ``n_added``.
+        """
         rows = self._rows.pop(flight_id)
         if rows:
             flat = np.frombuffer(rows, dtype=np.int64).reshape(-1, 2)
@@ -215,6 +280,24 @@ class CompiledHexOccupancy:
         self.n_added -= self._nvol.pop(flight_id)
 
     def _add(self, vol, own_cols, fid=None, _rows: list | None = None) -> None:
+        """Rasterize one committed volume into claim rows: column cells to the column pool
+        (recording the owner in ``col_owners``), corridor cells to the corridor pool minus the
+        committing flight's own interior; out-of-box corridor cells are skipped (a query falls back
+        via FB_OOB).
+
+        Parameters
+        ------------
+        - vol (Volume4D): the committed volume to rasterize.
+        - own_cols (tuple): the committing flight's own terminal columns ``(cx, cy, radius)``; a
+          corridor cell inside one is skipped as the vertiport's unreserved interior.
+        - fid: the owning flight id, passed through to ``_record`` for each emitted claim.
+        - _rows (list | None): list the packed ``(key, claim)`` rows are appended to.
+
+        Return
+        --------
+        - output (None): appends this volume's claim rows to ``_rows`` and updates ``col_owners`` /
+          ``oob_corridor_cells`` as needed.
+        """
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         # Loop-invariant own-column membership, resolved once per flight and shared with the reference
@@ -249,6 +332,23 @@ class CompiledHexOccupancy:
                 self._record(0, c, int(s_lo), int(s_hi), fid, _rows)
 
     def _record(self, pool_idx: int, c: int, s0: int, s1: int, fid, _rows: list | None) -> None:
+        """Append one packed ``(key, claim)`` row for cell ``c`` in ``pool_idx`` owned by ``fid``;
+        raises ``ValueError`` if a step or flight index would overflow its 20-bit field.
+
+        Parameters
+        ------------
+        - pool_idx (int): pool selector stored as the low key bit — 0 corridor, 1 column.
+        - c (int): flat cell id the claim covers.
+        - s0 (int): first blocked step of the span.
+        - s1 (int): last blocked step of the span.
+        - fid: owning flight id, interned to a 20-bit fid code.
+        - _rows (list | None): list the two packed int64 values (key, claim) are appended to.
+
+        Return
+        --------
+        - output (None): appends the packed ``(key, claim)`` pair to ``_rows``; raises
+          ``ValueError`` if ``s1`` or the fid code exceeds the 20-bit packing limit.
+        """
         if s1 >= _SPAN_LIMIT:
             # A committed volume can outlive the box (a late return commits past MAXS and box-guards
             # to the reference), so the constructor's MAXS check does not bound this. One compare
@@ -267,15 +367,16 @@ class CompiledHexOccupancy:
 
     def _on_static(self, center, term) -> None:
         """Derive the compiled routing wall from a ledger static-terminal registration — the
-        ``ReservationLedger.subscribe_static`` hook target (bound in ``AStarPlanner._compiled_occ``, and named
-        ``_on_static`` to match ``HexOccupancyService._on_static`` / the ``on_commit`` observer convention). Marks
-        ``static_col`` at every flight level for each terminal hex (``hg.terminal_cells`` — the SAME cell set
-        as ``HexOccupancyService.static_term_cells``, so the compiled wall is byte-identical to the
-        reference) and records the owning ``tid`` in ``col_owners`` so the own∩foreign overlap check (issue
-        #3) still fires. Appends to ``_static_terms`` so ``reset()`` re-applies it (col_owners is cleared on
-        reset — unlike the reference's `static_term_cells` which reset() never touches). The hub's own
-        flights pass through (the host overlay marks these cells own — see ``_build_overlay``). Idempotent
-        per hub. The authoritative wall is the ledger's permanent volume; this is the derived routing view."""
+        ``ReservationLedger.subscribe_static`` hook target (bound in ``AStarPlanner._compiled_occ``,
+        named ``_on_static`` to match ``HexOccupancyService._on_static`` / the ``on_commit``
+        observer convention). Marks ``static_col`` at every flight level for each terminal hex
+        (``hg.terminal_cells`` — the SAME cell set as ``HexOccupancyService.static_term_cells``, so
+        the compiled wall is byte-identical to the reference) and records the owning ``tid`` in
+        ``col_owners`` so the own∩foreign overlap check still fires. Appends to ``_static_terms`` so
+        ``reset()`` re-applies it (``col_owners`` is cleared on reset — unlike the reference's
+        ``static_term_cells``, which ``reset()`` never touches). The hub's own flights pass through
+        (the host overlay marks these cells own — see ``_build_overlay``). Idempotent per hub. The
+        authoritative wall is the ledger's permanent volume; this is the derived routing view."""
         self._static_terms.append((center, term))
         self._mark_static(center, term)
 
@@ -291,10 +392,30 @@ class CompiledHexOccupancy:
                     self.col_owners.setdefault(c, set()).add(tid)
 
     def evict_before(self, step) -> None:
+        """Advance the eviction floor (monotonic; an earlier/equal ``step`` is a no-op).
+
+        Only records the floor; committed spans below it are clipped on insert in ``_add`` (the
+        arena itself is not pruned).
+
+        Parameters
+        ------------
+        - step (int): the lowest step later commits should retain.
+
+        Return
+        --------
+        - output (None): updates ``evicted_before``.
+        """
         if self.evicted_before is None or step > self.evicted_before:
             self.evicted_before = step
 
     def reset(self) -> None:
+        """Clear the ledger-derived claims for a from-scratch rebuild (e.g. on ledger shrink).
+
+        ``_fids`` is an interning pool (value-identical across a rebuild) and survives. Static
+        terminals are NOT ledger-derived, so they are re-marked into the freshly-cleared
+        ``col_owners`` (``static_col`` was never cleared, so the re-mark is idempotent), mirroring
+        ``HexOccupancyService.reset`` leaving ``static_term_cells`` intact.
+        """
         self.n_added = 0
         self.evicted_before = None
         self.col_owners.clear()
@@ -302,10 +423,6 @@ class CompiledHexOccupancy:
         self._rows.clear()
         self._nvol.clear()
         self._arena.reset()
-        # `_fids` is an interning pool — value-identical across a rebuild, so it survives reset().
-        # Static terminals are NOT ledger-derived (a shrink rebuild must keep them) — re-mark them into the
-        # freshly-cleared col_owners (static_col was never cleared, so this is idempotent). Mirrors
-        # HexOccupancyService.reset() leaving static_term_cells intact.
         for center, term in self._static_terms:
             self._mark_static(center, term)
 
@@ -314,12 +431,24 @@ class CompiledHexOccupancy:
         """Point query reproducing the kernel's fold — the pure-Python oracle every compiled-path
         parity test compares against.
 
-        Now a scan of the cell's claim slab. That is ~3.3x more work per probe than the interval
-        walk it replaces, which is why the per-plan window is no longer optional: the kernel reads
-        the window, not this, and this exists for tests and diagnostics.
+        A scan of the cell's claim slab, more work per probe than the interval walk it replaces,
+        which is why the per-plan window is no longer optional: the kernel reads the window, not
+        this, and this exists for tests and diagnostics.
 
-        ``own_cells``: cell ids that are the planning flight's OWN column footprint (empty / ``None``
-        for ``own=∅``). Out-of-box ⇒ ``True`` (the kernel would fall back)."""
+        Parameters
+        ------------
+        - q (int): axial hex column coordinate.
+        - r (int): axial hex row coordinate.
+        - L (int): flight level.
+        - s (int): time step.
+        - own_cells (set[int] | None): cell ids that are the planning flight's OWN column footprint
+          (``None`` / empty for ``own=∅``), which read as transparent.
+
+        Return
+        --------
+        - output (bool): True if the cell is blocked at step ``s`` (also True when out of the box —
+          the kernel would fall back there).
+        """
         c = self.cell_id(q, r, L)
         if c < 0:
             return True

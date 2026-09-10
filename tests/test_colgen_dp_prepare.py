@@ -129,9 +129,8 @@ def test_topology_arcs_and_roles_match_the_graph_oracle(shape):
 def test_topology_reads_the_ceiling_rather_than_rebuilding_it(shape):
     """``air_hop_limit`` is ``fg.max_air_hops``, the one bound the search has.
 
-    Pinned because the predecessor of this code carried a second copy spelled
-    ``shortest_hops + detour_slack_hops``; issue #78 removed that knob precisely because
-    the two agreed at the shipped default and diverged everywhere else.
+    Pinned because a second copy spelled ``shortest_hops + detour_slack_hops`` would agree at
+    the shipped default and diverge everywhere else, so the collapsed knob must not come back.
     """
 
     cfg = _cfg()
@@ -214,10 +213,9 @@ def test_claim_only_cells_are_interned_but_unenterable(shape):
     """Endpoint-disc cells outside the reachable set get row ids and nothing else.
 
     An endpoint's hover cylinder claims a disc around the point, and its rim regularly
-    falls outside the forward-reachable set -- measured at 4 of the first 12
-    ``density_faa_wing_zipline`` flights, one cell each. Those cells must be numbered or
-    the endpoint dwell goes partly unpriced, which is a *cheaper wrong answer*. They must
-    equally stay out of the search, which is what the two assertions below pin.
+    falls outside the forward-reachable set. Those cells must be numbered or the endpoint
+    dwell goes partly unpriced, which is a *cheaper wrong answer*. They must equally stay
+    out of the search, which is what the two assertions below pin.
     """
 
     cfg = _cfg()
@@ -352,10 +350,10 @@ def test_row_numbering_is_injective_and_bounded():
 
 
 def test_rows_hold_no_table_so_memory_stays_off_the_graph():
-    """Nothing per-graph may be O(cells x steps) -- that product is ~3.6M on density.
+    """Nothing per-graph may be O(cells x steps).
 
-    A dense table would be ~14 MB per flight and ~65 GB across a 4,636-flight scenario,
-    which is the difference between this design scaling and not.
+    A dense table over that product would not scale across a full scenario, so rows must be
+    numbered arithmetically rather than tabulated.
     """
 
     cfg = _cfg()
@@ -451,8 +449,6 @@ def test_forbidden_bits_are_read_only_on_every_path_including_the_empty_one():
     of `_price_dag`. A solve sees both shapes -- the sweep passes an empty exclusion set and
     repair passes a populated one -- so if the empty fast path returned a writable array the
     kernel would compile a SECOND specialization, against the solve's own deadline.
-    Reproduced before the fix by handing the empty path a writable copy: `_price_dag`
-    signatures went 1 -> 2.
 
     The flag, not the contents, is the contract here: an empty bitset forbids nothing on
     either path, so this can never be caught by asserting on behaviour.
@@ -682,9 +678,9 @@ def test_paid_class_merges_exactly_the_roots_the_reference_merges(shape):
 def test_variant_scores_are_denominated_in_the_objective():
     """A ground-heavy model must move the score, or the kernel prices the wrong thing.
 
-    ``[[colgen-label-score-currency]]``: the label score is the search's ranking currency
-    and dominance prunes on it, so an unweighted score calls two labels tied where the
-    objective strictly prefers one. Silent -- the search still returns *a* column.
+    The label score is the search's ranking currency and dominance prunes on it, so an
+    unweighted score calls two labels tied where the objective strictly prefers one. Silent
+    -- the search still returns *a* column.
     """
 
     cfg = _cfg()
@@ -852,10 +848,10 @@ def test_completion_envelope_split_reproduces_the_eager_form(shape):
 def test_can_compete_agrees_with_the_eager_envelope_everywhere(shape):
     """The gate's verdict, swept over the arguments the search actually supplies.
 
-    `minimum_total_hops` is swept across the envelope's length because the 69.2% of real
-    calls that are answered by `first_hops >= len(delay_lbs)` never touch the destination
-    half at all -- so a split that got the length right and the values wrong would pass on
-    the common case and fail only where it decides the answer.
+    `minimum_total_hops` is swept across the envelope's length because most real calls are
+    answered by `first_hops >= len(delay_lbs)` and never touch the destination half at all --
+    so a split that got the length right and the values wrong would pass on the common case
+    and fail only where it decides the answer.
     """
 
     import math

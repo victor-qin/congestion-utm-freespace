@@ -2,21 +2,21 @@
 
 Every reduced cost, every admissible bound, and every master coefficient in column
 generation is built from the same two quantities: seconds spent waiting on the ground and
-seconds spent in the air beyond the reference trajectory.  Written longhand at each site
--- there were nineteen, across six files -- changing the objective means finding all of
-them, and a missed one is silent rather than loud: a pricing bound *is* the objective as
-far as dominance is concerned, so a stale weight discards the true optimum while the
-search still reports that it proved optimality.
+seconds spent in the air beyond the reference trajectory (the en-route detour ruler; see
+context/figures/enroute_rulers.png).  Because a pricing bound IS the objective as far as
+dominance is concerned, a weight that goes stale at even one call site fails silently: it
+discards the true optimum while the search still reports it proved optimality.
 
 :class:`CostModel` is therefore the single source of truth, and every site calls
 :meth:`evaluate` rather than restating the sum.  Any future accelerated pricing path
 inherits the same rule -- it may hold objective-agnostic arithmetic over pre-weighted
 inputs, but never a second copy of the weights.
 
-Term order matters.  ``evaluate`` sums ground, then hold, then detour, left to right,
-because that is the association the pre-existing expressions used.  At unit weights the
-multiplications are exact and the sum is bit-identical to what the code did before, which
-is what makes the (1.0, 1.0) default verifiable rather than merely plausible.
+Term order is a byte-exact contract, not a preference.  ``evaluate`` sums ground, then
+hold, then detour, left to right, matching the association the longhand expressions it
+replaced used; at unit weights the multiplications are exact and the sum is bit-identical
+to the prior code, which is what makes the (1.0, 1.0) default verifiable rather than merely
+plausible.
 """
 
 from __future__ import annotations
@@ -65,12 +65,12 @@ class CostModel:
         return benefit - cost - dual_cost - pi_f
 
 
-#: The historical objective: one second of ground delay costs the same as one second of
-#: excess flight.  Note this is *not* the cost model the A* planner uses (config's
-#: 1:3:3:4 per-second weights), and it is **no longer the colgen default** either --
-#: ``ColGenParams.objective`` now ships ``"total_cost"``.  Kept as the module default so
-#: every function that takes ``model: CostModel = DELAY_MODEL`` behaves as it always did
-#: when called without one, which is what the kernel-parity tests rely on.
+#: The equal-weight objective: one second of ground delay costs the same as one second of
+#: excess flight.  This is NOT the cost model the A* planner uses (config's 1:3:3:4
+#: per-second weights), nor is it the colgen default -- ``ColGenParams.objective`` ships
+#: ``"total_cost"``.  It stays the module default so every function taking
+#: ``model: CostModel = DELAY_MODEL`` keeps its historical behaviour when called without
+#: one, which is what the kernel-parity tests rely on.
 #:
 #: Reach for it deliberately, not by omission.  Equal weights make ``ground + flown``
 #: invariant under a ground-for-air swap, so large sets of columns tie EXACTLY -- see
@@ -84,6 +84,19 @@ def cost_model(cfg: Any, params: Any = None) -> CostModel:
     ``params.objective`` selects it; anything other than ``"total_cost"`` keeps the
     unweighted delay objective, so existing callers and every stored scenario behave
     exactly as before.
+
+    Parameters
+    ------------
+    - cfg (Any): the sim config; read for ``cost_ground_delay_per_s`` /
+      ``cost_air_lateral_per_s`` / ``cost_air_hold_per_s`` when ``"total_cost"`` is selected.
+    - params (Any): the colgen params; ``params.objective`` picks the model, defaulting to the
+      unweighted delay objective when ``params`` is ``None`` or the attribute is absent.
+
+    Return
+    --------
+    - output (CostModel): :data:`DELAY_MODEL` for the delay objective, else a model carrying
+      the config's ground/air weights.  Raises ``ValueError`` if the config's air-hold and
+      lateral weights differ, or if either resolved weight is non-positive.
     """
 
     objective = getattr(params, "objective", "total_delay")

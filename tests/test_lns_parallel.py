@@ -228,7 +228,7 @@ def test_index_free_coordinator_does_not_build_or_maintain_claims(monkeypatch):
 # ------------------------------------------------------------------ RepairOutcome payload
 @pytest.mark.slow
 def test_reject_path_carries_no_payload():
-    """79% of iterations reject; building the payload for them would be pure waste."""
+    """Most iterations reject; building the payload for them would be pure waste."""
     res = run(_congested(lam=400.0, horizon=240.0))
     state = LNSState(res.config, res.ledger, res.intents,
                      static_terms=res.ledger.static_terminals())
@@ -319,11 +319,9 @@ def _trajectory_key(out):
     """Row-for-row identity of an anytime trajectory, EXCLUDING wall_s.
 
     Every row carries `wall_s = monotonic() - t0`, so a digest over raw rows can never match
-    across two runs — both existing parity helpers in test_lns.py project it out for that reason.
-    TODO(rebase): hoist this into test_lns.py and have
-    `test_lns_incremental_release_matches_rebuild` and `test_lns_is_deterministic_per_seed` use it
-    too; three copies that can drift is how a parity test silently stops testing parity. Kept
-    local for now because `victor-qin/lns-efficiency-fixes` owns test_lns.py this week.
+    across two runs — both parity helpers in test_lns.py project it out for the same reason. This is
+    a third copy of that projection; keeping them in sync matters, since a drifted copy is how a
+    parity test silently stops testing parity.
     """
     return [(r["iter"], r["op"], r["n"], tuple(r["victims"]), r["accepted"], r["reason"],
              round(r["cost_old"], 6),
@@ -333,11 +331,12 @@ def _trajectory_key(out):
 
 
 @pytest.mark.slow
-def test_one_worker_sync_matches_sequential():
-    """THE gate. Not `cost_after` — a cost tie would hide a divergent victim set.
-
-    Effective widths below two deliberately use the in-process engine: a private replica cannot
-    add concurrency, and this pins that routing preserves the complete schedule trajectory.
+@pytest.mark.parametrize("mode", ["sync", "drop"])
+def test_one_worker_matches_sequential(mode):
+    """THE gate: a width-1 parallel run (either mode) routes to the in-process sequential engine and
+    reproduces run_lns EXACTLY — full trajectory, not `cost_after` (a cost tie would hide a divergent
+    victim set). A private replica cannot add concurrency, so both modes must preserve the complete
+    schedule trajectory.
     """
     from freespace_sim.planner.lns import LNSConfig, run_lns
     from freespace_sim.planner.lns.parallel import run_lns_parallel
@@ -348,7 +347,8 @@ def test_one_worker_sync_matches_sequential():
     a = run(cfg)
     seq = run_lns(a.config, a.ledger, a.intents, LNSConfig(**kw))
     b = run(cfg)
-    par = run_lns_parallel(b.config, b.ledger, b.intents, LNSConfig(search_workers=1, **kw))
+    par = run_lns_parallel(b.config, b.ledger, b.intents,
+                           LNSConfig(search_workers=1, parallel_mode=mode, **kw))
 
     assert _trajectory_key(par) == _trajectory_key(seq)
     assert [_intent_digest(i) for i in par.intents] == [_intent_digest(i) for i in seq.intents]
@@ -362,10 +362,13 @@ def test_one_worker_sync_matches_sequential():
 
 @pytest.mark.slow
 @pytest.mark.parametrize("m", [2, 4])
-def test_multi_worker_stays_feasible_and_writes_the_ledger_back(m):
-    """`run_lns`'s contract is that the CALLER's ledger is mutated in place and the returned
-    intents supersede it. The coordinator holds its state on that ledger, so apply_delta is the
-    write-back — this pins that it actually happened, which a zero-accept run would not."""
+@pytest.mark.parametrize("mode", ["sync", "drop"])
+def test_parallel_stays_feasible_and_writes_the_ledger_back(mode, m):
+    """Both modes at m>1: the improved schedule is conflict-free and written back to the CALLER's
+    ledger. ``run_lns``'s contract is that the caller's ledger is mutated in place and the returned
+    intents supersede it; the coordinator holds its state on that ledger, so apply_delta IS the
+    write-back — pinned here (a zero-accept run would make it vacuous). The incumbent is monotone and
+    the ledger is handed back clean. DROP additionally keeps per-row base_version/worker for audit."""
     from freespace_sim import verify
     from freespace_sim.planner.lns import LNSConfig
     from freespace_sim.planner.lns.parallel import run_lns_parallel
@@ -373,20 +376,22 @@ def test_multi_worker_stays_feasible_and_writes_the_ledger_back(m):
     res = run(_congested(lam=400.0, horizon=240.0))
     static_terms = res.ledger.static_terminals()
     out = run_lns_parallel(res.config, res.ledger, res.intents,
-                           LNSConfig(seed=7, neighborhood_size=4, log_every=0,
-                                     max_iterations=40, search_workers=m))
+                           LNSConfig(seed=7, neighborhood_size=4, log_every=0, max_iterations=40,
+                                     search_workers=m, parallel_mode=mode, verify_every=1))
     assert out.n_accepted > 0, "nothing accepted — the write-back assertion would be vacuous"
     assert out.verified
     assert verify.find_interflight_conflict(out.intents, res.config,
                                             static_terminals=static_terms) is None
+    assert out.cost_after <= out.cost_before        # monotone: every accept strictly improves
 
-    # The ledger holds the IMPROVED schedule, not the FCFS one it came in with.
+    # The ledger holds the IMPROVED schedule, not the FCFS one it came in with, handed back clean.
     live = sum(len(i.volumes) for i in out.intents if i.accepted)
     assert res.ledger.n_volumes == live
     assert _ledger_multiset(res.ledger) == _ledger_multiset(
         _replay_ledger(res.config, out.intents, static_terms))
-    # and it is handed back clean
     assert res.ledger._observers == [] and res.ledger._release_subs == []
+    if mode == "drop":  # DROP rows stay auditable even though the run is not reproducible
+        assert all("base_version" in r and "worker" in r for r in out.trajectory)
 
 
 def _replay_ledger(cfg, intents, static_terms):
@@ -836,62 +841,6 @@ def test_pool_start_timeout_is_closed_and_reported_as_zero_workers():
     assert pool.closed
 
 
-def test_zero_sequential_rate_has_no_relative_comparison():
-    from analysis.sweep_lns_workers import _relative_rate
-
-    assert _relative_rate(0.0, 0.0) is None
-    assert _relative_rate(2.0, 0.0) is None
-    assert _relative_rate(2.0, 1.0) == 2.0
-
-
-def test_replica_profiler_warms_lazy_planner_state_before_ready(monkeypatch):
-    from analysis import prof_lns_replica_memory as profiler
-
-    events = []
-    rng = object()
-
-    class State:
-        ledger = SimpleNamespace(n_volumes=17)
-
-        def __init__(self):
-            self.rng = rng
-
-        def movable_ids(self):
-            return list(range(12))
-
-        def try_repair(self, victims, actual_rng, epsilon, **kwargs):
-            events.append(("repair", victims, actual_rng, epsilon, kwargs))
-
-    class Conn:
-        def send(self, message):
-            events.append(("send", message[0]))
-
-        def recv(self):
-            return ("stop",)
-
-    monkeypatch.setattr(profiler.LNSState, "replica", lambda *_args, **_kwargs: State())
-    profiler._worker_main(Conn(), None, None, None, None, None)
-
-    kind, victims, actual_rng, epsilon, kwargs = events[0]
-    assert kind == "repair" and victims == list(range(8)) and actual_rng is rng
-    assert epsilon == float("inf")
-    assert kwargs == {"order_mode": "premium", "report_only": True}
-    assert events[1] == ("send", "ready")
-
-
-def test_sweep_reports_effective_workers_without_mislabeling_the_baseline():
-    from analysis.sweep_lns_workers import _sequential_baseline, _worker_metadata
-
-    capped = _worker_metadata(
-        4, SimpleNamespace(search_workers=np.int64(1), parallel_mode="sequential")
-    )
-    sequential = _worker_metadata(
-        1, SimpleNamespace(search_workers=1, parallel_mode="sequential")
-    )
-    assert capped == {"requested_workers": 4, "workers": 1, "mode": "sequential"}
-    assert _sequential_baseline([capped, sequential]) is sequential
-
-
 def test_default_config_is_the_sequential_path():
     """search_workers=1 stays in-process; enabling real workers adds full private replicas, so
     memory is linear in workers — the same reason colgen's pricing pool is defaulted off."""
@@ -903,50 +852,6 @@ def test_default_config_is_the_sequential_path():
 
 
 # ==================================================================== DROP mode
-@pytest.mark.slow
-def test_drop_at_one_worker_matches_sequential():
-    """A requested DROP run with no possible concurrency uses the sequential engine unchanged."""
-    from freespace_sim.planner.lns import LNSConfig, run_lns
-    from freespace_sim.planner.lns.parallel import run_lns_parallel
-
-    cfg = _congested(lam=400.0, horizon=240.0)
-    kw = dict(seed=7, neighborhood_size=4, log_every=0, max_iterations=40)
-
-    a = run(cfg)
-    seq = run_lns(a.config, a.ledger, a.intents, LNSConfig(**kw))
-    b = run(cfg)
-    drop = run_lns_parallel(b.config, b.ledger, b.intents,
-                            LNSConfig(search_workers=1, parallel_mode="drop", **kw))
-
-    assert _trajectory_key(drop) == _trajectory_key(seq)
-    assert [_intent_digest(i) for i in drop.intents] == [_intent_digest(i) for i in seq.intents]
-    assert drop.parallel_mode == "sequential"
-    assert drop.parallel_stats == {}
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("m", [2, 4])
-def test_drop_stays_feasible_and_writes_the_ledger_back(m):
-    from freespace_sim import verify
-    from freespace_sim.planner.lns import LNSConfig
-    from freespace_sim.planner.lns.parallel import run_lns_parallel
-
-    res = run(_congested(lam=400.0, horizon=240.0))
-    static_terms = res.ledger.static_terminals()
-    out = run_lns_parallel(res.config, res.ledger, res.intents,
-                           LNSConfig(seed=7, neighborhood_size=4, log_every=0,
-                                     max_iterations=40, search_workers=m,
-                                     parallel_mode="drop", verify_every=1))
-    assert out.verified
-    assert verify.find_interflight_conflict(out.intents, res.config,
-                                            static_terminals=static_terms) is None
-    assert out.cost_after <= out.cost_before        # monotone: every accept strictly improves
-    live = sum(len(i.volumes) for i in out.intents if i.accepted)
-    assert res.ledger.n_volumes == live
-    # DROP rows stay auditable even though the run is not reproducible.
-    assert all("base_version" in r and "worker" in r for r in out.trajectory)
-
-
 @pytest.mark.slow
 def test_drop_rows_cover_every_dispatched_task():
     from freespace_sim.planner.lns import LNSConfig

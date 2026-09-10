@@ -111,7 +111,19 @@ def _plan_shard(cfg, static_terms, requests, planner=None, free=None):
 
 
 def _worker_main(conn, cfg, static_terms, requests):
-    """Worker process: build a private ruler, plan the shard, send it back, exit."""
+    """Worker process: build a private ruler, plan the shard, send it back, exit.
+
+    Parameters
+    ------------
+    - conn (Connection): duplex pipe end; the shard result is sent on it, then it is closed.
+    - cfg (SimConfig): sim config for the private ruler.
+    - static_terms (tuple): permanent walls the ruler measures against.
+    - requests (list): the flight requests this shard plans.
+
+    Return
+    --------
+    - output (None): sends the planned shard over ``conn`` and closes it; returns nothing.
+    """
     try:
         conn.send(_plan_shard(cfg, static_terms, requests))
     finally:

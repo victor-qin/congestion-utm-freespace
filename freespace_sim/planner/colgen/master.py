@@ -292,7 +292,18 @@ class HighsBackend:
         self._row_columns[row] = set(indices)
 
     def _matrix(self) -> tuple[csc_matrix, np.ndarray]:
-        """Assemble the sparse constraint matrix and rhs (flight rows then capacity rows)."""
+        """Assemble the sparse constraint matrix and rhs (flight rows then capacity rows).
+
+        Parameters
+        ------------
+        - none: reads ``flight_ids`` / ``_objectives`` / ``_column_flights`` / ``_rows`` /
+          ``_row_columns`` / ``_row_rhs`` / ``_flight_pos``.
+
+        Return
+        --------
+        - output (tuple[csc_matrix, np.ndarray]): the constraint matrix (flight rows then
+          capacity rows) and the rhs vector.
+        """
         n_flights = len(self.flight_ids)
         n_columns = len(self._objectives)
         row_indices: list[int] = []

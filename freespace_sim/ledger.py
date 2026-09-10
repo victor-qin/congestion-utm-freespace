@@ -384,7 +384,16 @@ class ReservationLedger:
         keys a volume belongs to are already known, so re-deriving them (``_flat_aabb`` +
         ``_steps`` × ``_xy_cell_span``, per volume) buys nothing. Survivor order is preserved, so
         each flight's volumes stay contiguous (``iter_committed``'s contract) and every bucket list
-        stays ascending (the remap is monotone)."""
+        stays ascending (the remap is monotone).
+
+        Parameters
+        ------------
+        - none: reads and rewrites this ledger's committed arrays and bucket/run indices.
+
+        Return
+        --------
+        - output (None): mutates the ledger in place, dropping tombstoned slots and renumbering.
+        """
         tomb = self.TOMBSTONE_FID
         remap = [-1] * len(self._fids)            # old slot -> new slot, -1 = tombstoned (list, not
         #                                           dict: the bucket remap below is the hot loop)

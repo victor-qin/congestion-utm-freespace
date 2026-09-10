@@ -381,7 +381,18 @@ def _snapshot_request(
     origin_terminal: Terminal | None,
     dest_terminal: Terminal | None,
 ) -> FlightRequest:
-    """Detach graph geometry from caller-owned mutable endpoint arrays."""
+    """Detach graph geometry from caller-owned mutable endpoint arrays.
+
+    Parameters
+    ------------
+    - req (FlightRequest): the source request whose scalar fields are copied.
+    - origin_terminal (Terminal | None): origin terminal to attach to the snapshot.
+    - dest_terminal (Terminal | None): destination terminal to attach to the snapshot.
+
+    Return
+    --------
+    - output (FlightRequest): an immutable copy with detached endpoint arrays.
+    """
 
     return _ImmutableFlightRequest(
         flight_id=req.flight_id,
@@ -1071,6 +1082,18 @@ def _graph_max_step(
     The clock has to reach the LATEST legal departure plus that departure's longest legal route;
     anything smaller here becomes the binding constraint for late departures only, reinstating
     exactly the departure-dependent cap the ceiling exists to remove.
+
+    Parameters
+    ------------
+    - latest_departure_step (int): the latest legal departure step.
+    - takeoff_steps (tuple[int, ...]): per-level climb durations in steps (the max is used).
+    - origin_lanes (tuple[hg.Lane, ...]): origin exit lanes; their ``.steps`` traverse cost.
+    - max_air_hops (int): the route-length ceiling in hops.
+
+    Return
+    --------
+    - output (int): the final air-state step bound (latest departure + climb + longest origin
+      lane + max_air_hops).
     """
     return (
         latest_departure_step

@@ -1042,6 +1042,21 @@ def _paid_duals(
     certified against, so its arithmetic has to be reproducible EXACTLY, not to within a
     tolerance.  A sub-epsilon perturbation still propagates into later sums, where it can
     cross the band and flip a dominance tie.
+
+    Parameters
+    ------------
+    - label (int): index of the label whose paid duals to recover.
+    - hops (int): air hops the label has taken so far.
+    - variant (int): the label's root-variant index into the per-variant weight arrays.
+    - label_score (np.ndarray): per-label accumulated score.
+    - var_ground_w (np.ndarray): per-variant weighted ground-delay term.
+    - var_origin_leg_w (np.ndarray): per-variant weighted origin-leg term.
+    - air_weight (float): the air cost weight.
+    - dt_s (float): seconds per step.
+
+    Return
+    --------
+    - output (float): the de-duplicated duals paid so far, in the master's unweighted currency.
     """
 
     return (

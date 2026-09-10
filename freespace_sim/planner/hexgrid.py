@@ -616,7 +616,19 @@ def _cylinder_z_independent(vol: Volume4D, cfg: SimConfig, levels: list[int]) ->
     footprint is then z-INDEPENDENT — the radial slack doesn't depend on z and the altitude-band slack is
     ≤ 0 in-band, so the mask reduces to the radial term — hence the masked cell set is identical at each
     level and the per-level loop can compute it ONCE. (All committed hover/terminal columns span the whole
-    [ground, ceiling] tube, so this is their common case.)"""
+    [ground, ceiling] tube, so this is their common case.)
+
+    Parameters
+    ------------
+    - vol (Volume4D): the committed volume to test.
+    - cfg (SimConfig): sim config, read for ``flight_levels_m``.
+    - levels (list[int]): the overlapped flight-level indices, ascending.
+
+    Return
+    --------
+    - output (bool): True when ``vol`` is a cylinder whose z-band spans every overlapped level,
+      so its (q, r) footprint is level-independent.
+    """
     return (isinstance(vol.shape, CylinderSpec)
             and vol.shape.z_lo <= cfg.flight_levels_m[levels[0]]
             and cfg.flight_levels_m[levels[-1]] <= vol.shape.z_hi)

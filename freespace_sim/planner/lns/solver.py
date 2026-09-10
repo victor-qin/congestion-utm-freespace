@@ -532,7 +532,24 @@ def _build_lns_state(
     turnaround_s: float | None,
     maintain_claim_index: bool = True,
 ) -> LNSState:
-    """One construction path for the sequential runner and the parallel coordinator."""
+    """One construction path for the sequential runner and the parallel coordinator.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): sim config for the state and its repair planner.
+    - ledger (ReservationLedger): the ledger the state owns and mutates.
+    - intents (list[OperationalIntent]): the incumbent schedule to load.
+    - lns (LNSConfig): controls read here (frozen/movable ids, incremental_release, repair
+      planner, unimpeded workers, window bytes).
+    - static_terms (tuple | None): permanent terminal walls; None uses the ledger's own.
+    - turnaround_s (float | None): paired-return turnaround; None disables the precedence guard.
+    - maintain_claim_index (bool): build the destroy-heuristic claim index (skipped when no
+      iterations will run).
+
+    Return
+    --------
+    - output (LNSState): the constructed state, ready to repair.
+    """
     return LNSState(
         cfg,
         ledger,

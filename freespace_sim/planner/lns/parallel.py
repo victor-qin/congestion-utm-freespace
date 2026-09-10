@@ -962,6 +962,17 @@ def _run_and_close_pool(pool, *, deadline, execute):
     Startup timeout is the one non-fatal pool outcome: the configured wall budget was consumed
     before search began, so the valid incumbent is returned with zero started workers. Every other
     startup/loop failure propagates after the same teardown.
+
+    Parameters
+    ------------
+    - pool (PricingPool): the worker pool to start, run, and close.
+    - deadline (float): monotonic wall-clock deadline for worker startup.
+    - execute (Callable): the loop run against the started pool; its result is returned.
+
+    Return
+    --------
+    - output (tuple): ``(result_or_None, spawn_s, n_workers)`` — result is None and n_workers 0
+      when startup times out; the pool is always closed before returning.
     """
     try:
         try:

@@ -620,7 +620,18 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
         """Next fresh flight to dispatch. Frontier first, unconditionally (liveness: commits can
         never pass an undispatched frontier). Otherwise, with predictive dispatch, prefer the first
         of the next few candidates whose spatial tube misses every in-flight speculation — dispatch
-        REORDERING only; the commit order is untouchable."""
+        REORDERING only; the commit order is untouchable.
+
+        Parameters
+        ------------
+        - none: reads the enclosing scope's ``fresh`` / ``busy`` / ``pending`` / ``respec_q`` /
+          ``predictive`` state and mutates ``fresh`` (and ``n_deferred``).
+
+        Return
+        --------
+        - output (int): the flight id to dispatch next — the frontier flight, else the first
+          non-overlapping candidate under predictive dispatch, else the oldest fresh flight.
+        """
         nonlocal n_deferred
         if not predictive or fresh[0] == next_commit or len(fresh) == 1:
             return fresh.popleft()

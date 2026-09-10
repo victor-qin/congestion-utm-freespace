@@ -494,7 +494,17 @@ class LNSState:
 
     # ------------------------------------------------------------------ claim index
     def _rebuild_claim_index(self) -> None:
-        """Rebuild all destroy-heuristic claims from the incumbent schedule."""
+        """Rebuild all destroy-heuristic claims from the incumbent schedule.
+
+        Parameters
+        ------------
+        - none: reads ``self._movable`` and ``self.incumbent``; rewrites the claim indices.
+
+        Return
+        --------
+        - output (None): clears and repopulates ``_claims`` / ``_cells_of`` / ``_contended`` /
+          ``_visits`` in place (a no-op past the clear when ``_maintain_claim_index`` is False).
+        """
         self._claims.clear()
         self._cells_of.clear()
         self._contended.clear()

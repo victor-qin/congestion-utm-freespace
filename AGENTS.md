@@ -32,6 +32,7 @@ Return
 """
 ```
 - Classes should include a description at the top before parameters are defined.
+- Major functions should have all parameters typed.
 - Minor functions include at least a sentence long description, depending on how complex the function is.
 - Comments should succintly explain why non-obvious code is the way it is, or state a constraint future edits must preserve (ordering, parity, byte-exactness). Comments do not serve as changelog.
 - Avoid comments that try to describe the spatial or temporal functionality of a function, where a figure would be more illustrative. Instead, make a PNG and place it in `/context/figures/` and cite that figure as a comment.

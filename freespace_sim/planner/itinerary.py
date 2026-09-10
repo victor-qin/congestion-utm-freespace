@@ -69,7 +69,7 @@ class ItineraryPlanner:
         # Leg 2 is NOT deconflicted against leg 1: both are the same aircraft, and an aircraft does
         # not conflict with itself.
         back = self.inner.plan(self._leg(req, req.dest, req.origin, req.dest_terminal,
-                                         req.origin_terminal, float(landed) + req.service_time_s),
+                                         req.origin_terminal, float(landed) + req.turnaround_s),
                                ledger, cfg)
         if not back.accepted:
             return OperationalIntent(
@@ -87,13 +87,13 @@ class ItineraryPlanner:
         """
         return replace(req, origin=origin, dest=dest, origin_terminal=o_term, dest_terminal=d_term,
                        t_request=min(req.t_request, t_departure), t_departure=t_departure,
-                       return_to_origin=False, service_time_s=0.0)
+                       return_to_origin=False, turnaround_s=0.0)
 
     @staticmethod
     def _compose(req, out, back, landed, cfg) -> OperationalIntent:
         """Join both legs and the pad dwell into one intent.
 
-        The dwell spans arrival-column end -> departure-column start, not merely `service_time_s`: a
+        The dwell spans arrival-column end -> departure-column start, not merely `turnaround_s`: a
         congested return can be held past its service and the aircraft is parked for all of it, so
         anything shorter leaves the pad reservable underneath a parked drone.
         """

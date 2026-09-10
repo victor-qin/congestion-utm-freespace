@@ -182,7 +182,7 @@ def test_return_flights_makes_each_delivery_one_round_trip_itinerary():
         cfg, np.random.default_rng(0))
     assert len(rs) == len(one_way)                                # the return is a leg, not a flight
     assert all(r.return_to_origin for r in rs)
-    assert all(r.service_time_s == 90.0 for r in rs)
+    assert all(r.turnaround_s == 90.0 for r in rs)
     assert all(not r.return_to_origin for r in one_way)
 
     assert all(r.origin_terminal is not None and r.dest_terminal is None for r in rs)

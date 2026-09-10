@@ -14,7 +14,7 @@ from freespace_sim.types import FlightRequest, IntentStatus, OperationalIntent, 
 HUB, CUST = vec(0, 0, 0), vec(3000, 0, 0)
 
 
-def _itinerary_world(service_s=180.0, lam=900.0):
+def _itinerary_world(dwell_s=180.0, lam=900.0):
     """A congested hub world whose deliveries are round-trip itineraries."""
     from freespace_sim.demand import HubRadiusDemand
 
@@ -22,7 +22,7 @@ def _itinerary_world(service_s=180.0, lam=900.0):
                     region_size_m=(4000.0, 4000.0), seed=3, flight_levels_m=(75.0,),
                     airspace_ceiling_m=125.0, max_ground_delay_s=600.0)
     return cfg, HubRadiusDemand(n_hubs_per_uss={"a": 2}, return_flights=True,
-                                turnaround_s=service_s)
+                                turnaround_s=dwell_s)
 
 
 def test_an_itinerarys_return_leg_never_precedes_its_own_arrival():
@@ -42,7 +42,7 @@ def test_an_itinerarys_return_leg_never_precedes_its_own_arrival():
     assert res.verified
     # The fixture has to be in the regime that broke the two-request scheme, or this passes for the
     # wrong reason: a return only departed early because its outbound ran over the estimate.
-    assert all(_parked_s(i) > i.request.service_time_s + 1e-6 for i in trips), (
+    assert all(_parked_s(i) > i.request.turnaround_s + 1e-6 for i in trips), (
         "every return should be held past its service here; an uncongested fixture proves nothing")
 
     for it in trips:
@@ -72,10 +72,10 @@ def _split_legs(intent):
 
 def test_the_pad_is_held_continuously_while_the_aircraft_is_parked():
     """No gap between arriving and leaving: a held return is still on the pad, so the ground box
-    spans arrival-column end -> departure-column start, not merely `service_time_s`."""
+    spans arrival-column end -> departure-column start, not merely `turnaround_s`."""
     from freespace_sim.sim import run
 
-    cfg, model = _itinerary_world(service_s=180.0)
+    cfg, model = _itinerary_world(dwell_s=180.0)
     res = run(cfg, demand=model)
     trips = [i for i in res.intents if i.accepted and i.request.return_to_origin]
     assert trips
@@ -116,7 +116,7 @@ def test_an_itinerary_is_denied_whole_when_its_return_cannot_be_planned(monkeypa
         return real(req, ledger, c)
 
     monkeypatch.setattr(inner, "plan", deny_the_second)
-    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, service_time_s=60.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
     out = ItineraryPlanner(inner).plan(req, ReservationLedger(cfg), cfg)
     assert calls["n"] == 2                                  # it really did try the return
     assert not out.accepted and out.volumes == []
@@ -130,6 +130,6 @@ def test_colgen_refuses_an_itinerary_rather_than_dropping_the_return():
     from freespace_sim.scenario import scenario_from_requests
 
     scen = scenario_from_requests([
-        FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, service_time_s=30.0)])
+        FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=30.0)])
     with pytest.raises(NotImplementedError, match="round-trip itineraries"):
         run_batch(scen, SimConfig(), None, None, (), None, None, None)

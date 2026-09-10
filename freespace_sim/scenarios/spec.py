@@ -37,7 +37,7 @@ class DemandSpec:
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub
-    turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
+    turnaround_s: "float | None" = None    # customer-pad dwell; None ⇒ cfg.turnaround_s
     uss_share: "dict[str, float] | None" = None      # demand split across USSs (None ⇒ equal weight)
     # hub_radius: per-USS delivery Poisson rate (/hr). When set, REPLACES cfg.lam_per_hour × uss_share —
     # each USS is its own independent stream. None ⇒ the global-λ path.

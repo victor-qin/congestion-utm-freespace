@@ -32,7 +32,6 @@ SCENARIOS: dict[str, ScenarioSpec] = {
             # ONE-WAY: colgen cannot represent a round-trip itinerary and `run_batch` refuses one.
             # lam_per_uss is still calibrated for the old doubled load and wants re-tuning.
             return_flights=False,
-            turnaround_s=0.0,
             lam_per_uss={COLGEN_USS: 600.0},
             departure_offset_s={COLGEN_USS: (120.0, 30.0)},
             timing_mode="departure",

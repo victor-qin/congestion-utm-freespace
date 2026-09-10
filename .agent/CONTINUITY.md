@@ -58,6 +58,11 @@
   while the scheme it replaces was kept alive. Deleting it takes the branch to +610/-1200, a net
   -590. `realized_takeoff_s` survives — `ItineraryPlanner` uses it to size the ground box.
 
+- 2026-09-09T02:10Z `[USER]` `hover_time_s` 30 -> 16 s, and `service_time_s` 16 s with `SimConfig`
+  owning the number (`HubRadiusDemand.turnaround_s=None` inherits it). Every shipped scenario had
+  pinned `turnaround_s=0.0`, so the delivery took ZERO time; they now inherit. A column is
+  `hover_time_s + column_dwell_s` at BOTH ends of every leg, so the change moves every result.
+
 ## [OUTCOMES]
 
 - 2026-09-08T22:07Z `[TOOL]` PR #128 merged: one predicate for paired-leg precedence. Armed nominal

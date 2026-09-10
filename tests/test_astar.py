@@ -541,8 +541,10 @@ def test_capacity_gate_probes_the_full_column_window_not_the_climb():
                     region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0)
     hub = Terminal("hub#0", 1, 180.0)                  # ONE pad: dwells must never overlap
     led = ReservationLedger(cfg)
+    # 26 s puts A's dwell inside B's climb→climb+traverse band (21–33 s at the current
+    # hover_time_s); the self-check below fails if a config change moves it out again.
     a = AStarPlanner().plan(FlightRequest(1, vec(500, 500, 0), vec(4300, 3100, 0), 0.0,
-                                          t_departure=40.0, origin_terminal=hub), led, cfg)
+                                          t_departure=26.0, origin_terminal=hub), led, cfg)
     assert a.accepted
     led.commit(1, a.volumes)
     b = AStarPlanner().plan(FlightRequest(2, vec(500, 500, 0), vec(500, 4500, 0), 0.0,

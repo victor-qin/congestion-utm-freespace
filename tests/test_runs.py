@@ -286,19 +286,19 @@ def test_scenario_parquet_round_trips_the_itinerary(tmp_path):
     folder = runs.save_run(res, root=tmp_path, label="itinerary", experiment="unit", wall_seconds=0.1)
 
     sdf = pd.read_parquet(folder / "scenario.parquet")
-    assert {"return_to_origin", "service_time_s"} <= set(sdf.columns)
-    original = {i.request.flight_id: (i.request.return_to_origin, i.request.service_time_s)
+    assert {"return_to_origin", "turnaround_s"} <= set(sdf.columns)
+    original = {i.request.flight_id: (i.request.return_to_origin, i.request.turnaround_s)
                 for i in res.intents}
     assert any(rt for rt, _ in original.values())              # the fixture really flies round trips
 
-    back = {i.request.flight_id: (i.request.return_to_origin, i.request.service_time_s)
+    back = {i.request.flight_id: (i.request.return_to_origin, i.request.turnaround_s)
             for i in runs.load_run(folder).intents}
     assert back == original
     assert all(isinstance(rt, bool) for rt, _ in back.values())   # not numpy.bool_ out of parquet
 
     # A run archived before the columns existed loads as one-way, which is what it was: its return
     # was a separate flight with its own row.
-    legacy = sdf.drop(columns=["return_to_origin", "service_time_s"])
+    legacy = sdf.drop(columns=["return_to_origin", "turnaround_s"])
     legacy.to_parquet(folder / "scenario.parquet")
     assert all(not i.request.return_to_origin for i in runs.load_run(folder).intents)
 

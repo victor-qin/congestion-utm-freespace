@@ -366,9 +366,9 @@ class HubRadiusDemand:
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     # Each delivery is a round-trip itinerary (hub → customer → hub) flown as ONE flight.
     return_flights: bool = True
-    # Ground time at the customer pad between the legs. Excludes the descent and climb that bracket
-    # it: those come from the column geometry, so this cannot budget a turnaround physics contradicts.
-    turnaround_s: float = 0.0
+    # Ground time at the customer pad between the legs; ``None`` inherits ``cfg.turnaround_s``,
+    # which is the one owner of the number.
+    turnaround_s: "float | None" = None
     uss_share: dict[str, float] | None = None
     # Per-USS delivery Poisson rate (/hr). When set it REPLACES the global cfg.lam_per_hour × uss_share
     # path entirely: each USS is its own independent Poisson stream (Poisson thinning ⇒ a strict
@@ -530,6 +530,7 @@ class HubRadiusDemand:
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
         demand_duration_s = cfg.effective_demand_duration_s
+        dwell_s = cfg.turnaround_s if self.turnaround_s is None else self.turnaround_s
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
 
         # foreign-column filter (cfg.terminal_airspace_always_active): a delivery whose customer's hex
@@ -598,7 +599,7 @@ class HubRadiusDemand:
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
                     t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal,
                     return_to_origin=self.return_flights,
-                    service_time_s=self.turnaround_s if self.return_flights else 0.0))
+                    turnaround_s=dwell_s if self.return_flights else 0.0))
             fid += 1
 
         if self.lam_per_uss is None:

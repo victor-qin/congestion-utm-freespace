@@ -54,7 +54,11 @@ class SimConfig:
 
     # --- hover cylinder (own radius knob; defaults to corridor width) ---
     hover_radius_m: float | None = None   # None ⇒ effective_hover_radius_m = corridor_width_m
-    hover_time_s: float = 30.0         # dwell at takeoff/landing (climb time added on top)
+    hover_time_s: float = 16.0         # dwell at takeoff/landing (climb time added on top)
+    # Time parked on the customer pad between the legs of a round trip. Excludes the descent and
+    # climb that bracket it (``volumes.column_dwell_s``), so it cannot budget a dwell physics
+    # contradicts. ``HubRadiusDemand.turnaround_s=None`` inherits this; a value there overrides it.
+    turnaround_s: float = 16.0
     # Height of the box held while an aircraft SITS on a pad between the legs of a round trip; the
     # full column is still held for the descent and climb that bracket it. Not the full column
     # throughout, because that would reserve airspace nothing occupies and consume TerminalCapacity.

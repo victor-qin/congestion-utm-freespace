@@ -119,7 +119,7 @@ class FlightRequest:
     # Ground time at ``dest`` between the legs: the delivery itself. Excludes the descent and climb
     # that bracket it — those come from the column geometry (``volumes.column_dwell_s``), so a
     # scenario cannot budget a turnaround that physics contradicts.
-    service_time_s: float = 0.0
+    turnaround_s: float = 0.0
 
     def __post_init__(self):
         """Default and validate ``t_departure`` after construction.
@@ -144,8 +144,8 @@ class FlightRequest:
                 f"t_departure ({self.t_departure}) < t_request ({self.t_request}): "
                 "a flight cannot depart before it is filed"
             )
-        if self.service_time_s < 0.0:
-            raise ValueError(f"flight {self.flight_id}: service_time_s must be >= 0")
+        if self.turnaround_s < 0.0:
+            raise ValueError(f"flight {self.flight_id}: turnaround_s must be >= 0")
 
     def sort_key(self) -> tuple[float, int]:
         """FCFS sort key: ``(t_request, flight_id)``."""

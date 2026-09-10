@@ -37,7 +37,7 @@ def test_colgen_test_registered_with_density_miniature_parameters():
     assert demand.departure_offset_s == {COLGEN_USS: (120.0, 30.0)}
     # ONE-WAY: `run_batch` refuses a round-trip itinerary, so this scenario cannot use it.
     assert demand.return_flights is False
-    assert demand.turnaround_s == 0.0
+    assert demand.turnaround_s is None          # inherits cfg.turnaround_s
     assert demand.timing_mode == "departure"
 
 
@@ -55,7 +55,7 @@ def test_colgen_test_seed_zero_generates_calibrated_one_way_load():
     assert {r.uss_id for r in requests} == {COLGEN_USS}
     assert {r.origin_terminal.id for r in requests} == {f"{COLGEN_USS}#{i}" for i in range(8)}
 
-    assert all(r.service_time_s == 0.0 for r in requests)
+    assert all(r.turnaround_s == 0.0 for r in requests)
 
 
 def test_colgen_test_spec_round_trips_and_run_parser_accepts_it():

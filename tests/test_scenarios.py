@@ -183,7 +183,7 @@ def test_density_scenario_matrix(name, hubs, rates):
     if AMAZON_USS in hubs:
         assert demand.departure_offset_s[AMAZON_USS] == (1800.0, 300.0)
     assert demand.return_flights is True
-    assert demand.turnaround_s == 0.0
+    assert demand.turnaround_s is None          # inherits cfg.turnaround_s
     assert demand.timing_mode == "departure"
     # A round trip is ONE itinerary now, so the demand model emits one request per delivery.
     assert demand.return_flights is True

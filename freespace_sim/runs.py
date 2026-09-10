@@ -171,7 +171,7 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             # Without these a reloaded run is a ONE-WAY delivery whose return vanished — and `dest`
             # is the customer either way, so the loss is invisible in the geometry.
             "return_to_origin": bool(r.return_to_origin),
-            "service_time_s": float(r.service_time_s),
+            "turnaround_s": float(r.turnaround_s),
         })
     return pd.DataFrame(rows)
 
@@ -822,7 +822,7 @@ def load_run(folder: Path | str) -> LoadedRun:
                             # getattr defaults: a run archived before a column existed has neither
                             # the attribute nor a value, and reads back as one-way — which it was.
                             return_to_origin=bool(getattr(s, "return_to_origin", False)),
-                            service_time_s=float(getattr(s, "service_time_s", 0.0) or 0.0),
+                            turnaround_s=float(getattr(s, "turnaround_s", 0.0) or 0.0),
                             )
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(

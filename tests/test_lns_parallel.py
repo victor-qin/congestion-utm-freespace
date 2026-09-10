@@ -53,6 +53,17 @@ def _exit_before_ready(*_args):
 
 
 # ------------------------------------------------------------------ replica fidelity
+def _improvable_victims(state, n):
+    """The `n` most-delayed movable flights.
+
+    Picking by flight id instead selects an arbitrary slice that may hold no recoverable delay, so
+    the loop below would run out of tries whenever a config change shuffles which ids are held —
+    the test would then report a thin world while the world is fine. Premium order is also what the
+    solver itself repairs in.
+    """
+    return sorted(sorted(state.movable_ids(), key=state.delay, reverse=True)[:n])
+
+
 @pytest.mark.slow
 def test_replica_reproduces_the_state_it_copies():
     res = run(_congested(lam=400.0, horizon=240.0))
@@ -161,12 +172,12 @@ def test_apply_delta_moves_a_replica_onto_an_accepted_repair_and_back():
     for i in range(60):
         rng = np.random.default_rng(np.random.SeedSequence([7, i]))
         base.rng = rng
-        victims = sorted(base.movable_ids())[: 4 + (i % 3)]
+        victims = _improvable_victims(base, 4 + (i % 3))
         out = base.try_repair(victims, rng)
         if out.accepted:
             accepted = out
             break
-    assert accepted is not None, "no accepted repair in 60 tries — pick a denser world"
+    assert accepted is not None, "no accepted repair in 60 tries"
     assert accepted.new_intents, "the accept return must carry the repaired schedule"
 
     old = {f: rep.incumbent[f] for f in accepted.new_intents}
@@ -247,7 +258,7 @@ def test_report_only_repair_returns_candidate_without_adopting_or_indexing_it(mo
     accepted = None
     for i in range(60):
         rng = np.random.default_rng(np.random.SeedSequence([7, i]))
-        victims = sorted(rep.movable_ids())[: 4 + (i % 3)]
+        victims = _improvable_victims(rep, 4 + (i % 3))
         out = rep.try_repair(victims, rng, report_only=True)
         assert _state_digest(rep) == at_start
         if out.accepted:

@@ -48,3 +48,21 @@ Durable record of mistakes likely to recur between PRs. Format follows `.agent/C
   nothing outside the deleted code read the link. Check what actually depends on a legacy path before
   paying to keep it. Files: `freespace_sim/sim.py`, `freespace_sim/verify.py`,
   `freespace_sim/planner/lns/{state,solver,parallel}.py`, `freespace_sim/types.py`.
+
+- 2026-09-09T03:10Z `[TOOL]` A failing assertion's MESSAGE is a hypothesis, not evidence.
+  `test_lns_parallel` said "no accepted repair in 60 tries — pick a denser world"; density was not
+  the cause (λ=1000 with 51/67 flights held still failed). The fixture picked victims by flight id,
+  catching flights with delays [68,0,20,20,0,44] while the most-delayed six had [104,68,60,60,52,48].
+  Measure what the fixture actually selected before believing what it says about the world. Files:
+  `tests/test_lns_parallel.py`.
+
+- 2026-09-09T03:15Z `[TOOL]` A test fixture that pins some config but inherits the rest breaks on any
+  default change. `tests/test_colgen_solver._cfg` pinned flight levels, region and ground-delay cap
+  but inherited `hover_time_s`, and its hand-derived step counts are computed on the column window
+  that sets. Pin every knob an expectation was derived against. Files: `tests/test_colgen_solver.py`.
+
+- 2026-09-09T03:20Z `[CODE]` `freespace_sim/planner/colgen/__init__.py` must keep `run_batch` /
+  `ColGenSolver` behind its `__getattr__`. Importing them eagerly pulls SciPy into the geometry
+  surface (against the module docstring) and defeats `monkeypatch.setattr(batch, "run_batch", ...)`,
+  so `test_colgen_batch` runs the real Gurobi path and fails on a missing `gurobipy`. Files:
+  `freespace_sim/planner/colgen/__init__.py`, `tests/test_colgen_batch.py`.

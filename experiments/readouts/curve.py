@@ -23,6 +23,7 @@ from freespace_sim import runs  # noqa: E402
 
 
 def _filter(idx, args):
+    """Return the index rows matching the given ``--tag``/``--scenario``/``--planner`` filters."""
     df = idx
     for col, val in (("tag", args.tag), ("scenario", args.scenario), ("planner", args.planner)):
         if val is not None:
@@ -31,14 +32,30 @@ def _filter(idx, args):
 
 
 def _mean_by_lambda(df, key):
+    """Return ``(lambdas, values)`` for ``key`` averaged per ``lam_per_hour`` and sorted by λ."""
     g = df.groupby("lam_per_hour")[key].mean().sort_index()
     return list(g.index), list(g.values)
 
 
 def plot_curve(df, out_png, title) -> None:
+    """Write the 2x2 FCFS congestion panel (denial, total delay, air detour, throughput vs λ).
+
+    Steady-state twins are overlaid dotted on each panel when the index carries the ``steady_*``
+    columns.
+
+    Parameters
+    ------------
+    - df (pd.DataFrame): filtered index rows, one per run.
+    - out_png (str | Path): destination path for the PNG.
+    - title (str): the figure suptitle.
+
+    Return
+    --------
+    - output (None): writes the PNG to ``out_png``.
+    """
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     lam, _ = _mean_by_lambda(df, "denial_rate")
-    # steady-state twins (issue #25) — plotted dotted alongside the whole-run curves when the index
+    # steady-state twins — plotted dotted alongside the whole-run curves when the index
     # carries them (runs saved after the window feature landed). Each guarded by column presence.
     has_steady = "steady_mean_total_delay_s" in df.columns
 
@@ -89,6 +106,8 @@ def plot_curve(df, out_png, title) -> None:
 
 
 def main() -> None:
+    """Load the run index, filter to the ``--tag``/``--scenario``/``--planner`` set, and write the
+    2x2 congestion curve PNG for that set."""
     p = argparse.ArgumentParser(description="Congestion curve vs λ from the cross-run index.")
     p.add_argument("--tag", default=None, help="filter to a batch's runs (the join key)")
     p.add_argument("--scenario", default=None)

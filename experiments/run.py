@@ -115,6 +115,7 @@ class _StderrTee:
     __slots__ = ("path", "_read_fd", "_saved_fd", "_stop", "_thread")
 
     def __init__(self, path: Path) -> None:
+        """Redirect fd 2 into a pipe and start the daemon pump thread that tees it to ``path``."""
         self.path = path
         self._read_fd, write_fd = os.pipe()
         self._saved_fd = os.dup(2)
@@ -127,6 +128,7 @@ class _StderrTee:
         self._thread.start()
 
     def _pump(self) -> None:
+        """Copy bytes from the pipe to both the real stderr and the sink file until stopped."""
         with open(self.path, "wb") as sink:
             while True:
                 # Polled rather than blocking, because this thread must never be the reason
@@ -489,6 +491,8 @@ def colgen_params_from_args(args, planner: str):
 
 
 def main() -> None:
+    """Parse the execute CLI, install the stderr tee unless ``--no-run-log``, run one scenario via
+    ``_execute``, and always archive the captured log."""
     args = parse_args()
     # everything human-facing goes to stderr; stdout is reserved for the folder path (shell capture)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
@@ -525,6 +529,21 @@ def _archive_log(tee: _StderrTee, folder: Path | None) -> None:
 
 
 def _execute(args, saved: list[Path] | None = None) -> Path:
+    """Run one scenario end to end and persist it: build the spec, simulate, save the run folder.
+
+    Handles mode selection (sequential vs speculative parallel), the realized-anchor guards, the
+    late-departure warning, and the steady-state summary log.
+
+    Parameters
+    ------------
+    - args (argparse.Namespace): parsed execute CLI arguments.
+    - saved (list[Path] | None): when given, the run folder is appended as soon as it exists on
+      disk, so ``main``'s ``finally`` can archive the log even if the logging tail raises.
+
+    Return
+    --------
+    - output (Path): the persisted run folder, also printed as the last stdout line.
+    """
     spec = spec_from_args(args)
     # to_json_dict, not asdict: the latter loses every tuple to a JSON list and leaves `demand` a
     # plain dict, so the archived recipe could not be rebuilt. See ScenarioSpec.from_json_dict.

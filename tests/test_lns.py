@@ -69,6 +69,9 @@ def test_release_many_tombstones_conflicts_and_iteration():
 
 
 def test_release_many_compaction_preserves_content():
+    """Compaction (4 dead > 2 live) preserves the live committed multiset AND renumbers the own-slot
+    index and the (step, cell) buckets with the moved slots — a stale run would tombstone someone
+    else's volume on the next release."""
     led = ReservationLedger(CFG)
     for fid in range(6):
         led.commit(fid, [_wall(1000.0 + 500 * fid)])
@@ -77,11 +80,18 @@ def test_release_many_compaction_preserves_content():
     assert led._n_dead == 0                  # compacted
     assert led.n_volumes == 2
     assert sorted(f for f, _ in led.iter_committed()) == [4, 5]
+    # renumber: live slots and their buckets move with compaction; flight 4 stays findable
+    assert sorted(led._runs) == [4, 5]
+    assert sorted(r for runs in led._runs.values() for r in runs) == [[0, 1], [1, 2]]
+    probe = [_wall(1000.0 + 500 * 4)]        # flight 4's wall is still found after renumber
+    assert {f for f, _ in led.conflicts(probe)} == {4}
     led.commit(0, [_wall(1000.0)])
     led.commit(1, [_wall(1500.0)])
     led.commit(2, [_wall(2000.0)])
     led.commit(3, [_wall(2500.0)])
     assert _ledger_multiset(led) == before_live
+    # releasing the renumbered flight 4 takes exactly its own volume, clearing its station
+    assert led.release_many([4]) == 1 and led.conflicts(probe) == []
 
 
 def test_release_many_handles_a_flight_committed_in_several_calls():
@@ -98,21 +108,6 @@ def test_release_many_handles_a_flight_committed_in_several_calls():
     assert [f for f, _ in led.iter_committed()] == [2]
     assert led.n_volumes == 1
     assert 1 not in led._runs
-
-
-def test_compact_renumbers_runs_and_buckets():
-    """Compaction moves every live slot, so the own-slot index and the (step, cell) buckets have to
-    move with it. A stale run would tombstone SOMEONE ELSE's volume on the next release."""
-    led = ReservationLedger(CFG)
-    for fid in range(6):
-        led.commit(fid, [_wall(1000.0 + 500 * fid)])
-    led.release_many([0, 1, 2, 3])                   # 4 dead > 2 live -> compaction fires
-    assert led._n_dead == 0
-    assert sorted(led._runs) == [4, 5]
-    assert sorted(r for runs in led._runs.values() for r in runs) == [[0, 1], [1, 2]]
-    probe = [_wall(1000.0 + 500 * 4)]                # flight 4's wall is still found after renumber
-    assert {f for f, _ in led.conflicts(probe)} == {4}
-    assert led.release_many([4]) == 1 and led.conflicts(probe) == []
 
 
 def test_compact_coalesces_runs_that_become_adjacent():
@@ -243,21 +238,26 @@ def test_terminal_capacity_eviction_and_removal_stay_symmetric():
     assert not tcap.dwells
 
 
-def test_release_many_incremental_heals_planner_without_rebuild():
-    """With incremental_release, release_many is absorbed via on_release: the next plan must be
-    byte-identical to a fresh planner AND the shrink tripwire must never fire (no rebuild)."""
-    import warnings as _w
-
+@pytest.mark.parametrize("incremental_release", [True, False], ids=["incremental", "occupancy"])
+def test_release_many_heals_planner(incremental_release):
+    """After release_many the next plan must be byte-identical to a fresh planner on a ledger that
+    never held the released flight. With incremental_release the release is absorbed via on_release
+    and the shrink tripwire must NEVER fire (no rebuild); without it, the tripwire rebuilds occupancy."""
     led = ReservationLedger(CFG)
     led.commit(99, [_wall()])
-    planner = AStarPlanner(incremental_release=True)
+    planner = AStarPlanner(incremental_release=incremental_release)
     blocked = planner.plan(_req(1), led, CFG)
-    assert blocked.accepted and blocked.air_detour_m > 0.0
+    assert blocked.accepted and blocked.air_detour_m > 0.0    # wall absorbed, routed around
 
     led.release_many([99])
-    with _w.catch_warnings():
-        _w.filterwarnings("error", message="ReservationLedger shrank")  # a rebuild would fail loudly
+    if incremental_release:
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("error", message="ReservationLedger shrank")  # a rebuild would fail loudly
+            healed = planner.plan(_req(2), led, CFG)
+    else:
         healed = planner.plan(_req(2), led, CFG)
+
     fresh = AStarPlanner().plan(_req(2), ReservationLedger(CFG), CFG)
     assert _intent_digest(healed) == _intent_digest(fresh)
 
@@ -298,23 +298,6 @@ def test_detach_subscribers_forces_a_stale_planner_to_rebind():
     blind = AStarPlanner().plan(_req(2), ReservationLedger(CFG), CFG)
     assert _intent_digest(walled) != _intent_digest(blind)  # non-vacuous: the wall changes this plan
     assert _intent_digest(rebound) == _intent_digest(walled)
-
-
-def test_release_many_heals_planner_occupancy():
-    """After release_many (no observer re-feed), the planner's next plan must rebuild its
-    occupancy via the shrink tripwire and produce the same intent as a fresh planner on a
-    ledger that never contained the released flight."""
-    led = ReservationLedger(CFG)
-    led.commit(99, [_wall()])
-    planner = AStarPlanner()
-    blocked = planner.plan(_req(1), led, CFG)
-    assert blocked.accepted and blocked.air_detour_m > 0.0    # wall absorbed, routed around
-
-    led.release_many([99])
-    healed = planner.plan(_req(2), led, CFG)
-
-    fresh = AStarPlanner().plan(_req(2), ReservationLedger(CFG), CFG)
-    assert _intent_digest(healed) == _intent_digest(fresh)
 
 
 # ------------------------------------------------------------------------ destroy operators

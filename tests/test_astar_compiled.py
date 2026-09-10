@@ -8,6 +8,7 @@ terminal replay, and the transparent-fallback safety valve.
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import sys
 import warnings
@@ -67,47 +68,44 @@ def _assert_exact(req, commits, cfg=CFG):
 
 # ---------------- A/C: compiled == reference exact (non-terminal + multi-altitude) ----------------
 
-def test_compiled_empty_airspace_exact():
-    a, _ = _assert_exact(_req(), [])
-    assert a.status is IntentStatus.ACCEPTED
-
-
-def test_compiled_reroute_wall_exact():
-    _assert_exact(_req(), [(99, [_wall()])])
-
-
-def test_compiled_ground_delay_exact():
-    _assert_exact(_req(), [(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])])
-
-
-def test_compiled_climb_over_blocked_low_level_exact():
-    _assert_exact(_req(), [(99, [_level_wall(CFG.level_z(0))])])
-
-
-def test_compiled_midroute_climb_exact():
-    _assert_exact(_req(), [(98, [_level_wall(CFG.level_z(1), x=900.0)]),
-                           (97, [_level_wall(CFG.level_z(0), x=1500.0)])])
-
-
-def test_compiled_share_corridor_by_altitude_exact():
-    # commit a forward flight (reference), then plan the reverse flight compiled-vs-reference
+def _share_corridor_case():
+    """Reverse flight sharing a corridor by altitude with a committed forward flight."""
     fwd = FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0)
     rev = FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0)
-    la = ReservationLedger(CFG)
-    ia = AStarPlanner(compiled=False).plan(fwd, la, CFG)
-    _assert_exact(rev, [(1, ia.volumes)])
+    ia = AStarPlanner(compiled=False).plan(fwd, ReservationLedger(CFG), CFG)
+    return rev, [(1, ia.volumes)], CFG, None
 
 
-def test_compiled_single_level_config_exact():
-    cfg = SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0)   # cruise/z derive to 150
-    _assert_exact(_req(), [], cfg=cfg)
+# Each builder returns (req, commits, cfg, expected_status_or_None); callables so per-case setup
+# (share_corridor) and cfg construction run at call time. `single_level_config` cruise/z derive to 150.
+_EXACT_CASES = [
+    ("empty_airspace", lambda: (_req(), [], CFG, IntentStatus.ACCEPTED)),
+    ("reroute_wall", lambda: (_req(), [(99, [_wall()])], CFG, None)),
+    ("ground_delay",
+     lambda: (_req(), [(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])], CFG, None)),
+    ("climb_over_blocked_low_level",
+     lambda: (_req(), [(99, [_level_wall(CFG.level_z(0))])], CFG, None)),
+    ("midroute_climb",
+     lambda: (_req(), [(98, [_level_wall(CFG.level_z(1), x=900.0)]),
+                       (97, [_level_wall(CFG.level_z(0), x=1500.0)])], CFG, None)),
+    ("share_corridor_by_altitude", _share_corridor_case),
+    ("single_level_config",
+     lambda: (_req(), [], SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0), None)),
+    ("denial_budget_exceeded",
+     lambda: (FlightRequest(1, vec(0, 0, 0), vec(400, 0, 0), 0.0),
+              [(99, [Volume4D(CylinderSpec(400, 0, 60, 0, 150), 0.0, 1e5)])],
+              dataclasses.replace(CFG, max_ground_delay_s=20.0), None)),
+]
 
 
-def test_compiled_denial_budget_exceeded_exact():
-    import dataclasses as dc
-    cfg = dc.replace(CFG, max_ground_delay_s=20.0)
-    _assert_exact(FlightRequest(1, vec(0, 0, 0), vec(400, 0, 0), 0.0),
-                  [(99, [Volume4D(CylinderSpec(400, 0, 60, 0, 150), 0.0, 1e5)])], cfg=cfg)
+@pytest.mark.parametrize("build", [c[1] for c in _EXACT_CASES], ids=[c[0] for c in _EXACT_CASES])
+def test_compiled_matches_reference_exact(build):
+    """Compiled A* returns the reference's exact result across scenarios: identical status/denial,
+    cost within 1e-9, identical last_expansions, byte-identical centerline (see _assert_exact)."""
+    req, commits, cfg, expected_status = build()
+    a, _ = _assert_exact(req, commits, cfg=cfg)
+    if expected_status is not None:
+        assert a.status is expected_status
 
 
 def test_compiled_deterministic():

@@ -430,23 +430,17 @@ def test_compiled_replay_exact_big_dense_short_flights():
 # ---- the ground-state fold's exit-lane path: compiled == reference on terminal flights ----
 
 
-def test_compiled_replay_dallas_terminal_accept_set():
-    """Terminal (exit-lane) flights: the compiled kernel and the pure-Python reference must agree on
-    WHO FLIES and must not lean on the A* fallback. Cost equality is asserted separately."""
+def test_compiled_replay_dallas_terminal():
+    """Terminal (exit-lane) flights, one replay checking BOTH properties: the compiled kernel and the
+    pure-Python reference must agree on WHO FLIES (accept set) without leaning on the A* fallback, and
+    exact destination-lane scoring must keep their terminal costs identical."""
     rows, fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
     assert rows
     assert all(ca == ra for ca, ra, _, _, _, _ in rows), "accept-set mismatch vs reference"
     assert sum(1 for r in rows if r[0]) > 20, "too few accepted flights to exercise the exit-lane fold"
+    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
     if _COMPILED:
         assert fb < 0.15 * len(rows), f"kernel fell back too often ({fb}/{len(rows)})"
-
-
-@pytest.mark.slow
-def test_compiled_replay_exact_dallas_terminal():
-    """Exact destination-lane scoring keeps compiled and reference terminal costs identical."""
-    rows, _fb = _replay_cc("dallas_hub_2uss_large", 150.0, 1200.0, 0)
-    assert rows
-    assert all(abs(cc - rc) < 1e-9 for ca, _, cc, rc, _, _ in rows if ca), "cost mismatch vs reference"
 
 
 # ---- saturation regression: kernel must respect the own-lane overlay intervals ----

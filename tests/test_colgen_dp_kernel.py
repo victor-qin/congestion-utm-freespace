@@ -1804,53 +1804,20 @@ def test_kernel_paid_correction_matches_the_references_fsum_expression():
 # -------------------------------------------------------------- the production entry point
 
 
-def test_price_flight_takes_the_compiled_path_and_returns_the_reference_column():
-    """`price_flight` proves the compiled search and returns exactly what the oracle does.
+def _seed_incumbent(graph, cfg, model, view):
+    """Case ``returns_reference_column``'s warm start: the seed column priced at benefit 100."""
 
-    The end-to-end shape of Phase 2c, and the one that would otherwise ship silently wrong:
-    every earlier test drives `price_dag` directly, so none of them notices if
-    `_best_column_compiled` falls back on every flight -- which reads as a correct, slow
-    solve rather than as a failure. Hence `_compiled_or_fail`, which fails on a `Declined`,
-    as well as the assertion on the column.
-    """
-
-    cfg = _cfg()
-    graph, params = _terminal_graph(cfg)
-    model = cost_model(cfg, params)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
     seed = pricing.seed_column(graph, cfg, model=model)
-    incumbent = (
+    return (
         model.reduced_cost(
             benefit=100.0, cost=seed.delay_s, dual_cost=view.claim_cost(seed.claims), pi_f=0.0
         ),
         seed,
     )
 
-    rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=incumbent, model=model
-    )
-    assert column is not None
 
-    ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False,
-        incumbent=incumbent, model=model,
-    )
-    assert column == ref_column
-    assert rc == ref_rc
-
-
-def test_compiled_path_honours_forbidden_rows_without_falling_back():
-    """Repair runs INSIDE the kernel; a non-empty exclusion set is not a fallback trigger.
-
-    Required rather than optional: the sweep always passes `_EMPTY_ROWS` (solver.py), so
-    without this the whole repair path ships untested, and routing repair to Python was
-    rejected because it is O(flights) inside the greedy.
-    """
-
-    cfg = _cfg()
-    graph, params = _terminal_graph(cfg)
-    model = cost_model(cfg, params)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
+def _forbidden_random(graph):
+    """Case ``forbidden_rows``'s exclusion set: a non-trivial slice of corridor rows."""
 
     rng = random.Random(4242)
     forbidden = frozenset(
@@ -1860,17 +1827,75 @@ def test_compiled_path_honours_forbidden_rows_without_falling_back():
         if rng.random() < 0.25
     )
     assert len(forbidden) > 10
+    return forbidden
+
+
+def _check_returns_column(column, forbidden):
+    # The warm-started compiled path must return a real column, not silently fall through.
+    assert column is not None
+
+
+def _check_disjoint_from_forbidden(column, forbidden):
+    # Repair runs INSIDE the kernel: the returned column avoids every excluded row.
+    if column is not None:
+        assert column.claims.isdisjoint(forbidden)
+
+
+@pytest.mark.parametrize(
+    ("make_model", "make_incumbent", "make_forbidden", "check"),
+    [
+        (
+            lambda cfg, params: cost_model(cfg, params),
+            _seed_incumbent,
+            lambda graph: frozenset(),
+            _check_returns_column,
+        ),
+        (
+            lambda cfg, params: cost_model(cfg, params),
+            lambda graph, cfg, model, view: None,
+            _forbidden_random,
+            _check_disjoint_from_forbidden,
+        ),
+        (
+            lambda cfg, params: CostModel(ground_weight=9.0, air_weight=1.0),
+            lambda graph, cfg, model, view: None,
+            lambda graph: frozenset(),
+            lambda column, forbidden: None,
+        ),
+    ],
+    ids=["returns_reference_column", "forbidden_rows", "label_score_currency"],
+)
+def test_compiled_path_returns_the_reference_column(
+    make_model, make_incumbent, make_forbidden, check
+):
+    """`price_flight`'s compiled search returns exactly the oracle's column and reduced cost.
+
+    Every earlier test drives `price_dag` directly, so none notices if `_best_column_compiled`
+    falls back on every flight -- which reads as a correct, slow solve rather than a failure;
+    `_compiled_or_fail` turns a `Declined` into a test failure. The cases sweep the three
+    inputs that can silently change the answer: a warm incumbent (the seed case also asserts a
+    real column comes back), a non-empty forbidden set (repair runs inside the kernel, so the
+    column must avoid every excluded row -- the sweep always passes it via `_EMPTY_ROWS`), and
+    an asymmetric `CostModel` (only a ground-heavy model separates the objective currency from
+    raw seconds).
+    """
+
+    cfg = _cfg()
+    graph, params = _terminal_graph(cfg)
+    model = make_model(cfg, params)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    incumbent = make_incumbent(graph, cfg, model, view)
+    forbidden = make_forbidden(graph)
 
     rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, forbidden, incumbent=None, model=model
+        graph, view, 0.0, cfg, 100.0, forbidden, incumbent=incumbent, model=model
     )
     ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, forbidden, seed=False, incumbent=None, model=model
+        graph, view, 0.0, cfg, 100.0, forbidden, seed=False, incumbent=incumbent, model=model
     )
     assert column == ref_column
     assert rc == ref_rc
-    if column is not None:
-        assert column.claims.isdisjoint(forbidden)
+    check(column, forbidden)
 
 
 def test_compiled_path_respects_the_pricing_deadline():
@@ -1893,30 +1918,6 @@ def test_compiled_path_respects_the_pricing_deadline():
             graph, view, 0.0, cfg, 100.0, frozenset(),
             incumbent=None, deadline=time.monotonic() - 1.0, model=model,
         )
-
-
-def test_compiled_path_weights_the_label_score_in_the_objective_currency():
-    """A ground-heavy `CostModel` must still return the reference's column.
-
-    At unit weights `ground + flown` is invariant within a time layer, so the objective and
-    raw seconds coincide and a mis-weighted score is dormant. Under `total_cost` they diverge
-    -- trading one step of ground for one hop of air is free in seconds and worth `2*dt` in
-    cost -- so only an asymmetric model can tell the two apart.
-    """
-
-    cfg = _cfg()
-    graph, params = _terminal_graph(cfg)
-    model = CostModel(ground_weight=9.0, air_weight=1.0)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
-
-    rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
-    )
-    ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
-    )
-    assert column == ref_column
-    assert rc == ref_rc
 
 
 @pytest.mark.parametrize("overrun", [0, 1, 3, 9])

@@ -58,13 +58,24 @@ def _corners_in_env(vols, env):
 
 # ---------------- recording is observer-only ----------------
 
-def test_recording_does_not_change_intents():
+@pytest.mark.parametrize(
+    "planner_kind, compiled_flags",
+    [("astar", (False, True)), ("sipp", (True,))],
+    ids=["astar", "sipp"],
+)
+def test_recording_does_not_change_intents(planner_kind, compiled_flags):
+    """Recording is write-only w.r.t. the search, so kernel parity is untouched — both the compiled
+    and reference paths for A*, and the compiled kernel for SIPP (whose accumulator records per cell)."""
     req = FlightRequest(1, vec(0, 0, 0), vec(2500, 400, 0), 0.0)
     commits = [(9, [_wall()])]
-    for compiled in (False, True):
-        off = AStarPlanner(compiled=compiled)
-        on = AStarPlanner(compiled=compiled)
-        on.record_envelope = True
+    for compiled in compiled_flags:
+        if planner_kind == "astar":
+            off = AStarPlanner(compiled=compiled)
+            on = AStarPlanner(compiled=compiled)
+            on.record_envelope = True
+        else:
+            off = _sipp(record=False, compiled=compiled)
+            on = _sipp(record=True, compiled=compiled)
         a = _plan(off, req, commits)
         b = _plan(on, req, commits)
         assert a.status is b.status and a.denial_reason is b.denial_reason
@@ -184,16 +195,22 @@ def test_envelope_compiled_covers_reference_probes(monkeypatch):
 
 @pytest.mark.parametrize(
     "planner_name",
-    ["astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut"],
+    ["astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut", "sipp_shortcut"],
 )
 def test_envelope_covers_filed_corridor_shortcut(planner_name):
+    """Hull lemma: the shortcut only REMOVES knots, so the refined centreline lies in the convex hull
+    of the searched one, which the envelope already covers. Pinned for the A* variants and the SIPP
+    registry planner (`sipp_shortcut`); the bare comparison uses the same planner family as the inner."""
+    from freespace_sim.planner.sipp import SIPPPlanner
+
     req = FlightRequest(1, vec(0, 0, 0), vec(2400, 1400, 0), 0.0)   # diagonal → staircase → knots removed
+    is_sipp = planner_name == "sipp_shortcut"
     sc = get_planner(planner_name)
     inner = sc.inner
-    assert isinstance(inner, AStarPlanner)
+    assert isinstance(inner, (AStarPlanner, SIPPPlanner))
     inner.record_envelope = True
     refined = _plan(sc, req, [])
-    bare = _plan(AStarPlanner(), req, [])
+    bare = _plan(_sipp(record=False) if is_sipp else AStarPlanner(), req, [])
     assert refined.accepted and bare.accepted
     assert len(refined.centerline) < len(bare.centerline), \
         "shortcut removed no knots — hull lemma not exercised"
@@ -269,20 +286,6 @@ def _sipp(record=True, compiled=True):
     p = SIPPPlanner(compiled=compiled)
     p.record_envelope = record
     return p
-
-
-def test_sipp_recording_does_not_change_intents():
-    """Observer-only: the accumulator is write-only w.r.t. the search, so kernel parity is untouched."""
-    req = FlightRequest(1, vec(0, 0, 0), vec(2500, 400, 0), 0.0)
-    commits = [(9, [_wall()])]
-    off, on = _sipp(record=False), _sipp(record=True)
-    a, b = _plan(off, req, commits), _plan(on, req, commits)
-    assert a.status is b.status and a.denial_reason is b.denial_reason
-    assert off.last_expansions == on.last_expansions
-    assert abs(a.cost - b.cost) < 1e-12 and _clkey(a) == _clkey(b)
-    assert off.last_envelope is None                      # off → nothing built
-    assert isinstance(on.last_envelope, PlanEnvelope)
-    assert not on.last_envelope.unbounded
 
 
 def test_sipp_envelope_covers_the_filed_corridor():
@@ -468,22 +471,3 @@ def test_every_accepted_sipp_plan_reports_a_read_set():
         assert _corners_in_env(it.volumes, p.last_envelope)
         led.commit(rq.flight_id, it.volumes)
     assert n_acc > 40, f"only {n_acc} accepted — fixture too thin to be a coverage test"
-
-
-def test_sipp_shortcut_envelope_covers_the_refined_corridor():
-    """The hull lemma with SIPP inside the refiner: the shortcut only REMOVES knots, so the refined
-    centreline lies in the convex hull of the searched one, which the envelope already covers. A*
-    pins this for its own variants; SIPP is a registry planner (`sipp_shortcut`) and was not."""
-    from freespace_sim.planner.sipp import SIPPPlanner
-
-    req = FlightRequest(1, vec(0, 0, 0), vec(2400, 1400, 0), 0.0)   # diagonal ⇒ staircase ⇒ knots
-    sc = get_planner("sipp_shortcut")
-    inner = sc.inner
-    assert isinstance(inner, SIPPPlanner)
-    inner.record_envelope = True
-    refined = _plan(sc, req, [])
-    bare = _plan(_sipp(record=False), req, [])
-    assert refined.accepted and bare.accepted
-    assert len(refined.centerline) < len(bare.centerline), \
-        "shortcut removed no knots — hull lemma not exercised"
-    assert _corners_in_env(refined.volumes, inner.last_envelope)

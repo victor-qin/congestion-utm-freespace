@@ -181,16 +181,11 @@ def _two_uss_run():
     return run(cfg, demand=UniformPoissonDemand(uss_ids=("walmart", "stripmall")))
 
 
-def test_per_uss_frame_one_row_per_uss():
-    res = _two_uss_run()
-    pu = metrics.per_uss_frame(res)
-    assert set(pu["uss_id"]) == {"walmart", "stripmall"}
-    assert len(pu) == 2
-
-
 def test_per_uss_counts_sum_to_overall():
     res = _two_uss_run()
     pu = metrics.per_uss_frame(res)
+    assert set(pu["uss_id"]) == {"walmart", "stripmall"}   # one row per uss
+    assert len(pu) == 2
     agg = metrics.aggregate(res)
     assert int(pu["n_requests"].sum()) == agg["n_requests"]
     assert int(pu["n_accepted"].sum()) == agg["n_accepted"]

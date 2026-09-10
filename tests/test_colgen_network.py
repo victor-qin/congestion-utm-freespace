@@ -946,9 +946,28 @@ def test_flight_graph_one_hop_and_same_cell_degenerate_guard():
         build_flight_graph(same_cell, cfg, [], ColGenParams())
 
 
-def test_hub_graph_rejects_legacy_nonfixed_exit_lane_geometry():
-    cfg = replace(_cfg(), fixed_exit_lanes=False)
-    hub = Terminal("legacy", 1, radius=90.0)
+@pytest.mark.parametrize(
+    ("make_cfg", "raises_match"),
+    [
+        (
+            lambda: replace(_cfg(), fixed_exit_lanes=False),
+            "requires fixed_exit_lanes=True",
+        ),
+        (
+            lambda: replace(_cfg(), terminal_airspace_always_active=False),
+            "terminal_airspace_always_active=True",
+        ),
+    ],
+    ids=["fixed_exit_lanes", "terminal_airspace"],
+)
+def test_hub_geometry_requires_its_enabling_config(make_cfg, raises_match):
+    """A hub request needs the config that makes its fixed geometry expressible: with the knob
+    off, both the graph build and the column->intent translation must refuse, while an ordinary
+    customer request on the same config still builds a corridor and files cleanly.
+    """
+
+    cfg = make_cfg()
+    hub = Terminal("hub", 1, radius=90.0)
     hub_req = FlightRequest(
         117,
         _ground_point((0, 0), cfg),
@@ -956,7 +975,7 @@ def test_hub_graph_rejects_legacy_nonfixed_exit_lane_geometry():
         0.0,
         origin_terminal=hub,
     )
-    with pytest.raises(NotImplementedError, match="requires fixed_exit_lanes=True"):
+    with pytest.raises(NotImplementedError, match=raises_match):
         build_flight_graph(hub_req, cfg, [], ColGenParams())
 
     lanes = hg.terminal_lanes(hub_req.origin, hub, cfg)
@@ -966,7 +985,7 @@ def test_hub_graph_rejects_legacy_nonfixed_exit_lane_geometry():
     )
     path = _shortest_path(lanes[lane_idx].cell, (4, 0))
     raw = Column(hub_req.flight_id, 0, 0, lane_idx, None, path, 0.0)
-    with pytest.raises(NotImplementedError, match="requires fixed_exit_lanes=True"):
+    with pytest.raises(NotImplementedError, match=raises_match):
         column_to_intent(raw, hub_req, cfg)
 
     customer_req = FlightRequest(
@@ -986,48 +1005,6 @@ def test_hub_graph_rejects_legacy_nonfixed_exit_lane_geometry():
         0.0,
     )
     assert column_to_intent(customer_col, customer_req, cfg).accepted
-
-
-def test_hub_boundaries_require_always_active_terminal_airspace():
-    cfg = replace(_cfg(), terminal_airspace_always_active=False)
-    hub = Terminal("dynamic", 1, radius=90.0)
-    req = FlightRequest(
-        122,
-        _ground_point((0, 0), cfg),
-        _ground_point((4, 0), cfg),
-        0.0,
-        origin_terminal=hub,
-    )
-    with pytest.raises(NotImplementedError, match="terminal_airspace_always_active=True"):
-        build_flight_graph(req, cfg, [], ColGenParams())
-
-    lanes = hg.terminal_lanes(req.origin, hub, cfg)
-    lane_idx = min(
-        range(len(lanes)),
-        key=lambda index: hg.hex_distance(lanes[index].cell, (4, 0)),
-    )
-    path = _shortest_path(lanes[lane_idx].cell, (4, 0))
-    raw = Column(req.flight_id, 0, 0, lane_idx, None, path, 0.0)
-    with pytest.raises(NotImplementedError, match="terminal_airspace_always_active=True"):
-        column_to_intent(raw, req, cfg)
-
-    customer = FlightRequest(
-        123,
-        _ground_point((0, 0), cfg),
-        _ground_point((4, 0), cfg),
-        0.0,
-    )
-    assert build_flight_graph(customer, cfg, [], ColGenParams()).corridor_cells
-    customer_col = Column(
-        customer.flight_id,
-        0,
-        0,
-        None,
-        None,
-        _shortest_path((0, 0), (4, 0)),
-        0.0,
-    )
-    assert column_to_intent(customer_col, customer, cfg).accepted
 
 
 def test_terminal_lane_to_same_customer_cell_cannot_form_zero_hop_column():

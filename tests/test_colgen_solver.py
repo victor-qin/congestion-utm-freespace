@@ -732,29 +732,72 @@ def test_rounding_honours_fixed_and_unmaterialized_claims():
     _assert_claim_feasible(rounded, rows)
 
 
-def test_hand_checked_60deg_crossing():
-    """Two unique geodesics share one cell; W=4 makes one hold 4 steps (16 s)."""
+def _assert_60deg_initial_heuristic(result):
+    # The 2-flight crossing: the seeding heuristic already lands the optimum, so it reports
+    # both flights placed and the full 16 s of ground delay the final schedule keeps.
+    assert result.stats["initial_heuristic_flights"] == 2
+    assert result.stats["initial_heuristic_delay_s"] == pytest.approx(16.0, abs=1e-8)
 
-    cfg = _cfg(max_ground_delay_s=32.0)
-    requests = [
-        _request(1, (-4, 0), (4, 0), cfg),
-        _request(2, (0, -4), (0, 4), cfg),
-    ]
+
+@pytest.mark.parametrize(
+    (
+        "make_requests", "max_ground_delay_s", "expected_objective",
+        "delay_ladder", "expected_hop_distance", "extra_checks",
+    ),
+    [
+        (
+            lambda cfg: [
+                _request(1, (-4, 0), (4, 0), cfg),
+                _request(2, (0, -4), (0, 4), cfg),
+            ],
+            32.0,
+            16.0,
+            [0.0, 16.0],
+            8,
+            _assert_60deg_initial_heuristic,
+        ),
+        (
+            lambda cfg: [
+                _request(1, (-4, 0), (4, 0), cfg),
+                _request(2, (0, -4), (0, 4), cfg),
+                _request(3, (-4, 4), (4, -4), cfg),
+            ],
+            48.0,
+            48.0,
+            [0.0, 16.0, 32.0],
+            None,
+            lambda result: None,
+        ),
+    ],
+    ids=["60deg_crossing", "merge_three_flights"],
+)
+def test_hand_checked_shared_cell_hold_ladder(
+    make_requests, max_ground_delay_s, expected_objective, delay_ladder,
+    expected_hop_distance, extra_checks,
+):
+    """Unique geodesics sharing one cell force a ground-hold ladder whose total is the
+    objective: two flights hold 0/4 steps (16 s), three hold 0/4/8 steps (48 s). Only the
+    2-flight case's geodesics are all 8 hops long, so the hop-distance check is per case. The
+    continuous ledger is the independent referee that the selected columns file cleanly.
+    """
+
+    cfg = _cfg(max_ground_delay_s=max_ground_delay_s)
+    requests = make_requests(cfg)
     _assert_endpoint_cells_pairwise_disjoint(requests, cfg)
     for request in requests:
         start = hg.enu_to_axial(*request.origin[:2], hg.circumradius(cfg))
         destination = hg.enu_to_axial(*request.dest[:2], hg.circumradius(cfg))
-        assert hg.hex_distance(start, destination) == 8
+        if expected_hop_distance is not None:
+            assert hg.hex_distance(start, destination) == expected_hop_distance
         assert len(_geodesics(start, destination)) == 1
 
     result = ColGenSolver().solve(requests, cfg, (), _params())
 
-    assert len(result.columns) == 2
-    assert result.stats["objective"] == pytest.approx(16.0, abs=1e-8)
-    assert result.stats["initial_heuristic_flights"] == 2
-    assert result.stats["initial_heuristic_delay_s"] == pytest.approx(16.0, abs=1e-8)
+    assert len(result.columns) == len(requests)
+    assert result.stats["objective"] == pytest.approx(expected_objective, abs=1e-8)
+    extra_checks(result)
     assert sorted(column.delay_s for column in result.columns.values()) == pytest.approx(
-        [0.0, 16.0], abs=1e-8
+        delay_ladder, abs=1e-8
     )
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg)
@@ -797,32 +840,6 @@ def test_two_crossing_flights_bruteforce_optimal():
 
     assert brute == pytest.approx(16.0)
     assert result.stats["objective"] == pytest.approx(brute, abs=1e-8)
-
-
-def test_hand_checked_merge_three_flights():
-    """Three unique geodesics share one cell; holds 0, 4, 8 steps cost 48 s."""
-
-    cfg = _cfg(max_ground_delay_s=48.0)
-    requests = [
-        _request(1, (-4, 0), (4, 0), cfg),
-        _request(2, (0, -4), (0, 4), cfg),
-        _request(3, (-4, 4), (4, -4), cfg),
-    ]
-    _assert_endpoint_cells_pairwise_disjoint(requests, cfg)
-    for request in requests:
-        start = hg.enu_to_axial(*request.origin[:2], hg.circumradius(cfg))
-        destination = hg.enu_to_axial(*request.dest[:2], hg.circumradius(cfg))
-        assert len(_geodesics(start, destination)) == 1
-
-    result = ColGenSolver().solve(requests, cfg, (), _params())
-
-    assert len(result.columns) == 3
-    assert result.stats["objective"] == pytest.approx(48.0, abs=1e-8)
-    assert sorted(column.delay_s for column in result.columns.values()) == pytest.approx(
-        [0.0, 16.0, 32.0], abs=1e-8
-    )
-    _assert_claim_feasible(result.columns)
-    _assert_files_cleanly(requests, result.columns, cfg)
 
 
 def test_hand_checked_detour_beats_hold():

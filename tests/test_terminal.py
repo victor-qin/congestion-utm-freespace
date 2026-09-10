@@ -135,28 +135,27 @@ def _radial_delivery(hub_xy, angle_deg, dist, capacity, fid, t=0.0, radius=None)
                          origin_terminal=Terminal("H", capacity, radius=radius))
 
 
-@pytest.mark.parametrize("cap", [1, 2, 4])
-def test_pad_capacity_admits_n_concurrent_then_delays(cap):
-    # N+1 deliveries leave one hub at the same instant: exactly N launch now (capacity), the extra
-    # takes ground delay — admitted, not denied. This is the whole point of Phase B.
+@pytest.mark.parametrize(
+    ("cap", "n"),
+    [
+        pytest.param(2, 2, id="at_capacity"),
+        pytest.param(1, 2, id="over_cap1"),
+        pytest.param(2, 3, id="over_cap2"),
+        pytest.param(4, 5, id="over_cap4"),
+    ],
+)
+def test_pad_capacity_bounds_concurrent_launches(cap, n):
+    # Pad capacity bounds same-hub concurrency: exactly min(n, cap) launch at t0 (sharing the column),
+    # any extra takes ground delay — admitted, not denied (the whole point of Phase B). At capacity all
+    # launch concurrently (pre-Phase-B the first flight's column blocked the second into a ground delay).
     hub = (3000.0, 3000.0)
-    n = cap + 1
     reqs = [_radial_delivery(hub, i * 360.0 / n, 2000.0, cap, i) for i in range(n)]
     res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
     assert res.verified and len(res.accepted) == n                    # all admitted, none denied
     concurrent = [a for a in res.accepted if a.ground_delay_s == 0.0]
-    assert len(concurrent) == cap                                     # exactly N share the column now
-    assert any(a.ground_delay_s > 0.0 for a in res.accepted)          # the (N+1)th waits for a pad
-
-
-def test_two_same_hub_flights_launch_concurrently_under_capacity():
-    # the sharp before/after: with capacity 2, two same-hub launches BOTH go at t0 (pre-Phase-B the
-    # first flight's column blocked the second into a ground delay)
-    hub = (3000.0, 3000.0)
-    reqs = [_radial_delivery(hub, 0.0, 2000.0, 2, 0), _radial_delivery(hub, 180.0, 2000.0, 2, 1)]
-    res = run(SimConfig(planner="astar", region_size_m=(6000.0, 6000.0)), requests=reqs)
-    assert res.verified and len(res.accepted) == 2
-    assert all(a.ground_delay_s == 0.0 for a in res.accepted)         # concurrent, zero ground delay
+    assert len(concurrent) == min(n, cap)                             # exactly min(N, capacity) share now
+    if n > cap:
+        assert any(a.ground_delay_s > 0.0 for a in res.accepted)      # the extra waits for a pad
 
 
 # --- terminal-radius × fan-out sweeps ---------------------------------------------------------

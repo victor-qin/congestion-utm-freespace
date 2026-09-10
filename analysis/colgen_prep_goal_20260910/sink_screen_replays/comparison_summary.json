@@ -1,0 +1,57 @@
+{
+  "status": "complete",
+  "correctness": {
+    "rounds": [1, 6, 11],
+    "flights_per_round": 1537,
+    "output_identity_claim_cost_rc_work_parity": true,
+    "native_coverage_complete": true,
+    "native_declines": 0,
+    "reverse_round11_parity": true
+  },
+  "forward": {
+    "1": {
+      "old_wall_s": 84.07222874998115,
+      "screened_wall_s": 80.19376679207198,
+      "screened_task_s": 893.6144893371966,
+      "screened_goal_s": 11.740912550361827,
+      "sinks_asked": 1471,
+      "sinks_skipped": 13268
+    },
+    "6": {
+      "old_wall_s": 86.09434287506156,
+      "screened_wall_s": 77.00298750004731,
+      "screened_task_s": 838.2461700274143,
+      "screened_goal_s": 11.621958544710651,
+      "sinks_asked": 1119,
+      "sinks_skipped": 121616
+    },
+    "11": {
+      "old_wall_s": 84.99760516593233,
+      "screened_wall_s": 77.03335412521847,
+      "screened_task_s": 834.4011258517858,
+      "screened_goal_s": 9.927963913884014,
+      "sinks_asked": 1077,
+      "sinks_skipped": 136781
+    }
+  },
+  "reverse_round11": {
+    "old_wall_s": 84.75292937504128,
+    "screened_wall_s": 77.29927458404563,
+    "old_task_s": 895.1846791582648,
+    "screened_task_s": 838.6900165178813,
+    "old_goal_s": 66.87777387304232,
+    "screened_goal_s": 9.993314798222855
+  },
+  "paired_round11_average": {
+    "old_wall_s": 84.8752672704868,
+    "screened_wall_s": 77.16631435463205,
+    "wall_reduction_percent": 9.082684701642576,
+    "old_task_s": 895.0558872955153,
+    "screened_task_s": 836.5455711848335,
+    "task_reduction_percent": 6.5370572878388025,
+    "old_goal_s": 66.52843235130422,
+    "screened_goal_s": 9.960639356053434,
+    "goal_reduction_percent": 85.02799629569482
+  },
+  "limitation": "Fresh-process sweeps include worker startup and cold graph/preparation setup; no full master/IP solve was run for completed-route screening."
+}

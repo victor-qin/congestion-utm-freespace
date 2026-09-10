@@ -1059,6 +1059,7 @@ def _bootstrap_incumbent(
     method: str = "dp",
     max_labels: int = 20000,
     deadline: float | None = None,
+    preparation: dp_prepare.PricingPreparation | None = None,
 ) -> tuple[float, Column] | None:
     """Find an achievable reduced-cost cutoff over a few ranked start options.
 
@@ -1081,14 +1082,19 @@ def _bootstrap_incumbent(
     and certifies the final optimum; heuristic labels never enter either exact search.
     """
 
-    _LAST_SEARCH.update(n_labels=0, bootstrap_goal_labels=0, bootstrap_goal_s=0.0)
+    _LAST_SEARCH.update(n_labels=0, bootstrap_goal_labels=0, bootstrap_goal_s=0.0,
+                        bootstrap_goal_native=False, bootstrap_goal_decline_reason=None,
+                        bootstrap_goal_sinks_skipped=0, bootstrap_goal_sinks_asked=0)
 
     # Rank ONCE, here, and hand the result to whichever search runs.  `prepare_variants` is
     # pure Python -- `dp_prepare` has no numba anywhere -- so this works identically on a
     # numba-less install, which is what keeps `--reference-baseline` a real gate rather than
     # a second code path.  `prepared_for` is memoized per graph, so the packing is not
     # rebuilt for this.
-    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if preparation is not None:
+        preparation.check(fg, cfg, dual_view, benefit, pi_f, model, forbidden_rows)
+    topology, rows = (dp_prepare.prepared_for(fg, cfg) if preparation is None
+                      else preparation.topology_rows)
     if not (topology.ok and rows.ok):
         # Both searches decline this graph too, so skipping here keeps them symmetric.
         return incumbent
@@ -1098,7 +1104,7 @@ def _bootstrap_incumbent(
     # immediately discards, `prepare_variants` returns EMPTY, and the bootstrap silently does
     # nothing while still costing its own setup.  The failure is invisible -- no crash, a
     # successful `(-inf, None)`, the incumbent handed straight back.
-    envelopes = dp_prepare.CompletionEnvelopes(
+    envelopes = preparation.envelopes(incumbent, deadline) if preparation else dp_prepare.CompletionEnvelopes(
         fg,
         cfg,
         dual_view,
@@ -1121,6 +1127,7 @@ def _bootstrap_incumbent(
         model=model,
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
+        preparation=preparation,
     )
     if variants.departure_step.size == 0 or (
         variants.departure_step.size == 1 and not search_single_root
@@ -1162,6 +1169,7 @@ def _bootstrap_incumbent(
             fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model,
             variants, order, topology, envelopes, incumbent=incumbent,
             max_labels=max_labels, deadline=deadline,
+            preparation=preparation,
         )
         goal_labels = int(_LAST_SEARCH.get("n_labels", 0))
         goal_s = time.perf_counter() - goal_started
@@ -1178,6 +1186,7 @@ def _bootstrap_incumbent(
         model=model,
         keep_roots=keep,
         record_budget=False,
+        preparation=preparation,
     )
     if isinstance(outcome, Declined):
         # `roots` roots rather than the whole window, so the reference is affordable here in
@@ -1205,6 +1214,60 @@ def _bootstrap_incumbent(
 
 
 def _goal_directed_bootstrap(
+    fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+    variants, order, topology, envelopes, *, incumbent, max_labels, deadline,
+    preparation=None,
+):
+    """Run the bounded native heuristic, retaining the Python oracle on explicit decline.
+
+    Parameters
+    ------------
+    - fg, duals, pi_f, cfg, benefit, forbidden_rows, model: Fixed pricing subproblem.
+    - variants, order, topology, envelopes: Ranked roots and this stage's pruning bounds.
+    - incumbent, max_labels, deadline: Certified cutoff and heuristic work/time limits.
+    - preparation: Optional invocation-local packed inputs shared with both DP stages.
+
+    Return
+    --------
+    - incumbent: Canonically certified improvement or the original cutoff.
+    """
+    _check_deadline(deadline)
+    native = None
+    if _dp_kernel() is not None:
+        try:
+            from .bootstrap_kernel import goal_directed_bootstrap as native
+        except ImportError:
+            pass
+    diagnostics = dict(native_used=False, decline_reason="numba unavailable")
+    if native is not None:
+        packed = {}
+        if preparation is not None:
+            preparation.check(fg, cfg, duals, benefit, pi_f, model, forbidden_rows)
+            packed = dict(prepared_rows=preparation.topology_rows[1],
+                          prepared_duals=preparation.duals,
+                          prepared_forbidden=preparation.forbidden)
+        result = native(
+            fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+            variants, order, topology, envelopes, incumbent=incumbent,
+            max_labels=max_labels, deadline=deadline, diagnostics=diagnostics, **packed,
+        )
+        if result is not None:
+            incumbent, expanded = result
+            _LAST_SEARCH.update(n_labels=expanded, bootstrap_goal_native=True,
+                                bootstrap_goal_decline_reason=None,
+                                bootstrap_goal_sinks_skipped=int(diagnostics.get("sinks_skipped", 0)),
+                                bootstrap_goal_sinks_asked=int(diagnostics.get("sinks_asked", 0)))
+            return incumbent
+    _LAST_SEARCH.update(bootstrap_goal_native=False,
+                        bootstrap_goal_decline_reason=diagnostics["decline_reason"])
+    return _goal_directed_bootstrap_python(
+        fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+        variants, order, topology, envelopes, incumbent=incumbent,
+        max_labels=max_labels, deadline=deadline,
+    )
+
+
+def _goal_directed_bootstrap_python(
     fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
     variants, order, topology, envelopes, *, incumbent, max_labels, deadline,
 ):
@@ -2839,6 +2902,7 @@ def _best_column_compiled(
     record_budget: bool = True,
     additional_columns: list[Column] | None = None,
     column_limit: int = 1,
+    preparation: dp_prepare.PricingPreparation | None = None,
 ) -> tuple[float, Column | None] | Declined:
     """``_best_column`` over the compiled search: ``(reduced_cost, column)``, or a reason.
 
@@ -2891,14 +2955,18 @@ def _best_column_compiled(
         return Declined.MULTI_LEVEL
 
     _check_deadline(deadline)
-    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if preparation is not None:
+        preparation.check(fg, cfg, dual_view, benefit, pi_f, model, forbidden_rows)
+    topology, rows = (dp_prepare.prepared_for(fg, cfg) if preparation is None
+                      else preparation.topology_rows)
     if not topology.ok:
         return Declined.TOPOLOGY
     if not rows.ok:
         return Declined.ROWS
 
-    duals = dp_prepare.prepare_duals(dual_view, fg, topology, rows)
-    envelopes = dp_prepare.CompletionEnvelopes(
+    duals = (dp_prepare.prepare_duals(dual_view, fg, topology, rows) if preparation is None
+             else preparation.duals)
+    envelopes = preparation.envelopes(incumbent, deadline) if preparation else dp_prepare.CompletionEnvelopes(
         fg,
         cfg,
         dual_view,
@@ -2922,6 +2990,7 @@ def _best_column_compiled(
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
         keep_roots=keep_roots,
+        preparation=preparation,
     )
     if not variants.ok:
         # Unreachable today, and kept anyway.  `prepare_variants` has exactly two returns and
@@ -2931,7 +3000,8 @@ def _best_column_compiled(
         # nothing is a different thing entirely: it comes back `ok` with empty arrays and
         # correctly PROVES that no improving column exists.
         return Declined.TOPOLOGY if not topology.ok else Declined.ROWS
-    pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
+    pack = (dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
+            if preparation is None else preparation.forbidden)
     if pack.n_unmapped:
         # Every other Declined here costs time; this one would cost correctness. A dropped
         # forbidden row does not narrow the search, it WIDENS it past what the reference
@@ -3805,6 +3875,9 @@ def price_flight(
     _bootstrap_goal_labels = 0
     _bootstrap_goal_s = 0.0
     _bootstrap_dp_labels = 0
+    preparation = dp_prepare.PricingPreparation(
+        fg, cfg, view, benefit=benefit, pi_f=pi_value, model=model, forbidden_rows=forbidden
+    )
     if params.bootstrap_roots or heuristic_only:
         _bootstrap_started = time.perf_counter()
         incumbent = _bootstrap_incumbent(
@@ -3822,6 +3895,7 @@ def price_flight(
             method=params.bootstrap_method,
             max_labels=params.bootstrap_max_labels,
             deadline=deadline,
+            preparation=preparation,
         )
         _bootstrap_s = time.perf_counter() - _bootstrap_started
         # Snapshot NOW: `_bootstrap_incumbent` runs its own restricted
@@ -3859,6 +3933,7 @@ def price_flight(
         incumbent=incumbent,
         deadline=deadline,
         model=model,
+        preparation=preparation,
         **({"additional_columns": additional_columns, "column_limit": params.columns_per_flight}
             if additional_columns is not None else {}),
     )

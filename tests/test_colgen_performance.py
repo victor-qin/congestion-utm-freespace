@@ -111,6 +111,7 @@ def test_repeated_pricing_stops_touching_the_arc_oracle_entirely():
 
 
 def test_canonical_claim_cache_is_strictly_bounded():
+    """Time shifts share one certificate; distinct spatial paths still evict at two."""
     cfg = _cfg()
     graph, _params = _graph(cfg, overrun=2)
     seed = seed_column(graph, cfg)
@@ -123,7 +124,16 @@ def test_canonical_claim_cache_is_strictly_bounded():
         )
         column_claims(shifted, graph, cfg)
 
-    assert len(graph._search_cache.certified_claims) == 2
+    cache = graph._search_cache.certified_claims
+    assert len(cache) == 1
+    original_key = next(iter(cache))
+    for path in (
+        ((0, 0), (0, 1), (1, 1), (2, 0)),
+        ((0, 0), (1, -1), (2, -1), (2, 0)),
+    ):
+        column_claims(replace(seed, cell_path=path, claims=frozenset()), graph, cfg)
+        assert len(cache) == 2
+    assert original_key not in cache
 
 
 def _count_exact_pricing(monkeypatch) -> dict[str, int]:

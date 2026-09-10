@@ -1,0 +1,38 @@
+{
+  "scope": "Completed-route native bound screen, added after the full first-two-improvements benchmark.",
+  "test_suites": [
+    {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "32",
+      "time": "2.162",
+      "timestamp": "2026-09-10T15:42:23.774448-04:00",
+      "hostname": "OIs-Mac-Studio.local"
+    }
+  ],
+  "junit": "sink_screen_pytest.xml",
+  "log": "sink_screen_pytest.log",
+  "source_snapshot": "/private/tmp/colgen-sink-screen-20260910",
+  "source_sha256": {
+    "freespace_sim/planner/colgen/bootstrap_kernel.py": "ac71ccd822273211fc8e4e37de04d43983e367d126a2c7b649f8c1b8d324230b",
+    "freespace_sim/planner/colgen/pricing.py": "a73cd01e048b9c028626c871c1997b4a358c4682a7452151b16acc966fd83e80",
+    "tests/test_colgen_goal_kernel.py": "4088d50ef92b28288ebbd950723ec889838bb3f9c1c4e3797e1d46f85adeda78"
+  },
+  "six_tail_comparison": "sink_screen_profiles/summary.json",
+  "full_sweep_validation": {
+    "path": "sink_screen_replays",
+    "distinct_cases": 4611,
+    "rounds": [
+      1,
+      6,
+      11
+    ],
+    "parity": "Exact outputs/identity/claims/cost-RC bits/search work",
+    "repeat_status": "Complete: both round11 repeat arms pass exact output/claims/cost-RC/work parity; screened wall77.299s vs84.753s unscreened (-8.79%)."
+  },
+  "prior_tests": "test_validation.json records 273 unique passing cases for the earlier frozen candidate; 24 are superseded by the updated 32-case goal suite.",
+  "ruff": "All changed production/test files and analysis Python helpers pass",
+  "diff_check": "git diff --check passes"
+}

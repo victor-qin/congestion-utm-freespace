@@ -1050,6 +1050,99 @@ def visit_row_ids(rows: PreparedRows, cell_index: int, visit_step: int, offsets)
 # ------------------------------------------------------------------- completion envelope
 
 
+class PricingPreparation:
+    """Invocation-local prices and root data shared by pricing's successive searches.
+
+    The context belongs to one graph, dual view, objective and exclusion set. Only
+    calculations independent of the evolving incumbent are cached. Each stage receives
+    fresh completion envelopes and assigns its own surviving roots and paid-class IDs.
+    """
+
+    def __init__(self, fg, cfg, view, *, benefit, pi_f, model, forbidden_rows):
+        self.fg, self.cfg, self.view = fg, cfg, view
+        self.benefit, self.pi_f, self.model = benefit, pi_f, model
+        self.forbidden_rows = frozenset(forbidden_rows)
+        self._topology_rows = None
+        self._duals = None
+        self._forbidden = None
+        self._completion = None
+        self._origin_data = None
+        self._origin_claims = {}
+        self._root_prices = {}
+
+    def check(self, fg, cfg, view, benefit, pi_f, model, forbidden_rows):
+        """Reject accidental reuse across different pricing subproblems."""
+        if not (
+            fg is self.fg and cfg is self.cfg and view is self.view
+            and benefit == self.benefit and pi_f == self.pi_f and model == self.model
+            and (forbidden_rows is self.forbidden_rows or forbidden_rows == self.forbidden_rows)
+        ):
+            raise ValueError("pricing preparation belongs to another subproblem")
+
+    @property
+    def topology_rows(self):
+        """Use the existing immutable per-graph topology and row packing."""
+        if self._topology_rows is None:
+            self._topology_rows = prepared_for(self.fg, self.cfg)
+        return self._topology_rows
+
+    @property
+    def duals(self):
+        """Pack current duals once without changing prefix-sum arithmetic."""
+        if self._duals is None:
+            self._duals = prepare_duals(self.view, self.fg, *self.topology_rows)
+        return self._duals
+
+    @property
+    def forbidden(self):
+        """Pack this call's exclusions once, preserving unmapped-row detection."""
+        if self._forbidden is None:
+            topology, rows = self.topology_rows
+            self._forbidden = prepare_forbidden(self.forbidden_rows, self.fg, rows, topology)
+        return self._forbidden
+
+    def envelopes(self, incumbent, deadline):
+        """Start fresh incumbent-dependent bounds over shared fixed calculations."""
+        from .pricing import _check_deadline
+
+        _check_deadline(deadline)
+        result = CompletionEnvelopes(
+            self.fg, self.cfg, self.view, benefit=self.benefit, pi_f=self.pi_f,
+            model=self.model, forbidden_rows=self.forbidden_rows, incumbent=incumbent,
+            deadline=deadline, _shared=self._completion,
+        )
+        if self._completion is None:
+            self._completion = result
+        return result
+
+    def origin_data(self, topology):
+        """Memoize root geometry; pruning and class interning remain stage-local."""
+        if self._origin_data is None:
+            self._origin_data = _prepare_origin_data(self.fg, self.cfg, topology)
+        return self._origin_data
+
+    def origin_claims(self, departure):
+        """Reuse each departure's unchanged endpoint reservation across search stages."""
+        if departure not in self._origin_claims:
+            self._origin_claims[departure] = pricing_endpoint_claims(
+                self.fg, self.cfg, origin=True, step=departure
+            )
+        return self._origin_claims[departure]
+
+    def root_price(self, departure, lane, origin_claims, cell, start_step):
+        """Reuse canonical start prices and paid rows before the current cutoff gate."""
+        from .pricing import _visit_claims
+
+        key = departure, lane
+        if key not in self._root_prices:
+            claims = origin_claims | _visit_claims(cell, 0, start_step, self.view.offsets)
+            self._root_prices[key] = (
+                (self.view.claim_cost(claims), self.view.active_claims(claims))
+                if claims.isdisjoint(self.forbidden_rows) else None
+            )
+        return self._root_prices[key]
+
+
 class CompletionEnvelopes:
     """``_best_column``'s completion bound, lifted out of the search that owns it.
 
@@ -1085,6 +1178,7 @@ class CompletionEnvelopes:
     __slots__ = (
         "_cfg",
         "_deadline",
+        "_delay_values",
         "_delay_envelopes",
         "_destination_costs",
         "_initial_incumbent",
@@ -1118,6 +1212,7 @@ class CompletionEnvelopes:
         forbidden_rows=frozenset(),
         incumbent=None,
         deadline: float | None = None,
+        _shared: CompletionEnvelopes | None = None,
     ) -> None:
         """Capture the per-flight state ``completion_envelope``/``can_compete`` close over.
 
@@ -1161,7 +1256,22 @@ class CompletionEnvelopes:
         self._offsets = view.offsets
         self._envelopes: dict[tuple[int, int | None], tuple[tuple[float, ...], ...]] = {}
         self._delay_envelopes: dict[tuple[int, int | None], tuple[Any, int]] = {}
+        self._delay_values: dict[tuple[int, int | None], list[float]] = {}
         self._destination_costs: dict[tuple[int, int], float] = {}
+
+        if _shared is not None:
+            # These values do not depend on either stage's incumbent. In particular,
+            # never share _delay_envelopes/_envelopes: their first-use length is a prune.
+            self._destination_costs = _shared._destination_costs
+            self._delay_values = _shared._delay_values
+            self._destination_options = _shared._destination_options
+            self._origin_fold_lb_by_lane = _shared._origin_fold_lb_by_lane
+            self._destination_fold_lb = _shared._destination_fold_lb
+            self._destination_fold_exact = _shared._destination_fold_exact
+            self._reference_time_s = _shared._reference_time_s
+            self._detour_defined = _shared._detour_defined
+            self.destination_lane_tie = _shared.destination_lane_tie
+            return
 
         destination_options = _destination_options(fg)
         self._destination_options = destination_options
@@ -1364,10 +1474,15 @@ class CompletionEnvelopes:
         corridor_start = departure_step + fg.takeoff_steps[0] + lane_steps
         max_total_hops = min(fg.max_step - corridor_start, fg.max_air_hops)
         delay_lbs = [math.inf]
+        # Scalar costs are fixed; only this stage's cutoff decides the prefix length.
+        # Retain costs even beyond an earlier cutoff, and reapply the gate every time.
+        values = self._delay_values.setdefault(key, [])
         incumbent = self._incumbent
         for total_hops in range(1, max_total_hops + 1):
             _check_deadline(self._deadline)
-            delay_lb = self.delay_lower_bound(departure_step, lane_idx, total_hops, 0)
+            if total_hops > len(values):
+                values.append(self.delay_lower_bound(departure_step, lane_idx, total_hops, 0))
+            delay_lb = values[total_hops - 1]
             if incumbent is not None and (
                 self.benefit - self._pi_f - delay_lb + self._view.max_negative_credit
                 < incumbent[0] - _RECOMPUTE_EPS
@@ -1440,9 +1555,9 @@ class CompletionEnvelopes:
         explore less than the first, and the reference's column is defined by a search
         that never restarts.
 
-        The destination-cost memo deliberately survives. It is a pure function of the
-        duals, the graph and the exclusion set, none of which move when the incumbent
-        does, so keeping it makes the restart cheaper without making it different.
+        The destination-cost and raw delay-cost memos deliberately survive. They depend
+        only on fixed subproblem inputs, so retaining them makes the restart cheaper
+        without carrying over any incumbent-dependent envelope lengths.
 
         Parameters
         ------------
@@ -1667,6 +1782,24 @@ class PreparedVariants:
         return int(self.departure_step.shape[0])
 
 
+def _prepare_origin_data(fg, cfg, topology):
+    """Collect fixed root geometry, leaving incumbent-dependent gates to each stage."""
+    from .pricing import _destination_options, _fold_leg_s, _origin_options
+
+    cell_index = {
+        (int(q), int(r)): i
+        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
+    }
+    origin_options = _origin_options(fg)
+    origin_leg_by_lane = {}
+    for lane_idx, _cell, _steps in origin_options:
+        lane_dist = None if lane_idx is None else fg.origin_lanes[lane_idx].dist
+        origin_leg_by_lane[lane_idx] = _fold_leg_s(
+            fg.request.origin, fg.origin_terminal, lane_dist, cfg
+        )
+    return cell_index, origin_options, origin_leg_by_lane, frozenset(_destination_options(fg)), {}
+
+
 def prepare_variants(
     fg: FlightGraph,
     cfg: SimConfig,
@@ -1681,6 +1814,7 @@ def prepare_variants(
     forbidden_rows=frozenset(),
     envelopes: CompletionEnvelopes | None = None,
     keep_roots: frozenset[tuple[int, int]] | None = None,
+    preparation: PricingPreparation | None = None,
 ) -> PreparedVariants:
     """Price every root option once, exactly as ``_best_column``'s initialization does.
 
@@ -1734,7 +1868,7 @@ def prepare_variants(
     """
 
     from .objective import DELAY_MODEL
-    from .pricing import _RECOMPUTE_EPS, _fold_leg_s, _origin_options, _visit_claims
+    from .pricing import _RECOMPUTE_EPS, _distance_lower_bound, _visit_claims
 
     if not (topology.ok and rows.ok):
         return PreparedVariants(
@@ -1742,25 +1876,15 @@ def prepare_variants(
         )
     if model is None:
         model = DELAY_MODEL
+    if preparation is not None:
+        preparation.check(fg, cfg, view, benefit, pi_f, model, forbidden_rows)
     w_ground, w_air = model.ground_weight, model.air_weight
     offsets = view.offsets
 
-    cell_index = {
-        (int(q), int(r)): i
-        for i, (q, r) in enumerate(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
-    }
-    origin_options = _origin_options(fg)
-    # Endpoint legs, computed once per lane exactly as the reference does.
-    origin_leg_by_lane: dict[int | None, float] = {}
-    for lane_idx, _cell, _steps in origin_options:
-        lane_dist = None if lane_idx is None else fg.origin_lanes[lane_idx].dist
-        origin_leg_by_lane[lane_idx] = _fold_leg_s(
-            fg.request.origin, fg.origin_terminal, lane_dist, cfg
-        )
-
-    from .pricing import _destination_options, _distance_lower_bound
-    destination_cells = frozenset(_destination_options(fg))
-    distance_cache: dict[Cell, int] = {}
+    cell_index, origin_options, origin_leg_by_lane, destination_cells, distance_cache = (
+        _prepare_origin_data(fg, cfg, topology)
+        if preparation is None else preparation.origin_data(topology)
+    )
 
     def remaining_distance(cell: Cell) -> int:
         cached = distance_cache.get(cell)
@@ -1792,7 +1916,8 @@ def prepare_variants(
             if start_upper_bound < cost_cutoff - _RECOMPUTE_EPS:
                 prefiltered += 1
                 continue
-        origin_claims = pricing_endpoint_claims(fg, cfg, origin=True, step=departure_step)
+        origin_claims = (pricing_endpoint_claims(fg, cfg, origin=True, step=departure_step)
+                         if preparation is None else preparation.origin_claims(departure_step))
         if not origin_claims.isdisjoint(forbidden_rows):
             continue
         for lane_idx, cell, lane_steps in origin_options:
@@ -1811,11 +1936,19 @@ def prepare_variants(
                 continue
             if distance_to_go > topology.air_hop_limit:
                 continue
-            start_claims = origin_claims | _visit_claims(cell, 0, start_step, offsets)
-            if not start_claims.isdisjoint(forbidden_rows):
-                continue
-            start_dual_cost = view.claim_cost(start_claims)
-            origin_paid_rows = view.active_claims(start_claims)
+            if preparation is None:
+                start_claims = origin_claims | _visit_claims(cell, 0, start_step, offsets)
+                if not start_claims.isdisjoint(forbidden_rows):
+                    continue
+                start_dual_cost = view.claim_cost(start_claims)
+                origin_paid_rows = view.active_claims(start_claims)
+            else:
+                root_price = preparation.root_price(
+                    departure_step, lane_idx, origin_claims, cell, start_step
+                )
+                if root_price is None:
+                    continue
+                start_dual_cost, origin_paid_rows = root_price
             if envelopes is not None and not envelopes.can_compete(
                 departure_step,
                 lane_idx,

@@ -1,0 +1,632 @@
+{
+  "comparisons": {
+    "1": {
+      "combined_vs_prep": {
+        "bootstrap_total_s": {
+          "after_s": 722.465512863826,
+          "before_s": 737.5825815668795,
+          "reduction_percent": 2.0495425299957133,
+          "reduction_s": 15.11706870305352
+        },
+        "goal_total_s": {
+          "after_s": 16.16268715914339,
+          "before_s": 19.614073534263298,
+          "reduction_percent": 17.59647922748314,
+          "reduction_s": 3.4513863751199096
+        },
+        "task_s_per_flight": {
+          "after_s": 0.6078937870016166,
+          "before_s": 0.618867299293314,
+          "reduction_percent": 1.7731607897570427,
+          "reduction_s": 0.010973512291697407
+        },
+        "task_total_s": {
+          "after_s": 934.3327506214846,
+          "before_s": 951.1990390138235,
+          "reduction_percent": 1.7731607897570414,
+          "reduction_s": 16.8662883923389
+        },
+        "wall_s": {
+          "after_s": 84.07222874998115,
+          "before_s": 85.58017312502488,
+          "reduction_percent": 1.762025385062922,
+          "reduction_s": 1.507944375043735
+        }
+      },
+      "prep_vs_baseline": {
+        "bootstrap_total_s": {
+          "after_s": 737.5825815668795,
+          "before_s": 696.5962409602944,
+          "reduction_percent": -5.883801576374189,
+          "reduction_s": -40.986340606585145
+        },
+        "goal_total_s": {
+          "after_s": 19.614073534263298,
+          "before_s": 19.586407070513815,
+          "reduction_percent": -0.14125338889302197,
+          "reduction_s": -0.027666463749483228
+        },
+        "task_s_per_flight": {
+          "after_s": 0.618867299293314,
+          "before_s": 0.6175484165416578,
+          "reduction_percent": -0.21356750601710592,
+          "reduction_s": -0.0013188827516561474
+        },
+        "task_total_s": {
+          "after_s": 951.1990390138235,
+          "before_s": 949.1719162245281,
+          "reduction_percent": -0.2135675060170945,
+          "reduction_s": -2.0271227892953902
+        },
+        "wall_s": {
+          "after_s": 85.58017312502488,
+          "before_s": 85.00732329208404,
+          "reduction_percent": -0.6738829206191357,
+          "reduction_s": -0.5728498329408467
+        }
+      }
+    },
+    "11": {
+      "combined_vs_prep": {
+        "bootstrap_total_s": {
+          "after_s": 631.0625034354161,
+          "before_s": 641.1674490412697,
+          "reduction_percent": 1.5760228659398385,
+          "reduction_s": 10.104945605853572
+        },
+        "goal_total_s": {
+          "after_s": 66.17909082956612,
+          "before_s": 78.8015549541451,
+          "reduction_percent": 16.018039405344272,
+          "reduction_s": 12.622464124578983
+        },
+        "task_s_per_flight": {
+          "after_s": 0.5822557549985464,
+          "before_s": 0.5866018369851153,
+          "reduction_percent": 0.7408913018250756,
+          "reduction_s": 0.004346081986568828
+        },
+        "task_total_s": {
+          "after_s": 894.9270954327658,
+          "before_s": 901.6070234461222,
+          "reduction_percent": 0.7408913018250881,
+          "reduction_s": 6.6799280133564025
+        },
+        "wall_s": {
+          "after_s": 84.99760516593233,
+          "before_s": 86.6875546250958,
+          "reduction_percent": 1.9494718318818933,
+          "reduction_s": 1.689949459163472
+        }
+      },
+      "prep_vs_baseline": {
+        "bootstrap_total_s": {
+          "after_s": 641.1674490412697,
+          "before_s": 642.821362521965,
+          "reduction_percent": 0.25728975064029913,
+          "reduction_s": 1.653913480695337
+        },
+        "goal_total_s": {
+          "after_s": 78.8015549541451,
+          "before_s": 79.85648270999081,
+          "reduction_percent": 1.3210295771187641,
+          "reduction_s": 1.0549277558457106
+        },
+        "task_s_per_flight": {
+          "after_s": 0.5866018369851153,
+          "before_s": 0.618706064748353,
+          "reduction_percent": 5.188930510370143,
+          "reduction_s": 0.032104227763237736
+        },
+        "task_total_s": {
+          "after_s": 901.6070234461222,
+          "before_s": 950.9512215182185,
+          "reduction_percent": 5.1889305103701355,
+          "reduction_s": 49.34419807209633
+        },
+        "wall_s": {
+          "after_s": 86.6875546250958,
+          "before_s": 91.05101320915855,
+          "reduction_percent": 4.792322930047139,
+          "reduction_s": 4.363458584062755
+        }
+      }
+    },
+    "6": {
+      "combined_vs_prep": {
+        "bootstrap_total_s": {
+          "after_s": 651.9472007728182,
+          "before_s": 658.732554228045,
+          "reduction_percent": 1.0300619593908613,
+          "reduction_s": 6.785353455226868
+        },
+        "goal_total_s": {
+          "after_s": 63.13033438962884,
+          "before_s": 72.56794513412751,
+          "reduction_percent": 13.005205985997138,
+          "reduction_s": 9.43761074449867
+        },
+        "task_s_per_flight": {
+          "after_s": 0.5836668670183216,
+          "before_s": 0.5862345130538184,
+          "reduction_percent": 0.43798957214602485,
+          "reduction_s": 0.002567646035496751
+        },
+        "task_total_s": {
+          "after_s": 897.0959746071603,
+          "before_s": 901.0424465637188,
+          "reduction_percent": 0.43798957214602696,
+          "reduction_s": 3.9464719565585256
+        },
+        "wall_s": {
+          "after_s": 86.09434287506156,
+          "before_s": 86.57614854094572,
+          "reduction_percent": 0.5565108566319505,
+          "reduction_s": 0.48180566588416696
+        }
+      },
+      "prep_vs_baseline": {
+        "bootstrap_total_s": {
+          "after_s": 658.732554228045,
+          "before_s": 657.4978674864396,
+          "reduction_percent": -0.18778566481523462,
+          "reduction_s": -1.234686741605401
+        },
+        "goal_total_s": {
+          "after_s": 72.56794513412751,
+          "before_s": 73.52404888230376,
+          "reduction_percent": 1.3003959421586861,
+          "reduction_s": 0.9561037481762469
+        },
+        "task_s_per_flight": {
+          "after_s": 0.5862345130538184,
+          "before_s": 0.6150703557473701,
+          "reduction_percent": 4.688218579240976,
+          "reduction_s": 0.028835842693551772
+        },
+        "task_total_s": {
+          "after_s": 901.0424465637188,
+          "before_s": 945.3631367837079,
+          "reduction_percent": 4.688218579240973,
+          "reduction_s": 44.32069021998905
+        },
+        "wall_s": {
+          "after_s": 86.57614854094572,
+          "before_s": 90.67842104192823,
+          "reduction_percent": 4.523978752437345,
+          "reduction_s": 4.102272500982508
+        }
+      }
+    }
+  },
+  "round11_order_drift": {
+    "baseline": {
+      "goal_total_s": {
+        "delta_percent": -1.3106482434854678,
+        "delta_s": -1.046637587947771,
+        "forward_s": 79.85648270999081,
+        "reverse_s": 78.80984512204304
+      },
+      "task_s_per_flight": {
+        "delta_percent": -1.0206672260912057,
+        "delta_s": -0.006314930028725074,
+        "forward_s": 0.618706064748353,
+        "reverse_s": 0.6123911347196279
+      },
+      "task_total_s": {
+        "delta_percent": -1.020667226091201,
+        "delta_s": -9.706047454150394,
+        "forward_s": 950.9512215182185,
+        "reverse_s": 941.2451740640681
+      },
+      "wall_s": {
+        "delta_percent": -1.2912132086510055,
+        "delta_s": -1.1756627091672271,
+        "forward_s": 91.05101320915855,
+        "reverse_s": 89.87535049999133
+      }
+    },
+    "combined": {
+      "goal_total_s": {
+        "delta_percent": 0.34204775827096906,
+        "delta_s": 0.22636409662663937,
+        "forward_s": 66.17909082956612,
+        "reverse_s": 66.40545492619276
+      },
+      "task_s_per_flight": {
+        "delta_percent": -0.24808132982072667,
+        "delta_s": -0.0014444678199581062,
+        "forward_s": 0.5822557549985464,
+        "reverse_s": 0.5808112871785883
+      },
+      "task_total_s": {
+        "delta_percent": -0.2480813298207275,
+        "delta_s": -2.2201470392756164,
+        "forward_s": 894.9270954327658,
+        "reverse_s": 892.7069483934902
+      },
+      "wall_s": {
+        "delta_percent": -0.9792932274960804,
+        "delta_s": -0.8323757909238338,
+        "forward_s": 84.99760516593233,
+        "reverse_s": 84.1652293750085
+      }
+    },
+    "prep": {
+      "goal_total_s": {
+        "delta_percent": 0.22712306210449773,
+        "delta_s": 0.1789765045978129,
+        "forward_s": 78.8015549541451,
+        "reverse_s": 78.98053145874292
+      },
+      "task_s_per_flight": {
+        "delta_percent": 0.6075235555779367,
+        "delta_s": 0.0035637443371374644,
+        "forward_s": 0.5866018369851153,
+        "reverse_s": 0.5901655813222527
+      },
+      "task_total_s": {
+        "delta_percent": 0.6075235555779263,
+        "delta_s": 5.477475046180189,
+        "forward_s": 901.6070234461222,
+        "reverse_s": 907.0844984923024
+      },
+      "wall_s": {
+        "delta_percent": 0.3703857795625589,
+        "delta_s": 0.3210783749818802,
+        "forward_s": 86.6875546250958,
+        "reverse_s": 87.00863300007768
+      }
+    }
+  },
+  "runs": [
+    {
+      "arm": "baseline",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/01_forward_baseline_round_0001.log",
+      "metrics": {
+        "bootstrap_goal_calls": 1229,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.45321811383233207,
+        "bootstrap_total_s": 696.5962409602944,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 19.586407070513815,
+          "bootstrap_s": 696.5962409602944,
+          "compiled_s": 224.4310530417133,
+          "fallback_s": 0.0,
+          "task_s": 949.1719162245281
+        },
+        "goal_s_per_flight": 0.012743270703001831,
+        "goal_total_s": 19.586407070513815,
+        "pool_setup_s": 0.3369717081077397,
+        "task_s_per_flight": 0.6175484165416578,
+        "task_total_s": 949.1719162245281,
+        "wall_s": 85.00732329208404
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/01_forward_baseline_round_0001",
+      "returncode": 0,
+      "round": 1,
+      "sequence": 1
+    },
+    {
+      "arm": "baseline",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/02_forward_baseline_round_0006.log",
+      "metrics": {
+        "bootstrap_goal_calls": 388,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.427780004870813,
+        "bootstrap_total_s": 657.4978674864396,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 73.52404888230376,
+          "bootstrap_s": 657.4978674864396,
+          "compiled_s": 257.95439102477394,
+          "fallback_s": 0.0,
+          "task_s": 945.3631367837079
+        },
+        "goal_s_per_flight": 0.047836076045740895,
+        "goal_total_s": 73.52404888230376,
+        "pool_setup_s": 0.34915470820851624,
+        "task_s_per_flight": 0.6150703557473701,
+        "task_total_s": 945.3631367837079,
+        "wall_s": 90.67842104192823
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/02_forward_baseline_round_0006",
+      "returncode": 0,
+      "round": 6,
+      "sequence": 2
+    },
+    {
+      "arm": "baseline",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/03_forward_baseline_round_0011.log",
+      "metrics": {
+        "bootstrap_goal_calls": 241,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.41823120528429736,
+        "bootstrap_total_s": 642.821362521965,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 79.85648270999081,
+          "bootstrap_s": 642.821362521965,
+          "compiled_s": 277.09866286232136,
+          "fallback_s": 0.0,
+          "task_s": 950.9512215182185
+        },
+        "goal_s_per_flight": 0.05195607202992245,
+        "goal_total_s": 79.85648270999081,
+        "pool_setup_s": 0.35742429201491177,
+        "task_s_per_flight": 0.618706064748353,
+        "task_total_s": 950.9512215182185,
+        "wall_s": 91.05101320915855
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/03_forward_baseline_round_0011",
+      "returncode": 0,
+      "round": 11,
+      "sequence": 3
+    },
+    {
+      "arm": "prep",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/04_forward_prep_round_0001.log",
+      "metrics": {
+        "bootstrap_goal_calls": 1229,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.4798845683584122,
+        "bootstrap_total_s": 737.5825815668795,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 19.614073534263298,
+          "bootstrap_s": 737.5825815668795,
+          "compiled_s": 183.74413530807942,
+          "fallback_s": 0.0,
+          "task_s": 951.1990390138235
+        },
+        "goal_s_per_flight": 0.012761271004725632,
+        "goal_total_s": 19.614073534263298,
+        "pool_setup_s": 0.35588595806621015,
+        "task_s_per_flight": 0.618867299293314,
+        "task_total_s": 951.1990390138235,
+        "wall_s": 85.58017312502488
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/04_forward_prep_round_0001",
+      "returncode": 0,
+      "round": 1,
+      "sequence": 4
+    },
+    {
+      "arm": "prep",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/05_forward_prep_round_0006.log",
+      "metrics": {
+        "bootstrap_goal_calls": 388,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.42858331439690633,
+        "bootstrap_total_s": 658.732554228045,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 72.56794513412751,
+          "bootstrap_s": 658.732554228045,
+          "compiled_s": 211.2213698332198,
+          "fallback_s": 0.0,
+          "task_s": 901.0424465637188
+        },
+        "goal_s_per_flight": 0.04721401765395414,
+        "goal_total_s": 72.56794513412751,
+        "pool_setup_s": 0.35545941698364913,
+        "task_s_per_flight": 0.5862345130538184,
+        "task_total_s": 901.0424465637188,
+        "wall_s": 86.57614854094572
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/05_forward_prep_round_0006",
+      "returncode": 0,
+      "round": 6,
+      "sequence": 5
+    },
+    {
+      "arm": "prep",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/06_forward_prep_round_0011.log",
+      "metrics": {
+        "bootstrap_goal_calls": 241,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.4171551392591215,
+        "bootstrap_total_s": 641.1674490412697,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 78.8015549541451,
+          "bootstrap_s": 641.1674490412697,
+          "compiled_s": 228.7301431687083,
+          "fallback_s": 0.0,
+          "task_s": 901.6070234461222
+        },
+        "goal_s_per_flight": 0.05126971695129805,
+        "goal_total_s": 78.8015549541451,
+        "pool_setup_s": 0.3564057908952236,
+        "task_s_per_flight": 0.5866018369851153,
+        "task_total_s": 901.6070234461222,
+        "wall_s": 86.6875546250958
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/06_forward_prep_round_0011",
+      "returncode": 0,
+      "round": 11,
+      "sequence": 6
+    },
+    {
+      "arm": "combined",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/07_forward_combined_round_0001.log",
+      "metrics": {
+        "bootstrap_goal_calls": 1229,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 1229,
+        "bootstrap_s_per_flight": 0.4700491300350202,
+        "bootstrap_total_s": 722.465512863826,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 16.16268715914339,
+          "bootstrap_s": 722.465512863826,
+          "compiled_s": 182.38007105258293,
+          "fallback_s": 0.0,
+          "task_s": 934.3327506214846
+        },
+        "goal_s_per_flight": 0.010515736603216258,
+        "goal_total_s": 16.16268715914339,
+        "pool_setup_s": 0.37491166591644287,
+        "task_s_per_flight": 0.6078937870016166,
+        "task_total_s": 934.3327506214846,
+        "wall_s": 84.07222874998115
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/07_forward_combined_round_0001",
+      "returncode": 0,
+      "round": 1,
+      "sequence": 7
+    },
+    {
+      "arm": "combined",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/08_forward_combined_round_0006.log",
+      "metrics": {
+        "bootstrap_goal_calls": 388,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 388,
+        "bootstrap_s_per_flight": 0.4241686407110073,
+        "bootstrap_total_s": 651.9472007728182,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 63.13033438962884,
+          "bootstrap_s": 651.9472007728182,
+          "compiled_s": 213.7688314956613,
+          "fallback_s": 0.0,
+          "task_s": 897.0959746071603
+        },
+        "goal_s_per_flight": 0.04107373740379235,
+        "goal_total_s": 63.13033438962884,
+        "pool_setup_s": 0.3534099168609828,
+        "task_s_per_flight": 0.5836668670183216,
+        "task_total_s": 897.0959746071603,
+        "wall_s": 86.09434287506156
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/08_forward_combined_round_0006",
+      "returncode": 0,
+      "round": 6,
+      "sequence": 8
+    },
+    {
+      "arm": "combined",
+      "direction": "forward",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/09_forward_combined_round_0011.log",
+      "metrics": {
+        "bootstrap_goal_calls": 241,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 241,
+        "bootstrap_s_per_flight": 0.4105806788779546,
+        "bootstrap_total_s": 631.0625034354161,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 66.17909082956612,
+          "bootstrap_s": 631.0625034354161,
+          "compiled_s": 231.4814867065288,
+          "fallback_s": 0.0,
+          "task_s": 894.9270954327658
+        },
+        "goal_s_per_flight": 0.04305731348703066,
+        "goal_total_s": 66.17909082956612,
+        "pool_setup_s": 0.38626766693778336,
+        "task_s_per_flight": 0.5822557549985464,
+        "task_total_s": 894.9270954327658,
+        "wall_s": 84.99760516593233
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/09_forward_combined_round_0011",
+      "returncode": 0,
+      "round": 11,
+      "sequence": 9
+    },
+    {
+      "arm": "combined",
+      "direction": "reverse",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/10_reverse_combined_round_0011.log",
+      "metrics": {
+        "bootstrap_goal_calls": 241,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 241,
+        "bootstrap_s_per_flight": 0.4104339057331506,
+        "bootstrap_total_s": 630.8369131118525,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 66.40545492619276,
+          "bootstrap_s": 630.8369131118525,
+          "compiled_s": 229.65287192421965,
+          "fallback_s": 0.0,
+          "task_s": 892.7069483934902
+        },
+        "goal_s_per_flight": 0.04320459006258475,
+        "goal_total_s": 66.40545492619276,
+        "pool_setup_s": 0.3638022500090301,
+        "task_s_per_flight": 0.5808112871785883,
+        "task_total_s": 892.7069483934902,
+        "wall_s": 84.1652293750085
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/10_reverse_combined_round_0011",
+      "returncode": 0,
+      "round": 11,
+      "sequence": 10
+    },
+    {
+      "arm": "prep",
+      "direction": "reverse",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/11_reverse_prep_round_0011.log",
+      "metrics": {
+        "bootstrap_goal_calls": 241,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.4192683429486938,
+        "bootstrap_total_s": 644.4154431121424,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 78.98053145874292,
+          "bootstrap_s": 644.4154431121424,
+          "compiled_s": 230.8309210962616,
+          "fallback_s": 0.0,
+          "task_s": 907.0844984923024
+        },
+        "goal_s_per_flight": 0.05138616230237015,
+        "goal_total_s": 78.98053145874292,
+        "pool_setup_s": 0.3730416251346469,
+        "task_s_per_flight": 0.5901655813222527,
+        "task_total_s": 907.0844984923024,
+        "wall_s": 87.00863300007768
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/11_reverse_prep_round_0011",
+      "returncode": 0,
+      "round": 11,
+      "sequence": 11
+    },
+    {
+      "arm": "baseline",
+      "direction": "reverse",
+      "log": "analysis/colgen_prep_goal_20260910/replay_matrix/12_reverse_baseline_round_0011.log",
+      "metrics": {
+        "bootstrap_goal_calls": 241,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 0,
+        "bootstrap_s_per_flight": 0.4142916725200729,
+        "bootstrap_total_s": 636.766300663352,
+        "flight_stage_totals_s": {
+          "bootstrap_goal_s": 78.80984512204304,
+          "bootstrap_s": 636.766300663352,
+          "compiled_s": 273.8099986652378,
+          "fallback_s": 0.0,
+          "task_s": 941.2451740640681
+        },
+        "goal_s_per_flight": 0.05127511068447823,
+        "goal_total_s": 78.80984512204304,
+        "pool_setup_s": 0.34669362497515976,
+        "task_s_per_flight": 0.6123911347196279,
+        "task_total_s": 941.2451740640681,
+        "wall_s": 89.87535049999133
+      },
+      "out": "analysis/colgen_prep_goal_20260910/replay_matrix/12_reverse_baseline_round_0011",
+      "returncode": 0,
+      "round": 11,
+      "sequence": 12
+    }
+  ]
+}

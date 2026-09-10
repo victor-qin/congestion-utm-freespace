@@ -907,3 +907,136 @@ def test_can_compete_agrees_with_the_eager_envelope_everywhere(shape):
                     agreed_true += int(got)
     assert checked >= 50, f"only {checked} verdicts compared"
     assert 0 < agreed_true < checked, "the sweep never exercised both verdicts"
+
+
+# ------------------------------------------------------ invocation-local preparation reuse
+
+
+def _assert_prepared_exact(actual, expected):
+    """Compare packed records byte-for-byte, including float order and CSR class IDs."""
+    from dataclasses import fields
+
+    for field in fields(expected):
+        left, right = getattr(actual, field.name), getattr(expected, field.name)
+        if isinstance(right, np.ndarray):
+            assert left.dtype == right.dtype, field.name
+            assert left.shape == right.shape, field.name
+            assert left.tobytes() == right.tobytes(), field.name
+        else:
+            assert left == right, field.name
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPHS))
+def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape):
+    """Changing cutoffs, root restrictions and rewind must not share search-state pruning."""
+    from dataclasses import replace
+
+    cfg = _cfg()
+    fg = GRAPHS[shape](cfg)
+    view = pricing.DualView(_duals(fg, cfg, 903), cfg)
+    seed = pricing.seed_column(fg, cfg)
+    benefit = 1000.0
+    strong = (benefit - seed.delay_s - view.claim_cost(seed.claims), seed)
+    weak = (-1000.0, seed)
+    tied = (strong[0], replace(seed, departure_step=seed.departure_step + 1))
+    context = dp_prepare.PricingPreparation(
+        fg, cfg, view, benefit=benefit, pi_f=0.0, model=DELAY_MODEL, forbidden_rows=frozenset())
+    topology, rows = context.topology_rows
+    _assert_prepared_exact(context.duals, dp_prepare.prepare_duals(view, fg, topology, rows))
+    _assert_prepared_exact(context.forbidden, prepare_forbidden(frozenset(), fg, rows, topology))
+    unrestricted = dp_prepare.prepare_variants(fg, cfg, view, topology, rows, benefit=benefit)
+    roots = [(int(dep), int(lane)) for dep, lane in
+             zip(unrestricted.departure_step, unrestricted.lane_idx, strict=True)]
+    assert len(roots) > 2
+    keep = frozenset(roots[:2])
+    stages = [(None, None), (weak, keep), (strong, keep), (strong, None),
+              (tied, None), (weak, None), (None, None)]
+    for incumbent, restriction in stages:
+        shared = context.envelopes(incumbent, None)
+        fresh = dp_prepare.CompletionEnvelopes(
+            fg, cfg, view, benefit=benefit, pi_f=0.0, model=DELAY_MODEL,
+            forbidden_rows=frozenset(), incumbent=incumbent)
+        kwargs = dict(benefit=benefit, pi_f=0.0, model=DELAY_MODEL,
+                      cost_cutoff=None if incumbent is None else incumbent[0],
+                      keep_roots=restriction)
+        actual = dp_prepare.prepare_variants(
+            fg, cfg, view, topology, rows, envelopes=shared, preparation=context, **kwargs)
+        expected = dp_prepare.prepare_variants(
+            fg, cfg, view, topology, rows, envelopes=fresh, **kwargs)
+        _assert_prepared_exact(actual, expected)
+        if restriction is not None:
+            assert set(zip(actual.departure_step, actual.lane_idx)) <= restriction
+        if incumbent is None and restriction is None:
+            assert actual.n_variants == unrestricted.n_variants
+        # Explicitly materialize keys as the native envelope arena does. Updating its
+        # incumbent and rewinding must restore THIS stage's initial cutoff, not ranking's.
+        for departure, lane in roots[:3]:
+            lane = None if lane < 0 else lane
+            assert shared.envelope(departure, lane) == fresh.envelope(departure, lane)
+        keys = shared.built_keys()
+        assert keys == fresh.built_keys()
+        shared.set_incumbent((strong[0] + 100.0, seed))
+        fresh.set_incumbent((strong[0] + 100.0, seed))
+        shared.rewind(keys)
+        fresh.rewind(keys)
+        assert shared.incumbent == fresh.incumbent == incumbent
+        for departure, lane in keys:
+            assert shared.envelope(departure, lane) == fresh.envelope(departure, lane)
+    # A warm destination memo must not suppress the new stage's deadline check.
+    departure, lane = roots[0]
+    with pytest.raises(pricing.PricingTimeout):
+        expired = context.envelopes(None, 0.0)
+        expired.envelope(departure, None if lane < 0 else lane)
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPHS))
+def test_pricing_preparation_current_subproblem_scope_and_prices(shape):
+    """A new invocation must price current duals, forbidden rows and objective weights."""
+    cfg = _cfg()
+    fg = GRAPHS[shape](cfg)
+    seed = pricing.seed_column(fg, cfg)
+    forbidden = set()
+    views = [pricing.DualView({}, cfg), pricing.DualView(_duals(fg, cfg, 904), cfg)]
+    model = DELAY_MODEL
+    context = dp_prepare.PricingPreparation(
+        fg, cfg, views[0], benefit=1000.0, pi_f=0.0, model=model, forbidden_rows=forbidden)
+    topology, rows = context.topology_rows
+    # Warm the cached empty mask, then mutate the caller's set. It must not silently
+    # turn the cached data into an answer to a different repair problem.
+    context.forbidden
+    forbidden.add(next(iter(seed.claims)))
+    with pytest.raises(ValueError, match="another subproblem"):
+        context.check(fg, cfg, views[0], 1000.0, 0.0, model, forbidden)
+    for change in (dict(view=views[1]), dict(pi_f=1.0), dict(benefit=999.0),
+                   dict(model=CostModel(ground_weight=7.0, air_weight=1.0))):
+        scope = dict(fg=fg, cfg=cfg, view=views[0], benefit=1000.0, pi_f=0.0,
+                     model=model, forbidden_rows=frozenset())
+        scope.update(change)
+        with pytest.raises(ValueError, match="another subproblem"):
+            context.check(**scope)
+    with pytest.raises(ValueError, match="another subproblem"):
+        dp_prepare.prepare_variants(fg, cfg, views[1], topology, rows,
+                                    benefit=1000.0, preparation=context)
+    for view, exclusions, objective in (
+        (views[0], frozenset(), model),
+        (views[1], frozenset(forbidden), CostModel(ground_weight=7.0, air_weight=1.0)),
+        (pricing.DualView({next(iter(seed.claims)): -1e-12}, cfg), frozenset(), model),
+    ):
+        current = dp_prepare.PricingPreparation(
+            fg, cfg, view, benefit=1000.0, pi_f=0.0, model=objective, forbidden_rows=exclusions)
+        _assert_prepared_exact(current.duals, dp_prepare.prepare_duals(view, fg, topology, rows))
+        _assert_prepared_exact(current.forbidden, prepare_forbidden(exclusions, fg, rows, topology))
+        for _ in range(2):
+            kwargs = dict(benefit=1000.0, pi_f=0.0, model=objective, forbidden_rows=exclusions)
+            actual = dp_prepare.prepare_variants(
+                fg, cfg, view, topology, rows, preparation=current,
+                envelopes=current.envelopes(None, None), **kwargs)
+            expected = dp_prepare.prepare_variants(
+                fg, cfg, view, topology, rows,
+                envelopes=dp_prepare.CompletionEnvelopes(fg, cfg, view, **kwargs), **kwargs)
+            _assert_prepared_exact(actual, expected)
+            for departure, lane in zip(actual.departure_step[:3], actual.lane_idx[:3], strict=True):
+                departure, lane = int(departure), None if lane < 0 else int(lane)
+                shared = current.envelopes(None, None)
+                fresh = dp_prepare.CompletionEnvelopes(fg, cfg, view, **kwargs)
+                assert shared.envelope(departure, lane) == _eager_envelope(fresh, departure, lane)

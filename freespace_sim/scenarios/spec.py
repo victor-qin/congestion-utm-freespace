@@ -20,7 +20,7 @@ _DEFAULT_HUB_COUNTS = (6, 20)
 # Bumped when the persisted scenario_spec.json layout changes incompatibly. Stamped by
 # ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
 # reinterpreted under a schema it was not written with.
-_SPEC_SCHEMA_VERSION = 1
+_SPEC_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -174,11 +174,22 @@ class ScenarioSpec:
         replay under the wrong world.
         """
         payload = dict(payload)
-        version = payload.pop("schema_version", _SPEC_SCHEMA_VERSION)
+        # An unstamped payload predates versioning, so it is v1 — NOT "whatever this code is now",
+        # which would wave every pre-versioning recipe through as current.
+        version = payload.pop("schema_version", 1)
         if not isinstance(version, (int, float)) or isinstance(version, bool) or version > _SPEC_SCHEMA_VERSION:
             raise ValueError(
                 f"scenario_spec schema_version {version!r} is not readable by this code "
                 f"(understands integer versions <= {_SPEC_SCHEMA_VERSION}) — upgrade freespace_sim")
+        # v1 filed a round trip as TWO requests (`paired_return_request`); v2 files one itinerary.
+        # Replaying such a recipe under v2 silently halves the flight set and renumbers every id, so
+        # refuse it. A v1 recipe without paired returns is unaffected and still loads.
+        if version < _SPEC_SCHEMA_VERSION and (payload.get("demand") or {}).get("paired_return_request"):
+            raise ValueError(
+                "scenario_spec is v1 with paired_return_request=True: v2 files a round trip as ONE "
+                "itinerary request, so replaying this recipe would produce half the flights under "
+                "different ids. Re-run it with the code that wrote it, or drop the flag to replay it "
+                "as one-way deliveries (which is not the world it recorded).")
 
         demand_payload = dict(payload.pop("demand", None) or {})
         demand_fields = DemandSpec.__dataclass_fields__

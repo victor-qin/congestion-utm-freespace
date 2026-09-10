@@ -474,3 +474,29 @@ def test_every_accepted_sipp_plan_reports_a_read_set():
         assert _corners_in_env(it.volumes, p.last_envelope)
         led.commit(rq.flight_id, it.volumes)
     assert n_acc > 40, f"only {n_acc} accepted — fixture too thin to be a coverage test"
+
+
+def test_an_itinerarys_envelope_covers_every_leg_it_planned():
+    """A round trip is planned one ``plan()`` call per leg, and the planner clears ``last_envelope``
+    at the top of each call. Without a union the LAST leg's reads would stand for the whole flight,
+    so a commit landing inside the outbound's read set reads as clean — breaking the superset
+    contract this module exists to pin, and silently diverging exact mode from sequential."""
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    hub, cust = vec(0, 0, 0), vec(1200, 0, 0)
+
+    def envelope_for(req):
+        planner = get_planner("astar")
+        planner.record_envelope = True
+        assert planner.plan(req, ReservationLedger(cfg), cfg).accepted
+        return next(p.last_envelope for p in iter_planner_chain(planner)
+                    if getattr(p, "last_envelope", None) is not None)
+
+    # Same id and endpoints, so the one-way request is byte-identical to the leg the wrapper splits
+    # off for the outbound.
+    whole = envelope_for(FlightRequest(1, hub, cust, 0.0, return_to_origin=True, turnaround_s=60.0))
+    leg = envelope_for(FlightRequest(1, hub, cust, 0.0))
+
+    assert whole.cell_bbox is not None and leg.cell_bbox is not None
+    for i, (w, o) in enumerate(zip(whole.cell_bbox, leg.cell_bbox)):   # alternating (min, max)
+        assert (w <= o) if i % 2 == 0 else (w >= o), f"axis {i}: itinerary {w} misses leg {o}"
+    assert whole.t_lo <= leg.t_lo and whole.t_hi >= leg.t_hi

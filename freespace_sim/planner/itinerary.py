@@ -10,6 +10,7 @@ from ..config import SimConfig
 from ..ledger import ReservationLedger
 from ..types import DenialReason, FlightRequest, IntentStatus, OperationalIntent
 from ..volumes import ground_dwell_reservation, terminal_radius
+from . import iter_planner_chain
 
 
 def reject_itinerary(req: FlightRequest, planner: str) -> None:
@@ -57,8 +58,15 @@ class ItineraryPlanner:
     def __getattr__(self, name):
         """Read markers and optional members off the planner that plans.
 
-        Only reached for names this class does not define, so `inner` itself cannot recurse.
+        `inner` and `warm_planner` are refused rather than forwarded. `inner` because this hook runs
+        on any instance whose dict is empty — the shell `copy`/`pickle` build before calling
+        `__setstate__` — where forwarding recurses until the stack dies. `warm_planner` because this
+        wrapper has none of its own: answering with the inner planner's would make
+        `iter_planner_chain` yield a grandchild at this wrapper's depth, and that order is
+        load-bearing (`_terminal_capacity_for` takes the FIRST match).
         """
+        if name in ("inner", "warm_planner"):
+            raise AttributeError(name)
         return getattr(self.inner, name)
 
     def __setattr__(self, name, value):
@@ -101,20 +109,46 @@ class ItineraryPlanner:
         from ..sim import realized_release_s          # sim imports planners; keep one owner
         landed = realized_release_s(out)
         if landed is None:
-            return replace(out, request=req)
+            raise ValueError(
+                f"flight {req.flight_id}: the outbound leg was ACCEPTED with no volumes, so there is "
+                "no arrival for the return to depart from. An accepted intent must carry the volumes "
+                "it conflict-checked (see planner.Planner). Returning the outbound alone here would "
+                "be the silent half-trip reject_itinerary exists to prevent.")
         dwell = cfg.turnaround_s if req.turnaround_s is None else req.turnaround_s
 
         # Leg 2 is NOT deconflicted against leg 1: both are the same aircraft, and an aircraft does
         # not conflict with itself.
+        leg1_reads = self._recorded_envelopes()
         back = self.inner.plan(self._leg(req, req.dest, req.origin, req.dest_terminal,
                                          req.origin_terminal, float(landed) + dwell),
                                ledger, cfg)
+        self._absorb_envelopes(leg1_reads)
         if not back.accepted:
             return OperationalIntent(
                 request=req, status=IntentStatus.REJECTED, volumes=[], centerline=[],
                 denial_reason=back.denial_reason, planner=back.planner,
                 solve_time_s=out.solve_time_s + back.solve_time_s)
-        return self._compose(req, out, back, float(landed), cfg)
+        return self._compose(req, out, back, float(landed), cfg, ledger)
+
+    def _recorded_envelopes(self):
+        """Every chained planner holding a read envelope right now, paired with what it holds.
+
+        Empty unless a caller turned `record_envelope` on, which only the parallel engines do.
+        """
+        return [(p, p.last_envelope) for p in iter_planner_chain(self.inner)
+                if getattr(p, "last_envelope", None) is not None]
+
+    @staticmethod
+    def _absorb_envelopes(earlier) -> None:
+        """Fold an earlier leg's read set into the one its planner holds now.
+
+        A planner clears `last_envelope` per `plan` call, so without this an itinerary is summarised
+        by its LAST leg and `parallel.envelope_intersects` calls a commit inside the outbound's read
+        set clean — the speculation is kept and the run diverges from sequential.
+        """
+        for planner, env in earlier:
+            now = getattr(planner, "last_envelope", None)
+            planner.last_envelope = env if now is None else now.union(env)
 
     @staticmethod
     def _leg(req, origin, dest, o_term, d_term, t_departure) -> FlightRequest:
@@ -123,7 +157,7 @@ class ItineraryPlanner:
                        t_departure=t_departure, return_to_origin=False, turnaround_s=0.0)
 
     @staticmethod
-    def _compose(req, out, back, landed, cfg) -> OperationalIntent:
+    def _compose(req, out, back, landed, cfg, ledger) -> OperationalIntent:
         """Join both legs and the pad dwell into one intent.
 
         The dwell spans arrival-column end -> departure-column start, not merely `turnaround_s`: a
@@ -141,6 +175,15 @@ class ItineraryPlanner:
             dwell = [ground_dwell_reservation(
                 req.dest, landed, float(leaves) - landed, cfg,
                 radius=terminal_radius(d_term, cfg) if d_term is not None else None)]
+            # This box is derived from both legs' results, so neither search deconflicted it; check
+            # it against the ledger here, where the answer is still a denial the caller can read.
+            # `FCFSMechanism.commit` re-checks and would catch it, but reports it as a lost
+            # commit-time race, and the LNS commit path (`lns/state.py`) re-checks nothing at all.
+            if ledger.any_conflict(dwell):
+                return OperationalIntent(
+                    request=req, status=IntentStatus.REJECTED, volumes=[], centerline=[],
+                    denial_reason=DenialReason.CONFLICT_FILED, planner=out.planner,
+                    solve_time_s=out.solve_time_s + back.solve_time_s)
         return OperationalIntent(
             request=req,
             status=out.status,

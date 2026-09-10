@@ -105,6 +105,40 @@ class PlanEnvelope:
     t_hi: float
     unbounded: bool = False
 
+    def union(self, other: "PlanEnvelope | None") -> "PlanEnvelope":
+        """
+        The read set covering both this plan and ``other``.
+
+        A planner clears ``last_envelope`` at the top of every ``plan`` call, so a flight planned in
+        more than one call (a round-trip itinerary: one call per leg) would otherwise be summarised
+        by its LAST leg alone, and a commit landing in an earlier leg's read set would be judged
+        clean. Widening is always safe here — an envelope that claims more reads than happened costs
+        a replan, never a missed one.
+
+        Parameters
+        ------------
+        - other (PlanEnvelope | None): the other plan's envelope; ``None`` yields ``self``
+
+        Return
+        --------
+        - envelope (PlanEnvelope): covers both read sets; unbounded if either side is
+        """
+        if other is None:
+            return self
+        lo, hi = min(self.t_lo, other.t_lo), max(self.t_hi, other.t_hi)
+        hubs = self.hub_reads + other.hub_reads
+        if self.unbounded or other.unbounded:
+            return PlanEnvelope(None, None, hubs, lo, hi, unbounded=True)
+        a, b = self.cell_bbox, other.cell_bbox
+        # cell_bbox alternates (min, max) per axis; xy is (xmin, ymin, xmax, ymax). A None side
+        # probed nothing, so it widens nothing.
+        cell = a if b is None else b if a is None else tuple(
+            min(x, y) if i % 2 == 0 else max(x, y) for i, (x, y) in enumerate(zip(a, b)))
+        p, q = self.xy, other.xy
+        xy = p if q is None else q if p is None else (
+            min(p[0], q[0]), min(p[1], q[1]), max(p[2], q[2]), max(p[3], q[3]))
+        return PlanEnvelope(cell, xy, hubs, lo, hi)
+
 
 def _disc_hits_aabb(cx: float, cy: float, radius: float, a) -> bool:
     """Does the xy disc intersect the volume AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``?

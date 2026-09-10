@@ -142,6 +142,81 @@ def test_colgen_refuses_an_itinerary_rather_than_dropping_the_return():
         run_batch(scen, SimConfig(), None, None, (), None, None, None)
 
 
+def test_the_pad_hold_is_deconflicted_before_the_itinerary_is_accepted():
+    """The hold is built FROM both legs' results, so neither leg's search ever saw it.
+
+    Checking it in `_compose` keeps `FCFSMechanism.commit`'s re-check the no-op its docstring
+    promises, and matters most under LNS, whose commit path re-checks nothing at all.
+    """
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.types import DenialReason
+    from freespace_sim.volumes import Volume4D
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    planner = get_planner("astar")
+
+    clean = planner.plan(req, ReservationLedger(cfg), cfg)
+    assert clean.accepted
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    hold = next(v for v in clean.volumes
+                if isinstance(v.shape, CylinderSpec) and v.shape.z_hi <= top + 1e-9)
+    assert hold.t_end - hold.t_start > 10.0          # room for a blocker that clears both columns
+
+    # Strictly inside the turnaround gap: both columns stay clear, so both legs still plan exactly
+    # as before and the hold between them is the only thing that conflicts.
+    mid = 0.5 * (hold.t_start + hold.t_end)
+    led = ReservationLedger(cfg)
+    led.commit(2, [Volume4D(CylinderSpec(cx=hold.shape.cx, cy=hold.shape.cy,
+                                         radius=hold.shape.radius, z_lo=cfg.ground_level_m,
+                                         z_hi=cfg.airspace_ceiling_m), mid - 5.0, mid + 5.0)])
+    out = planner.plan(req, led, cfg)
+    assert not out.accepted
+    assert out.denial_reason is DenialReason.CONFLICT_FILED
+
+
+def test_an_outbound_accepted_without_volumes_raises_rather_than_stranding_the_return():
+    """`realized_release_s` is None for an accepted intent holding no volumes, and returning the
+    outbound there would be the silent half-trip `reject_itinerary` exists to prevent: a round trip
+    at roughly half the cost, which a cost-comparing caller reads as an improvement."""
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.itinerary import ItineraryPlanner
+
+    class _AcceptsWithNothing:
+        def plan(self, req, ledger, cfg):
+            return OperationalIntent(request=req, status=IntentStatus.ACCEPTED, volumes=[],
+                                     centerline=[])
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    with pytest.raises(ValueError, match="no volumes"):
+        ItineraryPlanner(_AcceptsWithNothing()).plan(req, ReservationLedger(cfg), cfg)
+
+
+def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
+    """`iter_planner_chain` order is load-bearing — `_terminal_capacity_for` takes the FIRST match —
+    and a wrapper that answers `warm_planner` on its child's behalf yields a grandchild at its own
+    depth. The same missing guard let `__getattr__` recurse forever on the empty-dict instance that
+    `copy`/`pickle` build before restoring state."""
+    import copy
+    import pickle
+
+    from freespace_sim.planner import _get_planner, get_planner, iter_planner_chain
+
+    for name in ("astar_milp", "milp", "astar_shortcut"):
+        bare = [type(p).__name__ for p in iter_planner_chain(_get_planner(name))]
+        wrapped = [type(p).__name__ for p in iter_planner_chain(get_planner(name))]
+        assert wrapped[0] == "ItineraryPlanner"
+        assert wrapped[1:] == bare               # the wrapper prepends itself; it must not reorder
+
+    planner = get_planner("astar")
+    assert type(copy.deepcopy(planner)) is type(planner)
+    # Round-trips a planner this test just built — no external data is deserialised.
+    assert type(pickle.loads(pickle.dumps(planner))) is type(planner)
+
+
 @pytest.mark.slow
 def test_lns_repair_keeps_both_legs_of_an_itinerary():
     """LNS must repair a round trip as a round trip.
@@ -167,3 +242,28 @@ def test_lns_repair_keeps_both_legs_of_an_itinerary():
     stranded = [f for f in before if not after[f].leg_starts]
     assert not stranded, f"{len(stranded)}/{len(before)} round trips lost their return leg"
     assert out.n_accepted > 0, "an LNS pass that accepted nothing cannot show the return survived"
+
+
+def test_the_arrival_and_departure_clocks_are_the_columns_not_the_waypoints():
+    """`ItineraryPlanner` derives the return's entire departure clock from `realized_release_s` and
+    ends the pad hold at `realized_takeoff_s`. Both are extremes over the volume list, which is the
+    landing/takeoff column only while nothing else reaches further — and the corridor stops at the
+    column EDGE at cruise altitude, so the first and last waypoints sit INSIDE the columns by the
+    climb. Pin both, or the first planner to file a volume past the landing column shifts every
+    return late and over-reserves every customer pad with nothing to catch it."""
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.sim import realized_release_s
+    from freespace_sim.verify import realized_takeoff_s
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    leg = get_planner("astar").plan(FlightRequest(1, HUB, CUST, 0.0), ReservationLedger(cfg), cfg)
+    assert leg.accepted
+
+    columns = [v for v in leg.volumes if isinstance(v.shape, CylinderSpec)]
+    assert len(columns) == 2            # a leg is [takeoff column, corridor boxes..., landing column]
+    assert realized_takeoff_s(leg) == pytest.approx(columns[0].t_start)
+    assert realized_release_s(leg) == pytest.approx(columns[-1].t_end)
+    assert realized_takeoff_s(leg) < leg.centerline[0][1] - 1e-9
+    assert realized_release_s(leg) > leg.centerline[-1][1] + 1e-9

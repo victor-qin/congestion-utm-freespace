@@ -669,9 +669,9 @@ def test_run_lns_does_not_leak_a_global_warnings_filter():
 
 
 def _result(ledger=None):
-    """A REAL SimResult, not a hand-rolled stand-in. A stub with the same four attributes would let
-    these tests keep passing after the field is renamed or dropped from the dataclass, while every
-    real run silently lost the anchor mode — the exact hole `run_lns_on_result` reads it to close."""
+    """A REAL SimResult, not a hand-rolled stand-in. A stub with the same attributes would let these
+    tests keep passing after a field is renamed or dropped from the dataclass, while every real run
+    silently lost whatever `run_lns_on_result` reads off the result to close a hole."""
     from freespace_sim.sim import SimResult
 
     return SimResult(config=CFG, intents=[], ledger=ledger or ReservationLedger(CFG),
@@ -679,7 +679,6 @@ def _result(ledger=None):
 
 
 class _WallInventingDemand:
-    turnaround_s = 900.0
 
     def terminals(self, cfg):
         raise AssertionError("walls must come from the ledger, not be re-derived from the demand")
@@ -707,7 +706,6 @@ def test_run_lns_on_result_takes_the_walls_from_the_ledger(monkeypatch):
     assert captured["static_terms"] == ()          # flag off ⇒ no walls, whatever the demand says
 
 
-@pytest.mark.slow
 @pytest.mark.slow
 def test_repair_restores_when_the_commit_itself_raises(monkeypatch):
     """`ledger.commit` appends the volumes and only THEN fires observers, so an observer that raises

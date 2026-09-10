@@ -5,7 +5,7 @@ so three things have to be exact before any pool exists:
 
 * ``LNSState.replica`` must reproduce the state it copies — same movable set, same delay ruler,
   same claim index, same ledger content — and must forward every keyword that changes what a
-  repair is ALLOWED to do (the anchor guard, the USS-restriction hooks, the occupancy path).
+  repair is ALLOWED to do (the frozen-flight set, the USS-restriction hooks, the occupancy path).
 * ``LNSState.apply_delta`` must move the ledger AND the in-memory views together, reversibly.
 * ``RepairOutcome`` must carry the repaired intents and their read sets back out, since the
   coordinator — not the worker — owns the incumbent.
@@ -96,7 +96,6 @@ def test_replica_forwards_the_movable_filters():
         assert not rep.is_movable(fid)
 
 
-@pytest.mark.slow
 def test_replica_spawns_no_child_processes():
     """Coexistence rule: a replica is constructed INSIDE a worker, so it must never stand up a
     pool of its own — m search workers x m ruler workers is a fork bomb, not a speedup."""

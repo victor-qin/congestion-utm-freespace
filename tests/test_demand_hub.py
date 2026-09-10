@@ -521,5 +521,3 @@ def test_invalid_timing_mode_raises():
     with pytest.raises(ValueError, match="timing_mode"):
         HubRadiusDemand(timing_mode="filing-ish")
 
-
-# --- round-trip returns anchored to the REALIZED outbound arrival (two-pass) ----------------------

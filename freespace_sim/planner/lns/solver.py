@@ -407,6 +407,8 @@ def assert_incumbent_ok(state) -> None:
         final, state.cfg, static_terminals=state.static_terms)
     if bad is not None:
         raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+
+
 def _effective_search_workers(lns: LNSConfig) -> int:
     """Processes that can receive work under this configuration's task budget."""
     return min(lns.search_workers, lns.max_iterations)

@@ -141,13 +141,6 @@ def _opt_float(v) -> float | None:
     return float(v)
 
 
-def _opt_int(v) -> int | None:
-    """A parquet cell back to ``int | None`` — None for a missing column or a NaN (unlinked) row."""
-    if v is None or (isinstance(v, float) and v != v):
-        return None
-    return int(v)
-
-
 def scenario_frame(result: SimResult) -> pd.DataFrame:
     """Every generated flight request — the scenario, independent of what got accepted.
 

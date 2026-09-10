@@ -135,8 +135,9 @@ def _get_planner(name: str, params=None) -> Planner:
         return AStarPlanner(compiled=False)              # pure-Python reference oracle (A/B + fallback)
     if name == "sipp":
         from .sipp import SIPPPlanner
-        # Cost-aware Safe Interval Path Planning:
-        # air search collapses the per-step axis into safe intervals
+        # Cost-aware Safe Interval Path Planning: same cost model, terminal gating and output contract as
+        # A*, but the air search collapses the per-step axis into safe intervals (Pareto over
+        # (arrival, cost)). Compiled by default, auto-falling back to A* when the kernel bails.
         return SIPPPlanner(compiled=True)
     if name == "sipp_ref":
         from .sipp import SIPPPlanner

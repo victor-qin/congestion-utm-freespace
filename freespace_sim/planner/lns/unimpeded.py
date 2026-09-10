@@ -209,8 +209,8 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
     W = min(n_workers, len(rest))
     log.info("lns: unimpeded baseline on %d workers (%d flights, ~%.0fs sequential)",
              W, n, projected)
-    # Round-robin, not contiguous: adjacent flights are the same delivery's legs, so a contiguous
-    # split would hand one worker a whole slow region.
+    # Round-robin, not contiguous: neighbouring flight ids share a hub and a filing window, so a
+    # contiguous split would hand one worker a whole slow region.
     shards = [rest[w::W] for w in range(W)]
     conns, procs = [], []
     by_worker: list = [None] * W

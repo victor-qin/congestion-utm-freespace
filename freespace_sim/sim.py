@@ -231,8 +231,6 @@ def _astar_planners(planner) -> list:
     return [p for p in iter_planner_chain(planner) if isinstance(p, AStarPlanner)]
 
 
-
-
 def realized_release_s(intent: OperationalIntent) -> float | None:
     """When an accepted flight's landing column clears (touchdown + pad dwell) — the earliest its
     aircraft can leave again, before turnaround. That is the destination cylinder's ``t_end``, hence

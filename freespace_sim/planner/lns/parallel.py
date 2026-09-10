@@ -88,8 +88,9 @@ class WorkerSpec:
     """Everything a worker needs to build a replica and run tasks. Must be picklable.
 
     Every field that changes what a repair is ALLOWED to do lives here, because a worker that
-    silently differs from the coordinator's belief is the failure mode with no symptom: dropping
-    ``    only, so the run still reports ``verified``.
+    silently differs from the coordinator's belief is the failure mode with no symptom: drop
+    ``frozen_flight_ids`` and the worker re-times flights the caller froze, while ``verify`` checks
+    4D conflicts only, so the run still reports ``verified``.
     """
 
     neighborhood_size: int
@@ -1004,7 +1005,6 @@ def run_lns_parallel(
     - intents (list[OperationalIntent]): the completed run's intents to improve.
     - lns: the ``LNSConfig`` controlling operators, budget, ``parallel_mode``, and worker count.
     - static_terms (tuple | None): always-active terminal walls; ``None`` reads them off the ledger.
-    - turnaround_s (float | None): paired-return spacing; ``None`` disables the return guard.
 
     Return
     --------
@@ -1015,12 +1015,14 @@ def run_lns_parallel(
     if pool_workers <= 1:
         return run_lns(
             cfg, ledger, intents, replace(lns, search_workers=1),
-            static_terms=static_terms,        )
+            static_terms=static_terms,
+        )
 
     t0 = time.monotonic()
     state = _build_lns_state(
         cfg, ledger, intents, lns,
-        static_terms=static_terms,        maintain_claim_index=False,
+        static_terms=static_terms,
+        maintain_claim_index=False,
     )
     static_terms = state.static_terms
     init_s = time.monotonic() - t0

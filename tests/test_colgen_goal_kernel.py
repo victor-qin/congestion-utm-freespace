@@ -23,7 +23,8 @@ def _case(shape, dual_case, *, forbidden=False):
     excluded = frozenset()
     if forbidden:
         seed = pricing.seed_column(graph, cfg, model=model)
-        cells = sorted((r for r in seed.claims if r.kind == 'cell'), key=lambda r: r.step)
+        # Break same-step ties so hash order cannot select a row blocking every root.
+        cells = sorted((r for r in seed.claims if r.kind == 'cell'), key=lambda r: (r.step, r))
         excluded = frozenset(cells[len(cells) // 2:len(cells) // 2 + 1])
     topology, rows = dp_prepare.prepared_for(graph, cfg)
     return graph, view, cfg, model, excluded, topology, rows

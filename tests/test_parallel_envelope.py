@@ -207,7 +207,7 @@ def test_envelope_covers_filed_corridor_shortcut(planner_name):
     is_sipp = planner_name == "sipp_shortcut"
     sc = get_planner(planner_name)
     inner = sc.inner
-    assert isinstance(inner, (AStarPlanner, SIPPPlanner))
+    assert isinstance(inner, SIPPPlanner if is_sipp else AStarPlanner)  # per-family: catch cross-wiring
     inner.record_envelope = True
     refined = _plan(sc, req, [])
     bare = _plan(_sipp(record=False) if is_sipp else AStarPlanner(), req, [])

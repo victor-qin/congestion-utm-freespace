@@ -331,7 +331,7 @@ def _trajectory_key(out):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("mode", [None, "drop"], ids=["sync", "drop"])
+@pytest.mark.parametrize("mode", ["sync", "drop"])
 def test_one_worker_matches_sequential(mode):
     """THE gate: a width-1 parallel run (either mode) routes to the in-process sequential engine and
     reproduces run_lns EXACTLY — full trajectory, not `cost_after` (a cost tie would hide a divergent
@@ -343,12 +343,12 @@ def test_one_worker_matches_sequential(mode):
 
     cfg = _congested(lam=400.0, horizon=240.0)
     kw = dict(seed=7, neighborhood_size=4, log_every=0, max_iterations=40)
-    extra = {"parallel_mode": mode} if mode else {}
 
     a = run(cfg)
     seq = run_lns(a.config, a.ledger, a.intents, LNSConfig(**kw))
     b = run(cfg)
-    par = run_lns_parallel(b.config, b.ledger, b.intents, LNSConfig(search_workers=1, **extra, **kw))
+    par = run_lns_parallel(b.config, b.ledger, b.intents,
+                           LNSConfig(search_workers=1, parallel_mode=mode, **kw))
 
     assert _trajectory_key(par) == _trajectory_key(seq)
     assert [_intent_digest(i) for i in par.intents] == [_intent_digest(i) for i in seq.intents]

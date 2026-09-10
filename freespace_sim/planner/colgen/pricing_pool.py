@@ -333,9 +333,8 @@ class StalePricingWorker(RuntimeError):
 
     Defence in depth: it converts a dispatch against state a worker does not hold into an
     exception rather than a silent wrong number that ``master.upper_bound`` would accept as a
-    valid bound. The threat it originally guarded (``mp.Pool`` silently respawning a dead
-    worker with no per-sweep duals) is gone now that raw processes are never respawned; what
-    remains reachable is a parent bug dispatching to the wrong worker.
+    valid bound. The reachable cause is a parent bug dispatching to the wrong worker; a stale-dual
+    respawn cannot arise, since raw processes are never respawned.
     """
 
 

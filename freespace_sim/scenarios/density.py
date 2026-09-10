@@ -48,12 +48,11 @@ LEAD_ARM_OPERATORS: dict[str, tuple[str, str]] = {
 # what makes the arms comparable flight-by-flight: without it, _shift_request_clock's data-dependent
 # shift translates the whole world by a different amount per arm, moving every t_departure.
 #
-# It must exceed the largest realized lead draw — the binding case is the lead30m arm, whose preroll
-# measures 2653 s (FAA) / 2341 s (far-future) at the default seed, leaving ~950-1260 s of margin. That
-# margin is not load-bearing: _shift_request_clock raises rather than clipping if a seed ever exceeds
-# the offset. The latest return departure is then offset + DEMAND_DURATION_S + the longest nominal trip
-# (16 km / 30 m/s + two climbs + a hover ≈ 597 s) ≈ 5990 s, comfortably inside SIM_HORIZON_S — so the
-# arms need no horizon bump, and the compiled A* occupancy box (sized from horizon_s) is unchanged.
+# It must exceed the largest realized lead draw (the lead30m arm binds); _shift_request_clock raises
+# rather than clipping if a seed ever exceeds it, so this is a guarded bound, not a tuned one. The
+# resulting latest return departure (offset + DEMAND_DURATION_S + the longest nominal trip) still
+# sits inside SIM_HORIZON_S, so the arms need no horizon bump and the compiled A* occupancy box
+# (sized from horizon_s) is unchanged.
 LEAD_ARM_CLOCK_OFFSET_S = 60.0 * 60.0
 
 # Vertically-stacked variant: three cruise levels 15 m apart. The 15 m gap is below the default 30 m

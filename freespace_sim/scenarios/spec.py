@@ -113,7 +113,7 @@ class ScenarioSpec:
     lam_per_hour: float = 600.0
     seed: int = 0
     planner: str | None = None             # None → SimConfig's default planner
-    fixed_exit_lanes: bool | None = None    # None → SimConfig's default (issue #18: on); set to override
+    fixed_exit_lanes: bool | None = None    # None → SimConfig's default (on); set to override
     terminal_airspace_always_active: bool | None = None   # None → SimConfig default (off)
     # flight-level ladder override (None → SimConfig default (30,70,110) multi-level). Pin a scenario to
     # one A* plane with flight_levels_m=(z,); widen by listing more levels. This is the single altitude

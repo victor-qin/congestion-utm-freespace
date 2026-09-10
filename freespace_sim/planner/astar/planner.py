@@ -109,6 +109,19 @@ class _RecordingOcc:
                      _BBOX_HUGE, -_BBOX_HUGE, _BBOX_HUGE, -_BBOX_HUGE]
 
     def _mark(self, q, r, L, s):
+        """Widen the accumulated read bbox to include the probed cell ``(q, r, L)`` at step ``s``.
+
+        Parameters
+        ------------
+        - q (int): axial hex column coordinate of the probe.
+        - r (int): axial hex row coordinate of the probe.
+        - L (int): flight level of the probe.
+        - s (int): time step of the probe.
+
+        Return
+        --------
+        - output (None): extends ``self.bbox`` (min/max over q, r, L, s) in place.
+        """
         b = self.bbox
         if q < b[0]:
             b[0] = q
@@ -204,7 +217,20 @@ class _BindBatch:
 
 def _perimeter(center_xy, toward, radius, z):
     """A point ``radius`` m from ``center_xy`` toward ``toward`` (xy), at altitude ``z`` — where a
-    hub's corridor starts/ends so same-hub flights diverge from the shared terminal edge."""
+    hub's corridor starts/ends so same-hub flights diverge from the shared terminal edge.
+
+    Parameters
+    ------------
+    - center_xy (np.ndarray): hub centre xy in metres.
+    - toward (array-like): point giving the outward direction; only its xy is used (a degenerate
+      zero-length direction falls back to +x).
+    - radius (float): distance from ``center_xy`` to the returned point.
+    - z (float): altitude of the returned point.
+
+    Return
+    --------
+    - output (np.ndarray): the point ``[x, y, z]`` on the terminal edge.
+    """
     d = np.asarray(toward, float)[:2] - center_xy
     n = float(np.linalg.norm(d))
     p = center_xy + (radius * d / n if n > 1e-9 else np.array([radius, 0.0]))
@@ -217,8 +243,20 @@ def _fold_head_into_column(wps, center, exit_r, speed):
 
     The folded centre→edge leg is flown but left UNRESERVED — inside the terminal the vertiport
     deconflicts its own traffic tactically, so same-hub flights may share that space; only the exit
-    lane reaches the ledger. ``wps`` is a list of ``[xyz, t]`` (mutable). Returns the trimmed list,
-    a no-op if the whole cruise stays inside."""
+    lane reaches the ledger.
+
+    Parameters
+    ------------
+    - wps (list): waypoints ``[[xyz, t], ...]`` (mutable), ordered origin→dest.
+    - center (np.ndarray): the origin hub centre xy in metres.
+    - exit_r (float): exit radius; leading waypoints within it of ``center`` are folded away.
+    - speed (float): cruise speed (m/s), timing the unreserved edge→first-cell leg.
+
+    Return
+    --------
+    - output (list): the trimmed ``[[xyz, t], ...]`` re-rooted at the column edge; the original
+      list unchanged when the whole cruise stays inside ``exit_r``.
+    """
     k = next((i for i in range(1, len(wps))
               if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
     if k is None:
@@ -230,7 +268,20 @@ def _fold_head_into_column(wps, center, exit_r, speed):
 
 def _fold_tail_into_column(wps, center, exit_r, speed):
     """Landing-end mirror of :func:`_fold_head_into_column`: drop trailing waypoints inside the
-    destination column and end the corridor at that column's edge (descent inside is unreserved)."""
+    destination column and end the corridor at that column's edge (descent inside is unreserved).
+
+    Parameters
+    ------------
+    - wps (list): waypoints ``[[xyz, t], ...]`` (mutable), ordered origin→dest.
+    - center (np.ndarray): the destination hub centre xy in metres.
+    - exit_r (float): exit radius; trailing waypoints within it of ``center`` are folded away.
+    - speed (float): cruise speed (m/s), timing the unreserved last-cell→edge leg.
+
+    Return
+    --------
+    - output (list): the trimmed ``[[xyz, t], ...]`` ending at the column edge; the original list
+      unchanged when the whole cruise stays inside ``exit_r``.
+    """
     k = next((i for i in range(len(wps) - 2, -1, -1)
               if float(np.linalg.norm(wps[i][0][:2] - center)) >= exit_r), None)
     if k is None:
@@ -245,7 +296,21 @@ def _fold_path(wps, origin, dest, origin_term, dest_term, cfg):
     the folded ``[[xyz, t], ...]`` list. Extracted so the landing gate computes the SAME arrival time the
     commit stamps — gate and commit fold through one function and cannot drift. The fold edge is
     :func:`volumes.exit_radius` (the one radius ``_build``, this gate, and ``TerminalCapacity.exit_clear``
-    all share). ``origin_term``/``dest_term`` must be normalized (:class:`Terminal` or ``None``)."""
+    all share). ``origin_term``/``dest_term`` must be normalized (:class:`Terminal` or ``None``).
+
+    Parameters
+    ------------
+    - wps (list): the cruise waypoints ``[[xyz, t], ...]`` to fold.
+    - origin (array-like): origin hub centre; only its xy is used.
+    - dest (array-like): destination hub centre; only its xy is used.
+    - origin_term (Terminal | None): normalized origin terminal; the head fold runs when set.
+    - dest_term (Terminal | None): normalized dest terminal; the tail fold runs when set.
+    - cfg (SimConfig): supplies the cruise speed and the exit radii.
+
+    Return
+    --------
+    - output (list): the head- and tail-folded ``[[xyz, t], ...]`` (untouched when no end folds).
+    """
     speed = cfg.nominal_speed_mps
     if origin_term is not None and len(wps) >= 2:
         wps = _fold_head_into_column(wps, np.asarray(origin, float)[:2], exit_radius(origin_term, cfg), speed)
@@ -265,7 +330,26 @@ def _committed_arrival(goal_st, came, R, dt, cfg, origin, dest, origin_term, des
     waypoints, run the SAME folds (:func:`_fold_path`), and return the folded edge-arrival time. Gate window
     ≡ commit window → the FCFS capacity count is exact, no margin needed. The goal hex is gated only when
     popped (≤ once per distinct arrival step — A* closes each state), each an O(path) reconstruction:
-    negligible against the search even at a saturated hub where it fires once per candidate arrival time."""
+    negligible against the search even at a saturated hub where it fires once per candidate arrival
+    time.
+
+    Parameters
+    ------------
+    - goal_st (tuple): the candidate goal air state ``("a", q, r, L, step)`` being gated.
+    - came (dict): the search's came-from map, used to walk this candidate's air path back.
+    - R (float): hex circumradius in metres, for the hex-centre reconstruction.
+    - dt (float): timestep in seconds.
+    - cfg (SimConfig): geometry and costs; supplies the flight levels.
+    - origin (array-like): origin hub centre.
+    - dest (array-like): destination hub centre.
+    - origin_term (Terminal | None): normalized origin terminal.
+    - dest_term (Terminal | None): normalized dest terminal.
+
+    Return
+    --------
+    - output (float): the tail-folded edge-arrival time (seconds) ``_build`` stamps on the dest
+      column.
+    """
     air = []
     s = goal_st
     while s is not None and s[0] == "a":
@@ -423,7 +507,21 @@ class AStarPlanner:
         """Deny with the built (rejected) corridor recorded for forensics — observer-only. With telemetry
         on, capture the filed volumes and, for a conflict, the blocker(s) via ``ledger.conflicts`` (a second,
         non-short-circuiting ledger scan — but only on a denial and only when telemetry is enabled); then
-        deny exactly as ``_deny`` (the returned intent is UNCHANGED ⇒ verify/reservations stay byte-exact)."""
+        deny exactly as ``_deny`` (the returned intent is UNCHANGED ⇒ verify/reservations stay
+        byte-exact).
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight being denied.
+        - reason (DenialReason): the denial reason recorded on the returned intent.
+        - volumes (list[Volume4D]): the built (rejected) corridor volumes, captured for telemetry.
+        - ledger (ReservationLedger): scanned for the blocker(s) on a ``CONFLICT_FILED`` denial
+          (telemetry only; a no-op when telemetry is off).
+
+        Return
+        --------
+        - output (OperationalIntent): a REJECTED intent identical to ``_deny(req, reason)``.
+        """
         if self._tele is not None:
             hits = ledger.conflicts(volumes) if reason is DenialReason.CONFLICT_FILED else None
             self._tele.on_deny(req.flight_id, reason.value, volumes, hits)
@@ -442,6 +540,16 @@ class AStarPlanner:
         Unlike :meth:`ReservationLedger.detach_subscribers`, this removes only this planner's bound
         methods and does not bump the ledger epoch or disturb unrelated observers. It is therefore
         safe both for a failed first bind and for replacing a planner-local service stack.
+
+        Parameters
+        ------------
+        - ledger (ReservationLedger | None): when given, unbind only if it is the currently bound
+          ledger; ``None`` unbinds whatever ledger is bound.
+
+        Return
+        --------
+        - output (None): detaches this planner's commit/release/static callbacks and clears ``_svc``
+          / ``_tcap`` / ``_svc_ledger`` / ``_svc_epoch``; a no-op if nothing (matching) is bound.
         """
         bound = self._svc_ledger
         if bound is None or (ledger is not None and bound is not ledger):
@@ -481,7 +589,20 @@ class AStarPlanner:
         ``_batch`` (compiled path only) defers this service's absorb, ``subscribe_static`` and
         eviction into a :class:`_BindBatch` so it can share ONE pass over the ledger with the compiled
         image — see :func:`_absorb_many`. ``None`` is the caller-visible default and takes the
-        original code path verbatim, which is what keeps ``_plan_reference`` byte-identical."""
+        original code path verbatim, which is what keeps ``_plan_reference`` byte-identical.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the plan's request; its clock sets the eviction watermark.
+        - ledger (ReservationLedger): the ledger to stay synced with (subscribe, absorb, rebuild).
+        - cfg (SimConfig): occupancy geometry; also converts the watermark to a step floor.
+        - _batch (_BindBatch | None): compiled path only — defers this service's absorb,
+          ``subscribe_static`` and eviction into a shared ledger pass; ``None`` runs them inline.
+
+        Return
+        --------
+        - output (HexOccupancyService): the occupancy service current for ``ledger``.
+        """
         svc = self._svc
         if svc is not None and self._svc_ledger is ledger and self._svc_epoch != ledger.epoch:
             svc = None      # detached mid-life: re-subscribe and re-absorb (the shrink tripwire below
@@ -591,7 +712,26 @@ class AStarPlanner:
         dwell/capacity probe at the last step reads ``hover + climb + lane traverse`` past it.
         ``hover_tail_steps`` covers hover + max climb + buffer only, and at large terminal radii the
         egress traverse outruns that buffer — so the traverse is added explicitly, per terminal, or
-        a concurrent commit in those last seconds would be invisible to exact-mode revalidation."""
+        a concurrent commit in those last seconds would be invisible to exact-mode revalidation.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the plan that just ran; its clock sets the read window's lower bound.
+        - cfg (SimConfig): geometry and timing for the pad inflation, hover tail and lane traverse.
+        - o_term (Terminal | None): normalized origin terminal; sizes the origin hub read disc.
+        - d_term (Terminal | None): normalized dest terminal; sizes the dest hub read disc.
+        - origin (array-like): origin hub centre.
+        - dest (array-like): destination hub centre.
+        - max_step (int): the plan's last reachable step, setting the read window's upper bound.
+        - bbox (Sequence[int] | None): the 8-slot probe accumulator (kernel ``read_bbox`` or
+          ``_RecordingOcc.bbox``); ``None`` or an empty (min>max) bbox records no cell box.
+        - unbounded (bool): mark the envelope unbounded (search truncated) so revalidation cannot
+          certify it clean.
+
+        Return
+        --------
+        - output (None): sets ``self.last_envelope`` to the built :class:`parallel.PlanEnvelope`.
+        """
         from ...parallel import PlanEnvelope, cell_bbox_to_aabb
 
         infl_pad = cfg.effective_hover_radius_m + hg.circumradius(cfg)   # occupancy pad inflation
@@ -660,7 +800,19 @@ class AStarPlanner:
         """Pure-Python space-time A* over the hex lattice: the reference planner the compiled kernel
         reproduces byte-for-byte. Searches ground/air/hover/reroute/altitude edges under the
         ledger's occupancy and terminal-pad capacity, then builds and returns the ACCEPTED (or
-        REJECTED) intent. See the module docstring for the state/edge model."""
+        REJECTED) intent. See the module docstring for the state/edge model.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): the shared reservation ledger to deconflict against.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
+          REJECTED intent carrying the :class:`DenialReason`.
+        """
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
         R = hg.circumradius(cfg)
@@ -918,7 +1070,38 @@ class AStarPlanner:
         Ground states expand to a ground-wait and per-level takeoff edges (fixed-lane or
         legacy/pad); air states expand to reroute, hover, and (when ``vertical_edges``)
         climb/descend rungs. Every edge is feasibility-checked against ``svc`` and the step horizon
-        before being emitted."""
+        before being emitted.
+
+        Parameters
+        ------------
+        - st (tuple): the state to expand — ``("g", q, r, step)`` ground or
+          ``("a", q, r, L, step)`` air.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+        - pitch (float): lateral distance per reroute hop in metres (speed·dt).
+        - levels (Sequence[float]): cruise flight-level altitudes.
+        - takeoff_steps (Sequence[int]): per-level climb step counts.
+        - takeoff_cost (Sequence[float]): per-level takeoff costs.
+        - rung_steps (Sequence[int]): per-rung step counts for a ±1 level change.
+        - rung_cost (Sequence[float]): per-rung costs for a ±1 level change.
+        - dwell_steps (Sequence[int]): per-level dwell-window lengths for the pad-clear check.
+        - c_alt (float): altitude-change cost per metre (unused here; edge altitude costs come from
+          the precomputed ``takeoff_cost``/``rung_cost``).
+        - c_lat (float): lateral cost per metre.
+        - svc: occupancy service (or recording shim) answering ``is_blocked``/``pad_clear``.
+        - max_step (int): last step an edge may reach.
+        - ground_max_step (int | None): last step a ground-wait may reach; ``None`` ⇒ unbounded.
+        - own (frozenset): terminal ids the flight owns (its own columns read transparent).
+        - o_cap (int): origin terminal pad capacity.
+        - o_term (Terminal | None): normalized origin terminal.
+        - origin (array-like | None): origin hub centre, for the capacity gate.
+        - tcap (TerminalCapacity | None): temporal pad-capacity authority.
+        - dest (array-like | None): destination hub centre, for the legacy toward-goal gate.
+        - o_lanes (Sequence): origin fixed exit lanes; empty ⇒ legacy/non-terminal takeoff.
+
+        Return
+        --------
+        - output (list): ``(neighbour_state, edge_cost)`` pairs A* may relax.
+        """
         dt = cfg.dt_s
         out = []
         if st[0] == "g":
@@ -994,9 +1177,22 @@ class AStarPlanner:
         (untagged): two flights can't occupy one exit lane at once, while divergent same-hub
         launches go concurrently.
 
-        Returns ``(volumes, centerline, cum_horiz, n_hover)``: the ASTM reservation volumes (origin
-        column, corridor boxes, dest column), the timed centreline, cumulative horizontal distance
-        (m), and the count of genuine hover segments.
+        Parameters
+        ------------
+        - cruise_wps (list[TimedPoint]): the A* cruise path as ``(xyz, t)`` waypoints.
+        - origin (array-like): origin hub centre.
+        - dest (array-like): destination hub centre.
+        - base (int): departure step (``ceil(t_departure / dt)``).
+        - ground_steps (int): ground-delay steps before takeoff; sets the takeoff time.
+        - cfg (SimConfig): geometry, costs, and timing.
+        - origin_term: origin terminal (normalized inside); ``None`` for a non-terminal origin.
+        - dest_term: dest terminal (normalized inside); ``None`` for a non-terminal destination.
+
+        Return
+        --------
+        - output (tuple): ``(volumes, centerline, cum_horiz, n_hover)`` — the ASTM reservation
+          volumes (origin column, corridor boxes, dest column), the timed centreline, cumulative
+          horizontal distance (m), and the count of genuine hover segments.
         """
         origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
         wps = [[np.asarray(p, float).copy(), t] for p, t in cruise_wps]
@@ -1071,7 +1267,20 @@ class AStarPlanner:
         service for ``pad_clear`` (non-terminal takeoff/landing gate).
 
         ``_batch``: see ``_occupancy``. Sharing one absorb pass with the reference service is the
-        whole point of the batch — they rasterize the same volumes with the same inflations."""
+        whole point of the batch — they rasterize the same volumes with the same inflations.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the plan's request; its clock sets the eviction watermark.
+        - ledger (ReservationLedger): the ledger to stay synced with.
+        - cfg (SimConfig): occupancy geometry.
+        - _batch (_BindBatch | None): defers absorb/``subscribe_static``/evict into a shared pass;
+          ``None`` runs them inline.
+
+        Return
+        --------
+        - output (CompiledHexOccupancy): the packed occupancy current for ``ledger``.
+        """
         cocc = self._cocc
         if cocc is not None and self._cocc_ledger is ledger and self._cocc_epoch != ledger.epoch:
             cocc = None                                  # detached mid-life — rebind (see _occupancy)
@@ -1211,6 +1420,31 @@ class AStarPlanner:
 
         Return ``False`` only when the separately compiled window kernel fails. That permanently disables
         the compiled planner, and the caller re-runs this flight through the reference path.
+
+        Parameters
+        ------------
+        - cocc (CompiledHexOccupancy): packed occupancy supplying the claim arena and box bounds.
+        - ks (dict): the occupancy-shaped kernel arrays (``win`` / ``wbox`` / ``ov_own_gen``).
+        - gen (int): this plan's generation stamp, folded into the window build.
+        - oq (int): origin hex q (a window anchor cell).
+        - orr (int): origin hex r (a window anchor cell).
+        - lane_q (np.ndarray): origin exit-lane cell qs (anchors).
+        - lane_r (np.ndarray): origin exit-lane cell rs (anchors).
+        - lane_stp (np.ndarray): per-lane egress traverse steps (sizes the step tail).
+        - goal_q (np.ndarray): landing-lane cell qs (anchors).
+        - goal_r (np.ndarray): landing-lane cell rs (anchors).
+        - base (int): first step the window covers.
+        - max_step (int): global last step, clipping the window's step span.
+        - n_gsteps (int): ground-delay allowance for the step span.
+        - tks (np.ndarray): per-level takeoff step counts (sizes the tail).
+        - climb_span (int): mid-route climb span (sizes the tail).
+        - n_hops (int): straight-line hop count (sizes the 3x detour tail).
+        - widen (int): window escalation level; each level doubles the margin and the step tail.
+
+        Return
+        --------
+        - output (bool): ``True`` when the window was built or intentionally disabled for a
+          reference dispatch; ``False`` only when the compiled window kernel fails (planner off).
         """
         wbox = ks["wbox"]
         # A prior oversized plan may have grown the reusable buffer past the configured starting
@@ -1279,7 +1513,22 @@ class AStarPlanner:
         the single-boolean overlay cannot distinguish "own here" from "own AND foreign here", so the
         caller falls back to the reference for exactness. ``demand.py`` reject-samples hub spacing,
         making this rare, but detecting it keeps the kernel exact regardless of spacing rather than
-        *assuming* separation."""
+        *assuming* separation.
+
+        Parameters
+        ------------
+        - cocc (CompiledHexOccupancy): supplies ``col_owners`` and the cell rasteriser.
+        - o_term (Terminal | None): normalized origin terminal whose column is marked own.
+        - d_term (Terminal | None): normalized dest terminal whose column is marked own.
+        - origin (array-like): origin hub centre.
+        - dest (array-like): destination hub centre.
+        - gen (int): generation stamp written into ``ov_own_gen`` for owned cells.
+
+        Return
+        --------
+        - output (bool): ``True`` if any own cell is ALSO under a FOREIGN hub's column (caller must
+          fall back to the reference); ``False`` otherwise.
+        """
         ov = self._ks["ov_own_gen"]
         cfg = cocc.cfg
         z_hi = cfg.flight_levels_m[-1]
@@ -1413,7 +1662,20 @@ class AStarPlanner:
         Sets up the same search inputs, binds both occupancy images in one ledger pass, builds the
         per-plan feasibility masks and dense window, then runs the kernel. Any safety-valve fallback
         (out-of-box, hash/heap full, window exhausted, own∩foreign overlap, kernel anomaly) re-runs
-        the whole flight through :meth:`_plan_reference`."""
+        the whole flight through :meth:`_plan_reference`.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): the shared reservation ledger to deconflict against.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
+          REJECTED intent carrying the :class:`DenialReason`; a safety-valve fallback returns the
+          :meth:`_plan_reference` result.
+        """
         from . import kernel as K
 
         # ---- setup: IDENTICAL to _plan_reference's head, so the kernel gets identical inputs ----

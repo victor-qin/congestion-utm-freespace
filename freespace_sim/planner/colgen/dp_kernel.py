@@ -194,6 +194,17 @@ def _fsum_add(partials, n, x):
     unavailable.  In this kernel's use -- one visit window's worth of rows -- reaching 64
     partials is not possible, which is exactly why a hard failure is the right response if
     it ever happens.
+
+    Parameters
+    ------------
+    - partials (np.ndarray): the running Shewchuk partial expansion (float64), updated in place.
+    - n (int): number of live partials currently in ``partials``.
+    - x (float): the new term to add.
+
+    Return
+    --------
+    - output (int): the new partial count, or ``-1`` when the expansion overflows
+      ``FSUM_MAX_PARTIALS`` (the sum must then be treated as unavailable).
     """
 
     i = 0
@@ -261,6 +272,20 @@ def _range_sum(series_first, series_start, series_prefix, series, start, stop):
     Term for term :meth:`~.dp_prepare.PreparedDuals.range_sum`, which is itself term for
     term ``pricing._PrefixSeries.range_sum``.  Bit-identical because it is the same two
     stored floats subtracted in the same order -- not because the values are close.
+
+    Parameters
+    ------------
+    - series_first (np.ndarray): first indexed step of each dual series.
+    - series_start (np.ndarray): CSR offsets into ``series_prefix`` per series.
+    - series_prefix (np.ndarray): per-series prefix sums of the duals.
+    - series (int): the series id to query; negative means no series (returns 0).
+    - start (int): inclusive lower step of the query range.
+    - stop (int): exclusive upper step of the query range.
+
+    Return
+    --------
+    - output (float): the summed duals over ``[start, stop)``, or ``0.0`` when the series is
+      absent or the clipped range is empty.
     """
 
     if series < 0:
@@ -283,7 +308,24 @@ def _range_sum(series_first, series_start, series_prefix, series, start, stop):
 def _visit_cost(
     cell_series, series_first, series_start, series_prefix, cell_index, visit_step, lo, hi
 ):
-    """Every cell-row dual a centre visit charges, in O(1)."""
+    """Every cell-row dual a centre visit charges, in O(1).
+
+    Parameters
+    ------------
+    - cell_series (np.ndarray): maps each cell index to its dual series id (``-1`` if none).
+    - series_first (np.ndarray): first indexed step of each dual series.
+    - series_start (np.ndarray): CSR offsets into ``series_prefix`` per series.
+    - series_prefix (np.ndarray): per-series prefix sums of the duals.
+    - cell_index (int): the visited cell's interned index; out of range returns 0.
+    - visit_step (int): the clock step of the visit.
+    - lo (int): low window offset (steps) around the visit.
+    - hi (int): high window offset (steps) around the visit.
+
+    Return
+    --------
+    - output (float): the summed cell-row duals over ``[visit_step + lo, visit_step + hi + 1)``,
+      or ``0.0`` when the cell has no series.
+    """
 
     if cell_index < 0 or cell_index >= cell_series.shape[0]:
         return 0.0
@@ -304,6 +346,16 @@ def _row_cost(row_id, row_value, row):
     Binary search over the sorted ids rather than a dense lookup: the row space is
     ``n_cells * n_steps`` -- ~5M on a density flight, 40 MB densely, per flight -- while the
     priced rows are a few thousand.  ``[[colgen-density-memory-ceiling]]``.
+
+    Parameters
+    ------------
+    - row_id (np.ndarray): sorted dense row ids that carry a dual.
+    - row_value (np.ndarray): the dual price for each id in ``row_id``.
+    - row (int): the dense row id to price; negative returns 0.
+
+    Return
+    --------
+    - output (float): the stored dual for ``row``, or ``0.0`` when it is negative or absent.
     """
 
     if row < 0:
@@ -360,6 +412,17 @@ def _fill_path(label, label_parent, label_cell, out):
     **``out`` must hold ``air_hop_limit + 1`` entries.**  Numba emits no bounds check, so a
     short buffer corrupts neighbouring memory silently rather than raising; the ceiling is
     the only bound on path length, so it is the only correct size.
+
+    Parameters
+    ------------
+    - label (int): the leaf label whose root-first cell path is written.
+    - label_parent (np.ndarray): parent-pointer per label (``-1`` at a root).
+    - label_cell (np.ndarray): interned cell index per label.
+    - out (np.ndarray): output buffer; must hold ``air_hop_limit + 1`` entries (no bounds check).
+
+    Return
+    --------
+    - output (int): the path length written into ``out`` (root-first).
     """
 
     n = 0
@@ -387,6 +450,20 @@ def _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b):
     Only reached on an exact tie of ``(cell, recent, hops, departure_step, lane)``, so its
     O(hops) walk is off the hot path; correctness here decides which of two equally scored
     columns is returned.
+
+    Parameters
+    ------------
+    - a (int): the first label id.
+    - b (int): the second label id.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - scratch_a (np.ndarray): scratch buffer for ``a``'s path (``air_hop_limit + 1`` entries).
+    - scratch_b (np.ndarray): scratch buffer for ``b``'s path (``air_hop_limit + 1`` entries).
+
+    Return
+    --------
+    - output (int): ``-1``, ``0`` or ``1`` as ``a``'s cell path sorts before, equal to, or
+      after ``b``'s under Python tuple ordering.
     """
 
     n_a = _fill_path(a, label_parent, label_cell, scratch_a)
@@ -412,6 +489,23 @@ def _tie_lt(
 
     ``lane`` is already stored as the reference's ``-1 if origin_lane_idx is None`` form, so
     a laneless start orders below lane 0 exactly as the tuple does.
+
+    Parameters
+    ------------
+    - a (int): the first label id.
+    - b (int): the second label id.
+    - label_hops (np.ndarray): hop count per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label (``-1`` for a laneless start).
+    - label_parent (np.ndarray): parent-pointer per label (for the path tie-break).
+    - label_cell (np.ndarray): interned cell index per label.
+    - scratch_a (np.ndarray): scratch path buffer for ``a``.
+    - scratch_b (np.ndarray): scratch path buffer for ``b``.
+
+    Return
+    --------
+    - output (bool): whether ``a``'s tie key ``(hops, departure_step, lane, path)`` is strictly
+      less than ``b``'s.
     """
 
     if label_hops[a] != label_hops[b]:
@@ -445,6 +539,24 @@ def _prefer(
     label survives depends on the order they arrive in.  That is why the kernel reproduces
     the reference's arc order (``AXIAL_NEIGHBORS``) and its roots-before-arcs insertion
     order rather than treating dominance as a set operation.
+
+    Parameters
+    ------------
+    - new (int): the candidate label id.
+    - old (int): the incumbent label id at the same dominance key; ``< 0`` means an empty slot.
+    - label_score (np.ndarray): score per label.
+    - label_hops (np.ndarray): hop count per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - scratch_a (np.ndarray): scratch path buffer for ``new``.
+    - scratch_b (np.ndarray): scratch path buffer for ``old``.
+
+    Return
+    --------
+    - output (bool): whether ``new`` displaces ``old`` -- ``True`` on an empty slot, a strictly
+      better score, or an equal score with a smaller tie key.
     """
 
     if old < 0:
@@ -488,6 +600,19 @@ def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
 
     ``recent`` carries its own length: a label ``k`` hops out has only ``min(k + 1, depth)``
     cells of history, and the reference's tuples of different lengths never compare equal.
+
+    Parameters
+    ------------
+    - cell (int): the label's current interned cell.
+    - recent (np.ndarray): the recent-cell history buffer, most-recent first.
+    - n_recent (int): number of valid entries in ``recent`` (part of the key).
+    - paid_class (int): the origin paid-rows class of the label's variant.
+    - first_a (int): first-hop source cell (``-1`` when not tracked).
+    - first_b (int): first-hop target cell (``-1`` when not tracked).
+
+    Return
+    --------
+    - output (np.uint64): the FNV-style hash of the dominance key.
     """
 
     h = np.uint64(cell) * np.uint64(0x100000001B3)
@@ -513,6 +638,18 @@ def _fill_recent(label, depth, label_parent, label_cell, out):
     the identity: a label two hops out has a two-cell history, and Python tuples of
     different lengths never compare equal, so a fixed-width buffer would merge states the
     reference keeps apart if the length were dropped.
+
+    Parameters
+    ------------
+    - label (int): the label whose recent-cell history is written.
+    - depth (int): the history depth to capture (``min(hops + 1, depth)`` cells result).
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - out (np.ndarray): output buffer, filled most-recent first; must hold ``depth`` entries.
+
+    Return
+    --------
+    - output (int): the number of cells written into ``out``.
     """
 
     n = 0
@@ -526,7 +663,19 @@ def _fill_recent(label, depth, label_parent, label_cell, out):
 
 @njit(cache=True, nogil=True)
 def _recent_cmp(a, n_a, b, n_b):
-    """Compare two ``recent`` buffers as Python would compare the tuples: -1, 0 or 1."""
+    """Compare two ``recent`` buffers as Python would compare the tuples: -1, 0 or 1.
+
+    Parameters
+    ------------
+    - a (np.ndarray): the first recent buffer.
+    - n_a (int): number of valid entries in ``a``.
+    - b (np.ndarray): the second recent buffer.
+    - n_b (int): number of valid entries in ``b``.
+
+    Return
+    --------
+    - output (int): ``-1``, ``0`` or ``1`` as ``a`` sorts before, equal to, or after ``b``.
+    """
 
     n = min(n_a, n_b)
     for i in range(n):
@@ -543,7 +692,18 @@ def _recent_cmp(a, n_a, b, n_b):
 
 @njit(cache=True, nogil=True)
 def _role_allows(roles, first, last):
-    """Whether an arc may be traversed in the requested role -- ``hop_allowed_for_role``."""
+    """Whether an arc may be traversed in the requested role -- ``hop_allowed_for_role``.
+
+    Parameters
+    ------------
+    - roles (int): the arc's packed role bitmask.
+    - first (bool): whether the arc is the path's first hop.
+    - last (bool): whether the arc is the path's last hop.
+
+    Return
+    --------
+    - output (bool): whether the arc permits the requested first/last role.
+    """
 
     if first:
         bit = _ARC_FIRST_LAST if last else _ARC_FIRST
@@ -564,6 +724,26 @@ def _layer_lt(
     at pricing.py:1522.  This is not cosmetic: relaxation order decides which label lands
     first in the next layer, and ``_prefer`` is non-transitive inside its epsilon band, so
     the surviving label depends on arrival order.
+
+    Parameters
+    ------------
+    - a (int): the first label id.
+    - b (int): the second label id.
+    - depth (int): history depth for the ``recent`` comparison.
+    - label_score (np.ndarray): unused; accepted so the signature matches :func:`_sort_layer`.
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_hops (np.ndarray): hop count per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label.
+    - recent_a (np.ndarray): scratch recent buffer for ``a``.
+    - recent_b (np.ndarray): scratch recent buffer for ``b``.
+    - scratch_a (np.ndarray): scratch path buffer for ``a``.
+    - scratch_b (np.ndarray): scratch path buffer for ``b``.
+
+    Return
+    --------
+    - output (bool): whether ``a`` sorts before ``b`` under ``(cell, recent, tie_key)``.
     """
 
     if label_cell[a] != label_cell[b]:
@@ -592,6 +772,27 @@ def _sort_layer(
     ``np.argsort`` because the ordering key ends in a whole path, which no numeric key can
     encode.  Stability is irrelevant to the result -- ``_layer_lt`` is a strict total order
     on distinct labels, since two labels in one layer cannot share the full key.
+
+    Parameters
+    ------------
+    - items (np.ndarray): the layer's label ids, sorted in place.
+    - buffer (np.ndarray): scratch buffer of at least ``n`` for the merge passes.
+    - n (int): number of label ids in ``items``.
+    - depth (int): history depth for the comparator.
+    - label_score (np.ndarray): forwarded to :func:`_layer_lt`, which does not read it.
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_hops (np.ndarray): hop count per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label.
+    - recent_a (np.ndarray): scratch recent buffer.
+    - recent_b (np.ndarray): scratch recent buffer.
+    - scratch_a (np.ndarray): scratch path buffer.
+    - scratch_b (np.ndarray): scratch path buffer.
+
+    Return
+    --------
+    - output (int): ``n`` (``items[:n]`` is now sorted ascending under :func:`_layer_lt`).
     """
 
     width = 1
@@ -647,6 +848,33 @@ def _state_find(
     slot instead of ``depth + 4``, which matters because the table is per-thread and sized
     to the largest layer of the largest flight.  Re-deriving costs a walk of ``depth``
     parent pointers, and ``depth`` is 2-4.
+
+    Parameters
+    ------------
+    - slot_label (np.ndarray): the state table's per-slot label id (``-1`` when empty).
+    - slot_hash (np.ndarray): the state table's per-slot stored hash.
+    - log2cap (int): log2 of the table capacity.
+    - key_hash (np.uint64): the hash of the key being located.
+    - depth (int): history depth used to re-derive an occupant's ``recent``.
+    - cell (int): the key's current cell.
+    - recent (np.ndarray): the key's recent-cell history buffer.
+    - n_recent (int): number of valid entries in ``recent``.
+    - paid_class (int): the key's origin paid-rows class.
+    - first_a (int): the key's first-hop source cell.
+    - first_b (int): the key's first-hop target cell.
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_variant (np.ndarray): variant id per label.
+    - var_paid_class (np.ndarray): paid-rows class per variant.
+    - label_first_a (np.ndarray): first-hop source per label.
+    - label_first_b (np.ndarray): first-hop target per label.
+    - probe_recent (np.ndarray): scratch buffer for re-deriving an occupant's ``recent``.
+
+    Return
+    --------
+    - output (tuple[int, bool]): ``(slot, found)`` -- ``found`` means the slot already holds this
+      exact key; otherwise ``slot`` is where an insertion belongs. ``slot`` is ``-1`` when the
+      table is full.
     """
 
     cap = 1 << log2cap
@@ -686,6 +914,25 @@ def _paid_visit_correction(
     ``sorted(paid)`` over ``RowKey`` tuples, and cell interning is sorted axial order -- so
     ascending ``step`` here is the same order ``visit_rows`` yields, and the ``fsum`` sees
     the same terms in the same sequence as ``math.fsum`` does.
+
+    Parameters
+    ------------
+    - paid_start (np.ndarray): CSR offsets into the paid-row arrays per paid class.
+    - paid_cell (np.ndarray): the cell of each paid row.
+    - paid_step (np.ndarray): the step of each paid row.
+    - paid_value (np.ndarray): the dual value of each paid row.
+    - paid_class (int): the label's origin paid-rows class to correct against.
+    - cell (int): the visited cell.
+    - visit_step (int): the clock step of the visit.
+    - lo (int): low window offset (steps).
+    - hi (int): high window offset (steps).
+    - partials (np.ndarray): scratch Shewchuk expansion buffer.
+
+    Return
+    --------
+    - output (tuple[float, bool]): the summed duals the origin endpoint already paid inside this
+      visit window and an ``ok`` flag; ``ok`` is ``False`` only when the ``fsum`` expansion
+      overflowed.
     """
 
     start = paid_start[paid_class]
@@ -714,6 +961,20 @@ def _visit_hits_forbidden(bits, rows_n_steps, rows_step0, cell, visit_step, lo, 
     Row ids are arithmetic (``cell * n_steps + (step - step0)``), so the whole window is a
     contiguous run and no ``RowKey`` is built -- which is the allocation the reference
     removed from its own hot path for the same reason.
+
+    Parameters
+    ------------
+    - bits (np.ndarray): the forbidden-row bitset (empty means nothing is forbidden).
+    - rows_n_steps (int): steps per cell in the arithmetic row numbering.
+    - rows_step0 (int): the first step of the row numbering.
+    - cell (int): the visited cell.
+    - visit_step (int): the clock step of the visit.
+    - lo (int): low window offset (steps).
+    - hi (int): high window offset (steps).
+
+    Return
+    --------
+    - output (bool): whether any row in the visit window is in the forbidden set.
     """
 
     if bits.shape[0] == 0:
@@ -733,7 +994,23 @@ def _visit_hits_forbidden(bits, rows_n_steps, rows_step0, cell, visit_step, lo, 
 
 @njit(cache=True, nogil=True)
 def _prefix_le(a0, a1, a2, a3, b0, b1, b2, b3):
-    """``(a0, a1, a2, a3) <= (b0, b1, b2, b3)`` -- Python's tuple order over four ints."""
+    """``(a0, a1, a2, a3) <= (b0, b1, b2, b3)`` -- Python's tuple order over four ints.
+
+    Parameters
+    ------------
+    - a0 (int): first component of the left tuple.
+    - a1 (int): second component of the left tuple.
+    - a2 (int): third component of the left tuple.
+    - a3 (int): fourth component of the left tuple.
+    - b0 (int): first component of the right tuple.
+    - b1 (int): second component of the right tuple.
+    - b2 (int): third component of the right tuple.
+    - b3 (int): fourth component of the right tuple.
+
+    Return
+    --------
+    - output (bool): whether ``(a0, a1, a2, a3) <= (b0, b1, b2, b3)`` under Python tuple order.
+    """
 
     if a0 != b0:
         return a0 < b0
@@ -798,6 +1075,30 @@ def _can_compete(
     live incumbent gave it, and that length is itself a prune (``first_hops >= len``
     returns False), so "not built yet" cannot be answered by guessing either way -- the
     host has to build it against the cutoff that is current *now*.
+
+    Parameters
+    ------------
+    - variant (int): the root variant id whose completion envelope is consulted.
+    - min_total_hops (int): a lower bound on the label's total hop count.
+    - paid_duals (float): the duals the label has paid so far (recovered from its score).
+    - paid_exact (bool): whether ``paid_duals`` is exact rather than a reconstruction.
+    - env_start (np.ndarray): per-variant envelope start offset (``-1`` = not built yet).
+    - env_len (np.ndarray): per-variant envelope length (hop count).
+    - env_delay (np.ndarray): the envelope's delay lower bound per total hop count.
+    - env_dest (np.ndarray): the envelope's positive destination cost per total hop count.
+    - var_departure (np.ndarray): departure step per variant.
+    - var_lane (np.ndarray): origin lane per variant.
+    - benefit (float): the flight's serve benefit ``M``.
+    - pi_f (float): the flight's assignment (row) dual.
+    - max_negative_credit (float): the largest negative dual credit available.
+    - destination_lane_tie (int): the destination lane index used in the four-field tie-break.
+    - cutoff (np.ndarray): 1-element current incumbent reduced cost.
+    - inc_state (np.ndarray): incumbent state ``(valid, hops, departure, origin_lane, dest_lane)``.
+
+    Return
+    --------
+    - output (int): ``1`` keep the label, ``0`` prune it, ``-1`` the variant's envelope is not
+      built yet (the host must build it).
     """
 
     if inc_state[0] == 0:
@@ -869,6 +1170,26 @@ def _sink_may_improve(
     Measured on one real search: 27,410 sinks registered, ``_canonical_candidate`` called
     6 times -- 0.02%.  Asking per sink would be the whole of the cost this kernel exists
     to remove; asking per *improvement* is 6 round trips.
+
+    Parameters
+    ------------
+    - variant (int): the sink's root variant id.
+    - hops (int): the sink's exact hop count.
+    - paid_duals (float): the duals the sink has paid so far.
+    - env_start (np.ndarray): per-variant envelope start offset (``-1`` = not built yet).
+    - env_len (np.ndarray): per-variant envelope length.
+    - env_delay (np.ndarray): the envelope's delay lower bound per total hop count.
+    - env_dest (np.ndarray): the envelope's positive destination cost per total hop count.
+    - benefit (float): the flight's serve benefit ``M``.
+    - pi_f (float): the flight's assignment (row) dual.
+    - max_negative_credit (float): the largest negative dual credit available.
+    - cutoff (np.ndarray): 1-element current incumbent reduced cost.
+    - inc_state (np.ndarray): incumbent state; index 0 flags whether an incumbent exists.
+
+    Return
+    --------
+    - output (int): ``1`` ask the host to certify this sink, ``0`` skip it, ``-1`` the variant's
+      envelope is not built yet.
     """
 
     if inc_state[0] == 0:
@@ -922,6 +1243,43 @@ def _register_sinks(
 
     ``sink_probe`` off means no certifier is attached, so there is nobody to answer an
     improving sink and the screen is skipped entirely.
+
+    Parameters
+    ------------
+    - nxt (int): the sink label id being registered.
+    - arrival_step (int): the sink's arrival clock step, recorded on each candidate.
+    - d_start (int): first destination-lane slot to append from (a resume cursor).
+    - skip_first_append (bool): skip appending at ``d_start`` (already appended before a pause).
+    - dest_lane_start (np.ndarray): CSR offsets into ``dest_lane_idx`` per cell.
+    - dest_lane_idx (np.ndarray): destination lane indices per cell.
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_hops (np.ndarray): hop count per label.
+    - label_variant (np.ndarray): variant id per label.
+    - label_score (np.ndarray): score per label.
+    - var_ground_w (np.ndarray): weighted ground delay per variant.
+    - var_origin_leg_w (np.ndarray): weighted origin-leg time per variant.
+    - air_weight (float): weight on air time in the objective currency.
+    - dt_s (float): seconds per hop/step.
+    - env_start (np.ndarray): per-variant envelope start offset (``-1`` = not built yet).
+    - env_len (np.ndarray): per-variant envelope length.
+    - env_delay (np.ndarray): the envelope's delay lower bound per total hop count.
+    - env_dest (np.ndarray): the envelope's positive destination cost per total hop count.
+    - benefit (float): the flight's serve benefit ``M``.
+    - pi_f (float): the flight's assignment (row) dual.
+    - max_negative_credit (float): the largest negative dual credit available.
+    - cutoff (np.ndarray): 1-element current incumbent reduced cost.
+    - inc_state (np.ndarray): incumbent state array.
+    - sink_probe (int): non-zero enables the improving-sink screen; ``0`` skips it.
+    - cand_label (np.ndarray): output buffer of candidate label ids.
+    - cand_lane (np.ndarray): output buffer of candidate destination lanes.
+    - cand_step (np.ndarray): output buffer of candidate arrival steps.
+    - n_cand (int): current number of buffered candidates.
+
+    Return
+    --------
+    - output (tuple[int, int, int]): ``(n_cand, code, lane_slot)`` -- the updated candidate
+      count, a code (0 lane range done, 1 pause to certify at ``lane_slot``, 2 pause to build
+      ``lane_slot``'s envelope, 3 output buffer full at ``lane_slot``), and that lane slot.
     """
 
     neighbour = label_cell[nxt]
@@ -969,6 +1327,41 @@ def _seed_layer(
     Roots go in through the same ``_prefer`` path as arcs because the reference inserts
     them into the very same per-layer dict, so two roots colliding on one dominance key
     resolve against each other exactly as two arcs would.
+
+    Parameters
+    ------------
+    - seed_step (int): the start step whose roots are inserted.
+    - min_step (int): the search's first step; bucket index is ``seed_step - min_step``.
+    - root_order (np.ndarray): root variant ids ordered by start step then insertion order.
+    - root_bucket_start (np.ndarray): CSR offsets into ``root_order`` per start-step bucket.
+    - var_cell (np.ndarray): origin cell per variant.
+    - var_score (np.ndarray): start score per variant.
+    - var_paid_class (np.ndarray): paid-rows class per variant.
+    - var_departure (np.ndarray): departure step per variant.
+    - var_lane (np.ndarray): origin lane per variant.
+    - n_labels (int): the current label count; new roots are appended from here.
+    - label_score (np.ndarray): score per label (written).
+    - label_cell (np.ndarray): interned cell index per label (written).
+    - label_parent (np.ndarray): parent-pointer per label (written ``-1`` for roots).
+    - label_hops (np.ndarray): hop count per label (written ``0`` for roots).
+    - label_variant (np.ndarray): variant id per label (written).
+    - label_departure (np.ndarray): departure step per label (written).
+    - label_lane (np.ndarray): origin lane per label (written).
+    - label_first_a (np.ndarray): first-hop source per label (written ``-1`` for roots).
+    - label_first_b (np.ndarray): first-hop target per label (written ``-1`` for roots).
+    - tbl_label (np.ndarray): the target layer's state table label ids.
+    - tbl_hash (np.ndarray): the target layer's state table hashes.
+    - log2cap (int): log2 of the state table capacity.
+    - depth (int): history depth for state keys.
+    - recent_a (np.ndarray): scratch recent buffer.
+    - probe_recent (np.ndarray): scratch buffer for state-table probing.
+    - scratch_a (np.ndarray): scratch path buffer for ``_prefer``.
+    - scratch_b (np.ndarray): scratch path buffer for ``_prefer``.
+
+    Return
+    --------
+    - output (int): the new label count, or ``-1`` when the label pool is full and ``-2`` when
+      the state table is saturated.
     """
 
     n_buckets = root_bucket_start.shape[0] - 1
@@ -1095,6 +1488,115 @@ def _price_dag(
     certification order cannot reach the answer either.  What it buys is that a pause can
     only ever happen with the arc's mutations already complete, so resuming never has to
     decide whether a label was allocated twice.
+
+    Parameters
+    ------------
+    Topology:
+    - arc_start (np.ndarray): CSR offsets into ``arc_target`` per cell.
+    - arc_target (np.ndarray): CSR arc target cells.
+    - arc_roles (np.ndarray): packed role bitmask per arc.
+    - hex_remaining (np.ndarray): admissible hops-to-destination per cell.
+    - dest_mask (np.ndarray): non-zero for destination cells.
+    - dest_lane_start (np.ndarray): CSR offsets into ``dest_lane_idx`` per cell.
+    - dest_lane_idx (np.ndarray): destination lane indices per cell.
+    - air_hop_limit (int): maximum air hops on any path.
+    - revisit_depth (int): how many recent cells a hop may not revisit.
+    - state_history_depth (int): dominance-key history depth.
+    - track_first_hop (bool): whether the first hop is part of the dominance key.
+    - min_step (int): the search's first clock step.
+    - max_step (int): the search's last clock step.
+
+    Roots (pre-bucketed by start step):
+    - root_order (np.ndarray): root variant ids ordered by start step then insertion order.
+    - root_bucket_start (np.ndarray): CSR offsets into ``root_order`` per start-step bucket.
+    - var_cell (np.ndarray): origin cell per variant.
+    - var_score (np.ndarray): start score per variant.
+    - var_paid_class (np.ndarray): paid-rows class per variant.
+    - var_departure (np.ndarray): departure step per variant.
+    - var_lane (np.ndarray): origin lane per variant.
+    - var_ground_w (np.ndarray): weighted ground delay per variant.
+    - var_origin_leg_w (np.ndarray): weighted origin-leg time per variant.
+    - paid_start (np.ndarray): CSR offsets into the paid-row arrays per paid class.
+    - paid_cell (np.ndarray): the cell of each paid row.
+    - paid_step (np.ndarray): the step of each paid row.
+    - paid_value (np.ndarray): the dual value of each paid row.
+
+    Duals:
+    - cell_series (np.ndarray): dual series id per cell (``-1`` if none).
+    - series_first (np.ndarray): first indexed step of each dual series.
+    - series_start (np.ndarray): CSR offsets into ``series_prefix`` per series.
+    - series_prefix (np.ndarray): per-series prefix sums of the duals.
+    - offsets_lo (int): low visit-window offset (steps).
+    - offsets_hi (int): high visit-window offset (steps).
+
+    Rows and exclusions:
+    - forbidden_bits (np.ndarray): the forbidden-row bitset.
+    - rows_n_steps (int): steps per cell in the arithmetic row numbering.
+    - rows_step0 (int): the first step of the row numbering.
+
+    Objective:
+    - air_dt_s (float): ``air_weight * dt_s``, the per-hop air cost.
+    - air_weight (float): weight on air time in the objective currency.
+    - dt_s (float): seconds per hop/step.
+    - benefit (float): the flight's serve benefit ``M``.
+    - pi_f (float): the flight's assignment (row) dual.
+    - max_negative_credit (float): the largest negative dual credit available.
+
+    Completion gate:
+    - env_start (np.ndarray): per-variant envelope start offset (``-1`` = not built yet).
+    - env_len (np.ndarray): per-variant envelope length.
+    - env_delay (np.ndarray): envelope delay lower bound per total hop count.
+    - env_dest (np.ndarray): envelope positive destination cost per total hop count.
+    - destination_lane_tie (int): destination lane index used in the tie-break.
+    - cutoff (np.ndarray): 1-element current incumbent reduced cost.
+    - inc_state (np.ndarray): incumbent state ``(valid, hops, departure, origin_lane, dest_lane)``.
+    - sink_probe (int): non-zero enables the improving-sink screen.
+
+    Workspace -- label pool:
+    - label_score (np.ndarray): score per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_hops (np.ndarray): hop count per label.
+    - label_variant (np.ndarray): variant id per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label.
+    - label_first_a (np.ndarray): first-hop source per label.
+    - label_first_b (np.ndarray): first-hop target per label.
+
+    Workspace -- two layer-local state tables:
+    - tbl_label_a (np.ndarray): state-table label ids for one layer parity.
+    - tbl_hash_a (np.ndarray): state-table hashes for one layer parity.
+    - tbl_label_b (np.ndarray): state-table label ids for the other layer parity.
+    - tbl_hash_b (np.ndarray): state-table hashes for the other layer parity.
+    - log2cap (int): log2 of each state table's capacity.
+
+    Workspace -- scratch:
+    - layer_items (np.ndarray): the current layer's gathered label ids.
+    - layer_buffer (np.ndarray): merge-sort scratch for ``layer_items``.
+    - recent_a (np.ndarray): scratch recent buffer.
+    - recent_b (np.ndarray): scratch recent buffer.
+    - probe_recent (np.ndarray): scratch buffer for state-table probing.
+    - scratch_a (np.ndarray): scratch path buffer.
+    - scratch_b (np.ndarray): scratch path buffer.
+    - partials (np.ndarray): scratch Shewchuk expansion buffer.
+
+    Workspace -- candidates:
+    - cand_label (np.ndarray): output buffer of candidate (sink) label ids.
+    - cand_lane (np.ndarray): output buffer of candidate destination lanes.
+    - cand_step (np.ndarray): output buffer of candidate arrival steps.
+
+    Control:
+    - cancel (np.ndarray): 1-element cooperative-cancel flag.
+    - out_counts (np.ndarray): outputs ``(n_labels, n_candidates, step_reached)``.
+    - resume (np.ndarray): caller-owned resume record (mode and saved cursors).
+    - out_sink (np.ndarray): outputs the paused sink's variant/label/lane/step/hops.
+
+    Return
+    --------
+    - output (int): a status code -- ``STATUS_OK`` on completion, ``STATUS_IMPROVING_SINK`` /
+      ``STATUS_NEED_ENVELOPE`` / ``STATUS_CANDIDATE_FULL`` as resumable pauses, and the
+      ``STATUS_*_LIMIT`` / ``STATUS_CANCELLED`` / ``STATUS_FSUM_OVERFLOW`` budget-or-failure
+      codes. ``out_counts``, ``resume`` and ``out_sink`` are written in place.
     """
 
     cap = 1 << log2cap
@@ -1465,6 +1967,24 @@ def _delay_lower_bound(
     then drop a hop without increasing canonical flown distance -- and the safe fallback is
     the irrevocable ground delay.  The same fallback covers a zero reference, because
     ``enroute_detour_m`` deliberately defines its detour as zero there.
+
+    Parameters
+    ------------
+    - ground_delay_s (float): the label's committed ground hold (s).
+    - origin_fold_s (float): the origin lane's fold-time contribution (s).
+    - hops (int): air hops taken so far.
+    - remaining_hops (int): admissible hops still to fly.
+    - destination_fold_s (float): the destination lane's fold-time lower bound (s).
+    - reference_time_s (float): the O-D reference flight time (s); ``<= 0`` defines zero detour.
+    - dt_s (float): seconds per hop/step.
+    - folding_exact (bool): whether the fold decomposition is valid (else ground-only fallback).
+    - ground_weight (float): weight on ground delay.
+    - air_weight (float): weight on air time.
+
+    Return
+    --------
+    - output (float): the admissible weighted delay lower bound; the ground-only term when
+      folding is inexact or the reference time is non-positive.
     """
 
     if (not folding_exact) or reference_time_s <= 0.0:
@@ -1487,6 +2007,25 @@ def _frontier_lt(
     lexicographically because two labels can tie on all four numeric fields, and ``serial``
     -- the push counter -- is what makes the order total, so a heap cannot reorder equal
     keys and change which path is expanded first.
+
+    Parameters
+    ------------
+    - a (int): the first label id.
+    - b (int): the second label id.
+    - lab_bound (np.ndarray): admissible delay bound per label.
+    - lab_estimate (np.ndarray): ``hops + remaining`` estimate per label.
+    - lab_departure (np.ndarray): departure step per label.
+    - lab_lane (np.ndarray): origin lane per label.
+    - lab_serial (np.ndarray): push counter per label (makes the order total).
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - scratch_a (np.ndarray): scratch path buffer for ``a``.
+    - scratch_b (np.ndarray): scratch path buffer for ``b``.
+
+    Return
+    --------
+    - output (bool): whether ``a`` orders before ``b`` under ``(bound, hops+remaining,
+      departure, lane, path, serial)``.
     """
 
     if lab_bound[a] != lab_bound[b]:
@@ -1508,7 +2047,27 @@ def _heap_push(
     heap, n, item, lab_bound, lab_estimate, lab_departure, lab_lane, lab_serial,
     label_parent, label_cell, scratch_a, scratch_b,
 ):
-    """Sift up.  Returns the new size, or -1 when the frontier array is full."""
+    """Sift up.  Returns the new size, or -1 when the frontier array is full.
+
+    Parameters
+    ------------
+    - heap (np.ndarray): the binary-heap array of label ids.
+    - n (int): current heap size.
+    - item (int): the label id to push.
+    - lab_bound (np.ndarray): admissible delay bound per label.
+    - lab_estimate (np.ndarray): ``hops + remaining`` estimate per label.
+    - lab_departure (np.ndarray): departure step per label.
+    - lab_lane (np.ndarray): origin lane per label.
+    - lab_serial (np.ndarray): push counter per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - scratch_a (np.ndarray): scratch path buffer.
+    - scratch_b (np.ndarray): scratch path buffer.
+
+    Return
+    --------
+    - output (int): the new heap size, or ``-1`` when the frontier array is full.
+    """
 
     if n >= heap.shape[0]:
         return -1
@@ -1534,7 +2093,27 @@ def _heap_pop(
     heap, n, lab_bound, lab_estimate, lab_departure, lab_lane, lab_serial,
     label_parent, label_cell, scratch_a, scratch_b,
 ):
-    """Sift down.  Returns ``(item, new_size)``."""
+    """Sift down.  Returns ``(item, new_size)``.
+
+    Parameters
+    ------------
+    - heap (np.ndarray): the binary-heap array of label ids.
+    - n (int): current heap size.
+    - lab_bound (np.ndarray): admissible delay bound per label.
+    - lab_estimate (np.ndarray): ``hops + remaining`` estimate per label.
+    - lab_departure (np.ndarray): departure step per label.
+    - lab_lane (np.ndarray): origin lane per label.
+    - lab_serial (np.ndarray): push counter per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - scratch_a (np.ndarray): scratch path buffer.
+    - scratch_b (np.ndarray): scratch path buffer.
+
+    Return
+    --------
+    - output (tuple[int, int]): ``(item, new_size)`` -- the popped (smallest) label id and the
+      reduced heap size.
+    """
 
     top = heap[0]
     n -= 1
@@ -1571,6 +2150,21 @@ def _feasible_state_hash(step, cell, recent, n_recent, departure_step, lane, fir
     A DIFFERENT key from the priced search's, and deliberately so.  That one is layer-local
     and carries ``origin_paid_rows``; this one is global -- best-first jumps between steps,
     so ``step`` has to be inside the key rather than implied by the table.
+
+    Parameters
+    ------------
+    - step (int): the state's clock step (inside the key, unlike the priced search).
+    - cell (int): the state's current cell.
+    - recent (np.ndarray): the recent-cell history buffer, most-recent first.
+    - n_recent (int): number of valid entries in ``recent``.
+    - departure_step (int): the label's departure step.
+    - lane (int): the label's origin lane (``-1`` for none).
+    - first_a (int): first-hop source cell.
+    - first_b (int): first-hop target cell.
+
+    Return
+    --------
+    - output (np.uint64): the FNV-style hash of the feasible-search state key.
     """
 
     h = np.uint64(step + 1) * np.uint64(0x100000001B3)
@@ -1597,6 +2191,35 @@ def _feasible_state_find(
     Every field of the key is verified on probe, not merely hashed.  Hashing a field and
     then trusting the hash makes the table correct only until two keys collide, which shows
     up rarely, on one graph shape, as a path silently dropped.
+
+    Parameters
+    ------------
+    - slot_label (np.ndarray): the state table's per-slot label id (``-1`` when empty).
+    - slot_hash (np.ndarray): the state table's per-slot stored hash.
+    - log2cap (int): log2 of the table capacity.
+    - key_hash (np.uint64): the hash of the key being located.
+    - depth (int): history depth used to re-derive an occupant's ``recent``.
+    - step (int): the key's clock step.
+    - cell (int): the key's current cell.
+    - recent (np.ndarray): the key's recent-cell history buffer.
+    - n_recent (int): number of valid entries in ``recent``.
+    - departure_step (int): the key's departure step.
+    - lane (int): the key's origin lane.
+    - first_a (int): the key's first-hop source cell.
+    - first_b (int): the key's first-hop target cell.
+    - lab_step (np.ndarray): clock step per label.
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label.
+    - label_first_a (np.ndarray): first-hop source per label.
+    - label_first_b (np.ndarray): first-hop target per label.
+    - probe_recent (np.ndarray): scratch buffer for re-deriving an occupant's ``recent``.
+
+    Return
+    --------
+    - output (tuple[int, bool]): ``(slot, found)`` -- ``found`` means the slot holds this exact
+      key; otherwise ``slot`` is the insertion point. ``slot`` is ``-1`` when the table is full.
     """
 
     cap = 1 << log2cap
@@ -1680,6 +2303,84 @@ def _feasible_dag(
     The resume record is ``resume[0]`` mode (0 fresh, 1 continue the lane loop), ``[1]`` the
     popped label, ``[2]`` the lane slot, ``[3]`` the frontier size, ``[4]`` the label count,
     ``[5]`` the serial counter.
+
+    Parameters
+    ------------
+    Topology:
+    - arc_start (np.ndarray): CSR offsets into ``arc_target`` per cell.
+    - arc_target (np.ndarray): CSR arc target cells.
+    - hex_remaining (np.ndarray): admissible hops-to-destination per cell.
+    - dest_mask (np.ndarray): non-zero for destination cells.
+    - dest_lane_start (np.ndarray): CSR offsets into destination lanes per cell.
+    - air_hop_limit (int): maximum air hops on any path.
+    - revisit_depth (int): how many recent cells a hop may not revisit.
+    - state_history_depth (int): dominance-key history depth.
+    - track_first_hop (bool): whether the first hop is part of the state key.
+    - max_step (int): the search's last clock step.
+
+    Roots (already filtered by the host, in the reference's order):
+    - root_cell (np.ndarray): origin cell per seeded root.
+    - root_step (np.ndarray): start step per root.
+    - root_departure (np.ndarray): departure step per root.
+    - root_lane (np.ndarray): origin lane per root.
+    - root_bound (np.ndarray): admissible delay bound per root.
+    - root_remaining (np.ndarray): ``hops + remaining`` estimate per root.
+
+    Delay bound:
+    - lane_fold_s (np.ndarray): fold time (s) per lane (indexed with a ``+1`` offset for none).
+    - lane_fold_exact (np.ndarray): per-lane flag for whether the fold decomposition is valid.
+    - destination_fold_lb (float): the destination fold-time lower bound (s).
+    - reference_time_s (float): the O-D reference flight time (s).
+    - dt_s (float): seconds per hop/step.
+    - ground_weight (float): weight on ground delay.
+    - air_weight (float): weight on air time.
+    - base_step (int): the flight's earliest departure step (ground-delay origin).
+
+    Exclusions:
+    - forbidden_bits (np.ndarray): the forbidden-row bitset.
+    - rows_n_steps (int): steps per cell in the arithmetic row numbering.
+    - rows_step0 (int): the first step of the row numbering.
+    - offsets_lo (int): low visit-window offset (steps).
+    - offsets_hi (int): high visit-window offset (steps).
+
+    Incumbent:
+    - incumbent (np.ndarray): ``(value, valid-flag)``; the host's early-exit bound on delay.
+
+    Workspace -- label pool:
+    - label_cell (np.ndarray): interned cell index per label.
+    - label_parent (np.ndarray): parent-pointer per label.
+    - label_hops (np.ndarray): hop count per label.
+    - label_departure (np.ndarray): departure step per label.
+    - label_lane (np.ndarray): origin lane per label.
+    - label_first_a (np.ndarray): first-hop source per label.
+    - label_first_b (np.ndarray): first-hop target per label.
+    - lab_step (np.ndarray): clock step per label.
+    - lab_bound (np.ndarray): admissible delay bound per label.
+    - lab_estimate (np.ndarray): ``hops + remaining`` estimate per label.
+    - lab_serial (np.ndarray): push counter per label.
+
+    Workspace -- frontier and state table:
+    - heap (np.ndarray): the frontier binary heap of label ids.
+    - tbl_label (np.ndarray): the global state table's label ids.
+    - tbl_hash (np.ndarray): the global state table's hashes.
+    - log2cap (int): log2 of the state table capacity.
+    - recent_a (np.ndarray): scratch recent buffer.
+    - recent_b (np.ndarray): scratch recent buffer.
+    - probe_recent (np.ndarray): scratch buffer for state-table probing.
+    - scratch_a (np.ndarray): scratch path buffer.
+    - scratch_b (np.ndarray): scratch path buffer.
+
+    Control:
+    - cancel (np.ndarray): 1-element cooperative-cancel flag.
+    - out_counts (np.ndarray): outputs the label count.
+    - resume (np.ndarray): caller-owned resume record.
+    - out_sink (np.ndarray): outputs the paused sink's label/lane/step/hops.
+
+    Return
+    --------
+    - output (int): a status code -- ``STATUS_OK`` on completion, ``STATUS_SINK`` as a resumable
+      pause to certify a sink, and the ``STATUS_*_LIMIT`` / ``STATUS_CANCELLED`` budget codes.
+      ``out_counts``, ``resume`` and ``out_sink`` are written in place.
     """
 
     depth = state_history_depth
@@ -1946,6 +2647,17 @@ def _root_buckets(variants, topology, rows_unused=None):
     the order ``prepare_variants`` emits and the order ``_best_column``'s two nested loops
     insert -- hence a STABLE sort. ``_prefer`` is non-transitive, so two roots colliding on
     one dominance key resolve differently if they arrive in the other order.
+
+    Parameters
+    ------------
+    - variants (PreparedVariants): the root variants; their ``start_step`` drives the bucketing.
+    - topology (PreparedTopology): supplies ``min_step`` / ``max_step`` for the bucket span.
+    - rows_unused (optional): unused; kept for call-signature compatibility (defaults to ``None``).
+
+    Return
+    --------
+    - output (tuple[np.ndarray, np.ndarray]): the stable-sorted root order (``int32``) and the
+      CSR ``bucket_start`` offsets per start-step bucket.
     """
 
     # `prepare_variants` already resolved this, applying the reference's start guards in the
@@ -1977,6 +2689,18 @@ def _next_label_capacity(capacity, step_reached, min_step, max_step):
     attempt extrapolates from a later step and lands closer.  The 8x ceiling is what stops
     a pathological early fill from asking for gigabytes: at 40 bytes a label -- the figure
     `MAX_LABEL_CAPACITY` is sized against -- 8x of a 13.3M pool is already 4.3 GB.
+
+    Parameters
+    ------------
+    - capacity (int): the label-pool size that filled.
+    - step_reached (int): the clock step the filled search reached.
+    - min_step (int): the search's first step.
+    - max_step (int): the search's last step.
+
+    Return
+    --------
+    - output (int): the next attempt's label-pool size -- at least double, extrapolated from
+      progress with a 1.25 margin, and capped at ``8 * capacity``.
     """
 
     span = max_step - min_step + 1
@@ -2234,6 +2958,19 @@ def price_dag(
         return arena
 
     def _publish(incumbent):
+        """Push an incumbent (or its absence) into the ``cutoff`` / ``inc_state`` arrays.
+
+        Parameters
+        ------------
+        - incumbent (tuple[float, Column] | None): the ``(reduced_cost, Column)`` incumbent, or
+          ``None`` to mark that no incumbent exists.
+
+        Return
+        --------
+        - output (None): writes ``cutoff`` and ``inc_state`` in place; ``inc_state[0]`` flags
+          whether an incumbent is present.
+        """
+
         if incumbent is None:
             inc_state[0] = 0
             cutoff[0] = 0.0

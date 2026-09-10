@@ -88,11 +88,29 @@ def _rebuild(corners, origin, dest, t_depart, g_delay, cfg, ledger, straight_hor
              origin_term=None, dest_term=None, corridor_t0=None, tcap=None):
     """Resample corners, then apply detour, ledger, and terminal-capacity gates.
 
-    Returns (volumes, centerline, cum_horiz, cum_dz) or None if it busts the detour budget or
-    overlaps a committed reservation or over-subscribes a terminal. This is the feasibility oracle
-    all shortcut strategies consult.
-    ``origin_term``/``dest_term`` preserve the inner A*'s terminal tags through the rebuild;
-    ``corridor_t0`` anchors the corridor at the inner planner's VERIFIED first-cruise stamp.
+    This is the feasibility oracle all shortcut strategies consult. ``origin_term``/``dest_term``
+    preserve the inner A*'s terminal tags through the rebuild; ``corridor_t0`` anchors the corridor
+    at the inner planner's VERIFIED first-cruise stamp.
+
+    Parameters
+    ------------
+    - corners (list[Vec]): the corner polyline to rebuild.
+    - origin (Vec): origin hub centre.
+    - dest (Vec): destination hub centre.
+    - t_depart (float): filed departure time (s).
+    - g_delay (float): ground delay held before departure (s).
+    - cfg (SimConfig): geometry, speeds, and timing.
+    - ledger (ReservationLedger): committed reservations the rebuild is checked against.
+    - straight_horiz (float): lane → lane reference distance (m) for the detour-budget gate.
+    - origin_term: origin terminal (``Terminal`` or tuple), or None.
+    - dest_term: destination terminal, or None.
+    - corridor_t0 (float | None): verified corridor start stamp anchoring the rebuild.
+    - tcap (TerminalCapacity | None): pad-capacity authority for the rebuilt windows, or None.
+
+    Return
+    --------
+    - output (tuple | None): ``(volumes, centerline, cum_horiz, cum_dz)``, or None if it busts the
+      detour budget, overlaps a committed reservation, or over-subscribes a terminal.
     """
     volumes, centerline, cum_horiz, cum_dz = build_reservation_from_corners(
         corners, origin, dest, t_depart, g_delay, cfg, origin_term=origin_term, dest_term=dest_term,
@@ -173,6 +191,17 @@ def _same_heading_3d(prev, knot, nxt) -> bool:
 
     The relative cross-product tolerance is scale-independent. Reversals fail the positive-dot gate,
     while a degenerate leg is conservatively classified as a heading change.
+
+    Parameters
+    ------------
+    - prev (Vec): the corner before the knot.
+    - knot (Vec): the knot whose two incident legs are compared.
+    - nxt (Vec): the corner after the knot.
+
+    Return
+    --------
+    - output (bool): True iff the incoming and outgoing legs point along the same ray (a degenerate
+      leg returns False).
     """
     incoming = np.asarray(knot, float) - np.asarray(prev, float)
     outgoing = np.asarray(nxt, float) - np.asarray(knot, float)
@@ -186,7 +215,18 @@ def _same_heading_3d(prev, knot, nxt) -> bool:
 
 
 def _segment_count(a, b, segment_len_m: float) -> int:
-    """Subdivision count used by ``build_reservation_from_corners`` for one chord."""
+    """Subdivision count used by ``build_reservation_from_corners`` for one chord.
+
+    Parameters
+    ------------
+    - a (Vec): chord start point ``(x, y, z)``.
+    - b (Vec): chord end point ``(x, y, z)``.
+    - segment_len_m (float): target subsegment length (m).
+
+    Return
+    --------
+    - output (int): number of subsegments the chord is split into (at least 1).
+    """
     dx = float(b[0]) - float(a[0])
     dy = float(b[1]) - float(a[1])
     dz = float(b[2]) - float(a[2])
@@ -200,6 +240,17 @@ def _segment_partition(a, b, segment_len_m: float):
     timing, terminal tagging, volume construction, and metrics. This deliberately mirrors the
     builder's arithmetic instead of treating mathematical collinearity as byte equality. Streaming
     avoids materializing a long run's complete partition during every progressive merge.
+
+    Parameters
+    ------------
+    - a (Vec): chord start point ``(x, y, z)``.
+    - b (Vec): chord end point ``(x, y, z)``.
+    - segment_len_m (float): target subsegment length (m).
+
+    Return
+    --------
+    - output (Iterator[tuple]): one ``(ax, ay, az, bx, by, bz)`` per subsegment, matching the
+      reservation builder's arithmetic exactly.
     """
     ax, ay, az = float(a[0]), float(a[1]), float(a[2])
     bx, by, bz = float(b[0]), float(b[1]), float(b[2])
@@ -219,6 +270,18 @@ def _merge_preserves_resampling(prev, knot, nxt, segment_len_m: float) -> bool:
 
     Heading equality by itself is insufficient because every logical chord is independently
     resampled. Merging arbitrary collinear chords can move box boundaries and their timestamps.
+
+    Parameters
+    ------------
+    - prev (Vec): the corner before the knot.
+    - knot (Vec): the same-heading knot considered for removal.
+    - nxt (Vec): the corner after the knot.
+    - segment_len_m (float): subsegment length (m) driving the resampling.
+
+    Return
+    --------
+    - output (bool): True iff dropping ``knot`` yields byte-identical subsegment signatures (same
+      heading, count, and packed corners).
     """
     if not _same_heading_3d(prev, knot, nxt):
         return False
@@ -271,7 +334,19 @@ def _knot_index(knots: tuple[_Knot, ...], knot_id: int) -> int | None:
 
 def _splice_between(state: _ShortcutState, left_id: int,
                     right_id: int) -> tuple[_Knot, ...] | None:
-    """Remove all knots strictly between surviving endpoints; endpoints themselves are immutable."""
+    """Remove all knots strictly between surviving endpoints; endpoints themselves are immutable.
+
+    Parameters
+    ------------
+    - state (_ShortcutState): the current knot state to splice.
+    - left_id (int): stable id of the left surviving endpoint.
+    - right_id (int): stable id of the right surviving endpoint.
+
+    Return
+    --------
+    - output (tuple[_Knot, ...] | None): the knot tuple with the interior removed, or None if an
+      endpoint is missing or nothing lies strictly between them.
+    """
     left = _knot_index(state.knots, left_id)
     right = _knot_index(state.knots, right_id)
     if left is None or right is None or right <= left + 1:
@@ -281,7 +356,20 @@ def _splice_between(state: _ShortcutState, left_id: int,
 
 def _try_splice(state: _ShortcutState, left_id: int, right_id: int,
                 context: _ShortcutContext) -> _ShortcutState | None:
-    """Build and fully check one chord; a rejection never mutates ``state``."""
+    """Build and fully check one chord; a rejection never mutates ``state``.
+
+    Parameters
+    ------------
+    - state (_ShortcutState): the current knot state to splice from.
+    - left_id (int): stable id of the left surviving endpoint.
+    - right_id (int): stable id of the right surviving endpoint.
+    - context (_ShortcutContext): shared rebuild arguments and the feasibility probe.
+
+    Return
+    --------
+    - output (_ShortcutState | None): the accepted spliced state (with its rebuilt reservation), or
+      None if the splice is empty or the rebuild fails.
+    """
     candidate = _splice_between(state, left_id, right_id)
     if candidate is None:
         return None
@@ -308,6 +396,17 @@ def _grow_one_turn(state: _ShortcutState, turn_id: int,
 
     The run endpoints and fallback order come from the immutable pre-splice snapshot; stable IDs
     resolve them against the progressively shortened current state.
+
+    Parameters
+    ------------
+    - state (_ShortcutState): the current knot state.
+    - turn_id (int): stable id of the turn knot the run is grown around.
+    - context (_ShortcutContext): shared rebuild arguments and the feasibility probe.
+
+    Return
+    --------
+    - output (_ShortcutState): the best state reached (the input ``state`` when no splice is
+      accepted).
     """
     snapshot = state
     turn_index = _knot_index(snapshot.knots, turn_id)
@@ -377,6 +476,17 @@ def _shortcut_turn_seeded(corners, had_holds: bool,
     The accepted inner intent is already verified. A no-turn route therefore performs zero rebuilds.
     When repeated positions were collapsed, the hold-free baseline is rebuilt first to preserve the
     legacy rule that a load-bearing hold may not be silently discarded.
+
+    Parameters
+    ------------
+    - corners (list[Vec]): the corner polyline to simplify (repeated positions already collapsed).
+    - had_holds (bool): True when holds were collapsed, forcing a hold-free baseline rebuild first.
+    - context (_ShortcutContext): shared rebuild arguments and the feasibility probe.
+
+    Return
+    --------
+    - output (_ShortcutState | None): the simplified knot state, or None when a required hold-free
+      baseline cannot be rebuilt.
     """
     state = _ShortcutState(tuple(
         _Knot(i, np.asarray(point, float)) for i, point in enumerate(corners)

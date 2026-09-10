@@ -71,6 +71,23 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
     `evict_floor = 0.0` is set HERE because this constructor is the owner: `LNSState`'s vet block
     only runs for a BORROWED planner, so a constructed one is never checked. Callers must validate
     `name` BEFORE the ledger is taken over (`solver._validate_lns_config`) — see `LNSState.__init__`.
+
+    Parameters
+    ------------
+    - name (str): repair planner name; one of ``astar``/``astar_ref``/``sipp``/``sipp_ref`` (the
+      ``*_ref`` variants build the pure-Python planner), else ``ValueError``.
+    - incremental_release (bool): planner incremental-release mode (keyword-only).
+    - kernel_log2_min (int | None): starting g-hash/heap size exponent (keyword-only); ``None``
+      uses the planner default.
+    - record_envelope (bool): when True, the planner records its per-plan read envelope
+      (keyword-only).
+    - window_bytes (int | None): dense-window byte budget (keyword-only); ``None`` keeps each
+      planner's own default.
+
+    Return
+    --------
+    - output (AStarPlanner | SIPPPlanner): the constructed planner with ``evict_floor = 0.0`` and
+      ``record_envelope`` set.
     """
     # `window_bytes` is the dense-window byte budget; omitted rather than passed as None so each
     # planner keeps its own default.
@@ -101,6 +118,17 @@ def _same_committed_schedule(
     Commits retain the immutable ``Volume4D`` objects from each intent. Comparing those references is
     exact without hashing geometry, and the ledger's per-flight runs let this use O(flights) memory.
     Flight commit order may change after a repair; volume order within each flight may not.
+
+    Parameters
+    ------------
+    - ledger (ReservationLedger): the ledger whose committed volumes are compared, via
+      ``iter_committed``.
+    - intents (list[OperationalIntent]): the schedule to match; only ``accepted`` intents count.
+
+    Return
+    --------
+    - output (bool): True iff the ledger's committed volumes are exactly the objects owned by the
+      accepted intents, per flight and in order.
     """
     expected: dict[int, list] = {}
     for intent in intents:
@@ -466,7 +494,23 @@ class LNSState:
             self._refresh_contention(cell)
 
     def _index_add(self, fid: int, volumes, refresh: bool = True) -> None:
-        """Index fid's blocked-cell claims (own-hub column interiors are skipped)."""
+        """Index ``fid``'s blocked-cell claims (own-hub column interiors are skipped).
+
+        A flight's own terminal-column interior is exempt from deconfliction, so those cells are
+        not indexed (else same-hub flights would look mutually contended at their shared hub).
+
+        Parameters
+        ------------
+        - fid (int): flight whose claims are added to the index.
+        - volumes (Sequence): the flight's committed volumes to rasterize into blocked cells.
+        - refresh (bool): when True, recompute contention for each newly claimed cell; pass False
+          to batch a single contention sweep afterwards.
+
+        Return
+        --------
+        - output (None): mutates ``self._cells_of``, ``self._claims`` and (when ``refresh``) the
+          contention set.
+        """
         rows = self._cells_of.get(fid)
         if rows is None:
             rows = self._cells_of[fid] = set()
@@ -606,8 +650,23 @@ class LNSState:
         return self._contended_list
 
     def _extract_visits(self, it: OperationalIntent) -> list[tuple[int, Cell]]:
-        """Per-step (step, cell) samples of the centerline at a flight level — the airborne
-        lateral path the random walk explores. Climb/descend samples (between levels) are skipped."""
+        """Per-step ``(step, cell)`` samples of the centerline at a flight level — the airborne
+        lateral path the random walk explores.
+
+        Interpolates the centerline at each integer step and maps it to a hex cell, keeping only
+        steps whose altitude is within 0.5 m of a flight level (climb/descend samples between
+        levels are skipped).
+
+        Parameters
+        ------------
+        - it (OperationalIntent): the flight whose centerline is sampled; an empty centerline
+          yields ``[]``.
+
+        Return
+        --------
+        - output (list[tuple[int, Cell]]): ordered ``(step, (q, r, level))`` samples, one per
+          cruise-level timestep.
+        """
         cl = it.centerline
         if not cl:
             return []
@@ -757,6 +816,19 @@ class LNSState:
         earlier one fails. If acceptance had begun, rebuild the full claim index from the restored
         incumbent; that exceptional O(all claims) path also heals partial index mutations while the
         ordinary rejection path remains one release plus k commits.
+
+        Parameters
+        ------------
+        - victims (Sequence[int]): flight ids to release and re-commit from ``old``.
+        - old (dict[int, OperationalIntent]): the pre-repair intents to restore each victim to.
+        - cost_at_entry (float): the running total cost to restore when acceptance had begun.
+        - applied (Sequence[int]): fids already moved onto the new schedule in memory; when
+          non-empty, the incumbent, ``total_cost`` and the full claim index are restored.
+
+        Return
+        --------
+        - output (None): mutates the ledger, ``self.total_cost``, ``self.incumbent`` and the claim
+          index; raises ``RuntimeError`` if any victim cannot be re-committed.
         """
         t0 = time.perf_counter()
         self.ledger.release_many(victims)

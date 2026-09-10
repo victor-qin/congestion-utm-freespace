@@ -194,6 +194,18 @@ class MILPOptPlanner:
         might. Tagged windows the pad cannot admit is real hub saturation. Since ``OperationalIntent``
         defaults a REJECTED status to ``BUDGET_EXCEEDED``, leaving the reason implicit would book the
         artifact into ``congestion_denial_rate`` — the split this enum exists to preserve.
+
+        Parameters
+        ------------
+        - warm (OperationalIntent): the warm fallback plan whose tagged dwells/windows are checked.
+        - o_term (Terminal | None): origin terminal required to be tagged, or None.
+        - d_term (Terminal | None): destination terminal required to be tagged, or None.
+        - tcap (TerminalCapacity): pad-capacity authority admitting the tagged dwell windows.
+
+        Return
+        --------
+        - output (DenialReason | None): ``SEARCH_EXHAUSTED`` if a required hub column is untagged,
+          ``BUDGET_EXCEEDED`` if a tagged dwell exceeds capacity, None if the contract is satisfied.
         """
         required = Counter(term.id for term in (o_term, d_term) if term is not None)
         if not required:
@@ -216,7 +228,18 @@ class MILPOptPlanner:
 
         Per-planner-instance by design (the established A* pattern): in ``astar_milp`` both the MILP
         and its warm A* keep an index on the shared ledger — duplicated commit work, consistent by
-        construction; a shared per-ledger authority is a possible future dedup."""
+        construction; a shared per-ledger authority is a possible future dedup.
+
+        Parameters
+        ------------
+        - ledger (ReservationLedger): the ledger the authority observes and queries.
+        - cfg (SimConfig): supplies column radius and timing for a (re)bound authority.
+        - t_request (float): request clock (s); dwells ending at or before it are evicted.
+
+        Return
+        --------
+        - output (TerminalCapacity): the authority bound to ``ledger``, made current for the plan.
+        """
         # A subscription generation change means our commit hook was detached (another solver took the
         # ledger over — ReservationLedger.detach_subscribers) and commits happened we never saw, so we
         # must REBIND, not merely rebuild. The count tripwire below cannot see it: LNS restores every
@@ -268,6 +291,23 @@ class MILPOptPlanner:
         Objective = c_lat·ΣL + c_alt·(ΣV + entry climb + exit descent) + c_gd·d. The solved corners
         are rebuilt into real committed boxes and re-checked (`_verify_with_delay`) — correctness
         never relies on the LP being exact.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): committed airspace the rebuilt path is re-checked against.
+        - cfg (SimConfig): geometry, costs, and timing.
+        - fixed_delay (float | None): pins the delay (pure spatial refiner); None solves for it.
+        - ref_path (Sequence | None): warm centerline whose which-side/temporal choices pin the
+          binaries (LP within one homotopy); None runs the full search.
+        - o_term (Terminal | None): origin terminal, tagged and pad-capacity gated.
+        - d_term (Terminal | None): destination terminal, tagged and pad-capacity gated.
+        - tcap (TerminalCapacity | None): pad-capacity authority for the rebuild check.
+
+        Return
+        --------
+        - output (OperationalIntent | None): an ACCEPTED intent for the solved+rebuilt path, or None
+          when the model is infeasible, has no incumbent, or the rebuild cannot be made feasible.
         """
         origin = np.asarray(req.origin, float)
         dest = np.asarray(req.dest, float)
@@ -472,8 +512,24 @@ class MILPOptPlanner:
         ``straight_ref`` is the en-route (lane → lane) reference, NOT the centre-to-centre
         ``straight_horiz`` used for the knot floor in ``_solve``.
 
-        Returns (volumes, centerline, cum_horiz, cum_dz, delay) or None if the spatial path can't be
-        made feasible by waiting within budget (then the caller falls back to the warm intent).
+        Parameters
+        ------------
+        - corners (list[np.ndarray]): the solved MILP corner points to fold and rebuild.
+        - origin (Vec): origin hub centre.
+        - dest (Vec): destination hub centre.
+        - t_depart (float): filed departure time (s).
+        - d_start (float): the MILP's delay (s); the ground delay is stepped up from here.
+        - straight_ref (float): en-route lane → lane reference distance (m) for the detour gate.
+        - cfg (SimConfig): geometry, speeds, and timing.
+        - ledger (ReservationLedger): committed airspace the rebuild is checked against.
+        - o_term (Terminal | None): origin terminal for folding and capacity.
+        - d_term (Terminal | None): destination terminal for folding and capacity.
+        - tcap (TerminalCapacity | None): pad-capacity authority for the rebuilt windows.
+
+        Return
+        --------
+        - output (tuple | None): ``(volumes, centerline, cum_horiz, cum_dz, delay)`` at the first
+          feasible delay, or None if none within budget makes the path conflict-free and admitted.
         """
         corners = fold_corners_to_columns(corners, origin, dest, o_term, d_term, cfg)
         d = max(0.0, d_start)
@@ -504,6 +560,25 @@ class MILPOptPlanner:
         still pad-capacity-admitted — a shorter path lands EARLIER, shifting the dest dwell window,
         so capacity must be re-checked through :meth:`TerminalCapacity.reservation_admitted`.
         Removals only shorten the path (triangle inequality), so the detour budget never re-trips.
+
+        Parameters
+        ------------
+        - corners (list[np.ndarray]): the folded corner points to splice knots out of.
+        - origin (Vec): origin hub centre.
+        - dest (Vec): destination hub centre.
+        - t_depart (float): filed departure time (s).
+        - d (float): the verified ground delay (s) held fixed across the splice.
+        - cfg (SimConfig): geometry, speeds, and timing.
+        - ledger (ReservationLedger): committed airspace each candidate rebuild is checked against.
+        - best (tuple): the current ``(volumes, centerline, cum_horiz, cum_dz)`` to improve on.
+        - o_term (Terminal | None): origin terminal for the rebuild and capacity.
+        - d_term (Terminal | None): destination terminal for the rebuild and capacity.
+        - tcap (TerminalCapacity | None): pad-capacity authority for the retimed rebuild.
+
+        Return
+        --------
+        - output (tuple): the ``(volumes, centerline, cum_horiz, cum_dz)`` after removing every knot
+          whose removal stays conflict-free and admitted (``best`` unchanged if none is removable).
         """
         corners = [np.asarray(c, float) for c in corners]
         changed = True
@@ -528,6 +603,16 @@ class MILPOptPlanner:
         Maps the warm path onto the MILP's n knots so each knot can read off the warm path's side and
         timing. Alignment is by arc-length *fraction*, so a long warm path and a short MILP path still
         correspond knot-for-knot (which is why far-apart knots agree but transition knots may not).
+
+        Parameters
+        ------------
+        - centerline (Sequence): the warm path as ``(position, time)`` samples.
+        - n (int): number of evenly arc-spaced output knots.
+
+        Return
+        --------
+        - output (tuple[list, list]): ``(positions, times)`` — ``n`` points and their interpolated
+          times, spaced by arc-length fraction along ``centerline``.
         """
         pts = [np.asarray(p, float) for p, _ in centerline]
         ts = [float(t) for _, t in centerline]
@@ -553,6 +638,17 @@ class MILPOptPlanner:
         binary when the margin is large (a clear side), leaving near-boundary knots free so the locked
         problem stays feasible. Box faces are ±x/±y/±z in the box frame; cylinder faces are the
         polygon edges + the two z-caps.
+
+        Parameters
+        ------------
+        - obs (dict): the obstacle dict (box faces or cylinder polygon + z-caps).
+        - ref_pt (Vec): the warm-path point whose clearest outside face is found.
+        - m (float): keep-out margin (m) added to each face.
+
+        Return
+        --------
+        - output (tuple[int, float]): ``(face index, signed margin)`` of the face the point is most
+          clearly outside (margin > 0 means that many metres beyond it).
         """
         p = np.asarray(ref_pt, float)
         if obs["kind"] == "box":
@@ -583,7 +679,22 @@ class MILPOptPlanner:
         OR the whole segment passes before/after the window (the two `temporal` binaries). When
         ``ref_ends`` is given, the binaries are pinned to the warm path's choice (which side /
         before-after) so CBC doesn't re-enumerate — the MILP becomes an LP that tightens *within*
-        that homotopy. Returns the number of binaries in the disjunction.
+        that homotopy.
+
+        Parameters
+        ------------
+        - prob (pulp.LpProblem): the model the keep-out constraints are added to.
+        - tag (str): unique name tag for this segment's binaries.
+        - ends (tuple): the segment's two endpoints as ``(x, y, z)`` variable triples.
+        - obs (dict): the obstacle dict (box or cylinder).
+        - m_space (float): spatial big-M bounding the face expressions.
+        - temporal (list): the segment's temporal binaries OR'd into the disjunction (may be empty).
+        - ref_ends (tuple | None): warm-path endpoints used to pin the spatial binaries, or None.
+        - temporal_locked (bool): True when a temporal face already carries the warm choice.
+
+        Return
+        --------
+        - output (int): the number of binaries in the enforced ``>= 1 face`` disjunction.
         """
         m = self.keepout_margin_m
         faces = list(temporal)
@@ -642,6 +753,21 @@ class MILPOptPlanner:
         gated separately by ``TerminalCapacity``. Sibling corridor BOXES stay obstacles (box↔box is
         never exempt). Foreign hubs' static walls are harvested FIRST — they are few and permanent,
         and must not be crowded out of the ``max_obstacles`` cap by transient traffic.
+
+        Parameters
+        ------------
+        - ledger (ReservationLedger): source of committed volumes and always-active walls.
+        - start (np.ndarray): route start point ``(x, y, z)``.
+        - goal (np.ndarray): route goal point ``(x, y, z)``.
+        - t_lo (float): reachable-horizon start (s); windows are clamped to it.
+        - t_hi (float): reachable-horizon end (s); windows are clamped to it.
+        - cfg (SimConfig): supplies corridor width and detour allowance.
+        - exempt_tids (frozenset): own-hub terminal ids whose cylinders are skipped.
+
+        Return
+        --------
+        - output (list[dict]): obstacle dicts — box ``{R, c, half}`` or cylinder ``{cx, cy, cz,
+          radius, hz}``, each with ``t0``/``t1``; capped at ``max_obstacles``, walls first.
         """
         reach = self.detour_allow * float(np.linalg.norm(goal[:2] - start[:2])) + cfg.corridor_width_m
         lo = np.minimum(start, goal) - reach

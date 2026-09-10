@@ -1028,6 +1028,17 @@ def _ellipse_cells(origin: Cell, dest: Cell, overrun: int) -> set[Cell]:
     ``overrun`` is ``params.max_air_overrun_hops``: the hop budget IS the corridor radius,
     because a route within ``shortest + overrun`` hops cannot touch a cell outside the
     ellipse of that radius (see context/figures/od_hop_ellipse.png).  See :class:`ColGenParams`.
+
+    Parameters
+    ------------
+    - origin (Cell): the O-D ellipse's origin axial cell.
+    - dest (Cell): the O-D ellipse's destination axial cell.
+    - overrun (int): extra hops allowed beyond the shortest O-D hop distance; sets the radius.
+
+    Return
+    --------
+    - output (set[Cell]): every axial cell ``c`` with ``d(origin, c) + d(c, dest) <= shortest +
+      overrun``.
     """
     shortest = hg.hex_distance(origin, dest)
     radius = shortest + overrun
@@ -1077,7 +1088,22 @@ def _segment_terminal_id(
     dest_terminal: Terminal | None,
     cfg: SimConfig,
 ) -> Hashable | None:
-    """Apply the reservation builder's geometry-dependent terminal tag priority."""
+    """Apply the reservation builder's geometry-dependent terminal tag priority.
+
+    Parameters
+    ------------
+    - p0 (tuple[float, float, float]): segment start point (ENU x, y, altitude z).
+    - p1 (tuple[float, float, float]): segment end point (ENU x, y, altitude z).
+    - req (FlightRequest): supplies the origin/dest column centres tested for overlap.
+    - origin_terminal (Terminal | None): origin terminal whose column takes tag priority.
+    - dest_terminal (Terminal | None): destination terminal, checked after the origin.
+    - cfg (SimConfig): supplies terminal radii and geometry.
+
+    Return
+    --------
+    - output (Hashable | None): the origin terminal id if the segment overlaps its column, else
+      the dest terminal id if it overlaps that column, else ``None``.
+    """
 
     if origin_terminal is not None and segment_overlaps_column(
         p0,
@@ -1115,6 +1141,22 @@ def _forbidden_static_hops(
     fixed exit-lane tags depend on a hop's position within the whole path.  A
     hop is globally forbidden only when every tag assignment possible for that
     arc conflicts; ambiguous endpoint arcs are left to the exact column guard.
+
+    Parameters
+    ------------
+    - cells (frozenset[Cell]): the corridor cells whose outgoing lattice hops are tested.
+    - walls (tuple[Volume4D, ...]): permanent wall volumes; an empty tuple forbids nothing.
+    - req (FlightRequest): the flight, forwarded for terminal-tag geometry.
+    - origin_terminal (Terminal | None): origin terminal, or ``None`` for a customer origin.
+    - dest_terminal (Terminal | None): destination terminal, or ``None`` for a customer dest.
+    - origin_lanes (tuple[hg.Lane, ...]): origin exit lanes, whose cells may take a first-arc tag.
+    - dest_lanes (tuple[hg.Lane, ...]): destination exit lanes, whose cells may take a last-arc tag.
+    - cfg (SimConfig): supplies lattice geometry, flight level, and segment length.
+
+    Return
+    --------
+    - output (frozenset[tuple[Cell, Cell]]): directed ``(source, target)`` hops for which every
+      possible builder tag assignment conflicts with a wall; empty when there are no walls.
     """
 
     if not walls:
@@ -1227,7 +1269,26 @@ def _static_hop_allowed_roles(
     dest_lane_cells: frozenset[Cell],
     cfg: SimConfig,
 ) -> int:
-    """Return a bit mask of wall-safe internal/endpoint roles for one hop."""
+    """Return a bit mask of wall-safe internal/endpoint roles for one hop.
+
+    Parameters
+    ------------
+    - source (Cell): the hop's source axial cell.
+    - target (Cell): the hop's target axial cell.
+    - walls_with_bounds (tuple[WallBound, ...] | _WallSpatialIndex): the permanent walls, either
+      as ``(volume, aabb)`` pairs or a spatial index that narrows candidates per sub-box.
+    - req (FlightRequest): the flight, forwarded for terminal-tag geometry.
+    - origin_terminal (Terminal | None): origin terminal, or ``None`` for a customer origin.
+    - dest_terminal (Terminal | None): destination terminal, or ``None`` for a customer dest.
+    - origin_lane_cells (frozenset[Cell]): cells eligible for the origin's first-arc tag.
+    - dest_lane_cells (frozenset[Cell]): cells eligible for the destination's last-arc tag.
+    - cfg (SimConfig): supplies lattice geometry, flight level, and segment length.
+
+    Return
+    --------
+    - output (int): the OR of the ``_ARC_*`` role bits whose builder tag assignment clears every
+      wall; ``_ALL_ARC_ROLES`` when there are no walls.
+    """
 
     if isinstance(walls_with_bounds, _WallSpatialIndex):
         all_wall_bounds = walls_with_bounds.all_bounds
@@ -1753,7 +1814,19 @@ def build_flight_graph(
 
 
 def _selected_lane(lanes: tuple[hg.Lane, ...], index: int | None, endpoint: str) -> hg.Lane:
-    """Return ``lanes[index]``, raising ``ValueError`` if ``index`` is missing or out of range."""
+    """Return ``lanes[index]``, raising ``ValueError`` if ``index`` is missing or out of range.
+
+    Parameters
+    ------------
+    - lanes (tuple[hg.Lane, ...]): the terminal's exit lanes to index into.
+    - index (int | None): the chosen lane index; ``None`` or a negative/out-of-range value raises.
+    - endpoint (str): endpoint label ("origin"/"dest") used in error messages.
+
+    Return
+    --------
+    - output (hg.Lane): ``lanes[index]``. Raises ``ValueError`` when ``index`` is ``None``,
+      negative, or beyond the lane tuple.
+    """
     if index is None:
         raise ValueError(f"{endpoint}_lane_idx is required for a terminal endpoint")
     try:

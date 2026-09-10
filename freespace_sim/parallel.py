@@ -108,7 +108,21 @@ class PlanEnvelope:
 
 def _disc_hits_aabb(cx: float, cy: float, radius: float, a) -> bool:
     """Does the xy disc intersect the volume AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``?
-    Clamp the centre into the box; compare the residual to the radius (scalar hot path)."""
+
+    Clamp the centre into the box; compare the residual to the radius (scalar hot path). Only the
+    xy extent is tested; the z bounds are ignored.
+
+    Parameters
+    ------------
+    - cx (float): disc centre x in metres.
+    - cy (float): disc centre y in metres.
+    - radius (float): disc radius in metres.
+    - a (tuple[float, ...]): flat AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
+
+    Return
+    --------
+    - output (bool): True iff the disc overlaps the box's xy extent.
+    """
     dx = (a[0] - cx) if cx < a[0] else (cx - a[3]) if cx > a[3] else 0.0
     dy = (a[1] - cy) if cy < a[1] else (cy - a[4]) if cy > a[4] else 0.0
     return dx * dx + dy * dy <= radius * radius

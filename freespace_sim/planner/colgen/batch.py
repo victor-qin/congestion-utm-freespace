@@ -89,6 +89,22 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     that is tolerated quietly is individual flights the column model cannot express (an
     air hold, a route outside the O-D ellipse); those are counted and logged, and
     `RestrictedMaster.complete_selection` re-picks them around the ones that placed.
+
+    Parameters
+    ------------
+    - requests (list[FlightRequest]): the flights to seed; re-planned by the warm-start
+      planner and, for those it accepts, rebuilt into columns.
+    - cfg (SimConfig): sim config, forwarded to the warm-start ``sim.run`` and graph build.
+    - static_terms (Iterable): the static terminal catalog (permanent walls), handed to both
+      ``sim.run`` and the graph build so the seed pass sees the same walls as the solve.
+    - params (ColGenParams): solver controls; reads ``warm_start_planner`` and is forwarded
+      to ``build_flight_graph``.
+
+    Return
+    --------
+    - output (dict[int, list[Column]] | None): seed columns per placed flight, or ``None``
+      when no warm-start planner is configured. Raises ``RuntimeError`` when the planner
+      accepts no flights or yields no usable columns (seeding would be a silent no-op).
     """
 
     planner = params.warm_start_planner

@@ -57,7 +57,20 @@ def _gslot(g_pack, gen, key, cap, log2cap):
     first empty (stale-generation) slot; -1 if the table is full.
 
     This is the per-``(cell, step)`` dedup the pure-Python reference gets free from its ``g`` dict.
-    Key and stamp share one 32 B record, so a probe step touches one cache line (see ``_packed``)."""
+    Key and stamp share one 32 B record, so a probe step touches one cache line (see ``_packed``).
+
+    Parameters
+    ------------
+    - g_pack (np.ndarray): int64 packed best-g table; column 0 is the key, column 1 the gen stamp.
+    - gen (int): current search generation; a slot whose stamp != gen is treated as empty.
+    - key (int): the packed ``(cell, step)`` key to locate.
+    - cap (int): number of slots (a power of two; ``cap - 1`` is the probe mask).
+    - log2cap (int): log2 of ``cap``; selects the high hash bits for the initial slot.
+
+    Return
+    --------
+    - output (int): slot holding ``key``, else the first empty slot for it; ``-1`` if full.
+    """
     h = np.uint64(key) * _MAGIC
     i = np.int64(h >> np.uint64(64 - log2cap))      # high log2cap bits → well-mixed slot
     mask = cap - 1
@@ -83,13 +96,25 @@ def _note_cell(read_bbox, q, r, L):
     getting it wrong under-reports the read set, which is the one error mode the envelope exists to
     prevent. A*'s ``_blocked`` answers ONE ``(cell, step)`` question, so recording that point is exact.
     SIPP instead walks a cell's whole free-interval CHAIN, whose shape is derived from every commit that
-    ever touched that cell: a commit at some *other* step in the same cell splits an interval and changes
+    ever touched that cell: a commit at another step in that cell splits an interval and changes
     what the walk finds. So touching a chain reads the cell across the plan's entire step window, and the
     honest record is the cell. (Slots 6-7, the step range, are filled ONCE by the host from
     ``[base, max_step]`` for the same reason.)
 
     Callers pass WORLD ``(q, r)``, not box indices — ``envelope_intersects`` converts slots 0-3 through
-    ``cell_bbox_to_aabb``, which assumes world axial coordinates."""
+    ``cell_bbox_to_aabb``, which assumes world axial coordinates.
+
+    Parameters
+    ------------
+    - read_bbox (np.ndarray): in/out int64[8] read-set summary; slots 0-5 hold min/max of q, r, L.
+    - q (int): WORLD axial q of the cell to record (not a window index).
+    - r (int): WORLD axial r of the cell to record.
+    - L (int): flight level of the cell.
+
+    Return
+    --------
+    - output (None): widens ``read_bbox`` slots 0-5 in place; never affects a search decision.
+    """
     if q < read_bbox[0]:
         read_bbox[0] = q
     if q > read_bbox[1]:
@@ -122,10 +147,92 @@ def _search(
     """Run the compiled safe-interval A* over the per-plan interval pool; see the module docstring
     for the algorithm, occupancy layout, and the kernel==reference parity contract.
 
-    Returns ``(n, cost, n_exp, status)``: on ``OK``, ``n`` path points are written to ``out_*``
-    (goal→start order) and ``cost`` is the total weighted cost; on a fallback
-    (``FB_OOB``/``FB_CAP``/``FB_HASH``) or ``NO_PATH``, ``n`` is -1 and the host branches on
-    ``status``.
+    Parameters are grouped by the signature's section labels. All arrays are flat buffers the host
+    (``_splan_compiled``) supplies.
+
+    Parameters
+    ------------
+    Window interval pool (a cell's free intervals are the chain from slot ``cell`` via ``iv_nxt``):
+    - iv_lo (np.ndarray): int32 free-interval low step per slot (inclusive).
+    - iv_hi (np.ndarray): int32 free-interval high step per slot (inclusive).
+    - iv_nxt (np.ndarray): int32 next slot in the cell's chain; ``-1`` ends it.
+    Window box + step window + level axis:
+    - qmin (int): window minimum world q; world q is ``iq + qmin``.
+    - rmin (int): window minimum world r.
+    - rspan (int): window row span; a level-less index is ``iq*rspan + ir``.
+    - qspan (int): window q-extent; bounds the out-of-box guard.
+    - base (int): first step of the search domain.
+    - max_step (int): last step of the search domain.
+    - nlevels (int): number of flight levels; cell id is ``(iq*rspan+ir)*nlevels + L``.
+    Takeoff lanes + egress steps + ground-delay mask:
+    - lane_qr (np.ndarray): int64 level-less window index of each takeoff-lane cell.
+    - lane_lat (np.ndarray): float64 lane lateral cost added to each start label.
+    - lane_st (np.ndarray): int64 egress translation steps per lane (climb, then translate out).
+    - n_lanes (int): number of takeoff lanes.
+    - to_ok (np.ndarray): bool takeoff feasibility per (ground-step, level), row ``si*nlevels + L``.
+    - n_to (int): number of ground-delay steps (rows of ``to_ok``).
+    - c_gd (float): per-second ground-delay cost.
+    Per-level takeoff + per-rung vertical edges:
+    - takeoff_steps (np.ndarray): int64 climb steps to each level.
+    - takeoff_cost (np.ndarray): float64 altitude cost to climb to each level (also descent term).
+    - rung_steps (np.ndarray): int64 climb/descend steps per rung, indexed by ``min(L, L±1)``.
+    - rung_cost (np.ndarray): float64 altitude cost per rung.
+    Goal flags/cost + landing intervals:
+    - goal_gen (np.ndarray): int64 per-cell goal flag; ``== gen`` marks a goal cell.
+    - goal_cost (np.ndarray): float64 per-cell lane-cell→terminal-edge cost (added at goal).
+    - lf_lo (np.ndarray): int64 low step of each per-level landing-feasible run (concatenated).
+    - lf_hi (np.ndarray): int64 high step of each landing run.
+    - lf_off (np.ndarray): int64 level offsets; level L's runs are ``[lf_off[L], lf_off[L+1])``.
+    Cost + heuristic params:
+    - c_hold (float): per-second air-hover cost (staircase slope; ``> c_gd``).
+    - c_lat (float): per-metre lateral cost.
+    - pitch (float): per-step cruise distance (m), charged as lateral cost per reroute hop.
+    - dt (float): seconds per step.
+    - gx (float): goal ENU x for the straight-line heuristic.
+    - gy (float): goal ENU y.
+    - R (float): hex circumradius (m).
+    - h_off (float): heuristic offset (max landing-lane distance) subtracted from range-to-goal.
+    - goal_cost_lb (float): lower bound on the goal lane cost, added to every f-score.
+    Search generation + per-slot Pareto staircase:
+    - gen (int): generation stamp; version-stamps the frontier/goal/best-g/dead arrays.
+    - front_head (np.ndarray): int64 head label of each slot's sorted-by-arrival staircase.
+    - front_tail (np.ndarray): int64 tail label per slot.
+    - front_gen (np.ndarray): int64 per-slot stamp; ``!= gen`` means the chain is stale (empty).
+    Labels (parallel arrays, one entry per search node):
+    - lab_cell (np.ndarray): int64 cell id per label.
+    - lab_slot (np.ndarray): int64 interval-slot id per label.
+    - lab_arr (np.ndarray): int64 arrival step per label.
+    - lab_g (np.ndarray): float64 cost-so-far per label.
+    - lab_par (np.ndarray): int64 parent label (``-1`` at a start), for reconstruction.
+    - lab_next (np.ndarray): int64 next label in the slot's staircase.
+    - lab_prev (np.ndarray): int64 previous label in the slot's staircase.
+    - lab_dead (np.ndarray): int64 eviction stamp; ``== gen`` ⇒ dominated after push, skip at pop.
+    - max_lab (int): label-array capacity; overflow returns ``FB_CAP``.
+    Binary heap:
+    - heap_f (np.ndarray): float64 f-score per entry (min-heap key).
+    - heap_c (np.ndarray): int64 insertion counter per entry (FIFO tie-break).
+    - heap_n (np.ndarray): int64 label id per entry.
+    - max_heap (int): heap capacity; overflow returns ``FB_CAP``.
+    (cell, step) best-g dedup table:
+    - g_pack (np.ndarray): int64 view of the packed best-g table (see ``_gslot``).
+    - g_packf (np.ndarray): float64 view of the same records; column 2 holds the best g.
+    - hash_cap (int): number of table slots (a power of two).
+    - log2cap (int): log2 of ``hash_cap``.
+    - nsteps (int): step stride for a packed key (``cell*nsteps + step``).
+    Output path buffers (written goal→start on ``OK``):
+    - out_q (np.ndarray): int64 output world q per path point.
+    - out_r (np.ndarray): int64 output world r.
+    - out_s (np.ndarray): int64 output step.
+    - out_L (np.ndarray): int64 output flight level.
+    Read set:
+    - read_bbox (np.ndarray): in/out int64[8] read-set summary, widened via ``_note_cell``.
+
+    Return
+    --------
+    - output (tuple[int, float, int, int]): ``(n, cost, n_exp, status)`` where ``n_exp`` is the
+      expansion count. On ``OK``, ``n`` path points are written to ``out_*`` (goal→start) and
+      ``cost`` is the total weighted cost. On a fallback (``FB_OOB``/``FB_CAP``/``FB_HASH``) or
+      ``NO_PATH``, ``n`` is ``-1`` and the host branches on ``status``.
     """
     nlab = 0
     size = 0

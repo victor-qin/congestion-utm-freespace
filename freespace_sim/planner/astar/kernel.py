@@ -66,7 +66,22 @@ def _slot0(key, log2cap):
 
 @njit(cache=True, nogil=True)
 def _hpush(heap_f, heap_c, heap_n, size, f, c, node):
-    """Append ``(f, c, node)`` to the binary min-heap and sift it up; returns the new size."""
+    """Append ``(f, c, node)`` to the binary min-heap and sift it up.
+
+    Parameters
+    ------------
+    - heap_f (np.ndarray): per-slot heap priorities ``f``.
+    - heap_c (np.ndarray): per-slot tie-break counters, parallel to ``heap_f``.
+    - heap_n (np.ndarray): per-slot packed node keys, parallel to ``heap_f``.
+    - size (int): current number of entries in the heap.
+    - f (float): priority of the entry being pushed.
+    - c (int): insertion counter of the entry being pushed (the ``(f, c)`` tie-break).
+    - node (int): packed state key being pushed.
+
+    Return
+    --------
+    - output (int): the heap size after the append (``size + 1``); ``heap_*`` mutated in place.
+    """
     heap_f[size] = f; heap_c[size] = c; heap_n[size] = node
     i = size
     while i > 0:
@@ -83,8 +98,10 @@ def _hpush(heap_f, heap_c, heap_n, size, f, c, node):
 
 @njit(cache=True, nogil=True)
 def _hpop(heap_f, heap_c, heap_n, size):
-    """Pop the minimum. Deliberately still a **binary heap over three separate arrays** — the one hot
-    structure in this kernel that the array-of-structs treatment does NOT help.
+    """Pop the minimum-priority entry off the binary min-heap and sift the tail entry down.
+
+    Deliberately still a **binary heap over three separate arrays** — the one hot structure in
+    this kernel that the array-of-structs treatment does NOT help.
 
     Packing these three into 32 B records and going 4-ary — which makes a node's four children one
     aligned cache line — was byte-exact but 21% slower end to end. The g-hash is accessed at random
@@ -92,7 +109,20 @@ def _hpop(heap_f, heap_c, heap_n, size):
     levels, which stay resident whatever the layout, and the one deep access per operation sits at
     index ``size``, which moves by ±1 and prefetches perfectly. So packing bought no locality here,
     while the variable-bound 4-ary child loop and the int64/float64 aliasing (which blocks alias
-    analysis across the swap) cost real cycles. Do not "finish the job" by packing this one too."""
+    analysis across the swap) cost real cycles. Do not "finish the job" by packing this one too.
+
+    Parameters
+    ------------
+    - heap_f (np.ndarray): per-slot heap priorities ``f``.
+    - heap_c (np.ndarray): per-slot tie-break counters, parallel to ``heap_f``.
+    - heap_n (np.ndarray): per-slot packed node keys, parallel to ``heap_f``.
+    - size (int): current number of entries in the heap.
+
+    Return
+    --------
+    - output (tuple[int, int]): ``(node, size)`` — the popped minimum's packed node key and the
+      heap size after removal; ``heap_*`` mutated in place.
+    """
     node = heap_n[0]
     size -= 1
     heap_f[0] = heap_f[size]; heap_c[0] = heap_c[size]; heap_n[0] = heap_n[size]
@@ -119,7 +149,20 @@ def _probe(g_pack, gen, key, cap, log2cap):
 
     Both fields the probe reads — the generation stamp and the key — live in the SAME 32 B record, so
     a probe step touches one cache line instead of two separate multi-MB arrays (see ``_packed``).
-    ``gen`` is always even; bit 0 of the stamp is the closed flag and is masked off here."""
+    ``gen`` is always even; bit 0 of the stamp is the closed flag and is masked off here.
+
+    Parameters
+    ------------
+    - g_pack (np.ndarray): packed hash records; column 0 is the key, column 1 the gen/closed stamp.
+    - gen (int): current generation stamp (always even); a slot is live iff stamp == ``gen``.
+    - key (int): packed state key being looked up.
+    - cap (int): table capacity in slots (a power of two); also the probe budget.
+    - log2cap (int): ``log2(cap)``, used to derive the initial slot.
+
+    Return
+    --------
+    - output (int): slot holding ``key`` or the first empty in-generation slot; ``-1`` if full.
+    """
     i = _slot0(key, log2cap)
     mask = cap - 1
     for _ in range(cap):
@@ -139,7 +182,30 @@ def _relax(g_pack, g_packf, gen, hash_cap, log2cap,
     the ``heapq.heappush(pq, (ng + hh, next(counter), nst))`` under it):
     push iff ``ng < g.get(nkey, inf)``; on relax, update g/came but PRESERVE the closed bit (the
     reference never reopens — with a consistent heuristic a closed node is never relaxed anyway).
-    Returns ``(size, ctr, rc)`` with rc: 1 pushed, 0 no-op, -1 hash-full, -2 heap-full."""
+
+    Parameters
+    ------------
+    - g_pack (np.ndarray): int view of the packed hash (col 0 key, 1 stamp, 3 came-from key).
+    - g_packf (np.ndarray): float view of the SAME records; col 2 holds the g-cost.
+    - gen (int): current generation stamp.
+    - hash_cap (int): hash table capacity in slots.
+    - log2cap (int): ``log2(hash_cap)``.
+    - heap_f (np.ndarray): heap priorities.
+    - heap_c (np.ndarray): heap tie-break counters.
+    - heap_n (np.ndarray): heap node keys.
+    - size (int): current heap size.
+    - max_heap (int): heap capacity; a push at/over it returns heap-full.
+    - nkey (int): packed state key being relaxed into.
+    - ng (float): candidate g-cost for ``nkey``.
+    - f (float): heap priority to push with (``ng`` plus the heuristic).
+    - ctr (int): current insertion counter (incremented on a push).
+    - st_key (int): predecessor state key, stored as ``nkey``'s came-from.
+
+    Return
+    --------
+    - output (tuple[int, int, int]): ``(size, ctr, rc)`` — heap size and counter after the
+      operation and a result code ``rc``: 1 pushed, 0 no-op, -1 hash-full, -2 heap-full.
+    """
     nslot = _probe(g_pack, gen, nkey, hash_cap, log2cap)
     if nslot < 0:
         return size, ctr, -1
@@ -184,7 +250,33 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
     into the plan's read set — the read envelope the exact-mode commit checks against
     (``parallel.PlanEnvelope``; see context/figures/read_envelope.png). Write-only w.r.t. the
     search: it cannot change any decision. Out-of-box probes are excluded deliberately: the -1
-    answer is pure box geometry, independent of every commit, so it can never be dirtied."""
+    answer is pure box geometry, independent of every commit, so it can never be dirtied.
+
+    Parameters
+    ------------
+    - q (int): axial q of the cell probed.
+    - r (int): axial r of the cell probed.
+    - L (int): flight level of the cell probed.
+    - s (int): time step probed.
+    - qmin (int): global box minimum q (index origin for the bounds check).
+    - rmin (int): global box minimum r.
+    - qspan (int): global box q-span.
+    - rspan (int): global box r-span; the ``(q, r)`` cell-index stride.
+    - n_levels (int): number of flight levels; the cell-index stride for a ``(q, r)`` pair.
+    - static_col (np.ndarray): per-cell always-active wall flag; carried for the host, not read
+      here (folded into the window at build time).
+    - ov_own_gen (np.ndarray): per-cell overlay owning-generation; carried for the host, not read
+      here (folded into the window at build time).
+    - gen (int): this plan's generation stamp.
+    - read_bbox (np.ndarray): int64[8] read-set bbox, extended by every in-box probe (write-only).
+    - win (np.ndarray): per-plan dense occupancy bitmap that answers the probe.
+    - wbox (np.ndarray): window geometry (``W_*`` fields); ``wbox[W_STEPS] == 0`` disables it.
+    - win_stats (np.ndarray): int64[3] probe counters plus the sticky ``WS_MISSED`` flag.
+
+    Return
+    --------
+    - output (int): ``0`` free, ``1`` blocked, ``-1`` out-of-box.
+    """
     iq = q - qmin; ir = r - rmin
     if iq < 0 or iq >= qspan or ir < 0 or ir >= rspan:
         return -1
@@ -221,7 +313,25 @@ def _blocked(q, r, L, s, qmin, rmin, qspan, rspan, n_levels,
 def _h_air(q, r, L, gx, gy, R, h_off, c_lat, takeoff_cost, goal_cost_lb):
     """The air-state heuristic: lateral cost of the straight-line gap from cell ``(q, r)`` to the
     goal ``(gx, gy)`` (minus ``h_off``, floored at 0), plus the level's ``takeoff_cost`` and
-    ``goal_cost_lb``."""
+    ``goal_cost_lb``.
+
+    Parameters
+    ------------
+    - q (int): axial q of the current cell.
+    - r (int): axial r of the current cell.
+    - L (int): flight level of the current cell (indexes ``takeoff_cost``).
+    - gx (float): goal x in metres.
+    - gy (float): goal y in metres.
+    - R (float): hex circumradius in metres, for the axial→world transform.
+    - h_off (float): distance offset subtracted from the straight-line gap (floored at 0).
+    - c_lat (float): lateral cost per metre.
+    - takeoff_cost (np.ndarray): per-level takeoff cost added to the estimate.
+    - goal_cost_lb (float): lower-bound goal cost added to the estimate.
+
+    Return
+    --------
+    - output (float): the admissible cost-to-go estimate for the air state ``(q, r, L)``.
+    """
     dx = R * _SQRT3 * (q + r / 2.0) - gx
     dy = R * 1.5 * r - gy
     d = np.sqrt(dx * dx + dy * dy)
@@ -259,10 +369,84 @@ def _search(
 
     Seeds at the ground state, expands with the reference's exact successor order and the
     ``(f, counter)`` tie-break, and keeps the best feasible goal until the heap lower bound proves
-    it optimal. Parameters are grouped by the section comments in the signature above. Returns the
-    tuple ``(n_path, best_g, n_exp, status, extra)``: path length written to ``out_*``, its cost,
-    expansions performed, a status / ``FB_*`` code, and a code-specific ``extra`` (goal ``step`` for
-    ``FB_MASK``, the packed stray cell for ``FB_OOB``, else -1).
+    it optimal. Parameters are grouped below under the section labels the signature uses.
+
+    Parameters
+    ------------
+    static walls + per-flight overlay (occupancy itself comes from the window):
+    - static_col (np.ndarray): per-cell always-active wall flag; folded into the window, not read.
+    - ov_own_gen (np.ndarray): per-cell overlay owning-generation; folded in, not read.
+    - qmin (int): global box minimum q (index origin).
+    - rmin (int): global box minimum r.
+    - qspan (int): global box q-span.
+    - rspan (int): global box r-span; the ``(q, r)`` cell-index stride.
+    - n_levels (int): number of flight levels.
+    - base (int): first time step; the ground seed sits here and ``step`` offsets from it.
+    - max_step (int): last time step any state may reach.
+    - ground_max_step (int): last step a ground-wait g→g edge may reach.
+    ground / takeoff-fan (host masks):
+    - oq (int): origin (pad) cell q.
+    - orr (int): origin (pad) cell r.
+    - lane_q (np.ndarray): per-lane exit-cell q.
+    - lane_r (np.ndarray): per-lane exit-cell r.
+    - lane_lat (np.ndarray): per-lane lateral cost of the pad→lane translate.
+    - lane_stp (np.ndarray): per-lane step count for the translate.
+    - n_lanes (int): number of takeoff exit lanes.
+    - takeoff_steps (np.ndarray): per-level step count for the climb.
+    - takeoff_cost (np.ndarray): per-level takeoff cost.
+    - to_ok (np.ndarray): takeoff mask over (ground step, level) of legal takeoff slots.
+    - n_gsteps (int): number of ground-delay steps the two-phase mask bounds.
+    - c_gd_dt (float): ground-wait cost per step.
+    air edges:
+    - rung_steps (np.ndarray): per-rung step count for a ±1 level change.
+    - rung_cost (np.ndarray): per-rung cost for a ±1 level change.
+    - c_lat_pitch (float): cost of one lateral reroute hop.
+    - c_hold_dt (float): cost of one air-hover (same-level wait) step.
+    - vertical_edges (bool): whether ±1 level-change edges are emitted.
+    goal (host masks):
+    - goal_q (np.ndarray): per-goal boundary-cell q.
+    - goal_r (np.ndarray): per-goal boundary-cell r.
+    - goal_lat (np.ndarray): per-goal exact lane radius of the boundary→terminal segment.
+    - n_goal (int): number of goal boundary cells.
+    - land_ok (np.ndarray): landing mask over (step, level) of legal landing slots.
+    heuristic:
+    - gx (float): goal x in metres.
+    - gy (float): goal y in metres.
+    - R (float): hex circumradius in metres.
+    - h_off (float): heuristic distance offset (floored at 0).
+    - c_lat (float): lateral cost per metre.
+    - goal_cost_lb (float): lower-bound goal cost the heuristic adds.
+    - h_ground (float): heuristic value at the ground seed state.
+    g/closed/came open-addressing hash (version-stamped, packed 32 B records):
+    - gen (int): this plan's generation stamp (even).
+    - g_pack (np.ndarray): int view of the packed hash (key, stamp, came-from).
+    - g_packf (np.ndarray): float view of the SAME records; holds the g-cost.
+    - hash_cap (int): hash table capacity in slots.
+    - log2cap (int): ``log2(hash_cap)``.
+    heap (binary, three arrays — see ``_hpop``):
+    - heap_f (np.ndarray): heap priorities.
+    - heap_c (np.ndarray): heap tie-break counters.
+    - heap_n (np.ndarray): heap node keys.
+    - max_heap (int): heap capacity; overflow returns ``FB_HEAP``.
+    output:
+    - out_q (np.ndarray): output buffer for the path cells' q, written goal→start.
+    - out_r (np.ndarray): output buffer for the path cells' r.
+    - out_L (np.ndarray): output buffer for the path cells' level.
+    - out_s (np.ndarray): output buffer for the path cells' step.
+    - max_expansions (int): expansion budget; exceeding it returns ``NO_PATH_TRUNC``.
+    read-set bbox (parallel exact mode):
+    - read_bbox (np.ndarray): int64[8] in/out read-set bbox over every in-box probe.
+    per-plan dense occupancy bitmap (``window``):
+    - win (np.ndarray): the dense occupancy bitmap the search probes.
+    - wbox (np.ndarray): window geometry (``W_*``); ``wbox[W_STEPS] == 0`` ⇒ no compiled answer.
+    - win_stats (np.ndarray): int64[3] probe counters plus the sticky miss flag.
+
+    Return
+    --------
+    - output (tuple[int, float, int, int, int]): ``(n_path, best_g, n_exp, status, extra)`` —
+      path length written into ``out_*``, its cost, expansions performed, a status / ``FB_*`` code,
+      and a code-specific ``extra`` (goal ``step`` for ``FB_MASK``, packed stray cell for
+      ``FB_OOB``, else -1).
     """
     step_span = max_step - base + 1
     nlp1 = n_levels + 1

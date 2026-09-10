@@ -130,7 +130,19 @@ class HexOccupancyService:
     @staticmethod
     def _bump(bucket: dict, s: int, key, tid=None) -> None:
         """Refcounted insert (removal mode): blocked/pad hold cell->count; term_cells holds
-        cell -> {tid: count}."""
+        cell -> {tid: count}.
+
+        Parameters
+        ------------
+        - bucket (dict): step-keyed map to insert into (``blocked``, ``pad``, or ``term_cells``).
+        - s (int): step whose bucket receives ``key``.
+        - key: cell key ``(q, r, L)`` (the interned tuple).
+        - tid: terminal id when inserting into ``term_cells``; ``None`` for ``blocked``/``pad``.
+
+        Return
+        --------
+        - output (None): increments the refcount for ``key`` in ``bucket[s]`` in place.
+        """
         d = bucket.setdefault(s, {})
         if tid is None:
             d[key] = d.get(key, 0) + 1
@@ -140,7 +152,20 @@ class HexOccupancyService:
 
     @staticmethod
     def _drop(bucket: dict, s: int, key, tid=None) -> None:
-        """Exact reverse of `_bump`; raises KeyError on drift (a row removed twice or never added)."""
+        """Exact reverse of `_bump`; raises KeyError on drift (a row removed twice or never added).
+
+        Parameters
+        ------------
+        - bucket (dict): step-keyed map to decrement (``blocked``, ``pad``, or ``term_cells``).
+        - s (int): step whose bucket holds ``key``.
+        - key: cell key ``(q, r, L)`` (the interned tuple).
+        - tid: terminal id when dropping from ``term_cells``; ``None`` for ``blocked``/``pad``.
+
+        Return
+        --------
+        - output (None): decrements the refcount, deleting ``key`` (and the bucket) at zero; raises
+          ``KeyError`` if the row was never added or is removed twice.
+        """
         d = bucket[s]
         if tid is None:
             n = d[key] - 1

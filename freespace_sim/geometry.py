@@ -40,8 +40,18 @@ def _segment_frame_scalars(p0, p1) -> tuple[tuple[float, ...], float]:
     frozen byte-identity oracle expect; :func:`box_from_segment` (which stores ``rot`` flat anyway)
     consumes the tuple directly, skipping a per-sub-box array build and ``flatten().tolist()``
     round-trip. Bit-for-bit identical to the numpy form and pinned to it in
-    ``tests/test_geometry.py``. The degenerate near-zero-length case returns the identity frame
-    flattened plus length ``0.0`` (exactly the numpy original's ``np.eye(3), 0.0``).
+    ``tests/test_geometry.py``.
+
+    Parameters
+    ------------
+    - p0 (np.ndarray): segment start point in world coordinates (length-3).
+    - p1 (np.ndarray): segment end point in world coordinates (length-3).
+
+    Return
+    --------
+    - output (tuple[tuple[float, ...], float]): the 9 row-major rotation floats (local→world,
+      columns x/y/z) plus the segment length. A near-zero-length segment returns the identity
+      frame flattened with length ``0.0`` (the numpy original's ``np.eye(3), 0.0``).
     """
     dx = float(p1[0]) - float(p0[0])
     dy = float(p1[1]) - float(p0[1])

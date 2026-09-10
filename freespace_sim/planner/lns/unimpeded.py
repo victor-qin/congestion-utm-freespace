@@ -80,7 +80,26 @@ def _new_ruler(cfg, static_terms):
 
 
 def _plan_shard(cfg, static_terms, requests, planner=None, free=None):
-    """``[(flight_id, cost | None, denial_reason | None), ...]`` — cost is None on a denial."""
+    """Plan every request on a ruler (walls-only) ledger, one row each.
+
+    Builds a private ruler via ``_new_ruler`` when ``planner``/``free`` are not supplied, so a
+    worker process can call it with no shared state.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): run config forwarded to the planner and, when built here, the new ruler.
+    - static_terms (tuple): ``(center, terminal)`` wall pairs, only used when a ruler is built
+      here.
+    - requests (Sequence[FlightRequest]): flights to plan; each is read for ``flight_id``.
+    - planner: an existing ruler planner; when ``None`` a fresh planner and ledger are built here
+      (``free`` is then ignored).
+    - free: the walls-only ledger the planner rules against; used only when ``planner`` is given.
+
+    Return
+    --------
+    - output (list): one ``(flight_id, cost | None, denial_reason | None)`` per request, in
+      request order; ``cost`` is ``None`` and ``denial_reason`` is set on a denial.
+    """
     if planner is None:
         planner, free = _new_ruler(cfg, static_terms)
     out = []
@@ -104,6 +123,16 @@ def _finish_processes(procs, timeout=5.0) -> None:
 
     One shared deadline per phase keeps a broken pool from multiplying ``timeout`` by its worker
     count. Processes whose ``start`` failed have no pid and require no OS cleanup.
+
+    Parameters
+    ------------
+    - procs (Sequence): worker processes to reap; those with no pid (``start`` failed) are
+      skipped.
+    - timeout (float): per-phase join deadline in seconds, shared across all workers in a phase.
+
+    Return
+    --------
+    - output (None): joins/terminates/kills the processes for their side effects; returns nothing.
     """
     started = [proc for proc in procs if proc.pid is not None]
     deadline = time.monotonic() + timeout
@@ -222,8 +251,25 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
 
 
 def _sequential(cfg, static_terms, requests, planner, free, log_every, offset):
-    """Plan ``requests`` in-process on the given ruler, one ``(fid, cost, denial)`` row each;
-    ``offset`` continues the progress count so a pool's probe + remainder log as one sequence."""
+    """Plan ``requests`` in-process on the given ruler, one ``(fid, cost, denial)`` row each.
+
+    ``offset`` continues the progress count so a pool's probe + remainder log as one sequence.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): run config passed to each ``planner.plan`` call.
+    - static_terms (tuple): accepted for call-site symmetry with ``_plan_shard``; not read here.
+    - requests (Sequence[FlightRequest]): flights to plan, in order; each read for ``flight_id``.
+    - planner: the ruler planner to plan against (shared, already built).
+    - free: the walls-only ledger the planner rules against.
+    - log_every (int): emit a progress line every this many plans; ``0`` (or falsy) disables it.
+    - offset (int): starting index for the progress count and log cadence.
+
+    Return
+    --------
+    - output (list): one ``(flight_id, cost | None, denial_reason | None)`` per request, in order;
+      ``cost`` is ``None`` and ``denial_reason`` set on a denial.
+    """
     rows = []
     for k, req in enumerate(requests):
         u = planner.plan(req, free, cfg)

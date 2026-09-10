@@ -88,6 +88,18 @@ def _coverage_diagnostics(master, x, rc_by_flight, benefit) -> dict:
     ``LP + sum(max(0, rc))``.  This measures the overlap directly rather than inferring
     it, and reports the largest column cost -- the quantity that actually bounds how
     small ``M`` is allowed to be.
+
+    Parameters
+    ------------
+    - master (RestrictedMaster): the solved master, read for its ``columns``.
+    - x (Sequence[float]): the LP primal solution, one weight per master column.
+    - rc_by_flight (Mapping[int, float]): per-flight reduced cost from the last pricing sweep.
+    - benefit (float): the per-flight benefit ``M`` the near-``M`` test compares against.
+
+    Return
+    --------
+    - output (dict): ``max_column_cost`` plus the counts ``n_uncovered``, ``n_rc_near_M``, and
+      their overlap ``n_overlap``.
     """
 
     coverage: dict[int, float] = collections.defaultdict(float)
@@ -107,7 +119,19 @@ def _coverage_diagnostics(master, x, rc_by_flight, benefit) -> dict:
 
 
 def _canonical_column(column: Column, graph: FlightGraph, cfg: SimConfig) -> Column:
-    """Re-run the one authoritative geometry/claim gate for a solver column."""
+    """Re-run the one authoritative geometry/claim gate for a solver column.
+
+    Parameters
+    ------------
+    - column (Column): the column whose canonical claims are re-derived.
+    - graph (FlightGraph): the flight's pricing graph, supplying geometry and lanes.
+    - cfg (SimConfig): supplies the lattice geometry and clock.
+
+    Return
+    --------
+    - output (Column): ``column`` unchanged when its claims already match, else a copy with
+      the recomputed ``claims``; ``column_claims`` raises ``ValueError`` on an illegal route.
+    """
 
     claims = column_claims(column, graph, cfg)
     if column.claims == claims:
@@ -133,7 +157,21 @@ def _shift_claims(claims: Sequence[RowKey] | frozenset[RowKey], steps: int) -> f
 def _shift_column(
     column: Column, departure_step: int, cfg: SimConfig, model: CostModel = DELAY_MODEL
 ) -> Column:
-    """Return the same certified spatial route at a later integer departure."""
+    """Return the same certified spatial route at a later integer departure.
+
+    Parameters
+    ------------
+    - column (Column): the seed whose spatial route is preserved.
+    - departure_step (int): the new departure step; must be at or after ``column``'s own.
+    - cfg (SimConfig): supplies ``dt_s`` for the added ground-delay term.
+    - model (CostModel): supplies ``ground_weight`` for the added delay; defaults to
+      ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (Column): the route at ``departure_step`` with ground delay added and claims
+      shifted; raises ``ValueError`` if ``departure_step`` is earlier than the column's.
+    """
 
     delta = departure_step - column.departure_step
     if delta < 0:
@@ -162,6 +200,20 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int) -> int:
     master's degeneracy instead of resolving it.  So the useful depth is set by the
     solution's slip, not by `max_ground_delay_s` (which permits far more).  Denser traffic
     slips further and moves the knee, so the shipped depth is calibrated, not universal.
+
+    Parameters
+    ------------
+    - master (RestrictedMaster): receives each rung via ``master.add_column``.
+    - seed (Column): the flight's seed column whose clock is translated.
+    - graph (FlightGraph): the flight's pricing graph, supplying the departure/horizon bounds.
+    - cfg (SimConfig): supplies ``dt_s`` and lattice geometry.
+    - model (CostModel): cost weights for each shifted column's ``delay_s``.
+    - steps (int): maximum number of successive one-period rungs to offer.
+
+    Return
+    --------
+    - output (int): the number of ladder columns added (``0`` when ``steps <= 0`` or none fit
+      before the flight's latest feasible departure).
     """
 
     if steps <= 0:
@@ -207,6 +259,21 @@ def _initial_feasible_selection(
     master, and pricing can add every route in the original universe.  Seeding
     the RMP with a real all-flight incumbent prevents a time-capped solve from
     discarding known coverage and then repeating the same search in repair.
+
+    Parameters
+    ------------
+    - seeds (Mapping[int, Column]): flight id -> the flight's nominal seed column.
+    - graphs (Mapping[int, FlightGraph]): flight id -> the flight's pricing graph.
+    - fixed_loads (Mapping[RowKey, int]): pre-committed row occupancy every pick must respect.
+    - row_index (RowIndex): supplies each capacity row's ``cap``.
+    - cfg (SimConfig): supplies ``dt_s`` and geometry.
+    - deadline (float | None): ``time.monotonic`` cutoff; ``None`` disables the timeout.
+    - model (CostModel): cost weights for each shift's ``delay_s``; defaults to ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (dict[int, Column]): flight id -> chosen shifted column, sorted by flight id;
+      flights that never fit (or that the deadline cut off) are omitted.
     """
 
     selected: dict[int, Column] = {}
@@ -268,6 +335,22 @@ def _greedy_feasible_selection(
     improvement is found.  A timeout therefore keeps a complete feasible
     schedule instead of discarding a partially built prefix.  It remains only
     an incumbent heuristic and never contributes to a global bound.
+
+    Parameters
+    ------------
+    - graphs (Mapping[int, FlightGraph]): flight id -> the flight's pricing graph.
+    - fixed_loads (Mapping[RowKey, int]): pre-committed row occupancy every pick must respect.
+    - row_index (RowIndex): supplies each capacity row's ``cap``.
+    - cfg (SimConfig): supplies geometry and, with ``params``, the cost model.
+    - params (ColGenParams): supplies ``n_heuristic_tries`` (the candidate cap) and cost weights.
+    - deadline (float): ``time.monotonic`` cutoff for the whole sweep.
+    - initial (Mapping[int, Column] | None): the complete incumbent to improve; ``None`` starts
+      from an empty selection.
+
+    Return
+    --------
+    - output (tuple[dict[int, Column], bool]): the improved selection sorted by flight id, and
+      a flag that is ``True`` only when every candidate flight was tried within the deadline.
     """
 
     model = cost_model(cfg, params)
@@ -395,7 +478,19 @@ def _better_selection(
     incumbent: Mapping[int, Column],
     benefit: float,
 ) -> bool:
-    """Compare maximize-sense incumbents, with a deterministic exact-tie rule."""
+    """Compare maximize-sense incumbents, with a deterministic exact-tie rule.
+
+    Parameters
+    ------------
+    - candidate (Mapping[int, Column]): the proposed selection.
+    - incumbent (Mapping[int, Column]): the selection to beat.
+    - benefit (float): the per-flight benefit ``M`` both selections are scored against.
+
+    Return
+    --------
+    - output (bool): ``True`` when ``candidate`` scores higher (maximize sense), or on an exact
+      tie has the lexicographically smaller selection key.
+    """
 
     candidate_obj = _selection_objective(candidate, benefit)
     incumbent_obj = _selection_objective(incumbent, benefit)
@@ -459,7 +554,19 @@ def _assert_claim_feasible(
     fixed_loads: Mapping[RowKey, int],
     row_index: RowIndex,
 ) -> Counter[RowKey]:
-    """Independently referee an integer selection against all canonical claims."""
+    """Independently referee an integer selection against all canonical claims.
+
+    Parameters
+    ------------
+    - selection (Mapping[int, Column]): the integer selection under audit.
+    - fixed_loads (Mapping[RowKey, int]): pre-committed occupancy folded into the totals.
+    - row_index (RowIndex): supplies each capacity row's ``cap``.
+
+    Return
+    --------
+    - output (Counter[RowKey]): the aggregate per-row load (selection plus fixed); raises
+      ``RuntimeError`` if any row's load exceeds its capacity.
+    """
 
     loads = _loads_for(selection, fixed_loads)
     for row, load in loads.items():
@@ -529,7 +636,36 @@ def _pre_master_timeout_result(
     time_to_master_s: float = 0.0,
     seedless_flight_ids: Sequence[int] = (),
 ) -> ColGenResult:
-    """Return an explicit compute-cap verdict before a usable master exists."""
+    """Return an explicit compute-cap verdict before a usable master exists.
+
+    Parameters
+    ------------
+    - flight_ids (Sequence[int]): every flight in the batch; all are denied as
+      search-exhausted and priced at ``params.M`` each.
+    - started (float): the ``time.monotonic`` timestamp the solve began, for the elapsed and
+      overrun stats.
+    - params (ColGenParams): solver config; supplies ``M``, ``time_limit_s``, ``gap_metric``,
+      ``objective``, ``ip_time_limit_s``, and ``warm_start_planner``.
+    - stage (str): the pre-master stage that ran out of time, recorded as
+      ``preprocessing_stage``.
+    - graphs (Mapping[int, FlightGraph] | None): graphs built so far, read for arc-cache and
+      corridor-materialization counts.
+    - catalog (StaticTerminalCatalog | None): supplies the static-terminal and wall-index
+      counts; ``None`` reports zeros.
+    - graph_build_elapsed_s (float): seconds spent building graphs, echoed into stats.
+    - seed_elapsed_s (float): seconds spent seeding, echoed into stats.
+    - seeds_completed (int): number of seed columns completed before the cutoff.
+    - seed_flights_processed (int): number of flights the seeding loop reached.
+    - master (RestrictedMaster | None): partial master, read for its backend name and column
+      count; ``None`` reports backend ``"none"``.
+    - time_to_master_s (float): seconds until the master was (nearly) ready, echoed into stats.
+    - seedless_flight_ids (Sequence[int]): flights with no seed column, recorded sorted.
+
+    Return
+    --------
+    - output (ColGenResult): a result with empty ``columns`` and a stats dict flagging a
+      ``time_limit`` termination with every flight search-exhausted.
+    """
 
     elapsed_s = time.monotonic() - started
     denied = tuple(flight_ids)

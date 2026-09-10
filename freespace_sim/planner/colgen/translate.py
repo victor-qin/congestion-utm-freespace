@@ -121,7 +121,20 @@ class Column:
 def _selected_lane(
     cell: Cell, lane_idx: int | None, lanes: list[hg.Lane], endpoint: str
 ) -> hg.Lane:
-    """Validate and return the terminal lane encoded by a column endpoint."""
+    """Validate and return the terminal lane encoded by a column endpoint.
+
+    Parameters
+    ------------
+    - cell (Cell): the column endpoint cell that must equal the selected lane's cell.
+    - lane_idx (int | None): index of the chosen lane; ``None`` is rejected.
+    - lanes (list[hg.Lane]): the terminal's exit lanes to index into.
+    - endpoint (str): endpoint label ("origin"/"dest") used in error messages.
+
+    Return
+    --------
+    - output (hg.Lane): the selected lane. Raises ``ValueError`` when ``lane_idx`` is ``None``,
+      out of range, or names a lane whose cell differs from ``cell``.
+    """
     if lane_idx is None:
         raise ValueError(f"{endpoint}_lane_idx is required for a terminal endpoint")
     lane_idx = _index_field(lane_idx, f"{endpoint}_lane_idx")
@@ -263,6 +276,26 @@ def _retime_lattice_reservation(
     here preserves every shape and terminal tag while distributing the fixed edge duration across
     its sub-boxes.  In particular, every original corner boundary and the landing cylinder start on
     the exact discrete arrival clock rather than on an accumulated distance clock.
+
+    Parameters
+    ------------
+    - volumes (list[Volume4D]): builder reservation boxes (origin cylinder, one per lattice
+      sub-edge, destination cylinder) to be re-stamped onto the discrete clock.
+    - centerline (list[TimedPoint]): builder timed centreline points, re-stamped in step.
+    - corners (list[Vec]): hex-centre corner polyline; its edge lengths set each hop's sub-box
+      count.
+    - corridor_t0 (float): corridor start stamp (s), rounded to the nearest discrete step.
+    - origin_t0 (float): takeoff stamp (s) anchoring the origin cylinder's ``t_start``.
+    - origin_dwell_s (float): origin terminal dwell added to the origin cylinder's ``t_end``.
+    - destination_dwell_s (float): destination dwell added to the landing cylinder's ``t_end``.
+    - cfg (SimConfig): supplies ``dt_s``, ``corridor_segment_len_m``, ``hover_time_s``, and
+      ``time_buffer_s``.
+
+    Return
+    --------
+    - output (tuple[list[Volume4D], list[TimedPoint]]): the retimed reservation volumes and
+      timed centreline. Raises ``RuntimeError`` when the builder output length does not match
+      the column's lattice subdivisions.
     """
     nsubs: list[int] = []
     segment_len = cfg.corridor_segment_len_m

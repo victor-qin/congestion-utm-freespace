@@ -69,7 +69,18 @@ WSTATS_N = 3
 @njit(cache=True, nogil=True)
 def _fill_row(win, row, wsteps):
     """Mark every in-window step of ``row`` blocked. Padding bits past ``wsteps`` stay 0 — the kernel
-    never reads them, and leaving them clear keeps the row's meaning unambiguous."""
+    never reads them, and leaving them clear keeps the row's meaning unambiguous.
+
+    Parameters
+    ------------
+    - win (np.ndarray): bit-packed occupancy bitmap (uint8), mutated in place.
+    - row (int): byte offset of this row's first byte within ``win``.
+    - wsteps (int): number of active steps in the window; bits ``0..wsteps-1`` are set.
+
+    Return
+    --------
+    - output (None): no return value; sets this row's step bits in ``win`` in place.
+    """
     full = wsteps >> 3
     for i in range(full):
         win[row + i] = np.uint8(0xFF)
@@ -80,7 +91,19 @@ def _fill_row(win, row, wsteps):
 
 @njit(cache=True, nogil=True)
 def _set_range(win, row, k0, k1):
-    """Set bits ``k0..k1`` inclusive in ``row`` — paints one claim's steps blocked."""
+    """Set bits ``k0..k1`` inclusive in ``row`` — paints one claim's steps blocked.
+
+    Parameters
+    ------------
+    - win (np.ndarray): bit-packed occupancy bitmap (uint8), mutated in place.
+    - row (int): byte offset of this row's first byte within ``win``.
+    - k0 (int): first bit index within the row to set (inclusive).
+    - k1 (int): last bit index within the row to set (inclusive).
+
+    Return
+    --------
+    - output (None): no return value; sets bits ``k0..k1`` of the row in ``win`` in place.
+    """
     b0 = k0 >> 3
     b1 = k1 >> 3
     if b0 == b1:

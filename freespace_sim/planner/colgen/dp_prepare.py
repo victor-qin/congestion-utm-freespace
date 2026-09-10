@@ -185,6 +185,18 @@ def _reverse_remaining(
     ever *smaller or equal*, so substituting it cannot make an inadmissible bound.  The
     kernel must therefore not use it where the reference's looser value decides a tie; see
     the parity tests.
+
+    Parameters
+    ------------
+    - n_cells (int): number of interned cells; sizes the output and the reversed CSR.
+    - arc_start (np.ndarray): CSR row offsets into ``arc_target`` (length ``n_cells + 1``).
+    - arc_target (np.ndarray): CSR arc targets (interned cell indices).
+    - destinations (list[int]): interned destination cells, the reverse BFS sources.
+
+    Return
+    --------
+    - output (np.ndarray): per-cell admissible hops to the nearest destination (``int32``);
+      ``UNREACHABLE`` for cells from which no destination is reachable.
     """
 
     remaining = np.full(n_cells, UNREACHABLE, dtype=np.int32)
@@ -243,6 +255,17 @@ def _role_mask(fg: FlightGraph, source: Cell, target: Cell) -> int:
     ``forbidden_hops`` is a plain frozenset on a transported graph, where only the public
     path works. The two agree by construction: ``_LazyForbiddenHops.allows`` is itself a
     bit test against the same mask, which the parity test asserts arc for arc.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's graph; its ``forbidden_hops`` mask or role oracle is queried.
+    - source (Cell): the hop's source axial cell.
+    - target (Cell): the hop's target axial cell.
+
+    Return
+    --------
+    - output (int): the OR of the ``ARC_INTERNAL``/``ARC_FIRST``/``ARC_LAST``/``ARC_FIRST_LAST``
+      bits allowed for the ``(source, target)`` hop.
     """
 
     lazy = fg.forbidden_hops
@@ -1261,6 +1284,17 @@ class CompletionEnvelopes:
         Mirrors the destination scan in ``pricing._best_column``.  ``math.fsum`` is
         order-independent, so the memo cannot perturb it even though the sets it sums are
         iterated in hash order.
+
+        Parameters
+        ------------
+        - arrival_step (int): the destination visit's clock step.
+        - total_hops (int): total air hops on arrival; times the endpoint claim window.
+
+        Return
+        --------
+        - output (float): the minimum over destination options of the summed positive row costs
+          of the unavoidable endpoint-plus-final-visit claims; ``math.inf`` when every option's
+          claims hit a forbidden row.
         """
 
         from .pricing import _endpoint_claims, _visit_claims
@@ -1305,6 +1339,17 @@ class CompletionEnvelopes:
 
         ``min()`` rather than the ceiling alone: the horizon is a real bound even though the
         two are provably equal today.
+
+        Parameters
+        ------------
+        - departure_step (int): the root's departure clock step.
+        - lane_idx (int | None): the root's origin lane, or ``None`` for a bare origin.
+
+        Return
+        --------
+        - output (tuple[tuple[float, ...], int]): the per-hop delay lower bounds (index 0 is
+          ``math.inf``, one entry per total hop count up to the incumbent-driven early break) and
+          the ``corridor_start`` step the bounds are measured from.
         """
 
         from .pricing import _RECOMPUTE_EPS, _check_deadline

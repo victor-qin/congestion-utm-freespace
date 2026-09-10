@@ -253,7 +253,18 @@ class HubVoronoiDemand:
 
 
 def _sample_in_disk(center: np.ndarray, radius_m: float, rng: np.random.Generator) -> np.ndarray:
-    """A point drawn uniformly in the disk of radius ``radius_m`` about ``center`` (area-uniform)."""
+    """A point drawn uniformly in the disk of radius ``radius_m`` about ``center`` (area-uniform).
+
+    Parameters
+    ------------
+    - center (np.ndarray): the disk centre as an xy point.
+    - radius_m (float): disk radius in metres.
+    - rng (np.random.Generator): source for the angle and (area-uniform) radius draws.
+
+    Return
+    --------
+    - output (np.ndarray): an xy point sampled area-uniformly inside the disk.
+    """
     theta = rng.uniform(0.0, 2.0 * np.pi)
     r = radius_m * np.sqrt(rng.uniform(0.0, 1.0))
     return np.asarray(center, float) + r * np.array([np.cos(theta), np.sin(theta)])
@@ -501,7 +512,18 @@ class HubRadiusDemand:
         return max(0.0, float(rng.normal(mean, std)))
 
     def _est_trip_s(self, o: np.ndarray, d: np.ndarray, cfg: SimConfig) -> float:
-        """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell."""
+        """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell.
+
+        Parameters
+        ------------
+        - o (np.ndarray): trip origin point.
+        - d (np.ndarray): trip destination point.
+        - cfg (SimConfig): supplies the cruise speed, climb time, and hover (pad dwell) time.
+
+        Return
+        --------
+        - output (float): nominal door-to-door time in seconds (cruise, climb, descent, dwell).
+        """
         dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
         return dist / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
 

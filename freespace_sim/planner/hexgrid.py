@@ -238,7 +238,19 @@ _COVERED_CACHE: dict = {}
 
 
 def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
-    """Bearing in degrees from hub ``(cx, cy)`` to ``cell``'s ENU centre (the lane sort key)."""
+    """Bearing in degrees from hub ``(cx, cy)`` to ``cell``'s ENU centre (the lane sort key).
+
+    Parameters
+    ------------
+    - cell (tuple[int, int]): the axial ``(q, r)`` cell whose centre the bearing points at.
+    - cx (float): hub centre easting (ENU x, m).
+    - cy (float): hub centre northing (ENU y, m).
+    - R (float): hex circumradius (m).
+
+    Return
+    --------
+    - output (float): bearing from the hub to the cell centre, in degrees.
+    """
     bx, by = hex_center(*cell, R)
     return math.degrees(math.atan2(by - cy, bx - cx))
 
@@ -253,7 +265,19 @@ def _covered_boundary(center, term, cfg: SimConfig) -> tuple[set, set]:
     the compiled A* hot path (the own-hub overlay, once per flight), so without the cache every
     same-hub plan re-ran this flood-fill. Callers treat the returned sets as read-only
     (``terminal_cells`` unions into a fresh set; ``terminal_lanes`` sorts/iterates), so sharing the
-    cached instances is safe. Mirrors ``_LANE_CACHE``."""
+    cached instances is safe. Mirrors ``_LANE_CACHE``.
+
+    Parameters
+    ------------
+    - center (Vec): the hub centre (column location).
+    - term (Terminal | tuple): the terminal, normalized via :func:`as_terminal`.
+    - cfg (SimConfig): supplies the circumradius and exit radius.
+
+    Return
+    --------
+    - output (tuple[set, set]): ``(covered, boundary)`` — covered column hexes and their outside
+      neighbour ring; both may be shared cached instances (treat as read-only).
+    """
     term = as_terminal(term)
     cx, cy = float(center[0]), float(center[1])
     key = (round(cx, 3), round(cy, 3), term, cfg)
@@ -352,7 +376,18 @@ def _levels_overlapped(vol: Volume4D, cfg: SimConfig) -> list[int]:
 
 def _hexes_in_box(amin, amax, R):
     """Yield all axial hexes whose centres could lie in the xy AABB [amin, amax] — a superset
-    of the kept footprint (see context/figures/rasterisation_coverage.png)."""
+    of the kept footprint (see context/figures/rasterisation_coverage.png).
+
+    Parameters
+    ------------
+    - amin (Sequence[float]): lower ``(x, y)`` corner of the AABB (m).
+    - amax (Sequence[float]): upper ``(x, y)`` corner of the AABB (m).
+    - R (float): hex circumradius (m).
+
+    Return
+    --------
+    - output (Iterator[tuple[int, int]]): axial ``(q, r)`` cells covering the box (a superset).
+    """
     qs, rs = [], []
     for x in (amin[0], amax[0]):
         for y in (amin[1], amax[1]):
@@ -368,7 +403,20 @@ def _footprint_contains(shape, c: np.ndarray, infl: float, cfg: SimConfig,
                         z: float | None = None) -> bool:
     """True if point ``c`` (at altitude ``z``, default cruise) lies inside ``shape`` inflated by
     ``infl`` metres. The scalar per-hex membership test; :func:`_footprint_slack` is its vectorized
-    twin, and ``_hexes_in_box`` + this is the test suite's independent oracle for the sweeps."""
+    twin, and ``_hexes_in_box`` + this is the test suite's independent oracle for the sweeps.
+
+    Parameters
+    ------------
+    - shape (BoxSpec | CylinderSpec): the volume footprint to test membership against.
+    - c (np.ndarray): the xy point ``(x, y)`` whose membership is tested.
+    - infl (float): footprint inflation (m).
+    - cfg (SimConfig): supplies the default cruise level.
+    - z (float | None): altitude probe (m); None ⇒ ``cfg.cruise_level_m``.
+
+    Return
+    --------
+    - output (bool): True iff ``c`` at altitude ``z`` lies inside ``shape`` inflated by ``infl``.
+    """
     z = cfg.cruise_level_m if z is None else z
     p = np.array([c[0], c[1], z])
     if isinstance(shape, BoxSpec):
@@ -390,6 +438,18 @@ def _footprint_slack(shape, cx: np.ndarray, cy: np.ndarray, cfg: SimConfig,
     Equivalence to the scalar test: for a box, ``all(|local_d| <= half_d + x)`` ⟺
     ``max_d(|local_d| - half_d) <= x``; for a cylinder the radial (``d - radius``) and altitude-band
     margins both reduce to ``margin <= x``. ``rotᵀ·v`` (column) equals ``v·rot`` (row), batched.
+
+    Parameters
+    ------------
+    - shape (BoxSpec | CylinderSpec): the volume footprint to measure margins against.
+    - cx (np.ndarray): x-coordinates of the candidate hex centres (m).
+    - cy (np.ndarray): y-coordinates of the candidate hex centres (m).
+    - cfg (SimConfig): supplies the default cruise level.
+    - z (float | None): altitude probe (m); None ⇒ ``cfg.cruise_level_m``.
+
+    Return
+    --------
+    - output (np.ndarray): per-centre slack; inside at inflation ``x`` iff ``slack <= x``.
     """
     z = cfg.cruise_level_m if z is None else z
     if isinstance(shape, BoxSpec):
@@ -411,6 +471,18 @@ def _axial_rect(xmin: float, ymin: float, xmax: float, ymax: float, R: float):
     compiled sweep that enumerated a differently-sized rectangle would silently keep a different
     cell set at the margin. Rounding stays in Python on purpose: :func:`_axial_round` uses banker's
     ``round``, whose numba semantics differ, so the kernel is handed bounds and never rounds.
+
+    Parameters
+    ------------
+    - xmin (float): lower x bound of the xy box (m).
+    - ymin (float): lower y bound of the xy box (m).
+    - xmax (float): upper x bound of the xy box (m).
+    - ymax (float): upper y bound of the xy box (m).
+    - R (float): hex circumradius (m).
+
+    Return
+    --------
+    - output (tuple[int, int, int, int]): inclusive axial bounds ``(q0, q1, r0, r1)``.
     """
     qs, rs = [], []
     for x in (xmin, xmax):
@@ -427,7 +499,21 @@ def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float, z: fl
     :func:`_hexes_in_box` as arrays.
 
     The numpy REFERENCE sweep: kept as the oracle the compiled kernel is pinned against, and as the
-    fallback when numba is absent or ``USE_COMPILED`` is off."""
+    fallback when numba is absent or ``USE_COMPILED`` is off.
+
+    Parameters
+    ------------
+    - vol (Volume4D): the committed volume whose footprint is swept.
+    - cfg (SimConfig): supplies the default cruise level (via :func:`_footprint_slack`).
+    - R (float): hex circumradius (m).
+    - infl (float): footprint inflation (m) sizing the candidate rectangle.
+    - z (float | None): altitude probe (m); None ⇒ ``cfg.cruise_level_m``.
+
+    Return
+    --------
+    - output (tuple[np.ndarray, np.ndarray, np.ndarray]): ``(q_grid, r_grid, slack)`` — the axial
+      ``q`` and ``r`` of each candidate cell and its :func:`_footprint_slack`.
+    """
     lo, hi = vol.aabb()
     q0, q1, r0, r1 = _axial_rect(lo[0] - infl, lo[1] - infl, hi[0] + infl, hi[1] + infl, R)
     q_grid, r_grid = np.meshgrid(
@@ -449,6 +535,20 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
     (``USE_COMPILED``) controls the A/B and the rollback for every one of them. ``infl_pad`` sizes
     the candidate rectangle (it is the wider inflation, so the blocked cells are a subset);
     ``in_blocked`` flags membership in the narrower corridor footprint.
+
+    Parameters
+    ------------
+    - vol (Volume4D): the committed volume whose footprint is swept.
+    - cfg (SimConfig): supplies the default cruise level and flight levels.
+    - R (float): hex circumradius (m).
+    - infl_blocked (float): inflation (m) for the narrower corridor footprint (sets ``in_blocked``).
+    - infl_pad (float): wider inflation (m) that sizes the candidate rectangle.
+    - z (float | None): altitude probe (m); None ⇒ ``cfg.cruise_level_m``.
+
+    Return
+    --------
+    - output (tuple[list[int], list[int], list[bool]]): ``(qs, rs, in_blocked)`` per kept cell —
+      axial ``q``/``r`` and whether the cell also lies in the narrower corridor footprint.
     """
     z = cfg.cruise_level_m if z is None else z
     if _COMPILED and USE_COMPILED:

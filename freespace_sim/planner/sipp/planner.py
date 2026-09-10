@@ -181,12 +181,37 @@ class SafeIntervalIndex:
                 entry.extend(rows)
 
     def _inside_a_column(self, q, r, cols) -> bool:
-        """True if hex ``(q, r)``'s center lies inside any ``(cx, cy, radius)`` column disc."""
+        """True if hex ``(q, r)``'s center lies inside any ``(cx, cy, radius)`` column disc.
+
+        Parameters
+        ------------
+        - q (int): axial q of the hex to test.
+        - r (int): axial r of the hex to test.
+        - cols (Iterable[tuple]): candidate column discs as ``(cx, cy, radius)`` in ENU.
+
+        Return
+        --------
+        - output (bool): True if the hex centre falls within any disc.
+        """
         c = hg.hex_center(q, r, self.R)
         return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
 
     def _add(self, vol, own_cols, _rows=None) -> None:
-        """Rasterize one volume into ``corr``/``cols`` (and the journal in removal mode)."""
+        """Rasterize one volume into ``corr``/``cols`` (and the journal in removal mode).
+
+        Parameters
+        ------------
+        - vol (Volume): one committed volume (corridor or terminal column) to rasterize.
+        - own_cols (Sequence[tuple]): the committing flight's own column discs ``(cx, cy, radius)``;
+          a corridor cell inside one is skipped (own terminal interior is passable).
+        - _rows (array | None): removal-mode journal to extend with flat int64 4-slot rows; ``None``
+          in set mode.
+
+        Return
+        --------
+        - output (None): mutates ``corr``/``cols`` in place; in removal mode also interns cells and
+          extends ``_rows``.
+        """
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         track = self.track_removal
@@ -427,12 +452,26 @@ class _SafeIntervals:
 def _nondominated(frontier, key, t, g, w):
     """Weighted-SIPP Pareto insert at ``key=(q, r, interval)`` on ``(arrival_time, cost)``.
 
-    The *only* in-air wait is hover at rate ``w = c_air_hold_per_s``, so an EARLIER, cheaper label can
-    reproduce a LATER one by hovering forward — but it pays for it. Hence the dominance is **not** plain
+    The only in-air wait is hover at rate ``w = c_air_hold_per_s``, so an EARLIER, cheaper label can
+    reproduce a LATER one by hovering forward, but it pays for it. Hence the dominance is not plain
     ``(t2<=t and g2<=g)`` (which wrongly prunes a later arrival that was reached via cheap upfront ground
     delay, forcing expensive goal-hover instead — observed as ``(c_hold-c_gd)·dt`` cost gaps vs A*).
     Stored ``(t2,g2)`` dominates new ``(t,g)`` iff it is no later AND can hover to ``t`` for ``<= g``:
-    ``t2 <= t and g2 + (t - t2)*w <= g``. Symmetric for eviction. Returns False ⇒ caller skips."""
+    ``t2 <= t and g2 + (t - t2)*w <= g``. Symmetric for eviction.
+
+    Parameters
+    ------------
+    - frontier (dict): slot key → its list of non-dominated ``(t, g)`` labels; mutated in place.
+    - key (tuple): the frontier slot; the caller keys by ``(q, r, level, interval)``.
+    - t (float): the new label's arrival time (seconds).
+    - g (float): the new label's cost.
+    - w (float): air-hover cost rate ``c_air_hold_per_s`` (the dominance slope).
+
+    Return
+    --------
+    - output (bool): True if the label was kept; False if a stored label dominates it (skip).
+      Rebuilds ``frontier[key]`` when the new label evicts stored ones.
+    """
     F = frontier.get(key)
     if F is None:
         frontier[key] = [(t, g)]
@@ -623,7 +662,19 @@ class SIPPPlanner(AStarPlanner):
     def _sipp_index(self, req, ledger, cfg) -> "SafeIntervalIndex":
         """Maintain the SafeIntervalIndex in lockstep with the ledger (mirrors ``_occupancy``): first use
         subscribes the commit hook + absorbs existing volumes; a ledger shrink rebuilds; then evict to
-        the request clock."""
+        the request clock.
+
+        Parameters
+        ------------
+        - req (FlightRequest): flight being planned; its ``t_request`` sets the eviction watermark.
+        - ledger (ReservationLedger): tracked ledger; commit/release/static hooks bind on first use.
+        - cfg (SimConfig): geometry to size a fresh index and convert the clock to steps.
+
+        Return
+        --------
+        - output (SafeIntervalIndex): the index bound to ``ledger``, absorbed and evicted to the
+          request (or coordinator) clock.
+        """
         sidx = self._sidx
         if sidx is not None and self._sidx_ledger is ledger and self._sidx_epoch != ledger.epoch:
             sidx = None     # detached mid-life: re-subscribe and re-absorb (the shrink tripwire
@@ -687,7 +738,20 @@ class SIPPPlanner(AStarPlanner):
         """Pure-Python cost-aware safe-interval search — the compiled kernel's correctness ORACLE
         and the fallback when the compiled path declines. Setup, cost model, terminal gating and
         output mirror ``AStarPlanner.plan`` exactly, so the accept/deny verdict and reported metrics
-        match."""
+        match.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): reservation ledger to deconflict against; the accepted
+          corridor is filed on it.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
+          REJECTED intent carrying a :class:`DenialReason`.
+        """
         # ---- setup: mirrors AStarPlanner.plan (cost/terminals/output parity) ----
         dt = cfg.dt_s
         pitch = cfg.nominal_speed_mps * dt
@@ -1001,6 +1065,16 @@ class SIPPPlanner(AStarPlanner):
         the allocation size never determined which cache lines were read. Sizing them from the tail
         rather than the estimate is therefore a MEMORY win (~18 MB per planner, a DROP concern when
         workers hold their own kernel state), NOT a speed one.
+
+        Parameters
+        ------------
+        - n_slots (int): required per-slot array length (the build's tail); arrays grow to this,
+          never shrinking.
+
+        Return
+        --------
+        - output (None): (re)allocates the per-slot frontier/goal arrays when ``n_slots`` exceeds
+          the current capacity; a no-op otherwise.
         """
         if self._k_cap >= n_slots:
             return
@@ -1014,22 +1088,47 @@ class SIPPPlanner(AStarPlanner):
 
     def _fallback(self, req, ledger, cfg):
         """Fallback when the compiled kernel bails (``FB_OOB``/``FB_CAP``/``FB_HASH``): run
-        **A\\*** — the superclass search — rather than the pure-Python SIPP reference.
+        A* — the superclass search — rather than the pure-Python SIPP reference.
 
         Flights that overflow the kernel are the hard / near-infeasible ones (e.g. always-active
-        walled-in hubs), SIPP's *worst* regime: no early goal to terminate on, so the cost-aware
+        walled-in hubs), SIPP's worst regime: no early goal to terminate on, so the cost-aware
         Pareto search fans out (the ~``max_ground_delay/dt``-deep ground-delay fan × fragmented
         intervals) until the label cap. The pure-Python SIPP reference re-does that same explosion
-        in interpreted Python; A\\* reaches the identical accept/deny verdict ~9× faster because its
-        per-node work is C-level and it has no ground-delay Pareto fan. A\\* shares this planner's
-        ``self._svc``/``self._tcap`` (inherited ``_occupancy``), so there is no occupancy re-sync."""
+        in interpreted Python; A* reaches the identical accept/deny verdict ~9× faster because its
+        per-node work is C-level and it has no ground-delay Pareto fan. A* shares this planner's
+        ``self._svc``/``self._tcap`` (inherited ``_occupancy``), so there is no occupancy re-sync.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight the kernel declined to plan.
+        - ledger (ReservationLedger): ledger shared with A* via the inherited ``_occupancy``, so
+          there is no re-sync.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent | None): A*'s result, re-attributed to the ``"sipp"`` planner;
+          ``None`` if A* returns None.
+        """
         intent = AStarPlanner.plan(self, req, ledger, cfg)
         if intent is not None:
             intent.planner = "sipp"                    # attribute to the selected planner (A* is internal)
         return intent
 
     def _file_deny(self, req, reason, volumes, ledger):
-        """Preserve A*'s filed-corridor telemetry while attributing the native SIPP denial to SIPP."""
+        """Preserve A*'s filed-corridor telemetry while attributing the native SIPP denial to SIPP.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the denied flight.
+        - reason (DenialReason): why the corridor was filed then denied.
+        - volumes (Sequence): the filed corridor volumes carried for telemetry.
+        - ledger (ReservationLedger): reservation ledger the corridor was filed against.
+
+        Return
+        --------
+        - output (OperationalIntent): the superclass REJECTED intent, re-attributed to ``"sipp"``.
+        """
         intent = super()._file_deny(req, reason, volumes, ledger)
         intent.planner = "sipp"
         return intent
@@ -1042,6 +1141,18 @@ class SIPPPlanner(AStarPlanner):
         on a box miss. Falls back to the reference on a box-guard miss or an own/foreign column
         overlap, and to A* (``_fallback``) on a kernel capacity/hash/OOB bail. Output mirrors
         ``_splan_reference``.
+
+        Parameters
+        ------------
+        - req (FlightRequest): the flight to plan.
+        - ledger (ReservationLedger): reservation ledger to deconflict against; the accepted
+          corridor is filed on it.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+
+        Return
+        --------
+        - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
+          REJECTED intent carrying a :class:`DenialReason`.
         """
         from .kernel import FB_CAP, FB_HASH, FB_OOB, NO_PATH
         dt = cfg.dt_s
@@ -1197,6 +1308,22 @@ class SIPPPlanner(AStarPlanner):
             wqspan = int(self._k_wbox[SW.W_Q1]) - wq0 + 1
 
             def _wqr(qc, rc, wq0=wq0, wr0=wr0, wrspan=wrspan, wqspan=wqspan):
+                """Map world axial ``(qc, rc)`` to its level-less window index, ``-1`` if outside.
+
+                Parameters
+                ------------
+                - qc (int): world axial q of the cell.
+                - rc (int): world axial r of the cell.
+                - wq0 (int): window origin q (bound per widen so the closure captures by value).
+                - wr0 (int): window origin r.
+                - wrspan (int): window row span (index stride).
+                - wqspan (int): window q-extent (bound for the in-window test).
+
+                Return
+                --------
+                - output (int): ``iq*wrspan + ir`` window index; ``-1`` if ``(qc, rc)`` is outside
+                  the window box.
+                """
                 iq, ir = qc - wq0, rc - wr0
                 return iq * wrspan + ir if 0 <= iq < wqspan and 0 <= ir < wrspan else -1
 
@@ -1342,7 +1469,40 @@ class SIPPPlanner(AStarPlanner):
         same-level reroute (one successor per reachable neighbour interval, folding pre-move hover) + vertical
         rungs to L±1 (folding pre-rung hover; both levels clear across the climb window — the interval-collapse
         image of the njit kernel's rung block) + a goal-cell hover to retry the landing gate. Mirrors
-        :meth:`AStarPlanner._edges`."""
+        :meth:`AStarPlanner._edges`.
+
+        Parameters
+        ------------
+        - st (tuple): the popped state — a 4-tuple ``("g", q, r, step)`` on the ground ray, else a
+          5-tuple ``("a", q, r, L, step)`` in the air.
+        - iv (int): the popped air state's interval index (carried in the heap); ``-1`` for ground.
+        - SI (_SafeIntervals): per-plan memoised free-interval view for this flight.
+        - cfg (SimConfig): scenario geometry, costs, and timing.
+        - pitch (float): per-step cruise distance (m), charged as lateral cost per reroute hop.
+        - levels (Sequence[float]): flight-level altitudes (m).
+        - takeoff_steps (Sequence[int]): climb steps to each level.
+        - takeoff_cost (Sequence[float]): altitude cost to climb to each level.
+        - rung_steps (Sequence[int]): climb/descend steps per vertical rung (level L↔L+1).
+        - rung_cost (Sequence[float]): altitude cost per rung.
+        - dwell_steps (Sequence[int]): per-level pad dwell steps (hover + climb) for the pad gate.
+        - own (frozenset): terminal ids this flight owns (its own columns are passable).
+        - o_cap (int): origin terminal capacity (departure gate).
+        - o_term (Terminal | None): origin terminal, or ``None`` for a non-terminal origin.
+        - origin (np.ndarray): origin ENU point.
+        - tcap (TerminalCapacity): terminal-capacity gate for dwell/landing checks.
+        - dest (np.ndarray): destination ENU point.
+        - o_lanes (Sequence): origin egress lanes (fixed-lane mode).
+        - o_r (float): origin terminal radius (subtracted from lane distance in the lane cost).
+        - fixed_lanes (bool): fixed exit lanes in force (one takeoff edge per lane/level).
+        - ground_max_step (int): last step the ground-wait ray may reach (max ground delay).
+        - max_step (int): last step of the search domain.
+        - is_goal_cell (callable): predicate ``(q, r) -> bool`` marking a landing cell.
+
+        Return
+        --------
+        - output (list[tuple]): successors as ``(AS, edge_cost, wait_steps, interval_index)``;
+          ``interval_index`` is ``-1`` for a ground successor, else the neighbour's interval index.
+        """
         dt = cfg.dt_s
         c_gd, c_hold, c_lat = (cfg.cost_ground_delay_per_s, cfg.cost_air_hold_per_s,
                                cfg.cost_air_lateral_per_m)

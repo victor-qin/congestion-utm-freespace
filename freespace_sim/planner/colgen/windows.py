@@ -34,7 +34,19 @@ _MIN_ENDPOINT_TIME_PAD_S = 1e-9
 
 
 def _endpoint_time_pad_s(t0: float, t1: float, dt: float, timing_steps: int) -> float:
-    """Conservatively bound floating accumulation in the corner-rebuild clock."""
+    """Conservatively bound floating accumulation in the corner-rebuild clock.
+
+    Parameters
+    ------------
+    - t0 (float): endpoint-cylinder start time (s); only its magnitude sets the pad scale.
+    - t1 (float): endpoint-cylinder end time (s); only its magnitude sets the pad scale.
+    - dt (float): grid period length (s), a floor on the pad scale.
+    - timing_steps (int): rebuilt lateral steps, scaling the accumulated-operation count.
+
+    Return
+    --------
+    - output (float): the time pad in seconds, never below ``_MIN_ENDPOINT_TIME_PAD_S``.
+    """
 
     scale = max(abs(t0), abs(t1), dt, 1.0)
     # A nominal hop can split into two subsegments at the pitch-rounding tripwire.
@@ -54,6 +66,17 @@ def _periods_overlapping(t0: float, t1: float, dt: float) -> range:
     ``ceil(t1 / dt)``.  This helper deliberately has no tolerance padding:
     template corridor times are created directly by the ledger builder and the
     expected default offset tuple is exactly ``(-2, 1)``.
+
+    Parameters
+    ------------
+    - t0 (float): inclusive start of the interval (s).
+    - t1 (float): exclusive end of the interval (s).
+    - dt (float): grid period length (s).
+
+    Return
+    --------
+    - output (range): the integer periods from ``floor(t0/dt)`` to ``ceil(t1/dt)`` (exclusive
+      stop) whose half-open intervals overlap ``[t0, t1)``.
     """
 
     # Division can put an exact constructed boundary on the wrong side of its
@@ -101,14 +124,37 @@ def visit_rows(v: int, offsets: CellWindow) -> range:
 
 
 def _point(cell: AxialCell, z: float, radius: float) -> Vec:
-    """Return a 3-D lattice-centre point for a small template construction."""
+    """Return a 3-D lattice-centre point for a small template construction.
+
+    Parameters
+    ------------
+    - cell (AxialCell): axial ``(q, r)`` cell whose centre gives the x/y coordinates.
+    - z (float): altitude in metres, used as the third coordinate.
+    - radius (float): hex circumradius that sizes the lattice.
+
+    Return
+    --------
+    - output (Vec): the point ``(x, y, z)`` at the cell centre as a float array.
+    """
 
     xy = hex_center(*cell, radius)
     return np.array((float(xy[0]), float(xy[1]), float(z)), dtype=float)
 
 
 def _shift_volume(volume: Volume4D, steps: int, dt: float) -> Volume4D:
-    """Translate only a template volume's time interval by ``steps`` periods."""
+    """Translate only a template volume's time interval by ``steps`` periods.
+
+    Parameters
+    ------------
+    - volume (Volume4D): the template volume whose time window is shifted.
+    - steps (int): number of periods to translate by (may be negative).
+    - dt (float): grid period length (s).
+
+    Return
+    --------
+    - output (Volume4D): a copy with ``t_start``/``t_end`` shifted by ``steps * dt`` and the
+      spatial extent unchanged.
+    """
 
     shift = steps * dt
     return replace(volume, t_start=volume.t_start + shift, t_end=volume.t_end + shift)
@@ -123,6 +169,16 @@ def _template_arcs(cfg: SimConfig, radius: float) -> list[tuple[Volume4D, tuple[
     those arc types are outside colgen v1's column universe, including them is
     a cheap guard that the measured per-visit window still covers the ledger's
     existing geometry classes.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies the clock, cruise level, and flight-level ladder.
+    - radius (float): hex circumradius used to place the cell centres.
+
+    Return
+    --------
+    - output (list[tuple[Volume4D, tuple[int, ...]]]): each entry pairs a ledger volume with
+      the centre-cell visit steps that would claim it.
     """
 
     dt = cfg.dt_s
@@ -176,6 +232,17 @@ def _cross_check_conflicts(cfg: SimConfig, offsets: CellWindow, radius: float) -
     finite scan ties the two together: for every representative arc class and
     every temporal displacement at which the volumes can meet, a geometric
     conflict must imply an intersecting row claim.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies the clock and geometry the template arcs are built from.
+    - offsets (CellWindow): the inclusive ``(lo, hi)`` visit offsets under test.
+    - radius (float): hex circumradius used to place the template arcs.
+
+    Return
+    --------
+    - output (None): returns on success; raises ``RuntimeError`` if a geometric template
+      conflict is not covered by a shared cell-capacity row.
     """
 
     dt = cfg.dt_s
@@ -389,6 +456,18 @@ def _distance_to_hex(px: float, py: float, cell: AxialCell, hex_radius: float) -
     whose CENTRE is inside ``radius + circumradius`` can still be out of reach of the disk,
     by up to a full circumradius (the exact test claims 3.89 cells per endpoint where the
     centre test claims 4.23).
+
+    Parameters
+    ------------
+    - px (float): point x-coordinate in local ENU metres.
+    - py (float): point y-coordinate in local ENU metres.
+    - cell (AxialCell): axial ``(q, r)`` cell whose closed hexagon is measured to.
+    - hex_radius (float): hex circumradius sizing the hexagon.
+
+    Return
+    --------
+    - output (float): planar distance in metres, ``0.0`` when the point is inside the
+      closed hexagon.
     """
 
     cx, cy = hex_center(cell[0], cell[1], hex_radius)

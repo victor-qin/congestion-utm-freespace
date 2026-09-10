@@ -279,7 +279,19 @@ class ReservationLedger:
     # ----- writes -----
     def _append(self, flight_id: int, v: Volume4D) -> None:
         """Insert one volume into the arrays and the (step, cell) buckets — the commit loop body,
-        shared with `_compact` (which must NOT re-fire observers)."""
+        shared with `_compact` (which must NOT re-fire observers).
+
+        Parameters
+        ------------
+        - flight_id (int): the flight that owns the volume.
+        - v (Volume4D): the reservation volume to record.
+
+        Return
+        --------
+        - output (None): appends to ``_vols`` / ``_fids`` / ``_aabb``, extends the per-flight
+          ``_runs`` slot index (coalescing contiguous rows), and adds the row to every
+          ``(step, cell)`` bucket it touches; fires no observers.
+        """
         idx = len(self._vols)
         self._vols.append(v)
         self._fids.append(flight_id)

@@ -144,6 +144,23 @@ def _column_at(intent, graph, cfg: "SimConfig", model, delta: int, base=None):
     re-run the centreline rasterisation, `column_to_intent` and `model.evaluate` for a
     byte-identical result.  Passing ``None`` rebuilds it, which is what a caller outside that
     loop wants; reusing it keeps the loop's cost from scaling with ``max_shift``.
+
+    Parameters
+    ------------
+    - intent (OperationalIntent): source schedule entry, used only to rebuild ``base`` when
+      it is not supplied.
+    - graph (FlightGraph): the flight's pricing graph; supplies ``latest_departure_step`` and
+      the cells ``column_claims`` reads.
+    - cfg (SimConfig): supplies the clock and lattice geometry.
+    - model (CostModel): cost weights used to refill ``delay_s`` after a shift.
+    - delta (int): departure hold in ``dt`` steps; ``0`` returns ``base`` unshifted.
+    - base (Column | None): the unshifted column to reuse; ``None`` rebuilds it via
+      :func:`intent_to_column`.
+
+    Return
+    --------
+    - output (tuple[Column | None, str | None]): ``(column, None)`` with ``claims`` filled on
+      success, or ``(None, reason)`` naming why the shift or translation was rejected.
     """
 
     if base is None:

@@ -351,6 +351,20 @@ def _visit_claims(
     visit_step: int,
     offsets: tuple[int, int],
 ) -> frozenset[RowKey]:
+    """Return the cell-capacity rows one visit to ``cell`` at ``visit_step`` claims.
+
+    Parameters
+    ------------
+    - cell (Cell): the axial ``(q, r)`` cell being visited.
+    - level (int): the flight level of the visit.
+    - visit_step (int): the step at which the cell centre is reached.
+    - offsets (tuple[int, int]): inclusive ``(lo, hi)`` window from :func:`derive_cell_window`.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): the cell rows ``visit_step+lo .. visit_step+hi`` at that
+      cell and level.
+    """
     q, r = cell
     return frozenset(
         RowKey.cell(q, r, level, row_step) for row_step in visit_rows(visit_step, offsets)
@@ -374,6 +388,17 @@ def _rows_hit_forbidden(
     ``tuple.__getitem__`` rather than the ``.kind`` / ``.step`` / ``.level`` properties, because
     each of those re-reads ``.kind`` to choose its index -- several attribute lookups per row on
     the hottest path in the greedy heuristic.
+
+    Parameters
+    ------------
+    - claims (Iterable[RowKey]): the untranslated canonical claim set to test.
+    - forbidden (AbstractSet[RowKey]): rows that must stay clear.
+    - delta_steps (int): integer clock shift applied to each claim before the membership test.
+
+    Return
+    --------
+    - output (bool): ``True`` if any shifted claim falls in ``forbidden``; ``False`` when
+      ``forbidden`` is empty.
     """
     if not forbidden:
         return False
@@ -407,6 +432,19 @@ def _visit_hits_forbidden(
     Same identity as :func:`_rows_hit_forbidden`, applied to the per-visit cell window: this
     is called once per relaxed arc, so the frozenset it replaces was the single largest source
     of ``RowKey`` construction in ``find_feasible_column``.
+
+    Parameters
+    ------------
+    - cell (Cell): the axial ``(q, r)`` cell being visited.
+    - level (int): the flight level of the visit.
+    - visit_step (int): the step at which the cell centre is reached.
+    - offsets (tuple[int, int]): inclusive ``(lo, hi)`` window from :func:`derive_cell_window`.
+    - forbidden (AbstractSet[RowKey]): rows that must stay clear.
+
+    Return
+    --------
+    - output (bool): ``True`` if any of the visit's cell rows is in ``forbidden``; ``False``
+      when ``forbidden`` is empty.
     """
     if not forbidden:
         return False
@@ -434,6 +472,18 @@ def _endpoint_claims(
     :func:`find_feasible_column`, which refuse a ``cfg`` that is not ``fg._cfg``.  The
     redundancy it exploits is extreme: one sink proposal per ``(arrival step, hop count)``
     pair, so the reachable key space is far smaller than the number of sinks reaching it.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying the endpoints, terminals, levels, and cache.
+    - cfg (SimConfig): must be ``fg._cfg``; supplies the clock and geometry.
+    - origin (bool): ``True`` for the origin endpoint, ``False`` for the destination.
+    - step (int): the step at which the endpoint is occupied.
+    - timing_steps (int): rebuilt-step count sizing the float-drift pad.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): the dwell rows that endpoint occupies, memoized on the graph.
     """
 
     key = (origin, step, timing_steps)
@@ -468,6 +518,19 @@ def _endpoint_claims_uncached(
 
     Kept separate rather than inlined so a test can assert the cache reproduces it exactly
     over the whole reachable key space, instead of trusting the purity argument above.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying the endpoints, terminals, and levels.
+    - cfg (SimConfig): must be ``fg._cfg``; supplies the clock and geometry.
+    - origin (bool): ``True`` for the origin endpoint, ``False`` for the destination.
+    - step (int): the step at which the endpoint is occupied.
+    - timing_steps (int): rebuilt-step count sizing the float-drift pad.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): terminal rows when the endpoint is a terminal, else the cell
+      rows the endpoint cylinder touches across its dwell.
     """
 
     point = fg.request.origin if origin else fg.request.dest
@@ -522,7 +585,21 @@ def _shortest_cell_path(
     *,
     deadline: float | None = None,
 ) -> tuple[Cell, ...] | None:
-    """Return one deterministic shortest path using lazy, cached A* expansion."""
+    """Return one deterministic shortest path using lazy, cached A* expansion.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): supplies ``outgoing_neighbors`` for lattice expansion.
+    - start (Cell): the start cell.
+    - destination (Cell): the goal cell.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+
+    Return
+    --------
+    - output (tuple[Cell, ...] | None): the cell path from ``start`` to ``destination``
+      inclusive, or ``None`` when ``start == destination`` or no path exists. Raises
+      ``PricingTimeout`` if ``deadline`` passes.
+    """
 
     if start == destination:
         return None  # A column must contain a real lateral hop.
@@ -576,6 +653,21 @@ def _path_claims(
       ``(origin, step, timing_steps)``, of which a batch has very few distinct values.
     * ``visit_cache`` -- sink proposals share path prefixes and corridor start steps,
       so ``(cell, visit_step)`` repeats heavily.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying lanes, takeoff steps, and endpoints.
+    - cfg (SimConfig): supplies the clock and the derived cell window.
+    - label (_Label): the search label carrying the path, departure step, and hop count.
+    - dest_lane_idx (int | None): the selected destination lane; ignored here (it changes
+      geometry, not dwell-row membership).
+    - endpoint_cache (dict | None): optional memo for endpoint row sets across a batch.
+    - visit_cache (dict | None): optional memo for per-visit cell row sets across a batch.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): the intended row union (both endpoints plus every per-visit
+      cell window) before canonical certification.
     """
 
     del dest_lane_idx  # The selected destination lane changes geometry, not dwell row membership.
@@ -619,7 +711,21 @@ def _path_claims(
 def _path_delay_s(
     fg: FlightGraph, cfg: SimConfig, label: _Label, model: CostModel = DELAY_MODEL
 ) -> float:
-    """Compute the exact v1 delay ruler without building reservation volumes."""
+    """Compute the exact v1 delay ruler without building reservation volumes.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): supplies the request endpoints, terminals, and levels.
+    - cfg (SimConfig): supplies the lattice geometry, clock, and nominal speed.
+    - label (_Label): the label carrying the cell path and departure step.
+    - model (CostModel): cost weights applied to the ground and air terms; defaults to
+      ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (float): the evaluated delay in the cost model's currency (ground delay plus the
+      en-route detour term).
+    """
 
     radius = hg.circumradius(cfg)
     z = fg.levels[0]
@@ -647,7 +753,20 @@ def _path_delay_s(
 
 
 def _fold_leg_s(point, terminal: Terminal | None, lane_dist: float | None, cfg: SimConfig) -> float:
-    """Return the endpoint leg charged by the arc-form delay objective."""
+    """Return the endpoint leg charged by the arc-form delay objective.
+
+    Parameters
+    ------------
+    - point (Vec): the endpoint position in local ENU metres; only x/y are used.
+    - terminal (Terminal | None): the endpoint's terminal, or ``None`` for a customer endpoint.
+    - lane_dist (float | None): the lane distance; required when ``terminal`` is set and must
+      be ``None`` otherwise.
+    - cfg (SimConfig): supplies the geometry, exit radius, and nominal speed.
+
+    Return
+    --------
+    - output (float): the endpoint leg time in seconds charged by the arc-form objective.
+    """
 
     if terminal is not None:
         assert lane_dist is not None
@@ -676,6 +795,18 @@ def _terminal_fold_leg_s(
     revive the terminal fold-replacement pruning bug.  Recompute the scalar
     distance with the same ``sqrt(dx*dx + dy*dy)`` predicate as folding and
     enable the arc lower bound only when the lane is retained exactly.
+
+    Parameters
+    ------------
+    - point (Vec): the endpoint position in local ENU metres; only x/y are used.
+    - terminal (Terminal): the endpoint's terminal.
+    - cell (Cell): the lane cell whose centre the fold measures from.
+    - cfg (SimConfig): supplies the geometry, exit radius, and nominal speed.
+
+    Return
+    --------
+    - output (tuple[float, bool]): the fold leg time in seconds, and whether folding retains
+      the lane cell exactly (distance >= the exit radius).
     """
 
     radius = hg.circumradius(cfg)
@@ -718,6 +849,24 @@ def _arc_delay_lower_bound_s(
     distance.  The safe fallback is then the irrevocable ground delay.  The
     same fallback is required for a zero reference because
     ``enroute_detour_m`` deliberately defines its detour as zero.
+
+    Parameters
+    ------------
+    - ground_delay_s (float): the prefix's irrevocable ground delay in seconds.
+    - origin_fold_s (float): the origin fold leg time in seconds.
+    - hops (int): hops already flown in the prefix.
+    - remaining_hops (int): admissible lower bound on the unflown hops (plain hex distance).
+    - destination_fold_s (float): the destination fold leg time in seconds.
+    - reference_time_s (float): the reference (geodesic) flight time in seconds.
+    - dt_s (float): the clock step in seconds.
+    - folding_exact (bool): whether both terminal folds retain their boundary cells.
+    - model (CostModel): cost weights for the ground and air terms; defaults to ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (float): a lower bound on canonical delay over every completion of the prefix;
+      falls back to the ground-only cost when ``folding_exact`` is False or the reference is
+      non-positive.
     """
 
     if not folding_exact or reference_time_s <= 0.0:
@@ -767,6 +916,25 @@ def _shifted_seed_incumbent(
     With non-negative duals, the first feasible translation that pays no dual
     dominates every later seed translation, so the scan may stop there.  A
     negative backend-tolerance dual disables that stopping rule.
+
+    Parameters
+    ------------
+    - seed (Column): the seed column whose integer time-translations are scanned.
+    - fg (FlightGraph): the flight graph, supplying the departure bounds and lanes.
+    - duals (DualView): the dual view scoring each translation's rows.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies ``dt_s`` for the ground-delay term.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - incumbent (tuple[float, Column] | None): the current best ``(reduced_cost, column)`` to
+      beat.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+    - model (CostModel): cost weights for the added ground delay; defaults to ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (tuple[float, Column] | None): the strengthened ``(reduced_cost, column)`` when a
+      better translation is found, else ``incumbent`` unchanged (possibly ``None``).
     """
 
     origin_lane_steps = (
@@ -835,6 +1003,20 @@ def _root_bounds(topology, variants, envelopes, benefit: float, pi_f: float, dua
     any search explores, so it cannot discard a column.
 
     ``-inf`` for a root the envelope's own LENGTH rejects, which sorts it last.
+
+    Parameters
+    ------------
+    - topology (PreparedTopology): supplies ``hex_remaining`` per corridor cell.
+    - variants (PreparedVariants): the candidate roots (departure step, lane, cell, dual cost).
+    - envelopes (CompletionEnvelopes): supplies ``_delay_envelope`` and ``_destination_cost``.
+    - benefit (float): the per-flight benefit ``M``.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - dual_view (DualView): supplies ``max_negative_credit``.
+
+    Return
+    --------
+    - output (np.ndarray): per-root ``hop_rc_bound`` (float64), ``-inf`` for a root the
+      envelope length rejects (sorts last); used only for ranking, never to prune.
     """
 
     n = int(variants.departure_step.size)
@@ -905,6 +1087,26 @@ def _bootstrap_incumbent(
 
     Returns the incumbent unchanged when it finds nothing better, so a bootstrap that
     declines outright leaves the caller exactly where it was.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph whose start options are ranked and searched.
+    - dual_view (DualView): the dual view scoring candidate rows.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights for the delay ruler.
+    - incumbent (tuple[float, Column] | None): the current cutoff to improve.
+    - roots (int): how many top-ranked start options to search.
+    - ranking (str): what to rank roots on -- ``"score"`` (root cost) or ``"bound"``
+      (``_root_bounds``); defaults to ``"score"``.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+
+    Return
+    --------
+    - output (tuple[float, Column] | None): a stronger cutoff ``(reduced_cost, column)`` when
+      the restricted search finds one, else ``incumbent`` unchanged (possibly ``None``).
     """
 
     # Rank ONCE, here, and hand the result to whichever search runs.  `prepare_variants` is
@@ -1033,6 +1235,25 @@ def _canonical_candidate(
     forbidden_rows: AbstractSet[RowKey],
     model: CostModel = DELAY_MODEL,
 ) -> tuple[float, Column] | None:
+    """Certify one search candidate's route and return its exact reduced cost, or ``None``.
+
+    Parameters
+    ------------
+    - candidate (_Candidate): the search candidate carrying the label, destination lane, and
+      provisional delay.
+    - fg (FlightGraph): the flight graph, supplying the request and geometry.
+    - duals (DualView): the dual view scoring the certified claims.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (tuple[float, Column] | None): the certified ``(reduced_cost, column)``, or
+      ``None`` when the route is not accepted, has illegal claims, or hits a forbidden row.
+    """
     label = candidate.label
     provisional = Column(
         flight_id=fg.request.flight_id,
@@ -1109,6 +1330,23 @@ def _sink_certifier(
 
     Returns the new ``(reduced_cost, Column)`` incumbent, or ``None`` when this sink does
     not improve on the one passed in.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying the request and geometry.
+    - dual_view (DualView): the dual view scoring certified claims.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+
+    Return
+    --------
+    - output (Callable): a ``certify(incumbent, departure_step, origin_lane_idx, dest_lane_idx,
+      arrival_step, path)`` closure returning the improved ``(reduced_cost, Column)`` incumbent,
+      or ``None`` when the sink does not improve on the one passed in.
     """
 
     def certify(
@@ -1173,6 +1411,18 @@ def _shortest_seed_columns(
     The result is cached on the graph, keyed on ``model`` -- not one seed per graph.  The key
     matters because comparing two objectives on one graph (the natural way to write such a
     comparison) would otherwise silently get the first model's seed twice, with no error.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying endpoints, lanes, and the search cache.
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+    - model (CostModel): cost weights and the cache key; defaults to ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (tuple[Column, ...]): a one-element tuple with the best certified shortest-delay
+      seed, or empty when none certifies; cached on the graph keyed by ``model``.
     """
 
     cache = fg._search_cache
@@ -1337,7 +1587,19 @@ def _shortest_seed(
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
 ) -> Column | None:
-    """Certify the best deterministic BFS seed without expanding the time DAG."""
+    """Certify the best deterministic BFS seed without expanding the time DAG.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying endpoints, lanes, and the search cache.
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+    - model (CostModel): cost weights and the cache key; defaults to ``DELAY_MODEL``.
+
+    Return
+    --------
+    - output (Column | None): the best certified seed column, or ``None`` when none certifies.
+    """
 
     columns = _shortest_seed_columns(fg, cfg, deadline=deadline, model=model)
     return None if not columns else columns[0]
@@ -1381,6 +1643,25 @@ def _certify_candidates(
     passes the one its pause-and-resume protocol arrived at. It is what the early
     ``_RECOMPUTE_EPS`` break is measured against, so passing ``None`` is not a neutral
     default -- it certifies far more candidates than the reference would.
+
+    Parameters
+    ------------
+    - candidates (list[_Candidate]): the sink proposals to rank and certify (sorted in place).
+    - fg (FlightGraph): the flight graph, supplying the request and geometry.
+    - dual_view (DualView): the dual view scoring certified claims.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
+    - incumbent (tuple[float, Column] | None): the score already certified before ranking; the
+      early break is measured against it, so ``None`` certifies far more candidates.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+
+    Return
+    --------
+    - output (tuple[float, Column] | None): the best certified ``(reduced_cost, column)``, or
+      ``incumbent`` when nothing beats it (possibly ``None``).
     """
 
     if not candidates:
@@ -1451,6 +1732,27 @@ def _best_column(
     compiled search takes the same argument straight through to ``prepare_variants``, and
     the allowlist is built ONCE by :func:`_bootstrap_incumbent`, so neither search ranks
     roots for itself and the two cannot disagree about which ones they kept.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph whose space-time DAG is searched.
+    - dual_view (DualView): the dual view scoring each candidate's rows.
+    - pi_f (float): the flight's dual (``pi_f``); must be finite.
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - seed (bool): restrict the search to the seed's single departure (every lane).
+    - incumbent (tuple[float, Column] | None): an already-certified cutoff that warm-starts
+      pruning.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+    - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
+    - keep_roots (frozenset[tuple[int, int]] | None): allowlist of ``(departure_step,
+      lane_idx)`` roots (``-1`` for a bare origin); ``None`` searches every root.
+
+    Return
+    --------
+    - output (tuple[float, Column | None]): the winning column and its reduced-cost score, or
+      ``(-math.inf, None)`` when no feasible column exists.
     """
 
     _check_deadline(deadline)
@@ -2196,6 +2498,19 @@ def _warn_budget_growth(kernel, fg: FlightGraph, result) -> None:
     per process too, which means a parallel sweep's totals live in the workers -- the
     aggregate a parent already sees is ``kernel_fell_back``, which every decline here also
     increments one level up in :func:`price_flight`.
+
+    Parameters
+    ------------
+    - kernel (module): the compiled ``dp_kernel`` module, supplying the ``STATUS_*`` codes and
+      label-capacity constants.
+    - fg (FlightGraph): the flight being priced, read for its ``flight_id`` in the warnings.
+    - result (DagResult): the compiled search's result -- ``status``, ``n_labels``,
+      ``attempts``, and ``budget``.
+
+    Return
+    --------
+    - output (None): increments the per-process ``_KERNEL_STATS`` counters and prints
+      once-per-process warnings to stderr; mutates the module-global warn-once flags.
     """
 
     global _kernel_restart_warned, _kernel_budget_warned
@@ -2318,6 +2633,24 @@ def _dag_candidates(
     why the kernel is allowed to register a sink the reference rejects: reproducing the two
     endpoint span rules in numba to save work Tier 2 redoes anyway would be a second place
     for them to drift.
+
+    Parameters
+    ------------
+    - result (DagResult): the compiled search result, supplying ``candidates`` and ``paths``.
+    - topology (PreparedTopology): supplies ``cell_q``/``cell_r`` for cell reconstruction.
+    - fg (FlightGraph): the flight graph, supplying the request and geometry.
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - dual_view (DualView): the dual view scoring each sink's rows.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights for the delay ruler.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+
+    Return
+    --------
+    - output (list[_Candidate]): one priced ``_Candidate`` per sink that clears both
+      forbidden-row gates, for Tier 2 to rank.
     """
 
     cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
@@ -2408,6 +2741,29 @@ def _best_column_compiled(
     between the Python stages, and a watchdog that sets the kernel's ``cancel`` flag, which
     it polls per time layer. An ``@njit(nogil=True)`` function cannot read a clock, and
     with geometric budget growth one call can run for minutes.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph whose space-time DAG is searched.
+    - dual_view (DualView): the dual view scoring each candidate's rows.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - incumbent (tuple[float, Column] | None): an already-certified cutoff that warm-starts
+      pruning.
+    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+    - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
+    - keep_roots (frozenset[tuple[int, int]] | None): allowlist of ``(departure_step,
+      lane_idx)`` roots; ``None`` searches every root.
+    - record_budget (bool): whether to record and warn about the label budget via
+      :func:`_warn_budget_growth`; defaults to ``True``.
+
+    Return
+    --------
+    - output (tuple[float, Column | None] | Declined): the winning ``(reduced_cost, column)``
+      (or ``(-math.inf, None)``) when the compiled search completes, else a ``Declined`` reason
+      telling the caller to run ``_best_column``.
     """
 
     kernel = _dp_kernel()
@@ -2610,6 +2966,35 @@ def _feasible_compiled(
     that judges them and it reaches the whole geometry stack. There are a few hundred sinks
     against those same hundreds of thousands of arcs, which is what makes pausing per sink
     affordable.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight's space-time graph; must have been built with ``cfg``.
+    - cfg (SimConfig): the config used to build ``fg``; supplies geometry and the clock.
+    - forbidden (AbstractSet[RowKey]): rows a feasible column may not claim.
+    - best_column (Column | None): the incumbent to beat; bounds the start loop and ranking.
+    - improve_below_delay_s (float | None): when set, stop at the first certified column whose
+      delay is strictly below it.
+    - origin_options (Iterable): the origin start options as ``(lane_idx, cell, steps)`` tuples.
+    - offsets (tuple[int, int]): the inclusive derived cell window ``(lo, hi)``.
+    - origin_fold_lb (Mapping): per-lane origin fold, lane index -> ``(fold_s, exact)``.
+    - destination_fold_lb (float): the destination fold leg lower bound in seconds.
+    - destination_fold_exact (bool): whether the destination fold retains its cell.
+    - reference_time_s (float): the reference (geodesic) flight time in seconds.
+    - reference_m (float): the reference distance in metres, gating exact folding.
+    - remaining_distance (Callable): maps a cell to its admissible remaining hop count.
+    - delay_bound (Callable): maps ``(departure_step, lane_idx, hops, remaining)`` to a delay
+      lower bound.
+    - column_key (Callable): maps a column to the canonical sort key used to break ties.
+    - view (DualView): the (empty) dual view used when certifying candidates.
+    - deadline (float | None): ``time.monotonic`` cutoff; reaching it raises ``PricingTimeout``.
+    - model (CostModel): the objective the bounds and canonical gate use.
+
+    Return
+    --------
+    - output (Column | None | Declined): the best (or first-improving) feasible column,
+      ``best_column`` when no root survives, or a ``Declined`` reason when the compiled search
+      cannot run.
     """
 
     kernel = _dp_kernel()

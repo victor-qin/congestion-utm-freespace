@@ -492,6 +492,19 @@ def _init_worker(
     every graph is the largest allocation a worker makes, so ``MemoryError`` -- the failure
     the ``n_workers`` ceiling is about -- lands exactly here, and a worker that merely
     exited would otherwise be indistinguishable from one that was killed.
+
+    Parameters
+    ------------
+    - worker (int): this worker's index, stored for diagnostics.
+    - worker_requests (list[FlightRequest]): only the flights assigned to this worker.
+    - cfg (SimConfig): simulation config, stored and used to build each graph.
+    - params (ColGenParams): solver controls, stored and used to build each graph.
+    - catalog (StaticTerminalCatalog): the shared wall catalogue every graph must see.
+
+    Return
+    --------
+    - output (None): populates the module-global ``_WORKER`` state; a build failure is
+      recorded under ``_WORKER["init_error"]`` as a traceback string, never raised.
     """
 
     _WORKER.clear()
@@ -536,6 +549,20 @@ def _load_sweep_state(
     one -- the worker must be left holding NOTHING, so the next task raises. Leaving the
     previous sweep's tuple in place would let it price iteration k against iteration k-1's
     duals and return a plausible wrong number.
+
+    Parameters
+    ------------
+    - epoch (tuple): names the sweep these duals belong to; checked by ``_price_one``.
+    - duals_blob (bytes): the iteration's row-dual mapping, pre-pickled once by the parent.
+    - flight_duals (dict[int, float]): per-flight dual (``pi_f``), sliced to this worker.
+    - known_columns (dict[int, Column]): incumbent column per flight, sliced to this worker.
+    - deadline (float | None): absolute ``time.monotonic`` pricing deadline, or ``None``.
+
+    Return
+    --------
+    - output (None): installs the sweep tuple in ``_WORKER["sweep"]``; a build failure is
+      recorded under ``_WORKER["sweep_error"]`` (never raised), and a prior init error is a
+      no-op.
     """
 
     if _WORKER.get("init_error") is not None:
@@ -591,6 +618,20 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
     them as they are produced. That is flow control, not cosmetics: a column is ~13.7 KB and
     a pipe buffer is ~64 KB, so a worker that produced everything before sending would block
     on a full pipe while the parent waited for a different one.
+
+    Parameters
+    ------------
+    - conn (Connection): this worker's end of the pipe to the parent.
+    - worker_index (int): this worker's index, forwarded to :func:`_init_worker`.
+    - requests (list[FlightRequest]): the flights assigned to this worker.
+    - cfg (SimConfig): simulation config, forwarded to graph construction.
+    - params (ColGenParams): solver controls, forwarded to graph construction.
+    - catalog (StaticTerminalCatalog): the shared wall catalogue every graph must see.
+
+    Return
+    --------
+    - output (None): serves the parent's pipe until a ``"stop"`` message or the pipe closes,
+      sending ``ready``/``results``/``error`` messages back over ``conn``.
     """
 
     try:
@@ -661,6 +702,22 @@ def _price_one(epoch: tuple, flight_id: int):
     A timeout is reported rather than raised for a related reason: propagating it would
     make the parent re-raise it, and a timeout here is an ordinary outcome, not a
     failure.
+
+    Parameters
+    ------------
+    - epoch (tuple): the sweep whose duals this worker is believed to hold; verified, not
+      trusted.
+    - flight_id (int): the flight to price; must belong to this worker.
+
+    Return
+    --------
+    - output (tuple): a 7-field result --
+      ``flight_id`` (int), ``priced`` (bool, ``False`` on timeout), ``reduced_cost`` (float,
+      ``0.0`` on timeout), ``column`` (Column | None, ``None`` on timeout), ``task_s`` (float,
+      seconds spent), ``counter_deltas`` (dict[str, int] kernel-stat deltas, ``{}`` on
+      timeout), and ``search_record`` (dict from ``last_search_record()``). Raises
+      ``RuntimeError``/``StalePricingWorker`` if the worker is uninitialised or holds the
+      wrong sweep epoch.
     """
 
     init_error = _WORKER.get("init_error")
@@ -791,7 +848,24 @@ def price_sweep(
 def _sweep_sequential(
     pricing_order, graphs, cfg, params, dual_view, flight_duals, known_columns, deadline
 ) -> SweepResult:
-    """The original in-process loop, kept verbatim as the parity baseline."""
+    """The original in-process loop, kept verbatim as the parity baseline.
+
+    Parameters
+    ------------
+    - pricing_order (list[int]): flight ids to price, in order; defines the accepted prefix.
+    - graphs (dict): prebuilt flight graphs keyed by flight id.
+    - cfg (SimConfig): simulation config.
+    - params (ColGenParams): solver controls forwarded to ``price_flight``.
+    - dual_view (DualView): the parent's dual view priced against.
+    - flight_duals (dict[int, float]): per-flight dual (``pi_f``) by flight id.
+    - known_columns (dict[int, Column]): incumbent column per flight, priced against as a cutoff.
+    - deadline (float | None): absolute ``time.monotonic`` pricing deadline, or ``None``.
+
+    Return
+    --------
+    - output (SweepResult): the accepted prefix in ``pricing_order`` order, ending at the
+      first flight to time out.
+    """
 
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
@@ -855,6 +929,19 @@ def _flight_record(flight_id: int, task_s: float, *, priced: bool, search=None) 
     inside the worker, and read here directly by the sequential arm. Empty when the flight
     never reached the compiled search at all, which is itself the answer to "why was this
     one cheap".
+
+    Parameters
+    ------------
+    - flight_id (int): the flight this row is about; also overwrites any stale id in ``search``.
+    - task_s (float): wall seconds spent on this flight.
+    - priced (bool): whether the flight was priced (``False`` if it timed out).
+    - search (dict | None): the kernel search record; ``None`` reads ``last_search_record()``
+      here (the sequential arm), otherwise the pool passes the worker's own.
+
+    Return
+    --------
+    - output (dict): the flight's row -- ``flight_id``, ``task_s``, ``priced``, ``worker``,
+      ``pid``, merged with the kernel search record.
     """
 
     # `worker`/`pid` describe the SEQUENTIAL arm as written -- one worker, this process. The
@@ -1231,6 +1318,24 @@ def _sweep_parallel(
     `price_sweep` does when called outside a solve. That path is now a special case of the
     solve-scoped one rather than a second implementation, so there is exactly one route
     through the workers and the tests that drive `price_sweep` directly still exercise it.
+
+    Parameters
+    ------------
+    - pricing_order (list[int]): flight ids to price, in order; defines the accepted prefix.
+    - requests (list[FlightRequest]): flight requests workers rebuild their own graphs from.
+    - cfg (SimConfig): simulation config.
+    - params (ColGenParams): supplies ``n_pricing_workers`` and ``pricing_chunksize``.
+    - catalog (StaticTerminalCatalog): the shared wall catalogue every worker graph must see.
+    - duals (dict): the iteration's row duals, pickled once and shipped to every worker.
+    - flight_duals (dict[int, float]): per-flight dual (``pi_f``) by flight id.
+    - known_columns (dict[int, Column]): incumbent column per flight, priced against as a cutoff.
+    - deadline (float | None): absolute ``time.monotonic`` pricing deadline, or ``None``.
+    - pool (PricingPool | None): caller-owned pool that outlives the sweep; ``None`` builds and
+      tears one down here.
+
+    Return
+    --------
+    - output (SweepResult): the accepted prefix in ``pricing_order`` index order.
     """
 
     if pool is not None:
@@ -1279,6 +1384,22 @@ def _sweep_results(collect, n_workers, pricing_order, worker_of, deadline, progr
     IS the j-th ``pricing_order`` entry assigned to *w*. Walking ``pricing_order`` and taking
     from the one worker that owns the next index therefore yields exactly index order, which
     rule 2 requires.
+
+    Parameters
+    ------------
+    - collect (Callable): ``collect(timeout) -> (results_by_worker, died)``; the only transport
+      dependency, so this is testable without processes.
+    - n_workers (int): number of worker pipes to merge.
+    - pricing_order (list[int]): flight ids in the order results are yielded.
+    - worker_of (Mapping[int, int]): flight id -> the worker index that owns it.
+    - deadline (float | None): absolute ``time.monotonic`` cutoff bounding each wait, or ``None``.
+    - progress (_SweepProgress | None): progress reporter; ``None`` builds a default one.
+
+    Return
+    --------
+    - output (Iterator[tuple]): yields each flight's result tuple (the ``_price_one`` shape) in
+      ``pricing_order`` order; a give-up yields that flight as a timeout and stops. Raises
+      ``RuntimeError`` if a worker returns an out-of-order flight.
     """
 
     pending = [collections.deque() for _ in range(n_workers)]
@@ -1349,6 +1470,16 @@ def _accepted_prefix(results) -> SweepResult:
 
     ``wall_s`` is left at zero: the caller owns the clock, because it has to start before
     the pool exists.
+
+    Parameters
+    ------------
+    - results (Iterable[tuple]): per-flight result tuples in ``pricing_order`` order, each the
+      ``_price_one`` shape.
+
+    Return
+    --------
+    - output (SweepResult): the accepted prefix, ending at the first unpriced (timed-out)
+      result; ``wall_s`` is left ``0.0`` because the caller owns the clock.
     """
 
     flight_ids: list[int] = []

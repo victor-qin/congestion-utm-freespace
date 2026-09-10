@@ -253,6 +253,22 @@ def _worker_main(conn, cfg: SimConfig, intents: list, static_terms: tuple,
     ``unimpeded_cost`` keeps its ``None``s: ``LNSState.__init__`` is the single owner of the
     "ruler denied this flight -> treat as undelayed" rule, so the coordinator and every worker
     resolve it identically by construction rather than by agreement.
+
+    Parameters
+    ------------
+    - conn: duplex pipe end to the coordinator; receives ``sync``/``task``/``stop`` messages and
+      sends ``ready``/``result`` tuples.
+    - cfg (SimConfig): run config for the replica and its repair planner.
+    - intents (list): the incumbent schedule the replica is built from.
+    - static_terms (tuple): the run's always-active terminal walls.
+    - unimpeded_cost (dict): per-flight ruler cost (``None`` entries preserved).
+    - spec (WorkerSpec): per-worker knobs (planner, neighborhood, epsilon, RNG/envelope flags).
+    - index (int): this worker's index, echoed back in every result tuple.
+
+    Return
+    --------
+    - output (None): runs until a ``stop`` message (or a replica build failure reported home),
+      then returns; communicates only over ``conn``.
     """
     try:
         state = LNSState.replica(
@@ -544,7 +560,7 @@ class LNSWorkerPool:
 def _pick_task(state, lns, selector, tabu, i):
     """Choose the operator and (for ``agent``) the seed for global task index ``i``.
 
-    Returns ``(op, seed_fid, rng_state)``. Two things here are load-bearing:
+    Two things here are load-bearing:
 
     * The seed is chosen by the COORDINATOR. ``tabu`` is a serial recurrence that
       ``_select_most_delayed`` mutates, so m workers with private copies would every one of them
@@ -553,6 +569,19 @@ def _pick_task(state, lns, selector, tabu, i):
     * What travels is the generator STATE, not the seed. ``AdaptiveSelector.pick`` consumes one
       draw from this very stream before the destroy operator reads it, so a worker re-seeding from
       ``(seed, i)`` would start a draw earlier — enough to change every victim set.
+
+    Parameters
+    ------------
+    - state (LNSState): incumbent state, read for the ``agent`` seed via ``_select_most_delayed``.
+    - lns (LNSConfig): supplies the seed, the operator list, and whether selection is adaptive.
+    - selector (AdaptiveSelector): roulette selector used when ``lns.adaptive`` is set.
+    - tabu (set[int]): most-delayed seeds already tried; mutated by ``_select_most_delayed``.
+    - i (int): global task index; seeds the per-task RNG stream ``SeedSequence([lns.seed, i])``.
+
+    Return
+    --------
+    - output (tuple): ``(op, seed_fid, rng_state)`` — the operator name, the agent seed flight id
+      (or ``None`` for non-agent operators), and the RNG bit-generator state to ship to the worker.
     """
     rng = np.random.default_rng(np.random.SeedSequence([lns.seed, i]))
     if lns.adaptive:
@@ -569,11 +598,24 @@ def _out_of_budget(lns, t0) -> bool:
 
 
 def _stale_overwrite(state, changelog, result, accept_epsilon):
-    """Return ``(combined_delta, net_gain)`` when a stale whole solution still wins.
+    """Decide whether a stale whole-worker solution still beats the incumbent, and how to apply it.
 
     If the worker improved its base by R and intervening commits improved it by S, replacing the
     incumbent with the worker's solution realizes R-S. The combined delta makes that replacement
     one ledger transaction even when the same victim changed in both solutions.
+
+    Parameters
+    ------------
+    - state (LNSState): current incumbent, read for the intervening flights' costs.
+    - changelog (_Changelog): accepted-repair record; reverted to the worker's base version.
+    - result (TaskResult): the worker's stale result (base version, improvement, new intents).
+    - accept_epsilon (float): minimum net gain to accept; ``net_gain <= max(0, epsilon)`` rejects.
+
+    Return
+    --------
+    - output (tuple): ``(combined_delta, net_gain)`` — ``combined_delta`` is the merged revert +
+      new intents to apply, or ``None`` when the net gain does not clear ``accept_epsilon``;
+      ``net_gain`` is the realized R-S improvement either way.
     """
     reverts = changelog.revert_to(result.base_version)
     intervening_gain = sum(
@@ -598,6 +640,23 @@ def _loop_sync(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
     SYNC behaviour, not a bug — SYNC buys wall clock, not iterations, and the paper reports quality
     against a fixed time budget for exactly this reason. DROP is the mode that converts throughput
     into accepted improvements.
+
+    Parameters
+    ------------
+    - state (LNSState): the incumbent state, mutated as winning results are applied.
+    - pool (LNSWorkerPool): the worker pool dispatched to and collected from each round.
+    - lns (LNSConfig): search controls (iteration budget, time limit, adaptivity, logging).
+    - selector (AdaptiveSelector): operator selector, rewarded on the applied result only.
+    - tabu (set[int]): shared most-delayed seed recurrence, advanced by ``_pick_task``.
+    - changelog (_Changelog): accepted-repair record kept in sync with the workers.
+    - t0 (float): ``time.monotonic`` run start, for wall timing and the time-limit check.
+    - trajectory (list[dict]): anytime trajectory, appended one row per slot.
+    - cost_before (float): incumbent cost before the search (used only for logging here).
+
+    Return
+    --------
+    - output (dict): run counters ``n_iter``, ``n_accepted``, ``n_not_selected``, ``n_dirty`` and
+      ``n_overwrite`` (the last two always 0 in SYNC).
     """
     m = pool.n_workers
     n_iter = n_accepted = n_not_selected = 0
@@ -675,6 +734,23 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
 
     Nondeterministic by construction: which of these fires depends on completion order, i.e. on the
     wall clock. Rows carry ``base_version`` so a run stays auditable.
+
+    Parameters
+    ------------
+    - state (LNSState): the incumbent state, mutated as results are applied/merged/overwritten.
+    - pool (LNSWorkerPool): the worker pool; each finished worker is re-dispatched immediately.
+    - lns (LNSConfig): search controls (iterations, time limit, epsilon, adaptivity, logging).
+    - selector (AdaptiveSelector): operator selector, rewarded on the applied result only.
+    - tabu (set[int]): shared most-delayed seed recurrence, advanced by ``_pick_task``.
+    - changelog (_Changelog): accepted-repair record; drives the clean/overwrite/discard decision.
+    - t0 (float): ``time.monotonic`` run start, for wall timing and the time-limit check.
+    - trajectory (list[dict]): anytime trajectory, appended one row per collected result.
+    - cost_before (float): incumbent cost before the search (used only for logging here).
+
+    Return
+    --------
+    - output (dict): run counters — ``n_iter``, ``n_accepted``, ``n_not_selected`` (0 in DROP),
+      ``n_stale_victims``, ``n_stale_cost``, ``n_dirty``, ``n_overwrite`` and ``n_clean_merge``.
     """
     m = pool.n_workers
     n_iter = n_accepted = n_clean = n_dirty = n_overwrite = 0
@@ -683,7 +759,19 @@ def _loop_drop(state, pool, lns, selector, tabu, changelog, t0, trajectory, cost
     inflight: set[int] = set()
 
     def _dispatch(w: int) -> bool:
-        """Sync worker ``w`` and hand it the next task; False when out of budget or iterations."""
+        """Sync worker ``w`` and hand it the next task; False when out of budget or iterations.
+
+        Advances the closed-over ``next_i`` task counter and records ``w`` as in-flight.
+
+        Parameters
+        ------------
+        - w (int): the worker index to sync and dispatch the next task to.
+
+        Return
+        --------
+        - output (bool): True if a task was dispatched; False when the iteration budget or
+          wall-clock time limit is exhausted (no task sent).
+        """
         nonlocal next_i
         if next_i >= lns.max_iterations or _out_of_budget(lns, t0):
             return False
@@ -814,7 +902,23 @@ def _read_set_is_clean(envelopes, boxes) -> bool:
 
 def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
     """Independent conflict replay. Only the coordinator can do this — it needs the whole intent
-    list, and no worker holds the blessed incumbent."""
+    list, and no worker holds the blessed incumbent.
+
+    Runs only when a result was just applied and ``n_accepted`` lands on a ``verify_every``
+    boundary.
+
+    Parameters
+    ------------
+    - state (LNSState): source of the final intents, config, and static walls to replay.
+    - lns (LNSConfig): read for ``verify_every`` (0 disables the check).
+    - n_accepted (int): accepted-iteration count, tested against ``verify_every``.
+    - just_applied (bool): whether this iteration applied a result; no check runs otherwise.
+
+    Return
+    --------
+    - output (None): returns nothing on success; raises ``AssertionError`` if the replay finds an
+      inter-flight conflict.
+    """
     if not (just_applied and lns.verify_every and n_accepted % lns.verify_every == 0):
         return
     bad = verify.find_interflight_conflict(
@@ -826,7 +930,26 @@ def _maybe_verify(state, lns, n_accepted, just_applied) -> None:
 def _maybe_log(
     lns, mode, m, n_iter, n_accepted, state, selector, cost_before, *, previous_iter
 ) -> None:
-    """Emit a progress line when ``n_iter`` crosses a ``log_every`` boundary."""
+    """Emit a progress line when ``n_iter`` crosses a ``log_every`` boundary.
+
+    Parameters
+    ------------
+    - lns (LNSConfig): read for ``log_every`` (0 disables) and ``max_iterations`` (shown in the
+      line).
+    - mode (str): execution-mode label for the line (e.g. ``sync``/``drop``).
+    - m (int): worker count shown in the line.
+    - n_iter (int): iterations completed so far.
+    - n_accepted (int): accepted iterations so far.
+    - state (LNSState): read for ``total_cost``.
+    - selector (AdaptiveSelector): read for the current operator weights.
+    - cost_before (float): starting incumbent cost, for the percent-below-start figure.
+    - previous_iter (int): iteration count before this step (keyword-only); the boundary crossing
+      is detected between it and ``n_iter``.
+
+    Return
+    --------
+    - output (None): logs a line for its side effect (nothing when no boundary was crossed).
+    """
     if (not lns.log_every
             or n_iter // lns.log_every == previous_iter // lns.log_every):
         return

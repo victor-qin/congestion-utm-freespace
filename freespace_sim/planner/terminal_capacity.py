@@ -64,8 +64,20 @@ def _merge_intervals(ivs):
 
 def _overlaps(ivs, lo, hi) -> bool:
     """True iff ``[lo, hi)`` intersects any interval in the sorted, DISJOINT list ``ivs`` (O(log n)).
+
     STRICT (half-open) to match ``conflict.volumes_conflict``'s ``a.t_start < b.t_end and b.t_start <
-    a.t_end`` — a volume ending exactly at ``lo`` (or starting exactly at ``hi``) does NOT overlap."""
+    a.t_end`` — a volume ending exactly at ``lo`` (or starting exactly at ``hi``) does NOT overlap.
+
+    Parameters
+    ------------
+    - ivs (list[tuple[float, float]]): sorted, disjoint intervals to test against.
+    - lo (float): query window start (s).
+    - hi (float): query window end (s).
+
+    Return
+    --------
+    - output (bool): True iff ``[lo, hi)`` intersects some interval in ``ivs``.
+    """
     if not ivs:
         return False
     i = bisect.bisect_left(ivs, (hi, float("-inf")))   # first interval starting at/after hi
@@ -305,7 +317,18 @@ class TerminalCapacity:
 
         Gate and commit MUST agree; asking one function is what makes that structural rather than a
         convention two call sites happen to follow. ``z=None`` (single-plane / capacity-only) keeps
-        the preferred-plane climb, which is exactly those planners' column length."""
+        the preferred-plane climb, which is exactly those planners' column length.
+
+        Parameters
+        ------------
+        - term (Terminal): the terminal/hub whose column window is measured.
+        - center (Vec): the hub centre (column location).
+        - z (float | None): cruise level; None keeps the preferred-plane climb.
+
+        Return
+        --------
+        - output (float): column window length past the pad hover (s).
+        """
         from ..volumes import column_dwell_s
 
         if z is None:

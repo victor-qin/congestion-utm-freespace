@@ -77,7 +77,19 @@ class DestroyContext(Protocol):
 def _neighbor_cells(cell: Cell, n_levels: int, include_stay: bool) -> list[Cell]:
     """The cells one step from ``cell``: its six in-plane hex neighbours plus one flight level
     down and/or up (clamped to ``[0, n_levels)``), and ``cell`` itself when ``include_stay``.
-    This is the per-step move set the destroy walk and the map BFS both expand over."""
+    This is the per-step move set the destroy walk and the map BFS both expand over.
+
+    Parameters
+    ------------
+    - cell (Cell): the ``(q, r, level)`` cell to expand from.
+    - n_levels (int): number of flight levels; caps the upward level move at ``n_levels - 1``.
+    - include_stay (bool): when True, append ``cell`` itself so the walk may hold in place.
+
+    Return
+    --------
+    - output (list[Cell]): the reachable one-step cells (6 to 9 entries depending on level
+      clamping and ``include_stay``).
+    """
     q, r, level = cell
     out = [(q + dq, r + dr, level) for dq, dr in AXIAL_NEIGHBORS]
     if level > 0:
@@ -95,9 +107,23 @@ def _steps_to(cell: Cell, goal: Cell) -> int:
 
 
 def _select_most_delayed(ctx: DestroyContext, tabu: set[int]) -> int | None:
-    """Algorithm 1 lines 1-4 with one deviation: after a tabu reset we re-select,
-    so a delay-0 pick is only returned when every movable flight has zero delay
-    (the schedule is unimpeded-optimal and the caller can stop)."""
+    """Algorithm 1 lines 1-4 with one deviation: after a tabu reset we re-select, so a delay-0
+    pick is only returned when every movable flight has zero delay (the schedule is
+    unimpeded-optimal and the caller can stop).
+
+    Parameters
+    ------------
+    - ctx (DestroyContext): read view of the incumbent schedule; queried for movable ids and
+      delays.
+    - tabu (set[int]): seeds already tried this round; mutated in place — the pick is added, and
+      the set is cleared when every movable flight is tabu or the best non-tabu pick has zero
+      delay.
+
+    Return
+    --------
+    - output (int | None): the chosen most-delayed movable flight id, or ``None`` when no flight
+      is movable.
+    """
     movable = list(ctx.movable_ids())
     if not movable:
         return None
@@ -114,8 +140,23 @@ def _select_most_delayed(ctx: DestroyContext, tabu: set[int]) -> int | None:
 
 
 def _random_walk(ctx: DestroyContext, fid: int, collected: set[int], n_target: int) -> None:
-    """Algorithm 1 RANDOMWALK: restricted to moves that could still beat the
-    incumbent arrival, collecting the owners of the claims each move runs into."""
+    """Algorithm 1 RANDOMWALK: from a step sampled on flight ``fid``'s virtual timeline, take
+    moves that could still beat its incumbent arrival, adding to ``collected`` the movable owners
+    of the claims each move runs into.
+
+    Parameters
+    ------------
+    - ctx (DestroyContext): read view of the incumbent schedule; supplies visits, launch step,
+      the RNG, claim owners, and the movable test.
+    - fid (int): flight whose plan is walked.
+    - collected (set[int]): destroy set accumulated so far; mutated in place with the owners hit.
+    - n_target (int): stop once ``collected`` reaches this size.
+
+    Return
+    --------
+    - output (None): mutates ``collected``; returns early without change when ``fid`` has fewer
+      than two visits or no move can still beat the arrival.
+    """
     vis = ctx.visits(fid)
     if len(vis) < 2:
         return
@@ -184,8 +225,21 @@ def agent_based_neighborhood(
 
 
 def _collect_intersection_agents(ctx: DestroyContext, cell: Cell, n: int, out: set[int]) -> None:
-    """Algorithm 2 GETINTERSECTIONAGENTS: from a random claimed step, spread
-    outward in time collecting the flights that claim this cell."""
+    """Algorithm 2 GETINTERSECTIONAGENTS: from a random claimed step on ``cell``, spread outward
+    in time, adding to ``out`` the movable flights that claim the cell at each step reached.
+
+    Parameters
+    ------------
+    - ctx (DestroyContext): read view of the incumbent schedule; supplies the claim span, owners,
+      the movable test, and the RNG.
+    - cell (Cell): the contended cell whose claimants are collected.
+    - n (int): stop once ``out`` reaches this size.
+    - out (set[int]): destroy set accumulated so far; mutated in place with the claimants found.
+
+    Return
+    --------
+    - output (None): mutates ``out`` in place.
+    """
     s_lo, s_hi = ctx.claim_span(cell)
     t = int(ctx.rng.integers(s_lo, s_hi + 1))
     delta = 0

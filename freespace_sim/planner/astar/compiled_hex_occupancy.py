@@ -175,7 +175,19 @@ class CompiledHexOccupancy:
 
 
     def _box(self, cfg, margin):
-        """Occupancy box ``(qmin, rmin, qspan, rspan, MAXS)`` from the region corners + margin."""
+        """Occupancy box ``(qmin, rmin, qspan, rspan, MAXS)`` from the region corners + margin.
+
+        Parameters
+        ------------
+        - cfg: simulation config; supplies the region size and hex geometry, plus the horizon that
+          ``schedulable_horizon_steps`` turns into ``MAXS``.
+        - margin (int): extra hex rings around the region corners so a rerouted cell stays in box.
+
+        Return
+        --------
+        - output (tuple[int, int, int, int, int]): ``(qmin, rmin, qspan, rspan, MAXS)`` — the box
+          origin, its q- and r-spans, and the step depth ``MAXS``.
+        """
         w, h = cfg.region_size_m
         R = self.R
         qs, rs = [], []
@@ -271,7 +283,21 @@ class CompiledHexOccupancy:
         """Rasterize one committed volume into claim rows: column cells to the column pool
         (recording the owner in ``col_owners``), corridor cells to the corridor pool minus the
         committing flight's own interior; out-of-box corridor cells are skipped (a query falls back
-        via FB_OOB)."""
+        via FB_OOB).
+
+        Parameters
+        ------------
+        - vol (Volume4D): the committed volume to rasterize.
+        - own_cols (tuple): the committing flight's own terminal columns ``(cx, cy, radius)``; a
+          corridor cell inside one is skipped as the vertiport's unreserved interior.
+        - fid: the owning flight id, passed through to ``_record`` for each emitted claim.
+        - _rows (list | None): list the packed ``(key, claim)`` rows are appended to.
+
+        Return
+        --------
+        - output (None): appends this volume's claim rows to ``_rows`` and updates ``col_owners`` /
+          ``oob_corridor_cells`` as needed.
+        """
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
         # Loop-invariant own-column membership, resolved once per flight and shared with the reference
@@ -307,7 +333,22 @@ class CompiledHexOccupancy:
 
     def _record(self, pool_idx: int, c: int, s0: int, s1: int, fid, _rows: list | None) -> None:
         """Append one packed ``(key, claim)`` row for cell ``c`` in ``pool_idx`` owned by ``fid``;
-        raises ``ValueError`` if a step or flight index would overflow its 20-bit field."""
+        raises ``ValueError`` if a step or flight index would overflow its 20-bit field.
+
+        Parameters
+        ------------
+        - pool_idx (int): pool selector stored as the low key bit — 0 corridor, 1 column.
+        - c (int): flat cell id the claim covers.
+        - s0 (int): first blocked step of the span.
+        - s1 (int): last blocked step of the span.
+        - fid: owning flight id, interned to a 20-bit fid code.
+        - _rows (list | None): list the two packed int64 values (key, claim) are appended to.
+
+        Return
+        --------
+        - output (None): appends the packed ``(key, claim)`` pair to ``_rows``; raises
+          ``ValueError`` if ``s1`` or the fid code exceeds the 20-bit packing limit.
+        """
         if s1 >= _SPAN_LIMIT:
             # A committed volume can outlive the box (a late return commits past MAXS and box-guards
             # to the reference), so the constructor's MAXS check does not bound this. One compare

@@ -167,7 +167,22 @@ class LNSResult:
 
 
 def _integer_config_value(name: str, value, *, minimum: int) -> int:
-    """Normalize an integer config value without truncating floats or parsing strings."""
+    """Normalize an integer config value without truncating floats or parsing strings.
+
+    Rejects booleans (including NumPy) and anything ``operator.index`` cannot convert, so a float
+    or string never silently becomes an int.
+
+    Parameters
+    ------------
+    - name (str): field name, used only in the ``ValueError`` message.
+    - value: the value to validate; must be integer-like via ``operator.index`` and not a bool.
+    - minimum (int): smallest allowed value (keyword-only); a smaller value raises.
+
+    Return
+    --------
+    - output (int): the normalized value; raises ``ValueError`` if it is not an int
+      >= ``minimum``.
+    """
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"LNSConfig.{name} must be an int >= {minimum}, got {value!r}")
     try:
@@ -188,7 +203,22 @@ def _float_config_value(
     maximum: float | None = None,
     allow_positive_infinity: bool = False,
 ) -> float:
-    """Normalize a bounded real config value without accepting booleans or NaNs."""
+    """Normalize a bounded real config value without accepting booleans or NaNs.
+
+    Parameters
+    ------------
+    - name (str): field name, used only in the ``ValueError`` message.
+    - value: the value to validate; must be a real number and not a bool.
+    - minimum (float | None): lower bound (keyword-only); ``None`` leaves it unbounded below.
+    - maximum (float | None): upper bound (keyword-only); ``None`` leaves it unbounded above.
+    - allow_positive_infinity (bool): when True, ``+inf`` is accepted (keyword-only); otherwise
+      any infinity raises.
+
+    Return
+    --------
+    - output (float): the value as a float; raises ``ValueError`` if it is not a real number
+      within the bounds (NaN and disallowed infinities also raise).
+    """
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise ValueError(f"LNSConfig.{name} must be a real number, got {value!r}")
     normalized = float(value)
@@ -228,7 +258,18 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     """Validate and normalize arguments before ``LNSState`` takes over the ledger.
 
     Normalized execution-control fields use ordinary Python scalars so pool widths and result
-    summaries remain JSON-serializable when callers supplied compatible NumPy scalar types.
+    summaries remain JSON-serializable when callers supplied compatible NumPy scalar types. Two
+    coordinator-side warnings are logged here (never in a worker, whose stream nobody reads) for
+    knobs that would silently do nothing.
+
+    Parameters
+    ------------
+    - lns (LNSConfig): the caller-supplied config to validate.
+
+    Return
+    --------
+    - output (LNSConfig): a new config (via ``dataclasses.replace``) with every field validated
+      and normalized; raises ``ValueError`` on any invalid field.
     """
     if isinstance(lns.operators, str) or not isinstance(lns.operators, (tuple, list)):
         raise ValueError(
@@ -376,7 +417,27 @@ def _trajectory_row(
     incumbent_before=None,
     audit: dict | None = None,
 ) -> dict:
-    """Build the common trajectory schema without coupling it to an execution mode."""
+    """Build the common trajectory schema without coupling it to an execution mode.
+
+    Parameters
+    ------------
+    - i (int): iteration index recorded as ``iter``.
+    - op (str): destroy-operator name used this iteration.
+    - victims (Sequence[int]): destroyed flight ids; stored as a list, with ``n`` its length.
+    - accepted (bool): whether the repaired schedule was accepted.
+    - reason (str): human-readable accept/reject reason.
+    - cost_old (float): incumbent cost before this iteration.
+    - cost_new (float | None): repaired cost; stored as ``None`` when it is ``None`` or infinite.
+    - incumbent_cost (float): incumbent cost after this iteration.
+    - wall_s (float): wall-clock seconds elapsed when the row was recorded.
+    - incumbent_before (float | None): incumbent before the iteration (keyword-only); when given,
+      adds ``realized_improvement = incumbent_before - incumbent_cost``.
+    - audit (dict | None): extra fields merged into the row (keyword-only).
+
+    Return
+    --------
+    - output (dict): one trajectory row with the schema above.
+    """
     row = dict(
         iter=i, op=op, n=len(victims), victims=list(victims),
         accepted=accepted, reason=reason, cost_old=cost_old,
@@ -391,7 +452,21 @@ def _trajectory_row(
 
 
 def _trajectory_auc(trajectory: list[dict], cost_before: float, horizon_s: float) -> float:
-    """Integrate the best-known cost as a right-continuous step function over ``[0, horizon]``."""
+    """Integrate the best-known cost as a right-continuous step function over ``[0, horizon]``.
+
+    Timestamps are clamped monotone and to the horizon so telemetry can never manufacture negative
+    area or integrate past the reported run horizon.
+
+    Parameters
+    ------------
+    - trajectory (list[dict]): iteration rows, each read for ``wall_s`` and ``incumbent_cost``.
+    - cost_before (float): incumbent cost at time 0, held until the first row's timestamp.
+    - horizon_s (float): integration horizon in seconds; negative values are treated as 0.
+
+    Return
+    --------
+    - output (float): the area under the best-known-cost step curve over ``[0, horizon]``.
+    """
     horizon = max(0.0, float(horizon_s))
     area = 0.0
     previous_t = 0.0
@@ -452,7 +527,34 @@ def _finalize_lns_result(
     pool_spawn_s: float = 0.0,
     parallel_stats: dict | None = None,
 ) -> LNSResult:
-    """Verify and build the common sequential/parallel result without metric drift."""
+    """Verify and build the common sequential/parallel result without metric drift.
+
+    Runs the closing inter-flight conflict check so ``verified`` reflects the final schedule.
+
+    Parameters
+    ------------
+    - state (LNSState): finished search state; read for the final intents, config, static walls,
+      costs, plan/ledger timings, and ledger subscriber counts.
+    - trajectory (list[dict]): the anytime trajectory rows; also integrated into ``auc``.
+    - cost_before (float): incumbent cost before the search.
+    - n_iter (int): number of iterations run.
+    - n_accepted (int): number of accepted iterations.
+    - t0 (float): ``time.monotonic`` at run start; the total wall time is measured from it.
+    - init_s (float): construction (ruler + state) wall seconds.
+    - selector (AdaptiveSelector): operator selector, read for its final weights.
+    - repair_planner_name (str): repair planner name recorded on the result (keyword-only).
+    - search_workers (int): search worker count (keyword-only); when > 1 the subscriber counts
+      are reported as ``None`` because they live in worker-local ledgers.
+    - parallel_mode (str): execution mode label (keyword-only).
+    - pool_spawn_s (float): seconds spent spawning the worker pool (keyword-only).
+    - parallel_stats (dict | None): parallel coordinator telemetry (keyword-only); ``None``
+      becomes an empty dict.
+
+    Return
+    --------
+    - output (LNSResult): the assembled result with schedule, trajectory, costs, timings, and
+      verification flag.
+    """
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)

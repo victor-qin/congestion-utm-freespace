@@ -375,12 +375,35 @@ def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: 
     o_term, d_term = as_terminal(origin_term), as_terminal(dest_term)
 
     def _outside(p, center, r):
-        """True if ``p`` lies on or outside the radius-``r`` circle at ``center`` (xy)."""
+        """True if ``p`` lies on or outside the radius-``r`` circle at ``center`` (xy).
+
+        Parameters
+        ------------
+        - p (np.ndarray): the point to test (only xy is read).
+        - center (np.ndarray): the circle centre (only xy is read).
+        - r (float): the circle radius in metres.
+
+        Return
+        --------
+        - output (bool): True iff the xy distance from ``center`` to ``p`` is at least ``r``.
+        """
         dx, dy = float(p[0]) - float(center[0]), float(p[1]) - float(center[1])
         return math.sqrt(dx * dx + dy * dy) >= r
 
     def _edge_point(center, toward, r):
-        """The radius-``r`` point on ``center`` toward ``toward`` (``None`` if degenerate)."""
+        """The radius-``r`` point on ``center`` toward ``toward`` (``None`` if degenerate).
+
+        Parameters
+        ------------
+        - center (np.ndarray): the circle centre (xy used; z ignored).
+        - toward (np.ndarray): point that sets the direction; its z is copied to the output.
+        - r (float): the circle radius in metres.
+
+        Return
+        --------
+        - output (np.ndarray | None): the xy point at radius ``r`` from ``center`` toward
+          ``toward`` with ``toward``'s z, or ``None`` when the two coincide in xy (degenerate).
+        """
         dx, dy = float(toward[0]) - float(center[0]), float(toward[1]) - float(center[1])
         n = math.sqrt(dx * dx + dy * dy)
         if n < 1e-9:

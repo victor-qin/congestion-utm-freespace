@@ -677,14 +677,19 @@ class GurobiBackend:
         # MIPSOL only, deliberately: MIPNODE fires per node and would turn a long solve's
         # trajectory into hundreds of thousands of rows describing nothing new.
         trajectory: list[tuple[float, float, float]] = []
+        best_seen = -math.inf
         started = time.perf_counter()
         grb = self._gp.GRB
 
         def _record(model, where):
+            nonlocal best_seen
             if where == grb.Callback.MIPSOL:
+                # OBJBST can still describe the previous incumbent at MIPSOL (including
+                # -infinity for the warm start). OBJ is the candidate being reported.
+                best_seen = max(best_seen, float(model.cbGet(grb.Callback.MIPSOL_OBJ)))
                 trajectory.append((
                     time.perf_counter() - started,
-                    float(model.cbGet(grb.Callback.MIPSOL_OBJBST)),
+                    best_seen,
                     float(model.cbGet(grb.Callback.MIPSOL_OBJBND)),
                 ))
 
@@ -1448,31 +1453,25 @@ class RestrictedMaster:
         incumbent: Mapping[int, Column],
         destroy: int,
         n_tries: int | None = None,
+        *,
+        deadline: float = math.inf,
+        lp_objective: float | None = None,
     ) -> dict[int, Column]:
-        """LP-guided destroy-and-repair over an existing incumbent.
+        """Improve a feasible incumbent using LP-guided neighborhood repair.
 
-        WHY THIS EXISTS, measured rather than assumed.  ``round_heuristic`` rebuilds a
-        schedule from nothing every try, and at 2,000 density flights its best try covered
-        **1,670 of 2,000** -- the 330 it stranded cost a full ``M`` each, 94% of the try's
-        total, so it lost by 3.3 million while being *better* on what it did place (133 s
-        per covered flight against the greedy incumbent's 175 s).  The LP guidance was
-        working; the completion was not.  It could not be: the fill may only pick columns
-        already in the pool, and a flight needing a departure later than the ladder spans
-        simply has none, whereas ``_initial_feasible_selection`` builds the column it needs.
+        Sample flights whose current columns disagree most with the LP. Release
+        one flight's claims, choose its highest-LP-weight alternative that fits,
+        and restore the original if none fits. A trial can temporarily increase
+        cost; only a better complete trial (or a deterministic equal-cost tie)
+        is retained. Coverage and capacity feasibility are preserved.
 
-        So this never leaves the feasible set.  It starts FROM the incumbent, and releases
-        one flight at a time: the flight's column is removed from ``loads``, a replacement
-        is sampled from its own columns by LP value, and if none fits the original goes
-        straight back -- which it always can, since exactly one column was removed and at
-        most one added.  Coverage is therefore invariant at ``len(incumbent)`` and every
-        intermediate state is claim-feasible, by construction rather than by check.
-
-        ``destroy`` is how many flights one try releases.  The candidates are ranked by how
-        much the LP DISAGREES with the incumbent -- ``1 - x`` of the incumbent's own column
-        -- because those are the flights the relaxation says are placed wrong, and a
-        release the LP has no opinion about is a wasted draw.
+        LP weights stay fixed throughout this call, so candidate lists are sorted
+        once. Trials edit one reservation map and roll back rejected swaps instead
+        of copying the fleet's full claim map on every try. A bounded joint repair
+        first permits reservation exchanges that sequential swaps cannot perform.
+        Stop heuristic work when the incumbent meets the restricted LP bound to
+        the requested cost tolerance; global pricing certification is unchanged.
         """
-
         values = np.asarray(x, dtype=float)
         if values.shape != (len(self._columns),):
             raise ValueError("x has the wrong number of columns")
@@ -1481,128 +1480,141 @@ class RestrictedMaster:
         tries = self.params.n_heuristic_tries if n_tries is None else operator.index(n_tries)
         if tries < 1:
             raise ValueError("n_tries must be positive")
+        if isinstance(destroy, bool):
+            raise TypeError("destroy must be an integer")
+        destroy = operator.index(destroy)
         if destroy < 1:
             raise ValueError("destroy must be positive")
-        base = {
-            flight_id: column
-            for flight_id, column in incumbent.items()
-            if column in self._column_indices
-        }
-        if not base:
-            return {}
+        base: dict[int, Column] = {}
+        for flight_id, column in incumbent.items():
+            if flight_id != column.flight_id:
+                raise ValueError("incumbent mapping key does not match column flight_id")
+            if column not in self._column_indices:
+                raise ValueError("incumbent contains a column outside this master")
+            base[flight_id] = self._columns[self._column_indices[column]]
+        if not self.is_claim_feasible(base):
+            raise ValueError("incumbent violates a capacity claim")
 
-        # How wrong the LP thinks each incumbent placement is, in [0, 1].
-        disagreement: list[tuple[float, int]] = []
-        base_loads: Counter[RowKey] = Counter(self.fixed_loads)
-        for flight_id, column in base.items():
-            base_loads.update(column.claims)
-            disagreement.append((1.0 - float(values[self._column_indices[column]]), flight_id))
-        # Deterministic order, most-disagreed first; ties by flight id so a try's release
-        # set does not depend on dict iteration order.
-        disagreement.sort(key=lambda item: (-item[0], item[1]))
-        ranked = [flight_id for _, flight_id in disagreement]
-
+        loads: Counter[RowKey] = Counter(self.fixed_loads)
+        for column in base.values():
+            loads.update(column.claims)
+        # Compute lists lazily: a small neighborhood need not touch every flight.
+        candidates_by_flight: dict[int, list[int]] = {}
+        ranked: list[int] | None = None
         best = dict(base)
-        best_loads = base_loads
-        best_objective = self.objective_of(base)
+        best_objective = self.objective_of(best)
         best_signature: tuple[tuple[object, ...], ...] | None = None
         best_swaps = 0
         try_swaps: list[int] = []
-        # A window wider than `destroy` so tries differ; the LP's opinion is a ranking,
-        # not a partition, and taking the top `destroy` outright would make every try
-        # release the identical set.
+        try_objectives: list[float] = []
         window = min(len(base), 4 * destroy)
-        for _ in range(tries):
-            # CHAINED, not independent.  Each try continues from the best schedule found so
-            # far rather than restarting from the incumbent, so 16 tries compound into one
-            # large move instead of competing to be the single best small one -- the first
-            # version restarted from `base` every time and its best try swapped 22 flights
-            # of 200 released, which is all 16 tries could ever amount to.  Monotonicity is
-            # unaffected: `best` only ever advances on a strict improvement.
+        trial_solutions: set[tuple[int, ...]] = set()
+        interrupted = False
+        exhausted_full_neighborhood = False
+
+        def pool_satisfied():
+            cost = len(self.flight_ids) * self.params.M - best_objective
+            return (lp_objective is not None and math.isfinite(lp_objective)
+                    and lp_objective - best_objective
+                    <= self.params.ip_gap * max(1.0, abs(cost)) + self.params.epsilon)
+
+        joint_stats = {}
+        if (base and not pool_satisfied() and self.params.lns_joint_time_limit_s > 0
+                and time.monotonic() < deadline):
+            from .lns import repair_neighborhood
+
+            joint_started = time.monotonic()
+            best, joint_stats = repair_neighborhood(
+                self, values, best, loads, destroy,
+                min(deadline, joint_started + self.params.lns_joint_time_limit_s),
+            )
+            joint_stats["elapsed_s"] = time.monotonic() - joint_started
+            best_objective = self.objective_of(best)
+            if joint_stats["improved"]:
+                loads = Counter(self.claim_loads(best))
+        for _ in range(tries if base else 0):
+            if pool_satisfied():
+                break
+            if time.monotonic() >= deadline:
+                interrupted = True
+                break
+            if ranked is None:
+                ranked = sorted(best, key=lambda flight_id: (
+                    -(1.0 - float(values[self._column_indices[best[flight_id]]])), flight_id,
+                ))
             selected = dict(best)
-            loads: Counter[RowKey] = Counter(best_loads)
-            # Re-ranked against the CURRENT incumbent, because chaining makes the ranking
-            # computed from `base` stale the moment a try is accepted.  2,000 dict lookups.
-            ranked = [
-                flight_id
-                for _, flight_id in sorted(
-                    (
-                        (1.0 - float(values[self._column_indices[column]]), flight_id)
-                        for flight_id, column in selected.items()
-                    ),
-                    key=lambda item: (-item[0], item[1]),
-                )
-            ]
-            # How many releases actually moved.  Without it "LNS bought 0.78%" cannot be
-            # told apart from "LNS reverted 197 of its 200 releases", which is the failure
-            # mode the probabilistic accept above caused.
-            swapped = 0
-            # Sample the release set from the most-disagreed WINDOW rather than taking the
-            # top `destroy` outright: identical release sets would make every try identical
-            # once the rng is only consumed downstream.
-            released = [
-                ranked[i]
-                for i in sorted(rng.choice(window, size=min(destroy, window), replace=False))
-            ]
+            swaps: list[tuple[Column, Column]] = []
+            released = [ranked[i] for i in sorted(
+                rng.choice(window, size=min(destroy, window), replace=False)
+            )]
             for flight_id in released:
+                if time.monotonic() >= deadline:
+                    interrupted = True
+                    break
                 previous = selected[flight_id]
+                if flight_id not in candidates_by_flight:
+                    candidates_by_flight[flight_id] = sorted(
+                        (i for i in self._columns_by_flight.get(flight_id, ())
+                         if values[i] > self.params.epsilon),
+                        key=lambda i: (-values[i], _column_sort_key(self._columns[i])),
+                    )
                 for row in previous.claims:
                     loads[row] -= 1
-                placed = False
-                # DETERMINISTIC repair: take the best-valued replacement that fits.  The
-                # first version kept the original rounding's `rng.random() >= value` accept,
-                # and that was a mistake worth naming -- with mean `x ~ 0.04` at 2,000
-                # flights it rejected ~96% of candidates by coin flip, so most released
-                # flights simply reverted and a try barely moved.  In LNS the randomness
-                # belongs in WHICH flights are released, not in whether an improvement is
-                # taken; the release set already differs per try because it is sampled from
-                # a window four times its size.
-                candidates = sorted(
-                    self._columns_by_flight.get(flight_id, ()),
-                    key=lambda i: (-values[i], _column_sort_key(self._columns[i])),
-                )
-                for index in candidates:
-                    if float(values[index]) <= self.params.epsilon:
-                        break
+                replacement = previous
+                for index in candidates_by_flight[flight_id]:
                     column = self._columns[index]
-                    if column == previous or not self._can_add(column, loads):
-                        continue
-                    selected[flight_id] = column
-                    loads.update(column.claims)
-                    placed = True
-                    swapped += 1
-                    break
-                if not placed:
-                    loads.update(previous.claims)
+                    if column != previous and self._can_add(column, loads):
+                        replacement = column
+                        break
+                loads.update(replacement.claims)
+                if replacement != previous:
+                    selected[flight_id] = replacement
+                    swaps.append((previous, replacement))
             objective = self.objective_of(selected)
             signature = tuple(
                 _column_sort_key(selected[flight_id])
-                for flight_id in self.flight_ids
-                if flight_id in selected
+                for flight_id in self.flight_ids if flight_id in selected
             )
-            try_swaps.append(swapped)
+            try_swaps.append(len(swaps))
+            try_objectives.append(objective)
+            # Stable column indices distinguish schedule diversity from merely different
+            # objective values; geometry and departure novelty are measured separately.
+            trial_solutions.add(tuple(self._column_indices[selected[fid]] for fid in sorted(selected)))
             if objective > best_objective + 1e-9 or (
                 abs(objective - best_objective) <= 1e-9
-                and best_signature is not None
-                and signature < best_signature
+                and best_signature is not None and signature < best_signature
             ):
                 best = selected
-                best_loads = loads
                 best_objective = objective
                 best_signature = signature
-                best_swaps += swapped
+                best_swaps += len(swaps)
+                ranked = None
+            else:
+                for previous, replacement in reversed(swaps):
+                    for row in replacement.claims:
+                        loads[row] -= 1
+                    loads.update(previous.claims)
+                # With the entire window released, sampling and sorting always
+                # produce the same flight order. A rejected trial cannot change
+                # the next repair, so repeating it does no useful work.
+                if destroy >= window:
+                    exhausted_full_neighborhood = True
+                    break
+            if interrupted:
+                break
         self.last_round_stats = {
-            "mode": "lns",
-            "n_released": destroy,
-            "n_window": window,
-            # CUMULATIVE across accepted tries now that they chain, which is the number
-            # that says whether the fleet actually moved.
-            "n_swapped_best": best_swaps,
+            "mode": "lns", "n_released": destroy, "n_window": window,
+            "n_swapped_best": best_swaps + joint_stats.get("n_swapped", 0),
+            "n_swapped_sequential": best_swaps,
             "n_swapped_max": max(try_swaps, default=0),
-            "n_columns": len(self._columns),
-            "n_flights": len(self.flight_ids),
-            "try_objectives": (best_objective,),
-            "try_covered": (len(best),),
+            "n_columns": len(self._columns), "n_flights": len(self.flight_ids),
+            "try_objectives": tuple(try_objectives),
+            "try_covered": (len(best),) * len(try_objectives),
+            "n_unique_trial_solutions": len(trial_solutions),
+            "best_objective": best_objective, "deadline_reached": interrupted,
+            "joint_repair": joint_stats, "pool_gap_satisfied": pool_satisfied(),
+            "covered_flights": len(best),
+            "exhausted_full_neighborhood": exhausted_full_neighborhood,
         }
         return {flight_id: best[flight_id] for flight_id in self.flight_ids if flight_id in best}
 
@@ -1675,11 +1687,11 @@ class RestrictedMaster:
         """Solve the current binary RMP, separating claim rows until it is clean.
 
         ``eager`` materializes every bindable row FIRST (see
-        :meth:`materialize_bindable_rows`), which turns the separation loop from a search into
-        a confirmation. Pass ``eager=False`` for a per-iteration call: these rows persist in
-        ``_materialized``, so carrying the ~95k bindable rows through the column-generation
-        loop would slow every subsequent LP -- the solver's single end-of-run call is the
-        intended user.
+        :meth:`materialize_bindable_rows`), which is what turns the separation loop from a
+        search into a confirmation. Per-round IP now uses this eager preparation too:
+        it pays the row setup once, then carries the rows through later LP solves.
+        ``eager=False`` retains lazy separation for experiments; short IP calls may
+        otherwise spend their budget discovering missing capacity constraints.
 
         Two different clocks, kept separate because materializing is setup, not search:
         ``deadline`` is a hard absolute wall (the whole solve's) that never moves, and
@@ -1730,6 +1742,7 @@ class RestrictedMaster:
         self.last_ip_bound = None
         self.last_ip_status = None
         self.last_ip_optimal = None
+        self.last_ip_trajectory = ()
         original_time_limit_s = self._backend.time_limit_s
         try:
             while True:

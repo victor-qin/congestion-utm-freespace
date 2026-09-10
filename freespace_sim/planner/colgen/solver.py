@@ -27,6 +27,7 @@ from ...types import FlightRequest, as_terminal
 from .objective import DELAY_MODEL, CostModel, cost_model
 from .network import (
     FlightGraph,
+    FlightGraphInfeasible,
     RowIndex,
     RowKey,
     StaticTerminalCatalog,
@@ -45,7 +46,7 @@ from .pricing import (
     seed_column,
 )
 from .pricing_pool import PricingPool, price_sweep
-from .translate import Column
+from .translate import Column, column_to_intent
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,10 @@ class ColGenResult:
     denial or a compute-cap artifact.  ``budget_denied_flight_ids`` and
     ``search_exhausted_flight_ids`` partition those cases for ``batch.run_batch``,
     which turns the distinction into a :class:`DenialReason`.
+
+    ``global_integer_gap`` (also exposed as ``ip_gap``) certifies the returned
+    schedule against the global pricing bound. ``restricted_ip_gap`` and
+    ``ip_optimal`` describe only the final IP over its generated column pool.
     """
 
     columns: dict[int, Column]
@@ -118,25 +123,21 @@ def _coverage_diagnostics(master, x, rc_by_flight, benefit) -> dict:
     }
 
 
-def _canonical_column(column: Column, graph: FlightGraph, cfg: SimConfig) -> Column:
-    """Re-run the one authoritative geometry/claim gate for a solver column.
+def _canonical_column(
+    column: Column, graph: FlightGraph, cfg: SimConfig, *, model: CostModel | None = None
+) -> Column:
+    """Certify claims, and reprice imported columns in the current solve's model.
 
-    Parameters
-    ------------
-    - column (Column): the column whose canonical claims are re-derived.
-    - graph (FlightGraph): the flight's pricing graph, supplying geometry and lanes.
-    - cfg (SimConfig): supplies the lattice geometry and clock.
-
-    Return
-    --------
-    - output (Column): ``column`` unchanged when its claims already match, else a copy with
-      the recomputed ``claims``; ``column_claims`` raises ``ValueError`` on an illegal route.
+    Internal pricing columns already carry certified costs. Imported seeds may come
+    from another objective or config, so their stored cost is never authoritative.
     """
 
-    claims = column_claims(column, graph, cfg)
-    if column.claims == claims:
+    intent = None if model is None else column_to_intent(column, graph.request, cfg)
+    claims = column_claims(column, graph, cfg, _intent=intent)
+    cost = column.delay_s if model is None else model.intent_cost(intent, cfg)
+    if column.claims == claims and column.delay_s == cost:
         return column
-    return replace(column, claims=claims)
+    return replace(column, claims=claims, delay_s=cost)
 
 
 def _shift_claims(claims: Sequence[RowKey] | frozenset[RowKey], steps: int) -> frozenset[RowKey]:
@@ -248,7 +249,11 @@ def _add_departure_ladder(master, seed, graph, cfg, model, steps: int, stride: i
         step = seed.departure_step + k * stride
         if step > latest:
             break
-        master.add_column(_canonical_column(_shift_column(seed, step, cfg, model), graph, cfg))
+        shifted = replace(
+            seed, departure_step=step, claims=frozenset(),
+            delay_s=seed.delay_s + model.ground_weight * ((step - seed.departure_step) * cfg.dt_s),
+        )
+        master.add_column(_canonical_column(shifted, graph, cfg))
         added += 1
     return added
 
@@ -550,6 +555,28 @@ def _relative_cost_gap(cost_upper_bound: float, cost_lower_bound: float) -> floa
     return max(0.0, cost_upper_bound - cost_lower_bound) / max(1.0, abs(cost_upper_bound))
 
 
+def _integer_gap_stats(
+    upper_bound: float, objective: float, total_benefit: float, params: ColGenParams
+) -> dict[str, float | bool]:
+    """Global certificates for the returned integer schedule, including repair.
+
+    The restricted IP's own bound cannot certify columns outside its pool. Keep
+    that diagnostic separate, and use the pricing bound on every result path.
+    """
+
+    revenue_gap = _relative_revenue_gap(upper_bound, objective)
+    cost_gap = _relative_cost_gap(total_benefit - objective, total_benefit - upper_bound)
+    gap = revenue_gap if params.gap_metric == "revenue" else cost_gap
+    return {
+        "global_integer_gap": gap,
+        "global_integer_gap_cost": cost_gap,
+        "global_integer_gap_revenue": revenue_gap,
+        "ip_gap": gap,
+        "ip_gap_met": gap <= params.ip_gap,
+        "ip_gap_revenue": revenue_gap,
+    }
+
+
 def _loads_for(
     selection: Mapping[int, Column], fixed_loads: Mapping[RowKey, int]
 ) -> Counter[RowKey]:
@@ -645,6 +672,7 @@ def _pre_master_timeout_result(
     master: RestrictedMaster | None = None,
     time_to_master_s: float = 0.0,
     seedless_flight_ids: Sequence[int] = (),
+    graph_infeasible_flight_ids: Sequence[int] = (),
 ) -> ColGenResult:
     """Return an explicit compute-cap verdict before a usable master exists.
 
@@ -679,6 +707,7 @@ def _pre_master_timeout_result(
 
     elapsed_s = time.monotonic() - started
     denied = tuple(flight_ids)
+    graph_infeasible = frozenset(graph_infeasible_flight_ids)
     heuristic_cost = len(denied) * params.M
     graph_values = tuple((graphs or {}).values())
     arc_stats: Counter[str] = Counter()
@@ -700,6 +729,9 @@ def _pre_master_timeout_result(
             "lp_gaps": (),
             "heuristic_objectives": (),
             "heuristic_costs": (),
+            "iteration_ip_calls": 0,
+            "iteration_ip_wall_s": 0.0,
+            "iteration_ip_records": (),
             "final_lp_objective": -math.inf,
             "upper_bound": math.inf,
             "cost_upper_bound": math.inf,
@@ -715,7 +747,7 @@ def _pre_master_timeout_result(
             "lp_gap_cost": math.inf,
             "heuristic_gap_revenue": math.inf,
             "heuristic_gap_cost": math.inf,
-            "ip_gap_revenue": None,
+            **_integer_gap_stats(math.inf, 0.0, heuristic_cost, params),
             "pricing_wall_s": 0.0,
             "pricing_task_total_s": 0.0,
             "pricing_pool_setup_s": 0.0,
@@ -731,6 +763,7 @@ def _pre_master_timeout_result(
             **_dual_regime_stats(backend_name),
             "ip_elapsed_s": 0.0,
             "ip_time_limit_s": params.ip_time_limit_s,
+            "ip_reserve_s": params.effective_ip_reserve_s,
             "ip_eager_rows": 0,
             "ip_separation_rounds": 0,
             "ip_setup_s": 0.0,
@@ -739,8 +772,7 @@ def _pre_master_timeout_result(
             "ip_upper_bound": None,
             "ip_cost_lower_bound": None,
             "ip_cost_upper_bound": None,
-            "ip_gap": None,
-            "ip_gap_met": None,
+            "restricted_ip_gap": None,
             "ip_status": "time_limit_skipped",
             "ip_optimal": None,
             "ip_skipped": True,
@@ -749,10 +781,10 @@ def _pre_master_timeout_result(
             "master_objective": 0.0,
             "selected_flights": 0,
             "denied_flight_ids": denied,
-            "budget_denied_flight_ids": (),
-            "search_exhausted_flight_ids": denied,
+            "budget_denied_flight_ids": tuple(f for f in denied if f in graph_infeasible),
+            "search_exhausted_flight_ids": tuple(f for f in denied if f not in graph_infeasible),
             "repair_added": 0,
-            "seedless_flight_ids": tuple(sorted(seedless_flight_ids)),
+            "seedless_flight_ids": tuple(sorted(set(seedless_flight_ids) | graph_infeasible)),
             "warm_start_planner": params.warm_start_planner,
             "initial_heuristic_strategy": "time_limit",
             "initial_heuristic_flights": 0,
@@ -783,6 +815,10 @@ def _pre_master_timeout_result(
             "wall_index_candidates": int(wall_stats.get("candidates", 0)),
             "pricing_flights_completed": 0,
             "pricing_sweeps_completed": 0,
+            "cheap_pricing_sweeps": 0,
+            "exact_pricing_sweeps": 0,
+            "cheap_pricing_wall_s": 0.0,
+            "exact_pricing_wall_s": 0.0,
             "pricing_timeout_flight_id": None,
             "n_columns": 0 if master is None else len(master.columns),
             "n_materialized_rows": 0,
@@ -795,7 +831,7 @@ def _pre_master_timeout_result(
 
 
 class ColGenSolver:
-    """Solve all requests together by deterministic delayed-row column generation."""
+    """Whole-schedule column generation solver orchestrating restricted master LP and pricing DAGs."""
 
     def solve(
         self,
@@ -808,7 +844,7 @@ class ColGenSolver:
         on_iteration=None,
         seed_columns: Mapping[int, Sequence[Column]] | None = None,
     ) -> ColGenResult:
-        """Run the column-generation loop to convergence, a bound, or a time limit.
+        """Solve whole-schedule flight scheduling and deconfliction via column generation.
 
         The loop shape (warm pool → master LP → price against duals → add columns → repeat,
         then a final restricted-master IP) is in context/figures/cg_loop.png.
@@ -849,6 +885,10 @@ class ColGenSolver:
         --------
         - output (ColGenResult): the selected column per placed flight plus a stats dict
           (termination reason, bounds, gaps, IP diagnostics, and the denial partition).
+
+        ``lp_columns`` and read-only ``lp_x`` are aligned snapshots; new columns
+        added after that LP have zero values, with ``lp_column_count`` identifying the
+        original LP prefix. ``master`` remains live and may grow after the callback.
         """
         started = time.monotonic()
         pricing_wall_s = 0.0
@@ -859,10 +899,10 @@ class ColGenSolver:
         # `declined_<reason>` key per `pricing.Declined` cause that fired.
         kernel_counters: Counter[str] = Counter()
         deadline = started + params.time_limit_s
-        # Leave a small tail for the final restricted-master IP.  An incomplete
+        # Hold back the configured final-IP stage budget. An incomplete
         # pricing sweep cannot certify a global bound, but every completed
         # column is still valid and can improve that final incumbent.
-        ip_reserve_s = min(5.0, 0.05 * params.time_limit_s)
+        ip_reserve_s = params.effective_ip_reserve_s
         pricing_deadline = deadline - ip_reserve_s
         ordered_requests = tuple(sorted(requests, key=lambda request: request.flight_id))
         flight_ids = tuple(request.flight_id for request in ordered_requests)
@@ -884,6 +924,9 @@ class ColGenSolver:
                     "lp_gaps": (),
                     "heuristic_objectives": (),
                     "heuristic_costs": (),
+                    "iteration_ip_calls": 0,
+                    "iteration_ip_wall_s": 0.0,
+                    "iteration_ip_records": (),
                     "final_lp_objective": 0.0,
                     "upper_bound": 0.0,
                     "cost_upper_bound": 0.0,
@@ -896,7 +939,7 @@ class ColGenSolver:
                     "lp_gap_cost": 0.0,
                     "heuristic_gap_revenue": 0.0,
                     "heuristic_gap_cost": 0.0,
-                    "ip_gap_revenue": None,
+                    **_integer_gap_stats(0.0, 0.0, 0.0, params),
                     "pricing_wall_s": 0.0,
                     "pricing_task_total_s": 0.0,
                     "pricing_pool_setup_s": 0.0,
@@ -913,6 +956,7 @@ class ColGenSolver:
                     **_dual_regime_stats("none"),
                     "ip_elapsed_s": 0.0,
                     "ip_time_limit_s": params.ip_time_limit_s,
+                    "ip_reserve_s": params.effective_ip_reserve_s,
                     "ip_eager_rows": 0,
                     "ip_separation_rounds": 0,
                     "ip_setup_s": 0.0,
@@ -921,8 +965,7 @@ class ColGenSolver:
                     "ip_upper_bound": None,
                     "ip_cost_lower_bound": None,
                     "ip_cost_upper_bound": None,
-                    "ip_gap": None,
-                    "ip_gap_met": None,
+                    "restricted_ip_gap": None,
                     "ip_status": "skipped",
                     "ip_optimal": None,
                     "ip_skipped": True,
@@ -962,6 +1005,10 @@ class ColGenSolver:
                     "wall_index_candidates": 0,
                     "pricing_flights_completed": 0,
                     "pricing_sweeps_completed": 0,
+                    "cheap_pricing_sweeps": 0,
+                    "exact_pricing_sweeps": 0,
+                    "cheap_pricing_wall_s": 0.0,
+                    "exact_pricing_wall_s": 0.0,
                     "pricing_timeout_flight_id": None,
                     "n_columns": 0,
                     "n_materialized_rows": 0,
@@ -974,10 +1021,13 @@ class ColGenSolver:
 
         # ``static_terms`` is commonly a generator owned by the simulation.  Every
         # graph must see the identical wall catalogue, so snapshot it once.
+        if not params.seed_nominal_routes and not any((seed_columns or {}).values()):
+            raise ValueError("seed_nominal_routes=False requires non-empty seed_columns")
         graph_build_started = time.monotonic()
         static_catalog = StaticTerminalCatalog(static_terms, cfg)
         static_term_snapshot = static_catalog.entries
         graphs: dict[int, FlightGraph] = {}
+        graph_infeasible: set[int] = set()
         for request in ordered_requests:
             if time.monotonic() >= pricing_deadline:
                 return _pre_master_timeout_result(
@@ -988,13 +1038,15 @@ class ColGenSolver:
                     graphs=graphs,
                     catalog=static_catalog,
                     graph_build_elapsed_s=time.monotonic() - graph_build_started,
+                    graph_infeasible_flight_ids=tuple(graph_infeasible),
                 )
-            graphs[request.flight_id] = build_flight_graph(
-                request,
-                cfg,
-                static_catalog,
-                params,
-            )
+            try:
+                graphs[request.flight_id] = build_flight_graph(
+                    request, cfg, static_catalog, params,
+                )
+            except FlightGraphInfeasible as exc:
+                graph_infeasible.add(request.flight_id)
+                log.info("colgen flight %s has no usable graph: %s", request.flight_id, exc)
         graph_build_elapsed_s = time.monotonic() - graph_build_started
         if time.monotonic() >= pricing_deadline:
             return _pre_master_timeout_result(
@@ -1005,6 +1057,7 @@ class ColGenSolver:
                 graphs=graphs,
                 catalog=static_catalog,
                 graph_build_elapsed_s=graph_build_elapsed_s,
+                graph_infeasible_flight_ids=tuple(graph_infeasible),
             )
 
         # One objective for the whole solve, threaded into seeding, the greedy
@@ -1038,11 +1091,11 @@ class ColGenSolver:
             fixed_loads=committed_loads,
         )
         time_to_master_s = time.monotonic() - started
-        seedless_flights: set[int] = set()
+        seedless_flights: set[int] = set(graph_infeasible)
         seeds: dict[int, Column] = {}
         ladder_columns = 0
         seed_started = time.monotonic()
-        for flight_id in flight_ids:
+        for flight_id in (graphs if params.seed_nominal_routes else ()):
             try:
                 seed = seed_column(
                     graphs[flight_id], cfg, deadline=pricing_deadline, model=model
@@ -1062,6 +1115,7 @@ class ColGenSolver:
                     master=master,
                     time_to_master_s=time_to_master_s,
                     seedless_flight_ids=tuple(seedless_flights),
+                    graph_infeasible_flight_ids=tuple(graph_infeasible),
                 )
             except ValueError:
                 # A disconnected/static-blocked graph is a legitimate
@@ -1086,7 +1140,7 @@ class ColGenSolver:
             cfg,
             deadline=pricing_deadline,
             model=model,
-        )
+        ) if params.seed_nominal_routes else {}
         # Keep initialization deliberately small: one certified shortest seed
         # per flight plus at most one time-shifted seed selected by the cheap
         # claim-feasible pass above.  Route alternatives belong to reduced-cost
@@ -1095,7 +1149,9 @@ class ColGenSolver:
         greedy_completed = False
         greedy_elapsed_s = 0.0
         initial_heuristic = dict(shifted_seed_heuristic)
-        initial_heuristic_strategy = "shifted_seeds"
+        initial_heuristic_strategy = (
+            "shifted_seeds" if params.seed_nominal_routes else "provided_only"
+        )
         best_heuristic = dict(initial_heuristic)
         for column in initial_heuristic.values():
             master.add_column(column)
@@ -1117,14 +1173,30 @@ class ColGenSolver:
         seeded_columns = 0
         seeded_first: dict[int, Column] = {}
         for flight_id, extras in (seed_columns or {}).items():
-            if flight_id not in graphs:
+            if flight_id not in flight_ids:
                 raise KeyError(f"seed_columns names flight {flight_id}, which is not in this batch")
+            if flight_id in graph_infeasible:
+                continue
             for position, column in enumerate(extras):
-                canonical = _canonical_column(column, graphs[flight_id], cfg)
+                canonical = _canonical_column(column, graphs[flight_id], cfg, model=model)
                 master.add_column(canonical)
                 seeded_columns += 1
                 if position == 0:
                     seeded_first[flight_id] = canonical
+                    half_width = params.provided_seed_ladder_steps
+                    if half_width:
+                        graph = graphs[flight_id]
+                        _add_departure_ladder(master, canonical, graph, cfg, model, half_width)
+                        # Earlier variants cannot predate the requested lattice
+                        # departure. Pure clock shifts preserve certified geometry.
+                        before = min(half_width, canonical.departure_step - graph.base_step)
+                        for steps in range(1, before + 1):
+                            master.add_column(_canonical_column(replace(
+                                canonical,
+                                departure_step=canonical.departure_step - steps,
+                                delay_s=canonical.delay_s - model.ground_weight * steps * cfg.dt_s,
+                                claims=_shift_claims(canonical.claims, -steps),
+                            ), graph, cfg))
         # The seed columns are also a candidate INCUMBENT, not only pool contents.  Adding
         # them to the pool alone leaves them reachable exclusively through the final IP --
         # and when that IP is truncated the run returns the shifted-seed heuristic instead,
@@ -1144,7 +1216,11 @@ class ColGenSolver:
         # its own best compatible column costs.
         if seeded_first:
             seeds_feasible = master.is_claim_feasible(seeded_first)
-            candidate = master.complete_selection(seeded_first) if seeds_feasible else {}
+            candidate = (
+                (master.complete_selection(seeded_first) if params.seed_nominal_routes
+                 else dict(seeded_first))
+                if seeds_feasible else {}
+            )
             # WHY a warm start was refused is not recoverable after the fact: a candidate
             # missing k flights loses on `k*M` while a clashing one never gets built at
             # all, and both surface only as `initial_heuristic_strategy == "shifted_seeds"`.
@@ -1156,7 +1232,7 @@ class ColGenSolver:
                 len(seeded_first),
                 "feasible" if seeds_feasible else "INFEASIBLE",
                 len(candidate),
-                len(best_heuristic),
+                len(flight_ids),
                 _selection_objective(candidate, params.M) if candidate else -math.inf,
                 _selection_objective(best_heuristic, params.M),
             )
@@ -1198,16 +1274,20 @@ class ColGenSolver:
         iterations = 0
         pricing_flights_completed = 0
         pricing_sweeps_completed = 0
+        cheap_pricing_sweeps = exact_pricing_sweeps = 0
+        cheap_pricing_wall_s = exact_pricing_wall_s = 0.0
         pricing_timeout_flight_id: int | None = None
+        iteration_ip_records: list[dict[str, Any]] = []
 
         # ONE pool for the whole solve, not one per sweep.  Constructed here but not
         # STARTED: `spawn` happens on the first sweep, so no worker process exists during
         # the parent-only greedy stage and peak RSS is where it was.  See `PricingPool`
         # for what a solve-scoped pool buys and why each flight is pinned to a worker.
+        pricing_requests = tuple(r for r in ordered_requests if r.flight_id in graphs)
         sweep_pool = (
             None
-            if params.n_pricing_workers == 0
-            else PricingPool(ordered_requests, cfg, params, static_catalog)
+            if params.n_pricing_workers == 0 or not graphs
+            else PricingPool(pricing_requests, cfg, params, static_catalog)
         )
         try:
             for iteration in range(params.max_iterations):
@@ -1276,10 +1356,16 @@ class ColGenSolver:
                 # iteration 1 and a real incumbent after, so it is never empty here -- but
                 # guard anyway, because an empty incumbent would silently return {} and
                 # look like a heuristic that found nothing.
-                if params.lns_destroy_flights and best_heuristic:
+                if params.iteration_ip_time_limit_s > 0.0:
+                    # The IP below sees this sweep's new columns. Keep the previous
+                    # feasible incumbent available to pricing until that call finishes.
+                    heuristic = dict(best_heuristic)
+                elif params.lns_destroy_flights and best_heuristic:
                     heuristic = _timed(
                         "lns_heuristic", master.lns_heuristic, last_x, rng,
                         best_heuristic, params.lns_destroy_flights, params.n_heuristic_tries,
+                        deadline=pricing_deadline,
+                        lp_objective=last_lp_objective,
                     )
                 else:
                     heuristic = _timed(
@@ -1299,10 +1385,11 @@ class ColGenSolver:
                     best_heuristic = dict(heuristic)
                     master.set_heuristic(best_heuristic)
 
-                if iteration == 0:
-                    # The first LP has established the real column-generation cycle.  Build
-                    # at most one route-aware incumbent column per flight using the same
-                    # lazy topology, bounded independently of the pricing loop.
+                if iteration == 0 and params.seed_nominal_routes:
+                    # The first LP has now established the real column-generation
+                    # cycle.  Build at most one route-aware incumbent column per
+                    # flight using the same lazy topology, bounded independently of
+                    # the pricing loop.
                     #
                     # The budget is per FLIGHT and clamped only by the absolute
                     # `pricing_deadline`.  The shipped rate is 0, which disables the stage
@@ -1349,7 +1436,7 @@ class ColGenSolver:
                     len(getattr(master, "materialized_rows", ()) or ()),
                 )
                 pricing_order = sorted(
-                    flight_ids,
+                    graphs,
                     key=lambda flight_id: (
                         flight_id in best_heuristic,
                         -best_heuristic[flight_id].delay_s
@@ -1365,79 +1452,174 @@ class ColGenSolver:
                 # cannot answer "is pricing getting cheaper as the cutoffs tighten, or is
                 # iteration 80 as expensive as iteration 1" -- and that question decides
                 # whether more iterations are affordable.
-                sweep_started = time.perf_counter()
-                sweep = price_sweep(
-                    pricing_order,
-                    ordered_requests,
-                    graphs,
-                    cfg,
-                    params,
-                    static_catalog,
-                    capacity_duals,
-                    dual_view,
-                    flight_duals,
-                    best_heuristic,
-                    deadline=pricing_deadline,
-                    pool=sweep_pool,
+                pricing_exact = (
+                    not params.cheap_pricing
+                    or iterations % params.exact_pricing_interval == 0
+                    or iterations == params.max_iterations
                 )
-                # Consumed in index order, which is what keeps a parallel sweep's answer equal
-                # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
-                # float addition is not associative.  `SweepResult` has already discarded
-                # everything at or past the first timeout, reproducing the loop's `break`.
-                for flight_id, reduced_cost, column in zip(
-                    sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
-                ):
-                    pricing_flights_completed += 1
-                    best_reduced_costs.append(reduced_cost)
-                    rc_by_flight[flight_id] = reduced_cost
-                    if column is not None and reduced_cost > _REDUCED_COST_TOL:
-                        priced_columns.append(
-                            _timed(
-                                "canonical_priced", _canonical_column,
-                                column, graphs[flight_id], cfg,
-                            )
-                        )
-                if not sweep.complete:
-                    pricing_complete = False
-                    pricing_timeout_flight_id = sweep.timeout_flight_id
-
-                iteration_sweep_s = time.perf_counter() - sweep_started
-                pricing_wall_s += iteration_sweep_s
-                # Production telemetry, summed across the solve.  A compiled-path fallback is
-                # the one regression nothing else can see: same column, same objective, 3-4.5x
-                # the time.  `sweep_task_total_s` against `pricing_wall_s * n_workers` is the
-                # pool's occupancy, which is the difference between "parallelism is not paying"
-                # and "parallelism is paying and the machine is saturated".
-                pricing_task_total_s += sweep.task_total_s
-                pricing_pool_setup_s += sweep.pool_setup_s
-                kernel_counters.update(sweep.kernel_counters)
-
-                log.info(
-                    "  pricing returned %d columns in %.1fs (%d with positive reduced "
-                    "cost); back to the master LP + heuristic",
-                    len(priced_columns), iteration_sweep_s,
-                    sum(1 for rc in sweep.reduced_costs if rc > 0.0),
-                )
-                before_pricing = len(master.columns)
-                for column in sorted(
-                    priced_columns, key=lambda item: (item.flight_id, _column_key(item))
-                ):
-                    _timed("add_column", master.add_column, column)
-                if not pricing_complete:
-                    # A LOST WORKER and an expired clock both end the sweep the same way,
-                    # and reporting them the same way would send a reader to the wrong
-                    # knob: one means "raise the time limit", the other means "a worker
-                    # died, probably to the OOM killer -- lower `n_pricing_workers`".
-                    # Same reason `ip_not_proven` exists rather than reusing `time_limit`.
-                    termination_reason = (
-                        "pricing_worker_lost"
-                        if sweep.kernel_counters.get("pool_worker_lost")
-                        else "time_limit"
+                iteration_sweep_s = cheap_attempt_s = 0.0
+                cheap_columns_added = 0
+                iteration_task_total_s = 0.0
+                iteration_flight_records = []
+                while True:
+                    sweep_started = time.perf_counter()
+                    sweep = price_sweep(
+                        pricing_order,
+                        pricing_requests,
+                        graphs,
+                        cfg,
+                        params,
+                        static_catalog,
+                        capacity_duals,
+                        dual_view,
+                        flight_duals,
+                        best_heuristic,
+                        deadline=pricing_deadline,
+                        pool=sweep_pool,
+                        heuristic_only=not pricing_exact,
                     )
-                    break
-                pricing_sweeps_completed += 1
+                    # Consumed in index order, which is what keeps a parallel sweep's answer equal
+                    # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
+                    # float addition is not associative.  `SweepResult` has already discarded
+                    # everything at or past the first timeout, reproducing the loop's `break`.
+                    for flight_id, reduced_cost, column in zip(
+                        sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
+                    ):
+                        pricing_flights_completed += 1
+                        best_reduced_costs.append(reduced_cost)
+                        rc_by_flight[flight_id] = reduced_cost
+                        if column is not None and reduced_cost > _REDUCED_COST_TOL:
+                            priced_columns.append(
+                                _timed(
+                                    "canonical_priced", _canonical_column,
+                                    column, graphs[flight_id], cfg,
+                                )
+                            )
+                    # Extra candidates improve the pool without adding another bound term
+                    # for the same flight. Pricing certifies each against the same duals.
+                    for column in sweep.extra_columns:
+                        priced_columns.append(_timed(
+                            "canonical_priced", _canonical_column,
+                            column, graphs[column.flight_id], cfg,
+                        ))
+                    if not sweep.complete:
+                        pricing_complete = False
+                        pricing_timeout_flight_id = sweep.timeout_flight_id
 
-                raw_upper_bound = master.upper_bound(last_lp_objective, best_reduced_costs)
+                    attempt_s = time.perf_counter() - sweep_started
+                    iteration_sweep_s += attempt_s
+                    pricing_wall_s += attempt_s
+                    if pricing_exact:
+                        exact_pricing_wall_s += attempt_s
+                    else:
+                        cheap_pricing_wall_s += attempt_s
+                        cheap_attempt_s += attempt_s
+                    # Production telemetry, summed across the solve.  A compiled-path fallback is
+                    # the one regression nothing else can see: same column, same objective, 3-4.5x
+                    # the time.  `sweep_task_total_s` against `pricing_wall_s * n_workers` is the
+                    # pool's occupancy, which is the difference between "parallelism is not paying"
+                    # and "parallelism is paying and the machine is saturated".
+                    iteration_task_total_s += sweep.task_total_s
+                    iteration_flight_records.extend(
+                        dict(record, pricing_exact=pricing_exact) for record in sweep.flight_records
+                    )
+                    pricing_task_total_s += sweep.task_total_s
+                    pricing_pool_setup_s += sweep.pool_setup_s
+                    kernel_counters.update(sweep.kernel_counters)
+
+                    log.info(
+                        "  pricing returned %d columns in %.1fs (%d with positive reduced "
+                        "cost); back to the master LP + heuristic",
+                        len(priced_columns), attempt_s,
+                        sum(1 for rc in sweep.reduced_costs if rc > 0.0),
+                    )
+                    before_pricing = len(master.columns)
+                    for column in sorted(
+                        priced_columns, key=lambda item: (item.flight_id, _column_key(item))
+                    ):
+                        _timed("add_column", master.add_column, column)
+                    if not pricing_complete:
+                        # A LOST WORKER and an expired clock both end the sweep the same way,
+                        # and reporting them the same way would send a reader to the wrong
+                        # knob: one means "raise the time limit", the other means "a worker
+                        # died, probably to the OOM killer -- lower `n_pricing_workers`".
+                        # Same reason `ip_not_proven` exists rather than reusing `time_limit`.
+                        termination_reason = (
+                            "pricing_worker_lost"
+                            if sweep.kernel_counters.get("pool_worker_lost")
+                            else "time_limit"
+                        )
+                        break
+                    pricing_sweeps_completed += 1
+
+                    if pricing_exact:
+                        exact_pricing_sweeps += 1
+                    else:
+                        cheap_pricing_sweeps += 1
+                        cheap_columns_added = len(master.columns) - before_pricing
+                        if cheap_columns_added == 0:
+                            # A restricted search cannot certify stagnation. Retry all
+                            # flights with the SAME LP duals through the exact oracle.
+                            pricing_exact = True
+                            best_reduced_costs.clear()
+                            rc_by_flight.clear()
+                            priced_columns.clear()
+                            log.info("  cheap pricing stalled; running a full sweep")
+                            continue
+                    break
+                if not pricing_complete:
+                    break
+
+                iteration_ip_info = {}
+                if params.iteration_ip_time_limit_s > 0.0:
+                    incumbent_cost = total_benefit - _selection_objective(best_heuristic, params.M)
+                    master.backend.ip_gap = (
+                        params.ip_gap * max(incumbent_cost, 1.0) / max(1.0, total_benefit)
+                    )
+                    rows_before_ip = len(master.materialized_rows)
+                    ip_round_started = time.monotonic()
+                    ip_candidate = _timed(
+                        "iteration_ip", master.solve_ip, best_heuristic,
+                        deadline=pricing_deadline,
+                        budget_s=params.iteration_ip_time_limit_s,
+                        eager=params.iteration_ip_eager,
+                        max_eager_rows=params.max_eager_ip_rows,
+                    )
+                    ip_candidate = _timed(
+                        "canonical_iteration_ip",
+                        lambda: {
+                            fid: _canonical_column(column, graphs[fid], cfg)
+                            for fid, column in ip_candidate.items()
+                        },
+                    )
+                    _assert_claim_feasible(ip_candidate, committed_loads, row_index)
+                    if _better_selection(ip_candidate, best_heuristic, params.M):
+                        best_heuristic = dict(ip_candidate)
+                    master.set_heuristic(best_heuristic)
+                    iteration_ip_info = {
+                        "iteration": iterations,
+                        "budget_s": params.iteration_ip_time_limit_s,
+                        "wall_s": time.monotonic() - ip_round_started,
+                        "status": master.last_ip_status,
+                        "optimal": master.last_ip_optimal,
+                        "columns": len(master.columns),
+                        "rows_added": len(master.materialized_rows) - rows_before_ip,
+                        "separation_rounds": master.last_ip_rounds,
+                        "covered": len(best_heuristic),
+                        "cost": total_benefit - _selection_objective(best_heuristic, params.M),
+                    }
+                    iteration_ip_records.append(iteration_ip_info)
+                    log.info("  iteration IP: %s, %d/%d flights, cost %.3f in %.2fs",
+                             iteration_ip_info["status"], len(best_heuristic), len(flight_ids),
+                             iteration_ip_info["cost"], iteration_ip_info["wall_s"])
+
+                # Restricted-search scores underestimate the best reduced costs.
+                # Only an exact sweep supplies a new valid global bound. Between
+                # exact sweeps retain the previous certificate (infinity initially).
+                raw_upper_bound = (
+                    master.upper_bound(last_lp_objective, best_reduced_costs)
+                    if pricing_exact else last_upper_bound
+                )
                 # Each iteration's value is a valid global upper bound.  Their
                 # running minimum remains valid and removes harmless solver jitter.
                 last_upper_bound = min(last_upper_bound, max(last_lp_objective, raw_upper_bound))
@@ -1491,6 +1673,9 @@ class ColGenSolver:
                         dual_l2 = math.sqrt(math.fsum(d * d for d in diffs))
                         dual_linf = max((abs(d) for d in diffs), default=0.0)
 
+                    callback_columns = master.columns
+                    callback_x = np.pad(last_x, (0, len(callback_columns) - len(last_x)))
+                    callback_x.setflags(write=False)
                     on_iteration({
                         "iteration": iterations,
                         "lp_objective": last_lp_objective,
@@ -1513,12 +1698,13 @@ class ColGenSolver:
                         # consequences; the solver reads back only `last_ip_*`, which its own
                         # final solve overwrites.
                         "master": master,
-                        # This iteration's LP solution, positionally aligned with
-                        # ``master.columns``.  Needed to tell a column that was ADDED from one
-                        # the LP actually USES: pricing's acceptance test is a reduced-cost
-                        # sign, which says a column improves the LP basis, not that it ends up
-                        # with x > 0.  Without x those two are indistinguishable from outside.
-                        "lp_x": last_x,
+                        # Immutable callback snapshot. Priced variables appended
+                        # since the LP have value zero; only the first lp_column_count
+                        # variables participated in that solve. The live master may
+                        # grow again, so retained callbacks must use lp_columns.
+                        "lp_x": callback_x,
+                        "lp_columns": callback_columns,
+                        "lp_column_count": columns_at_lp,
                         # This iteration's capacity duals, by row.  `dual_nonzero` counts them
                         # but cannot say WHICH rows are expensive, and that is the question
                         # behind "why do the new columns conflict": pricing steers every
@@ -1528,19 +1714,22 @@ class ColGenSolver:
                         # This iteration's pricing cost -- the wall the solver spent in the
                         # sweep, which is very nearly the wall of the whole iteration.
                         "sweep_s": iteration_sweep_s,
+                        "pricing_exact": pricing_exact,
+                        "cheap_sweep_s": cheap_attempt_s,
+                        "cheap_columns_added": cheap_columns_added,
                         # The work the sweep actually did, against the wall above.  With a
                         # pool, `sweep_task_total_s / (sweep_s * n_workers)` is the fraction of
                         # worker-seconds spent computing; the rest is workers idle behind a
                         # straggler.  That distinguishes scheduling loss from dispatch overhead,
                         # and only the latter is something `chunksize` can address.
-                        "sweep_task_total_s": sweep.task_total_s,
+                        "sweep_task_total_s": iteration_task_total_s,
                         # Per-flight rows behind that sum, in `pricing_order` index order.  The
                         # sum says how much work the sweep did; only these say WHERE it went,
                         # and a pool's wall clock is set by its slowest single task rather than
                         # by the total.  Available under a pool as well as sequentially, which
                         # `prof_colgen_cutoff.py` cannot be: its instrumentation rebinds a
                         # module global in this process and a spawned worker imports its own.
-                        "sweep_flight_records": sweep.flight_records,
+                        "sweep_flight_records": tuple(iteration_flight_records),
                         "columns": len(master.columns),
                         "columns_added": len(priced_columns),
                         "rc_sum": math.fsum(positives),
@@ -1555,7 +1744,7 @@ class ColGenSolver:
                         # This iteration alone, against which `sweep_s` and `stage_s` are a
                         # partial accounting.  Their residual is the unattributed block.
                         "iteration_wall_s": time.monotonic() - iteration_started,
-                        **_coverage_diagnostics(master, last_x, rc_by_flight, params.M),
+                        **_coverage_diagnostics(master, callback_x, rc_by_flight, params.M),
                         "stage_s": dict(stage_s),
                         "stage_n": dict(stage_n),
                         # Per-try outcomes of this iteration's rounding heuristic, and how
@@ -1564,6 +1753,7 @@ class ColGenSolver:
                         # these a reader cannot tell a try that stranded one flight (costing
                         # a full M) from one that was merely slower everywhere.
                         "round_stats": dict(getattr(master, "last_round_stats", {}) or {}),
+                        "iteration_ip": dict(iteration_ip_info),
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
                     })
@@ -1572,17 +1762,17 @@ class ColGenSolver:
                 new_columns_since_lp = len(master.columns) > columns_at_lp
                 # The pricing bound remains valid when this sweep banks columns, and the
                 # final IP already sees them, so an in-threshold gap terminates immediately.
-                if lp_gap <= params.lp_gap:
+                if pricing_exact and lp_gap <= params.lp_gap:
                     termination_reason = "lp_gap"
                     break
-                if best_heuristic and heuristic_gap <= params.ip_gap:
+                if pricing_exact and best_heuristic and heuristic_gap <= params.ip_gap:
                     termination_reason = "heuristic_gap"
                     break
-                if not priced_columns and not new_columns_since_lp:
+                if pricing_exact and not priced_columns and not new_columns_since_lp:
                     termination_reason = "no_improving_columns"
                     break
 
-                if len(master.columns) == before_pricing and not new_columns_since_lp:
+                if pricing_exact and len(master.columns) == before_pricing and not new_columns_since_lp:
                     termination_reason = "no_new_columns"
                     break
             else:
@@ -1609,9 +1799,7 @@ class ColGenSolver:
         ip_upper_bound: float | None = None
         ip_cost_lower_bound: float | None = None
         ip_cost_upper_bound: float | None = None
-        ip_gap: float | None = None
-        ip_gap_revenue: float | None = None
-        ip_gap_met: bool | None = None
+        restricted_ip_gap: float | None = None
         ip_elapsed_s = 0.0
         ip_status = "skipped"
         ip_optimal: bool | None = None
@@ -1660,21 +1848,15 @@ class ColGenSolver:
             ip_objective = _selection_objective(ip_selection, params.M)
             ip_upper_bound = master.last_ip_bound
             ip_cost_upper_bound = total_benefit - ip_objective
-            # Equation (11): the IP gap is measured against the LP UPPER BOUND -- a bound
-            # on the full master problem -- not against the restricted IP's own bound,
-            # which only certifies the columns already in the pool.
-            ip_gap_revenue = _relative_revenue_gap(last_upper_bound, ip_objective)
+            # This bound certifies only the generated column pool. Global gap
+            # fields are calculated below from the final schedule after repair.
             if ip_upper_bound is not None:
                 ip_cost_lower_bound = total_benefit - ip_upper_bound
-                ip_gap_cost = _relative_cost_gap(ip_cost_upper_bound, ip_cost_lower_bound)
-            else:
-                ip_gap_cost = None
-            if params.gap_metric == "revenue":
-                ip_gap = ip_gap_revenue
-                ip_gap_met = ip_gap <= params.ip_gap
-            elif ip_gap_cost is not None:
-                ip_gap = ip_gap_cost
-                ip_gap_met = ip_gap <= params.ip_gap
+                restricted_ip_gap = (
+                    _relative_revenue_gap(ip_upper_bound, ip_objective)
+                    if params.gap_metric == "revenue"
+                    else _relative_cost_gap(ip_cost_upper_bound, ip_cost_lower_bound)
+                )
             ip_status = master.last_ip_status or "unknown"
             ip_optimal = master.last_ip_optimal
             if ip_optimal is False and termination_reason not in {
@@ -1710,7 +1892,7 @@ class ColGenSolver:
         repair_added = 0
         search_exhausted_flights: set[int] = set()
         repair_order = sorted(
-            (graphs[flight_id] for flight_id in flight_ids if flight_id not in incumbent),
+            (graph for flight_id, graph in graphs.items() if flight_id not in incumbent),
             key=lambda graph: (graph.request.t_departure, graph.request.flight_id),
         )
         saturated = {
@@ -1765,7 +1947,7 @@ class ColGenSolver:
         if termination_reason in {
             "time_limit", "iteration_limit", "ip_not_proven", "pricing_worker_lost",
         }:
-            search_exhausted_flights.update(denied)
+            search_exhausted_flights.update(set(denied) - graph_infeasible)
         search_exhausted = tuple(
             flight_id for flight_id in denied if flight_id in search_exhausted_flights
         )
@@ -1814,6 +1996,9 @@ class ColGenSolver:
             "lp_gaps": tuple(lp_gaps),
             "heuristic_objectives": tuple(heuristic_objectives),
             "heuristic_costs": tuple(heuristic_costs),
+            "iteration_ip_calls": len(iteration_ip_records),
+            "iteration_ip_wall_s": sum(record["wall_s"] for record in iteration_ip_records),
+            "iteration_ip_records": tuple(iteration_ip_records),
             "final_lp_objective": last_lp_objective,
             "upper_bound": last_upper_bound,
             "cost_upper_bound": total_benefit - last_lp_objective,
@@ -1852,7 +2037,7 @@ class ColGenSolver:
             "heuristic_gap_cost": _relative_cost_gap(
                 heuristic_cost, final_cost_lower_bound
             ),
-            "ip_gap_revenue": ip_gap_revenue,
+            **_integer_gap_stats(last_upper_bound, master_objective, total_benefit, params),
             "gap_metric": params.gap_metric,
             "heuristic_objective": heuristic_objective,
             "heuristic_cost": heuristic_cost,
@@ -1862,8 +2047,7 @@ class ColGenSolver:
             "ip_upper_bound": ip_upper_bound,
             "ip_cost_lower_bound": ip_cost_lower_bound,
             "ip_cost_upper_bound": ip_cost_upper_bound,
-            "ip_gap": ip_gap,
-            "ip_gap_met": ip_gap_met,
+            "restricted_ip_gap": restricted_ip_gap,
             "ip_status": ip_status,
             "ip_optimal": ip_optimal,
             "ip_skipped": ip_skipped,
@@ -1871,20 +2055,22 @@ class ColGenSolver:
             # Reported alongside the elapsed time so a reader can tell an IP that finished
             # from one the cap cut off, without inferring it from `ip_optimal` alone.
             "ip_time_limit_s": params.ip_time_limit_s,
+            "ip_reserve_s": params.effective_ip_reserve_s,
             # Rows the bindability filter pre-materialized, and how many separation rounds
             # were still needed afterwards.  A nonzero round count after an eager solve is
             # the signal that some violable row was not predicted -- worth a look, since the
             # filter is supposed to be exact rather than approximate.
-            "ip_eager_rows": master.last_ip_eager_rows,
-            "ip_separation_rounds": master.last_ip_rounds,
-            "ip_setup_s": master.last_ip_setup_s,
+            "ip_eager_rows": 0 if ip_skipped else master.last_ip_eager_rows,
+            "ip_separation_rounds": 0 if ip_skipped else master.last_ip_rounds,
+            "ip_setup_s": 0.0 if ip_skipped else master.last_ip_setup_s,
             # (elapsed_s, incumbent, bound) per MILP incumbent, Gurobi only -- scipy's
             # `milp` exposes no callback, so this is empty on HiGHS.  Recorded because the
             # final MILP is otherwise a black box: a 25-minute solve and a hang look
             # identical, and "would a looser ip_gap have stopped it, and when" is
             # unanswerable without the trajectory.  Both values are in MAXIMIZE revenue
             # sense, matching `ip_upper_bound`.
-            "ip_trajectory": tuple(getattr(master, "last_ip_trajectory", ()) or ()),
+            "ip_trajectory": (() if ip_skipped else
+                              tuple(getattr(master, "last_ip_trajectory", ()) or ())),
             # ``objective`` is the user-facing minimization objective.  The
             # maximize-sense master value is retained under an explicit name.
             "objective": objective_value,
@@ -1925,6 +2111,10 @@ class ColGenSolver:
             "wall_index_candidates": static_catalog.wall_index.stats["candidates"],
             "pricing_flights_completed": pricing_flights_completed,
             "pricing_sweeps_completed": pricing_sweeps_completed,
+            "cheap_pricing_sweeps": cheap_pricing_sweeps,
+            "exact_pricing_sweeps": exact_pricing_sweeps,
+            "cheap_pricing_wall_s": cheap_pricing_wall_s,
+            "exact_pricing_wall_s": exact_pricing_wall_s,
             "pricing_timeout_flight_id": pricing_timeout_flight_id,
             # Total pricing wall across every sweep.  Pricing is where a solve spends
             # its time, so this against `elapsed_s` says how much of the run was the

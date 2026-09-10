@@ -416,6 +416,8 @@ class SweepResult:
     #: its own field rather than folded into `wall_s` so a run can still SEE that cost after
     #: it stops recurring.
     pool_setup_s: float = 0.0
+    #: Additional valid positive columns from accepted tasks; never additional bound terms.
+    extra_columns: tuple[Column, ...] = ()
 
     @property
     def kernel_priced(self) -> int:
@@ -530,6 +532,7 @@ def _load_sweep_state(
     flight_duals: dict[int, float],
     known_columns: dict[int, Column],
     deadline: float | None,
+    heuristic_only: bool = False,
 ) -> None:
     """Install one sweep's duals in this worker. Runs once per worker per sweep.
 
@@ -582,6 +585,7 @@ def _load_sweep_state(
         # taken in the parent is directly comparable here. It would NOT be across hosts.
         _WORKER["sweep"] = (
             epoch, DualView(duals, _WORKER["cfg"]), flight_duals, known_columns, deadline,
+            heuristic_only,
         )
     except Exception:
         _WORKER["sweep_error"] = traceback.format_exc()
@@ -610,7 +614,8 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
     Messages, FIFO per pipe (the ordering `_load_sweep_state` relies on -- a sweep's duals
     are always drained before the tasks that read them):
 
-      ("sweep", epoch, duals_blob, flight_duals, known_columns, deadline)  -> install duals
+      ("sweep", epoch, duals_blob, flight_duals, known_columns, deadline, heuristic_only)
+                                                        -> install duals and search mode
       ("price", epoch, flight_ids, chunksize)  -> stream ("results", [...]) per chunk
       ("stop",)                                -> exit
 
@@ -656,8 +661,9 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
         if tag == "stop":
             return
         if tag == "sweep":
-            _, epoch, duals_blob, flight_duals, known_columns, deadline = message
-            _load_sweep_state(epoch, duals_blob, flight_duals, known_columns, deadline)
+            _, epoch, duals_blob, flight_duals, known_columns, deadline, heuristic_only = message
+            _load_sweep_state(epoch, duals_blob, flight_duals, known_columns, deadline,
+                              heuristic_only)
             continue
         if tag == "price":
             _, epoch, flight_ids, chunksize = message
@@ -681,9 +687,9 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
 def _price_one(epoch: tuple, flight_id: int):
     """Price one flight in a worker.
 
-    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas, search_record)`` --
-    the shape :func:`_accepted_prefix` reduces, and the reason that function takes a
-    sequence of these rather than a pool.
+    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas, search_record)``.
+    Multi-column pricing appends an eighth field containing certified extra columns;
+    :func:`_accepted_prefix` accepts both shapes and keeps one bound term per flight.
 
     ``epoch`` names the sweep whose duals the caller believes this worker holds, and is
     checked rather than trusted; see :class:`StalePricingWorker` for the failure it is
@@ -743,7 +749,7 @@ def _price_one(epoch: tuple, flight_id: int):
         raise StalePricingWorker(
             f"flight {flight_id} is not in worker {_WORKER.get('worker_index')!r}"
         )
-    _, dual_view, flight_duals, known_columns, deadline = state
+    _, dual_view, flight_duals, known_columns, deadline, heuristic_only = state
     # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
     # so shipping the absolute would double-count on the second task and beyond.
     before = kernel_stats()
@@ -752,6 +758,9 @@ def _price_one(epoch: tuple, flight_id: int):
     # to another is worse than reporting nothing.
     clear_search_record()
     started = time.perf_counter()
+    extras = []
+    extra_kwargs = ({"additional_columns": extras}
+                    if _WORKER["params"].columns_per_flight > 1 else {})
     try:
         reduced_cost, column = price_flight(
             _WORKER["graphs"][flight_id],
@@ -759,6 +768,8 @@ def _price_one(epoch: tuple, flight_id: int):
             flight_duals[flight_id],
             _WORKER["cfg"],
             _WORKER["params"],
+            **extra_kwargs,
+            heuristic_only=heuristic_only,
             known_column=known_columns.get(flight_id),
             deadline=deadline,
         )
@@ -781,7 +792,7 @@ def _price_one(epoch: tuple, flight_id: int):
         time.perf_counter() - started,
         {key: value - before.get(key, 0) for key, value in after.items()},
         last_search_record(),
-    )
+    ) + ((tuple(extras),) if extra_kwargs else ())
 
 
 # --------------------------------------------------------------------------- parent side
@@ -801,8 +812,13 @@ def price_sweep(
     *,
     deadline: float | None = None,
     pool: "PricingPool | None" = None,
+    heuristic_only: bool = False,
 ) -> SweepResult:
     """Price every flight in ``pricing_order``, sequentially or across processes.
+
+    With ``heuristic_only=True``, returned reduced costs are achievable scores,
+    not certified subproblem optima. ``complete`` only means every task finished;
+    these scores must not be used to tighten a global pricing bound.
 
     Width comes from ``params.n_pricing_workers``; 0 is the sequential loop and is
     byte-identical to no pool at all.  ``graphs`` is used only by the sequential path;
@@ -837,16 +853,17 @@ def price_sweep(
     if params.n_pricing_workers == 0:
         return _sweep_sequential(
             pricing_order, graphs, cfg, params, dual_view, flight_duals,
-            known_columns, deadline,
+            known_columns, deadline, heuristic_only,
         )
     return _sweep_parallel(
         pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-        known_columns, deadline, pool,
+        known_columns, deadline, pool, heuristic_only,
     )
 
 
 def _sweep_sequential(
-    pricing_order, graphs, cfg, params, dual_view, flight_duals, known_columns, deadline
+    pricing_order, graphs, cfg, params, dual_view, flight_duals, known_columns, deadline,
+    heuristic_only=False,
 ) -> SweepResult:
     """The original in-process loop, kept verbatim as the parity baseline.
 
@@ -870,6 +887,7 @@ def _sweep_sequential(
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    extra_columns: list[Column] = []
     task_total_s = 0.0
     before = Counter(kernel_stats())
     # Built here too, and not only in the pool: the two arms must report the same SHAPE or
@@ -885,6 +903,8 @@ def _sweep_sequential(
     for flight_id in pricing_order:
         task_started = time.perf_counter()
         clear_search_record()
+        extras = []
+        extra_kwargs = {"additional_columns": extras} if params.columns_per_flight > 1 else {}
         try:
             reduced_cost, column = price_flight(
                 graphs[flight_id],
@@ -892,6 +912,8 @@ def _sweep_sequential(
                 flight_duals[flight_id],
                 cfg,
                 params,
+                **extra_kwargs,
+                heuristic_only=heuristic_only,
                 known_column=known_columns.get(flight_id),
                 deadline=deadline,
             )
@@ -904,6 +926,7 @@ def _sweep_sequential(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
                 Counter(kernel_stats()) - before, tuple(records),
+                extra_columns=tuple(extra_columns),
             )
         task_s = time.perf_counter() - task_started
         records.append(_flight_record(flight_id, task_s, priced=True))
@@ -911,6 +934,7 @@ def _sweep_sequential(
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        extra_columns.extend(extras)
         progress.advance(len(flight_ids))
     progress.finish(len(flight_ids), complete=True)
     # One worker's worth of work, by definition -- which is what makes it the denominator
@@ -919,6 +943,7 @@ def _sweep_sequential(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
         Counter(kernel_stats()) - before, tuple(records),
+        extra_columns=tuple(extra_columns),
     )
 
 
@@ -1124,7 +1149,8 @@ class PricingPool:
         return time.perf_counter() - started
 
     def run_sweep(
-        self, pricing_order, duals, flight_duals, known_columns, deadline
+        self, pricing_order, duals, flight_duals, known_columns, deadline,
+        heuristic_only=False,
     ) -> SweepResult:
         """Price one sweep across the workers, in ``pricing_order`` order.
 
@@ -1190,6 +1216,7 @@ class PricingPool:
                 {f: flight_duals[f] for f in own if f in flight_duals},
                 {f: c for f, c in known_columns.items() if f in own},
                 deadline,
+                heuristic_only,
             ))
             # ONE message carrying every flight this worker owns, rather than one per chunk:
             # it is a list of ints, so it cannot fill the pipe, and the worker streams the
@@ -1310,7 +1337,7 @@ class PricingPool:
 
 def _sweep_parallel(
     pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-    known_columns, deadline, pool: "PricingPool | None" = None,
+    known_columns, deadline, pool: "PricingPool | None" = None, heuristic_only=False,
 ) -> SweepResult:
     """Fan the sweep across the workers, on a caller-owned pool when there is one.
 
@@ -1339,9 +1366,11 @@ def _sweep_parallel(
     """
 
     if pool is not None:
-        return pool.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline)
+        return pool.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline,
+                              heuristic_only)
     with PricingPool(requests, cfg, params, catalog) as own:
-        return own.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline)
+        return own.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline,
+                             heuristic_only)
 
 
 def _price_batch(task):
@@ -1485,12 +1514,15 @@ def _accepted_prefix(results) -> SweepResult:
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    extra_columns: list[Column] = []
     task_total_s = 0.0
     # `Counter.update` ADDS where `dict.update` would REPLACE, which is the whole reason
     # this is a Counter: a plain dict here would silently report only the last task's tally.
     counters: Counter[str] = Counter()
     records: list[dict[str, Any]] = []
-    for flight_id, priced, reduced_cost, column, task_s, deltas, search in results:
+    for result in results:
+        flight_id, priced, reduced_cost, column, task_s, deltas, search = result[:7]
+        extras = result[7] if len(result) > 7 else ()
         if not priced:
             # Past the first gap nothing is accepted, so returning here stops consuming --
             # which abandons the outstanding tasks, and leaving the caller's `with` block
@@ -1509,6 +1541,7 @@ def _accepted_prefix(results) -> SweepResult:
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, 0.0, counters, tuple(records),
+                extra_columns=tuple(extra_columns),
             )
         records.append(_flight_record(flight_id, task_s, priced=True, search=search))
         task_total_s += task_s
@@ -1516,7 +1549,9 @@ def _accepted_prefix(results) -> SweepResult:
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        extra_columns.extend(extras)
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, 0.0, counters, tuple(records),
+        extra_columns=tuple(extra_columns),
     )

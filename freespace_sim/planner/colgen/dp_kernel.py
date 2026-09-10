@@ -590,8 +590,8 @@ def _mix(value, log2cap):
 
 
 @njit(cache=True, nogil=True)
-def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
-    """Hash the reference's dominance key: ``(cell, recent, origin_paid_rows, first_hop)``.
+def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b, hops):
+    """Hash the reference's dominance key: ``(cell, recent, origin_paid_rows, first_hop, hops)``.
 
     ``step`` is deliberately absent: it is the *layer*, and the table is layer-local.
     Folding it into the key instead would let two labels at different steps share a slot
@@ -622,6 +622,7 @@ def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
     h = (h ^ np.uint64(paid_class + 1)) * np.uint64(0x100000001B3)
     h = (h ^ np.uint64(first_a + 1)) * np.uint64(0x100000001B3)
     h = (h ^ np.uint64(first_b + 1)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(hops + 1)) * np.uint64(0x100000001B3)
     return h
 
 
@@ -834,8 +835,8 @@ def _sort_layer(
 @njit(cache=True, nogil=True)
 def _state_find(
     slot_label, slot_hash, log2cap, key_hash, depth,
-    cell, recent, n_recent, paid_class, first_a, first_b,
-    label_cell, label_parent, label_variant, var_paid_class,
+    cell, recent, n_recent, paid_class, first_a, first_b, hops,
+    label_cell, label_parent, label_hops, label_variant, var_paid_class,
     label_first_a, label_first_b, probe_recent,
 ):
     """Locate the slot for one dominance key: its occupant, or the first free slot.
@@ -889,6 +890,7 @@ def _state_find(
         if (
             slot_hash[slot] == key_hash
             and label_cell[occupant] == cell
+            and label_hops[occupant] == hops
             and label_first_a[occupant] == first_a
             and label_first_b[occupant] == first_b
             and var_paid_class[label_variant[occupant]] == paid_class
@@ -1402,11 +1404,11 @@ def _seed_layer(
         label_first_a[label] = -1
         label_first_b[label] = -1
         recent_a[0] = cell
-        key_hash = _state_hash(cell, recent_a, 1, paid_class, -1, -1)
+        key_hash = _state_hash(cell, recent_a, 1, paid_class, -1, -1, 0)
         slot, found = _state_find(
             tbl_label, tbl_hash, log2cap, key_hash, depth,
-            cell, recent_a, 1, paid_class, -1, -1,
-            label_cell, label_parent, label_variant, var_paid_class,
+            cell, recent_a, 1, paid_class, -1, -1, 0,
+            label_cell, label_parent, label_hops, label_variant, var_paid_class,
             label_first_a, label_first_b, probe_recent,
         )
         if slot < 0:
@@ -1893,13 +1895,13 @@ def _price_dag(
                         n_next += 1
                     key_hash = _state_hash(
                         neighbour, recent_b, n_next, paid_class,
-                        label_first_a[nxt], label_first_b[nxt],
+                        label_first_a[nxt], label_first_b[nxt], hops + 1,
                     )
                     slot, found = _state_find(
                         nxt_label, nxt_hash, log2cap, key_hash, depth,
                         neighbour, recent_b, n_next, paid_class,
-                        label_first_a[nxt], label_first_b[nxt],
-                        label_cell, label_parent, label_variant, var_paid_class,
+                        label_first_a[nxt], label_first_b[nxt], hops + 1,
+                        label_cell, label_parent, label_hops, label_variant, var_paid_class,
                         label_first_a, label_first_b, probe_recent,
                     )
                     if slot < 0:
@@ -3418,7 +3420,7 @@ def warm_kernel() -> bool:
     )
     recent_a = np.zeros(2, np.int32)
     recent_b = np.zeros(2, np.int32)
-    key_hash = np.uint64(_state_hash(0, recent_a, 1, 0, -1, -1))
+    key_hash = np.uint64(_state_hash(0, recent_a, 1, 0, -1, -1, 0))
     _mix(key_hash, 8)
     _fill_recent(0, 2, parent, cell, recent_a)
     _recent_cmp(recent_a, 1, recent_b, 1)
@@ -3431,7 +3433,7 @@ def warm_kernel() -> bool:
     )
     _state_find(
         np.full(2, -1, np.int32), np.zeros(2, np.uint64), 1, key_hash, 2,
-        0, recent_a, 1, 0, -1, -1, cell, parent, zeros_i, zeros_i,
+        0, recent_a, 1, 0, -1, -1, 0, cell, parent, zeros_i, zeros_i, zeros_i,
         parent, parent, recent_b,
     )
     _paid_visit_correction(

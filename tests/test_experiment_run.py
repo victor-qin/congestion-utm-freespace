@@ -169,12 +169,14 @@ def test_colgen_flags_reach_the_planner_params():
         "--colgen-seed-ladder", "30",
         "--colgen-greedy-budget-rate", "1.5",
         "--colgen-ip-time-limit", "300",
+        "--colgen-ip-reserve", "350",
         "--colgen-max-eager-rows", "1000",
         "--colgen-warm-start", "astar",
     )
     params = colgen_params_from_args(args, "colgen")
 
     assert params.ip_time_limit_s == 300.0
+    assert params.ip_reserve_s == 350.0
     assert params.max_eager_ip_rows == 1000
     assert params.warm_start_planner == "astar"
     assert params.time_limit_s == 900.0
@@ -201,6 +203,7 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
 
     assert defaults.time_limit_s == 1200.0
     assert defaults.objective == "total_cost"
+    assert defaults.max_air_overrun_hops == 6
     # Pricing-path knobs, pinned so a change to a shipped default has to be deliberate.
     # `n_pricing_workers` stays 0 (pool off by default); `greedy_budget_s_per_flight=0.0`
     # DISABLES the stage; `seed_ladder_steps` defaults ON, so a `None` leaking through would
@@ -258,6 +261,7 @@ def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():
         ("--colgen-seed-ladder", "30"),
         ("--colgen-greedy-budget-rate", "1.5"),
         ("--colgen-ip-time-limit", "300"),
+        ("--colgen-ip-reserve", "350"),
         ("--colgen-max-eager-rows", "1000"),
         ("--colgen-warm-start", "astar"),
     ],

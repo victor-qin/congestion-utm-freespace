@@ -107,6 +107,8 @@ def main() -> int:
     ap.add_argument("--flights", type=int, default=500)
     ap.add_argument("--iterations", type=int, default=5)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--lns", type=int, default=0,
+                    help="number of incumbent flights reconsidered per LNS try; 0 uses rounding")
     ap.add_argument("--scenario", default="density_faa_wing_zipline")
     ap.add_argument("--solver", default="highs")
     ap.add_argument(
@@ -290,6 +292,10 @@ def main() -> int:
                 )
         pi_arr = np.asarray(pi_used, dtype=float) if pi_used else np.zeros(0)
 
+        round_stats = state.get("round_stats") or {}
+        # LNS may skip every trial when the incumbent already meets the pool LP
+        # bound. That is preserved coverage, not an empty schedule.
+        covered = round_stats.get("try_covered") or (round_stats.get("covered_flights", 0),)
         row = {
             "iteration": state["iteration"],
             "lp_objective": _finite(state.get("lp_objective")),
@@ -373,12 +379,9 @@ def main() -> int:
             "round_n_swapped_best": (state.get("round_stats") or {}).get("n_swapped_best"),
             "round_n_swapped_max": (state.get("round_stats") or {}).get("n_swapped_max"),
             "round_mode": (state.get("round_stats") or {}).get("mode", "round"),
-            "round_try_covered_min": min(
-                (state.get("round_stats") or {}).get("try_covered") or [0], default=0
-            ),
-            "round_try_covered_max": max(
-                (state.get("round_stats") or {}).get("try_covered") or [0], default=0
-            ),
+            "round_try_covered_min": min(covered),
+            "round_try_covered_max": max(covered),
+            "round_pool_gap_satisfied": round_stats.get("pool_gap_satisfied", False),
             "round_try_cost_best": _finite(
                 min(
                     (

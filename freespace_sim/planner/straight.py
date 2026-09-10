@@ -149,6 +149,7 @@ def plan_timeshift(
     return OperationalIntent(
         request=req,
         status=IntentStatus.REJECTED,
+        ground_delay_s=delay,
         denial_reason=DenialReason.BUDGET_EXCEEDED,
         planner=planner_name,
     )
@@ -161,4 +162,4 @@ class StraightLineTimeShift:
         self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig
     ) -> OperationalIntent:
         """Deconflict ``req`` by ground delay only, at nominal cruise speed."""
-        return plan_timeshift(req, ledger, cfg, speed_factor=1.0, planner_name="straight")
+        return plan_timeshift(req, ledger, cfg, planner_name="straight")

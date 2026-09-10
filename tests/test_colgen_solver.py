@@ -98,6 +98,8 @@ def _request(
 def _params(**overrides) -> ColGenParams:
     values = {
         "solver": "highs",
+        "iteration_ip_time_limit_s": 0.0,
+        "lp_gap": 1e-4,
         "max_air_overrun_hops": 0,
         "max_iterations": 30,
         "time_limit_s": 30.0,
@@ -296,7 +298,10 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
         origin_terminal=origin_terminal,
         dest_terminal=destination_terminal,
     )
-    # The air-time ceiling is lifted: replacing terminal fold distance with an extra hop is
+    # Lift the ceiling enough to exercise fold replacement on this three-hop flight.
+    # A six-hop allowance contains the five-hop regression route without enumerating
+    # arbitrary long loops, which are unrelated to its delay-accounting assertion.
+    # Replacing terminal fold distance with an extra hop is
     # itself an air-time overrun, and this test is about the delay accounting rather than
     # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic. Lifted at
     # the graph so the corridor stays where the fixture put it (one knob sizes both).
@@ -317,7 +322,7 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
         ((origin, origin_terminal), (destination, destination_terminal)),
         params,
     )
-    graph = with_air_hops(graph, graph.shortest_hops + 64)
+    graph = with_air_hops(graph, graph.shortest_hops + 6)
     duals = {
         RowKey.cell((1, 38), 0, 9): 1.0,
         RowKey.cell((1, 40), 0, 10): 1.0,
@@ -968,7 +973,7 @@ def test_lns_heuristic_never_returns_worse_than_the_incumbent_it_started_from():
     # Coverage is invariant: LNS swaps, it never drops a flight.
     assert all(p["round_stats"]["mode"] == "lns" for p in lns)
     assert all(
-        p["round_stats"]["try_covered"][0] == lns[0]["round_stats"]["try_covered"][0]
+        p["round_stats"]["covered_flights"] == lns[0]["round_stats"]["covered_flights"]
         for p in lns
     )
     # And the schedule it returns is genuinely claim-feasible, not merely scored well.
@@ -1362,8 +1367,11 @@ def test_repair_finds_feasible_column_even_when_delay_exceeds_m():
     assert result.stats["denied_flight_ids"] == ()
     assert result.stats["ip_objective"] == pytest.approx(0.0)
     assert result.stats["ip_upper_bound"] == pytest.approx(0.0)
-    assert result.stats["ip_gap"] == pytest.approx(0.0)
-    assert result.stats["ip_gap_met"] is True
+    assert result.stats["restricted_ip_gap"] == pytest.approx(0.0)
+    # Repair accepts a cost-16 flight despite benefit 1. The returned schedule
+    # therefore has a global cost gap of (16 - 1) / 16, even though its IP was exact.
+    assert result.stats["ip_gap"] == pytest.approx(15.0 / 16.0)
+    assert result.stats["ip_gap_met"] is False
     assert result.columns[7].delay_s == pytest.approx(16.0)
     assert result.columns[7].claims.isdisjoint(fixed)
 
@@ -1837,6 +1845,50 @@ def test_a_malformed_gurobi_env_var_names_itself(monkeypatch):
         master_module.gurobi_lp_method()
 
 
+@pytest.mark.parametrize("reserve,expected", [(None, 2.75), (660.0, 600.0)])
+def test_final_ip_reserve_survives_pricing_exhaustion_and_setup(monkeypatch, reserve, expected):
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    now = [0.0]
+    monkeypatch.setattr(solver_module.time, "monotonic", lambda: now[0])
+    original_sweep = solver_module.price_sweep
+    original_setup = RestrictedMaster.materialize_bindable_rows
+    original_ip = master_module.HighsBackend.solve_ip
+    seen = []
+
+    def exhaust_pricing(*args, **kwargs):
+        result = original_sweep(*args, **kwargs)
+        now[0] = kwargs["deadline"] + 0.25
+        return result
+
+    def setup(self, *args, **kwargs):
+        result = original_setup(self, *args, **kwargs)
+        now[0] += 2.0
+        return result
+
+    def ip(self, warm_start=None):
+        seen.append(self.time_limit_s)
+        return original_ip(self, warm_start)
+
+    monkeypatch.setattr(solver_module, "price_sweep", exhaust_pricing)
+    monkeypatch.setattr(RestrictedMaster, "materialize_bindable_rows", setup)
+    monkeypatch.setattr(master_module.HighsBackend, "solve_ip", ip)
+    result = ColGenSolver().solve(requests, cfg, (), _params(
+        seed_ladder_steps=0, max_iterations=1, time_limit_s=1560.0,
+        ip_time_limit_s=600.0, ip_reserve_s=reserve,
+    ))
+    assert seen and seen[0] == pytest.approx(expected)
+    assert result.stats["ip_reserve_s"] == (5.0 if reserve is None else reserve)
+    assert result.stats["ip_setup_s"] == pytest.approx(2.0)
+    _assert_claim_feasible(result.columns)
+
+
+@pytest.mark.parametrize("reserve", [-1, 30, 31, float("inf"), float("nan")])
+def test_ip_reserve_rejects_invalid_or_all_consuming_budgets(reserve):
+    with pytest.raises(ValueError, match="ip_reserve_s"):
+        _params(time_limit_s=30, ip_reserve_s=reserve)
+
+
 def test_ip_gets_its_own_budget_not_the_whole_solve_remainder(monkeypatch):
     """The IP is capped by ``ip_time_limit_s``, however much of the solve is left.
 
@@ -1963,6 +2015,8 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         # number of times took a different path through the code, which is exactly the kind
         # of difference this contract exists to catch.
         "pricing_task_total_s",
+        "cheap_pricing_wall_s",
+        "exact_pricing_wall_s",
         "seed_elapsed_s",
         "time_to_master_s",
     }

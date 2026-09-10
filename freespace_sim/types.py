@@ -25,7 +25,18 @@ TimedPoint = tuple[Vec, float]
 
 
 def vec(x: float, y: float, z: float = 0.0) -> Vec:
-    """Build a 3D position vector (metres)."""
+    """Build a 3D position vector in metres.
+
+    Parameters
+    ------------
+    - x (float): Local ENU x-coordinate (East) in metres.
+    - y (float): Local ENU y-coordinate (North) in metres.
+    - z (float): Local ENU z-coordinate (Up) in metres. Defaults to 0.0.
+
+    Return
+    --------
+    - position (Vec): 3-element float array representing the 3D position.
+    """
     return np.array([x, y, z], dtype=float)
 
 
@@ -64,19 +75,14 @@ class DenialReason(Enum):
 
 
 class Terminal(NamedTuple):
-    """A multi-pad vertiport endpoint a flight uses (origin for a takeoff, dest for a landing).
+    """Multi-pad vertiport terminal endpoint used by a flight at origin or destination.
 
-    Vertiport infrastructure travels with the terminal, not in global config:
-    - ``radius`` — the shared terminal column size; ``None`` ⇒ ``cfg.terminal_radius_m`` (90 m default),
-      wide enough that divergent same-hub exit lanes don't crowd at the edge when flush.
-    - ``corridor_overlap`` — how far the reserved exit lane overlaps INTO the column (inner edge =
-      ``R − overlap``). ``None``/``0`` (default) ⇒ the lane starts FLUSH with the column edge; the
-      column-involved exemption (``conflict.volumes_conflict``) keeps the tagged exit-lane box
-      conflict-free with same-hub columns, while two same-hub corridors still contend. ``> 0`` penetrates
-      the column; ``< 0`` leaves a clearance gap outside it. See ``volumes.exit_radius``.
-
-    Both are set when hubs are created (the demand model), so a big-box hub and a small pad can differ
-    and a non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).
+    Parameters
+    ------------
+    - id (Hashable): Unique identifier for the vertiport terminal.
+    - capacity (int): Number of concurrent landing/takeoff pads N. Defaults to 1.
+    - radius (float | None): Shared terminal column radius in metres, or None to use default. Defaults to None.
+    - corridor_overlap (float | None): Overlap distance into terminal column in metres. Defaults to None.
     """
 
     id: Hashable
@@ -86,8 +92,16 @@ class Terminal(NamedTuple):
 
 
 def as_terminal(t) -> "Terminal | None":
-    """Normalize a terminal descriptor: ``None``, a :class:`Terminal`, or a plain
-    ``(id, capacity[, radius[, corridor_overlap]])`` tuple → a :class:`Terminal` (or ``None``)."""
+    """Normalize a terminal descriptor tuple or instance into a Terminal object.
+
+    Parameters
+    ------------
+    - t (Terminal | tuple | None): Terminal instance or (id, capacity[, radius[, corridor_overlap]]) tuple.
+
+    Return
+    --------
+    - terminal (Terminal | None): Normalized Terminal object or None.
+    """
     if t is None or isinstance(t, Terminal):
         return t
     return Terminal(*t)
@@ -95,10 +109,19 @@ def as_terminal(t) -> "Terminal | None":
 
 @dataclass
 class FlightRequest:
-    """Pure demand: who wants to fly from where to where, and when they filed.
+    """Demand request representing a flight intent from origin to destination.
 
-    FCFS order is defined by ``(t_request, flight_id)``. Positions are continuous 3D vectors;
-    origin/dest are typically at ground level (z = 0).
+    Parameters
+    ------------
+    - flight_id (int): Unique identifier for the flight.
+    - origin (Vec): 3D origin position vector [x, y, z] in local ENU metres.
+    - dest (Vec): 3D destination position vector [x, y, z] in local ENU metres.
+    - t_request (float): Time the flight was filed/requested (seconds).
+    - t_departure (float | None): Desired departure time (seconds). Defaults to None (depart at t_request).
+    - uss_id (str): UAS Service Supplier identifier. Defaults to "default".
+    - origin_terminal (Terminal | None): Origin vertiport terminal specification if applicable. Defaults to None.
+    - dest_terminal (Terminal | None): Destination vertiport terminal specification if applicable. Defaults to None.
+    - paired_outbound_id (int | None): Flight ID of outbound leg for round-trip return flights. Defaults to None.
     """
 
     flight_id: int
@@ -152,11 +175,23 @@ class FlightRequest:
 
 @dataclass
 class OperationalIntent:
-    """The reserved plan for one flight (ASTM operational intent).
+    """The reserved plan for one flight under ASTM F3548-21 operational intent semantics.
 
-    ``volumes`` is the full reservation: hover cylinder @origin + corridor boxes + hover cylinder
-    @dest. ``centerline`` is the timed polyline the corridor was built around (also the v0 flown
-    path). Cost decomposes into the knobs that drive FCFS trade-offs.
+    Parameters
+    ------------
+    - request (FlightRequest): The underlying demand request.
+    - status (IntentStatus): Operational intent state (ACCEPTED, REJECTED, etc.).
+    - volumes (list[Volume4D] | None): 4D reserved space-time volumes. Defaults to None.
+    - centerline (list[TimedPoint] | None): Timed waypoint polyline path. Defaults to None.
+    - ground_delay_s (float): Delay held on the pad before departure (seconds). Defaults to 0.0.
+    - air_hold_s (float): Airborne holding or hovering time (seconds). Defaults to 0.0.
+    - air_detour_m (float): En-route lateral detour distance (metres). Defaults to 0.0.
+    - lattice_overhead_m (float): Geometric overhead attributed to lattice discretization (metres). Defaults to 0.0.
+    - altitude_change_m (float): Total vertical climb and descent distance (metres). Defaults to 0.0.
+    - cost (float): Total weighted cost according to the cost model. Defaults to 0.0.
+    - denial_reason (DenialReason): Root cause classification if rejected. Defaults to None.
+    - planner (str): Identifier of the planner that generated this intent. Defaults to "".
+    - solve_time_s (float): Planner compute wall-clock time in seconds. Defaults to 0.0.
     """
 
     request: FlightRequest
@@ -212,7 +247,14 @@ class OperationalIntent:
 
 @dataclass
 class FlightLog:
-    """What was actually flown. v0 = perfect conformance (trajectory == reserved centerline)."""
+    """Record of trajectory flown by a flight and conformance verification.
+
+    Parameters
+    ------------
+    - flight_id (int): Unique identifier of the flight.
+    - trajectory (list[TimedPoint]): List of timed 3D waypoints actually flown.
+    - conformed (bool): True if flight maintained conformance to operational intent. Defaults to True.
+    """
 
     flight_id: int
     trajectory: list[TimedPoint] = field(default_factory=list)

@@ -111,6 +111,14 @@ HiGHS additionally runs the final IP cold because `scipy.optimize.milp` takes no
 ships a size-limited trial that imports fine and only fails at `optimize()`, so verify by solving a
 model rather than by importing the module.
 
+Column generation now runs an eager restricted-master IP after every pricing round, with a
+30-second native search budget and the previous feasible schedule as its MIP start. The LP
+stopping tolerance is 0.1% (`--colgen-lp-gap 0.001`). Set
+`--colgen-iteration-ip-time-limit 0` to use rounding/LNS instead. The final IP has its own budget.
+Experimental `--colgen-cheap-pricing` searches the best-ranked departure/lane root first;
+full pricing runs every five rounds, on stagnation, and on the last round. Only full sweeps
+can update the global bound or certify convergence. This option changes the generated pool.
+
 Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-ip-time-limit` (the FINAL MILP's
 own budget, separate because it otherwise inherits whatever the generation loop did not spend, and
 paired with `--colgen-max-eager-rows`, which bounds the row pre-materialization that budget is

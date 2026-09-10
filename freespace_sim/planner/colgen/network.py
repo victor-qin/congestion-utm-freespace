@@ -700,21 +700,23 @@ class RowIndex:
 
 
 class _LazyCorridorCells(AbstractSet[Cell]):
-    """Implicit finite O-D ellipse with exact legacy membership semantics.
+    """Implicit finite corridor bounded by actual cruise endpoints and the hop cap.
 
     Pricing only needs membership checks while it explores a route.  Materializing
     every cell (and then duplicating it into a tuple and index mapping) was a large
     all-flight startup barrier at density scale.  Iteration remains available for
-    diagnostics/tests and materializes the legacy set exactly once on demand.
+    diagnostics/tests and materializes the same membership set once on demand.
     """
 
     __slots__ = (
         "_dest",
+        "_dest_cells",
         "_explicit_lanes",
         "_foreign_exclusions",
         "_lock",
         "_materialized",
         "_origin",
+        "_origin_cells",
         "_overrun",
         "_own_interiors",
         "_shortest",
@@ -728,10 +730,14 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         foreign_exclusions: AbstractSet[Cell],
         own_interiors: frozenset[Cell],
         explicit_lanes: frozenset[Cell],
+        origin_cells: tuple[Cell, ...] | None = None,
+        dest_cells: tuple[Cell, ...] | None = None,
     ) -> None:
         """Store the O-D ellipse parameters; membership stays lazy until first materialized."""
         self._origin = origin
         self._dest = dest
+        self._origin_cells = origin_cells if origin_cells is not None else (origin,)
+        self._dest_cells = dest_cells if dest_cells is not None else (dest,)
         self._overrun = overrun
         self._shortest = hg.hex_distance(origin, dest)
         self._foreign_exclusions = foreign_exclusions
@@ -756,8 +762,13 @@ class _LazyCorridorCells(AbstractSet[Cell]):
             return True
         if cell in self._own_interiors:
             return False
+        return self._within_budget(cell)
+
+    def _within_budget(self, cell: Cell) -> bool:
+        """Apply a lower bound on cruise hops through this cell."""
         return (
-            hg.hex_distance(self._origin, cell) + hg.hex_distance(cell, self._dest)
+            min(hg.hex_distance(start, cell) for start in self._origin_cells)
+            + min(hg.hex_distance(cell, end) for end in self._dest_cells)
             <= self._shortest + self._overrun
         )
 
@@ -769,7 +780,15 @@ class _LazyCorridorCells(AbstractSet[Cell]):
         with self._lock:
             materialized = self._materialized
             if materialized is None:
-                cells = _ellipse_cells(self._origin, self._dest, self._overrun)
+                # See context/figures/colgen_lane_aware_corridor.png.
+                padding = max(
+                    hg.hex_distance(self._origin, start) for start in self._origin_cells
+                ) + max(hg.hex_distance(end, self._dest) for end in self._dest_cells)
+                cells = {
+                    cell
+                    for cell in _ellipse_cells(self._origin, self._dest, self._overrun + padding)
+                    if self._within_budget(cell)
+                }
                 cells.difference_update(self._foreign_exclusions)
                 cells.difference_update(self._own_interiors)
                 cells.update(
@@ -802,6 +821,8 @@ class _LazyCorridorCells(AbstractSet[Cell]):
             self._foreign_exclusions,
             self._own_interiors,
             self._explicit_lanes,
+            self._origin_cells,
+            self._dest_cells,
         )
 
     def __eq__(self, other: object) -> bool:
@@ -848,7 +869,7 @@ class _FlightSearchCache:
         # Answer-neutral: a budget only bounds work, never the search.
         self.dag_budget: tuple[int, int, int] | None = None
         self.certified_claims: OrderedDict[
-            tuple[Any, ...], frozenset[RowKey]
+            tuple[Any, ...], tuple[int, frozenset[RowKey], tuple[tuple[int, int], ...]]
         ] = OrderedDict()
         # Endpoint dwell rows, keyed `(origin, step, timing_steps)`.  See
         # `pricing._endpoint_claims`, which owns the purity argument that makes this
@@ -903,11 +924,9 @@ class FlightGraph:
     # Resolved here rather than in pricing so both searches over this domain agree on it
     # and so it participates in graph identity.
     #
-    # AS BUILT BY `build_flight_graph`, `max_air_hops - shortest_hops` is also the radius of
-    # `corridor_cells` -- one knob sizes both (see `ColGenParams`).  That is a property of the
-    # builder, not of this type: a graph assembled by hand can carry a ceiling unrelated to its
-    # corridor, and `tests/_colgen_support.with_air_hops` does exactly that on purpose.  Nothing
-    # in pricing depends on the two agreeing; the ceiling is the operative bound either way.
+    # The same budget determines admissible corridor membership; terminal lane access time
+    # remains separate from cruise hops. See context/figures/colgen_lane_aware_corridor.png.
+    # Hand-built graphs may use another corridor; this ceiling remains the route-length bound.
     max_air_hops: int
     static_exclusions: AbstractSet[Cell]
     foreign_exclusions: AbstractSet[Cell]
@@ -1036,9 +1055,9 @@ class FlightGraph:
 def _ellipse_cells(origin: Cell, dest: Cell, overrun: int) -> set[Cell]:
     """Enumerate the finite axial O-D ellipse used by the pricing network.
 
-    ``overrun`` is ``params.max_air_overrun_hops``: the hop budget IS the corridor radius,
-    because a route within ``shortest + overrun`` hops cannot touch a cell outside the
-    ellipse of that radius (see context/figures/od_hop_ellipse.png).  See :class:`ColGenParams`.
+    A path within ``shortest + overrun`` hops cannot leave this endpoint ellipse.
+    Terminal-lane corridors supply their own endpoints and remaining hop allowance;
+    ``overrun`` is therefore not necessarily ``params.max_air_overrun_hops``.
 
     Parameters
     ------------
@@ -1633,6 +1652,10 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         )
 
 
+class FlightGraphInfeasible(ValueError):
+    """A request cannot be represented by the configured column-generation graph."""
+
+
 def build_flight_graph(
     req: FlightRequest,
     cfg: SimConfig,
@@ -1679,11 +1702,6 @@ def build_flight_graph(
     radius = hg.circumradius(cfg)
     origin_cell = hg.enu_to_axial(float(req.origin[0]), float(req.origin[1]), radius)
     dest_cell = hg.enu_to_axial(float(req.dest[0]), float(req.dest[1]), radius)
-    if origin_cell == dest_cell:
-        raise ValueError(
-            f"flight {req.flight_id} origin and destination map to the same hex {origin_cell}; "
-            "colgen requires at least one lateral hop"
-        )
 
     origin_terminal = as_terminal(req.origin_terminal)
     dest_terminal = as_terminal(req.dest_terminal)
@@ -1695,6 +1713,11 @@ def build_flight_graph(
         )
     if not cfg.fixed_exit_lanes and (origin_terminal is not None or dest_terminal is not None):
         raise NotImplementedError("colgen v1 requires fixed_exit_lanes=True for terminal endpoints")
+    if origin_cell == dest_cell:
+        raise FlightGraphInfeasible(
+            f"flight {req.flight_id} origin and destination map to the same hex {origin_cell}; "
+            "colgen requires at least one lateral hop"
+        )
     origin_lanes = tuple(
         hg.terminal_lanes(req.origin, origin_terminal, cfg) if origin_terminal is not None else ()
     )
@@ -1732,7 +1755,7 @@ def build_flight_graph(
             distance = math.hypot(px - float(center[0]), py - float(center[1]))
             reach = endpoint_radius + terminal_radius(static_terminal, cfg)
             if distance <= reach + 1e-9:
-                raise ValueError(
+                raise FlightGraphInfeasible(
                     f"flight {req.flight_id} {label} cylinder overlaps foreign static terminal "
                     f"{static_terminal.id!r} (distance={distance:g} m, combined radius={reach:g} m)"
                 )
@@ -1752,9 +1775,7 @@ def build_flight_graph(
     frozen_own_interiors = frozenset(own_interiors)
     static_exclusions = _CombinedCellSet(foreign_exclusions, frozen_own_interiors)
     explicit_lanes = frozenset(lane.cell for lane in (*origin_lanes, *dest_lanes))
-    # The corridor radius IS the hop budget: a route within `max_air_hops` cannot touch a cell
-    # outside the ellipse of radius `overrun`, so sizing it by anything else would be either a
-    # band no route can reach or a second, hidden cap.
+    # See context/figures/colgen_lane_aware_corridor.png for the admissible cruise-hop bound.
     corridor = _LazyCorridorCells(
         origin_cell,
         dest_cell,
@@ -1762,24 +1783,28 @@ def build_flight_graph(
         foreign_exclusions,
         frozen_own_interiors,
         explicit_lanes,
+        tuple(lane.cell for lane in origin_lanes)
+        if origin_terminal is not None
+        else (origin_cell,),
+        tuple(lane.cell for lane in dest_lanes) if dest_terminal is not None else (dest_cell,),
     )
 
     if origin_terminal is None:
         if origin_cell not in corridor:
-            raise ValueError(
+            raise FlightGraphInfeasible(
                 f"flight {req.flight_id} customer origin {origin_cell} is excluded by "
                 "terminal airspace"
             )
     elif not any(lane.cell in corridor for lane in origin_lanes):
-        raise ValueError(f"flight {req.flight_id} has no available origin terminal lane")
+        raise FlightGraphInfeasible(f"flight {req.flight_id} has no available origin terminal lane")
     if dest_terminal is None:
         if dest_cell not in corridor:
-            raise ValueError(
+            raise FlightGraphInfeasible(
                 f"flight {req.flight_id} customer destination {dest_cell} is excluded by "
                 "terminal airspace"
             )
     elif not any(lane.cell in corridor for lane in dest_lanes):
-        raise ValueError(f"flight {req.flight_id} has no available destination terminal lane")
+        raise FlightGraphInfeasible(f"flight {req.flight_id} has no available destination terminal lane")
 
     frozen_static_walls = catalog.walls
     frozen_request = _snapshot_request(req, origin_terminal, dest_terminal)
@@ -1861,6 +1886,23 @@ def _selected_lane(lanes: tuple[hg.Lane, ...], index: int | None, endpoint: str)
     return lane
 
 
+def _column_endpoint_steps(column, fg, cfg, arrival_step):
+    """Compute endpoint windows at the actual clock, including float boundary rules."""
+
+    windows = []
+    for point, terminal, step, hops in (
+        (fg.request.origin, fg.origin_terminal, column.departure_step, 0),
+        (fg.request.dest, fg.dest_terminal, arrival_step, len(column.cell_path) - 1),
+    ):
+        t0 = step * cfg.dt_s
+        t1 = t0 + cfg.hover_time_s + column_dwell_s(point, terminal, cfg, fg.levels[column.level])
+        windows.append(
+            terminal_claim_steps(t0, t1, cfg) if terminal is not None else
+            endpoint_claim_steps(t0, t1, cfg, timing_steps=hops)
+        )
+    return tuple(windows)
+
+
 def column_claims(
     column: Column,
     fg: FlightGraph,
@@ -1929,24 +1971,42 @@ def column_claims(
     path = tuple(tuple(cell) for cell in column.cell_path)
     certificate_key = (
         column.flight_id,
-        column.departure_step,
         column.level,
         column.origin_lane_idx,
         column.dest_lane_idx,
         path,
     )
     with fg._search_cache.lock:
-        cached_claims = fg._search_cache.certified_claims.get(certificate_key)
-        if cached_claims is not None:
+        certificate = fg._search_cache.certified_claims.get(certificate_key)
+        if certificate is not None:
             fg._search_cache.certified_claims.move_to_end(certificate_key)
-    if cached_claims is not None:
-        return cached_claims
+    if certificate is not None:
+        old_departure, cached_claims, old_windows = certificate
+        lane_steps = (0 if column.origin_lane_idx is None else
+                      fg.origin_lanes[column.origin_lane_idx].steps)
+        arrival = column.departure_step + fg.takeoff_steps[column.level] + lane_steps + len(path) - 1
+        if arrival > fg.max_step:
+            raise ValueError(f"column arrives at step {arrival}, beyond graph maximum {fg.max_step}")
+        delta = column.departure_step - old_departure
+        if delta == 0:
+            return cached_claims
+        windows = _column_endpoint_steps(column, fg, cfg, arrival)
+        relative_windows = tuple((w.start - column.departure_step, w.stop - column.departure_step)
+                                 for w in windows)
+        # Endpoint rounding depends on absolute floating-point timestamps. Only translate
+        # the full union when its windows translate exactly; otherwise rebuild rows below.
+        if relative_windows == old_windows:
+            return frozenset(
+                RowKey.cell(*row.cell_coord, row.level, row.step + delta)
+                if row.kind == "cell" else RowKey.term(row.terminal_id, row.step + delta)
+                for row in cached_claims
+            )
     if len(path) < 2:
         raise ValueError("a column path must contain at least two cells and one lateral hop")
-    if any(cell not in fg.corridor_cells for cell in path):
+    if certificate is None and any(cell not in fg.corridor_cells for cell in path):
         invalid = next(cell for cell in path if cell not in fg.corridor_cells)
         raise ValueError(f"column cell {invalid} is outside the flight graph corridor")
-    for a, b in zip(path, path[1:]):
+    for a, b in (() if certificate is not None else zip(path, path[1:])):
         if hg.hex_distance(a, b) != 1:
             raise ValueError(f"column contains a non-neighbour lateral hop {a} -> {b}")
         if (a, b) in fg.forbidden_hops:
@@ -1993,11 +2053,10 @@ def column_claims(
     # to violate the simulation's independent budgets.  Translation is the
     # canonical gate: using its actual resampled centerline here prevents even
     # an ulp-level difference from making a claimed column fail at filing.
-    z = fg.levels[column.level]
     from .translate import column_to_intent
 
-    intent = _intent if _intent is not None else column_to_intent(column, fg.request, cfg)
-    if intent.status is not IntentStatus.ACCEPTED:
+    intent = (_intent if _intent is not None else column_to_intent(column, fg.request, cfg)) if certificate is None else None
+    if intent is not None and intent.status is not IntentStatus.ACCEPTED:
         raise ValueError(
             f"column violates max_detour_factor or another translation budget "
             f"({intent.denial_reason})"
@@ -2010,7 +2069,7 @@ def column_claims(
     # column against the exact ledger geometry before exposing its row claims.
     # Reusing ``volumes_conflict`` is essential: its same-terminal cylinder
     # exemption is precisely the one applied again when the intent is filed.
-    if fg.static_walls:
+    if fg.static_walls and intent is not None:
         for volume in intent.volumes:
             for wall, _wall_bound in fg._wall_index.candidates(volume.flat_aabb()):
                 if volumes_conflict(volume, wall):
@@ -2026,26 +2085,22 @@ def column_claims(
             for row_step in visit_rows(visit_step, offsets)
         )
 
-    dt = cfg.dt_s
-    origin_t0 = column.departure_step * dt
-    arrival_t0 = arrival_step * dt
+    windows = _column_endpoint_steps(column, fg, cfg, arrival_step)
     endpoints = (
-        (fg.request.origin, fg.origin_terminal, origin_t0, 0),
-        (fg.request.dest, fg.dest_terminal, arrival_t0, len(path) - 1),
+        (fg.request.origin, fg.origin_terminal),
+        (fg.request.dest, fg.dest_terminal),
     )
-    for point, terminal, t0, timing_steps in endpoints:
-        dwell_t1 = t0 + cfg.hover_time_s + column_dwell_s(point, terminal, cfg, z)
+    for (point, terminal), endpoint_steps in zip(endpoints, windows, strict=True):
         if terminal is not None:
             claims.update(
                 RowKey.term(terminal.id, row_step)
-                for row_step in terminal_claim_steps(t0, dwell_t1, cfg)
+                for row_step in endpoint_steps
             )
             continue
 
         # Customer cylinders are untagged ledger geometry.  They span the regulated tube, hence
         # claim every flight level in every nearby cell and time row that could meet a transit.
         endpoint_cells = endpoint_claim_cells(point, cfg.effective_hover_radius_m, cfg)
-        endpoint_steps = endpoint_claim_steps(t0, dwell_t1, cfg, timing_steps=timing_steps)
         claims.update(
             RowKey.cell(q, r, level, row_step)
             for q, r in endpoint_cells
@@ -2055,7 +2110,10 @@ def column_claims(
 
     result = frozenset(claims)
     with fg._search_cache.lock:
-        fg._search_cache.certified_claims[certificate_key] = result
+        fg._search_cache.certified_claims[certificate_key] = (
+            column.departure_step, result,
+            tuple((w.start - column.departure_step, w.stop - column.departure_step) for w in windows),
+        )
         fg._search_cache.certified_claims.move_to_end(certificate_key)
         while len(fg._search_cache.certified_claims) > _MAX_CERTIFIED_COLUMNS:
             fg._search_cache.certified_claims.popitem(last=False)
@@ -2065,6 +2123,7 @@ def column_claims(
 __all__ = [
     "Cell",
     "FlightGraph",
+    "FlightGraphInfeasible",
     "RowIndex",
     "RowKey",
     "StaticTerminalCatalog",

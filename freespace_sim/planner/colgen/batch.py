@@ -88,7 +88,8 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     unseeded arms of an experiment become indistinguishable after the fact.  The one thing
     that is tolerated quietly is individual flights the column model cannot express (an
     air hold, a route outside the O-D ellipse); those are counted and logged, and
-    `RestrictedMaster.complete_selection` re-picks them around the ones that placed.
+    the master can complete them from nominal seeds when enabled. Provided-only mode
+    leaves missing flights for pricing to recover.
 
     Parameters
     ------------
@@ -116,6 +117,7 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     from freespace_sim import sim
     from freespace_sim.planner.colgen import warm_start as warm_start_module
     from freespace_sim.planner.colgen.network import (
+        FlightGraphInfeasible,
         RowIndex,
         StaticTerminalCatalog,
         build_flight_graph,
@@ -145,11 +147,19 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
             f"warm_start_planner={planner!r} accepted no flights; there is nothing to seed"
         )
     catalog = StaticTerminalCatalog(list(static_terms), cfg)
-    graphs = {
-        request.flight_id: build_flight_graph(request, cfg, catalog, params)
-        for request in requests
-        if request.flight_id in accepted
-    }
+    graphs = {}
+    for request in requests:
+        if request.flight_id not in accepted:
+            continue
+        try:
+            graphs[request.flight_id] = build_flight_graph(request, cfg, catalog, params)
+        except FlightGraphInfeasible:
+            # The main solve reports this request's denial; other seeds remain useful.
+            continue
+    if not graphs:
+        log.info("warm start has no graph-compatible flights; continuing without seeds")
+        return None
+
     # Built the SAME WAY `ColGenSolver.solve` builds its own, and that is a correctness
     # requirement rather than tidiness: `warm_start.build` calls `row_index.cap(row)` on
     # every claim of every candidate column, and `RowIndex.cap` raises `KeyError` for an
@@ -163,7 +173,10 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
         for terminal_id, capacity in graph.terminal_capacities.items():
             row_index.register_terminal(terminal_id, capacity)
     seed_columns, stats = warm_start_module.build(
-        accepted, graphs, cfg, cost_model(cfg, params), row_index
+        accepted, graphs, cfg, cost_model(cfg, params), row_index,
+        max_shift=params.warm_start_max_shift_steps,
+        require_joint_feasibility=(params.seed_nominal_routes
+                                   or params.warm_start_max_shift_steps > 0),
     )
     # Every flight that did NOT place, logged by reason.  Without this the only number a
     # reader gets is `accepted - placed`, which cannot tell an inexpressible route (an air
@@ -422,20 +435,22 @@ def run_batch(
     # message above: the generation loop finished, and only the final integer master failed
     # to PROVE its selection optimal over the pool it was handed.  The schedule is feasible
     # and may well be optimal; it is simply uncertified, so no absent flight can be reported
-    # as a physical denial.  Note the backend is asked for a much tighter gap than `ip_gap`
-    # names -- it is converted to the master's revenue scale by dividing by n*M -- so at a
-    # large M this is the expected outcome rather than a rare one.
+    # as a physical denial. The native IP has its own search cap, separate from the
+    # whole-solve deadline. The solver converts the configured gap to the backend's
+    # revenue scale; report the user's configured tolerance here.
     elif stats.get("termination_reason") == "ip_not_proven":
         log.warning(
             "colgen's generation loop converged (%s iterations) but the final integer "
             "master returned status=%s without proving optimality over its %s columns. "
             "The schedule is feasible; its optimality is NOT certified, and every denial "
-            "is reported as search-exhausted rather than infeasible. Raising "
-            "--colgen-time-limit gives the IP more room; loosening ip_gap (currently %g, "
-            "handed to the backend divided by n*M) asks it to prove less.",
+            "is reported as search-exhausted rather than infeasible. The IP search cap "
+            "is %gs. Increase --colgen-ip-time-limit for more search; ensure "
+            "--colgen-ip-reserve and --colgen-time-limit leave enough time for setup "
+            "and search. Loosening ip_gap (currently %g) asks it to prove less.",
             stats.get("iterations", "?"),
             stats.get("ip_status", "unknown"),
             stats.get("n_columns", "?"),
+            batch_params.ip_time_limit_s,
             batch_params.ip_gap,
         )
     # The two gap scales can disagree by orders of magnitude, and only one of them is the

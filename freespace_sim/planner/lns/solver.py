@@ -114,7 +114,12 @@ class LNSResult:
     wall_s: float
     init_wall_s: float                  # state build incl. the unimpeded baseline pass
     weights: dict[str, float]
-    verified: bool
+    verified: bool                      # SEPARATION only, like `SimResult.verified`
+    # Paired-leg PRECEDENCE, which `verified` deliberately excludes: a return departing before its
+    # outbound lands holds a DISJOINT pad window, so it is not a conflict and no separation replay
+    # can see it. Counts pairs this run made WORSE than the schedule it was handed — a nominal-anchor
+    # baseline arrives with violations already in it, and LNS is answerable only for adding to them.
+    n_precedence_worsened: int = 0
     # --- parallel only; defaulted so every existing construction site is untouched ---
     search_workers: int = 1
     parallel_mode: str = "sequential"
@@ -398,6 +403,39 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
     )
 
 
+def assert_incumbent_ok(state) -> None:
+    """Both LNS invariants over the current incumbent — separation AND paired-leg precedence.
+
+    Shared by the sequential loop and the parallel coordinator so the two engines cannot check
+    different things. Precedence ratchets PER PAIR against the shortfalls the state was built with:
+    the schedule may already contain violations (a nominal-anchor baseline does), and failing on
+    those would make `verify_every` unusable on exactly the runs that need watching. Per pair, not
+    per count — LNS can repair one pair and break another in the same iteration, leaving the count
+    unmoved, so a count-based ratchet is blind to the identities that changed."""
+    final = state.final_intents()
+    bad = verify.find_interflight_conflict(
+        final, state.cfg, static_terminals=state.static_terms)
+    if bad is not None:
+        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+    worse = _worsened_pairs(final, state)
+    if worse:
+        (out_fid, ret_fid), (was, now) = worse[0]
+        raise AssertionError(
+            f"LNS worsened {len(worse)} paired-return precedence shortfall(s); e.g. return "
+            f"{ret_fid} now departs {now:.1f}s before outbound {out_fid} releases its pad "
+            f"(was {was:.1f}s)")
+
+
+def _worsened_pairs(final, state) -> list[tuple[tuple[int, int], tuple[float, float]]]:
+    """``[((outbound, return), (baseline, now))]`` for every pair this run made worse, worst first."""
+    turnaround = float(state._turnaround_s or 0.0)
+    now = verify.pair_shortfalls(final, turnaround)
+    base = state._pair_shortfall
+    worse = [(k, (base.get(k, 0.0), v)) for k, v in now.items() if v > base.get(k, 0.0) + 1e-6]
+    worse.sort(key=lambda kv: kv[1][0] - kv[1][1])
+    return worse
+
+
 def _effective_search_workers(lns: LNSConfig) -> int:
     """Processes that can receive work under this configuration's task budget."""
     return min(lns.search_workers, lns.max_iterations)
@@ -558,6 +596,19 @@ def _finalize_lns_result(
     final = state.final_intents()
     bad = verify.find_interflight_conflict(
         final, state.cfg, static_terminals=state.static_terms)
+    # Precedence was checked only under `verify_every`, which defaults to 0 — so every run ended
+    # with ZERO precedence verification. It is one O(pairs) pass at the end of a whole search; run
+    # it unconditionally. Reported, not raised, and kept out of `verified`: `verified` means
+    # separation everywhere else in the codebase, and folding this in would retroactively relabel
+    # every archived nominal-anchor run (see the same split in `sim.run`).
+    worse = _worsened_pairs(final, state)
+    if worse:
+        (out_fid, ret_fid), (was, now) = worse[0]
+        log.warning(
+            "lns worsened %d paired-return precedence shortfall(s); worst: return %d departs "
+            "%.0fs before outbound %d releases its pad (baseline %.0fs). This is a precedence "
+            "violation, not a conflict, so `verified` does not see it.",
+            len(worse), ret_fid, now, out_fid, was)
     wall_s = time.monotonic() - t0
     worker_local_subscribers = search_workers > 1
     return LNSResult(
@@ -571,6 +622,7 @@ def _finalize_lns_result(
         init_wall_s=init_s,
         weights=dict(selector.weights),
         verified=bad is None,
+        n_precedence_worsened=len(worse),
         repair_planner=repair_planner_name,
         t_plan_s=state.t_plan_s,
         t_ledger_s=state.t_ledger_s,
@@ -693,11 +745,7 @@ def run_lns(
                     state.total_cost, time.monotonic() - t0,
                 ))
                 if out.accepted and lns.verify_every and n_accepted % lns.verify_every == 0:
-                    bad = verify.find_interflight_conflict(
-                        state.final_intents(), cfg, static_terminals=static_terms
-                    )
-                    if bad is not None:
-                        raise AssertionError(f"LNS incumbent has an interflight conflict: {bad}")
+                    assert_incumbent_ok(state)
                 if lns.log_every and (i + 1) % lns.log_every == 0:
                     log.info(
                         "lns %d/%d: cost %.0f (%.2f%% below start), %d accepted, weights %s",

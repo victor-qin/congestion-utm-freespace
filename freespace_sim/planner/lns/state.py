@@ -38,6 +38,7 @@ from freespace_sim.geometry import CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.lns.unimpeded import resolve_workers, unimpeded_costs
 from freespace_sim.types import OperationalIntent
 
@@ -105,7 +106,10 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
             f"(want one of {LNS_REPAIR_PLANNERS})")
     planner.evict_floor = 0.0   # random/premium repair orders need the full-horizon occupancy
     planner.record_envelope = record_envelope
-    return planner
+    # Wrapped so a round-trip request is repaired as BOTH legs. Unwrapped, A*/SIPP plan the outbound
+    # alone and drop the return: the halved cost then reads as a large improvement and `try_repair`
+    # adopts it, so LNS strips the return off every itinerary it touches.
+    return ItineraryPlanner(planner)
 _MISSING = object()
 
 

@@ -599,7 +599,7 @@ class HubRadiusDemand:
                     fid, vec(hub[0], hub[1], gl), vec(customer[0], customer[1], gl), t_req,
                     t_departure=t_dep, uss_id=uss_id, origin_terminal=terminal,
                     return_to_origin=self.return_flights,
-                    turnaround_s=dwell_s if self.return_flights else 0.0))
+                    turnaround_s=dwell_s if self.return_flights else None))
             fid += 1
 
         if self.lam_per_uss is None:

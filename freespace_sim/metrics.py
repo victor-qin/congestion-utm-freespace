@@ -301,15 +301,40 @@ def _flown_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
     """
     if not intent.centerline:
         return float("nan")
-    return enroute_flown_m([p[0] for p in intent.centerline],
-                           intent.request.origin, intent.request.dest,
-                           intent.request.origin_terminal, intent.request.dest_terminal, cfg)
+    return sum(enroute_flown_m([p[0] for p in leg], o, d, o_t, d_t, cfg)
+               for leg, o, d, o_t, d_t in _legs(intent))
 
 
 def _straight_horizontal_m(intent: OperationalIntent, cfg: SimConfig) -> float:
     """The straight-line reference: exit lane → exit lane (:func:`volumes.enroute_reference_m`)."""
-    return enroute_reference_m(intent.request.origin, intent.request.dest,
-                               intent.request.origin_terminal, intent.request.dest_terminal, cfg)
+    return sum(enroute_reference_m(o, d, o_t, d_t, cfg) for _, o, d, o_t, d_t in _legs(intent))
+
+
+def _legs(intent: OperationalIntent):
+    """
+    One entry per flown leg: ``(centerline_slice, origin, dest, origin_terminal, dest_terminal)``.
+
+    A round-trip itinerary flies origin -> dest -> origin as ONE intent, so the flown distance covers
+    both legs. Measuring it against a single origin -> dest reference reports the whole return trip
+    as en-route detour: measured 4,080 m against a true 160 m on one flight, 11.2x over a population.
+    Splitting at ``leg_starts`` keeps flown and reference on the same ruler.
+
+    Parameters
+    ------------
+    - intent (OperationalIntent): the flight; ``leg_starts`` empty means a single leg
+
+    Return
+    --------
+    - legs (list): one tuple per leg, in flown order
+    """
+    req, cl = intent.request, intent.centerline or []
+    if not intent.leg_starts:
+        return [(cl, req.origin, req.dest, req.origin_terminal, req.dest_terminal)]
+    bounds = [0, *intent.leg_starts, len(cl)]
+    ends = [(req.origin, req.dest, req.origin_terminal, req.dest_terminal),
+            (req.dest, req.origin, req.dest_terminal, req.origin_terminal)]
+    return [(cl[a:b], *ends[k % 2]) for k, (a, b) in enumerate(zip(bounds, bounds[1:]))
+            if b - a >= 2]
 
 
 def _unimpeded_cruise_z(cfg: SimConfig) -> float:

@@ -116,10 +116,11 @@ class FlightRequest:
     # ``origin -> dest -> origin`` flown as ONE flight (:class:`~planner.itinerary.ItineraryPlanner`).
     # The return leg departs from the arrival the outbound ACTUALLY achieved, so it cannot precede it.
     return_to_origin: bool = False
-    # Ground time at ``dest`` between the legs: the delivery itself. Excludes the descent and climb
-    # that bracket it — those come from the column geometry (``volumes.column_dwell_s``), so a
-    # scenario cannot budget a turnaround that physics contradicts.
-    turnaround_s: float = 0.0
+    # Ground time at ``dest`` between the legs: the delivery itself. ``None`` inherits
+    # ``SimConfig.turnaround_s``, which is the one owner of the number. Excludes the descent and
+    # climb that bracket it (``volumes.column_dwell_s``), so it cannot budget a dwell physics
+    # contradicts.
+    turnaround_s: "float | None" = None
 
     def __post_init__(self):
         """Default and validate ``t_departure`` after construction.
@@ -144,7 +145,7 @@ class FlightRequest:
                 f"t_departure ({self.t_departure}) < t_request ({self.t_request}): "
                 "a flight cannot depart before it is filed"
             )
-        if self.turnaround_s < 0.0:
+        if self.turnaround_s is not None and self.turnaround_s < 0.0:
             raise ValueError(f"flight {self.flight_id}: turnaround_s must be >= 0")
 
     def sort_key(self) -> tuple[float, int]:

@@ -9,7 +9,31 @@ from dataclasses import replace
 from ..config import SimConfig
 from ..ledger import ReservationLedger
 from ..types import DenialReason, FlightRequest, IntentStatus, OperationalIntent
-from ..volumes import ground_dwell_reservation
+from ..volumes import ground_dwell_reservation, terminal_radius
+
+
+def reject_itinerary(req: FlightRequest, planner: str) -> None:
+    """
+    Refuse a round-trip request on a planner that can only plan one leg.
+
+    A single-leg planner handed a `return_to_origin` request plans the outbound and drops the return
+    without a trace — and because that costs about half a round trip, a cost-comparing caller reads
+    the loss as an improvement. Fail loudly instead; wrap the planner in `ItineraryPlanner`.
+
+    Parameters
+    ------------
+    - req (FlightRequest): the request about to be planned
+    - planner (str): name used in the error, so the offending construction site is identifiable
+
+    Return
+    --------
+    - None; raises NotImplementedError when `req.return_to_origin` is set.
+    """
+    if req.return_to_origin:
+        raise NotImplementedError(
+            f"{planner} cannot plan a round-trip itinerary (flight {req.flight_id}): it plans one "
+            "origin->dest leg, so the return would be dropped without a trace. Wrap it in "
+            "ItineraryPlanner (planner.get_planner does this) or file the legs separately.")
 
 
 class ItineraryPlanner:
@@ -31,10 +55,23 @@ class ItineraryPlanner:
         self.inner = inner
 
     def __getattr__(self, name):
-        # Markers and optional members (`plans_whole_schedule`, `capacity_authority`, ...) belong to
-        # the planner that plans. Only reached for names this class does not define, so `inner`
-        # itself cannot recurse.
+        """Read markers and optional members off the planner that plans.
+
+        Only reached for names this class does not define, so `inner` itself cannot recurse.
+        """
         return getattr(self.inner, name)
+
+    def __setattr__(self, name, value):
+        """Write configuration through to the inner planner, so a set and a get agree.
+
+        `evict_floor`, `record_envelope` and the kernel knobs are set on whatever object a caller
+        holds. Storing them here instead would leave the getter reporting the new value while the
+        planner that actually plans kept the old one.
+        """
+        if name == "inner" or name in type(self).__dict__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.inner, name, value)
 
     def plan(self, req: FlightRequest, ledger: ReservationLedger,
              cfg: SimConfig) -> OperationalIntent:
@@ -65,11 +102,12 @@ class ItineraryPlanner:
         landed = realized_release_s(out)
         if landed is None:
             return replace(out, request=req)
+        dwell = cfg.turnaround_s if req.turnaround_s is None else req.turnaround_s
 
         # Leg 2 is NOT deconflicted against leg 1: both are the same aircraft, and an aircraft does
         # not conflict with itself.
         back = self.inner.plan(self._leg(req, req.dest, req.origin, req.dest_terminal,
-                                         req.origin_terminal, float(landed) + req.turnaround_s),
+                                         req.origin_terminal, float(landed) + dwell),
                                ledger, cfg)
         if not back.accepted:
             return OperationalIntent(
@@ -80,14 +118,9 @@ class ItineraryPlanner:
 
     @staticmethod
     def _leg(req, origin, dest, o_term, d_term, t_departure) -> FlightRequest:
-        """One leg as an ordinary one-way request.
-
-        `t_request` is pulled down to the leg's own departure: a return leg departs long after the
-        itinerary was filed, and `FlightRequest` forbids departing before filing.
-        """
+        """One leg as an ordinary one-way request, keeping the itinerary's filing time."""
         return replace(req, origin=origin, dest=dest, origin_terminal=o_term, dest_terminal=d_term,
-                       t_request=min(req.t_request, t_departure), t_departure=t_departure,
-                       return_to_origin=False, turnaround_s=0.0)
+                       t_departure=t_departure, return_to_origin=False, turnaround_s=0.0)
 
     @staticmethod
     def _compose(req, out, back, landed, cfg) -> OperationalIntent:
@@ -101,11 +134,12 @@ class ItineraryPlanner:
         dwell = []
         leaves = realized_takeoff_s(back)
         if leaves is not None and leaves > landed + 1e-9:
-            from ..volumes import terminal_radius
             d_term = req.dest_terminal
+            # NOT tagged with the terminal: `conflict.volumes_conflict` makes two same-hub volumes
+            # transparent whenever either is a cylinder, and this box is one. Tagging it would let
+            # another flight of the same hub land its column on top of the parked aircraft.
             dwell = [ground_dwell_reservation(
                 req.dest, landed, float(leaves) - landed, cfg,
-                terminal_id=d_term.id if d_term is not None else None,
                 radius=terminal_radius(d_term, cfg) if d_term is not None else None)]
         return OperationalIntent(
             request=req,

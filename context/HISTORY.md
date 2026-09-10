@@ -66,3 +66,19 @@ Durable record of mistakes likely to recur between PRs. Format follows `.agent/C
   surface (against the module docstring) and defeats `monkeypatch.setattr(batch, "run_batch", ...)`,
   so `test_colgen_batch` runs the real Gurobi path and fails on a missing `gurobipy`. Files:
   `freespace_sim/planner/colgen/__init__.py`, `tests/test_colgen_batch.py`.
+
+- 2026-09-10T01:25Z `[TOOL]` When a request type needs a wrapper to be planned correctly, ask "who
+  constructs a planner WITHOUT going through `get_planner`?" and guard the shared entry point rather
+  than the one planner you were thinking about. A hand-audit found two of the three sites; the guard
+  in `AStarPlanner.plan` / `SIPPPlanner.plan` found the third (`lns/unimpeded.py:_new_ruler`) on its
+  first run. Files: `freespace_sim/planner/itinerary.py` (`reject_itinerary`),
+  `freespace_sim/planner/lns/{state,unimpeded}.py`.
+
+- 2026-09-10T01:30Z `[TOOL]` A cost-comparing search will ADOPT a plan that silently lost work: the
+  one-way plan LNS produced for a round trip cost about half, so `try_repair` read the deleted return
+  leg as a large improvement and reported 66.93%. A dropped-work bug inside an optimiser presents as
+  a win, not as a failure. Files: `freespace_sim/planner/lns/state.py`.
+
+- 2026-09-10T01:32Z `[CODE]` A metric pair must measure the same thing: `_flown_horizontal_m` summed
+  a two-leg centerline while `_straight_horizontal_m` used one origin->dest pair, reporting 4,332 m
+  of detour where 387 m existed. Both now split at `leg_starts`. Files: `freespace_sim/metrics.py`.

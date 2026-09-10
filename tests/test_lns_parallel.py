@@ -304,7 +304,8 @@ def test_replica_planner_is_configured_for_out_of_order_repair():
     rep = LNSState.replica(res.config, base.final_intents(), static_terms=base.static_terms,
                            unimpeded_cost=dict(base._unimp_cost))
     assert rep.repair_planner.evict_floor == 0.0
-    assert isinstance(rep.repair_planner, AStarPlanner)
+    # wrapped for round trips; the planner that plans is inside
+    assert isinstance(rep.repair_planner.inner, AStarPlanner)
 
 
 # ==================================================================== the pool + SYNC mode

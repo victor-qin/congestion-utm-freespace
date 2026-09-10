@@ -65,6 +65,7 @@ def _new_ruler(cfg, static_terms):
     arbitrary shard."""
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.itinerary import ItineraryPlanner
 
     free = ReservationLedger(cfg)
     for center, term in static_terms:
@@ -76,7 +77,10 @@ def _new_ruler(cfg, static_terms):
     # hash tables for searches that expand a few hundred nodes.
     planner = AStarPlanner(kernel_log2_min=_RULER_LOG2)
     planner.evict_floor = 0.0
-    return planner, free
+    # Wrapped for the same reason the repair planner is: a round trip ruled as its outbound leg alone
+    # would report roughly half its unimpeded cost, inflating every `delay()` premium that picks
+    # victims and orders repair.
+    return ItineraryPlanner(planner), free
 
 
 def _plan_shard(cfg, static_terms, requests, planner=None, free=None):

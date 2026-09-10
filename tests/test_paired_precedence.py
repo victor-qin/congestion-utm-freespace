@@ -42,11 +42,11 @@ def test_an_itinerarys_return_leg_never_precedes_its_own_arrival():
     assert res.verified
     # The fixture has to be in the regime that broke the two-request scheme, or this passes for the
     # wrong reason: a return only departed early because its outbound ran over the estimate.
-    assert all(_parked_s(i) > i.request.turnaround_s + 1e-6 for i in trips), (
+    assert all(_parked_s(i, cfg) > (cfg.turnaround_s if i.request.turnaround_s is None else i.request.turnaround_s) + 1e-6 for i in trips), (
         "every return should be held past its service here; an uncongested fixture proves nothing")
 
     for it in trips:
-        legs = _split_legs(it)
+        legs = _split_legs(it, cfg)
         assert len(legs) == 2
         out_land = max(v.t_end for v in legs[0])
         back_off = min(v.t_start for v in legs[1])
@@ -54,16 +54,23 @@ def test_an_itinerarys_return_leg_never_precedes_its_own_arrival():
             f"flight {it.request.flight_id} leaves {out_land - back_off:.1f}s before it arrives")
 
 
-def _parked_s(intent):
+def _ground_boxes(intent, cfg):
+    """The parked-aircraft boxes: the ones only `ground_box_height_m` tall, not full columns."""
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    return [v for v in intent.volumes
+            if hasattr(v.shape, "z_hi") and v.shape.z_hi <= top + 1e-9]
+
+
+def _parked_s(intent, cfg):
     """How long the aircraft sat on the customer pad, service plus any hold on the return."""
-    box = [v for v in intent.volumes if hasattr(v.shape, "z_hi") and v.shape.z_hi < 100.0]
+    box = _ground_boxes(intent, cfg)
     return (box[0].t_end - box[0].t_start) if box else 0.0
 
 
-def _split_legs(intent):
+def _split_legs(intent, cfg):
     """Volumes grouped by leg, split at the parked-aircraft ground box."""
-    ground = [k for k, v in enumerate(intent.volumes)
-              if hasattr(v.shape, "z_hi") and v.shape.z_hi < 100.0]
+    boxes = set(id(v) for v in _ground_boxes(intent, cfg))
+    ground = [k for k, v in enumerate(intent.volumes) if id(v) in boxes]
     if not ground:
         return [intent.volumes]
     k = ground[0]
@@ -82,13 +89,13 @@ def test_the_pad_is_held_continuously_while_the_aircraft_is_parked():
 
     held = 0
     for it in trips:
-        box = [v for v in it.volumes if hasattr(v.shape, "z_hi") and v.shape.z_hi < 100.0]
+        box = _ground_boxes(it, cfg)
         if not box:
             continue
         held += 1
         (box,) = box
         assert box.shape.z_hi == pytest.approx(cfg.ground_level_m + cfg.ground_box_height_m)
-        legs = _split_legs(it)
+        legs = _split_legs(it, cfg)
         assert box.t_start == pytest.approx(max(v.t_end for v in legs[0]))
         assert box.t_end == pytest.approx(min(v.t_start for v in legs[1]))
         assert box.t_end - box.t_start >= 180.0 - 1e-6      # service, plus any hold on top
@@ -133,3 +140,30 @@ def test_colgen_refuses_an_itinerary_rather_than_dropping_the_return():
         FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=30.0)])
     with pytest.raises(NotImplementedError, match="round-trip itineraries"):
         run_batch(scen, SimConfig(), None, None, (), None, None, None)
+
+
+@pytest.mark.slow
+def test_lns_repair_keeps_both_legs_of_an_itinerary():
+    """LNS must repair a round trip as a round trip.
+
+    An unwrapped repair planner plans the outbound alone and drops the return; because that costs
+    about half the trip, `try_repair`'s strict-improvement test then ADOPTS it. Measured before the
+    fix: 36 of 36 round trips stranded, reported as a 66.93% improvement with verified=True.
+    """
+    from freespace_sim.planner.lns import LNSConfig, run_lns
+    from freespace_sim.sim import run
+
+    cfg, model = _itinerary_world(lam=300.0)      # the ruler replans every flight; keep it small
+    res = run(cfg, demand=model)
+    before = {i.request.flight_id: i for i in res.intents
+              if i.accepted and i.request.return_to_origin and i.leg_starts}
+    assert before, "the fixture must fly round trips with both legs"
+
+    out = run_lns(cfg, res.ledger, res.intents,
+                  LNSConfig(seed=7, max_iterations=60, neighborhood_size=2,
+                            operators=("agent",), log_every=0, unimpeded_workers=1),
+                  static_terms=res.ledger.static_terminals())
+    after = {i.request.flight_id: i for i in out.intents}
+    stranded = [f for f in before if not after[f].leg_starts]
+    assert not stranded, f"{len(stranded)}/{len(before)} round trips lost their return leg"
+    assert out.n_accepted > 0, "an LNS pass that accepted nothing cannot show the return survived"

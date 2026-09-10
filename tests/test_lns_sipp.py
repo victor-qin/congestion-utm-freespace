@@ -470,7 +470,8 @@ def test_the_repair_planner_reaches_a_parallel_worker():
         unimpeded_cost=dict.fromkeys(movable, 0.0),
         repair_planner_name=spec.repair_planner,
     )
-    assert type(replica.repair_planner).__name__ == "SIPPPlanner"
+    # `.inner`: the repair planner is wrapped so a round trip is repaired as both legs.
+    assert type(replica.repair_planner.inner).__name__ == "SIPPPlanner"
     assert replica.repair_planner.evict_floor == 0.0
     # and the default still builds A*, so the forward is what selects it — not a global flip
     default = LNSState.replica(
@@ -478,7 +479,7 @@ def test_the_repair_planner_reaches_a_parallel_worker():
         static_terms=res.ledger.static_terminals(),
         unimpeded_cost=dict.fromkeys(movable, 0.0),
     )
-    assert type(default.repair_planner).__name__ == "AStarPlanner"
+    assert type(default.repair_planner.inner).__name__ == "AStarPlanner"
 
     # link 4: `_worker_main` actually PASSES the spec's name through. Links 1-3 all hold with this
     # forward deleted — the test would be calling `replica` itself and never notice — so spy on the

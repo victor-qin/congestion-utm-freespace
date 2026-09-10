@@ -63,6 +63,15 @@
   pinned `turnaround_s=0.0`, so the delivery took ZERO time; they now inherit. A column is
   `hover_time_s + column_dwell_s` at BOTH ends of every leg, so the change moves every result.
 
+- 2026-09-10T01:20Z `[TOOL]` xhigh review of #129 found 10 issues, all fixed. Two were severe:
+  LNS repaired a round trip as its outbound leg alone (36/36 stranded, reported as a 66.93% gain,
+  verified=True) and the detour metric measured two legs flown against a one-leg reference (11.2x).
+  Both re-measured clean: 36/36 legs kept, gain 8.67%, detour exactly 1.0x.
+- 2026-09-10T01:25Z `[CODE]` `reject_itinerary` now guards `AStarPlanner.plan` / `SIPPPlanner.plan`,
+  so a round-trip request reaching an unwrapped planner raises. It immediately caught a third site
+  a hand-audit had missed: `lns/unimpeded.py:_new_ruler`, whose ruler halved every round trip's
+  unimpeded cost and so inflated the `delay()` premium that picks victims.
+
 ## [OUTCOMES]
 
 - 2026-09-08T22:07Z `[TOOL]` PR #128 merged: one predicate for paired-leg precedence. Armed nominal

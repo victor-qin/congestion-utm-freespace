@@ -134,6 +134,13 @@ def _term_from_json(s):
     return tuple(json.loads(s))
 
 
+def _opt_float(v) -> float | None:
+    """A parquet cell back to ``float | None`` — None for a missing column or a NaN (inherit) row."""
+    if v is None or (isinstance(v, float) and v != v):
+        return None
+    return float(v)
+
+
 def _opt_int(v) -> int | None:
     """A parquet cell back to ``int | None`` — None for a missing column or a NaN (unlinked) row."""
     if v is None or (isinstance(v, float) and v != v):
@@ -171,7 +178,7 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             # Without these a reloaded run is a ONE-WAY delivery whose return vanished — and `dest`
             # is the customer either way, so the loss is invisible in the geometry.
             "return_to_origin": bool(r.return_to_origin),
-            "turnaround_s": float(r.turnaround_s),
+            "turnaround_s": None if r.turnaround_s is None else float(r.turnaround_s),
         })
     return pd.DataFrame(rows)
 
@@ -822,7 +829,7 @@ def load_run(folder: Path | str) -> LoadedRun:
                             # getattr defaults: a run archived before a column existed has neither
                             # the attribute nor a value, and reads back as one-way — which it was.
                             return_to_origin=bool(getattr(s, "return_to_origin", False)),
-                            turnaround_s=float(getattr(s, "turnaround_s", 0.0) or 0.0),
+                            turnaround_s=_opt_float(getattr(s, "turnaround_s", None)),
                             )
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(

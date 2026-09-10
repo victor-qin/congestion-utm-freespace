@@ -41,10 +41,12 @@ class NativeProfile:
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in funcs:
                     collect(node.func.id)
         collect('_price_dag')
-        names = ['calls' + name for name in sorted(reachable)] + [
+        # Retain zero-valued legacy/new path counters when a helper is unreachable.
+        compared_helpers = reachable | {'_fill_path', '_path_cmp', '_path_cmp_equal_depth'}
+        names = ['calls' + name for name in sorted(compared_helpers)] + [
             'hash_probes', 'hash_matches', 'hash_empty', 'dominance_updates',
             'dominance_rejects', 'path_nodes_materialized', 'path_elements_compared',
-            'labels_created', 'root_labels_created']
+            'labels_created', 'root_labels_created', 'path_parent_pairs_visited']
         self.names = names
         self.counts = np.zeros(len(names), np.int64)
         indices = {name: i for i, name in enumerate(names)}
@@ -70,6 +72,8 @@ class NativeProfile:
                 self.generic_visit(node)
                 if self.function == '_fill_path':
                     node.body.insert(0, bump('path_nodes_materialized'))
+                if self.function == '_path_cmp_equal_depth':
+                    node.body.insert(0, bump('path_parent_pairs_visited'))
                 return node
 
             def visit_AugAssign(self, node):

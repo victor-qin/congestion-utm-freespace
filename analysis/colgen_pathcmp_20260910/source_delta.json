@@ -1,0 +1,7 @@
+{
+  "changed_production_files": [
+    "freespace_sim/planner/colgen/dp_kernel.py"
+  ],
+  "baseline_head": "6a4c815",
+  "comparison_parameters": "six extra hops, hybrid bootstrap, 12 workers for sweep"
+}

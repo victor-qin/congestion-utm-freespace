@@ -1,0 +1,227 @@
+{
+  "single_flights": [
+    {
+      "flight_id": 934,
+      "baseline_total_s": 0.753652875078842,
+      "candidate_total_s": 0.6293995419982821,
+      "total_change_percent": -16.486812057548573,
+      "baseline_native_s": 0.2912893742322922,
+      "candidate_native_s": 0.19028641493059695,
+      "native_change_percent": -34.674440002452414,
+      "baseline_arena_bytes": 2684354560,
+      "candidate_arena_bytes": 2684354560
+    },
+    {
+      "flight_id": 2692,
+      "baseline_total_s": 0.7192172920331359,
+      "candidate_total_s": 0.5943239589687437,
+      "total_change_percent": -17.365173842154803,
+      "baseline_native_s": 0.292768627172336,
+      "candidate_native_s": 0.19293154357001185,
+      "native_change_percent": -34.10101846177521,
+      "baseline_arena_bytes": 2684354560,
+      "candidate_arena_bytes": 2684354560
+    },
+    {
+      "flight_id": 1520,
+      "baseline_total_s": 0.3077858330216259,
+      "candidate_total_s": 0.2838524580001831,
+      "total_change_percent": -7.775983314917923,
+      "baseline_native_s": 0.09379041683860123,
+      "candidate_native_s": 0.08007983327843249,
+      "native_change_percent": -14.61832031705599,
+      "baseline_arena_bytes": 2684354560,
+      "candidate_arena_bytes": 2684354560
+    },
+    {
+      "flight_id": 1600,
+      "baseline_total_s": 1.0754497910384089,
+      "candidate_total_s": 0.9367039580829442,
+      "total_change_percent": -12.90119112129796,
+      "baseline_native_s": 0.4331848321016878,
+      "candidate_native_s": 0.3529395835939795,
+      "native_change_percent": -18.524482521325027,
+      "baseline_arena_bytes": 2684354560,
+      "candidate_arena_bytes": 2684354560
+    },
+    {
+      "flight_id": 1640,
+      "baseline_total_s": 2.483515749918297,
+      "candidate_total_s": 1.65809249994345,
+      "total_change_percent": -33.236078732418015,
+      "baseline_native_s": 2.083927211817354,
+      "candidate_native_s": 1.2869572080671787,
+      "native_change_percent": -38.24365837879494,
+      "baseline_arena_bytes": 2684354560,
+      "candidate_arena_bytes": 2684354560
+    },
+    {
+      "flight_id": 2282,
+      "baseline_total_s": 3.947619750164449,
+      "candidate_total_s": 2.5066571249626577,
+      "total_change_percent": -36.502062417277244,
+      "baseline_native_s": 3.408468000823632,
+      "candidate_native_s": 1.9722487900871783,
+      "native_change_percent": -42.13679607346765,
+      "baseline_arena_bytes": 2684354560,
+      "candidate_arena_bytes": 2684354560
+    }
+  ],
+  "native_counters": [
+    {
+      "flight_id": 934,
+      "other_counters_match": true,
+      "path_call_counts_match": true,
+      "old_materialized_nodes": 37884680,
+      "old_full_path_calls": 251286,
+      "new_parent_pairs": 12152362,
+      "new_materialized_nodes": 0,
+      "new_equal_depth_calls": 251286
+    },
+    {
+      "flight_id": 2692,
+      "other_counters_match": true,
+      "path_call_counts_match": true,
+      "old_materialized_nodes": 37761584,
+      "old_full_path_calls": 256770,
+      "new_parent_pairs": 11218192,
+      "new_materialized_nodes": 0,
+      "new_equal_depth_calls": 256770
+    },
+    {
+      "flight_id": 1520,
+      "other_counters_match": true,
+      "path_call_counts_match": true,
+      "old_materialized_nodes": 5995332,
+      "old_full_path_calls": 69124,
+      "new_parent_pairs": 2143476,
+      "new_materialized_nodes": 0,
+      "new_equal_depth_calls": 69124
+    },
+    {
+      "flight_id": 1600,
+      "other_counters_match": true,
+      "path_call_counts_match": true,
+      "old_materialized_nodes": 25303636,
+      "old_full_path_calls": 641155,
+      "new_parent_pairs": 8934997,
+      "new_materialized_nodes": 0,
+      "new_equal_depth_calls": 641155
+    },
+    {
+      "flight_id": 1640,
+      "other_counters_match": true,
+      "path_call_counts_match": true,
+      "old_materialized_nodes": 286482868,
+      "old_full_path_calls": 2054394,
+      "new_parent_pairs": 113892967,
+      "new_materialized_nodes": 0,
+      "new_equal_depth_calls": 2054394
+    },
+    {
+      "flight_id": 2282,
+      "other_counters_match": true,
+      "path_call_counts_match": true,
+      "old_materialized_nodes": 414741876,
+      "old_full_path_calls": 2757467,
+      "new_parent_pairs": 152393900,
+      "new_materialized_nodes": 0,
+      "new_equal_depth_calls": 2757467
+    }
+  ],
+  "sweeps": [
+    {
+      "run": "baseline_sweep",
+      "complete": true,
+      "flights": 1537,
+      "wall_s": 88.86681450018659,
+      "task_total_s": 995.9411289831623,
+      "pool_setup_s": 0.3348049169871956,
+      "kernel_counters": {
+        "priced": 1246,
+        "fell_back": 0,
+        "label_restarts": 0,
+        "budget_declined": 0
+      },
+      "timeout_flight_id": null
+    },
+    {
+      "run": "candidate_sweep",
+      "complete": true,
+      "flights": 1537,
+      "wall_s": 83.26021529198624,
+      "task_total_s": 928.8221570006572,
+      "pool_setup_s": 0.33889783290214837,
+      "kernel_counters": {
+        "priced": 1246,
+        "fell_back": 0,
+        "label_restarts": 0,
+        "budget_declined": 0
+      },
+      "timeout_flight_id": null
+    },
+    {
+      "run": "candidate_sweep_repeat",
+      "complete": true,
+      "flights": 1537,
+      "wall_s": 82.9394768748898,
+      "task_total_s": 926.99426206504,
+      "pool_setup_s": 0.32690608291886747,
+      "kernel_counters": {
+        "priced": 1246,
+        "fell_back": 0,
+        "label_restarts": 0,
+        "budget_declined": 0
+      },
+      "timeout_flight_id": null
+    },
+    {
+      "run": "baseline_sweep_repeat",
+      "complete": true,
+      "flights": 1537,
+      "wall_s": 87.59327191696502,
+      "task_total_s": 981.5701590692624,
+      "pool_setup_s": 0.3263748330064118,
+      "kernel_counters": {
+        "priced": 1246,
+        "fell_back": 0,
+        "label_restarts": 0,
+        "budget_declined": 0
+      },
+      "timeout_flight_id": null
+    }
+  ],
+  "parity": {
+    "baseline_counts": {
+      "passed": true,
+      "compared": 6,
+      "mismatches": []
+    },
+    "baseline_sweep_repeat": {
+      "passed": true,
+      "compared": 1537,
+      "mismatches": []
+    },
+    "candidate_counts": {
+      "passed": true,
+      "compared": 6,
+      "mismatches": []
+    },
+    "candidate_single": {
+      "passed": true,
+      "compared": 6,
+      "mismatches": []
+    },
+    "candidate_sweep": {
+      "passed": true,
+      "compared": 1537,
+      "mismatches": []
+    },
+    "candidate_sweep_repeat": {
+      "passed": true,
+      "compared": 1537,
+      "mismatches": []
+    }
+  },
+  "sweep_median_change_percent": -5.8145694352772725
+}

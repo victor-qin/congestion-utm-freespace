@@ -21,7 +21,7 @@ What has to be reproduced exactly, and why each is here:
     ``visit_cost`` is a *subtraction of two prefix sums* and ``row_cost`` is a *stored
     value*: deriving the second from the first is the one shortcut that is not available,
     since ``(a + v) - a != v``.
-``_path_cmp`` / ``_tie_lt`` / ``_prefer``
+``_path_cmp_equal_depth`` / ``_path_cmp`` / ``_tie_lt`` / ``_prefer``
     The reference's dominance rule compares scores within ``_SCORE_EPS`` and breaks ties on
     ``(hops, departure_step, lane, path)`` -- the whole path, lexicographically from its
     root.  That epsilon band makes ``_prefer`` **non-transitive**, so insertion order is
@@ -447,9 +447,8 @@ def _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b):
     interned index, which :func:`~.dp_prepare.prepare_topology` assigns in **sorted axial
     order**, so index order is the ``Cell`` tuple order the reference compares.
 
-    Only reached on an exact tie of ``(cell, recent, hops, departure_step, lane)``, so its
-    O(hops) walk is off the hot path; correctness here decides which of two equally scored
-    columns is returned.
+    This general comparison also handles unequal path lengths in the feasible-search
+    frontier. The pricing DP's equal-hop ties use :func:`_path_cmp_equal_depth` instead.
 
     Parameters
     ------------
@@ -479,6 +478,30 @@ def _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b):
     if n_a > n_b:
         return 1
     return 0
+
+
+@njit(cache=True, nogil=True)
+def _path_cmp_equal_depth(a, b, label_parent, label_cell):
+    """Compare equal-length paths exactly without materializing either parent chain.
+
+    Walking toward the root visits differences in reverse lexicographic priority, so
+    every unequal cell replaces the previous verdict. The last difference encountered
+    is the earliest one in the paths. A shared label ID ends the walk because its entire
+    parent chain is identical; equal cell IDs alone cannot justify that shortcut.
+
+    Callers must establish equal hop counts. Accepted parent labels are immutable, and
+    each parent removes one hop, so both walks reach their shared node or -1 together.
+    """
+
+    order = 0
+    while a != b:
+        if label_cell[a] < label_cell[b]:
+            order = -1
+        elif label_cell[a] > label_cell[b]:
+            order = 1
+        a = label_parent[a]
+        b = label_parent[b]
+    return order
 
 
 @njit(cache=True, nogil=True)
@@ -514,7 +537,7 @@ def _tie_lt(
         return label_departure[a] < label_departure[b]
     if label_lane[a] != label_lane[b]:
         return label_lane[a] < label_lane[b]
-    return _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b) < 0
+    return _path_cmp_equal_depth(a, b, label_parent, label_cell) < 0
 
 
 @njit(cache=True, nogil=True)

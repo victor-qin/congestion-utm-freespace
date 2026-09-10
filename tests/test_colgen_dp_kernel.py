@@ -559,8 +559,9 @@ def _chain(parent, node):
     return list(reversed(out))
 
 
-def test_kernel_path_compare_matches_python_tuple_ordering():
-    """`_path_cmp` is Python's tuple comparison, prefix rule included."""
+@pytest.mark.parametrize("equal_depth", [False, True])
+def test_kernel_path_compare_matches_python_tuple_ordering(equal_depth):
+    """Both comparators match tuple ordering on their supported path depths."""
 
     rng = random.Random(7)
     pool = _random_pool(rng)
@@ -568,19 +569,84 @@ def test_kernel_path_compare_matches_python_tuple_ordering():
     scratch_a = np.zeros(64, np.int32)
     scratch_b = np.zeros(64, np.int32)
 
+    by_depth = {}
+    for label, depth in enumerate(pool.hops):
+        by_depth.setdefault(depth, []).append(label)
     compared_prefixes = 0
     for _ in range(3000):
         a = rng.randrange(len(pool.labels))
-        b = rng.randrange(len(pool.labels))
+        b = (rng.choice(by_depth[pool.hops[a]]) if equal_depth
+             else rng.randrange(len(pool.labels)))
         path_a = tuple(pool.cell[i] for i in _chain(pool.parent, a))
         path_b = tuple(pool.cell[i] for i in _chain(pool.parent, b))
         expected = int(path_a > path_b) - int(path_a < path_b)
-        assert dp_kernel._path_cmp(a, b, parent, cell, scratch_a, scratch_b) == expected
+        if equal_depth:
+            assert dp_kernel._path_cmp_equal_depth(a, b, parent, cell) == expected
+        else:
+            assert dp_kernel._path_cmp(a, b, parent, cell, scratch_a, scratch_b) == expected
         if path_a != path_b and (
             path_a[: len(path_b)] == path_b or path_b[: len(path_a)] == path_a
         ):
             compared_prefixes += 1
-    assert compared_prefixes > 20, "no common-prefix pairs were compared"
+    if not equal_depth:
+        assert compared_prefixes > 20, "no common-prefix pairs were compared"
+
+
+@pytest.mark.parametrize("case", ["shared_nodes", "shared_deep_equal", "shared_cells", "duplicate_roots",
+                                 "opposite_differences", "same_node", "deep_chain",
+                                 "tentative_slot_reuse"])
+def test_equal_depth_path_comparison_adversarial_ancestry(case):
+    """Shared ancestry, tuple ties, and unpublished slot reuse preserve tuple order."""
+    parents, cells = [], []
+
+    def append_path(values, parent=-1):
+        for value in values:
+            parents.append(parent)
+            cells.append(value)
+            parent = len(parents) - 1
+        return parent
+
+    if case in {"shared_nodes", "shared_deep_equal"}:
+        shared = append_path([9, 1] * 2500)
+        a = append_path([4, 0], shared)
+        b = append_path([4, 0 if case == "shared_deep_equal" else 3], shared)
+        assert a != b and parents[parents[a]] == parents[parents[b]] == shared
+    elif case == "shared_cells":
+        a, b = append_path([0, 8, 5]), append_path([1, 0, 5])
+    elif case == "duplicate_roots":
+        a, b = append_path([3, 1, 7]), append_path([3, 1, 7])
+    elif case == "opposite_differences":
+        a, b = append_path([0, 9, 9]), append_path([1, 0, 0])
+    elif case == "same_node":
+        a = b = append_path([4])
+    elif case == "deep_chain":
+        a = append_path([0] + [2] * 5000 + [9])
+        b = append_path([1] + [2] * 5000 + [0])
+    else:
+        first = append_path([0, 1])
+        second = append_path([0, 2])
+        a, b = append_path([8], first), append_path([0], second)
+    parent = np.asarray(parents, dtype=np.int32)
+    cell = np.asarray(cells, dtype=np.int32)
+
+    def check():
+        before_parent, before_cell = parent.copy(), cell.copy()
+        left = tuple(int(cell[i]) for i in _chain(parent, a))
+        right = tuple(int(cell[i]) for i in _chain(parent, b))
+        assert len(left) == len(right)
+        expected = int(left > right) - int(left < right)
+        assert dp_kernel._path_cmp_equal_depth(a, b, parent, cell) == expected
+        assert dp_kernel._path_cmp_equal_depth(b, a, parent, cell) == -expected
+        np.testing.assert_array_equal(parent, before_parent)
+        np.testing.assert_array_equal(cell, before_cell)
+
+    check()
+    if case == "tentative_slot_reuse":
+        # Feasible search reuses only its unpublished tail slot, never accepted ancestors.
+        parent[b], cell[b] = first, 7
+        check()
+        cell[b] = 8
+        check()
 
 
 @pytest.fixture(scope="module")
@@ -1974,7 +2040,7 @@ def test_compiled_path_respects_the_pricing_deadline():
         )
 
 
-@pytest.mark.parametrize("overrun", [0, 1, 3, 9])
+@pytest.mark.parametrize("overrun", [0, 1, 3, 6, 9])
 def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
     """The route-length bound is the only knob shaping the corridor, so sweep it.
 

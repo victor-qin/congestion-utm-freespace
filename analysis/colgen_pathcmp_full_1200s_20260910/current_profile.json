@@ -1,0 +1,56 @@
+{
+  "source_head": "30ffaf5",
+  "n_flights": 1537,
+  "rounds": 11,
+  "flight_round_calls": 16907,
+  "calls_entering_main_search": 15580,
+  "worker_seconds": {
+    "task_s": {
+      "count": 16907,
+      "sum": 5658.75637984043,
+      "mean": 0.33469902288048914,
+      "median": 0.2577641671523452,
+      "p95": 0.9296211587963618,
+      "p99": 1.5351525785960234,
+      "maximum": 4.208192249992862
+    },
+    "compiled_s": {
+      "count": 16907,
+      "sum": 2888.3795680296607,
+      "mean": 0.1708392717826735,
+      "median": 0.15638804202899337,
+      "p95": 0.33355866263154893,
+      "p99": 0.47605826849117766,
+      "maximum": 3.9512004158459604
+    },
+    "bootstrap_s": {
+      "count": 16907,
+      "sum": 2708.4225876308046,
+      "mean": 0.16019533847700979,
+      "median": 0.06471754191443324,
+      "p95": 0.6806193660479037,
+      "p99": 1.1698862700909372,
+      "maximum": 3.862701541977003
+    },
+    "bootstrap_goal_s": {
+      "count": 16907,
+      "sum": 742.2176510589197,
+      "mean": 0.04390002076411662,
+      "median": 0.0,
+      "p95": 0.2567176624666899,
+      "p99": 0.9822937104711299,
+      "maximum": 3.742012874921784
+    }
+  },
+  "disjoint_simulation_wall_s": {
+    "pricing_including_parent_validation": 641.6439908349421,
+    "iteration_and_final_ip": 363.72313899942674,
+    "lp_and_row_separation": 156.40832641534507,
+    "initial_seeding": 56.98085937509313,
+    "other": 37.44954766728915
+  },
+  "parent_validation_within_pricing_s": 82.46250890055671,
+  "bootstrap_no_expansion_calls": 9011,
+  "bootstrap_no_expansion_worker_s": 372.1200675375294,
+  "scope": "Aggregate saved full-run diagnostics, no new simulation. Zero for skipped stages in per-call distribution. compiled_s includes Python host preparation/validation; native-only time is not available for every flight. Worker seconds are concurrent elapsed task durations, not OS CPU time."
+}

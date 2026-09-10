@@ -35,7 +35,7 @@ HOR = float(sys.argv[4]) if len(sys.argv) > 4 else 6000.0
 
 
 def _build(spec, cfg, demand):
-    res = sim.run(cfg, demand=demand, planner_name="astar", progress=False, return_anchor="nominal")
+    res = sim.run(cfg, demand=demand, planner_name="astar", progress=False)
     by_fid = {}
     for fid, v in res.ledger.iter_committed():
         by_fid.setdefault(fid, []).append(v)

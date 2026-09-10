@@ -82,3 +82,36 @@ Durable record of mistakes likely to recur between PRs. Format follows `.agent/C
 - 2026-09-10T01:32Z `[CODE]` A metric pair must measure the same thing: `_flown_horizontal_m` summed
   a two-leg centerline while `_straight_horizontal_m` used one origin->dest pair, reporting 4,332 m
   of detour where 387 m existed. Both now split at `leg_starts`. Files: `freespace_sim/metrics.py`.
+
+- 2026-09-10T04:10Z `[TOOL]` A regex/sed-style deletion of one field left scars in six files that no
+  linter catches, and one of them silently removed test coverage: deleting a test took its body but
+  left its `@pytest.mark.slow`, which re-bound to the NEXT function — a fast test on `main` became
+  slow on the branch and dropped out of `-m "not slow"`, the mode this repo iterates with. Others
+  were a docstring truncated mid-sentence (the one stating `WorkerSpec`'s invariant), two welded
+  argument lists, and two runs of stray blank lines. After a mechanical delete, diff the marker →
+  function bindings, not just the removed lines. Files: `freespace_sim/planner/lns/{parallel,solver}.py`,
+  `freespace_sim/sim.py`, `tests/test_lns.py`, `tests/test_lns_parallel.py`.
+
+- 2026-09-10T04:12Z `[CODE]` A wrapper whose `__getattr__` forwards EVERYTHING breaks two invariants
+  at once. Forwarding `warm_planner` made `iter_planner_chain` yield the inner planner's warm planner
+  at the wrapper's own depth, reordering a chain whose order is load-bearing (`astar_milp` went
+  `[MILP, AStar]` -> `[Itinerary, AStar, MILP]`; `_terminal_capacity_for` takes the FIRST match).
+  Forwarding `inner` made `copy`/`pickle` recurse to a stack overflow, because both build an instance
+  with an empty `__dict__` before restoring state. A forwarding wrapper must refuse its own
+  structural attribute names. Files: `freespace_sim/planner/itinerary.py`.
+
+- 2026-09-10T04:14Z `[CODE]` A volume synthesized AFTER the searches that produced it is invisible to
+  the thing that would have routed around it. The round-trip pad hold is built in `_compose` from
+  both legs' results, and it rasterizes to nothing in every planner's hex occupancy (`z=[0,5]` vs a
+  30 m ladder floor with `corridor_height_m` 30 ⇒ `_levels_overlapped` returns `[]`) while
+  `ledger.any_conflict` sees it — so FCFS denied it at commit as a lost race, and the LNS commit path
+  (which re-checks nothing) committed a real conflict. Anything added to `volumes` after planning
+  must be conflict-checked before the intent is returned ACCEPTED. Files:
+  `freespace_sim/planner/itinerary.py`, `freespace_sim/mechanism.py`, `freespace_sim/planner/lns/state.py`.
+
+- 2026-09-10T15:45Z `[USER]` `.gitignore` line 8 is `*.png` and stays that way — figures are not
+  committed, so a figure citation names a path the reader REGENERATES. That makes the citation honest
+  only if `context/figures/make_figures.py` holds a `fig_*` whose `_save` name matches the cited file
+  AND is registered in `FIGURES`. Three citations added here pointed at a PNG rendered by a throwaway
+  script, so nobody but its author could produce it; the fix is to move the generator into
+  `make_figures.py`, never to un-ignore the image. Files: `context/figures/make_figures.py`, `.gitignore`.

@@ -12,7 +12,6 @@ runlogs/
 .ruff_cache/
 .DS_Store
 .claude/settings.local.json
-.agent/
 
 results/supercloud
 

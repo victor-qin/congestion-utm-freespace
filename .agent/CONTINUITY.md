@@ -110,6 +110,13 @@
 
 ## [OUTCOMES]
 
+- 2026-09-10T22:10Z `[USER]` `context/HISTORY.md` streamlined 21 -> 15 entries before merge. The file is
+  new in this PR (absent on main), so no published record is rewritten. Removed: the run-limited-tests
+  rule (duplicates AGENTS.md), the A/B-imports-workspace entry (cites only untracked `.context/perf`),
+  and the two #128 entries whose every cited symbol this PR deleted. Merged the two LNS
+  wrapper-bypass entries and the two pad-hold entries. Refreshed `verified`, the default-off checker
+  and the tautological-fixture entries to cite live code, folding in the audit's vacuous `union` test.
+
 - 2026-09-10T20:25Z `[USER]` SUPERSEDES the 20:05Z removal: KEEP all four guards from `e420a68` — the
   `_compose` precedence raise, `SimConfig`'s `turnaround_s >= 0` and `ground_box_height_m` lattice
   checks, and `reject_itinerary` on milp/straight/decoupled — plus their tests. They defend states

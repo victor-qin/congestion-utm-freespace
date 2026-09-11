@@ -205,24 +205,24 @@ class ItineraryPlanner:
         from ..verify import realized_takeoff_s
         dwell = []
         leaves = realized_takeoff_s(back)
-        if leaves is not None and leaves < landed - 1e-9:
-            # Structural, not a denial: leg 2 was asked to depart at `landed + turnaround`, and a
-            # planner may only delay a departure. An earlier volume means the return is airborne
-            # before its own aircraft is down — the one thing this model exists to make
-            # inexpressible — and the branch below would file no pad hold, so nothing else catches
-            # it. `verify` cannot: both legs are one flight now, and it checks INTERflight overlap.
+        # How long the aircraft sits: arrival column clear -> departure column start. NEGATIVE means
+        # the return is airborne before its own aircraft is down, which a planner cannot produce (it
+        # was asked to depart at `landed + turnaround` and may only delay) — and nothing downstream
+        # would catch it, since the branch below files no hold and `verify` checks INTERflight
+        # overlap while both legs are now one flight.
+        parked_s = 0.0 if leaves is None else float(leaves) - landed
+        if parked_s < -1e-9:
             raise ValueError(
-                f"flight {req.flight_id}: the return leg's first volume starts {landed - leaves:.1f}s "
-                f"before the outbound's landing column clears ({leaves:.1f} < {landed:.1f}). A leg is "
-                "planned with t_departure = realized arrival + turnaround, and no planner may depart "
-                "earlier than asked, so this is a planner contract violation, not congestion.")
-        if leaves is not None and leaves > landed + 1e-9:
+                f"flight {req.flight_id}: the return leg's first volume starts {-parked_s:.1f}s "
+                f"before the outbound's landing column clears ({leaves:.1f} < {landed:.1f}) — a "
+                "planner contract violation, not congestion.")
+        if parked_s > 1e-9:
             d_term = req.dest_terminal
             # NOT tagged with the terminal: `conflict.volumes_conflict` makes two same-hub volumes
             # transparent whenever either is a cylinder, and this box is one. Tagging it would let
             # another flight of the same hub land its column on top of the parked aircraft.
             dwell = [ground_dwell_reservation(
-                req.dest, landed, float(leaves) - landed, cfg,
+                req.dest, landed, parked_s, cfg,
                 radius=terminal_radius(d_term, cfg) if d_term is not None else None)]
             # This box is derived from both legs' results, so neither search deconflicted it; check
             # it against the ledger here, where the answer is still a denial the caller can read.

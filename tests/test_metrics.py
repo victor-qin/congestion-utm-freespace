@@ -635,6 +635,35 @@ def test_planner_detour_and_metrics_stretch_cannot_drift(planner):
         assert row["stretch"] < 1.01, f"milp stretch {row['stretch']:.4f} — column legs leaking in?"
 
 
+def test_an_itinerarys_reference_survives_a_degenerate_leg():
+    """A leg's endpoints come from the REQUEST, so its straight-line reference exists whether or not
+    its centerline did. Filtering short legs out of `_legs` shortened flown AND reference together,
+    which keeps `stretch` honest but halves the ruler `nominal_flight_time_s` reads — and that feeds
+    `delay_pct` and `trip_time_ratio`, neither of which is guarded against a short `straight`."""
+    from dataclasses import replace
+
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    hub, cust = vec(0, 0, 0), vec(2000, 0, 0)
+    trip = get_planner("astar").plan(
+        FlightRequest(1, hub, cust, 0.0, return_to_origin=True), ReservationLedger(cfg), cfg)
+    assert trip.accepted and trip.leg_starts
+
+    both = metrics._straight_horizontal_m(trip, cfg)
+    one_way = metrics._straight_horizontal_m(
+        get_planner("astar").plan(FlightRequest(2, hub, cust, 0.0), ReservationLedger(cfg), cfg), cfg)
+    assert math.isclose(both, 2.0 * one_way, rel_tol=1e-9), "a round trip measures against BOTH legs"
+
+    k = trip.leg_starts[0]
+    # leg 2 cut to a single waypoint, and an outbound that contributed none: both used to drop a leg
+    # from the reference and report half the ruler.
+    for degenerate in (replace(trip, centerline=trip.centerline[:k + 1], leg_starts=(k,)),
+                       replace(trip, leg_starts=(0,))):
+        assert math.isclose(metrics._straight_horizontal_m(degenerate, cfg), both, rel_tol=1e-9)
+
+
 @pytest.mark.parametrize("planner", ["astar", "milp", "straight"])
 def test_overlapping_terminal_columns_book_no_enroute_detour(planner):
     """A flight with no en-route segment must not have its whole path booked as detour.

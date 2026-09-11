@@ -281,11 +281,11 @@ class SimConfig:
         # make it rasterize into the hex occupancy, where a foreign column cell is a hard wall
         # (`compiled_hex_occupancy.blocked`) — so a parked aircraft would close the airspace above
         # itself for its whole turnaround, which is exactly what a low box exists to prevent.
-        if not 0.0 < self.ground_box_height_m <= lv[0] - half - self.ground_level_m + 1e-9:
+        headroom = lv[0] - half - self.ground_level_m
+        if not 0.0 < self.ground_box_height_m <= headroom + 1e-9:
             raise ValueError(
-                f"ground_box_height_m {self.ground_box_height_m} must be > 0 and fit under the "
-                f"lowest flight level's band (at most {lv[0] - half - self.ground_level_m} here): a "
-                "taller box rasterizes into the lattice and walls off the airspace over a parked pad")
+                f"ground_box_height_m {self.ground_box_height_m} must be in (0, {headroom}]: a taller "
+                "box rasterizes into the lattice and walls off the airspace over a parked pad")
         # The per-metre cost weights and the climb-time properties divide by these, so a zero would
         # surface as a ZeroDivisionError deep in planner setup rather than here at construction.
         if self.nominal_speed_mps <= 0.0 or self.climb_rate_mps <= 0.0:

@@ -110,6 +110,46 @@
 
 ## [OUTCOMES]
 
+- 2026-09-10T20:25Z `[USER]` SUPERSEDES the 20:05Z removal: KEEP all four guards from `e420a68` — the
+  `_compose` precedence raise, `SimConfig`'s `turnaround_s >= 0` and `ground_box_height_m` lattice
+  checks, and `reject_itinerary` on milp/straight/decoupled — plus their tests. They defend states
+  measured unreachable today; the user wants them as insurance anyway. Kept from the simplification
+  pass because they remove no guard: `_compose`'s duplicated `leaves is not None` branches collapsed
+  into one `parked_s` interval, and the lattice-check message reads its bound from a `headroom` local.
+
+- 2026-09-10T20:05Z `[USER]` SUPERSEDES part of the 18:30Z entry: fix by SIMPLIFYING and reconfiguring
+  existing code, not by adding guards. Four guards from `e420a68` REMOVED as defending unreachable
+  states: the `_compose` precedence raise (a planner may only delay a departure), both `SimConfig`
+  validations (`turnaround_s >= 0`, the `ground_box_height_m` lattice check), and `reject_itinerary`
+  on milp/straight/decoupled (no bypassing site). A*/SIPP guards predate the review (`d450273`) and
+  stay. Their two tests went with them. The spec v1 guard KEEPS its field check (`hub_radius` +
+  `return_flights`) rather than refusing all v1 payloads, so one-way v1 recipes still replay.
+- 2026-09-10T20:05Z `[TOOL]` What remains of the review fixes is reconfiguration, not addition: the
+  spec condition, `any_conflict` -> `conflicting_flights` (one word), the metrics filter moved to the
+  flown side (a net deletion), `union` re-deriving `xy`, `leg_slices` replacing two copies, and the
+  demand turnaround forwarded unresolved. Source diff vs `de7291c` went +155/-48 -> +130/-50; the
+  `_compose` branch pair collapsed to one `parked_s` interval. Measured reachability: the wall case is
+  0/2551 on density_faa_wing_zipline_amazon (31.5 m clearance) — latent, not live.
+
+- 2026-09-10T19:20Z `[TOOL]` SELF-AUDIT of the 13 fixes: reverted each one and re-ran its test. Five
+  pinned correctly (wall exemption, precedence raise, v1 guard, config validation, leaf guards —
+  3 failed / 2 passed, the 2 being A*/SIPP which kept theirs). TWO DID NOT: the `union` xy assertion
+  passed either way, and the metrics reference fix had NO test at all. Both now pinned by tests
+  confirmed to fail on the unfixed code.
+- 2026-09-10T19:20Z `[TOOL]` CORRECTION to review finding #8: a real itinerary CANNOT exhibit the
+  `union` xy divergence. Its legs retrace one corridor, so both span nearly the same (q,r) box
+  (measured: leg1 q[-1,10] r[-1,1], leg2 q[0,11] r[-1,1]) and, with r equal on both sides, the shear
+  term cancels — derived and naively-unioned xy are byte-identical. The divergence needs legs
+  differing in q and r in OPPOSITE directions. The fix is still right (it is a widening, and makes
+  the invariant hold by construction) but it is an invariant repair, not a live bug.
+- 2026-09-10T19:20Z `[TOOL]` The metrics fix IS live and measured: a round trip whose leg 2 is cut to
+  one waypoint, or whose `leg_starts` is `(0,)`, reported `straight = 2000.0 m` against a true
+  4000.0 m under the old `_legs` — half the ruler `nominal_flight_time_s` / `delay_pct` /
+  `trip_time_ratio` read from. Reachability is still narrow (both legs must be ACCEPTED to compose).
+- 2026-09-10T19:20Z `[CODE]` The v1 spec refusal's blast radius is bounded and intended: `load_run`
+  never calls `load_scenario_spec`, so archived RESULTS still load and only the re-run RECIPE is
+  refused. `turnaround_s=None` round-trips through parquet (None -> NaN -> None) verified end to end.
+
 - 2026-09-10T18:30Z `[TOOL]` xhigh review of #129 (10 angles + sweep) surfaced 13 findings; all 13
   fixed. The two severe ones were both in the schema migration this PR ships: the v1 guard keyed on
   `paired_return_request` when the field that changes the flight SET is `return_flights` (and it

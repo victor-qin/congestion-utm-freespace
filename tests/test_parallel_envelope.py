@@ -476,6 +476,35 @@ def test_every_accepted_sipp_plan_reports_a_read_set():
     assert n_acc > 40, f"only {n_acc} accepted — fixture too thin to be a coverage test"
 
 
+def test_union_derives_xy_from_the_unioned_cell_box():
+    """`xy` is `cell_bbox`'s meters conversion, and `union` must RE-DERIVE it rather than union the
+    two operands' boxes: the axial->world map is a shear (x = R*sqrt3*(q + r/2)), so xmin depends
+    jointly on q and r and the two forms give different boxes.
+
+    A real itinerary cannot show this — its legs retrace one corridor, so both span the same (q, r)
+    region and the two forms agree — which is exactly why this pins `union` directly.
+    """
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+
+    def env(qlo, qhi, rlo, rhi):
+        cell = (qlo, qhi, rlo, rhi, 0, 0, 0, 10)
+        return PlanEnvelope(cell, cell_bbox_to_aabb(cell, cfg), (), 0.0, 100.0)
+
+    # opposite corners of the shear: low q with high r against high q with low r
+    a, b = env(0, 1, 10, 11), env(10, 11, 0, 1)
+    u = a.union(b, cfg)
+
+    assert u.cell_bbox == (0, 11, 0, 11, 0, 0, 0, 10)
+    assert u.xy == pytest.approx(cell_bbox_to_aabb(u.cell_bbox, cfg))
+    # not vacuous: unioning the two AABBs instead would have claimed a strictly narrower box
+    naive = min(a.xy[0], b.xy[0])
+    assert u.xy[0] < naive - 1e-6, f"derived xmin {u.xy[0]} should undercut the naive union {naive}"
+    # ...and widening is the safe direction — the union covers each operand
+    for side in (a, b):
+        assert u.xy[0] <= side.xy[0] and u.xy[1] <= side.xy[1]
+        assert u.xy[2] >= side.xy[2] and u.xy[3] >= side.xy[3]
+
+
 def test_an_itinerarys_envelope_covers_every_leg_it_planned():
     """A round trip is planned one ``plan()`` call per leg, and the planner clears ``last_envelope``
     at the top of each call. Without a union the LAST leg's reads would stand for the whole flight,
@@ -500,9 +529,6 @@ def test_an_itinerarys_envelope_covers_every_leg_it_planned():
     for i, (w, o) in enumerate(zip(whole.cell_bbox, leg.cell_bbox)):   # alternating (min, max)
         assert (w <= o) if i % 2 == 0 else (w >= o), f"axis {i}: itinerary {w} misses leg {o}"
     assert whole.t_lo <= leg.t_lo and whole.t_hi >= leg.t_hi
-    # `xy` must stay `cell_bbox`'s conversion, not a separate union of the two legs' boxes: the
-    # axial->world map is a shear (x = R*sqrt3*(q + r/2)), so unioning the AABBs gives a DIFFERENT
-    # box than converting the unioned cell box, and `envelope_intersects` reads only `xy`.
     assert whole.xy == pytest.approx(cell_bbox_to_aabb(whole.cell_bbox, cfg))
     # a hub both legs consulted is carried once, not once per leg
     assert len(whole.hub_reads) == len(set(whole.hub_reads))

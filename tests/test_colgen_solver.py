@@ -600,6 +600,97 @@ class _RetainingBackend:
         raise NotImplementedError
 
 
+@pytest.mark.parametrize("tol", [0.0, 1e-15, 1e-7])
+@pytest.mark.parametrize("mode", ["feasible", "arbitrary", "overflow"])
+def test_capacity_separation_matches_full_loads_after_pool_growth(tol, mode):
+    """Skipping implied rows must preserve separation for every public input vector."""
+
+    rng = np.random.default_rng(47)
+    rows = RowIndex({"hub": 3})
+    resources = [RowKey.cell((i, 0), 0, 0) for i in range(8)]
+    resources.append(RowKey.term("hub", 0))
+    fixed_only = RowKey.term("hub", 1)
+    master = RestrictedMaster(
+        range(4), rows, _params(), backend=_RetainingBackend(range(4)),
+        fixed_loads={resources[0]: 1, resources[-1]: 1, fixed_only: 2},
+    )
+    for batch in range(3):
+        for fid in range(4):
+            for step in range(batch * 8, (batch + 1) * 8):
+                claims = {row for row in resources if rng.random() < 0.35}
+                master.add_column(_synthetic_column(fid, float(step), frozenset(claims),
+                                                    departure_step=step))
+        values = rng.random(len(master.columns))
+        if mode == "feasible":
+            for fid in range(4):
+                indices = [i for i, c in enumerate(master.columns) if c.flight_id == fid]
+                values[indices] /= sum(values[indices])
+        elif mode == "arbitrary":
+            values -= 0.3
+        else:
+            values[:] = 1e308
+        expected = {
+            row for row, load in master.fractional_loads(values).items()
+            if load > rows.cap(row) + tol and row not in master.materialized_rows
+        }
+        before = master.materialized_rows
+        assert master.add_violated_rows(values, tol) == len(expected)
+        assert master.materialized_rows - before == expected
+        # Eager IP materialization followed by another LP must not add rows again.
+        master.materialize_bindable_rows()
+        assert master.add_violated_rows(values, tol) == 0
+
+
+@pytest.mark.parametrize("tol", [0.0, 1e-15, 1e-7])
+def test_capacity_separation_retains_small_flight_mass_violations(tol):
+    """A tolerance shortcut must not hide either rounding or positive-only overloads."""
+
+    shared = RowKey.cell((0, 0), 0, 0)
+    master = RestrictedMaster((1,), RowIndex(), _params(), backend=_RetainingBackend((1,)))
+    for step in range(50):
+        master.add_column(_synthetic_column(1, float(step), frozenset({shared}),
+                                            departure_step=step))
+    for values in (np.full(50, 0.02), np.full(50, 0.02 + 1e-9),
+                   np.array([1.0, 0.5, -0.5] + [0.0] * 47)):
+        load = master.fractional_loads(values)[shared]
+        expected = int(load > 1 + tol and shared not in master.materialized_rows)
+        assert master.add_violated_rows(values, tol) == expected
+
+
+def test_capacity_separation_handles_fixed_load_changes_during_pool_growth():
+    """A changed fixed-load dictionary must invalidate the original implication proof."""
+
+    row = RowKey.term("hub", 0)
+    fixed_only = RowKey.term("hub", 1)
+    rows = RowIndex({"hub": 3})
+    master = RestrictedMaster((1, 2), rows, _params(), fixed_loads={row: 2},
+                              backend=_RetainingBackend((1, 2)))
+    master.fixed_loads.clear()
+    for fid in (1, 2):
+        master.add_column(_synthetic_column(fid, 0.0, frozenset({row})))
+    master.fixed_loads[row] = 2
+    assert master.add_violated_rows([1.0, 1.0]) == 1
+    master.fixed_loads[fixed_only] = 4
+    with pytest.raises(ValueError, match="fixed load exceeds capacity"):
+        master.add_violated_rows([0.0, 0.0])
+
+
+@pytest.mark.parametrize("capacity", [3, 2**53 + 1])
+def test_capacity_separation_respects_accumulated_tolerance_and_large_capacities(capacity):
+    """Small flight residuals may accumulate past tolerance on a multi-capacity row."""
+
+    row = RowKey.term("hub", 0)
+    rows = RowIndex({"hub": capacity})
+    master = RestrictedMaster((1, 2, 3), rows, _params(),
+                              fixed_loads={row: capacity - 3},
+                              backend=_RetainingBackend((1, 2, 3)))
+    for fid in (1, 2, 3):
+        master.add_column(_synthetic_column(fid, 0.0, frozenset({row})))
+    values = [1.0 + 4e-8] * 3
+    expected = int(master.fractional_loads(values)[row] > rows.cap(row) + 1e-7)
+    assert master.add_violated_rows(values) == expected
+
+
 def test_materialize_rows_hands_the_backend_an_isolated_sequence():
     """Columns added later must not mutate a row the backend already received.
 
@@ -1843,6 +1934,39 @@ def test_a_malformed_gurobi_env_var_names_itself(monkeypatch):
     monkeypatch.setenv("COLGEN_GUROBI_LP_METHOD", "barrier")
     with pytest.raises(ValueError, match="COLGEN_GUROBI_LP_METHOD must be an integer"):
         master_module.gurobi_lp_method()
+
+
+@pytest.mark.parametrize("columns_per_flight", [1, 3])
+def test_solver_revalidates_replaced_pricing_results(monkeypatch, columns_per_flight):
+    """Changed sweep payloads must recover canonical claims and costs before entering the LP."""
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    params = _params(seed_ladder_steps=0, max_iterations=3, columns_per_flight=columns_per_flight)
+    # Start without a complete incumbent so pricing must supply a positive column.
+    monkeypatch.setattr(solver_module, "_initial_feasible_selection", lambda *args, **kwargs: {})
+    expected = ColGenSolver().solve(requests, cfg, (), params)
+    original_sweep = solver_module.price_sweep
+
+    def replaced_sweep(*args, **kwargs):
+        result = original_sweep(*args, **kwargs)
+
+        def foreign(column):
+            return None if column is None else replace(
+                column, claims=frozenset(), delay_s=column.delay_s + 123.0,
+            )
+
+        return replace(result, columns=tuple(map(foreign, result.columns)),
+                       extra_columns=tuple(map(foreign, result.extra_columns)))
+
+    monkeypatch.setattr(solver_module, "price_sweep", replaced_sweep)
+    actual = ColGenSolver().solve(requests, cfg, (), params)
+    assert actual.stats["pricing_certified_columns"] == 0
+    assert actual.stats["pricing_revalidated_columns"] > 0
+    assert expected.stats["pricing_certified_columns"] > 0
+    assert actual.columns == expected.columns
+    assert actual.stats["objective"] == expected.stats["objective"]
+    _assert_claim_feasible(actual.columns)
 
 
 @pytest.mark.parametrize("reserve,expected", [(None, 2.75), (660.0, 600.0)])

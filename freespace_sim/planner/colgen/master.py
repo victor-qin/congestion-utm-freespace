@@ -837,6 +837,9 @@ class RestrictedMaster:
                 raise ValueError(f"fixed load {load} exceeds capacity {cap} for row {row!r}")
             if load:
                 self.fixed_loads[row] = load
+        self._bindability_fixed_loads = self.fixed_loads.copy()
+        self._bindability_valid = True
+        self._claim_capacities = {row_index.cap(row) for row in self.fixed_loads}
 
         self._backend: LpBackend = backend or create_backend(
             self.flight_ids,
@@ -960,8 +963,8 @@ class RestrictedMaster:
         coefficients = Counter(normalized_claims)
         if any(value not in {0, 1} for value in coefficients.values()):
             raise AssertionError("column coefficients must be in {0, 1}")
-        for row in normalized_claims:
-            self.row_index.cap(row)  # validates terminal metadata before any solve
+        # Validate terminal metadata before committing any variable.
+        capacities = {self.row_index.cap(row) for row in normalized_claims}
         try:
             delay_s = float(column.delay_s)
         except (TypeError, ValueError) as exc:
@@ -983,6 +986,9 @@ class RestrictedMaster:
         index = len(self._columns)
         self._backend.add_column(objective, column.flight_id, materialized_claims)
         self._columns.append(column)
+        self._claim_capacities.update(capacities)
+        if self.fixed_loads != self._bindability_fixed_loads:
+            self._bindability_valid = False
         # THE ONLY SITE THAT MAINTAINS `_columns_by_row`, and it belongs here rather than in
         # the claim loop above.  Three preconditions first hold on this line: `index` is not
         # bound until two lines up; the `existing is not None` early return would otherwise
@@ -1170,13 +1176,72 @@ class RestrictedMaster:
 
         if tol < 0.0 or not math.isfinite(tol):
             raise ValueError("tol must be finite and non-negative")
-        loads = self.fractional_loads(x)
-        violated = [
-            row
-            for row, load in loads.items()
-            if load > self.row_index.cap(row) + tol and row not in self._materialized
-        ]
+        values = np.asarray(x, dtype=float)
+        if values.shape != (len(self._columns),):
+            raise ValueError("x has the wrong number of columns")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("x must contain finite values")
+        if self._flight_rows_cover_implicit_capacities(values, tol):
+            candidates = self._bindable.difference(self._materialized)
+        else:
+            candidates = self._columns_by_row.keys() | self.fixed_loads.keys()
+            candidates.difference_update(self._materialized)
+        violated = []
+        for row in candidates:
+            load = float(self.fixed_loads.get(row, 0))
+            # Preserve fractional_loads' positive-only, ascending-column arithmetic.
+            for index in self._columns_by_row.get(row, ()):
+                value = float(values[index])
+                if value > 0.0:
+                    load += value
+            if load > self.row_index.cap(row) + tol:
+                violated.append(row)
         return self.materialize_rows(violated)
+
+    def _flight_rows_cover_implicit_capacities(self, values: np.ndarray, tol: float) -> bool:
+        """Prove nonbindable rows safe, including floating-point summation error.
+
+        Parameters
+        ------------
+        - values (np.ndarray): already validated finite per-column values.
+        - tol (float): the capacity separator's non-negative tolerance.
+
+        Return
+        --------
+        - output (bool): whether only bindable rows need explicit load evaluation.
+        """
+
+        if not self._bindability_valid or self.fixed_loads != self._bindability_fixed_loads:
+            return False
+        # A nonbindable row has at most cap - fixed distinct claiming flights. Bound
+        # each flight's POSITIVE mass: arbitrary public inputs may violate flight rows
+        # or include negative values, which fractional_loads deliberately ignores.
+        try:
+            mass = max(
+                (math.fsum(float(values[i]) for i in indices if values[i] > 0.0)
+                 for indices in self._columns_by_flight.values()),
+                default=0.0,
+            )
+        except OverflowError:
+            return False
+        # Twice the unit roundoff, with more terms than either accumulation, gives
+        # a conservative bound for both flight sums and the original row sums.
+        error = (len(values) + 2) * np.finfo(float).eps
+        if error >= 0.25:
+            return False
+        denominator = math.nextafter(1.0 - error, -math.inf)
+        flight_bound = math.nextafter(mass / denominator, math.inf)
+        factor = math.nextafter(max(1.0, flight_bound) / denominator, math.inf)
+        if not math.isfinite(factor):
+            return False
+        for capacity in self._claim_capacities:
+            # Keep fixed integer loads exactly representable in the proof.
+            if capacity > 2**52:
+                return False
+            bound = math.nextafter(float(capacity) * factor, math.inf)
+            if bound > capacity + tol:
+                return False
+        return True
 
     @staticmethod
     def upper_bound(objective: float, best_reduced_costs: Iterable[float]) -> float:

@@ -45,7 +45,7 @@ from .pricing import (
     price_flight,
     seed_column,
 )
-from .pricing_pool import PricingPool, price_sweep
+from .pricing_pool import PricingPool, certified_sweep_columns, price_sweep
 from .translate import Column, column_to_intent
 
 log = logging.getLogger(__name__)
@@ -814,6 +814,8 @@ def _pre_master_timeout_result(
             "wall_index_queries": int(wall_stats.get("queries", 0)),
             "wall_index_candidates": int(wall_stats.get("candidates", 0)),
             "pricing_flights_completed": 0,
+            "pricing_certified_columns": 0,
+            "pricing_revalidated_columns": 0,
             "pricing_sweeps_completed": 0,
             "cheap_pricing_sweeps": 0,
             "exact_pricing_sweeps": 0,
@@ -1004,6 +1006,8 @@ class ColGenSolver:
                     "wall_index_queries": 0,
                     "wall_index_candidates": 0,
                     "pricing_flights_completed": 0,
+                    "pricing_certified_columns": 0,
+                    "pricing_revalidated_columns": 0,
                     "pricing_sweeps_completed": 0,
                     "cheap_pricing_sweeps": 0,
                     "exact_pricing_sweeps": 0,
@@ -1273,6 +1277,7 @@ class ColGenSolver:
         last_x: np.ndarray | None = None
         iterations = 0
         pricing_flights_completed = 0
+        pricing_certified_columns = pricing_revalidated_columns = 0
         pricing_sweeps_completed = 0
         cheap_pricing_sweeps = exact_pricing_sweeps = 0
         cheap_pricing_wall_s = exact_pricing_wall_s = 0.0
@@ -1482,6 +1487,12 @@ class ColGenSolver:
                     # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
                     # float addition is not associative.  `SweepResult` has already discarded
                     # everything at or past the first timeout, reproducing the loop's `break`.
+                    certified_ids = {
+                        id(column) for column in _timed(
+                            "pricing_certificate_check", certified_sweep_columns,
+                            sweep, graphs, cfg, params, static_catalog,
+                        )
+                    }
                     for flight_id, reduced_cost, column in zip(
                         sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
                     ):
@@ -1489,19 +1500,27 @@ class ColGenSolver:
                         best_reduced_costs.append(reduced_cost)
                         rc_by_flight[flight_id] = reduced_cost
                         if column is not None and reduced_cost > _REDUCED_COST_TOL:
-                            priced_columns.append(
-                                _timed(
+                            if id(column) in certified_ids:
+                                pricing_certified_columns += 1
+                                priced_columns.append(column)
+                            else:
+                                pricing_revalidated_columns += 1
+                                priced_columns.append(_timed(
                                     "canonical_priced", _canonical_column,
-                                    column, graphs[flight_id], cfg,
-                                )
-                            )
+                                    column, graphs[flight_id], cfg, model=model,
+                                ))
                     # Extra candidates improve the pool without adding another bound term
                     # for the same flight. Pricing certifies each against the same duals.
                     for column in sweep.extra_columns:
-                        priced_columns.append(_timed(
-                            "canonical_priced", _canonical_column,
-                            column, graphs[column.flight_id], cfg,
-                        ))
+                        if id(column) in certified_ids:
+                            pricing_certified_columns += 1
+                            priced_columns.append(column)
+                        else:
+                            pricing_revalidated_columns += 1
+                            priced_columns.append(_timed(
+                                "canonical_priced", _canonical_column,
+                                column, graphs[column.flight_id], cfg, model=model,
+                            ))
                     if not sweep.complete:
                         pricing_complete = False
                         pricing_timeout_flight_id = sweep.timeout_flight_id
@@ -2110,6 +2129,8 @@ class ColGenSolver:
             "wall_index_queries": static_catalog.wall_index.stats["queries"],
             "wall_index_candidates": static_catalog.wall_index.stats["candidates"],
             "pricing_flights_completed": pricing_flights_completed,
+            "pricing_certified_columns": pricing_certified_columns,
+            "pricing_revalidated_columns": pricing_revalidated_columns,
             "pricing_sweeps_completed": pricing_sweeps_completed,
             "cheap_pricing_sweeps": cheap_pricing_sweeps,
             "exact_pricing_sweeps": exact_pricing_sweeps,

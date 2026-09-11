@@ -1,0 +1,18 @@
+{
+  "baseline_commit": "40c25e9ea63165eda6e173c4095d31e1e903dede",
+  "baseline_files": 297,
+  "baseline_root": "/private/tmp/colgen-validation-baseline-20260910",
+  "benchmark_sha256": "d6d98104c4978922ec6e5f181d59d58c8854c0e1f00a71ba07d3018fa29335b1",
+  "frozen_head_versions": {
+    "AGENTS.md": "3f24af40bd528ee76e85d9726fd768f02a1649edf80859b753675d5daedece86",
+    "context/colgen_current_profile_20260910.md": "543ac3046c70cb960a45638cf9495eb5430099b1e26cf851794b9d41b1a289db"
+  },
+  "input_preview": "input_preview.json",
+  "source_archive_sha256": "2adf2455be26ff683032aa6be03cd3920368d01e3aab50f947c837106ffdf859",
+  "source_manifest_sha256": "079125e6a504d61a3bfc184be45f771385ff8ee8303080a9c1cb7cd15a4514c6",
+  "trace_sha256": "53bd00832bba80dfef3764804ae2ec729e0085c400aaa09b264a4a41d3bd20c4",
+  "working_user_files_preserved": {
+    "AGENTS.md": "be2072b85dd44751e460e772d51f21e0bdbae623ea5eb0a487c714893c6d44c5",
+    "context/colgen_current_profile_20260910.md": "6faef3687129ee4790f8d14c84b05906ffe139301e99449a2f41e384110dfbfd"
+  }
+}

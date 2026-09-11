@@ -1,0 +1,125 @@
+{
+  "accepted_all": true,
+  "candidate_safety": {
+    "all_priced_columns_certified": true,
+    "final_lp_gap_reached": true,
+    "no_fallback_restart_workerloss_repair": true,
+    "restricted_ip_optimal": true,
+    "termination_lp_gap": true
+  },
+  "canonical_iteration_ip_s": {
+    "candidate": 48.57830483233556,
+    "control": 45.83592691645026
+  },
+  "deltas": {
+    "congestion_cost": {
+      "candidate": 161062.13325351613,
+      "control": 161135.99633414706,
+      "delta": -73.86308063092292,
+      "percent": -0.04583896975928203
+    },
+    "ip_wall_s": {
+      "candidate": 16.948639125097543,
+      "control": 19.526332583045587,
+      "delta": -2.577693457948044,
+      "percent": -13.201114172285555
+    },
+    "iteration_ip_wall_s": {
+      "candidate": 412.48842387623154,
+      "control": 446.65887029259466,
+      "delta": -34.17044641636312,
+      "percent": -7.650233475488566
+    },
+    "simulation_wall_s": {
+      "candidate": 1358.2534507079981,
+      "control": 1345.4894493748434,
+      "delta": 12.764001333154738,
+      "percent": 0.9486511647553542
+    }
+  },
+  "diagnostics": {
+    "candidate": {
+      "kernel_fell_back": 0,
+      "kernel_label_restarts": 0,
+      "pricing_certified_columns": 14310,
+      "pricing_revalidated_columns": 0,
+      "pricing_worker_lost": 0,
+      "repair_added": 0
+    },
+    "control": {
+      "kernel_fell_back": 0,
+      "kernel_label_restarts": 0,
+      "pricing_certified_columns": 12998,
+      "pricing_revalidated_columns": 0,
+      "pricing_worker_lost": 0,
+      "repair_added": 0
+    }
+  },
+  "final_lp_gap_cost": {
+    "candidate": 0.0006897625213499879,
+    "control": 0.000717475378373292
+  },
+  "input_hashes_match": {
+    "demand_config_sha": true,
+    "generated_requests_sha": true,
+    "input_sha": true,
+    "requests_sha": true
+  },
+  "iteration_ip_time_limit_s": {
+    "candidate": 25.0,
+    "control": 30.0
+  },
+  "params_match_except_iteration_ip_time_limit_s": true,
+  "passed": true,
+  "quality": {
+    "columns": {
+      "candidate": 46885,
+      "control": 45568
+    },
+    "congestion_cost": {
+      "candidate": 161062.13325351613,
+      "control": 161135.99633414706
+    },
+    "global_cost_gap": {
+      "candidate": 0.008471926483817217,
+      "control": 0.008954789047231368
+    },
+    "ip_wall_s": {
+      "candidate": 16.948639125097543,
+      "control": 19.526332583045587
+    },
+    "iteration_ip_wall_s": {
+      "candidate": 412.48842387623154,
+      "control": 446.65887029259466
+    },
+    "iterations": {
+      "candidate": 15,
+      "control": 14
+    },
+    "simulation_wall_s": {
+      "candidate": 1358.2534507079981,
+      "control": 1345.4894493748434
+    },
+    "solver_objective": {
+      "candidate": 161062.13325351613,
+      "control": 161135.99633414706
+    }
+  },
+  "restricted_ip": {
+    "candidate": {
+      "gap": 1.156476144705657e-14,
+      "optimal": true,
+      "status": "optimal"
+    },
+    "control": {
+      "gap": 0.0,
+      "optimal": true,
+      "status": "optimal"
+    }
+  },
+  "termination": {
+    "candidate": "lp_gap",
+    "control": "lp_gap"
+  },
+  "verified": true
+}

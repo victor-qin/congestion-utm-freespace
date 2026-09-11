@@ -103,24 +103,27 @@ import uuid
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Mapping
 
 from ...config import SimConfig
 from ...progress import RollingRate
-from ...types import FlightRequest
-from .network import StaticTerminalCatalog, build_flight_graph
+from ...types import FlightRequest, as_terminal
+from .network import FlightGraph, StaticTerminalCatalog, build_flight_graph
 from .params import ColGenParams
+from .objective import cost_model
 from .pricing import (
     DualView,
     PricingTimeout,
     clear_search_record,
     kernel_stats,
     last_search_record,
+    is_certified_column,
     price_flight,
 )
 from .translate import Column
 
 log = logging.getLogger(__name__)
+_PRODUCTION_PRICE_FLIGHT = price_flight
 
 
 __all__ = [
@@ -418,6 +421,8 @@ class SweepResult:
     pool_setup_s: float = 0.0
     #: Additional valid positive columns from accepted tasks; never additional bound terms.
     extra_columns: tuple[Column, ...] = ()
+    _certificate: tuple | None = field(default=None, repr=False, compare=False)
+    _certificate_owner: object = field(default_factory=object, init=False, repr=False, compare=False)
 
     @property
     def kernel_priced(self) -> int:
@@ -782,6 +787,9 @@ def _price_one(epoch: tuple, flight_id: int):
             last_search_record(),
         )
     after = kernel_stats()
+    search = last_search_record()
+    search["_canonical_pricing_result"] = _certified_result(
+        column, extras, _WORKER["graphs"][flight_id], _WORKER["params"], _WORKER["cfg"])
     # Subtraction over the UNION of keys, not over `before`'s: a `declined_<reason>` key
     # appears the first time that cause fires, so it exists in `after` and not in `before`.
     return (
@@ -791,8 +799,85 @@ def _price_one(epoch: tuple, flight_id: int):
         column,
         time.perf_counter() - started,
         {key: value - before.get(key, 0) for key, value in after.items()},
-        last_search_record(),
+        search,
     ) + ((tuple(extras),) if extra_kwargs else ())
+
+
+def _request_definition(request):
+    """Detach caller-owned arrays when identifying a worker's immutable input."""
+    return (request.flight_id, tuple(request.origin), tuple(request.dest), request.t_request,
+            request.t_departure, request.uss_id, as_terminal(request.origin_terminal),
+            as_terminal(request.dest_terminal), request.paired_outbound_id)
+
+
+def _certified_result(column, extras, graph, params, cfg):
+    """Only graph/objective-certified immutable objects qualify for transport trust."""
+    if price_flight is not _PRODUCTION_PRICE_FLIGHT:
+        return False
+    model = cost_model(cfg, params)
+    return all(is_certified_column(c, graph, model)
+               for c in (column, *extras) if c is not None)
+
+
+def certified_sweep_columns(
+    sweep: SweepResult, graphs: Mapping[int, FlightGraph], cfg: SimConfig,
+    params: ColGenParams, catalog: StaticTerminalCatalog,
+) -> tuple[Column, ...]:
+    """Return exact internal result objects whose graph and solve context still match.
+
+    Parameters
+    ------------
+    - sweep: A production SweepResult; manually constructed results have no receipt.
+    - graphs, cfg, params, catalog: The parent solve context used by price_sweep.
+
+    Return
+    --------
+    - columns: Receipt-backed primary and extra objects, or an empty tuple on mismatch.
+    """
+    receipt = getattr(sweep, '_certificate', None)
+    if receipt is None:
+        return ()
+    owner, primary, extra, context, graph_objects, certified = receipt
+    if owner is not sweep._certificate_owner or primary is not sweep.columns or extra is not sweep.extra_columns:
+        return ()
+    if context != (cfg, params, catalog.entries):
+        return ()
+    if any(graphs.get(fid) is not graph for fid, graph in graph_objects):
+        return ()
+    return certified
+
+
+def _receipt(sweep, requests, graphs, cfg, params, catalog):
+    """Bind worker-validated objects to matching parent graph snapshots once per sweep."""
+    if not isinstance(catalog, StaticTerminalCatalog):
+        return sweep
+    if not (
+        len(sweep.flight_ids) == len(sweep.reduced_costs) == len(sweep.columns)
+        and all(
+            column is None or column.flight_id == flight_id
+            for flight_id, column in zip(sweep.flight_ids, sweep.columns, strict=True)
+        )
+    ):
+        object.__setattr__(sweep, "_certificate", None)
+        return sweep
+    records = {r['flight_id']: r for r in sweep.flight_records if r.get('priced')}
+    request_defs = {r.flight_id: _request_definition(r) for r in requests}
+    context = (cfg, params, catalog.entries)
+    graph_objects = []
+    for fid in sweep.flight_ids:
+        if not records.get(fid, {}).get("_canonical_pricing_result"):
+            continue
+        graph = graphs.get(fid)
+        if (graph is None or graph._search_cache.pricing_context != context
+                or _request_definition(graph.request) != request_defs.get(fid)):
+            continue
+        graph_objects.append((fid, graph))
+    certified_ids = {fid for fid, _graph in graph_objects}
+    certified = tuple(c for c in (*sweep.columns, *sweep.extra_columns)
+                      if c is not None and c.flight_id in certified_ids)
+    object.__setattr__(sweep, '_certificate', (sweep._certificate_owner, sweep.columns, sweep.extra_columns,
+                                             context, tuple(graph_objects), certified))
+    return sweep
 
 
 # --------------------------------------------------------------------------- parent side
@@ -850,15 +935,22 @@ def price_sweep(
     - output (SweepResult): the accepted prefix in ``pricing_order`` index order.
     """
 
+    if isinstance(pool, PricingPool) and (
+        pool._cfg != cfg or pool._params != params or pool._catalog != catalog
+        or pool._request_definitions != tuple(_request_definition(r) for r in requests)
+    ):
+        raise ValueError("pricing pool does not match the current request/config/catalog snapshot")
     if params.n_pricing_workers == 0:
-        return _sweep_sequential(
+        result = _sweep_sequential(
             pricing_order, graphs, cfg, params, dual_view, flight_duals,
             known_columns, deadline, heuristic_only,
         )
-    return _sweep_parallel(
-        pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-        known_columns, deadline, pool, heuristic_only,
-    )
+    else:
+        result = _sweep_parallel(
+            pricing_order, requests, cfg, params, catalog, duals, flight_duals,
+            known_columns, deadline, pool, heuristic_only,
+        )
+    return _receipt(result, requests, graphs, cfg, params, catalog)
 
 
 def _sweep_sequential(
@@ -929,7 +1021,10 @@ def _sweep_sequential(
                 extra_columns=tuple(extra_columns),
             )
         task_s = time.perf_counter() - task_started
-        records.append(_flight_record(flight_id, task_s, priced=True))
+        record = _flight_record(flight_id, task_s, priced=True)
+        record["_canonical_pricing_result"] = _certified_result(
+            column, extras, graphs[flight_id], params, cfg)
+        records.append(record)
         task_total_s += task_s
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
@@ -1034,7 +1129,8 @@ class PricingPool:
         --------
         - output (None): raises ``ValueError`` when ``n_pricing_workers`` is not positive.
         """
-        self._requests = list(requests)
+        self._requests = pickle.loads(pickle.dumps(list(requests), protocol=pickle.HIGHEST_PROTOCOL))
+        self._request_definitions = tuple(_request_definition(r) for r in self._requests)
         self._cfg = cfg
         self._params = params
         self._catalog = catalog

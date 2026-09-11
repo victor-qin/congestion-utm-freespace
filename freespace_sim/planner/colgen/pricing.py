@@ -28,11 +28,12 @@ import math
 import sys
 import threading
 import time
+import weakref
 import heapq
 import itertools
 from collections import Counter
 from collections.abc import Iterable, Mapping, Set as AbstractSet
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Hashable
 
 import numpy as np
@@ -54,6 +55,7 @@ from .network import (
     FlightGraph,
     RowKey,
     column_claims,
+    shifted_claims_are_exact,
 )
 from .objective import DELAY_MODEL, CostModel, cost_model
 from .translate import Column, column_to_intent
@@ -892,6 +894,74 @@ def _shift_claims(claims: Iterable[RowKey], delta_steps: int) -> frozenset[RowKe
     return frozenset(shifted)
 
 
+def _remember_certified_column(
+    column: Column, fg: FlightGraph, model: CostModel, air_detour_s: float
+) -> Column:
+    """Recognize live certified objects without extending their lifetime."""
+    cache = fg._search_cache.certified_columns
+    lock = fg._search_cache.lock
+    key = id(column)
+
+    def discard(reference):
+        # The registry may already contain a newer reference at the same object ID.
+        # Capture only the registry, lock and integer key, never the column or graph.
+        with lock:
+            entry = cache.get(key)
+            if entry is not None and entry[0] is reference:
+                cache.pop(key)
+
+    with lock:
+        cache[key] = (weakref.ref(column, discard), model, air_detour_s)
+    return column
+
+
+def is_certified_column(column: Column, fg: FlightGraph, model: CostModel) -> bool:
+    """Recognize an exact internally certified object, never an equal replacement.
+
+    Parameters
+    ------------
+    - column: Immutable column object to look up.
+    - fg: Graph owning the weak identity certification registry.
+    - model: Objective weights required for the cached cost.
+
+    Return
+    --------
+    - certified (bool): Whether this exact object was certified in that context.
+    """
+    with fg._search_cache.lock:
+        entry = fg._search_cache.certified_columns.get(id(column))
+    return entry is not None and entry[0]() is column and entry[1] == model
+
+
+def certify_column(column: Column, fg: FlightGraph, cfg: SimConfig, model: CostModel) -> Column:
+    """Validate foreign claims and cost once before accepting a pricing cutoff.
+
+    Parameters
+    ------------
+    - column: Internal or imported immutable route to validate.
+    - fg: Graph supplying the immutable request, domain and static walls.
+    - cfg: Configuration used to build the graph; mismatches raise ValueError.
+    - model: Current objective weights for canonical trajectory cost.
+
+    Return
+    --------
+    - canonical (Column): Original object or corrected claims/cost copy, certified
+      in this graph and objective. Invalid routes raise ValueError.
+    """
+    if cfg != fg._cfg:
+        raise ValueError("certification requires the SimConfig used to build the flight graph")
+    if is_certified_column(column, fg, model):
+        return column
+    intent = column_to_intent(column, fg.request, cfg)
+    if intent.status is not IntentStatus.ACCEPTED:
+        raise ValueError("column does not translate to an accepted intent")
+    claims = column_claims(column, fg, cfg, _intent=intent)
+    cost = model.intent_cost(intent, cfg)
+    canonical = column if claims == column.claims and cost == column.delay_s else replace(
+        column, claims=claims, delay_s=cost)
+    return _remember_certified_column(canonical, fg, model, intent.air_detour_m / cfg.nominal_speed_mps)
+
+
 def _shifted_seed_incumbent(
     seed: Column,
     fg: FlightGraph,
@@ -908,8 +978,10 @@ def _shifted_seed_incumbent(
     """Strengthen an incumbent by scanning time-translations of its seed path.
 
     The spatial path, endpoint lanes, wall verdict, and detour are invariant
-    under an integer clock translation.  Canonical capacity claims translate
-    by the same integer, and ground delay grows by exactly ``delta * dt``.
+    under an integer clock translation. Endpoint rounding at the actual clock
+    must agree before translating claims; otherwise the candidate is canonically
+    rebuilt before scoring. Cost uses the canonical air term and the new absolute
+    lattice ground delay, preserving floating-point evaluation order.
     These columns are used only as certified lower bounds for the exact DAG;
     the prepass never proves optimality or replaces pricing.
 
@@ -952,32 +1024,40 @@ def _shifted_seed_incumbent(
     # throws the row set away; every translation that is not the winner was materialized for
     # nothing.  ``shift_terms`` resolves the seed's rows once so each step is a handful of
     # dict lookups instead of rebuilding a frozenset of RowKey objects.
+    seed = certify_column(seed, fg, cfg, model)
     terms = duals.shift_terms(seed.claims)
+    with fg._search_cache.lock:
+        air_detour_s = fg._search_cache.certified_columns[id(seed)][2]
     best_delta: int | None = None
     best_delay_s = 0.0
     for departure_step in range(seed.departure_step + 1, latest_departure + 1):
         _check_deadline(deadline)
         delta_steps = departure_step - seed.departure_step
-        # Both halves are set-free: `_rows_hit_forbidden` answers the disjointness question
-        # without building a translated frozenset, and `shifted_claim_cost` sums the pre-
-        # resolved terms.  The greedy heuristic always supplies `forbidden_rows` (its saturated
-        # set), so this is the hot path.
-        if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
-            continue
-        dual_cost = duals.shifted_claim_cost(terms, delta_steps)
-        # A pure clock translation adds GROUND delay only -- the spatial path, and hence
-        # the air term, is invariant -- so this is the one weight that applies.
-        delay_s = seed.delay_s + model.ground_weight * (delta_steps * cfg.dt_s)
+        exact_shift = shifted_claims_are_exact(seed, fg, cfg, departure_step)
+        shifted = None
+        if exact_shift:
+            if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
+                continue
+            dual_cost = duals.shifted_claim_cost(terms, delta_steps)
+            delay_s = model.evaluate(
+                ground_s=(departure_step - fg.base_step) * cfg.dt_s,
+                air_detour_s=air_detour_s)
+        else:
+            shifted = certify_column(replace(seed, departure_step=departure_step), fg, cfg, model)
+            if not shifted.claims.isdisjoint(forbidden_rows):
+                continue
+            dual_cost = duals.claim_cost(shifted.claims)
+            delay_s = shifted.delay_s
         reduced_cost = model.reduced_cost(
             benefit=benefit, cost=delay_s, dual_cost=dual_cost, pi_f=pi_f
         )
         if best is None or reduced_cost > best[0] + _SCORE_EPS:
-            best = (reduced_cost, None)  # column built once, after the scan
+            best = (reduced_cost, shifted)  # fast-path column built once after the scan
             best_delta = delta_steps
             best_delay_s = delay_s
         if dual_cost == 0.0 and duals.max_negative_credit == 0.0:
             break
-    if best_delta is not None:
+    if best_delta is not None and best[1] is None:
         best = (
             best[0],
             Column(
@@ -991,6 +1071,8 @@ def _shifted_seed_incumbent(
                 claims=_shift_claims(seed.claims, best_delta),
             ),
         )
+    if best is not None and best_delta is not None:
+        _remember_certified_column(best[1], fg, model, air_detour_s)
     return best
 
 
@@ -1450,7 +1532,8 @@ def _canonical_candidate(
     reduced_cost = model.reduced_cost(
         benefit=benefit, cost=exact_delay, dual_cost=duals.claim_cost(claims), pi_f=pi_f
     )
-    return reduced_cost, column
+    return reduced_cost, _remember_certified_column(
+        column, fg, model, intent.air_detour_m / cfg.nominal_speed_mps)
 
 
 def _sink_certifier(
@@ -3454,6 +3537,7 @@ def find_feasible_column(
     except ValueError:
         seed = None
     if seed is not None:
+        seed = certify_column(seed, fg, cfg, model)
         if seed.claims.isdisjoint(forbidden):
             best_column = seed
             if (
@@ -3851,6 +3935,8 @@ def price_flight(
     # Fold in the caller's existing column, after the seed work so it can only tighten.
     # Its claims are re-checked against the exclusion set because the repair path may have
     # saturated a row the column occupies since it was filed.
+    if known_column is not None:
+        known_column = certify_column(known_column, fg, cfg, model)
     if known_column is not None and known_column.claims.isdisjoint(forbidden):
         known_rc = model.reduced_cost(
             benefit=benefit,

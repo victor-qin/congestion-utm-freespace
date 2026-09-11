@@ -1,0 +1,17 @@
+{
+  "reported_validation": {
+    "prior_v1_native_dp_cases": 24,
+    "prior_v1_unchanged_geometry_network_cases": 94,
+    "ruff": "clean",
+    "solver_pool_certification_cases": 161,
+    "status": "passed",
+    "wall_s": 24.53
+  },
+  "source_archive_sha256": "5b24193fa9fb6b6198a7f65990d416da71130bfc6b26ebcce695aa7047bc6ce5",
+  "source_manifest_sha256": "c78723763bb0a36595c7bf20faac62b4471d840270ae2be28fd6d3d657d6fb57",
+  "test_archive_sha256": "40187c7320d9877ddfa0fadc3df464032a37b6f3ba9f82678ac8eeb564fe4635",
+  "test_files": {
+    "tests/test_colgen_pricing_certification.py": "57f888b72dc01f3d7183086b583d81b976710b4515b40a52d8195ce53052f901",
+    "tests/test_colgen_solver.py": "a04c2849d63b2ea127f7878717815c2e4eecc092ffeb3303608361efba266365"
+  }
+}

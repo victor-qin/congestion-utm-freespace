@@ -373,6 +373,7 @@ class _ImmutableFlightRequest(FlightRequest):
             self.uss_id,
             self.origin_terminal,
             self.dest_terminal,
+            self.paired_outbound_id,
         )
 
 
@@ -403,6 +404,7 @@ def _snapshot_request(
         uss_id=req.uss_id,
         origin_terminal=origin_terminal,
         dest_terminal=dest_terminal,
+        paired_outbound_id=req.paired_outbound_id,
     )
 
 
@@ -845,6 +847,8 @@ class _FlightSearchCache:
     __slots__ = (
         "lock",
         "certified_claims",
+        "certified_columns",
+        "pricing_context",
         "dag_budget",
         "endpoint_claims",
         "prepared",
@@ -857,6 +861,9 @@ class _FlightSearchCache:
     def __init__(self) -> None:
         """Initialize an empty, answer-neutral per-flight search cache."""
         self.lock = threading.RLock()
+        # Weak identity proofs are removed when their columns die; this registry owns no routes.
+        self.certified_columns: dict[int, tuple[Any, Any, float]] = {}
+        self.pricing_context = None
         # `(PreparedTopology, PreparedRows)` for the compiled pricing path, built on first
         # use.  Both are pure functions of the graph and its `SimConfig`, so this is a
         # memo rather than state -- but it is not an optional one: the same flight is
@@ -1834,7 +1841,7 @@ def build_flight_graph(
         max_air_hops,
     )
 
-    return FlightGraph(
+    graph = FlightGraph(
         request=frozen_request,
         _cfg=cfg,
         origin_cell=origin_cell,
@@ -1859,6 +1866,8 @@ def build_flight_graph(
         _wall_index=wall_index,
         forbidden_hops=forbidden_hops,
     )
+    graph._search_cache.pricing_context = (cfg, params, catalog.entries)
+    return graph
 
 
 def _selected_lane(lanes: tuple[hg.Lane, ...], index: int | None, endpoint: str) -> hg.Lane:
@@ -1886,12 +1895,13 @@ def _selected_lane(lanes: tuple[hg.Lane, ...], index: int | None, endpoint: str)
     return lane
 
 
-def _column_endpoint_steps(column, fg, cfg, arrival_step):
+def _column_endpoint_steps(column, fg, cfg, arrival_step, *, departure_step=None):
     """Compute endpoint windows at the actual clock, including float boundary rules."""
 
+    departure = column.departure_step if departure_step is None else departure_step
     windows = []
     for point, terminal, step, hops in (
-        (fg.request.origin, fg.origin_terminal, column.departure_step, 0),
+        (fg.request.origin, fg.origin_terminal, departure, 0),
         (fg.request.dest, fg.dest_terminal, arrival_step, len(column.cell_path) - 1),
     ):
         t0 = step * cfg.dt_s
@@ -1901,6 +1911,23 @@ def _column_endpoint_steps(column, fg, cfg, arrival_step):
             endpoint_claim_steps(t0, t1, cfg, timing_steps=hops)
         )
     return tuple(windows)
+
+
+def shifted_claims_are_exact(column: Column, fg: FlightGraph, cfg: SimConfig, departure: int) -> bool:
+    """Whether an already-certified row union translates at this endpoint clock.
+
+    The caller must certify the source column first. Computing its endpoint windows
+    directly avoids relying on the separate two-path claim cache surviving a DP call.
+    """
+    lane_steps = 0 if column.origin_lane_idx is None else fg.origin_lanes[column.origin_lane_idx].steps
+    arrival = departure + fg.takeoff_steps[column.level] + lane_steps + len(column.cell_path) - 1
+    if not fg.base_step <= departure <= fg.latest_departure_step or arrival > fg.max_step:
+        return False
+    windows = _column_endpoint_steps(column, fg, cfg, arrival, departure_step=departure)
+    old_arrival = column.departure_step + fg.takeoff_steps[column.level] + lane_steps + len(column.cell_path) - 1
+    old_windows = _column_endpoint_steps(column, fg, cfg, old_arrival)
+    return tuple((w.start - departure, w.stop - departure) for w in windows) == tuple(
+        (w.start - column.departure_step, w.stop - column.departure_step) for w in old_windows)
 
 
 def column_claims(

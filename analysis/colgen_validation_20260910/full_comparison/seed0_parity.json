@@ -1,0 +1,121 @@
+{
+  "correctness_passed": true,
+  "input_checks": {
+    "algorithm_params_sha": true,
+    "demand_config_sha": true,
+    "generated_requests_sha": true,
+    "input_sha": true,
+    "n_requests": true,
+    "n_static_terminals": true,
+    "requests_sha": true
+  },
+  "quality": {
+    "accepted": {
+      "baseline": 1537,
+      "combined": 1537
+    },
+    "columns": {
+      "baseline": 42879,
+      "combined": 42879
+    },
+    "congestion_cost": {
+      "baseline": 156817.30255254533,
+      "combined": 156817.30255254533
+    },
+    "denied": {
+      "baseline": 0,
+      "combined": 0
+    },
+    "filed_cost": {
+      "baseline": 361750.63588587864,
+      "combined": 361750.63588587864
+    },
+    "final_lp_gap_cost": {
+      "baseline": 0.0008520122267288545,
+      "combined": 0.0008520122267288545
+    },
+    "global_cost_gap": {
+      "baseline": 0.011825996423121772,
+      "combined": 0.011825996423121772
+    },
+    "ip_status": {
+      "baseline": "optimal",
+      "combined": "optimal"
+    },
+    "iterations": {
+      "baseline": 11,
+      "combined": 11
+    },
+    "peak_process_rss_mib": {
+      "baseline": 9857.78125,
+      "combined": 9233.84375
+    },
+    "solver_objective": {
+      "baseline": 156817.30255254533,
+      "combined": 156817.30255254533
+    },
+    "termination": {
+      "baseline": "lp_gap",
+      "combined": "lp_gap"
+    },
+    "total_delay_s": {
+      "baseline": 53523.100850848445,
+      "combined": 53523.100850848445
+    },
+    "trajectory_sha": {
+      "baseline": "4a99c3005d15df0fcdcc4d7b6ddd3a296260ecfdbe3ed735e64ee05004d38ce3",
+      "combined": "4a99c3005d15df0fcdcc4d7b6ddd3a296260ecfdbe3ed735e64ee05004d38ce3"
+    },
+    "verified": {
+      "baseline": true,
+      "combined": true
+    }
+  },
+  "quality_deltas": {
+    "congestion_cost": 0.0,
+    "solver_objective": 0.0
+  },
+  "quality_within_tolerance": {
+    "congestion_cost": true,
+    "solver_objective": true
+  },
+  "safety": {
+    "baseline": {
+      "all_requests_accepted": true,
+      "budget_denied_zero": true,
+      "goal_declines_zero": true,
+      "ip_optimal_true": true,
+      "ip_status_optimal": true,
+      "kernel_fallback_zero": true,
+      "kernel_restart_zero": true,
+      "objective_consistent": true,
+      "repair_added_zero": true,
+      "restricted_ip_gap_finite": true,
+      "search_exhausted_zero": true,
+      "verified": true,
+      "worker_loss_zero": true
+    },
+    "combined": {
+      "all_requests_accepted": true,
+      "budget_denied_zero": true,
+      "goal_declines_zero": true,
+      "ip_optimal_true": true,
+      "ip_status_optimal": true,
+      "kernel_fallback_zero": true,
+      "kernel_restart_zero": true,
+      "objective_consistent": true,
+      "repair_added_zero": true,
+      "restricted_ip_gap_finite": true,
+      "search_exhausted_zero": true,
+      "verified": true,
+      "worker_loss_zero": true
+    }
+  },
+  "trace_note": "Finite 30-second per-round IPs may change incumbents and final trajectories; differences are reported, not silently accepted as exact parity.",
+  "trace_parity": {
+    "column_identities_sha256": true,
+    "column_numbers_sha256": true,
+    "paths_jsonl_sha256": true,
+    "semantic_iterations_sha256": true
+  }
+}

@@ -1,6 +1,6 @@
 # HISTORY
 
-Durable record of mistakes likely to recur between PRs. Format follows `.agent/CONTINUITY.md`.
+Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
 - 2026-09-08T20:40Z `[CODE]` `verified` means INTERflight separation only: `find_interflight_conflict`
   replays intents in order and checks each against the flights committed BEFORE it, never against

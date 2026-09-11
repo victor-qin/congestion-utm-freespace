@@ -62,6 +62,9 @@
   owning the number (`HubRadiusDemand.turnaround_s=None` inherits it). Every shipped scenario had
   pinned `turnaround_s=0.0`, so the delivery took ZERO time; they now inherit. A column is
   `hover_time_s + column_dwell_s` at BOTH ends of every leg, so the change moves every result.
+- 2026-09-10T22:20Z `[CODE]` CORRECTION to the 02:10Z entry: the field is `SimConfig.turnaround_s`
+  (`config.py:61`); `service_time_s` does not exist in the code. The PR body carried the same wrong
+  name and is corrected.
 
 - 2026-09-10T01:20Z `[TOOL]` xhigh review of #129 found 10 issues, all fixed. Two were severe:
   LNS repaired a round trip as its outbound leg alone (36/36 stranded, reported as a 66.93% gain,
@@ -109,6 +112,13 @@
   is keyed on shape alone.
 
 ## [OUTCOMES]
+
+- 2026-09-10T22:45Z `[TOOL]` #129 prepared for merge at the user's "lgtm". Main has not moved (base
+  `ae797d2`, 0 behind), so no rebase. Full suite on the final tree: 1,237 passed / 2 skipped
+  (`-m "not slow"`) and 67 passed / 1 strict xfail (`-m slow`), both exit 0. Pending docs landed as two
+  commits (the user's AGENTS.md class template, credited; OperationalIntent docstring + HISTORY
+  streamline); the PR body now covers both review rounds and the corrected v1-guard migration text.
+  NOT merged: the user asked to prepare it only.
 
 - 2026-09-10T22:10Z `[USER]` `context/HISTORY.md` streamlined 21 -> 15 entries before merge. The file is
   new in this PR (absent on main), so no published record is rewritten. Removed: the run-limited-tests

@@ -42,6 +42,7 @@ from ...volumes import (
     exit_radius,
     terminal_radius,
 )
+from ..itinerary import reject_itinerary
 from .. import hexgrid as hg
 from . import window as SW
 from ..astar import AStarPlanner
@@ -716,6 +717,7 @@ class SIPPPlanner(AStarPlanner):
         - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
           REJECTED intent carrying the :class:`DenialReason`.
         """
+        reject_itinerary(req, "sipp")
         # Per-plan diagnostics must never leak a previous compiled flight through an early host denial,
         # a reference dispatch, or a kernel fallback. Cumulative fallback counters remain cumulative.
         self.last_expansions = 0

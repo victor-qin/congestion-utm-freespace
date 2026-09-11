@@ -113,12 +113,11 @@ def test_demand_hub_radius_plumbs_lam_per_uss_and_departure_offset():
     d = DemandSpec(pattern="hub_radius", uss=("a", "b"), hubs=(3, 5),
                    lam_per_uss={"a": 1000.0, "b": 250.0},
                    departure_offset_s={"a": (450.0, 60.0)},
-                   timing_mode="departure", paired_return_request=True).build()
+                   timing_mode="departure").build()
     assert isinstance(d, HubRadiusDemand)
     assert d.lam_per_uss == {"a": 1000.0, "b": 250.0}
     assert d.departure_offset_s == {"a": (450.0, 60.0)}
     assert d.timing_mode == "departure"
-    assert d.paired_return_request is True
 
 
 def test_dallas_large_scenario_uses_radius_pads_returns():
@@ -184,9 +183,8 @@ def test_density_scenario_matrix(name, hubs, rates):
     if AMAZON_USS in hubs:
         assert demand.departure_offset_s[AMAZON_USS] == (1800.0, 300.0)
     assert demand.return_flights is True
-    assert demand.turnaround_s == 0.0
+    assert demand.turnaround_s is None          # inherits cfg.turnaround_s
     assert demand.timing_mode == "departure"
-    assert demand.paired_return_request is True
 
 
 @pytest.mark.parametrize(
@@ -262,7 +260,6 @@ def test_lead_arm_changes_one_operators_lead_and_pins_the_clock(base, token, arm
     assert demand.radius_m == base_demand.radius_m
     assert demand.pads_per_hub == base_demand.pads_per_hub
     assert demand.terminal_radius_m == base_demand.terminal_radius_m
-    assert demand.paired_return_request == base_demand.paired_return_request
     assert (spec.region_m, spec.horizon_s, spec.demand_duration_s, spec.lam_per_hour) == (
         base_spec.region_m, base_spec.horizon_s, base_spec.demand_duration_s, base_spec.lam_per_hour)
     assert spec.flight_levels_m == base_spec.flight_levels_m

@@ -65,6 +65,7 @@ def _new_ruler(cfg, static_terms):
     arbitrary shard."""
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.itinerary import ItineraryPlanner
 
     free = ReservationLedger(cfg)
     for center, term in static_terms:
@@ -76,7 +77,10 @@ def _new_ruler(cfg, static_terms):
     # hash tables for searches that expand a few hundred nodes.
     planner = AStarPlanner(kernel_log2_min=_RULER_LOG2)
     planner.evict_floor = 0.0
-    return planner, free
+    # Wrapped for the same reason the repair planner is: a round trip ruled as its outbound leg alone
+    # would report roughly half its unimpeded cost, inflating every `delay()` premium that picks
+    # victims and orders repair.
+    return ItineraryPlanner(planner), free
 
 
 def _plan_shard(cfg, static_terms, requests, planner=None, free=None):
@@ -205,8 +209,8 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000)
     W = min(n_workers, len(rest))
     log.info("lns: unimpeded baseline on %d workers (%d flights, ~%.0fs sequential)",
              W, n, projected)
-    # Round-robin, not contiguous: adjacent flights are the same delivery's legs, so a contiguous
-    # split would hand one worker a whole slow region.
+    # Round-robin, not contiguous: neighbouring flight ids share a hub and a filing window, so a
+    # contiguous split would hand one worker a whole slow region.
     shards = [rest[w::W] for w in range(W)]
     conns, procs = [], []
     by_worker: list = [None] * W

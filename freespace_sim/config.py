@@ -54,7 +54,16 @@ class SimConfig:
 
     # --- hover cylinder (own radius knob; defaults to corridor width) ---
     hover_radius_m: float | None = None   # None ⇒ effective_hover_radius_m = corridor_width_m
-    hover_time_s: float = 30.0         # dwell at takeoff/landing (climb time added on top)
+    hover_time_s: float = 16.0         # dwell at takeoff/landing (climb time added on top)
+    # Time parked on the customer pad between the legs of a round trip. Excludes the descent and
+    # climb that bracket it (``volumes.column_dwell_s``), so it cannot budget a dwell physics
+    # contradicts. ``HubRadiusDemand.turnaround_s=None`` inherits this; a value there overrides it.
+    turnaround_s: float = 16.0
+    # Height of the box held while an aircraft SITS on a pad between the legs of a round trip; the
+    # full column is still held for the descent and climb that bracket it. Not the full column
+    # throughout, because that would reserve airspace nothing occupies and consume TerminalCapacity.
+    # See context/figures/itinerary_reservation.png.
+    ground_box_height_m: float = 5.0
     # default shared-terminal COLUMN radius when a Terminal doesn't set its own (per-hub Terminal.radius
     # overrides). 90 m (> corridor_width) gives divergent same-hub exit lanes enough angular spread to
     # start flush with the column edge (corridor_overlap=0) and still launch concurrently. See volumes.exit_radius.
@@ -262,6 +271,21 @@ class SimConfig:
                 raise ValueError(
                     f"levels {a},{b} gap {b - a} <= corridor_height_m {self.corridor_height_m}; "
                     "adjacent level boxes would overlap in z")
+        # The pad dwell is a DURATION the itinerary planner adds to a realized arrival to place the
+        # return's departure. Negative, and leg 2 is asked to depart before leg 1 has landed — the
+        # one thing the itinerary model exists to make inexpressible. `FlightRequest.turnaround_s`
+        # already guards the per-request override; this is the value it inherits from.
+        if self.turnaround_s < 0.0:
+            raise ValueError(f"turnaround_s ({self.turnaround_s}) must be >= 0")
+        # The parked-aircraft box must stay UNDER the lattice. Reaching the lowest level's band would
+        # make it rasterize into the hex occupancy, where a foreign column cell is a hard wall
+        # (`compiled_hex_occupancy.blocked`) — so a parked aircraft would close the airspace above
+        # itself for its whole turnaround, which is exactly what a low box exists to prevent.
+        headroom = lv[0] - half - self.ground_level_m
+        if not 0.0 < self.ground_box_height_m <= headroom + 1e-9:
+            raise ValueError(
+                f"ground_box_height_m {self.ground_box_height_m} must be in (0, {headroom}]: a taller "
+                "box rasterizes into the lattice and walls off the airspace over a parked pad")
         # The per-metre cost weights and the climb-time properties divide by these, so a zero would
         # surface as a ZeroDivisionError deep in planner setup rather than here at construction.
         if self.nominal_speed_mps <= 0.0 or self.climb_rate_mps <= 0.0:

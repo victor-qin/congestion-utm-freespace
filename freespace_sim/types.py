@@ -113,13 +113,14 @@ class FlightRequest:
     # return sets dest_terminal. Plain ``(id, capacity)`` tuples are accepted (normalized by builders).
     origin_terminal: "Terminal | None" = None
     dest_terminal: "Terminal | None" = None
-    # Round-trip link: on a RETURN leg, the flight_id of the outbound whose arrival this leg waits on.
-    # Demand models anchor the return's desired departure to a NOMINAL estimate of that arrival, which
-    # ignores whatever ground delay / hold / detour the outbound actually took — so under congestion a
-    # return can want to depart before its aircraft has landed. Naming the dependency explicitly (rather
-    # than leaving it an implicit flight_id + 1 convention) lets ``sim.run(return_anchor="realized")``
-    # re-anchor the return to the arrival its outbound actually achieved.
-    paired_outbound_id: "int | None" = None
+    # ``origin -> dest -> origin`` flown as ONE flight (:class:`~planner.itinerary.ItineraryPlanner`).
+    # The return leg departs from the arrival the outbound ACTUALLY achieved, so it cannot precede it.
+    return_to_origin: bool = False
+    # Ground time at ``dest`` between the legs: the delivery itself. ``None`` inherits
+    # ``SimConfig.turnaround_s``, which is the one owner of the number. Excludes the descent and
+    # climb that bracket it (``volumes.column_dwell_s``), so it cannot budget a dwell physics
+    # contradicts.
+    turnaround_s: "float | None" = None
 
     def __post_init__(self):
         """Default and validate ``t_departure`` after construction.
@@ -144,6 +145,8 @@ class FlightRequest:
                 f"t_departure ({self.t_departure}) < t_request ({self.t_request}): "
                 "a flight cannot depart before it is filed"
             )
+        if self.turnaround_s is not None and self.turnaround_s < 0.0:
+            raise ValueError(f"flight {self.flight_id}: turnaround_s must be >= 0")
 
     def sort_key(self) -> tuple[float, int]:
         """FCFS sort key: ``(t_request, flight_id)``."""
@@ -152,39 +155,53 @@ class FlightRequest:
 
 @dataclass
 class OperationalIntent:
-    """The reserved plan for one flight (ASTM operational intent).
+    """
+    The reserved plan for one flight (ASTM operational intent).
 
-    ``volumes`` is the full reservation: hover cylinder @origin + corridor boxes + hover cylinder
-    @dest. ``centerline`` is the timed polyline the corridor was built around (also the v0 flown
-    path). Cost decomposes into the knobs that drive FCFS trade-offs.
+    Attributes
+    ------------
+    - request (FlightRequest): the request this answers; for a round trip, the whole itinerary
+    - status (IntentStatus): lifecycle state; ACCEPTED and ACTIVATED both count as `accepted`
+    - volumes (list[Volume4D] | None): the full reservation — origin column, corridor boxes,
+      destination column, and for a round trip the return leg with the pad-hold ground box between
+      the two. Empty or None when denied.
+    - centerline (list[TimedPoint] | None): the timed polyline the corridor was built around, which
+      is also the flown path in v0
+    - ground_delay_s (float): time held on the pad before departure
+    - air_hold_s (float): time loitering or hovering mid-route
+    - air_detour_m (float): en-route detour, flown minus reference, both measured exit lane to exit
+      lane (`volumes.enroute_flown_m` / `enroute_reference_m`). Never derive it from a hub-centre
+      baseline, which reintroduces stretch < 1; `metrics.flight_row` explains why A* books its
+      endpoint snap here and continuous planners do not.
+    - lattice_overhead_m (float): the A*-only share of `air_detour_m` forced by the hex lattice
+      rather than by traffic, up to 2/√3 − 1 ≈ 15.5% of an unimpeded flight. Subtract it for the
+      traffic-attributable detour. 0.0 for continuous planners; ShortcutRefiner reduces it.
+    - altitude_change_m (float): total vertical travel, climb plus descent
+    - cost (float): weighted sum of ground delay, air hold, detour and altitude change
+      (`cost.trajectory_cost`), the one number every planner minimizes
+    - denial_reason (DenialReason): why it was denied; defaulted from `status` in `__post_init__`
+    - leg_starts (tuple[int, ...]): centerline indices where each later leg begins; empty for a
+      one-way flight. The segment joining two legs is an unflown ground dwell, so split with
+      `leg_slices` before building one corridor box per segment.
+    - planner (str): name of the planner that produced this intent
+    - solve_time_s (float): wall time spent in this flight's `plan()` call
+
     """
 
     request: FlightRequest
     status: IntentStatus
     volumes: list[Volume4D] | None = None
     centerline: list[TimedPoint] | None = None
-    ground_delay_s: float = 0.0       # time held on the pad before departure
-    air_hold_s: float = 0.0           # time loitering/hovering mid-route
-    # EN-ROUTE detour: flown minus reference, BOTH measured exit lane -> exit lane via
-    # volumes.enroute_flown_m / enroute_reference_m — never hub centre -> hub centre. Terminal-column
-    # flying is in neither side (capacity-only); a terminal-free endpoint extends to the true
-    # origin/dest, so A* pays its endpoint snap here while continuous planners don't (deliberate —
-    # see metrics.flight_row). Any producer setting this from a hand-rolled centre->centre baseline
-    # reintroduces the stretch<1 bug.
+    ground_delay_s: float = 0.0
+    air_hold_s: float = 0.0
     air_detour_m: float = 0.0
-    # A*-ONLY diagnostic: the share of ``air_detour_m`` forced by the hex lattice rather than by
-    # traffic. A* moves on 6 axial directions, so the Euclidean (lane -> lane) straight line
-    # ``air_detour_m`` measures against is UNREACHABLE — a wholly unimpeded flight still books up to
-    # 2/√3 − 1 ≈ 15.5% of pure geometry as if it were congestion (worst case at 30° off-axis, zero
-    # on-axis). Subtract this to read the traffic-attributable detour. 0.0 for the continuous
-    # planners (milp / straight), which have no lattice; reduced by ShortcutRefiner, which
-    # collapses the staircase.
     lattice_overhead_m: float = 0.0
-    altitude_change_m: float = 0.0    # total vertical travel (climb + descent)
+    altitude_change_m: float = 0.0
     cost: float = 0.0
     denial_reason: "DenialReason" = field(default=None)  # type: ignore[assignment]
-    planner: str = ""                 # which planner produced this intent
-    solve_time_s: float = 0.0         # wall time the planner spent on this flight's plan() call
+    leg_starts: tuple[int, ...] = ()
+    planner: str = ""
+    solve_time_s: float = 0.0
 
     def __post_init__(self):
         """Default ``denial_reason`` from ``status`` when it was not given explicitly.
@@ -203,6 +220,29 @@ class OperationalIntent:
                 DenialReason.NONE if self.status is not IntentStatus.REJECTED
                 else DenialReason.BUDGET_EXCEEDED
             )
+
+    def leg_slices(self, seq=None) -> list:
+        """
+        ``seq`` cut at :attr:`leg_starts` — one slice per flown leg, in flown order.
+
+        The one owner of "split an itinerary into legs", so metrics, the viz payload and any future
+        consumer cannot drift apart on where a leg ends. Slices are returned UNFILTERED, including
+        empty ones, because dropping a short leg silently renumbers the rest — a caller that cannot
+        use a run shorter than two points must skip it itself and say so.
+
+        Parameters
+        ------------
+        - seq (Sequence | None): the per-waypoint sequence to cut, indexed like ``centerline``;
+          ``None`` uses this intent's own ``centerline``
+
+        Return
+        --------
+        - legs (list): ``len(leg_starts) + 1`` slices of ``seq``, covering it exactly once
+        """
+        if seq is None:
+            seq = self.centerline or []
+        bounds = [0, *self.leg_starts, len(seq)]
+        return [seq[a:b] for a, b in zip(bounds, bounds[1:])]
 
     @property
     def accepted(self) -> bool:

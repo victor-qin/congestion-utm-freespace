@@ -31,10 +31,11 @@ def _wall_led():
 
 
 def test_get_planner_registers_shortcut_variants():
-    legacy = get_planner("astar_shortcut")
-    heading = get_planner("astar_heading_shortcut")
-    batched = get_planner("astar_batched_shortcut")
-    sandwich = get_planner("astar_milp_shortcut")
+    # `.inner` unwraps the itinerary wrapper; the refiner underneath is what this test is about.
+    legacy = get_planner("astar_shortcut").inner
+    heading = get_planner("astar_heading_shortcut").inner
+    batched = get_planner("astar_batched_shortcut").inner
+    sandwich = get_planner("astar_milp_shortcut").inner
     assert isinstance(legacy, ShortcutRefiner) and legacy.strategy == "single_knot"
     assert isinstance(heading, ShortcutRefiner) and heading.strategy == "single_knot_heading"
     assert heading.label == legacy.label == "astar_sc"

@@ -31,12 +31,29 @@ Return
 - output (Type): description
 """
 ```
+- For classes, the docstring should be standardized as:
+```
+"""
+[Description]
+
+Attributes
+------------
+- attribute (Type): description
+
+"""
+```
 - Classes should include a description at the top before parameters are defined.
 - Major functions should annotate every parameter and the return type in the signature
 - Minor functions include at least a sentence long description, depending on how complex the function is.
 - Comments should succintly explain why non-obvious code is the way it is, or state a constraint future edits must preserve (ordering, parity, byte-exactness). Comments do not serve as changelog.
 - Avoid comments that try to describe the spatial or temporal functionality of a function, where a figure would be more illustrative. Instead, make a PNG and place it in `/context/figures/` and cite that figure as a comment.
 - Put the code for figures in `/context/figures/make_figures.py`. Try to reuse code as much as possible.
+
+## Reiviewing Pull Requests
+- Prioritize bugs and flaws that affect the functionality of the changes and surface them to the user. If they arise from a lack of specification about functionality, ask for user feedback.
+- Include in your review any ways to streamline or simplify code, without losing functionality.
+- Whenever fixing code after a review, double-check the issues that were surfaced.
+- Look for sections of code that can be removed.
 
 ## CONTINUITY.md (REQUIRED)
 

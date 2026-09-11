@@ -68,6 +68,9 @@ def _cfg(**overrides) -> SimConfig:
         "region_size_m": (20_000.0, 20_000.0),
         "terminal_airspace_always_active": True,
         "max_ground_delay_s": 48.0,
+        # Pinned like the other geometry knobs above: the expectations below are hand-derived step
+        # counts, and the column window (hover + climb) sets the step grid they were computed on.
+        "hover_time_s": 30.0,
     }
     values.update(overrides)
     return SimConfig(**values)

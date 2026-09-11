@@ -238,7 +238,11 @@ def test_relaxed_revalidates_terminal_capacity_at_ordered_commit(planner_name):
     )
     parallel = run(cfg, requests=requests(), parallel=pcfg)
 
-    assert [intent.ground_delay_s for intent in parallel.intents] == [0.0, 44.0]
+    # Flight 2 must be HELD — that is the revalidation firing. The amount tracks the column window
+    # (hover_time_s + climb), so pinning it would break on any dwell change without saying anything
+    # about the property; parity with sequential and the capacity bound below carry that.
+    delays = [intent.ground_delay_s for intent in parallel.intents]
+    assert delays[0] == 0.0 and delays[1] > 0.0
     assert [intent.ground_delay_s for intent in parallel.intents] == [
         intent.ground_delay_s for intent in sequential.intents
     ]

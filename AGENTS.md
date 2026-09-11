@@ -41,6 +41,7 @@ Return
 ## Reiviewing Pull Requests
 - Prioritize bugs and flaws that affect the functionality of the changes and surface them to the user. If they arise from a lack of specification about functionality, ask for user feedback.
 - Include in your review any ways to streamline or simplify code, without losing functionality.
+- Whenever fixing code after a review, double-check the issues that were surfaced.
 - Look for sections of code that can be removed.
 
 ## CONTINUITY.md (REQUIRED)

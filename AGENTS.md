@@ -31,6 +31,17 @@ Return
 - output (Type): description
 """
 ```
+- For classes, the docstring should be standardized as:
+```
+"""
+[Description]
+
+Attributes
+------------
+- attribute (Type): description
+
+"""
+```
 - Classes should include a description at the top before parameters are defined.
 - Major functions should annotate every parameter and the return type in the signature
 - Minor functions include at least a sentence long description, depending on how complex the function is.

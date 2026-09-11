@@ -12,6 +12,8 @@ comparison, and the scripts used to run and summarize the experiments. Raw
 captures, full flight traces, logs, source archives, and incomplete attempts
 remain local under this directory and are not included in the PR. References to
 those files in reports are provenance locations, not promised Git-tracked files.
+The final PR regression scope, results, and tested source hashes are recorded in
+[`pr_validation.json`](pr_validation.json).
 
 `run_full_matrix.py`, `run_ablations.py`, and `run_policy25.py` are archived
 experiment drivers. They expect explicit frozen source trees and some original

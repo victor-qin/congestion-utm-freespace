@@ -25,6 +25,7 @@ from freespace_sim.planner.colgen.pricing_pool import (
     price_sweep,
 )
 from freespace_sim.planner.colgen.solver import ColGenSolver
+from freespace_sim.planner.colgen.translate import Column
 from freespace_sim.types import FlightRequest, vec
 
 
@@ -52,6 +53,8 @@ def _request(flight_id: int, origin, destination, cfg: SimConfig) -> FlightReque
 def _params(**overrides) -> ColGenParams:
     values = {
         "solver": "highs",
+        "iteration_ip_time_limit_s": 0.0,
+        "lp_gap": 1e-4,
         "max_air_overrun_hops": 0,
         "max_iterations": 3,
         "time_limit_s": 120.0,
@@ -196,7 +199,8 @@ def test_an_expired_deadline_yields_an_empty_prefix_in_both_paths(n_workers):
     assert result.columns == ()
 
 
-def test_a_timeout_discards_later_results_that_completed():
+@pytest.mark.parametrize("multiple", [False, True])
+def test_a_timeout_discards_later_results_that_completed(multiple):
     """The rule the module exists for, on the sequence neither arm above can produce.
 
     The deadline is a wall clock, so `price_sweep` is either past it -- every flight times
@@ -206,11 +210,16 @@ def test_a_timeout_discards_later_results_that_completed():
     admits a column the sequential sweep would have stopped before reaching.
     """
 
-    accepted = _accepted_prefix(iter([
+    extras = [Column(fid, 1, 0, None, None, ((0, 0), (1, 0)), 1.0) for fid in (7, 3, 9)]
+    rows = [
         (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, False, 0.0, None, 0.25, {}, {}),
         (9, True, 4.0, None, 8.0, {"priced": 1, "fell_back": 1}, {}),
-    ]))
+    ]
+    if multiple:
+        rows = [row + ((extra,),) for row, extra in zip(rows, extras, strict=True)]
+    accepted = _accepted_prefix(iter(rows))
+    assert accepted.extra_columns == ((extras[0],) if multiple else ())
 
     assert accepted.flight_ids == (7,)
     assert accepted.reduced_costs == (0.5,)
@@ -1085,3 +1094,37 @@ def test_results_already_in_the_pipe_survive_an_expired_deadline():
     assert accepted.flight_ids == (10,), "a delivered result was dropped by the deadline"
     assert accepted.timeout_flight_id == 11
     assert not accepted.complete
+
+
+@pytest.mark.parametrize("columns_per_flight", [1, 3])
+@pytest.mark.parametrize("transport", ["sequential", "worker"])
+def test_sweep_transports_extras_without_extra_bound_terms(monkeypatch, columns_per_flight, transport):
+    """Extra routes travel with their flight while the certificate has one term per flight."""
+    extra = Column(7, 1, 0, None, None, ((0, 0), (1, 0)), 1.0)
+
+    def fake_price(*args, **kwargs):
+        if columns_per_flight > 1:
+            kwargs["additional_columns"].append(extra)
+        else:
+            assert "additional_columns" not in kwargs
+        return 2.0, None
+
+    monkeypatch.setattr(pricing_pool, "price_flight", fake_price)
+    params = _params(columns_per_flight=columns_per_flight)
+    if transport == "sequential":
+        result = pricing_pool._sweep_sequential(
+            [7], {7: None}, None, params, None, {7: 0.0}, {}, None,
+        )
+    else:
+        epoch = ("test", 1)
+        monkeypatch.setattr(pricing_pool, "_WORKER", dict(
+            sweep=(epoch, None, {7: 0.0}, {}, None, False), worker_flights={7},
+            graphs={7: None}, cfg=None, params=params,
+        ))
+        # Exercise the serialization boundary as well as prefix acceptance.
+        worker_result = pickle.loads(pickle.dumps(pricing_pool._price_one(epoch, 7)))
+        result = _accepted_prefix([worker_result])
+    assert result.flight_ids == (7,)
+    assert result.reduced_costs == (2.0,)
+    assert result.columns == (None,)
+    assert result.extra_columns == ((extra,) if columns_per_flight > 1 else ())

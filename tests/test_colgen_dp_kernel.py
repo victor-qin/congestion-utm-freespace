@@ -559,8 +559,9 @@ def _chain(parent, node):
     return list(reversed(out))
 
 
-def test_kernel_path_compare_matches_python_tuple_ordering():
-    """`_path_cmp` is Python's tuple comparison, prefix rule included."""
+@pytest.mark.parametrize("equal_depth", [False, True])
+def test_kernel_path_compare_matches_python_tuple_ordering(equal_depth):
+    """Both comparators match tuple ordering on their supported path depths."""
 
     rng = random.Random(7)
     pool = _random_pool(rng)
@@ -568,24 +569,102 @@ def test_kernel_path_compare_matches_python_tuple_ordering():
     scratch_a = np.zeros(64, np.int32)
     scratch_b = np.zeros(64, np.int32)
 
+    by_depth = {}
+    for label, depth in enumerate(pool.hops):
+        by_depth.setdefault(depth, []).append(label)
     compared_prefixes = 0
     for _ in range(3000):
         a = rng.randrange(len(pool.labels))
-        b = rng.randrange(len(pool.labels))
+        b = (rng.choice(by_depth[pool.hops[a]]) if equal_depth
+             else rng.randrange(len(pool.labels)))
         path_a = tuple(pool.cell[i] for i in _chain(pool.parent, a))
         path_b = tuple(pool.cell[i] for i in _chain(pool.parent, b))
         expected = int(path_a > path_b) - int(path_a < path_b)
-        assert dp_kernel._path_cmp(a, b, parent, cell, scratch_a, scratch_b) == expected
+        if equal_depth:
+            assert dp_kernel._path_cmp_equal_depth(a, b, parent, cell) == expected
+        else:
+            assert dp_kernel._path_cmp(a, b, parent, cell, scratch_a, scratch_b) == expected
         if path_a != path_b and (
             path_a[: len(path_b)] == path_b or path_b[: len(path_a)] == path_a
         ):
             compared_prefixes += 1
-    assert compared_prefixes > 20, "no common-prefix pairs were compared"
+    if not equal_depth:
+        assert compared_prefixes > 20, "no common-prefix pairs were compared"
 
 
-def test_kernel_prefer_matches_the_reference_dominance_rule():
+@pytest.mark.parametrize("case", ["shared_nodes", "shared_deep_equal", "shared_cells", "duplicate_roots",
+                                 "opposite_differences", "same_node", "deep_chain",
+                                 "tentative_slot_reuse"])
+def test_equal_depth_path_comparison_adversarial_ancestry(case):
+    """Shared ancestry, tuple ties, and unpublished slot reuse preserve tuple order."""
+    parents, cells = [], []
+
+    def append_path(values, parent=-1):
+        for value in values:
+            parents.append(parent)
+            cells.append(value)
+            parent = len(parents) - 1
+        return parent
+
+    if case in {"shared_nodes", "shared_deep_equal"}:
+        shared = append_path([9, 1] * 2500)
+        a = append_path([4, 0], shared)
+        b = append_path([4, 0 if case == "shared_deep_equal" else 3], shared)
+        assert a != b and parents[parents[a]] == parents[parents[b]] == shared
+    elif case == "shared_cells":
+        a, b = append_path([0, 8, 5]), append_path([1, 0, 5])
+    elif case == "duplicate_roots":
+        a, b = append_path([3, 1, 7]), append_path([3, 1, 7])
+    elif case == "opposite_differences":
+        a, b = append_path([0, 9, 9]), append_path([1, 0, 0])
+    elif case == "same_node":
+        a = b = append_path([4])
+    elif case == "deep_chain":
+        a = append_path([0] + [2] * 5000 + [9])
+        b = append_path([1] + [2] * 5000 + [0])
+    else:
+        first = append_path([0, 1])
+        second = append_path([0, 2])
+        a, b = append_path([8], first), append_path([0], second)
+    parent = np.asarray(parents, dtype=np.int32)
+    cell = np.asarray(cells, dtype=np.int32)
+
+    def check():
+        before_parent, before_cell = parent.copy(), cell.copy()
+        left = tuple(int(cell[i]) for i in _chain(parent, a))
+        right = tuple(int(cell[i]) for i in _chain(parent, b))
+        assert len(left) == len(right)
+        expected = int(left > right) - int(left < right)
+        assert dp_kernel._path_cmp_equal_depth(a, b, parent, cell) == expected
+        assert dp_kernel._path_cmp_equal_depth(b, a, parent, cell) == -expected
+        np.testing.assert_array_equal(parent, before_parent)
+        np.testing.assert_array_equal(cell, before_cell)
+
+    check()
+    if case == "tentative_slot_reuse":
+        # Feasible search reuses only its unpublished tail slot, never accepted ancestors.
+        parent[b], cell[b] = first, 7
+        check()
+        cell[b] = 8
+        check()
+
+
+@pytest.fixture(scope="module")
+def native_profile():
+    """Build the optional analysis twin once for primitive and full-search parity."""
+    from analysis.profile_native_dp import NativeProfile
+    return NativeProfile(dp_kernel)
+
+
+@pytest.mark.parametrize("instrumented", [False, True])
+def test_kernel_prefer_matches_the_reference_dominance_rule(instrumented, native_profile):
     """`_prefer` agrees with `pricing._prefer` on every pair, ties included."""
 
+    prefer = dp_kernel._prefer
+    if instrumented:
+        native_profile.counts.fill(0)
+        def prefer(*args):
+            return native_profile.functions["_prefer"](*args, native_profile.counts)
     rng = random.Random(11)
     pool = _random_pool(rng)
     score, hops, departure, lane, parent, cell = pool.arrays()
@@ -597,7 +676,7 @@ def test_kernel_prefer_matches_the_reference_dominance_rule():
         a = rng.randrange(len(pool.labels))
         b = rng.randrange(len(pool.labels))
         expected = pricing._prefer(pool.labels[a], pool.labels[b])
-        actual = dp_kernel._prefer(
+        actual = prefer(
             a, b, score, hops, departure, lane, parent, cell, scratch_a, scratch_b
         )
         assert actual == expected, (a, b, pool.score[a], pool.score[b])
@@ -606,9 +685,15 @@ def test_kernel_prefer_matches_the_reference_dominance_rule():
     assert within_band > 200, f"only {within_band} pairs landed in the tie band"
 
     # An empty slot always loses, which is how a first insertion is spelled.
-    assert dp_kernel._prefer(
+    assert prefer(
         0, -1, score, hops, departure, lane, parent, cell, scratch_a, scratch_b
     )
+
+    if instrumented:
+        counts = native_profile.report()["counters"]
+        assert counts["calls_prefer"] == 4001
+        assert counts["dominance_updates"] + counts["dominance_rejects"] == 4001
+        assert counts["calls_tie_lt"] > 0
 
 
 def test_kernel_prefer_reproduces_the_non_transitive_epsilon_band():
@@ -648,7 +733,7 @@ def test_kernel_prefer_reproduces_the_non_transitive_epsilon_band():
 
 
 def test_kernel_state_hash_separates_the_reference_key_fields():
-    """Each component of `(cell, recent, paid_class, first_hop)` changes the hash.
+    """Each component of `(cell, recent, paid_class, first_hop, hops)` changes the hash.
 
     A hash collision is survivable -- the probe verifies the full key -- but a hash that
     ignored a field would make collisions systematic on exactly the states that must stay
@@ -656,16 +741,17 @@ def test_kernel_state_hash_separates_the_reference_key_fields():
     """
 
     recent = np.asarray([3, 5, 7, -1], np.int32)
-    base = dp_kernel._state_hash(2, recent, 3, 4, 8, 9)
-    assert dp_kernel._state_hash(3, recent, 3, 4, 8, 9) != base
-    assert dp_kernel._state_hash(2, recent, 2, 4, 8, 9) != base
-    assert dp_kernel._state_hash(2, recent, 3, 5, 8, 9) != base
-    assert dp_kernel._state_hash(2, recent, 3, 4, -1, -1) != base
-    assert dp_kernel._state_hash(2, recent, 3, 4, 9, 8) != base
+    base = dp_kernel._state_hash(2, recent, 3, 4, 8, 9, 6)
+    assert dp_kernel._state_hash(3, recent, 3, 4, 8, 9, 6) != base
+    assert dp_kernel._state_hash(2, recent, 2, 4, 8, 9, 6) != base
+    assert dp_kernel._state_hash(2, recent, 3, 5, 8, 9, 6) != base
+    assert dp_kernel._state_hash(2, recent, 3, 4, -1, -1, 6) != base
+    assert dp_kernel._state_hash(2, recent, 3, 4, 9, 8, 6) != base
+    assert dp_kernel._state_hash(2, recent, 3, 4, 8, 9, 7) != base
     other = np.asarray([3, 5, 8, -1], np.int32)
-    assert dp_kernel._state_hash(2, other, 3, 4, 8, 9) != base
+    assert dp_kernel._state_hash(2, other, 3, 4, 8, 9, 6) != base
     # Same inputs, same hash: the table depends on it being a function.
-    assert dp_kernel._state_hash(2, recent, 3, 4, 8, 9) == base
+    assert dp_kernel._state_hash(2, recent, 3, 4, 8, 9, 6) == base
 
 
 def test_kernel_mix_stays_inside_the_table():
@@ -673,6 +759,31 @@ def test_kernel_mix_stays_inside_the_table():
         for value in (0, 1, 7, 1 << 20, (1 << 63) - 1):
             slot = dp_kernel._mix(np.uint64(value), log2cap)
             assert 0 <= slot < (1 << log2cap)
+
+
+def test_state_table_checks_hops_even_when_hashes_collide():
+    # The two prefixes have the same last two cells but use different hop budgets.
+    cell = np.array([2, 3, 2, 3], dtype=np.int32)
+    parent = np.array([-1, 0, 1, 2], dtype=np.int32)
+    hops = np.arange(4, dtype=np.int32)
+    variant = np.zeros(4, dtype=np.int32)
+    paid_class = np.zeros(1, dtype=np.int32)
+    first = np.full(4, -1, dtype=np.int32)
+    slots = np.full(8, -1, dtype=np.int32)
+    hashes = np.zeros(8, dtype=np.uint64)
+    recent = np.array([3, 2], dtype=np.int32)
+    probe = np.empty(2, dtype=np.int32)
+    collision = np.uint64(123)
+    for label in (1, 3):
+        slot, found = dp_kernel._state_find(
+            slots, hashes, 3, collision, 2,
+            3, recent, 2, 0, -1, -1, int(hops[label]),
+            cell, parent, hops, variant, paid_class, first, first, probe,
+        )
+        assert not found
+        slots[slot] = label
+        hashes[slot] = collision
+    assert set(slots[slots >= 0]) == {1, 3}
 
 
 def test_warm_kernel_compiles_every_primitive():
@@ -818,8 +929,9 @@ def _certification_trace(monkeypatch):
     return seen
 
 
+@pytest.mark.parametrize("instrumented", [False, True])
 @pytest.mark.parametrize("shape", sorted(GRAPH_SHAPES))
-def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch):
+def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch, instrumented, native_profile):
     """The kernel's sink set EQUALS the reference's, on both endpoint shapes.
 
     Equality, not inclusion, and the difference is the whole of Phase 2d. Missing a sink
@@ -840,7 +952,13 @@ def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch
     model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
-    result, kernel_side = _kernel_candidates(graph, cfg, view, model)
+    if instrumented:
+        original = dp_kernel._price_dag
+        with native_profile.installed():
+            result, kernel_side = _kernel_candidates(graph, cfg, view, model)
+        assert dp_kernel._price_dag is original
+    else:
+        result, kernel_side = _kernel_candidates(graph, cfg, view, model)
     assert result.ok, result.status
     if shape == "terminal":
         topology = dp_prepare.prepare_topology(graph, cfg)
@@ -1702,7 +1820,7 @@ def test_kernel_state_table_finds_what_it_inserted_and_separates_keys():
 
     rng = random.Random(17)
     pool = _random_pool(rng, n_labels=200, depth=5)
-    _score, _hops, _dep, _lane, parent, cell = pool.arrays()
+    _score, hops, _dep, _lane, parent, cell = pool.arrays()
     depth = 3
     log2cap = 10
     slot_label = np.full(1 << log2cap, -1, np.int32)
@@ -1720,14 +1838,16 @@ def test_kernel_state_table_finds_what_it_inserted_and_separates_keys():
     for label in range(len(pool.labels)):
         n = dp_kernel._fill_recent(label, depth, parent, cell, recent)
         paid_class = int(var_paid_class[label])
-        key_hash = np.uint64(dp_kernel._state_hash(int(cell[label]), recent, n, paid_class, -1, -1))
+        key_hash = np.uint64(dp_kernel._state_hash(
+            int(cell[label]), recent, n, paid_class, -1, -1, int(hops[label]),
+        ))
         slot, found = dp_kernel._state_find(
             slot_label, slot_hash, log2cap, key_hash, depth,
-            int(cell[label]), recent, n, paid_class, -1, -1,
-            cell, parent, variant, var_paid_class, no_first, no_first, probe,
+            int(cell[label]), recent, n, paid_class, -1, -1, int(hops[label]),
+            cell, parent, hops, variant, var_paid_class, no_first, no_first, probe,
         )
         assert slot >= 0
-        key = (int(cell[label]), tuple(recent[:n].tolist()), paid_class)
+        key = (int(cell[label]), tuple(recent[:n].tolist()), paid_class, int(hops[label]))
         if key in placed:
             assert found and slot_label[slot] == placed[key]
         else:
@@ -1920,7 +2040,7 @@ def test_compiled_path_respects_the_pricing_deadline():
         )
 
 
-@pytest.mark.parametrize("overrun", [0, 1, 3, 9])
+@pytest.mark.parametrize("overrun", [0, 1, 3, 6, 9])
 def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
     """The route-length bound is the only knob shaping the corridor, so sweep it.
 
@@ -2212,3 +2332,100 @@ def test_compiled_feasible_search_declines_rather_than_reporting_infeasible():
     finally:
         pricing._dp_kernel = real
     assert column is not None, "the reference fallback did not run"
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPH_SHAPES))
+@pytest.mark.parametrize("case", ["ordinary", "forbidden", "tiny_negative_and_exhausted"])
+def test_goal_bootstrap_and_extra_columns_preserve_exact_pricing(shape, case):
+    """Heuristic failure still reaches exact DP; extra columns cannot move its bound."""
+    from dataclasses import replace
+
+    cfg = _cfg(max_ground_delay_s=16.0)
+    graph, params = GRAPH_SHAPES[shape](cfg, overrun=1)
+    params = replace(params, M=1000.0, bootstrap_roots=4)
+    model = cost_model(cfg, params)
+    raw = _random_duals(graph, cfg, 606)
+    forbidden = frozenset()
+    if case == "forbidden":
+        seed = pricing.seed_column(graph, cfg, model=model)
+        cells = sorted((r for r in seed.claims if r.kind == "cell"), key=lambda r: r.step)
+        forbidden = frozenset(cells[len(cells)//2:len(cells)//2 + 1])
+        assert forbidden
+    if case == "tiny_negative_and_exhausted":
+        raw = {row: -1e-13 if i % 2 else value for i, (row, value) in enumerate(raw.items())}
+        params = replace(params, bootstrap_max_labels=1)
+    view = DualView(raw, cfg)
+    reference = pricing._best_column(graph, view, 0.0, cfg, params.M, forbidden,
+                                     seed=False, incumbent=None, model=model)
+    off = pricing.price_flight(graph, view, 0.0, cfg, replace(params, bootstrap_roots=0),
+                               forbidden_rows=forbidden)
+    assert off[0] == reference[0] or abs(off[0] - reference[0]) <= 1e-8
+    pricing.clear_search_record()
+    single_extras = []
+    answer = pricing.price_flight(graph, view, 0.0, cfg, params, forbidden_rows=forbidden,
+                                  additional_columns=single_extras)
+    assert not single_extras
+    record = pricing.last_search_record()
+    assert answer[0] == off[0] or abs(answer[0] - off[0]) <= 1e-8
+    assert record.get("status") == "OK", record
+    if case == "tiny_negative_and_exhausted":
+        assert record["bootstrap_goal_labels"] <= 1
+        assert record["bootstrap_labels"] == record["bootstrap_goal_labels"] + record["bootstrap_dp_labels"]
+        assert record["n_labels"] > 1
+    extras = []
+    multiple = pricing.price_flight(graph, view, 0.0, cfg, replace(params, columns_per_flight=3),
+                                   forbidden_rows=forbidden, additional_columns=extras)
+    assert multiple == answer
+    assert pricing.last_search_record()["final_rc"] == record["final_rc"]
+    assert len(extras) <= 2
+    if case == "ordinary" and shape == "terminal":
+        assert extras, "must exercise certification of an additional column"
+    assert len({pricing._column_sort_key(c) for c in [answer[1], *extras] if c is not None}) == (answer[1] is not None) + len(extras)
+    for column in extras:
+        assert column.claims.isdisjoint(forbidden)
+        assert pricing.column_claims(column, graph, cfg) == column.claims
+        assert model.reduced_cost(benefit=params.M, cost=column.delay_s,
+                                  dual_cost=view.claim_cost(column.claims), pi_f=0.0) > pricing._IMPROVING_RC_TOL
+
+
+@pytest.mark.parametrize("failure", ["exhausted", "weak_first_goal"])
+def test_bootstrap_refines_exhausted_and_weak_first_goals(failure, monkeypatch):
+    """A valid weak first goal must still receive restricted-DP refinement."""
+    cfg = _cfg(max_ground_delay_s=16.0)
+    graph, params = _terminal_graph(cfg, overrun=1)
+    model = cost_model(cfg, params)
+    seed = pricing.seed_column(graph, cfg, model=model)
+    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    weak = (model.reduced_cost(benefit=100000.0, cost=seed.delay_s,
+                              dual_cost=view.claim_cost(seed.claims), pi_f=0.0), seed)
+    expected = pricing._bootstrap_incumbent(
+        graph, view, 0.0, cfg, 100000.0, frozenset(), model, incumbent=None,
+        roots=4, method="dp", search_single_root=True,
+    )
+    assert expected is not None
+    assert weak[0] > 0 and expected[0] > weak[0] + 1e-8
+
+    def goal(*args, **kwargs):
+        pricing._LAST_SEARCH["n_labels"] = 1
+        return kwargs["incumbent"] if failure == "exhausted" else weak
+
+    compiled = pricing._best_column_compiled
+    calls = []
+    def observed(*args, **kwargs):
+        calls.append((kwargs.get("keep_roots"), kwargs.get("incumbent")))
+        return compiled(*args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_goal_directed_bootstrap", goal)
+    monkeypatch.setattr(pricing, "_best_column_compiled", observed)
+    refined = pricing._bootstrap_incumbent(
+        graph, view, 0.0, cfg, 100000.0, frozenset(), model, incumbent=None,
+        roots=4, method="astar", max_labels=1, search_single_root=True,
+    )
+    assert refined == expected
+    assert len(calls) == 1 and calls[0][0]
+    assert calls[0][1] == (None if failure == "exhausted" else weak)
+    final = compiled(graph, view, 0.0, cfg, 100000.0, frozenset(), incumbent=refined, model=model)
+    reference = pricing._best_column(graph, view, 0.0, cfg, 100000.0, frozenset(),
+                                     seed=False, incumbent=None, model=model)
+    assert not isinstance(final, pricing.Declined)
+    assert abs(final[0] - reference[0]) <= 1e-8

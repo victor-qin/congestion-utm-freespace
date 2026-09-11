@@ -28,11 +28,12 @@ import math
 import sys
 import threading
 import time
+import weakref
 import heapq
 import itertools
 from collections import Counter
 from collections.abc import Iterable, Mapping, Set as AbstractSet
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Hashable
 
 import numpy as np
@@ -54,6 +55,7 @@ from .network import (
     FlightGraph,
     RowKey,
     column_claims,
+    shifted_claims_are_exact,
 )
 from .objective import DELAY_MODEL, CostModel, cost_model
 from .translate import Column, column_to_intent
@@ -892,6 +894,74 @@ def _shift_claims(claims: Iterable[RowKey], delta_steps: int) -> frozenset[RowKe
     return frozenset(shifted)
 
 
+def _remember_certified_column(
+    column: Column, fg: FlightGraph, model: CostModel, air_detour_s: float
+) -> Column:
+    """Recognize live certified objects without extending their lifetime."""
+    cache = fg._search_cache.certified_columns
+    lock = fg._search_cache.lock
+    key = id(column)
+
+    def discard(reference):
+        # The registry may already contain a newer reference at the same object ID.
+        # Capture only the registry, lock and integer key, never the column or graph.
+        with lock:
+            entry = cache.get(key)
+            if entry is not None and entry[0] is reference:
+                cache.pop(key)
+
+    with lock:
+        cache[key] = (weakref.ref(column, discard), model, air_detour_s)
+    return column
+
+
+def is_certified_column(column: Column, fg: FlightGraph, model: CostModel) -> bool:
+    """Recognize an exact internally certified object, never an equal replacement.
+
+    Parameters
+    ------------
+    - column: Immutable column object to look up.
+    - fg: Graph owning the weak identity certification registry.
+    - model: Objective weights required for the cached cost.
+
+    Return
+    --------
+    - certified (bool): Whether this exact object was certified in that context.
+    """
+    with fg._search_cache.lock:
+        entry = fg._search_cache.certified_columns.get(id(column))
+    return entry is not None and entry[0]() is column and entry[1] == model
+
+
+def certify_column(column: Column, fg: FlightGraph, cfg: SimConfig, model: CostModel) -> Column:
+    """Validate foreign claims and cost once before accepting a pricing cutoff.
+
+    Parameters
+    ------------
+    - column: Internal or imported immutable route to validate.
+    - fg: Graph supplying the immutable request, domain and static walls.
+    - cfg: Configuration used to build the graph; mismatches raise ValueError.
+    - model: Current objective weights for canonical trajectory cost.
+
+    Return
+    --------
+    - canonical (Column): Original object or corrected claims/cost copy, certified
+      in this graph and objective. Invalid routes raise ValueError.
+    """
+    if cfg != fg._cfg:
+        raise ValueError("certification requires the SimConfig used to build the flight graph")
+    if is_certified_column(column, fg, model):
+        return column
+    intent = column_to_intent(column, fg.request, cfg)
+    if intent.status is not IntentStatus.ACCEPTED:
+        raise ValueError("column does not translate to an accepted intent")
+    claims = column_claims(column, fg, cfg, _intent=intent)
+    cost = model.intent_cost(intent, cfg)
+    canonical = column if claims == column.claims and cost == column.delay_s else replace(
+        column, claims=claims, delay_s=cost)
+    return _remember_certified_column(canonical, fg, model, intent.air_detour_m / cfg.nominal_speed_mps)
+
+
 def _shifted_seed_incumbent(
     seed: Column,
     fg: FlightGraph,
@@ -908,8 +978,10 @@ def _shifted_seed_incumbent(
     """Strengthen an incumbent by scanning time-translations of its seed path.
 
     The spatial path, endpoint lanes, wall verdict, and detour are invariant
-    under an integer clock translation.  Canonical capacity claims translate
-    by the same integer, and ground delay grows by exactly ``delta * dt``.
+    under an integer clock translation. Endpoint rounding at the actual clock
+    must agree before translating claims; otherwise the candidate is canonically
+    rebuilt before scoring. Cost uses the canonical air term and the new absolute
+    lattice ground delay, preserving floating-point evaluation order.
     These columns are used only as certified lower bounds for the exact DAG;
     the prepass never proves optimality or replaces pricing.
 
@@ -952,32 +1024,40 @@ def _shifted_seed_incumbent(
     # throws the row set away; every translation that is not the winner was materialized for
     # nothing.  ``shift_terms`` resolves the seed's rows once so each step is a handful of
     # dict lookups instead of rebuilding a frozenset of RowKey objects.
+    seed = certify_column(seed, fg, cfg, model)
     terms = duals.shift_terms(seed.claims)
+    with fg._search_cache.lock:
+        air_detour_s = fg._search_cache.certified_columns[id(seed)][2]
     best_delta: int | None = None
     best_delay_s = 0.0
     for departure_step in range(seed.departure_step + 1, latest_departure + 1):
         _check_deadline(deadline)
         delta_steps = departure_step - seed.departure_step
-        # Both halves are set-free: `_rows_hit_forbidden` answers the disjointness question
-        # without building a translated frozenset, and `shifted_claim_cost` sums the pre-
-        # resolved terms.  The greedy heuristic always supplies `forbidden_rows` (its saturated
-        # set), so this is the hot path.
-        if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
-            continue
-        dual_cost = duals.shifted_claim_cost(terms, delta_steps)
-        # A pure clock translation adds GROUND delay only -- the spatial path, and hence
-        # the air term, is invariant -- so this is the one weight that applies.
-        delay_s = seed.delay_s + model.ground_weight * (delta_steps * cfg.dt_s)
+        exact_shift = shifted_claims_are_exact(seed, fg, cfg, departure_step)
+        shifted = None
+        if exact_shift:
+            if _rows_hit_forbidden(seed.claims, forbidden_rows, delta_steps=delta_steps):
+                continue
+            dual_cost = duals.shifted_claim_cost(terms, delta_steps)
+            delay_s = model.evaluate(
+                ground_s=(departure_step - fg.base_step) * cfg.dt_s,
+                air_detour_s=air_detour_s)
+        else:
+            shifted = certify_column(replace(seed, departure_step=departure_step), fg, cfg, model)
+            if not shifted.claims.isdisjoint(forbidden_rows):
+                continue
+            dual_cost = duals.claim_cost(shifted.claims)
+            delay_s = shifted.delay_s
         reduced_cost = model.reduced_cost(
             benefit=benefit, cost=delay_s, dual_cost=dual_cost, pi_f=pi_f
         )
         if best is None or reduced_cost > best[0] + _SCORE_EPS:
-            best = (reduced_cost, None)  # column built once, after the scan
+            best = (reduced_cost, shifted)  # fast-path column built once after the scan
             best_delta = delta_steps
             best_delay_s = delay_s
         if dual_cost == 0.0 and duals.max_negative_credit == 0.0:
             break
-    if best_delta is not None:
+    if best_delta is not None and best[1] is None:
         best = (
             best[0],
             Column(
@@ -991,6 +1071,8 @@ def _shifted_seed_incumbent(
                 claims=_shift_claims(seed.claims, best_delta),
             ),
         )
+    if best is not None and best_delta is not None:
+        _remember_certified_column(best[1], fg, model, air_detour_s)
     return best
 
 
@@ -1054,67 +1136,47 @@ def _bootstrap_incumbent(
     *,
     incumbent: tuple[float, Column] | None,
     roots: int,
+    search_single_root: bool = False,
     ranking: str = "score",
+    method: str = "dp",
+    max_labels: int = 20000,
     deadline: float | None = None,
+    preparation: dp_prepare.PricingPreparation | None = None,
 ) -> tuple[float, Column] | None:
-    """Buy a real cutoff cheaply, by searching the few most promising start options.
-
-    The cutoff ``price_flight`` can assemble for free is not merely weak, it is
-    **structurally zero**, and that is a property of column generation rather than a defect
-    here.  ``seed_column``, ``_shifted_seed_incumbent`` and the master's ``known_column``
-    are all columns the master's pool already holds, and LP optimality over that pool forces
-    every pool column's reduced cost ``<= 0`` -- complementary slackness pins the basic one
-    at exactly ``0``.  So no reuse of anything already known can produce a positive cutoff;
-    the only source is a search, and cutoff quality is then the dominant lever on it.
-
-    **Only the incumbent escapes.**  What comes back is fed to the real search as a cutoff
-    and nothing else; no bootstrap candidate reaches ``_certify_candidates``.  That
-    separation is load-bearing rather than tidy: a restricted search's labels compete for
-    dominance slots, and one of them evicting a survivor the unrestricted search would have
-    kept is how a prune stops being answer-neutral.
-
-    **Ranked, not truncated.**  Taking the earliest N departures misses an optimum that
-    departs late.  ``PreparedVariants.score`` is the root's own upper bound, so it puts the
-    promising start option first whenever it is, and it costs ``roots`` roots instead of
-    ``N * n_origin_lanes``.
-
-    **It re-uses the two real searches rather than writing a third**, which is where its
-    safety comes from.  Every column either returns has already passed
-    ``_canonical_candidate``, so the score is certified achievable and pruning against it
-    cannot discard anything strictly better.  A bootstrap that invented its own scoring
-    could sit above the true optimum and discard it -- silently, with no crash and no
-    fallback, which is the one failure mode here that does not raise.
-
-    Returns the incumbent unchanged when it finds nothing better, so a bootstrap that
-    declines outright leaves the caller exactly where it was.
+    """Find an achievable reduced-cost cutoff over a few ranked start options.
 
     Parameters
     ------------
-    - fg (FlightGraph): the flight graph whose start options are ranked and searched.
-    - dual_view (DualView): the dual view scoring candidate rows.
-    - pi_f (float): the flight's dual (``pi_f``).
-    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
-    - benefit (float): the per-flight benefit ``M``.
-    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
-    - model (CostModel): cost weights for the delay ruler.
-    - incumbent (tuple[float, Column] | None): the current cutoff to improve.
-    - roots (int): how many top-ranked start options to search.
-    - ranking (str): what to rank roots on -- ``"score"`` (root cost) or ``"bound"``
-      (``_root_bounds``); defaults to ``"score"``.
-    - deadline (float | None): ``time.monotonic`` deadline; ``None`` disables the check.
+    - fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model: Pricing subproblem.
+    - incumbent: Previously certified reduced cost and column, or None.
+    - roots (int): Number of start options selected by the ranking.
+    - method (str): Goal-directed warm start plus restricted DP (astar), or DP alone (dp).
+    - max_labels (int): Expansion limit for the goal-directed heuristic.
+    - deadline: Caller-owned monotonic deadline.
 
     Return
     --------
-    - output (tuple[float, Column] | None): a stronger cutoff ``(reduced_cost, column)`` when
-      the restricted search finds one, else ``incumbent`` unchanged (possibly ``None``).
+    - incumbent: Improved, canonically certified cutoff, or the original incumbent.
+
+    The heuristic only supplies a feasible route. Restricted DP refines its cutoff:
+    an exhausted heuristic or a weak first goal must not leave the full search with
+    worse pruning than the DP-only bootstrap. The unrestricted DP retains every root
+    and certifies the final optimum; heuristic labels never enter either exact search.
     """
+
+    _LAST_SEARCH.update(n_labels=0, bootstrap_goal_labels=0, bootstrap_goal_s=0.0,
+                        bootstrap_goal_native=False, bootstrap_goal_decline_reason=None,
+                        bootstrap_goal_sinks_skipped=0, bootstrap_goal_sinks_asked=0)
 
     # Rank ONCE, here, and hand the result to whichever search runs.  `prepare_variants` is
     # pure Python -- `dp_prepare` has no numba anywhere -- so this works identically on a
     # numba-less install, which is what keeps `--reference-baseline` a real gate rather than
     # a second code path.  `prepared_for` is memoized per graph, so the packing is not
     # rebuilt for this.
-    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if preparation is not None:
+        preparation.check(fg, cfg, dual_view, benefit, pi_f, model, forbidden_rows)
+    topology, rows = (dp_prepare.prepared_for(fg, cfg) if preparation is None
+                      else preparation.topology_rows)
     if not (topology.ok and rows.ok):
         # Both searches decline this graph too, so skipping here keeps them symmetric.
         return incumbent
@@ -1124,7 +1186,7 @@ def _bootstrap_incumbent(
     # immediately discards, `prepare_variants` returns EMPTY, and the bootstrap silently does
     # nothing while still costing its own setup.  The failure is invisible -- no crash, a
     # successful `(-inf, None)`, the incumbent handed straight back.
-    envelopes = dp_prepare.CompletionEnvelopes(
+    envelopes = preparation.envelopes(incumbent, deadline) if preparation else dp_prepare.CompletionEnvelopes(
         fg,
         cfg,
         dual_view,
@@ -1147,8 +1209,11 @@ def _bootstrap_incumbent(
         model=model,
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
+        preparation=preparation,
     )
-    if variants.departure_step.size <= 1:
+    if variants.departure_step.size == 0 or (
+        variants.departure_step.size == 1 and not search_single_root
+    ):
         # Nothing to bootstrap FROM: with one root the bootstrap IS the search.
         return incumbent
     # Descending, STABLE, so ties resolve by `prepare_variants`' insertion order --
@@ -1178,6 +1243,19 @@ def _bootstrap_incumbent(
     keep = frozenset(
         (int(variants.departure_step[i]), int(variants.lane_idx[i])) for i in order
     )
+    goal_labels = 0
+    goal_s = 0.0
+    if method == "astar":
+        goal_started = time.perf_counter()
+        incumbent = _goal_directed_bootstrap(
+            fg, dual_view, pi_f, cfg, benefit, forbidden_rows, model,
+            variants, order, topology, envelopes, incumbent=incumbent,
+            max_labels=max_labels, deadline=deadline,
+            preparation=preparation,
+        )
+        goal_labels = int(_LAST_SEARCH.get("n_labels", 0))
+        goal_s = time.perf_counter() - goal_started
+    _LAST_SEARCH["n_labels"] = 0
     outcome = _best_column_compiled(
         fg,
         dual_view,
@@ -1190,6 +1268,7 @@ def _bootstrap_incumbent(
         model=model,
         keep_roots=keep,
         record_budget=False,
+        preparation=preparation,
     )
     if isinstance(outcome, Declined):
         # `roots` roots rather than the whole window, so the reference is affordable here in
@@ -1207,12 +1286,177 @@ def _bootstrap_incumbent(
             model=model,
             keep_roots=keep,
         )
+    _LAST_SEARCH.update(bootstrap_goal_labels=goal_labels, bootstrap_goal_s=goal_s)
     score, column = outcome
     if column is None:
         return incumbent
     if incumbent is not None and score <= incumbent[0] + _SCORE_EPS:
         return incumbent
     return score, column
+
+
+def _goal_directed_bootstrap(
+    fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+    variants, order, topology, envelopes, *, incumbent, max_labels, deadline,
+    preparation=None,
+):
+    """Run the bounded native heuristic, retaining the Python oracle on explicit decline.
+
+    Parameters
+    ------------
+    - fg, duals, pi_f, cfg, benefit, forbidden_rows, model: Fixed pricing subproblem.
+    - variants, order, topology, envelopes: Ranked roots and this stage's pruning bounds.
+    - incumbent, max_labels, deadline: Certified cutoff and heuristic work/time limits.
+    - preparation: Optional invocation-local packed inputs shared with both DP stages.
+
+    Return
+    --------
+    - incumbent: Canonically certified improvement or the original cutoff.
+    """
+    _check_deadline(deadline)
+    native = None
+    if _dp_kernel() is not None:
+        try:
+            from .bootstrap_kernel import goal_directed_bootstrap as native
+        except ImportError:
+            pass
+    diagnostics = dict(native_used=False, decline_reason="numba unavailable")
+    if native is not None:
+        packed = {}
+        if preparation is not None:
+            preparation.check(fg, cfg, duals, benefit, pi_f, model, forbidden_rows)
+            packed = dict(prepared_rows=preparation.topology_rows[1],
+                          prepared_duals=preparation.duals,
+                          prepared_forbidden=preparation.forbidden)
+        result = native(
+            fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+            variants, order, topology, envelopes, incumbent=incumbent,
+            max_labels=max_labels, deadline=deadline, diagnostics=diagnostics, **packed,
+        )
+        if result is not None:
+            incumbent, expanded = result
+            _LAST_SEARCH.update(n_labels=expanded, bootstrap_goal_native=True,
+                                bootstrap_goal_decline_reason=None,
+                                bootstrap_goal_sinks_skipped=int(diagnostics.get("sinks_skipped", 0)),
+                                bootstrap_goal_sinks_asked=int(diagnostics.get("sinks_asked", 0)))
+            return incumbent
+    _LAST_SEARCH.update(bootstrap_goal_native=False,
+                        bootstrap_goal_decline_reason=diagnostics["decline_reason"])
+    return _goal_directed_bootstrap_python(
+        fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+        variants, order, topology, envelopes, incumbent=incumbent,
+        max_labels=max_labels, deadline=deadline,
+    )
+
+
+def _goal_directed_bootstrap_python(
+    fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+    variants, order, topology, envelopes, *, incumbent, max_labels, deadline,
+):
+    """Find a certified cutoff with bounded best-first search over ranked roots.
+
+    Parameters
+    ------------
+    - variants, order: Prepared start options and their selected ranking.
+    - max_labels (int): Maximum expanded labels across the heuristic search.
+    - incumbent: Achievable reduced cost and column, or None.
+    - deadline: Caller-owned monotonic deadline.
+
+    Return
+    --------
+    - incumbent: Best certified route found, retaining the input on failure.
+
+    Only a canonically checked route leaves this heuristic. Its queue order, label
+    limit and early exit cannot certify optimality; the unrestricted DP still runs.
+    """
+
+    destinations = _destination_options(fg)
+    remaining_cache = {}
+    offsets = duals.offsets
+    recent_depth = max(2, offsets[1] - offsets[0])
+    revisit_depth = offsets[1] - offsets[0]
+    serial = itertools.count()
+    expanded = 0
+    certify = _sink_certifier(fg, duals, pi_f, cfg, benefit, forbidden_rows, model,
+                             deadline=deadline)
+
+    def remaining(cell):
+        """Memoize the distance used only for queue order and the hop ceiling."""
+        if cell not in remaining_cache:
+            remaining_cache[cell] = _distance_lower_bound(cell, destinations)
+        return remaining_cache[cell]
+
+    for root in order:
+        _check_deadline(deadline)
+        departure = int(variants.departure_step[root])
+        lane_raw = int(variants.lane_idx[root])
+        lane = None if lane_raw < 0 else lane_raw
+        cell_index = int(variants.cell[root])
+        cell = (int(topology.cell_q[cell_index]), int(topology.cell_r[cell_index]))
+        start = int(variants.start_step[root])
+        origin_rows = _endpoint_claims(fg, cfg, origin=True, step=departure, timing_steps=0)
+        paid_rows = origin_rows | _visit_claims(cell, 0, start, offsets)
+        paid_lookup = {(r.cell_coord, r.step): duals.row_cost(r)
+                       for r in paid_rows if r.kind == "cell" and r.level == 0}
+        paid_cells = {c for c, _step in paid_lookup}
+        delay_bounds, _corridor_start = envelopes._delay_envelope(departure, lane)
+
+        def priority(hops, distance, paid):
+            """Rank by a completion estimate; only certification supplies a cutoff."""
+            total = max(1, hops + distance)
+            if total >= len(delay_bounds):
+                return math.inf
+            destination_cost = envelopes._destination_cost(start + total, total)
+            return float(delay_bounds[total]) + max(paid, destination_cost)
+
+        initial_paid = duals.claim_cost(paid_rows)
+        frontier = [(priority(0, remaining(cell), initial_paid), remaining(cell),
+                     next(serial), start, (cell,), initial_paid, False)]
+        best_paid = {}
+        while frontier and expanded < max_labels:
+            _check_deadline(deadline)
+            _bound, _distance, _serial, step, path, paid, finished = heapq.heappop(frontier)
+            if finished:
+                for dest_lane in destinations[path[-1]]:
+                    candidate = certify(incumbent, departure, lane, dest_lane, step, path)
+                    if candidate is not None:
+                        _LAST_SEARCH["n_labels"] = expanded
+                        return candidate
+                continue
+            expanded += 1
+            hops = len(path) - 1
+            if hops >= fg.max_air_hops or step >= fg.max_step:
+                continue
+            recent = path[-recent_depth:]
+            for neighbor in fg.outgoing_neighbors(path[-1]):
+                if revisit_depth and neighbor in path[-revisit_depth:]:
+                    continue
+                distance = remaining(neighbor)
+                next_step = step + 1
+                if hops + 1 + distance > fg.max_air_hops or next_step + distance > fg.max_step:
+                    continue
+                finish = neighbor in destinations and fg.hop_allowed_for_role(
+                    path[-1], neighbor, first=hops == 0, last=True)
+                onward = fg.hop_allowed_for_role(path[-1], neighbor, first=hops == 0, last=False)
+                if not (finish or onward) or _visit_hits_forbidden(neighbor, 0, next_step, offsets, forbidden_rows):
+                    continue
+                visit = duals.visit_cost(neighbor, 0, next_step)
+                if neighbor in paid_cells:
+                    visit -= math.fsum(paid_lookup.get((neighbor, t), 0.0)
+                                       for t in visit_rows(next_step, offsets))
+                new_paid = paid + visit
+                new_path = (*path, neighbor)
+                bound = priority(hops + 1, distance, new_paid)
+                if finish:
+                    heapq.heappush(frontier, (bound, 0, next(serial), next_step, new_path, new_paid, True))
+                if onward:
+                    first_hop = new_path[:2] if fg.static_walls and fg.origin_terminal is not None else ()
+                    state = (neighbor, next_step, (*recent, neighbor)[-recent_depth:], first_hop)
+                    if new_paid < best_paid.get(state, math.inf) - _SCORE_EPS:
+                        best_paid[state] = new_paid
+                        heapq.heappush(frontier, (bound, distance, next(serial), next_step, new_path, new_paid, False))
+    _LAST_SEARCH["n_labels"] = expanded
+    return incumbent
 
 
 def _benefit(params: Any) -> float:
@@ -1274,14 +1518,7 @@ def _canonical_candidate(
     if not claims.isdisjoint(forbidden_rows):
         return None
 
-    # ``column_claims`` already translated the path as its canonical budget
-    # gate.  Translate once more to set the objective from precisely the same
-    # metric fields exposed to callers; this is only done for top sink labels.
-    exact_delay = model.evaluate(
-        ground_s=intent.ground_delay_s,
-        air_hold_s=intent.air_hold_s,
-        air_detour_s=intent.air_detour_m / cfg.nominal_speed_mps,
-    )
+    exact_delay = model.intent_cost(intent, cfg)
     column = Column(
         flight_id=provisional.flight_id,
         departure_step=provisional.departure_step,
@@ -1295,7 +1532,8 @@ def _canonical_candidate(
     reduced_cost = model.reduced_cost(
         benefit=benefit, cost=exact_delay, dual_cost=duals.claim_cost(claims), pi_f=pi_f
     )
-    return reduced_cost, column
+    return reduced_cost, _remember_certified_column(
+        column, fg, model, intent.air_detour_m / cfg.nominal_speed_mps)
 
 
 def _sink_certifier(
@@ -1629,6 +1867,8 @@ def _certify_candidates(
     *,
     incumbent: tuple[float, Column] | None = None,
     deadline: float | None = None,
+    additional_columns: list[Column] | None = None,
+    column_limit: int = 1,
 ) -> tuple[float, Column] | None:
     """Tier 2: rank sink proposals and return the best certified column, or ``None``.
 
@@ -1699,6 +1939,26 @@ def _certify_candidates(
         if rc > best_rc + _SCORE_EPS or (abs(rc - best_rc) <= _SCORE_EPS and column_key < best_key):
             best = canonical
 
+    if additional_columns is not None and column_limit > 1:
+        seen = set() if best is None else {_column_sort_key(best[1])}
+        for candidate in candidates:
+            _check_deadline(deadline)
+            if candidate.reduced_cost <= _IMPROVING_RC_TOL:
+                continue
+            # Reuse the completed DP's surviving sinks. This is a bounded selection
+            # of useful alternatives, not an exhaustive k-best pricing certificate.
+            canonical = _canonical_candidate(candidate, fg, dual_view, pi_f, cfg,
+                                             benefit, forbidden_rows, model)
+            if canonical is None or canonical[0] <= _IMPROVING_RC_TOL:
+                continue
+            key = _column_sort_key(canonical[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            additional_columns.append(canonical[1])
+            if len(additional_columns) >= column_limit - 1:
+                break
+
     return best
 
 
@@ -1715,6 +1975,8 @@ def _best_column(
     deadline: float | None = None,
     model: CostModel = DELAY_MODEL,
     keep_roots: frozenset[tuple[int, int]] | None = None,
+    additional_columns: list[Column] | None = None,
+    column_limit: int = 1,
 ) -> tuple[float, Column | None]:
     """Return the most negative-reduced-cost column, or ``(-inf, None)`` when none exists.
 
@@ -1810,14 +2072,9 @@ def _best_column(
         return entry
 
     origin_options = _origin_options(fg)
-    # The air-time ceiling (`params.max_air_overrun_hops`, resolved at graph build), and the
-    # ONLY route-length bound this search has.  A label at the cap cannot be extended, and one
-    # that could not reach a destination within it is dead on creation.  It also implies the
-    # corridor -- a route within `max_air_hops` cannot touch a cell outside the ellipse of
-    # radius `max_air_hops - shortest_hops`, which is why the two are one knob and why the
-    # per-arc form below is a stronger test than corridor membership, not a redundant one.
-    # Costs optimality -- a route needing more hops is unreachable even if it is the true
-    # optimum -- and buys the thing that matters: labels never created.
+    # max_air_hops is the route-length ceiling. The corridor lower bound uses actual
+    # cruise endpoints; accumulated hops plus remaining distance is a stronger test.
+    # See context/figures/colgen_lane_aware_corridor.png.
     air_hop_limit = fg.max_air_hops
     if air_hop_limit < 1:
         return -math.inf, None
@@ -1833,7 +2090,9 @@ def _best_column(
     state_history_depth = max(2, revisit_depth)
     track_first_hop = bool(fg.static_walls and fg.origin_terminal is not None)
     # The state keeps enough tail to distinguish sink unions; the revisit
-    # check below reads only the prefix whose windows could overlap.
+    # check below reads only the prefix whose windows could overlap. Consumed hops
+    # are a separate resource: a better-scoring prefix with less remaining allowance
+    # cannot dominate a prefix that can still complete a longer suffix.
     layers: dict[
         int,
         dict[
@@ -1842,6 +2101,7 @@ def _best_column(
                 tuple[Cell, ...],
                 frozenset[RowKey],
                 tuple[Cell, Cell] | None,
+                int,  # consumed hops: labels with different remaining budgets cannot merge
             ],
             _Label,
         ],
@@ -2139,7 +2399,7 @@ def _best_column(
             )
             label = _Label(score, departure_step, lane_idx, (cell,), origin_paid_rows)
             recent = (cell,)
-            key = (cell, recent, origin_paid_rows, None)
+            key = (cell, recent, origin_paid_rows, None, 0)
             layer = layers.setdefault(start_step, {})
             if _prefer(label, layer.get(key)):
                 layer[key] = label
@@ -2209,7 +2469,7 @@ def _best_column(
         layer = layers.pop(step, None)
         if not layer:
             continue
-        for label_index, ((cell, recent, origin_paid_rows, first_hop), label) in enumerate(
+        for label_index, ((cell, recent, origin_paid_rows, first_hop, _hops), label) in enumerate(
             sorted(
                 layer.items(),
                 key=lambda item: (item[0][0], item[0][1], item[1].tie_key),
@@ -2320,6 +2580,7 @@ def _best_column(
                     next_recent,
                     origin_paid_rows,
                     next_first_hop,
+                    next_label.hops,
                 )
                 next_layer = layers.setdefault(next_step, {})
                 if _prefer(next_label, next_layer.get(key)):
@@ -2336,6 +2597,7 @@ def _best_column(
         model,
         incumbent=incumbent,
         deadline=deadline,
+        additional_columns=additional_columns, column_limit=column_limit,
     )
     return (-math.inf, None) if best is None else best
 
@@ -2721,6 +2983,9 @@ def _best_column_compiled(
     model: CostModel = DELAY_MODEL,
     keep_roots: frozenset[tuple[int, int]] | None = None,
     record_budget: bool = True,
+    additional_columns: list[Column] | None = None,
+    column_limit: int = 1,
+    preparation: dp_prepare.PricingPreparation | None = None,
 ) -> tuple[float, Column | None] | Declined:
     """``_best_column`` over the compiled search: ``(reduced_cost, column)``, or a reason.
 
@@ -2773,14 +3038,18 @@ def _best_column_compiled(
         return Declined.MULTI_LEVEL
 
     _check_deadline(deadline)
-    topology, rows = dp_prepare.prepared_for(fg, cfg)
+    if preparation is not None:
+        preparation.check(fg, cfg, dual_view, benefit, pi_f, model, forbidden_rows)
+    topology, rows = (dp_prepare.prepared_for(fg, cfg) if preparation is None
+                      else preparation.topology_rows)
     if not topology.ok:
         return Declined.TOPOLOGY
     if not rows.ok:
         return Declined.ROWS
 
-    duals = dp_prepare.prepare_duals(dual_view, fg, topology, rows)
-    envelopes = dp_prepare.CompletionEnvelopes(
+    duals = (dp_prepare.prepare_duals(dual_view, fg, topology, rows) if preparation is None
+             else preparation.duals)
+    envelopes = preparation.envelopes(incumbent, deadline) if preparation else dp_prepare.CompletionEnvelopes(
         fg,
         cfg,
         dual_view,
@@ -2804,6 +3073,7 @@ def _best_column_compiled(
         forbidden_rows=forbidden_rows,
         envelopes=envelopes,
         keep_roots=keep_roots,
+        preparation=preparation,
     )
     if not variants.ok:
         # Unreachable today, and kept anyway.  `prepare_variants` has exactly two returns and
@@ -2813,7 +3083,8 @@ def _best_column_compiled(
         # nothing is a different thing entirely: it comes back `ok` with empty arrays and
         # correctly PROVES that no improving column exists.
         return Declined.TOPOLOGY if not topology.ok else Declined.ROWS
-    pack = dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
+    pack = (dp_prepare.prepare_forbidden(forbidden_rows, fg, rows, topology)
+            if preparation is None else preparation.forbidden)
     if pack.n_unmapped:
         # Every other Declined here costs time; this one would cost correctness. A dropped
         # forbidden row does not narrow the search, it WIDENS it past what the reference
@@ -2924,6 +3195,7 @@ def _best_column_compiled(
         model,
         incumbent=result.incumbent,
         deadline=deadline,
+        additional_columns=additional_columns, column_limit=column_limit,
     )
     return (-math.inf, None) if best is None else best
 
@@ -3265,6 +3537,7 @@ def find_feasible_column(
     except ValueError:
         seed = None
     if seed is not None:
+        seed = certify_column(seed, fg, cfg, model)
         if seed.claims.isdisjoint(forbidden):
             best_column = seed
             if (
@@ -3549,10 +3822,17 @@ def price_flight(
     *,
     forbidden_rows: AbstractSet[RowKey] = _EMPTY_ROWS,
     require_improving: bool = True,
+    heuristic_only: bool = False,
     known_column: Column | None = None,
     deadline: float | None = None,
+    additional_columns: list[Column] | None = None,
 ) -> tuple[float, Column | None]:
     """Return the best positive-reduced-cost column for one flight.
+
+    ``heuristic_only`` returns after the restricted bootstrap. Its score is a
+    feasible reduced cost, NOT the subproblem optimum: it must never certify a
+    global bound or absence of improving columns. The normal exact path and
+    repair calls retain their existing behavior.
 
     ``known_column`` is a column the caller already holds -- the restricted master's current
     selection.  Its reduced cost under the current duals is a *proven achievable* score, so it
@@ -3655,6 +3935,8 @@ def price_flight(
     # Fold in the caller's existing column, after the seed work so it can only tighten.
     # Its claims are re-checked against the exclusion set because the repair path may have
     # saturated a row the column occupies since it was filed.
+    if known_column is not None:
+        known_column = certify_column(known_column, fg, cfg, model)
     if known_column is not None and known_column.claims.isdisjoint(forbidden):
         known_rc = model.reduced_cost(
             benefit=benefit,
@@ -3676,7 +3958,13 @@ def price_flight(
     # search explored exactly what the reference would -- is what would drift first.
     _bootstrap_s = 0.0
     _bootstrap_labels = 0
-    if params.bootstrap_roots:
+    _bootstrap_goal_labels = 0
+    _bootstrap_goal_s = 0.0
+    _bootstrap_dp_labels = 0
+    preparation = dp_prepare.PricingPreparation(
+        fg, cfg, view, benefit=benefit, pi_f=pi_value, model=model, forbidden_rows=forbidden
+    )
+    if params.bootstrap_roots or heuristic_only:
         _bootstrap_started = time.perf_counter()
         incumbent = _bootstrap_incumbent(
             fg,
@@ -3687,15 +3975,35 @@ def price_flight(
             forbidden,
             model,
             incumbent=incumbent,
-            roots=params.bootstrap_roots,
+            roots=max(1, params.bootstrap_roots) if heuristic_only else params.bootstrap_roots,
+            search_single_root=heuristic_only,
             ranking=getattr(params, "bootstrap_ranking", "score"),
+            method=params.bootstrap_method,
+            max_labels=params.bootstrap_max_labels,
             deadline=deadline,
+            preparation=preparation,
         )
         _bootstrap_s = time.perf_counter() - _bootstrap_started
         # Snapshot NOW: `_bootstrap_incumbent` runs its own restricted
         # `_best_column_compiled`, which writes `_LAST_SEARCH`, and the main search below
         # overwrites it. Read late and this reports the main search's labels twice.
-        _bootstrap_labels = int(_LAST_SEARCH.get("n_labels", 0))
+        _bootstrap_goal_labels = int(_LAST_SEARCH.get("bootstrap_goal_labels", 0))
+        _bootstrap_goal_s = float(_LAST_SEARCH.get("bootstrap_goal_s", 0.0))
+        _bootstrap_dp_labels = int(_LAST_SEARCH.get("n_labels", 0))
+        _bootstrap_labels = _bootstrap_goal_labels + _bootstrap_dp_labels
+    _bootstrap_record = dict(
+        bootstrap_s=_bootstrap_s, bootstrap_labels=_bootstrap_labels,
+        bootstrap_goal_labels=_bootstrap_goal_labels, bootstrap_goal_s=_bootstrap_goal_s,
+        bootstrap_dp_labels=_bootstrap_dp_labels,
+    )
+    if heuristic_only:
+        _KERNEL_STATS["cheap_priced"] += 1
+        reduced_cost, column = incumbent if incumbent is not None else (-math.inf, None)
+        _LAST_SEARCH.update(heuristic_only=True, **_bootstrap_record, final_rc=float(reduced_cost))
+        if (column is None or column == known_column
+                or (require_improving and reduced_cost <= _IMPROVING_RC_TOL)):
+            return reduced_cost, None
+        return reduced_cost, column
     # The compiled search first, the reference when it cannot prove it ran to completion.
     # `forbidden_rows` deliberately does NOT force the fallback: repair is O(flights) inside
     # the greedy, so a Python round trip per repair would be a scaling cliff at thousands of
@@ -3711,6 +4019,9 @@ def price_flight(
         incumbent=incumbent,
         deadline=deadline,
         model=model,
+        preparation=preparation,
+        **({"additional_columns": additional_columns, "column_limit": params.columns_per_flight}
+            if additional_columns is not None else {}),
     )
     # Split here rather than timing the whole call, because on a flight that DECLINES the
     # two halves want opposite fixes and a combined number cannot tell them apart: most of a
@@ -3724,8 +4035,7 @@ def price_flight(
     # The bootstrap is a SEPARATE `_best_column_compiled` call at the seam above, so it is not
     # inside `compiled_s`; timed on its own so a straggler's bootstrap wall is not lost between
     # the two fields.
-    _LAST_SEARCH["bootstrap_s"] = _bootstrap_s
-    _LAST_SEARCH["bootstrap_labels"] = _bootstrap_labels
+    _LAST_SEARCH.update(_bootstrap_record)
     # What the main search actually ENTERS with, which is the number that separates the two
     # explanations for an expensive flight: a cutoff at or near the final reduced cost means
     # the cutoff was fine and the labels went somewhere else. `-inf` is no incumbent at all,
@@ -3767,6 +4077,8 @@ def price_flight(
                 incumbent=incumbent,
                 deadline=deadline,
                 model=model,
+                **({"additional_columns": additional_columns, "column_limit": params.columns_per_flight}
+                    if additional_columns is not None else {}),
             )
         finally:
             _LAST_SEARCH["fallback_s"] = time.perf_counter() - _fallback_started
@@ -3777,6 +4089,10 @@ def price_flight(
     # handed the search a bound worth having and the labels went elsewhere; a large gap
     # means the search discovered the answer itself and the cutoff was doing nothing.
     _LAST_SEARCH["final_rc"] = float(reduced_cost)
+    if additional_columns is not None:
+        additional_columns[:] = [c for c in additional_columns
+                                 if c != column and c != known_column]
+
     if column is None or (require_improving and reduced_cost <= _IMPROVING_RC_TOL):
         return reduced_cost, None
     if known_column is not None and column == known_column:

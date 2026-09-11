@@ -306,6 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "falls back to the validated rounding incumbent and reports a "
                         "non-optimal ip_status, so the schedule is still claim-feasible, just "
                         "uncertified")
+    p.add_argument("--colgen-ip-reserve", type=float, default=None, metavar="S",
+                   help="colgen: whole-solve seconds reserved for final IP setup and search; "
+                        "default min(5, 5%% of the whole budget). Reserve more than the IP "
+                        "search limit to allow for setup")
     p.add_argument("--colgen-max-eager-rows", type=int, default=None, metavar="N",
                    help="colgen: ceiling on the rows the final IP may pre-materialize "
                         "(default none). The pre-pass is all-or-nothing — over the ceiling it "
@@ -314,6 +318,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "and still has to search. Worth setting on a pool denser than the ones "
                         "measured here: at 1,500 flights the pre-pass is 495,574 rows and 272 s "
                         "and it scales WITH the pool. 0 pins the old lazy loop for an A/B")
+    p.add_argument("--colgen-iteration-ip-time-limit", type=float, default=None,
+                   help="colgen: IP search seconds every round (default 30); 0 uses rounding/LNS")
+    p.add_argument("--colgen-lp-gap", type=float, default=None,
+                   help="colgen: relative LP stopping tolerance (default 0.001 = 0.1%%)")
+    p.add_argument("--colgen-cheap-pricing", action="store_true", default=None,
+                   help="colgen: restricted pricing with periodic exact certification")
+    p.add_argument("--colgen-exact-pricing-interval", type=int, default=None,
+                   help="colgen: full pricing every N rounds in cheap mode (default 5)")
     p.add_argument("--colgen-max-iterations", type=int, default=None, metavar="N",
                    help="colgen: cap on column-generation iterations (default 30)")
     p.add_argument("--colgen-objective", choices=("total_delay", "total_cost"), default=None,
@@ -343,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     # cost — so without it a run cannot be tuned, only given more time.
     p.add_argument("--colgen-max-air-overrun", type=int, default=None, metavar="HOPS",
                    help="colgen: hop budget over the lattice geodesic for a priced route "
-                        "(default 3). Also the half-width of the O-D ellipse the flight is "
+                        "(default 6). Also determines the derived O-D corridor the flight is "
                         "priced over, because the budget implies it — a route within the budget "
                         "cannot reach a cell outside that ellipse. The dominant term in how much "
                         "search a sweep does; suboptimal by construction, since a route needing "
@@ -369,6 +381,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "Costs one extra planner pass (64 s against a 3,750 s solve at x1500); "
                         "flights whose route the column model cannot express — an air hold, or "
                         "a route outside the O-D ellipse — are dropped and logged, not forced.")
+    p.add_argument("--colgen-no-nominal-seeds", action="store_false",
+                   dest="colgen_seed_nominal_routes", default=None,
+                   help="Initialize only from the warm-start planner; skip nominal seeds, "
+                        "their departure ladder, and the greedy nominal-route schedule.")
+    p.add_argument("--colgen-warm-start-max-shift", type=int, default=None, metavar="STEPS",
+                   help="Extra steps allowed when fitting imported routes; 0 preserves their "
+                        "departures (default 8). With nominal seeds disabled, 0 keeps all "
+                        "individually valid imports for the IP to combine.")
+    p.add_argument("--colgen-provided-seed-ladder", type=int, default=None, metavar="STEPS",
+                   help="Add up to this many departure alternatives on EACH side of each "
+                        "imported seed, clipped to legal times (default 0; 10 adds up to 20).")
     p.add_argument("--colgen-workers", type=int, default=None, metavar="N",
                    help="colgen: fan each pricing sweep across N worker processes (default 0, "
                         "in-process). Note this is NOT --workers, which sizes the simulation's "
@@ -458,8 +481,13 @@ def _colgen_overrides(args) -> dict:
         for name, value in (
             ("time_limit_s", args.colgen_time_limit),
             ("ip_time_limit_s", args.colgen_ip_time_limit),
+            ("ip_reserve_s", args.colgen_ip_reserve),
             ("max_eager_ip_rows", args.colgen_max_eager_rows),
             ("max_iterations", args.colgen_max_iterations),
+            ("iteration_ip_time_limit_s", args.colgen_iteration_ip_time_limit),
+            ("lp_gap", args.colgen_lp_gap),
+            ("cheap_pricing", args.colgen_cheap_pricing),
+            ("exact_pricing_interval", args.colgen_exact_pricing_interval),
             ("objective", args.colgen_objective),
             ("solver", args.colgen_solver),
             ("gap_metric", args.colgen_gap_metric),
@@ -468,6 +496,9 @@ def _colgen_overrides(args) -> dict:
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),
+            ("seed_nominal_routes", args.colgen_seed_nominal_routes),
+            ("provided_seed_ladder_steps", args.colgen_provided_seed_ladder),
+            ("warm_start_max_shift_steps", args.colgen_warm_start_max_shift),
         )
         if value is not None
     }

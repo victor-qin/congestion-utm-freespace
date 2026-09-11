@@ -464,6 +464,7 @@ def test_row_index_interns_stably_and_uses_terminal_pad_capacity():
 
 
 def test_params_validate_integral_nonnegative_overrun():
+    assert ColGenParams().max_air_overrun_hops == 6
     # `max_air_overrun_hops` is the first field, so these positional forms reach it.
     assert ColGenParams(np.int64(3)).max_air_overrun_hops == 3
     with pytest.raises(TypeError, match="must be an integer"):
@@ -514,6 +515,102 @@ def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
         fg.request.origin_terminal = Terminal("mutated", 1)
     with pytest.raises(AttributeError, match="snapshot is immutable"):
         rebuilt.request.dest_terminal = Terminal("mutated", 1)
+
+
+@pytest.mark.parametrize("origin_is_terminal", [False, True])
+@pytest.mark.parametrize("dest_is_terminal", [False, True])
+def test_corridor_cruise_endpoint_bound_and_materialized_parity(
+    origin_is_terminal, dest_is_terminal
+):
+    """Every endpoint combination uses the cruise-hop bound and preserves static exclusions."""
+    cfg = _cfg()
+    origin, dest = (-3, 0), (5, 0)
+    req = FlightRequest(
+        108,
+        _ground_point(origin, cfg),
+        _ground_point(dest, cfg),
+        0.0,
+        origin_terminal=Terminal("origin", 1, radius=90.0) if origin_is_terminal else None,
+        dest_terminal=Terminal("dest", 1, radius=90.0) if dest_is_terminal else None,
+    )
+    wall = Terminal("foreign", 1, radius=90.0)
+    graph = build_flight_graph(
+        req, cfg, [(_ground_point((1, 1), cfg), wall)], ColGenParams(max_air_overrun_hops=2)
+    )
+    starts = tuple(lane.cell for lane in graph.origin_lanes) or (origin,)
+    ends = tuple(lane.cell for lane in graph.dest_lanes) or (dest,)
+    explicit = {lane.cell for lane in (*graph.origin_lanes, *graph.dest_lanes)}
+    probes = {(q, r) for q in range(-16, 18) for r in range(-14, 15)}
+    expected = {
+        cell
+        for cell in probes
+        if cell not in graph.foreign_exclusions
+        and (
+            cell in explicit
+            or (
+                cell not in graph.own_terminal_interiors
+                and any(
+                    hg.hex_distance(start, cell) + hg.hex_distance(cell, end) <= graph.max_air_hops
+                    for start in starts
+                    for end in ends
+                )
+            )
+        )
+    }
+    assert not graph.corridor_cells.is_materialized
+    assert {cell for cell in probes if cell in graph.corridor_cells} == expected
+    assert not graph.corridor_cells.is_materialized
+    assert frozenset(graph.corridor_cells) == expected
+    assert graph.corridor_cells.is_materialized
+    assert {cell for cell in probes if cell in graph.corridor_cells} == expected
+    restored = pickle.loads(pickle.dumps(graph.corridor_cells))
+    assert not restored.is_materialized
+    assert {cell for cell in probes if cell in restored} == expected
+
+
+def test_terminal_exit_corridor_keeps_real_127_hop_route_below_128_cap():
+    """Flight 1600's valid detour must survive pruning with its original hop/time caps."""
+    cfg = replace(
+        _cfg(),
+        nominal_speed_mps=30.0,
+        max_ground_delay_s=3600.0,
+        max_detour_factor=100.0,
+    )
+    req = FlightRequest(
+        1600,
+        vec(36835.9224761, 27246.97435197, 0.0),
+        vec(29286.78386012, 14239.54583087, 0.0),
+        319.7304140898543,
+        832.1099729256033,
+        origin_terminal=Terminal("wing_zipline_uss#124", 40, radius=180.0),
+    )
+    # Exact path from analysis/colgen_pricing_profile_20260909/flight_1600_wider_column.json.
+    path = _walk(
+        (176, 260),
+        [(0, -1)] * 22
+        + [(1, -1)] * 3
+        + [(0, -1)] * 11
+        + [(1, -1)]
+        + [(0, -1)] * 2
+        + [(-1, 0)]
+        + [(0, -1)] * 51
+        + [(-1, 0)] * 3
+        + [(0, -1)] * 33,
+    )
+    col, graph = _column_for(req, path, cfg, departure_step=209, overrun=3)
+    assert (graph.origin_cell, graph.dest_cell) == ((176, 262), (176, 137))
+    assert (graph.shortest_hops, graph.max_air_hops, graph.max_step) == (125, 128, 1245)
+    assert len(path) - 1 == 127
+    excluded_before = {
+        cell
+        for cell in path
+        if hg.hex_distance(graph.origin_cell, cell) + hg.hex_distance(cell, graph.dest_cell)
+        > graph.max_air_hops
+    }
+    assert excluded_before == {(180, 223), (180, 222), (180, 221)}
+    assert set(path) <= graph.corridor_cells
+    assert col.claims
+    assert column_to_intent(col, req, cfg) is not None
 
 
 def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
@@ -1811,3 +1908,130 @@ def test_claims_deduped_constructed():
     assert isinstance(col.claims, frozenset)
     assert len(col.claims) == len(set(col.claims))
     assert set(raw_visit_rows) <= col.claims
+
+
+@pytest.mark.parametrize("endpoints", ["cc", "tc", "ct", "tt"])
+@pytest.mark.parametrize(
+    "dt, clock", [(4.0, 0.0), (0.7, 0.0), (7.50045227268982, 1314.5403973767247), (0.7, 1e12)]
+)
+@pytest.mark.parametrize("time_buffer_s", [0.0, 4.0])
+def test_shifted_spatial_certificate_matches_cold_claims(
+    monkeypatch, endpoints, dt, clock, time_buffer_s
+):
+    """Clock shifts preserve cold-graph claims, including rounding at dwell boundaries."""
+    import freespace_sim.planner.colgen.translate as translate_module
+
+    cfg = replace(
+        _cfg(time_buffer_s=time_buffer_s),
+        dt_s=dt,
+        nominal_speed_mps=120.0 / dt,
+        max_ground_delay_s=64 * dt,
+        max_detour_factor=100.0,
+    )
+    req = FlightRequest(
+        601,
+        _ground_point((0, 0), cfg),
+        _ground_point((8, 0), cfg),
+        clock,
+        clock,
+        origin_terminal=Terminal("origin", 1, radius=90.0) if endpoints[0] == "t" else None,
+        dest_terminal=Terminal("dest", 1, radius=90.0) if endpoints[1] == "t" else None,
+    )
+    dwell = column_dwell_s(req.origin, req.origin_terminal, cfg, cfg.flight_levels_m[0])
+    cfg = replace(cfg, hover_time_s=(math.ceil(dwell / dt) + 2) * dt - dwell)
+    params = ColGenParams(max_air_overrun_hops=3)
+    terms = [(_ground_point((4, 5), cfg), Terminal("foreign", 1, radius=90.0))]
+    graph = build_flight_graph(req, cfg, terms, params)
+    starts = tuple(lane.cell for lane in graph.origin_lanes) or (graph.origin_cell,)
+    ends = tuple(lane.cell for lane in graph.dest_lanes) or (graph.dest_cell,)
+    start, end = min(
+        ((s, e) for s in starts for e in ends), key=lambda pair: hg.hex_distance(*pair)
+    )
+    path = _shortest_path(start, end)
+    raw = Column(
+        req.flight_id,
+        graph.base_step + 16,
+        0,
+        _lane_index(graph.origin_lanes, start) if graph.origin_lanes else None,
+        _lane_index(graph.dest_lanes, end) if graph.dest_lanes else None,
+        path,
+        0.0,
+    )
+    shifts = (-16, -5, -1, 0, 1, 5, 16)
+    columns = [replace(raw, departure_step=raw.departure_step + delta) for delta in shifts]
+    expected = [
+        column_claims(column, build_flight_graph(req, cfg, terms, params), cfg)
+        for column in columns
+    ]
+    if endpoints == "tt" and clock == 1e12:
+        from freespace_sim.planner.colgen.solver import _shift_claims
+
+        baseline = expected[shifts.index(0)]
+        assert any(
+            claims != _shift_claims(baseline, delta)
+            for claims, delta in zip(expected, shifts, strict=True)
+        )
+    calls = []
+    original = translate_module.column_to_intent
+
+    def observed(*args, **kwargs):
+        calls.append(args[0].departure_step)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(translate_module, "column_to_intent", observed)
+    column_claims(raw, graph, cfg)
+    for column, cold_claims in zip(columns, expected, strict=True):
+        assert column_claims(column, graph, cfg) == cold_claims
+    assert calls == [raw.departure_step]
+    for field, lanes in (
+        ("origin_lane_idx", graph.origin_lanes),
+        ("dest_lane_idx", graph.dest_lanes),
+    ):
+        if lanes:
+            with pytest.raises(ValueError, match="invalid .* terminal lane index"):
+                column_claims(replace(raw, **{field: len(lanes)}), graph, cfg)
+            alternate = (getattr(raw, field) + 1) % len(lanes)
+            with pytest.raises(ValueError, match="does not match selected lane"):
+                column_claims(replace(raw, **{field: alternate}), graph, cfg)
+
+
+def test_shifted_spatial_certificate_does_not_trust_changed_columns_or_claims():
+    """Cached validation applies only to its route/configuration and legal departure bounds."""
+    cfg = _cfg()
+    req = FlightRequest(602, _ground_point((0, 0), cfg), _ground_point((5, 0), cfg), 0.0)
+    params = ColGenParams(max_air_overrun_hops=3)
+    graph = build_flight_graph(req, cfg, [], params)
+    raw = Column(req.flight_id, 4, 0, None, None, _shortest_path((0, 0), (5, 0)), 0.0)
+    claims = column_claims(raw, graph, cfg)
+    forged = frozenset({RowKey.cell((1000, 1000), 0, 0)})
+    assert column_claims(replace(raw, claims=forged), graph, cfg) == claims
+    assert (
+        column_claims(replace(raw, claims=forged), build_flight_graph(req, cfg, [], params), cfg)
+        == claims
+    )
+    shifted = replace(raw, departure_step=5, claims=forged)
+    assert column_claims(shifted, graph, cfg) == column_claims(
+        shifted, build_flight_graph(req, cfg, [], params), cfg
+    )
+    invalid = (
+        (replace(raw, flight_id=999), "flight_id"),
+        (replace(raw, level=1), "outside graph levels"),
+        (replace(raw, origin_lane_idx=0), "origin_lane_idx"),
+        (replace(raw, dest_lane_idx=0), "dest_lane_idx"),
+        (replace(raw, cell_path=((0, 0), (2, 0), (3, 0), (4, 0), (5, 0))), "non-neighbour"),
+        (replace(raw, departure_step=-1), "outside legal range"),
+        (replace(raw, departure_step=graph.latest_departure_step + 1), "outside legal range"),
+    )
+    for column, message in invalid:
+        with pytest.raises(ValueError, match=message):
+            column_claims(column, graph, cfg)
+    with pytest.raises(ValueError, match="SimConfig"):
+        column_claims(raw, graph, replace(cfg, max_detour_factor=cfg.max_detour_factor + 1.0))
+    with pytest.raises(ValueError, match="cell-window"):
+        column_claims(raw, graph, cfg, W=999)
+    tight = replace(
+        graph, max_step=raw.departure_step + graph.takeoff_steps[0] + len(raw.cell_path) - 1
+    )
+    column_claims(raw, tight, cfg)
+    with pytest.raises(ValueError, match="beyond graph maximum"):
+        column_claims(shifted, tight, cfg)

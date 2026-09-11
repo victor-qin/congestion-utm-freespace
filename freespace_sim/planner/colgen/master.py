@@ -226,6 +226,11 @@ class HighsBackend:
         # Retained as part of the common deterministic-backend contract.  The
         # scipy.optimize wrappers currently expose no HiGHS random-seed option.
         self.seed = operator.index(seed)
+        # ALWAYS EMPTY here, and that is a property of the wrapper rather than a gap worth
+        # filling: `scipy.optimize.milp` exposes no callback, so HiGHS's incumbent
+        # trajectory is unreachable without dropping to `highspy`.  Declared so callers can
+        # read the field unconditionally instead of branching on backend name.
+        self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
 
     def add_column(
         self,
@@ -478,6 +483,8 @@ class GurobiBackend:
         except gp.GurobiError as exc:  # pragma: no cover - depends on local license
             raise _GurobiUnavailable(f"Gurobi could not start: {exc}") from exc
         self._model = model
+        # (elapsed_s, incumbent, bound) per MIPSOL, filled by `solve_ip`'s callback.
+        self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
         model.Params.OutputFlag = 0
         # ONE thread by default, and it is a determinism choice, not a performance one:
         # parallel Gurobi breaks ties by whichever worker got there first, so a threaded
@@ -659,7 +666,35 @@ class GurobiBackend:
         self._model.Params.Method = -1
         self._model.Params.Crossover = -1
         self._model.update()
-        self._model.optimize()
+        # THE MILP IS THE ONE BLOCK NOTHING CAN SEE INSIDE.  `OutputFlag = 0` suppresses
+        # console AND log-file output, and a bare `optimize()` records nothing, so a solve
+        # that runs for 25 minutes is indistinguishable from one that hung -- and three
+        # questions this repo actually asks cannot be answered at all: when would a looser
+        # `ip_gap` have stopped it, did it ever improve on the warm start, and is the tail
+        # spent searching or proving.  One callback answers all three for the cost of a
+        # tuple per incumbent.
+        #
+        # MIPSOL only, deliberately: MIPNODE fires per node and would turn a long solve's
+        # trajectory into hundreds of thousands of rows describing nothing new.
+        trajectory: list[tuple[float, float, float]] = []
+        best_seen = -math.inf
+        started = time.perf_counter()
+        grb = self._gp.GRB
+
+        def _record(model, where):
+            nonlocal best_seen
+            if where == grb.Callback.MIPSOL:
+                # OBJBST can still describe the previous incumbent at MIPSOL (including
+                # -infinity for the warm start). OBJ is the candidate being reported.
+                best_seen = max(best_seen, float(model.cbGet(grb.Callback.MIPSOL_OBJ)))
+                trajectory.append((
+                    time.perf_counter() - started,
+                    best_seen,
+                    float(model.cbGet(grb.Callback.MIPSOL_OBJBND)),
+                ))
+
+        self._model.optimize(_record)
+        self.last_ip_trajectory = tuple(trajectory)
         if self._model.SolCount < 1 and self._model.Status == self._gp.GRB.TIME_LIMIT:
             # As with HiGHS, a sub-millisecond limit can expire before Gurobi
             # processes the supplied MIP start.  RestrictedMaster owns the
@@ -802,6 +837,9 @@ class RestrictedMaster:
                 raise ValueError(f"fixed load {load} exceeds capacity {cap} for row {row!r}")
             if load:
                 self.fixed_loads[row] = load
+        self._bindability_fixed_loads = self.fixed_loads.copy()
+        self._bindability_valid = True
+        self._claim_capacities = {row_index.cap(row) for row in self.fixed_loads}
 
         self._backend: LpBackend = backend or create_backend(
             self.flight_ids,
@@ -812,6 +850,10 @@ class RestrictedMaster:
             raise ValueError("backend flight ids do not match the restricted master")
         self._columns: list[Column] = []
         self._column_indices: dict[Column, int] = {}
+        # Flight -> its column indices, append-only for the same reason `_columns` is.
+        # The LNS repair needs "what else could this flight fly", which is otherwise a
+        # scan of the whole pool per released flight.
+        self._columns_by_flight: dict[int, list[int]] = {}
         self._objectives: list[float] = []
         self._materialized: dict[RowKey, float] = {}
         # Transpose of the pool's claim sets: row -> dense indices of every column claiming
@@ -852,6 +894,10 @@ class RestrictedMaster:
         self.last_ip_objective: float | None = None
         self.last_ip_bound: float | None = None
         self.last_ip_status: str | None = None
+        # The backend's incumbent trajectory for the last IP, empty on HiGHS.
+        self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
+        # Per-try outcomes of the last `round_heuristic` call; see there.
+        self.last_round_stats: dict = {}
         self.last_ip_optimal: bool | None = None
         # Diagnostics for the eager path: how many rows it pre-materialized, and how many
         # separation rounds were still needed.  Rounds > 0 after an eager solve means the
@@ -917,8 +963,8 @@ class RestrictedMaster:
         coefficients = Counter(normalized_claims)
         if any(value not in {0, 1} for value in coefficients.values()):
             raise AssertionError("column coefficients must be in {0, 1}")
-        for row in normalized_claims:
-            self.row_index.cap(row)  # validates terminal metadata before any solve
+        # Validate terminal metadata before committing any variable.
+        capacities = {self.row_index.cap(row) for row in normalized_claims}
         try:
             delay_s = float(column.delay_s)
         except (TypeError, ValueError) as exc:
@@ -940,6 +986,9 @@ class RestrictedMaster:
         index = len(self._columns)
         self._backend.add_column(objective, column.flight_id, materialized_claims)
         self._columns.append(column)
+        self._claim_capacities.update(capacities)
+        if self.fixed_loads != self._bindability_fixed_loads:
+            self._bindability_valid = False
         # THE ONLY SITE THAT MAINTAINS `_columns_by_row`, and it belongs here rather than in
         # the claim loop above.  Three preconditions first hold on this line: `index` is not
         # bound until two lines up; the `existing is not None` early return would otherwise
@@ -980,6 +1029,7 @@ class RestrictedMaster:
                         self._bindable.add(row)
                         del self._row_flight_sets[row]
         self._column_indices[column] = index
+        self._columns_by_flight.setdefault(column.flight_id, []).append(index)
         self._objectives.append(objective)
         # Existing warm starts stay meaningful when pricing appends a column.
         if self._warm_start is not None:
@@ -1126,13 +1176,72 @@ class RestrictedMaster:
 
         if tol < 0.0 or not math.isfinite(tol):
             raise ValueError("tol must be finite and non-negative")
-        loads = self.fractional_loads(x)
-        violated = [
-            row
-            for row, load in loads.items()
-            if load > self.row_index.cap(row) + tol and row not in self._materialized
-        ]
+        values = np.asarray(x, dtype=float)
+        if values.shape != (len(self._columns),):
+            raise ValueError("x has the wrong number of columns")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("x must contain finite values")
+        if self._flight_rows_cover_implicit_capacities(values, tol):
+            candidates = self._bindable.difference(self._materialized)
+        else:
+            candidates = self._columns_by_row.keys() | self.fixed_loads.keys()
+            candidates.difference_update(self._materialized)
+        violated = []
+        for row in candidates:
+            load = float(self.fixed_loads.get(row, 0))
+            # Preserve fractional_loads' positive-only, ascending-column arithmetic.
+            for index in self._columns_by_row.get(row, ()):
+                value = float(values[index])
+                if value > 0.0:
+                    load += value
+            if load > self.row_index.cap(row) + tol:
+                violated.append(row)
         return self.materialize_rows(violated)
+
+    def _flight_rows_cover_implicit_capacities(self, values: np.ndarray, tol: float) -> bool:
+        """Prove nonbindable rows safe, including floating-point summation error.
+
+        Parameters
+        ------------
+        - values (np.ndarray): already validated finite per-column values.
+        - tol (float): the capacity separator's non-negative tolerance.
+
+        Return
+        --------
+        - output (bool): whether only bindable rows need explicit load evaluation.
+        """
+
+        if not self._bindability_valid or self.fixed_loads != self._bindability_fixed_loads:
+            return False
+        # A nonbindable row has at most cap - fixed distinct claiming flights. Bound
+        # each flight's POSITIVE mass: arbitrary public inputs may violate flight rows
+        # or include negative values, which fractional_loads deliberately ignores.
+        try:
+            mass = max(
+                (math.fsum(float(values[i]) for i in indices if values[i] > 0.0)
+                 for indices in self._columns_by_flight.values()),
+                default=0.0,
+            )
+        except OverflowError:
+            return False
+        # Twice the unit roundoff, with more terms than either accumulation, gives
+        # a conservative bound for both flight sums and the original row sums.
+        error = (len(values) + 2) * np.finfo(float).eps
+        if error >= 0.25:
+            return False
+        denominator = math.nextafter(1.0 - error, -math.inf)
+        flight_bound = math.nextafter(mass / denominator, math.inf)
+        factor = math.nextafter(max(1.0, flight_bound) / denominator, math.inf)
+        if not math.isfinite(factor):
+            return False
+        for capacity in self._claim_capacities:
+            # Keep fixed integer loads exactly representable in the proof.
+            if capacity > 2**52:
+                return False
+            bound = math.nextafter(float(capacity) * factor, math.inf)
+            if bound > capacity + tol:
+                return False
+        return True
 
     @staticmethod
     def upper_bound(objective: float, best_reduced_costs: Iterable[float]) -> float:
@@ -1340,6 +1449,13 @@ class RestrictedMaster:
         best: dict[int, Column] = {}
         best_objective = -math.inf
         best_signature: tuple[tuple[object, ...], ...] | None = None
+        # PER-TRY OUTCOMES.  The stage has produced exactly one observable -- "no
+        # improvement" -- across 192 tries at 2,000 flights, which cannot say whether a try
+        # loses by stranding a single flight (each one costs a full M in
+        # `_selection_objective`, 83x the mean per-flight delay) or by accumulating delay
+        # across all of them.  Those want opposite fixes, and the counters are two appends.
+        try_objectives: list[float] = []
+        try_covered: list[int] = []
         for _ in range(tries):
             selected: dict[int, Column] = {}
             loads: Counter[RowKey] = Counter(self.fixed_loads)
@@ -1369,6 +1485,8 @@ class RestrictedMaster:
                     loads.update(column.claims)
 
             objective = self.objective_of(selected)
+            try_objectives.append(objective)
+            try_covered.append(len(selected))
             signature = tuple(
                 _column_sort_key(selected[flight_id])
                 for flight_id in self.flight_ids
@@ -1381,6 +1499,188 @@ class RestrictedMaster:
                 best = selected
                 best_objective = objective
                 best_signature = signature
+        # `n_forced` is the other half of the diagnosis: it is how much of the LP's
+        # solution was integral enough to commit outright, so `n_forced == 0` means the
+        # rounding had no LP guidance at all and every try was a near-uniform draw.
+        self.last_round_stats = {
+            "n_forced": len(forced),
+            "n_columns": len(self._columns),
+            "n_flights": len(self.flight_ids),
+            "try_objectives": tuple(try_objectives),
+            "try_covered": tuple(try_covered),
+        }
+        return {flight_id: best[flight_id] for flight_id in self.flight_ids if flight_id in best}
+
+    def lns_heuristic(
+        self,
+        x: Sequence[float],
+        rng: np.random.Generator,
+        incumbent: Mapping[int, Column],
+        destroy: int,
+        n_tries: int | None = None,
+        *,
+        deadline: float = math.inf,
+        lp_objective: float | None = None,
+    ) -> dict[int, Column]:
+        """Improve a feasible incumbent using LP-guided neighborhood repair.
+
+        Sample flights whose current columns disagree most with the LP. Release
+        one flight's claims, choose its highest-LP-weight alternative that fits,
+        and restore the original if none fits. A trial can temporarily increase
+        cost; only a better complete trial (or a deterministic equal-cost tie)
+        is retained. Coverage and capacity feasibility are preserved.
+
+        LP weights stay fixed throughout this call, so candidate lists are sorted
+        once. Trials edit one reservation map and roll back rejected swaps instead
+        of copying the fleet's full claim map on every try. A bounded joint repair
+        first permits reservation exchanges that sequential swaps cannot perform.
+        Stop heuristic work when the incumbent meets the restricted LP bound to
+        the requested cost tolerance; global pricing certification is unchanged.
+        """
+        values = np.asarray(x, dtype=float)
+        if values.shape != (len(self._columns),):
+            raise ValueError("x has the wrong number of columns")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("x must contain finite values")
+        tries = self.params.n_heuristic_tries if n_tries is None else operator.index(n_tries)
+        if tries < 1:
+            raise ValueError("n_tries must be positive")
+        if isinstance(destroy, bool):
+            raise TypeError("destroy must be an integer")
+        destroy = operator.index(destroy)
+        if destroy < 1:
+            raise ValueError("destroy must be positive")
+        base: dict[int, Column] = {}
+        for flight_id, column in incumbent.items():
+            if flight_id != column.flight_id:
+                raise ValueError("incumbent mapping key does not match column flight_id")
+            if column not in self._column_indices:
+                raise ValueError("incumbent contains a column outside this master")
+            base[flight_id] = self._columns[self._column_indices[column]]
+        if not self.is_claim_feasible(base):
+            raise ValueError("incumbent violates a capacity claim")
+
+        loads: Counter[RowKey] = Counter(self.fixed_loads)
+        for column in base.values():
+            loads.update(column.claims)
+        # Compute lists lazily: a small neighborhood need not touch every flight.
+        candidates_by_flight: dict[int, list[int]] = {}
+        ranked: list[int] | None = None
+        best = dict(base)
+        best_objective = self.objective_of(best)
+        best_signature: tuple[tuple[object, ...], ...] | None = None
+        best_swaps = 0
+        try_swaps: list[int] = []
+        try_objectives: list[float] = []
+        window = min(len(base), 4 * destroy)
+        trial_solutions: set[tuple[int, ...]] = set()
+        interrupted = False
+        exhausted_full_neighborhood = False
+
+        def pool_satisfied():
+            cost = len(self.flight_ids) * self.params.M - best_objective
+            return (lp_objective is not None and math.isfinite(lp_objective)
+                    and lp_objective - best_objective
+                    <= self.params.ip_gap * max(1.0, abs(cost)) + self.params.epsilon)
+
+        joint_stats = {}
+        if (base and not pool_satisfied() and self.params.lns_joint_time_limit_s > 0
+                and time.monotonic() < deadline):
+            from .lns import repair_neighborhood
+
+            joint_started = time.monotonic()
+            best, joint_stats = repair_neighborhood(
+                self, values, best, loads, destroy,
+                min(deadline, joint_started + self.params.lns_joint_time_limit_s),
+            )
+            joint_stats["elapsed_s"] = time.monotonic() - joint_started
+            best_objective = self.objective_of(best)
+            if joint_stats["improved"]:
+                loads = Counter(self.claim_loads(best))
+        for _ in range(tries if base else 0):
+            if pool_satisfied():
+                break
+            if time.monotonic() >= deadline:
+                interrupted = True
+                break
+            if ranked is None:
+                ranked = sorted(best, key=lambda flight_id: (
+                    -(1.0 - float(values[self._column_indices[best[flight_id]]])), flight_id,
+                ))
+            selected = dict(best)
+            swaps: list[tuple[Column, Column]] = []
+            released = [ranked[i] for i in sorted(
+                rng.choice(window, size=min(destroy, window), replace=False)
+            )]
+            for flight_id in released:
+                if time.monotonic() >= deadline:
+                    interrupted = True
+                    break
+                previous = selected[flight_id]
+                if flight_id not in candidates_by_flight:
+                    candidates_by_flight[flight_id] = sorted(
+                        (i for i in self._columns_by_flight.get(flight_id, ())
+                         if values[i] > self.params.epsilon),
+                        key=lambda i: (-values[i], _column_sort_key(self._columns[i])),
+                    )
+                for row in previous.claims:
+                    loads[row] -= 1
+                replacement = previous
+                for index in candidates_by_flight[flight_id]:
+                    column = self._columns[index]
+                    if column != previous and self._can_add(column, loads):
+                        replacement = column
+                        break
+                loads.update(replacement.claims)
+                if replacement != previous:
+                    selected[flight_id] = replacement
+                    swaps.append((previous, replacement))
+            objective = self.objective_of(selected)
+            signature = tuple(
+                _column_sort_key(selected[flight_id])
+                for flight_id in self.flight_ids if flight_id in selected
+            )
+            try_swaps.append(len(swaps))
+            try_objectives.append(objective)
+            # Stable column indices distinguish schedule diversity from merely different
+            # objective values; geometry and departure novelty are measured separately.
+            trial_solutions.add(tuple(self._column_indices[selected[fid]] for fid in sorted(selected)))
+            if objective > best_objective + 1e-9 or (
+                abs(objective - best_objective) <= 1e-9
+                and best_signature is not None and signature < best_signature
+            ):
+                best = selected
+                best_objective = objective
+                best_signature = signature
+                best_swaps += len(swaps)
+                ranked = None
+            else:
+                for previous, replacement in reversed(swaps):
+                    for row in replacement.claims:
+                        loads[row] -= 1
+                    loads.update(previous.claims)
+                # With the entire window released, sampling and sorting always
+                # produce the same flight order. A rejected trial cannot change
+                # the next repair, so repeating it does no useful work.
+                if destroy >= window:
+                    exhausted_full_neighborhood = True
+                    break
+            if interrupted:
+                break
+        self.last_round_stats = {
+            "mode": "lns", "n_released": destroy, "n_window": window,
+            "n_swapped_best": best_swaps + joint_stats.get("n_swapped", 0),
+            "n_swapped_sequential": best_swaps,
+            "n_swapped_max": max(try_swaps, default=0),
+            "n_columns": len(self._columns), "n_flights": len(self.flight_ids),
+            "try_objectives": tuple(try_objectives),
+            "try_covered": (len(best),) * len(try_objectives),
+            "n_unique_trial_solutions": len(trial_solutions),
+            "best_objective": best_objective, "deadline_reached": interrupted,
+            "joint_repair": joint_stats, "pool_gap_satisfied": pool_satisfied(),
+            "covered_flights": len(best),
+            "exhausted_full_neighborhood": exhausted_full_neighborhood,
+        }
         return {flight_id: best[flight_id] for flight_id in self.flight_ids if flight_id in best}
 
     def set_heuristic(self, selection: Mapping[int, Column]) -> None:
@@ -1452,11 +1752,11 @@ class RestrictedMaster:
         """Solve the current binary RMP, separating claim rows until it is clean.
 
         ``eager`` materializes every bindable row FIRST (see
-        :meth:`materialize_bindable_rows`), which turns the separation loop from a search into
-        a confirmation. Pass ``eager=False`` for a per-iteration call: these rows persist in
-        ``_materialized``, so carrying the ~95k bindable rows through the column-generation
-        loop would slow every subsequent LP -- the solver's single end-of-run call is the
-        intended user.
+        :meth:`materialize_bindable_rows`), which is what turns the separation loop from a
+        search into a confirmation. Per-round IP now uses this eager preparation too:
+        it pays the row setup once, then carries the rows through later LP solves.
+        ``eager=False`` retains lazy separation for experiments; short IP calls may
+        otherwise spend their budget discovering missing capacity constraints.
 
         Two different clocks, kept separate because materializing is setup, not search:
         ``deadline`` is a hard absolute wall (the whole solve's) that never moves, and
@@ -1507,6 +1807,7 @@ class RestrictedMaster:
         self.last_ip_bound = None
         self.last_ip_status = None
         self.last_ip_optimal = None
+        self.last_ip_trajectory = ()
         original_time_limit_s = self._backend.time_limit_s
         try:
             while True:
@@ -1546,6 +1847,7 @@ class RestrictedMaster:
                 self.last_ip_bound = max(self.last_ip_objective, float(result.upper_bound))
                 self.last_ip_status = result.status
                 self.last_ip_optimal = result.optimal
+                self.last_ip_trajectory = getattr(self._backend, "last_ip_trajectory", ())
                 return selection
         finally:
             self._backend.time_limit_s = original_time_limit_s

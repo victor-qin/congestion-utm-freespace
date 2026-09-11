@@ -5,9 +5,13 @@ departure-shifted copies, and the incumbent it rounds out of that is weak; since
 scale ends on a truncated MILP, that incumbent is also the floor the answer falls back to.
 Seeding from an accepted A* schedule gives the master a stronger start.
 
-This module converts an accepted schedule into master columns that are **mutually
+By default, this module converts an accepted schedule into master columns that are **mutually
 row-feasible**, which is what `solve` needs before it will take them as an incumbent
 rather than as pool contents.  Two things have to happen for that:
+
+The unrepaired option instead keeps every individually valid source column, even if
+the centers conflict under CG rows. They remain pool alternatives; the solver only
+adopts their center selection as an incumbent after checking joint feasibility.
 
 **Translation.**  A*'s corridor centreline is continuous; a column is a lattice path plus a
 departure step.  `intent_to_column` rasterises the centreline onto the axial lattice and
@@ -17,8 +21,8 @@ way to represent at all, and a route that bows outside the flight graph's O-D el
 
 **Repair.**  Snapping to ``dt`` is what makes translation insufficient on its own: two
 flights the ledger cleared at 98.6 s and 101.4 s both round to step 25 and collide on a
-cap-1 row that never existed in the original schedule.  `build` walks flights in flight-id
-order -- FCFS, the same priority A* itself used -- and holds a conflicting column later
+cap-1 row that never existed in the original schedule.  `build` walks flights in
+request-time/flight-id order, matching FCFS, and holds a conflicting column later
 until its claims fit, so an earlier flight keeps its slot and a later one yields.
 
 ``max_shift`` bounds that hold, and it is a SEARCH DEPTH rather than a delay limit: the
@@ -30,8 +34,9 @@ counter.  One step is ``cfg.dt_s``, so the default 8 is 32 s of ground hold at t
 inside `_column_at` -- so raising ``max_shift`` buys more search, not more legal delay.
 Exhausting it drops the flight from the warm start entirely (counted as
 ``dropped (no feasible shift)``, and logged by `batch._build_warm_start`), which costs
-warm-start QUALITY and not correctness: `RestrictedMaster.complete_selection` re-picks
-every dropped flight around the ones that placed.
+warm-start quality rather than correctness. With nominal seeding enabled, the master
+can complete the schedule from that pool; provided-only initialization leaves missing
+flights for pricing and the IP to recover. Setting max_shift=0 disables hold repair.
 """
 
 from __future__ import annotations
@@ -74,6 +79,10 @@ def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
       ``(None, reason)`` naming why the route could not be expressed as a column.
     """
 
+    # Consecutive-cell deduplication below would silently erase a hover and
+    # advance all later arrivals. CG cannot represent that source schedule.
+    if float(getattr(intent, "air_hold_s", 0.0)) > 1e-9:
+        return None, "air hold is not representable"
     radius = hg.circumradius(cfg)
     cells: list[tuple[int, int]] = []
     for point, _t in intent.centerline:
@@ -82,6 +91,8 @@ def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
             cells.append(cell)
     if len(cells) < 2:
         return None, "degenerate path"
+    if len(cells) - 1 > graph.max_air_hops:
+        return None, "path exceeds pricing hop budget"
     departure_step = graph.base_step + int(round(intent.ground_delay_s / cfg.dt_s))
     if not graph.base_step <= departure_step <= graph.latest_departure_step:
         return None, "departure outside graph window"
@@ -104,8 +115,7 @@ def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
         return None, "dest cell mismatch"
     for before, after in zip(cells, cells[1:]):
         if hg.hex_distance(before, after) != 1:
-            # An air hold shows up here: the centreline dwells in one cell and the next
-            # sampled point is not a neighbour.  Nothing in the column model expresses it.
+            # Every cruise transition must be one adjacent-cell hop.
             return None, "path contains a non-neighbour hop"
 
     column = Column(
@@ -128,10 +138,7 @@ def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
         return None, f"translation rejected: {str(exc)[:50]}"
     return replace(
         column,
-        delay_s=model.evaluate(
-            ground_s=translated.ground_delay_s,
-            air_detour_s=translated.air_detour_m / cfg.nominal_speed_mps,
-        ),
+        delay_s=model.intent_cost(translated, cfg),
     ), None
 
 
@@ -186,10 +193,7 @@ def _column_at(intent, graph, cfg: "SimConfig", model, delta: int, base=None):
             return None, f"shifted translation rejected: {str(exc)[:50]}"
         column = replace(
             column,
-            delay_s=model.evaluate(
-                ground_s=translated.ground_delay_s,
-                air_detour_s=translated.air_detour_m / cfg.nominal_speed_mps,
-            ),
+            delay_s=model.intent_cost(translated, cfg),
         )
     try:
         return replace(column, claims=column_claims(column, graph, cfg)), None
@@ -206,12 +210,20 @@ def build(
     *,
     max_shift: int = 8,
     ladder: int = 0,
+    require_joint_feasibility: bool = True,
 ) -> tuple[dict[int, list[Column]], Counter]:
-    """Return ``(seed_columns, stats)`` -- a mutually row-feasible warm start.
+    """Return canonical imports and conversion statistics.
 
-    Flights are repaired in flight-id order, which is FCFS order, so the pass mirrors the
-    priority the source planner itself used: an earlier flight keeps its slot and a later one
-    holds.  ``max_shift`` is how DEEP that hold may search, not how long a flight may legally
+    By default their first columns form a mutually row-feasible warm start.
+    With require_joint_feasibility=False and max_shift=0, retain every individually
+    valid source route unchanged: no greedy conflict filtering or hold repair.
+    Their centers may conflict under CG rows, so the solver must check feasibility
+    before adopting them as an incumbent. They remain useful pool alternatives.
+
+    Flights are repaired in request-time/flight-id order, so the pass mirrors the
+    priority the source planner itself used: an earlier flight keeps its slot and a later
+    one holds.
+    ``max_shift`` is how DEEP that hold may search, not how long a flight may legally
     be held -- each flight is offered ``max_shift + 1`` departures (its translated one, then
     that many successive ``cfg.dt_s`` steps later) and takes the first whose claims fit under
     the running counter.  The legal bound is the graph's ``latest_departure_step`` (from
@@ -224,7 +236,8 @@ def build(
     exactly where the warm start matters most
     (`test_warm_start_max_shift_is_below_the_shared_origin_threshold` pins it).  A dropped
     flight costs warm-start QUALITY, not correctness: the master's `complete_selection`
-    re-picks it around the survivors.
+    re-picks it around the survivors when nominal seeding is enabled. Provided-only mode
+    leaves missing flights for pricing and the IP to recover.
 
     Parameters
     ------------
@@ -234,6 +247,8 @@ def build(
     - model (CostModel): cost weights for each column's ``delay_s``.
     - row_index (RowIndex): supplies each capacity row's ``cap`` during repair.
     - max_shift (int): search depth for the hold, in ``dt`` steps (NOT a delay limit).
+    - require_joint_feasibility (bool): repair/filter imports to fit together; disabling
+      this requires ``max_shift=0`` and keeps individually valid pool alternatives.
     - ladder (int): extra departure-shifted copies of each placed column added to the pool.
       Deliberately NOT checked against the claim counter -- they are LP alternatives, not
       members of the feasible set, so counting them would reserve capacity twice.
@@ -248,13 +263,17 @@ def build(
         raise ValueError("max_shift must be non-negative")
     if ladder < 0:
         raise ValueError("ladder must be non-negative")
+    if not require_joint_feasibility and max_shift:
+        raise ValueError("unrepaired imports require max_shift=0")
 
     loads: Counter = Counter()
     seed_columns: dict[int, list[Column]] = {}
     stats: Counter = Counter()
     shifts: list[int] = []
 
-    for flight_id in sorted(accepted):
+    for flight_id in sorted(
+        accepted, key=lambda fid: accepted[fid].request.sort_key()
+    ):
         graph = graphs.get(flight_id)
         if graph is None:
             stats["no graph"] += 1
@@ -275,7 +294,9 @@ def build(
                         stats[f"unconvertible: {why}"] += 1
                         break
                     continue
-                if any(loads[row] + 1 > row_index.cap(row) for row in column.claims):
+                if require_joint_feasibility and any(
+                    loads[row] + 1 > row_index.cap(row) for row in column.claims
+                ):
                     continue
                 placed = (delta, column)
                 break

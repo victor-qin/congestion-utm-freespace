@@ -26,9 +26,12 @@ from array import array
 
 import numpy as np
 
+from ...config import SimConfig
 from ...cost import endpoint_altitude_change_m, trajectory_cost
+from ...ledger import ReservationLedger
 from ...types import (
     DenialReason,
+    FlightRequest,
     IntentStatus,
     OperationalIntent,
     TimedPoint,
@@ -697,7 +700,7 @@ class SIPPPlanner(AStarPlanner):
         sidx.evict_before(int(wm // cfg.dt_s))
         return sidx
 
-    def plan(self, req, ledger, cfg):
+    def plan(self, req: FlightRequest, ledger: ReservationLedger, cfg: SimConfig) -> OperationalIntent:
         """Plan one flight: dispatch to the compiled safe-interval kernel, else the reference.
 
         Falls back to the pure-Python reference when numba is absent, legacy-terminal folding is

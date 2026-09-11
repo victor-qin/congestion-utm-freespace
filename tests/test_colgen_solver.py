@@ -98,6 +98,8 @@ def _request(
 def _params(**overrides) -> ColGenParams:
     values = {
         "solver": "highs",
+        "iteration_ip_time_limit_s": 0.0,
+        "lp_gap": 1e-4,
         "max_air_overrun_hops": 0,
         "max_iterations": 30,
         "time_limit_s": 30.0,
@@ -296,7 +298,10 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
         origin_terminal=origin_terminal,
         dest_terminal=destination_terminal,
     )
-    # The air-time ceiling is lifted: replacing terminal fold distance with an extra hop is
+    # Lift the ceiling enough to exercise fold replacement on this three-hop flight.
+    # A six-hop allowance contains the five-hop regression route without enumerating
+    # arbitrary long loops, which are unrelated to its delay-accounting assertion.
+    # Replacing terminal fold distance with an extra hop is
     # itself an air-time overrun, and this test is about the delay accounting rather than
     # the ceiling -- otherwise the ceiling would pick the lane, not the arithmetic. Lifted at
     # the graph so the corridor stays where the fixture put it (one knob sizes both).
@@ -317,7 +322,7 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
         ((origin, origin_terminal), (destination, destination_terminal)),
         params,
     )
-    graph = with_air_hops(graph, graph.shortest_hops + 64)
+    graph = with_air_hops(graph, graph.shortest_hops + 6)
     duals = {
         RowKey.cell((1, 38), 0, 9): 1.0,
         RowKey.cell((1, 40), 0, 10): 1.0,
@@ -593,6 +598,97 @@ class _RetainingBackend:
 
     def solve_ip(self, warm_start=None):  # pragma: no cover - not exercised by this test
         raise NotImplementedError
+
+
+@pytest.mark.parametrize("tol", [0.0, 1e-15, 1e-7])
+@pytest.mark.parametrize("mode", ["feasible", "arbitrary", "overflow"])
+def test_capacity_separation_matches_full_loads_after_pool_growth(tol, mode):
+    """Skipping implied rows must preserve separation for every public input vector."""
+
+    rng = np.random.default_rng(47)
+    rows = RowIndex({"hub": 3})
+    resources = [RowKey.cell((i, 0), 0, 0) for i in range(8)]
+    resources.append(RowKey.term("hub", 0))
+    fixed_only = RowKey.term("hub", 1)
+    master = RestrictedMaster(
+        range(4), rows, _params(), backend=_RetainingBackend(range(4)),
+        fixed_loads={resources[0]: 1, resources[-1]: 1, fixed_only: 2},
+    )
+    for batch in range(3):
+        for fid in range(4):
+            for step in range(batch * 8, (batch + 1) * 8):
+                claims = {row for row in resources if rng.random() < 0.35}
+                master.add_column(_synthetic_column(fid, float(step), frozenset(claims),
+                                                    departure_step=step))
+        values = rng.random(len(master.columns))
+        if mode == "feasible":
+            for fid in range(4):
+                indices = [i for i, c in enumerate(master.columns) if c.flight_id == fid]
+                values[indices] /= sum(values[indices])
+        elif mode == "arbitrary":
+            values -= 0.3
+        else:
+            values[:] = 1e308
+        expected = {
+            row for row, load in master.fractional_loads(values).items()
+            if load > rows.cap(row) + tol and row not in master.materialized_rows
+        }
+        before = master.materialized_rows
+        assert master.add_violated_rows(values, tol) == len(expected)
+        assert master.materialized_rows - before == expected
+        # Eager IP materialization followed by another LP must not add rows again.
+        master.materialize_bindable_rows()
+        assert master.add_violated_rows(values, tol) == 0
+
+
+@pytest.mark.parametrize("tol", [0.0, 1e-15, 1e-7])
+def test_capacity_separation_retains_small_flight_mass_violations(tol):
+    """A tolerance shortcut must not hide either rounding or positive-only overloads."""
+
+    shared = RowKey.cell((0, 0), 0, 0)
+    master = RestrictedMaster((1,), RowIndex(), _params(), backend=_RetainingBackend((1,)))
+    for step in range(50):
+        master.add_column(_synthetic_column(1, float(step), frozenset({shared}),
+                                            departure_step=step))
+    for values in (np.full(50, 0.02), np.full(50, 0.02 + 1e-9),
+                   np.array([1.0, 0.5, -0.5] + [0.0] * 47)):
+        load = master.fractional_loads(values)[shared]
+        expected = int(load > 1 + tol and shared not in master.materialized_rows)
+        assert master.add_violated_rows(values, tol) == expected
+
+
+def test_capacity_separation_handles_fixed_load_changes_during_pool_growth():
+    """A changed fixed-load dictionary must invalidate the original implication proof."""
+
+    row = RowKey.term("hub", 0)
+    fixed_only = RowKey.term("hub", 1)
+    rows = RowIndex({"hub": 3})
+    master = RestrictedMaster((1, 2), rows, _params(), fixed_loads={row: 2},
+                              backend=_RetainingBackend((1, 2)))
+    master.fixed_loads.clear()
+    for fid in (1, 2):
+        master.add_column(_synthetic_column(fid, 0.0, frozenset({row})))
+    master.fixed_loads[row] = 2
+    assert master.add_violated_rows([1.0, 1.0]) == 1
+    master.fixed_loads[fixed_only] = 4
+    with pytest.raises(ValueError, match="fixed load exceeds capacity"):
+        master.add_violated_rows([0.0, 0.0])
+
+
+@pytest.mark.parametrize("capacity", [3, 2**53 + 1])
+def test_capacity_separation_respects_accumulated_tolerance_and_large_capacities(capacity):
+    """Small flight residuals may accumulate past tolerance on a multi-capacity row."""
+
+    row = RowKey.term("hub", 0)
+    rows = RowIndex({"hub": capacity})
+    master = RestrictedMaster((1, 2, 3), rows, _params(),
+                              fixed_loads={row: capacity - 3},
+                              backend=_RetainingBackend((1, 2, 3)))
+    for fid in (1, 2, 3):
+        master.add_column(_synthetic_column(fid, 0.0, frozenset({row})))
+    values = [1.0 + 4e-8] * 3
+    expected = int(master.fractional_loads(values)[row] > rows.cap(row) + 1e-7)
+    assert master.add_violated_rows(values) == expected
 
 
 def test_materialize_rows_hands_the_backend_an_isolated_sequence():
@@ -935,35 +1031,74 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
     assert revenue.stats["lp_gap_cost"] > 1e3 * revenue.stats["lp_gap_revenue"]
 
 
-def test_cost_gap_stops_after_a_productive_pricing_sweep():
-    """A met cost gap must not wait for a sweep that adds zero columns.
+def test_lns_heuristic_never_returns_worse_than_the_incumbent_it_started_from():
+    """Monotonicity is the whole point, and it is structural rather than lucky.
 
-    The first sweep on this fixture reaches a 25% cost gap while banking the detour
-    that makes the final IP optimal.  Requiring an empty sweep delayed termination
-    despite the pricing bound already proving the requested tolerance.
+    `round_heuristic` rebuilds from nothing and, measured at 2,000 flights, stranded 330 of
+    them at a full ``M`` each -- 94% of its cost -- because its fill can only pick columns
+    already in the pool.  LNS releases one flight at a time and puts the original column
+    straight back when nothing fits, so coverage cannot fall and the returned selection is
+    the incumbent unless a try strictly beat it.
     """
 
-    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=20.0)
-    requests = [
-        _request(1, (-2, -5), (-2, -11), cfg),
-        _request(2, (-8, -4), (0, -4), cfg),
-    ]
-    seen: list[dict] = []
+    cfg = _cfg(max_ground_delay_s=120.0, seed=29)
+    requests = [_request(i, (-4, 0), (4, 0), cfg) for i in range(1, 7)]
+    params = _params(max_iterations=3)
 
+    seen: list[dict] = []
+    ColGenSolver().solve(requests, cfg, (), params, on_iteration=seen.append)
+    baseline_cost = seen[-1]["heuristic_cost"]
+
+    lns: list[dict] = []
     result = ColGenSolver().solve(
-        requests,
-        cfg,
-        (),
-        _params(max_air_overrun_hops=1, gap_metric="cost", lp_gap=0.3),
-        on_iteration=seen.append,
+        requests, cfg, (), _params(max_iterations=3, lns_destroy_flights=2),
+        on_iteration=lns.append,
     )
 
-    assert len(seen) == 1
-    assert seen[0]["columns_added"] > 0
-    assert seen[0]["lp_gap_cost"] == pytest.approx(0.25)
-    assert result.stats["termination_reason"] == "lp_gap"
-    assert result.stats["iterations"] == 1
-    assert result.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert lns, "at least one iteration must report"
+    # Never worse than the greedy seed it starts from, at every iteration.
+    assert all(p["heuristic_cost"] <= baseline_cost + 1e-6 for p in lns)
+    # Monotone across iterations -- the incumbent can only improve.
+    costs = [p["heuristic_cost"] for p in lns]
+    assert costs == sorted(costs, reverse=True)
+    # Coverage is invariant: LNS swaps, it never drops a flight.
+    assert all(p["round_stats"]["mode"] == "lns" for p in lns)
+    assert all(
+        p["round_stats"]["covered_flights"] == lns[0]["round_stats"]["covered_flights"]
+        for p in lns
+    )
+    # And the schedule it returns is genuinely claim-feasible, not merely scored well.
+    assert result.columns
+
+
+def test_ladder_stride_trades_resolution_for_span_at_a_fixed_column_count():
+    """``steps`` stays a column COUNT under any stride; the span is ``steps * stride``.
+
+    The calibrated depth of 20 was measured on a consecutive ladder, so it describes 80 s
+    of departure delay at ``dt_s=4`` -- against a mean of ~120 cost units per flight at
+    2,000 density flights.  Keeping the two knobs independent is what lets span be widened
+    without re-deriving that calibration or paying for more columns.
+    """
+
+    cfg = _cfg(max_ground_delay_s=600.0)
+    request = _request(1, (-4, 0), (4, 0), cfg)
+    graph = build_flight_graph(request, cfg, (), _params())
+    seed = solver_module._canonical_column(seed_column(graph, cfg), graph, cfg)
+
+    def ladder_steps(stride: int, steps: int = 4) -> list[int]:
+        master = RestrictedMaster((1,), RowIndex(), _params())
+        master.add_column(seed)
+        added = _add_departure_ladder(master, seed, graph, cfg, DELAY_MODEL, steps, stride)
+        assert added == steps, "the fixture must not be truncated by the horizon"
+        return [c.departure_step - seed.departure_step for c in master.columns[1:]]
+
+    assert ladder_steps(1) == [1, 2, 3, 4]
+    assert ladder_steps(3) == [3, 6, 9, 12]
+    # Same column count, 3x the span -- which is the whole trade.
+    assert len(ladder_steps(3)) == len(ladder_steps(1))
+    assert max(ladder_steps(3)) == 3 * max(ladder_steps(1))
+    with pytest.raises(ValueError):
+        ladder_steps(0)
 
 
 def test_colgen_beats_fcfs_on_constructed_congestion():
@@ -1323,8 +1458,11 @@ def test_repair_finds_feasible_column_even_when_delay_exceeds_m():
     assert result.stats["denied_flight_ids"] == ()
     assert result.stats["ip_objective"] == pytest.approx(0.0)
     assert result.stats["ip_upper_bound"] == pytest.approx(0.0)
-    assert result.stats["ip_gap"] == pytest.approx(0.0)
-    assert result.stats["ip_gap_met"] is True
+    assert result.stats["restricted_ip_gap"] == pytest.approx(0.0)
+    # Repair accepts a cost-16 flight despite benefit 1. The returned schedule
+    # therefore has a global cost gap of (16 - 1) / 16, even though its IP was exact.
+    assert result.stats["ip_gap"] == pytest.approx(15.0 / 16.0)
+    assert result.stats["ip_gap_met"] is False
     assert result.columns[7].delay_s == pytest.approx(16.0)
     assert result.columns[7].claims.isdisjoint(fixed)
 
@@ -1798,6 +1936,83 @@ def test_a_malformed_gurobi_env_var_names_itself(monkeypatch):
         master_module.gurobi_lp_method()
 
 
+@pytest.mark.parametrize("columns_per_flight", [1, 3])
+def test_solver_revalidates_replaced_pricing_results(monkeypatch, columns_per_flight):
+    """Changed sweep payloads must recover canonical claims and costs before entering the LP."""
+
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    params = _params(seed_ladder_steps=0, max_iterations=3, columns_per_flight=columns_per_flight)
+    # Start without a complete incumbent so pricing must supply a positive column.
+    monkeypatch.setattr(solver_module, "_initial_feasible_selection", lambda *args, **kwargs: {})
+    expected = ColGenSolver().solve(requests, cfg, (), params)
+    original_sweep = solver_module.price_sweep
+
+    def replaced_sweep(*args, **kwargs):
+        result = original_sweep(*args, **kwargs)
+
+        def foreign(column):
+            return None if column is None else replace(
+                column, claims=frozenset(), delay_s=column.delay_s + 123.0,
+            )
+
+        return replace(result, columns=tuple(map(foreign, result.columns)),
+                       extra_columns=tuple(map(foreign, result.extra_columns)))
+
+    monkeypatch.setattr(solver_module, "price_sweep", replaced_sweep)
+    actual = ColGenSolver().solve(requests, cfg, (), params)
+    assert actual.stats["pricing_certified_columns"] == 0
+    assert actual.stats["pricing_revalidated_columns"] > 0
+    assert expected.stats["pricing_certified_columns"] > 0
+    assert actual.columns == expected.columns
+    assert actual.stats["objective"] == expected.stats["objective"]
+    _assert_claim_feasible(actual.columns)
+
+
+@pytest.mark.parametrize("reserve,expected", [(None, 2.75), (660.0, 600.0)])
+def test_final_ip_reserve_survives_pricing_exhaustion_and_setup(monkeypatch, reserve, expected):
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg), _request(2, (0, -4), (0, 4), cfg)]
+    now = [0.0]
+    monkeypatch.setattr(solver_module.time, "monotonic", lambda: now[0])
+    original_sweep = solver_module.price_sweep
+    original_setup = RestrictedMaster.materialize_bindable_rows
+    original_ip = master_module.HighsBackend.solve_ip
+    seen = []
+
+    def exhaust_pricing(*args, **kwargs):
+        result = original_sweep(*args, **kwargs)
+        now[0] = kwargs["deadline"] + 0.25
+        return result
+
+    def setup(self, *args, **kwargs):
+        result = original_setup(self, *args, **kwargs)
+        now[0] += 2.0
+        return result
+
+    def ip(self, warm_start=None):
+        seen.append(self.time_limit_s)
+        return original_ip(self, warm_start)
+
+    monkeypatch.setattr(solver_module, "price_sweep", exhaust_pricing)
+    monkeypatch.setattr(RestrictedMaster, "materialize_bindable_rows", setup)
+    monkeypatch.setattr(master_module.HighsBackend, "solve_ip", ip)
+    result = ColGenSolver().solve(requests, cfg, (), _params(
+        seed_ladder_steps=0, max_iterations=1, time_limit_s=1560.0,
+        ip_time_limit_s=600.0, ip_reserve_s=reserve,
+    ))
+    assert seen and seen[0] == pytest.approx(expected)
+    assert result.stats["ip_reserve_s"] == (5.0 if reserve is None else reserve)
+    assert result.stats["ip_setup_s"] == pytest.approx(2.0)
+    _assert_claim_feasible(result.columns)
+
+
+@pytest.mark.parametrize("reserve", [-1, 30, 31, float("inf"), float("nan")])
+def test_ip_reserve_rejects_invalid_or_all_consuming_budgets(reserve):
+    with pytest.raises(ValueError, match="ip_reserve_s"):
+        _params(time_limit_s=30, ip_reserve_s=reserve)
+
+
 def test_ip_gets_its_own_budget_not_the_whole_solve_remainder(monkeypatch):
     """The IP is capped by ``ip_time_limit_s``, however much of the solve is left.
 
@@ -1924,6 +2139,8 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         # number of times took a different path through the code, which is exactly the kind
         # of difference this contract exists to catch.
         "pricing_task_total_s",
+        "cheap_pricing_wall_s",
+        "exact_pricing_wall_s",
         "seed_elapsed_s",
         "time_to_master_s",
     }

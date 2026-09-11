@@ -11,6 +11,8 @@ runlogs/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+.context/
+.agent/CONTINUITY.md
 .claude/settings.local.json
 
 results/supercloud

@@ -21,7 +21,7 @@ What has to be reproduced exactly, and why each is here:
     ``visit_cost`` is a *subtraction of two prefix sums* and ``row_cost`` is a *stored
     value*: deriving the second from the first is the one shortcut that is not available,
     since ``(a + v) - a != v``.
-``_path_cmp`` / ``_tie_lt`` / ``_prefer``
+``_path_cmp_equal_depth`` / ``_path_cmp`` / ``_tie_lt`` / ``_prefer``
     The reference's dominance rule compares scores within ``_SCORE_EPS`` and breaks ties on
     ``(hops, departure_step, lane, path)`` -- the whole path, lexicographically from its
     root.  That epsilon band makes ``_prefer`` **non-transitive**, so insertion order is
@@ -447,9 +447,8 @@ def _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b):
     interned index, which :func:`~.dp_prepare.prepare_topology` assigns in **sorted axial
     order**, so index order is the ``Cell`` tuple order the reference compares.
 
-    Only reached on an exact tie of ``(cell, recent, hops, departure_step, lane)``, so its
-    O(hops) walk is off the hot path; correctness here decides which of two equally scored
-    columns is returned.
+    This general comparison also handles unequal path lengths in the feasible-search
+    frontier. The pricing DP's equal-hop ties use :func:`_path_cmp_equal_depth` instead.
 
     Parameters
     ------------
@@ -479,6 +478,30 @@ def _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b):
     if n_a > n_b:
         return 1
     return 0
+
+
+@njit(cache=True, nogil=True)
+def _path_cmp_equal_depth(a, b, label_parent, label_cell):
+    """Compare equal-length paths exactly without materializing either parent chain.
+
+    Walking toward the root visits differences in reverse lexicographic priority, so
+    every unequal cell replaces the previous verdict. The last difference encountered
+    is the earliest one in the paths. A shared label ID ends the walk because its entire
+    parent chain is identical; equal cell IDs alone cannot justify that shortcut.
+
+    Callers must establish equal hop counts. Accepted parent labels are immutable, and
+    each parent removes one hop, so both walks reach their shared node or -1 together.
+    """
+
+    order = 0
+    while a != b:
+        if label_cell[a] < label_cell[b]:
+            order = -1
+        elif label_cell[a] > label_cell[b]:
+            order = 1
+        a = label_parent[a]
+        b = label_parent[b]
+    return order
 
 
 @njit(cache=True, nogil=True)
@@ -514,7 +537,7 @@ def _tie_lt(
         return label_departure[a] < label_departure[b]
     if label_lane[a] != label_lane[b]:
         return label_lane[a] < label_lane[b]
-    return _path_cmp(a, b, label_parent, label_cell, scratch_a, scratch_b) < 0
+    return _path_cmp_equal_depth(a, b, label_parent, label_cell) < 0
 
 
 @njit(cache=True, nogil=True)
@@ -590,8 +613,8 @@ def _mix(value, log2cap):
 
 
 @njit(cache=True, nogil=True)
-def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
-    """Hash the reference's dominance key: ``(cell, recent, origin_paid_rows, first_hop)``.
+def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b, hops):
+    """Hash the reference's dominance key: ``(cell, recent, origin_paid_rows, first_hop, hops)``.
 
     ``step`` is deliberately absent: it is the *layer*, and the table is layer-local.
     Folding it into the key instead would let two labels at different steps share a slot
@@ -622,6 +645,7 @@ def _state_hash(cell, recent, n_recent, paid_class, first_a, first_b):
     h = (h ^ np.uint64(paid_class + 1)) * np.uint64(0x100000001B3)
     h = (h ^ np.uint64(first_a + 1)) * np.uint64(0x100000001B3)
     h = (h ^ np.uint64(first_b + 1)) * np.uint64(0x100000001B3)
+    h = (h ^ np.uint64(hops + 1)) * np.uint64(0x100000001B3)
     return h
 
 
@@ -834,8 +858,8 @@ def _sort_layer(
 @njit(cache=True, nogil=True)
 def _state_find(
     slot_label, slot_hash, log2cap, key_hash, depth,
-    cell, recent, n_recent, paid_class, first_a, first_b,
-    label_cell, label_parent, label_variant, var_paid_class,
+    cell, recent, n_recent, paid_class, first_a, first_b, hops,
+    label_cell, label_parent, label_hops, label_variant, var_paid_class,
     label_first_a, label_first_b, probe_recent,
 ):
     """Locate the slot for one dominance key: its occupant, or the first free slot.
@@ -889,6 +913,7 @@ def _state_find(
         if (
             slot_hash[slot] == key_hash
             and label_cell[occupant] == cell
+            and label_hops[occupant] == hops
             and label_first_a[occupant] == first_a
             and label_first_b[occupant] == first_b
             and var_paid_class[label_variant[occupant]] == paid_class
@@ -1402,11 +1427,11 @@ def _seed_layer(
         label_first_a[label] = -1
         label_first_b[label] = -1
         recent_a[0] = cell
-        key_hash = _state_hash(cell, recent_a, 1, paid_class, -1, -1)
+        key_hash = _state_hash(cell, recent_a, 1, paid_class, -1, -1, 0)
         slot, found = _state_find(
             tbl_label, tbl_hash, log2cap, key_hash, depth,
-            cell, recent_a, 1, paid_class, -1, -1,
-            label_cell, label_parent, label_variant, var_paid_class,
+            cell, recent_a, 1, paid_class, -1, -1, 0,
+            label_cell, label_parent, label_hops, label_variant, var_paid_class,
             label_first_a, label_first_b, probe_recent,
         )
         if slot < 0:
@@ -1893,13 +1918,13 @@ def _price_dag(
                         n_next += 1
                     key_hash = _state_hash(
                         neighbour, recent_b, n_next, paid_class,
-                        label_first_a[nxt], label_first_b[nxt],
+                        label_first_a[nxt], label_first_b[nxt], hops + 1,
                     )
                     slot, found = _state_find(
                         nxt_label, nxt_hash, log2cap, key_hash, depth,
                         neighbour, recent_b, n_next, paid_class,
-                        label_first_a[nxt], label_first_b[nxt],
-                        label_cell, label_parent, label_variant, var_paid_class,
+                        label_first_a[nxt], label_first_b[nxt], hops + 1,
+                        label_cell, label_parent, label_hops, label_variant, var_paid_class,
                         label_first_a, label_first_b, probe_recent,
                     )
                     if slot < 0:
@@ -3418,7 +3443,7 @@ def warm_kernel() -> bool:
     )
     recent_a = np.zeros(2, np.int32)
     recent_b = np.zeros(2, np.int32)
-    key_hash = np.uint64(_state_hash(0, recent_a, 1, 0, -1, -1))
+    key_hash = np.uint64(_state_hash(0, recent_a, 1, 0, -1, -1, 0))
     _mix(key_hash, 8)
     _fill_recent(0, 2, parent, cell, recent_a)
     _recent_cmp(recent_a, 1, recent_b, 1)
@@ -3431,7 +3456,7 @@ def warm_kernel() -> bool:
     )
     _state_find(
         np.full(2, -1, np.int32), np.zeros(2, np.uint64), 1, key_hash, 2,
-        0, recent_a, 1, 0, -1, -1, cell, parent, zeros_i, zeros_i,
+        0, recent_a, 1, 0, -1, -1, 0, cell, parent, zeros_i, zeros_i, zeros_i,
         parent, parent, recent_b,
     )
     _paid_visit_correction(

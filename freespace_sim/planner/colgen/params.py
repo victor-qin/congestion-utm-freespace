@@ -29,10 +29,9 @@ class ColGenParams:
 
     # THE knob that sizes the pricing search, and it is one degree of freedom doing two jobs:
     # how far over the LATTICE geodesic a priced route may fly (in hops; one hop = `dt_s` of air
-    # time), and the radius of the spatial O-D ellipse the flight is priced over. The second
-    # follows from the first -- a route within `shortest + overrun` hops can only touch cells
-    # inside the ellipse of that radius -- so the hop budget is primary and the corridor is
-    # derived, not an independent choice.
+    # time), and the spatial corridor derived from that budget. Terminal-lane corridors
+    # account for their fixed prefixes/suffixes and envelope the remaining endpoint paths;
+    # the corridor is derived, not an independent choice.
     #
     # ABSOLUTE, not a fraction of the flight length: every flight gets the same room to route
     # around a busy cell regardless of distance, where a fractional cap is harshest exactly
@@ -44,7 +43,7 @@ class ColGenParams:
     # suboptimal -- a route needing more than this is unreachable even if optimal -- so this is
     # the first knob to widen (`--colgen-max-air-overrun`) if a congested scenario denies
     # flights pricing ought to place, and the dominant term in how much search a sweep does.
-    max_air_overrun_hops: int = 3
+    max_air_overrun_hops: int = 6
     # Gurobi by default, NOT "auto": "auto" falls back to HiGHS silently when gurobipy is
     # missing, and the backend is answer-affecting (Gurobi's duals can close the revenue gap at
     # iteration 1 where HiGHS runs many more). "gurobi" raises instead, naming the missing
@@ -54,6 +53,16 @@ class ColGenParams:
     # silent fall-back.
     solver: str = "gurobi"
     max_iterations: int = 30
+    # Flights released per LNS try; zero retains the rounding heuristic.
+    lns_destroy_flights: int = 0
+    # Before sequential swaps, jointly repair the most LP-disagreed neighborhood.
+    # Budget includes construction; 0 retains the original sequential-only heuristic.
+    lns_joint_time_limit_s: float = 0.5
+    # Default: replace rounding/LNS with a full-pool IP after each completed pricing round.
+    # Zero disables it. Each call is bounded by the pricing deadline so the final
+    # IP reserve remains available; feasible improvements seed the next round.
+    iteration_ip_time_limit_s: float = 30.0
+    iteration_ip_eager: bool = True
     # Best-effort whole-solve wall budget (20 min). The old 120 s default could not finish a
     # single pricing sweep on a real instance and reported `time_limit` with a heuristic-only
     # schedule. `ip_reserve_s = min(5, 0.05 * t)` is already at its cap here, so the tail left
@@ -68,6 +77,11 @@ class ColGenParams:
     # claim-feasible (just uncertified) schedule. Composes with `ip_reserve_s`: that is how much
     # pricing holds back, this is how long the IP may then run.
     ip_time_limit_s: float = 120.0
+    # Whole-solve seconds held back from preprocessing, LPs and pricing for the final IP
+    # stage. None preserves the legacy min(5, 5% of time_limit_s) reserve. This includes
+    # IP setup and separation, so reserve more than ip_time_limit_s when the full native
+    # search allowance is required. The whole-solve deadline remains authoritative.
+    ip_reserve_s: float | None = None
     # Ceiling on rows the final IP may pre-materialize, or None for no ceiling (the shipped
     # default, and the behaviour measured throughout this PR).
     # `RestrictedMaster.materialize_bindable_rows` is all-or-nothing: over the bound it
@@ -75,7 +89,7 @@ class ColGenParams:
     # worst of both. Worth having reachable because eager materialization scales WITH the pool,
     # so a denser pool than any measured here would otherwise have no brake.
     max_eager_ip_rows: int | None = None
-    lp_gap: float = 1e-4
+    lp_gap: float = 1e-3
     ip_gap: float = 1e-3
     # Revenue per served flight in the set-packing objective `sum (M - delay_s) x`. Its only
     # requirement is that serving beats denying (`M > max delay_s`); everything above that is
@@ -117,10 +131,24 @@ class ColGenParams:
     # plus colgen refinement" -- a different, weaker claim -- with no way to tell archived runs
     # apart. Reported in `stats` for the same reason.
     warm_start_planner: str | None = None
+    # False starts from supplied columns only: no nominal-route construction,
+    # departure ladder, or greedy nominal-route scheduling pass. Pricing may
+    # still generate nominal routes later. The solve requires supplied columns.
+    seed_nominal_routes: bool = True
+    # For each supplied flight's first column, add up to this many departure
+    # steps on EACH side, clipped to the graph's legal departure window.
+    # Zero leaves provided columns unchanged; 10 offers up to 20 alternatives.
+    provided_seed_ladder_steps: int = 0
+    # Extra departure steps allowed when fitting translated warm-start routes.
+    # Zero preserves translated departures; provided-only mode leaves joint
+    # conflicts to the IP instead of filtering or repairing the imports.
+    warm_start_max_shift_steps: int = 8
     # Pure clock translations of each flight's seed, offered to the master before the first LP.
     # A shift is arithmetic, not a search, and pricing otherwise spends its early iterations
     # rediscovering exactly these. See :func:`solver._add_departure_ladder`; 0 disables.
     seed_ladder_steps: int = 20
+    # Spacing between departure alternatives in lattice steps.
+    seed_ladder_stride: int = 1
     # Wall clock for the post-first-LP greedy, PER FLIGHT. NOW 0, WHICH DISABLES THE STAGE. The
     # stage's cutoff is measurably worthless: it produces `best_heuristic`, handed to pricing as
     # the `known_column` each subproblem prunes against, whose reduced cost `entry_rc` is exactly
@@ -148,6 +176,11 @@ class ColGenParams:
     # while chunking costs load balance (pre-partitioned chunks leave nothing to rebalance a
     # straggler against). Kept configurable so the claim stays measurable.
     pricing_chunksize: int = 1
+    # Experimental restricted pricing: search only bootstrap_roots promising starts.
+    # Its reduced costs are achievable scores, never global bounds. Full pricing
+    # runs every N rounds, on cheap stagnation, and on the last allowed round.
+    cheap_pricing: bool = False
+    exact_pricing_interval: int = 5
     # How many ROOTS the pricing BOOTSTRAP searches before the real search, in descending order
     # of `PreparedVariants.score`; 0 disables. A root is one `(departure_step, origin lane)`
     # pair. Ranked rather than truncated to a departure prefix, which would miss an optimum that
@@ -169,6 +202,16 @@ class ColGenParams:
     # prune, because the bootstrap returns an incumbent and the main search still fans over
     # every root.
     bootstrap_ranking: str = "bound"
+    # A* supplies a quick candidate; restricted DP still refines it before full pricing.
+    bootstrap_method: str = "astar"
+    bootstrap_max_labels: int = 20000
+    # Additional certified surviving sinks, not an exhaustive k-best route search.
+    columns_per_flight: int = 1
+
+    @property
+    def effective_ip_reserve_s(self) -> float:
+        return (min(5.0, 0.05 * self.time_limit_s) if self.ip_reserve_s is None
+                else self.ip_reserve_s)
 
     def __post_init__(self) -> None:
         """Normalize and validate every field after construction, raising on bad input.
@@ -182,6 +225,16 @@ class ColGenParams:
         - output (None): coerces fields via ``object.__setattr__``; raises ``TypeError`` on a
           wrong-typed field or ``ValueError`` on an out-of-range one.
         """
+        if self.bootstrap_method not in {"astar", "dp"}:
+            raise ValueError("bootstrap_method must be 'astar' or 'dp'")
+        for name in ("bootstrap_max_labels", "columns_per_flight"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            value = operator.index(value)
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            object.__setattr__(self, name, value)
         if isinstance(self.max_air_overrun_hops, bool):
             raise TypeError("max_air_overrun_hops must be an integer")
         try:
@@ -204,6 +257,40 @@ class ColGenParams:
                 f"ip_time_limit_s must be finite and positive, got {self.ip_time_limit_s!r}"
             )
         object.__setattr__(self, "ip_time_limit_s", ip_limit)
+
+        for name in ("iteration_ip_eager", "cheap_pricing", "seed_nominal_routes"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+        if isinstance(self.warm_start_max_shift_steps, bool):
+            raise TypeError("warm_start_max_shift_steps must be an integer")
+        try:
+            warm_shift = operator.index(self.warm_start_max_shift_steps)
+        except TypeError as exc:
+            raise TypeError("warm_start_max_shift_steps must be an integer") from exc
+        if warm_shift < 0:
+            raise ValueError("warm_start_max_shift_steps must be non-negative")
+        object.__setattr__(self, "warm_start_max_shift_steps", warm_shift)
+        if isinstance(self.provided_seed_ladder_steps, bool):
+            raise TypeError("provided_seed_ladder_steps must be an integer")
+        try:
+            provided_steps = operator.index(self.provided_seed_ladder_steps)
+        except TypeError as exc:
+            raise TypeError("provided_seed_ladder_steps must be an integer") from exc
+        if provided_steps < 0:
+            raise ValueError("provided_seed_ladder_steps must be non-negative")
+        object.__setattr__(self, "provided_seed_ladder_steps", provided_steps)
+        interval = self.exact_pricing_interval
+        if isinstance(interval, bool):
+            raise TypeError("exact_pricing_interval must be an integer")
+        interval = operator.index(interval)
+        if interval < 1:
+            raise ValueError("exact_pricing_interval must be positive")
+        object.__setattr__(self, "exact_pricing_interval", interval)
+
+        iteration_ip_limit = float(self.iteration_ip_time_limit_s)
+        if not math.isfinite(iteration_ip_limit) or iteration_ip_limit < 0.0:
+            raise ValueError("iteration_ip_time_limit_s must be finite and non-negative")
+        object.__setattr__(self, "iteration_ip_time_limit_s", iteration_ip_limit)
 
         # None is "no ceiling", distinct from 0 ("never materialize eagerly", a way to pin the
         # old lazy separation loop for an A/B). Both are reachable, so reject only negatives and
@@ -288,6 +375,20 @@ class ColGenParams:
             raise ValueError("pricing_chunksize must be positive")
         object.__setattr__(self, "pricing_chunksize", chunksize)
 
+        if isinstance(self.lns_destroy_flights, bool):
+            raise TypeError("lns_destroy_flights must be an integer")
+        try:
+            destroy = operator.index(self.lns_destroy_flights)
+        except TypeError as exc:
+            raise TypeError("lns_destroy_flights must be an integer") from exc
+        if destroy < 0:
+            raise ValueError("lns_destroy_flights must be non-negative")
+        object.__setattr__(self, "lns_destroy_flights", destroy)
+        joint_budget = float(self.lns_joint_time_limit_s)
+        if not math.isfinite(joint_budget) or joint_budget < 0:
+            raise ValueError("lns_joint_time_limit_s must be finite and non-negative")
+        object.__setattr__(self, "lns_joint_time_limit_s", joint_budget)
+
         if isinstance(self.bootstrap_roots, bool):
             raise TypeError("bootstrap_roots must be an integer")
         try:
@@ -341,6 +442,16 @@ class ColGenParams:
 
         if self.time_limit_s <= 0.0:
             raise ValueError("time_limit_s must be positive")
+        if self.ip_reserve_s is not None:
+            if isinstance(self.ip_reserve_s, bool):
+                raise TypeError("ip_reserve_s must be a real number or None")
+            try:
+                reserve = float(self.ip_reserve_s)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("ip_reserve_s must be a real number or None") from exc
+            if not math.isfinite(reserve) or not 0 <= reserve < self.time_limit_s:
+                raise ValueError("ip_reserve_s must be finite and in [0, time_limit_s)")
+            object.__setattr__(self, "ip_reserve_s", reserve)
         if not 0.0 <= self.lp_gap < 1.0:
             raise ValueError("lp_gap must be in [0, 1)")
         if not 0.0 <= self.ip_gap < 1.0:

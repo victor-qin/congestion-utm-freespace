@@ -98,7 +98,7 @@ reserved; `colgen` instead solves the whole schedule at once.
 | `astar_heading_shortcut` | `OperationalIntent`-equivalent legacy ordering; skips same-heading probes only when reservation sampling is exactly unchanged (the run config retains the distinct public planner name) |
 | `astar_batched_shortcut` | experimental A\* shortcut: seed at 3D turns, then batch maximal straight runs for A/B evaluation |
 | `astar_milp_shortcut` | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |
-| `colgen` | **whole-schedule** column generation (Balakrishnan–Chandran): a route is a column, the master is a set-partitioning LP over them, pricing is an exact label DP per flight. Single flight level; needs `terminal_airspace_always_active` for hub endpoints |
+| `colgen` | **whole-schedule** column generation (Balakrishnan–Chandran): a route is a column, the master is a set-packing LP over them, pricing is an exact label DP per flight. Single flight level; needs `terminal_airspace_always_active` for hub endpoints |
 
 `colgen` is not FCFS — it optimizes every flight jointly, so it answers a different question from the
 rest of the table ("what is the best schedule" rather than "what can this flight get, given the
@@ -119,30 +119,19 @@ Experimental `--colgen-cheap-pricing` searches the best-ranked departure/lane ro
 full pricing runs every five rounds, on stagnation, and on the last round. Only full sweeps
 can update the global bound or certify convergence. This option changes the generated pool.
 
-Its solver knobs are exposed as `--colgen-time-limit`, `--colgen-ip-time-limit` (the FINAL MILP's
-own budget, separate because it otherwise inherits whatever the generation loop did not spend, and
-paired with `--colgen-max-eager-rows`, which bounds the row pre-materialization that budget is
-measured after — 495,574 rows and 272 s at 1,500 flights, and it scales with the pool),
-`--colgen-max-iterations`, `--colgen-objective`, `--colgen-solver` and `--colgen-gap-metric`, plus
-`--colgen-warm-start astar`, which plans the batch through A* first and hands colgen that schedule as
-both pool columns and the starting incumbent. Leave the warm start OFF unless you mean it: it is
-reported in `planner_stats.json` because it changes what the run measures — unaided colgen is +11.3%
-against A* at 1,500 flights and A*-seeded colgen is −7.1%, so turning it on silently would convert
-"colgen beats A*" into "refining A* beats A*". The knob that sizes the pricing
-search itself is `--colgen-max-air-overrun` (the hop budget over the lattice geodesic, which is also
-the half-width of the O-D ellipse a flight is priced over — the budget implies the ellipse, since a
-route within it cannot reach a cell outside). Three more tune the cost of the sweep rather than what
-it answers: `--colgen-workers` fans pricing across worker processes (default 0, in-process; measured
-2.6× at 100 flights and 4.4× at 200, and bound by memory before cores, since each worker rebuilds
-every graph and holds its own label pool), while `--colgen-seed-ladder` and
-`--colgen-greedy-budget-rate` size the two pre-LP stages — the ladder buys objective for pricing time
-and is the one of the three that does move the answer. Pricing dominates its
-cost, and one sweep at 100 flights is already ~147 s, so the 1200 s default budget buys roughly three
-iterations there rather than a converged solve. A run that stops on that
-budget still files a complete, feasible schedule, so read the WARNING and `planner_stats.json` in the
-run folder rather than assuming the result converged. One reporting caveat: a whole-schedule planner
-has no per-flight solve, so `colgen` stamps every intent with the same amortized share (solve wall ÷
-flights) — its `*_solve_time_s` columns in `index.parquet` are not comparable with an FCFS run's.
+`--colgen-max-air-overrun` controls the route allowance (six extra lattice hops by default),
+`--colgen-workers` controls pricing processes, and `--colgen-seed-ladder` controls the initial
+later-departure alternatives. `--colgen-warm-start astar` imports an FCFS schedule;
+`--colgen-no-nominal-seeds` can use those imports in place of nominal initialization.
+`--colgen-time-limit`, `--colgen-ip-time-limit`, and `--colgen-ip-reserve` control the
+whole solve, final IP search allowance, and time reserved for the final IP stage.
+
+An optimal final IP certifies the generated pool; global quality bounds also require pricing.
+Read `planner_stats.json` for termination, gaps, and per-stage times. Whole-schedule solve time
+is amortized across flights in `index.parquet`, unlike the actual per-flight timings of FCFS.
+The [column-generation guide](context/colgen.md) explains the model, certificate reuse, defaults,
+and measured results. [Reusable benchmark tools](analysis/colgen/README.md) capture and replay
+pricing work; dated local experiment history belongs under ignored `.context/`.
 
 ## Experiments
 

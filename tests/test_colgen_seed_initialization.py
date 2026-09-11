@@ -135,11 +135,33 @@ def test_import_does_not_expand_the_pricing_hop_budget():
     assert reason == "path exceeds pricing hop budget"
 
 
-@pytest.mark.parametrize("departure_step", [0, 3, 15, 31])
-def test_centered_ladder_is_clipped_to_both_legal_departure_bounds(departure_step):
+@pytest.mark.parametrize(
+    "departure_step,cfg_overrides,exact_earlier_costs",
+    [
+        (0, {}, False),
+        (3, {}, False),
+        (15, {}, False),
+        (31, {}, False),
+        pytest.param(
+            7,
+            {
+                "dt_s": 0.7,
+                "nominal_speed_mps": 120.0 / 0.7,
+                "max_ground_delay_s": 14.0,
+                "cost_ground_delay_per_s": 0.3,
+            },
+            True,
+            id="fractional-weighted",
+        ),
+    ],
+)
+def test_centered_ladder_is_clipped_to_both_legal_departure_bounds(
+    departure_step, cfg_overrides, exact_earlier_costs,
+):
     from freespace_sim.planner.colgen.network import column_claims
 
-    cfg = _cfg(max_ground_delay_s=128)
+    cfg_values = {"max_ground_delay_s": 128, **cfg_overrides}
+    cfg = _cfg(**cfg_values)
     params = _params(seed_nominal_routes=False, provided_seed_ladder_steps=10,
                      max_iterations=1, iteration_ip_time_limit_s=3,
                      ip_time_limit_s=5, time_limit_s=60)
@@ -153,13 +175,18 @@ def test_centered_ladder_is_clipped_to_both_legal_departure_bounds(departure_ste
                         on_iteration=lambda row: snapshots.append(row["lp_columns"][:row["lp_column_count"]]))
     initial = snapshots[0]
     assert {c.departure_step for c in initial} == set(range(
-        max(0, departure_step - 10), min(32, departure_step + 10) + 1,
+        max(graph.base_step, departure_step - 10),
+        min(graph.latest_departure_step, departure_step + 10) + 1,
     ))
     assert len(initial) == len({c.departure_step for c in initial})
     for column in initial:
         assert column.cell_path == seed.cell_path
         assert column.claims == column_claims(column, graph, cfg)
-        assert column.delay_s == pytest.approx(model.intent_cost(column_to_intent(column, request, cfg), cfg))
+        expected = model.intent_cost(column_to_intent(column, request, cfg), cfg)
+        if exact_earlier_costs and column.departure_step <= departure_step:
+            assert column.delay_s == expected
+        else:
+            assert column.delay_s == pytest.approx(expected)
 
 
 def test_unrepaired_import_keeps_conflicting_centers_for_the_ip():

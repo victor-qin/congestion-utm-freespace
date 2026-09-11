@@ -187,6 +187,31 @@ def _shift_column(
     )
 
 
+def _retime_column(
+    column: Column,
+    departure_step: int,
+    graph: FlightGraph,
+    cfg: SimConfig,
+    model: CostModel,
+    *,
+    air_hold_s: float,
+    air_detour_s: float,
+) -> Column:
+    """Re-time a certified route and price its absolute ground and preserved air terms."""
+
+    shifted = replace(
+        column,
+        departure_step=departure_step,
+        claims=_shift_claims(column.claims, departure_step - column.departure_step),
+        delay_s=model.evaluate(
+            ground_s=(departure_step - graph.base_step) * cfg.dt_s,
+            air_hold_s=air_hold_s,
+            air_detour_s=air_detour_s,
+        ),
+    )
+    return _canonical_column(shifted, graph, cfg)
+
+
 def _add_departure_ladder(master, seed, graph, cfg, model, steps: int, stride: int = 1) -> int:
     """Offer the master `steps` pure clock translations of one flight's seed.
 
@@ -1194,13 +1219,21 @@ class ColGenSolver:
                         # Earlier variants cannot predate the requested lattice
                         # departure. Pure clock shifts preserve certified geometry.
                         before = min(half_width, canonical.departure_step - graph.base_step)
+                        intent = column_to_intent(canonical, graph.request, cfg)
+                        air_hold_s = intent.air_hold_s
+                        air_detour_s = intent.air_detour_m / cfg.nominal_speed_mps
                         for steps in range(1, before + 1):
-                            master.add_column(_canonical_column(replace(
-                                canonical,
-                                departure_step=canonical.departure_step - steps,
-                                delay_s=canonical.delay_s - model.ground_weight * steps * cfg.dt_s,
-                                claims=_shift_claims(canonical.claims, -steps),
-                            ), graph, cfg))
+                            master.add_column(
+                                _retime_column(
+                                    canonical,
+                                    canonical.departure_step - steps,
+                                    graph,
+                                    cfg,
+                                    model,
+                                    air_hold_s=air_hold_s,
+                                    air_detour_s=air_detour_s,
+                                )
+                            )
         # The seed columns are also a candidate INCUMBENT, not only pool contents.  Adding
         # them to the pool alone leaves them reachable exclusively through the final IP --
         # and when that IP is truncated the run returns the shifted-seed heuristic instead,

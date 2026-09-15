@@ -105,7 +105,7 @@ def _state_with_pair(monkeypatch, *, turnaround_s=0.0):
     for it in (outbound, ret):
         led.commit(it.request.flight_id, it.volumes)
     monkeypatch.setattr(state_mod, "unimpeded_costs",
-                        lambda cfg, st, reqs, *, n_workers: [(r.flight_id, 1.0, None) for r in reqs])
+                        lambda cfg, st, reqs, *, n_workers, shortcut=False: [(r.flight_id, 1.0, None) for r in reqs])
     st = LNSState(CFG, led, [outbound, ret], turnaround_s=turnaround_s)
     return st, outbound, ret
 
@@ -186,7 +186,7 @@ def _state_with_headroom(monkeypatch):
     for it in (outbound, ret):
         led.commit(it.request.flight_id, it.volumes)
     monkeypatch.setattr(state_mod, "unimpeded_costs",
-                        lambda cfg, st, reqs, *, n_workers: [(r.flight_id, 1.0, None) for r in reqs])
+                        lambda cfg, st, reqs, *, n_workers, shortcut=False: [(r.flight_id, 1.0, None) for r in reqs])
     return LNSState(CFG, led, [outbound, ret], turnaround_s=0.0), outbound, ret
 
 
@@ -226,7 +226,7 @@ def test_a_pre_existing_violation_is_grandfathered_but_not_worsened(monkeypatch)
     for it in (outbound, ret):
         led.commit(it.request.flight_id, it.volumes)
     monkeypatch.setattr(state_mod, "unimpeded_costs",
-                        lambda cfg, st, reqs, *, n_workers: [(r.flight_id, 1.0, None) for r in reqs])
+                        lambda cfg, st, reqs, *, n_workers, shortcut=False: [(r.flight_id, 1.0, None) for r in reqs])
     st = LNSState(CFG, led, [outbound, ret], turnaround_s=0.0)
     assert st._pair_shortfall[(1, 2)] == pytest.approx(140.0)
     assert st._precedence_baseline == 1

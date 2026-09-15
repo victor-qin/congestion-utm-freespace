@@ -28,7 +28,11 @@ class Planner(Protocol):
     #       The pad-capacity authority this planner has ALREADY brought current for ``ledger``, or
     #       None if it holds none bound to that ledger. Lets a post-pass reuse the authority the
     #       inner plan just built instead of paying a second ledger subscription + index. A*
-    #       and the MILP implement it; ``shortcut._terminal_capacity_for`` is the consumer.
+    #       and the MILP implement it; ``shortcut.terminal_capacity_for`` is the consumer.
+
+
+#: "No planner in the chain carries this attribute" — distinct from any value one could carry.
+_MISSING = object()
 
 
 def iter_planner_chain(planner):
@@ -36,10 +40,10 @@ def iter_planner_chain(planner):
 
     One definition of "walk the wrapper chain", shared by ``sim`` (attach telemetry, test whether
     the committed corridor is wall-aware), ``parallel`` (reach the A* instances inside a worker's
-    planner), and ``shortcut`` (find a capacity authority). Centralised so a newly added wrapper
-    attribute cannot be missed in one copy and make that caller silently see no planners. Order is
-    load-bearing — ``_terminal_capacity_for`` returns the FIRST match — so the walk is LIFO, with
-    ``warm_planner`` visited before ``inner``.
+    planner), ``shortcut`` (find a capacity authority), and :func:`chain_attr`. Centralised so a
+    newly added wrapper attribute cannot be missed in one copy and make that caller silently see no
+    planners. Order is load-bearing — ``terminal_capacity_for`` returns the FIRST match — so the
+    walk is LIFO, with ``warm_planner`` visited before ``inner``.
 
     Parameters
     ------------
@@ -60,6 +64,29 @@ def iter_planner_chain(planner):
         seen.add(id(p))
         yield p
         stack.extend((getattr(p, "inner", None), getattr(p, "warm_planner", None)))
+
+
+def chain_attr(planner, name) -> list:
+    """Collect every value of attribute ``name`` carried by a planner in ``planner``'s chain.
+
+    An empty result means no planner in the chain carries the attribute — a third answer a
+    ``getattr`` default would silently replace with a plausible value. A wrapper holds none of its
+    search planner's knobs, so ``getattr(wrapper, "evict_floor", 0.0)`` would read as a correctly
+    set floor and ``getattr(wrapper, "record_envelope", False)`` as a deliberate opt-out. Callers
+    decide what an empty list means; the LNS callers refuse rather than assume a default.
+
+    Parameters
+    ------------
+    - planner (Planner): the head of the wrapper chain.
+    - name (str): the attribute to read from each planner in the chain.
+
+    Return
+    --------
+    - output (list): the values found, in :func:`iter_planner_chain` order; empty when no planner
+      in the chain has ``name``.
+    """
+    return [v for v in (getattr(pl, name, _MISSING) for pl in iter_planner_chain(planner))
+            if v is not _MISSING]
 
 
 #: Planners that solve every flight at once, so `sim.run` routes them to `colgen.run_batch` and they

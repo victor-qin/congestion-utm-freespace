@@ -510,7 +510,19 @@ def _shortcut_turn_seeded(corners, had_holds: bool,
             return state
 
 
-def _terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
+def can_refine(intent: OperationalIntent, strategy: _ShortcutStrategy = "single_knot") -> bool:
+    """Could :func:`refine_intent` do anything but hand ``intent`` straight back?
+
+    The three-point floor keeps the legacy wrapper's exact behavior; ``batched_turns`` fixes the
+    E-F-G blind spot at two, without silently changing ``astar_shortcut``'s A/B baseline. Public
+    because a caller that must RELEASE a flight before refining it wants to skip that round trip —
+    and a hardcoded ``<= 3`` at its end both duplicates this rule and omits ``batched_turns``.
+    """
+    return bool(intent.accepted and intent.centerline
+                and len(intent.centerline) > (2 if strategy == "batched_turns" else 3))
+
+
+def terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
     """Find a capacity authority already brought current by the inner A*/MILP plan.
 
     Reuse avoids a second ledger subscription/index. Asks each planner in the wrapper chain via the
@@ -585,86 +597,112 @@ class ShortcutRefiner:
           otherwise the inner planner's intent unchanged.
         """
         intent = self.inner.plan(req, ledger, cfg)
-        # Keep the legacy wrapper's exact three-point behavior. The experimental strategy fixes the
-        # E-F-G blind spot without silently changing astar_shortcut's A/B baseline.
-        min_centerline = 2 if self.strategy == "batched_turns" else 3
-        if (not intent.accepted or not intent.centerline
-                or len(intent.centerline) <= min_centerline):
-            return intent
+        return refine_intent(intent, ledger, cfg, tcap=terminal_capacity_for(self.inner, ledger),
+                             strategy=self.strategy, label=self.label)
 
-        corners: list[np.ndarray] = []
-        for p, _ in intent.centerline:                 # collapse repeated positions (holds)
-            p = np.asarray(p, float)
-            if not corners or not np.allclose(p, corners[-1]):
-                corners.append(p)
-        had_holds = len(corners) < len(intent.centerline)
-        if len(corners) <= 2:
-            return intent
 
-        g_delay = intent.ground_delay_s
-        # Read takeoff off the committed origin column rather than inverting the centerline.
-        # ``volumes[0].t_start`` IS the takeoff time in both builders, so no lane knowledge is
-        # needed; inverting instead lands late by the egress traverse, leaving the origin column
-        # unreserved while the drone still occupies it.
-        t_depart = intent.volumes[0].t_start - g_delay
-        # Anchor the rebuilt corridor at the inner planner's VERIFIED first-cruise stamp: a refiner
-        # re-times splices, not the takeoff. Re-deriving the start inside the rebuild would mix its
-        # continuous clock (climb_time_to + WORST lane) with A*'s quantised stamp (climb_steps*dt +
-        # CHOSEN lane's steps) and drift every rebuilt volume by a lane-dependent amount.
-        t_first = float(intent.centerline[0][1])
-        ot, dt = req.origin_terminal, req.dest_terminal
-        straight = enroute_reference_m(req.origin, req.dest, ot, dt, cfg)
-        tcap = _terminal_capacity_for(self.inner, ledger)
-        # Without the same interval authority the inner terminal-aware planner consulted, a retimed
-        # shortcut cannot prove pad capacity. Refuse only the refinement; the verified inner intent is
-        # still a valid fallback. Non-terminal routes need no capacity service.
-        if (ot is not None or dt is not None) and tcap is None:
-            return intent
+def refine_intent(intent: OperationalIntent, ledger: ReservationLedger, cfg: SimConfig, *,
+                  tcap: TerminalCapacity | None, strategy: _ShortcutStrategy = "single_knot",
+                  label: str | None = None) -> OperationalIntent:
+    """Refine an intent whose volumes are NOT (or no longer) committed to ``ledger``.
 
-        if self.strategy == "batched_turns":
-            context = _ShortcutContext(
-                req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight,
-                ot, dt, t_first, tcap,
-            )
-            state = _shortcut_turn_seeded(corners, had_holds, context)
-            if (state is None or len(state.knots) >= len(corners) or state.built is None):
-                return intent
-            simplified = [k.point for k in state.knots]
-            built = state.built                   # already rebuilt + fully checked; do not duplicate it
-        else:
-            simplified = shortcut_corners(
-                corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger,
-                ot, dt, corridor_t0=t_first, tcap=tcap,
-                skip_exact_heading=self.strategy == "single_knot_heading",
-            )
-            if len(simplified) >= len(corners):
-                return intent                              # nothing removed
-            built = _rebuild(
-                simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight,
-                ot, dt, corridor_t0=t_first, tcap=tcap,
-            )
-            if built is None:
-                return intent
+    :meth:`ShortcutRefiner.plan` without the search, for a caller already holding a planned intent:
+    LNS's deferred arms release a repaired flight, call this, and re-commit. Same contract as the
+    wrapper — never costlier than ``intent``, and the returned geometry is what was conflict-checked.
 
-        volumes, centerline, cum_horiz, cum_dz = built
-        # Lattice overhead: decrement by what the sweep actually removed rather than inheriting the
-        # inner planner's figure (which would over-report staircase on an already-straightened path).
-        # Splicing out a redundant knot removes hex staircase before it removes any real berth, so
-        # attributing the removal to overhead first is the right first-order split — approximate for
-        # the refiner, exact for bare A*. Floored at 0 and monotone, so it can never invent overhead.
-        inner_horiz = float(np.linalg.norm(np.diff(np.array(corners)[:, :2], axis=0), axis=1).sum())
-        removed = max(0.0, inner_horiz - cum_horiz)
-        refined = OperationalIntent(
-            request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
-            ground_delay_s=g_delay, air_hold_s=0.0,
-            air_detour_m=enroute_detour_m(
-                enroute_flown_m([p for p, _ in centerline], req.origin, req.dest, ot, dt, cfg),
-                straight),
-            lattice_overhead_m=max(0.0, intent.lattice_overhead_m - removed),
-            altitude_change_m=endpoint_altitude_change_m(
-                float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),
-                cum_dz, cfg),
-            planner=self.label or f"{intent.planner}+sc",
+    Parameters
+    ------------
+    - intent (OperationalIntent): the planned intent to refine. Its volumes must not be live in
+      ``ledger``, or every rebuild conflicts with the flight itself.
+    - ledger (ReservationLedger): committed reservations the rebuild is re-checked against.
+    - cfg (SimConfig): geometry, speeds, and timing.
+    - tcap (TerminalCapacity | None): pad-capacity authority already current for ``ledger``
+      (keyword-only). Supplied by the caller because only it knows which planner brought one
+      current; ``None`` returns every terminal flight unrefined.
+    - strategy (_ShortcutStrategy): ``single_knot``, ``single_knot_heading``, or ``batched_turns``.
+    - label (str | None): planner name stamped on a refined intent; ``None`` ⇒ ``<planner>+sc``.
+
+    Return
+    --------
+    - output (OperationalIntent): the refined intent when it is feasible and no costlier, otherwise
+      ``intent`` itself — the same object, so callers detect a refinement with ``is not``.
+    """
+    if not can_refine(intent, strategy):
+        return intent
+    req = intent.request
+
+    corners: list[np.ndarray] = []
+    for p, _ in intent.centerline:                 # collapse repeated positions (holds)
+        p = np.asarray(p, float)
+        if not corners or not np.allclose(p, corners[-1]):
+            corners.append(p)
+    had_holds = len(corners) < len(intent.centerline)
+    if len(corners) <= 2:
+        return intent
+
+    g_delay = intent.ground_delay_s
+    # Read takeoff off the committed origin column rather than inverting the centerline.
+    # ``volumes[0].t_start`` IS the takeoff time in both builders, so no lane knowledge is
+    # needed; inverting instead lands late by the egress traverse, leaving the origin column
+    # unreserved while the drone still occupies it.
+    t_depart = intent.volumes[0].t_start - g_delay
+    # Anchor the rebuilt corridor at the inner planner's VERIFIED first-cruise stamp: a refiner
+    # re-times splices, not the takeoff. Re-deriving the start inside the rebuild would mix its
+    # continuous clock (climb_time_to + WORST lane) with A*'s quantised stamp (climb_steps*dt +
+    # CHOSEN lane's steps) and drift every rebuilt volume by a lane-dependent amount.
+    t_first = float(intent.centerline[0][1])
+    ot, dt = req.origin_terminal, req.dest_terminal
+    straight = enroute_reference_m(req.origin, req.dest, ot, dt, cfg)
+    # Without the same interval authority the inner terminal-aware planner consulted, a retimed
+    # shortcut cannot prove pad capacity. Refuse only the refinement; the verified inner intent is
+    # still a valid fallback. Non-terminal routes need no capacity service.
+    if (ot is not None or dt is not None) and tcap is None:
+        return intent
+
+    if strategy == "batched_turns":
+        context = _ShortcutContext(
+            req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight,
+            ot, dt, t_first, tcap,
         )
-        refined.cost = trajectory_cost(refined, cfg)
-        return refined if refined.cost <= intent.cost + _EPS else intent
+        state = _shortcut_turn_seeded(corners, had_holds, context)
+        if (state is None or len(state.knots) >= len(corners) or state.built is None):
+            return intent
+        simplified = [k.point for k in state.knots]
+        built = state.built                   # already rebuilt + fully checked; do not duplicate it
+    else:
+        simplified = shortcut_corners(
+            corners, req.origin, req.dest, t_depart, g_delay, cfg, ledger,
+            ot, dt, corridor_t0=t_first, tcap=tcap,
+            skip_exact_heading=strategy == "single_knot_heading",
+        )
+        if len(simplified) >= len(corners):
+            return intent                              # nothing removed
+        built = _rebuild(
+            simplified, req.origin, req.dest, t_depart, g_delay, cfg, ledger, straight,
+            ot, dt, corridor_t0=t_first, tcap=tcap,
+        )
+        if built is None:
+            return intent
+
+    volumes, centerline, cum_horiz, cum_dz = built
+    # Lattice overhead: decrement by what the sweep actually removed rather than inheriting the
+    # inner planner's figure (which would over-report staircase on an already-straightened path).
+    # Splicing out a redundant knot removes hex staircase before it removes any real berth, so
+    # attributing the removal to overhead first is the right first-order split — approximate for
+    # the refiner, exact for bare A*. Floored at 0 and monotone, so it can never invent overhead.
+    inner_horiz = float(np.linalg.norm(np.diff(np.array(corners)[:, :2], axis=0), axis=1).sum())
+    removed = max(0.0, inner_horiz - cum_horiz)
+    refined = OperationalIntent(
+        request=req, status=IntentStatus.ACCEPTED, volumes=volumes, centerline=centerline,
+        ground_delay_s=g_delay, air_hold_s=0.0,
+        air_detour_m=enroute_detour_m(
+            enroute_flown_m([p for p, _ in centerline], req.origin, req.dest, ot, dt, cfg),
+            straight),
+        lattice_overhead_m=max(0.0, intent.lattice_overhead_m - removed),
+        altitude_change_m=endpoint_altitude_change_m(
+            float(np.asarray(centerline[0][0])[2]), float(np.asarray(centerline[-1][0])[2]),
+            cum_dz, cfg),
+        planner=label or f"{intent.planner}+sc",
+    )
+    refined.cost = trajectory_cost(refined, cfg)
+    return refined if refined.cost <= intent.cost + _EPS else intent

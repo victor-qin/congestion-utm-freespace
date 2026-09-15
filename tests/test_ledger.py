@@ -57,8 +57,8 @@ def test_conflicts_reports_committed_volumes():
 
 
 # ---------------- always-active static terminal walls (permanent, on-ledger) ----------------
-# `register_static_terminal` files a hub's terminal airspace as a PERMANENT, time-invariant ledger volume so
-# any_conflict / verify / refiners see it (previously it lived off-ledger in the A* occupancy only).
+# `register_static_terminal` files a hub's terminal airspace as a PERMANENT, time-invariant ledger
+# volume so any_conflict / verify / refiners see it.
 
 _HUB = (3000.0, 3000.0)
 
@@ -77,8 +77,8 @@ def _led_with_static():
 
 
 def test_static_terminal_walls_foreign_corridor():
-    """The core fix: a foreign corridor crossing a registered static terminal now CONFLICTS — any_conflict
-    is no longer blind to the wall (it was off-ledger before)."""
+    """A foreign corridor crossing a registered static terminal CONFLICTS: any_conflict now sees the
+    wall (it is on the ledger, not off-ledger in the A* occupancy)."""
     assert _led_with_static().any_conflict([_through_hub()]) is True
 
 
@@ -131,7 +131,7 @@ def test_subscribe_static_replays_already_registered():
 
 
 def _brute_static_any_conflict(led, vols):
-    """The pre-F1 behaviour: scan EVERY static wall (no spatial index) — the oracle the grid must match."""
+    """Scan EVERY static wall (no spatial index) — the oracle the xy-index grid must match."""
     from freespace_sim.conflict import volumes_conflict
     for v in vols:
         vbb = led._flat_aabb(v)
@@ -144,7 +144,7 @@ def _brute_static_any_conflict(led, vols):
 
 
 def test_static_wall_grid_matches_bruteforce_scan():
-    """F1: the xy spatial index over the static walls is only a broadphase prune, so any_conflict must give
+    """The xy spatial index over the static walls is a broadphase prune, so any_conflict must give
     byte-identical answers to a full linear scan across a dallas-like field of hubs — no overlap missed, no
     false positive. Probes span through-hub, between-hub, and far-outside boxes, plus a multi-cell box."""
     import random
@@ -171,11 +171,11 @@ def test_static_wall_grid_matches_bruteforce_scan():
 
 
 def test_static_wall_is_time_invariant_covers_late_departures():
-    """G1: the permanent wall is TIME-INVARIANT — it mirrors the occupancy static_col (which blocks at every
-    step, no time dimension), so a foreign crossing must be walled at ANY time, including well past the search's
-    MAXS*dt / horizon_s. A late-departing return (t_request + est_trip + turnaround_s > horizon_s) commits a
-    corridor past any finite cfg-derived bound; the earlier MAXS*dt wall missed those, the sentinel t_end
-    covers them (this asserts crossings past MAXS*dt that the finite bound would have let through)."""
+    """The permanent wall is TIME-INVARIANT — it mirrors the occupancy static_col (which blocks at
+    every step, no time dimension), so a foreign crossing must be walled at ANY time, including well
+    past the search's MAXS*dt / horizon_s. A late-departing return (t_request + est_trip +
+    turnaround_s > horizon_s) commits a corridor past any finite cfg-derived bound, so only a
+    sentinel t_end (not a finite bound) walls it."""
     from freespace_sim.planner.astar.compiled_hex_occupancy import schedulable_horizon_steps
     cfg = SimConfig(max_detour_factor=1.2)
     hx, hy = 3000.0, 3000.0
@@ -188,14 +188,14 @@ def test_static_wall_is_time_invariant_covers_late_departures():
         assert led.any_conflict([box]) is True, f"a crossing at t={t_cross} past MAXS*dt must still be walled"
 
 
-# ---------------- dynamic committed-volume xy sub-index (issue #30) ----------------
+# ---------------- dynamic committed-volume xy sub-index ----------------
 # The per-step _buckets are keyed by (step, cell_x, cell_y): a TIME bucket crossed with an xy SPATIAL sub-index,
 # so a query scans only volumes sharing its timestep AND near its xy. That is only a broadphase prune, so
 # any_conflict / conflicts must stay byte-identical (as a SET of hits) to a full linear scan over every volume.
 
 
 def _brute_dynamic_conflicts(led, vols):
-    """Oracle: full linear scan over EVERY committed volume (no bucket index) — the pre-#30 behaviour the
+    """Oracle: full linear scan over EVERY committed volume (no bucket index) — the behaviour the
     (step, cell) sub-index must match. Returns (fid, vol) pairs exactly as ``ledger.conflicts``, so result SETS
     compare directly (cell/bucket iteration order is unspecified; the set of hits is the contract)."""
     from freespace_sim.conflict import volumes_conflict
@@ -211,7 +211,7 @@ def _brute_dynamic_conflicts(led, vols):
 
 
 def test_dynamic_bucket_grid_matches_bruteforce_scan():
-    """Issue #30: the xy sub-index over the committed volumes is only a broadphase prune, so any_conflict and
+    """The xy sub-index over the committed volumes is only a broadphase prune, so any_conflict and
     conflicts must give byte-identical answers (as hit SETS) to a full linear scan across a dense field of
     committed corridor boxes — no overlap missed, no false positive. Probes span conflicting, clear, altitude-
     separated (same xy-cell, different z), a multi-cell big box, and a temporal-only miss."""

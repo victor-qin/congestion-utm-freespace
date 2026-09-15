@@ -19,6 +19,8 @@ from freespace_sim import runs, viz_html
 
 
 def main() -> None:
+    """Load a saved run folder and (re)write its standalone ``replay.html`` viewer, optionally
+    clipping at the horizon and opening it in a browser."""
     p = argparse.ArgumentParser(description="Regenerate replay.html from a saved run folder.")
     p.add_argument("folder", help="a results/ run folder written by experiments.run")
     p.add_argument("--open", action="store_true", help="open the replay in the default browser")

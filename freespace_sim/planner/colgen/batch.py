@@ -31,6 +31,7 @@ class ColumnGenerationPlanner:
     plans_whole_schedule = True
 
     def __init__(self, params: ColGenParams | None = None) -> None:
+        """Store the run's :class:`ColGenParams`, defaulting to the shipped configuration."""
         self.params = params if params is not None else ColGenParams()
 
     def plan(
@@ -88,6 +89,22 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     that is tolerated quietly is individual flights the column model cannot express (an
     air hold, a route outside the O-D ellipse); those are counted and logged, and
     `RestrictedMaster.complete_selection` re-picks them around the ones that placed.
+
+    Parameters
+    ------------
+    - requests (list[FlightRequest]): the flights to seed; re-planned by the warm-start
+      planner and, for those it accepts, rebuilt into columns.
+    - cfg (SimConfig): sim config, forwarded to the warm-start ``sim.run`` and graph build.
+    - static_terms (Iterable): the static terminal catalog (permanent walls), handed to both
+      ``sim.run`` and the graph build so the seed pass sees the same walls as the solve.
+    - params (ColGenParams): solver controls; reads ``warm_start_planner`` and is forwarded
+      to ``build_flight_graph``.
+
+    Return
+    --------
+    - output (dict[int, list[Column]] | None): seed columns per placed flight, or ``None``
+      when no warm-start planner is configured. Raises ``RuntimeError`` when the planner
+      accepts no flights or yields no usable columns (seeding would be a silent no-op).
     """
 
     planner = params.warm_start_planner
@@ -110,10 +127,9 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     # is a correctness requirement.  That derivation is not a function of the requests: from
     # a demand model it is every PLACED hub, from a bare request list only the hubs a flight
     # touches.  This call passes a bare request list, so without the override a hub that
-    # draws no flight in the horizon would be SOLID for the colgen solve and OPEN for the A*
-    # pass seeding it -- measured on `density_faa_wing_zipline` truncated to 600 s, 182
-    # against 180, so A* routes through two walls colgen enforces and the columns carrying
-    # them are then rejected in translation and counted as drops.
+    # draws no flight in the horizon would be SOLID for the colgen solve but OPEN for the A*
+    # pass seeding it -- A* then routes through walls colgen enforces, and the columns
+    # carrying those routes are rejected in translation and counted as drops.
     seeded = sim.run(
         cfg,
         requests=list(requests),
@@ -149,10 +165,9 @@ def _build_warm_start(requests, cfg: SimConfig, static_terms, params: ColGenPara
     seed_columns, stats = warm_start_module.build(
         accepted, graphs, cfg, cost_model(cfg, params), row_index
     )
-    # Every flight that did NOT place, by reason.  The counts existed and were thrown away,
-    # which left the one number a reader needs -- why 7 of 1,500 were dropped -- derivable
-    # only as `accepted - placed`, with no way to tell an inexpressible route (an air hold)
-    # from one the repair loop could not fit inside `max_shift`.  Those two point at
+    # Every flight that did NOT place, logged by reason.  Without this the only number a
+    # reader gets is `accepted - placed`, which cannot tell an inexpressible route (an air
+    # hold) from one the repair loop could not fit inside `max_shift` -- and those point at
     # completely different fixes.
     #
     # Selected by EXCLUDING the summary keys rather than by matching a reason prefix, and
@@ -202,35 +217,48 @@ def run_batch(
 ) -> tuple[list[OperationalIntent], dict]:
     """Solve once, then file every result through the normal DSS in FCFS order.
 
-    Returns ``(intents, stats)``.  The stats are returned rather than only logged because
-    the intents alone cannot answer "did this solve converge" -- a run that stopped at
+    The stats are returned alongside the intents rather than only logged because the
+    intents alone cannot answer "did this solve converge" -- a run that stopped at
     iteration 1 files a complete, feasible, ordinary-looking accepted set.  ``sim.run``
     carries them onto :class:`~freespace_sim.sim.SimResult` so they reach the run folder.
 
-    ``collector`` is accepted for parity with the parallel runner.  Column generation
-    has no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
+    ``collector`` is accepted for parity with the parallel runner.  Column generation has
+    no A* telemetry hooks, so its conflict/filed streams intentionally remain empty.
 
     Pricing fans across worker processes when ``params.n_pricing_workers`` is nonzero, and
     runs in this process otherwise (the default -- the pool is opt-in because its memory is
-    linear in workers).  :func:`pricing_pool.price_sweep`
-    reproduces the sequential loop's prefix RULE and hands the reduced costs back in index
-    order, so on any sweep that finishes the columns and the objective do not move.
+    linear in workers).  :func:`pricing_pool.price_sweep` reproduces the sequential loop's
+    prefix RULE and hands the reduced costs back in index order, so on any sweep that
+    finishes the columns and the objective do not move.  It is NOT answer-identical on a
+    sweep that hits the deadline: ``PricingTimeout`` fires off a wall clock, not a work
+    budget, so a pool -- running flights concurrently -- finishes more of them before the
+    SAME absolute deadline and keeps a longer accepted prefix.  Longer is strictly more
+    pricing done inside the budget, not worse, but it is a different column set, so a parity
+    run must leave ``n_pricing_workers`` at 0.  ``sim.run``'s own ``parallel`` argument is a
+    different mechanism -- the A* speculative runner -- and rejects whole-schedule planners,
+    so the two never interact.
 
-    It is NOT answer-identical on a sweep that hits the deadline, and that limit is worth
-    stating because a run at scenario scale usually does.  ``PricingTimeout`` fires off a
-    wall clock, not a work budget: sequentially, flight *k* is reached only after the
-    cumulative time of the flights before it, whereas a pool runs them concurrently, so
-    more of them finish before the SAME absolute deadline and the accepted prefix is
-    generally longer.  Longer is not worse -- it is strictly more pricing done inside the
-    budget -- but it is a different column set, so a parity run must leave this at 0.
+    Parameters
+    ------------
+    - scenario (Scenario): the batch to solve; each ``scenario.events`` entry carries one
+      :class:`FlightRequest`, and the event order is the FCFS filing order.
+    - cfg (SimConfig): sim config; must have ``n_levels == 1`` (colgen v1 is single-level).
+    - ledger (ReservationLedger): the shared commit ledger; must be the one ``dss`` holds
+      and must be empty (pre-existing reservations must be fixed row claims, not dynamic).
+    - dss (DSS): files each intent via ``dss.commit`` in FCFS order.
+    - static_terms: the static terminal catalog (permanent walls), forwarded to the warm
+      start and the solver.
+    - status: per-flight callback ``status(done, request, intent)`` invoked as each files.
+    - report: optional progress callback ``report(done, total, intent)``; falsy to skip.
+    - collector: accepted for parallel-runner parity and otherwise unused (see above).
+    - params (ColGenParams | None): solver controls; defaults to ``ColGenParams()``.
+    - on_iteration: per-iteration callback forwarded to the solver; defaults to
+      :func:`_log_iteration`, because a silent multi-minute sweep is worse than a banner.
 
-    ``sim.run``'s own ``parallel`` argument is a different mechanism entirely -- the
-    A* speculative runner -- and rejects whole-schedule planners, so the two never interact.
-
-    ``on_iteration`` is forwarded to the solver, which calls it once per column-generation
-    iteration.  A caller that supplies nothing gets :func:`_log_iteration`, because pricing
-    is minutes per sweep at scenario scale and the alternative is a production entry point
-    that prints its banner and then says nothing for the rest of the solve.
+    Return
+    --------
+    - output (tuple[list[OperationalIntent], dict]): the filed intents (one per event, in
+      order) and the solver ``stats`` dict, which alone records whether the solve converged.
     """
     if cfg.n_levels != 1:
         # Also guarded inside `build_flight_graph`, but that fires per flight from four frames
@@ -268,11 +296,10 @@ def run_batch(
     # BEFORE the solve, because both existing colgen banners fire after it returns and the
     # thing most likely to end a run badly is decided here.  The only pre-solve line that
     # mentions parallelism is `sim.run`'s "mode=sequential", which describes the A*
-    # speculative runner and says "sequential" whatever this is set to -- so without this a
-    # run fanning across eight processes announces itself as serial and then, if it is
-    # OOM-killed, HANGS rather than failing (`pricing_pool`).  The memory figure is on the
-    # line because it is linear in workers and that is the whole hazard: measured across the
-    # process tree, `density_faa` x50 goes 3.9 GB in-process to 12.5 GB at 4 workers.
+    # speculative runner and reads "sequential" whatever this is set to -- so without this a
+    # run fanning across many processes would announce itself as serial and then, if it is
+    # OOM-killed, HANG rather than fail (`pricing_pool`).  The memory figure rides on the
+    # line because it is linear in worker count, and that is the whole hazard.
     workers = batch_params.n_pricing_workers
     log.info(
         "colgen pricing: %s | %d flights | objective=%s greedy=%s ladder=%s",
@@ -296,10 +323,9 @@ def run_batch(
         seed_columns=seed_columns,
         on_iteration=on_iteration if on_iteration is not None else _log_iteration,
         # Worker count is NOT plumbed here: it rides on `batch_params.n_pricing_workers`,
-        # which `price_sweep` reads directly.  This used to build a `ParallelPricingConfig`
-        # and pass it as `parallel=`, mapping an explicit 0 to `None` -- which `price_sweep`
-        # resolved as "the dataclass default" rather than "sequential", so raising that
-        # default would have turned `--colgen-workers 0` into a pool.
+        # which `price_sweep` reads directly.  Do NOT reintroduce a `parallel=` config that
+        # maps an explicit 0 to `None`: `price_sweep` reads `None` as "the dataclass default"
+        # rather than "sequential", which would turn `--colgen-workers 0` into a pool.
     )
     solve_elapsed = time.monotonic() - solve_started
     solve_share = solve_elapsed / len(events) if events else 0.0
@@ -337,10 +363,9 @@ def run_batch(
         stats.get("wall_index_candidates", "unknown"),
         solve_elapsed,
     )
-    # A second line rather than a longer first one: the line above is a stable format
-    # that callers grep, and these are answers to a different question -- "how converged
-    # is this really, and where did the wall go".  Both were unanswerable from a
-    # production log before.
+    # A second line rather than a longer first one: the line above is a stable format that
+    # callers grep, so answers to a different question -- "how converged is this really, and
+    # where did the wall go" -- go here instead of destabilising it.
     log.info(
         "colgen detail: gap_metric=%s lp_gap_revenue=%s lp_gap_cost=%s ip_gap_revenue=%s "
         "greedy_s=%s pricing_wall_s=%s",
@@ -367,10 +392,10 @@ def run_batch(
             batch_params.time_limit_s,
             stats.get("iterations", "?"),
         )
-    # The third truncated exit, and until now the silent one.  `solver` treats it exactly
-    # like the branch above -- every denial becomes SEARCH_EXHAUSTED and the schedule is
-    # uncertified -- and the shipped cap of 30 makes it reachable, so leaving it
-    # unannounced is the same failure that branch exists to prevent.
+    # The third truncated exit.  `solver` treats it exactly like the branch above -- every
+    # denial becomes SEARCH_EXHAUSTED and the schedule is uncertified -- and the shipped cap
+    # of 30 makes it reachable, so leaving it unannounced is the same failure that branch
+    # exists to prevent.
     elif stats.get("termination_reason") == "iteration_limit":
         log.warning(
             "colgen stopped at its iteration cap (%s) -- this is the best schedule found "
@@ -415,13 +440,12 @@ def run_batch(
         )
     # The two gap scales can disagree by orders of magnitude, and only one of them is the
     # gate.  Under `gap_metric="revenue"` the denominator carries n*M, so with M an
-    # artificial big-M the gate can close on a pool that is barely past the greedy start --
-    # measured on colgen_test: Gurobi's duals close it at ITERATION 1 where HiGHS's, on the
-    # identical problem, leave it at 0.194.  Both bounds are valid; they are different
-    # optimal dual vertices of a degenerate master, and the gate keys on how tight the one
-    # the backend happened to return is.  A converged LP also says nothing about the
-    # integrality gap over the pool it converged on.  So when the two scales disagree, say
-    # so rather than let "lp_gap" read as "solved".
+    # artificial big-M the gate can close on a pool barely past the greedy start.  Both
+    # bounds stay valid -- they are different optimal dual vertices of a degenerate master,
+    # and the gate keys on how tight the one the backend happened to return is (Gurobi and
+    # HiGHS routinely differ here).  A converged LP also says nothing about the integrality
+    # gap over the pool it converged on.  So when the two scales disagree, say so rather
+    # than let "lp_gap" read as "solved".
     # Report the criterion that actually stopped the solve.  `lp_gap` and `heuristic_gap`
     # are different quantities against different thresholds -- the LP bound against
     # `lp_gap`, the incumbent against `ip_gap` -- and quoting the LP's numbers at a run

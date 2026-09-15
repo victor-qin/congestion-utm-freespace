@@ -48,12 +48,11 @@ LEAD_ARM_OPERATORS: dict[str, tuple[str, str]] = {
 # what makes the arms comparable flight-by-flight: without it, _shift_request_clock's data-dependent
 # shift translates the whole world by a different amount per arm, moving every t_departure.
 #
-# It must exceed the largest realized lead draw — the binding case is the lead30m arm, whose preroll
-# measures 2653 s (FAA) / 2341 s (far-future) at the default seed, leaving ~950-1260 s of margin. That
-# margin is not load-bearing: _shift_request_clock raises rather than clipping if a seed ever exceeds
-# the offset. The latest return departure is then offset + DEMAND_DURATION_S + the longest nominal trip
-# (16 km / 30 m/s + two climbs + a hover ≈ 597 s) ≈ 5990 s, comfortably inside SIM_HORIZON_S — so the
-# arms need no horizon bump, and the compiled A* occupancy box (sized from horizon_s) is unchanged.
+# It must exceed the largest realized lead draw (the lead30m arm binds); _shift_request_clock raises
+# rather than clipping if a seed ever exceeds it, so this is a guarded bound, not a tuned one. The
+# resulting latest return departure (offset + DEMAND_DURATION_S + the longest nominal trip) still
+# sits inside SIM_HORIZON_S, so the arms need no horizon bump and the compiled A* occupancy box
+# (sized from horizon_s) is unchanged.
 LEAD_ARM_CLOCK_OFFSET_S = 60.0 * 60.0
 
 # Vertically-stacked variant: three cruise levels 15 m apart. The 15 m gap is below the default 30 m
@@ -80,15 +79,33 @@ def _density_scenario(
 ) -> ScenarioSpec:
     """Build one density recipe, preserving Wing/Zipline-first USS and hub ordering.
 
-    ``flight_levels_m`` defaults to the single 100 m cruise plane; pass a wider ladder (plus a matching
-    ``corridor_height_m`` if the levels sit closer than 30 m apart) to study vertically-stacked traffic.
-    ``corridor_height_m=None`` keeps SimConfig's 30 m default.
+    The scheduling-lead knobs exist for the lead arms (:data:`LEAD_ARMS`) and default to today's
+    values, so any recipe that omits them is unchanged. Shifting the mean lead of the only operator
+    present just translates every filing equally and leaves FCFS order untouched, so the lead
+    contrast is only meaningful when a second operator holds still.
 
-    ``wing_lead_s`` / ``amazon_lead_s`` / ``request_clock_offset_s`` exist for the scheduling-lead arms
-    (:data:`LEAD_ARMS`); all three default to today's values, so every recipe that omits them is
-    unchanged. ``wing_lead_s`` applies to single-operator worlds too, but note that shifting the MEAN
-    lead of the only operator present just translates every filing equally and leaves FCFS order
-    untouched — the contrast is only meaningful when a second operator holds still.
+    Parameters
+    ------------
+    - name (str): scenario id stored on the returned spec.
+    - description (str): human-readable summary stored on the returned spec.
+    - wing_hubs (int): number of Wing/Zipline hubs.
+    - wing_rate_per_hub (float): Wing/Zipline demand rate per hub, in flights per hour.
+    - amazon_hubs (int | None): number of Amazon hubs; ``None`` for a single-operator world.
+    - amazon_rate_per_hub (float | None): Amazon demand rate per hub; must be paired with
+      ``amazon_hubs`` (both set or both ``None``).
+    - wing_lead_s (tuple[float, float]): Wing/Zipline departure lead ``(mean, std)`` in seconds.
+    - amazon_lead_s (tuple[float, float]): Amazon departure lead ``(mean, std)`` in seconds.
+    - request_clock_offset_s (float | None): fixed request-clock preroll; ``None`` keeps the
+      default data-dependent shift.
+    - flight_levels_m (tuple[float, ...]): cruise levels in metres; defaults to the single 100 m
+      plane. A wider ladder studies vertically-stacked traffic.
+    - corridor_height_m (float | None): corridor box height in metres; ``None`` keeps SimConfig's
+      30 m default. Pass one under 30 m for a ladder whose levels sit closer than that.
+
+    Return
+    --------
+    - output (ScenarioSpec): the assembled density scenario; raises ``ValueError`` if exactly one
+      of ``amazon_hubs`` / ``amazon_rate_per_hub`` is supplied.
     """
     if (amazon_hubs is None) != (amazon_rate_per_hub is None):
         raise ValueError("amazon_hubs and amazon_rate_per_hub must be supplied together")

@@ -69,6 +69,7 @@ def box_footprint(spec: BoxSpec) -> np.ndarray:
 
 
 def _active(volumes: list[Volume4D] | None, t: float) -> list[Volume4D]:
+    """Volumes whose half-open window ``[t_start, t_end)`` is live at time ``t``."""
     return [v for v in (volumes or []) if v.t_start <= t < v.t_end]
 
 
@@ -86,7 +87,20 @@ def _position_at(centerline, t: float):
 def snapshot(result: SimResult, t: float, ax=None, out=None, uss: str | None = None):
     """Top-down view of every reservation active at time ``t`` + drone dots, colored by owning USS.
 
-    Pass ``uss`` to slice the view to a single operator's flights.
+    Renders the committed geometry exactly: corridor boxes as translucent polygons, hover cylinders
+    as circles, each airborne drone as a dot on its centerline.
+
+    Parameters
+    ------------
+    - result (SimResult): run whose accepted intents are drawn.
+    - t (float): simulation time (s) to snapshot.
+    - ax (Axes | None): target matplotlib axes; a new 8x8 figure is made when None.
+    - out (path | None): if set, the figure is saved here (120 dpi) and closed.
+    - uss (str | None): restrict to one operator's flights; None draws all.
+
+    Return
+    --------
+    - output (Axes): the axes the snapshot was drawn on.
     """
     own = ax is None
     if own:
@@ -123,12 +137,22 @@ def snapshot(result: SimResult, t: float, ax=None, out=None, uss: str | None = N
 
 def congestion_heatmap(result: SimResult, out=None, bins: int = 60):
     """2D histogram of reserved volume-seconds projected onto the ground plane (where airspace is
-    busiest). The free-space analog of the sibling's hex-occupancy heatmap.
+    busiest) — the free-space analog of the sibling's hex-occupancy heatmap.
 
-    Measured over :func:`metrics.simulation_window` — the same span ``metrics.flight_frame`` uses, so
-    the figure's total reconciles with ``summary.json``'s ``reserved_vol_m3_s``. This used to clamp at
-    ``cfg.horizon_s``, which silently omitted exactly the post-horizon return tail the density
-    scenarios exist to produce (4.6% of departures on dallas_full alone)."""
+    Integrated over :func:`metrics.simulation_window` (the same span ``metrics.flight_frame`` uses),
+    so the figure's total reconciles with ``summary.json``'s ``reserved_vol_m3_s``. Do NOT anchor on
+    ``cfg.horizon_s`` instead: it drops the post-horizon return tail the density scenarios produce.
+
+    Parameters
+    ------------
+    - result (SimResult): run whose accepted intents are summed.
+    - out (path | None): if set, the figure is saved here (120 dpi) and closed.
+    - bins (int): grid resolution per axis of the ground-plane histogram.
+
+    Return
+    --------
+    - output (Axes): the axes holding the heatmap image.
+    """
     from .metrics import shape_volume_m3, simulation_window
 
     w, h = result.config.region_size_m
@@ -159,13 +183,27 @@ def delay_histogram(values, ax=None, out=None, bins=20, title="Delay distributio
                     overlay=None, labels=("all flights", "steady-state")):
     """Histogram of delay — how many flights suffered how much congestion lateness.
 
-    ``xlabel``/``unit``/``meanfmt`` let the same plotter serve absolute seconds, the percent-of-trip
-    flavour (see :func:`delay_pct_histogram`), and the unbounded trip-time-inflation ratio (see
-    :func:`trip_ratio_histogram`). NaN (denied) flights are dropped.
+    ``xlabel`` / ``unit`` / ``meanfmt`` let the one plotter serve absolute seconds, the
+    percent-of-trip flavour (:func:`delay_pct_histogram`), and the unbounded trip-time-inflation
+    ratio (:func:`trip_ratio_histogram`). NaN (denied) flights are dropped.
 
-    Pass ``overlay`` (a second series) to draw the whole-run distribution and its steady-state-windowed
-    twin on shared bins — the leftward ramp-tail bias then reads off directly (issue #25). ``labels``
-    names the two series.
+    Parameters
+    ------------
+    - values (Sequence[float]): per-flight delays; NaN entries are dropped.
+    - ax (Axes | None): target axes; a new figure is made when None.
+    - out (path | None): if set, the figure is saved here (120 dpi) and closed.
+    - bins (int | array): bin count or explicit edges passed to ``ax.hist``.
+    - title (str): plot title.
+    - xlabel (str): x-axis label.
+    - unit (str): unit suffix appended to the mean annotation.
+    - meanfmt (str): format spec for the mean value.
+    - overlay (Sequence[float] | None): a second series drawn on shared bins beside ``values``, to
+      compare the whole-run distribution against its steady-state-windowed twin.
+    - labels (tuple[str, str]): names for the ``values`` and ``overlay`` series.
+
+    Return
+    --------
+    - output (Axes): the axes the histogram was drawn on.
     """
     vals = np.asarray([v for v in values if v == v], float)  # drop NaN (denied) flights
     own = ax is None
@@ -202,9 +240,22 @@ def delay_histograms_by_lambda(per_flight_df, out=None, col="total_delay_s", xla
                                unit="s", bins=None, suptitle="Total-delay distribution by offered demand"):
     """One delay histogram per λ (shared x-axis) — the congestion distribution shifting with demand.
 
-    ``per_flight_df`` is a concat of `metrics.flight_frame` results, each tagged with its
+    ``per_flight_df`` is a concat of :func:`metrics.flight_frame` results, each tagged with its
     ``lam_per_hour``. Denied flights (NaN delay) are dropped; the surviving count is in each title.
-    ``col``/``xlabel``/``unit``/``bins`` select the absolute-seconds or percent-of-trip flavour.
+
+    Parameters
+    ------------
+    - per_flight_df (DataFrame): per-flight rows carrying ``lam_per_hour`` and ``col``.
+    - out (path | None): if set, the figure is saved here (120 dpi) and closed.
+    - col (str): delay column to histogram (absolute-seconds or percent-of-trip flavour).
+    - xlabel (str): x-axis label.
+    - unit (str): unit suffix appended to each panel's mean annotation.
+    - bins (int | array | None): shared bins; None spans 0 to the column max in 25 steps.
+    - suptitle (str): figure super-title.
+
+    Return
+    --------
+    - output (Figure): the figure of one panel per λ; raises ``ValueError`` if no flights survive.
     """
     df = per_flight_df.dropna(subset=[col])
     lams = sorted(df["lam_per_hour"].unique())
@@ -261,15 +312,11 @@ def delay_pct_histograms_by_lambda(per_flight_df, out=None):
         bins=np.linspace(0, 100, 21), suptitle="Delay-as-%-of-flight-time distribution by offered demand")
 
 
-# The FIVE levers of total_delay_s, in stack order: (key, label, colour, hatch).
-#
-# Two were missing before, so the stack silently failed to reach ``total_delay_s``:
-#   * the climb lever was absent entirely — any multi-level run under-reported by the whole
-#     traffic-forced climb (7% of the total at λ=1029 on a 3-level ladder);
-#   * ``detour_time_s`` was one band, but on A*'s hex lattice most of it is quantization, not
-#     congestion — an unimpeded off-axis flight books up to 2/√3 − 1 ≈ 15.5% of pure geometry.
-# Splitting the detour keeps the stack reconciling exactly (nothing is dropped) while making the
-# non-congestion share visually obvious through the hatch.
+# The five levers of total_delay_s, in stack order: (key, label, colour, hatch). They sum exactly
+# to total_delay_s, so the stack must carry all five — a missing lever silently under-reports the
+# total. The detour is split into traffic vs lattice because on A*'s hex lattice most of it is
+# quantization, not congestion (see context/figures/hex_lattice_overhead.png); the hatch marks
+# that non-congestion band.
 _DELAY_SOURCES = [
     ("ground_delay_s", "ground delay", "#2563eb", None),          # waited on the pad (FCFS queueing)
     ("air_hold_s", "air hold", "#f59e0b", None),                  # loitered/hovered mid-route
@@ -284,9 +331,8 @@ def delay_sources(per_flight_df, out=None, by="lam_per_hour"):
     (ground hold / air hold / detour-traffic / detour-lattice / traffic-forced climb).
 
     Left panel = absolute seconds (how the total grows); right panel = % share (how the *mix* shifts —
-    e.g. detour-dominated when sparse, ground-delay-dominated once the airspace saturates). Groups by
-    ``by`` (λ) if that column is present, else shows a single aggregate bar. The five sources sum
-    exactly to ``total_delay_s`` — see :func:`metrics.delay_breakdown_s`.
+    e.g. detour-dominated when sparse, ground-delay-dominated once the airspace saturates). The five
+    sources sum exactly to ``total_delay_s`` (see :func:`metrics.delay_breakdown_s`).
 
     **Reading the hatched "detour — lattice" band.** It is real flight time, but for bare A* it is not
     caused by other traffic: a 6-direction lattice cannot fly the Euclidean straight line
@@ -295,24 +341,33 @@ def delay_sources(per_flight_df, out=None, by="lam_per_hour"):
     band. Caveat for ``astar_shortcut``: there the refiner splices most of the staircase out, and what
     survives *does* grow with load (heavier traffic blocks more splices), so under a refiner the band
     is partly congestion-driven rather than pure geometry.
+
+    Parameters
+    ------------
+    - per_flight_df (DataFrame): per-flight breakdown; filtered to accepted rows if an ``accepted``
+      column is present, then NaN ``total_delay_s`` rows are dropped.
+    - out (path | None): if set, the figure is saved here (120 dpi) and closed.
+    - by (str): column to group bars on (λ); a single aggregate bar when absent or falsy.
+
+    Return
+    --------
+    - output (Figure): the two-panel (absolute + share) figure.
     """
     df = per_flight_df
     if "accepted" in df.columns:
         df = df[df["accepted"]]
     df = df.dropna(subset=["total_delay_s"])
-    # Frames archived before the lattice/traffic detour split (PR #49) carry detour_time_s but
-    # not its two sub-bands. Reconstruct them the way load_run treats legacy runs: no lattice
-    # info ⇒ the whole detour is traffic-attributable. Still partitions detour_time_s exactly,
-    # so the five bands keep reconciling to total_delay_s.
+    # Legacy frames carry detour_time_s but not its two sub-bands. Back-fill as load_run does —
+    # with no lattice info, the whole detour is traffic-attributable. This still partitions
+    # detour_time_s exactly, so the five bands keep reconciling to total_delay_s.
     if "detour_traffic_s" not in df.columns:
         df = df.assign(detour_traffic_s=df["detour_time_s"], detour_lattice_s=0.0)
-    # altitude_delay_phys_s postdates the ancient ground/air_hold levers but predates this PR, so a run
-    # older than the climb band lacks it; zero-fill JUST that one band (its climb info isn't recoverable
-    # from the parquet). Deliberately NOT a blanket fill over _DELAY_SOURCES: every planner emits all
-    # five bands (0 where a lever doesn't apply — e.g. the A*-only lattice split is 0 for the continuous
-    # planners), so a current-schema frame is only ever missing a CORE lever (ground_delay_s/air_hold_s)
-    # through a real upstream defect — that must still surface as a KeyError, not a silent 0 band under a
-    # wrong-but-reconciling total.
+    # A run older than the climb band lacks altitude_delay_phys_s; zero-fill JUST that one band
+    # (its climb info isn't recoverable from the parquet). Deliberately NOT a blanket fill over
+    # _DELAY_SOURCES: every planner emits all five bands (0 where a lever doesn't apply — e.g. the
+    # A*-only lattice split is 0 for the continuous planners), so a current-schema frame missing a
+    # CORE lever (ground_delay_s/air_hold_s) is a real upstream defect that must still surface as a
+    # KeyError, not a silent 0 band under a wrong-but-reconciling total.
     if "altitude_delay_phys_s" not in df.columns:
         df = df.assign(altitude_delay_phys_s=0.0)
     if by and by in df.columns:
@@ -358,9 +413,16 @@ def delay_sources(per_flight_df, out=None, by="lam_per_hour"):
 
 
 def scene_3d(result: SimResult, t: float | None = None):
-    """Assemble active reservations as a `trimesh.Scene` (boxes + cylinders) for a true-3D view.
+    """Assemble accepted reservations as a ``trimesh.Scene`` (boxes + cylinders) for a true-3D view.
 
-    With ``t=None`` every accepted volume is shown; otherwise only those active at ``t``.
+    Parameters
+    ------------
+    - result (SimResult): run whose accepted intents become meshes.
+    - t (float | None): show only volumes active at ``t``; None shows every accepted volume.
+
+    Return
+    --------
+    - output (trimesh.Scene): the assembled scene, one translucent mesh per volume.
     """
     import trimesh
 

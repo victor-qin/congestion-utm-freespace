@@ -313,7 +313,7 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
     that credit costs hops. With a small hop budget the credited cell is out of reach, so
     this contract is about what pricing does when the ceiling is not the binding
     constraint. Lifted at the graph so the corridor stays at the fixture's 4 -- one knob sizes
-    both since issue #78, and widening the corridor to 64 would change the instance.
+    both, and widening the corridor to 64 would change the instance.
     """
 
     cfg = _cfg()
@@ -345,12 +345,12 @@ def test_negative_dual_disables_the_seed_locality_shortcut():
 def test_completion_envelope_never_costs_a_hop_count_the_ceiling_forbids(monkeypatch):
     """The envelope builds no entry for a hop count the ceiling makes unreachable.
 
-    `completion_envelope` sizes its range from the HORIZON (`max_step - corridor_start`, ~920
-    hops for an early departure) while the ceiling is ~20, and every entry costs an
-    `_endpoint_claims` call plus a sweep over destination options. Its `break` contains that,
-    but only conditionally: the break needs `delay_lb` monotone in hops, which holds in the arc
-    form and NOT in the conservative ground-only fallback, where `delay_lb` is constant and the
-    break fires at `total_hops == 1` or never.
+    `completion_envelope` sizes its range from the HORIZON (`max_step - corridor_start`, far
+    larger than the ceiling), and every entry costs an `_endpoint_claims` call plus a sweep
+    over destination options. Its `break` contains that, but only conditionally: the break
+    needs `delay_lb` monotone in hops, which holds in the arc form and NOT in the conservative
+    ground-only fallback, where `delay_lb` is constant and the break fires at `total_hops == 1`
+    or never.
 
     `timing_steps` on a destination-endpoint claim IS the hop count, so watching that argument
     states the invariant directly and without reaching into a closure.
@@ -358,13 +358,12 @@ def test_completion_envelope_never_costs_a_hop_count_the_ceiling_forbids(monkeyp
     Do not read the small number of over-ceiling calls this catches as the size of what the cap
     buys. Construction is the cheap half; the envelope's LENGTH is the expensive half, because
     it bounds `completion_can_compete`'s scan and an entry past the ceiling keeps a label alive
-    on a completion the ceiling forbids. That is worth 2.17x the labels on the 50-flight
-    harness. This test guards the invariant those savings rest on, not the savings.
+    on a completion the ceiling forbids. This test guards the invariant those savings rest on,
+    not the savings.
     """
 
     # A wide ground-delay budget is what opens the gap this guards: `max_step` has to cover the
-    # latest legal departure, so the horizon runs far past any one route's length. The shipped
-    # colgen_test budget is 3600 s, which is where the ~920-against-20 figure comes from.
+    # latest legal departure, so the horizon runs far past any one route's length.
     cfg = replace(_cfg(), max_ground_delay_s=400.0)
     graph, params = _graph(cfg, overrun=1)
     # Duals ON the seed's own claims: with none, `price_flight` takes the zero-dual locality

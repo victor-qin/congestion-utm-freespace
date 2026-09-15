@@ -627,12 +627,11 @@ def test_realized_anchor_departs_on_the_arrival_that_actually_happened():
 
 
 def test_realized_anchor_waits_out_the_descent_inside_the_landing_column():
-    """Regression: the anchor used to be ``centerline[-1]``, the last CRUISE waypoint.
+    """A return must wait out the descent inside the landing column, not launch at cruise end.
 
-    The corridor ends at the destination column's edge and the descent inside is unreserved, so that
-    launched every return ``climb_time_to(z_land)`` before its aircraft was down — and since the legs
-    share one pad cylinder, the planner billed the overlap back as ground delay (94/94 here, 5 s each
-    at 30 m; 16.7 s at the density scenarios' 100 m).
+    The corridor ends at the column edge and the descent inside is unreserved. Anchoring on the
+    last cruise waypoint would launch a return before its aircraft is down, and since the legs share
+    one pad cylinder, the planner would bill that overlap back as ground delay.
     """
     from freespace_sim.sim import realized_release_s
 
@@ -743,9 +742,8 @@ def test_nominal_anchor_is_byte_identical_to_no_flag():
 def test_realized_anchor_does_not_mutate_caller_owned_requests():
     """run() must not write the coupled departures back into the caller's list.
 
-    Regression: it used to assign req.t_departure in place, so a nominal run over the SAME list after
-    a realized one silently inherited the coupled schedule — 157 of 188 flights differed. That is
-    precisely the anchor A/B this option invites someone to write.
+    If it assigned req.t_departure in place, a nominal run over the SAME list after a realized one
+    would silently inherit the coupled schedule — precisely the anchor A/B this option invites.
     """
     cfg, model = _roundtrip_world()
     reqs = model.generate(cfg, np.random.default_rng(0))

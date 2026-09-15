@@ -24,7 +24,7 @@ _AGG = {
     "mean_total_delay_s": "mean", "mean_air_detour_m": "mean", "mean_cost": "mean",
     "airspace_utilization": "mean", "mean_solve_time_s": "mean", "wall_seconds": "mean",
     "verified": "all",
-    # steady-state twin (issue #25) — present on runs saved after the window feature landed; the
+    # steady-state twin — present on runs saved after the window feature landed; the
     # `if k in df.columns` filter below silently drops them for older index rows.
     "steady_mean_total_delay_s": "mean", "steady_p95_total_delay_s": "mean",
     "steady_throughput_per_h": "mean", "steady_denial_rate": "mean",
@@ -32,6 +32,8 @@ _AGG = {
 
 
 def main() -> None:
+    """Load the run index, filter to the ``--tag``/``--scenario`` set, and print (and CSV-write) a
+    table of per-run metrics grouped by ``--by`` and averaged across seeds."""
     p = argparse.ArgumentParser(description="Comparison table over a filtered run set (cross-run).")
     p.add_argument("--tag", default=None, help="filter to a batch's runs (the join key)")
     p.add_argument("--scenario", default=None)

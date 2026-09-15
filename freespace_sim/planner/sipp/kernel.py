@@ -1,4 +1,4 @@
-"""Compiled (numba) air-cruise kernel for cost-aware SIPP (issue #8, Track B).
+"""Compiled (numba) air-cruise kernel for cost-aware SIPP (Safe Interval Path Planning).
 
 This is the hot path of :class:`~freespace_sim.planner.sipp.SIPPPlanner` — the safe-interval A* over the
 air lattice — lifted into a ``@njit`` function over flat arrays. The pure-Python ``SIPPPlanner`` stays
@@ -6,17 +6,17 @@ the reference oracle (and the fallback); this kernel must reproduce its exact op
 Everything terminal/geometry/commit stays in the Python host.
 
 **Occupancy** is a PER-PLAN interval pool over the window this flight reads, built from the A* claim
-arena by :func:`~freespace_sim.planner.sipp.window.build_window_intervals`: a cell's free intervals are
-slots walked from slot ``cell`` along ``iv_nxt``, and each slot is a unique frontier node id. Cell ids
+arena by :func:`~freespace_sim.planner.sipp.window.build_window_intervals` (see
+context/figures/sipp_safe_intervals.png): a cell's free intervals are slots walked from slot
+``cell`` along ``iv_nxt``, and each slot is a unique frontier node id. Cell ids
 are therefore WINDOW-local — ``qmin``/``rmin``/``rspan``/``qspan`` are the window's bounds, not the
 global box's — which is why an out-of-box stray returns ``FB_OOB`` for the host to widen on rather
 than fall back on. World ``(q, r)`` is reconstructed as ``iq + qmin`` at every site that needs it, so
 the recorded read set and the output path stay in world coordinates.
 
-There is no own-lane OVERLAY any more. The window build skips a cell's terminal-column claims when the
-planning flight owns it (A*'s ``ov_own_gen`` stamp), so what used to be a redirect to a second slot
-space is now just the chain this kernel already walks. The global free-interval pool it replaced could
-not do that: it stored columns foreign-to-everyone and needed the overlay to make them transparent.
+Own-lane transparency is baked into the chain this kernel walks: the window build skips a cell's
+terminal-column claims when the planning flight owns it (A*'s ``ov_own_gen`` stamp). There is no
+separate overlay or redirect to a second slot space — the successor loops walk one chain per cell.
 
 **Multi-label, not single-best.** Because the objective is weighted cost (``c_hold != c_gd``), a
 ``(cell, interval)`` is reached at several non-dominating ``(arrival, cost)`` labels (e.g. the origin via
@@ -26,8 +26,8 @@ linked list** of labels (unbounded — a fixed cap would overflow at the origin 
 dominance on insert. No eviction (a since-dominated label only adds a cheap compare). A per-``(cell, step)``
 **best-g table** (``_gslot``, open-addressing, version-stamped) and the matching **stale-skip** at pop
 mirror the reference's ``g`` dict: both are optimality-preserving, but they are NOT optional — without
-them the kernel expanded 3.2x more labels than the reference for the same answer (the interval frontier
-prunes ~17% of successors, this table ~58%).
+them the kernel expands ~3.2x more labels for the identical answer (the interval frontier alone
+prunes far fewer successors than the (cell, step) table does).
 
 Dominance (matches ``sipp._nondominated``): stored ``(t2,g2)`` dominates new ``(t,g)`` iff
 ``t2 <= t and g2 + (t - t2)*c_hold <= g``. Goal cells are frontier-EXEMPT (their per-step landing gate
@@ -56,11 +56,21 @@ def _gslot(g_pack, gen, key, cap, log2cap):
     """Linear-probe the open-addressing best-g table for ``key``; return the slot holding it OR the
     first empty (stale-generation) slot; -1 if the table is full.
 
-    This is the per-``(cell, step)`` dedup the pure-Python reference gets free from its ``g`` dict and
-    that this kernel used to omit (see the module docstring's old 'no per-(cell,step) dedup' note).
-    Measured: that omission cost 3.2x more labels than the reference for the identical answer, because
-    the interval frontier only prunes ~17% of successors while the (cell, step) check prunes ~58%.
-    Key and stamp share one 32 B record, so a probe step touches one cache line (see ``_packed``)."""
+    This is the per-``(cell, step)`` dedup the pure-Python reference gets free from its ``g`` dict.
+    Key and stamp share one 32 B record, so a probe step touches one cache line (see ``_packed``).
+
+    Parameters
+    ------------
+    - g_pack (np.ndarray): int64 packed best-g table; column 0 is the key, column 1 the gen stamp.
+    - gen (int): current search generation; a slot whose stamp != gen is treated as empty.
+    - key (int): the packed ``(cell, step)`` key to locate.
+    - cap (int): number of slots (a power of two; ``cap - 1`` is the probe mask).
+    - log2cap (int): log2 of ``cap``; selects the high hash bits for the initial slot.
+
+    Return
+    --------
+    - output (int): slot holding ``key``, else the first empty slot for it; ``-1`` if full.
+    """
     h = np.uint64(key) * _MAGIC
     i = np.int64(h >> np.uint64(64 - log2cap))      # high log2cap bits → well-mixed slot
     mask = cap - 1
@@ -76,8 +86,9 @@ def _gslot(g_pack, gen, key, cap, log2cap):
 @njit(cache=True, nogil=True)
 def _note_cell(read_bbox, q, r, L):
     """Widen the read bbox to cover hex cell ``(q, r, L)`` — one entry in the plan's READ SET, consumed
-    by the Track-A staleness test (``parallel.PlanEnvelope``) so a coordinator can tell whether anything
-    committed since this plan started could have changed its answer.
+    by the staleness test (``parallel.PlanEnvelope``, see context/figures/read_envelope.png) so a
+    coordinator can tell whether anything committed since this plan started could have changed its
+    answer.
 
     Write-only w.r.t. the search: it cannot change a decision, so kernel==reference parity is untouched.
 
@@ -85,13 +96,25 @@ def _note_cell(read_bbox, q, r, L):
     getting it wrong under-reports the read set, which is the one error mode the envelope exists to
     prevent. A*'s ``_blocked`` answers ONE ``(cell, step)`` question, so recording that point is exact.
     SIPP instead walks a cell's whole free-interval CHAIN, whose shape is derived from every commit that
-    ever touched that cell: a commit at some *other* step in the same cell splits an interval and changes
+    ever touched that cell: a commit at another step in that cell splits an interval and changes
     what the walk finds. So touching a chain reads the cell across the plan's entire step window, and the
     honest record is the cell. (Slots 6-7, the step range, are filled ONCE by the host from
     ``[base, max_step]`` for the same reason.)
 
     Callers pass WORLD ``(q, r)``, not box indices — ``envelope_intersects`` converts slots 0-3 through
-    ``cell_bbox_to_aabb``, which assumes world axial coordinates."""
+    ``cell_bbox_to_aabb``, which assumes world axial coordinates.
+
+    Parameters
+    ------------
+    - read_bbox (np.ndarray): in/out int64[8] read-set summary; slots 0-5 hold min/max of q, r, L.
+    - q (int): WORLD axial q of the cell to record (not a window index).
+    - r (int): WORLD axial r of the cell to record.
+    - L (int): flight level of the cell.
+
+    Return
+    --------
+    - output (None): widens ``read_bbox`` slots 0-5 in place; never affects a search decision.
+    """
     if q < read_bbox[0]:
         read_bbox[0] = q
     if q > read_bbox[1]:
@@ -121,6 +144,96 @@ def _search(
     out_q, out_r, out_s, out_L,                                      # output path buffers (+ flight level)
     read_bbox,                       # in/out int64[8]: read-set summary (see `_note_cell`)
 ):
+    """Run the compiled safe-interval A* over the per-plan interval pool; see the module docstring
+    for the algorithm, occupancy layout, and the kernel==reference parity contract.
+
+    Parameters are grouped by the signature's section labels. All arrays are flat buffers the host
+    (``_splan_compiled``) supplies.
+
+    Parameters
+    ------------
+    Window interval pool (a cell's free intervals are the chain from slot ``cell`` via ``iv_nxt``):
+    - iv_lo (np.ndarray): int32 free-interval low step per slot (inclusive).
+    - iv_hi (np.ndarray): int32 free-interval high step per slot (inclusive).
+    - iv_nxt (np.ndarray): int32 next slot in the cell's chain; ``-1`` ends it.
+    Window box + step window + level axis:
+    - qmin (int): window minimum world q; world q is ``iq + qmin``.
+    - rmin (int): window minimum world r.
+    - rspan (int): window row span; a level-less index is ``iq*rspan + ir``.
+    - qspan (int): window q-extent; bounds the out-of-box guard.
+    - base (int): first step of the search domain.
+    - max_step (int): last step of the search domain.
+    - nlevels (int): number of flight levels; cell id is ``(iq*rspan+ir)*nlevels + L``.
+    Takeoff lanes + egress steps + ground-delay mask:
+    - lane_qr (np.ndarray): int64 level-less window index of each takeoff-lane cell.
+    - lane_lat (np.ndarray): float64 lane lateral cost added to each start label.
+    - lane_st (np.ndarray): int64 egress translation steps per lane (climb, then translate out).
+    - n_lanes (int): number of takeoff lanes.
+    - to_ok (np.ndarray): bool takeoff feasibility per (ground-step, level), row ``si*nlevels + L``.
+    - n_to (int): number of ground-delay steps (rows of ``to_ok``).
+    - c_gd (float): per-second ground-delay cost.
+    Per-level takeoff + per-rung vertical edges:
+    - takeoff_steps (np.ndarray): int64 climb steps to each level.
+    - takeoff_cost (np.ndarray): float64 altitude cost to climb to each level (also descent term).
+    - rung_steps (np.ndarray): int64 climb/descend steps per rung, indexed by ``min(L, L±1)``.
+    - rung_cost (np.ndarray): float64 altitude cost per rung.
+    Goal flags/cost + landing intervals:
+    - goal_gen (np.ndarray): int64 per-cell goal flag; ``== gen`` marks a goal cell.
+    - goal_cost (np.ndarray): float64 per-cell lane-cell→terminal-edge cost (added at goal).
+    - lf_lo (np.ndarray): int64 low step of each per-level landing-feasible run (concatenated).
+    - lf_hi (np.ndarray): int64 high step of each landing run.
+    - lf_off (np.ndarray): int64 level offsets; level L's runs are ``[lf_off[L], lf_off[L+1])``.
+    Cost + heuristic params:
+    - c_hold (float): per-second air-hover cost (staircase slope; ``> c_gd``).
+    - c_lat (float): per-metre lateral cost.
+    - pitch (float): per-step cruise distance (m), charged as lateral cost per reroute hop.
+    - dt (float): seconds per step.
+    - gx (float): goal ENU x for the straight-line heuristic.
+    - gy (float): goal ENU y.
+    - R (float): hex circumradius (m).
+    - h_off (float): heuristic offset (max landing-lane distance) subtracted from range-to-goal.
+    - goal_cost_lb (float): lower bound on the goal lane cost, added to every f-score.
+    Search generation + per-slot Pareto staircase:
+    - gen (int): generation stamp; version-stamps the frontier/goal/best-g/dead arrays.
+    - front_head (np.ndarray): int64 head label of each slot's sorted-by-arrival staircase.
+    - front_tail (np.ndarray): int64 tail label per slot.
+    - front_gen (np.ndarray): int64 per-slot stamp; ``!= gen`` means the chain is stale (empty).
+    Labels (parallel arrays, one entry per search node):
+    - lab_cell (np.ndarray): int64 cell id per label.
+    - lab_slot (np.ndarray): int64 interval-slot id per label.
+    - lab_arr (np.ndarray): int64 arrival step per label.
+    - lab_g (np.ndarray): float64 cost-so-far per label.
+    - lab_par (np.ndarray): int64 parent label (``-1`` at a start), for reconstruction.
+    - lab_next (np.ndarray): int64 next label in the slot's staircase.
+    - lab_prev (np.ndarray): int64 previous label in the slot's staircase.
+    - lab_dead (np.ndarray): int64 eviction stamp; ``== gen`` ⇒ dominated after push, skip at pop.
+    - max_lab (int): label-array capacity; overflow returns ``FB_CAP``.
+    Binary heap:
+    - heap_f (np.ndarray): float64 f-score per entry (min-heap key).
+    - heap_c (np.ndarray): int64 insertion counter per entry (FIFO tie-break).
+    - heap_n (np.ndarray): int64 label id per entry.
+    - max_heap (int): heap capacity; overflow returns ``FB_CAP``.
+    (cell, step) best-g dedup table:
+    - g_pack (np.ndarray): int64 view of the packed best-g table (see ``_gslot``).
+    - g_packf (np.ndarray): float64 view of the same records; column 2 holds the best g.
+    - hash_cap (int): number of table slots (a power of two).
+    - log2cap (int): log2 of ``hash_cap``.
+    - nsteps (int): step stride for a packed key (``cell*nsteps + step``).
+    Output path buffers (written goal→start on ``OK``):
+    - out_q (np.ndarray): int64 output world q per path point.
+    - out_r (np.ndarray): int64 output world r.
+    - out_s (np.ndarray): int64 output step.
+    - out_L (np.ndarray): int64 output flight level.
+    Read set:
+    - read_bbox (np.ndarray): in/out int64[8] read-set summary, widened via ``_note_cell``.
+
+    Return
+    --------
+    - output (tuple[int, float, int, int]): ``(n, cost, n_exp, status)`` where ``n_exp`` is the
+      expansion count. On ``OK``, ``n`` path points are written to ``out_*`` (goal→start) and
+      ``cost`` is the total weighted cost. On a fallback (``FB_OOB``/``FB_CAP``/``FB_HASH``) or
+      ``NO_PATH``, ``n`` is ``-1`` and the host branches on ``status``.
+    """
     nlab = 0
     size = 0
     ctr = 0
@@ -132,8 +245,8 @@ def _search(
     # ---- takeoff enumeration (folded), per flight level: ground-step si × lane li × level Lk. A start
     # label at level Lk arrives ts = base+si+takeoff_steps[Lk] (per-level climb) at cell
     # lane_qr[li]*nlevels+Lk, with g = si*c_gd*dt + takeoff_cost[Lk] + lane_lat[li]. Heap + dominance
-    # order the search, so seeding order is free (unlike the single-level fold, this need not be byte-
-    # ordered). ``lane_qr`` is the level-less (iq*rspan+ir) index the kernel completes with Lk. ----
+    # order the search, so seeding order is free. ``lane_qr`` is the level-less (iq*rspan+ir) index
+    # the kernel completes with Lk. ----
     for si in range(n_to):
         g_gd = si * c_gd * dt                           # ground-delay cost (per-level climb + lane added below)
         for li in range(n_lanes):
@@ -141,7 +254,7 @@ def _search(
             for Lk in range(nlevels):
                 if not to_ok[si * nlevels + Lk]:        # per-(ground-step, level) dwell/pad gate
                     continue
-                ts = base + si + takeoff_steps[Lk] + lane_st[li]   # climb, THEN translate out (issue #52)
+                ts = base + si + takeoff_steps[Lk] + lane_st[li]   # climb, THEN translate out
                 if ts > max_step:
                     continue
                 cell = qr * nlevels + Lk
@@ -271,7 +384,7 @@ def _search(
                     if a < lo:
                         a = lo
                     if a > hi:
-                        sj = nxts                   # next interval in THIS chain (overlay or pool)
+                        sj = nxts                   # next interval in THIS chain
                         continue
                     if a - 1 > hi_c:                     # cannot hover here long enough (chain ascends)
                         break
@@ -374,9 +487,9 @@ def _search(
                 # both are already in the bbox: the cell was recorded when its own label was created
                 # (site A seeds every level of each takeoff lane, site B records every reroute
                 # neighbour), and a rung can only be taken from a cell that was expanded, i.e.
-                # pushed. Measured across 83 envelopes on a 3-level congested scenario: recording
-                # here widened NONE of them. Left out rather than kept "for safety" — an accumulator
-                # line no test can distinguish from its absence is one nobody can maintain.
+                # pushed. Measured to widen no envelope on a 3-level congested scenario. Left out,
+                # not kept "for safety" — an accumulator line no test can distinguish from its
+                # absence is one nobody can maintain.
                 ncell = qr * nlevels + tlv              # same (q, r), adjacent level
                 ngoal = goal_gen[ncell] == gen
                 sj = ncell                           # neighbour chain; own-lane transparency is

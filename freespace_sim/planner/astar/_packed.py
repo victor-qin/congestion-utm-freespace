@@ -1,18 +1,15 @@
-"""Cache-line-aligned packed record arrays for the A* kernel's random-access structures (issue #8).
+"""Cache-line-aligned packed record arrays for the A* kernel's random-access structures.
 
 **Why.** Struct-of-arrays is the right layout for sequential sweeps and the wrong one for random
 access. The kernel's g-hash was five separate allocations (``g_key``/``g_gen``/``g_val``/``g_came``/
 ``g_flag``), so a single node relaxation touched **five cache lines — 640 B on this machine's 128 B
 lines — to move 33 B of payload** (5% line utilization). That is invisible in a solo profile (one
 process has a whole 12 MB cluster L2 to itself) but dominates under concurrency: this machine's
-P-cores share **12 MB of L2 per 4-core cluster**, so W workers each get ~12/W MB, and a 60k-expansion
-search touching ~37 MB of cache lines misses essentially every probe.
+P-cores share 12 MB of L2 per 4-core cluster, so W workers each get ~12/W MB and a large search
+misses essentially every probe.
 
-Packing the same fields into one 32 B record — 4 records per 128 B line — was measured
-(``analysis/prof_memory.py``) at **2.5x faster solo and 3.1x at 8 concurrent processes** on the
-kernel's exact probe+relax pattern, and it cuts that structure's own concurrency tax from 2.28x to
-1.85x. It is a pure layout change: the probe sequence, the comparisons and the stored values are
-identical, so plans stay byte-identical.
+Packing the same fields into one 32 B record — 4 records per 128 B line — is a pure layout change:
+the probe sequence, comparisons and stored values are identical, so plans stay byte-identical.
 
 **How the 32 B record holds 33 B of fields.** ``g_val`` is a float and the rest are integers, so the
 buffer is allocated once as ``(rows, 4) int64`` and a ``float64`` *view of the same memory* addresses
@@ -50,7 +47,19 @@ def aligned_2d(rows: int, cols: int, dtype=np.int64, align: int = CACHE_LINE) ->
     """A ``(rows, cols)`` C-contiguous array whose base address is a multiple of ``align``.
 
     Over-allocates a byte buffer and slices to the first aligned offset; the returned view keeps the
-    oversized buffer alive, so no copy and no lifetime hazard."""
+    oversized buffer alive, so there is no copy and no lifetime hazard.
+
+    Parameters
+    ------------
+    - rows (int): number of records.
+    - cols (int): fields per record (4 for the g-hash: key, gen|closed, val, came).
+    - dtype (np.dtype): element type of the backing buffer (default ``int64``).
+    - align (int): required base-address alignment in bytes (default :data:`CACHE_LINE`).
+
+    Return
+    --------
+    - output (np.ndarray): a ``(rows, cols)`` view whose base address is ``align``-aligned.
+    """
     itemsize = np.dtype(dtype).itemsize
     nbytes = rows * cols * itemsize
     raw = np.empty(nbytes + align, np.uint8)

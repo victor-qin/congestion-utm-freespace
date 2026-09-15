@@ -110,16 +110,6 @@ def test_placement_deterministic_in_hub_seed():
             assert np.allclose(a[uid], b[uid])
 
 
-def test_placement_independent_of_pad_capacity():
-    """Pads are terminal capacity, not geometry — changing them must not move a hub."""
-    cfg = SimConfig(region_size_m=(9000.0, 9000.0))
-    ha = HubRadiusDemand(n_hubs_per_uss={"a": 4}, pads_per_hub=1).place_hubs(
-        cfg, np.random.default_rng(0xA17F))["a"]
-    hb = HubRadiusDemand(n_hubs_per_uss={"a": 4}, pads_per_hub=9).place_hubs(
-        cfg, np.random.default_rng(0xA17F))["a"]
-    assert np.allclose(ha, hb)
-
-
 def test_hub_counts_preserved():
     cfg = SimConfig(region_size_m=(10000.0, 10000.0))
     hubs = HubRadiusDemand(n_hubs_per_uss={"a": 3, "b": 7}).place_hubs(

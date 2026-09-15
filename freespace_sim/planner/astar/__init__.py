@@ -10,11 +10,11 @@ Three couplings are easy to get wrong from the file names alone:
 
   * ``_packed`` is NOT compiled-only. ``planner`` imports seven names from it for the pure-Python
     reference's own g-hash, so its layout constants are pinned by the parity suite on BOTH sides —
-    editing them without re-pinning the oracle is the trap the array-of-structs work left behind.
+    editing them without re-pinning the oracle breaks parity silently.
   * ``compiled_hex_occupancy`` is NOT compiled-only either. Alongside :class:`CompiledHexOccupancy`
     it owns ``search_horizon`` / ``hover_tail_steps`` / ``schedulable_horizon_steps``, plain
-    cfg-to-step arithmetic and the ONE definition (issue #5) shared by the reference path, the
-    compiled path, and the ledger. Gating this module on numba would silently un-bound all three.
+    cfg-to-step arithmetic and the ONE definition shared by the reference path, the compiled path,
+    and the ledger. Gating this module on numba would silently un-bound all three.
   * ``window`` and ``claim_arena`` have their own ``@njit`` dispatchers, so ``kernel`` is no longer
     this family's only compiled module. Both are imported at module level through the occupancy
     stack, while ``AStarPlanner.__init__``'s optional-numba guard sits around ``.kernel``; each leaf

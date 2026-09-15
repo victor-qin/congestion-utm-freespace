@@ -61,7 +61,7 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     assert isinstance(back.demand.uss, tuple) and isinstance(back.demand.hubs, tuple)
     assert all(isinstance(v, tuple) for v in back.demand.departure_offset_s.values())
     assert back.demand.request_clock_offset_s == spec.demand.request_clock_offset_s
-    back.demand_model()          # used to raise AttributeError
+    back.demand_model()          # must not raise
     back.config()
 
     # and the floating-preroll base world still round-trips its absent offset as None
@@ -304,9 +304,9 @@ def test_load_run_tolerates_runs_archived_before_the_pairing_column(tmp_path):
 
 
 def test_run_folders_of_different_lead_arms_do_not_collide(tmp_path):
-    """Regression: the arms share a byte-identical SimConfig and differ only in DemandSpec, so
-    _config_hash(cfg) alone gave all five the SAME hash (a246cd5e). Under one --tag their folders then
-    differed only by a second-granularity timestamp, and same-second finishers merged into one."""
+    """Arms share a byte-identical SimConfig and differ only in DemandSpec, so hashing the config
+    alone would collide. Under one --tag their folders would then differ only by a
+    second-granularity timestamp, and same-second finishers would merge into one."""
     from freespace_sim.scenarios import SCENARIOS
 
     base = "density_faa_wing_zipline_amazon"

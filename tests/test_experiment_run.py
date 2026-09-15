@@ -201,52 +201,29 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
 
     assert defaults.time_limit_s == 1200.0
     assert defaults.objective == "total_cost"
-    # The pricing-path knobs specifically.  These pin the SHIPPED defaults so that changing
-    # one has to be deliberate -- which is the whole point of the test, and both of the
-    # values below moved for measured reasons rather than drifting:
-    #
-    #   `n_pricing_workers` STAYS 0, and the attempt to default it to 4 is worth knowing
-    #   about: the pool is fast (3.50x at 4 workers on density x50) but its memory is
-    #   LINEAR -- 3.9 GB sequential, 12.5 GB at 4 workers, 22.7 GB at 8, sampled across the
-    #   process tree.  The evidence that briefly said otherwise was `rss_children`, which
-    #   is the largest single child rather than the sum and therefore reads flat no matter
-    #   how many workers run.
-    #
-    #   `greedy_budget_s_per_flight` 0.7 -> 0.0, which DISABLES the stage.  At convergence
-    #   it buys 0.129% of objective for +57% of wall, and iteration 1 is bit-identical
-    #   without it because `round_heuristic` sets `best_heuristic` anyway.
-    #
-    # `seed_ladder_steps` still defaults ON, so a `None` leaking through would silently
-    # disable the ladder rather than merely resetting a budget -- the original point here.
+    # Pricing-path knobs, pinned so a change to a shipped default has to be deliberate.
+    # `n_pricing_workers` stays 0 (pool off by default); `greedy_budget_s_per_flight=0.0`
+    # DISABLES the stage; `seed_ladder_steps` defaults ON, so a `None` leaking through would
+    # silently disable the ladder rather than merely resetting a budget.
     assert defaults.n_pricing_workers == 0
     assert defaults.seed_ladder_steps == 20
     assert defaults.greedy_budget_s_per_flight == 0.0
-    #   The bootstrap is ON at K=1, and the two fields move together: `bootstrap_roots=1`
-    #   works only because `bootstrap_ranking="bound"` orders roots by `g+h`.  At "score"
-    #   K=1 provably fails (`entry_rc` stays exactly 0.0000) and 2 is the floor.  Both are
-    #   ANSWER-AFFECTING -- they change which equally-optimal column returns -- so a change
-    #   here needs an `ab_colgen_parity.py` re-baseline, not just a green suite.
+    # Bootstrap is ON at K=1, and the two fields move together: `bootstrap_roots=1` works
+    # only because `bootstrap_ranking="bound"` orders roots by `g+h`. Both are ANSWER-AFFECTING
+    # (they change which equally-optimal column returns), so a change needs an
+    # `ab_colgen_parity.py` re-baseline, not just a green suite.
     assert defaults.bootstrap_roots == 1
     assert defaults.bootstrap_ranking == "bound"
-    #   The four that moved (or arrived) with the objective-scale change, pinned here for
-    #   the same reason as everything above -- these are the ones an archived run cannot be
-    #   compared across, so drifting one silently is the expensive failure:
-    #
-    #   `solver` "auto" -> "gurobi".  Not a speed knob: the two backends return different
-    #   optimal dual vertices on a degenerate master, so "auto" quietly falling back to
-    #   HiGHS changes the answer.  Failing loudly is the point.
-    #
-    #   `M` 1e6 -> 1e4 and `gap_metric` "revenue" -> "cost" SHIP AS A PAIR.  The revenue
-    #   gate reduces to `tau*M` (n cancels), so moving M alone retunes the stopping rule by
-    #   100x and turns ordinary runs into time-limit runs.
-    #
-    #   `ip_time_limit_s` is new: without it the final MILP inherits whatever the CG loop
-    #   did not spend, which is unbounded exactly when the loop went well.
+    # `solver` "gurobi" is not a speed knob: the two backends return different optimal dual
+    # vertices on a degenerate master, so "auto" quietly falling back to HiGHS changes the answer.
+    # `M` and `gap_metric` ship as a PAIR: the revenue gate reduces to `tau*M` (n cancels), so
+    # moving M alone retunes the stopping rule. `ip_time_limit_s` bounds the final MILP, which
+    # otherwise inherits whatever the CG loop did not spend.
     assert defaults.solver == "gurobi"
     assert defaults.M == 10_000.0
     assert defaults.gap_metric == "cost"
     assert defaults.ip_time_limit_s == 120.0
-    # None is "no ceiling", which is what every measurement in this PR ran under.
+    # None is "no ceiling".
     assert defaults.max_eager_ip_rows is None
     assert defaults.warm_start_planner is None
 

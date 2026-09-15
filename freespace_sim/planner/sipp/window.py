@@ -1,13 +1,11 @@
 """Per-plan safe-interval chains, built from the A* claim arena over the window a plan reads.
 
-This is ``astar/window.py``'s move applied to SIPP. The reasoning is identical and the measurement
-is in ``context/sipp_runtime_plan.md``: a global structure that derives free intervals from every
-commit is maintained in full so each plan can read **1.37% of its cells** (p50 3,910 of 286,026,
-over 28.5% of the steps). Worse, free intervals are the one representation that cannot be un-built —
-a blocked span can be subtracted from a free run, but removing one flight's span cannot be undone
-without re-applying every other flight's, which is why ``CompiledOccupancy.on_release`` costs 5.995
-ms/flight against the arena's 0.034 and **grows with congestion** (amplification 1.88x at 150 warm
-flights, 7.03x at 2,400).
+This is ``astar/window.py``'s move applied to SIPP, for the same reason. A global structure that
+derives free intervals from every commit must be maintained in full, yet each plan reads only a
+small fraction of its cells over a fraction of the steps. Worse, free intervals are the one
+representation that cannot be un-built — a blocked span can be subtracted from a free run, but
+removing one flight's span cannot be undone without re-applying every other flight's, so
+``CompiledOccupancy.on_release`` is expensive and **grows with congestion**.
 
 So: keep the claims, derive the intervals. One pass per in-window cell reads that cell's claim slabs
 out of the arena and emits the complement of them over ``[ws0, ws1]``, into the exact chain layout
@@ -27,25 +25,22 @@ arena's slabs are indeed unordered because removal is a swap-remove. Hence the s
 of a sorted, merged span list is ascending by construction rather than by assertion.
 
 The own-column fold is A*'s, term for term — ``ov_own_gen[cell] == gen`` skips the column slab and
-the always-active wall. That boolean reproduces the overlay ``SIPPPlanner._sbuild_overlay`` built
-out of ``SafeIntervalIndex``, which is why this replaces two structures rather than one — **but
-only on a cell no FOREIGN column also covers.** One boolean per cell cannot say "own AND
-foreign here", so on a mixed cell this reports the cell transparent and the foreign wall vanishes.
-``SafeIntervalIndex`` resolved ownership per ``(cell, step)`` and did not have that limit.
+the always-active wall, so an own-hub flight passes its shared column while foreign cruise stays
+walled (see context/figures/cell_blocking.png). That one boolean does the job the overlay
+``SIPPPlanner._sbuild_overlay`` did — **but only on a cell no FOREIGN column also covers.** One
+boolean per cell cannot say "own AND foreign here", so on a mixed cell it reports the cell
+transparent and the foreign wall vanishes. ``SafeIntervalIndex`` resolved ownership per
+``(cell, step)`` and did not have that limit.
 
 That is A*'s trade, not a new one, and A* handles it the same way: ``_build_overlay`` returns True
 when ``col_owners`` shows a foreign owner on an own cell, and the caller dispatches to the exact
-pure-Python reference (issue #3). **A host calling this builder MUST do the same** — the builder
-cannot detect it, because ``col_owners`` is a dict and this is an njit kernel.
+pure-Python reference. **A host calling this builder MUST do the same** — the builder cannot detect
+it, because ``col_owners`` is a dict and this is an njit kernel.
 
-Measured, so the guard's rarity is not assumed: on demand-generated layouts the case does not arise
-at all — ``density_faa`` (182 hubs, min centre separation 787.8 m) and ``dallas_hub_2uss``
-(26 hubs, 712.9 m) both have **zero** cells with more than one owning hub, and two hubs at the
-MINIMUM separation ``_scatter_hubs`` permits (670.0 m, i.e.
-``2*(exit_radius + sqrt3*R) + min_hub_gap_m``) share none. It takes ~55% of that legal separation
-to produce one.
-So the guard is for hand-built geometry and for scenarios that bypass ``_scatter_hubs``, not for the
-production ones.
+Measured, so the guard's rarity is not assumed: on demand-generated layouts (``density_faa``,
+``dallas_hub_2uss``) the case does not arise at all — no cell has more than one owning hub, and even
+two hubs at the minimum separation ``_scatter_hubs`` permits share none. So the guard is for
+hand-built geometry and for scenarios that bypass ``_scatter_hubs``, not for the production ones.
 """
 from __future__ import annotations
 
@@ -76,14 +71,16 @@ except ImportError:                     # numba absent — same guard as `astar/
         return deco
 
 # Above this many claims in one cell, insertion sort's quadratic term would beat the library sort's
-# per-call setup. Measured claim counts per window cell at density_faa are single digits (p50
-# window: 10,488 cells, ~24k overflow intervals), so this bounds the tail rather than tuning it.
+# per-call setup. Measured claim counts per window cell are single digits, so this bounds the tail
+# rather than tuning it.
 _INSERTION_MAX = 32
 
 
 def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, lateral_margin) -> int:
     """Size the window around the cells a plan is anchored to; return its cell count, or 0 if it
-    degenerated. Mirrors ``astar/window.window_bounds`` with two deliberate differences.
+    degenerated.
+
+    Mirrors ``astar/window.window_bounds`` with two deliberate differences.
 
     **The step span is ``[base, max_step]`` exactly — no heuristic tail.** A* clips steps to
     ``base + n_gsteps + tail_steps`` because a step outside its span costs one probe, which the
@@ -95,10 +92,27 @@ def window_bounds(cocc, wbox, *, q_cells, r_cells, base, max_step, lateral_margi
     where A*'s bitmap pays row bytes per step.
 
     **No slot budget here.** A* prices its buffer with arithmetic (cells x row_bytes); an interval
-    count is data-dependent. Summing ``slab_len`` over the window would be 20k-80k Python iterations
-    per plan, which would exhaust the whole build budget before one interval is emitted, so the
-    capacity check lives inside :func:`build_window_intervals` — which visits exactly those cells
-    anyway, in compiled code.
+    count is data-dependent. Summing ``slab_len`` over the window would be tens of thousands of
+    Python iterations per plan, exhausting the whole build budget before one interval is emitted, so
+    the capacity check lives inside :func:`build_window_intervals` — which visits exactly those
+    cells anyway, in compiled code.
+
+    Parameters
+    ------------
+    - cocc (CompiledOccupancy): supplies the global box bounds and step ceiling the window clips to
+      (``qmin``/``qspan``/``rmin``/``rspan``/``MAXS``/``n_levels``).
+    - wbox (np.ndarray[int64]): window-box buffer written in place (bounds + spans), or marked off
+      via :func:`disable` when the window degenerates.
+    - q_cells (Sequence[int]): anchor cell q-coordinates the window must cover.
+    - r_cells (Sequence[int]): anchor cell r-coordinates the window must cover.
+    - base (int): first step of the plan's step window.
+    - max_step (int): last step of the plan's step window (inclusive; no heuristic tail).
+    - lateral_margin (int): ring of cells added around the anchor bbox on each side.
+
+    Return
+    --------
+    - output (int): window cell count ``(q1-q0+1)*(r1-r0+1)*n_levels``, or 0 if the window
+      degenerated (in which case ``wbox`` is marked off).
     """
     q0 = int(min(q_cells)) - lateral_margin
     q1 = int(max(q_cells)) + lateral_margin
@@ -140,6 +154,39 @@ def build_window_intervals(arena, slab_start, slab_len, static_col, ov_own_gen, 
 
         w    = ((q - wq0)  * wrspan * n_levels) + ...   sequential counter
         cell = ((q - qmin) * rspan  + (r - rmin)) * n_levels + L
+
+    Parameters
+    ------------
+    - arena (np.ndarray[int64]): the packed claim arena; each entry packs a blocked span's
+      ``(start, end)`` steps.
+    - slab_start (np.ndarray[int64]): per-``(cell, kind)`` start offset into ``arena``, indexed
+      ``cell << 1 | kind`` (kind 0 = corridor claims, 1 = own-column claims).
+    - slab_len (np.ndarray[int64]): per-``(cell, kind)`` claim count; same indexing as
+      ``slab_start``.
+    - static_col (np.ndarray[bool]): per-cell always-active terminal wall (blocked at every step).
+    - ov_own_gen (np.ndarray[int64]): per-cell stamp; ``== gen`` marks a cell whose column the
+      planning flight owns, so its column claims and wall are skipped (own-lane transparency).
+    - gen (int): current generation stamp compared against ``ov_own_gen``.
+    - qmin (int): global box origin q (axial), for the global cell-id encoding.
+    - rmin (int): global box origin r (axial), for the global cell-id encoding.
+    - rspan (int): global box r-span, for the global cell-id encoding.
+    - n_levels (int): flight-level count.
+    - wbox (np.ndarray[int64]): the window box (bounds + spans) from :func:`window_bounds`.
+    - iv_lo (np.ndarray[int64]): OUT — per-slot free-interval low step; head of window-cell ``w`` is
+      slot ``w``.
+    - iv_hi (np.ndarray[int64]): OUT — per-slot free-interval high step.
+    - iv_nxt (np.ndarray[int64]): OUT — per-slot next-slot link (-1 ends the chain).
+    - scratch (np.ndarray[int64]): per-cell claim-sort scratch; must be int64 and at least as long
+      as ``iv_lo``.
+    - s0_shift (int): right-shift that extracts a packed span's start step.
+    - span_bits (int): right-shift that extracts a packed span's end step.
+    - field_mask (int): mask applied after ``span_bits`` to isolate the end step.
+
+    Return
+    --------
+    - output (int): slots used on success; 0 if the window is off; -1 if ``scratch`` is not int64;
+      or a negative value on a buffer shortfall (``-needed`` from the capacity pass, before anything
+      is written).
     """
     if wbox[W_STEPS] == 0:
         # OFF, the same encoding `astar/window` uses and `kernel._blocked` gates on. Without this a

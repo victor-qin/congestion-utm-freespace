@@ -34,7 +34,19 @@ _MIN_ENDPOINT_TIME_PAD_S = 1e-9
 
 
 def _endpoint_time_pad_s(t0: float, t1: float, dt: float, timing_steps: int) -> float:
-    """Conservatively bound floating accumulation in the corner-rebuild clock."""
+    """Conservatively bound floating accumulation in the corner-rebuild clock.
+
+    Parameters
+    ------------
+    - t0 (float): endpoint-cylinder start time (s); only its magnitude sets the pad scale.
+    - t1 (float): endpoint-cylinder end time (s); only its magnitude sets the pad scale.
+    - dt (float): grid period length (s), a floor on the pad scale.
+    - timing_steps (int): rebuilt lateral steps, scaling the accumulated-operation count.
+
+    Return
+    --------
+    - output (float): the time pad in seconds, never below ``_MIN_ENDPOINT_TIME_PAD_S``.
+    """
 
     scale = max(abs(t0), abs(t1), dt, 1.0)
     # A nominal hop can split into two subsegments at the pitch-rounding tripwire.
@@ -54,6 +66,17 @@ def _periods_overlapping(t0: float, t1: float, dt: float) -> range:
     ``ceil(t1 / dt)``.  This helper deliberately has no tolerance padding:
     template corridor times are created directly by the ledger builder and the
     expected default offset tuple is exactly ``(-2, 1)``.
+
+    Parameters
+    ------------
+    - t0 (float): inclusive start of the interval (s).
+    - t1 (float): exclusive end of the interval (s).
+    - dt (float): grid period length (s).
+
+    Return
+    --------
+    - output (range): the integer periods from ``floor(t0/dt)`` to ``ceil(t1/dt)`` (exclusive
+      stop) whose half-open intervals overlap ``[t0, t1)``.
     """
 
     # Division can put an exact constructed boundary on the wrong side of its
@@ -78,17 +101,20 @@ def _periods_overlapping(t0: float, t1: float, dt: float) -> range:
 def visit_rows(v: int, offsets: CellWindow) -> range:
     """Return all cell-capacity row periods claimed by a visit at step ``v``.
 
-    ``offsets`` is the inclusive ``(lo, hi)`` tuple returned by
-    :func:`derive_cell_window`.  With the default reservation geometry this is
-    ``(-2, 1)``, so a visit at step ``v`` claims ``v-2, ..., v+1``.  Returning a
-    :class:`range` keeps both pricing and claim construction allocation-light.
+    ``offsets`` is the inclusive ``(lo, hi)`` tuple from :func:`derive_cell_window`; with the
+    default reservation geometry it is ``(-2, 1)``, so a visit at step ``v`` claims
+    ``v-2, ..., v+1``.  Returning a :class:`range` keeps both pricing and claim construction
+    allocation-light.
 
-    Args:
-        v: Integer step at which the trajectory centre reaches the cell.
-        offsets: Inclusive temporal offsets relative to ``v``.
+    Parameters
+    ------------
+    - v (int): step at which the trajectory centre reaches the cell.
+    - offsets (CellWindow): inclusive ``(lo, hi)`` temporal offsets relative to ``v``.
 
-    Raises:
-        ValueError: If the offset interval is empty or reversed.
+    Return
+    --------
+    - output (range): the claimed row periods ``v+lo .. v+hi``; raises ``ValueError`` if the
+      offset interval is reversed (``lo > hi``).
     """
 
     lo, hi = offsets
@@ -98,14 +124,37 @@ def visit_rows(v: int, offsets: CellWindow) -> range:
 
 
 def _point(cell: AxialCell, z: float, radius: float) -> Vec:
-    """Return a 3-D lattice-centre point for a small template construction."""
+    """Return a 3-D lattice-centre point for a small template construction.
+
+    Parameters
+    ------------
+    - cell (AxialCell): axial ``(q, r)`` cell whose centre gives the x/y coordinates.
+    - z (float): altitude in metres, used as the third coordinate.
+    - radius (float): hex circumradius that sizes the lattice.
+
+    Return
+    --------
+    - output (Vec): the point ``(x, y, z)`` at the cell centre as a float array.
+    """
 
     xy = hex_center(*cell, radius)
     return np.array((float(xy[0]), float(xy[1]), float(z)), dtype=float)
 
 
 def _shift_volume(volume: Volume4D, steps: int, dt: float) -> Volume4D:
-    """Translate only a template volume's time interval by ``steps`` periods."""
+    """Translate only a template volume's time interval by ``steps`` periods.
+
+    Parameters
+    ------------
+    - volume (Volume4D): the template volume whose time window is shifted.
+    - steps (int): number of periods to translate by (may be negative).
+    - dt (float): grid period length (s).
+
+    Return
+    --------
+    - output (Volume4D): a copy with ``t_start``/``t_end`` shifted by ``steps * dt`` and the
+      spatial extent unchanged.
+    """
 
     shift = steps * dt
     return replace(volume, t_start=volume.t_start + shift, t_end=volume.t_end + shift)
@@ -120,6 +169,16 @@ def _template_arcs(cfg: SimConfig, radius: float) -> list[tuple[Volume4D, tuple[
     those arc types are outside colgen v1's column universe, including them is
     a cheap guard that the measured per-visit window still covers the ledger's
     existing geometry classes.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies the clock, cruise level, and flight-level ladder.
+    - radius (float): hex circumradius used to place the cell centres.
+
+    Return
+    --------
+    - output (list[tuple[Volume4D, tuple[int, ...]]]): each entry pairs a ledger volume with
+      the centre-cell visit steps that would claim it.
     """
 
     dt = cfg.dt_s
@@ -173,6 +232,17 @@ def _cross_check_conflicts(cfg: SimConfig, offsets: CellWindow, radius: float) -
     finite scan ties the two together: for every representative arc class and
     every temporal displacement at which the volumes can meet, a geometric
     conflict must imply an intersecting row claim.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies the clock and geometry the template arcs are built from.
+    - offsets (CellWindow): the inclusive ``(lo, hi)`` visit offsets under test.
+    - radius (float): hex circumradius used to place the template arcs.
+
+    Return
+    --------
+    - output (None): returns on success; raises ``RuntimeError`` if a geometric template
+      conflict is not covered by a shared cell-capacity row.
     """
 
     dt = cfg.dt_s
@@ -206,11 +276,19 @@ def _cross_check_conflicts(cfg: SimConfig, offsets: CellWindow, radius: float) -
 def validate_edge_locality(cfg: SimConfig) -> None:
     """Require every conflicting pair of lattice hops to share an endpoint cell.
 
-    Visit-only rows can cover a hop conflict only through one of the hop's two
-    visited cells.  The shipped 60 m corridor on a 120 m pitch has this
-    property, but wider otherwise-valid corridor configurations need not.  A
-    finite translation-invariant local sweep fails closed until hex sizing is
-    derived from corridor geometry (GitHub issue #72).
+    Visit-only rows can cover a hop conflict only through one of the hop's two visited cells.
+    The shipped 60 m corridor on a 120 m pitch has this property, but wider otherwise-valid
+    corridor configurations need not, so this finite translation-invariant local sweep fails
+    closed until hex sizing is derived from corridor geometry (GitHub issue #72).
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies the corridor and lattice geometry; result cached per ``cfg``.
+
+    Return
+    --------
+    - output (None): returns on success; raises ``NotImplementedError`` if two non-incident
+      lattice edges conflict, or ``ValueError`` on a non-positive corridor pitch.
     """
 
     radius = circumradius(cfg)
@@ -276,28 +354,25 @@ def _cells_in_ring(origin: AxialCell, rings: int):
 def derive_cell_window(cfg: SimConfig) -> CellWindow:
     """Measure inclusive row offsets for one centre crossing from ledger volumes.
 
-    A visit at step zero is incident to an inbound hop ``[-dt, 0]`` and an
-    outbound hop ``[0, dt]``.  Both are built with
-    :func:`corridor_segment_volume`, so their actual buffered half-open time
-    windows—not an assumed width—determine the periods in which the cell's
-    reservation is present.  The returned tuple is inclusive.
+    A visit at step zero is incident to an inbound hop ``[-dt, 0]`` and an outbound hop
+    ``[0, dt]``.  Both are built with :func:`corridor_segment_volume`, so their actual
+    buffered half-open time windows -- not an assumed width -- determine the periods in which
+    the cell's reservation is present.
 
-    The default geometry yields ``(-2, 1)``.  Setting ``time_buffer_s=0``
-    yields ``(-1, 0)``; this asymmetry is why deriving only a scalar width and
-    reconstructing offsets later would be incorrect.  A representative FCL
-    conflict scan is run once per cached configuration as an independent
-    coverage check.
+    The default geometry yields ``(-2, 1)``; ``time_buffer_s=0`` yields ``(-1, 0)``.  That
+    asymmetry is why deriving only a scalar width and reconstructing offsets later would be
+    incorrect.  A representative FCL conflict scan runs once per cached configuration as an
+    independent coverage check.
 
-    Args:
-        cfg: Simulation geometry and global-clock configuration.
+    Parameters
+    ------------
+    - cfg (SimConfig): simulation geometry and global-clock config; result cached per ``cfg``.
 
-    Returns:
-        Inclusive ``(lo_offset, hi_offset)`` row offsets relative to a visit.
-
-    Raises:
-        ValueError: If the clock or time-buffer configuration is invalid.
-        RuntimeError: If the measured footprint is non-contiguous or fails the
-            representative ledger-conflict coverage check.
+    Return
+    --------
+    - output (CellWindow): inclusive ``(lo_offset, hi_offset)`` row offsets relative to a
+      visit.  Raises ``ValueError`` on invalid clock/time-buffer config, and ``RuntimeError``
+      if the measured footprint is empty, non-contiguous, or fails the coverage check.
     """
 
     dt = float(cfg.dt_s)
@@ -350,6 +425,16 @@ def hop_box_stays_in_its_cells(cfg: SimConfig) -> bool:
     Both hold for the shipped 60 m corridor on a 120 m pitch (60 <= 69.28 and
     42.43 <= 60), but neither is implied by anything else in the configuration, so
     :func:`endpoint_claim_cells` asks rather than assumes.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies ``corridor_segment_len_m`` (pitch), ``corridor_width_m``, and
+      the derived circumradius.
+
+    Return
+    --------
+    - output (bool): True if both containment conditions hold (and the geometry is finite and
+      positive), False otherwise.
     """
 
     hex_radius = circumradius(cfg)
@@ -369,8 +454,20 @@ def _distance_to_hex(px: float, py: float, cell: AxialCell, hex_radius: float) -
 
     This is what ``endpoint_claim_cells`` needs and the centre test only approximates: a hex
     whose CENTRE is inside ``radius + circumradius`` can still be out of reach of the disk,
-    by up to a full circumradius.  Measured: 4.23 cells per endpoint under the centre test
-    against 3.89 under this one.
+    by up to a full circumradius (the exact test claims 3.89 cells per endpoint where the
+    centre test claims 4.23).
+
+    Parameters
+    ------------
+    - px (float): point x-coordinate in local ENU metres.
+    - py (float): point y-coordinate in local ENU metres.
+    - cell (AxialCell): axial ``(q, r)`` cell whose closed hexagon is measured to.
+    - hex_radius (float): hex circumradius sizing the hexagon.
+
+    Return
+    --------
+    - output (float): planar distance in metres, ``0.0`` when the point is inside the
+      closed hexagon.
     """
 
     cx, cy = hex_center(cell[0], cell[1], hex_radius)
@@ -416,27 +513,24 @@ def endpoint_claim_cells(point: Vec, radius: float, cfg: SimConfig) -> list[Axia
       between (:func:`hop_box_stays_in_its_cells`), so a box meeting the disk meets it
       inside a hex the transit itself VISITS, and that hex touches the disk.
 
-    That second bound is why no corridor-width term appears.  Adding one — as the
-    original ``radius + max(corridor_width_m, effective_hover_radius_m) +
-    circumradius`` did — reaches 189.28 m instead of 129.28 m at defaults and claims
-    9.0 cells where 4.2 suffice, and every extra cell is a cap-1 row that forbids
-    traffic which provably cannot conflict (GitHub issue #101: at 2,000 flights it was
-    1,272 of 1,287 over-capacity rows, none of them a real conflict).  Configurations
-    that break containment keep the wider reach.
+    That second bound is why no corridor-width term appears: adding one -- e.g.
+    ``radius + max(corridor_width_m, effective_hover_radius_m) + circumradius`` -- over-claims
+    (~9 cells where ~4.2 suffice), and every extra cell is a cap-1 row that forbids traffic
+    which provably cannot conflict.  Configurations that break containment keep the wider reach.
 
-    Enumeration is bounded to a finite axial ring around ``cell(point)`` and
-    the result is sorted lexicographically for deterministic column claims.
+    Enumeration is bounded to a finite axial ring around ``cell(point)`` and the result is
+    sorted lexicographically for deterministic column claims.
 
-    Args:
-        point: Endpoint position in local ENU metres; only x/y are used.
-        radius: Cylinder radius in metres.
-        cfg: Simulation geometry configuration.
+    Parameters
+    ------------
+    - point (Vec): endpoint position in local ENU metres; only x/y are used.
+    - radius (float): cylinder radius in metres.
+    - cfg (SimConfig): simulation geometry configuration.
 
-    Returns:
-        Deterministically ordered axial ``(q, r)`` cells.
-
-    Raises:
-        ValueError: If the point or radius is non-finite, or radius is negative.
+    Return
+    --------
+    - output (list[AxialCell]): deterministically ordered axial ``(q, r)`` cells.  Raises
+      ``ValueError`` if the point or radius is non-finite, or the radius is negative.
     """
 
     px, py = float(point[0]), float(point[1])
@@ -473,7 +567,7 @@ def endpoint_claim_cells(point: Vec, radius: float, cfg: SimConfig) -> list[Axia
     # exact disk-touches-hexagon question, which is the predicate the cover argument actually
     # rests on.  Exact is a strict subset of the centre test, so this only ever drops cells,
     # and it drops the ones that produce phantom conflicts between two endpoints on opposite
-    # sides of a hex neither of them reaches (GitHub issue #101).
+    # sides of a hex neither of them reaches.
     exact = hop_box_stays_in_its_cells(cfg)
     cells: list[AxialCell] = []
     oq, or_ = origin
@@ -502,30 +596,29 @@ def endpoint_claim_steps(
     *,
     timing_steps: int = 0,
 ) -> range:
-    """Return row periods conservatively touched by endpoint window ``[t0,t1)``.
+    """Return row periods conservatively touched by endpoint window ``[t0, t1)``.
 
-    The row index denotes the physical period ``[j*dt, (j+1)*dt)``.  Rounding
-    the endpoint interval outward makes it intersect the derived
-    :func:`visit_rows` of every transit box whose ledger time window can overlap
-    the endpoint.  A floating-point error bound based on the number of rebuilt
-    lateral steps covers clock drift; direct callers retain a minimum 1 ns pad.
+    The row index denotes the physical period ``[j*dt, (j+1)*dt)``.  Rounding the endpoint
+    interval outward makes it intersect the derived :func:`visit_rows` of every transit box
+    whose ledger time window can overlap the endpoint.  A floating-point error bound based on
+    the number of rebuilt lateral steps covers clock drift; direct callers retain a minimum
+    1 ns pad.  An exact grid-boundary endpoint claims one adjacent period on each side because
+    the rebuilt timestamp may drift either way -- a small conservative expansion, never an
+    under-approximation.
 
-    Exact grid-boundary endpoints intentionally claim one adjacent period on
-    each side because the rebuilt timestamp may drift either way.  This is a
-    small conservative expansion, never an under-approximation.
+    Parameters
+    ------------
+    - t0 (float): inclusive endpoint-cylinder start time (s).
+    - t1 (float): exclusive endpoint-cylinder end time (s).
+    - cfg (SimConfig): simulation clock configuration.
+    - timing_steps (int): lateral steps accumulated by the corner-rebuild clock, sizing the
+      float-drift pad.
 
-    Args:
-        t0: Inclusive endpoint-cylinder start time in seconds.
-        t1: Exclusive endpoint-cylinder end time in seconds.
-        cfg: Simulation clock configuration.
-        timing_steps: Lateral steps accumulated by the corner-rebuild clock.
-
-    Returns:
-        A range of integer capacity-row periods.  A zero-duration interval
-        returns an empty range.
-
-    Raises:
-        ValueError: If times are non-finite, reversed, or ``dt_s`` is invalid.
+    Return
+    --------
+    - output (range): integer capacity-row periods; empty for a zero-duration interval.
+      Raises ``ValueError`` on non-finite/reversed times, invalid ``dt_s``, or a negative
+      ``timing_steps``, and ``TypeError`` on a non-integer ``timing_steps``.
     """
 
     t0, t1 = float(t0), float(t1)
@@ -555,16 +648,25 @@ def endpoint_claim_steps(
 def terminal_claim_steps(t0: float, t1: float, cfg: SimConfig) -> range:
     """Return the exact clock periods overlapped by terminal dwell ``[t0, t1)``.
 
-    Terminal rows model pad occupancy rather than a conservative geometric
-    envelope.  They must therefore use the same half-open interval semantics as
-    :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`: period
-    ``j`` is claimed exactly when ``[j*dt, (j+1)*dt)`` overlaps the dwell.  In
-    particular, a dwell ending on a grid boundary does not claim the following
-    period, and one starting there does not claim the preceding period.
+    Terminal rows model pad occupancy rather than a conservative geometric envelope, so they
+    use the same half-open interval semantics as
+    :class:`~freespace_sim.planner.terminal_capacity.TerminalCapacity`: period ``j`` is
+    claimed exactly when ``[j*dt, (j+1)*dt)`` overlaps the dwell.  A dwell ending on a grid
+    boundary does not claim the following period, and one starting there does not claim the
+    preceding period.  Unlike :func:`endpoint_claim_steps`, this applies no floating-point
+    padding: customer endpoint cylinders need that outward geometric cover; terminal capacity
+    is an exact scheduling resource.
 
-    Unlike :func:`endpoint_claim_steps`, this helper deliberately applies no
-    floating-point padding.  Customer endpoint cylinders need that outward
-    geometric cover; terminal capacity is an exact scheduling resource.
+    Parameters
+    ------------
+    - t0 (float): inclusive dwell start time (s).
+    - t1 (float): exclusive dwell end time (s).
+    - cfg (SimConfig): simulation clock configuration.
+
+    Return
+    --------
+    - output (range): the exactly-overlapped integer clock periods; empty for a zero-duration
+      dwell.  Raises ``ValueError`` on non-finite/reversed times or invalid ``dt_s``.
     """
 
     t0, t1 = float(t0), float(t1)

@@ -400,175 +400,96 @@ def test_sim_run_forwards_planner_params_to_the_factory(monkeypatch):
     assert seen == [("colgen", params)]
 
 
-def test_a_budget_terminated_solve_says_so(monkeypatch, caplog):
-    """A time-limited solve returns a full schedule, so nothing downstream can tell.
-
-    The run folder records an ordinary-looking accepted set either way; the only place the
-    difference can surface is the log, at the moment the run could still be relaunched.
-    """
-
-    cfg = _cfg()
-    monkeypatch.setattr(
-        batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
-            columns={}, stats={"termination_reason": "time_limit", "iterations": 1},
+@pytest.mark.parametrize(
+    ("stats", "make_params", "expected", "forbidden"),
+    [
+        # A time-limited solve returns a full, ordinary-looking schedule; the only place the
+        # truncation can surface is the log, at the moment the run could still be relaunched.
+        (
+            {"termination_reason": "time_limit", "iterations": 1},
+            lambda: ColGenParams(time_limit_s=45.0),
+            ("stopped on its time limit (45s)",),
+            None,
         ),
-    )
-
-    with caplog.at_level(logging.WARNING, logger=batch.__name__):
-        run_batch(
-            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
-            _RecordingDSS(),  # type: ignore[arg-type]
-            (), lambda *_args: None, None, None,
-            params=ColGenParams(time_limit_s=45.0),
-        )
-
-    assert any("stopped on its time limit (45s)" in record.message for record in caplog.records)
-
-
-def test_an_early_revenue_gap_close_is_flagged_against_the_cost_scale(monkeypatch, caplog):
-    """The gate is one scale; the honest magnitude is the other, and they disagree.
-
-    Measured on ``colgen_test``: Gurobi's duals close the revenue gap at iteration 1 where
-    HiGHS's, on the identical problem, leave it at 0.194. Both bounds are valid -- they are
-    different optimal dual vertices of a degenerate master -- so which backend is installed
-    decides whether the solve stops immediately, and nothing in the results says so.
-    """
-
-    cfg = _cfg()
-    monkeypatch.setattr(
-        batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
-            columns={},
-            stats={
+        # The gate is the revenue scale; the honest magnitude is the cost scale, and they
+        # disagree. On ``colgen_test`` Gurobi's duals close the revenue gap at iteration 1
+        # where HiGHS's leave it open, so which backend is installed decides the early stop and
+        # nothing in the results says so -- hence the warning quotes the cost-scale value.
+        (
+            {
                 "termination_reason": "lp_gap", "iterations": 1,
                 "lp_gap_revenue": 4.65e-05, "lp_gap_cost": 1.166,
             },
+            lambda: ColGenParams(gap_metric="revenue"),
+            ("stopped on the revenue-scale lp_gap", "still 1.17"),
+            None,
         ),
-    )
-
-    with caplog.at_level(logging.WARNING, logger=batch.__name__):
-        run_batch(
-            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
-            _RecordingDSS(),  # type: ignore[arg-type]
-            (), lambda *_args: None, None, None,
-            params=ColGenParams(gap_metric="revenue"),
-        )
-
-    assert any(
-        "stopped on the revenue-scale lp_gap" in record.message
-        and "still 1.17" in record.message
-        for record in caplog.records
-    )
-
-
-def test_a_genuinely_converged_solve_is_not_flagged(monkeypatch, caplog):
-    """Both scales agreeing is the case the warning must stay quiet for."""
-
-    cfg = _cfg()
-    monkeypatch.setattr(
-        batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
-            columns={},
-            stats={
+        # Both scales agreeing is the case the warning must stay quiet for.
+        (
+            {
                 "termination_reason": "lp_gap", "iterations": 40,
                 "lp_gap_revenue": 1e-06, "lp_gap_cost": 1e-05,
             },
+            lambda: ColGenParams(gap_metric="revenue"),
+            (),
+            None,
         ),
-    )
-
-    with caplog.at_level(logging.WARNING, logger=batch.__name__):
-        run_batch(
-            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
-            _RecordingDSS(),  # type: ignore[arg-type]
-            (), lambda *_args: None, None, None,
-            params=ColGenParams(gap_metric="revenue"),
-        )
-
-    assert not caplog.records, "a converged solve must not cry wolf"
-
-
-def test_an_uncertified_final_ip_is_not_reported_as_a_budget_timeout(monkeypatch, caplog):
-    """Two different facts had one name, and the name pointed at the wrong knob.
-
-    ``ip_optimal is False`` used to overwrite ``termination_reason`` with ``time_limit``,
-    because both mean an absent flight is unproven rather than impossible. But a run whose
-    generation loop converged on ``lp_gap`` and whose final MILP merely failed to certify
-    has not exhausted its wall clock, and telling its operator to raise the time limit
-    describes a cause that is not there.
-    """
-
-    cfg = _cfg()
-    monkeypatch.setattr(
-        batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
-            columns={},
-            stats={
+        # ``ip_not_proven`` is not a budget timeout: a run whose loop converged on ``lp_gap``
+        # and whose final MILP merely failed to certify has not exhausted its wall clock, so
+        # the message must name the columns, not the (absent) time limit.
+        (
+            {
                 "termination_reason": "ip_not_proven", "iterations": 12,
                 "ip_status": "iteration_limit", "n_columns": 431,
             },
+            lambda: ColGenParams(time_limit_s=45.0),
+            ("without proving optimality over its 431 columns",),
+            "stopped on its time limit",
         ),
-    )
-
-    with caplog.at_level(logging.WARNING, logger=batch.__name__):
-        run_batch(
-            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
-            _RecordingDSS(),  # type: ignore[arg-type]
-            (), lambda *_args: None, None, None,
-            params=ColGenParams(time_limit_s=45.0),
-        )
-
-    messages = [record.message for record in caplog.records]
-    assert any("without proving optimality over its 431 columns" in m for m in messages)
-    assert not any("stopped on its time limit" in m for m in messages), (
-        "the budget message names a cause this run does not have"
-    )
-
-
-def test_the_iteration_cap_is_announced_like_the_other_truncated_exits(monkeypatch, caplog):
-    """`solver` treats `iteration_limit` exactly like `time_limit`: every denial becomes
-    SEARCH_EXHAUSTED and the schedule is uncertified. It was the one truncated exit that
-    said nothing, which is the failure the other two warnings exist to prevent."""
-
-    cfg = _cfg()
-    monkeypatch.setattr(
-        batch.ColGenSolver, "solve",
-        lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
-            columns={}, stats={"termination_reason": "iteration_limit", "iterations": 30},
+        # The iteration cap is a truncated exit like ``time_limit`` -- every denial becomes
+        # SEARCH_EXHAUSTED and the schedule is uncertified -- yet it was the one that said
+        # nothing, which is the failure the other warnings exist to prevent.
+        (
+            {"termination_reason": "iteration_limit", "iterations": 30},
+            lambda: ColGenParams(max_iterations=30),
+            ("iteration cap (30)",),
+            None,
         ),
-    )
+        # ``lp_gap`` and ``heuristic_gap`` are different quantities against different
+        # thresholds. The LP's cost gap has closed; the HEURISTIC's has not. Keying on the
+        # former would stay silent on exactly the run worth warning about.
+        (
+            {
+                "termination_reason": "heuristic_gap", "iterations": 3,
+                "lp_gap_cost": 1e-9, "heuristic_gap_cost": 0.42,
+            },
+            lambda: ColGenParams(gap_metric="revenue", ip_gap=1e-3),
+            ("stopped on the revenue-scale heuristic_gap", "still 0.42", "threshold 0.001"),
+            None,
+        ),
+    ],
+    ids=[
+        "budget", "revenue_gap", "converged",
+        "uncertified_ip", "iteration_cap", "heuristic_gap",
+    ],
+)
+def test_solve_termination_is_reported_faithfully(
+    monkeypatch, caplog, stats, make_params, expected, forbidden
+):
+    """Every truncated or early exit is announced against the right scale, a genuinely
+    converged solve stays quiet, and no warning names a cause the run does not have.
 
-    with caplog.at_level(logging.WARNING, logger=batch.__name__):
-        run_batch(
-            scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
-            _RecordingDSS(),  # type: ignore[arg-type]
-            (), lambda *_args: None, None, None,
-            params=ColGenParams(max_iterations=30),
-        )
-
-    assert any("iteration cap (30)" in record.message for record in caplog.records)
-
-
-def test_a_heuristic_gap_stop_is_measured_against_the_heuristic_threshold(monkeypatch, caplog):
-    """`lp_gap` and `heuristic_gap` are different quantities against different thresholds.
-
-    The LP bound is gated by `lp_gap`; the incumbent by `ip_gap`. Quoting the LP's numbers
-    at a run that stopped on the heuristic's describes something that did not happen -- and
-    the honest value was not even in the stats to quote, having been computed per iteration
-    and discarded with the loop frame.
+    A finished run folder looks the same whichever way a solve stopped; the only place the
+    difference surfaces is the log, at the moment the run could still be relaunched.
+    ``expected`` is the set of substrings that must co-occur in one record; an empty
+    ``expected`` asserts silence; ``forbidden`` names a cause the message must not claim.
     """
 
     cfg = _cfg()
     monkeypatch.setattr(
         batch.ColGenSolver, "solve",
         lambda self, requests, solve_cfg, static_terms, params, on_iteration=None, **_kw: ColGenResult(
-            columns={},
-            stats={
-                "termination_reason": "heuristic_gap", "iterations": 3,
-                # The LP's cost gap has closed; the HEURISTIC's has not. Keying on the
-                # former would stay silent on exactly the run worth warning about.
-                "lp_gap_cost": 1e-9, "heuristic_gap_cost": 0.42,
-            },
+            columns={}, stats=stats,
         ),
     )
 
@@ -577,12 +498,18 @@ def test_a_heuristic_gap_stop_is_measured_against_the_heuristic_threshold(monkey
             scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),
             _RecordingDSS(),  # type: ignore[arg-type]
             (), lambda *_args: None, None, None,
-            params=ColGenParams(gap_metric="revenue", ip_gap=1e-3),
+            params=make_params(),
         )
 
-    assert any(
-        "stopped on the revenue-scale heuristic_gap" in record.message
-        and "still 0.42" in record.message
-        and "threshold 0.001" in record.message
-        for record in caplog.records
-    )
+    if expected:
+        assert any(
+            all(substring in record.message for substring in expected)
+            for record in caplog.records
+        )
+    else:
+        assert not caplog.records, "a converged solve must not cry wolf"
+
+    if forbidden is not None:
+        assert not any(forbidden in record.message for record in caplog.records), (
+            "the budget message names a cause this run does not have"
+        )

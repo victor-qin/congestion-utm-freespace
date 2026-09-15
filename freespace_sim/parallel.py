@@ -1,20 +1,20 @@
-"""Track A parallel infrastructure (issue #8) — read-envelopes for speculative planning.
+"""Track A parallel infrastructure — read-envelopes for speculative planning.
 
-This module carries the *validation geometry* for the speculative-planning / ordered-commit
-parallel sim: a :class:`PlanEnvelope` summarises everything one plan **read** — every occupancy
+This module carries the validation geometry for the speculative-planning / ordered-commit
+parallel sim: a :class:`PlanEnvelope` summarises everything one plan READ — every occupancy
 cell the search probed (recorded as a (q, r, L, step) bbox by the compiled kernel / the
 ``_RecordingOcc`` reference shim in ``planner.astar``) plus the origin/destination hub discs whose
-capacity/mask state the host consulted. The exact-mode commit test is then: *if no interleaved
+capacity/mask state the host consulted. The exact-mode commit test follows: if no interleaved
 commit's volumes intersect the envelope, the sequential planner would have produced a byte-identical
-intent* — a plan is a deterministic function of its read set.
+intent — a plan is a deterministic function of its read set.
 
 Conventions:
   * The cell bbox is conservative in z (levels are recorded but the meters conversion ignores them —
     committed columns span the tube anyway); xy + the recorded time window are the discriminators.
   * The time window is RECORDED, not predicted (``[t_request - dt - time_buffer, max_step*dt +
     hover tail + worst egress traverse]`` — the lower lookback covers occupancy rasterization and
-    the upper traverse term covers a dwell read at the last step, issue #52); the spatial-only rule
-    applies to *pre-plan prediction* tubes (Phase 3), never to this validation.
+    the upper traverse term covers a dwell read at the last step); the spatial-only rule
+    applies to pre-plan prediction tubes (Phase 3), never to this validation.
   * Hub discs cover the host-side reads the cell bbox can't see: ``TerminalCapacity`` dwell/transit
     queries, the compiled path's takeoff/landing masks, and ``col_owners`` overlay marks.
 
@@ -43,22 +43,42 @@ BBOX_HUGE = 1 << 62
 
 
 def env_pad_m(cfg: SimConfig) -> float:
-    """Meters a probed cell's influence extends past its centre: the occupancy rasterisation
-    inflation (``occupancy.HexOccupancyService`` — ``infl_blocked = corridor_width/2 + R``,
-    ``infl_pad = hover_radius + R``). A volume can affect a cell iff it comes within this of the
-    cell centre, so padding the cell bbox by it makes the meters envelope a superset of every
-    volume that could have changed any probe. Both terms already include the circumradius R —
-    do NOT add R again (it only inflates the false-dirty rate)."""
+    """Meters a probed cell's influence extends past its centre.
+
+    Equals the occupancy rasterisation inflation (``occupancy.HexOccupancyService`` —
+    ``infl_blocked = corridor_width/2 + R``, ``infl_pad = hover_radius + R``). A volume can affect
+    a cell iff it comes within this of the cell centre, so padding the cell bbox by it makes the
+    meters envelope a superset of every volume that could have changed any probe. Both terms
+    already include circumradius R — do NOT add R again (it only inflates the false-dirty rate).
+
+    Parameters
+    ------------
+    - cfg (SimConfig): source of corridor width, hover radius, and hex circumradius.
+
+    Return
+    --------
+    - output (float): the padding in meters (max of the blocked and pad inflations).
+    """
     R = hg.circumradius(cfg)
     return max(cfg.corridor_width_m / 2.0 + R, cfg.effective_hover_radius_m + R)
 
 
 def cell_bbox_to_aabb(cell_bbox, cfg: SimConfig):
-    """The world-xy AABB ``(xmin, ymin, xmax, ymax)`` covering hex cells ``qmin..qmax × rmin..rmax``
-    (slots 0-3 of an 8-slot read bbox), padded by :func:`env_pad_m`.
+    """World-xy AABB ``(xmin, ymin, xmax, ymax)`` covering a hex-cell read bbox, padded.
 
-    ``x = R·√3·(q + r/2)`` depends on BOTH q and r, so evaluate all four (q, r) corners and take
-    min/max; ``y = R·1.5·r`` is monotone in r alone."""
+    Covers cells ``qmin..qmax × rmin..rmax`` (slots 0-3 of an 8-slot read bbox), padded by
+    :func:`env_pad_m`. ``x = R·√3·(q + r/2)`` depends on BOTH q and r, so evaluate all four
+    (q, r) corners and take min/max; ``y = R·1.5·r`` is monotone in r alone.
+
+    Parameters
+    ------------
+    - cell_bbox (Sequence): read bbox whose slots 0-3 are (qmin, qmax, rmin, rmax).
+    - cfg (SimConfig): source of the hex circumradius and the pad width.
+
+    Return
+    --------
+    - output (tuple): ``(xmin, ymin, xmax, ymax)`` in meters.
+    """
     qmin, qmax, rmin, rmax = cell_bbox[0], cell_bbox[1], cell_bbox[2], cell_bbox[3]
     R = hg.circumradius(cfg)
     xs = [R * hg.SQRT3 * (q + r / 2.0) for q in (qmin, qmax) for r in (rmin, rmax)]
@@ -88,17 +108,43 @@ class PlanEnvelope:
 
 def _disc_hits_aabb(cx: float, cy: float, radius: float, a) -> bool:
     """Does the xy disc intersect the volume AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``?
-    Clamp the centre into the box; compare the residual to the radius (scalar hot path)."""
+
+    Clamp the centre into the box; compare the residual to the radius (scalar hot path). Only the
+    xy extent is tested; the z bounds are ignored.
+
+    Parameters
+    ------------
+    - cx (float): disc centre x in metres.
+    - cy (float): disc centre y in metres.
+    - radius (float): disc radius in metres.
+    - a (tuple[float, ...]): flat AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
+
+    Return
+    --------
+    - output (bool): True iff the disc overlaps the box's xy extent.
+    """
     dx = (a[0] - cx) if cx < a[0] else (cx - a[3]) if cx > a[3] else 0.0
     dy = (a[1] - cy) if cy < a[1] else (cy - a[4]) if cy > a[4] else 0.0
     return dx * dx + dy * dy <= radius * radius
 
 
 def envelope_intersects(env: PlanEnvelope, commits) -> bool:
-    """True iff any committed volume ``(flat_aabb, t_start, t_end)`` in ``commits`` intersects the
-    envelope — i.e. the speculation is DIRTY and exact mode must replan. The time window is the
-    plan's *recorded* reach (kept deliberately — measured, not predicted); within it, a volume is a
-    hit if it overlaps the probed-cell xy box or any consulted hub disc."""
+    """True iff any committed volume in ``commits`` intersects the read envelope
+    (see context/figures/read_envelope.png).
+
+    A hit means the speculation is DIRTY and exact mode must replan it serially. The time window
+    is the plan's RECORDED reach (measured, not predicted — kept deliberately); within it, a volume
+    is a hit if it overlaps the probed-cell xy box or any consulted hub disc.
+
+    Parameters
+    ------------
+    - env (PlanEnvelope): the plan's recorded read set (``unbounded`` ⇒ always dirty).
+    - commits (Iterable): committed volumes as ``(flat_aabb, t_start, t_end)`` triples.
+
+    Return
+    --------
+    - output (bool): True if any commit intersects the envelope in space and time.
+    """
     if env.unbounded:
         return True
     xy = env.xy
@@ -141,16 +187,15 @@ class ParallelConfig:
     whether the result is already back when the dirtying commit lands — wall-clock timing. Exact
     mode tolerates that provably (clean-envelope validation forces the sequential answer no matter
     which prefix a worker saw), so it is ON there; in relaxed+pinned mode it would leak timing into
-    results, so it is DISABLED (relaxed dirty-rates are tiny — 0.6–5% measured at practical windows
-    on dallas_full — so frontier serial replans stay cheap). relaxed+unpinned keeps it on and
-    accepts nondeterminism.
+    results, so it is DISABLED (relaxed dirty-rates are tiny in practice, so frontier serial
+    replans stay cheap). relaxed+unpinned keeps it on and accepts nondeterminism.
 
     ``run_parallel`` writes a ``stats`` dict (serial replans, re-specs, canary count, dirty rate)
     onto the instance after the run."""
 
-    # Capped at 8: the dallas_full sweep showed speedup PEAKS at ~4 workers (exact) / ~8 (relaxed) and
-    # regresses hard past that — a shared cluster-L2 + ordered-commit-stall effect, not core count — so
-    # `cpu-2` (18 here) would be a catastrophic default. Pass n_workers explicitly to go higher.
+    # Capped at 8: speedup PEAKS near ~4 workers (exact) / ~8 (relaxed) then regresses hard — a
+    # shared cluster-L2 + ordered-commit-stall effect, not core count — so an unbounded `cpu-2`
+    # default (18 here) would be catastrophic. Pass n_workers explicitly to go higher.
     n_workers: int = min(8, max(1, (os.cpu_count() or 4) - 2))
     window: int | None = None              # None → 4 × n_workers
     mode: str = "exact"                    # "exact" | "relaxed"
@@ -163,13 +208,24 @@ class ParallelConfig:
     tube_margin_m: float | None = None     # predictive tube pad (None → env_pad_m); SPATIAL-ONLY
     adaptive_window: bool = False          # shrink/grow the live window on the dirty-rate EMA
     worker_kernel_log2: int | None = None  # workers' adaptive g-hash floor (regrow keeps any value
-    #                                        exact). Measured on dallas_full @ 8 workers: no plan-time
-    #                                        difference vs the ceiling (the concurrency slowdown is
-    #                                        broader memory-system contention, not hash footprint) —
-    #                                        so default None = planner default; knob kept for study.
+    #                                        exact). Measured to make no plan-time difference
+    #                                        vs the ceiling — the concurrency slowdown is broader
+    #                                        memory-system contention, not hash footprint — so
+    #                                        default None = planner default; knob kept for study.
     stats: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        """Validate ``mode`` and ``n_workers`` after construction; raise on bad input.
+
+        Parameters
+        ------------
+        - none: reads the constructed fields on ``self``.
+
+        Return
+        --------
+        - output (None): raises ``ValueError`` if ``mode`` is not 'exact'/'relaxed' or
+          ``n_workers`` < 1.
+        """
         if self.mode not in ("exact", "relaxed"):
             raise ValueError(f"ParallelConfig.mode must be 'exact' or 'relaxed', got {self.mode!r}")
         if self.n_workers < 1:
@@ -177,27 +233,44 @@ class ParallelConfig:
 
     @property
     def resolved_window(self) -> int:
+        """Live speculation window: ``window`` if set, else 4 × ``n_workers``."""
         return self.window if self.window is not None else 4 * self.n_workers
 
     @property
     def eager_enabled(self) -> bool:
-        # exact: timing-safe by the clean-envelope theorem; relaxed+pinned: would break determinism
+        """Whether eager re-speculation runs (``max_respec`` > 0) in a timing-safe mode.
+
+        On in exact mode (timing-safe by the clean-envelope theorem) and unpinned relaxed mode;
+        off in relaxed+pinned mode, where it would break determinism.
+        """
         return self.max_respec > 0 and (self.mode == "exact" or not self.pin_prefixes)
 
 
-#: Planners the parallel path supports in v1: every plan must come from an envelope-recording A*
+#: Planners the parallel path supports: every plan must come from an envelope-recording A*
 #: (bare, reference oracle, or wrapped by a shortcut strategy, whose chords stay inside the
-#: inner A* path's hull — the convex-hull lemma). The MILP family optimizes outside any recorded read set.
+#: inner A* path's hull — the convex-hull lemma). The MILP family optimizes outside any read set.
 PARALLEL_PLANNERS = (
     "astar", "astar_ref", "astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut",
 )
 
 
 def spatial_tube(req, cfg: SimConfig, margin_m: float):
-    """The pre-plan prediction tube for a flight: the xy-AABB spanning origin→dest ⊕ ``margin_m``.
-    SPATIAL-ONLY by design (issue #8 directive): under density, queueing delay makes departure /
-    arrival times unpredictable before planning, so the tube deliberately carries no time axis.
-    A scheduling HINT only — dispatch preference, never validation."""
+    """Pre-plan prediction tube for a flight: the xy-AABB spanning origin→dest ⊕ ``margin_m``.
+
+    SPATIAL-ONLY by design: under density, queueing delay makes departure / arrival times
+    unpredictable before planning, so the tube deliberately carries no time axis. A scheduling
+    HINT only — dispatch preference, never validation.
+
+    Parameters
+    ------------
+    - req (FlightRequest): source of the ``origin`` and ``dest`` xy points.
+    - cfg (SimConfig): unused here; kept for signature parity with the other tube helpers.
+    - margin_m (float): pad added on every side of the O-D box.
+
+    Return
+    --------
+    - output (tuple): ``(xmin, ymin, xmax, ymax)`` in meters.
+    """
     ox, oy = float(req.origin[0]), float(req.origin[1])
     dx, dy = float(req.dest[0]), float(req.dest[1])
     return (min(ox, dx) - margin_m, min(oy, dy) - margin_m,
@@ -205,13 +278,27 @@ def spatial_tube(req, cfg: SimConfig, margin_m: float):
 
 
 def _tubes_overlap(a, b) -> bool:
+    """True iff the two xy AABBs ``(xmin, ymin, xmax, ymax)`` overlap."""
     return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 
 
 def predicted_overlap_density(reqs, cfg: SimConfig, margin_m: float | None = None) -> float:
-    """Fraction of flight pairs in ``reqs`` whose spatial tubes overlap — a cheap pre-run predictor
-    of speculation interference (drives window sizing / bench expectations). O(n²) scalar tests:
-    intended for a bounded lookahead slice, not a whole scenario."""
+    """Fraction of flight pairs in ``reqs`` whose spatial tubes overlap.
+
+    A cheap pre-run predictor of speculation interference (drives window sizing / bench
+    expectations). O(n²) scalar tests — intended for a bounded lookahead slice, not a whole
+    scenario.
+
+    Parameters
+    ------------
+    - reqs (Sequence[FlightRequest]): the flights to score, in any order.
+    - cfg (SimConfig): source of the default tube pad.
+    - margin_m (float | None): tube pad; ``None`` ⇒ :func:`env_pad_m`.
+
+    Return
+    --------
+    - output (float): overlapping pairs ÷ total pairs, or 0.0 for fewer than two flights.
+    """
     m = margin_m if margin_m is not None else env_pad_m(cfg)
     tubes = [spatial_tube(r, cfg, m) for r in reqs]
     n = len(tubes)
@@ -230,12 +317,36 @@ class AdaptiveWindow:
 
     def __init__(self, lo: int, hi: int, alpha: float = 0.15,
                  shrink_at: float = 0.35, grow_at: float = 0.10):
+        """Build a window controller starting wide open at ``hi``.
+
+        Parameters
+        ------------
+        - lo (int): smallest window it may shrink to (clamped to >= 1).
+        - hi (int): largest window / initial width (clamped to >= 1).
+        - alpha (float): EMA smoothing factor for the observed dirty rate.
+        - shrink_at (float): dirty-rate EMA above which the window shrinks by one.
+        - grow_at (float): dirty-rate EMA below which the window grows by one.
+
+        Return
+        --------
+        - output (None): initialises ``lo``/``hi``/``w``/``ema`` and the thresholds on ``self``.
+        """
         self.lo, self.hi = max(1, lo), max(1, hi)
         self.w = self.hi
         self.ema = 0.0
         self.alpha, self.shrink_at, self.grow_at = alpha, shrink_at, grow_at
 
     def observe(self, dirty: bool) -> None:
+        """Fold one commit's dirty flag into the EMA and step the window by at most one.
+
+        Parameters
+        ------------
+        - dirty (bool): whether the just-committed speculation had to be replanned.
+
+        Return
+        --------
+        - output (None): updates ``ema`` and ``w`` in place (window clamped to [lo, hi]).
+        """
         self.ema = (1.0 - self.alpha) * self.ema + self.alpha * (1.0 if dirty else 0.0)
         if self.ema > self.shrink_at:
             self.w = max(self.lo, self.w - 1)
@@ -244,9 +355,11 @@ class AdaptiveWindow:
 
 
 def _iter_astar(planner):
-    """Every ``AStarPlanner`` reachable via the ``inner``/``warm_planner`` chain. Shares one walker
-    with ``sim`` (``planner.iter_planner_chain``) — this was a hand-copy of ``sim._astar_planners``
-    kept to dodge a sim ↔ parallel cycle, which the neutral home in ``planner`` removes."""
+    """Every ``AStarPlanner`` reachable via the ``inner``/``warm_planner`` chain.
+
+    Uses ``planner.iter_planner_chain`` — the shared walker whose neutral home in ``planner``
+    avoids a sim ↔ parallel import cycle.
+    """
     from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
     return [p for p in iter_planner_chain(planner) if isinstance(p, AStarPlanner)]
@@ -259,11 +372,13 @@ def _flat_aabb_t(vol):
 
 
 def _worker_main(conn, cfg, planner_name, static_terms, mode, pin, telemetry, kernel_log2):
-    """Worker process: a replica ledger + its own planner stack, kept in sync by the coordinator's
-    delta stream through the EXISTING subscribe machinery (``replica.commit`` fires the occupancy /
-    TerminalCapacity hooks exactly as the live sim does — planners bind to whatever ledger they're
-    handed). One delta arrives per COMMITTED FLIGHT SLOT (denials included, with empty volumes), so
-    the applied-delta count IS the flight-index prefix the plan saw.
+    """Worker process main loop: a replica ledger plus its own planner stack, driven over ``conn``.
+
+    Kept in sync by the coordinator's delta stream through the EXISTING subscribe machinery
+    (``replica.commit`` fires the occupancy / TerminalCapacity hooks exactly as the live sim does —
+    planners bind to whatever ledger they're handed). One delta arrives per COMMITTED FLIGHT SLOT
+    (denials included, with empty volumes), so the applied-delta count IS the flight-index prefix
+    the plan saw.
 
     Messages (FIFO per pipe — every delta the coordinator sent before an assign is drained before
     that assign is processed, so ``applied`` ≥ the assign's pinned prefix by construction):
@@ -272,9 +387,26 @@ def _worker_main(conn, cfg, planner_name, static_terms, mode, pin, telemetry, ke
       ("assign", k, req, P, floor)    → sync, plan, reply ("result", k, intent, env, P_used, tele)
       ("stop",)                       → exit
 
-    ``telemetry``: a per-worker observer collector captures this plan's ``on_deny`` rows; the fresh
+    Telemetry (when on): a per-worker observer captures this plan's ``on_deny`` rows; the fresh
     rows ride the result message and the coordinator merges them IN COMMIT ORDER (discarding rows of
-    superseded speculations), so the master streams match the sequential run's."""
+    superseded speculations), so the master streams match the sequential run's.
+
+    Parameters
+    ------------
+    - conn (Connection): duplex pipe to the coordinator (delta/assign/stop in, result/error out).
+    - cfg (SimConfig): shared config used to build the replica ledger and planners.
+    - planner_name (str): registry name of the planner stack to instantiate.
+    - static_terms (list): ``(center, term)`` pairs pre-registered as static terminals.
+    - mode (str): "exact" or "relaxed"; with ``pin`` selects the delta-absorption discipline.
+    - pin (bool): relaxed-only prefix pinning — buffer deltas, applying only up to ``P``.
+    - telemetry (bool): whether to attach a ``TelemetryCollector`` and ship its new rows.
+    - kernel_log2 (int | None): optional worker g-hash floor for contention relief.
+
+    Return
+    --------
+    - output (None): loops until a "stop" message or ``EOFError``; each assign sends back one
+      ("result", ...) or ("error", ...) message over ``conn``.
+    """
     from .ledger import ReservationLedger
     from .planner import get_planner
     from .uss import _warn_if_terminal_dropped
@@ -363,7 +495,26 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
     whose SPATIAL tube avoids everything currently in flight (the frontier flight is always taken
     first — liveness); ``adaptive_window`` shrinks the live window while the dirty-rate EMA runs
     hot. ``collector`` (telemetry) receives worker ``on_deny`` rows merged in commit order; serial
-    replans write into it directly."""
+    replans write into it directly.
+
+    Parameters
+    ------------
+    - scenario (Scenario): the FCFS event stream; ``scenario.events`` gives request order.
+    - cfg (SimConfig): shared simulation config.
+    - pcfg (ParallelConfig): mode, worker count, window, and the Phase-3 scheduling knobs.
+    - ledger (ReservationLedger): the authoritative ledger commits validate and write against.
+    - dss (DSS): applies each accepted intent (``dss.commit`` returns whether it took).
+    - planner_name (str): registry name of the planner stack (must be in ``PARALLEL_PLANNERS``).
+    - static_terms (list): ``(center, term)`` pairs replayed into every worker's replica.
+    - status (callable): progress callback ``(n_committed, request, intent)`` per commit.
+    - report (callable | None): optional ``(n_committed, total, intent)`` progress reporter.
+    - collector (TelemetryCollector | None): observer that receives merged worker/serial rows.
+
+    Return
+    --------
+    - output (list): the ``OperationalIntent`` per flight in scenario order; also writes
+      ``pcfg.stats``.
+    """
     import multiprocessing as mp
 
     from .planner import get_planner
@@ -422,11 +573,11 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
     next_commit = 0
     cursor_box = [0]                        # next fresh flight index not yet in `fresh`
     n_serial = n_respec = n_canary = n_dirty = n_deferred = 0
-    # coordinator wall accounting (issue #8 Phase E/F): is the serial commit floor binding, or is the
-    # coordinator idle waiting on straggler workers? t_commit = time inside the ordered-commit block
-    # (dss.commit + occupancy hooks + delta broadcast, all serial); t_wait = time blocked in
-    # connection.wait for any worker to return. t_commit ≫ t_wait ⇒ shrink the floor; t_wait ≫
-    # t_commit ⇒ the bottleneck is worker plan variance, not the coordinator.
+    # coordinator wall accounting: is the serial commit floor binding, or is the coordinator idle
+    # waiting on straggler workers? t_commit = time inside the ordered-commit block (dss.commit +
+    # occupancy hooks + delta broadcast, all serial); t_wait = time blocked in connection.wait for
+    # any worker to return. t_commit ≫ t_wait ⇒ shrink the floor; t_wait ≫ t_commit ⇒ the
+    # bottleneck is worker plan variance, not the coordinator.
     t_commit = t_wait = 0.0
     # live window: adaptive only where it is a pure throughput knob (exact / unpinned relaxed) —
     # in relaxed+pinned mode W is SEMANTIC (part of the pinned prefixes) and must stay fixed.
@@ -442,18 +593,21 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
     tubes: dict[int, tuple] = {}
 
     def _tube(k: int):
+        """Memoized spatial tube for flight ``k`` (cached in ``tubes``)."""
         t = tubes.get(k)
         if t is None:
             t = tubes[k] = spatial_tube(events[k].request, cfg, tube_m)
         return t
 
     def _flush(widx: int):
+        """Send worker ``widx`` its queued delta blobs, then clear its outbox."""
         conn = workers[widx][1]
         for blob in outbox[widx]:
             conn.send_bytes(blob)
         outbox[widx].clear()
 
     def _assign(widx: int, k: int):
+        """Flush pending deltas to worker ``widx`` and assign it flight ``k`` to plan."""
         _flush(widx)                                        # flush deltas FIRST (FIFO ⇒ applied ≥ P)
         conn = workers[widx][1]
         req = events[k].request
@@ -466,7 +620,18 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
         """Next fresh flight to dispatch. Frontier first, unconditionally (liveness: commits can
         never pass an undispatched frontier). Otherwise, with predictive dispatch, prefer the first
         of the next few candidates whose spatial tube misses every in-flight speculation — dispatch
-        REORDERING only; the commit order is untouchable."""
+        REORDERING only; the commit order is untouchable.
+
+        Parameters
+        ------------
+        - none: reads the enclosing scope's ``fresh`` / ``busy`` / ``pending`` / ``respec_q`` /
+          ``predictive`` state and mutates ``fresh`` (and ``n_deferred``).
+
+        Return
+        --------
+        - output (int): the flight id to dispatch next — the frontier flight, else the first
+          non-overlapping candidate under predictive dispatch, else the oldest fresh flight.
+        """
         nonlocal n_deferred
         if not predictive or fresh[0] == next_commit or len(fresh) == 1:
             return fresh.popleft()
@@ -483,6 +648,7 @@ def run_parallel(scenario, cfg, pcfg: ParallelConfig, ledger, dss, planner_name,
         return fresh.popleft()                              # all overlap → no starvation, take oldest
 
     def _dispatch():
+        """Refill the fresh queue under the live window and hand work to idle workers."""
         W_live = adapt.w if adapt is not None else W
         while cursor_box[0] < total and len(fresh) < 16 and cursor_box[0] - next_commit < W_live:
             fresh.append(cursor_box[0])

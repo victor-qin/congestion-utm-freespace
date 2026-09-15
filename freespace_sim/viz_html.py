@@ -62,10 +62,12 @@ _FALLBACK_WARN_FRAC = 0.10
 
 
 def _static_walls(result: SimResult):
-    """The run's always-active terminal walls (permanent no-fly columns): from the live ledger
-    (``SimResult.ledger._static_vols``) or a loaded run's ``static_walls`` (populated by ``load_run`` from
-    ``ledger_end.parquet``). Empty otherwise. These are NOT in any accepted intent's volumes, so the replay
-    must render them separately — otherwise a denial's blocker is invisible (see the telemetry design §10)."""
+    """The run's always-active terminal walls (permanent no-fly columns), else an empty list.
+
+    Read from the live ledger (``ledger._static_vols``) or a loaded run's ``static_walls`` (which
+    ``load_run`` populates from ``ledger_end.parquet``). These are NOT in any accepted intent's
+    volumes, so the replay must render them separately — otherwise a denial's blocker is invisible.
+    """
     led = getattr(result, "ledger", None)
     if led is not None and getattr(led, "_static_vols", None):
         return list(led._static_vols)
@@ -133,6 +135,18 @@ def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
     that is what the browser actually has. Verifying against the full-precision centerline would pass a
     segment that quantisation collapses to zero length or pushes across ``segment_frame``'s near-vertical
     branch, and the replay would then draw a corridor tens of metres from the one that was reserved.
+
+    Parameters
+    ------------
+    - intent: accepted intent whose ``BoxSpec`` volumes are checked against the rebuild.
+    - cfg (SimConfig): supplies the corridor geometry for :func:`volumes.build_corridor`.
+    - quantised_centerline: the dequantised path the browser will actually reconstruct from.
+    - tolerance_m (float): max world-space corner/altitude error tolerated per box.
+
+    Return
+    --------
+    - output (bool): True iff box count, time bounds, and every footprint corner match within
+      tolerance; False makes this flight ship explicit polygons instead.
     """
     got = [v for v in (intent.volumes or []) if isinstance(v.shape, BoxSpec)]
     want = volumes.build_corridor(quantised_centerline, cfg)
@@ -152,14 +166,21 @@ def _payload(result: SimResult, clip_to_horizon: bool | None = None) -> dict:
     The clock spans the **realized operation** — :func:`metrics.simulation_window`, i.e. the first
     airspace reservation through the last one to clear — not ``[0, cfg.horizon_s]``. ``horizon_s`` is a
     planner *envelope*, not a schedule: flights are filed from t=0 but depart on a lead of hundreds of
-    seconds, and they all land long before the envelope closes. Anchoring on it left the density replays
-    with 768 s of nothing at the head and 3329 s at the tail — 57% of the slider scrubbing through an
-    empty sky. This is a display choice only; the measurement window is a separate concern that
-    :func:`metrics.steady_state_window` owns (issue #25).
+    seconds, and they all land long before the envelope closes, so anchoring on it would leave the
+    slider scrubbing through long empty spans at the head and tail. This is a display choice only;
+    the measurement window is a separate concern that :func:`metrics.steady_state_window` owns.
 
-    ``clip_to_horizon`` is a compatibility switch for callers of the previous API. ``None`` (the new
-    default) uses the realized window; explicit ``True`` restores ``[0, horizon_s]`` and explicit
-    ``False`` restores ``[0, max(horizon_s, last activity)]``.
+    ``clip_to_horizon`` is a compatibility switch for callers of the previous API.
+
+    Parameters
+    ------------
+    - result (SimResult): the run to serialise.
+    - clip_to_horizon (bool | None): None (default) uses the realized window; True restores
+      ``[0, horizon_s]``; False restores ``[0, max(horizon_s, last activity)]``.
+
+    Return
+    --------
+    - output (dict): the schema-``v2`` scene dict (flights, walls, quantisation, geometry scalars).
     """
     cfg = result.config
     hues = result_uss_hues(result)
@@ -724,17 +745,27 @@ function buildLevelLegend(){{                     // flight-level dash key (A* m
 
 
 def write_html(result: SimResult, out, clip_to_horizon: bool | None = None) -> str:
-    """Render a standalone HTML scrubber; return its path.
+    """Render a standalone HTML scrubber to ``out``; return its path.
 
-    With no compatibility argument the replay uses the realized operation. Explicit booleans retain
-    the previous API's horizon-clipped (``True``) and horizon-or-tail (``False``) clock modes.
+    Warns when too many flights fall back to explicit polygons (the file-size lever failing).
+
+    Parameters
+    ------------
+    - result (SimResult): the run to render.
+    - out (path-like): destination ``.html`` path; written UTF-8.
+    - clip_to_horizon (bool | None): clock mode forwarded to :func:`_payload` — None uses the
+      realized operation, ``True`` clips to ``[0, horizon_s]``, ``False`` to horizon-or-tail.
+
+    Return
+    --------
+    - output (str): ``str(out)``, the path written.
     """
     payload = _payload(result, clip_to_horizon)
     n_explicit, n_flights = payload["explicit_box_flights"], len(payload["flights"])
     if n_flights and n_explicit > _FALLBACK_WARN_FRAC * n_flights:
-        # Loud, because this is the size lever failing: these flights ship their polygons verbatim, which
-        # is what took a dense replay to 78 MB. A planner that stopped reserving the swept centerline —
-        # or an archive planned under an older corridor formula — regresses silently otherwise.
+        # Loud, because this is the size lever failing: these flights ship their polygons verbatim,
+        # which is what blows a dense replay up. A planner that stopped reserving the swept
+        # centerline — or an archive planned under an older corridor formula — regresses silently.
         warnings.warn(
             f"replay: {n_explicit}/{n_flights} flights could not have their corridor boxes rebuilt from "
             f"the path (planner={payload['planner']}); storing explicit polygons for those, so {out} "

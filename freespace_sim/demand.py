@@ -4,8 +4,8 @@
 region at ground level, with a minimum O/D separation so requests are non-trivial. Deterministic
 under a seeded RNG.
 
-`HubVoronoiDemand`: same Poisson arrival process in *time*, but origins are geographically anchored —
-each USS owns a fixed set of synthetic hubs and a flight runs from the *nearest* hub (its Voronoi
+`HubVoronoiDemand`: same Poisson arrival process in time, but origins are geographically anchored —
+each USS owns a fixed set of synthetic hubs and a flight runs from the nearest hub (its Voronoi
 cell) to a random customer. Flights become short and convergent (cheap to plan, less denial) while
 two overlapping hub tessellations keep crossing traffic high.
 """
@@ -25,15 +25,37 @@ from .types import FlightRequest, Terminal, vec
 
 
 class DemandModel(Protocol):
-    def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]: ...
+    """Interface a demand model implements: build one run's flight requests from a config + RNG."""
+
+    def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
+        """Return the flight requests for one run, drawn deterministically from ``rng``."""
+        ...
 
 
 @dataclass
 class UniformPoissonDemand:
+    """Poisson(λ) arrivals with origin and destination sampled uniformly across the region.
+
+    Every request is drawn at ground level with a minimum O/D separation so none is trivially
+    short; the whole draw is deterministic under the seeded RNG. Each request's operator is
+    chosen uniformly from ``uss_ids``.
+    """
+
     min_od_separation_m: float = 1000.0
     uss_ids: tuple[str, ...] = ("default",)
 
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
+        """Sample one run's requests: Poisson count, uniform O/D, uniform filing times.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies the region size, demand window, and arrival rate.
+        - rng (np.random.Generator): the seeded source for the count, positions, and times.
+
+        Return
+        --------
+        - output (list[FlightRequest]): requests sorted by ``(t_request, flight_id)``.
+        """
         w, h = cfg.region_size_m
         demand_duration_s = cfg.effective_demand_duration_s
         n = int(rng.poisson(cfg.lam_per_hour * demand_duration_s / 3600.0))
@@ -60,7 +82,8 @@ class UniformPoissonDemand:
 
 
 def nearest_hub(point: np.ndarray, hubs: np.ndarray) -> np.ndarray:
-    """Return the row of ``hubs`` (shape ``(k, 2)``) closest to ``point`` — its Voronoi-cell owner."""
+    """Row of ``hubs`` (shape ``(k, 2)``) closest to ``point`` — its Voronoi-cell owner (see
+    context/figures/hub_placement.png)."""
     return hubs[int(np.argmin(np.linalg.norm(hubs - point, axis=1)))]
 
 
@@ -68,22 +91,32 @@ _MAX_HUB_ATTEMPTS = 20000
 
 
 def _scatter_hubs(cfg, rng, n_hubs_per_uss, radius_of, gap_m):
-    """Uniform-scatter hub centres, reject-sampled so **no two terminal airspaces overlap**.
+    """Uniform-scatter hub centres, reject-sampled so no two terminal airspaces overlap
+    (see context/figures/hub_placement.png).
 
-    Every accepted centre keeps a distance of at least ``r_i + r_j + gap_m`` to every other hub —
-    **across all operators**, since each candidate is checked against the one shared set of
-    already-placed centres, not a per-USS one — where ``r`` is the hub's terminal (column) radius and
-    ``gap_m`` is the clearance left between airspace *edges* (enough for an approach corridor to fit
-    between neighbours). Without this, an unconstrained ``rng.uniform`` scatter occasionally drops two
-    hubs within a radius of each other (the observed engulfment happened to be same-operator —
-    ``stripmall_uss#11``/``#17`` — but the check spans operators), and under
-    ``terminal_airspace_always_active`` one hub's permanent wall then engulfs the other's landing
-    approach, making its flights near-infeasible (the walls are transient without the flag, so the
-    overlap is a latent modelling wart there rather than a hard failure).
+    Every accepted centre stays at least ``r_i + r_j + gap_m`` from every other hub ACROSS ALL
+    OPERATORS (checked against one shared set of placed centres, not a per-USS one). ``gap_m`` is
+    the clearance between airspace edges (room for an approach corridor between neighbours). Without
+    it, under ``terminal_airspace_always_active`` one hub's permanent wall can engulf a neighbour's
+    landing approach, leaving its flights near-infeasible; without the flag the overlap is a latent
+    modelling wart rather than a hard failure.
 
-    Deterministic in ``rng``; placement depends only on the region, hub counts and radii (not pad
-    capacity or the demand seed). Raises ``ValueError`` if the region is too crowded to satisfy the
-    separation — a mis-specified scenario fails loudly instead of silently overlapping."""
+    Deterministic in ``rng``; placement depends only on the region, hub counts and radii, not pad
+    capacity or the demand seed.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies the region size the centres are scattered in.
+    - rng (np.random.Generator): seeded source for candidate positions.
+    - n_hubs_per_uss (dict[str, int]): number of hubs to place per operator.
+    - radius_of (Callable[[str], float]): terminal (column) radius for a given operator.
+    - gap_m (float): clearance to leave between neighbouring airspace edges.
+
+    Return
+    --------
+    - output (dict[str, np.ndarray]): per-operator ``(n_hubs, 2)`` hub centres in region metres.
+      Raises ``ValueError`` if the region is too crowded to satisfy the separation.
+    """
     w, h = cfg.region_size_m
     xs: list[float] = []
     ys: list[float] = []
@@ -121,16 +154,16 @@ def _scatter_hubs(cfg, rng, n_hubs_per_uss, radius_of, gap_m):
 @dataclass
 class HubVoronoiDemand:
     """Hub-and-spoke demand: each USS serves a fixed set of synthetic ground hubs (think one USS for
-    every *Walmart*, another for every *strip mall*). A customer is drawn uniformly and assigned a
-    serving USS; the flight runs FROM that USS's *nearest* hub TO the customer (delivery). The flown
-    length is bounded by the serving USS's Voronoi-cell radius — short, convergent, far cheaper than a
-    uniform O/D dash across the whole metro — yet two USSs with *independent* hub tessellations cross
+    every Walmart, another for every strip mall). A customer is drawn uniformly and assigned a
+    serving USS; the flight runs FROM that USS's nearest hub TO the customer (delivery). The flown
+    length is bounded by the serving USS's Voronoi-cell radius — short, convergent, far cheaper than
+    a uniform O/D dash across the metro — yet two USSs with independent hub tessellations cross
     each other's spokes and pile up on shared pads, so demand and conflict stay high.
 
-    Arrivals are the *same* Poisson process in time as ``UniformPoissonDemand`` (count ``Poisson(λH)``,
-    ``t_request ~ U(0, H)``); only the O/D *geometry* changes. Hubs are placed once under their own
-    RNG (``hub_seed``) so the "infrastructure" is stable while only the demand varies with ``cfg.seed``
-    — Walmarts don't move when you reroll traffic.
+    Arrivals are the same Poisson process in time as ``UniformPoissonDemand`` (count
+    ``Poisson(λH)``, ``t_request ~ U(0, H)``); only the O/D geometry changes. Hubs are placed once
+    under their own RNG (``hub_seed``) so "infrastructure" is stable while only the demand varies
+    with ``cfg.seed`` — Walmarts don't move when you reroll traffic.
     """
 
     # hubs per USS — fewer hubs ⇒ bigger cells ⇒ longer flights (the two USSs differ on purpose)
@@ -143,14 +176,24 @@ class HubVoronoiDemand:
     hub_seed: int = 0xA17F                          # infrastructure RNG, independent of cfg.seed
 
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
-        """Return ``{uss_id: (n_hubs, 2)}`` hub positions in region ENU metres.
+        """Scatter each USS's hubs uniformly in the region — the demand's spatial structure.
 
-        DESIGN KNOB — this is where the *spatial structure* of demand is decided. The default
-        scatters hubs uniformly (already differentiating the USSs by density); swap in a clustered
-        process (town-centre seeds + Gaussian spread) to mimic real retail geography. Unlike
-        :class:`HubRadiusDemand`, these flights carry no ``origin_terminal``/``dest_terminal`` (see
-        ``generate`` below), so there are no terminal airspaces to overlap — hence no
-        minimum-separation reject-sampling here (that belongs only where hubs build walls).
+        DESIGN KNOB: the default scatters hubs uniformly (already differentiating the USSs by
+        density); swap in a clustered process (town-centre seeds + Gaussian spread) to mimic real
+        retail geography. Unlike :class:`HubRadiusDemand`, these flights carry no
+        ``origin_terminal``/``dest_terminal`` (see ``generate``), so there are no terminal airspaces
+        to overlap — hence no minimum-separation reject-sampling here (that belongs only where hubs
+        build walls).
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies the region size.
+        - rng (np.random.Generator): seeded source for the hub positions.
+
+        Return
+        --------
+        - output (dict[str, np.ndarray]): ``{uss_id: (n_hubs, 2)}`` hub positions in region ENU
+          metres.
         """
         w, h = cfg.region_size_m
         return {
@@ -159,6 +202,7 @@ class HubVoronoiDemand:
         }
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
+        """USS ids and their normalized demand shares; equal weights when ``uss_share`` is None."""
         ids = list(self.n_hubs_per_uss)
         if self.uss_share is None:
             p = np.ones(len(ids))
@@ -167,6 +211,17 @@ class HubVoronoiDemand:
         return ids, p / p.sum()
 
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
+        """Sample deliveries: Poisson count, between a USS's nearest hub and a uniform customer.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies the region size, demand window, and arrival rate.
+        - rng (np.random.Generator): seeded source for the count, USS choice, and customers.
+
+        Return
+        --------
+        - output (list[FlightRequest]): requests sorted by ``(t_request, flight_id)``.
+        """
         w, h = cfg.region_size_m
         demand_duration_s = cfg.effective_demand_duration_s
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
@@ -198,7 +253,18 @@ class HubVoronoiDemand:
 
 
 def _sample_in_disk(center: np.ndarray, radius_m: float, rng: np.random.Generator) -> np.ndarray:
-    """A point drawn uniformly in the disk of radius ``radius_m`` about ``center`` (area-uniform)."""
+    """A point drawn uniformly in the disk of radius ``radius_m`` about ``center`` (area-uniform).
+
+    Parameters
+    ------------
+    - center (np.ndarray): the disk centre as an xy point.
+    - radius_m (float): disk radius in metres.
+    - rng (np.random.Generator): source for the angle and (area-uniform) radius draws.
+
+    Return
+    --------
+    - output (np.ndarray): an xy point sampled area-uniformly inside the disk.
+    """
     theta = rng.uniform(0.0, 2.0 * np.pi)
     r = radius_m * np.sqrt(rng.uniform(0.0, 1.0))
     return np.asarray(center, float) + r * np.array([np.cos(theta), np.sin(theta)])
@@ -227,16 +293,27 @@ def _uss_rng(base_seed: int, uss_id: str) -> np.random.Generator:
 def _shift_request_clock(requests: list[FlightRequest], offset_s: float | None = None) -> float:
     """Shift every request and desired departure forward onto a nonnegative clock.
 
-    ``offset_s=None`` (default) shifts by the REALIZED preroll, putting the earliest filing at exactly
-    zero. That amount is a max-order statistic over the departure-lead draws, so two otherwise-identical
-    runs whose leads differ end up translated relative to each other — every ``t_departure`` moves, and
-    the runs can only be compared in aggregate.
+    ``offset_s=None`` (default) shifts by the REALIZED preroll, putting the earliest filing at
+    exactly zero. That amount is a max-order statistic over the departure-lead draws, so two
+    otherwise-identical runs whose leads differ end up translated relative to each other — every
+    ``t_departure`` moves, and the runs can only be compared in aggregate.
 
     Passing a FIXED ``offset_s`` instead pins the translation, so a family of runs differing only in
     ``departure_offset_s`` keeps byte-identical desired departures and differs solely in FCFS filing
-    order — the paired per-flight comparison the scheduling-lead arms rely on. The constant must cover
-    the realized preroll: a filing before t=0 would break the planner's monotonic-``t_request``
-    occupancy eviction (see ``planner/astar/occupancy.py``), so an undersized offset raises rather than clips.
+    order — the paired per-flight comparison the scheduling-lead arms rely on. The constant must
+    cover the realized preroll: a filing before t=0 breaks the planner's monotonic-``t_request``
+    occupancy eviction (see ``planner/astar/occupancy.py``), so an undersized offset raises, not
+    clips.
+
+    Parameters
+    ------------
+    - requests (list[FlightRequest]): requests to shift in place; empty is a no-op.
+    - offset_s (float | None): fixed shift to apply, or None to shift by the realized preroll.
+
+    Return
+    --------
+    - output (float): the shift applied, in seconds; raises ``ValueError`` if a fixed ``offset_s``
+      is smaller than the realized preroll.
     """
     if not requests:
         return 0.0
@@ -261,21 +338,22 @@ class HubRadiusDemand:
     """Hub-and-spoke demand for a realistic metro vertiport study — three differences from
     :class:`HubVoronoiDemand`, each a knob the bottleneck analysis asked for:
 
-    - **multi-pad hubs** (``pads_per_hub``): each hub is a *single location* that is a shared
+    - multi-pad hubs (``pads_per_hub``): each hub is a single location that is a shared
       vertiport terminal with capacity N — up to N flights take off/land concurrently, the (N+1)th
       takes ground delay. Modelled via ``FlightRequest.origin_terminal``/``dest_terminal`` =
       ``(hub_id, N)``; the planner shares the hub's terminal column among its own flights (see
-      ``conflict.volumes_conflict``) and bounds concurrency at N (occupancy). No spatial pad-spreading.
-    - **radius service areas** (``radius_m``, ``float`` or per-USS ``dict``): a customer is drawn
-      uniformly in the *disk* of that radius about a hub. Overlapping disks create crossing traffic
+      ``conflict.volumes_conflict``) and bounds concurrency at N (occupancy). No spatial
+      pad-spreading.
+    - radius service areas (``radius_m``, ``float`` or per-USS ``dict``): a customer is drawn
+      uniformly in the disk of that radius about a hub. Overlapping disks create crossing traffic
       and bound flight length directly.
-    - **return flights** (``return_flights``): each delivery (hub → customer) is followed by a return
-      (customer → the *same hub*, landing on any open pad), filed at the delivery's estimated arrival
-      + ``turnaround_s`` in legacy mode. With ``paired_return_request``, both legs are filed together
-      and the return's desired departure follows the outbound's nominal arrival. The return's landing
-      also consumes a pad, counted against the hub's N.
+    - return flights (``return_flights``): each delivery (hub → customer) is followed by a return
+      (customer → the same hub, landing on any open pad), filed at the delivery's estimated arrival
+      + ``turnaround_s`` in legacy mode. With ``paired_return_request`` both legs are filed
+      together and the return's desired departure follows the outbound's nominal arrival. The
+      return's landing also consumes a pad, counted against the hub's N.
 
-    ``lam_per_hour`` counts *deliveries*; with returns on, the realised flight count is ~2×. Hubs are
+    ``lam_per_hour`` counts deliveries; with returns on, the realised flight count is ~2×. Hubs are
     placed once under ``hub_seed`` (stable infrastructure); only demand varies with ``cfg.seed``.
     """
 
@@ -316,6 +394,18 @@ class HubRadiusDemand:
     min_hub_gap_m: float = 100.0                     # clearance between terminal-airspace EDGES (no overlap)
 
     def __post_init__(self):
+        """Validate timing/offset knobs and reject USS keys absent from ``n_hubs_per_uss``.
+
+        Parameters
+        ------------
+        - none: reads the constructed fields on ``self``.
+
+        Return
+        --------
+        - output (None): raises ``ValueError`` on an unknown ``timing_mode``, a
+          ``request_clock_offset_s`` that is negative or set outside ``timing_mode='departure'``, or
+          a ``lam_per_uss`` / ``departure_offset_s`` key not present in ``n_hubs_per_uss``.
+        """
         if self.timing_mode not in {"request", "departure"}:
             raise ValueError(
                 f"unknown timing_mode {self.timing_mode!r} (want 'request' | 'departure')")
@@ -341,10 +431,21 @@ class HubRadiusDemand:
                     f"n_hubs_per_uss {sorted(hubs)}")
 
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
-        """Return ``{uss_id: (n_hubs, 2)}`` single-point hub centres, reject-sampled so no two hubs'
-        terminal airspaces overlap (:func:`_scatter_hubs`; each USS's column radius is
-        ``terminal_radius_m`` or the ``cfg`` hover footprint). DESIGN KNOB for spatial structure (swap
-        the uniform scatter for a clustered process to mimic real retail geography)."""
+        """Single-point hub centres, reject-sampled so no two hubs' terminal airspaces overlap.
+
+        Delegates to :func:`_scatter_hubs`; each USS's column radius is ``terminal_radius_m`` or the
+        ``cfg`` hover footprint. DESIGN KNOB for spatial structure (swap the uniform scatter for a
+        clustered process to mimic real retail geography).
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies the region size, hover footprint, and wall extent.
+        - rng (np.random.Generator): seeded source for candidate positions.
+
+        Return
+        --------
+        - output (dict[str, np.ndarray]): ``{uss_id: (n_hubs, 2)}`` hub centres in region metres.
+        """
         def radius_of(uid: str) -> float:
             tr = self._terminal_radius_for(uid)
             # always-active terminals wall the WIDER terminal_cells (column + one boundary-hex ring), not
@@ -360,28 +461,41 @@ class HubRadiusDemand:
 
     def terminals(self, cfg: SimConfig) -> list:
         """All placed hubs as ``(center, Terminal)`` — permanent vertiport infrastructure, EVERY hub
-        regardless of whether it draws a flight this horizon. Under terminal_airspace_always_active the
-        sim walls this whole set, matching the foreign-column filter (which drops against ALL placed
-        hubs) — else a zero-flight hub would be filtered against but never walled."""
+        regardless of whether it draws a flight this horizon. Under terminal_airspace_always_active
+        the sim walls this whole set, matching the foreign-column filter (which drops against ALL
+        placed hubs) — else a zero-flight hub would be filtered against but never walled.
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies hub placement and terminal geometry.
+
+        Return
+        --------
+        - output (list): ``(center, Terminal)`` pairs, one per placed hub.
+        """
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
         return [(pts[hj], Terminal(f"{uid}#{hj}", self._pads_for(uid),
                                    self._terminal_radius_for(uid), self.corridor_overlap_m))
                 for uid, pts in hubs.items() for hj in range(pts.shape[0])]
 
     def _radius_for(self, uss_id: str) -> float:
+        """The customer demand radius for one USS (scalar config, or its per-USS entry)."""
         return float(self.radius_m[uss_id] if isinstance(self.radius_m, dict) else self.radius_m)
 
     def _terminal_radius_for(self, uss_id: str) -> float | None:
+        """The terminal (column) radius for one USS, or None to use the hover footprint."""
         tr = self.terminal_radius_m
         if tr is None:
             return None                              # builder defaults to the hover footprint
         return float(tr[uss_id] if isinstance(tr, dict) else tr)
 
     def _pads_for(self, uss_id: str) -> int:
+        """The pad capacity N for one USS (scalar config, or its per-USS entry)."""
         p = self.pads_per_hub
         return int(p[uss_id] if isinstance(p, dict) else p)
 
     def _shares(self) -> tuple[list[str], np.ndarray]:
+        """USS ids and their normalized demand shares; equal weights when ``uss_share`` is None."""
         ids = list(self.n_hubs_per_uss)
         p = (np.ones(len(ids)) if self.uss_share is None
              else np.array([self.uss_share.get(uid, 0.0) for uid in ids], float))
@@ -398,11 +512,37 @@ class HubRadiusDemand:
         return max(0.0, float(rng.normal(mean, std)))
 
     def _est_trip_s(self, o: np.ndarray, d: np.ndarray, cfg: SimConfig) -> float:
-        """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell."""
+        """Nominal door-to-door time for the return clock: cruise + climb/descent + one pad dwell.
+
+        Parameters
+        ------------
+        - o (np.ndarray): trip origin point.
+        - d (np.ndarray): trip destination point.
+        - cfg (SimConfig): supplies the cruise speed, climb time, and hover (pad dwell) time.
+
+        Return
+        --------
+        - output (float): nominal door-to-door time in seconds (cruise, climb, descent, dwell).
+        """
         dist = float(np.linalg.norm(np.asarray(d, float) - np.asarray(o, float)))
         return dist / cfg.nominal_speed_mps + 2.0 * cfg.climb_time_s + cfg.hover_time_s
 
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
+        """Emit deliveries (and optional returns) from each hub to customers in its service disk.
+
+        Honours both timing modes and the per-USS Poisson / share paths; under
+        ``terminal_airspace_always_active`` it drops deliveries whose customer hex falls inside a
+        foreign hub's permanent wall (both legs).
+
+        Parameters
+        ------------
+        - cfg (SimConfig): supplies the region, ground level, demand window, and wall geometry.
+        - rng (np.random.Generator): seeded source for counts, hub choice, customers, and leads.
+
+        Return
+        --------
+        - output (list[FlightRequest]): deliveries and returns sorted by ``(t_request, flight_id)``.
+        """
         w, h = cfg.region_size_m
         gl = cfg.ground_level_m
         demand_duration_s = cfg.effective_demand_duration_s

@@ -37,6 +37,8 @@ from pathlib import Path
 # huggingface_hub is imported lazily so a plain checkout (without the 'cloud' extra) still imports
 # this module — the friendly install hint fires only when you actually try to sync.
 def _require_hf():
+    """Import and return the ``huggingface_hub`` module, raising SystemExit with an install hint
+    when the optional ``cloud`` extra is missing from this interpreter."""
     try:
         import huggingface_hub as hf
     except ModuleNotFoundError as exc:
@@ -53,6 +55,8 @@ def _require_hf():
 
 
 def _resolve_remote(remote: str | None) -> str:
+    """Return the dataset repo id from ``remote`` or ``$FREESPACE_HF_REPO``, raising SystemExit if
+    neither is set."""
     repo = remote or os.environ.get("FREESPACE_HF_REPO")
     if not repo:
         raise SystemExit("no cloud repo: pass --remote <user/dataset> or set $FREESPACE_HF_REPO")
@@ -84,10 +88,13 @@ def pull_runs(target: str, remote: str | None, *, root: str = ".") -> str:
 
 
 def _add_remote(sp: argparse.ArgumentParser) -> None:
+    """Add the shared ``--remote`` argument (HF dataset repo id) to a subparser."""
     sp.add_argument("--remote", default=None, help="HF Hub dataset repo id (else $FREESPACE_HF_REPO)")
 
 
 def main() -> None:
+    """Parse the push/pull CLI and dispatch to ``push_run`` or ``pull_runs``, printing the run's
+    browsable URL (push) or local results path (pull) as the last stdout line."""
     p = argparse.ArgumentParser(description="Push/pull run folders to a Hugging Face Hub dataset repo.")
     sub = p.add_subparsers(dest="action", required=True)
 

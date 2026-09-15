@@ -1,27 +1,23 @@
-"""CONFLICT_FILED denials at busy shared-terminal hubs — the three mechanisms surfaced by the
-TerminalCapacity work, each reproduced *deterministically* from a tiny subset of the
-``dallas_hub_2uss_large`` @ seed-0 demand (replaying only the few FCFS-ordered flights involved, so each
-test is <1 s and needs no full ~100-flight run).
+"""CONFLICT_FILED denials at busy shared-terminal hubs — three mechanisms, each reproduced
+deterministically from a tiny subset of the ``dallas_hub_2uss_large`` @ seed-0 demand (replaying
+only the few FCFS-ordered flights involved, so each test is <1 s and needs no full run). All three
+are now FIXED; the tests below are regressions that assert ``.accepted``.
 
-  1. **own-column vs foreign corridor** (the lazy-skip bug) — a same-hub sibling's own near-hub cruise
-     corridor intruded a window its column "covered", so the unsound "already-deployed → skip the ledger"
-     shortcut admitted a takeoff into it. **FIXED**: ``TerminalCapacity.column_clear`` always queries.
-     Regression below: the {46,4,58,8} subset (which the pre-fix code denied) now fully admits.
+  1. **own-column vs foreign corridor** — a same-hub sibling's near-hub cruise corridor intruded a
+     window its column "covered", so an unsound "already-deployed → skip the ledger" shortcut
+     admitted a takeoff into it. FIXED: ``TerminalCapacity.column_clear`` always queries.
 
-  2. **cruise box vs sibling column** — a near-hub cruise box just past the exit lane reaches back into
-     a same-hub sibling's column. **FIXED**: every box overlapping the flight's own column is now tagged
-     (``volumes.segment_overlaps_column``, applied in ``astar._build`` + ``build_reservation_from_corners``),
-     not just box[0]/box[-1], so the near-hub corridor is column-exempt instead of CONFLICT_FILED.
+  2. **cruise box vs sibling column** — a near-hub cruise box just past the exit lane reaches back
+     into a same-hub sibling's column. FIXED: every box overlapping the flight's own column is now
+     tagged (``volumes.segment_overlaps_column``), not just box[0]/box[-1], so it is column-exempt.
 
-  3. **same-hub exit lanes collide** — two exit boxes overlap at the shared-column edge; box↔box is not
-     exempt (``conflict.volumes_conflict`` L29-31). **FIXED**: the takeoff/landing edge is gated by
-     ``TerminalCapacity.exit_clear`` — a precise FCL check of the exit lane vs committed sibling lanes —
-     so the colliding flight ground-delays (the hex grid can't do this: its inflation would also
-     serialize DIVERGENT launches).
+  3. **same-hub exit lanes collide** — two exit boxes overlap at the shared-column edge; box↔box is
+     not exempt. FIXED: the takeoff/landing edge is gated by ``TerminalCapacity.exit_clear`` — a
+     precise FCL check of the exit lane vs committed sibling lanes — so the colliding flight
+     ground-delays.
 
-All three are now FIXED; the tests below are **regressions** (they assert ``.accepted`` and pass). See
-``tests/test_terminal_capacity.py::test_column_clear_always_queries_even_when_siblings_cover`` for the
-unit-level guard on mechanism 1.
+See ``tests/test_terminal_capacity.py::test_column_clear_always_queries_even_when_siblings_cover``
+for the unit-level guard on mechanism 1.
 """
 
 import numpy as np
@@ -47,7 +43,8 @@ def _replay(fids, fixed=False):
     """Plan just ``fids`` (FCFS-ordered) from the seed-0 dallas demand; return {flight_id: intent}."""
     # Pin the baseline the fixture flight-ids were extracted from: no always-active walls (else the
     # foreign-column filter drops fixture flights) and the default hover-footprint terminal radius (else
-    # #27 reject-sampling places hubs differently). This is a fixed_exit_lanes regression test, not a taa one.
+    # reject-sampling places hubs differently). This is a fixed_exit_lanes regression test, not
+    # a taa one.
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
                           demand_overrides={"pads_per_hub": 4, "terminal_radius_m": None}, planner="astar",
                           lam_per_hour=600.0, horizon_s=300.0, seed=0, fixed_exit_lanes=fixed,
@@ -95,7 +92,7 @@ def test_same_hub_exit_lanes_do_not_collide():
 
 @pytest.mark.parametrize("fids", [LAZY_SKIP, CRUISE_CLIP, EXIT_COLLISION])
 def test_fixed_exit_lanes_admit_all_three_mechanisms(fids):
-    # fixed_exit_lanes (issue #18): the structural fix, now the default. Each mechanism subset is admitted
+    # fixed_exit_lanes: the structural fix, now the default. Each mechanism subset is admitted
     # conflict-free under fixed boundary-hex lanes — same-hub exit-lane contention serialises on exact
     # CELL occupancy (``occupancy.is_blocked`` sees a committed sibling exit corridor in the column
     # footprint) instead of filing a CONFLICT_FILED. All-accepted ⇒ all committed clean (the FCFS
@@ -118,17 +115,17 @@ def _max_concurrent(intervals):
 @pytest.mark.slow
 @pytest.mark.parametrize("seed,pads", [(s, 2) for s in range(8)] + [(4, 4)])
 def test_landing_capacity_accurate_to_arrival_and_not_oversubscribed(seed, pads):
-    # Issue #15 regression (the landing-side capacity gate, across seeds, with returns). Two properties:
-    #  (1) ACCURATE TO ARRIVAL — every return's committed LANDING column opens EXACTLY at the flown arrival
-    #      (dest hover t_start == centerline[-1] time). The committed arrival is the tail-folded column
-    #      edge, and the gate counts capacity there (``astar._committed_arrival``), so the window it counts
-    #      IS the window the drone occupies the hub — not the goal-hex step time ``st[3]*dt``, ~2-7 s later.
-    #  (2) NO OVER-SUBSCRIPTION — peak concurrent same-hub dwells (delivery-takeoffs + return-landings)
-    #      never exceeds the pad count. Pre-fix, gating at the goal-hex step over-subscribed pads=2 on 7/8
-    #      seeds (capacity-2 hubs reaching 3 concurrent dwells); capacity has no commit-time backstop
-    #      (same-hub columns are conflict-exempt in volumes_conflict / verify), so ONLY this gate prevents
-    #      it. (`slow`: one full ~100-flight hub run per case.)
-    # Same pin as _replay: this is an issue-#15 landing-capacity regression, not a taa one — keep
+    # The landing-side capacity gate, across seeds, with returns. Two properties:
+    #  (1) ACCURATE TO ARRIVAL — every return's committed LANDING column opens EXACTLY at the flown
+    #      arrival (dest hover t_start == centerline[-1] time). The committed arrival is the
+    #      tail-folded column edge, and the gate counts capacity at that committed arrival
+    #      (``astar._committed_arrival``), so the window it counts IS the window the drone occupies
+    #      the hub — not the goal-hex step time ``st[3]*dt``, which is later.
+    #  (2) NO OVER-SUBSCRIPTION — peak concurrent same-hub dwells (delivery-takeoffs +
+    #      return-landings) never exceeds the pad count. Capacity has no commit-time backstop
+    #      (same-hub columns are conflict-exempt in volumes_conflict / verify), so ONLY this gate
+    #      prevents over-subscription. (`slow`: one full hub run per case.)
+    # Same pin as _replay: this is a landing-capacity regression, not a taa one — keep
     # dallas_hub_2uss_large's always-active walls + wide columns out of the pad-capacity signal.
     spec = with_overrides(get_scenario("dallas_hub_2uss_large"),
                           demand_overrides={"pads_per_hub": pads, "terminal_radius_m": None},

@@ -1,27 +1,20 @@
 """Flat, numba-visible storage for the occupancy claim journal.
 
-``CompiledHexOccupancy`` records every committed (cell, step-span) as a packed int64 "claim". The
-predecessor stored those in ``dict[key, list[int]]`` and derived free-interval query pools; removing
-a flight then rebuilt each touched cell from its SURVIVORS — measured at 12.2x the released flight's
-own footprint at ``density_faa`` scale, and growing with congestion.
+``CompiledHexOccupancy`` records every committed (cell, step-span) as a packed int64 "claim".
+Storing those as free-interval query pools made removing a flight rebuild every cell it touched
+from its SURVIVORS — super-linear in congestion, far more than the released flight's own footprint.
+Answering occupancy from the claims directly removes that cost, but numba cannot iterate a dict of
+lists, so the storage has to be FLAT for a window build to read it without host-side flattening.
 
-The obvious fix is to answer occupancy from the claims directly and delete the pools. Phase 0
-measured what that needs (``context/lns_plan.md``):
-
-  * a claim IS a blocked span, so painting the per-plan window bitmap from claims replaces the
-    pools' invert-and-merge and is **2.81x faster** (0.514 ms against 1.443 ms per window);
-  * but numba cannot iterate a dict of lists, so the host would have to flatten the window's claims
-    first — **37.6 ms per window, 26x worse than the whole build it replaces**.
-
-So the storage has to be flat, and this is it. One ``int64`` arena holds every claim; each cell's
-claims occupy ONE contiguous slab within it, described by ``start``/``length``/``cap`` arrays keyed
-by ``key = (cell << 1) | pool_idx`` (the same key ``_claims`` uses). A window build then reads
-``arena[start[key] : start[key] + length[key]]`` with no host-side work at all.
+One ``int64`` arena holds every claim; each cell's claims occupy ONE contiguous slab within it,
+described by ``start``/``length``/``cap`` arrays keyed by ``key = (cell << 1) | pool_idx`` (the same
+key ``_claims`` uses). A window build then reads ``arena[start[key] : start[key] + length[key]]``
+with no host-side work at all.
 
 **Removal is a swap-remove**, which is what makes the whole thing worth doing: find the claim in its
-slab (~30 comparisons at full scale) and move the slab's last entry over it. Order within a slab is
-irrelevant — the window paint ORs spans together and ``blocked_at`` is a membership test — so
-nothing depends on it, and the cost is the flight's OWN footprint rather than everyone else's.
+slab and move the slab's last entry over it. Order within a slab is irrelevant — the window paint
+ORs spans together and ``blocked_at`` is a membership test — so nothing depends on it, and the cost
+is the flight's OWN footprint rather than everyone else's.
 
 **Growth is the only source of garbage.** A full slab is re-homed at the arena tail at twice the
 capacity and its old extent abandoned; ``compact`` reclaims those. Removals never fragment, so
@@ -56,11 +49,29 @@ _HEADROOM_NUM, _HEADROOM_DEN = 1, 4     # slack a compacted slab keeps, so the n
 
 @njit(cache=True, nogil=True)
 def add_many(keys, vals, n, arena, start, length, cap, tail, garbage):
-    """Append ``n`` claims (``keys`` SORTED ascending, ``vals`` permuted to match).
+    """Append ``n`` claims to their cells' slabs (``keys`` SORTED ascending, ``vals`` matching).
 
-    Returns 0 on success, or the number of extra arena slots required — in which case **nothing has
-    been written**. The capacity pass runs first precisely so a caller can grow and retry without
-    tracking what a partial batch already applied."""
+    A capacity pass runs first and is read-only, so on a shortfall NOTHING is written and the caller
+    can grow and retry without tracking what a partial batch already applied. Requires keys sorted
+    so each cell's whole batch is seen at once.
+
+    Parameters
+    ------------
+    - keys (int64[:]): per-claim cell key ``(cell << 1) | pool_idx``, sorted ascending.
+    - vals (int64[:]): packed claim for each key, permuted to match ``keys``.
+    - n (int): number of claims to append (a prefix of ``keys``/``vals``).
+    - arena (int64[:]): the shared claim buffer, mutated in place.
+    - start (int64[:]): per-key slab start offset, rewritten when a slab is re-homed.
+    - length (int64[:]): per-key live claim count, incremented here.
+    - cap (int64[:]): per-key slab capacity, grown when a slab is re-homed.
+    - tail (int64[1]): one-past-last used arena slot, advanced on re-home.
+    - garbage (int64[1]): abandoned-slot counter, incremented on re-home.
+
+    Return
+    --------
+    - output (int): 0 on success, else the extra arena slots required (in which case nothing is
+      written).
+    """
     need = 0
     i = 0
     while i < n:                                    # capacity pass — read-only
@@ -108,9 +119,25 @@ def add_many(keys, vals, n, arena, start, length, cap, tail, garbage):
 
 @njit(cache=True, nogil=True)
 def remove_many(keys, vals, n, arena, start, length):
-    """Swap-remove ``n`` claims. Returns the number NOT found, which must be 0 — a miss is the same
-    drift signal ``_claims[key].remove`` raises ``ValueError`` for, reported rather than thrown so
-    the caller decides (numba cannot raise a useful exception here)."""
+    """Swap-remove ``n`` claims from their cells' slabs.
+
+    A miss (claim not present) is the drift signal ``_claims[key].remove`` raises ``ValueError``
+    for; it is COUNTED and returned rather than thrown (numba cannot raise a useful exception here),
+    so the caller decides. The count must be 0 in a consistent journal.
+
+    Parameters
+    ------------
+    - keys (int64[:]): per-claim cell key ``(cell << 1) | pool_idx``.
+    - vals (int64[:]): the packed claim to remove for each key.
+    - n (int): number of claims to remove.
+    - arena (int64[:]): the shared claim buffer, mutated in place.
+    - start (int64[:]): per-key slab start offset (read only).
+    - length (int64[:]): per-key live claim count, decremented per hit.
+
+    Return
+    --------
+    - output (int): the number of claims NOT found (0 in a consistent journal).
+    """
     missing = 0
     for i in range(n):
         k = keys[i]
@@ -132,7 +159,23 @@ def remove_many(keys, vals, n, arena, start, length):
 
 @njit(cache=True, nogil=True)
 def blocked_at(key, s, arena, start, length, s0_shift, span_bits, field_mask):
-    """Is ``key`` blocked at step ``s``? Diagnostic membership scan over the cell's claim slab."""
+    """Is ``key`` blocked at step ``s``? Diagnostic membership scan over the cell's claim slab.
+
+    Parameters
+    ------------
+    - key (int): the cell key ``(cell << 1) | pool_idx`` whose slab to scan.
+    - s (int): the step to test for membership in any claimed span.
+    - arena (int64[:]): the shared claim buffer.
+    - start (int64[:]): per-key slab start offset.
+    - length (int64[:]): per-key live claim count.
+    - s0_shift (int): right-shift recovering a claim's span start.
+    - span_bits (int): right-shift recovering a claim's span end.
+    - field_mask (int): mask isolating the span-end field after the shift.
+
+    Return
+    --------
+    - output (bool): True if any claim in the slab covers step ``s``.
+    """
     base = start[key]
     for m in range(length[key]):
         packed = arena[base + m]
@@ -143,13 +186,27 @@ def blocked_at(key, s, arena, start, length, s0_shift, span_bits, field_mask):
 
 @njit(cache=True, nogil=True)
 def compact_into(arena, start, length, cap, dst, headroom_num, headroom_den):
-    """Copy every live slab into ``dst`` back to back, rewriting ``start``/``cap``. Returns the new
-    tail. Only growth produces the garbage this reclaims, so this is off the destroy path.
+    """Copy every live slab into ``dst`` back to back, rewriting ``start``/``cap``; return new tail.
 
-    Each slab keeps a little headroom rather than being packed to exactly its length. Packing tight
-    is smaller for an instant and worse immediately after: with ``cap == length`` the very next claim
-    added to a cell re-homes the whole slab, so a compaction would hand back its own savings as fresh
-    garbage on the following commit."""
+    Only growth produces the garbage this reclaims, so this is off the destroy path. Each slab
+    keeps a little headroom rather than being packed to exactly its length: with ``cap == length``
+    the very next claim added to a cell would re-home the whole slab, so a tight pack hands back its
+    own savings as fresh garbage on the following commit.
+
+    Parameters
+    ------------
+    - arena (int64[:]): the source claim buffer (live slabs read from it).
+    - start (int64[:]): per-key slab start offset, rewritten to the ``dst`` layout.
+    - length (int64[:]): per-key live claim count (unchanged; read to size each slab).
+    - cap (int64[:]): per-key slab capacity, rewritten to length + headroom.
+    - dst (int64[:]): destination buffer the live slabs are packed into.
+    - headroom_num (int): numerator of the per-slab headroom fraction.
+    - headroom_den (int): denominator of the per-slab headroom fraction.
+
+    Return
+    --------
+    - output (int): the new arena tail (one past the last packed slot).
+    """
     tail = 0
     for k in range(start.shape[0]):
         ln = length[k]
@@ -172,6 +229,21 @@ class ClaimArena:
 
     def __init__(self, n_keys: int, s0_shift: int, span_bits: int, field_mask: int,
                  capacity: int = 1 << 16):
+        """Allocate the arena and per-key slab arrays for ``n_keys`` cell keys.
+
+        Parameters
+        ------------
+        - n_keys (int): number of distinct cell keys ``(cell << 1) | pool_idx``; sizes the
+          ``start``/``length``/``cap`` arrays.
+        - s0_shift (int): right-shift recovering a claim's span start (stored for :meth:`blocked`).
+        - span_bits (int): right-shift recovering a claim's span end.
+        - field_mask (int): mask isolating the span-end field.
+        - capacity (int): initial arena size in claims (default ``1 << 16``).
+
+        Return
+        --------
+        - output (None): initializes the arena, slab arrays, and packed-field constants.
+        """
         self.n_keys = n_keys
         self._s0_shift, self._span_bits, self._field_mask = s0_shift, span_bits, field_mask
         self.arena = np.zeros(max(capacity, _MIN_SLAB), np.int64)
@@ -183,9 +255,22 @@ class ClaimArena:
 
     # ---- maintenance ----
     def add(self, keys: np.ndarray, vals: np.ndarray) -> None:
-        """Add a batch. Sorts by key (``add_many``'s capacity pass needs each cell's batch contiguous),
-        then grows and retries at most twice: once for the reported shortfall, once if compaction is
-        the cheaper way to find it."""
+        """Add a batch of claims, sorting, growing, and compacting as needed.
+
+        Sorts by key because ``add_many``'s capacity pass needs each cell's batch contiguous, then
+        retries up to three times: reclaim garbage first when it dominates (growth is the only thing
+        that made it), otherwise grow the backing buffer.
+
+        Parameters
+        ------------
+        - keys (np.ndarray): per-claim cell keys (any order; sorted here).
+        - vals (np.ndarray): packed claim for each key, permuted to match the sort.
+
+        Return
+        --------
+        - output (None): mutates the arena in place; raises ``RuntimeError`` if the batch cannot be
+          satisfied after growing and compacting.
+        """
         n = keys.shape[0]
         if n == 0:
             return
@@ -224,6 +309,18 @@ class ClaimArena:
             self.compact()
 
     def remove(self, keys: np.ndarray, vals: np.ndarray) -> None:
+        """Swap-remove a batch of claims, raising if any are absent.
+
+        Parameters
+        ------------
+        - keys (np.ndarray): per-claim cell keys.
+        - vals (np.ndarray): the packed claim to remove for each key.
+
+        Return
+        --------
+        - output (None): mutates the arena in place; raises ``ValueError`` if any claim to remove is
+          not present (the journal and arena have drifted).
+        """
         n = keys.shape[0]
         if n == 0:
             return
@@ -234,11 +331,21 @@ class ClaimArena:
                 f"the arena have drifted")
 
     def blocked(self, key: int, s: int) -> bool:
+        """True if any claim in ``key``'s slab covers step ``s`` (wraps ``blocked_at``)."""
         return bool(blocked_at(key, s, self.arena, self.start, self.length,
                                self._s0_shift, self._span_bits, self._field_mask))
 
     def slab(self, key: int) -> np.ndarray:
-        """The cell's claims as one contiguous view — what a window build reads."""
+        """The cell's claims as one contiguous view — what a window build reads.
+
+        Parameters
+        ------------
+        - key (int): the cell key ``(cell << 1) | pool_idx`` whose slab to view.
+
+        Return
+        --------
+        - output (np.ndarray): a view of ``arena`` spanning the key's live claims (may be empty).
+        """
         s = int(self.start[key])
         return self.arena[s:s + int(self.length[key])]
 
@@ -246,9 +353,9 @@ class ClaimArena:
         """Rewrite every live slab back to back into a RIGHT-SIZED buffer.
 
         Sizing the destination to the live claims (plus headroom for the next round of growth) rather
-        than to the current buffer is what actually returns the memory — compacting in place leaves
-        the allocation at its high-water mark, which is how the arena sat at 150 MB while holding
-        34 MB of claims."""
+        than to the current buffer is what actually returns the memory: compacting in place leaves
+        the allocation at its high-water mark instead of shrinking it.
+        """
         live = int(self.length.sum())
         n_live_keys = int(np.count_nonzero(self.length))
         want = live + (live * _HEADROOM_NUM) // _HEADROOM_DEN + 2 * n_live_keys
@@ -259,6 +366,7 @@ class ClaimArena:
         self.garbage[0] = 0
 
     def reset(self) -> None:
+        """Zero the slab arrays and tail/garbage counters, dropping every claim (buffer kept)."""
         self.start[:] = 0
         self.length[:] = 0
         self.cap[:] = 0
@@ -267,6 +375,7 @@ class ClaimArena:
 
     # ---- diagnostics ----
     def _grow(self, shortfall: int) -> None:
+        """Reallocate the arena larger (≥ double, ≥ ``2 * shortfall``), copying the live prefix."""
         size = max(self.arena.shape[0] * 2, self.arena.shape[0] + shortfall * 2, 1 << 16)
         grown = np.zeros(size, np.int64)
         grown[:self.tail[0]] = self.arena[:self.tail[0]]
@@ -274,9 +383,11 @@ class ClaimArena:
 
     @property
     def n_claims(self) -> int:
+        """Total live claims across all slabs."""
         return int(self.length.sum())
 
     def nbytes(self) -> int:
+        """Backing-store size in bytes (arena plus the ``start``/``length``/``cap`` arrays)."""
         return int(self.arena.nbytes + self.start.nbytes + self.length.nbytes + self.cap.nbytes)
 
     def as_dict(self) -> dict:

@@ -20,12 +20,12 @@ def with_air_hops(fg: FlightGraph, max_air_hops: int) -> FlightGraph:
     contract is what decides the answer, or to hold a corridor wider than the budget so a
     containment claim is about the SEARCH rather than about the graph.  This is how they say
     so: at the ``FlightGraph`` level, where the two are separate fields, rather than through
-    a params pairing that no longer exists (issue #78).
+    a params pairing that no longer exists.
 
     ``max_step`` MUST be recomputed alongside.  It is denominated in ``max_air_hops`` (see
     :func:`_graph_max_step`), so lifting the ceiling without it leaves the clock short of the
     new budget and the horizon, not the ceiling, binds at the latest departures -- the exact
-    departure-dependent cap ``9816f61`` was written to remove, reintroduced inside a test that
+    departure-dependent cap the ceiling exists to remove, reintroduced inside a test that
     would then quietly measure the wrong thing.
 
     ``dataclasses.replace`` shares ``corridor_cells`` and ``forbidden_hops`` by reference, so

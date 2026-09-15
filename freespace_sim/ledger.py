@@ -4,8 +4,8 @@ Holds every committed flight's `Volume4D`s and answers "does this candidate inte
 anything already committed?" To stay fast for thousands of flights it prunes in two cheap stages
 before the exact FCL test:
 
-1. **Time bucketing** by discrete step — only volumes sharing a timestep are candidates.
-2. **AABB overlap** — reject candidates whose world bounding boxes miss in any axis.
+1. Time bucketing by discrete step — only volumes sharing a timestep are candidates.
+2. AABB overlap — reject candidates whose world bounding boxes miss in any axis.
 
 Survivors get the exact `volumes_conflict` (time + FCL narrowphase). Under FCFS, earlier-committed
 intents are obstacles the newcomer must avoid; the ledger never mutates them.
@@ -26,11 +26,23 @@ _DYNAMIC_GRID_CELL_M = 1024.0  # coarse xy-cell edge for the per-step committed-
 def _xy_cell_span(aabb, cell):
     """The (cx, cy) xy-grid cells a flat AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)`` touches.
 
-    Shared by the always-active-wall grid (:class:`_StaticWallGrid`) and the per-step committed-volume xy
-    sub-index (:meth:`ReservationLedger.commit` / :meth:`ReservationLedger._candidate_indices`). Floor-division
-    so the slightly-negative coords a boundary corridor box can produce map to the correct (negative) cell — and
-    so a box is indexed in, and a query visits, EVERY cell its xy-AABB overlaps. That is the no-false-negative
-    property both indexes rely on: if two xy-AABBs overlap they cannot be cell-separated, so they share a cell."""
+    Shared by the always-active-wall grid (:class:`_StaticWallGrid`) and the per-step
+    committed-volume xy sub-index (:meth:`ReservationLedger.commit` /
+    :meth:`ReservationLedger._candidate_indices`). Floor-division so the slightly-negative coords a
+    boundary corridor box can produce map to the correct (negative) cell — and so a box is indexed
+    in, and a query visits, EVERY cell its xy-AABB overlaps. That is the no-false-negative property
+    both indexes rely on: if two xy-AABBs overlap they cannot be cell-separated, so they share a
+    cell.
+
+    Parameters
+    ------------
+    - aabb (tuple[float, ...]): the flat world AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
+    - cell (float): the xy-cell edge length.
+
+    Return
+    --------
+    - output (Iterator[tuple[int, int]]): the ``(cx, cy)`` cell keys the box's xy-AABB overlaps.
+    """
     for cx in range(int(aabb[0] // cell), int(aabb[3] // cell) + 1):
         for cy in range(int(aabb[1] // cell), int(aabb[4] // cell) + 1):
             yield (cx, cy)
@@ -51,17 +63,21 @@ class _StaticWallGrid:
     __slots__ = ("_cell", "_cells")
 
     def __init__(self, cell: float):
+        """Create an empty grid with xy-cell edge ``cell``."""
         self._cell = cell
         self._cells: dict[tuple[int, int], list[int]] = {}
 
-    def _span(self, aabb):        # (xmin,ymin,zmin,xmax,ymax,zmax) → the xy-cells the box touches
+    def _span(self, aabb):
+        """Yield the ``(cx, cy)`` xy-cells ``aabb`` touches (see :func:`_xy_cell_span`)."""
         yield from _xy_cell_span(aabb, self._cell)
 
     def insert(self, idx: int, aabb) -> None:
+        """Index ``idx`` in every xy-cell the flat AABB ``aabb`` touches."""
         for key in self._span(aabb):
             self._cells.setdefault(key, []).append(idx)
 
     def candidates(self, aabb) -> list[int]:
+        """The wall ids whose xy-cell the query box ``aabb`` touches, in ascending index order."""
         if not self._cells:
             return []
         hit: set[int] = set()
@@ -71,6 +87,14 @@ class _StaticWallGrid:
 
 
 class ReservationLedger:
+    """The committed airspace: stores every committed flight's volumes and answers conflict queries.
+
+    Prunes by time bucket, then xy-cell, then AABB before the exact FCL test; under FCFS a committed
+    intent is a fixed obstacle for later flights. Always-active terminal walls are held separately
+    (time-invariant), and released flights are tombstoned in place, so reads must go through
+    :meth:`iter_committed` or the AABB-pruned queries rather than the raw arrays.
+    """
+
     # Partner-id sentinel reported by `conflicts` for an always-active terminal WALL (a permanent
     # `_static_vols` entry owns no flight). Callers treat it as "static wall", never a real flight id.
     STATIC_WALL_FID = -1
@@ -84,6 +108,7 @@ class ReservationLedger:
     _DEAD_AABB = (np.inf, np.inf, np.inf, -np.inf, -np.inf, -np.inf)
 
     def __init__(self, cfg: SimConfig):
+        """Initialize empty volume arrays, indexes, subscriber lists, and the static-wall grid."""
         self.cfg = cfg
         # `_vols` KEEPS a tombstoned volume's object (only its `_fids` owner and `_aabb` box are
         # overwritten — see release_many), so a raw `zip(_fids, _vols)` walk sees dead geometry as if it
@@ -93,17 +118,17 @@ class ReservationLedger:
         self._fids: list[int] = []
         self._aabb: list[tuple[float, float, float, float, float, float]] = []  # flat per-volume AABB
         self._n_dead = 0                     # tombstoned entries in _vols (release_many); compacted lazily
-        # flight_id -> the [start, stop) slot RUNS it owns in `_vols`, so a release touches only its own
-        # entries instead of scanning every committed volume (the LNS destroy is ~380 volumes out of
-        # ~26k — a 69x over-scan, and the last per-iteration term that grew with schedule size).
-        # Maintained in `_append`, which is the single insertion point (commit / _compact / release),
-        # and which COALESCES an append onto the previous run when it is contiguous — so a flight
-        # committed in one call costs one run, and `_compact`/`release` rebuild the index for free.
+        # flight_id -> the [start, stop) slot RUNS it owns in `_vols`, so a release touches only its
+        # own entries instead of scanning every committed volume — the per-iteration term that
+        # otherwise grows with schedule size and dominates the LNS destroy. `_append` is the single
+        # insertion point (commit / _compact / release) and COALESCES an append onto the previous
+        # run when it is contiguous, so a flight committed in one call costs one run and
+        # `_compact`/`release` rebuild the index for free.
         self._runs: dict[int, list[list[int]]] = {}
         self._release_subs: list = []        # release_many subscribers (removal publish hook)
         # committed-volume index keyed by (step, cell_x, cell_y): a TIME bucket (discrete step) CROSSED with an
         # xy SPATIAL sub-index, so a query scans only volumes sharing its timestep AND near its xy — not every
-        # volume metro-wide that merely shares the step (issue #30). See commit / _candidate_indices.
+        # volume metro-wide that merely shares the step. See commit / _candidate_indices.
         self._buckets: dict[tuple[int, int, int], list[int]] = {}
         self._observers: list = []   # commit subscribers (publish hook); see subscribe()
         # Always-active terminal walls (cfg.terminal_airspace_always_active): PERMANENT, whole-horizon
@@ -136,6 +161,14 @@ class ReservationLedger:
         cannot detect a release/re-commit cycle. Static callbacks are cleared too, and
         :meth:`subscribe_static` replays registered hubs on rebind. Rebinding, rather than restoring
         old callbacks, is the supported handoff.
+
+        Parameters
+        ------------
+        - none: operates on the ledger's subscriber lists.
+
+        Return
+        --------
+        - output (None): clears all subscribers and increments :attr:`epoch`.
         """
         self._observers.clear()
         self._release_subs.clear()
@@ -206,6 +239,7 @@ class ReservationLedger:
 
     # ----- internals -----
     def _steps(self, vol: Volume4D) -> range:
+        """The inclusive range of discrete timesteps ``vol`` spans."""
         s0 = int(np.floor(vol.t_start / self.cfg.dt_s))
         s1 = int(np.floor(vol.t_end / self.cfg.dt_s))
         return range(s0, s1 + 1)
@@ -226,12 +260,12 @@ class ReservationLedger:
     def _flat_aabb(vol: Volume4D) -> tuple[float, float, float, float, float, float]:
         """A volume's world AABB as six plain floats ``(xmin, ymin, zmin, xmax, ymax, zmax)``.
 
-        Delegates to ``vol.flat_aabb()``, which the shape computes directly as scalars — no ``np.array``
-        allocation and no ``float(...)`` unpack (the old ``vol.aabb()`` built two length-3 arrays here just
-        to read six floats back out; it was the profile's #1 self-time line via this path). Flattening lets
-        the per-pair overlap prune below run as scalar comparisons; ``_aabb_miss`` is the ledger's single
-        hottest line (tens of millions of calls per run). Bit-for-bit identical to the prior
-        ``float(vol.aabb()[...])`` — pinned in ``tests/test_geometry.py``."""
+        Delegates to ``vol.flat_aabb()``, which computes the scalars directly — no ``np.array``
+        allocation and no ``float(...)`` unpack, unlike the obvious ``vol.aabb()`` (which builds two
+        length-3 arrays just to read six floats back out). This path is hot: ``_aabb_miss`` runs the
+        per-pair overlap prune as scalar comparisons tens of millions of times per run. Bit-for-bit
+        identical to the prior ``float(vol.aabb()[...])`` — pinned in ``tests/test_geometry.py``.
+        """
         return vol.flat_aabb()
 
     @staticmethod
@@ -245,7 +279,19 @@ class ReservationLedger:
     # ----- writes -----
     def _append(self, flight_id: int, v: Volume4D) -> None:
         """Insert one volume into the arrays and the (step, cell) buckets — the commit loop body,
-        shared with `_compact` (which must NOT re-fire observers)."""
+        shared with `_compact` (which must NOT re-fire observers).
+
+        Parameters
+        ------------
+        - flight_id (int): the flight that owns the volume.
+        - v (Volume4D): the reservation volume to record.
+
+        Return
+        --------
+        - output (None): appends to ``_vols`` / ``_fids`` / ``_aabb``, extends the per-flight
+          ``_runs`` slot index (coalescing contiguous rows), and adds the row to every
+          ``(step, cell)`` bucket it touches; fires no observers.
+        """
         idx = len(self._vols)
         self._vols.append(v)
         self._fids.append(flight_id)
@@ -292,7 +338,7 @@ class ReservationLedger:
     def release_many(self, flight_ids) -> int:
         """Remove several flights by tombstoning their volumes in place — the LNS destroy primitive.
 
-        O(released volumes), no bucket rebuild, and — unlike ``release`` — **no observer re-feed**:
+        O(released volumes), no bucket rebuild, and — unlike ``release`` — NO observer re-feed:
         removal subscribers reverse their rows directly; commit-only services detect the shrink on
         their next ``plan()`` and rebuild from ``iter_committed``. A tombstone keeps its slot in
         ``_vols``/``_buckets`` but its AABB becomes the empty box, so every AABB-pruned read
@@ -338,7 +384,16 @@ class ReservationLedger:
         keys a volume belongs to are already known, so re-deriving them (``_flat_aabb`` +
         ``_steps`` × ``_xy_cell_span``, per volume) buys nothing. Survivor order is preserved, so
         each flight's volumes stay contiguous (``iter_committed``'s contract) and every bucket list
-        stays ascending (the remap is monotone)."""
+        stays ascending (the remap is monotone).
+
+        Parameters
+        ------------
+        - none: reads and rewrites this ledger's committed arrays and bucket/run indices.
+
+        Return
+        --------
+        - output (None): mutates the ledger in place, dropping tombstoned slots and renumbering.
+        """
         tomb = self.TOMBSTONE_FID
         remap = [-1] * len(self._fids)            # old slot -> new slot, -1 = tombstoned (list, not
         #                                           dict: the bucket remap below is the hot loop)

@@ -16,6 +16,8 @@ from freespace_sim import runs, viz
 
 
 def main() -> None:
+    """Load a saved run folder and write its snapshot, congestion heatmap, and (unless ``--no-3d``)
+    3D scene figures next to it."""
     p = argparse.ArgumentParser(description="Write snapshot/heatmap/3D figures from a saved run folder.")
     p.add_argument("folder", help="a results/ run folder written by experiments.run")
     p.add_argument("--t", type=float, default=None, help="snapshot time (s); default 0.4·horizon")

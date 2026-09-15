@@ -1,3 +1,5 @@
+import pytest
+
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
@@ -55,25 +57,25 @@ def _wide_wall(clear_t):
     return Volume4D(box_from_segment(vec(1000, -800, 150), vec(1000, 800, 150), 40, 400), 0.0, clear_t)
 
 
-def test_milp_waits_when_a_temporary_block_makes_detour_expensive():
-    # delay is a decision variable now: a wide wall that CLEARS soon → the global solve WAITS
+@pytest.mark.parametrize(
+    ("clear_t", "expects_delay"),
+    [
+        pytest.param(70.0, True, id="temporary_waits"),
+        pytest.param(1e6, False, id="permanent_detours"),
+    ],
+)
+def test_milp_waits_or_detours_around_a_wide_wall(clear_t, expects_delay):
+    # delay is a decision variable now: a wide wall that CLEARS soon → the global solve WAITS; identical
+    # geometry that never clears → waiting can't help, so the global solve DETOURS instead.
     cfg = SimConfig()
     led = ReservationLedger(cfg)
-    led.commit(99, [_wide_wall(70.0)])
+    led.commit(99, [_wide_wall(clear_t)])
     intent = MILPOptPlanner().plan(_req(), led, cfg)
     assert intent.status is IntentStatus.ACCEPTED
-    assert intent.ground_delay_s > 0.0 and intent.air_detour_m < 10.0   # chose to wait, not detour
-    assert not led.any_conflict(intent.volumes)
-
-
-def test_milp_detours_when_the_same_wide_wall_is_permanent():
-    # identical geometry but it never clears → waiting can't help, so the global solve DETOURS
-    cfg = SimConfig()
-    led = ReservationLedger(cfg)
-    led.commit(99, [_wide_wall(1e6)])
-    intent = MILPOptPlanner().plan(_req(), led, cfg)
-    assert intent.status is IntentStatus.ACCEPTED
-    assert intent.air_detour_m > 10.0
+    if expects_delay:
+        assert intent.ground_delay_s > 0.0 and intent.air_detour_m < 10.0   # chose to wait, not detour
+    else:
+        assert intent.air_detour_m > 10.0
     assert not led.any_conflict(intent.volumes)
 
 

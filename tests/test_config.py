@@ -38,24 +38,18 @@ def test_climb_time_to_and_steps():
     assert c.climb_steps_to(30.0) == 2            # ceil((30/6)/4) = ceil(1.25)
 
 
-def test_validation_rejects_unsorted_levels():
-    with pytest.raises(ValueError):
-        SimConfig(flight_levels_m=(110.0, 70.0, 30.0))
-
-
-def test_validation_rejects_levels_too_close():
-    with pytest.raises(ValueError, match="corridor_height"):
-        SimConfig(flight_levels_m=(25.0, 55.0))                        # gap 30 == corridor_height
-
-
-def test_validation_rejects_top_above_ceiling():
-    with pytest.raises(ValueError):
-        SimConfig(flight_levels_m=(30.0, 70.0, 130.0))                 # 130 + 15 > 125
-
-
-def test_validation_rejects_lowest_below_ground():
-    with pytest.raises(ValueError):
-        SimConfig(flight_levels_m=(10.0, 70.0, 110.0))                 # 10 - 15 < 0
+@pytest.mark.parametrize(
+    ("bad_ladder", "expected_match"),
+    [
+        pytest.param((110.0, 70.0, 30.0), None, id="unsorted"),
+        pytest.param((25.0, 55.0), "corridor_height", id="too_close"),   # gap 30 == corridor_height
+        pytest.param((30.0, 70.0, 130.0), None, id="above_ceiling"),     # 130 + 15 > 125
+        pytest.param((10.0, 70.0, 110.0), None, id="below_ground"),      # 10 - 15 < 0
+    ],
+)
+def test_validation_rejects_bad_ladder(bad_ladder, expected_match):
+    with pytest.raises(ValueError, match=expected_match):
+        SimConfig(flight_levels_m=bad_ladder)
 
 
 def test_cruise_and_band_derive_from_ladder():
@@ -64,16 +58,13 @@ def test_cruise_and_band_derive_from_ladder():
     assert c.z_min_m == 30.0 and c.z_max_m == 110.0      # MILP band = ladder floor→top
 
 
-def test_altitudes_derive_from_single_level_ladder():
-    c = SimConfig(flight_levels_m=(100.0,))          # a scenario pinned to one plane at 100 m
-    assert c.cruise_level_m == c.z_min_m == c.z_max_m == 100.0   # single level ⇒ cruise + band collapse
-
-
-def test_single_level_config_supported():
-    c = SimConfig(flight_levels_m=(75.0,))                             # ceiling stays 125
+@pytest.mark.parametrize("level", [100.0, 75.0], ids=["derive_100m", "supported_75m"])
+def test_single_level_ladder_collapses_band(level):
+    # a single-level ladder pins one plane: cruise + band collapse onto the lone level (ceiling stays 125)
+    c = SimConfig(flight_levels_m=(level,))
     assert c.n_levels == 1
-    assert c.flight_levels_m == (75.0,)
-    assert c.cruise_level_m == c.z_min_m == c.z_max_m == 75.0          # all derive onto the lone level
+    assert c.flight_levels_m == (level,)
+    assert c.cruise_level_m == c.z_min_m == c.z_max_m == level         # all derive onto the lone level
 
 
 def test_demand_duration_defaults_to_horizon():

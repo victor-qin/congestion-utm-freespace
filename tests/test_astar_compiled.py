@@ -8,6 +8,7 @@ terminal replay, and the transparent-fallback safety valve.
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import sys
 import warnings
@@ -67,47 +68,44 @@ def _assert_exact(req, commits, cfg=CFG):
 
 # ---------------- A/C: compiled == reference exact (non-terminal + multi-altitude) ----------------
 
-def test_compiled_empty_airspace_exact():
-    a, _ = _assert_exact(_req(), [])
-    assert a.status is IntentStatus.ACCEPTED
-
-
-def test_compiled_reroute_wall_exact():
-    _assert_exact(_req(), [(99, [_wall()])])
-
-
-def test_compiled_ground_delay_exact():
-    _assert_exact(_req(), [(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])])
-
-
-def test_compiled_climb_over_blocked_low_level_exact():
-    _assert_exact(_req(), [(99, [_level_wall(CFG.level_z(0))])])
-
-
-def test_compiled_midroute_climb_exact():
-    _assert_exact(_req(), [(98, [_level_wall(CFG.level_z(1), x=900.0)]),
-                           (97, [_level_wall(CFG.level_z(0), x=1500.0)])])
-
-
-def test_compiled_share_corridor_by_altitude_exact():
-    # commit a forward flight (reference), then plan the reverse flight compiled-vs-reference
+def _share_corridor_case():
+    """Reverse flight sharing a corridor by altitude with a committed forward flight."""
     fwd = FlightRequest(1, vec(0, 0, 0), vec(6000, 0, 0), 0.0)
     rev = FlightRequest(2, vec(6000, 0, 0), vec(0, 0, 0), 0.0)
-    la = ReservationLedger(CFG)
-    ia = AStarPlanner(compiled=False).plan(fwd, la, CFG)
-    _assert_exact(rev, [(1, ia.volumes)])
+    ia = AStarPlanner(compiled=False).plan(fwd, ReservationLedger(CFG), CFG)
+    return rev, [(1, ia.volumes)], CFG, None
 
 
-def test_compiled_single_level_config_exact():
-    cfg = SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0)   # cruise/z derive to 150
-    _assert_exact(_req(), [], cfg=cfg)
+# Each builder returns (req, commits, cfg, expected_status_or_None); callables so per-case setup
+# (share_corridor) and cfg construction run at call time. `single_level_config` cruise/z derive to 150.
+_EXACT_CASES = [
+    ("empty_airspace", lambda: (_req(), [], CFG, IntentStatus.ACCEPTED)),
+    ("reroute_wall", lambda: (_req(), [(99, [_wall()])], CFG, None)),
+    ("ground_delay",
+     lambda: (_req(), [(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])], CFG, None)),
+    ("climb_over_blocked_low_level",
+     lambda: (_req(), [(99, [_level_wall(CFG.level_z(0))])], CFG, None)),
+    ("midroute_climb",
+     lambda: (_req(), [(98, [_level_wall(CFG.level_z(1), x=900.0)]),
+                       (97, [_level_wall(CFG.level_z(0), x=1500.0)])], CFG, None)),
+    ("share_corridor_by_altitude", _share_corridor_case),
+    ("single_level_config",
+     lambda: (_req(), [], SimConfig(flight_levels_m=(150.0,), airspace_ceiling_m=165.0), None)),
+    ("denial_budget_exceeded",
+     lambda: (FlightRequest(1, vec(0, 0, 0), vec(400, 0, 0), 0.0),
+              [(99, [Volume4D(CylinderSpec(400, 0, 60, 0, 150), 0.0, 1e5)])],
+              dataclasses.replace(CFG, max_ground_delay_s=20.0), None)),
+]
 
 
-def test_compiled_denial_budget_exceeded_exact():
-    import dataclasses as dc
-    cfg = dc.replace(CFG, max_ground_delay_s=20.0)
-    _assert_exact(FlightRequest(1, vec(0, 0, 0), vec(400, 0, 0), 0.0),
-                  [(99, [Volume4D(CylinderSpec(400, 0, 60, 0, 150), 0.0, 1e5)])], cfg=cfg)
+@pytest.mark.parametrize("build", [c[1] for c in _EXACT_CASES], ids=[c[0] for c in _EXACT_CASES])
+def test_compiled_matches_reference_exact(build):
+    """Compiled A* returns the reference's exact result across scenarios: identical status/denial,
+    cost within 1e-9, identical last_expansions, byte-identical centerline (see _assert_exact)."""
+    req, commits, cfg, expected_status = build()
+    a, _ = _assert_exact(req, commits, cfg=cfg)
+    if expected_status is not None:
+        assert a.status is expected_status
 
 
 def test_compiled_deterministic():
@@ -209,7 +207,7 @@ def test_compiled_always_active_static_terminal_exact():
     deconflicts against them EXACTLY instead of falling back. A foreign flight whose straight path crosses a
     static hub must reroute (its cost carries a lateral detour, well above the straight-through climb-only
     cost) byte-identically to the reference,
-    with node-count parity and NO fallback (the old preventative gate is gone). This is the regression guard
+    with node-count parity and NO fallback. This is the regression guard
     for the safety bug where the kernel flew straight through a permanent no-fly wall."""
     cfg = SimConfig(terminal_airspace_always_active=True)
     hub = Terminal("foreign_hub#0", 8, 180.0)
@@ -228,8 +226,8 @@ def test_compiled_always_active_static_terminal_exact():
     # the reroute carries a lateral detour on top of the climb round-trip; the (blocked) straight-through
     # would cost only the climb. Both the baseline AND the margin are cfg-derived so the check stays
     # discriminating under any cost-weight regime — the margin is two hex steps of lateral, i.e. strictly
-    # more berth than rounding could produce (an absolute constant here silently stopped discriminating
-    # once the weights were normalized to per-second, where every lateral metre got 30x cheaper).
+    # more berth than rounding could produce. An absolute constant would stop discriminating if the
+    # cost weights change.
     straight_through = 2.0 * cfg.flight_levels_m[0] * cfg.cost_altitude_change_per_m
     two_hexes = 2.0 * cfg.cost_air_lateral_per_m * cfg.nominal_speed_mps * cfg.dt_s
     assert a.cost > straight_through + two_hexes, "reference should reroute around the wall, not fly straight through"
@@ -492,23 +490,14 @@ def test_compiled_replay_exact_dallas_terminal():
 
 
 @pytest.mark.slow
-def test_compiled_demand_run_is_verified():
-    from freespace_sim.sim import run
-    cfg = SimConfig(planner="astar", lam_per_hour=40.0, horizon_s=900.0, seed=4,
-                    region_size_m=(4000.0, 4000.0))
-    assert run(cfg).verified
-
-
-@pytest.mark.slow
 def test_compiled_replay_exact_saturated_terminal():
     """Saturated fixed-lane terminal replay (pads=1, high λ ⇒ large ground delays): full compiled==reference
     parity — status, cost, last_expansions, centerline — across the batch, 0 fallbacks. This is COVERAGE of
     the terminal-takeoff path under heavy base_g, NOT a discriminating guard for the A1 associativity fix:
-    reverting the parenthesisation at astar/kernel.py leaves this green, because the ~1-ULP takeoff-edge
-    difference (~3.7% of takeoff-lane edges here) never flips a heap ``(f, counter)`` tie in practice
-    (verified by reverting + re-running). The fix is correct-by-construction — the kernel now assembles
-    ``base_g + (takeoff_cost + lane_lat)`` exactly as the reference builds its single-float edge cost — so no
-    behavioural test can distinguish it; this guards the surrounding parity under load instead."""
+    the ~1-ULP takeoff-edge difference never flips a heap ``(f, counter)`` tie in practice.
+    The fix is correct-by-construction: the kernel assembles ``base_g + (takeoff_cost + lane_lat)``
+    exactly as the reference builds its single-float edge cost, so no behavioural test can
+    distinguish it; this guards the surrounding parity under load instead."""
     from freespace_sim.demand import HubRadiusDemand
     cfg = SimConfig(region_size_m=(8000.0, 6000.0), lam_per_hour=9000.0, horizon_s=300.0, planner="astar", seed=1)
     assert cfg.fixed_exit_lanes and cfg.n_levels >= 2

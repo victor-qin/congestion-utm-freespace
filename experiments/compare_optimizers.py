@@ -23,10 +23,12 @@ REQ = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)
 
 
 def _thin_wall(clear=1e6):
+    """A thin vertical wall obstacle at x=1000 m, active from t=0 until ``clear`` seconds."""
     return Volume4D(box_from_segment(vec(1000, -200, 150), vec(1000, 200, 150), 40, 400), 0.0, clear)
 
 
 def _dest_pad_block():
+    """A cylinder blocking the destination pad at (2000, 0), active t=0 until it clears at 200 s."""
     return Volume4D(CylinderSpec(2000, 0, CFG.effective_hover_radius_m, 0, 150), 0.0, 200.0)
 
 
@@ -39,6 +41,8 @@ SCENARIOS = {
 
 
 def main() -> None:
+    """Run every planner on each SCENARIOS obstacle set and print a per-scenario table of cost,
+    levers used, conflict-free flag, and wall-time, with the MILP cost as the yardstick."""
     planners = ["straight", "astar", "milp", "astar_milp"]
     print(f'{"scenario":>28} | {"planner":>8} {"cost":>8} {"delay":>6} {"detour":>7} {"cf":>3} {"sec":>6}')
     print("-" * 80)

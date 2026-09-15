@@ -36,17 +36,24 @@ _MISSING = object()
 
 
 def iter_planner_chain(planner):
-    """Every planner reachable from ``planner`` through the ``inner``/``warm_planner`` wrapper chain,
-    ``planner`` itself first. Deduped by identity, so a diamond (``astar_milp_shortcut`` wraps a MILP
-    that is warm-started by a *different* ShortcutRefiner) visits each node once.
+    """Yield every planner reachable through the ``inner``/``warm_planner`` wrapper chain.
 
-    ONE definition of "walk the wrapper chain": ``sim`` uses it to find where to attach telemetry and
-    whether the committed corridor is wall-aware, ``parallel`` to reach the A* instances inside a
-    worker's planner, and ``shortcut`` to find a capacity authority. Those four had drifted into four
-    identical copies (``parallel``'s even documented itself as one), which is a silent-divergence
-    risk: add a fifth wrapper attribute, miss one copy, and that caller quietly sees no planners
-    rather than raising. Order is load-bearing — ``terminal_capacity_for`` returns the FIRST match —
-    so this reproduces the copies exactly: LIFO, ``warm_planner`` visited before ``inner``.
+    One definition of "walk the wrapper chain", shared by ``sim`` (attach telemetry, test whether
+    the committed corridor is wall-aware), ``parallel`` (reach the A* instances inside a worker's
+    planner), ``shortcut`` (find a capacity authority), and :func:`chain_attr`. Centralised so a
+    newly added wrapper attribute cannot be missed in one copy and make that caller silently see no
+    planners. Order is load-bearing — ``terminal_capacity_for`` returns the FIRST match — so the
+    walk is LIFO, with ``warm_planner`` visited before ``inner``.
+
+    Parameters
+    ------------
+    - planner (Planner): the head of the wrapper chain; yielded first.
+
+    Return
+    --------
+    - output (Iterator[Planner]): each reachable planner once, deduped by identity, so a diamond
+      (``astar_milp_shortcut`` wraps a MILP warm-started by a *different* ShortcutRefiner) visits
+      each node once.
     """
     seen: set[int] = set()
     stack = [planner]
@@ -60,13 +67,23 @@ def iter_planner_chain(planner):
 
 
 def chain_attr(planner, name) -> list:
-    """Every value of ``name`` carried by a planner in ``planner``'s chain, in chain order.
+    """Collect every value of attribute ``name`` carried by a planner in ``planner``'s chain.
 
-    An EMPTY list is the answer "nobody in this chain has that attribute", which is a real third
-    state a `getattr` default silently destroys: a wrapper holds none of the search planner's knobs,
-    so `getattr(wrapper, "evict_floor", 0.0)` reads as a correctly configured floor and
-    `getattr(wrapper, "record_envelope", False)` as a deliberate opt-out. Both bugs shipped. Callers
-    decide what an empty list means — usually "refuse", never "the default".
+    An empty result means no planner in the chain carries the attribute — a third answer a
+    ``getattr`` default would silently replace with a plausible value. A wrapper holds none of its
+    search planner's knobs, so ``getattr(wrapper, "evict_floor", 0.0)`` would read as a correctly
+    set floor and ``getattr(wrapper, "record_envelope", False)`` as a deliberate opt-out. Callers
+    decide what an empty list means; the LNS callers refuse rather than assume a default.
+
+    Parameters
+    ------------
+    - planner (Planner): the head of the wrapper chain.
+    - name (str): the attribute to read from each planner in the chain.
+
+    Return
+    --------
+    - output (list): the values found, in :func:`iter_planner_chain` order; empty when no planner
+      in the chain has ``name``.
     """
     return [v for v in (getattr(pl, name, _MISSING) for pl in iter_planner_chain(planner))
             if v is not _MISSING]
@@ -90,11 +107,21 @@ def uses_hex_lattice(name: str) -> bool:
 
 
 def get_planner(name: str, params=None) -> Planner:
-    """Resolve a planner by name.
+    """Resolve a planner registry name to a fresh planner instance.
 
-    ``params`` is a planner-specific configuration object. Only ``colgen`` accepts one today
-    (a :class:`~.colgen.ColGenParams`), so passing one for any other planner raises rather than
-    being silently dropped — a dropped solver budget looks like a converged run, not an error.
+    Only ``colgen`` accepts a ``params`` object today, so passing one for any other name raises
+    rather than being silently dropped — a dropped solver budget looks like a converged run, not an
+    error.
+
+    Parameters
+    ------------
+    - name (str): registry name (e.g. ``"astar"``, ``"astar_shortcut"``, ``"colgen"``).
+    - params: planner config (a :class:`~.colgen.ColGenParams` for ``colgen``), else ``None``.
+
+    Return
+    --------
+    - output (Planner): the resolved planner; raises ``ValueError`` on an unknown name or on a
+      ``params`` object passed for a non-``colgen`` planner.
     """
     if params is not None and name != "colgen":
         raise ValueError(f"planner {name!r} takes no params object (got {type(params).__name__})")

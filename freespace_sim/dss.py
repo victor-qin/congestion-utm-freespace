@@ -16,6 +16,12 @@ from .types import OperationalIntent
 
 @dataclass
 class DSS:
+    """Discovery & Synchronization Service: owns the shared ledger and the commit mechanism.
+
+    A thin ASTM-shaped wrapper (§3.2.17) — every commit routes through the one mechanism into the
+    one ledger, so the USS/DSS split has a home once multiple USSs coordinate through it.
+    """
+
     ledger: ReservationLedger
     mechanism: Mechanism
 

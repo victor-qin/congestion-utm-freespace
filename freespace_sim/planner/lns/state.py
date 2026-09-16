@@ -38,8 +38,8 @@ from freespace_sim.geometry import CylinderSpec
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.lns.unimpeded import resolve_workers, unimpeded_costs
-from freespace_sim.verify import pair_precedence_shortfall
 from freespace_sim.types import OperationalIntent
 
 log = logging.getLogger("freespace_sim.lns")
@@ -106,7 +106,10 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
             f"(want one of {LNS_REPAIR_PLANNERS})")
     planner.evict_floor = 0.0   # random/premium repair orders need the full-horizon occupancy
     planner.record_envelope = record_envelope
-    return planner
+    # Wrapped so a round-trip request is repaired as BOTH legs. Unwrapped, A*/SIPP plan the outbound
+    # alone and drop the return: the halved cost then reads as a large improvement and `try_repair`
+    # adopts it, so LNS strips the return off every itinerary it touches.
+    return ItineraryPlanner(planner)
 _MISSING = object()
 
 
@@ -167,7 +170,7 @@ class RepairOutcome:
     """What one destroy->repair transaction did."""
 
     accepted: bool
-    reason: str  # "improved" | "no_improvement" | "denied" | "anchor"
+    reason: str  # "improved" | "no_improvement" | "denied"
     cost_old: float
     cost_new: float  # inf when the repair never produced a complete candidate
     n_planned: int
@@ -200,7 +203,6 @@ class LNSState:
         static_terms: tuple = (),
         frozen_flight_ids: frozenset[int] = frozenset(),
         movable_uss_ids: frozenset[str] | None = None,
-        turnaround_s: float | None = None,
         repair_planner: AStarPlanner | None = None,
         repair_planner_name: str = "astar",
         incremental_release: bool = True,
@@ -226,7 +228,6 @@ class LNSState:
           replays the same world the ruler was measured in.
         - frozen_flight_ids (frozenset[int]): flights excluded from the movable set.
         - movable_uss_ids (frozenset[str] | None): if set, only these USS ids are movable.
-        - turnaround_s (float | None): enables the paired-return anchor guard when not None.
         - repair_planner (AStarPlanner | None): a borrowed repair planner (must have
           ``evict_floor == 0.0`` and not already be bound to this ledger); None constructs one.
         - repair_planner_name (str): which planner to construct when ``repair_planner`` is None.
@@ -323,30 +324,6 @@ class LNSState:
         # (the byte-parity reference for A/Bs).
         self.repair_planner = repair_planner
 
-        # Paired-return PRECEDENCE: a return cannot depart before the aircraft flying it has landed.
-        # This is a different property from `verify`'s separation check and invisible to it — the two
-        # legs hold DISJOINT windows at the same pad, so there is no 4D overlap to find. `try_repair`
-        # is the only place it can be PREVENTED, because by the time a whole-schedule replay sees it
-        # the repair has already been accepted.
-        self._turnaround_s = turnaround_s
-        from freespace_sim import verify as _verify
-        # Per-pair, not a count. A nominal-anchor schedule arrives with violations already in it, so
-        # the rule is "no pair gets worse", not "no pair is bad" — and a COUNT cannot express that:
-        # LNS can repair pair A and break pair B in one iteration with the count unchanged.
-        self._pair_shortfall = _verify.pair_shortfalls(intents, float(turnaround_s or 0.0))
-        self._precedence_baseline = sum(1 for v in self._pair_shortfall.values() if v > 1e-6)
-        # Round-trip partners, BOTH directions: the guard has to reach the leg this repair did NOT
-        # touch. Built from the requests, so it is populated under nominal anchoring too.
-        self._pair_of: dict[int, int] = {}
-        self._outbound_of_pair: dict[int, int] = {}   # either leg's fid -> the OUTBOUND leg's fid
-        for it in intents:
-            pid = it.request.paired_outbound_id
-            if pid is not None:
-                fid = it.request.flight_id
-                self._pair_of[fid] = pid
-                self._pair_of[pid] = fid
-                self._outbound_of_pair[fid] = self._outbound_of_pair[pid] = pid
-
         # Unimpeded weighted cost per movable flight — the paper's d(s_i, g_i) analogue, so
         # delay(fid) = incumbent cost - unimpeded cost. One plan per flight on a static-walls-only
         # ledger, which nothing is ever committed to: the plans cannot see each other, so
@@ -415,7 +392,6 @@ class LNSState:
         *,
         static_terms: tuple,
         unimpeded_cost: dict[int, float | None],
-        turnaround_s: float | None = None,
         frozen_flight_ids: frozenset[int] = frozenset(),
         movable_uss_ids: frozenset[str] | None = None,
         incremental_release: bool = True,
@@ -443,9 +419,6 @@ class LNSState:
         - static_terms (tuple): the (center, terminal) walls to re-register, so the worker measures
           the same world as the ruler.
         - unimpeded_cost (dict[int, float | None]): the broadcast ruler; a None entry means denied.
-        - turnaround_s (float | None): arms ``try_repair``'s paired-leg precedence guard; without it
-          a repair may land an outbound after its return has departed, or shed a return's hold until
-          it lifts off before its own aircraft is back (a precedence break ``verify`` cannot see).
         - frozen_flight_ids (frozenset[int]): non-movable flights; omitting them lets destroy pick
           frozen flights while the membership assert still passes on the worker's own (wrong) set.
         - movable_uss_ids (frozenset[str] | None): USS movability filter, forwarded for the same
@@ -482,7 +455,6 @@ class LNSState:
             static_terms=static_terms,
             frozen_flight_ids=frozen_flight_ids,
             movable_uss_ids=movable_uss_ids,
-            turnaround_s=turnaround_s,
             repair_planner=planner,
             incremental_release=incremental_release,
             unimpeded_cost=unimpeded_cost,
@@ -795,28 +767,6 @@ class LNSState:
                 new[fid] = it
                 if rec_env:
                     envelopes.append(self.repair_planner.last_envelope)
-
-            if reason == "improved" and self._turnaround_s is not None:
-                # One predicate over the PAIR, not two branches keyed by which leg moved. Whichever
-                # leg this repair touched, the pair is re-scored the same way `verify` scores it, and
-                # the partner is read from `new` when the same transaction moved it too — so the
-                # verdict does not depend on repair order, and a pair with both legs repaired is
-                # judged once, from both new plans.
-                seen: set[int] = set()
-                for fid in new:
-                    out_fid = self._outbound_of_pair.get(fid)
-                    if out_fid is None or out_fid in seen:
-                        continue
-                    seen.add(out_fid)
-                    ret_fid = self._pair_of[out_fid]
-                    outbound = new.get(out_fid) or self.incumbent.get(out_fid)
-                    ret = new.get(ret_fid) or self.incumbent.get(ret_fid)
-                    if outbound is None or ret is None:
-                        continue          # partner denied or not in this state: nothing to preserve
-                    short = pair_precedence_shortfall(outbound, ret, self._turnaround_s)
-                    if short > self._pair_shortfall.get((out_fid, ret_fid), 0.0) + 1e-6:
-                        reason = "anchor"
-                        break
 
             cost_new = float(sum(it.cost for it in new.values())) if reason == "improved" else math.inf
             if reason == "improved" and cost_new < cost_old - accept_epsilon:

@@ -538,6 +538,42 @@ def build_reservation_from_corners(
     return volumes, centerline, cum_horiz, cum_dz
 
 
+def ground_dwell_reservation(center: Vec, t0: float, duration_s: float, cfg: SimConfig, *,
+                             radius: float | None = None) -> Volume4D:
+    """
+    The pad an aircraft occupies while SITTING on it, between the legs of a round trip.
+
+    A LOW box, not the full column :func:`hover_reservation` books — the descent that put the aircraft
+    there and the climb that takes it away sweep the column and are reserved separately. Same
+    footprint radius as the hover column, so another flight may overfly at altitude but none may land
+    here while this one is parked. See context/figures/itinerary_reservation.png.
+
+    Parameters
+    ------------
+    - center (Vec): pad centre
+    - t0 (float): when the aircraft is down, i.e. the arrival column's ``t_end``
+    - duration_s (float): how long it stays parked
+    - cfg (SimConfig): supplies ``ground_box_height_m`` and the default footprint radius
+    - radius (float): footprint radius; None uses ``effective_hover_radius_m``
+
+    Return
+    --------
+    - volume (Volume4D): the parked-aircraft reservation
+    """
+    center = np.asarray(center, float)
+    spec = CylinderSpec(
+        cx=float(center[0]),
+        cy=float(center[1]),
+        radius=cfg.effective_hover_radius_m if radius is None else float(radius),
+        z_lo=cfg.ground_level_m,
+        z_hi=cfg.ground_level_m + cfg.ground_box_height_m,
+    )
+    # Deliberately UNTAGGED, and no knob to tag it: `conflict.volumes_conflict` makes two same-hub
+    # volumes transparent whenever either is a cylinder, so a tagged box would let another flight of
+    # that hub land its column on top of the parked aircraft.
+    return Volume4D(spec, t0, t0 + float(duration_s))
+
+
 def hover_reservation(center: Vec, t0: float, cfg: SimConfig, *, terminal_id: Hashable = None,
                       radius: float | None = None, z_hi: float | None = None,
                       climb_time_s: float | None = None) -> Volume4D:

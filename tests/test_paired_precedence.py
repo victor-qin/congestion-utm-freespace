@@ -1,242 +1,345 @@
-"""Paired round trips must be flyable: a return cannot depart before its own aircraft has landed.
+"""A round trip is ONE flight, so its return leg cannot precede its own arrival.
 
-This is a PRECEDENCE property, not a separation one, and the distinction is the whole point of the
-check. The two legs are independent flights with independently timed reservations, so a return that
-lifts off early holds a *disjoint* window at the same pad — no 4D overlap, ledger accepts it, and
-`find_interflight_conflict` reports the schedule clean. Only an explicit check sees it.
+The two legs are planned as one itinerary (`planner.itinerary.ItineraryPlanner`): the return departs
+from the arrival the outbound actually achieved, so there is no filed time left to be wrong. This
+replaced a scheme that filed the return separately, on a straight-line estimate of that arrival.
 """
 from __future__ import annotations
 
-import numpy as np
+from dataclasses import replace
+
 import pytest
 
-from freespace_sim import verify
 from freespace_sim.config import SimConfig
-from freespace_sim.geometry import CylinderSpec
-from freespace_sim.types import FlightRequest, IntentStatus, OperationalIntent, vec
-from freespace_sim.volumes import Volume4D
-
-CFG = SimConfig()
-
-
-def _leg(fid, origin, dest, t_takeoff, t_land, *, paired=None, dwell=40.0, cost=0.0):
-    """An accepted intent holding a takeoff column at `origin` and a landing column at `dest`."""
-    req = FlightRequest(fid, origin, dest, 0.0, t_departure=t_takeoff, paired_outbound_id=paired)
-    vols = [
-        Volume4D(CylinderSpec(float(origin[0]), float(origin[1]), 60.0, 0.0, 125.0),
-                 t_takeoff, t_takeoff + dwell),
-        Volume4D(CylinderSpec(float(dest[0]), float(dest[1]), 60.0, 0.0, 125.0),
-                 t_land, t_land + dwell),
-    ]
-    return OperationalIntent(request=req, status=IntentStatus.ACCEPTED, volumes=vols,
-                             centerline=[(np.asarray(origin, float), t_takeoff),
-                                         (np.asarray(dest, float), t_land)], cost=cost)
-
+from freespace_sim.types import FlightRequest, IntentStatus, OperationalIntent, Terminal, vec
 
 HUB, CUST = vec(0, 0, 0), vec(3000, 0, 0)
 
 
-def test_a_return_that_waits_for_its_aircraft_is_clean():
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0)                 # lands 500, pad clears 540
-    ret = _leg(2, CUST, HUB, 540.0, 1040.0, paired=1)         # departs exactly when it clears
-    assert verify.find_paired_precedence_violation([outbound, ret], CFG) is None
-    assert verify.count_paired_precedence_violations([outbound, ret], CFG) == (0, 0.0)
+def _itinerary_world(dwell_s=180.0, lam=900.0):
+    """A congested hub world whose deliveries are round-trip itineraries."""
+    from freespace_sim.demand import HubRadiusDemand
+
+    cfg = SimConfig(planner="astar", lam_per_hour=lam, horizon_s=900.0,
+                    region_size_m=(4000.0, 4000.0), seed=3, flight_levels_m=(75.0,),
+                    airspace_ceiling_m=125.0, max_ground_delay_s=600.0)
+    return cfg, HubRadiusDemand(n_hubs_per_uss={"a": 2}, return_flights=True,
+                                turnaround_s=dwell_s)
 
 
-def test_a_return_that_departs_before_its_aircraft_lands_is_caught():
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0)                 # pad clears at 540
-    ret = _leg(2, CUST, HUB, 300.0, 800.0, paired=1)          # departs 240s early
-    bad = verify.find_paired_precedence_violation([outbound, ret], CFG)
-    assert bad is not None
-    ret_id, out_id, short = bad
-    assert (ret_id, out_id) == (2, 1)
-    assert short == pytest.approx(240.0)
-    assert verify.count_paired_precedence_violations([outbound, ret], CFG)[0] == 1
-    with pytest.raises(AssertionError, match="before outbound 1 releases"):
-        verify.assert_no_paired_precedence_violation([outbound, ret], CFG)
+def test_an_itinerarys_return_leg_never_precedes_its_own_arrival():
+    """The property the whole model exists for, under congestion that used to break it.
+
+    A two-request round trip filed its return on a straight-line estimate of the outbound's arrival,
+    so any ground hold or detour put the return in the air before its aircraft was down. An itinerary
+    reads the arrival that actually happened, so the second leg cannot start before the first ends —
+    there is no filed time left to be wrong.
+    """
+    from freespace_sim.sim import run
+
+    cfg, model = _itinerary_world()
+    res = run(cfg, demand=model)
+    trips = [i for i in res.intents if i.accepted and i.request.return_to_origin]
+    assert trips, "the fixture must actually fly round trips"
+    assert res.verified
+    # The fixture has to be in the regime that broke the two-request scheme, or this passes for the
+    # wrong reason: a return only departed early because its outbound ran over the estimate.
+    assert all(_parked_s(i, cfg) > (cfg.turnaround_s if i.request.turnaround_s is None else i.request.turnaround_s) + 1e-6 for i in trips), (
+        "every return should be held past its service here; an uncongested fixture proves nothing")
+
+    for it in trips:
+        legs = _split_legs(it, cfg)
+        assert len(legs) == 2
+        out_land = max(v.t_end for v in legs[0])
+        back_off = min(v.t_start for v in legs[1])
+        assert back_off >= out_land - 1e-6, (
+            f"flight {it.request.flight_id} leaves {out_land - back_off:.1f}s before it arrives")
 
 
-def test_this_is_invisible_to_the_separation_check():
-    """The reason the check has to exist: the early return is not a conflict."""
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0)                 # customer column 500-540
-    ret = _leg(2, CUST, HUB, 300.0, 800.0, paired=1)          # customer column 300-340: DISJOINT
-    assert verify.find_interflight_conflict([outbound, ret], CFG) is None
-    assert verify.find_paired_precedence_violation([outbound, ret], CFG) is not None
+def _ground_boxes(intent, cfg):
+    """The parked-aircraft boxes: the ones only `ground_box_height_m` tall, not full columns."""
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    return [v for v in intent.volumes
+            if hasattr(v.shape, "z_hi") and v.shape.z_hi <= top + 1e-9]
 
 
-def test_turnaround_is_part_of_availability():
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0)                 # pad clears at 540
-    ret = _leg(2, CUST, HUB, 560.0, 1060.0, paired=1)
-    assert verify.find_paired_precedence_violation([outbound, ret], CFG, turnaround_s=0.0) is None
-    bad = verify.find_paired_precedence_violation([outbound, ret], CFG, turnaround_s=60.0)
-    assert bad is not None and bad[2] == pytest.approx(40.0)
+def _parked_s(intent, cfg):
+    """How long the aircraft sat on the customer pad, service plus any hold on the return."""
+    box = _ground_boxes(intent, cfg)
+    return (box[0].t_end - box[0].t_start) if box else 0.0
 
 
-def test_unpaired_and_denied_legs_are_ignored():
-    solo = _leg(1, HUB, CUST, 0.0, 500.0)                     # no paired_outbound_id
-    assert verify.find_paired_precedence_violation([solo], CFG) is None
-    orphan = _leg(2, CUST, HUB, 300.0, 800.0, paired=99)      # outbound absent from the list
-    assert verify.find_paired_precedence_violation([orphan], CFG) is None
-    denied = OperationalIntent(request=FlightRequest(1, HUB, CUST, 0.0, t_departure=0.0),
-                               status=IntentStatus.REJECTED, volumes=[], centerline=[])
-    ret = _leg(2, CUST, HUB, 300.0, 800.0, paired=1)
-    assert verify.find_paired_precedence_violation([denied, ret], CFG) is None
+def _split_legs(intent, cfg):
+    """Volumes grouped by leg, split at the parked-aircraft ground box."""
+    boxes = set(id(v) for v in _ground_boxes(intent, cfg))
+    ground = [k for k, v in enumerate(intent.volumes) if id(v) in boxes]
+    if not ground:
+        return [intent.volumes]
+    k = ground[0]
+    return [intent.volumes[:k], intent.volumes[k + 1:]]
 
 
-def test_realized_takeoff_is_the_column_start_not_the_first_waypoint():
-    """Under fixed exit lanes the corridor begins at the column EDGE, so the first centerline point
-    follows liftoff by the climb dwell — measuring there would understate the hold."""
-    leg = _leg(1, HUB, CUST, 100.0, 500.0)
-    assert verify.realized_takeoff_s(leg) == pytest.approx(100.0)
-    assert verify.realized_takeoff_s(leg) < leg.centerline[0][1] + 1e-9
+def test_the_pad_is_held_continuously_while_the_aircraft_is_parked():
+    """No gap between arriving and leaving: a held return is still on the pad, so the ground box
+    spans arrival-column end -> departure-column start, not merely `turnaround_s`."""
+    from freespace_sim.sim import run
+
+    cfg, model = _itinerary_world(dwell_s=180.0)
+    res = run(cfg, demand=model)
+    trips = [i for i in res.intents if i.accepted and i.request.return_to_origin]
+    assert trips
+
+    held = 0
+    for it in trips:
+        box = _ground_boxes(it, cfg)
+        if not box:
+            continue
+        held += 1
+        (box,) = box
+        assert box.shape.z_hi == pytest.approx(cfg.ground_level_m + cfg.ground_box_height_m)
+        legs = _split_legs(it, cfg)
+        assert box.t_start == pytest.approx(max(v.t_end for v in legs[0]))
+        assert box.t_end == pytest.approx(min(v.t_start for v in legs[1]))
+        assert box.t_end - box.t_start >= 180.0 - 1e-6      # service, plus any hold on top
+    assert held == len(trips)
 
 
-# --------------------------------------------------------------- the LNS anchor guard
-
-def _state_with_pair(monkeypatch, *, turnaround_s=0.0):
-    """An LNSState over one round trip, with the unimpeded ruler stubbed out (it would plan)."""
+def test_an_itinerary_is_denied_whole_when_its_return_cannot_be_planned(monkeypatch):
+    """A delivery whose aircraft cannot get home is not a half success, so `accepted` keeps meaning
+    'this aircraft flew the trip' and nothing downstream has to handle a stranded leg."""
     from freespace_sim.ledger import ReservationLedger
-    from freespace_sim.planner.lns import state as state_mod
-    from freespace_sim.planner.lns.state import LNSState
+    from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.itinerary import ItineraryPlanner
+    from freespace_sim.types import DenialReason
 
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0)                 # pad clears at 540
-    ret = _leg(2, CUST, HUB, 540.0, 1040.0, paired=1, cost=9.0)   # departs exactly when it clears
-    led = ReservationLedger(CFG)
-    for it in (outbound, ret):
-        led.commit(it.request.flight_id, it.volumes)
-    monkeypatch.setattr(state_mod, "unimpeded_costs",
-                        lambda cfg, st, reqs, *, n_workers: [(r.flight_id, 1.0, None) for r in reqs])
-    st = LNSState(CFG, led, [outbound, ret], turnaround_s=turnaround_s)
-    return st, outbound, ret
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    inner = AStarPlanner()
+    real = inner.plan
+    calls = {"n": 0}
 
+    def deny_the_second(req, ledger, c):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return OperationalIntent(request=req, status=IntentStatus.REJECTED, volumes=[],
+                                     denial_reason=DenialReason.BUDGET_EXCEEDED)
+        return real(req, ledger, c)
 
-def test_the_guard_sees_the_pair_not_one_leg(monkeypatch):
-    """The bug this pins: the guard held two dicts keyed by two different legs, and the one that
-    would have caught an early RETURN was keyed by OUTBOUND id — on full density_faa its 2,318 keys
-    and the schedule's 2,318 returns intersected in ZERO cases. One map over the PAIR cannot have
-    that failure mode: either leg resolves to the same entry."""
-    st, outbound, ret = _state_with_pair(monkeypatch)
-    assert st._outbound_of_pair[1] == st._outbound_of_pair[2] == 1
-    assert st._pair_of[1] == 2 and st._pair_of[2] == 1
-    assert (1, 2) in st._pair_shortfall            # keyed (outbound, return), reachable from either
-
-
-def test_the_baseline_is_per_pair_not_a_count(monkeypatch):
-    """A count-based ratchet is identity-blind: repair pair A, break pair B, count unchanged."""
-    st, outbound, ret = _state_with_pair(monkeypatch)
-    assert st._pair_shortfall == {(1, 2): pytest.approx(0.0)}
-    assert st._precedence_baseline == 0
+    monkeypatch.setattr(inner, "plan", deny_the_second)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    out = ItineraryPlanner(inner).plan(req, ReservationLedger(cfg), cfg)
+    assert calls["n"] == 2                                  # it really did try the return
+    assert not out.accepted and out.volumes == []
+    assert out.request is req                               # the itinerary, not the leg it split off
 
 
-class _FixedPlanner:
-    """A repair planner that always returns one prepared intent, so `try_repair` is exercised for
-    real (guard included) instead of a test re-implementing the guard's arithmetic."""
+def test_colgen_refuses_an_itinerary_rather_than_dropping_the_return():
+    """Colgen prices one path per flight, so an itinerary would be solved as its outbound alone —
+    indistinguishable in the output from a one-way delivery. It must fail loudly instead."""
+    from freespace_sim.planner.colgen.batch import run_batch
+    from freespace_sim.scenario import scenario_from_requests
 
-    def __init__(self, out):
-        self._out = out
+    scen = scenario_from_requests([
+        FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=30.0)])
+    with pytest.raises(NotImplementedError, match="round-trip itineraries"):
+        run_batch(scen, SimConfig(), None, None, (), None, None, None)
 
-    def plan(self, request, ledger, cfg):
-        return self._out
 
+def test_the_pad_hold_is_deconflicted_before_the_itinerary_is_accepted():
+    """The hold is built FROM both legs' results, so neither leg's search ever saw it.
 
-def test_a_repaired_return_that_departs_early_is_rejected(monkeypatch):
-    """End-to-end through `try_repair`: a return re-planned to lift off before its outbound's pad
-    clears is a strict cost improvement, the ledger accepts it, and `find_interflight_conflict`
-    sees nothing — only the guard can refuse it. Before the fix this returned "improved"."""
-    st, outbound, ret = _state_with_pair(monkeypatch)
-    early = _leg(2, CUST, HUB, 400.0, 900.0, paired=1, cost=1.0)   # 140 s before the pad clears
-    st.repair_planner = _FixedPlanner(early)
-    rng = np.random.default_rng(0)
+    Checking it in `_compose` keeps `FCFSMechanism.commit`'s re-check the no-op its docstring
+    promises, and matters most under LNS, whose commit path re-checks nothing at all.
+    """
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.types import DenialReason
+    from freespace_sim.volumes import Volume4D
 
-    out = st.try_repair([2], rng)
-    assert out.reason == "anchor", "the early return must be refused by the guard"
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    planner = get_planner("astar")
+
+    clean = planner.plan(req, ReservationLedger(cfg), cfg)
+    assert clean.accepted
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    hold = next(v for v in clean.volumes
+                if isinstance(v.shape, CylinderSpec) and v.shape.z_hi <= top + 1e-9)
+    assert hold.t_end - hold.t_start > 10.0          # room for a blocker that clears both columns
+
+    # Strictly inside the turnaround gap: both columns stay clear, so both legs still plan exactly
+    # as before and the hold between them is the only thing that conflicts.
+    mid = 0.5 * (hold.t_start + hold.t_end)
+    led = ReservationLedger(cfg)
+    led.commit(2, [Volume4D(CylinderSpec(cx=hold.shape.cx, cy=hold.shape.cy,
+                                         radius=hold.shape.radius, z_lo=cfg.ground_level_m,
+                                         z_hi=cfg.airspace_ceiling_m), mid - 5.0, mid + 5.0)])
+    out = planner.plan(req, led, cfg)
     assert not out.accepted
-    # `cost_new` is inf on any non-"improved" exit, so the improvement it gave up is the plan's
-    # own cost: 1.0 against an incumbent 9.0. The guard refused a strict gain, not a wash.
-    assert early.cost < out.cost_old, "and refused DESPITE being a strict improvement"
-
-    # Nothing else in the stack would have caught it.
-    assert verify.find_interflight_conflict([outbound, early], CFG) is None
-    assert verify.find_paired_precedence_violation([outbound, early], CFG) is not None
-
-    # The incumbent is untouched by the rejected repair.
-    assert st.incumbent[2] is ret
+    assert out.denial_reason is DenialReason.CONFLICT_FILED
 
 
-def test_a_repaired_return_that_waits_is_still_accepted(monkeypatch):
-    """The guard must not be a blanket veto on returns: same repair, departing on time, accepted."""
-    st, outbound, ret = _state_with_pair(monkeypatch)
-    ok = _leg(2, CUST, HUB, 600.0, 1100.0, paired=1, cost=1.0)     # 60 s AFTER the pad clears
-    st.repair_planner = _FixedPlanner(ok)
-
-    out = st.try_repair([2], np.random.default_rng(0))
-    assert out.reason == "improved" and out.accepted
-    assert verify.find_paired_precedence_violation([outbound, ok], CFG) is None
-
-
-def _state_with_headroom(monkeypatch):
-    """A round trip whose return departs 60 s AFTER its pad clears — so the outbound has slack."""
+def test_the_pad_hold_is_not_denied_by_its_own_terminals_permanent_wall():
+    """A permanent terminal wall is not another flight, and the aircraft is a member of that
+    terminal: its own tagged columns fly straight through the wall by the shared-terminal exemption.
+    The hold cannot be tagged (a tagged cylinder is transparent to same-hub columns, which is what
+    would let another flight land on the parked aircraft), so it is opaque to the wall as well —
+    and checking it against the wall would refuse the trip for its own hub's airspace."""
+    from freespace_sim.geometry import CylinderSpec
     from freespace_sim.ledger import ReservationLedger
-    from freespace_sim.planner.lns import state as state_mod
-    from freespace_sim.planner.lns.state import LNSState
+    from freespace_sim.planner import get_planner
 
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0, cost=9.0)        # lands 500, pad clears at 540
-    ret = _leg(2, CUST, HUB, 600.0, 1100.0, paired=1)          # departs 600: 60 s of headroom
-    led = ReservationLedger(CFG)
-    for it in (outbound, ret):
-        led.commit(it.request.flight_id, it.volumes)
-    monkeypatch.setattr(state_mod, "unimpeded_costs",
-                        lambda cfg, st, reqs, *, n_workers: [(r.flight_id, 1.0, None) for r in reqs])
-    return LNSState(CFG, led, [outbound, ret], turnaround_s=0.0), outbound, ret
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0,
+                    terminal_airspace_always_active=True)
+    term = Terminal(id="cust-hub", capacity=4, radius=90.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0,
+                        dest_terminal=term)
+    led = ReservationLedger(cfg)
+    led.register_static_terminal(CUST, term)
 
-
-def test_an_outbound_slip_inside_the_pairs_headroom_is_allowed(monkeypatch):
-    """The over-strictness this fixes. The old guard compared the outbound's release against the
-    return's FILED `t_departure`, which on nominal every pair is already behind (p50 -58 s over
-    2,318 pairs) — so ANY outbound slip was vetoed, 2,318 pairs blocked to protect the 85 that
-    actually violate. The predicate now compares against the return's REALIZED takeoff, so a slip
-    the return can absorb is accepted."""
-    st, outbound, ret = _state_with_headroom(monkeypatch)
-    slipped = _leg(1, HUB, CUST, 0.0, 550.0, cost=1.0)         # lands 50 s later; pad clears at 590
-    st.repair_planner = _FixedPlanner(slipped)
-    out = st.try_repair([1], np.random.default_rng(0))
-    assert out.reason == "improved" and out.accepted, "60 s of headroom exists; do not veto it"
-    assert verify.find_paired_precedence_violation([slipped, ret], CFG) is None
+    out = get_planner("astar").plan(req, led, cfg)
+    assert out.accepted, f"denied {out.denial_reason} — the wall is its own terminal's"
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    hold = next(v for v in out.volumes
+                if isinstance(v.shape, CylinderSpec) and v.shape.z_hi <= top + 1e-9)
+    # The check only proves something if the wall really does overlap the hold: `any_conflict` sees
+    # it (untagged), while the flight-only test `_compose` runs does not.
+    assert led.any_conflict([hold])
+    assert not led.conflicting_flights([hold])
 
 
-def test_an_outbound_slip_past_the_headroom_is_refused(monkeypatch):
-    st, outbound, ret = _state_with_headroom(monkeypatch)
-    late = _leg(1, HUB, CUST, 0.0, 600.0, cost=1.0)            # pad does not clear until 640 > 600
-    st.repair_planner = _FixedPlanner(late)
-    out = st.try_repair([1], np.random.default_rng(0))
-    assert out.reason == "anchor" and not out.accepted
-    assert verify.find_paired_precedence_violation([late, ret], CFG) is not None
-
-
-def test_a_pre_existing_violation_is_grandfathered_but_not_worsened(monkeypatch):
-    """A nominal-anchor baseline arrives WITH violations. LNS is answerable for not adding to them,
-    not for the schedule it was handed — so the ratchet is per-pair 'no worse', not 'must be clean'."""
+def test_an_outbound_accepted_without_volumes_raises_rather_than_stranding_the_return():
+    """`realized_release_s` is None for an accepted intent holding no volumes, and returning the
+    outbound there would be the silent half-trip `reject_itinerary` exists to prevent: a round trip
+    at roughly half the cost, which a cost-comparing caller reads as an improvement."""
     from freespace_sim.ledger import ReservationLedger
-    from freespace_sim.planner.lns import state as state_mod
-    from freespace_sim.planner.lns.state import LNSState
+    from freespace_sim.planner.itinerary import ItineraryPlanner
 
-    outbound = _leg(1, HUB, CUST, 0.0, 500.0)                  # pad clears at 540
-    ret = _leg(2, CUST, HUB, 400.0, 900.0, paired=1, cost=9.0)  # ALREADY 140 s early
-    led = ReservationLedger(CFG)
-    for it in (outbound, ret):
-        led.commit(it.request.flight_id, it.volumes)
-    monkeypatch.setattr(state_mod, "unimpeded_costs",
-                        lambda cfg, st, reqs, *, n_workers: [(r.flight_id, 1.0, None) for r in reqs])
-    st = LNSState(CFG, led, [outbound, ret], turnaround_s=0.0)
-    assert st._pair_shortfall[(1, 2)] == pytest.approx(140.0)
-    assert st._precedence_baseline == 1
+    class _AcceptsWithNothing:
+        def plan(self, req, ledger, cfg):
+            return OperationalIntent(request=req, status=IntentStatus.ACCEPTED, volumes=[],
+                                     centerline=[])
 
-    # same shortfall, cheaper: allowed, because it does not make the pair worse
-    same = _leg(2, CUST, HUB, 400.0, 880.0, paired=1, cost=1.0)
-    st.repair_planner = _FixedPlanner(same)
-    assert st.try_repair([2], np.random.default_rng(0)).reason == "improved"
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    with pytest.raises(ValueError, match="no volumes"):
+        ItineraryPlanner(_AcceptsWithNothing()).plan(req, ReservationLedger(cfg), cfg)
 
-    # one second earlier: refused
-    worse = _leg(2, CUST, HUB, 399.0, 879.0, paired=1, cost=1.0)
-    st.repair_planner = _FixedPlanner(worse)
-    assert st.try_repair([2], np.random.default_rng(0)).reason == "anchor"
+
+def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
+    """`iter_planner_chain` order is load-bearing — `_terminal_capacity_for` takes the FIRST match —
+    and a wrapper that answers `warm_planner` on its child's behalf yields a grandchild at its own
+    depth. The same missing guard let `__getattr__` recurse forever on the empty-dict instance that
+    `copy`/`pickle` build before restoring state."""
+    import copy
+    import pickle
+
+    from freespace_sim.planner import _get_planner, get_planner, iter_planner_chain
+
+    for name in ("astar_milp", "milp", "astar_shortcut"):
+        bare = [type(p).__name__ for p in iter_planner_chain(_get_planner(name))]
+        wrapped = [type(p).__name__ for p in iter_planner_chain(get_planner(name))]
+        assert wrapped[0] == "ItineraryPlanner"
+        assert wrapped[1:] == bare               # the wrapper prepends itself; it must not reorder
+
+    planner = get_planner("astar")
+    assert type(copy.deepcopy(planner)) is type(planner)
+    # Round-trips a planner this test just built — no external data is deserialised.
+    assert type(pickle.loads(pickle.dumps(planner))) is type(planner)
+
+
+@pytest.mark.parametrize("name", ["astar", "sipp", "milp", "straight", "decoupled"])
+def test_every_leaf_planner_refuses_an_unwrapped_itinerary(name):
+    """`get_planner` wraps them all, so this guard exists for the sites that BYPASS it — and one
+    such site (`lns/unimpeded._new_ruler`) was already found by it. A leaf that plans the outbound
+    and drops the return costs about half a round trip, which a cost-comparing caller reads as an
+    improvement, so every leaf has to fail loudly rather than only the two searched ones."""
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import _get_planner
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    with pytest.raises(NotImplementedError, match="round-trip itinerary"):
+        _get_planner(name).plan(req, ReservationLedger(cfg), cfg)
+
+
+def test_a_return_that_starts_before_its_own_arrival_raises(monkeypatch):
+    """`_compose` files the pad hold only when the return leaves AFTER the outbound is down, so a
+    leg 2 that starts earlier would be composed with no hold and no ledger check — and `verify`
+    cannot see it, because both legs are one flight now and it checks INTERflight overlap. A planner
+    may only delay a departure, so this is a contract violation, not congestion."""
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.itinerary import ItineraryPlanner
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    inner = AStarPlanner()
+    real = inner.plan
+    calls = {"n": 0}
+
+    def leave_early(req, ledger, c):
+        calls["n"] += 1
+        it = real(req, ledger, c)
+        if calls["n"] != 2:
+            return it
+        # Same plan, shifted 1000 s earlier: an accepted return whose first volume predates the
+        # outbound's landing column.
+        return replace(it, volumes=[replace(v, t_start=v.t_start - 1000.0, t_end=v.t_end - 1000.0)
+                                    for v in it.volumes])
+
+    monkeypatch.setattr(inner, "plan", leave_early)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    with pytest.raises(ValueError, match="before the outbound's landing column clears"):
+        ItineraryPlanner(inner).plan(req, ReservationLedger(cfg), cfg)
+
+
+@pytest.mark.slow
+def test_lns_repair_keeps_both_legs_of_an_itinerary():
+    """LNS must repair a round trip as a round trip.
+
+    An unwrapped repair planner plans the outbound alone and drops the return; because that costs
+    about half the trip, `try_repair`'s strict-improvement test then ADOPTS it. Measured before the
+    fix: 36 of 36 round trips stranded, reported as a 66.93% improvement with verified=True.
+    """
+    from freespace_sim.planner.lns import LNSConfig, run_lns
+    from freespace_sim.sim import run
+
+    cfg, model = _itinerary_world(lam=300.0)      # the ruler replans every flight; keep it small
+    res = run(cfg, demand=model)
+    before = {i.request.flight_id: i for i in res.intents
+              if i.accepted and i.request.return_to_origin and i.leg_starts}
+    assert before, "the fixture must fly round trips with both legs"
+
+    out = run_lns(cfg, res.ledger, res.intents,
+                  LNSConfig(seed=7, max_iterations=60, neighborhood_size=2,
+                            operators=("agent",), log_every=0, unimpeded_workers=1),
+                  static_terms=res.ledger.static_terminals())
+    after = {i.request.flight_id: i for i in out.intents}
+    stranded = [f for f in before if not after[f].leg_starts]
+    assert not stranded, f"{len(stranded)}/{len(before)} round trips lost their return leg"
+    assert out.n_accepted > 0, "an LNS pass that accepted nothing cannot show the return survived"
+
+
+def test_the_arrival_and_departure_clocks_are_the_columns_not_the_waypoints():
+    """`ItineraryPlanner` derives the return's entire departure clock from `realized_release_s` and
+    ends the pad hold at `realized_takeoff_s`. Both are extremes over the volume list, which is the
+    landing/takeoff column only while nothing else reaches further — and the corridor stops at the
+    column EDGE at cruise altitude, so the first and last waypoints sit INSIDE the columns by the
+    climb. Pin both, or the first planner to file a volume past the landing column shifts every
+    return late and over-reserves every customer pad with nothing to catch it."""
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.sim import realized_release_s
+    from freespace_sim.verify import realized_takeoff_s
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    leg = get_planner("astar").plan(FlightRequest(1, HUB, CUST, 0.0), ReservationLedger(cfg), cfg)
+    assert leg.accepted
+
+    columns = [v for v in leg.volumes if isinstance(v.shape, CylinderSpec)]
+    assert len(columns) == 2            # a leg is [takeoff column, corridor boxes..., landing column]
+    assert realized_takeoff_s(leg) == pytest.approx(columns[0].t_start)
+    assert realized_release_s(leg) == pytest.approx(columns[-1].t_end)
+    assert realized_takeoff_s(leg) < leg.centerline[0][1] - 1e-9
+    assert realized_release_s(leg) > leg.centerline[-1][1] + 1e-9

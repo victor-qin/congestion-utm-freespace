@@ -134,11 +134,11 @@ def _term_from_json(s):
     return tuple(json.loads(s))
 
 
-def _opt_int(v) -> int | None:
-    """A parquet cell back to ``int | None`` — None for a missing column or a NaN (unlinked) row."""
+def _opt_float(v) -> float | None:
+    """A parquet cell back to ``float | None`` — None for a missing column or a NaN (inherit) row."""
     if v is None or (isinstance(v, float) and v != v):
         return None
-    return int(v)
+    return float(v)
 
 
 def scenario_frame(result: SimResult) -> pd.DataFrame:
@@ -168,12 +168,10 @@ def scenario_frame(result: SimResult) -> pd.DataFrame:
             "dest_x": d[0], "dest_y": d[1], "dest_z": d[2],
             "origin_terminal": _term_to_json(r.origin_terminal),
             "dest_terminal": _term_to_json(r.dest_terminal),
-            # Round-trip link (return leg → its outbound). Without it a reloaded run cannot tell
-            # which legs were paired, so nothing can re-derive the schedule slip or re-anchor a
-            # return post-hoc — the coupled t_departure above is the OUTCOME, not the relationship.
-            # pandas has no nullable-int dtype by default, so an unlinked leg stores NaN; load_run
-            # reads it back as None.
-            "paired_outbound_id": r.paired_outbound_id,
+            # Without these a reloaded run is a ONE-WAY delivery whose return vanished — and `dest`
+            # is the customer either way, so the loss is invisible in the geometry.
+            "return_to_origin": bool(r.return_to_origin),
+            "turnaround_s": None if r.turnaround_s is None else float(r.turnaround_s),
         })
     return pd.DataFrame(rows)
 
@@ -821,9 +819,11 @@ def load_run(folder: Path | str) -> LoadedRun:
                             t_departure=t_dep, uss_id=str(s.uss_id),
                             origin_terminal=_term_from_json(getattr(s, "origin_terminal", None)),
                             dest_terminal=_term_from_json(getattr(s, "dest_terminal", None)),
-                            # getattr + NaN check: runs archived before the column existed have neither
-                            # the attribute nor a value, and an unlinked leg stores NaN either way.
-                            paired_outbound_id=_opt_int(getattr(s, "paired_outbound_id", None)))
+                            # getattr defaults: a run archived before a column existed has neither
+                            # the attribute nor a value, and reads back as one-way — which it was.
+                            return_to_origin=bool(getattr(s, "return_to_origin", False)),
+                            turnaround_s=_opt_float(getattr(s, "turnaround_s", None)),
+                            )
         accepted = bool(fr.accepted)
         intents.append(OperationalIntent(
             request=req,

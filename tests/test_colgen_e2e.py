@@ -226,7 +226,8 @@ def test_colgen_test_fast_real_batch_smoke():
     assert result.verified
     assert len(result.intents) == len(requests)
     assert all(intent.accepted for intent in result.intents)
-    assert any(intent.ground_delay_s > 0.0 for intent in result.intents)
+    # No ground-delay assertion: colgen_test is one-way now, halving the load its lam_per_uss was
+    # calibrated for, so at the old λ nothing is held. Restoring it needs the scenario re-tuned.
     assert not {
         DenialReason.CONFLICT_FILED,
         DenialReason.CONFLICT_AT_COMMIT,
@@ -273,6 +274,10 @@ def full_colgen_test_results():
 
 
 @pytest.mark.slow
+@pytest.mark.xfail(strict=True, reason=(
+    "colgen_test is one-way (run_batch refuses a round-trip itinerary), halving the load its "
+    "lam_per_uss was calibrated for: 49 requests where this wants >=80. Re-tuning the scenario is a "
+    "research decision, not a threshold to lower. STRICT so it fails once someone recalibrates."))
 def test_colgen_runs_full_density_miniature_without_filing_denials(full_colgen_test_results):
     data = full_colgen_test_results
     result = data.colgen

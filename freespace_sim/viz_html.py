@@ -149,7 +149,10 @@ def _rebuildable(intent, cfg, quantised_centerline, tolerance_m: float) -> bool:
       tolerance; False makes this flight ship explicit polygons instead.
     """
     got = [v for v in (intent.volumes or []) if isinstance(v.shape, BoxSpec)]
-    want = volumes.build_corridor(quantised_centerline, cfg)
+    # Break at the leg starts: the segment joining two legs spans a ground dwell nobody flies and
+    # reserved no box, so building straight through invents one and fails every round trip.
+    want = [v for leg in intent.leg_slices(quantised_centerline) if len(leg) >= 2
+            for v in volumes.build_corridor(leg, cfg)]
     if len(got) != len(want):
         return False
     return all(

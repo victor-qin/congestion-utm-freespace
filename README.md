@@ -211,47 +211,36 @@ leads at once, or a lead on a single-operator world) are one call away. Note tha
 lead of the *only* operator present just translates every filing equally and leaves FCFS order
 untouched — the contrast is only meaningful when a second operator holds still.
 
-**Round-trip return anchoring.** A demand model emits every request before anything is planned, so it
-can only anchor a return's desired departure to a *nominal* estimate of its outbound's arrival —
-straight-line distance at cruise speed, ignoring the outbound's ground delay, air hold, and detour
-(including unavoidable hex-lattice overhead). Under congestion that schedules the return before its
-aircraft is back — measured on `density_faa_wing_zipline_amazon`, **80%** of returns are filed to
-depart before their outbound has even touched down, and **every one** of the 2551 before its pad
-clears (median 57 s early, worst 471 s). The slip correlates 0.999 with the outbound's total delay,
-so it worsens exactly where congestion does.
+**Round trips are ONE flight.** A delivery that returns to its hub is a single `FlightRequest` with
+`return_to_origin=True`, planned by `planner.itinerary.ItineraryPlanner`: it plans the outbound, reads
+the arrival that actually happened, and departs the return from there. A return can therefore never be
+scheduled before its own aircraft is back — the property is structural, not checked.
 
-`--return-anchor realized` couples the legs inside the one run: plan the outbound, then anchor its
-return to the arrival that actually happened — the moment its **landing column clears** (`touchdown +
-pad dwell`), plus `turnaround`. That column is the authority rather than the last centerline waypoint,
-because the corridor stops at the column's *edge* at cruise altitude and the descent inside is flown
-but unreserved: anchoring on the waypoint launches the return `climb_time_to(z_land)` before its own
-aircraft is down (16.7 s at the density scenarios' 100 m level).
+It replaced a scheme that filed the return as a *separate* request whose departure was a straight-line
+estimate of the outbound's arrival, ignoring its ground delay, air hold and detour. Under congestion
+that estimate is wrong in one direction: on `density_faa_wing_zipline_amazon`, **80%** of returns were
+filed to depart before their outbound had touched down, and **every one** of the 2551 before its pad
+cleared (median 57 s early, worst 471 s), with the slip correlating 0.999 with the outbound's total
+delay — so it failed hardest exactly where congestion was worst.
 
-```bash
-uv run python -m experiments.run --scenario density_faa_wing_zipline_amazon --return-anchor realized
-```
+The arrival is the moment the **landing column clears** (`touchdown + pad dwell`), not the last
+centerline waypoint: the corridor stops at the column's *edge* at cruise altitude and the descent
+inside is flown but unreserved, so anchoring on the waypoint launches the return `climb_time_to(z_land)`
+before its own aircraft is down (16.7 s at the density scenarios' 100 m level). The aircraft then holds
+its pad for the whole turnaround — `cfg.turnaround_s`, or longer if the return is held — as a low
+ground box, so no one may land on top of a parked drone while another flight may still overfly it. See
+`context/figures/itinerary_reservation.png`.
 
-This is **exact, and free**. FCFS already guarantees the outbound is planned first: a paired return
-shares its outbound's filing time and takes the next `flight_id`, so `(t_request, flight_id)` sorts it
-immediately behind (measured: 100% adjacent), and a legacy return files strictly later still. So the
-arrival is always in hand by the time the return is planned — no second run, no approximation.
+The two legs are **chained, not searched jointly**: leg 2 is planned against leg 1's outcome. A joint
+search would need a leg dimension in the A* state that the compiled kernel, the fixed-lane gates and
+the heuristic's admissibility corrections all key off. Leg 2 is not deconflicted against leg 1 — they
+are the same aircraft.
 
-Filing times never move, so FCFS order and the monotonic-`t_request` eviction invariant are untouched;
-the flight set is identical, and a return whose outbound was *denied* keeps its nominal anchor
-(dropping it would make the flight set depend on congestion).
-
-**Sequential mode only, per-flight planners only.** A speculative worker could plan a return before
-its outbound has committed, and exact mode would not catch it — the envelope check tracks *ledger
-reads*, and a stale `t_departure` is request data, so the speculation would be accepted and silently
-diverge. A whole-schedule planner (`colgen`) is refused for the opposite reason: it solves every
-flight at once and never enters the per-flight loop the coupling lives in, so the flag would do
-nothing at all. `run()` raises on both rather than letting either slide (and parallel loses to
-sequential on the density scenarios anyway).
-
-⚠️ **This interacts with the lead arms.** Re-anchored return departures depend on realized outbound
-delay, which is precisely what differs between arms — so returns are no longer byte-identical across
-arms and only *outbound* legs stay exactly paired. Use the nominal anchor for arm comparisons, or
-difference outbounds only.
+**Per-flight planners only.** A whole-schedule planner (`colgen`) prices one path per flight, so an
+itinerary would be solved as its outbound alone and be indistinguishable in the output from a one-way
+delivery; `run_batch` refuses it rather than dropping the return silently. `get_planner` wraps every
+per-flight planner, and `AStarPlanner.plan` / `SIPPPlanner.plan` raise if a round-trip request reaches
+them unwrapped.
 
 **3. READ OUT** — standalone consumers that load saved data (never re-simulate):
 

@@ -16,8 +16,8 @@ import pytest
 from freespace_sim.config import SimConfig
 from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
-from freespace_sim.parallel import PlanEnvelope, envelope_intersects
-from freespace_sim.planner import get_planner
+from freespace_sim.parallel import PlanEnvelope, cell_bbox_to_aabb, envelope_intersects
+from freespace_sim.planner import get_planner, iter_planner_chain
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.types import FlightRequest, Terminal, vec
@@ -206,8 +206,11 @@ def test_envelope_covers_filed_corridor_shortcut(planner_name):
     req = FlightRequest(1, vec(0, 0, 0), vec(2400, 1400, 0), 0.0)   # diagonal → staircase → knots removed
     is_sipp = planner_name == "sipp_shortcut"
     sc = get_planner(planner_name)
-    inner = sc.inner
-    assert isinstance(inner, SIPPPlanner if is_sipp else AStarPlanner)  # per-family: catch cross-wiring
+    # Walk the wrapper chain rather than peeling a fixed number of `.inner`s: `get_planner` now
+    # returns ItineraryPlanner(ShortcutRefiner(<leaf>)), and the depth is not this test's business.
+    want = SIPPPlanner if is_sipp else AStarPlanner
+    inner = next((p for p in iter_planner_chain(sc) if isinstance(p, want)), None)
+    assert inner is not None, f"{planner_name} has no {want.__name__} inside"  # catch cross-wiring
     inner.record_envelope = True
     refined = _plan(sc, req, [])
     bare = _plan(_sipp(record=False) if is_sipp else AStarPlanner(), req, [])
@@ -471,3 +474,61 @@ def test_every_accepted_sipp_plan_reports_a_read_set():
         assert _corners_in_env(it.volumes, p.last_envelope)
         led.commit(rq.flight_id, it.volumes)
     assert n_acc > 40, f"only {n_acc} accepted — fixture too thin to be a coverage test"
+
+
+def test_union_derives_xy_from_the_unioned_cell_box():
+    """`xy` is `cell_bbox`'s meters conversion, and `union` must RE-DERIVE it rather than union the
+    two operands' boxes: the axial->world map is a shear (x = R*sqrt3*(q + r/2)), so xmin depends
+    jointly on q and r and the two forms give different boxes.
+
+    A real itinerary cannot show this — its legs retrace one corridor, so both span the same (q, r)
+    region and the two forms agree — which is exactly why this pins `union` directly.
+    """
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+
+    def env(qlo, qhi, rlo, rhi):
+        cell = (qlo, qhi, rlo, rhi, 0, 0, 0, 10)
+        return PlanEnvelope(cell, cell_bbox_to_aabb(cell, cfg), (), 0.0, 100.0)
+
+    # opposite corners of the shear: low q with high r against high q with low r
+    a, b = env(0, 1, 10, 11), env(10, 11, 0, 1)
+    u = a.union(b, cfg)
+
+    assert u.cell_bbox == (0, 11, 0, 11, 0, 0, 0, 10)
+    assert u.xy == pytest.approx(cell_bbox_to_aabb(u.cell_bbox, cfg))
+    # not vacuous: unioning the two AABBs instead would have claimed a strictly narrower box
+    naive = min(a.xy[0], b.xy[0])
+    assert u.xy[0] < naive - 1e-6, f"derived xmin {u.xy[0]} should undercut the naive union {naive}"
+    # ...and widening is the safe direction — the union covers each operand
+    for side in (a, b):
+        assert u.xy[0] <= side.xy[0] and u.xy[1] <= side.xy[1]
+        assert u.xy[2] >= side.xy[2] and u.xy[3] >= side.xy[3]
+
+
+def test_an_itinerarys_envelope_covers_every_leg_it_planned():
+    """A round trip is planned one ``plan()`` call per leg, and the planner clears ``last_envelope``
+    at the top of each call. Without a union the LAST leg's reads would stand for the whole flight,
+    so a commit landing inside the outbound's read set reads as clean — breaking the superset
+    contract this module exists to pin, and silently diverging exact mode from sequential."""
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    hub, cust = vec(0, 0, 0), vec(1200, 0, 0)
+
+    def envelope_for(req):
+        planner = get_planner("astar")
+        planner.record_envelope = True
+        assert planner.plan(req, ReservationLedger(cfg), cfg).accepted
+        return next(p.last_envelope for p in iter_planner_chain(planner)
+                    if getattr(p, "last_envelope", None) is not None)
+
+    # Same id and endpoints, so the one-way request is byte-identical to the leg the wrapper splits
+    # off for the outbound.
+    whole = envelope_for(FlightRequest(1, hub, cust, 0.0, return_to_origin=True, turnaround_s=60.0))
+    leg = envelope_for(FlightRequest(1, hub, cust, 0.0))
+
+    assert whole.cell_bbox is not None and leg.cell_bbox is not None
+    for i, (w, o) in enumerate(zip(whole.cell_bbox, leg.cell_bbox)):   # alternating (min, max)
+        assert (w <= o) if i % 2 == 0 else (w >= o), f"axis {i}: itinerary {w} misses leg {o}"
+    assert whole.t_lo <= leg.t_lo and whole.t_hi >= leg.t_hi
+    assert whole.xy == pytest.approx(cell_bbox_to_aabb(whole.cell_bbox, cfg))
+    # a hub both legs consulted is carried once, not once per leg
+    assert len(whole.hub_reads) == len(set(whole.hub_reads))

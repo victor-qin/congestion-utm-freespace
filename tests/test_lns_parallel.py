@@ -5,7 +5,7 @@ so three things have to be exact before any pool exists:
 
 * ``LNSState.replica`` must reproduce the state it copies — same movable set, same delay ruler,
   same claim index, same ledger content — and must forward every keyword that changes what a
-  repair is ALLOWED to do (the anchor guard, the USS-restriction hooks, the occupancy path).
+  repair is ALLOWED to do (the frozen-flight set, the USS-restriction hooks, the occupancy path).
 * ``LNSState.apply_delta`` must move the ledger AND the in-memory views together, reversibly.
 * ``RepairOutcome`` must carry the repaired intents and their read sets back out, since the
   coordinator — not the worker — owns the incumbent.
@@ -53,6 +53,17 @@ def _exit_before_ready(*_args):
 
 
 # ------------------------------------------------------------------ replica fidelity
+def _improvable_victims(state, n):
+    """The `n` most-delayed movable flights.
+
+    Picking by flight id instead selects an arbitrary slice that may hold no recoverable delay, so
+    the loop below would run out of tries whenever a config change shuffles which ids are held —
+    the test would then report a thin world while the world is fine. Premium order is also what the
+    solver itself repairs in.
+    """
+    return sorted(sorted(state.movable_ids(), key=state.delay, reverse=True)[:n])
+
+
 @pytest.mark.slow
 def test_replica_reproduces_the_state_it_copies():
     res = run(_congested(lam=400.0, horizon=240.0))
@@ -83,25 +94,6 @@ def test_replica_forwards_the_movable_filters():
     assert not (set(rep.movable_ids()) & frozen)
     for fid in frozen:
         assert not rep.is_movable(fid)
-
-
-@pytest.mark.slow
-def test_replica_forwards_the_anchor_guard():
-    """turnaround_s arms try_repair's paired-leg precedence guard. Dropping it disarms the anchor
-    rejection SILENTLY: verify.find_interflight_conflict checks 4D conflicts only, so a schedule
-    that re-times an outbound past its return's departure still reports verified."""
-    res = run(_congested(lam=400.0, horizon=240.0))
-    base = LNSState(res.config, res.ledger, res.intents,
-                    static_terms=res.ledger.static_terminals())
-    intents = base.final_intents()
-    unimp = dict(base._unimp_cost)
-
-    armed = LNSState.replica(res.config, intents, static_terms=base.static_terms,
-                             unimpeded_cost=unimp, turnaround_s=60.0)
-    disarmed = LNSState.replica(res.config, intents, static_terms=base.static_terms,
-                                unimpeded_cost=unimp)
-    assert armed._turnaround_s == 60.0
-    assert disarmed._turnaround_s is None
 
 
 def test_replica_spawns_no_child_processes():
@@ -179,12 +171,12 @@ def test_apply_delta_moves_a_replica_onto_an_accepted_repair_and_back():
     for i in range(60):
         rng = np.random.default_rng(np.random.SeedSequence([7, i]))
         base.rng = rng
-        victims = sorted(base.movable_ids())[: 4 + (i % 3)]
+        victims = _improvable_victims(base, 4 + (i % 3))
         out = base.try_repair(victims, rng)
         if out.accepted:
             accepted = out
             break
-    assert accepted is not None, "no accepted repair in 60 tries — pick a denser world"
+    assert accepted is not None, "no accepted repair in 60 tries"
     assert accepted.new_intents, "the accept return must carry the repaired schedule"
 
     old = {f: rep.incumbent[f] for f in accepted.new_intents}
@@ -265,7 +257,7 @@ def test_report_only_repair_returns_candidate_without_adopting_or_indexing_it(mo
     accepted = None
     for i in range(60):
         rng = np.random.default_rng(np.random.SeedSequence([7, i]))
-        victims = sorted(rep.movable_ids())[: 4 + (i % 3)]
+        victims = _improvable_victims(rep, 4 + (i % 3))
         out = rep.try_repair(victims, rng, report_only=True)
         assert _state_digest(rep) == at_start
         if out.accepted:
@@ -311,7 +303,8 @@ def test_replica_planner_is_configured_for_out_of_order_repair():
     rep = LNSState.replica(res.config, base.final_intents(), static_terms=base.static_terms,
                            unimpeded_cost=dict(base._unimp_cost))
     assert rep.repair_planner.evict_floor == 0.0
-    assert isinstance(rep.repair_planner, AStarPlanner)
+    # wrapped for round trips; the planner that plans is inside
+    assert isinstance(rep.repair_planner.inner, AStarPlanner)
 
 
 # ==================================================================== the pool + SYNC mode
@@ -436,7 +429,7 @@ def test_a_dead_worker_fails_loudly_rather_than_hanging():
     base = LNSState(res.config, res.ledger, res.intents,
                     static_terms=res.ledger.static_terminals())
     spec = WorkerSpec(neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
-                      max_walks=10, map_max_cells=4096, turnaround_s=None,
+                      max_walks=10, map_max_cells=4096,
                       frozen_flight_ids=frozenset(), movable_uss_ids=None,
                       incremental_release=True, kernel_log2_min=None, window_bytes=None)
     pool = LNSWorkerPool(res.config, base.final_intents(), base.static_terms,
@@ -457,7 +450,7 @@ def test_worker_exit_during_startup_is_cleaned_up(monkeypatch):
     monkeypatch.setattr(parallel, "_worker_main", _exit_before_ready)
     spec = parallel.WorkerSpec(
         neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
-        max_walks=10, map_max_cells=4096, turnaround_s=None,
+        max_walks=10, map_max_cells=4096,
         frozen_flight_ids=frozenset(), movable_uss_ids=None,
         incremental_release=True, kernel_log2_min=None,
     )
@@ -485,7 +478,7 @@ def test_pool_start_preserves_optional_kernel_fallback(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", numba_free_import)
     spec = WorkerSpec(
         neighborhood_size=4, accept_epsilon=0.0, repair_order="premium",
-        max_walks=10, map_max_cells=4096, turnaround_s=None,
+        max_walks=10, map_max_cells=4096,
         frozen_flight_ids=frozenset(), movable_uss_ids=None,
         incremental_release=True, kernel_log2_min=None,
     )

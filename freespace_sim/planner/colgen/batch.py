@@ -260,6 +260,15 @@ def run_batch(
     - output (tuple[list[OperationalIntent], dict]): the filed intents (one per event, in
       order) and the solver ``stats`` dict, which alone records whether the solve converged.
     """
+    # Colgen prices one origin→dest path per flight, so an itinerary would be solved as its outbound
+    # leg alone and the return would vanish — indistinguishable in the output from a one-way delivery.
+    bad = [ev.request.flight_id for ev in scenario.events if ev.request.return_to_origin]
+    if bad:
+        raise NotImplementedError(
+            f"colgen cannot plan round-trip itineraries ({len(bad)} of {len(scenario.events)} "
+            f"requests, e.g. flight {bad[0]}): it prices one path per flight, so the return leg "
+            "would be dropped without a trace. Use a per-flight planner, or return_flights=False.")
+
     if cfg.n_levels != 1:
         # Also guarded inside `build_flight_graph`, but that fires per flight from four frames
         # down. Selecting a planner is a whole-run decision, so refuse it here where the message

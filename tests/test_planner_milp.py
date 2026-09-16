@@ -4,6 +4,7 @@ from freespace_sim.config import SimConfig
 from freespace_sim.geometry import box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.milp import MILPOptPlanner
 from freespace_sim.planner.straight import StraightLineTimeShift
 from freespace_sim.types import FlightRequest, IntentStatus, vec
@@ -19,7 +20,8 @@ def _wall(x=1000.0):
 
 
 def test_get_planner_milp():
-    assert isinstance(get_planner("milp"), MILPOptPlanner)
+    p = get_planner("milp")          # wrapped for round-trip itineraries; MILP is the inner one
+    assert isinstance(p, ItineraryPlanner) and isinstance(p.inner, MILPOptPlanner)
 
 
 def test_milp_empty_airspace_optimal_and_conflict_free():

@@ -20,7 +20,7 @@ _DEFAULT_HUB_COUNTS = (6, 20)
 # Bumped when the persisted scenario_spec.json layout changes incompatibly. Stamped by
 # ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
 # reinterpreted under a schema it was not written with.
-_SPEC_SCHEMA_VERSION = 1
+_SPEC_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,7 @@ class DemandSpec:
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
     corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     return_flights: bool = True            # each delivery → a return to its origin hub
-    turnaround_s: float = 0.0              # delay before the return is filed (0 ⇒ on est. arrival)
+    turnaround_s: "float | None" = None    # customer-pad dwell; None ⇒ cfg.turnaround_s
     uss_share: "dict[str, float] | None" = None      # demand split across USSs (None ⇒ equal weight)
     # hub_radius: per-USS delivery Poisson rate (/hr). When set, REPLACES cfg.lam_per_hour × uss_share —
     # each USS is its own independent stream. None ⇒ the global-λ path.
@@ -48,9 +48,6 @@ class DemandSpec:
     # "request" samples filings then adds the lead; "departure" samples outbound desired departures
     # over the common demand window, subtracts the lead, then shifts the full clock nonnegative.
     timing_mode: str = "request"
-    # Strategic round-trip filing: return shares the outbound filing time and requests departure after
-    # the outbound's nominal arrival. False preserves the legacy independently-filed return behavior.
-    paired_return_request: bool = False
     # timing_mode="departure": pin the clock shift to this FIXED constant instead of the realized
     # preroll, so scenarios differing only in departure_offset_s share byte-identical desired departures
     # and differ solely in FCFS filing order. None → the legacy data-dependent shift.
@@ -84,7 +81,6 @@ class DemandSpec:
                 lam_per_uss=self.lam_per_uss,
                 departure_offset_s=self.departure_offset_s,
                 timing_mode=self.timing_mode,
-                paired_return_request=self.paired_return_request,
                 request_clock_offset_s=self.request_clock_offset_s,
                 min_hub_gap_m=self.min_hub_gap_m,
             )
@@ -178,11 +174,28 @@ class ScenarioSpec:
         replay under the wrong world.
         """
         payload = dict(payload)
-        version = payload.pop("schema_version", _SPEC_SCHEMA_VERSION)
+        # An unstamped payload predates versioning, so it is v1 — NOT "whatever this code is now",
+        # which would wave every pre-versioning recipe through as current.
+        version = payload.pop("schema_version", 1)
         if not isinstance(version, (int, float)) or isinstance(version, bool) or version > _SPEC_SCHEMA_VERSION:
             raise ValueError(
                 f"scenario_spec schema_version {version!r} is not readable by this code "
                 f"(understands integer versions <= {_SPEC_SCHEMA_VERSION}) — upgrade freespace_sim")
+        # v1 filed a round trip as TWO requests, v2 as ONE itinerary, so replaying a v1 round-trip
+        # recipe under v2 halves the flight set and renumbers every id. The switch is
+        # `return_flights`, NOT `paired_return_request` — the latter only chose which of v1's two
+        # filing schemes ran, and BOTH emitted two requests per delivery. It also defaults to True,
+        # so an absent key is a round-trip recipe. Only `hub_radius` reads the field; the other
+        # patterns never emitted returns, so their recipes are unaffected and still load.
+        v1_demand = (payload.get("demand") or {}) if version < _SPEC_SCHEMA_VERSION else {}
+        if v1_demand.get("pattern") == "hub_radius" and v1_demand.get("return_flights", True):
+            raise ValueError(
+                "scenario_spec is v1 with return_flights=True: v1 filed each delivery's return as a "
+                "SECOND request, v2 files the round trip as one itinerary, so replaying this recipe "
+                "would produce half the flights under different ids. Its `turnaround_s` has also "
+                "changed meaning — v1 delayed when the return was FILED, v2 is the pad dwell between "
+                "the legs. Re-run it with the code that wrote it, or set return_flights=false to "
+                "replay it as one-way deliveries (which is not the world it recorded).")
 
         demand_payload = dict(payload.pop("demand", None) or {})
         demand_fields = DemandSpec.__dataclass_fields__

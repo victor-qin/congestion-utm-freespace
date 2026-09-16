@@ -26,7 +26,7 @@ import pytest
 
 pytest.importorskip("numba")  # kernel import does ``from numba import njit`` — skip the module if absent
 
-from freespace_sim.planner.sipp.kernel import FB_OOB, NO_PATH, OK, _search  # noqa: E402
+from freespace_sim.planner.sipp.kernel import NO_PATH, OK, _search  # noqa: E402
 
 SQRT3 = math.sqrt(3.0)
 

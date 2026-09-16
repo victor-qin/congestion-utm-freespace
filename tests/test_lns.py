@@ -668,18 +668,17 @@ def test_run_lns_does_not_leak_a_global_warnings_filter():
     assert list(_w.filters) == before
 
 
-def _result(ledger=None, return_anchor="nominal"):
-    """A REAL SimResult, not a hand-rolled stand-in. A stub with the same four attributes would let
-    these tests keep passing after the field is renamed or dropped from the dataclass, while every
-    real run silently lost the anchor mode — the exact hole `run_lns_on_result` reads it to close."""
+def _result(ledger=None):
+    """A REAL SimResult, not a hand-rolled stand-in. A stub with the same attributes would let these
+    tests keep passing after a field is renamed or dropped from the dataclass, while every real run
+    silently lost whatever `run_lns_on_result` reads off the result to close a hole."""
     from freespace_sim.sim import SimResult
 
     return SimResult(config=CFG, intents=[], ledger=ledger or ReservationLedger(CFG),
-                     verified=True, return_anchor=return_anchor)
+                     verified=True)
 
 
 class _WallInventingDemand:
-    turnaround_s = 900.0
 
     def terminals(self, cfg):
         raise AssertionError("walls must come from the ledger, not be re-derived from the demand")
@@ -707,47 +706,6 @@ def test_run_lns_on_result_takes_the_walls_from_the_ledger(monkeypatch):
     assert captured["static_terms"] == ()          # flag off ⇒ no walls, whatever the demand says
 
 
-def test_run_lns_on_result_takes_the_anchor_mode_from_the_baseline(monkeypatch):
-    """The paired-return guard is only correct if it runs whenever the baseline anchored returns to
-    realized arrivals. Defaulting the mode here disabled it silently for exactly those runs."""
-    from freespace_sim.planner.lns import solver as lns_solver
-
-    captured = {}
-    monkeypatch.setattr(lns_solver, "run_lns", lambda *a, **kw: captured.update(kw))
-    demand = _WallInventingDemand()
-
-    lns_solver.run_lns_on_result(_result(return_anchor="realized"), demand, LNSConfig())
-    assert captured["turnaround_s"] == 900.0       # guard armed without being asked
-
-    captured.clear()
-    lns_solver.run_lns_on_result(_result(), demand, LNSConfig())
-    assert captured["turnaround_s"] is None
-
-    with pytest.raises(ValueError, match="contradicts"):
-        lns_solver.run_lns_on_result(_result(return_anchor="realized"), demand,
-                                     LNSConfig(), return_anchor="nominal")
-
-
-@pytest.mark.slow
-def test_paired_return_anchor_guard_rejects_and_reverts(monkeypatch):
-    res = run(_congested(lam=400.0, horizon=240.0))
-    state = LNSState(res.config, res.ledger, res.intents, turnaround_s=60.0)
-    victim = state.movable_ids()[0]
-    # Make the victim one leg of a pair with zero baseline shortfall, then have the predicate report
-    # a violation for it. What the predicate MEANS is pinned in tests/test_paired_precedence.py; this
-    # test is about the transaction — a guard rejection must leave the ledger byte-identical.
-    partner = state.movable_ids()[1]
-    state._pair_of[victim], state._pair_of[partner] = partner, victim
-    state._outbound_of_pair[victim] = state._outbound_of_pair[partner] = victim
-    state._pair_shortfall[(victim, partner)] = 0.0
-    monkeypatch.setattr(lns_state, "pair_precedence_shortfall", lambda o, r, t: 1e9)
-    before = _ledger_multiset(res.ledger)
-    out = state.try_repair([victim], np.random.default_rng(0))
-    assert not out.accepted and out.reason == "anchor"
-    assert _ledger_multiset(res.ledger) == before
-
-
-# --------------------------------------------------------------- transaction atomicity
 @pytest.mark.slow
 def test_repair_restores_when_the_commit_itself_raises(monkeypatch):
     """`ledger.commit` appends the volumes and only THEN fires observers, so an observer that raises
@@ -1125,18 +1083,6 @@ def test_direct_lns_state_builds_its_planner_before_ledger_takeover():
     assert led._observers and led.epoch == 0
 
 
-def test_run_lns_on_result_refuses_a_result_without_an_anchor_mode():
-    """'nominal' is the value that DISARMS the paired-return guard, so defaulting to it on a result
-    type that does not carry the field is the unsafe direction."""
-    from freespace_sim.planner.lns import solver as lns_solver
-
-    class _NoAnchor:
-        config, ledger, intents = CFG, ReservationLedger(CFG), []
-
-    with pytest.raises(TypeError, match="return_anchor"):
-        lns_solver.run_lns_on_result(_NoAnchor(), None, LNSConfig())
-
-
 def test_lns_state_refuses_intents_that_are_not_this_ledgers():
     """run_lns mutates the ledger in place and never writes back to the caller's intent list, so
     reusing one SimResult for a second pass measures a stale baseline against an improved ledger and
@@ -1169,16 +1115,6 @@ def test_lns_refuses_a_baseline_it_cannot_measure():
     cfg = SimConfig(planner="astar_shortcut")
     with pytest.raises(ValueError, match="cannot measure"):
         LNSState(cfg, ReservationLedger(cfg), [])
-
-
-def test_sim_run_records_the_anchor_mode_it_flew():
-    """The read side is pinned by the run_lns_on_result tests; this is the write. Without it the
-    field silently defaults to 'nominal' and the paired-return guard never arms."""
-    cfg = _congested(lam=200.0, horizon=120.0)
-    assert run(cfg).return_anchor == "nominal"
-    assert run(cfg, return_anchor="realized").return_anchor == "realized"
-
-
 
 
 def test_reference_fallback_does_not_trigger_a_shrink_rebuild():

@@ -87,19 +87,23 @@ def test_vectorized_rasterize_matches_scalar_reference(sweep_mode):
         hover_reservation(vec(1500, -700, 0.0), 60.0, CFG),                             # cylinder
     ]
     infl_b = CFG.corridor_width_m / 2.0 + R
-    infl_p = CFG.effective_hover_radius_m + R
-    assert infl_p >= infl_b
-    for v in vols:
-        # single-inflation path == scalar oracle (default corridor inflation)
-        assert set(hg.rasterize_volume(v, CFG, R)) == _scalar_rasterize(v, CFG, R, infl_b)
-        # dual sweep reconstructs BOTH inflation sets exactly
-        blk, pad = set(), set()
-        for q, r, L, s, in_blocked in hg.rasterize_volume_dual(v, CFG, R, infl_b, infl_p):
-            pad.add((q, r, L, s))
-            if in_blocked:
-                blk.add((q, r, L, s))
-        assert blk == _scalar_rasterize(v, CFG, R, infl_b)
-        assert pad == _scalar_rasterize(v, CFG, R, infl_p)
+    # Both orders of the two inflations: a delivery pad narrower than the corridor half-width makes
+    # the PAD footprint the smaller one (#134), and sizing the sweep by it used to drop the outer
+    # ring of the corridor footprint — silently under-blocking every committed corridor.
+    for infl_p in (CFG.effective_hover_radius_m + R, 10.0 + R):
+        for v in vols:
+            # single-inflation path == scalar oracle (default corridor inflation)
+            assert set(hg.rasterize_volume(v, CFG, R)) == _scalar_rasterize(v, CFG, R, infl_b)
+            # dual sweep reconstructs BOTH inflation sets exactly, whichever is wider
+            blk, pad = set(), set()
+            for q, r, L, s, in_blocked, in_pad in hg.rasterize_volume_dual(v, CFG, R, infl_b, infl_p):
+                assert in_blocked or in_pad          # a kept cell lies in at least one footprint
+                if in_pad:
+                    pad.add((q, r, L, s))
+                if in_blocked:
+                    blk.add((q, r, L, s))
+            assert blk == _scalar_rasterize(v, CFG, R, infl_b)
+            assert pad == _scalar_rasterize(v, CFG, R, infl_p)
 
 
 def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
@@ -130,7 +134,7 @@ def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
         again = hg.rasterize_ranges(v, CFG, R, infl_b, infl_p)    # warm: reused, no recompute
         assert again is ranges                                    # the SECOND consumer reuses it
         assert calls["n"] == before + 1                           # exactly one underlying sweep
-        expanded = [(q, r, L, s, b) for q, r, L, s_lo, s_hi, b in ranges
+        expanded = [(q, r, L, s, b, pd) for q, r, L, s_lo, s_hi, b, pd in ranges
                     for s in range(s_lo, s_hi + 1)]
         assert expanded == want                                   # ranges ⇒ dual sweep, byte-for-byte
         assert len(ranges) < len(want)                            # the collapse actually happened

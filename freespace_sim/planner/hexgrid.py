@@ -526,35 +526,52 @@ def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float, z: fl
     return q_grid, r_grid, _footprint_slack(vol.shape, cx, cy, cfg, z=z)
 
 
+def _split_flags(qs: list, rs: list, in_narrow: list, pad_is_wide: bool):
+    """Map a sweep's (kept, in_narrow) pair onto ``(qs, rs, in_blocked, in_pad)``.
+
+    Every kept cell lies in the wider footprint by construction, so the wider membership is all-True
+    and ``in_narrow`` carries the other one; which is which depends on the inflations.
+    """
+    wide_all = [True] * len(qs)
+    return (qs, rs, wide_all, in_narrow) if not pad_is_wide else (qs, rs, in_narrow, wide_all)
+
+
 def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float,
                 z: float | None = None):
-    """``(qs, rs, in_blocked)`` for the cells of ``vol``'s footprint at altitude probe ``z`` — the
-    single place the compiled/reference choice is made.
+    """``(qs, rs, in_blocked, in_pad)`` for the cells of ``vol``'s footprint at altitude probe ``z``
+    — the single place the compiled/reference choice is made.
 
     All three public rasterisers funnel through here so they cannot drift apart and so one switch
-    (``USE_COMPILED``) controls the A/B and the rollback for every one of them. ``infl_pad`` sizes
-    the candidate rectangle (it is the wider inflation, so the blocked cells are a subset);
-    ``in_blocked`` flags membership in the narrower corridor footprint.
+    (``USE_COMPILED``) controls the A/B and the rollback for every one of them. The WIDER of the two
+    inflations sizes the candidate rectangle and the narrower one is flagged within it; which of the
+    two is wider is a config question, not an invariant — a delivery pad below ``corridor_width/2``
+    makes ``infl_pad`` the narrower one (#134), and sizing the sweep by it would silently drop the
+    outer ring of the corridor footprint. Each cell therefore carries BOTH memberships.
 
     Parameters
     ------------
     - vol (Volume4D): the committed volume whose footprint is swept.
     - cfg (SimConfig): supplies the default cruise level and flight levels.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor footprint (sets ``in_blocked``).
-    - infl_pad (float): wider inflation (m) that sizes the candidate rectangle.
+    - infl_blocked (float): inflation (m) for the corridor footprint (sets ``in_blocked``).
+    - infl_pad (float): inflation (m) for the pad footprint (sets ``in_pad``).
     - z (float | None): altitude probe (m); None ⇒ ``cfg.cruise_level_m``.
 
     Return
     --------
-    - output (tuple[list[int], list[int], list[bool]]): ``(qs, rs, in_blocked)`` per kept cell —
-      axial ``q``/``r`` and whether the cell also lies in the narrower corridor footprint.
+    - output (tuple[list[int], list[int], list[bool], list[bool]]): ``(qs, rs, in_blocked, in_pad)``
+      per kept cell — axial ``q``/``r`` and its membership in each footprint. A kept cell lies in at
+      least one of them.
     """
     z = cfg.cruise_level_m if z is None else z
+    # The kernel keeps candidates within its FIRST inflation and flags those within its second, so
+    # it is handed (wide, narrow) rather than (pad, blocked); the flags are mapped back below.
+    wide, narrow = max(infl_blocked, infl_pad), min(infl_blocked, infl_pad)
+    pad_is_wide = infl_pad >= infl_blocked
     if _COMPILED and USE_COMPILED:
         x0, y0, _z0, x1, y1, _z1 = vol.flat_aabb()   # scalars; pinned bit-for-bit against aabb()
-        q0, q1, r0, r1 = _axial_rect(x0 - infl_pad, y0 - infl_pad,
-                                     x1 + infl_pad, y1 + infl_pad, R)
+        q0, q1, r0, r1 = _axial_rect(x0 - wide, y0 - wide,
+                                     x1 + wide, y1 + wide, R)
         n_cand = (q1 - q0 + 1) * (r1 - r0 + 1)       # exact upper bound: overflow is impossible
         oq = np.empty(n_cand, np.int64)
         orr = np.empty(n_cand, np.int64)
@@ -567,7 +584,7 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
                 n = _sweep_box(q0, q1, r0, r1, R, s.center[0], s.center[1], s.center[2],
                                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
                                e[0] / 2.0, e[1] / 2.0, e[2] / 2.0,
-                               z, infl_pad, infl_blocked, oq, orr, ob, oa)
+                               z, wide, narrow, oq, orr, ob, oa)
             except Exception as exc:
                 _disable_compiled(exc)
             else:
@@ -578,25 +595,25 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
                     cy = R * 1.5 * ar
                     slack = _footprint_slack(s, cx, cy, cfg, z=z)
                     keep = np.ones(n, dtype=np.bool_)
-                    keep[ambiguous] = slack <= infl_pad
-                    ob[ambiguous] = slack <= infl_blocked
-                    return (oq[:n][keep].tolist(), orr[:n][keep].tolist(),
-                            ob[:n][keep].tolist())
-                return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
+                    keep[ambiguous] = slack <= wide
+                    ob[ambiguous] = slack <= narrow
+                    return _split_flags(oq[:n][keep].tolist(), orr[:n][keep].tolist(),
+                                        ob[:n][keep].tolist(), pad_is_wide)
+                return _split_flags(oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist(), pad_is_wide)
         else:
             try:
                 n = _sweep_cyl(q0, q1, r0, r1, R, s.cx, s.cy, s.radius, s.z_lo, s.z_hi,
-                               z, infl_pad, infl_blocked, oq, orr, ob)
+                               z, wide, narrow, oq, orr, ob)
             except Exception as exc:
                 _disable_compiled(exc)
             else:
-                return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
+                return _split_flags(oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist(), pad_is_wide)
     if not _COMPILED and USE_COMPILED:
         _warn_no_kernel(_compiled_error)
-    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=z)
-    in_pad = slack <= infl_pad
-    return (q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
-            (slack[in_pad] <= infl_blocked).tolist())
+    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, wide, z=z)
+    keep = slack <= wide
+    return (q_grid[keep].tolist(), r_grid[keep].tolist(),
+            (slack[keep] <= infl_blocked).tolist(), (slack[keep] <= infl_pad).tolist())
 
 
 def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
@@ -662,7 +679,7 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
         infl = cfg.corridor_width_m / 2.0 + R      # corridor half-width + one hex (conservative)
     steps = _step_range(vol, cfg)
     if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
-        qs, rs, _b = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[levels[0]])
+        qs, rs, _b, _p = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[levels[0]])
         cells = list(zip(qs, rs))
         for L in levels:
             for q, r in cells:
@@ -670,7 +687,7 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
                     yield q, r, L, s
         return
     for L in levels:
-        qs, rs, _b = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[L])
+        qs, rs, _b, _p = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[L])
         for q, r in zip(qs, rs):
             for s in steps:
                 yield q, r, L, s
@@ -679,24 +696,26 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
 def rasterize_volume_dual(
     vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float
 ):
-    """One vectorized sweep yielding ``(q, r, L, s, in_blocked)`` over the pad footprint, where
-    ``in_blocked`` flags membership in the (smaller) corridor footprint.
+    """One vectorized sweep yielding ``(q, r, L, s, in_blocked, in_pad)`` over the UNION of the two
+    footprints, where each flag marks membership in one of them.
 
-    Requires ``infl_pad >= infl_blocked`` so pad cells are a superset of blocked cells. Replaces two
-    :func:`rasterize_volume` passes with a single geometry computation per volume (the A* hot path).
+    Neither footprint is assumed to contain the other — a pad narrower than the corridor half-width
+    is a supported config (#134) — so the sweep spans both and every cell carries both memberships.
+    Replaces two :func:`rasterize_volume` passes with a single geometry computation per volume (the
+    A* hot path).
 
     Parameters
     ------------
     - vol (Volume4D): the committed volume to rasterize.
     - cfg (SimConfig): supplies the flight levels and step timing.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor (``in_blocked``) footprint.
-    - infl_pad (float): inflation (m) for the wider pad footprint that sizes the candidate set.
+    - infl_blocked (float): inflation (m) for the corridor (``in_blocked``) footprint.
+    - infl_pad (float): inflation (m) for the pad (``in_pad``) footprint.
 
     Return
     --------
-    - output (Iterator): yields ``(q, r, L, s, in_blocked)`` per pad (cell, level, step); empty when
-      the volume overlaps no flight level.
+    - output (Iterator): yields ``(q, r, L, s, in_blocked, in_pad)`` per (cell, level, step) in
+      either footprint; empty when the volume overlaps no flight level.
     """
     levels = _levels_overlapped(vol, cfg)
     if not levels:
@@ -706,23 +725,24 @@ def rasterize_volume_dual(
         rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
                                      z=cfg.flight_levels_m[levels[0]])))
         for L in levels:
-            for q, r, b in rows:
+            for q, r, b, pd in rows:
                 for s in steps:
-                    yield q, r, L, s, b
+                    yield q, r, L, s, b, pd
         return
     for L in levels:
-        qp, rp, in_blk = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad, z=cfg.flight_levels_m[L])
-        for q, r, b in zip(qp, rp, in_blk):
+        qp, rp, in_blk, in_pad = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
+                                            z=cfg.flight_levels_m[L])
+        for q, r, b, pd in zip(qp, rp, in_blk, in_pad):
             for s in steps:
-                yield q, r, L, s, b
+                yield q, r, L, s, b, pd
 
 
 def rasterize_volume_ranges(
     vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float
 ):
-    """Like :func:`rasterize_volume_dual`, but yields one ``(q, r, L, s_lo, s_hi, in_blocked)`` per
-    cell with the step axis collapsed to its inclusive ``[s_lo, s_hi]`` range instead of one row per
-    (cell, step).
+    """Like :func:`rasterize_volume_dual`, but yields one ``(q, r, L, s_lo, s_hi, in_blocked,
+    in_pad)`` per cell with the step axis collapsed to its inclusive ``[s_lo, s_hi]`` range instead
+    of one row per (cell, step).
 
     A committed volume occupies each cell over a contiguous step span (``_step_range`` is a plain
     ``range``), so the per-step form yields ``S`` rows the consumers then process one at a time.
@@ -735,13 +755,13 @@ def rasterize_volume_ranges(
     - vol (Volume4D): the committed volume to rasterize.
     - cfg (SimConfig): supplies the flight levels and step timing.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor footprint.
-    - infl_pad (float): inflation (m) for the wider pad footprint.
+    - infl_blocked (float): inflation (m) for the corridor footprint.
+    - infl_pad (float): inflation (m) for the pad footprint.
 
     Return
     --------
-    - output (Iterator): yields ``(q, r, L, s_lo, s_hi, in_blocked)`` per cell; empty if the volume
-      overlaps no flight level or spans no step.
+    - output (Iterator): yields ``(q, r, L, s_lo, s_hi, in_blocked, in_pad)`` per cell; empty if the
+      volume overlaps no flight level or spans no step.
     """
     levels = _levels_overlapped(vol, cfg)
     if not levels:
@@ -754,13 +774,14 @@ def rasterize_volume_ranges(
         rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
                                      z=cfg.flight_levels_m[levels[0]])))
         for L in levels:
-            for q, r, b in rows:
-                yield q, r, L, s_lo, s_hi, b
+            for q, r, b, pd in rows:
+                yield q, r, L, s_lo, s_hi, b, pd
         return
     for L in levels:
-        qp, rp, in_blk = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad, z=cfg.flight_levels_m[L])
-        for q, r, b in zip(qp, rp, in_blk):
-            yield q, r, L, s_lo, s_hi, b
+        qp, rp, in_blk, in_pad = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
+                                            z=cfg.flight_levels_m[L])
+        for q, r, b, pd in zip(qp, rp, in_blk, in_pad):
+            yield q, r, L, s_lo, s_hi, b, pd
 
 
 _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
@@ -893,12 +914,12 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     - cfg (SimConfig): supplies flight levels, step timing, and inflations; its identity is part of
       the cache key.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor footprint.
-    - infl_pad (float): inflation (m) for the wider pad footprint.
+    - infl_blocked (float): inflation (m) for the corridor footprint.
+    - infl_pad (float): inflation (m) for the pad footprint.
 
     Return
     --------
-    - output (list): the materialized ``(q, r, L, s_lo, s_hi, in_blocked)`` rows for ``vol``, cached
+    - output (list): the materialized ``(q, r, L, s_lo, s_hi, in_blocked, in_pad)`` rows for ``vol``, cached
       under ``(id(vol), id(cfg), R, infl_blocked, infl_pad, backend)``.
     """
     # Backend and config identity are output inputs too. Keeping the identities in the key and the

@@ -102,8 +102,44 @@ def test_vectorized_rasterize_matches_scalar_reference(sweep_mode):
                     pad.add((q, r, L, s))
                 if in_blocked:
                     blk.add((q, r, L, s))
-            assert blk == _scalar_rasterize(v, CFG, R, infl_b)
+            assert blk == _scalar_rasterize(v, CFG, R, hg.claim_inflation(v, CFG, R, infl_b))
             assert pad == _scalar_rasterize(v, CFG, R, infl_p)
+
+
+def test_only_a_single_lattice_hop_drops_the_discretization_margin():
+    """#38: the ``+R`` margin exists because the search tests hex CENTRES and only a move's ARRIVAL
+    cell. A corridor that runs one hop centre-to-centre needs neither — the pitch (120 m) exceeds the
+    corridor width (60 m), so distinct cells are separated by construction — and claims just the two
+    cells it flies through. Everything that can pass BETWEEN two centres keeps the margin: a hover
+    disc at an arbitrary pad, an approach leg, a climb box, and a merged multi-hop run."""
+    z = CFG.cruise_level_m
+    infl_b = CFG.corridor_width_m / 2.0 + R
+    c0, c1, c2 = hg.hex_center(10, 3, R), hg.hex_center(11, 3, R), hg.hex_center(12, 3, R)
+    hop = corridor_segment_volume(vec(c0[0], c0[1], z), 0.0, vec(c1[0], c1[1], z), CFG.dt_s, CFG)
+    keeps_margin = {
+        "approach leg": corridor_segment_volume(
+            vec(c0[0] + 37, c0[1] - 12, z), 0.0, vec(c1[0], c1[1], z), CFG.dt_s, CFG),
+        "merged two-hop run": corridor_segment_volume(
+            vec(c0[0], c0[1], z), 0.0, vec(c2[0], c2[1], z), 2 * CFG.dt_s, CFG),
+        "climb box": corridor_segment_volume(
+            vec(c0[0], c0[1], z), 0.0, vec(c1[0], c1[1], z + 15.0), CFG.dt_s, CFG),
+        "hover disc": hover_reservation(vec(1500, -700, 0.0), 60.0, CFG),
+    }
+    assert hg.claim_inflation(hop, CFG, R, infl_b) == CFG.corridor_width_m / 2.0
+    for name, vol in keeps_margin.items():
+        assert hg.claim_inflation(vol, CFG, R, infl_b) == infl_b, name
+
+    def corridor_cells(vol):
+        return {(q, r, L) for q, r, L, _s, blk, _pad
+                in hg.rasterize_volume_dual(vol, CFG, R, infl_b, CFG.effective_hover_radius_m + R)
+                if blk}
+
+    # The hop claims the two cells it flies between — and nothing else.
+    assert {(q, r) for q, r, _L in corridor_cells(hop)} == {(10, 3), (11, 3)}
+    assert len({(q, r) for q, r, _L in corridor_cells(keeps_margin["approach leg"])}) > 2
+    # A pitch below the corridor width would break the argument, so the margin must come back.
+    narrow = replace(CFG, corridor_width_m=hg.SQRT3 * R + 1.0)
+    assert hg.claim_inflation(hop, narrow, R, infl_b) == infl_b
 
 
 def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):

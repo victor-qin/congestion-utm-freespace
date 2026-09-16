@@ -16,9 +16,14 @@ INF_P = CFG.effective_hover_radius_m + R
 
 
 def _batch(volumes, infl):
+    """The from-scratch oracle. ``INF_B`` is the OFF-LATTICE corridor inflation: a volume the claim
+    rule recognises as a single lattice hop is rasterized at the inflation that rule picks for it
+    (`hg.claim_inflation`, #38), exactly as the service does — the property under test is
+    incremental == batch, not that the inflation is one constant."""
     out = set()
     for v in volumes:
-        out.update(hg.rasterize_volume(v, CFG, R, infl=infl))
+        per_vol = hg.claim_inflation(v, CFG, R, infl) if infl == INF_B else infl
+        out.update(hg.rasterize_volume(v, CFG, R, infl=per_vol))
     return out
 
 

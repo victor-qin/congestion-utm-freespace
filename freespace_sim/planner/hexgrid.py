@@ -7,11 +7,13 @@ analogue of the sibling project's occupancy ledger). The pitch (centre-to-centre
 A* time axis clean and makes the MILP's "slow-down-for-free" / "hop-a-thin-wall" exploits
 structurally impossible.
 
-Rasterization is deliberately conservative (see context/figures/rasterisation_coverage.png): a
-cell is blocked if a committed volume, inflated by the new corridor's half-width PLUS one hex
-circumradius, reaches its centre. Over-blocking by up to a hex is safe — A* avoids a hair more
-than necessary, the NLP recovers the slack by smoothing into the true continuous gap, and FCL
-verify is the backstop.
+A cell is blocked when a committed volume, inflated, reaches its centre (see
+context/figures/rasterisation_coverage.png). How far to inflate depends on whether the volume is on
+the lattice — see :func:`claim_inflation`. Off-lattice geometry is inflated by the new corridor's
+half-width PLUS one hex circumradius: over-blocking by up to a hex covers both the centre sampling
+and the traversed edge the search never tests. A corridor that runs one hex hop, centre to centre,
+needs neither and is inflated by the half-width alone; the pitch does the separating (#38). FCL
+verify remains the backstop either way.
 """
 
 from __future__ import annotations
@@ -33,6 +35,15 @@ SQRT3 = math.sqrt(3.0)
 # The six pointy-top axial neighbour directions around a centre hex, in ring order (see
 # context/figures/hex_layout.png).
 AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
+
+# How far a corridor's end face may sit from a hex centre and still count as lattice-aligned
+# (:func:`claim_inflation`). A lattice corridor is BUILT from `hex_center`, so its error is floating
+# point; the off-lattice cases this must reject — pad approach legs, shortcut diagonals — measure
+# tens of metres off at density, so the threshold has three orders of magnitude of daylight.
+_LATTICE_EPS_M = 1.0
+# A lattice hop is level by construction (both ends sit at the same flight level), so any vertical
+# component at all means a climb box, whose footprint at a given level is a SLICE of the hop.
+_LEVEL_EPS = 1e-9
 
 # ---- compiled footprint sweep (see hexgrid_kernel) ------------------------------------------
 # The reference sweep below (`_candidate_slack` + a mask) stays the oracle and the fallback. The
@@ -176,6 +187,59 @@ def lattice_overhead_m(cells, pitch, air_detour_m):
 def circumradius(cfg: SimConfig) -> float:
     """Hex circumradius R, from pitch = nominal_speed·dt and pitch = √3·R."""
     return cfg.nominal_speed_mps * cfg.dt_s / SQRT3
+
+
+def claim_inflation(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float) -> float:
+    """The corridor-footprint inflation to claim ``vol`` with: exact for a lattice-aligned corridor,
+    ``+R`` for anything off the lattice.
+
+    ``infl_blocked`` carries the discretization margin ``R`` because a hex is blocked by testing its
+    CENTRE against continuous geometry, and the search tests only a move's ARRIVAL cell — never the
+    edge it traverses. Both gaps close for a corridor that runs hex-centre to hex-centre: the pitch
+    (``√3·R`` = nominal_speed·dt) exceeds the corridor width, so two lattice corridors either share a
+    cell — caught at ``width/2``, the centre lies on the other's axis — or their centrelines are a
+    full lattice step apart and their bodies never meet. Off-lattice geometry keeps the margin: a
+    hover disc at a customer pad, an approach leg, a climb box or a shortcut's diagonal can all pass
+    BETWEEN two hex centres, where the arrival-cell test cannot see them (#38).
+
+    Parameters
+    ------------
+    - vol (Volume4D): the committed volume being rasterized.
+    - cfg (SimConfig): supplies the corridor width and the lattice pitch.
+    - R (float): hex circumradius (m).
+    - infl_blocked (float): the off-lattice inflation (m), i.e. ``corridor_width/2 + R``.
+
+    Return
+    --------
+    - output (float): ``corridor_width/2`` for a lattice-aligned corridor box, else ``infl_blocked``.
+    """
+    if not isinstance(vol.shape, BoxSpec):
+        return infl_blocked                       # hover/terminal disc: never lattice-aligned
+    if SQRT3 * R < cfg.corridor_width_m:
+        return infl_blocked      # pitch below the corridor width: distinct cells no longer separate
+    ext = vol.shape.extents
+    a = max(range(3), key=lambda i: ext[i])       # the box's long axis: the direction of travel
+    u = np.asarray(vol.shape.rotation(), float)[:, a]
+    if abs(u[2]) > _LEVEL_EPS:
+        return infl_blocked      # climbing box: its per-level footprint is a slice, not the full hop
+    # Undo `volumes.corridor_segment_volume`'s longitudinal extension (recomputed here exactly as it
+    # is applied) to recover the flown segment, whose ends are the cell centres to test.
+    overhang = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(u[0], u[1]),
+                                cfg.corridor_height_m * u[2])
+    reach = ext[a] / 2.0 - overhang
+    if reach <= 0.0:
+        return infl_blocked
+    centre = np.asarray(vol.shape.center, float)
+    cells = []
+    for end in (centre - u * reach, centre + u * reach):
+        q, r = enu_to_axial(float(end[0]), float(end[1]), R)
+        c = hex_center(q, r, R)
+        if math.hypot(end[0] - c[0], end[1] - c[1]) > _LATTICE_EPS_M:
+            return infl_blocked                   # an end off the lattice: approach leg, shortcut
+        cells.append((q, r))
+    if hex_distance(cells[0], cells[1]) != 1:
+        return infl_blocked      # not a single lattice edge: a merged run can pass BETWEEN centres
+    return cfg.corridor_width_m / 2.0
 
 
 def hex_center(q: int, r: int, R: float) -> np.ndarray:
@@ -721,6 +785,7 @@ def rasterize_volume_dual(
     if not levels:
         return
     steps = _step_range(vol, cfg)
+    infl_blocked = claim_inflation(vol, cfg, R, infl_blocked)
     if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
         rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
                                      z=cfg.flight_levels_m[levels[0]])))
@@ -770,6 +835,7 @@ def rasterize_volume_ranges(
     s_lo, s_hi = steps.start, steps.stop - 1               # range(s0, s1+1) → inclusive [s0, s1]
     if s_hi < s_lo:
         return
+    infl_blocked = claim_inflation(vol, cfg, R, infl_blocked)
     if _cylinder_z_independent(vol, cfg, levels):
         rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
                                      z=cfg.flight_levels_m[levels[0]])))

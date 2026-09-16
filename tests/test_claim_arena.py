@@ -181,7 +181,7 @@ def test_release_returns_the_arena_to_its_pre_commit_state():
     ``blocked_py`` (now an arena scan) against ``HexOccupancyService.is_blocked``, an entirely
     independent implementation that never used the pools."""
     cfg, led, cocc, fids = _committed_occupancy()
-    assert cocc._arena.n_claims > 50_000
+    assert cocc._arena.n_claims > 20_000   # a lattice hop claims 2 cells, not a 99.3 m disc (#38)
     before = {int(k): sorted(int(x) for x in cocc._arena.slab(int(k)))
               for k in np.nonzero(cocc._arena.length)[0]}
     victims = fids[: max(1, len(fids) // 4)]

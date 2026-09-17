@@ -628,7 +628,7 @@ def test_claim_index_excludes_the_flights_own_terminal_interior():
     for v in vols:
         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
             continue
-        for q, r, level, _lo, _hi, in_blk in hg.rasterize_ranges(
+        for q, r, level, _lo, _hi, in_blk, _in_pad in hg.rasterize_ranges(
             v, cfg, state._R, state._infl_b, state._infl_p
         ):
             if in_blk:

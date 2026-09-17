@@ -192,7 +192,11 @@ def test_compiled_mask_widen_re_run_exact():
     version-resets the kernel's hash, so it must run inside the widen loop — hoisting it made the re-run
     reuse the tight pass's closed nodes and return a spurious BUDGET_EXCEEDED while the reference ACCEPTED.
     Assert compiled == reference exactly THROUGH the widen, and that the widen path was actually taken."""
-    wall = Volume4D(box_from_segment(vec(200, -400, 150), vec(200, 400, 150), 200, 400), 0.0, 1000.0)
+    # The wall's near face sits 60 m off the origin pad, INSIDE the pad footprint inflation
+    # (`effective_hover_radius_m + R`, whose R term alone is 69.3 m), so the pad is claimed until the
+    # wall expires at any pad radius — at 100 m it only blocked a 60 m pad and today's 10 m one flew
+    # around, leaving the widen unexercised.
+    wall = Volume4D(box_from_segment(vec(160, -400, 150), vec(160, 400, 150), 200, 400), 0.0, 1000.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)
     _, b = _assert_exact(req, [(99, [wall])])          # full exact check incl. last_expansions node-parity
     assert b.accepted

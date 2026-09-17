@@ -1552,7 +1552,7 @@ class AStarPlanner:
             col = hover_reservation(np.asarray(center, float), 0.0, cfg,
                                     terminal_id=term.id, radius=terminal_radius(term, cfg),
                                     climb_time_s=cfg.climb_time_to(z_hi))
-            for q, r, L, _s, in_blk in hg.rasterize_volume_dual(
+            for q, r, L, _s, in_blk, _in_pad in hg.rasterize_volume_dual(
                 col, cfg, cocc.R, cocc.infl_blocked, cocc.infl_pad
             ):
                 if in_blk:

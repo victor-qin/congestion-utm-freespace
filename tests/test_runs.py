@@ -101,6 +101,16 @@ def test_scenario_spec_round_trips_through_the_run_folder(tmp_path):
     v1_oneway["demand"] = {**v1_oneway["demand"], "pattern": "hub_radius", "return_flights": False}
     assert ScenarioSpec.from_json_dict(v1_oneway).demand.return_flights is False
 
+    # v2 predates `hover_radius_m`, when a delivery pad fell back to the 60 m corridor width: a v2 recipe
+    # replays on 60 m pads, including a round-trip one (the itinerary refusal is v1-only), and a
+    # current recipe on the 10 m default.
+    v2 = json.loads(json.dumps(spec.to_json_dict()))
+    v2["schema_version"] = 2
+    v2.pop("hover_radius_m", None)
+    assert ScenarioSpec.from_json_dict(v2).config().effective_hover_radius_m == 60.0
+    current = ScenarioSpec.from_json_dict(json.loads(json.dumps(spec.to_json_dict())))
+    assert current.config().effective_hover_radius_m == 10.0
+
 
 def test_scenario_frame_includes_every_request():
     res = _small()

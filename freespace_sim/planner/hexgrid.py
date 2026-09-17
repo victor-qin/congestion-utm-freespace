@@ -7,11 +7,13 @@ analogue of the sibling project's occupancy ledger). The pitch (centre-to-centre
 A* time axis clean and makes the MILP's "slow-down-for-free" / "hop-a-thin-wall" exploits
 structurally impossible.
 
-Rasterization is deliberately conservative (see context/figures/rasterisation_coverage.png): a
-cell is blocked if a committed volume, inflated by the new corridor's half-width PLUS one hex
-circumradius, reaches its centre. Over-blocking by up to a hex is safe — A* avoids a hair more
-than necessary, the NLP recovers the slack by smoothing into the true continuous gap, and FCL
-verify is the backstop.
+A cell is blocked when a committed volume, inflated, reaches its centre (see
+context/figures/rasterisation_coverage.png). How far to inflate depends on whether the volume is on
+the lattice — see :func:`claim_inflation`. Off-lattice geometry is inflated by the new corridor's
+half-width PLUS one hex circumradius: over-blocking by up to a hex covers both the centre sampling
+and the traversed edge the search never tests. A corridor that runs one hex hop, centre to centre,
+needs neither and is inflated by the half-width alone; the pitch does the separating (#38). FCL
+verify remains the backstop either way.
 """
 
 from __future__ import annotations
@@ -33,6 +35,15 @@ SQRT3 = math.sqrt(3.0)
 # The six pointy-top axial neighbour directions around a centre hex, in ring order (see
 # context/figures/hex_layout.png).
 AXIAL_NEIGHBORS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
+
+# How far a corridor's end face may sit from a hex centre and still count as lattice-aligned
+# (:func:`claim_inflation`). A lattice corridor is BUILT from `hex_center`, so its error is floating
+# point; the off-lattice cases this must reject — pad approach legs, shortcut diagonals — measure
+# tens of metres off at density, so the threshold has three orders of magnitude of daylight.
+_LATTICE_EPS_M = 1.0
+# A lattice hop is level by construction (both ends sit at the same flight level), so any vertical
+# component at all means a climb box, whose footprint at a given level is a SLICE of the hop.
+_LEVEL_EPS = 1e-9
 
 # ---- compiled footprint sweep (see hexgrid_kernel) ------------------------------------------
 # The reference sweep below (`_candidate_slack` + a mask) stays the oracle and the fallback. The
@@ -176,6 +187,102 @@ def lattice_overhead_m(cells, pitch, air_detour_m):
 def circumradius(cfg: SimConfig) -> float:
     """Hex circumradius R, from pitch = nominal_speed·dt and pitch = √3·R."""
     return cfg.nominal_speed_mps * cfg.dt_s / SQRT3
+
+
+def hop_box_stays_in_its_cells(cfg: SimConfig) -> bool:
+    """Is a lattice hop's corridor box contained in the union of its two hexes?
+
+    :func:`corridor_segment_volume` builds a hop box that runs between the two cell
+    centres, overhangs each end by ``ext = corridor_width_m / 2`` and is
+    ``corridor_width_m`` wide.  Split it at the midpoint and each half must fit in
+    its own hex:
+
+    * the far corners ``(pitch/2, ±width/2)`` sit on the shared edge, whose half
+      length is the circumradius over two, so ``width <= circumradius``;
+    * the near corners ``(-width/2, ±width/2)`` are inside whenever they are within
+      the inradius ``pitch/2`` of the centre.
+
+    Both hold for the shipped 60 m corridor on a 120 m pitch (60 <= 69.28 and
+    42.43 <= 60), but neither is implied by anything else in the configuration, so
+    :func:`endpoint_claim_cells` asks rather than assumes.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies ``corridor_segment_len_m`` (pitch), ``corridor_width_m``, and
+      the derived circumradius.
+
+    Return
+    --------
+    - output (bool): True if both containment conditions hold (and the geometry is finite and
+      positive), False otherwise.
+    """
+
+    hex_radius = circumradius(cfg)
+    pitch = float(cfg.corridor_segment_len_m)
+    width = float(cfg.corridor_width_m)
+    if not math.isfinite(pitch) or pitch <= 0.0 or not math.isfinite(width) or width < 0.0:
+        return False
+    return width <= hex_radius and math.hypot(width / 2.0, width / 2.0) <= pitch / 2.0
+
+
+def claim_inflation(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float) -> float:
+    """The corridor-footprint inflation to claim ``vol`` with: exact for a lattice-aligned corridor,
+    ``+R`` for anything off the lattice.
+
+    ``infl_blocked`` carries the discretization margin ``R`` because a hex is blocked by testing its
+    CENTRE against continuous geometry, and the search tests only a move's ARRIVAL cell — never the
+    edge it traverses. Both gaps close for a corridor that runs hex-centre to hex-centre, PROVIDED
+    :func:`hop_box_stays_in_its_cells`: the hop's body then lies inside its two hexes, hexes tile
+    without overlap, so two hops that share no cell cannot touch, and the ones that do share a cell
+    are caught at ``width/2`` (the shared centre lies in the other's body). This is the same
+    containment colgen's capacity rows rest on — the two planners' conflict models agree here rather
+    than by coincidence. Off-lattice geometry keeps the margin: a hover disc at a customer pad, an
+    approach leg, a climb box or a shortcut's diagonal can all pass BETWEEN two hex centres, where
+    the arrival-cell test cannot see them (#38).
+
+    Parameters
+    ------------
+    - vol (Volume4D): the committed volume being rasterized.
+    - cfg (SimConfig): supplies the corridor width and the lattice pitch.
+    - R (float): hex circumradius (m).
+    - infl_blocked (float): the off-lattice inflation (m), i.e. ``corridor_width/2 + R``.
+
+    Return
+    --------
+    - output (float): ``corridor_width/2`` for a lattice-aligned corridor box, else ``infl_blocked``.
+    """
+    shape = vol.shape
+    if not isinstance(shape, BoxSpec):
+        return infl_blocked                       # hover/terminal disc: never lattice-aligned
+    if not hop_box_stays_in_its_cells(cfg):
+        return infl_blocked      # geometry too wide for the lattice: cells no longer separate hops
+    # Scalar throughout, like `volumes.corridor_segment_volume` itself: this runs per committed
+    # volume on the commit path, and a numpy round trip to read one column of `rot` and add two
+    # points cost 2.5x what the arithmetic does.
+    e = shape.extents
+    a = 0 if e[0] >= e[1] and e[0] >= e[2] else (1 if e[1] >= e[2] else 2)   # the long axis: travel
+    m = shape.rot                                 # flat 3x3, row-major: column `a` is m[a], m[3+a], m[6+a]
+    ux, uy, uz = m[a], m[3 + a], m[6 + a]
+    if uz > _LEVEL_EPS or uz < -_LEVEL_EPS:
+        return infl_blocked      # climbing box: its per-level footprint is a slice, not the full hop
+    # Undo `volumes.corridor_segment_volume`'s longitudinal extension (recomputed here exactly as it
+    # is applied) to recover the flown segment, whose ends are the cell centres to test.
+    reach = e[a] / 2.0 - 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(ux, uy),
+                                          cfg.corridor_height_m * uz)
+    if reach <= 0.0:
+        return infl_blocked
+    cx, cy = shape.center[0], shape.center[1]
+    cells = []
+    for sign in (-1.0, 1.0):
+        ex, ey = cx + sign * ux * reach, cy + sign * uy * reach
+        q, r = enu_to_axial(ex, ey, R)
+        c = hex_center(q, r, R)
+        if math.hypot(ex - c[0], ey - c[1]) > _LATTICE_EPS_M:
+            return infl_blocked                   # an end off the lattice: approach leg, shortcut
+        cells.append((q, r))
+    if hex_distance(cells[0], cells[1]) != 1:
+        return infl_blocked      # not a single lattice edge: a merged run can pass BETWEEN centres
+    return cfg.corridor_width_m / 2.0
 
 
 def hex_center(q: int, r: int, R: float) -> np.ndarray:
@@ -526,35 +633,52 @@ def _candidate_slack(vol: Volume4D, cfg: SimConfig, R: float, infl: float, z: fl
     return q_grid, r_grid, _footprint_slack(vol.shape, cx, cy, cfg, z=z)
 
 
+def _split_flags(qs: list, rs: list, in_narrow: list, pad_is_wide: bool):
+    """Map a sweep's (kept, in_narrow) pair onto ``(qs, rs, in_blocked, in_pad)``.
+
+    Every kept cell lies in the wider footprint by construction, so the wider membership is all-True
+    and ``in_narrow`` carries the other one; which is which depends on the inflations.
+    """
+    wide_all = [True] * len(qs)
+    return (qs, rs, wide_all, in_narrow) if not pad_is_wide else (qs, rs, in_narrow, wide_all)
+
+
 def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float,
                 z: float | None = None):
-    """``(qs, rs, in_blocked)`` for the cells of ``vol``'s footprint at altitude probe ``z`` — the
-    single place the compiled/reference choice is made.
+    """``(qs, rs, in_blocked, in_pad)`` for the cells of ``vol``'s footprint at altitude probe ``z``
+    — the single place the compiled/reference choice is made.
 
     All three public rasterisers funnel through here so they cannot drift apart and so one switch
-    (``USE_COMPILED``) controls the A/B and the rollback for every one of them. ``infl_pad`` sizes
-    the candidate rectangle (it is the wider inflation, so the blocked cells are a subset);
-    ``in_blocked`` flags membership in the narrower corridor footprint.
+    (``USE_COMPILED``) controls the A/B and the rollback for every one of them. The WIDER of the two
+    inflations sizes the candidate rectangle and the narrower one is flagged within it; which of the
+    two is wider is a config question, not an invariant — a delivery pad below ``corridor_width/2``
+    makes ``infl_pad`` the narrower one (#134), and sizing the sweep by it would silently drop the
+    outer ring of the corridor footprint. Each cell therefore carries BOTH memberships.
 
     Parameters
     ------------
     - vol (Volume4D): the committed volume whose footprint is swept.
     - cfg (SimConfig): supplies the default cruise level and flight levels.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor footprint (sets ``in_blocked``).
-    - infl_pad (float): wider inflation (m) that sizes the candidate rectangle.
+    - infl_blocked (float): inflation (m) for the corridor footprint (sets ``in_blocked``).
+    - infl_pad (float): inflation (m) for the pad footprint (sets ``in_pad``).
     - z (float | None): altitude probe (m); None ⇒ ``cfg.cruise_level_m``.
 
     Return
     --------
-    - output (tuple[list[int], list[int], list[bool]]): ``(qs, rs, in_blocked)`` per kept cell —
-      axial ``q``/``r`` and whether the cell also lies in the narrower corridor footprint.
+    - output (tuple[list[int], list[int], list[bool], list[bool]]): ``(qs, rs, in_blocked, in_pad)``
+      per kept cell — axial ``q``/``r`` and its membership in each footprint. A kept cell lies in at
+      least one of them.
     """
     z = cfg.cruise_level_m if z is None else z
+    # The kernel keeps candidates within its FIRST inflation and flags those within its second, so
+    # it is handed (wide, narrow) rather than (pad, blocked); the flags are mapped back below.
+    wide, narrow = max(infl_blocked, infl_pad), min(infl_blocked, infl_pad)
+    pad_is_wide = infl_pad >= infl_blocked
     if _COMPILED and USE_COMPILED:
         x0, y0, _z0, x1, y1, _z1 = vol.flat_aabb()   # scalars; pinned bit-for-bit against aabb()
-        q0, q1, r0, r1 = _axial_rect(x0 - infl_pad, y0 - infl_pad,
-                                     x1 + infl_pad, y1 + infl_pad, R)
+        q0, q1, r0, r1 = _axial_rect(x0 - wide, y0 - wide,
+                                     x1 + wide, y1 + wide, R)
         n_cand = (q1 - q0 + 1) * (r1 - r0 + 1)       # exact upper bound: overflow is impossible
         oq = np.empty(n_cand, np.int64)
         orr = np.empty(n_cand, np.int64)
@@ -567,7 +691,7 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
                 n = _sweep_box(q0, q1, r0, r1, R, s.center[0], s.center[1], s.center[2],
                                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
                                e[0] / 2.0, e[1] / 2.0, e[2] / 2.0,
-                               z, infl_pad, infl_blocked, oq, orr, ob, oa)
+                               z, wide, narrow, oq, orr, ob, oa)
             except Exception as exc:
                 _disable_compiled(exc)
             else:
@@ -578,25 +702,25 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
                     cy = R * 1.5 * ar
                     slack = _footprint_slack(s, cx, cy, cfg, z=z)
                     keep = np.ones(n, dtype=np.bool_)
-                    keep[ambiguous] = slack <= infl_pad
-                    ob[ambiguous] = slack <= infl_blocked
-                    return (oq[:n][keep].tolist(), orr[:n][keep].tolist(),
-                            ob[:n][keep].tolist())
-                return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
+                    keep[ambiguous] = slack <= wide
+                    ob[ambiguous] = slack <= narrow
+                    return _split_flags(oq[:n][keep].tolist(), orr[:n][keep].tolist(),
+                                        ob[:n][keep].tolist(), pad_is_wide)
+                return _split_flags(oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist(), pad_is_wide)
         else:
             try:
                 n = _sweep_cyl(q0, q1, r0, r1, R, s.cx, s.cy, s.radius, s.z_lo, s.z_hi,
-                               z, infl_pad, infl_blocked, oq, orr, ob)
+                               z, wide, narrow, oq, orr, ob)
             except Exception as exc:
                 _disable_compiled(exc)
             else:
-                return oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist()
+                return _split_flags(oq[:n].tolist(), orr[:n].tolist(), ob[:n].tolist(), pad_is_wide)
     if not _COMPILED and USE_COMPILED:
         _warn_no_kernel(_compiled_error)
-    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, infl_pad, z=z)
-    in_pad = slack <= infl_pad
-    return (q_grid[in_pad].tolist(), r_grid[in_pad].tolist(),
-            (slack[in_pad] <= infl_blocked).tolist())
+    q_grid, r_grid, slack = _candidate_slack(vol, cfg, R, wide, z=z)
+    keep = slack <= wide
+    return (q_grid[keep].tolist(), r_grid[keep].tolist(),
+            (slack[keep] <= infl_blocked).tolist(), (slack[keep] <= infl_pad).tolist())
 
 
 def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
@@ -635,13 +759,16 @@ def _cylinder_z_independent(vol: Volume4D, cfg: SimConfig, levels: list[int]) ->
 
 
 def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None = None):
-    """Yield ``(q, r, L, s)`` cells a committed volume blocks (conservatively inflated), for every
-    overlapped flight level ``L`` and every blocked step ``s``.
+    """Yield ``(q, r, L, s)`` cells a committed volume blocks at ONE inflation, for every overlapped
+    flight level ``L`` and every blocked step ``s``.
 
-    ``infl`` overrides the footprint inflation (metres). It defaults to the corridor half-width plus
-    one hex — correct for the swept corridor. Callers checking pad occupancy (the takeoff/landing
-    hover cylinder) pass ``effective_hover_radius_m + R`` instead, so the blocked footprint matches
-    the wider cylinder rather than the corridor.
+    Single-footprint and single-inflation: it takes the inflation it is given and does not consult
+    :func:`claim_inflation`, so it is NOT how the occupancy images are built — they need both
+    footprints per cell and the per-volume claim rule, and go through
+    :func:`rasterize_volume_ranges`. What is left here is the independent oracle those sweeps are
+    pinned against (``tests/test_hexgrid.py``): one inflation, one pass, no flag bookkeeping.
+
+    ``infl`` defaults to the OFF-LATTICE corridor inflation, the corridor half-width plus one hex.
 
     Parameters
     ------------
@@ -662,7 +789,7 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
         infl = cfg.corridor_width_m / 2.0 + R      # corridor half-width + one hex (conservative)
     steps = _step_range(vol, cfg)
     if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
-        qs, rs, _b = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[levels[0]])
+        qs, rs, _b, _p = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[levels[0]])
         cells = list(zip(qs, rs))
         for L in levels:
             for q, r in cells:
@@ -670,7 +797,7 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
                     yield q, r, L, s
         return
     for L in levels:
-        qs, rs, _b = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[L])
+        qs, rs, _b, _p = _sweep_kept(vol, cfg, R, infl, infl, z=cfg.flight_levels_m[L])
         for q, r in zip(qs, rs):
             for s in steps:
                 yield q, r, L, s
@@ -679,50 +806,54 @@ def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None
 def rasterize_volume_dual(
     vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float
 ):
-    """One vectorized sweep yielding ``(q, r, L, s, in_blocked)`` over the pad footprint, where
-    ``in_blocked`` flags membership in the (smaller) corridor footprint.
+    """One vectorized sweep yielding ``(q, r, L, s, in_blocked, in_pad)`` over the UNION of the two
+    footprints, where each flag marks membership in one of them.
 
-    Requires ``infl_pad >= infl_blocked`` so pad cells are a superset of blocked cells. Replaces two
-    :func:`rasterize_volume` passes with a single geometry computation per volume (the A* hot path).
+    Neither footprint is assumed to contain the other — a pad narrower than the corridor half-width
+    is a supported config (#134) — so the sweep spans both and every cell carries both memberships.
+    Replaces two :func:`rasterize_volume` passes with a single geometry computation per volume (the
+    A* hot path).
 
     Parameters
     ------------
     - vol (Volume4D): the committed volume to rasterize.
     - cfg (SimConfig): supplies the flight levels and step timing.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor (``in_blocked``) footprint.
-    - infl_pad (float): inflation (m) for the wider pad footprint that sizes the candidate set.
+    - infl_blocked (float): inflation (m) for the corridor (``in_blocked``) footprint.
+    - infl_pad (float): inflation (m) for the pad (``in_pad``) footprint.
 
     Return
     --------
-    - output (Iterator): yields ``(q, r, L, s, in_blocked)`` per pad (cell, level, step); empty when
-      the volume overlaps no flight level.
+    - output (Iterator): yields ``(q, r, L, s, in_blocked, in_pad)`` per (cell, level, step) in
+      either footprint; empty when the volume overlaps no flight level.
     """
     levels = _levels_overlapped(vol, cfg)
     if not levels:
         return
     steps = _step_range(vol, cfg)
+    infl_blocked = claim_inflation(vol, cfg, R, infl_blocked)
     if _cylinder_z_independent(vol, cfg, levels):          # z-independent footprint → compute once
         rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
                                      z=cfg.flight_levels_m[levels[0]])))
         for L in levels:
-            for q, r, b in rows:
+            for q, r, b, pd in rows:
                 for s in steps:
-                    yield q, r, L, s, b
+                    yield q, r, L, s, b, pd
         return
     for L in levels:
-        qp, rp, in_blk = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad, z=cfg.flight_levels_m[L])
-        for q, r, b in zip(qp, rp, in_blk):
+        qp, rp, in_blk, in_pad = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
+                                            z=cfg.flight_levels_m[L])
+        for q, r, b, pd in zip(qp, rp, in_blk, in_pad):
             for s in steps:
-                yield q, r, L, s, b
+                yield q, r, L, s, b, pd
 
 
 def rasterize_volume_ranges(
     vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, infl_pad: float
 ):
-    """Like :func:`rasterize_volume_dual`, but yields one ``(q, r, L, s_lo, s_hi, in_blocked)`` per
-    cell with the step axis collapsed to its inclusive ``[s_lo, s_hi]`` range instead of one row per
-    (cell, step).
+    """Like :func:`rasterize_volume_dual`, but yields one ``(q, r, L, s_lo, s_hi, in_blocked,
+    in_pad)`` per cell with the step axis collapsed to its inclusive ``[s_lo, s_hi]`` range instead
+    of one row per (cell, step).
 
     A committed volume occupies each cell over a contiguous step span (``_step_range`` is a plain
     ``range``), so the per-step form yields ``S`` rows the consumers then process one at a time.
@@ -735,13 +866,13 @@ def rasterize_volume_ranges(
     - vol (Volume4D): the committed volume to rasterize.
     - cfg (SimConfig): supplies the flight levels and step timing.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor footprint.
-    - infl_pad (float): inflation (m) for the wider pad footprint.
+    - infl_blocked (float): inflation (m) for the corridor footprint.
+    - infl_pad (float): inflation (m) for the pad footprint.
 
     Return
     --------
-    - output (Iterator): yields ``(q, r, L, s_lo, s_hi, in_blocked)`` per cell; empty if the volume
-      overlaps no flight level or spans no step.
+    - output (Iterator): yields ``(q, r, L, s_lo, s_hi, in_blocked, in_pad)`` per cell; empty if the
+      volume overlaps no flight level or spans no step.
     """
     levels = _levels_overlapped(vol, cfg)
     if not levels:
@@ -750,17 +881,19 @@ def rasterize_volume_ranges(
     s_lo, s_hi = steps.start, steps.stop - 1               # range(s0, s1+1) → inclusive [s0, s1]
     if s_hi < s_lo:
         return
+    infl_blocked = claim_inflation(vol, cfg, R, infl_blocked)
     if _cylinder_z_independent(vol, cfg, levels):
         rows = list(zip(*_sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
                                      z=cfg.flight_levels_m[levels[0]])))
         for L in levels:
-            for q, r, b in rows:
-                yield q, r, L, s_lo, s_hi, b
+            for q, r, b, pd in rows:
+                yield q, r, L, s_lo, s_hi, b, pd
         return
     for L in levels:
-        qp, rp, in_blk = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad, z=cfg.flight_levels_m[L])
-        for q, r, b in zip(qp, rp, in_blk):
-            yield q, r, L, s_lo, s_hi, b
+        qp, rp, in_blk, in_pad = _sweep_kept(vol, cfg, R, infl_blocked, infl_pad,
+                                            z=cfg.flight_levels_m[L])
+        for q, r, b, pd in zip(qp, rp, in_blk, in_pad):
+            yield q, r, L, s_lo, s_hi, b, pd
 
 
 _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
@@ -893,12 +1026,12 @@ def rasterize_ranges(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: floa
     - cfg (SimConfig): supplies flight levels, step timing, and inflations; its identity is part of
       the cache key.
     - R (float): hex circumradius (m).
-    - infl_blocked (float): inflation (m) for the narrower corridor footprint.
-    - infl_pad (float): inflation (m) for the wider pad footprint.
+    - infl_blocked (float): inflation (m) for the corridor footprint.
+    - infl_pad (float): inflation (m) for the pad footprint.
 
     Return
     --------
-    - output (list): the materialized ``(q, r, L, s_lo, s_hi, in_blocked)`` rows for ``vol``, cached
+    - output (list): the materialized ``(q, r, L, s_lo, s_hi, in_blocked, in_pad)`` rows for ``vol``, cached
       under ``(id(vol), id(cfg), R, infl_blocked, infl_pad, backend)``.
     """
     # Backend and config identity are output inputs too. Keeping the identities in the key and the

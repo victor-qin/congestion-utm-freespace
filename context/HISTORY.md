@@ -112,3 +112,30 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   stored `0.0` would have replayed as a zero-second dwell. Refuse on the VERSION plus the field that
   changes the flight SET, and check what an absent key defaults to. Files:
   `freespace_sim/scenarios/spec.py`.
+
+- 2026-09-16T17:00Z `[CODE]` An invariant that lives only in a test's precondition is not enforced.
+  `_sweep_kept` sized its candidate rectangle by `infl_pad` and took the corridor set as a subset,
+  which holds only while the pad footprint is the WIDER of the two; nothing in the code said so, and
+  the one place it was written down was `assert infl_p >= infl_b` at the top of a test. Changing a
+  config default (a 10 m delivery pad, 79.3 m vs 99.3 m) inverted it and silently dropped the outer
+  ring of every committed corridor — 20 hex cells became 16 — so every planner deconflicted against
+  less than the corridor sweeps. Sweep the union and carry both memberships instead of assuming an
+  order. When a footprint is derived from a knob, the ordering of two derived quantities is a knob
+  too. Files: `freespace_sim/planner/hexgrid.py`, `freespace_sim/planner/astar/occupancy.py`.
+
+- 2026-09-16T17:05Z `[CODE]` A journal that encodes a boolean cannot record a third state. The
+  reference occupancy wrote `-1` pad-only / `-2` pad+blocked per released row, which assumed every
+  corridor cell was also a pad cell — true only under the nesting above. Once a cell could be
+  blocked-only, `on_release` decremented a `pad` refcount that was never incremented, corrupting the
+  map under LNS destroy with no test failing at the point of damage. Any encoding that mirrors a
+  membership pair has to change with it; grep the release path whenever the add path grows a case.
+  Files: `freespace_sim/planner/astar/occupancy.py`.
+
+- 2026-09-16T23:40Z `[CODE]` Check whether the other planner already owns the geometry predicate you
+  are about to write. `claim_inflation` guarded its exact-claim branch with "pitch exceeds corridor
+  width", which is too weak — two hops on neighbouring lattice rows are 103.9 m apart, so a 110 m
+  corridor on a 120 m pitch would have claimed exactly while overlapping. colgen had carried the
+  correct predicate for a year (`hop_box_stays_in_its_cells`: `width <= circumradius` AND the
+  overhang corner within the inradius), because its capacity rows rest on the same containment. It
+  now lives in `hexgrid` and both call it. Files: `freespace_sim/planner/hexgrid.py`,
+  `freespace_sim/planner/colgen/windows.py`.

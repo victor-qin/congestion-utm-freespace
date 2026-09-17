@@ -189,18 +189,56 @@ def circumradius(cfg: SimConfig) -> float:
     return cfg.nominal_speed_mps * cfg.dt_s / SQRT3
 
 
+def hop_box_stays_in_its_cells(cfg: SimConfig) -> bool:
+    """Is a lattice hop's corridor box contained in the union of its two hexes?
+
+    :func:`corridor_segment_volume` builds a hop box that runs between the two cell
+    centres, overhangs each end by ``ext = corridor_width_m / 2`` and is
+    ``corridor_width_m`` wide.  Split it at the midpoint and each half must fit in
+    its own hex:
+
+    * the far corners ``(pitch/2, ±width/2)`` sit on the shared edge, whose half
+      length is the circumradius over two, so ``width <= circumradius``;
+    * the near corners ``(-width/2, ±width/2)`` are inside whenever they are within
+      the inradius ``pitch/2`` of the centre.
+
+    Both hold for the shipped 60 m corridor on a 120 m pitch (60 <= 69.28 and
+    42.43 <= 60), but neither is implied by anything else in the configuration, so
+    :func:`endpoint_claim_cells` asks rather than assumes.
+
+    Parameters
+    ------------
+    - cfg (SimConfig): supplies ``corridor_segment_len_m`` (pitch), ``corridor_width_m``, and
+      the derived circumradius.
+
+    Return
+    --------
+    - output (bool): True if both containment conditions hold (and the geometry is finite and
+      positive), False otherwise.
+    """
+
+    hex_radius = circumradius(cfg)
+    pitch = float(cfg.corridor_segment_len_m)
+    width = float(cfg.corridor_width_m)
+    if not math.isfinite(pitch) or pitch <= 0.0 or not math.isfinite(width) or width < 0.0:
+        return False
+    return width <= hex_radius and math.hypot(width / 2.0, width / 2.0) <= pitch / 2.0
+
+
 def claim_inflation(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float) -> float:
     """The corridor-footprint inflation to claim ``vol`` with: exact for a lattice-aligned corridor,
     ``+R`` for anything off the lattice.
 
     ``infl_blocked`` carries the discretization margin ``R`` because a hex is blocked by testing its
     CENTRE against continuous geometry, and the search tests only a move's ARRIVAL cell — never the
-    edge it traverses. Both gaps close for a corridor that runs hex-centre to hex-centre: the pitch
-    (``√3·R`` = nominal_speed·dt) exceeds the corridor width, so two lattice corridors either share a
-    cell — caught at ``width/2``, the centre lies on the other's axis — or their centrelines are a
-    full lattice step apart and their bodies never meet. Off-lattice geometry keeps the margin: a
-    hover disc at a customer pad, an approach leg, a climb box or a shortcut's diagonal can all pass
-    BETWEEN two hex centres, where the arrival-cell test cannot see them (#38).
+    edge it traverses. Both gaps close for a corridor that runs hex-centre to hex-centre, PROVIDED
+    :func:`hop_box_stays_in_its_cells`: the hop's body then lies inside its two hexes, hexes tile
+    without overlap, so two hops that share no cell cannot touch, and the ones that do share a cell
+    are caught at ``width/2`` (the shared centre lies in the other's body). This is the same
+    containment colgen's capacity rows rest on — the two planners' conflict models agree here rather
+    than by coincidence. Off-lattice geometry keeps the margin: a hover disc at a customer pad, an
+    approach leg, a climb box or a shortcut's diagonal can all pass BETWEEN two hex centres, where
+    the arrival-cell test cannot see them (#38).
 
     Parameters
     ------------
@@ -215,8 +253,8 @@ def claim_inflation(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float
     """
     if not isinstance(vol.shape, BoxSpec):
         return infl_blocked                       # hover/terminal disc: never lattice-aligned
-    if SQRT3 * R < cfg.corridor_width_m:
-        return infl_blocked      # pitch below the corridor width: distinct cells no longer separate
+    if not hop_box_stays_in_its_cells(cfg):
+        return infl_blocked      # geometry too wide for the lattice: cells no longer separate hops
     ext = vol.shape.extents
     a = max(range(3), key=lambda i: ext[i])       # the box's long axis: the direction of travel
     u = np.asarray(vol.shape.rotation(), float)[:, a]

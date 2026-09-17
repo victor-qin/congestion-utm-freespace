@@ -251,28 +251,33 @@ def claim_inflation(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float
     --------
     - output (float): ``corridor_width/2`` for a lattice-aligned corridor box, else ``infl_blocked``.
     """
-    if not isinstance(vol.shape, BoxSpec):
+    shape = vol.shape
+    if not isinstance(shape, BoxSpec):
         return infl_blocked                       # hover/terminal disc: never lattice-aligned
     if not hop_box_stays_in_its_cells(cfg):
         return infl_blocked      # geometry too wide for the lattice: cells no longer separate hops
-    ext = vol.shape.extents
-    a = max(range(3), key=lambda i: ext[i])       # the box's long axis: the direction of travel
-    u = np.asarray(vol.shape.rotation(), float)[:, a]
-    if abs(u[2]) > _LEVEL_EPS:
+    # Scalar throughout, like `volumes.corridor_segment_volume` itself: this runs per committed
+    # volume on the commit path, and a numpy round trip to read one column of `rot` and add two
+    # points cost 2.5x what the arithmetic does.
+    e = shape.extents
+    a = 0 if e[0] >= e[1] and e[0] >= e[2] else (1 if e[1] >= e[2] else 2)   # the long axis: travel
+    m = shape.rot                                 # flat 3x3, row-major: column `a` is m[a], m[3+a], m[6+a]
+    ux, uy, uz = m[a], m[3 + a], m[6 + a]
+    if uz > _LEVEL_EPS or uz < -_LEVEL_EPS:
         return infl_blocked      # climbing box: its per-level footprint is a slice, not the full hop
     # Undo `volumes.corridor_segment_volume`'s longitudinal extension (recomputed here exactly as it
     # is applied) to recover the flown segment, whose ends are the cell centres to test.
-    overhang = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(u[0], u[1]),
-                                cfg.corridor_height_m * u[2])
-    reach = ext[a] / 2.0 - overhang
+    reach = e[a] / 2.0 - 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(ux, uy),
+                                          cfg.corridor_height_m * uz)
     if reach <= 0.0:
         return infl_blocked
-    centre = np.asarray(vol.shape.center, float)
+    cx, cy = shape.center[0], shape.center[1]
     cells = []
-    for end in (centre - u * reach, centre + u * reach):
-        q, r = enu_to_axial(float(end[0]), float(end[1]), R)
+    for sign in (-1.0, 1.0):
+        ex, ey = cx + sign * ux * reach, cy + sign * uy * reach
+        q, r = enu_to_axial(ex, ey, R)
         c = hex_center(q, r, R)
-        if math.hypot(end[0] - c[0], end[1] - c[1]) > _LATTICE_EPS_M:
+        if math.hypot(ex - c[0], ey - c[1]) > _LATTICE_EPS_M:
             return infl_blocked                   # an end off the lattice: approach leg, shortcut
         cells.append((q, r))
     if hex_distance(cells[0], cells[1]) != 1:
@@ -754,13 +759,16 @@ def _cylinder_z_independent(vol: Volume4D, cfg: SimConfig, levels: list[int]) ->
 
 
 def rasterize_volume(vol: Volume4D, cfg: SimConfig, R: float, infl: float | None = None):
-    """Yield ``(q, r, L, s)`` cells a committed volume blocks (conservatively inflated), for every
-    overlapped flight level ``L`` and every blocked step ``s``.
+    """Yield ``(q, r, L, s)`` cells a committed volume blocks at ONE inflation, for every overlapped
+    flight level ``L`` and every blocked step ``s``.
 
-    ``infl`` overrides the footprint inflation (metres). It defaults to the corridor half-width plus
-    one hex — correct for the swept corridor. Callers checking pad occupancy (the takeoff/landing
-    hover cylinder) pass ``effective_hover_radius_m + R`` instead, so the blocked footprint matches
-    the wider cylinder rather than the corridor.
+    Single-footprint and single-inflation: it takes the inflation it is given and does not consult
+    :func:`claim_inflation`, so it is NOT how the occupancy images are built — they need both
+    footprints per cell and the per-volume claim rule, and go through
+    :func:`rasterize_volume_ranges`. What is left here is the independent oracle those sweeps are
+    pinned against (``tests/test_hexgrid.py``): one inflation, one pass, no flag bookkeeping.
+
+    ``infl`` defaults to the OFF-LATTICE corridor inflation, the corridor half-width plus one hex.
 
     Parameters
     ------------

@@ -37,6 +37,7 @@ import numpy as np
 
 from freespace_sim import sim, verify
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.lns import LNSConfig
 from freespace_sim.planner.lns.solver import run_lns_on_result
 from freespace_sim.planner.shortcut import can_refine, refine_intent, terminal_capacity_for
@@ -65,7 +66,10 @@ def _polish(intents, ledger, cfg) -> tuple[list, int, float]:
     # `release_many` subtract the released flight's own pad dwell. On the rebuild path that dwell
     # survives, so `reservation_admitted` counts the flight against itself and refuses its own
     # shortcut at a capacity-1 pad — and this post-pass never calls `plan` to trip the rebuild.
-    planner = AStarPlanner(incremental_release=True)
+    # Wrapped like `get_planner` does: a bare search planner raises on a round-trip request
+    # (`reject_itinerary`). Note the polish itself is a no-op on round trips — `can_refine` refuses a
+    # COMPOSED itinerary, which is why the in-loop arm refines per leg instead.
+    planner = ItineraryPlanner(AStarPlanner(incremental_release=True))
     planner.evict_floor = 0.0
     first = next((it.request for it in intents if it.accepted), None)
     if first is None:

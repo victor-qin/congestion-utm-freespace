@@ -34,9 +34,12 @@ from freespace_sim.uss import USS
 
 # Flights extracted from dallas_hub_2uss_large @ seed 0, pads_per_hub=4. Replaying just these in FCFS
 # order reproduces each denial exactly (the demand is deterministic for a fixed seed).
-LAZY_SKIP = (46, 4, 58, 8)    # walmart#4 deliveries + fid 58's hub-crossing corridor; pre-fix denied 4 & 8
-CRUISE_CLIP = (4, 8, 86)      # walmart#4 deliveries; fid 86's first cruise box clips fid 4/8 columns
-EXIT_COLLISION = (44, 92)     # stripmall#5 deliveries; their exit lanes collide inside the shared column
+# Ids are HALF their pre-itinerary values: the demand consumed two per delivery (outbound 2k, return
+# 2k+1) and now consumes one. Verified a pure renumbering — all 53 deliveries match old fid 2k on
+# (t_request, origin, dest), this scenario setting no `departure_offset_s` to perturb the RNG.
+LAZY_SKIP = (23, 2, 29, 4)    # walmart#4 deliveries + fid 29's hub-crossing corridor; pre-fix denied 2 & 4
+CRUISE_CLIP = (2, 4, 43)      # walmart#4 deliveries; fid 43's first cruise box clips fid 2/4 columns
+EXIT_COLLISION = (22, 46)     # stripmall#5 deliveries; their exit lanes collide inside the shared column
 
 
 def _replay(fids, fixed=False):
@@ -74,8 +77,8 @@ def test_cruise_box_does_not_clip_a_sibling_column():
     # (``volumes.segment_overlaps_column``, applied in ``astar._build`` + ``build_reservation_from_corners``),
     # not just box[0]/box[-1] — so fid 86's first cruise box is column-exempt instead of CONFLICT_FILED.
     intents = _replay(CRUISE_CLIP)
-    assert intents[4].accepted and intents[8].accepted          # the two sibling columns commit
-    assert intents[86].accepted                                  # column-exempt cruise box; admitted
+    assert intents[2].accepted and intents[4].accepted          # the two sibling columns commit
+    assert intents[43].accepted                                  # column-exempt cruise box; admitted
 
 
 def test_same_hub_exit_lanes_do_not_collide():
@@ -86,8 +89,8 @@ def test_same_hub_exit_lanes_do_not_collide():
     # via exact cell occupancy in ``occupancy.is_blocked`` — see
     # ``test_fixed_exit_lanes_admit_all_three_mechanisms``.)
     intents = _replay(EXIT_COLLISION)
-    assert intents[44].accepted                                  # the first lane commits
-    assert intents[92].accepted                                  # ground-delays past fid 44's lane; admitted
+    assert intents[22].accepted                                  # the first lane commits
+    assert intents[46].accepted                                  # ground-delays past fid 22's lane; admitted
 
 
 @pytest.mark.parametrize("fids", [LAZY_SKIP, CRUISE_CLIP, EXIT_COLLISION])

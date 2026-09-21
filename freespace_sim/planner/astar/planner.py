@@ -49,6 +49,7 @@ from ...volumes import (
     segment_overlaps_column,
     terminal_radius,
 )
+from ..itinerary import reject_itinerary
 from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, aligned_2d
 from . import window as W
@@ -785,6 +786,7 @@ class AStarPlanner:
         - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
           REJECTED intent carrying the :class:`DenialReason`.
         """
+        reject_itinerary(req, "astar")
         self.last_envelope = None            # never leak a previous flight's read set to a consumer
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)

@@ -39,8 +39,8 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner import chain_attr, iter_planner_chain
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.lns.unimpeded import resolve_workers, unimpeded_costs
-from freespace_sim.verify import pair_precedence_shortfall
 from freespace_sim.types import OperationalIntent
 
 log = logging.getLogger("freespace_sim.lns")
@@ -65,7 +65,7 @@ LNS_REPAIR_PLANNERS = ("astar", "astar_ref", "sipp", "sipp_ref")
 
 
 def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
-                        record_envelope=False, window_bytes=None):
+                        record_envelope=False, window_bytes=None, shortcut=False):
     """The ONE construction site for an LNS repair planner, so the sequential path, `LNSState`'s
     default and `LNSState.replica` cannot drift.
 
@@ -84,11 +84,13 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
       (keyword-only).
     - window_bytes (int | None): dense-window byte budget (keyword-only); ``None`` keeps each
       planner's own default.
+    - shortcut (bool): wrap the search in a ``ShortcutRefiner`` (keyword-only), beneath the
+      itinerary wrapper, so each repaired leg is tightened before it is committed.
 
     Return
     --------
-    - output (AStarPlanner | SIPPPlanner): the constructed planner with ``evict_floor = 0.0`` and
-      ``record_envelope`` set.
+    - output (ItineraryPlanner): the constructed planner with ``evict_floor = 0.0`` and
+      ``record_envelope`` set, wrapped so a round trip is repaired as both legs.
     """
     # `window_bytes` is the dense-window byte budget; omitted rather than passed as None so each
     # planner keeps its own default.
@@ -107,7 +109,17 @@ def _new_repair_planner(name, *, incremental_release, kernel_log2_min=None,
             f"(want one of {LNS_REPAIR_PLANNERS})")
     planner.evict_floor = 0.0   # random/premium repair orders need the full-horizon occupancy
     planner.record_envelope = record_envelope
-    return planner
+    if shortcut:
+        from freespace_sim.planner.shortcut import ShortcutRefiner
+
+        # INSIDE the itinerary wrapper, the order `get_planner` composes `astar_shortcut` in: the
+        # refiner must see one leg at a time. Outside, it would be handed the composed round trip,
+        # which it refuses (`shortcut.can_refine`), so the arm would silently cut nothing.
+        planner = ShortcutRefiner(planner, label=f"{name}_sc")
+    # Wrapped so a round-trip request is repaired as BOTH legs. Unwrapped, A*/SIPP plan the outbound
+    # alone and drop the return: the halved cost then reads as a large improvement and `try_repair`
+    # adopts it, so LNS strips the return off every itinerary it touches.
+    return ItineraryPlanner(planner)
 
 
 #: Absent-value sentinel for `_same_committed_schedule`'s per-owner walk, where None is a real value.
@@ -176,7 +188,7 @@ class RepairOutcome:
     """What one destroy->repair transaction did."""
 
     accepted: bool
-    reason: str  # "improved" | "no_improvement" | "denied" | "anchor"
+    reason: str  # "improved" | "no_improvement" | "denied"
     cost_old: float
     cost_new: float  # inf when the repair never produced a complete candidate
     n_planned: int
@@ -209,7 +221,6 @@ class LNSState:
         static_terms: tuple = (),
         frozen_flight_ids: frozenset[int] = frozenset(),
         movable_uss_ids: frozenset[str] | None = None,
-        turnaround_s: float | None = None,
         repair_planner: AStarPlanner | None = None,
         repair_planner_name: str = "astar",
         incremental_release: bool = True,
@@ -237,7 +248,6 @@ class LNSState:
           replays the same world the ruler was measured in.
         - frozen_flight_ids (frozenset[int]): flights excluded from the movable set.
         - movable_uss_ids (frozenset[str] | None): if set, only these USS ids are movable.
-        - turnaround_s (float | None): enables the paired-return anchor guard when not None.
         - repair_planner (AStarPlanner | None): a borrowed repair planner (must have
           ``evict_floor == 0.0`` and not already be bound to this ledger); None constructs one.
         - repair_planner_name (str): which planner to construct when ``repair_planner`` is None.
@@ -376,30 +386,18 @@ class LNSState:
 
         self.shortcut_repair = shortcut_repair
         self.repair_planner = repair_planner
-
-        # Paired-return PRECEDENCE: a return cannot depart before the aircraft flying it has landed.
-        # This is a different property from `verify`'s separation check and invisible to it — the two
-        # legs hold DISJOINT windows at the same pad, so there is no 4D overlap to find. `try_repair`
-        # is the only place it can be PREVENTED, because by the time a whole-schedule replay sees it
-        # the repair has already been accepted.
-        self._turnaround_s = turnaround_s
-        from freespace_sim import verify as _verify
-        # Per-pair, not a count. A nominal-anchor schedule arrives with violations already in it, so
-        # the rule is "no pair gets worse", not "no pair is bad" — and a COUNT cannot express that:
-        # LNS can repair pair A and break pair B in one iteration with the count unchanged.
-        self._pair_shortfall = _verify.pair_shortfalls(intents, float(turnaround_s or 0.0))
-        self._precedence_baseline = sum(1 for v in self._pair_shortfall.values() if v > 1e-6)
-        # Round-trip partners, BOTH directions: the guard has to reach the leg this repair did NOT
-        # touch. Built from the requests, so it is populated under nominal anchoring too.
-        self._pair_of: dict[int, int] = {}
-        self._outbound_of_pair: dict[int, int] = {}   # either leg's fid -> the OUTBOUND leg's fid
-        for it in intents:
-            pid = it.request.paired_outbound_id
-            if pid is not None:
-                fid = it.request.flight_id
-                self._pair_of[fid] = pid
-                self._pair_of[pid] = fid
-                self._outbound_of_pair[fid] = self._outbound_of_pair[pid] = pid
+        # The deferred arms hold a COMPOSED intent, which `can_refine` refuses, so on a round-trip
+        # schedule they cut nothing at all. Said once here rather than left to be inferred from a
+        # flat result table: an arm that silently does nothing reads as an arm that does not help.
+        # Refining inside a round trip means refining per LEG — `shortcut_arm="interleaved"`.
+        if shortcut_repair != "none":
+            n_rt = sum(1 for f in self._movable if self.incumbent[f].request.return_to_origin)
+            if n_rt:
+                log.warning(
+                    "lns: shortcut_repair=%r cannot refine %d of %d movable flights: a composed "
+                    "round trip cannot be spliced (shortcut.can_refine). Use "
+                    "shortcut_arm='interleaved', which refines each leg beneath ItineraryPlanner.",
+                    shortcut_repair, n_rt, len(self._movable))
 
         # Unimpeded weighted cost per movable flight — the paper's d(s_i, g_i) analogue, so
         # delay(fid) = incumbent cost - unimpeded cost. One plan per flight on a static-walls-only
@@ -507,7 +505,6 @@ class LNSState:
         *,
         static_terms: tuple,
         unimpeded_cost: dict[int, float | None],
-        turnaround_s: float | None = None,
         frozen_flight_ids: frozenset[int] = frozenset(),
         movable_uss_ids: frozenset[str] | None = None,
         incremental_release: bool = True,
@@ -535,9 +532,6 @@ class LNSState:
         - static_terms (tuple): the (center, terminal) walls to re-register, so the worker measures
           the same world as the ruler.
         - unimpeded_cost (dict[int, float | None]): the broadcast ruler; a None entry means denied.
-        - turnaround_s (float | None): arms ``try_repair``'s paired-leg precedence guard; without it
-          a repair may land an outbound after its return has departed, or shed a return's hold until
-          it lifts off before its own aircraft is back (a precedence break ``verify`` cannot see).
         - frozen_flight_ids (frozenset[int]): non-movable flights; omitting them lets destroy pick
           frozen flights while the membership assert still passes on the worker's own (wrong) set.
         - movable_uss_ids (frozenset[str] | None): USS movability filter, forwarded for the same
@@ -574,7 +568,6 @@ class LNSState:
             static_terms=static_terms,
             frozen_flight_ids=frozen_flight_ids,
             movable_uss_ids=movable_uss_ids,
-            turnaround_s=turnaround_s,
             repair_planner=planner,
             incremental_release=incremental_release,
             unimpeded_cost=unimpeded_cost,
@@ -807,43 +800,6 @@ class LNSState:
                 out.append((s, (q, r, level)))
         return out
 
-    # ------------------------------------------------------------------- transaction guards
-    def _precedence_broken(self, new: dict) -> bool:
-        """Would adopting ``new`` push a paired return further ahead of its aircraft's release?
-
-        One predicate over the PAIR, not two branches keyed by which leg moved. Whichever leg this
-        repair touched, the pair is re-scored the same way `verify` scores it, and the partner is
-        read from ``new`` when the same transaction moved it too — so the verdict does not depend on
-        repair order, and a pair with both legs repaired is judged once, from both new plans. A
-        caller must invoke it on the geometry it would ADOPT, after any refinement.
-
-        Parameters
-        ------------
-        - new (dict[int, OperationalIntent]): this transaction's repaired plans, by flight id.
-
-        Return
-        --------
-        - output (bool): True iff some touched pair's precedence shortfall exceeds the shortfall it
-          carried in the baseline; always False when the baseline has no ``turnaround_s``.
-        """
-        if self._turnaround_s is None:
-            return False
-        seen: set[int] = set()
-        for fid in new:
-            out_fid = self._outbound_of_pair.get(fid)
-            if out_fid is None or out_fid in seen:
-                continue
-            seen.add(out_fid)
-            ret_fid = self._pair_of[out_fid]
-            outbound = new.get(out_fid) or self.incumbent.get(out_fid)
-            ret = new.get(ret_fid) or self.incumbent.get(ret_fid)
-            if outbound is None or ret is None:
-                continue          # partner denied or not in this state: nothing to preserve
-            short = pair_precedence_shortfall(outbound, ret, self._turnaround_s)
-            if short > self._pair_shortfall.get((out_fid, ret_fid), 0.0) + 1e-6:
-                return True
-        return False
-
     # ------------------------------------------------------------------- shortcut arms
     def _shortcut_repaired(self, new: dict, order) -> None:
         """Refine each freshly-repaired flight against the OTHER repaired plans; mutate ``new``.
@@ -963,13 +919,10 @@ class LNSState:
                 if rec_src is not None:
                     envelopes.append(rec_src.last_envelope)
 
-            # A2: tighten the whole neighborhood BEFORE the precedence guard and the accept test, so
-            # both weigh the geometry that would be adopted.
+            # A2: tighten the whole neighborhood BEFORE the accept test, so the test weighs the
+            # geometry that would be adopted.
             if reason == "improved" and self.shortcut_repair == "deferred":
                 self._shortcut_repaired(new, order)
-
-            if reason == "improved" and self._precedence_broken(new):
-                reason = "anchor"
 
             cost_new = float(sum(it.cost for it in new.values())) if reason == "improved" else math.inf
             if reason == "improved" and cost_new < cost_old - accept_epsilon:
@@ -977,24 +930,19 @@ class LNSState:
                 # rejected repair never pays for a cut. `cost_new` is then RESTATED from the refined
                 # plans; leaving the pre-cut figure would make `total_cost` disagree with the sum of
                 # the incumbent's own costs, which is the number every later accept test reads.
-                # Precedence is re-checked because the geometry the guard cleared has just changed.
                 if self.shortcut_repair == "post_accept":
                     self._shortcut_repaired(new, order)
                     cost_new = float(sum(it.cost for it in new.values()))
-                    if self._precedence_broken(new):
-                        reason = "anchor"
-                if reason == "improved":
-                    candidate = RepairOutcome(
-                        True, "improved", cost_old, cost_new, len(new),
-                        new_intents=dict(new), envelopes=tuple(envelopes),
-                    )
-                    if not report_only:
-                        # Inside the try as well: this rewrites the incumbent, running cost, and
-                        # claim index, so a raise part-way would otherwise leave them describing a
-                        # schedule the ledger does not hold. LEDGER-FREE: the loop already committed
-                        # the plans.
-                        self._apply_in_memory(new, applied)
-                        return candidate
+                candidate = RepairOutcome(
+                    True, "improved", cost_old, cost_new, len(new),
+                    new_intents=dict(new), envelopes=tuple(envelopes),
+                )
+                if not report_only:
+                    # Inside the try as well: this rewrites the incumbent, running cost, and claim
+                    # index, so a raise part-way would otherwise leave them describing a schedule
+                    # the ledger does not hold. LEDGER-FREE: the loop already committed the plans.
+                    self._apply_in_memory(new, applied)
+                    return candidate
         except BaseException:
             self._rewind(victims, old, cost_at_entry, applied)
             raise

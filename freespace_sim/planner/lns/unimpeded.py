@@ -80,6 +80,7 @@ def _new_ruler(cfg, static_terms, shortcut: bool = False):
     """
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner.astar import AStarPlanner
+    from freespace_sim.planner.itinerary import ItineraryPlanner
 
     free = ReservationLedger(cfg)
     for center, term in static_terms:
@@ -94,8 +95,14 @@ def _new_ruler(cfg, static_terms, shortcut: bool = False):
     if shortcut:
         from freespace_sim.planner.shortcut import ShortcutRefiner
 
-        return ShortcutRefiner(planner, label="astar_sc"), free
-    return planner, free
+        # INSIDE the itinerary wrapper, exactly as `get_planner` composes `astar_shortcut`: the
+        # refiner must see one leg at a time. Outside, it would be handed the composed round trip,
+        # whose centerline runs origin -> dest -> origin around a mandatory ground dwell.
+        planner = ShortcutRefiner(planner, label="astar_sc")
+    # Wrapped for the same reason the repair planner is: a round trip ruled as its outbound leg alone
+    # would report roughly half its unimpeded cost, inflating every `delay()` premium that picks
+    # victims and orders repair.
+    return ItineraryPlanner(planner), free
 
 
 def _plan_shard(cfg, static_terms, requests, planner=None, free=None, shortcut: bool = False):
@@ -231,8 +238,8 @@ def unimpeded_costs(cfg, static_terms, requests, *, n_workers=1, log_every=1000,
     W = min(n_workers, len(rest))
     log.info("lns: unimpeded baseline on %d workers (%d flights, ~%.0fs sequential)",
              W, n, projected)
-    # Round-robin, not contiguous: adjacent flights are the same delivery's legs, so a contiguous
-    # split would hand one worker a whole slow region.
+    # Round-robin, not contiguous: neighbouring flight ids share a hub and a filing window, so a
+    # contiguous split would hand one worker a whole slow region.
     shards = [rest[w::W] for w in range(W)]
     conns, procs = [], []
     by_worker: list = [None] * W

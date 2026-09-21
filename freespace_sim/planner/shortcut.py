@@ -517,8 +517,16 @@ def can_refine(intent: OperationalIntent, strategy: _ShortcutStrategy = "single_
     E-F-G blind spot at two, without silently changing ``astar_shortcut``'s A/B baseline. Public
     because a caller that must RELEASE a flight before refining it wants to skip that round trip —
     and a hardcoded ``<= 3`` at its end both duplicates this rule and omits ``batched_turns``.
+
+    A COMPOSED itinerary is refused. Its centerline runs origin -> dest -> origin around a mandatory
+    ground dwell, and this refiner splices interior knots against an origin/dest detour budget, so
+    it would measure the round trip against a one-way reference and can cut the delivery stop out of
+    the middle. Round trips are refined per LEG, underneath ``ItineraryPlanner`` — the order
+    ``get_planner`` composes — and a leg carries ``return_to_origin=False`` (``ItineraryPlanner._leg``),
+    so this refuses only the composed intent, never the legs it is built from.
     """
     return bool(intent.accepted and intent.centerline
+                and not intent.request.return_to_origin
                 and len(intent.centerline) > (2 if strategy == "batched_turns" else 3))
 
 

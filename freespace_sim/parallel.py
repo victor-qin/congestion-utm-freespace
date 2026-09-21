@@ -105,6 +105,45 @@ class PlanEnvelope:
     t_hi: float
     unbounded: bool = False
 
+    def union(self, other: "PlanEnvelope | None", cfg: SimConfig) -> "PlanEnvelope":
+        """
+        The read set covering both this plan and ``other``.
+
+        A planner clears ``last_envelope`` at the top of every ``plan`` call, so a flight planned in
+        more than one call (a round-trip itinerary: one call per leg) would otherwise be summarised
+        by its LAST leg alone, and a commit landing in an earlier leg's read set would be judged
+        clean. Widening is always safe here — an envelope that claims more reads than happened costs
+        a replan, never a missed one.
+
+        Parameters
+        ------------
+        - other (PlanEnvelope | None): the other plan's envelope; ``None`` yields ``self``
+        - cfg (SimConfig): the lattice geometry, to re-derive ``xy`` from the unioned ``cell_bbox``
+
+        Return
+        --------
+        - envelope (PlanEnvelope): covers both read sets; unbounded if either side is
+        """
+        if other is None:
+            return self
+        lo, hi = min(self.t_lo, other.t_lo), max(self.t_hi, other.t_hi)
+        # Dedup: a round trip's two legs share both endpoints, so concatenating would make
+        # `envelope_intersects` re-test the same disc for every candidate commit.
+        hubs = tuple(dict.fromkeys(self.hub_reads + other.hub_reads))
+        if self.unbounded or other.unbounded:
+            return PlanEnvelope(None, None, hubs, lo, hi, unbounded=True)
+        a, b = self.cell_bbox, other.cell_bbox
+        # cell_bbox alternates (min, max) per axis. A None side probed nothing, so it widens nothing.
+        cell = a if b is None else b if a is None else tuple(
+            min(x, y) if i % 2 == 0 else max(x, y) for i, (x, y) in enumerate(zip(a, b)))
+        # `xy` is DERIVED from `cell`, never unioned alongside it: the axial->world map is a shear
+        # (x = R*sqrt3*(q + r/2)), so xmin depends jointly on q and r and the AABB of the unioned
+        # cell box is strictly larger than the union of the two AABBs. Unioning `xy` separately
+        # would leave the two fields describing different regions, breaking the invariant this
+        # class documents and any consumer that re-derives one from the other.
+        return PlanEnvelope(cell, None if cell is None else cell_bbox_to_aabb(cell, cfg),
+                            hubs, lo, hi)
+
 
 def _disc_hits_aabb(cx: float, cy: float, radius: float, a) -> bool:
     """Does the xy disc intersect the volume AABB ``(xmin, ymin, zmin, xmax, ymax, zmax)``?

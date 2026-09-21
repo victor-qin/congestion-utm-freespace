@@ -40,6 +40,7 @@ from ..types import (DenialReason, FlightRequest, IntentStatus, OperationalInten
 from ..volumes import (build_reservation_from_corners, enroute_detour_m,
                        enroute_flown_m, enroute_reference_m, fold_corners_to_columns)
 from .hexgrid import max_lane_traverse_s
+from .itinerary import reject_itinerary
 from .straight import StraightLineTimeShift
 from .terminal_capacity import TerminalCapacity
 
@@ -143,6 +144,7 @@ class MILPOptPlanner:
         - output (OperationalIntent): the cheaper accepted warm/MILP intent, or a REJECTED intent
           carrying the denial reason when neither is admissible (``planner`` is always "milp").
         """
+        reject_itinerary(req, "milp")
         warm = self.warm_planner.plan(req, ledger, cfg)   # candidate + fallback (+ delay if fixed)
         fixed = None if self.optimize_delay else (warm.ground_delay_s if warm.accepted else 0.0)
         ref = warm.centerline if (self.lock_homotopy and warm.accepted and warm.centerline) else None

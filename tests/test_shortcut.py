@@ -31,10 +31,11 @@ def _wall_led():
 
 
 def test_get_planner_registers_shortcut_variants():
-    legacy = get_planner("astar_shortcut")
-    heading = get_planner("astar_heading_shortcut")
-    batched = get_planner("astar_batched_shortcut")
-    sandwich = get_planner("astar_milp_shortcut")
+    # `.inner` unwraps the itinerary wrapper; the refiner underneath is what this test is about.
+    legacy = get_planner("astar_shortcut").inner
+    heading = get_planner("astar_heading_shortcut").inner
+    batched = get_planner("astar_batched_shortcut").inner
+    sandwich = get_planner("astar_milp_shortcut").inner
     assert isinstance(legacy, ShortcutRefiner) and legacy.strategy == "single_knot"
     assert isinstance(heading, ShortcutRefiner) and heading.strategy == "single_knot_heading"
     assert heading.label == legacy.label == "astar_sc"
@@ -1010,3 +1011,21 @@ def test_shortcut_reuses_the_inner_capacity_authority():
 
     # ...and correctly ABSENT for a ledger this planner never planned against
     assert shortcut_mod.terminal_capacity_for(astar, ReservationLedger(CFG)) is None
+
+
+def test_a_composed_round_trip_is_never_spliced():
+    """A round trip is ONE flight whose centerline runs origin -> dest -> origin around the delivery
+    dwell. The refiner splices interior knots and measures the result against an origin->dest
+    reference, so refining the composed intent could cut the delivery stop out of the middle.
+    Round trips are refined per LEG, beneath ItineraryPlanner — the order `get_planner` composes."""
+    led = ReservationLedger(CFG)
+    composed = get_planner("astar").plan(
+        FlightRequest(1, vec(0, 0, 0), vec(2400, 0, 0), 0.0, return_to_origin=True), led, CFG)
+    assert composed.accepted and composed.request.return_to_origin
+    assert len(composed.centerline) > 3          # long enough that the 3-point floor is not the refuser
+    assert not shortcut_mod.can_refine(composed)
+    assert shortcut_mod.refine_intent(composed, led, CFG, tcap=None) is composed
+
+    leg = get_planner("astar").plan(_req(), led, CFG)     # the one-way legs stay refinable
+    assert not leg.request.return_to_origin
+    assert shortcut_mod.can_refine(leg)

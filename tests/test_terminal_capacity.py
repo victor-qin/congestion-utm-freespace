@@ -22,7 +22,7 @@ from freespace_sim.types import DenialReason, FlightRequest, Terminal, vec
 from freespace_sim.volumes import Volume4D, hover_reservation
 
 CFG = SimConfig()
-DWELL = CFG.hover_time_s + CFG.climb_time_s   # a column cylinder's committed lifetime (55 s default)
+DWELL = CFG.hover_time_s + CFG.climb_time_s   # a column cylinder's committed lifetime
 
 
 def _col(center_xy=(1000.0, 1000.0), t0=0.0, tid="H", radius=90.0):

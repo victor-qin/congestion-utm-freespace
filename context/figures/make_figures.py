@@ -734,6 +734,47 @@ def fig_hover_tail_steps() -> None:
     _save(fig, "hover_tail_steps")
 
 
+def fig_itinerary_reservation() -> None:
+    """One round-trip itinerary: what it reserves at each pad, and for how long."""
+    # Geometry from a real planned itinerary (hub -> customer 2 km away, turnaround_s=180):
+    # (t_start, t_end, z_lo, z_hi, label_key). The dwell runs 183.5 s, not 180 — the return's
+    # realized takeoff slipped past the nominal turnaround, which is exactly why the box is
+    # sized from both legs' results rather than from the request.
+    CUST = "#5b9bd5"
+    pads = [(0.0, 28.5, 0.0, 125.0, BLUE),      # hub column: leg 1 takeoff
+            (84.0, 112.5, 0.0, 125.0, CUST),    # customer column: leg 1 descent
+            (112.5, 296.0, 0.0, 5.0, GREEN),    # customer GROUND BOX: parked
+            (296.0, 324.5, 0.0, 125.0, CUST),   # customer column: leg 2 climb
+            (380.0, 408.5, 0.0, 125.0, BLUE)]   # hub column: leg 2 landing
+    fig, ax = plt.subplots(figsize=(11.0, 4.4))
+    for t0, t1, z0, z1, color in pads:
+        ax.add_patch(Rectangle((t0, z0), t1 - t0, z1 - z0, fc=color, ec="white", lw=1.4,
+                               alpha=0.9, zorder=3))
+        ax.text((t0 + t1) / 2, z1 + 4, f"{t1 - t0:.0f}s", ha="center", fontsize=8.5, color=color)
+    # Two flown legs at cruise altitude; the gap between them is the dwell, which is NOT flown.
+    for t0, t1 in ((16.0, 84.0), (312.0, 380.0)):
+        ax.plot([t0, t1], [75.0, 75.0], color=RAW, lw=1.6, ls="--", zorder=4)
+    ax.axhline(5.0, color=GREEN, lw=0.8, ls=":")
+    ax.text(-12, 8, "ground_box_height_m", fontsize=8, color=GREEN, va="bottom", ha="left")
+    ax.annotate("aircraft parked: another flight may overfly,\nbut none may land here",
+                xy=(258, 5), xytext=(258, 46), ha="center", fontsize=8.5, color=GREEN,
+                arrowprops=dict(arrowstyle="->", color=GREEN, lw=0.9))
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("altitude (m)")
+    ax.set_ylim(-6, 151)
+    ax.set_xlim(-20, 470)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(handles=[Rectangle((0, 0), 1, 1, fc=BLUE, label="hub column (full height)"),
+                       Rectangle((0, 0), 1, 1, fc=CUST, label="customer column: descent / climb"),
+                       Rectangle((0, 0), 1, 1, fc=GREEN, label="customer GROUND BOX: parked"),
+                       plt.Line2D([], [], color=RAW, ls="--", label="flown centerline")],
+              loc="upper center", ncol=4, fontsize=8.5, frameon=False)
+    ax.set_title("One round-trip itinerary: what it reserves, and for how long\n"
+                 "the full column is held only while the aircraft sweeps it",
+                 fontsize=11.5, fontweight="bold", loc="left")
+    _save(fig, "itinerary_reservation")
+
+
 def fig_sipp_safe_intervals() -> None:
     """sipp: per-cell safe intervals (left) and safe-interval successor expansion (right)."""
     fig, (axl, axr) = plt.subplots(1, 2, figsize=(11.5, 4.6))
@@ -1261,7 +1302,7 @@ FIGURES = (
     fig_hex_lattice_overhead, fig_read_envelope,
     fig_search_window, fig_hex_layout, fig_rasterisation_coverage, fig_cell_blocking,
     fig_takeoff_fan, fig_batched_turns, fig_milp_obstacles, fig_hover_tail_steps,
-    fig_sipp_safe_intervals,
+    fig_sipp_safe_intervals, fig_itinerary_reservation,
     fig_lns_anytime_loop, fig_lns_destroy_operators, fig_lns_drop_vs_sync,
     fig_od_hop_ellipse, fig_pricing_dag, fig_label_dp_dominance, fig_completion_envelope,
     fig_cg_loop, fig_pricing_pool_schedule,

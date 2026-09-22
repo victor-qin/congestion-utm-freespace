@@ -650,8 +650,8 @@ def test_overlapping_terminal_columns_book_no_enroute_detour(planner):
     ``enroute_reference_m`` clamps to 0 when two column radii cover the whole trip, and
     ``max(0.0, flown - 0.0)`` then charged the ENTIRE flown path as ``air_detour_m`` — real seconds
     and real cost — while the ``max_detour_factor`` gate was skipped by its own ``> _EPS`` guard.
-    Reachable through a shipped flag: ``--corridor-overlap -100`` (``exit_radius`` documents negative
-    overlap as "leaves a clearance gap"), which pushes exit_radius to 310 m.
+    Reachable with a per-hub ``Terminal.radius`` of 310 m (``exit_radius`` is the column radius), which
+    covers the whole 250 m trip.
     """
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner import get_planner
@@ -661,7 +661,7 @@ def test_overlapping_terminal_columns_book_no_enroute_detour(planner):
     cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
                     region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0,
                     max_detour_factor=1.2)
-    hub = Terminal("hub#0", 8, 180.0, -100.0)          # exit_radius 310 m > the 250 m trip
+    hub = Terminal("hub#0", 8, 310.0)                  # exit_radius 310 m > the 250 m trip
     req = FlightRequest(1, vec(5000, 5000, 0), vec(5000, 5250, 0), 0.0, origin_terminal=hub)
     # guard the guard: this configuration must actually reach the clamp
     assert enroute_reference_m(req.origin, req.dest, hub, None, cfg) == 0.0, "clamp not reached"

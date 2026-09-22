@@ -329,8 +329,8 @@ def _terminal_graph(cfg):
     """A graph whose endpoints are both terminals, so the *term* row branch is reached."""
 
     origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
-    origin_terminal = Terminal("cache-A", 1, radius=90.0)
-    dest_terminal = Terminal("cache-B", 1, radius=90.0)
+    origin_terminal = Terminal("cache-A", 1, radius=120.0)
+    dest_terminal = Terminal("cache-B", 1, radius=120.0)
     request = FlightRequest(
         7, origin, dest, 0.0, 0.0,
         origin_terminal=origin_terminal,

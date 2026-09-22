@@ -560,7 +560,7 @@ def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
 def test_static_catalog_is_shared_without_rebuilding_terminal_cells(monkeypatch):
     cfg = _cfg()
     terminals = tuple(
-        (_ground_point(cell, cfg), Terminal(f"wall-{index}", 1, radius=90.0))
+        (_ground_point(cell, cfg), Terminal(f"wall-{index}", 1, radius=120.0))
         for index, cell in enumerate(((40, 40), (50, 50), (60, 60)))
     )
     calls = 0
@@ -595,7 +595,7 @@ def test_many_far_walls_never_reach_narrow_phase(monkeypatch):
     terminals = tuple(
         (
             _ground_point((80 + index, 80), cfg),
-            Terminal(f"far-{index}", 1, radius=90.0),
+            Terminal(f"far-{index}", 1, radius=120.0),
         )
         for index in range(100)
     )
@@ -719,7 +719,7 @@ def test_corridor_prune_removes_foreign_terminal_cells():
         0.0,
     )
     foreign_center = _ground_point((0, 0), cfg)
-    foreign = Terminal("foreign", 4, radius=90.0)
+    foreign = Terminal("foreign", 4, radius=120.0)
     fg = build_flight_graph(
         req,
         cfg,
@@ -735,7 +735,7 @@ def test_corridor_prune_removes_foreign_terminal_cells():
 
 def test_customer_endpoint_disk_cannot_overlap_foreign_static_terminal():
     cfg = _cfg()
-    foreign = Terminal("foreign", 4, radius=90.0)
+    foreign = Terminal("foreign", 4, radius=120.0)
     # Snaps outside terminal_cells, but 149.82 m < 90 m wall + 60 m customer cylinder.
     origin = vec(-137.5, -59.5, 0.0)
     assert hg.enu_to_axial(*origin[:2], hg.circumradius(cfg)) not in hg.terminal_cells(
@@ -757,8 +757,8 @@ def test_hop_overlapping_both_endpoint_walls_is_rejected():
     cfg = _cfg()
     origin = vec(5.0, -55.0, 0.0)
     dest = vec(345.0, 60.0, 0.0)
-    origin_terminal = Terminal("A", 1, radius=90.0)
-    dest_terminal = Terminal("B", 1, radius=90.0)
+    origin_terminal = Terminal("A", 1, radius=120.0)
+    dest_terminal = Terminal("B", 1, radius=120.0)
     assert hg.terminal_cells(origin, origin_terminal, cfg).isdisjoint(
         hg.terminal_cells(dest, dest_terminal, cfg)
     )
@@ -806,8 +806,8 @@ def test_resampled_endpoint_hop_with_separate_tags_is_not_falsely_forbidden():
     cfg = _cfg()
     origin = _ground_point((1, 39), cfg)
     dest = _ground_point((-2, 42), cfg)
-    origin_terminal = Terminal("A", 1, radius=90.0)
-    dest_terminal = Terminal("B", 1, radius=90.0)
+    origin_terminal = Terminal("A", 1, radius=120.0)
+    dest_terminal = Terminal("B", 1, radius=120.0)
     req = FlightRequest(
         116,
         origin,
@@ -972,7 +972,7 @@ def test_hub_geometry_requires_its_enabling_config(make_cfg, raises_match):
     """
 
     cfg = make_cfg()
-    hub = Terminal("hub", 1, radius=90.0)
+    hub = Terminal("hub", 1, radius=120.0)
     hub_req = FlightRequest(
         117,
         _ground_point((0, 0), cfg),
@@ -1015,7 +1015,7 @@ def test_hub_geometry_requires_its_enabling_config(make_cfg, raises_match):
 def test_terminal_lane_to_same_customer_cell_cannot_form_zero_hop_column():
     cfg = _cfg()
     hub = vec(0.0, 0.0, 0.0)
-    terminal = Terminal("hub", 1, radius=90.0)
+    terminal = Terminal("hub", 1, radius=105.0)     # smallest admissible column: 105 + 60 m hover < 170
     customer = vec(170.0, 0.0, 0.0)
     req = FlightRequest(115, hub, customer, 0.0, origin_terminal=terminal)
     fg = build_flight_graph(
@@ -1088,7 +1088,7 @@ def test_column_requires_integral_network_clock_and_coordinates():
 
 def _translation_fixture(kind: str):
     cfg = _cfg()
-    terminal = Terminal(f"hub-{kind}", 2, radius=90.0)
+    terminal = Terminal(f"hub-{kind}", 2, radius=120.0)
     if kind == "clean":
         hub_cell = (0, 0)
         path = ((1, 0), (2, 0), (3, 0), (4, 0))
@@ -1260,8 +1260,8 @@ def test_translated_hops_stay_on_integer_clock_and_preserve_row_coverage(
 @pytest.mark.parametrize("endpoint_kinds", ["hub-hub", "hub-customer", "customer-customer"])
 def test_column_delay_equals_metrics_total_delay(endpoint_kinds):
     cfg = _cfg()
-    term_a = Terminal(f"A-{endpoint_kinds}", 3, radius=90.0)
-    term_b = Terminal(f"B-{endpoint_kinds}", 2, radius=90.0)
+    term_a = Terminal(f"A-{endpoint_kinds}", 3, radius=120.0)
+    term_b = Terminal(f"B-{endpoint_kinds}", 2, radius=120.0)
 
     if endpoint_kinds == "hub-hub":
         origin = _ground_point((0, 0), cfg)
@@ -1655,7 +1655,7 @@ def test_hub_terminal_rows_cover_dwell_overlap(time_buffer_s, hub_endpoint):
     """Production column claims mirror pad dwell rows for takeoff and landing hubs."""
 
     cfg = _cfg(time_buffer_s=time_buffer_s)
-    terminal = Terminal(f"terminal-{hub_endpoint}", 3, radius=90.0)
+    terminal = Terminal(f"terminal-{hub_endpoint}", 3, radius=120.0)
     hub = _ground_point((0, 0), cfg)
     customer = _ground_point((7, 0), cfg, 9.0, -4.0)
     if hub_endpoint == "origin":
@@ -1734,7 +1734,7 @@ def test_terminal_claim_steps_are_exact_half_open_periods():
 def test_origin_terminal_cylinder_uses_exact_departure_clock():
     dt = 7.50045227268982
     cfg = replace(_cfg(), dt_s=dt, max_ground_delay_s=6000.0)
-    terminal = Terminal("H", 1, radius=90.0)
+    terminal = Terminal("H", 1, radius=120.0)
     req = FlightRequest(
         504,
         _ground_point((0, 0), cfg),

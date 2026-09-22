@@ -23,7 +23,6 @@ import math
 import sys
 import warnings
 from collections import Counter
-from dataclasses import replace
 
 import numpy as np
 
@@ -40,13 +39,16 @@ from ...types import (
 )
 from ...volumes import (
     column_dwell_s,
+    corridor_box_reaches_column,
     corridor_segment_volume,
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
     exit_radius,
     hover_reservation,
-    segment_overlaps_column,
+    lane_link_volume,
+    TAG_MARGIN_M,
+    Volume4D,
     terminal_radius,
 )
 from ..itinerary import reject_itinerary
@@ -1175,9 +1177,10 @@ class AStarPlanner:
         "exit lane") begins at the column EDGE (see context/figures/fold_corners.png and
         exit_radius.png). In-column waypoints are folded away — the centre→edge leg is flown but NOT
         reserved, since the vertiport handles its own traffic tactically (same-hub flights may share
-        that space). Only the exit lane + cruise reach the ledger, where corridor boxes stay strict
-        (untagged): two flights can't occupy one exit lane at once, while divergent same-hub
-        launches go concurrently.
+        that space). From the column edge outward everything is filed: the tagged link box
+        (``lane_link_volume``, when the first corridor box does not itself reach the column), then
+        the exit lane + cruise, where corridor boxes stay strict against each other: two flights
+        can't occupy one exit lane at once, while divergent same-hub launches go concurrently.
 
         Parameters
         ------------
@@ -1213,15 +1216,15 @@ class AStarPlanner:
         d_r = terminal_radius(dest_term, cfg) if dest_term is not None else 0.0
         for (a, ta), (b, tb) in zip(wps, wps[1:]):
             # Tag EVERY box that reaches into its hub's OWN column, not just the first/last exit
-            # lane (see context/figures/segment_overlaps_column.png), so the column-involved
+            # lane (exact rectangle test, see context/figures/exit_radius.png), so the column-involved
             # exemption covers the whole in-column reach; an untagged cruise box grazing the shared
             # column would conflict (different tid) at commit. The number of such boxes is
             # geometry-dependent (radius × exit angle), so we test each box, not a fixed index. Far
             # cruise boxes stay untagged; two same-hub boxes still conflict (box↔box), so
             # same-direction launches contend — serialised by is_blocked cell occupancy under fixed
             # lanes, or by exit_clear on the legacy path.
-            tid = (origin_term.id if origin_term is not None and segment_overlaps_column(a, b, o_xy, o_r, cfg)
-                   else dest_term.id if dest_term is not None and segment_overlaps_column(a, b, d_xy, d_r, cfg)
+            tid = (origin_term.id if origin_term is not None and corridor_box_reaches_column(a, b, o_xy, o_r, cfg, TAG_MARGIN_M)
+                   else dest_term.id if dest_term is not None and corridor_box_reaches_column(a, b, d_xy, d_r, cfg, TAG_MARGIN_M)
                    else None)
             edges.append(corridor_segment_volume(a, ta, b, tb, cfg, terminal_id=tid))
             centerline.append((b.copy(), tb))
@@ -1230,17 +1233,20 @@ class AStarPlanner:
             if horiz < _EPS and abs(float(b[2] - a[2])) < _EPS:   # genuine hover (a layer change is not)
                 n_hover += 1
         if cfg.fixed_exit_lanes and edges:
-            # Force the hub tag on the first/last (boundary-cell) box: it leaves from / arrives at the
-            # column edge and can graze the shared column, and an untagged box grazing it would conflict
-            # at commit (different tid) — the cruise-box-clip. segment_overlaps_column tags interior
-            # boxes; this guarantees the boundary box too.
-            if origin_term is not None:
-                edges[0] = replace(edges[0], terminal_id=origin_term.id)
-            # When a single-box corridor is both the origin exit and the dest approach (a degenerate
-            # hub→hub short hop), edges[-1] IS edges[0]; tag dest only when it is a distinct box, so it
-            # can't clobber the origin tag above (which would conflict the box against the origin column).
-            if dest_term is not None and not (origin_term is not None and len(edges) == 1):
-                edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
+            # A boundary box that reaches its column is tagged above and IS the exit lane; one that does
+            # NOT reach it gets a tagged link box (column edge → cell centre) filed in front of / behind
+            # it, so the egress leg is never unfiled (see volumes.lane_link_volume). A single-box hub→hub
+            # hop is the origin's exit only, so it files at most the outbound link.
+            links_out: list[Volume4D] = []
+            links_in: list[Volume4D] = []
+            if origin_term is not None and not corridor_box_reaches_column(wps[0][0], wps[1][0], o_xy, o_r, cfg):
+                links_out.append(lane_link_volume(origin, o_r, wps[0][0], wps[0][1], cfg,
+                                                  origin_term.id, outbound=True))
+            if (dest_term is not None and not (origin_term is not None and len(edges) == 1)
+                    and not corridor_box_reaches_column(wps[-2][0], wps[-1][0], d_xy, d_r, cfg)):
+                links_in.append(lane_link_volume(dest, d_r, wps[-1][0], wps[-1][1], cfg,
+                                                 dest_term.id, outbound=False))
+            edges = links_out + edges + links_in
         t_takeoff = (base + ground_steps) * cfg.dt_s
         t_arrive = wps[-1][1]
         # the takeoff/landing columns span the regulated tube (z_hi defaults to airspace_ceiling_m);

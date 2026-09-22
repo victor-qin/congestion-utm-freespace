@@ -195,7 +195,7 @@ class SafeIntervalIndex:
         - output (bool): True if the hex centre falls within any disc.
         """
         c = hg.hex_center(q, r, self.R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
+        return any(hg.centre_in_column(c[0], c[1], cx, cy, rad) for cx, cy, rad in cols)
 
     def _add(self, vol, own_cols, _rows=None) -> None:
         """Rasterize one volume into ``corr``/``cols`` (and the journal in removal mode).

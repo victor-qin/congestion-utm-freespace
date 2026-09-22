@@ -526,7 +526,7 @@ def test_read_envelope_covers_the_landing_dwell_traverse():
     Load-bearing anchor: for a fixed request the radius enters ``t_hi`` through exactly TWO terms —
     ``search_horizon``'s takeoff term carries the worst origin-lane steps (one traverse), and
     ``_mk_envelope`` adds the worst-end traverse again for the dwell read past the last step — so
-    ``t_hi(350) - t_hi(90) == 2 * (traverse(350) - traverse(90))``. Dropping EITHER widening drops
+    ``t_hi(350) - t_hi(120) == 2 * (traverse(350) - traverse(120))``. Dropping EITHER widening drops
     the difference to one traverse (or zero for both) and fails this. Anchoring a sliver on
     ``env.t_hi`` alone would slide WITH the fix and pass with it reverted, so it is not used here.
     """
@@ -545,18 +545,18 @@ def test_read_envelope_covers_the_landing_dwell_traverse():
         assert intent.accepted and p.last_envelope is not None
         return p.last_envelope, hg.max_lane_traverse_s(np.asarray(req.dest, float), hub, cfg), cfg, req
 
-    env90, trav90, _, _ = env_at(90.0)
+    env120, trav120, _, _ = env_at(120.0)
     env350, trav350, cfg, req = env_at(350.0)
-    assert trav350 > trav90, "traverse no longer grows with radius — the anchor premise is gone"
+    assert trav350 > trav120, "traverse no longer grows with radius — the anchor premise is gone"
     # Guard the guard: the hover tail alone must NOT cover a last-step dwell read at 350 m, or the
     # widening is unnecessary at this config and the test proves nothing.
     max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
     assert hover_tail_steps(cfg) * cfg.dt_s < cfg.hover_time_s + max_climb + trav350, \
         "hover tail covers the traverse at this config — the test lost its bite"
-    # The widening itself, pinned against the fix-independent r=90 run: one traverse from the
+    # The widening itself, pinned against the fix-independent r=120 run: one traverse from the
     # search-horizon lane term + one from the envelope's dwell-read term.
-    assert math.isclose(env350.t_hi - env90.t_hi, 2.0 * (trav350 - trav90), abs_tol=1e-9), (
-        f"t_hi grew by {env350.t_hi - env90.t_hi:.1f}s, expected {2.0 * (trav350 - trav90):.1f}s — "
+    assert math.isclose(env350.t_hi - env120.t_hi, 2.0 * (trav350 - trav120), abs_tol=1e-9), (
+        f"t_hi grew by {env350.t_hi - env120.t_hi:.1f}s, expected {2.0 * (trav350 - trav120):.1f}s — "
         "either the horizon lane term or the envelope traverse term is missing")
     # ... and the semantics: a commit 1 s past the unwidened bound, at the dest hub, reads DIRTY.
     d = np.asarray(req.dest, float)

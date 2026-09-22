@@ -99,7 +99,7 @@ def test_column_and_exit_lane_box_are_tagged_cruise_is_not():
     # tag; cruise boxes stay untagged. The column-involved exemption (conflict.py) then lets the
     # exit-lane box pass through its own column while two same-hub boxes still conflict.
     req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
-                        origin_terminal=Terminal("H", 4, corridor_overlap=40.0))
+                        origin_terminal=Terminal("H", 4))
     res = run(_astar(), requests=[req])
     vols = res.accepted[0].volumes
     tagged_cyl = [v for v in vols if v.terminal_id == "H" and isinstance(v.shape, CylinderSpec)]
@@ -107,19 +107,6 @@ def test_column_and_exit_lane_box_are_tagged_cruise_is_not():
     assert tagged_cyl                                       # the shared column is tagged
     assert tagged_box                                       # the exit-lane box is now tagged too
     assert any(v.terminal_id is None for v in vols if isinstance(v.shape, BoxSpec))   # cruise boxes are not
-
-
-def test_corridor_overlap_controls_perimeter_start():
-    # the overlap is a *geometry* knob for the LEGACY fold (fixed_exit_lanes off): bigger overlap →
-    # corridor starts deeper inside the terminal. (Fixed lanes root the exit at the boundary cell, not
-    # the overlap-controlled fold, so this knob is legacy-only.)
-    def start_dist(overlap):
-        req = FlightRequest(0, vec(1500, 1500, 0), vec(4000, 1500, 0), 0.0,
-                            origin_terminal=Terminal("H", 4, corridor_overlap=overlap))
-        first = np.array(run(_astar(fixed_exit_lanes=False), requests=[req]).accepted[0].centerline[0][0])[:2]
-        return float(np.linalg.norm(first - np.array([1500.0, 1500.0])))
-
-    assert start_dist(40.0) < start_dist(0.0)   # more overlap → starts closer to the hub centre
 
 
 # --- Phase B: pad capacity — N concurrent same-hub launches, then ground delay ----------------
@@ -167,7 +154,7 @@ _REGION = (8000.0, 8000.0)
 _HUB = (4000.0, 4000.0)
 
 
-@pytest.mark.parametrize("radius", [60.0, 150.0, 300.0])
+@pytest.mark.parametrize("radius", [120.0, 150.0, 300.0])
 def test_no_untagged_cruise_box_enters_the_shared_column(radius):
     # FOLD-BACK regression. The exit lane starts FLUSH with the column edge (default overlap=0) and the
     # first box is TAGGED with the hub — it may touch the column (the column-involved exemption makes it
@@ -186,7 +173,7 @@ def test_no_untagged_cruise_box_enters_the_shared_column(radius):
     assert cruise and min(d2hub(v) for v in cruise) > radius
 
 
-@pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
+@pytest.mark.parametrize("radius", [120.0, 150.0, 300.0])
 @pytest.mark.parametrize("n", [3, 4, 5])
 def test_divergent_same_hub_launches_are_concurrent(radius, n):
     # The LEGACY path (fixed_exit_lanes off): n flights fanning out from a single hub (capacity n)
@@ -200,7 +187,7 @@ def test_divergent_same_hub_launches_are_concurrent(radius, n):
     assert all(a.ground_delay_s == 0.0 for a in res.accepted)
 
 
-@pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
+@pytest.mark.parametrize("radius", [120.0, 150.0, 300.0])
 def test_pad_capacity_gate_holds_across_radii(radius):
     # Capacity sweep: capacity 3 with 4 fanned-out flights → exactly 3 launch concurrently and
     # the 4th is ground-delayed (admitted, not denied), at every terminal radius. Pins that the dwell
@@ -304,7 +291,7 @@ def _astar_fl(**over):
     return SimConfig(planner="astar", region_size_m=_REGION, fixed_exit_lanes=True, **over)
 
 
-@pytest.mark.parametrize("radius", [90.0, 150.0, 300.0])
+@pytest.mark.parametrize("radius", [120.0, 150.0, 300.0])
 @pytest.mark.parametrize("n", [3, 4, 5])
 def test_divergent_same_hub_launches_concurrent_fixed_lanes(radius, n):
     # flag-on headline: fanned-out flights take DIFFERENT boundary-hex lanes → (nearly) all launch at
@@ -321,13 +308,22 @@ def test_divergent_same_hub_launches_concurrent_fixed_lanes(radius, n):
     assert sum(a.ground_delay_s == 0.0 for a in res.accepted) >= n - 1
 
 
-def test_same_direction_same_hub_launches_do_not_deny_fixed_lanes():
+@pytest.mark.parametrize("hub,dest,radius", [
+    (_HUB, (_HUB[0] + 2500.0, _HUB[1]), 150.0),                # customer pad destination
+    ((0.0, 0.0), (3000.0, 0.0), 120.0),                        # hub → hub, both ON hex centres
+])
+def test_same_direction_same_hub_launches_do_not_deny_fixed_lanes(hub, dest, radius):
     # two deliveries to the SAME destination from one hub (capacity 2) want the SAME exit cell. Pre-fix
     # this was a same-hub exit-lane CONFLICT_FILED; now the second serialises (ground delay) or diverts
-    # to a neighbour lane (detour) — either way both ACCEPT and the run verifies.
-    dest = vec(_HUB[0] + 2500.0, _HUB[1], 0)
-    reqs = [FlightRequest(i, vec(_HUB[0], _HUB[1], 0), dest, 0.0,
-                          origin_terminal=Terminal("H", 2, radius=150.0)) for i in range(2)]
+    # to a neighbour lane (detour) — either way both ACCEPT and the run verifies. The hub→hub case sits
+    # on hex centres so hex_center(1, 0) = (120.0, 0.0) is a lane cell at EXACTLY r: it is a lane, not
+    # interior, so the raster's own-column skip (hexgrid.centre_in_column, strict) must still let a
+    # sibling's claims on it block — an inclusive test let the second launch slip through one step
+    # behind the first (the dest ring makes the diagonal route equally short) and collide at filing.
+    dest_term = Terminal("D", 2, radius=radius) if dest[0] == 3000.0 else None
+    reqs = [FlightRequest(i, vec(hub[0], hub[1], 0), vec(dest[0], dest[1], 0), 0.0,
+                          origin_terminal=Terminal("H", 2, radius=radius), dest_terminal=dest_term)
+            for i in range(2)]
     res = run(_astar_fl(), requests=reqs)
     assert res.verified and len(res.accepted) == 2
     assert any(a.ground_delay_s > 0.0 or a.air_detour_m > 0.0 for a in res.accepted)
@@ -339,10 +335,29 @@ def test_fixed_lane_exit_box_carries_terminal_tag():
     # boxes stay untagged.
     req = FlightRequest(0, vec(_HUB[0], _HUB[1], 0), vec(_HUB[0] + 2500.0, _HUB[1], 0), 0.0,
                         origin_terminal=Terminal("H", 4, radius=150.0))
-    vols = run(_astar_fl(), requests=[req]).accepted[0].volumes
+    cfg = _astar_fl()
+    flight = run(cfg, requests=[req]).accepted[0]
+    vols = flight.volumes
     boxes = [v for v in vols if isinstance(v.shape, BoxSpec)]
     assert boxes[0].terminal_id == "H"                                  # exit lane tagged with the hub
     assert any(v.terminal_id is None for v in boxes)                    # far cruise boxes untagged
+    # The column-edge → lane-centre leg is inside a tagged own box at every instant it is flown: a
+    # 150 m column leaves the lane's first box (rooted at the cell centre, 30 m rear extension) short
+    # of the edge, so the link box (volumes.lane_link_volume) has to carry it.
+    from freespace_sim.conflict import volumes_conflict
+    from freespace_sim.geometry import box_from_segment
+    from freespace_sim.volumes import Volume4D
+    cell, t_cell = flight.centerline[0]
+    hub = np.array([_HUB[0], _HUB[1]])
+    ray = cell[:2] - hub
+    dist = float(np.linalg.norm(ray))
+    edge = hub + ray / dist * 150.0
+    assert dist - 150.0 > cfg.corridor_width_m / 2 + 1.0                 # genuinely a case-B lane
+    for f in np.linspace(0.0, 1.0, 9):
+        p = np.array([*(edge + f * (cell[:2] - edge)), cell[2]])
+        t = t_cell - (1.0 - f) * (dist - 150.0) / cfg.nominal_speed_mps
+        probe = Volume4D(box_from_segment(p, p + np.array([0.01, 0.0, 0.0]), 0.2, 0.2), t, t)
+        assert any(volumes_conflict(probe, v) for v in boxes if v.terminal_id == "H"), f"unfiled at f={f:.2f}"
 
 
 @pytest.mark.parametrize(
@@ -382,7 +397,7 @@ def test_static_terminals_override_walls_a_hub_no_flight_touches():
 
     cfg = _astar(terminal_airspace_always_active=True)
     req = _terminal_req()
-    unused = (vec(_HUB[0] + 1200.0, _HUB[1] + 1200.0, 0.0), Terminal("unused", 1, radius=90.0))
+    unused = (vec(_HUB[0] + 1200.0, _HUB[1] + 1200.0, 0.0), Terminal("unused", 1, radius=120.0))
 
     derived = run(cfg, requests=[req])
     assert "unused" not in derived.ledger._static_terminal_ids, (

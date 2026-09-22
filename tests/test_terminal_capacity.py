@@ -25,7 +25,7 @@ CFG = SimConfig()
 DWELL = CFG.hover_time_s + CFG.climb_time_s   # a column cylinder's committed lifetime
 
 
-def _col(center_xy=(1000.0, 1000.0), t0=0.0, tid="H", radius=90.0):
+def _col(center_xy=(1000.0, 1000.0), t0=0.0, tid="H", radius=120.0):
     """A committed terminal-column cylinder at ``center_xy`` opening at ``t0`` → window [t0, t0+DWELL)."""
     return hover_reservation((center_xy[0], center_xy[1], 0.0), t0, CFG, terminal_id=tid, radius=radius)
 
@@ -56,7 +56,7 @@ def test_reservation_admitted_uses_half_open_capacity_windows():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
     committed = replace(_col(t0=40.0), t_end=70.0)       # incumbent [40, 70)
     tcap.on_commit(1, [committed])
-    term = Terminal("H", 1, radius=90.0)
+    term = Terminal("H", 1, radius=120.0)
 
     overlap = replace(_col(t0=38.33), t_end=81.33)
     touching = replace(_col(t0=70.0), t_end=100.0)
@@ -66,7 +66,7 @@ def test_reservation_admitted_uses_half_open_capacity_windows():
 
 def test_reservation_admitted_respects_capacity_greater_than_one():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
-    term = Terminal("H", 2, radius=90.0)
+    term = Terminal("H", 2, radius=120.0)
     candidate = replace(_col(t0=10.0), t_end=20.0)
 
     tcap.on_commit(1, [replace(_col(t0=0.0), t_end=30.0)])
@@ -78,7 +78,7 @@ def test_reservation_admitted_respects_capacity_greater_than_one():
 def test_reservation_admitted_ignores_unrelated_or_untagged_volumes():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
     tcap.on_commit(1, [replace(_col(t0=0.0), t_end=30.0)])
-    term = Terminal("H", 1, radius=90.0)
+    term = Terminal("H", 1, radius=120.0)
     untagged_cylinder = replace(_col(t0=10.0), terminal_id=None, t_end=20.0)
     unrelated_cylinder = replace(_col(t0=10.0, tid="OTHER"), t_end=20.0)
     matching_box = replace(_foreign_through_hub(), terminal_id="H", t_start=10.0, t_end=20.0)
@@ -94,8 +94,8 @@ def test_reservation_admitted_rejects_inconsistent_capacity_for_one_terminal_id(
     with pytest.raises(ValueError, match="capacity must be constant"):
         tcap.reservation_admitted(
             [_col(t0=10.0)],
-            origin_term=Terminal("H", 2, radius=90.0),
-            dest_term=Terminal("H", 1, radius=90.0),
+            origin_term=Terminal("H", 2, radius=120.0),
+            dest_term=Terminal("H", 1, radius=120.0),
         )
 
 
@@ -108,7 +108,7 @@ def test_on_commit_records_both_cylinders_of_a_roundtrip():
 
 def test_radius_must_be_constant_per_hub():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
-    tcap.on_commit(1, [_col(radius=90.0)])
+    tcap.on_commit(1, [_col(radius=120.0)])
     with pytest.raises(ValueError, match="radius must be constant"):
         tcap.on_commit(2, [_col(radius=150.0)])
 
@@ -119,7 +119,7 @@ def test_column_clear_detects_foreign_transit():
     led = ReservationLedger(CFG)
     led.commit(99, [_foreign_through_hub()])
     tcap = TerminalCapacity(CFG, led)
-    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+    term, center = Terminal("H", 4, radius=120.0), vec(1000, 1000, 0)
     assert not tcap.column_clear(term, center, 0.0)        # the foreign corridor intrudes → not clear
 
 
@@ -129,14 +129,14 @@ def test_column_clear_always_queries_even_when_siblings_cover():
     led = ReservationLedger(CFG)
     led.commit(99, [_foreign_through_hub()])
     tcap = TerminalCapacity(CFG, led)
-    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+    term, center = Terminal("H", 4, radius=120.0), vec(1000, 1000, 0)
     tcap.dwells["H"] = [(0.0, DWELL)]                       # a sibling 'covers' the window...
     assert not tcap.column_clear(term, center, 0.0)         # ...but the ledger still gates the foreign
 
 
 def test_column_clear_is_clear_in_empty_airspace():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
-    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+    term, center = Terminal("H", 4, radius=120.0), vec(1000, 1000, 0)
     assert tcap.column_clear(term, center, 0.0)
 
 
@@ -151,12 +151,12 @@ def test_always_active_shortcut_requires_this_hubs_registered_wall():
     led = ReservationLedger(cfg)
     led.commit(99, [_foreign_through_hub()])
     tcap = TerminalCapacity(cfg, led)
-    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+    term, center = Terminal("H", 4, radius=120.0), vec(1000, 1000, 0)
 
     assert not led.has_static_terminal(term.id)
     assert not tcap.column_clear(term, center, 0.0, z=70.0)
 
-    other = Terminal("OTHER", 4, radius=90.0)
+    other = Terminal("OTHER", 4, radius=120.0)
     led.register_static_terminal(vec(3000, 3000, 0), other)
     assert led.has_static_terminal(other.id)
     assert not led.has_static_terminal(term.id)
@@ -187,7 +187,7 @@ def test_direct_planner_without_registered_wall_preserves_legacy_gate(monkeypatc
         vec(1000, 1000, 0),
         vec(1400, 1000, 0),
         0.0,
-        origin_terminal=Terminal("H", 4, radius=90.0),
+        origin_terminal=Terminal("H", 4, radius=120.0),
     )
 
     def plan(skip):
@@ -206,7 +206,7 @@ def test_direct_planner_without_registered_wall_preserves_legacy_gate(monkeypatc
 def test_registered_wall_shortcut_covers_every_flight_level(monkeypatch):
     cfg = replace(CFG, terminal_airspace_always_active=True)
     led = ReservationLedger(cfg)
-    term, center = Terminal("H", 4, radius=90.0), vec(1000, 1000, 0)
+    term, center = Terminal("H", 4, radius=120.0), vec(1000, 1000, 0)
     led.register_static_terminal(center, term)
     tcap = TerminalCapacity(cfg, led)
 
@@ -258,7 +258,7 @@ def test_always_active_shortcut_is_exact_with_multiple_flight_levels(monkeypatch
 
 def test_dwell_ok_requires_capacity_and_clear():
     tcap = TerminalCapacity(CFG, ReservationLedger(CFG))
-    term, center = Terminal("H", 2, radius=90.0), vec(1000, 1000, 0)
+    term, center = Terminal("H", 2, radius=120.0), vec(1000, 1000, 0)
     assert tcap.dwell_ok(term, center, 0.0, capacity=2)    # empty: capacity + clear
     tcap.dwells["H"] = [(0.0, DWELL), (0.0, DWELL)]         # two overlapping dwells fill capacity 2
     assert not tcap.dwell_ok(term, center, 0.0, capacity=2)

@@ -22,14 +22,15 @@ import math
 import sys
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from ..config import SimConfig
+from ..conflict import volumes_conflict
 from ..geometry import BoxSpec, CylinderSpec
 from ..types import as_terminal
-from ..volumes import Volume4D, exit_radius
+from ..volumes import Volume4D, exit_radius, lane_link_volume, terminal_radius
 
 SQRT3 = math.sqrt(3.0)
 # The six pointy-top axial neighbour directions around a centre hex, in ring order (see
@@ -362,6 +363,30 @@ def _bearing_deg(cell, cx: float, cy: float, R: float) -> float:
     return math.degrees(math.atan2(by - cy, bx - cx))
 
 
+def centre_in_column(x: float, y: float, cx: float, cy: float, radius: float) -> bool:
+    """Is the point ``(x, y)`` strictly inside the column disc ``(cx, cy, radius)``?
+
+    THE membership test for hex centres against a hub column, shared by :func:`_covered_boundary`
+    (covered vs exit-lane cells), :func:`column_hexes` (the raster's own-column skip) and SIPP's
+    own-column test. Strict with a 1e-9 tolerance: the exit ring is rooted at the column edge, so a
+    hub on a hex centre puts lane cells at EXACTLY ``radius``; those are lanes, not interior, and a
+    sibling's claims on them must not be skipped (else two same-lane launches only collide at filing).
+
+    Parameters
+    ------------
+    - x (float): point easting (m).
+    - y (float): point northing (m).
+    - cx (float): column centre easting (m).
+    - cy (float): column centre northing (m).
+    - radius (float): column radius (m).
+
+    Return
+    --------
+    - output (bool): True iff the point lies strictly inside the disc.
+    """
+    return math.hypot(x - cx, y - cy) < radius - 1e-9
+
+
 def _covered_boundary(center, term, cfg: SimConfig) -> tuple[set, set]:
     """Flood-fill a hub's column into ``covered`` hexes (centre within ``exit_radius``) and
     the ``boundary`` ring just outside them — neighbours of a covered cell that aren't covered (see
@@ -399,8 +424,7 @@ def _covered_boundary(center, term, cfg: SimConfig) -> tuple[set, set]:
         h = stack.pop()
         if h in covered:
             continue
-        hx, hy = hex_center(*h, R)
-        if math.hypot(hx - cx, hy - cy) < er - 1e-9:
+        if centre_in_column(*hex_center(*h, R), cx, cy, er):
             covered.add(h)
             stack.extend(hex_neighbors(*h))
     boundary = {n for h in covered for n in hex_neighbors(*h) if n not in covered}
@@ -438,7 +462,10 @@ def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
     Classify hexes by centre distance to the hub — covered if within ``exit_radius`` (flood-filled
     out from the home hex), boundary if not covered but hex-adjacent to a covered cell (see
     context/figures/exit_radius.png). The boundary ring is the canonical exit-lane set, fully
-    determined by the hub position and the fixed grid (no snapping). Deterministic in
+    determined by the hub position and the fixed grid (no snapping), except that a column too narrow
+    for its corridor (``cfg.corridor_width_m > cfg.max_corridor_width_m(radius)``) keeps only the
+    largest subset of ring cells whose link boxes are pairwise disjoint (:func:`_disjoint_lane_subset`);
+    the wall (:func:`terminal_cells`) still covers the whole ring. Deterministic in
     ``(center, term, cfg)`` and memoised — hubs don't move during a run.
 
     Parameters
@@ -461,14 +488,95 @@ def terminal_lanes(center, term, cfg: SimConfig) -> list[Lane]:
     _covered, boundary = _covered_boundary(center, term, cfg)
     cells = sorted(boundary, key=lambda c: _bearing_deg(c, cx, cy, R))
     hub = np.array([cx, cy])
+    pitch = cfg.nominal_speed_mps * cfg.dt_s
+    # ceil with a tolerance: a hub ON a hex centre puts corner lanes at an exact multiple of the pitch,
+    # and float noise (240.0000000000008 m) must not charge them an extra step.
     lanes = [
         Lane(cell=c, bearing=_bearing_deg(c, cx, cy, R),
              dist=(d := float(np.linalg.norm(hex_center(*c, R) - hub))),
-             steps=int(math.ceil(d / (cfg.nominal_speed_mps * cfg.dt_s))))
+             steps=int(math.ceil(d / pitch - 1e-9)))
         for c in cells
     ]
+    # Pruned here — once per hub, the memo key holds cfg — and not for walls (``terminal_cells``): a
+    # static obstacle may have any radius.
+    lanes = _disjoint_lane_subset(lanes, hub, terminal_radius(term, cfg), cfg, term.id)
     _LANE_CACHE[key] = lanes
     return lanes
+
+
+def _disjoint_lane_subset(lanes: list[Lane], hub: np.ndarray, radius: float, cfg: SimConfig,
+                          terminal_id) -> list[Lane]:
+    """The largest subset of ``lanes`` whose link boxes are pairwise disjoint, spread as evenly as
+    the ring allows.
+
+    A column narrower than :meth:`SimConfig.max_corridor_width_m` permits can put two exit cells so
+    close in bearing that their link boxes (:func:`~freespace_sim.volumes.lane_link_volume`) overlap
+    at the column edge; links are strict box↔box volumes, so such a pair could never be used at the
+    same time. Rather than refuse the hub, drop the fewest lanes that make the rest disjoint: a
+    maximum independent set of the exact-FCL conflict graph (every link normalised to one time
+    window, so only geometry decides). Among equally large sets prefer the one whose smallest
+    bearing gap between consecutive kept lanes is widest, then the first in bearing order — a
+    deterministic, permanent choice. The graph is tiny (≤ ~20 lanes, conflicts only between bearing
+    neighbours in practice), so the bounded enumeration below is exact and cheap. Sibling *corridor*
+    boxes may still overlap and serialise as usual; only the links are made disjoint.
+
+    Parameters
+    ------------
+    - lanes (list[Lane]): the full ring, sorted by bearing.
+    - hub (np.ndarray): the hub centre xy.
+    - radius (float): the column radius the links are rooted at.
+    - cfg (SimConfig): corridor geometry (any one flight level stands in for all: xy decides).
+    - terminal_id (Hashable): the hub tag the links carry.
+
+    Return
+    --------
+    - output (list[Lane]): the kept lanes, still in bearing order; ``lanes`` itself when nothing overlaps.
+    """
+    n = len(lanes)
+    if n < 2:
+        return lanes
+    R = circumradius(cfg)
+    z = cfg.level_z(0)
+    links = [replace(lane_link_volume(hub, radius, (*hex_center(*ln.cell, R), z), 1.0, cfg, terminal_id,
+                                      outbound=True), t_start=0.0, t_end=1.0)
+             for ln in lanes]
+    conflicts = [0] * n                                   # bitmask of lanes whose link overlaps lane i's
+    for i in range(n):
+        for j in range(i + 1, n):
+            if volumes_conflict(links[i], links[j]):
+                conflicts[i] |= 1 << j
+                conflicts[j] |= 1 << i
+    if not any(conflicts):
+        return lanes
+    bearings = [ln.bearing for ln in lanes]
+
+    def smallest_gap(kept: list[int]) -> float:
+        if len(kept) < 2:
+            return 360.0
+        b = [bearings[k] for k in kept]
+        return min(min(b[i + 1] - b[i] for i in range(len(b) - 1)), b[0] + 360.0 - b[-1])
+
+    best: tuple[int, float, list[int]] = (0, 0.0, [])     # (count, smallest gap, kept)
+
+    def search(i: int, kept: list[int], excluded: int) -> None:
+        """DFS in bearing order, keep-first: the first set found at a given (count, gap) is the
+        lexicographically first in bearing order, so a strict-improvement update is the tie-break."""
+        nonlocal best
+        if len(kept) + (n - i) < best[0]:                 # cannot reach the best count
+            return
+        if i == n:
+            gap = smallest_gap(kept)
+            if len(kept) > best[0] or (len(kept) == best[0] and gap > best[1] + 1e-9):
+                best = (len(kept), gap, list(kept))
+            return
+        if not (excluded >> i) & 1:
+            kept.append(i)
+            search(i + 1, kept, excluded | conflicts[i])
+            kept.pop()
+        search(i + 1, kept, excluded)
+
+    search(0, [], 0)
+    return [lanes[k] for k in best[2]]
 
 
 def _levels_overlapped(vol: Volume4D, cfg: SimConfig) -> list[int]:
@@ -933,9 +1041,9 @@ def column_hexes(cols: tuple, R: float) -> frozenset:
     per flight and shared instead of recomputed per rasterized cell.
 
     Exact by construction, not by approximation: the set is built with the SAME ``hex_center`` and the
-    SAME ``<=`` comparison the per-cell test uses, and ``_hexes_in_box`` yields a SUPERSET
-    of the hexes whose centres could lie in a box — so every centre within ``rad`` of a disc centre,
-    which necessarily lies in that disc's AABB, is enumerated.
+    SAME strict test (:func:`centre_in_column`) that classifies covered vs exit-lane cells, and
+    ``_hexes_in_box`` yields a SUPERSET of the hexes whose centres could lie in a box — so every centre
+    within ``rad`` of a disc centre, which necessarily lies in that disc's AABB, is enumerated.
 
     Parameters
     ------------
@@ -957,8 +1065,7 @@ def column_hexes(cols: tuple, R: float) -> frozenset:
     out = set()
     for cx, cy, rad in cols:
         for q, r in _hexes_in_box((cx - rad, cy - rad), (cx + rad, cy + rad), R):
-            c = hex_center(q, r, R)
-            if (c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad:
+            if centre_in_column(*hex_center(q, r, R), cx, cy, rad):
                 out.add((q, r))
     res = frozenset(out)
     _COL_HEX_CACHE[key] = res

@@ -9,7 +9,7 @@ are now FIXED; the tests below are regressions that assert ``.accepted``.
 
   2. **cruise box vs sibling column** — a near-hub cruise box just past the exit lane reaches back
      into a same-hub sibling's column. FIXED: every box overlapping the flight's own column is now
-     tagged (``volumes.segment_overlaps_column``), not just box[0]/box[-1], so it is column-exempt.
+     tagged (``volumes.corridor_box_reaches_column``), not just box[0]/box[-1], so it is column-exempt.
 
   3. **same-hub exit lanes collide** — two exit boxes overlap at the shared-column edge; box↔box is
      not exempt. FIXED: the takeoff/landing edge is gated by ``TerminalCapacity.exit_clear`` — a
@@ -74,7 +74,7 @@ def test_lazy_skip_column_admit_is_fixed():
 
 def test_cruise_box_does_not_clip_a_sibling_column():
     # Mechanism 2, FIXED. Every box reaching into its hub's own column is now tagged
-    # (``volumes.segment_overlaps_column``, applied in ``astar._build`` + ``build_reservation_from_corners``),
+    # (``volumes.corridor_box_reaches_column``, applied in ``astar._build`` + ``build_reservation_from_corners``),
     # not just box[0]/box[-1] — so fid 86's first cruise box is column-exempt instead of CONFLICT_FILED.
     intents = _replay(CRUISE_CLIP)
     assert intents[2].accepted and intents[4].accepted          # the two sibling columns commit

@@ -191,7 +191,7 @@ def test_the_pad_hold_is_not_denied_by_its_own_terminals_permanent_wall():
 
     cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0,
                     terminal_airspace_always_active=True)
-    term = Terminal(id="cust-hub", capacity=4, radius=90.0)
+    term = Terminal(id="cust-hub", capacity=4, radius=120.0)
     req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0,
                         dest_terminal=term)
     led = ReservationLedger(cfg)

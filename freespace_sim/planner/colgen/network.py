@@ -27,7 +27,8 @@ from ...volumes import (
     column_dwell_s,
     corridor_segment_volume,
     permanent_terminal_reservation,
-    segment_overlaps_column,
+    TAG_MARGIN_M,
+    corridor_box_reaches_column,
     terminal_radius,
 )
 from .. import hexgrid as hg
@@ -1128,20 +1129,12 @@ def _segment_terminal_id(
       the dest terminal id if it overlaps that column, else ``None``.
     """
 
-    if origin_terminal is not None and segment_overlaps_column(
-        p0,
-        p1,
-        req.origin,
-        terminal_radius(origin_terminal, cfg),
-        cfg,
+    if origin_terminal is not None and corridor_box_reaches_column(
+        p0, p1, req.origin, terminal_radius(origin_terminal, cfg), cfg, TAG_MARGIN_M,
     ):
         return origin_terminal.id
-    if dest_terminal is not None and segment_overlaps_column(
-        p0,
-        p1,
-        req.dest,
-        terminal_radius(dest_terminal, cfg),
-        cfg,
+    if dest_terminal is not None and corridor_box_reaches_column(
+        p0, p1, req.dest, terminal_radius(dest_terminal, cfg), cfg, TAG_MARGIN_M,
     ):
         return dest_terminal.id
     return None

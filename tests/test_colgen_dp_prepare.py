@@ -57,7 +57,7 @@ def _plain_graph(cfg, origin=(0, 0), dest=(4, -1), overrun=4):
 
 def _terminal_graph(cfg, origin=(0, 0), dest=(4, -1), overrun=4):
     o, d = _point(origin, cfg), _point(dest, cfg)
-    o_term, d_term = Terminal("prep-A", 1, radius=90.0), Terminal("prep-B", 1, radius=90.0)
+    o_term, d_term = Terminal("prep-A", 1, radius=120.0), Terminal("prep-B", 1, radius=120.0)
     request = FlightRequest(2, o, d, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term)
     params = ColGenParams(solver="highs", max_air_overrun_hops=overrun)
     return build_flight_graph(request, cfg, [(o, o_term), (d, d_term)], params)

@@ -462,7 +462,7 @@ def test_compiled_terminal_path_never_routes_through_blocked():
     spec = with_overrides(
         get_scenario("dallas_hub_2uss_large"), lam_per_hour=12000.0, horizon_s=1200.0, seed=0,
         demand_overrides={"pads_per_hub": {"walmart_uss": 40, "stripmall_uss": 16},
-                          "terminal_radius_m": {"walmart_uss": 135.0, "stripmall_uss": 90.0},
+                          "terminal_radius_m": {"walmart_uss": 135.0, "stripmall_uss": 120.0},
                           "radius_m": 6000.0})
     cfg = spec.config()
     reqs = spec.demand_model().generate(cfg, np.random.default_rng(cfg.seed))

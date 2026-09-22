@@ -135,7 +135,7 @@ def test_envelope_superset_audit_reference(monkeypatch):
 def test_envelope_superset_audit_terminal(monkeypatch):
     log = _audit(monkeypatch)
     cfg = SimConfig()
-    hub_o, hub_d = Terminal("h#0", 8, 90.0), Terminal("h#1", 8, 90.0)
+    hub_o, hub_d = Terminal("h#0", 8, 120.0), Terminal("h#1", 8, 120.0)
     p = AStarPlanner(compiled=False)
     p.record_envelope = True
     led = ReservationLedger(cfg)

@@ -130,7 +130,7 @@ def test_compiled_occupancy_matches_is_blocked():
                     planner="astar", seed=0)
     demand = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 6, "stripmall_uss": 30},
                              radius_m={"walmart_uss": 6000.0, "stripmall_uss": 3000.0},
-                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 120.0},
                              pads_per_hub=8, return_flights=True)
     reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)
@@ -170,7 +170,7 @@ def test_compiled_own_foreign_shared_cell_falls_back_exact():
     parity: once the fallback fires, the compiled planner IS running the reference for this flight — which
     is exactly the intended behavior. (The exact kernel-vs-reference contract lives in the other tests.)"""
     cfg = SimConfig()
-    hub_a, hub_b = Terminal("uss_a#0", 8, 90.0), Terminal("uss_b#0", 8, 90.0)
+    hub_a, hub_b = Terminal("uss_a#0", 8, 120.0), Terminal("uss_b#0", 8, 120.0)
     Pa, Pb = vec(2000, 2000, 0), vec(2150, 2000, 0)          # 150 m apart → footprints share cells
     foreign = FlightRequest(1, vec(2000, 4000, 0), Pb, 0.0, uss_id="uss_b", dest_terminal=hub_b)
     own = FlightRequest(2, vec(2000, 500, 0), Pa, 20.0, uss_id="uss_a", dest_terminal=hub_a)
@@ -474,7 +474,7 @@ def test_compiled_replay_exact_dallas_terminal():
     assert cfg.fixed_exit_lanes and cfg.n_levels >= 2
     demand = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 5, "stripmall_uss": 20},
                              radius_m={"walmart_uss": 6000.0, "stripmall_uss": 3000.0},
-                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 120.0},
                              pads_per_hub=8, return_flights=True)
     reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)
@@ -511,7 +511,7 @@ def test_compiled_replay_exact_saturated_terminal():
     assert cfg.fixed_exit_lanes and cfg.n_levels >= 2
     demand = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 1, "stripmall_uss": 2},
                              radius_m={"walmart_uss": 4000.0, "stripmall_uss": 2500.0},
-                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 120.0},
                              pads_per_hub=1, return_flights=True)          # pads=1 ⇒ big ground delays (large base_g)
     reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)

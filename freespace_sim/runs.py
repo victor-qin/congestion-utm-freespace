@@ -116,19 +116,20 @@ def _env_info() -> dict:
 
 
 def _term_to_json(t) -> str | None:
-    """Serialize a flight's terminal (id, capacity, radius, corridor_overlap) to JSON so hub membership
-    round-trips — including for DENIED flights, whose geometry is otherwise unrecoverable. ``None`` for a
-    non-hub endpoint. The id round-trips exactly for str/int ids (the common case)."""
+    """Serialize a flight's terminal (id, capacity, radius) to JSON so hub membership round-trips —
+    including for DENIED flights, whose geometry is otherwise unrecoverable. ``None`` for a non-hub
+    endpoint. The id round-trips exactly for str/int ids (the common case)."""
     t = as_terminal(t)
     if t is None:
         return None
     tid = t.id if isinstance(t.id, (str, int, float, bool)) else str(t.id)   # JSON-safe (str for exotic ids)
-    return json.dumps([tid, t.capacity, t.radius, t.corridor_overlap])
+    return json.dumps([tid, t.capacity, t.radius])
 
 
 def _term_from_json(s):
-    """Inverse of :func:`_term_to_json` → an ``(id, capacity, radius, corridor_overlap)`` tuple
-    (as_terminal-friendly), or ``None``. Tolerates a NaN/None cell from parquet."""
+    """Inverse of :func:`_term_to_json` → an ``(id, capacity, radius)`` tuple (as_terminal-friendly),
+    or ``None``. Tolerates a NaN/None cell from parquet and the 4-element form archives wrote before
+    ``corridor_overlap`` was removed (``as_terminal`` drops the extra element)."""
     if s is None or (isinstance(s, float) and s != s):
         return None
     return tuple(json.loads(s))

@@ -363,7 +363,6 @@ class HubRadiusDemand:
     radius_m: "float | dict[str, float]" = 3000.0   # customer demand radius (scalar, or per-USS)
     pads_per_hub: "int | dict[str, int]" = 1         # terminal capacity N per hub (scalar, or per-USS)
     terminal_radius_m: "float | dict[str, float] | None" = None   # column size; None → hover footprint
-    corridor_overlap_m: "float | None" = None        # exit-lane overlap into column; None/0 → flush at edge
     # Each delivery is a round-trip itinerary (hub → customer → hub) flown as ONE flight.
     return_flights: bool = True
     # Ground time at the customer pad between the legs. Forwarded to every request as-is; ``None``
@@ -455,7 +454,7 @@ class HubRadiusDemand:
             # pitch (SQRT3·circumradius) of the exit_radius edge, so that rigorously upper-bounds the ring
             # for any gap ≥ 0. Flag off ⇒ the bare column radius (transient dwell walls don't engulf).
             if cfg.terminal_airspace_always_active:
-                term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
+                term = Terminal(f"{uid}#0", self._pads_for(uid), tr)
                 return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
             return cfg.terminal_radius_m if tr is None else float(tr)
         return _scatter_hubs(cfg, rng, self.n_hubs_per_uss, radius_of, self.min_hub_gap_m)
@@ -475,8 +474,7 @@ class HubRadiusDemand:
         - output (list): ``(center, Terminal)`` pairs, one per placed hub.
         """
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
-        return [(pts[hj], Terminal(f"{uid}#{hj}", self._pads_for(uid),
-                                   self._terminal_radius_for(uid), self.corridor_overlap_m))
+        return [(pts[hj], Terminal(f"{uid}#{hj}", self._pads_for(uid), self._terminal_radius_for(uid)))
                 for uid, pts in hubs.items() for hj in range(pts.shape[0])]
 
     def _radius_for(self, uss_id: str) -> float:
@@ -545,8 +543,7 @@ class HubRadiusDemand:
             foreign_cells: dict[tuple[int, int], set] = {}
             for uid, pts in hubs.items():
                 for hj in range(pts.shape[0]):
-                    term = Terminal(f"{uid}#{hj}", self._pads_for(uid),
-                                    self._terminal_radius_for(uid), self.corridor_overlap_m)
+                    term = Terminal(f"{uid}#{hj}", self._pads_for(uid), self._terminal_radius_for(uid))
                     for cell in terminal_cells(pts[hj], term, cfg):
                         foreign_cells.setdefault(cell, set()).add(term.id)
 
@@ -557,8 +554,7 @@ class HubRadiusDemand:
             """Emit one outbound delivery and, optionally, its return."""
             nonlocal fid
             hub = hubs[uss_id][hi]
-            terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id),
-                                self._terminal_radius_for(uss_id), self.corridor_overlap_m)
+            terminal = Terminal(f"{uss_id}#{hi}", self._pads_for(uss_id), self._terminal_radius_for(uss_id))
             radius = self._radius_for(uss_id)
             # Keep customers clear of the hub's own always-active WALL. A customer within
             # (terminal_radius + hover_radius) of its serving hub has its landing/takeoff column overlap

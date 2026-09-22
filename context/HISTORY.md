@@ -175,3 +175,28 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `terminal_lanes`), `freespace_sim/volumes.py` (`exit_radius`), `freespace_sim/config.py`
   (`terminal_radius_m`, `corridor_width_m`); derivation script `.context/lanes/egress_rule.py`
   (gitignored; regenerate `lanes_10_egress_rule.png` from it).
+
+- 2026-09-22T09:00Z `[CODE]` A conservative bound is not an exact predicate, and a force-tag that papers
+  over it hides the gap it leaves. `segment_overlaps_column` tested a CAPSULE around the box's axis
+  against the column: it said "reaches" for a box whose rectangle stopped 21 m short (25 m of egress
+  then sat in no filed volume) and "misses" for boxes whose corners already touched the column, which
+  the builders masked by force-tagging the first/last box. Neither a sub- nor a superset of the real
+  geometry. Replaced by the exact rectangle test `corridor_box_reaches_column` (`TAG_MARGIN_M = 0.5`
+  for tagging, 0 for the link decision) and the force-tags deleted. Lesson: a predicate that decides
+  what gets FILED must be the exact geometry; a bound needs a stated direction and a test that proves
+  it (an FCL probe along the egress caught this, the byte-identity test did not). Files:
+  `freespace_sim/volumes.py`, `freespace_sim/planner/astar/planner.py`,
+  `freespace_sim/planner/colgen/network.py`, `tests/test_terminal.py`.
+
+- 2026-09-22T11:00Z `[TOOL]` Disc membership at the exit-ring edge must be STRICT and shared. With the
+  ring rooted at the column radius, a hub on a hex centre has lane cells at EXACTLY `r`
+  (`hex_center(1, 0) == (120.0, 0.0)`); `column_hexes` used `<=` while `_covered_boundary` used
+  `< r - 1e-9`, so the raster's own-column skip dropped a sibling's claims on that lane cell and the
+  second same-lane launch slipped one step behind the first, colliding only at filing
+  (`CONFLICT_FILED`). Before #135 the +R raster over-claim masked it (the suite was green on the old
+  base); main's exact hop claims exposed it after the rebase. One predicate now
+  (`hexgrid.centre_in_column`) for the flood fill, `column_hexes` and SIPP. Lesson: an over-claim can
+  hide a skip hole, so when claims become exact re-run same-hub serialisation with hubs ON hex centres
+  (a snapped-to-centre hub with float noise does NOT reproduce; the origin does), and keep ONE
+  membership test for anything keyed to the ring edge. Files: `freespace_sim/planner/hexgrid.py`,
+  `freespace_sim/planner/sipp/planner.py`, `tests/test_terminal.py`.

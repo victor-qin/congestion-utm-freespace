@@ -34,6 +34,7 @@ from ...volumes import (
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
+    lane_links_needed,
 )
 from .. import hexgrid as hg
 
@@ -266,6 +267,7 @@ def _retime_lattice_reservation(
     origin_dwell_s: float,
     destination_dwell_s: float,
     cfg: SimConfig,
+    links: tuple[bool, bool] = (False, False),
 ) -> tuple[list[Volume4D], list[TimedPoint]]:
     """Stamp resampled geometry onto the pricing network's exact lattice clock.
 
@@ -290,6 +292,9 @@ def _retime_lattice_reservation(
     - destination_dwell_s (float): destination dwell added to the landing cylinder's ``t_end``.
     - cfg (SimConfig): supplies ``dt_s``, ``corridor_segment_len_m``, ``hover_time_s``, and
       ``time_buffer_s``.
+    - links (tuple[bool, bool]): whether the builder filed an outbound / inbound lane link box
+      (:func:`volumes.lane_links_needed`); each sits between its cylinder and the sub-boxes and is
+      shifted with the corridor end it is attached to.
 
     Return
     --------
@@ -307,7 +312,8 @@ def _retime_lattice_reservation(
         nsubs.append(max(1, math.ceil(length / segment_len)))
 
     edge_count = sum(nsubs)
-    if len(volumes) != edge_count + 2 or len(centerline) != edge_count + 1:
+    n_out, n_in = int(links[0]), int(links[1])
+    if len(volumes) != edge_count + 2 + n_out + n_in or len(centerline) != edge_count + 1:
         raise RuntimeError(
             "reservation builder output does not match the column's lattice subdivisions"
         )
@@ -321,6 +327,10 @@ def _retime_lattice_reservation(
             t_end=origin_t0 + cfg.hover_time_s + origin_dwell_s,
         )
     ]
+    if n_out:                                   # the outbound link ends at the (exact) corridor start
+        shift = exact_corridor_t0 - centerline[0][1]
+        retimed_volumes.append(replace(volumes[1], t_start=volumes[1].t_start + shift,
+                                       t_end=volumes[1].t_end + shift))
     retimed_centerline: list[TimedPoint] = [(centerline[0][0], exact_corridor_t0)]
     edge_index = 0
     for hop_index, nsub in enumerate(nsubs):
@@ -332,7 +342,7 @@ def _retime_lattice_reservation(
             # Pin both original-hop boundaries explicitly; interpolate only interior cuts.
             raw_t0 = hop_t0 if sub_index == 0 else hop_t0 + cfg.dt_s * sub_index / nsub
             raw_t1 = hop_t1 if sub_index + 1 == nsub else hop_t0 + cfg.dt_s * (sub_index + 1) / nsub
-            edge = volumes[edge_index + 1]
+            edge = volumes[edge_index + 1 + n_out]
             retimed_volumes.append(
                 replace(
                     edge,
@@ -345,6 +355,10 @@ def _retime_lattice_reservation(
             edge_index += 1
 
     arrival_t = (corridor_start_step + len(nsubs)) * cfg.dt_s
+    if n_in:                                    # the inbound link starts at the (exact) arrival
+        link = volumes[-2]
+        shift = arrival_t - centerline[-1][1]
+        retimed_volumes.append(replace(link, t_start=link.t_start + shift, t_end=link.t_end + shift))
     destination = volumes[-1]
     retimed_volumes.append(
         replace(
@@ -426,6 +440,7 @@ def column_to_intent(
         column_dwell_s(req.origin, origin_term, cfg, z),
         column_dwell_s(req.dest, dest_term, cfg, z),
         cfg,
+        links=lane_links_needed(corners, req.origin, req.dest, origin_term, dest_term, cfg),
     )
     reference = enroute_reference_m(req.origin, req.dest, origin_term, dest_term, cfg)
     flown = enroute_flown_m(

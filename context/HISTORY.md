@@ -139,3 +139,13 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   overhang corner within the inradius), because its capacity rows rest on the same containment. It
   now lives in `hexgrid` and both call it. Files: `freespace_sim/planner/hexgrid.py`,
   `freespace_sim/planner/colgen/windows.py`.
+
+- 2026-09-22T16:00Z `[CODE]` Eighteen tests pinned the literal default ladder / box / ceiling and rotted
+  the moment the defaults moved (30/70/110 m -> 70/85/100/115 m, 30 -> 10 m box, 125 -> 120 m
+  ceiling). Tests about ladder MECHANICS now derive their expectation from the SimConfig they run on
+  (`set(range(cfg.n_levels))`, `cfg.nearest_level(cfg.cruise_level_m)`, the validator's own headroom
+  formula) or pin an explicit ladder when the default is too tight for the fixture's premise (a 15 m
+  rung is a 1-step check that cannot tell ceil from max(1, .); a planner has no vertical escape above a
+  100 m warm plane under a 120 m ceiling). Exactly ONE test pins the literal defaults
+  (`test_default_config_is_multilevel`), so a default change fails in one place. Files:
+  `tests/test_config.py`, `tests/test_astar.py`, `tests/test_planner_milp.py`.

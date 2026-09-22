@@ -34,7 +34,7 @@ class SimConfig:
     # strictly ascending. Adjacent gaps must EXCEED corridor_height_m and the top/bottom boxes must
     # fit within [ground_level_m, airspace_ceiling_m] (see context/figures/altitude_ladder.png).
     # Set ``flight_levels_m=(z,)`` (+ matching ceiling) for one plane.
-    flight_levels_m: tuple[float, ...] = (70.0, 80.0, 90.0, 100.0, 110.0)
+    flight_levels_m: tuple[float, ...] = (70.0, 85.0, 100.0, 115.0)
 
     # --- region (continuous horizontal free space), local ENU metres ---
     region_size_m: tuple[float, float] = (10_000.0, 10_000.0)

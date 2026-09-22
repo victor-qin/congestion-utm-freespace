@@ -630,7 +630,7 @@ def test_claim_index_excludes_the_flights_own_terminal_interior():
     for v in vols:
         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
             continue
-        for q, r, level, _lo, _hi, in_blk in hg.rasterize_ranges(
+        for q, r, level, _lo, _hi, in_blk, _in_pad in hg.rasterize_ranges(
             v, cfg, state._R, state._infl_b, state._infl_p
         ):
             if in_blk:
@@ -997,23 +997,6 @@ def test_run_lns_logs_and_detaches_when_an_iteration_raises(monkeypatch, caplog)
     assert not res.ledger._static_subs
     records = [record for record in caplog.records if "lns aborted" in record.message]
     assert len(records) == 1 and records[0].exc_info is not None
-
-
-def test_milp_capacity_rebinds_after_a_takeover():
-    """The epoch contract is ledger-wide, not an A* detail: MILPOptPlanner keeps its own pad-capacity
-    index on the shared ledger, and its count tripwire cannot see a takeover (LNS restores every
-    flight it releases, so n_volumes ends at or above the frozen count)."""
-    from freespace_sim.planner.milp import MILPOptPlanner
-
-    led = ReservationLedger(CFG)
-    planner = MILPOptPlanner()
-    first = planner._capacity(led, CFG, 0.0)
-    assert led._observers
-
-    led.detach_subscribers()
-    second = planner._capacity(led, CFG, 0.0)
-    assert second is not first                    # rebound, not merely reused
-    assert led._observers                         # and re-subscribed, so it stays in sync
 
 
 # -------------------------------------------------------------------- run_lns argument contract

@@ -256,10 +256,12 @@ def test_cost_and_time_diverge_by_their_weights():
 
 
 def test_altitude_recorded_as_cost_and_both_time_readings():
-    # a flight pushed up to level 1 (z=70): altitude_change 140, floor 60 ⇒ 80 m of congestion climb
-    intent = _accepted(altitude_change_m=2.0 * 70.0)
+    # a flight pushed 40 m above the ladder floor: the FULL round-trip climb is charged as altitude
+    # cost, but only the part above the unimpeded round trip (2·floor) reads as congestion climb
+    floor = CFG.flight_levels_m[0]
+    intent = _accepted(altitude_change_m=2.0 * floor + 80.0)
     cb, db = metrics.cost_breakdown(intent, CFG), metrics.delay_breakdown_s(intent, CFG)
-    assert math.isclose(cb["altitude_cost"], CFG.cost_altitude_change_per_m * 140.0)        # FULL climb
+    assert math.isclose(cb["altitude_cost"], CFG.cost_altitude_change_per_m * (2.0 * floor + 80.0))
     assert math.isclose(db["excess_altitude_m"], 80.0)                                       # above floor
     # A (physical) and B (cost-equivalent) — BOTH recorded, and genuinely different (12× at defaults)
     assert math.isclose(db["altitude_delay_phys_s"], 80.0 / CFG.climb_rate_mps)              # ≈13.3 s
@@ -544,28 +546,10 @@ def test_aggregate_with_steady_reports_both_views():
     assert agg["n_requests"] == full["n_requests"]
 
 
-class _DenyAll:
-    """A warm planner that always denies — see :func:`_hub_flight`."""
-
-    def plan(self, req, ledger, cfg):
-        from freespace_sim.types import DenialReason, IntentStatus, OperationalIntent
-
-        return OperationalIntent(request=req, status=IntentStatus.REJECTED,
-                                 denial_reason=DenialReason.BUDGET_EXCEEDED, planner="deny")
-
-
 def _hub_flight(planner, radius=180.0, levels=(100.0,)):
-    """An unimpeded flight between two hubs of ``radius`` on the given flight-level ladder.
-
-    ``get_planner("milp")`` returns MILPOptPlanner, whose ``plan`` yields the CHEAPER of its warm
-    StraightLineTimeShift candidate and its own solve — and in empty airspace the warm one wins,
-    making the ``milp`` arm a byte-identical duplicate of the ``straight`` arm that never enters
-    milp.py. Deny the warm start so the MILP's own folded path comes back. Same trap, same fix as
-    ``test_astar._folded_planner``.
-    """
+    """An unimpeded flight between two hubs of ``radius`` on the given flight-level ladder."""
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner import get_planner
-    from freespace_sim.planner.milp import MILPOptPlanner
     from freespace_sim.types import Terminal
 
     cfg = SimConfig(flight_levels_m=levels, airspace_ceiling_m=max(levels) + 25.0,
@@ -573,8 +557,7 @@ def _hub_flight(planner, radius=180.0, levels=(100.0,)):
     hub = Terminal("hub#0", 8, radius)
     req = FlightRequest(1, vec(0, 0, 0), vec(5000, 2000, 0), 0.0,
                         origin_terminal=hub, dest_terminal=hub)
-    resolved = MILPOptPlanner(warm_planner=_DenyAll()) if planner == "milp" else get_planner(planner)
-    intent = resolved.plan(req, ReservationLedger(cfg), cfg)
+    intent = get_planner(planner).plan(req, ReservationLedger(cfg), cfg)
     assert intent.accepted
     return cfg, req, intent
 
@@ -614,7 +597,7 @@ def test_enroute_metrics_exclude_terminal_airspace():
         "flown length does not exclude exactly the two terminal column legs"
 
 
-@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "milp", "straight"])
+@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "straight"])
 def test_planner_detour_and_metrics_stretch_cannot_drift(planner):
     """``air_detour_m`` (planner) and ``flown_m - straight_line_m`` (metrics) must agree EXACTLY.
 
@@ -629,10 +612,6 @@ def test_planner_detour_and_metrics_stretch_cannot_drift(planner):
     assert row["stretch"] >= 1.0 - 1e-9
     if planner == "straight":
         assert math.isclose(row["stretch"], 1.0, abs_tol=1e-9), "straight flies the ideal line exactly"
-    if planner == "milp":
-        # a REAL milp intent (denied warm start) discretizes into knots, so it lands just off the
-        # ideal line rather than exactly on it — but it must not carry the column legs
-        assert row["stretch"] < 1.01, f"milp stretch {row['stretch']:.4f} — column legs leaking in?"
 
 
 def test_an_itinerarys_reference_survives_a_degenerate_leg():
@@ -664,7 +643,7 @@ def test_an_itinerarys_reference_survives_a_degenerate_leg():
         assert math.isclose(metrics._straight_horizontal_m(degenerate, cfg), both, rel_tol=1e-9)
 
 
-@pytest.mark.parametrize("planner", ["astar", "milp", "straight"])
+@pytest.mark.parametrize("planner", ["astar", "straight"])
 def test_overlapping_terminal_columns_book_no_enroute_detour(planner):
     """A flight with no en-route segment must not have its whole path booked as detour.
 

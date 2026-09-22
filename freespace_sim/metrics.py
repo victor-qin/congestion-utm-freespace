@@ -344,14 +344,13 @@ def _unimpeded_cruise_z(cfg: SimConfig) -> float:
     """The altitude the run's planner cruises at when UNIMPEDED.
 
     Hex-lattice families deconflict by altitude on the discrete ladder, so their unimpeded cruise is
-    the lowest flight level; the MILP cruises the continuous band ``[z_min_m, z_max_m]``, so its
-    unimpeded cruise is the band floor; only the truly single-plane planners (straight / decoupled)
-    are pinned to ``cruise_level_m`` (no altitude lever).
+    the lowest flight level; only the truly single-plane planners (straight / decoupled) are pinned
+    to ``cruise_level_m`` (no altitude lever).
 
     Keyed on ``cfg.planner`` (the run's registry name), NOT ``intent.planner``, which a refiner
-    relabels to its own stage (``astar_milp`` stamps 'milp'), dropping the A* origin — so a
-    single-plane run reads ZERO excess altitude (its cruise IS its baseline) while a traffic-forced
-    climb above the floor reads positive excess (real congestion).
+    relabels to its own stage, dropping the A* origin — so a single-plane run reads ZERO excess
+    altitude (its cruise IS its baseline) while a traffic-forced climb above the floor reads
+    positive excess (real congestion).
 
     Parameters
     ------------
@@ -363,8 +362,6 @@ def _unimpeded_cruise_z(cfg: SimConfig) -> float:
     """
     if uses_hex_lattice(cfg.planner):
         return cfg.flight_levels_m[0]
-    if "milp" in cfg.planner:
-        return cfg.z_min_m           # MILP band floor (astar_milp takes the astar branch — same value)
     return cfg.cruise_level_m        # straight / decoupled: single-plane
 
 
@@ -626,9 +623,8 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         # correct). For "how hard is traffic pushing flights sideways?" read deconfliction_detour_m:
         # its traffic share is derived from hex step counts, independently of air_detour_m, so the
         # snap and staircase both land in lattice_overhead_m and the traffic number is unchanged by
-        # them. Exact for the A* family; continuous planners have lattice_overhead_m == 0, but their
-        # air_detour_m is NOT 0 (a MILP books its knot discretization there), so for milp read
-        # deconfliction_detour_m ± that knot noise.
+        # them. Exact for the A* family; continuous planners have lattice_overhead_m == 0, so for
+        # them deconfliction_detour_m is simply air_detour_m.
         "lattice_overhead_m": lattice_m,
         "deconfliction_detour_m": intent.air_detour_m - lattice_m,
         # detour as lateness-seconds; ground_delay_s + air_hold_s + detour_time_s +

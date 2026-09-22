@@ -227,7 +227,7 @@ def test_an_outbound_accepted_without_volumes_raises_rather_than_stranding_the_r
 
 
 def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
-    """`iter_planner_chain` order is load-bearing — `_terminal_capacity_for` takes the FIRST match —
+    """`iter_planner_chain` order is load-bearing — `terminal_capacity_for` takes the FIRST match —
     and a wrapper that answers `warm_planner` on its child's behalf yields a grandchild at its own
     depth. The same missing guard let `__getattr__` recurse forever on the empty-dict instance that
     `copy`/`pickle` build before restoring state."""
@@ -236,7 +236,7 @@ def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
 
     from freespace_sim.planner import _get_planner, get_planner, iter_planner_chain
 
-    for name in ("astar_milp", "milp", "astar_shortcut"):
+    for name in ("astar_shortcut", "sipp_shortcut", "straight"):
         bare = [type(p).__name__ for p in iter_planner_chain(_get_planner(name))]
         wrapped = [type(p).__name__ for p in iter_planner_chain(get_planner(name))]
         assert wrapped[0] == "ItineraryPlanner"
@@ -248,7 +248,7 @@ def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
     assert type(pickle.loads(pickle.dumps(planner))) is type(planner)
 
 
-@pytest.mark.parametrize("name", ["astar", "sipp", "milp", "straight", "decoupled"])
+@pytest.mark.parametrize("name", ["astar", "sipp", "straight", "decoupled"])
 def test_every_leaf_planner_refuses_an_unwrapped_itinerary(name):
     """`get_planner` wraps them all, so this guard exists for the sites that BYPASS it — and one
     such site (`lns/unimpeded._new_ruler`) was already found by it. A leaf that plans the outbound

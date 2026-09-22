@@ -287,7 +287,7 @@ class ParallelConfig:
 
 #: Planners the parallel path supports: every plan must come from an envelope-recording A*
 #: (bare, reference oracle, or wrapped by a shortcut strategy, whose chords stay inside the
-#: inner A* path's hull — the convex-hull lemma). The MILP family optimizes outside any read set.
+#: inner A* path's hull — the convex-hull lemma). Straight/decoupled/colgen record no read set.
 PARALLEL_PLANNERS = (
     "astar", "astar_ref", "astar_shortcut", "astar_heading_shortcut", "astar_batched_shortcut",
 )

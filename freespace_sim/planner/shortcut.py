@@ -531,7 +531,7 @@ def can_refine(intent: OperationalIntent, strategy: _ShortcutStrategy = "single_
 
 
 def terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
-    """Find a capacity authority already brought current by the inner A*/MILP plan.
+    """Find a capacity authority already brought current by the inner A* plan.
 
     Reuse avoids a second ledger subscription/index. Asks each planner in the wrapper chain via the
     optional ``capacity_authority(ledger)`` member (see the ``Planner`` Protocol) and takes the first

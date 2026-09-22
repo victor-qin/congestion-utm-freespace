@@ -5,14 +5,17 @@ import pytest
 from freespace_sim.config import SimConfig
 
 
+_D = SimConfig()                    # the shipped defaults; every derived expectation below reads them
+_H = _D.corridor_height_m
+
+
 def test_default_config_is_multilevel():
-    c = SimConfig()
-    assert c.flight_levels_m == (30.0, 70.0, 110.0)
-    assert c.n_levels == 3
-    assert c.airspace_ceiling_m == 125.0
-    # cruise + band DERIVE from the ladder: cruise = middle level; MILP band = floor→top
-    assert c.cruise_level_m == 70.0
-    assert c.z_min_m == 30.0 and c.z_max_m == 110.0
+    # The ONE literal pin of the shipped altitude defaults: changing them is a research decision, so
+    # it should fail exactly here. Every other ladder test derives from whatever ladder is configured.
+    assert _D.flight_levels_m == (70.0, 85.0, 100.0, 115.0)
+    assert _D.n_levels > 1
+    assert _D.corridor_height_m == 10.0
+    assert _D.airspace_ceiling_m == 120.0
 
 
 def test_equidistant_levels_builds_ladder():
@@ -24,11 +27,11 @@ def test_equidistant_levels_n1_is_single():
 
 
 def test_level_z_and_nearest_level():
-    c = SimConfig()
-    assert c.level_z(1) == 70.0
-    assert c.nearest_level(72.0) == 1
-    assert c.nearest_level(10.0) == 0
-    assert c.nearest_level(200.0) == 2
+    for i, z in enumerate(_D.flight_levels_m):
+        assert _D.level_z(i) == z
+        assert _D.nearest_level(z + 1.0) == i                                # inside the level's half-gap
+    assert _D.nearest_level(_D.ground_level_m) == 0                          # below the ladder → floor
+    assert _D.nearest_level(_D.airspace_ceiling_m + 100.0) == _D.n_levels - 1   # above it → top
 
 
 def test_climb_time_to_and_steps():
@@ -41,10 +44,11 @@ def test_climb_time_to_and_steps():
 @pytest.mark.parametrize(
     ("bad_ladder", "expected_match"),
     [
-        pytest.param((110.0, 70.0, 30.0), None, id="unsorted"),
-        pytest.param((25.0, 55.0), "corridor_height", id="too_close"),   # gap 30 == corridor_height
-        pytest.param((30.0, 70.0, 130.0), None, id="above_ceiling"),     # 130 + 15 > 125
-        pytest.param((10.0, 70.0, 110.0), None, id="below_ground"),      # 10 - 15 < 0
+        pytest.param(tuple(reversed(_D.flight_levels_m)), None, id="unsorted"),
+        # adjacent boxes must not even touch: a gap EQUAL to the box height is rejected
+        pytest.param((_D.flight_levels_m[0], _D.flight_levels_m[0] + _H), "corridor_height", id="too_close"),
+        pytest.param((_D.airspace_ceiling_m - _H / 2.0 + 1.0,), None, id="above_ceiling"),   # top box pokes out
+        pytest.param((_D.ground_level_m + _H / 2.0 - 1.0,), None, id="below_ground"),       # bottom box dips
     ],
 )
 def test_validation_rejects_bad_ladder(bad_ladder, expected_match):
@@ -59,9 +63,10 @@ def test_validation_rejects_bad_ladder(bad_ladder, expected_match):
         # the one thing the itinerary model exists to make inexpressible.
         pytest.param({"turnaround_s": -1.0}, "turnaround_s", id="negative_turnaround"),
         pytest.param({"ground_box_height_m": 0.0}, "ground_box_height_m", id="flat_ground_box"),
-        # 20 + 0 reaches the lowest level's band (30 - 15 = 15), so the parked-aircraft box would
-        # rasterize into the lattice and wall off the airspace over its own pad.
-        pytest.param({"ground_box_height_m": 20.0}, "ground_box_height_m", id="box_reaches_lattice"),
+        # A box taller than the headroom under the lowest level's band (levels[0] - h/2 - ground)
+        # would rasterize into the lattice and wall off the airspace over its own pad.
+        pytest.param({"ground_box_height_m": _D.flight_levels_m[0] - _H / 2.0 - _D.ground_level_m + 1.0},
+                     "ground_box_height_m", id="box_reaches_lattice"),
     ],
 )
 def test_validation_rejects_bad_round_trip_geometry(kwargs, expected_match):
@@ -69,19 +74,19 @@ def test_validation_rejects_bad_round_trip_geometry(kwargs, expected_match):
         SimConfig(**kwargs)
 
 
-def test_cruise_and_band_derive_from_ladder():
-    c = SimConfig(flight_levels_m=(30.0, 70.0, 110.0))   # derived, not settable
-    assert c.cruise_level_m == 70.0                      # cruise = middle level (straight/decoupled)
-    assert c.z_min_m == 30.0 and c.z_max_m == 110.0      # MILP band = ladder floor→top
-
-
-@pytest.mark.parametrize("level", [100.0, 75.0], ids=["derive_100m", "supported_75m"])
-def test_single_level_ladder_collapses_band(level):
-    # a single-level ladder pins one plane: cruise + band collapse onto the lone level (ceiling stays 125)
-    c = SimConfig(flight_levels_m=(level,))
-    assert c.n_levels == 1
-    assert c.flight_levels_m == (level,)
-    assert c.cruise_level_m == c.z_min_m == c.z_max_m == level         # all derive onto the lone level
+@pytest.mark.parametrize(
+    "ladder",
+    [_D.flight_levels_m, (30.0, 70.0, 110.0), (100.0,), (75.0,)],
+    ids=["default", "three_level", "single_100m", "single_75m"],
+)
+def test_cruise_and_band_derive_from_ladder(ladder):
+    # derived, never stored: cruise = middle level (straight/decoupled), band = ladder floor→top;
+    # a single-level ladder collapses all three onto the lone plane (the ceiling is untouched)
+    c = SimConfig(flight_levels_m=ladder)
+    assert c.flight_levels_m == ladder and c.n_levels == len(ladder)
+    assert c.cruise_level_m == ladder[len(ladder) // 2]
+    assert (c.z_min_m, c.z_max_m) == (ladder[0], ladder[-1])
+    assert c.airspace_ceiling_m == _D.airspace_ceiling_m
 
 
 def test_demand_duration_defaults_to_horizon():

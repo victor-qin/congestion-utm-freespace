@@ -49,7 +49,7 @@ Cell = tuple[int, int, int]
 
 # Baselines whose per-flight costs a plain ``AStarPlanner`` reproduces, so the unimpeded ruler and the
 # incumbent are denominated in the same currency. ``astar_ref`` is the same search without the compiled
-# kernel (byte-identical by contract); the shortcut/MILP/colgen families are NOT — see LNSState.
+# kernel (byte-identical by contract); the shortcut/colgen families are NOT — see LNSState.
 #
 # The SIPP pair belongs on measured evidence: A* and SIPP are exact optimizers of the same
 # weighted cost over the same lattice, so they agree on the optimum even though they break ties
@@ -356,9 +356,10 @@ class LNSState:
             # The floor belongs to the SEARCH planner, so a wrapper (ShortcutRefiner) never carries
             # one — walk the chain. Reading it off the wrapper made every correctly-configured
             # wrapper raise, which is why no shortcut repair arm could be constructed at all.
-            # Demand it of every planner in the chain that has the attribute: a diamond
-            # (astar_milp_shortcut) holds several searches and ANY of them advancing the watermark
-            # would evict an earlier victim's obstacles out from under a later one.
+            # Demand it of every planner in the chain that has the attribute: a diamond (a wrapper
+            # whose ``inner`` and ``warm_planner`` chains meet) holds several searches, and ANY of
+            # them advancing the watermark would evict an earlier victim's obstacles out from under a
+            # later one.
             floors = chain_attr(repair_planner, "evict_floor")
             if not floors or any(f != 0.0 for f in floors):
                 raise ValueError("repair_planner.evict_floor must be 0.0 on every search planner in "
@@ -637,7 +638,7 @@ class LNSState:
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 continue  # capacity-gated own column, not a blocked cell
-            for q, r, level, s_lo, s_hi, in_blk in hg.rasterize_ranges(
+            for q, r, level, s_lo, s_hi, in_blk, _in_pad in hg.rasterize_ranges(
                 v, self.cfg, self._R, self._infl_b, self._infl_p
             ):
                 if not in_blk:

@@ -16,9 +16,14 @@ INF_P = CFG.effective_hover_radius_m + R
 
 
 def _batch(volumes, infl):
+    """The from-scratch oracle. ``INF_B`` is the OFF-LATTICE corridor inflation: a volume the claim
+    rule recognises as a single lattice hop is rasterized at the inflation that rule picks for it
+    (`hg.claim_inflation`, #38), exactly as the service does — the property under test is
+    incremental == batch, not that the inflation is one constant."""
     out = set()
     for v in volumes:
-        out.update(hg.rasterize_volume(v, CFG, R, infl=infl))
+        per_vol = hg.claim_inflation(v, CFG, R, infl) if infl == INF_B else infl
+        out.update(hg.rasterize_volume(v, CFG, R, infl=per_vol))
     return out
 
 
@@ -146,7 +151,7 @@ def test_terminal_column_recorded_at_all_levels():
                    0.0, 60.0, terminal_id="H")
     svc.add_volume(col)
     s = next(iter(svc.term_cells))
-    assert {L for (_, _, L) in svc.term_cells[s]} == {0, 1, 2}
+    assert {L for (_, _, L) in svc.term_cells[s]} == set(range(CFG.n_levels))
     q, r, L = next(iter(svc.term_cells[s]))
     assert svc.is_blocked(q, r, L, s)                        # foreign cruise walled at every level
     assert not svc.is_blocked(q, r, L, s, own={"H"})        # the hub's own flights pass through

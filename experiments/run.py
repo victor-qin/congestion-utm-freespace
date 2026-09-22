@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None, dest="terminal_airspace_always_active",
                    help="permanently wall each hub's column+lanes off from foreign traffic (foreign "
                         "transit → air detour instead of ground-block); needs a wall-aware planner "
-                        "(A* family, terminal-aware MILP, or colgen)")
+                        "(A* family or colgen)")
     p.add_argument("--demand", choices=("uniform", "hub", "hub_radius"), default=None,
                    help="demand pattern")
     p.add_argument("--uss", nargs="+", default=None, help="USS labels (multi-operator demand)")
@@ -559,7 +559,7 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
                 kw["n_workers"] = args.workers
             pcfg = ParallelConfig(**kw)
             log.info("mode=%s: %d workers, window=%d", pcfg.mode, pcfg.n_workers, pcfg.resolved_window)
-        else:                                            # MILP/straight/etc. have no envelope-recording
+        else:                                            # straight/decoupled/colgen have no envelope-recording
             log.info("planner %r has no parallel kernel — running sequential (--mode %s ignored)",
                      cfg.planner, args.mode)
     else:

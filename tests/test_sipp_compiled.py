@@ -258,8 +258,8 @@ def test_non_integral_ground_delay_cap_rounds_down_for_every_lattice_path(planne
     ledger = ReservationLedger(cfg)
     # The pad is occupied for periods 0-1 (t < 8 s), so departure steps 0 and 1 are blocked and step 2
     # (8 s) is the first clear one — past the 5 s cap. Rounding 5/4 upward would accept that illegal
-    # 8 s delay; rounding down allows only steps 0..1 and correctly denies. (Half-open time: a
-    # zero-duration volume would claim nothing, so the blocker has to have real duration.)
+    # 8 s delay; rounding down allows only steps 0..1 and correctly denies. (A zero-duration blocker at
+    # t = 0 overlaps no period, so it would block no departure: the blocker needs real duration.)
     ledger.commit(99, [Volume4D(CylinderSpec(300, 500, 100, 0, 150), 0.0, 8.0)])
 
     intent = get_planner(planner_name).plan(req, ledger, cfg)

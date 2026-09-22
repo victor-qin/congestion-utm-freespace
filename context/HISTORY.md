@@ -160,9 +160,11 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `freespace_sim/metrics.py`.
 
 - 2026-09-22T18:40Z `[CODE]` Two fixture traps from moving the temporal claim onto half-open time (#136).
-  A ZERO-DURATION volume `Volume4D(shape, t, t)` claims nothing (the old `floor` bound handed it two
-  steps, and one test used that as a pad blocker). An arrival-step probe reads the period BEFORE the
-  step and its own, so a window that starts at the step a column opens (`pad_clear(s0, ...)`) begins at
-  `s0 + 1`, and a zero-length dwell checks nothing. Give blockers real duration and dwells `>= 1`.
+  A ZERO-DURATION volume at a grid instant, `Volume4D(shape, k·dt, k·dt)`, overlaps no period: with no
+  buffer it claims only step `k` (the old `floor` bound handed it `k` and `k + 1`), and a dwell opening at
+  step `k` reads from `k + 1`, so a test that used one as a pad blocker stopped blocking. An arrival-step
+  probe reads the period BEFORE the step and its own, so a window that starts at the step a column opens
+  (`pad_clear(s0, ...)`) begins at `s0 + 1`, and a zero-length dwell checks nothing. Give blockers real
+  duration and dwells `>= 1`.
   Files: `freespace_sim/planner/hexgrid.py` (`_step_range`), `freespace_sim/planner/astar/occupancy.py`
   (`pad_clear`), `tests/test_sipp_compiled.py`, `tests/test_occupancy.py`.

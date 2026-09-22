@@ -562,9 +562,11 @@ class HexOccupancyService:
 
     def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int) -> bool:
         """Is the ordinary (non-terminal) pad at hex (q, r) free for the whole dwell — arrival steps
-        ``s0 + 1 .. s0 + dwell_steps``, which read the periods ``s0 .. s0 + dwell_steps`` the column
-        can occupy (an arrival step reads the period before it and its own; step ``s0`` would read
-        period ``s0 - 1``, before the column opens — #136)?
+        ``s0 + 1 .. s0 + dwell_steps``, which read periods ``s0 .. s0 + dwell_steps``? An arrival step
+        reads the period before it and its own, so starting at ``s0`` would read period ``s0 - 1``,
+        before the column opens (#136). The planners pass ``dwell_steps = ceil((hover + climb) / dt)``,
+        so the column ends by ``(s0 + dwell_steps)·dt`` and the last period read lies past it: the
+        window is conservative by one period at the top.
 
         The takeoff/landing hover column spans the full tube [ground, ceiling], so the pad is clear
         iff NO committed corridor sweeps its cell at ANY flight level AND it does not sit under any

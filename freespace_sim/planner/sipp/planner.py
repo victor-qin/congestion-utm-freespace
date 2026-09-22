@@ -1553,11 +1553,11 @@ class SIPPPlanner(AStarPlanner):
                 continue
             rung = L if dL == 1 else L2                                  # rung index = min(L, L2)
             rsteps = rung_steps[rung]
-            if s + rsteps > hi_c:                                        # current level not free through climb
+            if s + rsteps - 1 > hi_c:                                    # current level not free through climb
                 continue
             for j, (lo, hi) in enumerate(SI.intervals(q, r, L2)):
                 ap = max(s, lo - 1)                                      # rung-start step (fold pre-rung hover)
-                if ap > hi_c - rsteps:                                   # current level can't hold climb window
+                if ap > hi_c - rsteps + 1:                               # current level can't hold climb window
                     break                                               # later target intervals need even more
                 a = ap + rsteps                                          # arrival on the target level
                 if a > hi or a > max_step:

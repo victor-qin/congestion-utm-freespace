@@ -466,8 +466,9 @@ def _search(
                 sj = nxts
 
         # ---- vertical rungs: climb/descend to an adjacent level (mirrors A* _edges). A rung from (q,r,Lc)
-        # arriving at (q,r,tlv) at a = ap+rsteps needs BOTH levels free over the transit (ap, a]: the
-        # current level through a<=hi_c, and the target level as [ap+1,a] ⊆ one of its free intervals.
+        # arriving at (q,r,tlv) at a = ap+rsteps needs the target level free as [ap+1,a] ⊆ one of its
+        # free intervals and the current level through a-1<=hi_c: the climb box has left it by period a,
+        # which an arrival probe at a would read (#136).
         # ap = max(arr, lo-1) folds pre-rung hover (cost ch_dt); one label per reachable target interval. ----
         if nlevels > 1:
             for dL in range(2):
@@ -480,7 +481,7 @@ def _search(
                         continue
                     tlv = Lc + 1; rung = Lc
                 rsteps = rung_steps[rung]
-                if arr + rsteps > hi_c:                 # current level not free through even a zero-hover climb
+                if arr + rsteps - 1 > hi_c:             # current level not free through even a zero-hover climb
                     continue
                 rcost = rung_cost[rung]
                 # No `_note_cell` here. A rung's target is the SAME (q, r) at an adjacent level, and
@@ -503,7 +504,7 @@ def _search(
                         ap = arr                        # rung-start step (hover current level from arr → ap)
                         if ap < lo - 1:
                             ap = lo - 1
-                        if ap > hi_c - rsteps:          # current level can't hold the climb window → chain ascends
+                        if ap > hi_c - rsteps + 1:      # current level can't hold the climb window → chain ascends
                             break
                         a = ap + rsteps                 # arrival on the target level
                         if a > hi:                      # target interval too short for the transit → next interval

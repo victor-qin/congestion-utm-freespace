@@ -561,8 +561,10 @@ class HexOccupancyService:
         return (q, r, L) in self.blocked.get(s, ())
 
     def pad_clear(self, q: int, r: int, s0: int, dwell_steps: int) -> bool:
-        """Is the ordinary (non-terminal) pad at hex (q, r) free for the whole dwell window
-        ``[s0, s0 + dwell_steps]``?
+        """Is the ordinary (non-terminal) pad at hex (q, r) free for the whole dwell — arrival steps
+        ``s0 + 1 .. s0 + dwell_steps``, which read the periods ``s0 .. s0 + dwell_steps`` the column
+        can occupy (an arrival step reads the period before it and its own; step ``s0`` would read
+        period ``s0 - 1``, before the column opens — #136)?
 
         The takeoff/landing hover column spans the full tube [ground, ceiling], so the pad is clear
         iff NO committed corridor sweeps its cell at ANY flight level AND it does not sit under any
@@ -573,7 +575,7 @@ class HexOccupancyService:
         ------------
         - q (int): axial hex column coordinate.
         - r (int): axial hex row coordinate.
-        - s0 (int): first step of the dwell window.
+        - s0 (int): the step the column opens at (its first occupied period).
         - dwell_steps (int): window length in steps (the window includes ``s0 + dwell_steps``).
 
         Return
@@ -587,7 +589,7 @@ class HexOccupancyService:
         cells = [(q, r, L) for L in range(self.cfg.n_levels)]
         pad = self.pad
         term_cells = self.term_cells
-        for k in range(s0, s0 + dwell_steps + 1):
+        for k in range(s0 + 1, s0 + dwell_steps + 1):
             padk = pad.get(k, ())
             tck = term_cells.get(k, _EMPTY) if term_cells else _EMPTY
             for cell in cells:

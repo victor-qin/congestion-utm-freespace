@@ -158,3 +158,11 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `plans_terminal_airspace` is now declared only by colgen, so `sim._wall_aware` admits A*-reaching
   chains and colgen and nothing else. Files: `freespace_sim/planner/__init__.py`, `freespace_sim/sim.py`,
   `freespace_sim/metrics.py`.
+
+- 2026-09-22T18:40Z `[CODE]` Two fixture traps from moving the temporal claim onto half-open time (#136).
+  A ZERO-DURATION volume `Volume4D(shape, t, t)` claims nothing (the old `floor` bound handed it two
+  steps, and one test used that as a pad blocker). An arrival-step probe reads the period BEFORE the
+  step and its own, so a window that starts at the step a column opens (`pad_clear(s0, ...)`) begins at
+  `s0 + 1`, and a zero-length dwell checks nothing. Give blockers real duration and dwells `>= 1`.
+  Files: `freespace_sim/planner/hexgrid.py` (`_step_range`), `freespace_sim/planner/astar/occupancy.py`
+  (`pad_clear`), `tests/test_sipp_compiled.py`, `tests/test_occupancy.py`.

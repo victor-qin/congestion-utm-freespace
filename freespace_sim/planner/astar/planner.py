@@ -1159,10 +1159,11 @@ class AStarPlanner:
                 ts = s + rung_steps[rung]                                # ≥2 steps for a 40 m rung, precomputed
                 # the rebuilt climb box occupies only the levels it traverses ({L, L2}): volumes.py sizes
                 # its z-extent to [z_L, z_L2] ± corridor_height/2, matching _levels_overlapped, so require
-                # clearance on exactly those two levels across the window (s, ts] — not every level.
+                # clearance on exactly those two levels — L2 across (s, ts], L only across (s, ts): the
+                # box has left level L by period ts, which an arrival probe at ts would read (#136).
                 if ts <= max_step and all(
                     not svc.is_blocked(q, r, Lk, sk, own)
-                    for Lk in (L, L2) for sk in range(s + 1, ts + 1)
+                    for Lk, last in ((L, ts), (L2, ts + 1)) for sk in range(s + 1, last)
                 ):
                     out.append((("a", q, r, L2, ts), rung_cost[rung]))
         return out

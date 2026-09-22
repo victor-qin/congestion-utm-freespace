@@ -616,15 +616,15 @@ def _search(
                 ts = step + rung_steps[rung]
                 if ts > max_step:
                     continue
-                clear = True                            # both {L, L2} clear over (step, ts]
-                sk = step + 1
+                clear = True                            # L2 clear over (step, ts]; L over (step, ts) —
+                sk = step + 1                           # the box has left level L by period ts (#136)
                 while sk <= ts:
-                    if _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
+                    if _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
                                 static_col, ov_own_gen, gen,
                                 read_bbox, win, wbox, win_stats) != 0 or \
-                       _blocked(q, r, L2, sk, qmin, rmin, qspan, rspan, n_levels,
-                                static_col, ov_own_gen, gen,
-                                read_bbox, win, wbox, win_stats) != 0:
+                       (sk < ts and _blocked(q, r, L, sk, qmin, rmin, qspan, rspan, n_levels,
+                                             static_col, ov_own_gen, gen,
+                                             read_bbox, win, wbox, win_stats) != 0):
                         clear = False
                         break
                     sk += 1

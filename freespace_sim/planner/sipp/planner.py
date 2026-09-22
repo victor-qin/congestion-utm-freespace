@@ -220,7 +220,7 @@ class SafeIntervalIndex:
         # identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per commit, not 3.
         # This index is step-keyed, so like the hex service it expands the span back out; the saving
         # here is the sweep and the per-row dispatch, not the storage shape.
-        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
+        for q, r, L, s_lo, s_hi, in_blk, _in_pad in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:

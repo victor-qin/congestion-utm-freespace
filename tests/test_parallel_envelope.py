@@ -158,7 +158,9 @@ def test_envelope_superset_audit_terminal(monkeypatch):
 def test_envelope_compiled_accumulates_across_mask_widen():
     # long time-block forces the FB_MASK widen re-run (mirrors test_compiled_mask_widen_re_run_exact);
     # the envelope must accumulate across BOTH kernel passes and still cover the accepted corridor.
-    wall = Volume4D(box_from_segment(vec(200, -400, 150), vec(200, 400, 150), 200, 400), 0.0, 1000.0)
+    # 60 m off the origin pad, inside the pad footprint inflation at any pad radius (its R term
+    # alone is 69.3 m); at 100 m it only blocked a 60 m pad, and the widen went unexercised.
+    wall = Volume4D(box_from_segment(vec(160, -400, 150), vec(160, 400, 150), 200, 400), 0.0, 1000.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)
     p = AStarPlanner(compiled=True)
     p.record_envelope = True

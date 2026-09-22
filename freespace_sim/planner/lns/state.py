@@ -524,7 +524,7 @@ class LNSState:
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 continue  # capacity-gated own column, not a blocked cell
-            for q, r, level, s_lo, s_hi, in_blk in hg.rasterize_ranges(
+            for q, r, level, s_lo, s_hi, in_blk, _in_pad in hg.rasterize_ranges(
                 v, self.cfg, self._R, self._infl_b, self._infl_p
             ):
                 if not in_blk:

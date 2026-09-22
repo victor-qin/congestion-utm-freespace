@@ -20,7 +20,7 @@ _DEFAULT_HUB_COUNTS = (6, 20)
 # Bumped when the persisted scenario_spec.json layout changes incompatibly. Stamped by
 # ScenarioSpec.to_json_dict and checked by from_json_dict so an archived run cannot be silently
 # reinterpreted under a schema it was not written with.
-_SPEC_SCHEMA_VERSION = 2
+_SPEC_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -121,6 +121,9 @@ class ScenarioSpec:
     # MORE than this apart (else the boxes overlap in z). Lower it below the level gap to stack levels
     # closer than 30 m — e.g. 14 m tubes let the (80, 95, 110) ladder sit 15 m apart and stay FCL-disjoint.
     corridor_height_m: "float | None" = None
+    # Delivery-pad footprint override (None → SimConfig default, 10 m). Stored so a recipe replays on the
+    # pad size it was written with.
+    hover_radius_m: "float | None" = None
     demand: DemandSpec = field(default_factory=DemandSpec)
 
     def config(self) -> SimConfig:
@@ -146,6 +149,7 @@ class ScenarioSpec:
                if self.terminal_airspace_always_active is not None else {}),
             **({"flight_levels_m": self.flight_levels_m} if self.flight_levels_m is not None else {}),
             **({"corridor_height_m": self.corridor_height_m} if self.corridor_height_m is not None else {}),
+            **({"hover_radius_m": self.hover_radius_m} if self.hover_radius_m is not None else {}),
         )
 
     def demand_model(self) -> DemandModel | None:
@@ -187,7 +191,7 @@ class ScenarioSpec:
         # filing schemes ran, and BOTH emitted two requests per delivery. It also defaults to True,
         # so an absent key is a round-trip recipe. Only `hub_radius` reads the field; the other
         # patterns never emitted returns, so their recipes are unaffected and still load.
-        v1_demand = (payload.get("demand") or {}) if version < _SPEC_SCHEMA_VERSION else {}
+        v1_demand = (payload.get("demand") or {}) if version < 2 else {}
         if v1_demand.get("pattern") == "hub_radius" and v1_demand.get("return_flights", True):
             raise ValueError(
                 "scenario_spec is v1 with return_flights=True: v1 filed each delivery's return as a "
@@ -196,6 +200,11 @@ class ScenarioSpec:
                 "changed meaning — v1 delayed when the return was FILED, v2 is the pad dwell between "
                 "the legs. Re-run it with the code that wrote it, or set return_flights=false to "
                 "replay it as one-way deliveries (which is not the world it recorded).")
+
+        # v1 and v2 recipes predate `hover_radius_m`: a delivery pad then fell back to the 60 m corridor
+        # width. Pin it, or they silently replay on today's 10 m pads.
+        if version < 3 and payload.get("hover_radius_m") is None:
+            payload["hover_radius_m"] = 60.0
 
         demand_payload = dict(payload.pop("demand", None) or {})
         demand_fields = DemandSpec.__dataclass_fields__

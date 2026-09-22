@@ -88,16 +88,22 @@ def _z_profile(intent):
     return [round(float(p[2]), 1) for p, _ in intent.centerline]
 
 
-def _low_wall(x=1000.0, half_y=2000.0):
-    """A wide permanent wall spanning z 15..70: blocks the band floor (30) AND the straight warm
-    planner's 75 m plane, but leaves the upper band clear — the only cheap lever is to climb.
+def _low_wall(x=1000.0, half_y=2000.0, cfg=None):
+    """A wide permanent wall from under the band floor's box up to the straight warm planner's cruise
+    plane: blocks the floor AND the warm start, but leaves the top of the band clear — the only cheap
+    lever is to climb.
 
     ``half_y`` must be wide enough that going AROUND is dearer than going over, and how wide that is
     depends on the cost weights. Under the per-second currency a metre of climb costs 6.7x a metre of
     cruise (climbing is 5x slower, at 4x vs 3x the rate), so the berth has to exceed ~930 m of extra
     path before it loses: at the old 800 m the two levers landed within 12% of each other and the
     solver's gap tolerance picked the winner. 2000 m puts climbing ahead ~3.5x, restoring the margin."""
-    return Volume4D(box_from_segment(vec(x, -half_y, 42.5), vec(x, half_y, 42.5), 40, 55.0), 0.0, 1e6)
+    cfg = cfg or SimConfig()
+    half = cfg.corridor_height_m / 2.0
+    z_lo, z_hi = cfg.z_min_m - half, cfg.cruise_level_m       # under the floor's box … to the warm plane
+    assert z_hi + 2.0 * half < cfg.z_max_m, "fixture: a box must fit between the wall and the band top"
+    zc = 0.5 * (z_lo + z_hi)
+    return Volume4D(box_from_segment(vec(x, -half_y, zc), vec(x, half_y, zc), 40, z_hi - z_lo), 0.0, 1e6)
 
 
 def test_milp_cruises_at_band_floor_in_empty_airspace():
@@ -110,10 +116,13 @@ def test_milp_cruises_at_band_floor_in_empty_airspace():
 
 
 def test_milp_climbs_over_a_wall_blocking_the_floor_and_the_warm_plane():
-    cfg = SimConfig()
+    # Pinned to a ladder with room above the warm plane: on the default (70, 85, 100, 115) band the
+    # straight warm start flies at 100 m and the MILP finds no vertical escape over any wall tall
+    # enough to block it (a 96 m wall top is already infeasible), so the premise needs the wider band.
+    cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0))
     led = ReservationLedger(cfg)
-    led.commit(99, [_low_wall()])
-    # the straight warm start is blocked too (its 75 m corridor overlaps the wall) → the accepted
+    led.commit(99, [_low_wall(cfg=cfg)])
+    # the straight warm start is blocked too (its cruise-plane corridor overlaps the wall) → the accepted
     # intent is the MILP solver's own, and climbing beats the ~2.6 km lateral berth (see _low_wall)
     assert StraightLineTimeShift().plan(_req(), led, cfg).status is IntentStatus.REJECTED
     intent = MILPOptPlanner().plan(_req(), led, cfg)

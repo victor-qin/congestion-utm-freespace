@@ -256,10 +256,12 @@ def test_cost_and_time_diverge_by_their_weights():
 
 
 def test_altitude_recorded_as_cost_and_both_time_readings():
-    # a flight pushed up to level 1 (z=70): altitude_change 140, floor 60 ⇒ 80 m of congestion climb
-    intent = _accepted(altitude_change_m=2.0 * 70.0)
+    # a flight pushed 40 m above the ladder floor: the FULL round-trip climb is charged as altitude
+    # cost, but only the part above the unimpeded round trip (2·floor) reads as congestion climb
+    floor = CFG.flight_levels_m[0]
+    intent = _accepted(altitude_change_m=2.0 * floor + 80.0)
     cb, db = metrics.cost_breakdown(intent, CFG), metrics.delay_breakdown_s(intent, CFG)
-    assert math.isclose(cb["altitude_cost"], CFG.cost_altitude_change_per_m * 140.0)        # FULL climb
+    assert math.isclose(cb["altitude_cost"], CFG.cost_altitude_change_per_m * (2.0 * floor + 80.0))
     assert math.isclose(db["excess_altitude_m"], 80.0)                                       # above floor
     # A (physical) and B (cost-equivalent) — BOTH recorded, and genuinely different (12× at defaults)
     assert math.isclose(db["altitude_delay_phys_s"], 80.0 / CFG.climb_rate_mps)              # ≈13.3 s

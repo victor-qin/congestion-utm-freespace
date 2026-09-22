@@ -71,6 +71,10 @@ def _cfg(**overrides) -> SimConfig:
         # Pinned like the other geometry knobs above: the expectations below are hand-derived step
         # counts, and the column window (hover + climb) sets the step grid they were computed on.
         "hover_time_s": 30.0,
+        # Pinned, not inherited: these worlds are built from 60 m endpoint discs — the fallback
+        # before a delivery pad got its own default (#134). At 10 m the constructed congestion
+        # simply is not there, and the hand-derived expectations below stop meaning anything.
+        "hover_radius_m": 60.0,
     }
     values.update(overrides)
     return SimConfig(**values)
@@ -998,7 +1002,10 @@ def test_colgen_beats_fcfs_on_constructed_congestion():
         fcfs_delays.append(total_delay_s(intent, astar_cfg))
 
     assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 16.0]
-    assert fcfs_delays == pytest.approx([0.0, 24.0, 24.0])
+    # 20 s, not 24: a lattice hop claims the two cells it flies through rather than a 99.3 m disc
+    # around them (#38), so FCFS clears each crossing one step sooner. Colgen still wins — the
+    # comparison below is the property; these are the witnesses.
+    assert fcfs_delays == pytest.approx([0.0, 20.0, 20.0])
     # `objective` is in the cost model's currency, which is now the config's 1:3 weighting
     # and NOT seconds in general.  It is comparable to the A* delays here for a reason
     # specific to this instance: colgen resolves the congestion entirely with GROUND delay

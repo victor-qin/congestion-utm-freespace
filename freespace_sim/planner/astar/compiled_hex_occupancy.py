@@ -59,8 +59,8 @@ def hover_tail_steps(cfg) -> int:
     every committed step; query correctness never needs it (every query ``≤ max_step ≤ MAXS``)."""
     max_climb = max(cfg.climb_time_to(z) for z in cfg.flight_levels_m)
     # +2 is discretisation headroom OVER the ceil count (see context/figures/hover_tail_steps.png):
-    # `_step_range`'s own +dt widening and a mid-step arrival's floor slip each add a step, and MAXS
-    # only sizes the box, so a safe over-count costs nothing while an undercount would clip the tail.
+    # `_step_range`'s own "period after" step and a mid-step arrival's rounding each add a step, and
+    # MAXS only sizes the box, so a safe over-count costs nothing while an undercount would clip the tail.
     return int(math.ceil((cfg.hover_time_s + max_climb + cfg.time_buffer_s) / cfg.dt_s)) + 2
 
 

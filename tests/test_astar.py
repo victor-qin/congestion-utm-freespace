@@ -22,7 +22,7 @@ from freespace_sim.types import (
     Terminal,
     vec,
 )
-from freespace_sim.volumes import Volume4D
+from freespace_sim.volumes import Volume4D, corridor_segment_volume
 
 CFG = SimConfig()
 
@@ -257,6 +257,45 @@ def test_vertical_edge_step_count_matches_climb_kinematics():
     assert climbs, "expected a level-0 → level-1 climb mid-route"
     t_a, t_b = climbs[0]
     assert abs((t_b - t_a) - rung_steps * cfg.dt_s) < 1e-6
+
+
+@pytest.mark.parametrize("planner_name", ("astar_ref", "astar", "sipp_ref", "sipp"))
+@pytest.mark.parametrize("still_on_level", (False, True))
+def test_climb_is_blocked_by_the_level_it_leaves_only_while_on_it(planner_name, still_on_level):
+    """A climb occupies the level it leaves until it arrives on the next one, and no longer (#136).
+
+    The kinematics test's walls force a level 0 → 1 climb between x = 900 and 1500. Every row cell
+    there then gets a level-0 hop that starts either the period a zero-delay climb from that cell
+    arrives on level 1 (the climb has left, so the plan keeps its unimpeded cost) or one period
+    earlier (the climb is still there, so every zero-delay climb is refused, conflict-free). All four
+    lattice planners run the same fixture, so each copy of the rung check is pinned on its own.
+    """
+    cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0), time_buffer_s=0.0)
+    R, dt, z0 = hg.circumradius(cfg), cfg.dt_s, cfg.level_z(0)
+    rung_steps = math.ceil((cfg.level_z(1) - z0) / (cfg.climb_rate_mps * dt))
+    assert rung_steps == 2, "fixture: the climb must spend a period on level 0 after its first step"
+    led = ReservationLedger(cfg)
+    led.commit(98, [_level_wall(cfg.level_z(1), x=900.0, cfg=cfg)])  # level 1 blocked early → fly low
+    led.commit(97, [_level_wall(z0, x=1500.0, cfg=cfg)])              # level 0 blocked late → must climb
+    planner = get_planner(planner_name)
+    unimpeded = planner.plan(_req(), led, cfg)
+    assert unimpeded.ground_delay_s == 0.0 and unimpeded.air_hold_s == 0.0
+    # With no delay the flight reaches row cell (q, 0) on level 0 at step climb_steps_to(z0) + q, so a
+    # climb started there arrives on level 1 `rung_steps` later. Each hop claims exactly its two cells.
+    pitch = R * math.sqrt(3.0)
+    hops = []
+    for q in range(int(600.0 // pitch), int(1500.0 // pitch) + 2):
+        t = (cfg.climb_steps_to(z0) + q + rung_steps - int(still_on_level)) * dt
+        a, b = hg.hex_center(q, 0, R), hg.hex_center(q, 1, R)
+        hops.append(corridor_segment_volume(vec(a[0], a[1], z0), t, vec(b[0], b[1], z0), t + dt, cfg))
+    led.commit(96, hops)
+    intent = planner.plan(_req(), led, cfg)
+    assert intent.status is IntentStatus.ACCEPTED
+    assert not led.any_conflict(intent.volumes)
+    if still_on_level:
+        assert intent.cost > unimpeded.cost                  # no zero-delay climb survives
+    else:
+        assert intent.cost == pytest.approx(unimpeded.cost)  # a climb that has left is not blocked
 
 
 def test_astar_multilevel_is_deterministic():

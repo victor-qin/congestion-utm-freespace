@@ -1002,10 +1002,11 @@ def test_colgen_beats_fcfs_on_constructed_congestion():
         fcfs_delays.append(total_delay_s(intent, astar_cfg))
 
     assert sorted(column.delay_s for column in colgen.columns.values()) == [0.0, 0.0, 16.0]
-    # 20 s, not 24: a lattice hop claims the two cells it flies through rather than a 99.3 m disc
-    # around them (#38), so FCFS clears each crossing one step sooner. Colgen still wins — the
-    # comparison below is the property; these are the witnesses.
-    assert fcfs_delays == pytest.approx([0.0, 20.0, 20.0])
+    # 16 s, not 24: a lattice hop claims the two cells it flies through rather than a 99.3 m disc
+    # around them (#38), and its claim ends at the last arrival that can conflict rather than one
+    # step later (#136), so FCFS clears each crossing two steps sooner than it used to. Colgen
+    # still wins — the comparison below is the property; these are the witnesses.
+    assert fcfs_delays == pytest.approx([0.0, 16.0, 16.0])
     # `objective` is in the cost model's currency, which is now the config's 1:3 weighting
     # and NOT seconds in general.  It is comparable to the A* delays here for a reason
     # specific to this instance: colgen resolves the congestion entirely with GROUND delay

@@ -256,9 +256,11 @@ def test_non_integral_ground_delay_cap_rounds_down_for_every_lattice_path(planne
     )
     req = FlightRequest(1, vec(300, 500, 0), vec(700, 500, 0), 0.0)
     ledger = ReservationLedger(cfg)
-    # The pad is blocked at departure steps 0 and 1, then free at step 2. Rounding 5/4 upward therefore
-    # accepts with an illegal 8 s delay; rounding down allows only steps 0..1 and correctly denies.
-    ledger.commit(99, [Volume4D(CylinderSpec(300, 500, 100, 0, 150), 0.0, 0.0)])
+    # The pad is occupied for periods 0-1 (t < 8 s), so departure steps 0 and 1 are blocked and step 2
+    # (8 s) is the first clear one — past the 5 s cap. Rounding 5/4 upward would accept that illegal
+    # 8 s delay; rounding down allows only steps 0..1 and correctly denies. (A zero-duration blocker at
+    # t = 0 overlaps no period, so it would block no departure: the blocker needs real duration.)
+    ledger.commit(99, [Volume4D(CylinderSpec(300, 500, 100, 0, 150), 0.0, 8.0)])
 
     intent = get_planner(planner_name).plan(req, ledger, cfg)
     assert not intent.accepted

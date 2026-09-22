@@ -19,8 +19,9 @@ def _scalar_rasterize(vol, cfg, r_circ, infl):
     levels = hg._levels_overlapped(vol, cfg)
     if not levels:
         return set()
-    s0 = int(math.floor((vol.t_start - cfg.time_buffer_s) / cfg.dt_s))
-    s1 = int(math.floor((vol.t_end + cfg.dt_s + cfg.time_buffer_s) / cfg.dt_s))
+    b = cfg.time_buffer_s
+    s0 = int(math.floor((vol.t_start - b) / cfg.dt_s))
+    s1 = int(math.ceil((vol.t_end + b) / cfg.dt_s))     # the step after the last buffered period
     lo, hi = vol.aabb()
     amin = lo[:2] - infl
     amax = hi[:2] + infl
@@ -448,3 +449,40 @@ def test_column_hexes_cache_is_bounded_and_answer_stable():
         hg.column_hexes(((float(i) * 1000.0, 0.0, 90.0),), R)
     assert len(hg._COL_HEX_CACHE) <= hg._COL_HEX_CACHE_CAP
     assert hg.column_hexes(key, R) == first, "a recomputed entry disagreed with the cached one"
+
+
+@pytest.mark.parametrize("buffer_s", [0.0, 2.0, 4.0, 6.0, 8.0])
+def test_step_range_claims_exactly_the_conflicting_arrivals(buffer_s):
+    """A passed-through cell is claimed at every step where a visitor's arrival could conflict with
+    the committed hops, and at no other (#136: the old ``floor`` bound claimed one step past the
+    last conflicting arrival on every grid-aligned volume).
+
+    A committed flight crosses the cell's centre at step ``m``. A visitor arriving at step ``s``
+    from any neighbour (or a hold) and leaving to any neighbour (or a hold) conflicts iff one of its
+    two boxes meets one of the committed boxes under the ledger's own ``volumes_conflict``; the set
+    of such ``s`` must equal the union of the two hops' ``_step_range`` claims.
+    """
+    from freespace_sim.conflict import volumes_conflict
+
+    cfg = replace(CFG, time_buffer_s=buffer_s)
+    dt, z = cfg.dt_s, cfg.cruise_level_m
+
+    def centre(q, r=0):
+        c = hg.hex_center(q, r, R)
+        return vec(c[0], c[1], z)
+
+    m = 100
+    cell = (m, 0)
+    committed = [corridor_segment_volume(centre(m - 1), (m - 1) * dt, centre(m), m * dt, cfg),
+                 corridor_segment_volume(centre(m), m * dt, centre(m + 1), (m + 1) * dt, cfg)]
+    claimed = {s for v in committed for s in hg._step_range(v, cfg)}
+    visits = [(m + dq, dr) for dq, dr in hg.AXIAL_NEIGHBORS] + [cell]
+    needed = set()
+    for s in range(m - 12, m + 13):
+        for n in visits:
+            inbound = corridor_segment_volume(centre(*n), (s - 1) * dt, centre(*cell), s * dt, cfg)
+            outbound = corridor_segment_volume(centre(*cell), s * dt, centre(*n), (s + 1) * dt, cfg)
+            if any(volumes_conflict(v, w) for v in committed for w in (inbound, outbound)):
+                needed.add(s)
+    assert claimed == needed
+    assert len(needed) == 3 + int(round(4 * buffer_s / dt))          # 3/5/7/9/11 steps at 0/2/4/6/8 s

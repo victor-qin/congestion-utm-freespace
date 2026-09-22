@@ -723,16 +723,60 @@ def _sweep_kept(vol: Volume4D, cfg: SimConfig, R: float, infl_blocked: float, in
             (slack[keep] <= infl_blocked).tolist(), (slack[keep] <= infl_pad).tolist())
 
 
-def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
-    """The inclusive step span a committed volume blocks, widened by the corridor box's temporal
-    extent: a move ARRIVING at step s commits a box spanning ``[(s−1)·dt − buffer, s·dt + buffer]``,
-    so s is blocked whenever that box could overlap the obstacle window. Without the widening A*
-    enters a just-cleared cell and the rebuilt box clips it.
+def _periods_overlapping(t0: float, t1: float, dt: float) -> range:
+    """Return grid periods whose half-open intervals overlap ``[t0, t1)``.
+
+    Period ``j`` denotes ``[j * dt, (j + 1) * dt)``.  Consequently the first
+    touched period is ``floor(t0 / dt)`` and the exclusive stop is
+    ``ceil(t1 / dt)``.  This helper deliberately has no tolerance padding:
+    template corridor times are created directly by the ledger builder and the
+    expected default offset tuple is exactly ``(-2, 1)``.
+
+    Parameters
+    ------------
+    - t0 (float): inclusive start of the interval (s).
+    - t1 (float): exclusive end of the interval (s).
+    - dt (float): grid period length (s).
+
+    Return
+    --------
+    - output (range): the integer periods from ``floor(t0/dt)`` to ``ceil(t1/dt)`` (exclusive
+      stop) whose half-open intervals overlap ``[t0, t1)``.
     """
-    dt = cfg.dt_s
-    s0 = int(math.floor((vol.t_start - cfg.time_buffer_s) / dt))
-    s1 = int(math.floor((vol.t_end + dt + cfg.time_buffer_s) / dt))
-    return range(s0, s1 + 1)
+
+    # Division can put an exact constructed boundary on the wrong side of its
+    # integer (for example ``(3 * 0.7) / 0.7 < 3``).  Correct the quotient by
+    # comparing against the same multiplied grid values that define the row
+    # intervals.  Unlike an epsilon snap, this still treats ``nextafter(k*dt,
+    # +inf)`` as genuinely inside the following period.
+    start = math.floor(t0 / dt)
+    while (start + 1) * dt <= t0:
+        start += 1
+    while start * dt > t0:
+        start -= 1
+
+    stop = math.ceil(t1 / dt)
+    while (stop - 1) * dt >= t1:
+        stop -= 1
+    while stop * dt < t1:
+        stop += 1
+    return range(start, stop)
+
+
+def _step_range(vol: Volume4D, cfg: SimConfig) -> range:
+    """The inclusive steps at which a committed volume blocks an ARRIVAL: every grid period the
+    volume occupies once widened by the prober's time buffer, plus the period after each — a move
+    arriving at step s flies period s−1 into the cell and period s out of it, and its next move never
+    re-checks the cell it leaves, so both periods must be clear.
+
+    Half-open on both ends, like ``volumes_conflict``: a visitor whose box only touches the window
+    at an instant is no conflict, so the top is the exclusive ``ceil`` of
+    :func:`_periods_overlapping`, not a ``floor`` — the latter claimed one step past the last
+    conflicting arrival on every grid-aligned volume (#136).
+    """
+    b = cfg.time_buffer_s
+    p = _periods_overlapping(vol.t_start - b, vol.t_end + b, cfg.dt_s)
+    return range(p.start, p.stop + 1)
 
 
 def _cylinder_z_independent(vol: Volume4D, cfg: SimConfig, levels: list[int]) -> bool:

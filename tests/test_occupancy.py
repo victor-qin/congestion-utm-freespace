@@ -166,7 +166,9 @@ def test_pad_clear_blocked_by_corridor_at_any_level():
     s = next(iter(svc.pad))
     q, r, L = next(iter(svc.pad[s]))
     assert L == 1                                            # the corridor sits at level 1
-    assert not svc.pad_clear(q, r, s, 0)                     # but the pad's column spans all levels
+    # a one-step dwell opening at period s reads arrival step s + 1 (periods s and s + 1), both inside
+    # the corridor's claim — but the pad's column spans all levels, so level 1 blocks it
+    assert not svc.pad_clear(q, r, s, 1)
 
 
 # ------------------------------------------------- the `blocked` map's deferred build (area 2)

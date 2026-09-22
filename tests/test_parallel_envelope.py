@@ -350,14 +350,14 @@ def test_sipp_envelope_covers_the_reference_paths_probes(monkeypatch):
 
 
 @pytest.mark.parametrize("planner", ["astar", "sipp"])
-@pytest.mark.parametrize("t_end", [92.0, 100.0])
+@pytest.mark.parametrize("t_end", [98.0, 100.0])
 def test_envelope_covers_occupancy_rasterization_before_the_request(planner, t_end):
     """A stale DROP repair must be dirty when an interleaved volume changes the first occupancy
     step, even if the raw volume ends at or before the request clock.
 
-    With the default 4 s step and 4 s time buffer, `_step_range` retains a volume ending at t=92
-    through the t=100 request's base step. The equality is load-bearing: the step range is inclusive
-    while `envelope_intersects` uses a half-open lower-time comparison.
+    With the default 4 s step and 4 s time buffer, a volume ending at t=98 (buffered to 102) still
+    occupies the t=100 request's first pad period, which the pad dwell's first arrival probe reads;
+    one ending at t=96 does not (#136), so the envelope's lookback must reach at least this far.
     """
     from freespace_sim.planner.lns.parallel import _read_set_is_clean
 

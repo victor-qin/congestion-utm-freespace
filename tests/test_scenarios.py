@@ -206,13 +206,13 @@ def test_density_stacked_scenarios_are_three_levels(stacked_name, twin_name):
     assert (cfg.z_min_m, cfg.cruise_level_m, cfg.z_max_m) == (80.0, 95.0, 110.0)
 
     # the stacked variant changes ONLY altitude — its demand world is identical to the single-level twin,
-    # which itself is untouched (still the 100 m plane on SimConfig's default 30 m box).
+    # which itself is untouched (still the 100 m plane, inheriting SimConfig's default corridor box).
     stacked, twin = SCENARIOS[stacked_name], SCENARIOS[twin_name]
     assert stacked.lam_per_hour == twin.lam_per_hour
     assert stacked.demand == twin.demand
     twin_cfg = twin.config()
     assert twin_cfg.flight_levels_m == (100.0,)
-    assert twin_cfg.corridor_height_m == 30.0
+    assert twin_cfg.corridor_height_m == SimConfig().corridor_height_m
 
 
 _MIXED_WORLDS = ["density_faa_wing_zipline_amazon", "density_future_wing_zipline_amazon"]

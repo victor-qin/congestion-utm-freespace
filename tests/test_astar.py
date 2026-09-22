@@ -171,10 +171,10 @@ def _cruise_levels(intent):
     return sorted({round(float(p[2]), 1) for p, _ in intent.centerline})
 
 
-def _level_wall(z, x=1000.0, half_y=400.0):
+def _level_wall(z, x=1000.0, half_y=400.0, cfg=CFG):
     """A wide, all-time wall centred at altitude ``z`` (height = corridor_height ⇒ blocks ONE level)."""
     return Volume4D(
-        box_from_segment(vec(x, -half_y, z), vec(x, half_y, z), 40, CFG.corridor_height_m), 0.0, 1e6
+        box_from_segment(vec(x, -half_y, z), vec(x, half_y, z), 40, cfg.corridor_height_m), 0.0, 1e6
     )
 
 
@@ -266,21 +266,26 @@ def test_continuous_planners_report_no_lattice_overhead():
 
 def test_vertical_edge_step_count_matches_climb_kinematics():
     """Force a mid-route layer change (level 1 walled early, level 0 walled late) and check it spans
-    ceil(Δz / (climb_rate·dt)) steps — 40 m / 24 m ⇒ 2 steps. Both walls are mid-route, never over a
-    pad (the takeoff/landing tube reserves [ground, ceiling] at the endpoints)."""
-    led = ReservationLedger(CFG)
-    led.commit(98, [_level_wall(CFG.level_z(1), x=900.0)])           # level 1 blocked early → fly low
-    led.commit(97, [_level_wall(CFG.level_z(0), x=1500.0)])          # level 0 blocked late → must climb
-    intent = AStarPlanner().plan(_req(), led, CFG)
+    ceil(Δz / (climb_rate·dt)) steps. Pinned to a 40 m rung (2 steps at 6 m/s · 4 s) rather than the
+    default ladder so the count stays multi-step — a 1-step rung cannot tell ceil from max(1, ·). Both
+    walls are mid-route, never over a pad (the takeoff/landing tube reserves [ground, ceiling] at the
+    endpoints)."""
+    cfg = SimConfig(flight_levels_m=(30.0, 70.0, 110.0))
+    rung_steps = math.ceil((cfg.level_z(1) - cfg.level_z(0)) / (cfg.climb_rate_mps * cfg.dt_s))
+    assert rung_steps == 2, "fixture: the rung must take more than one step"
+    led = ReservationLedger(cfg)
+    led.commit(98, [_level_wall(cfg.level_z(1), x=900.0, cfg=cfg)])  # level 1 blocked early → fly low
+    led.commit(97, [_level_wall(cfg.level_z(0), x=1500.0, cfg=cfg)])  # level 0 blocked late → must climb
+    intent = AStarPlanner().plan(_req(), led, cfg)
     assert intent.status is IntentStatus.ACCEPTED
     assert not led.any_conflict(intent.volumes)
     cl = intent.centerline
     climbs = [(cl[i][1], cl[i + 1][1]) for i in range(len(cl) - 1)
-              if round(float(cl[i][0][2])) == CFG.level_z(0)
-              and round(float(cl[i + 1][0][2])) == CFG.level_z(1)]
+              if round(float(cl[i][0][2])) == cfg.level_z(0)
+              and round(float(cl[i + 1][0][2])) == cfg.level_z(1)]
     assert climbs, "expected a level-0 → level-1 climb mid-route"
     t_a, t_b = climbs[0]
-    assert abs((t_b - t_a) - 2 * CFG.dt_s) < 1e-6                    # 2 timesteps for the 40 m rung
+    assert abs((t_b - t_a) - rung_steps * cfg.dt_s) < 1e-6
 
 
 def test_astar_multilevel_is_deterministic():

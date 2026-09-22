@@ -74,7 +74,8 @@ def test_heading_only_skip_would_bypass_a_real_temporal_conflict():
     # Split boxes occupy x≈0 early and x≈120 later. Merging creates one coarse box that claims the
     # full x-range for the full traversal window, so this late obstacle conflicts only after merging.
     ledger = ReservationLedger(CFG)
-    ledger.commit(99, [Volume4D(CylinderSpec(10, 0, 2, 60, 80), 6.5, 7.5)])
+    half = CFG.corridor_height_m / 2.0                      # obstacle spans the corridor's own z-band
+    ledger.commit(99, [Volume4D(CylinderSpec(10, 0, 2, z - half, z + half), 6.5, 7.5)])
     origin, dest = vec(-500, -500, 0), vec(500, 500, 0)
     assert shortcut_mod._rebuild(
         [a, b, c], origin, dest, 0.0, 0.0, CFG, ledger, 1000.0,

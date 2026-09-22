@@ -245,12 +245,12 @@ def test_terminal_column_spans_all_inband_levels():
 
     col = Volume4D(CylinderSpec(0.0, 0.0, 60.0, CFG.ground_level_m, CFG.airspace_ceiling_m), 0.0, 60.0)
     levels = {L for (_, _, L, _) in hg.rasterize_volume(col, CFG, R)}
-    assert levels == {0, 1, 2}
+    assert levels == set(range(CFG.n_levels))
 
 
 def test_single_level_rasterize_tags_zero():
     """With one flight level the (q,r,s) projection matches a single-plane raster, all at L==0."""
-    cfg1 = SimConfig(flight_levels_m=(75.0,))               # one level, ceiling stays 125
+    cfg1 = SimConfig(flight_levels_m=(75.0,))               # one level, ceiling stays at the default
     box = corridor_segment_volume(vec(0, 0, 75.0), 0.0, vec(120, 0, 75.0), cfg1.dt_s, cfg1)
     cells = set(hg.rasterize_volume(box, cfg1, R))
     assert cells
@@ -287,7 +287,8 @@ def test_compiled_box_repairs_a_numpy_threshold_rounding_flip():
         compiled = list(hg.rasterize_volume(vol, CFG, R))
 
     assert compiled == reference
-    assert any((q, r, L) == (4, 3, 1) for q, r, L, _s in compiled)
+    cruise_L = CFG.nearest_level(CFG.cruise_level_m)         # the level the fixture's box flies at
+    assert any((q, r, L) == (4, 3, cruise_L) for q, r, L, _s in compiled)
 
 
 def test_compiled_box_matches_reference_at_random_exact_thresholds():

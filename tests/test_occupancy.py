@@ -151,7 +151,7 @@ def test_terminal_column_recorded_at_all_levels():
                    0.0, 60.0, terminal_id="H")
     svc.add_volume(col)
     s = next(iter(svc.term_cells))
-    assert {L for (_, _, L) in svc.term_cells[s]} == {0, 1, 2}
+    assert {L for (_, _, L) in svc.term_cells[s]} == set(range(CFG.n_levels))
     q, r, L = next(iter(svc.term_cells[s]))
     assert svc.is_blocked(q, r, L, s)                        # foreign cruise walled at every level
     assert not svc.is_blocked(q, r, L, s, own={"H"})        # the hub's own flights pass through

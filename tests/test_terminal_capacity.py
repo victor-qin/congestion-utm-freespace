@@ -271,9 +271,10 @@ def test_evict_drops_past_dwells_and_is_monotonic():
     tcap.on_commit(1, [_col(t0=0.0)])                      # [0, DWELL)
     tcap.on_commit(2, [_col(t0=200.0)])                    # [200, 200+DWELL)
     tcap.evict_before(DWELL + 1.0)                         # drops the first (ended), keeps the second
-    assert tcap.dwells["H"] == [(200.0, 200.0 + DWELL)]
+    second = [(200.0, pytest.approx(200.0 + DWELL))]       # approx: the column sums t0+hover+climb in
+    assert tcap.dwells["H"] == second                      # a different order (last-ulp difference)
     tcap.evict_before(10.0)                                # earlier watermark → no-op (monotonic)
-    assert tcap.dwells["H"] == [(200.0, 200.0 + DWELL)]
+    assert tcap.dwells["H"] == second
     tcap.evict_before(10_000.0)                            # everything past → hub dropped entirely
     assert "H" not in tcap.dwells
 

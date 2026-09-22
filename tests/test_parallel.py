@@ -95,7 +95,7 @@ def test_exact_byte_identical_hub_dense_always_active():
                     planner="astar_shortcut", seed=1, terminal_airspace_always_active=True)
     demand = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 2, "stripmall_uss": 5},
                              radius_m={"walmart_uss": 2500.0, "stripmall_uss": 1500.0},
-                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                             terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 120.0},
                              pads_per_hub=4, return_flights=True)
     seq = run(cfg, demand=demand)
     assert len(seq.intents) > 10 and any(
@@ -104,7 +104,7 @@ def test_exact_byte_identical_hub_dense_always_active():
     pc = ParallelConfig(n_workers=2, window=8)
     demand2 = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 2, "stripmall_uss": 5},
                               radius_m={"walmart_uss": 2500.0, "stripmall_uss": 1500.0},
-                              terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                              terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 120.0},
                               pads_per_hub=4, return_flights=True)
     par = run(cfg, demand=demand2, parallel=pc)
     _assert_byte_identical(seq, par)
@@ -152,7 +152,7 @@ def test_respec_out_of_order_eviction_safe():
     results byte-match fresh planners; uses a capacity-gated multi-pad hub so the tcap eviction path
     (seconds dimension) is exercised, not just the hex-occupancy steps dimension."""
     cfg = SimConfig()
-    hub = Terminal("h#0", 2, 90.0)                       # capacity 2 → dwell contention matters
+    hub = Terminal("h#0", 2, 120.0)                       # capacity 2 → dwell contention matters
     seed_req = FlightRequest(1, vec(0, 0, 0), vec(3000, -400, 0), 0.0, origin_terminal=hub)
     early = FlightRequest(2, vec(0, 0, 0), vec(3000, 400, 0), 4.0, origin_terminal=hub)
     later = FlightRequest(3, vec(0, 0, 0), vec(3000, 0, 0), 600.0, origin_terminal=hub)
@@ -213,7 +213,7 @@ def test_relaxed_revalidates_terminal_capacity_at_ordered_commit(planner_name):
         planner=planner_name,
         max_ground_delay_s=300.0,
     )
-    hub = Terminal("hub", 1, 90.0)
+    hub = Terminal("hub", 1, 120.0)
 
     def requests():
         return [
@@ -273,7 +273,7 @@ def test_relaxed_denials_kept():
     # Relaxed mode must commit the snapshot denial as-is: no serial replan (obstacle monotonicity).
     from freespace_sim.types import DenialReason
     cfg = SimConfig(region_size_m=(5000.0, 4000.0), terminal_airspace_always_active=True)
-    hub = Terminal("x#0", 4, 90.0)
+    hub = Terminal("x#0", 4, 120.0)
     reqs = [FlightRequest(1, vec(2000, 1500, 0), vec(0, 0, 0), 0.0, dest_terminal=hub),
             FlightRequest(2, vec(0, 0, 0), vec(3000, 0, 0), 1.0)]
     seq = run(cfg, requests=list(reqs))
@@ -295,7 +295,7 @@ def test_delta_stream_rebuilds_identical_ledger():
                       0.0, 77.7)]
     vols2 = [Volume4D(box_from_segment(vec(100, 200, 70), vec(900, 800, 70), 60, 25), 10.0, 55.0,
                       terminal_id="h#0")]
-    hub = Terminal("h#0", 4, 90.0)
+    hub = Terminal("h#0", 4, 120.0)
     auth, replica = ReservationLedger(cfg), ReservationLedger(cfg)
     auth.register_static_terminal(vec(2000, 2000, 0), hub)
     replica.register_static_terminal(vec(2000, 2000, 0), hub)
@@ -403,7 +403,7 @@ def test_parallel_telemetry_merge_matches_sequential():
     # runs. Exact mode ⇒ identical plans ⇒ identical telemetry rows, merged in commit order.
     cfg = SimConfig(region_size_m=(5000.0, 4000.0), terminal_airspace_always_active=True,
                     max_detour_factor=1.005)
-    hub = Terminal("x#0", 4, 90.0)
+    hub = Terminal("x#0", 4, 120.0)
     reqs = [FlightRequest(1, vec(1500, 1500, 0), vec(1500, 0, 0), 0.0, dest_terminal=hub),
             FlightRequest(2, vec(0, 0, 0), vec(3000, 0, 0), 1.0)]
     seq = run(cfg, requests=list(reqs), telemetry=True)

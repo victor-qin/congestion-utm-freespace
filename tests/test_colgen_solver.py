@@ -257,8 +257,8 @@ def test_hub_fold_legs_and_terminal_rows_are_priced_exactly():
     cfg = _cfg(max_ground_delay_s=16.0)
     origin = _point((-8, 0), cfg)
     destination = _point((8, 0), cfg)
-    origin_terminal = Terminal("A", 2, radius=90.0)
-    destination_terminal = Terminal("B", 2, radius=90.0)
+    origin_terminal = Terminal("A", 2, radius=120.0)
+    destination_terminal = Terminal("B", 2, radius=120.0)
     request = FlightRequest(
         30,
         origin,
@@ -292,8 +292,8 @@ def test_hub_pruning_does_not_treat_fold_replacement_as_unavoidable_delay():
     cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=10.0)
     origin = _point((1, 39), cfg)
     destination = _point((-2, 42), cfg)
-    origin_terminal = Terminal("A", 1, radius=90.0)
-    destination_terminal = Terminal("B", 1, radius=90.0)
+    origin_terminal = Terminal("A", 1, radius=120.0)
+    destination_terminal = Terminal("B", 1, radius=120.0)
     request = FlightRequest(
         31,
         origin,
@@ -1202,7 +1202,7 @@ def test_initial_seed_shifts_stop_at_the_path_specific_arrival_horizon():
     cfg = _cfg(max_ground_delay_s=48.0)
     request = _request(1, (-10, 0), (10, 0), cfg)
     static_terms = tuple(
-        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=0.0))
+        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=1.0))   # one-hex obstacle (ring rooted at r)
         for index, cell in enumerate(((3, 1), (1, -1)))
     )
     params = _params(max_air_overrun_hops=1)
@@ -1302,7 +1302,7 @@ def test_the_departure_ladder_stops_at_the_arrival_horizon_not_the_ground_budget
     cfg = _cfg(max_ground_delay_s=48.0)
     request = _request(1, (-10, 0), (10, 0), cfg)
     static_terms = tuple(
-        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=0.0))
+        (_point(cell, cfg), Terminal(f"X{index}", 1, radius=1.0))   # one-hex obstacle (ring rooted at r)
         for index, cell in enumerate(((3, 1), (1, -1)))
     )
     graph = build_flight_graph(request, cfg, static_terms, _params(max_air_overrun_hops=1))
@@ -1343,7 +1343,7 @@ def test_disconnected_static_wall_denies_only_that_flight():
     cfg = _cfg(max_ground_delay_s=32.0)
     request = _request(8, (-4, 0), (4, 0), cfg)
     wall_center = _point((0, 0), cfg)
-    static_terms = ((wall_center, Terminal("X", 1, radius=90.0)),)
+    static_terms = ((wall_center, Terminal("X", 1, radius=120.0)),)
 
     result = ColGenSolver().solve([request], cfg, static_terms, _params())
 
@@ -2484,7 +2484,7 @@ def test_the_warm_start_plans_against_the_batch_s_walls_not_its_own(monkeypatch)
     cfg = _cfg(max_ground_delay_s=32.0)
     requests = [_request(1, (-4, 0), (4, 0), cfg)]
     # A hub NO request touches -- exactly the case the two derivations disagree about.
-    unused_hub = (_point((6, 6), cfg), Terminal("unused-hub", 1, radius=90.0))
+    unused_hub = (_point((6, 6), cfg), Terminal("unused-hub", 1, radius=120.0))
 
     import freespace_sim.sim as sim_module
 

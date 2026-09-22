@@ -283,10 +283,10 @@ A standalone webpage (no server) that plays the reservations back like a video:
   including across neighboring grid cells; dense regions therefore stay clean and zooming in annotates
   everything (1% of drones labelled at fit on a 28k-flight run, 93% by 8×, 100% by 16×).
 - **Terminal columns and their exit lanes** — a permanent (always-active) terminal airspace draws as
-  an amber no-fly disc at its column radius, with a fine ring at `volumes.exit_radius`, where the hub's
-  *reserved* lanes begin. The ring may sit inside or outside the column according to the terminal's
-  configured corridor overlap. With the default flush geometry its separation is `corridor_width/2`
-  (0.4 px at fit on a 60 km region), so it is drawn only once zoom makes it distinct from the column.
+  an amber no-fly disc at its column radius, with a fine ring at `volumes.exit_radius`, the root of
+  the hub's exit ring. The ring coincides with the column edge (exit lanes are rooted at it and each
+  lane's link box runs from that edge to its cell), so it is drawn only once zoom makes it distinct
+  from the column.
 - **Zoom / pan** — scroll to zoom at the cursor, drag to pan, double-click to zoom in, `0` to fit
   (also `+` / `−` and the on-screen buttons). 1–64×, clamped so the region can't slide off-screen.
 - **Hex-grid toggle** — overlays the exact lattice A\* searched on (only shown when an A\*-based

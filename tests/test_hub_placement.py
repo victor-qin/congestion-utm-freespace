@@ -26,7 +26,7 @@ from freespace_sim.volumes import exit_radius
 def _radius_of(dm, uss, cfg):
     tr = dm._terminal_radius_for(uss)          # already collapses a per-USS dict to a scalar (or None)
     if cfg.terminal_airspace_always_active:    # match place_hubs: taa reject-samples on the WIDER walled
-        term = Terminal(f"{uss}#0", dm._pads_for(uss), tr, dm.corridor_overlap_m)   # extent (column+ring)
+        term = Terminal(f"{uss}#0", dm._pads_for(uss), tr)   # extent (column+ring)
         return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
     return cfg.terminal_radius_m if tr is None else float(tr)
 
@@ -71,7 +71,7 @@ def test_dallas_large_hubs_have_no_overlapping_airspaces():
 def test_min_hub_gap_is_respected_across_operators():
     cfg = SimConfig(region_size_m=(12000.0, 12000.0))
     dm = HubRadiusDemand(n_hubs_per_uss={"big": 4, "small": 10},
-                         terminal_radius_m={"big": 180.0, "small": 90.0}, min_hub_gap_m=150.0)
+                         terminal_radius_m={"big": 180.0, "small": 120.0}, min_hub_gap_m=150.0)
     hubs = _hubs_with_radii(dm, cfg)
     for (i1, c1, r1), (i2, c2, r2) in combinations(hubs, 2):
         assert float(np.linalg.norm(c1 - c2)) >= r1 + r2 + 150.0 - 1e-6, f"{i1}/{i2} closer than the gap"
@@ -92,7 +92,7 @@ def test_demand_spec_threads_min_hub_gap():
     the crowded-region ValueError told you to tune was frozen at its default, unreachable from specs."""
     from freespace_sim.scenarios.spec import DemandSpec
     dm = DemandSpec(pattern="hub_radius", uss=("a", "b"), hubs=(3, 5),
-                    terminal_radius_m=90.0, min_hub_gap_m=300.0).build()
+                    terminal_radius_m=120.0, min_hub_gap_m=300.0).build()
     assert dm.min_hub_gap_m == 300.0
     cfg = SimConfig(region_size_m=(12000.0, 12000.0))
     hubs = _hubs_with_radii(dm, cfg)
@@ -120,6 +120,6 @@ def test_hub_counts_preserved():
 def test_place_hubs_raises_when_too_crowded():
     """A region that can't fit the hubs at their separation fails loudly, never silently overlaps."""
     cfg = SimConfig(region_size_m=(100.0, 100.0))                   # 280 m separation can't fit in 100 m
-    dm = HubRadiusDemand(n_hubs_per_uss={"a": 5}, terminal_radius_m=90.0, min_hub_gap_m=100.0)
+    dm = HubRadiusDemand(n_hubs_per_uss={"a": 5}, terminal_radius_m=120.0, min_hub_gap_m=100.0)
     with pytest.raises(ValueError, match="too crowded"):
         dm.place_hubs(cfg, np.random.default_rng(dm.hub_seed))

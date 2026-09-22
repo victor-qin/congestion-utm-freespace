@@ -158,3 +158,45 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `plans_terminal_airspace` is now declared only by colgen, so `sim._wall_aware` admits A*-reaching
   chains and colgen and nothing else. Files: `freespace_sim/planner/__init__.py`, `freespace_sim/sim.py`,
   `freespace_sim/metrics.py`.
+
+- 2026-09-22T00:10Z `[TOOL]` Exit-lane egress corridors (column edge -> exit-cell centre, width `w`)
+  never overlap each other at the column edge iff `w <= p/2` AND `r >= (sqrt3/2) p`, where `p` is the
+  hex pitch (`nominal_speed_mps * dt_s`, 120 m) and `r` the column radius with the exit ring rooted at
+  `r` (`corridor_overlap = w/2`, i.e. `exit_radius == terminal_radius`). Derived, then validated on a
+  hub-offset sweep for r = 72-400 m (error <= 0.011 deg): two radial bands overlap iff
+  `2 r tan(dtheta/2) < w`, and the lattice's smallest adjacent exit-cell gap is `asin(p/2r)` for
+  `r >= p` (an exit cell stacked behind one at distance r) or `2 atan(p/(2r + sqrt3 p))` for `r <= p`
+  (two exit cells sharing one inner covered cell). Consequences to remember: the current `w = 60 = p/2`
+  is EXACTLY the critical width, so the margin is ~`p^3/(32 r^2)` (1.8 m at 180 m, 0.3 m at 105 m) and
+  `w = 62` already overlaps at 180 m hubs; the default `terminal_radius_m = 90` is below 103.9 m and
+  overlaps at 46% of hub positions; the safest column is `r = p` (w_max 64.3 m). With the default
+  `exit_radius = r + w/2` instead, 1-5 covered cells per hub have centres OUTSIDE the column and every
+  lane moves one ring out. Files: `freespace_sim/planner/hexgrid.py` (`_covered_boundary`,
+  `terminal_lanes`), `freespace_sim/volumes.py` (`exit_radius`), `freespace_sim/config.py`
+  (`terminal_radius_m`, `corridor_width_m`); derivation script `.context/lanes/egress_rule.py`
+  (gitignored; regenerate `lanes_10_egress_rule.png` from it).
+
+- 2026-09-22T09:00Z `[CODE]` A conservative bound is not an exact predicate, and a force-tag that papers
+  over it hides the gap it leaves. `segment_overlaps_column` tested a CAPSULE around the box's axis
+  against the column: it said "reaches" for a box whose rectangle stopped 21 m short (25 m of egress
+  then sat in no filed volume) and "misses" for boxes whose corners already touched the column, which
+  the builders masked by force-tagging the first/last box. Neither a sub- nor a superset of the real
+  geometry. Replaced by the exact rectangle test `corridor_box_reaches_column` (`TAG_MARGIN_M = 0.5`
+  for tagging, 0 for the link decision) and the force-tags deleted. Lesson: a predicate that decides
+  what gets FILED must be the exact geometry; a bound needs a stated direction and a test that proves
+  it (an FCL probe along the egress caught this, the byte-identity test did not). Files:
+  `freespace_sim/volumes.py`, `freespace_sim/planner/astar/planner.py`,
+  `freespace_sim/planner/colgen/network.py`, `tests/test_terminal.py`.
+
+- 2026-09-22T11:00Z `[TOOL]` Disc membership at the exit-ring edge must be STRICT and shared. With the
+  ring rooted at the column radius, a hub on a hex centre has lane cells at EXACTLY `r`
+  (`hex_center(1, 0) == (120.0, 0.0)`); `column_hexes` used `<=` while `_covered_boundary` used
+  `< r - 1e-9`, so the raster's own-column skip dropped a sibling's claims on that lane cell and the
+  second same-lane launch slipped one step behind the first, colliding only at filing
+  (`CONFLICT_FILED`). Before #135 the +R raster over-claim masked it (the suite was green on the old
+  base); main's exact hop claims exposed it after the rebase. One predicate now
+  (`hexgrid.centre_in_column`) for the flood fill, `column_hexes` and SIPP. Lesson: an over-claim can
+  hide a skip hole, so when claims become exact re-run same-hub serialisation with hubs ON hex centres
+  (a snapped-to-centre hub with float noise does NOT reproduce; the origin does), and keep ONE
+  membership test for anything keyed to the ring edge. Files: `freespace_sim/planner/hexgrid.py`,
+  `freespace_sim/planner/sipp/planner.py`, `tests/test_terminal.py`.

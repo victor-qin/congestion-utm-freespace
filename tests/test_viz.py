@@ -399,8 +399,8 @@ def test_walls_carry_the_exit_lane_radius():
     assert len(walls) == 1
     assert walls[0]["r"] == volumes.terminal_radius(term, cfg) == 180.0
     # pinned to the real helper, not a re-derived number — exit_radius is the single source of truth
-    assert walls[0]["er"] == volumes.exit_radius(term, cfg) == 210.0
-    assert walls[0]["er"] > walls[0]["r"], "the lane ring must sit outside the no-fly column"
+    assert walls[0]["er"] == volumes.exit_radius(term, cfg) == 180.0
+    assert walls[0]["er"] == walls[0]["r"], "the lane ring is rooted at the no-fly column's edge"
 
 
 def test_wall_without_a_known_terminal_has_no_exit_ring():
@@ -408,14 +408,14 @@ def test_wall_without_a_known_terminal_has_no_exit_ring():
     cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(4000.0, 4000.0))
     res = run(cfg, requests=[FlightRequest(1, vec(500, 500, 0), vec(3000, 3000, 0), 0.0)])
     res.static_walls = [volumes.hover_reservation(
-        vec(500, 500, 0), 0.0, cfg, terminal_id="orphan", radius=90.0)]
+        vec(500, 500, 0), 0.0, cfg, terminal_id="orphan", radius=120.0)]
     assert viz_html._payload(res)["walls"][0]["er"] is None
 
 
 def test_denied_only_terminal_still_supplies_the_exit_ring():
     """Terminal metadata belongs to every request, not just successful reservations."""
     cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0))
-    term = Terminal("denied-hub", capacity=2, radius=90.0, corridor_overlap=-20.0)
+    term = Terminal("denied-hub", capacity=2, radius=120.0)
     res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
     res.intents[0].request.origin_terminal = term
     res.intents[0].status = IntentStatus.REJECTED
@@ -430,12 +430,12 @@ def test_denied_only_terminal_still_supplies_the_exit_ring():
 def test_unused_static_terminal_ring_survives_save_and_load(tmp_path):
     """An unused placed hub has no request metadata, so ledger_end must persist its lane edge."""
     res = _small_run()
-    term = Terminal("unused-hub", capacity=3, radius=90.0, corridor_overlap=40.0)
+    term = Terminal("unused-hub", capacity=3, radius=120.0)
     res.ledger.register_static_terminal(vec(900, 900, 0), term)
 
     live_wall = viz_html._payload(res)["walls"][0]
-    assert live_wall["er"] == volumes.exit_radius(term, res.config) == 80.0
-    assert live_wall["er"] < live_wall["r"]                # valid inside ring (positive overlap)
+    assert live_wall["er"] == volumes.exit_radius(term, res.config) == 120.0
+    assert live_wall["er"] == live_wall["r"]               # the exit ring is rooted at the column edge
 
     folder = runs.save_run(res, root=tmp_path, label="static", write_replay=False, index=False)
     loaded = runs.load_run(folder)
@@ -448,7 +448,7 @@ def test_loaded_legacy_wall_without_exit_radius_remains_supported(tmp_path):
     import pandas as pd
 
     cfg = SimConfig(planner="straight", horizon_s=600.0, region_size_m=(2200.0, 2200.0))
-    term = Terminal("known-hub", capacity=2, radius=100.0, corridor_overlap=-10.0)
+    term = Terminal("known-hub", capacity=2, radius=120.0)
     res = run(cfg, requests=[FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)])
     res.intents[0].request.origin_terminal = term
     res.ledger.register_static_terminal(vec(0, 0, 0), term)

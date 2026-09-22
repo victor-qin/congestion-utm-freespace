@@ -63,6 +63,7 @@ class Volume4D:
 
 def corridor_segment_volume(
     p0: Vec, t0: float, p1: Vec, t1: float, cfg: SimConfig, *, terminal_id: Hashable = None,
+    extend_start: bool = True, extend_end: bool = True,
 ) -> Volume4D:
     """Build the single corridor box for one segment ``(p0, t0)`` → ``(p1, t1)``.
 
@@ -85,6 +86,9 @@ def corridor_segment_volume(
     - t1 (float): time (s) the flight is at ``p1``.
     - cfg (SimConfig): supplies corridor width/height and ``time_buffer_s``.
     - terminal_id (Hashable): tags the box as part of a shared terminal column, or ``None``.
+    - extend_start (bool): extend the box ``ext`` behind ``p0`` (default). A lane link box turns this
+      off at its column end so it touches the column edge without re-entering it.
+    - extend_end (bool): extend the box ``ext`` beyond ``p1`` (default); the inbound link's column end.
 
     Return
     --------
@@ -100,10 +104,152 @@ def corridor_segment_volume(
     ux, uy, uz = (dx / length, dy / length, dz / length) if length > 1e-9 else (1.0, 0.0, 0.0)
     # half the cross-section: width/2 when level, height/2 for a climb — no z overshoot.
     ext = 0.5 * math.hypot(cfg.corridor_width_m * math.hypot(ux, uy), cfg.corridor_height_m * uz)
-    a = (p0x - ux * ext, p0y - uy * ext, p0z - uz * ext)           # extend behind the start
-    b = (p1x + ux * ext, p1y + uy * ext, p1z + uz * ext)           # and beyond the end → overlap neighbours
+    a = (p0x - ux * ext, p0y - uy * ext, p0z - uz * ext) if extend_start else (p0x, p0y, p0z)
+    b = (p1x + ux * ext, p1y + uy * ext, p1z + uz * ext) if extend_end else (p1x, p1y, p1z)
     spec = box_from_segment(a, b, cfg.corridor_width_m, cfg.corridor_height_m)
     return Volume4D(spec, t0 - cfg.time_buffer_s, t1 + cfg.time_buffer_s, terminal_id=terminal_id)
+
+
+# Tag a box that comes within this of its own column too: the ledger's FCL narrowphase may report
+# contact where the 2-D distance is a hair above the radius, and a tagged box costs nothing (the tag
+# only exempts it against same-hub COLUMNS; box↔box stays strict).
+TAG_MARGIN_M = 0.5
+
+
+def corridor_box_reaches_column(a: Vec, b: Vec, center: Vec, radius: float, cfg: SimConfig,
+                                margin: float = 0.0) -> bool:
+    """Exact xy test: does the corridor box of segment ``a→b`` reach within ``margin`` of the column disk?
+
+    The ONE geometric predicate for near-hub boxes: with ``margin=TAG_MARGIN_M`` it decides which
+    boxes carry the hub tag (every box that reaches its own column, so the column-involved exemption
+    covers the whole in-column reach), and with ``margin=0`` it decides whether a lane's first (last)
+    box already reaches the column or needs a link box (:func:`lane_links_needed`). It clamps the hub
+    centre into the box's own frame and measures the true distance to the rectangle — a capsule
+    around the centreline is NOT a bound in either direction (it over-reaches 30 m along the axis and
+    misses the corners by 12 m). Level segments use the corridor half-width as the longitudinal
+    extension (as :func:`corridor_segment_volume` does); a vertical rung's footprint is the
+    ``corridor_width`` square at its cell.
+
+    Parameters
+    ------------
+    - a (Vec): segment start (only xy is used).
+    - b (Vec): segment end (only xy is used).
+    - center (Vec): column centre (only xy is used).
+    - radius (float): column radius (m).
+    - cfg (SimConfig): supplies ``corridor_width_m``.
+    - margin (float): extra reach (m) to count as touching; ``TAG_MARGIN_M`` for tagging, 0 for the
+      link decision.
+
+    Return
+    --------
+    - output (bool): True iff the box's xy footprint reaches within ``radius + margin`` of ``center``.
+    """
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    cx, cy = float(center[0]), float(center[1])
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    hw = 0.5 * cfg.corridor_width_m
+    if length > 1e-9:
+        ux, uy, ext = dx / length, dy / length, hw
+    else:
+        ux, uy, ext, length = 1.0, 0.0, hw, 0.0                 # vertical rung: a w×w square at the cell
+    s = (cx - ax) * ux + (cy - ay) * uy
+    t = -(cx - ax) * uy + (cy - ay) * ux
+    s = min(max(s, -ext), length + ext)
+    t = min(max(t, -hw), hw)
+    qx, qy = ax + s * ux - t * uy, ay + s * uy + t * ux         # closest point of the box to the centre
+    return math.hypot(qx - cx, qy - cy) <= radius + margin + 1e-9
+
+
+def lane_links_needed(corners: list, origin, dest, origin_term, dest_term, cfg: SimConfig) -> tuple[bool, bool]:
+    """Which lane link boxes :func:`build_reservation_from_corners` files for a corner polyline.
+
+    A link is needed at an end whose first (last) corridor SUB-box — the first ``corridor_segment_len_m``
+    slice of the first (last) hop, exactly as the builder chops it — does not itself reach the hub column
+    (:func:`corridor_box_reaches_column`). Shared with ``colgen.translate``, which must know how many
+    volumes sit in front of / behind the lattice sub-boxes before it re-stamps them.
+
+    Parameters
+    ------------
+    - corners (list): hex-centre corner polyline (xyz).
+    - origin (Vec): origin hub centre.
+    - dest (Vec): destination hub centre.
+    - origin_term (Terminal | tuple | None): origin terminal; ``None`` ⇒ no outbound link.
+    - dest_term (Terminal | tuple | None): destination terminal; ``None`` ⇒ no inbound link.
+    - cfg (SimConfig): corridor geometry and ``fixed_exit_lanes``.
+
+    Return
+    --------
+    - output (tuple[bool, bool]): ``(outbound link filed, inbound link filed)``.
+    """
+    origin_term, dest_term = as_terminal(origin_term), as_terminal(dest_term)
+    if not cfg.fixed_exit_lanes or len(corners) < 2 or (origin_term is None and dest_term is None):
+        return False, False
+    seg = cfg.corridor_segment_len_m
+
+    def sub_end(a, b):
+        ax, ay, az = float(a[0]), float(a[1]), float(a[2])
+        bx, by, bz = float(b[0]), float(b[1]), float(b[2])
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        nsub = max(1, math.ceil(math.sqrt(dx * dx + dy * dy + dz * dz) / seg))
+        return nsub, (ax, ay, az), (ax + dx / nsub, ay + dy / nsub, az + dz / nsub)
+
+    out = inbound = False
+    if origin_term is not None:
+        _, sa, sb = sub_end(corners[0], corners[1])
+        out = not corridor_box_reaches_column(sa, sb, np.asarray(origin, float)[:2], terminal_radius(origin_term, cfg), cfg)
+    n_edges_one = len(corners) == 2 and sub_end(corners[0], corners[1])[0] == 1
+    if dest_term is not None and not (origin_term is not None and n_edges_one):
+        a, b = corners[-2], corners[-1]
+        ax, ay, az = float(a[0]), float(a[1]), float(a[2])
+        bx, by, bz = float(b[0]), float(b[1]), float(b[2])
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        nsub = max(1, math.ceil(math.sqrt(dx * dx + dy * dy + dz * dz) / seg))
+        f0 = (nsub - 1) / nsub
+        sa = (ax + f0 * dx, ay + f0 * dy, az + f0 * dz)
+        inbound = not corridor_box_reaches_column(sa, (bx, by, bz), np.asarray(dest, float)[:2], terminal_radius(dest_term, cfg), cfg)
+    return out, inbound
+
+
+def lane_link_volume(center: Vec, radius: float, cell: Vec, t_cell: float, cfg: SimConfig,
+                     terminal_id: Hashable, *, outbound: bool) -> Volume4D:
+    """The tagged link box between a hub column's edge and one exit-lane cell centre.
+
+    Filed only when the flight's first (last) corridor box does not already reach the column
+    (:func:`corridor_box_reaches_column`), so the column-edge → cell-centre leg is always inside a ledger
+    volume (see context/figures/exit_radius.png). Runs along the hub→cell ray from the point at
+    ``radius`` to the cell centre at the cell's altitude, timed as the physical traverse at cruise
+    speed ending (outbound) or starting (inbound) at ``t_cell``. Its column end carries NO
+    longitudinal extension: the box touches the edge without re-entering it, which together with the
+    lane pruning in ``hexgrid.terminal_lanes`` keeps a hub's links pairwise disjoint, so they can stay
+    strict (box↔box) while the hub tag exempts them against the column.
+
+    Parameters
+    ------------
+    - center (Vec): the hub centre (only xy is used).
+    - radius (float): the column radius the link is rooted at.
+    - cell (Vec): the exit-lane cell centre at the flight's level (xyz).
+    - t_cell (float): the instant the flight is at ``cell``.
+    - cfg (SimConfig): corridor geometry, cruise speed and time buffer.
+    - terminal_id (Hashable): the hub tag.
+    - outbound (bool): True for a departure (edge → cell), False for an arrival (cell → edge).
+
+    Return
+    --------
+    - output (Volume4D): the tagged link box.
+    """
+    cx, cy = float(center[0]), float(center[1])
+    px, py, pz = float(cell[0]), float(cell[1]), float(cell[2])
+    dx, dy = px - cx, py - cy
+    dist = math.hypot(dx, dy)
+    ex, ey = cx + dx / dist * radius, cy + dy / dist * radius
+    dt_link = max(dist - radius, 0.0) / cfg.nominal_speed_mps
+    if outbound:
+        return corridor_segment_volume((ex, ey, pz), t_cell - dt_link, (px, py, pz), t_cell, cfg,
+                                       terminal_id=terminal_id, extend_start=False)
+    return corridor_segment_volume((px, py, pz), t_cell, (ex, ey, pz), t_cell + dt_link, cfg,
+                                   terminal_id=terminal_id, extend_end=False)
 
 
 def build_corridor(centerline: list[TimedPoint], cfg: SimConfig) -> list[Volume4D]:
@@ -133,75 +279,26 @@ def terminal_radius(term, cfg: SimConfig) -> float:
 
 
 def exit_radius(term, cfg: SimConfig) -> float:
-    """A hub's exit-lane inner edge — flush with the column edge when ``corridor_overlap`` is 0
-    (see context/figures/exit_radius.png).
+    """A hub's exit-ring root: the column edge itself (see context/figures/exit_radius.png).
 
-    The exit-lane box is tagged with the hub and the column-involved exemption
-    (:func:`conflict.volumes_conflict`) makes it transparent to same-hub COLUMNS, while two same-hub
-    corridor boxes still contend (box↔box stays strict), so divergent lanes need the column wide
-    enough not to crowd (``cfg.terminal_radius_m`` 90 m default).
-
-    The single source of truth for the fold/lane radius — used by the A* head/tail fold
-    (:func:`planner.astar.planner._fold_path`, driving both the commit and the landing gate) and
+    Hexes whose centre lies inside this radius are the column's covered cells; the ring of hexes
+    around them is the exit-lane set (:func:`planner.hexgrid.terminal_lanes`). The lane's link box
+    (:func:`lane_link_volume`) runs from this edge to the cell centre, so rooting the ring here makes
+    the column-edge → lane leg a filed volume. The single source of truth for the fold/lane radius —
+    also read by the legacy A* fold (:func:`planner.astar.planner._fold_path`) and
     :meth:`planner.terminal_capacity.TerminalCapacity.exit_clear` — so the gate, the commit, and the
-    exit-lane check all root the lane at the same edge and cannot drift.
+    lane geometry all root at the same edge and cannot drift.
 
     Parameters
     ------------
-    - term (Terminal): the hub, read for ``radius`` and ``corridor_overlap``.
-    - cfg (SimConfig): supplies the default column radius and ``corridor_width_m``.
+    - term (Terminal): the hub, read for ``radius``.
+    - cfg (SimConfig): supplies the default column radius.
 
     Return
     --------
-    - output (float): the lane inner-edge radius, ``terminal_radius + corridor_width/2 − overlap``.
+    - output (float): the ring root radius, equal to :func:`terminal_radius`.
     """
-    ov = term.corridor_overlap if term.corridor_overlap is not None else 0.0
-    return terminal_radius(term, cfg) + cfg.corridor_width_m / 2.0 - ov
-
-
-def segment_overlaps_column(a, b, center, radius: float, cfg: SimConfig) -> bool:
-    """Does segment ``a→b``'s corridor box reach into the disk of ``radius`` at ``center`` (xy)?
-
-    The box reaches the column iff the distance from ``center`` to its extended centreline is below
-    ``radius + corridor_width/2`` (see context/figures/segment_overlaps_column.png).
-
-    Used to tag EVERY near-hub box reaching into a flight's own column — not just box[0]/box[-1].
-    The box count is geometry-dependent (radius × exit angle), so a fixed "tag the first N" rule is
-    unsound (e.g. a 500 m column can need boxes [1] and [2] tagged); this geometric test scales.
-    Far cruise boxes stay untagged, so foreign/same-hub overflight still deconflicts.
-
-    The xy point-to-segment distance is computed with scalars (norm via ``math.sqrt``, dot as a
-    scalar sum) — bit-for-bit identical to the numpy form but without its per-call ufunc dispatch,
-    since this runs once per corridor sub-box during every rebuild. See ``tests/test_volumes.py``
-    for the frozen-numpy byte-identity oracle.
-
-    Parameters
-    ------------
-    - a (Vec): segment start (only xy is used).
-    - b (Vec): segment end (only xy is used).
-    - center (Vec): column centre (only xy is used).
-    - radius (float): column radius to test against.
-    - cfg (SimConfig): supplies ``corridor_width_m`` for the extension and half-width.
-
-    Return
-    --------
-    - output (bool): True if the extended corridor box overlaps the column disk.
-    """
-    ax, ay = float(a[0]), float(a[1])
-    bx, by = float(b[0]), float(b[1])
-    cx, cy = float(center[0]), float(center[1])
-    segx, segy = bx - ax, by - ay
-    length = math.sqrt(segx * segx + segy * segy)         # == np.linalg.norm(seg) on the xy pair
-    ux, uy = (segx / length, segy / length) if length > 1e-9 else (1.0, 0.0)
-    ext = cfg.corridor_width_m / 2.0
-    p0x, p0y = ax - ux * ext, ay - uy * ext               # box centerline incl. longitudinal extension
-    p1x, p1y = bx + ux * ext, by + uy * ext
-    abx, aby = p1x - p0x, p1y - p0y
-    t = ((cx - p0x) * abx + (cy - p0y) * aby) / max(abx * abx + aby * aby, 1e-12)
-    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t         # == np.clip(t, 0.0, 1.0)
-    dx, dy = cx - (p0x + t * abx), cy - (p0y + t * aby)
-    d = math.sqrt(dx * dx + dy * dy)                      # distance center → extended centerline
-    return d < radius + cfg.corridor_width_m / 2.0        # + box half-width
+    return terminal_radius(term, cfg)
 
 
 def column_dwell_s(center, term, cfg: SimConfig, z: float) -> float:
@@ -256,9 +353,9 @@ def enroute_reference_m(origin, dest, origin_term, dest_term, cfg: SimConfig) ->
     LATENT EDGE — the 0-clamp (columns covering the whole trip) is NOT benign: every caller's
     ``straight > _EPS`` guard then skips the ``max_detour_factor`` gate and :func:`enroute_detour_m`
     books 0, so the flight escapes the only length term in ``trajectory_cost`` and ``stretch`` goes
-    NaN. Unreached in shipped scenarios (``HubRadiusDemand``'s ``min_r``), but ``min_r`` does not
-    scale with ``corridor_overlap``, so ``--corridor-overlap <= -60`` reaches it. Short flights are
-    geometry-dominated either way — read ``stretch``/``delay_pct`` with care there.
+    NaN. Unreached in shipped scenarios (``HubRadiusDemand``'s ``min_r`` keeps customers outside both
+    columns), but a hand-built request with both endpoints inside one column reaches it. Short flights
+    are geometry-dominated either way — read ``stretch``/``delay_pct`` with care there.
 
     Parameters
     ------------
@@ -443,7 +540,7 @@ def build_reservation_from_corners(
     The one corner-polyline rebuild (the shortcut refiner's), so every refined path emits the same
     contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are given,
     the hub hover column is tagged shared (sized to the terminal's radius) AND every corridor box
-    that reaches into that column (:func:`segment_overlaps_column` — not just the first/last) is
+    that reaches into that column (:func:`corridor_box_reaches_column` — not just the first/last) is
     tagged with the hub, so the column-involved exemption lets the near-hub corridor pass through
     the shared column; every box clear of the column stays strict (untagged).
 
@@ -485,7 +582,7 @@ def build_reservation_from_corners(
     o_r = terminal_radius(origin_term, cfg) if origin_term is not None else 0.0
     d_r = terminal_radius(dest_term, cfg) if dest_term is not None else 0.0
     # Scalar hot path (hundreds of thousands of sub-boxes per refined plan): sa/sb are plain-float
-    # tuples, so segment_overlaps_column and corridor_segment_volume allocate no per-sub-box arrays.
+    # tuples, so corridor_box_reaches_column and corridor_segment_volume allocate no per-sub-box arrays.
     # Bit-identical to the numpy form (the frozen oracles and the scenario A/B SHA256 pin it);
     # centerline keeps its np.ndarray points.
     for a, b in zip(corners, corners[1:]):
@@ -504,9 +601,9 @@ def build_reservation_from_corners(
             t_next = t + max(horiz / cfg.nominal_speed_mps, dz / cfg.climb_rate_mps, 1e-3)
             # Tag EVERY box reaching into its hub's own column (not just first/last), so a near-hub
             # cruise box grazing the shared column is column-exempt rather than a CONFLICT_FILED. See
-            # segment_overlaps_column; mirrors astar._build's per-box tagging.
-            tid = (origin_term.id if o_xy is not None and segment_overlaps_column(sa, sb, o_xy, o_r, cfg)
-                   else dest_term.id if d_xy is not None and segment_overlaps_column(sa, sb, d_xy, d_r, cfg)
+            # corridor_box_reaches_column; mirrors astar._build's per-box tagging.
+            tid = (origin_term.id if o_xy is not None and corridor_box_reaches_column(sa, sb, o_xy, o_r, cfg, TAG_MARGIN_M)
+                   else dest_term.id if d_xy is not None and corridor_box_reaches_column(sa, sb, d_xy, d_r, cfg, TAG_MARGIN_M)
                    else None)
             edges.append(corridor_segment_volume(sa, t, sb, t_next, cfg, terminal_id=tid))
             centerline.append((np.array([sb[0], sb[1], sb[2]]), t_next))
@@ -514,16 +611,16 @@ def build_reservation_from_corners(
             cum_horiz += horiz
             cum_dz += dz
     if cfg.fixed_exit_lanes and edges and (origin_term is not None or dest_term is not None):
-        # Fixed exit lanes: force the hub tag on the first/last (boundary-cell) box. It leaves from /
-        # arrives at the column edge and can graze the shared column; an untagged box grazing it would
-        # conflict at commit (different tid) — the cruise-box-clip. ``segment_overlaps_column`` tags
-        # interior boxes; this guarantees the boundary box too (mirrors ``astar._build``).
-        if origin_term is not None:
-            edges[0] = replace(edges[0], terminal_id=origin_term.id)
-        # Single-box hub→hub corridor: edges[-1] IS edges[0]; tag dest only when distinct so it can't
-        # clobber the origin tag above (mirrors astar._build).
-        if dest_term is not None and not (origin_term is not None and len(edges) == 1):
-            edges[-1] = replace(edges[-1], terminal_id=dest_term.id)
+        # A lane box that reaches its column is tagged by the per-box test above and IS the exit lane;
+        # one that does not gets a tagged link box (column edge → cell centre) filed in front of
+        # (behind) it, so the egress leg is never unfiled — see lane_link_volume / lane_links_needed
+        # (which also settles the single-box hub→hub case: outbound link only). Mirrors astar._build.
+        need_out, need_in = lane_links_needed(corners, origin, dest, origin_term, dest_term, cfg)
+        links_out = ([lane_link_volume(origin, o_r, corners[0], centerline[0][1], cfg, origin_term.id, outbound=True)]
+                     if need_out else [])
+        links_in = ([lane_link_volume(dest, d_r, corners[-1], centerline[-1][1], cfg, dest_term.id, outbound=False)]
+                    if need_in else [])
+        edges = links_out + edges + links_in
     volumes = [
         hover_reservation(origin, t_depart + g_delay, cfg,
                           terminal_id=origin_term.id if origin_term else None,
@@ -634,11 +731,10 @@ def permanent_terminal_reservation(center: Vec, term, cfg: SimConfig) -> Volume4
     transparent to its own hub's flights while walling foreign cruise.
 
     Radius = :func:`terminal_radius` — byte-identical to the per-flight dwell column (built by
-    reusing :func:`hover_reservation`, so the two cannot drift). It deliberately excludes the
-    ``+corridor_width/2`` of :func:`exit_radius` (exit-LANE routing geometry, not a reservation) and
-    the wider ``terminal_cells`` flood-fill (A*'s discrete keep-out); since ``terminal_radius ⊂
-    terminal_cells``, any corridor routed around those cells clears this column with margin (no
-    spurious commit-time denials).
+    reusing :func:`hover_reservation`, so the two cannot drift) and to :func:`exit_radius`, the root
+    of the exit ring. It deliberately excludes the wider ``terminal_cells`` flood-fill (A*'s discrete
+    keep-out, the column plus its lane ring); since ``terminal_radius ⊂ terminal_cells``, any corridor
+    routed around those cells clears this column with margin (no spurious commit-time denials).
 
     Time-invariant — active for ALL time, mirroring the A* occupancy ``static_col`` (which blocks
     these cells at EVERY step). Any finite ``cfg``-derived ``t_end`` has a hole: a return departing

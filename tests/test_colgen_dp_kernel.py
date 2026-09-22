@@ -765,7 +765,7 @@ def _kernel_candidates(
 def _terminal_graph(cfg, *, overrun: int = 4):
     """A graph with both endpoints in terminal airspace, so terminal rows exist to price."""
     origin, dest = _point((0, 0), cfg), _point((4, -1), cfg)
-    o_term, d_term = Terminal("kern-A", 1, radius=90.0), Terminal("kern-B", 1, radius=90.0)
+    o_term, d_term = Terminal("kern-A", 1, radius=120.0), Terminal("kern-B", 1, radius=120.0)
     request = FlightRequest(
         12, origin, dest, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term
     )
@@ -1982,7 +1982,9 @@ def _random_case(rng, index):
 
     cfg = _cfg(max_ground_delay_s=rng.choice((16.0, 48.0, 96.0)))
     origin = (0, 0)
-    dest = (rng.randint(2, 5), rng.randint(-3, 1))
+    # >= 3 hexes apart: two 120 m columns (the admissible minimum is 103.9 m) need > 240 m
+    # between centres, and hex distance 3 is >= 311.8 m.
+    dest = (rng.randint(3, 5), rng.randint(-3, 1))
     if dest == origin:
         dest = (3, -1)
     overrun = rng.choice((0, 1, 3, 9))
@@ -1990,8 +1992,8 @@ def _random_case(rng, index):
     o, d = _point(origin, cfg), _point(dest, cfg)
     params = ColGenParams(solver="highs", max_air_overrun_hops=overrun)
     if terminal:
-        o_term = Terminal(f"rnd-A{index}", 1, radius=90.0)
-        d_term = Terminal(f"rnd-B{index}", 1, radius=90.0)
+        o_term = Terminal(f"rnd-A{index}", 1, radius=120.0)
+        d_term = Terminal(f"rnd-B{index}", 1, radius=120.0)
         request = FlightRequest(
             index, o, d, 0.0, 0.0, origin_terminal=o_term, dest_terminal=d_term
         )

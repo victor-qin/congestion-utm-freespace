@@ -210,7 +210,7 @@ def test_terminal_airspace_filter_drops_foreign_column_customers():
     foreign: dict = {}                                        # cell -> {walling terminal ids}
     for uid, pts in hubs.items():
         for hj in range(pts.shape[0]):
-            term = Terminal(f"{uid}#{hj}", dm._pads_for(uid), dm._terminal_radius_for(uid), dm.corridor_overlap_m)
+            term = Terminal(f"{uid}#{hj}", dm._pads_for(uid), dm._terminal_radius_for(uid))
             for c in terminal_cells(pts[hj], term, cfg):
                 foreign.setdefault(c, set()).add(term.id)
     reqs = dm.generate(cfg, np.random.default_rng(0))

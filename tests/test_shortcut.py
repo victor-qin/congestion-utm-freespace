@@ -99,8 +99,8 @@ def test_heading_skip_predicate_implies_byte_identical_build(points):
         a, b, c, CFG.corridor_segment_len_m)
     origin = vec(a[0], a[1], 0)
     dest = vec(c[0], c[1], 0)
-    origin_terminal = Terminal("exact-origin", 2, radius=90.0)
-    dest_terminal = Terminal("exact-dest", 2, radius=90.0)
+    origin_terminal = Terminal("exact-origin", 2, radius=120.0)
+    dest_terminal = Terminal("exact-dest", 2, radius=120.0)
     before = build_reservation_from_corners(
         [a, b, c], origin, dest, 0.0, 0.0, CFG,
         origin_term=origin_terminal, dest_term=dest_terminal, corridor_t0=31.25,
@@ -178,7 +178,7 @@ def test_heading_skip_falls_back_to_rebuild_when_sampling_would_change(monkeypat
 
 def test_heading_shortcut_is_byte_identical_to_legacy_across_commits(monkeypatch):
     cfg = SimConfig(region_size_m=(5000.0, 3500.0), max_ground_delay_s=120.0)
-    hub = Terminal("byte-hub", 1, radius=90.0)
+    hub = Terminal("byte-hub", 1, radius=120.0)
     requests = [
         FlightRequest(1, vec(0, 0, 0), vec(3600, 0, 0), 0.0),
         FlightRequest(2, vec(3600, 120, 0), vec(0, 120, 0), 2.0),
@@ -787,7 +787,7 @@ def test_batched_growth_handles_nonmonotone_temporal_feasibility():
 
 def test_shortcut_rebuild_rejects_terminal_capacity_failure():
     origin, dest = vec(0, 0, 0), vec(1200, 0, 0)
-    term = Terminal("H", 1, radius=90.0)
+    term = Terminal("H", 1, radius=120.0)
     z = CFG.cruise_level_m
     calls = []
 
@@ -806,7 +806,7 @@ def test_shortcut_rebuild_rejects_terminal_capacity_failure():
 def test_batched_shortcut_returns_inner_when_earlier_landing_exceeds_capacity():
     cfg = SimConfig()
     ledger = ReservationLedger(cfg)
-    term = Terminal("H", 1, radius=90.0)
+    term = Terminal("H", 1, radius=120.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(1000, 0, 0), 0.0, dest_terminal=term)
     z = cfg.cruise_level_m
     corners = [vec(0, 0, z), vec(0, 2000, z), vec(1000, 0, z)]
@@ -842,7 +842,7 @@ def test_batched_shortcut_returns_inner_when_earlier_landing_exceeds_capacity():
 def test_terminal_refinement_without_capacity_authority_is_conservative(strategy):
     cfg = SimConfig()
     ledger = ReservationLedger(cfg)
-    term = Terminal("H", 1, radius=90.0)
+    term = Terminal("H", 1, radius=120.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(1000, 0, 0), 0.0, dest_terminal=term)
     z = cfg.cruise_level_m
     corners = [vec(0, 0, z), vec(500, 500, z), vec(1000, 0, z)]

@@ -153,7 +153,7 @@ def _committed_occupancy():
                     planner="astar", seed=0)
     reqs = HubRadiusDemand(n_hubs_per_uss={"walmart_uss": 6, "stripmall_uss": 30},
                            radius_m={"walmart_uss": 6000.0, "stripmall_uss": 3000.0},
-                           terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 90.0},
+                           terminal_radius_m={"walmart_uss": 125.0, "stripmall_uss": 120.0},
                            pads_per_hub=8, return_flights=True).generate(
         cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)

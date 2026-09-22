@@ -67,30 +67,26 @@ class Terminal(NamedTuple):
     """A multi-pad vertiport endpoint a flight uses (origin for a takeoff, dest for a landing).
 
     Vertiport infrastructure travels with the terminal, not in global config:
-    - ``radius`` — the shared terminal column size; ``None`` ⇒ ``cfg.terminal_radius_m`` (90 m default),
-      wide enough that divergent same-hub exit lanes don't crowd at the edge when flush.
-    - ``corridor_overlap`` — how far the reserved exit lane overlaps INTO the column (inner edge =
-      ``R − overlap``). ``None``/``0`` (default) ⇒ the lane starts FLUSH with the column edge; the
-      column-involved exemption (``conflict.volumes_conflict``) keeps the tagged exit-lane box
-      conflict-free with same-hub columns, while two same-hub corridors still contend. ``> 0`` penetrates
-      the column; ``< 0`` leaves a clearance gap outside it. See ``volumes.exit_radius``.
+    - ``radius`` — the shared terminal column size; ``None`` ⇒ ``cfg.terminal_radius_m``. The exit
+      ring is rooted at this edge (``volumes.exit_radius``); below ``SimConfig.max_corridor_width_m``
+      the ring is pruned to the largest subset whose link boxes are disjoint (``hexgrid.terminal_lanes``).
 
-    Both are set when hubs are created (the demand model), so a big-box hub and a small pad can differ
-    and a non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).
+    Set when hubs are created (the demand model), so a big-box hub and a small pad can differ and a
+    non-hub flight simply has no terminal. ``capacity`` is the pad count N (Phase B).
     """
 
     id: Hashable
     capacity: int = 1
     radius: float | None = None
-    corridor_overlap: float | None = None
 
 
 def as_terminal(t) -> "Terminal | None":
     """Normalize a terminal descriptor: ``None``, a :class:`Terminal`, or a plain
-    ``(id, capacity[, radius[, corridor_overlap]])`` tuple → a :class:`Terminal` (or ``None``)."""
+    ``(id, capacity[, radius])`` tuple → a :class:`Terminal` (or ``None``). A 4th element (the
+    removed ``corridor_overlap``, still present in archived run frames) is ignored."""
     if t is None or isinstance(t, Terminal):
         return t
-    return Terminal(*t)
+    return Terminal(*tuple(t)[:3])
 
 
 @dataclass

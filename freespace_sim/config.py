@@ -68,9 +68,11 @@ class SimConfig:
     # See context/figures/itinerary_reservation.png.
     ground_box_height_m: float = 5.0
     # default shared-terminal COLUMN radius when a Terminal doesn't set its own (per-hub Terminal.radius
-    # overrides). 90 m (> corridor_width) gives divergent same-hub exit lanes enough angular spread to
-    # start flush with the column edge (corridor_overlap=0) and still launch concurrently. See volumes.exit_radius.
-    terminal_radius_m: float = 90.0
+    # overrides). The exit ring is rooted at this edge and a lane's link box runs from the edge to its
+    # cell; a column narrower than ``max_corridor_width_m`` allows loses lanes to pruning
+    # (hexgrid.terminal_lanes), and one hex pitch (120 m) is where that bound peaks. See
+    # volumes.exit_radius / lane_link_volume.
+    terminal_radius_m: float = 120.0
 
     # --- COST MODEL (shared by every planner; the FCFS trade-off knobs) ---
     # ONE currency: cost per SECOND. Every A* edge advances the clock by an integer number of dt
@@ -137,6 +139,31 @@ class SimConfig:
     def corridor_segment_len_m(self) -> float:
         """Box length per timestep = cruise speed × timestep."""
         return self.nominal_speed_mps * self.dt_s
+
+    def max_corridor_width_m(self, radius: float) -> float:
+        """Widest corridor whose exit-lane link boxes never overlap at a column of ``radius``.
+
+        Two link boxes of width ``w`` leaving the column edge on rays ``dtheta`` apart overlap iff
+        ``2 r tan(dtheta/2) < w``; the smallest ``dtheta`` the hex lattice can produce between adjacent
+        exit cells is ``asin(p/2r)`` for ``r >= p`` and ``2 atan(p/(2r + sqrt3 p))`` for ``r <= p``
+        (``p`` = pitch = ``nominal_speed_mps * dt_s``), which gives the closed forms below (see
+        context/figures/exit_radius.png). ``w = p/2`` is the large-``r`` limit, so the bound is tight.
+        Below it ``hexgrid.terminal_lanes`` keeps only the largest disjoint subset of the ring.
+
+        Parameters
+        ------------
+        - radius (float): column radius (m), must be positive.
+
+        Return
+        --------
+        - output (float): the largest ``corridor_width_m`` (m) that keeps adjacent links disjoint.
+        """
+        if radius <= 0.0:
+            raise ValueError(f"terminal radius must be positive, got {radius}")
+        p = self.nominal_speed_mps * self.dt_s
+        if radius >= p:
+            return p / (1.0 + math.sqrt(1.0 - (p / (2.0 * radius)) ** 2))
+        return 2.0 * radius * p / (2.0 * radius + math.sqrt(3.0) * p)
 
     @property
     def effective_hover_radius_m(self) -> float:

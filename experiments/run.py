@@ -202,8 +202,6 @@ def spec_from_args(args):
         demand["pads_per_hub"] = args.pads_per_hub
     if args.terminal_radius is not None:
         demand["terminal_radius_m"] = args.terminal_radius
-    if args.corridor_overlap is not None:
-        demand["corridor_overlap_m"] = args.corridor_overlap
     if args.return_flights is not None:
         demand["return_flights"] = args.return_flights
     if args.turnaround is not None:
@@ -246,8 +244,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pads-per-hub", type=int, default=None, help="terminal capacity N per hub")
     p.add_argument("--terminal-radius", type=float, default=None,
                    help="shared terminal column radius (m); default = hover footprint")
-    p.add_argument("--corridor-overlap", type=float, default=None,
-                   help="how far the first corridor box penetrates the terminal (m); default corridor_width/2")
     p.add_argument("--return-flights", action=argparse.BooleanOptionalAction, default=None,
                    help="emit a return flight to the origin pad for each delivery")
     p.add_argument("--turnaround", type=float, default=None, help="return-flight turnaround (s)")

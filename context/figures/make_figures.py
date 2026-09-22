@@ -158,75 +158,51 @@ def fig_corridor_box_extension() -> None:
 
 
 def fig_exit_radius() -> None:
-    """volumes.exit_radius: exit-lane inner edge vs the hub column, overlap penetration/gap."""
-    r_t, w = 90.0, 60.0
-    r_e = r_t + w / 2
-    fig, ax = plt.subplots(figsize=(8.2, 5.4))
+    """volumes.exit_radius / lane_link_volume: the exit ring is rooted at the column edge; a lane's
+    first box either reaches the column itself (case A) or gets a tangent link box (case B)."""
+    import math
+    r_t, w, pitch = 120.0, 60.0, 120.0
+    fig, ax = plt.subplots(figsize=(9.0, 5.6))
     ax.set_aspect("equal")
     ax.axis("off")
     ax.plot([0], [0], "o", color=INK, ms=6, zorder=5)
     ax.text(0, -12, "hub centre", ha="center", va="top", fontsize=9, color=INK)
     ax.add_patch(Circle((0, 0), r_t, facecolor="#edf2f7", edgecolor=BLUE, lw=1.8, zorder=1))
-    ax.add_patch(Circle((0, 0), r_e, facecolor="none", edgecolor=ORANGE, lw=1.8, ls="--", zorder=2))
-    ax.annotate("", xy=(r_t * 0.71, r_t * 0.71), xytext=(0, 0),
-                arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.3))
-    ax.text(r_t * 0.36, r_t * 0.40, "terminal_radius\n= 90 m", color=BLUE, fontsize=8.5, ha="center")
-    ax.annotate("", xy=(-r_e * 0.71, r_e * 0.71), xytext=(0, 0),
-                arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.3))
-    ax.text(-r_e * 0.5, r_e * 0.78, "exit_radius\n= 90 + 60/2 = 120 m", color=ORANGE, fontsize=8.5,
-            ha="center")
-    ax.add_patch(Rectangle((r_e, -w / 2), 140, w, facecolor="#fdf0e6", edgecolor=ORANGE, lw=1.6,
-                           zorder=3))
-    ax.plot([r_e, r_e + 140], [0, 0], color=ORANGE, lw=1.2, zorder=4)
-    ax.text(r_e + 70, -w / 2 - 12, "exit-lane corridor\n(flush at overlap = 0)", ha="center",
-            va="top", fontsize=8.5, color=ORANGE)
-    ax.text(0, -r_e - 40, "exit_radius = terminal_radius + corridor_width/2 − overlap\n"
-            "overlap > 0 penetrates the column · overlap < 0 leaves a gap", ha="center", va="top",
-            fontsize=9, color=INK)
-    ax.set_title("exit_radius — the exit-lane inner edge relative to the hub column", fontsize=11,
-                 color=INK, pad=8)
-    lim = r_e + 160
-    ax.set_xlim(-lim * 0.6, lim)
-    ax.set_ylim(-r_e - 80, r_e + 20)
-    _save(fig, "exit_radius")
+    ax.annotate("", xy=(-r_t * 0.71, r_t * 0.71), xytext=(0, 0), arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.3))
+    ax.text(-r_t * 0.95, r_t * 0.98, "terminal_radius\n= exit_radius = r", color=BLUE, fontsize=8.5, ha="right", va="bottom")
 
+    def lane(theta_deg, dist, label, link):
+        th = math.radians(theta_deg)
+        u = np.array([math.cos(th), math.sin(th)])
+        n = np.array([-u[1], u[0]])
+        cell = u * dist
+        # the flight's first box: cell centre -> next cell (one pitch), ±w/2 extension at both ends
+        a, b = cell - u * (w / 2), cell + u * (pitch + w / 2)
+        ax.add_patch(Polygon([a + n * w / 2, b + n * w / 2, b - n * w / 2, a - n * w / 2], closed=True,
+                             facecolor="#fdf0e6", edgecolor=ORANGE, lw=1.4, zorder=3))
+        ax.plot(*cell, "o", color=INK, ms=4, zorder=6)
+        ax.plot([0, cell[0]], [0, cell[1]], color=INK, lw=0.7, ls="--", zorder=2)
+        if link:                                     # case B: tangent link box, NO inward extension
+            e = u * r_t
+            c2 = cell + u * (w / 2)
+            ax.add_patch(Polygon([e + n * w / 2, c2 + n * w / 2, c2 - n * w / 2, e - n * w / 2], closed=True,
+                                 facecolor="#e6f4ea", edgecolor=GREEN, lw=1.6, zorder=4))
+            ax.plot(*e, "o", color=GREEN, ms=5, zorder=7)
+        ax.text(*(cell + u * 40 - n * (w / 2 + 14)), label, fontsize=8, color=INK, ha="center",
+                va="top", rotation=theta_deg, rotation_mode="anchor")   # below its box, clear of the title
 
-def fig_segment_overlaps_column() -> None:
-    """volumes.segment_overlaps_column: distance(centre, extended centreline) < R + width/2."""
-    w, R = 60.0, 90.0
-    ext = hw = w / 2
-    cx, cy = 0.0, 0.0
-    fig, ax = plt.subplots(figsize=(9.4, 5.6))
-    ax.set_aspect("equal")
-    ax.axis("off")
-    ax.add_patch(Circle((cx, cy), R, facecolor="#edf2f7", edgecolor=INK, lw=1.6, zorder=1))
-    ax.add_patch(Circle((cx, cy), R + hw, facecolor="none", edgecolor=GRID, lw=1.2, ls=":",
-                        zorder=1))
-    ax.plot([cx], [cy], "o", color=INK, ms=5, zorder=5)
-    ax.text(R + 16, 0, "hub column\n(radius R)", ha="left", va="center", fontsize=9, color=INK)
-    ax.text(cx, -(R + hw) - 10, "dotted = test radius  R + width/2", ha="center", va="top",
-            fontsize=8, color=GRID)
-
-    def draw_seg(y, color, label, dy):
-        """Draw a horizontal segment at height ``y``, its extended centreline, and centre→line dist."""
-        ax0, bx0 = -130.0, 250.0
-        ax.plot([ax0, bx0], [y, y], color=color, lw=2.6, marker="o", ms=4, zorder=4)
-        ax.plot([ax0 - ext, bx0 + ext], [y, y], color=color, lw=1.0, ls="--", zorder=3)
-        ax.plot([cx, cx], [cy, y], color=color, lw=1.2, ls="-.", zorder=3)
-        d = abs(y - cy)
-        verdict = "TAGGED  (d < R + width/2)" if d < R + hw else "untagged  (d ≥ R + width/2)"
-        ax.text(cx + 8, (cy + y) / 2, f"d = {d:.0f}", fontsize=8, color=color, ha="left",
-                va="center")
-        ax.text((ax0 + bx0) / 2, y + dy, f"{label} → {verdict}", fontsize=9, color=color,
-                ha="center", va="center", weight="bold")
-
-    draw_seg(105.0, ORANGE, "near-hub box", 26)
-    draw_seg(-205.0, BLUE, "far cruise box", -26)
-    ax.set_title("segment_overlaps_column — distance(centre, extended centreline) < R + width/2",
+    lane(0.0, 130.0, "case A: first box already reaches\nthe column ⇒ it is the exit lane", link=False)
+    lane(50.0, 240.0, "case B: link box from the column edge\nto the cell centre (tagged, strict)", link=True)
+    ax.text(0, -r_t - 40,
+            "exit cells = hexes whose centre is ≥ r and adjacent to one < r  ·  link box touches the column, never enters it\n"
+            "no two links overlap iff corridor_width ≤ max_corridor_width(r):  w = p/2 needs r ≥ (√3/2)·p = 103.9 m\n"
+            "a narrower column keeps the largest subset of lanes whose links are disjoint (terminal_lanes)",
+            ha="center", va="top", fontsize=8.5, color=INK)
+    ax.set_title("exit_radius — the exit ring is rooted at the column edge; lane link boxes bridge edge → cell",
                  fontsize=10.5, color=INK, pad=8)
-    ax.set_xlim(-175, 330)
-    ax.set_ylim(-250, 165)
-    _save(fig, "segment_overlaps_column")
+    ax.set_xlim(-r_t - 40, 420)
+    ax.set_ylim(-r_t - 90, 330)
+    _save(fig, "exit_radius")
 
 
 def fig_fold_corners() -> None:
@@ -1260,7 +1236,7 @@ def fig_pricing_pool_schedule() -> None:
 
 
 FIGURES = (
-    fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
+    fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,
     fig_hex_lattice_overhead, fig_read_envelope,
     fig_search_window, fig_hex_layout, fig_rasterisation_coverage, fig_cell_blocking,

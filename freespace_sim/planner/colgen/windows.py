@@ -21,8 +21,10 @@ from ...config import SimConfig
 from ...conflict import volumes_conflict
 from ...types import Vec
 from ...volumes import Volume4D, corridor_segment_volume
-from ..hexgrid import (AXIAL_NEIGHBORS, circumradius, enu_to_axial, hex_center,
-                       hex_distance, hop_box_stays_in_its_cells)
+from ..hexgrid import (AXIAL_NEIGHBORS, _periods_overlapping, circumradius, enu_to_axial,  # noqa: F401
+                       hex_center, hex_distance, hop_box_stays_in_its_cells)
+# ``_periods_overlapping`` lives in ``hexgrid`` (the ledger-side ``_step_range`` shares it) and is
+# re-exported here for its colgen callers.
 
 AxialCell = tuple[int, int]
 CellWindow = tuple[int, int]
@@ -57,46 +59,6 @@ def _endpoint_time_pad_s(t0: float, t1: float, dt: float, timing_steps: int) -> 
         _MIN_ENDPOINT_TIME_PAD_S,
         64.0 * sys.float_info.epsilon * operations * scale,
     )
-
-
-def _periods_overlapping(t0: float, t1: float, dt: float) -> range:
-    """Return grid periods whose half-open intervals overlap ``[t0, t1)``.
-
-    Period ``j`` denotes ``[j * dt, (j + 1) * dt)``.  Consequently the first
-    touched period is ``floor(t0 / dt)`` and the exclusive stop is
-    ``ceil(t1 / dt)``.  This helper deliberately has no tolerance padding:
-    template corridor times are created directly by the ledger builder and the
-    expected default offset tuple is exactly ``(-2, 1)``.
-
-    Parameters
-    ------------
-    - t0 (float): inclusive start of the interval (s).
-    - t1 (float): exclusive end of the interval (s).
-    - dt (float): grid period length (s).
-
-    Return
-    --------
-    - output (range): the integer periods from ``floor(t0/dt)`` to ``ceil(t1/dt)`` (exclusive
-      stop) whose half-open intervals overlap ``[t0, t1)``.
-    """
-
-    # Division can put an exact constructed boundary on the wrong side of its
-    # integer (for example ``(3 * 0.7) / 0.7 < 3``).  Correct the quotient by
-    # comparing against the same multiplied grid values that define the row
-    # intervals.  Unlike an epsilon snap, this still treats ``nextafter(k*dt,
-    # +inf)`` as genuinely inside the following period.
-    start = math.floor(t0 / dt)
-    while (start + 1) * dt <= t0:
-        start += 1
-    while start * dt > t0:
-        start -= 1
-
-    stop = math.ceil(t1 / dt)
-    while (stop - 1) * dt >= t1:
-        stop -= 1
-    while stop * dt < t1:
-        stop += 1
-    return range(start, stop)
 
 
 def visit_rows(v: int, offsets: CellWindow) -> range:
@@ -408,8 +370,6 @@ def derive_cell_window(cfg: SimConfig) -> CellWindow:
     offsets = (lo, hi)
     _cross_check_conflicts(cfg, offsets, radius)
     return offsets
-
-
 
 
 def _distance_to_hex(px: float, py: float, cell: AxialCell, hex_radius: float) -> float:

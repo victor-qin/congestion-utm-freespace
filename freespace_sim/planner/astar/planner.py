@@ -707,9 +707,9 @@ class AStarPlanner:
         dwell/transit queries, the compiled path's takeoff/landing masks, and the own-column
         overlay's ``col_owners`` lookups. The time window is the plan's recorded reach
         ``[t_request − dt − time_buffer, max_step·dt + hover tail + worst egress traverse]``. The
-        lookback is required because ``hexgrid._step_range`` keeps a committed volume through
-        ``floor((t_end + dt + time_buffer) / dt)``: a volume ending before the request clock can
-        therefore change the first step the planner reads. Queries are ≤ max_step, and a
+        lookback is required because ``hexgrid._step_range`` keeps a committed volume through the
+        step after its last buffered period, ``ceil((t_end + time_buffer) / dt)``: a volume ending
+        before the request clock can therefore change the first step the planner reads. Queries are ≤ max_step, and a
         dwell/capacity probe at the last step reads ``hover + climb + lane traverse`` past it.
         ``hover_tail_steps`` covers hover + max climb + buffer only, and at large terminal radii the
         egress traverse outruns that buffer — so the traverse is added explicitly, per terminal, or

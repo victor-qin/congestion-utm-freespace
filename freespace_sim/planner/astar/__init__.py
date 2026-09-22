@@ -22,10 +22,9 @@ Three couplings are easy to get wrong from the file names alone:
     ledger. A numba-less install still imports cleanly and degrades to the reference search.
 
 What stayed at ``planner/`` level, owned by neither family: ``hexgrid`` (the lattice primitives —
-colgen, ``milp``, ``demand``, ``volumes``, ``viz_html`` and ``parallel`` all consume it, and it
-also owns ``lattice_overhead_m``, the geometry-vs-traffic split both planners report),
-``terminal_capacity`` (``milp``, ``shortcut``, ``parallel``), and ``shortcut`` — a refiner that is
-planner-agnostic in its imports and wraps the MILP, not an A*, in the ``astar_milp_shortcut`` arm.
+colgen, ``demand``, ``volumes``, ``viz_html`` and ``parallel`` all consume it, and it also owns
+``lattice_overhead_m``, the geometry-vs-traffic split both planners report), ``terminal_capacity``
+(``shortcut``, ``parallel``), and ``shortcut`` — a refiner that is planner-agnostic in its imports.
 With ``lattice_overhead_m`` hoisted, colgen imports nothing from this package.
 
 Nothing is re-exported lazily. ``AStarPlanner`` is the surface every consumer wants and it pulls

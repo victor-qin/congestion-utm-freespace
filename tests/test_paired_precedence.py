@@ -236,7 +236,7 @@ def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
 
     from freespace_sim.planner import _get_planner, get_planner, iter_planner_chain
 
-    for name in ("astar_milp", "milp", "astar_shortcut"):
+    for name in ("astar_shortcut", "sipp_shortcut", "straight"):
         bare = [type(p).__name__ for p in iter_planner_chain(_get_planner(name))]
         wrapped = [type(p).__name__ for p in iter_planner_chain(get_planner(name))]
         assert wrapped[0] == "ItineraryPlanner"
@@ -248,7 +248,7 @@ def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
     assert type(pickle.loads(pickle.dumps(planner))) is type(planner)
 
 
-@pytest.mark.parametrize("name", ["astar", "sipp", "milp", "straight", "decoupled"])
+@pytest.mark.parametrize("name", ["astar", "sipp", "straight", "decoupled"])
 def test_every_leaf_planner_refuses_an_unwrapped_itinerary(name):
     """`get_planner` wraps them all, so this guard exists for the sites that BYPASS it — and one
     such site (`lns/unimpeded._new_ruler`) was already found by it. A leaf that plans the outbound

@@ -95,13 +95,13 @@ def test_payload_carries_uss_and_colors():
 
 def test_replay_exposes_grid_for_every_hex_lattice_planner_family():
     res = _small_run()
-    for planner in ("astar", "astar_milp", "sipp", "sipp_ref", "sipp_shortcut", "colgen"):
+    for planner in ("astar", "astar_shortcut", "sipp", "sipp_ref", "sipp_shortcut", "colgen"):
         configured = dataclasses.replace(res, config=dataclasses.replace(res.config, planner=planner))
         payload = viz_html._payload(configured)
         assert payload["hex_available"] is True, planner
         assert payload["hex_R"] > 0.0, planner
 
-    for planner in ("straight", "decoupled", "milp"):
+    for planner in ("straight", "decoupled"):
         configured = dataclasses.replace(res, config=dataclasses.replace(res.config, planner=planner))
         payload = viz_html._payload(configured)
         assert payload["hex_available"] is False, planner

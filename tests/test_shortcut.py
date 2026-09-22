@@ -35,14 +35,11 @@ def test_get_planner_registers_shortcut_variants():
     legacy = get_planner("astar_shortcut").inner
     heading = get_planner("astar_heading_shortcut").inner
     batched = get_planner("astar_batched_shortcut").inner
-    sandwich = get_planner("astar_milp_shortcut").inner
     assert isinstance(legacy, ShortcutRefiner) and legacy.strategy == "single_knot"
     assert isinstance(heading, ShortcutRefiner) and heading.strategy == "single_knot_heading"
     assert heading.label == legacy.label == "astar_sc"
     assert isinstance(batched, ShortcutRefiner) and batched.strategy == "batched_turns"
     assert batched.label == "astar_batched_sc"
-    assert isinstance(sandwich, ShortcutRefiner) and sandwich.strategy == "single_knot"
-    assert sandwich.inner.warm_planner.strategy == "single_knot"
     with pytest.raises(ValueError, match="unknown shortcut strategy"):
         ShortcutRefiner(AStarPlanner(), strategy="unknown")
 
@@ -886,16 +883,6 @@ def test_astar_shortcut_runs_under_always_active():
     assert cfg.terminal_airspace_always_active
     r = run(cfg, demand=spec.demand_model(), planner_name="astar_shortcut")   # must NOT raise
     assert r.verified, "shortcut refiner must respect the ledger walls (verified conflict-free)"
-
-
-@pytest.mark.slow
-def test_milp_shortcut_never_worsens_the_milp_solution():
-    base = get_planner("astar_milp").plan(_req(), _wall_led(), CFG)
-    led = _wall_led()
-    sc = get_planner("astar_milp_shortcut").plan(_req(), led, CFG)
-    assert sc.accepted
-    assert not led.any_conflict(sc.volumes)
-    assert sc.cost <= base.cost + 1e-6                 # post-MILP shortcut is monotone
 
 
 # --- multi-altitude: the refiner polishes A*'s multi-level output -----------------------------------

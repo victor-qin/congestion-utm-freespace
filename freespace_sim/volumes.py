@@ -440,7 +440,7 @@ def build_reservation_from_corners(
 ) -> tuple[list[Volume4D], list[TimedPoint], float, float]:
     """Resample a corner polyline to ≤segment-length boxes, time at nominal speed, assemble.
 
-    Shared by the MILP planner and the shortcut refiner so they all emit the same
+    The one corner-polyline rebuild (the shortcut refiner's), so every refined path emits the same
     contract-preserving boxes (checked == committed). When ``origin_term``/``dest_term`` are given,
     the hub hover column is tagged shared (sized to the terminal's radius) AND every corridor box
     that reaches into that column (:func:`segment_overlaps_column` — not just the first/last) is

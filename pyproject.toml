@@ -12,7 +12,6 @@ dependencies = [
     "matplotlib>=3.8",
     "shapely>=2.0",      # optional: top-down 2D projections of volumes in figures only
     "scipy>=1.17.1",
-    "pulp>=3.3.2",
 ]
 
 [project.optional-dependencies]
@@ -56,10 +55,7 @@ packages = ["freespace_sim"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["slow: marks slow tests (deselect with '-m \"not slow\"')"]
-filterwarnings = [
-    # PuLP 3.x emits DeprecationWarnings about the future 4.0 API (one per variable) — not ours
-    "ignore::DeprecationWarning:pulp",
-]
+filterwarnings = []
 
 [tool.ruff]
 line-length = 100

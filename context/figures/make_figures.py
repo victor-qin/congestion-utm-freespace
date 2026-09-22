@@ -618,43 +618,6 @@ def fig_batched_turns() -> None:
     _save(fig, "batched_turns")
 
 
-def fig_milp_obstacles() -> None:
-    """MILP: reachability-lens obstacle pruning (left) and per-segment half-space keep-out by convexity (right)."""
-    fig, (axl, axr) = plt.subplots(1, 2, figsize=(11.0, 4.9))
-    axl.set_aspect("equal")
-    axl.axis("off")
-    s, g = np.array([0.0, 0.0]), np.array([8.0, 0.0])
-    cap, k, n = 2.2, 2, 5
-    axl.add_patch(Circle(s, k * cap, facecolor=BLUE, alpha=0.10, edgecolor=BLUE, lw=1.2))
-    axl.add_patch(Circle(g, (n - 1 - k) * cap, facecolor=ORANGE, alpha=0.10, edgecolor=ORANGE, lw=1.2))
-    axl.plot([s[0]], [s[1]], "o", color=INK, ms=6)
-    axl.plot([g[0]], [g[1]], "o", color=INK, ms=6)
-    axl.text(s[0], s[1] - 0.6, "start", ha="center", va="top", fontsize=8.5, color=INK)
-    axl.text(g[0], g[1] - 0.6, "goal", ha="center", va="top", fontsize=8.5, color=INK)
-    axl.plot([2.0], [3.0], "s", color=GREEN, ms=9)
-    axl.text(2.0, 3.4, "in BOTH lenses → kept", ha="center", fontsize=7.5, color=GREEN)
-    axl.plot([6.8], [4.6], "x", color=RED, ms=11, mew=2)
-    axl.text(6.8, 5.0, "outside both → pruned", ha="center", fontsize=7.5, color=RED)
-    axl.text(4, -3.0, "segment k: disk k·cap at start, (N−1−k)·cap at goal", ha="center", fontsize=8.5, color=INK)
-    axl.set_title("Reachability-lens pruning", fontsize=10, color=INK)
-    axl.set_xlim(-6, 14)
-    axl.set_ylim(-3.8, 6)
-    axr.set_aspect("equal")
-    axr.axis("off")
-    axr.add_patch(Rectangle((3, -0.5), 3, 4, facecolor="#f0f0f0", edgecolor=GRID, lw=1.2))
-    axr.text(4.5, 1.5, "obstacle", ha="center", fontsize=8, color=GRID)
-    axr.plot([3, 3], [-2, 5], color=RED, lw=1.6, ls="--")
-    axr.text(3.15, 4.7, "face half-space", color=RED, fontsize=8)
-    axr.plot([0, 2], [0, 3], color=BLUE, lw=2.4, marker="o", ms=6)
-    axr.text(0.2, 1.4, "segment\n(both endpoints\nbeyond the face)", fontsize=7.5, color=BLUE)
-    axr.text(2.5, -3.0, "both endpoints on the outer side ⇒ by convexity the whole segment is outside", ha="center", fontsize=8, color=INK)
-    axr.set_title("Per-segment half-space keep-out", fontsize=10, color=INK)
-    axr.set_xlim(-2.5, 7)
-    axr.set_ylim(-3.8, 5.5)
-    fig.suptitle("MILP obstacle handling", fontsize=11.5, color=INK, y=1.0)
-    _save(fig, "milp_obstacles")
-
-
 def fig_hover_tail_steps() -> None:
     """compiled_hex_occupancy.hover_tail_steps: why the landing-column tail is ``ceil(...) + 2``.
 
@@ -1301,7 +1264,7 @@ FIGURES = (
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,
     fig_hex_lattice_overhead, fig_read_envelope,
     fig_search_window, fig_hex_layout, fig_rasterisation_coverage, fig_cell_blocking,
-    fig_takeoff_fan, fig_batched_turns, fig_milp_obstacles, fig_hover_tail_steps,
+    fig_takeoff_fan, fig_batched_turns, fig_hover_tail_steps,
     fig_sipp_safe_intervals, fig_itinerary_reservation,
     fig_lns_anytime_loop, fig_lns_destroy_operators, fig_lns_drop_vs_sync,
     fig_od_hop_ellipse, fig_pricing_dag, fig_label_dp_dominance, fig_completion_envelope,

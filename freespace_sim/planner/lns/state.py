@@ -48,7 +48,7 @@ Cell = tuple[int, int, int]
 
 # Baselines whose per-flight costs a plain ``AStarPlanner`` reproduces, so the unimpeded ruler and the
 # incumbent are denominated in the same currency. ``astar_ref`` is the same search without the compiled
-# kernel (byte-identical by contract); the shortcut/MILP/colgen families are NOT — see LNSState.
+# kernel (byte-identical by contract); the shortcut/colgen families are NOT — see LNSState.
 #
 # The SIPP pair belongs on measured evidence: A* and SIPP are exact optimizers of the same
 # weighted cost over the same lattice, so they agree on the optimum even though they break ties

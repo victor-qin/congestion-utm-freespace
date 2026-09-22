@@ -29,12 +29,12 @@ class SimConfig:
     # ladder's middle level (straight/decoupled), and the MILP continuous band [z_min_m, z_max_m] = the
     # ladder's floor→top. A single-level ladder collapses the band to that one plane.
     # Regulated airspace ceiling: every hover/terminal column spans [ground_level_m, airspace_ceiling_m].
-    airspace_ceiling_m: float = 125.0
+    airspace_ceiling_m: float = 120.0
     # A*'s discrete cruise levels — the SINGLE altitude knob (cruise / z-band derive from it),
     # strictly ascending. Adjacent gaps must EXCEED corridor_height_m and the top/bottom boxes must
     # fit within [ground_level_m, airspace_ceiling_m] (see context/figures/altitude_ladder.png).
     # Set ``flight_levels_m=(z,)`` (+ matching ceiling) for one plane.
-    flight_levels_m: tuple[float, ...] = (30.0, 70.0, 110.0)
+    flight_levels_m: tuple[float, ...] = (70.0, 80.0, 90.0, 100.0, 110.0)
 
     # --- region (continuous horizontal free space), local ENU metres ---
     region_size_m: tuple[float, float] = (10_000.0, 10_000.0)
@@ -49,7 +49,7 @@ class SimConfig:
 
     # --- corridor geometry (WIDTH & HEIGHT are knobs; LENGTH is derived from speed×dt) ---
     corridor_width_m: float = 60.0     # full lateral width of each corridor box
-    corridor_height_m: float = 30.0    # full vertical extent, centered on the segment
+    corridor_height_m: float = 10.0    # full vertical extent, centered on the segment
     time_buffer_s: float = 4.0         # ASTM time buffer (§4.3.11); ≈ one dt
 
     # --- delivery pad: an endpoint with no Terminal ---

@@ -997,23 +997,6 @@ def test_run_lns_logs_and_detaches_when_an_iteration_raises(monkeypatch, caplog)
     assert len(records) == 1 and records[0].exc_info is not None
 
 
-def test_milp_capacity_rebinds_after_a_takeover():
-    """The epoch contract is ledger-wide, not an A* detail: MILPOptPlanner keeps its own pad-capacity
-    index on the shared ledger, and its count tripwire cannot see a takeover (LNS restores every
-    flight it releases, so n_volumes ends at or above the frozen count)."""
-    from freespace_sim.planner.milp import MILPOptPlanner
-
-    led = ReservationLedger(CFG)
-    planner = MILPOptPlanner()
-    first = planner._capacity(led, CFG, 0.0)
-    assert led._observers
-
-    led.detach_subscribers()
-    second = planner._capacity(led, CFG, 0.0)
-    assert second is not first                    # rebound, not merely reused
-    assert led._observers                         # and re-subscribed, so it stays in sync
-
-
 # -------------------------------------------------------------------- run_lns argument contract
 def test_run_lns_defaults_unimpeded_ruler_to_in_process(monkeypatch):
     """A public API caller must opt into spawn; its top-level module may not have a main guard."""

@@ -80,7 +80,7 @@ def test_validation_rejects_bad_round_trip_geometry(kwargs, expected_match):
     ids=["default", "three_level", "single_100m", "single_75m"],
 )
 def test_cruise_and_band_derive_from_ladder(ladder):
-    # derived, never stored: cruise = middle level (straight/decoupled), MILP band = ladder floor→top;
+    # derived, never stored: cruise = middle level (straight/decoupled), band = ladder floor→top;
     # a single-level ladder collapses all three onto the lone plane (the ceiling is untouched)
     c = SimConfig(flight_levels_m=ladder)
     assert c.flight_levels_m == ladder and c.n_levels == len(ladder)

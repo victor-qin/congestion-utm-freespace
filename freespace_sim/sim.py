@@ -208,7 +208,7 @@ def _wall_aware(planner) -> bool:
     """True if ``planner`` is wall-aware under always-active terminal airspace.
 
     Wall-aware means it TAGS its terminal columns and gates pad capacity itself (A*, or any planner
-    declaring ``plans_terminal_airspace`` — the MILP family), or it reaches such a planner through
+    declaring ``plans_terminal_airspace`` — colgen), or it reaches such a planner through
     its ``inner`` / ``warm_planner`` chain and so rebuilds or falls back to a tagged intent. Walking
     the chain is why refiners and warm-start wrappers qualify. Used only to gate
     ``terminal_airspace_always_active`` (see :func:`run`): tagged columns are exempt from their own
@@ -223,8 +223,8 @@ def _wall_aware(planner) -> bool:
 def _astar_planners(planner) -> list:
     """Every ``AStarPlanner`` reachable from ``planner`` via the inner / warm_planner chain.
 
-    Lets telemetry attach to the A* inside a shortcut refiner or a warm-start wrapper (astar_milp),
-    not just a bare top-level planner.
+    Lets telemetry attach to the A* inside a shortcut refiner or a warm-start wrapper, not just a
+    bare top-level planner.
     """
     from .planner import iter_planner_chain
     from .planner.astar import AStarPlanner
@@ -363,17 +363,15 @@ def run(
         # The walls are per-hub TAGGED CylinderSpecs; a flight's own-hub column is exempt from its
         # own hub's wall only if it too is tagged (conflict.volumes_conflict, same-tid + cylinder).
         # Wall-aware planners all produce tagged columns: astar and its shortcut variants tag
-        # directly; the MILP family (plans_terminal_airspace) folds corners to the column edge, tags
-        # the rebuilt columns, and serialises the pad through its own TerminalCapacity (so the
-        # same-tid exemption cannot pull a flight into a same-hub pad overlap); refiners and
-        # warm-start wrappers qualify through their chain. A planner that is none of these (bare
-        # straight / decoupled) would commit untagged near-hub columns that collide with the wall
-        # and deny or mis-plan every hub flight — refused LOUDLY below rather than silently.
+        # directly; colgen (plans_terminal_airspace) tags its own columns and gates the pad itself;
+        # refiners and warm-start wrappers qualify through their chain. A planner that is none of
+        # these (bare straight / decoupled) would commit untagged near-hub columns that collide with
+        # the wall and deny or mis-plan every hub flight — refused LOUDLY below rather than silently.
         for u in usses.values():
             if not _wall_aware(u.planner):
                 raise ValueError(
                     f"terminal_airspace_always_active=True needs a wall-aware planner (tagged terminal "
-                    f"columns — A*-reaching or terminal-aware MILP), but {pname!r} is neither and would "
+                    f"columns — A*-reaching or colgen), but {pname!r} is neither and would "
                     f"commit untagged near-hub columns that collide with the wall and deny every hub flight.")
 
     collector: TelemetryCollector | None = None
@@ -398,7 +396,7 @@ def run(
         if pname not in PARALLEL_PLANNERS:
             raise ValueError(
                 f"parallel mode needs an envelope-recording planner {PARALLEL_PLANNERS}, got {pname!r} "
-                f"(the MILP/opt refiners optimize outside any recorded read set — not supported in v1).")
+                f"(only the A* family records the read set the coordinator revalidates — v1).")
         # telemetry: workers capture per-flight on_deny rows and the coordinator merges them in
         # commit order into `collector`; serial replans write into it directly.
         intents = run_parallel(scenario, cfg, pcfg, ledger, dss, pname, static_terms, status, report,

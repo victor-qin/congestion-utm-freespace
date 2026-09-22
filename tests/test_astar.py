@@ -13,14 +13,12 @@ from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.astar import AStarPlanner
 from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.planner.astar.planner import _committed_arrival
-from freespace_sim.planner.milp import MILPOptPlanner
 from freespace_sim.planner.shortcut import ShortcutRefiner
 from freespace_sim.sim import run
 from freespace_sim.types import (
     DenialReason,
     FlightRequest,
     IntentStatus,
-    OperationalIntent,
     Terminal,
     vec,
 )
@@ -98,32 +96,6 @@ def test_astar_is_deterministic():
     b = AStarPlanner().plan(_req(), led, CFG)
     assert a.cost == b.cost
     assert len(a.centerline) == len(b.centerline)
-
-
-def test_astar_milp_refiner_keeps_astars_delay_and_smooths():
-    # delay-dominated case: A* picks the 120 s wait, the fixed-delay MILP refines the geometry fast
-    led = ReservationLedger(CFG)
-    led.commit(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])
-    astar = get_planner("astar").plan(_req(), led, CFG)
-    refined = get_planner("astar_milp").plan(_req(), led, CFG)
-    assert refined.status is IntentStatus.ACCEPTED
-    assert refined.ground_delay_s > 0.0                   # kept A*'s ground-delay choice
-    assert refined.air_detour_m <= astar.air_detour_m + 1e-6
-    assert not led.any_conflict(refined.volumes)
-
-
-@pytest.mark.slow
-def test_astar_milp_refiner_restructures_the_wide_berth():
-    # the MILP refiner cuts A*'s conservative 400 m berth to the global optimum — restructuring the
-    # segment count within the homotopy, which a pure smoothing polish cannot.
-    led = ReservationLedger(CFG)
-    led.commit(99, [_wall()])
-    astar = get_planner("astar").plan(_req(), led, CFG)
-    refined = get_planner("astar_milp").plan(_req(), led, CFG)
-    assert refined.status is IntentStatus.ACCEPTED
-    assert not led.any_conflict(refined.volumes)
-    assert refined.cost < astar.cost
-    assert refined.air_detour_m < astar.air_detour_m - 100.0   # genuinely restructured, not nudged
 
 
 def test_astar_demand_run_is_verified():
@@ -256,12 +228,11 @@ def test_lattice_overhead_absorbs_quantization_leaving_no_phantom_deconfliction(
 
 
 def test_continuous_planners_report_no_lattice_overhead():
-    """``lattice_overhead_m`` is an A*-family diagnostic: milp/straight plan on continuous geometry,
-    so their ``air_detour_m`` carries no quantization and must not be discounted by this split."""
+    """``lattice_overhead_m`` is an A*-family diagnostic: straight plans on continuous geometry, so
+    its ``air_detour_m`` carries no quantization and must not be discounted by this split."""
     cfg = SimConfig()
-    for name in ("milp", "straight"):
-        intent = get_planner(name).plan(_req(), ReservationLedger(cfg), cfg)
-        assert intent.accepted and intent.lattice_overhead_m == 0.0
+    intent = get_planner("straight").plan(_req(), ReservationLedger(cfg), cfg)
+    assert intent.accepted and intent.lattice_overhead_m == 0.0
 
 
 def test_vertical_edge_step_count_matches_climb_kinematics():
@@ -340,31 +311,6 @@ def test_vertical_edge_checks_only_traversed_levels_not_all():
     assert climb_edge not in got2, "an obstacle on the destination level must block the climb"
 
 
-class _DenyAll:
-    """A warm planner that always denies — see :func:`_folded_planner`."""
-
-    def plan(self, req, ledger, cfg):
-        return OperationalIntent(request=req, status=IntentStatus.REJECTED,
-                                 denial_reason=DenialReason.BUDGET_EXCEEDED, planner="deny")
-
-
-def _folded_planner(name):
-    """Resolve ``name`` to a planner that actually returns a TERMINAL-FOLDED path.
-
-    ``get_planner("milp")`` is a trap here: ``MILPOptPlanner.plan`` returns the CHEAPER of its warm
-    ``StraightLineTimeShift`` candidate and its own solve, and in empty airspace the warm one wins.
-    That candidate is never folded to the terminal columns — its centerline starts exactly at
-    ``req.origin`` — so the milp.py detour site never executes and every assertion below would pass
-    vacuously. Denying the warm start forces the MILP's own folded path to come back.
-
-    ``intent.planner == "milp"`` would NOT be a usable guard: ``MILPOptPlanner.plan`` relabels
-    whichever candidate wins, including the warm one.
-    """
-    if name == "milp":
-        return MILPOptPlanner(warm_planner=_DenyAll())
-    return get_planner(name)
-
-
 def _terminal_case(**cfg_kw):
     cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
                     region_size_m=(20_000.0, 20_000.0), terminal_radius_m=180.0, **cfg_kw)
@@ -372,7 +318,7 @@ def _terminal_case(**cfg_kw):
     return cfg, FlightRequest(1, vec(0, 0, 0), vec(5000, 2000, 0), 0.0, origin_terminal=hub)
 
 
-@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "milp"])
+@pytest.mark.parametrize("planner", ["astar", "astar_shortcut"])
 def test_stretch_never_below_one_leaving_a_terminal(planner):
     """Regression for issue #50: a flight cannot fly SHORTER than the straight line.
 
@@ -394,7 +340,7 @@ def test_stretch_never_below_one_leaving_a_terminal(planner):
     from freespace_sim.volumes import enroute_reference_m
 
     cfg, req = _terminal_case()
-    intent = _folded_planner(planner).plan(req, ReservationLedger(cfg), cfg)
+    intent = get_planner(planner).plan(req, ReservationLedger(cfg), cfg)
     assert intent.accepted
     # Guard the guard: the hub must actually shorten the baseline, else there is no bug to catch.
     centre = float(np.linalg.norm(np.asarray(req.dest, float)[:2] - np.asarray(req.origin, float)[:2]))
@@ -414,17 +360,18 @@ def test_accepted_stretch_respects_the_detour_budget():
     straight line, so a terminal flight passes the ``max_detour_factor`` gate yet reports a stretch
     above it. Invisible at the default factor of 100.0, so pin it at a value the fold can breach.
 
-    NOT parametrized, deliberately. Once the gate is correct the two refiners simply DENY at this
-    budget (no path can shrink the unreserved fold), so as separate params they would be silent
-    no-ops that look like passing coverage. Looping here lets the test assert that at least one
-    planner actually reached the accept path — otherwise the whole check is vacuous.
+    NOT parametrized, deliberately. Once the gate is correct the two lattice planners simply DENY at
+    this budget (no path can shrink the unreserved fold) — they are the arms a lenient gate would
+    wrongly admit — so as separate params they would be silent no-ops that look like passing
+    coverage. ``straight`` flies the ideal line and is the arm that reaches the accept path; looping
+    lets the test assert that at least one planner did — otherwise the whole check is vacuous.
     """
     from freespace_sim import metrics
 
     cfg, req = _terminal_case(max_detour_factor=1.07)
     accepted = 0
-    for planner in ("astar", "astar_shortcut", "milp"):
-        intent = _folded_planner(planner).plan(req, ReservationLedger(cfg), cfg)
+    for planner in ("astar", "astar_shortcut", "straight"):
+        intent = get_planner(planner).plan(req, ReservationLedger(cfg), cfg)
         if not intent.accepted:
             continue                      # denying is a legitimate outcome; over-reporting is not
         accepted += 1
@@ -435,7 +382,7 @@ def test_accepted_stretch_respects_the_detour_budget():
     assert accepted, "every planner denied — the budget check never exercised the accept path"
 
 
-@pytest.mark.parametrize("planner", ["astar", "astar_shortcut", "milp", "astar_milp"])
+@pytest.mark.parametrize("planner", ["astar", "astar_shortcut"])
 def test_takeoff_clock_includes_the_egress_traverse(planner):
     """Issue #52: the corridor starts after climb AND the traverse out to the lane cell.
 

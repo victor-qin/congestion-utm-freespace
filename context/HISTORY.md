@@ -149,3 +149,12 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   100 m warm plane under a 120 m ceiling). Exactly ONE test pins the literal defaults
   (`test_default_config_is_multilevel`), so a default change fails in one place. Files:
   `tests/test_config.py`, `tests/test_astar.py`, `tests/test_planner_milp.py`.
+
+- 2026-09-22T15:35Z `[CODE]` The MILP planner family (`milp`, `astar_milp`, `astar_milp_shortcut`;
+  `planner/milp.py`, the `pulp` dependency) was REMOVED: superseded by colgen as the bound and by the
+  shortcut refiner as the geometric polish, and the largest source of default-sensitive fixture rot
+  (its climb-over-wall test has no vertical escape on a 70-115 m band). Pitfalls that outlive it: an
+  archived run whose config names a `milp*` planner no longer resolves in `get_planner`, and
+  `plans_terminal_airspace` is now declared only by colgen, so `sim._wall_aware` admits A*-reaching
+  chains and colgen and nothing else. Files: `freespace_sim/planner/__init__.py`, `freespace_sim/sim.py`,
+  `freespace_sim/metrics.py`.

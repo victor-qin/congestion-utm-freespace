@@ -4,8 +4,8 @@ The grid is a fixed global pointy-top hex tiling anchored at ENU (0,0) and share
 flight, so the blocked-set built from committed volumes is global and incremental (the continuous
 analogue of the sibling project's occupancy ledger). The pitch (centre-to-centre) is tied to
 ``nominal_speed · dt`` so one hex move is exactly one timestep at nominal speed — which keeps the
-A* time axis clean and makes the MILP's "slow-down-for-free" / "hop-a-thin-wall" exploits
-structurally impossible.
+A* time axis clean and makes a continuous planner's "slow-down-for-free" / "hop-a-thin-wall"
+exploits structurally impossible.
 
 A cell is blocked when a committed volume, inflated, reaches its centre (see
 context/figures/rasterisation_coverage.png). How far to inflate depends on whether the volume is on

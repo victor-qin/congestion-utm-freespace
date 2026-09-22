@@ -227,7 +227,7 @@ def test_an_outbound_accepted_without_volumes_raises_rather_than_stranding_the_r
 
 
 def test_the_itinerary_wrapper_neither_reorders_the_chain_nor_blocks_copying():
-    """`iter_planner_chain` order is load-bearing — `_terminal_capacity_for` takes the FIRST match —
+    """`iter_planner_chain` order is load-bearing — `terminal_capacity_for` takes the FIRST match —
     and a wrapper that answers `warm_planner` on its child's behalf yields a grandchild at its own
     depth. The same missing guard let `__getattr__` recurse forever on the empty-dict instance that
     `copy`/`pickle` build before restoring state."""

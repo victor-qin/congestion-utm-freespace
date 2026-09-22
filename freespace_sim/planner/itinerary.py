@@ -63,7 +63,7 @@ class ItineraryPlanner:
         `__setstate__` — where forwarding recurses until the stack dies. `warm_planner` because this
         wrapper has none of its own: answering with the inner planner's would make
         `iter_planner_chain` yield a grandchild at this wrapper's depth, and that order is
-        load-bearing (`_terminal_capacity_for` takes the FIRST match).
+        load-bearing (`terminal_capacity_for` takes the FIRST match).
         """
         if name in ("inner", "warm_planner"):
             raise AttributeError(name)

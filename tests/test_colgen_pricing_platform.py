@@ -662,3 +662,38 @@ def test_unavailable_cuda_fails_explicitly(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(GPUUnavailable, match="[Cc][Uu][Dd][Aa]"):
         platform = PricingPlatform(PricingOptions(device="gpu", gpu_backend="cuda"))
         platform.price_batch([_problem()])
+
+
+def test_snapshot_summaries_preserve_rounding_and_interrupted_publication():
+    """Shared summaries match ordered FP64 bounds, including signed out-of-domain rows."""
+    from freespace_sim.planner.colgen.gpu_prices import summary_for
+
+    cfg = _cfg()
+    raw = {RowKey.cell((-999, 99), 0, 1): -1e20,
+           RowKey.cell((0, 0), 0, 2): -3.25,
+           RowKey.term("terminal", -100): 1e20}
+    view = pricing.DualView(raw, cfg)
+    calls = 0
+
+    def interrupt():
+        """Stop before publication rather than retaining partially accumulated bounds."""
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise pricing.PricingTimeout()
+
+    with pytest.raises(pricing.PricingTimeout):
+        summary_for(view, interrupt)
+    assert view._gpu_summary is None
+    negative = absolute = 0.0
+    for price in raw.values():
+        if price < 0:
+            negative = math.nextafter(negative + price, -math.inf)
+        if price:
+            absolute = math.nextafter(absolute + abs(price), math.inf)
+    result = summary_for(view)
+    assert (result.negative, result.absolute) == (negative, absolute)
+    assert summary_for(view) is result
+    raw[RowKey.term("terminal", -100)] = -7.0
+    assert summary_for(view) is result
+    assert summary_for(pricing.DualView(raw, cfg)).negative < result.negative

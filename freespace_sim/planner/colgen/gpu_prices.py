@@ -8,6 +8,52 @@ import math
 from .pricing import DualView
 
 
+class PriceSummary:
+    """Original-price validation and outward sums shared by one immutable snapshot."""
+
+    def __init__(self, view: DualView, check: Callable[[], None]) -> None:
+        """Retain the exact iteration order and FP64 rounding of the per-flight bounds.
+
+        Parameters
+        ------------
+        - view (DualView): fixed normalized prices, including every signed/terminal row.
+        - check (Callable[[], None]): cooperative deadline check during construction.
+
+        Return
+        --------
+        - output (None): downward negative credit and upward absolute-price allowance.
+        """
+        negative = absolute = 0.0
+        for index, price in enumerate(view._duals.values()):
+            if index % 256 == 0:
+                check()
+            if not math.isfinite(price):
+                raise ValueError("Normalized dual prices must be finite")
+            if price < 0.0:
+                negative = math.nextafter(negative + price, -math.inf)
+            if price != 0.0:
+                absolute = math.nextafter(absolute + abs(price), math.inf)
+        check()
+        self.negative, self.absolute = negative, absolute
+
+
+def summary_for(view: DualView, check: Callable[[], None] = lambda: None) -> PriceSummary:
+    """Publish a complete summary once per immutable dual snapshot.
+
+    Parameters
+    ------------
+    - view (DualView): snapshot owning the cache; raw mapping callers must normalize anew.
+    - check (Callable[[], None]): optional deadline check; failures leave no partial cache.
+
+    Return
+    --------
+    - output (PriceSummary): shared numerical summaries with unchanged FP64 semantics.
+    """
+    if view._gpu_summary is None:
+        view._gpu_summary = PriceSummary(view, check)
+    return view._gpu_summary
+
+
 class SparseVisitPrices:
     """Sum each priced resource/visit window once, independently of flight graphs.
 

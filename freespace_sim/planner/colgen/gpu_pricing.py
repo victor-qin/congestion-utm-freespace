@@ -20,7 +20,7 @@ from .dp_prepare import prepare_variants, prepared_for
 from .gpu_bounds import CompletionBounds
 from .gpu_endpoint import EndpointBounds, Mask
 from .gpu_future import FutureBounds
-from .gpu_prices import SparseVisitPrices
+from .gpu_prices import SparseVisitPrices, summary_for
 from .gpu_prepare import GPUPreparation, packing_for
 from .gpu_runtime import ComputeRuntime
 from .network import RowKey
@@ -133,13 +133,7 @@ class _Batch:
             raise ValueError("DualView visit offsets must match the problem configuration")
         self.models = [cost_model(p.cfg, p.params) for p in problems]
         self.benefits = [pricing._benefit(p.params) for p in problems]
-        self.negative = []
-        for view in self.views:
-            value = 0.0
-            for price in view._duals.values():
-                if price < 0:
-                    value = _down(value + price)
-            self.negative.append(value)
+        self.negative: list[float] = []
         self.arena = np.empty((options.max_labels, 3), np.int32)
         self.search_label_limit = options.max_labels
         self.prefix_positive = np.empty(options.max_labels, np.float64)
@@ -212,6 +206,7 @@ class _Batch:
         - output (None): initializes shared graph/root arrays and feasible incumbents.
         """
         topologies, variants = [], []
+        self.negative = [summary_for(view, self.check).negative for view in self.views]
         self.bounds: list[CompletionBounds] = []
         self.cells: list[tuple[int, int]] = []
         self.cell_flights: list[int] = []
@@ -229,8 +224,6 @@ class _Batch:
                 math.isfinite(v) and v >= 0 for v in (model.ground_weight, model.air_weight)
             ):
                 raise ValueError("Certified bounds require finite nonnegative objective weights")
-            if not all(math.isfinite(v) for v in view._duals.values()):
-                raise ValueError("Normalized dual prices must be finite")
             topology, rows = prepared_for(p.graph, p.cfg)
             if not topology.ok or not rows.ok:
                 raise _Stopped("unsupported")

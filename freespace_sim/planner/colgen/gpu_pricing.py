@@ -16,11 +16,12 @@ from typing import Any
 import numpy as np
 
 from . import pricing
-from .dp_prepare import PricingPreparation, prepare_variants, prepared_for
+from .dp_prepare import prepare_variants, prepared_for
 from .gpu_bounds import CompletionBounds
 from .gpu_endpoint import EndpointBounds, Mask
 from .gpu_future import FutureBounds
 from .gpu_prices import SparseVisitPrices
+from .gpu_prepare import GPUPreparation, packing_for
 from .gpu_runtime import ComputeRuntime
 from .network import RowKey
 from .objective import cost_model
@@ -265,7 +266,7 @@ class _Batch:
                     if rc > self.best[i][0]:
                         self.best[i] = rc, column
             self.check()
-            preparation = PricingPreparation(
+            preparation = GPUPreparation(
                 p.graph, p.cfg, view, benefit=benefit, pi_f=p.pi_f, model=model,
                 forbidden_rows=p.forbidden_rows, retain_root_claims=True,
             )
@@ -299,16 +300,12 @@ class _Batch:
                 self.endpoints[i] = EndpointBounds(bounds, self.options, self.check)
             offset = len(self.cells)
             self.cell_offsets.append(offset)
-            self.cells.extend(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
+            packing = packing_for(p.graph, p.cfg, topology)
+            self.cells.extend(packing.cells)
             self.cell_flights.extend([i] * topology.n_cells)
-            graph = np.full((topology.n_cells, 14), -1, np.int32)
-            graph[:, 6:12] = 0
-            graph[:, 12] = remaining_hops
-            graph[:, 13] = topology.dest_mask
-            for cell in range(topology.n_cells):
-                start, stop = map(int, topology.arc_start[cell : cell + 2])
-                graph[cell, : stop - start] = topology.arc_target[start:stop] + offset
-                graph[cell, 6 : 6 + stop - start] = topology.arc_roles[start:stop]
+            graph = packing.graph.copy()
+            neighbors = graph[:, :6]
+            neighbors[neighbors >= 0] += offset
             graphs.append(graph)
             paid_offset = len(paid_values)
             paid_rows.extend(zip(map(int, v.paid_cell + offset), map(int, v.paid_step)))

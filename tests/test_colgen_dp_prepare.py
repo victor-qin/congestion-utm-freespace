@@ -25,6 +25,7 @@ from freespace_sim.planner.colgen.dp_prepare import (
     prepare_topology,
 )
 from freespace_sim.planner.colgen.network import RowKey, build_flight_graph
+from freespace_sim.planner.colgen.gpu_prepare import GPUPreparation
 from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.types import FlightRequest, Terminal, vec
@@ -927,7 +928,8 @@ def _assert_prepared_exact(actual, expected):
 
 
 @pytest.mark.parametrize("shape", sorted(GRAPHS))
-def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape):
+@pytest.mark.parametrize("preparer", [dp_prepare.PricingPreparation, GPUPreparation])
+def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape, preparer):
     """Changing cutoffs, root restrictions and rewind must not share search-state pruning."""
     from dataclasses import replace
 
@@ -939,7 +941,7 @@ def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape):
     strong = (benefit - seed.delay_s - view.claim_cost(seed.claims), seed)
     weak = (-1000.0, seed)
     tied = (strong[0], replace(seed, departure_step=seed.departure_step + 1))
-    context = dp_prepare.PricingPreparation(
+    context = preparer(
         fg, cfg, view, benefit=benefit, pi_f=0.0, model=DELAY_MODEL, forbidden_rows=frozenset())
     topology, rows = context.topology_rows
     _assert_prepared_exact(context.duals, dp_prepare.prepare_duals(view, fg, topology, rows))
@@ -990,7 +992,8 @@ def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape):
 
 
 @pytest.mark.parametrize("shape", sorted(GRAPHS))
-def test_pricing_preparation_current_subproblem_scope_and_prices(shape):
+@pytest.mark.parametrize("preparer", [dp_prepare.PricingPreparation, GPUPreparation])
+def test_pricing_preparation_current_subproblem_scope_and_prices(shape, preparer):
     """A new invocation must price current duals, forbidden rows and objective weights."""
     cfg = _cfg()
     fg = GRAPHS[shape](cfg)
@@ -998,7 +1001,7 @@ def test_pricing_preparation_current_subproblem_scope_and_prices(shape):
     forbidden = set()
     views = [pricing.DualView({}, cfg), pricing.DualView(_duals(fg, cfg, 904), cfg)]
     model = DELAY_MODEL
-    context = dp_prepare.PricingPreparation(
+    context = preparer(
         fg, cfg, views[0], benefit=1000.0, pi_f=0.0, model=model, forbidden_rows=forbidden)
     topology, rows = context.topology_rows
     # Warm the cached empty mask, then mutate the caller's set. It must not silently
@@ -1022,7 +1025,7 @@ def test_pricing_preparation_current_subproblem_scope_and_prices(shape):
         (views[1], frozenset(forbidden), CostModel(ground_weight=7.0, air_weight=1.0)),
         (pricing.DualView({next(iter(seed.claims)): -1e-12}, cfg), frozenset(), model),
     ):
-        current = dp_prepare.PricingPreparation(
+        current = preparer(
             fg, cfg, view, benefit=1000.0, pi_f=0.0, model=objective, forbidden_rows=exclusions)
         _assert_prepared_exact(current.duals, dp_prepare.prepare_duals(view, fg, topology, rows))
         _assert_prepared_exact(current.forbidden, prepare_forbidden(exclusions, fg, rows, topology))
@@ -1040,3 +1043,58 @@ def test_pricing_preparation_current_subproblem_scope_and_prices(shape):
                 shared = current.envelopes(None, None)
                 fresh = dp_prepare.CompletionEnvelopes(fg, cfg, view, **kwargs)
                 assert shared.envelope(departure, lane) == _eager_envelope(fresh, departure, lane)
+
+
+@pytest.mark.parametrize("shape", sorted(GRAPHS))
+def test_gpu_unpriced_memberships_are_complete_bounded_and_reusable(shape, monkeypatch):
+    """Warm roots retain zero-priced/terminal rows and rebuild exactly after cache eviction."""
+    from freespace_sim.planner.colgen import gpu_prepare
+
+    cfg = _cfg()
+    fg = GRAPHS[shape](cfg)
+    topo, rows = dp_prepare.prepared_for(fg, cfg)
+    view = pricing.DualView({}, cfg)
+    context = GPUPreparation(fg, cfg, view, benefit=0.0, pi_f=0.0,
+                             model=DELAY_MODEL, forbidden_rows=frozenset())
+    packing = context.packing
+    expected = _reference_roots(fg, cfg, view, DELAY_MODEL, topo.air_hop_limit)
+    first = dp_prepare.prepare_variants(fg, cfg, view, topo, rows, preparation=context)
+    builds = packing.claim_builds
+    assert builds > 0
+    for _ in range(2):
+        current = GPUPreparation(fg, cfg, view, benefit=0.0, pi_f=0.0,
+                                 model=DELAY_MODEL, forbidden_rows=frozenset())
+        actual = dp_prepare.prepare_variants(fg, cfg, view, topo, rows, preparation=current)
+        _assert_prepared_exact(actual, first)
+    assert packing.claim_builds == builds
+    for (departure, lane), (cell, step, _, _) in expected.items():
+        origin = pricing._endpoint_claims_uncached(
+            fg, cfg, origin=True, step=departure, timing_steps=0)
+        claims = origin | pricing._visit_claims(cell, 0, step, view.offsets)
+        assert context.root_claims(departure, None if lane < 0 else lane,
+                                   origin, cell, step) == claims
+    all_rows = set().union(*packing.claims.values())
+    assert all_rows and all(view.row_cost(row) == 0.0 for row in all_rows)
+    if shape == "terminal":
+        assert any(row.kind == "term" for row in all_rows)
+    # Clear before lowering the budget; eviction must affect reuse, never domain coverage.
+    packing.claims.clear()
+    packing.claim_rows = 0
+    monkeypatch.setattr(gpu_prepare, "_MAX_CLAIM_ROWS", 8)
+    changed = pricing.DualView({row: (-1.0 if i % 2 else 3.0)
+                               for i, row in enumerate(sorted(all_rows))}, cfg)
+    current = GPUPreparation(fg, cfg, changed, benefit=0.0, pi_f=0.0,
+                             model=DELAY_MODEL, forbidden_rows=frozenset())
+    actual = dp_prepare.prepare_variants(fg, cfg, changed, topo, rows, preparation=current)
+    reference = dp_prepare.prepare_variants(fg, cfg, changed, topo, rows)
+    _assert_prepared_exact(actual, reference)
+    assert packing.claim_rows <= 8
+    old = dict(packing.claims)
+
+    def interrupted():
+        """A failed exact-membership build must leave the preceding cache intact."""
+        raise pricing.PricingTimeout()
+
+    with pytest.raises(pricing.PricingTimeout):
+        packing.membership(("interrupted",), interrupted)
+    assert dict(packing.claims) == old

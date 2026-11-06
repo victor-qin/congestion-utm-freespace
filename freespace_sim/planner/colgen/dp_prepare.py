@@ -41,7 +41,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, AbstractSet, Any
 
 import numpy as np
 
@@ -58,6 +58,8 @@ from .windows import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...config import SimConfig
     from .network import FlightGraph
+    from .objective import CostModel
+    from .pricing import DualView
 
 Cell = tuple[int, int]
 
@@ -1058,7 +1060,29 @@ class PricingPreparation:
     fresh completion envelopes and assigns its own surviving roots and paid-class IDs.
     """
 
-    def __init__(self, fg, cfg, view, *, benefit, pi_f, model, forbidden_rows):
+    def __init__(
+        self, fg: FlightGraph, cfg: SimConfig, view: DualView, *, benefit: float,
+        pi_f: float, model: CostModel, forbidden_rows: AbstractSet[RowKey],
+        retain_root_claims: bool = False,
+    ) -> None:
+        """Create lazy caches scoped to one pricing subproblem.
+
+        Parameters
+        ------------
+        - fg (FlightGraph): fixed geometry and departure domain.
+        - cfg (SimConfig): the graph's simulation configuration.
+        - view (DualView): current capacity prices.
+        - benefit (float): the flight's objective benefit.
+        - pi_f (float): current flight-row price.
+        - model (CostModel): objective weights for this call.
+        - forbidden_rows (AbstractSet[RowKey]): excluded rows, copied for scope validation.
+        - retain_root_claims (bool): share full origin unions with GPU verification for
+          this call; disabled for CPU pricing, which needs only their active prices.
+
+        Return
+        --------
+        - output (None): initializes empty caches; search-stage pruning stays separate.
+        """
         self.fg, self.cfg, self.view = fg, cfg, view
         self.benefit, self.pi_f, self.model = benefit, pi_f, model
         self.forbidden_rows = frozenset(forbidden_rows)
@@ -1069,6 +1093,9 @@ class PricingPreparation:
         self._origin_data = None
         self._origin_claims = {}
         self._root_prices = {}
+        self._root_claims: dict[tuple[int, int | None], frozenset[RowKey]] | None = (
+            {} if retain_root_claims else None
+        )
 
     def check(self, fg, cfg, view, benefit, pi_f, model, forbidden_rows):
         """Reject accidental reuse across different pricing subproblems."""
@@ -1129,18 +1156,47 @@ class PricingPreparation:
             )
         return self._origin_claims[departure]
 
-    def root_price(self, departure, lane, origin_claims, cell, start_step):
+    def root_price(
+        self, departure: int, lane: int | None, origin_claims: frozenset[RowKey],
+        cell: Cell, start_step: int,
+    ) -> tuple[float, frozenset[RowKey]] | None:
         """Reuse canonical start prices and paid rows before the current cutoff gate."""
-        from .pricing import _visit_claims
-
         key = departure, lane
         if key not in self._root_prices:
-            claims = origin_claims | _visit_claims(cell, 0, start_step, self.view.offsets)
+            claims = self.root_claims(departure, lane, origin_claims, cell, start_step)
             self._root_prices[key] = (
                 (self.view.claim_cost(claims), self.view.active_claims(claims))
                 if claims.isdisjoint(self.forbidden_rows) else None
             )
         return self._root_prices[key]
+
+    def root_claims(
+        self, departure: int, lane: int | None, origin_claims: frozenset[RowKey],
+        cell: Cell, start_step: int,
+    ) -> frozenset[RowKey]:
+        """Construct the canonical starting union, optionally retaining it for this call.
+
+        Parameters
+        ------------
+        - departure (int): root departure clock step.
+        - lane (int | None): origin lane, or None for a bare origin.
+        - origin_claims (frozenset[RowKey]): this departure's endpoint rows.
+        - cell (Cell): first visited cell for this lane.
+        - start_step (int): first visit clock step.
+
+        Return
+        --------
+        - output (frozenset[RowKey]): endpoint and first-visit union before price filtering.
+        """
+        from .pricing import _visit_claims
+
+        key = departure, lane
+        claims = None if self._root_claims is None else self._root_claims.get(key)
+        if claims is None:
+            claims = origin_claims | _visit_claims(cell, 0, start_step, self.view.offsets)
+            if self._root_claims is not None:
+                self._root_claims[key] = claims
+        return claims
 
 
 class CompletionEnvelopes:

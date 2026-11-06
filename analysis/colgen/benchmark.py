@@ -27,6 +27,42 @@ import time
 import traceback
 
 
+_PRICING_DEFAULTS = {
+    "pricing_device": "cpu",
+    "pricing_gpu_backend": None,
+    "pricing_cpu_recompute": True,
+    "pricing_gpu_batch_size": 1,
+    "pricing_gpu_max_labels": 250_000,
+    "pricing_gpu_chunk_size": 2048,
+}
+
+
+def _pricing_options(args: argparse.Namespace) -> dict[str, object]:
+    """Return explicit backend metadata even for older callers using CPU defaults."""
+    return {name: getattr(args, name, default) for name, default in _PRICING_DEFAULTS.items()}
+
+
+def _pricing_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    """Keep default CPU runs compatible with archived parameter classes lacking GPU fields."""
+    options = _pricing_options(args)
+    return {} if options == _PRICING_DEFAULTS else options
+
+
+def _pricing_argv(args: argparse.Namespace) -> list[str]:
+    """Preserve selected GPU controls when the paired harness starts its child process."""
+    values = _pricing_kwargs(args)
+    result = []
+    for name, value in values.items():
+        if value is None:
+            continue
+        flag = name.replace("_", "-")
+        if isinstance(value, bool):
+            result.append(f"--{'' if value else 'no-'}{flag}")
+        else:
+            result.extend((f"--{flag}", str(value)))
+    return result
+
+
 def jsonable(value):
     if dataclasses.is_dataclass(value):
         return jsonable(dataclasses.asdict(value))
@@ -108,7 +144,17 @@ def persist_flights(out, sequence, payload):
     return summary
 
 
-def child(args):
+def child(args: argparse.Namespace) -> None:
+    """Run one selected source tree through warmup, optimization and independent filing checks.
+
+    Parameters
+    ------------
+    - args (argparse.Namespace): parsed child arguments, including the pricing backend.
+
+    Return
+    --------
+    - output (None): writes the run's input, iteration, solver and trajectory artifacts.
+    """
     root = Path(args.root).resolve()
     sys.path.insert(0, str(root))
     import numpy as np
@@ -128,17 +174,38 @@ def child(args):
     # Feasibility-search compilation is not exercised by this warmup; record the
     # signatures so runs that need that separate kernel can be identified.
     warm_started = time.perf_counter()
-    dp_kernel.warm_kernel()
+    pricing_options = _pricing_options(args)
+    gpu_pricing = pricing_options["pricing_device"] == "gpu"
+    if not gpu_pricing:
+        dp_kernel.warm_kernel()
     warm_spec = with_overrides(get_scenario("colgen_test"), planner="colgen", seed=0,
                                horizon_s=600.0, demand_duration_s=4.0)
     warm_cfg = warm_spec.config()
     warm_demand = warm_spec.demand_model()
     warm_requests = warm_demand.generate(warm_cfg, np.random.default_rng(0))
+    warm_kwargs = {}
+    warm_params = {}
+    if gpu_pricing:
+        from freespace_sim.planner import hexgrid
+        from freespace_sim.types import FlightRequest, vec
+
+        # Keep warmup small; nominal seeding supplies the required initial column.
+        warm_cfg = dataclasses.replace(warm_cfg, max_ground_delay_s=0.0, time_buffer_s=0.0,
+                                       flight_levels_m=(warm_cfg.flight_levels_m[0],))
+        radius = hexgrid.circumradius(warm_cfg)
+        origin = vec(*hexgrid.hex_center(0, 0, radius), warm_cfg.ground_level_m)
+        destination = vec(*hexgrid.hex_center(2, 0, radius), warm_cfg.ground_level_m)
+        warm_requests = [FlightRequest(1, origin, destination, 0.0, 0.0)]
+        warm_kwargs["static_terminals"] = []
+        warm_demand = None
+        warm_params = dict(max_air_overrun_hops=0, seed_nominal_routes=True,
+                           seed_ladder_steps=0, iteration_ip_time_limit_s=0.0)
     warm_result = run(
         warm_cfg, requests=warm_requests, demand=warm_demand, progress=False,
         planner_params=ColGenParams(solver="gurobi", n_pricing_workers=0,
                                    max_iterations=2, time_limit_s=300.0,
-                                   ip_time_limit_s=15.0),
+                                   ip_time_limit_s=15.0, **warm_params, **_pricing_kwargs(args)),
+        **warm_kwargs,
     )
     assert warm_result.verified
     warm_s = time.perf_counter() - warm_started
@@ -146,7 +213,11 @@ def child(args):
         "pricing": len(dp_kernel._price_dag.signatures),
         "feasible": len(dp_kernel._feasible_dag.signatures),
     }
-    assert warm_signatures["pricing"] > 0, "Warmup did not compile pricing"
+    if gpu_pricing:
+        warm_signatures["gpu_dispatches"] = warm_result.planner_stats.get("gpu_dispatches", 0)
+        assert warm_signatures["gpu_dispatches"] > 0, "Warmup did not dispatch GPU pricing"
+    else:
+        assert warm_signatures["pricing"] > 0, "Warmup did not compile pricing"
     del warm_result
     print(f"WARMED {warm_s:.3f}s", flush=True)
 
@@ -175,7 +246,7 @@ def child(args):
     if args.bootstrap_method is not None:
         experimental["bootstrap_method"] = args.bootstrap_method
     params = ColGenParams(
-        max_air_overrun_hops=args.overrun, **experimental,
+        max_air_overrun_hops=args.overrun, **experimental, **_pricing_kwargs(args),
         solver="gurobi", n_pricing_workers=args.workers, max_iterations=args.iterations,
         time_limit_s=args.budget, ip_time_limit_s=args.ip_budget,
         ip_reserve_s=args.ip_reserve,
@@ -379,6 +450,12 @@ def child(args):
         reason = intent.denial_reason.value
         denied_reasons[reason] = denied_reasons.get(reason, 0) + 1
     row = {
+        **pricing_options,
+        **{name: stats.get(name) for name in (
+            "pricing_bound_certified", "pricing_search_complete", "last_pricing_status",
+            "gpu_dispatches", "gpu_batches", "gpu_cpu_recomputations", "gpu_labels",
+            "approximate_pricing_sweeps",
+        )},
         "version": args.version, "scenario": args.scenario, "seed": args.seed,
         "heuristic_mode": (args.version if args.version.startswith("iteration_ip") else
                            "rounding" if args.version == "baseline" else "lns"),
@@ -437,7 +514,17 @@ def child(args):
     print(json.dumps(jsonable(row), sort_keys=True), flush=True)
 
 
-def parent(args):
+def parent(args: argparse.Namespace) -> int:
+    """Run selected benchmark arms serially in isolated child processes.
+
+    Parameters
+    ------------
+    - args (argparse.Namespace): parsed paired-run arguments and pricing selection.
+
+    Return
+    --------
+    - output (int): nonzero if any child failed; all outputs and errors are preserved.
+    """
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).resolve()
@@ -457,6 +544,7 @@ def parent(args):
              for scenario in args.scenarios
              for seed in args.seeds]
     manifest = {
+        **_pricing_options(args),
         "roots": roots, "python": sys.version, "platform": platform.platform(),
         "machine": platform.machine(), "logical_cpu_count": os.cpu_count(),
         "packages": {name: importlib.metadata.version(name)
@@ -503,7 +591,8 @@ def parent(args):
             manifest[f"{version}_frozen_manifest_sha256"] = hashlib.sha256(frozen_manifest.read_bytes()).hexdigest()
         manifest[f"{version}_source_sha256"] = {
             str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted((Path(root) / "freespace_sim").rglob("*.py"))
+            for path in sorted((Path(root) / "freespace_sim").rglob("*"))
+            if path.is_file() and path.suffix in {".py", ".h"}
         }
     patch = (subprocess.check_output(["git", "diff", "--", "freespace_sim/planner/colgen"],
                                     cwd=roots["fixed"])
@@ -543,7 +632,7 @@ def parent(args):
                        "--iteration-ip-budget", str(args.iteration_ip_budget),
                        "--lp-gap", str(args.lp_gap),
                        "--exact-pricing-interval", str(args.exact_pricing_interval),
-                       "--gurobi-threads", str(args.gurobi_threads)]
+                       "--gurobi-threads", str(args.gurobi_threads), *_pricing_argv(args)]
             if args.bootstrap_method is not None:
                 command.extend(["--bootstrap-method", args.bootstrap_method])
             if args.demand_seconds is not None:
@@ -590,7 +679,17 @@ def parent(args):
     return int(any("error" in row for row in rows))
 
 
-def main():
+def main() -> int:
+    """Validate command-line controls and dispatch one benchmark mode.
+
+    Parameters
+    ------------
+    - none: reads command-line arguments from ``sys.argv``.
+
+    Return
+    --------
+    - output (int): zero on success and nonzero on a failed benchmark.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
     run = sub.add_parser("run")
@@ -627,6 +726,13 @@ def main():
         command.add_argument("--columns-per-flight", type=int, default=1)
         command.add_argument("--bootstrap-method", choices=["dp", "astar"])
         command.add_argument("--workers", type=int, default=4)
+        command.add_argument("--pricing-device", choices=("cpu", "gpu"), default="cpu")
+        command.add_argument("--pricing-gpu-backend", choices=("metal", "cuda"))
+        command.add_argument("--pricing-cpu-recompute", action=argparse.BooleanOptionalAction,
+                             default=True)
+        command.add_argument("--pricing-gpu-batch-size", type=int, default=1)
+        command.add_argument("--pricing-gpu-max-labels", type=int, default=250_000)
+        command.add_argument("--pricing-gpu-chunk-size", type=int, default=2048)
         command.add_argument("--gurobi-threads", type=int, default=4)
         command.add_argument("--lp-gap", type=float, default=0.001)
         command.add_argument("--exact-pricing-interval", type=int, default=5)
@@ -640,13 +746,25 @@ def main():
         parser.error("--overrun must be nonnegative and --columns-per-flight positive")
     if args.gurobi_threads < 1:
         parser.error("--gurobi-threads must be positive")
+    if ((args.pricing_device == "cpu" and args.pricing_gpu_backend is not None)
+            or (args.pricing_device == "gpu" and args.pricing_gpu_backend is None)):
+        parser.error("Select --pricing-gpu-backend exactly when --pricing-device gpu is selected")
+    for name in ("pricing_gpu_batch_size", "pricing_gpu_max_labels", "pricing_gpu_chunk_size"):
+        value = getattr(args, name)
+        if value < 1 or (name != "pricing_gpu_batch_size" and value >= 2**27):
+            parser.error(f"--{name.replace('_', '-')} must be positive and fit the GPU index limit")
+    if args.pricing_device == "gpu":
+        versions = args.versions if args.mode == "run" else (args.version,)
+        if args.columns_per_flight != 1 or "iteration_ip_cheap" in versions:
+            parser.error("GPU pricing requires --columns-per-flight 1 and does not support cheap pricing")
     os.environ["COLGEN_GUROBI_THREADS"] = str(args.gurobi_threads)
     if not math.isfinite(args.iteration_ip_budget) or args.iteration_ip_budget <= 0:
         parser.error("--iteration-ip-budget must be finite and positive")
     if args.mode == "run" and len(set(args.versions)) != len(args.versions):
         parser.error("--versions must not contain duplicate arms")
     try:
-        return parent(args) if args.mode == "run" else child(args)
+        outcome = parent(args) if args.mode == "run" else child(args)
+        return 0 if outcome is None else outcome
     except Exception:
         traceback.print_exc()
         return 1

@@ -44,8 +44,10 @@ from .pricing import (
     find_feasible_column,
     price_flight,
     seed_column,
+    _shortest_seed,
 )
-from .pricing_pool import PricingPool, certified_sweep_columns, price_sweep
+from .pricing_pool import PricingPool, certified_sweep_columns, make_pricing_platform, price_sweep
+from .pricing_platform import PricingProblem
 from .translate import Column, column_to_intent
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,34 @@ log = logging.getLogger(__name__)
 _FEASIBILITY_TOL = 1e-7
 _REDUCED_COST_TOL = 1e-9
 _OBJECTIVE_TOL = 1e-8
+
+
+def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
+    """Describe the selected pricing implementation even when setup stops early.
+
+    Parameters
+    ------------
+    - params (ColGenParams): selected device, backend and numeric mode.
+
+    Return
+    --------
+    - output (dict[str, Any]): configuration and zero-work defaults for pricing diagnostics.
+    """
+    return {
+        "pricing_device": params.pricing_device,
+        "pricing_gpu_backend": params.pricing_gpu_backend,
+        "pricing_cpu_recompute": params.pricing_cpu_recompute,
+        "pricing_bound_certified": False,
+        "pricing_search_complete": False,
+        "last_pricing_status": "not_started",
+        "pricing_failure_status": None,
+        "gpu_dispatches": 0,
+        "gpu_batches": 0,
+        "gpu_cpu_recomputations": 0,
+        "gpu_labels": 0,
+        "approximate_pricing_sweeps": 0,
+        "approximate_pricing_wall_s": 0.0,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +773,7 @@ def _pre_master_timeout_result(
     return ColGenResult(
         columns={},
         stats={
+            **_pricing_selection_stats(params),
             "backend": backend_name,
             "iterations": 0,
             "termination_reason": "time_limit",
@@ -900,7 +931,8 @@ class ColGenSolver:
           before this batch is placed.
         - on_iteration: optional callback invoked once per iteration with a dict of that
           iteration's master state (LP objective, global upper bound, gaps, column and
-          dual diagnostics).  Without it the per-iteration bound and gap surface only in
+          dual diagnostics), including an interrupted pricing sweep marked by
+          ``pricing_search_complete=False``. Without it the bound and gap surface only in
           the final stats, so a killed or watched run discards them.
         - seed_columns (Mapping[int, Sequence[Column]] | None): optional warm-start columns
           per flight.  ORDER is load-bearing: element 0 is that flight's entry in the
@@ -940,6 +972,7 @@ class ColGenSolver:
             return ColGenResult(
                 columns={},
                 stats={
+                    **_pricing_selection_stats(params),
                     "backend": "none",
                     "iterations": 0,
                     "termination_reason": "empty",
@@ -1126,9 +1159,13 @@ class ColGenSolver:
         seed_started = time.monotonic()
         for flight_id in (graphs if params.seed_nominal_routes else ()):
             try:
-                seed = seed_column(
+                seed_builder = _shortest_seed if params.pricing_device == "gpu" else seed_column
+                seed = seed_builder(
                     graphs[flight_id], cfg, deadline=pricing_deadline, model=model
                 )
+                if seed is None:
+                    seedless_flights.add(flight_id)
+                    continue
             except PricingTimeout:
                 return _pre_master_timeout_result(
                     flight_ids,
@@ -1314,6 +1351,11 @@ class ColGenSolver:
         pricing_sweeps_completed = 0
         cheap_pricing_sweeps = exact_pricing_sweeps = 0
         cheap_pricing_wall_s = exact_pricing_wall_s = 0.0
+        approximate_pricing_sweeps = 0
+        approximate_pricing_wall_s = 0.0
+        last_pricing_status = "not_started"
+        last_pricing_complete = False
+        pricing_failure_status: str | None = None
         pricing_timeout_flight_id: int | None = None
         iteration_ip_records: list[dict[str, Any]] = []
 
@@ -1324,9 +1366,10 @@ class ColGenSolver:
         pricing_requests = tuple(r for r in ordered_requests if r.flight_id in graphs)
         sweep_pool = (
             None
-            if params.n_pricing_workers == 0 or not graphs
+            if params.pricing_device == "gpu" or params.n_pricing_workers == 0 or not graphs
             else PricingPool(pricing_requests, cfg, params, static_catalog)
         )
+        pricing_platform = make_pricing_platform(params) if params.pricing_device == "gpu" else None
         try:
             for iteration in range(params.max_iterations):
                 # One line per iteration BEFORE any of its work, so a run that wedges says
@@ -1463,6 +1506,7 @@ class ColGenSolver:
                         master.set_heuristic(best_heuristic)
 
                 best_reduced_costs: list[float] = []
+                pricing_upper_bounds: list[float] = []
                 rc_by_flight: dict[int, float] = {}
                 priced_columns: list[Column] = []
                 # The LP and the heuristic are done; pricing is the long block that follows.
@@ -1501,6 +1545,7 @@ class ColGenSolver:
                 iteration_flight_records = []
                 while True:
                     sweep_started = time.perf_counter()
+                    requested_exact = pricing_exact
                     sweep = price_sweep(
                         pricing_order,
                         pricing_requests,
@@ -1515,7 +1560,18 @@ class ColGenSolver:
                         deadline=pricing_deadline,
                         pool=sweep_pool,
                         heuristic_only=not pricing_exact,
+                        **({"platform": pricing_platform} if pricing_platform is not None else {}),
                     )
+                    pricing_exact = requested_exact and sweep.certified
+                    pricing_upper_bounds.extend(
+                        sweep.reduced_costs if sweep.upper_bounds is None else sweep.upper_bounds
+                    )
+                    last_pricing_status = sweep.status
+                    last_pricing_complete = sweep.complete
+                    if params.pricing_device == "gpu":
+                        pricing_flights_completed += sum(
+                            bool(record.get("search_complete")) for record in sweep.flight_records
+                        )
                     # Consumed in index order, which is what keeps a parallel sweep's answer equal
                     # to the sequential one: `master.upper_bound` sums these with plain `sum`, and
                     # float addition is not associative.  `SweepResult` has already discarded
@@ -1529,7 +1585,8 @@ class ColGenSolver:
                     for flight_id, reduced_cost, column in zip(
                         sweep.flight_ids, sweep.reduced_costs, sweep.columns, strict=True
                     ):
-                        pricing_flights_completed += 1
+                        if params.pricing_device == "cpu":
+                            pricing_flights_completed += 1
                         best_reduced_costs.append(reduced_cost)
                         rc_by_flight[flight_id] = reduced_cost
                         if column is not None and reduced_cost > _REDUCED_COST_TOL:
@@ -1557,11 +1614,15 @@ class ColGenSolver:
                     if not sweep.complete:
                         pricing_complete = False
                         pricing_timeout_flight_id = sweep.timeout_flight_id
+                        if params.pricing_device == "gpu":
+                            pricing_failure_status = sweep.status
 
                     attempt_s = time.perf_counter() - sweep_started
                     iteration_sweep_s += attempt_s
                     pricing_wall_s += attempt_s
-                    if pricing_exact:
+                    if params.pricing_device == "gpu" and not params.pricing_cpu_recompute:
+                        approximate_pricing_wall_s += attempt_s
+                    elif requested_exact:
                         exact_pricing_wall_s += attempt_s
                     else:
                         cheap_pricing_wall_s += attempt_s
@@ -1599,13 +1660,16 @@ class ColGenSolver:
                         termination_reason = (
                             "pricing_worker_lost"
                             if sweep.kernel_counters.get("pool_worker_lost")
-                            else "time_limit"
+                            else ("time_limit" if sweep.status in {"deadline", "complete"}
+                                  else f"pricing_{sweep.status}")
                         )
                         break
                     pricing_sweeps_completed += 1
 
                     if pricing_exact:
                         exact_pricing_sweeps += 1
+                    elif params.pricing_device == "gpu":
+                        approximate_pricing_sweeps += 1
                     else:
                         cheap_pricing_sweeps += 1
                         cheap_columns_added = len(master.columns) - before_pricing
@@ -1614,16 +1678,14 @@ class ColGenSolver:
                             # flights with the SAME LP duals through the exact oracle.
                             pricing_exact = True
                             best_reduced_costs.clear()
+                            pricing_upper_bounds.clear()
                             rc_by_flight.clear()
                             priced_columns.clear()
                             log.info("  cheap pricing stalled; running a full sweep")
                             continue
                     break
-                if not pricing_complete:
-                    break
-
                 iteration_ip_info = {}
-                if params.iteration_ip_time_limit_s > 0.0:
+                if pricing_complete and params.iteration_ip_time_limit_s > 0.0:
                     incumbent_cost = total_benefit - _selection_objective(best_heuristic, params.M)
                     master.backend.ip_gap = (
                         params.ip_gap * max(incumbent_cost, 1.0) / max(1.0, total_benefit)
@@ -1669,8 +1731,8 @@ class ColGenSolver:
                 # Only an exact sweep supplies a new valid global bound. Between
                 # exact sweeps retain the previous certificate (infinity initially).
                 raw_upper_bound = (
-                    master.upper_bound(last_lp_objective, best_reduced_costs)
-                    if pricing_exact else last_upper_bound
+                    master.upper_bound(last_lp_objective, pricing_upper_bounds)
+                    if pricing_complete and pricing_exact else last_upper_bound
                 )
                 # Each iteration's value is a valid global upper bound.  Their
                 # running minimum remains valid and removes harmless solver jitter.
@@ -1695,13 +1757,14 @@ class ColGenSolver:
                 else:
                     lp_gap, heuristic_gap = lp_gap_cost, heuristic_gap_cost
 
-                lp_objectives.append(last_lp_objective)
-                upper_bounds.append(last_upper_bound)
-                cost_upper_bounds.append(cost_upper_bound)
-                cost_lower_bounds.append(cost_lower_bound)
-                lp_gaps.append(lp_gap)
-                heuristic_objectives.append(heuristic_objective)
-                heuristic_costs.append(heuristic_cost)
+                if pricing_complete:
+                    lp_objectives.append(last_lp_objective)
+                    upper_bounds.append(last_upper_bound)
+                    cost_upper_bounds.append(cost_upper_bound)
+                    cost_lower_bounds.append(cost_lower_bound)
+                    lp_gaps.append(lp_gap)
+                    heuristic_objectives.append(heuristic_objective)
+                    heuristic_costs.append(heuristic_cost)
 
                 if on_iteration is not None:
                     # Reduced-cost spread.  The bound is LP + sum(max(0, rc)), so whether the
@@ -1767,6 +1830,15 @@ class ColGenSolver:
                         # sweep, which is very nearly the wall of the whole iteration.
                         "sweep_s": iteration_sweep_s,
                         "pricing_exact": pricing_exact,
+                        "pricing_device": params.pricing_device,
+                        "pricing_gpu_backend": params.pricing_gpu_backend,
+                        "pricing_cpu_recompute": params.pricing_cpu_recompute,
+                        "pricing_bound_certified": math.isfinite(last_upper_bound),
+                        "pricing_search_complete": pricing_complete,
+                        "pricing_failure_status": pricing_failure_status,
+                        "pricing_timeout_flight_id": pricing_timeout_flight_id,
+                        "last_pricing_status": last_pricing_status,
+                        "gpu_dispatches": kernel_counters.get("gpu_dispatches", 0),
                         "cheap_sweep_s": cheap_attempt_s,
                         "cheap_columns_added": cheap_columns_added,
                         # The work the sweep actually did, against the wall above.  With a
@@ -1809,6 +1881,10 @@ class ColGenSolver:
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
                     })
+                # Preserve failed-sweep diagnostics before leaving for final IP, without
+                # treating partial scores as a proof of convergence.
+                if not pricing_complete:
+                    break
                 prev_capacity_duals = dict(capacity_duals)
 
                 new_columns_since_lp = len(master.columns) > columns_at_lp
@@ -1820,12 +1896,21 @@ class ColGenSolver:
                 if pricing_exact and best_heuristic and heuristic_gap <= params.ip_gap:
                     termination_reason = "heuristic_gap"
                     break
+                if (pricing_exact and sweep.upper_bounds is not None
+                        and len(master.columns) == before_pricing and not new_columns_since_lp
+                        and any(bound > _REDUCED_COST_TOL for bound in pricing_upper_bounds)):
+                    termination_reason = "pricing_bound_gap"
+                    break
                 if pricing_exact and not priced_columns and not new_columns_since_lp:
                     termination_reason = "no_improving_columns"
                     break
 
                 if pricing_exact and len(master.columns) == before_pricing and not new_columns_since_lp:
                     termination_reason = "no_new_columns"
+                    break
+                if (params.pricing_device == "gpu" and not pricing_exact
+                        and len(master.columns) == before_pricing and not new_columns_since_lp):
+                    termination_reason = "approximate_no_new_columns"
                     break
             else:
                 termination_reason = "iteration_limit"
@@ -1957,17 +2042,38 @@ class ColGenSolver:
                     pending.request.flight_id for pending in repair_order[repair_index:]
                 )
                 break
+            repair_deadline = False
             try:
-                _reduced_cost, repaired = price_flight(
-                    graph,
-                    {},
-                    0.0,
-                    cfg,
-                    params,
-                    forbidden_rows=saturated,
-                    require_improving=False,
-                    deadline=deadline,
-                )
+                if pricing_platform is None:
+                    _reduced_cost, repaired = price_flight(
+                        graph,
+                        {},
+                        0.0,
+                        cfg,
+                        params,
+                        forbidden_rows=saturated,
+                        require_improving=False,
+                        deadline=deadline,
+                    )
+                else:
+                    outcome, = pricing_platform.price_batch((PricingProblem(
+                        graph, cfg, params, {}, 0.0, forbidden_rows=frozenset(saturated),
+                        require_improving=False,
+                    ),), deadline=deadline)
+                    repaired = outcome.column
+                    kernel_counters["gpu_batches"] += 1
+                    for counter, key in (("gpu_dispatches", "gpu_dispatches"),
+                                         ("gpu_cpu_recomputations", "cpu_recomputations"),
+                                         ("gpu_labels", "labels")):
+                        kernel_counters[counter] += int(outcome.stats.get(key, 0))
+                    if not outcome.search_complete:
+                        pricing_failure_status = outcome.status
+                        search_exhausted_flights.add(graph.request.flight_id)
+                    if repaired is None and not outcome.certified:
+                        search_exhausted_flights.add(graph.request.flight_id)
+                    repair_deadline = outcome.status == "deadline"
+                    if repair_deadline and repaired is None:
+                        raise PricingTimeout("GPU repair reached the solver deadline")
             except PricingTimeout:
                 termination_reason = "time_limit"
                 search_exhausted_flights.update(
@@ -1990,6 +2096,13 @@ class ColGenSolver:
                 if old_load < row_index.cap(row) <= new_load:
                     saturated.add(row)
             repair_added += 1
+            if repair_deadline:
+                # An incomplete GPU search can still return a validated incumbent.
+                termination_reason = "time_limit"
+                search_exhausted_flights.update(
+                    pending.request.flight_id for pending in repair_order[repair_index + 1:]
+                )
+                break
 
         incumbent = dict(sorted(incumbent.items()))
         _assert_claim_feasible(incumbent, committed_loads, row_index)
@@ -1998,7 +2111,10 @@ class ColGenSolver:
         # then a compute-cap artifact, not the optimizer's verdict that no plan exists.
         if termination_reason in {
             "time_limit", "iteration_limit", "ip_not_proven", "pricing_worker_lost",
-        }:
+            "pricing_bound_gap",
+        } or (params.pricing_device == "gpu" and (
+            not params.pricing_cpu_recompute or pricing_failure_status is not None
+        )):
             search_exhausted_flights.update(set(denied) - graph_infeasible)
         search_exhausted = tuple(
             flight_id for flight_id in denied if flight_id in search_exhausted_flights
@@ -2036,7 +2152,11 @@ class ColGenSolver:
         worker_losses = kernel_counters.get("pool_worker_lost", 0)
         if worker_losses:
             termination_reason = "pricing_worker_lost"
+        elif pricing_failure_status is not None:
+            termination_reason = ("time_limit" if pricing_failure_status == "deadline"
+                                  else f"pricing_{pricing_failure_status}")
         stats: dict[str, Any] = {
+            **_pricing_selection_stats(params),
             "backend": _backend_name(master),
             "iterations": iterations,
             "termination_reason": termination_reason,
@@ -2169,6 +2289,16 @@ class ColGenSolver:
             "exact_pricing_sweeps": exact_pricing_sweeps,
             "cheap_pricing_wall_s": cheap_pricing_wall_s,
             "exact_pricing_wall_s": exact_pricing_wall_s,
+            "approximate_pricing_sweeps": approximate_pricing_sweeps,
+            "approximate_pricing_wall_s": approximate_pricing_wall_s,
+            "pricing_bound_certified": math.isfinite(last_upper_bound),
+            "pricing_search_complete": last_pricing_complete,
+            "last_pricing_status": last_pricing_status,
+            "pricing_failure_status": pricing_failure_status,
+            "gpu_dispatches": kernel_counters.get("gpu_dispatches", 0),
+            "gpu_batches": kernel_counters.get("gpu_batches", 0),
+            "gpu_cpu_recomputations": kernel_counters.get("gpu_cpu_recomputations", 0),
+            "gpu_labels": kernel_counters.get("gpu_labels", 0),
             "pricing_timeout_flight_id": pricing_timeout_flight_id,
             # Total pricing wall across every sweep.  Pricing is where a solve spends
             # its time, so this against `elapsed_s` says how much of the run was the
@@ -2183,7 +2313,7 @@ class ColGenSolver:
             # pool this is paid on the first sweep and never again, so a value near
             # `pricing_wall_s` means the pool is being rebuilt and the workers are cold.
             "pricing_pool_setup_s": pricing_pool_setup_s,
-            "n_pricing_workers": params.n_pricing_workers,
+            "n_pricing_workers": params.n_pricing_workers if params.pricing_device == "cpu" else 0,
             # Exact-pricing calls and how many fell back to the pure-Python reference.
             # A fallback returns the SAME column 3-4.5x slower, so it moves no other number
             # in this dict; a nonzero count is the only way a run reports that its compiled

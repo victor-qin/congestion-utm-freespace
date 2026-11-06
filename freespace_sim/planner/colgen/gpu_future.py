@@ -64,7 +64,7 @@ class FutureBounds:
         *,
         cpu_recompute: bool = True,
     ) -> None:
-        """Build the backward table on the GPU and optionally refine its arithmetic.
+        """Build the relaxed table in FP64, or on the GPU in unchecked FP32 mode.
 
         Parameters
         ------------
@@ -75,7 +75,7 @@ class FutureBounds:
         - view (pricing.DualView): original binary64 prices and visit-window offsets.
         - runtime (ComputeRuntime): selected GPU with the ``future_bounds`` kernel.
         - deadline (float | None): shared monotonic deadline, checked each layer.
-        - cpu_recompute (bool): independently recompute relaxed layers in binary64;
+        - cpu_recompute (bool): compute relaxed layers directly in binary64;
           this does not invoke the constrained CPU pricing search.
 
         Return
@@ -127,7 +127,7 @@ class FutureBounds:
         self._costs[-1, destination] = tails[-1] if cpu_recompute else _float32_lower(tails[-1:])[0]
         for cell in roots_by_step.get(self.last_step, ()):
             self._root_costs[cell, self.last_step] = float(self._costs[-1, cell])
-        next32 = _float32_lower(self._costs[-1].astype(np.float64, copy=False))
+        next32 = None if cpu_recompute else self._costs[-1]
         control = np.array([n_cells], np.int32)
         static_prefix = f"future:{id(self)}"
         static = {
@@ -138,67 +138,47 @@ class FutureBounds:
         for offset in range(len(self._costs) - 2, -1, -1):
             self._check_deadline()
             visit = visits[offset + 1]
-            visit32 = _float32_lower(visit)
             stop = float(tails[offset])
-            air32 = _float32_lower(np.array([air, stop], np.float64))
-            (current32,) = runtime.run(
-                "future_bounds",
-                n_cells,
-                (
-                    control,
-                    graph,
-                    next32,
-                    visit32,
-                    air32,
-                    np.empty(n_cells, np.float32),
-                ),
-                (5,),
-                static=static,
-                write_only=(5,),
-            )
-            self._check_deadline()
-            if np.any(np.isnan(current32)) or np.any(current32 < 0.0):
-                raise ValueError("GPU future bounds must be nonnegative and not NaN")
             if cpu_recompute:
                 self._costs[offset] = self._relax(
                     graph, destination, visit, self._costs[offset + 1], air, stop
                 )
             else:
+                visit32 = _float32_lower(visit)
+                air32 = _float32_lower(np.array([air, stop], np.float64))
+                (current32,) = runtime.run(
+                    "future_bounds", n_cells,
+                    (control, graph, next32, visit32, air32, np.empty(n_cells, np.float32)),
+                    (5,), static=static, write_only=(5,),
+                )
+                if np.any(np.isnan(current32)) or np.any(current32 < 0.0):
+                    raise ValueError("GPU future bounds must be nonnegative and not NaN")
                 self._costs[offset] = current32
+            self._check_deadline()
             step = self.first_step + offset
             root_cells = roots_by_step.get(step)
             if root_cells:
                 cells = np.asarray(sorted(root_cells), np.int32)
                 root_graph = first_graph[cells]
-                (root32,) = runtime.run(
-                    "future_bounds",
-                    len(cells),
-                    (
-                        np.array([len(cells)], np.int32),
-                        root_graph,
-                        next32,
-                        visit32,
-                        air32,
-                        np.empty(len(cells), np.float32),
-                    ),
-                    (5,),
-                    static={},
-                    write_only=(5,),
-                )
-                self._check_deadline()
-                if np.any(np.isnan(root32)) or np.any(root32 < 0.0):
-                    raise ValueError("GPU future root bounds must be nonnegative and not NaN")
-                root_costs = (
-                    self._relax(
+                if cpu_recompute:
+                    root_costs = self._relax(
                         root_graph, destination[cells], visit, self._costs[offset + 1], air, stop
                     )
-                    if cpu_recompute
-                    else root32
-                )
+                else:
+                    (root_costs,) = runtime.run(
+                        "future_bounds", len(cells),
+                        (np.array([len(cells)], np.int32), root_graph, next32, visit32,
+                         air32, np.empty(len(cells), np.float32)),
+                        (5,), static={}, write_only=(5,),
+                    )
+                    if np.any(np.isnan(root_costs)) or np.any(root_costs < 0.0):
+                        raise ValueError("GPU future root bounds must be nonnegative and not NaN")
+                self._check_deadline()
                 for cell, cost in zip(cells, root_costs, strict=True):
                     self._root_costs[int(cell), step] = float(cost)
                 self.stats["future_root_layers"] += 1
-            next32 = current32
+            if not cpu_recompute:
+                next32 = current32
             self.stats["future_layers"] += 1
         self._check_deadline()
         self._costs.flags.writeable = False

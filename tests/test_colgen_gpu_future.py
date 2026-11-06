@@ -138,6 +138,11 @@ def test_future_table_covers_all_relaxed_paths_and_visit_windows(
     problem, topology, variants, view = _case()
     monkeypatch.setattr(pricing, "_endpoint_claims", lambda *args, **kwargs: frozenset())
     runtime = _ReferenceRuntime()
+    if cpu_recompute:
+        def no_device(*args, **kwargs):
+            """Certified preparation must not depend on any device recurrence result."""
+            pytest.fail("certified future preparation dispatched an unused GPU recurrence")
+        monkeypatch.setattr(runtime, "run", no_device)
     result = FutureBounds(
         problem,
         topology,
@@ -180,7 +185,9 @@ def test_future_table_covers_all_relaxed_paths_and_visit_windows(
 
     assert result.first_step == 10
     assert result.last_step == 16
-    assert result.stats["future_dispatches"] == runtime.dispatches == 8
+    assert result.stats["future_dispatches"] == runtime.dispatches
+    if not cpu_recompute:
+        assert runtime.dispatches > 0
     assert result.stats["future_layers"] == 6
     assert result.stats["future_root_layers"] == 2
     assert result.stats["future_roots"] == 5
@@ -212,6 +219,12 @@ def test_future_table_covers_all_relaxed_paths_and_visit_windows(
         assert result.root_lookup(1, 12) == pytest.approx(0.3)
         assert result.lookup(3, 12) == pytest.approx(0.6)
         assert result.lookup(0, 14) == pytest.approx(0.6)
+        if cpu_recompute:
+            # Frozen original FP64 results: deleting the unused device recurrence
+            # must not change even the final bits of these independently stored bounds.
+            assert result.lookup(0, 10).hex() == "0x1.7d33333333331p+7"
+            assert result.root_lookup(0, 10).hex() == "0x1.7fffffffffffcp+0"
+            assert result.root_lookup(0, 12).hex() == "0x1.3333333333330p+0"
     assert result.lookup(0, 15) == np.inf
     assert result.lookup(6, 10) == np.inf
     with pytest.raises(IndexError):
@@ -414,14 +427,16 @@ def test_endpoint_reachability_bound_covers_every_rooted_claim_union(
                     assert lower + Decimal(-11) <= exact_signed
 
 
+@pytest.mark.parametrize("cpu_recompute", [True, False])
 def test_future_table_empty_roots_and_deadline_are_explicit(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, cpu_recompute: bool,
 ) -> None:
     """No roots need no dispatch, and an expired layer cannot publish a partial table.
 
     Parameters
     ------------
-    - monkeypatch (pytest.MonkeyPatch): expires the deadline after the first fake dispatch.
+    - monkeypatch (pytest.MonkeyPatch): expires the deadline after a computed layer.
+    - cpu_recompute (bool): exercises CPU recurrence and unchecked GPU recurrence deadlines.
 
     Return
     --------
@@ -436,7 +451,7 @@ def test_future_table_empty_roots_and_deadline_are_explicit(
     assert empty.lookup(0, 16) == np.inf
     assert empty.lookup(5, 16) == pytest.approx(2.7)
     deadline = time.monotonic() + 100.0
-    original = runtime.run
+    original = FutureBounds._relax if cpu_recompute else runtime.run
 
     def expire(*args, **kwargs):
         """Move time past the deadline once the first completed layer is available."""
@@ -444,7 +459,12 @@ def test_future_table_empty_roots_and_deadline_are_explicit(
         monkeypatch.setattr(time, "monotonic", lambda: deadline + 1.0)
         return output
 
-    monkeypatch.setattr(runtime, "run", expire)
+    if cpu_recompute:
+        monkeypatch.setattr(FutureBounds, "_relax", staticmethod(expire))
+    else:
+        monkeypatch.setattr(runtime, "run", expire)
     with pytest.raises(pricing.PricingTimeout, match="future-bound"):
-        FutureBounds(problem, topology, variants, geometry, view, runtime, deadline)
-    assert runtime.dispatches == 1
+        FutureBounds(
+            problem, topology, variants, geometry, view, runtime, deadline,
+            cpu_recompute=cpu_recompute,
+        )

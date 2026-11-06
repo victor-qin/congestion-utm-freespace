@@ -373,3 +373,5 @@ in `analysis/colgen/`; archived profiling scripts and reports remain local evide
 See [GPU development scope and endpoint-flag plan](GPU_DEVELOPMENT.md) for the
 implemented reachability bound, the proposed cheaper endpoint accounting,
 merge boundaries, and the separate CPU preparation work.
+The [CPU–GPU handoff walkthrough](GPU_HANDOFF.md) shows the current per-flight
+dispatch loop and the proposed reductions in copying and synchronization.

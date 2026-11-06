@@ -18,6 +18,7 @@ import numpy as np
 from . import pricing
 from .dp_prepare import PricingPreparation, prepare_variants, prepared_for
 from .gpu_bounds import CompletionBounds
+from .gpu_endpoint import EndpointBounds, Mask
 from .gpu_future import FutureBounds
 from .gpu_prices import SparseVisitPrices
 from .gpu_runtime import ComputeRuntime
@@ -140,8 +141,13 @@ class _Batch:
         self.arena = np.empty((options.max_labels, 3), np.int32)
         self.prefix_positive = np.empty(options.max_labels, np.float64)
         self.visit_prefix_positive = np.empty(options.max_labels, np.float64)
+        self.paid_masks = np.empty((options.max_labels, 2), np.uint32)
         self._visit_positive: dict[tuple[int, int, int], float] = {}
         self.future: list[FutureBounds | None] = [None for _ in problems]
+        self.endpoints: list[EndpointBounds | None] = [None for _ in problems]
+        self._endpoint_generation: tuple[int, ...] | None = None
+        self._endpoint_visit_step: int | None = None
+        self._endpoint_visits = np.empty((0, 2), np.uint32)
         self.used = 0
         self.stats = dict(
             candidates=0,
@@ -152,6 +158,8 @@ class _Batch:
             max_frontier=0,
             grouped_labels=0,
             root_prunes=0,
+            gpu_endpoint_prune_proposals=0,
+            endpoint_verified_prunes=0,
         )
         self.offsets = self.views[0].offsets
         self.destinations = [pricing._destination_options(p.graph) for p in problems]
@@ -251,6 +259,15 @@ class _Batch:
             variants.append(v)
             bounds = CompletionBounds(p, topology, v, view, preparation=preparation)
             self.bounds.append(bounds)
+            if (self.options.endpoint_bounds and self.options.endpoint_max_rows and any(
+                completion_upper_bound(
+                    benefit, p.pi_f,
+                    bounds.cost_lower(variant, int(remaining_hops[v.cell[variant]])),
+                    (bounds.root_positive(variant),), self.negative[i],
+                ) > self.best[i][0] + _BOUND_CLOSURE_TOL
+                for variant in range(v.n_variants)
+            )):
+                self.endpoints[i] = EndpointBounds(bounds, self.options, self.check)
             offset = len(self.cells)
             self.cell_offsets.append(offset)
             self.cells.extend(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
@@ -302,7 +319,7 @@ class _Batch:
         if len(self.cells) >= 2**27 or len(roots) >= 2**27 or len(paid_rows) >= 2**27:
             raise _Stopped("label_limit")
         self.topologies, self.variants = topologies, variants
-        self.stride = 7 + max(t.state_history_depth for t in topologies)
+        self.stride = 9 + max(t.state_history_depth for t in topologies)
         if (
             self.options.max_labels * self.stride >= 2**31
             or 6 * min(self.options.chunk_size, self.options.max_labels) * self.stride >= 2**31
@@ -313,6 +330,14 @@ class _Batch:
         self.root_values = np.asarray(root_values, np.float32).reshape(-1, 11)
         self.paid_rows = np.asarray(paid_rows, np.int32).reshape(-1, 2)
         self.paid_values = np.asarray(paid_values, np.float32)
+        self.root_endpoint = np.zeros((len(roots), 3), np.int32)
+        for root, i in enumerate(self.root_flights):
+            variant = self.root_variants[root]
+            endpoint = self.endpoints[i]
+            if endpoint is not None:
+                self.root_endpoint[root, :2] = endpoint.root_masks[variant].view(np.int32)
+            self.root_endpoint[root, 2] = self.variants[i].start_step[variant]
+        self.pack_endpoints()
         self.evaluate_roots()
 
     def evaluate_roots(self) -> None:
@@ -321,9 +346,90 @@ class _Batch:
         (self.root_upper,) = self.runtime.run(
             "bound_roots", count,
             (np.asarray((count,), np.int32), self.root_values,
-             np.empty(count, np.float32)), (2,),
+             np.empty(count, np.float32), self.roots, self.root_endpoint,
+             self.endpoint_meta, self.endpoint_entries, self.endpoint_trees), (2,),
+            static={3: "roots", 4: "root_endpoint", 5: "endpoint_meta",
+                    6: "endpoint_entries", 7: "endpoint_trees"},
             write_only=(2,),
         )
+
+    def pack_endpoints(self) -> None:
+        """Refresh immutable GPU cache buffers only after new mask entries have been built.
+
+        Parameters
+        ------------
+        - self (_Batch): snapshot-local per-flight caches; no weighted data persists across batches.
+
+        Return
+        --------
+        - output (None): prepares shared FP32 proposal trees and explicit entry-validity metadata.
+        """
+        generation = tuple(len(e.entries) if e is not None else 0 for e in self.endpoints)
+        if generation == self._endpoint_generation:
+            return
+        metadata, entries, arrays = [], [], []
+        offset = 0
+        for endpoint in self.endpoints:
+            if endpoint is None:
+                metadata.append((0, 0, 1, 0, 0))
+                continue
+            start = len(entries)
+            for low, high in endpoint.entries:
+                entries.append((low, high, offset, 1))
+                offset += 4 * endpoint.leaves
+            metadata.append((endpoint.first, endpoint.last, endpoint.leaves, start, len(entries)))
+            arrays.append(endpoint.gpu_trees())
+        if offset >= 2**31:
+            raise ValueError("GPU endpoint-tree indexing exceeds int32 range")
+        self.endpoint_meta = np.asarray(metadata, np.int32).reshape(-1, 5)
+        self.endpoint_entries = np.asarray(entries, np.uint32).reshape(-1, 4).view(np.int32)
+        self.endpoint_trees = np.concatenate(arrays) if arrays else np.empty(0, np.float32)
+        self._endpoint_generation = generation
+
+    def endpoint_visits(self, step: int) -> np.ndarray:
+        """Gather exact visit masks once per layer, sharing them across expansion chunks.
+
+        Parameters
+        ------------
+        - step (int): absolute time of the candidate visits.
+
+        Return
+        --------
+        - output (np.ndarray): cell-aligned uint32 pairs, immutable until replaced for a new step.
+        """
+        if step != self._endpoint_visit_step:
+            masks = np.zeros((len(self.cells), 2), np.uint32)
+            for i, endpoint in enumerate(self.endpoints):
+                if endpoint is not None and step in endpoint.visit_masks:
+                    cells, words = endpoint.visit_masks[step]
+                    masks[cells + self.cell_offsets[i]] = words
+            self._endpoint_visits = masks
+            self._endpoint_visit_step = step
+        return self._endpoint_visits
+
+    def paid_mask(self, root: int, parent: int, cell: int, hops: int) -> Mask:
+        """Update parent-aligned exact masks independently of the GPU's proposed bits.
+
+        Parameters
+        ------------
+        - root (int): packed departure/lane root.
+        - parent (int): stable predecessor ID, or -1 for an initial root.
+        - cell (int): packed current cell.
+        - hops (int): completed moves, used to recover the exact absolute visit time.
+
+        Return
+        --------
+        - output (Mask): original origin-and-visit union in the snapshot's fixed row mapping.
+        """
+        i, variant = self.root_flights[root], self.root_variants[root]
+        endpoint = self.endpoints[i]
+        if endpoint is None:
+            return 0, 0
+        if parent < 0:
+            return tuple(map(int, endpoint.root_masks[variant]))
+        step = int(self.variants[i].start_step[variant]) + hops
+        visit = self.endpoint_visits(step)[cell]
+        return tuple(map(int, self.paid_masks[parent] | visit))
 
     def prepare_future(self) -> None:
         """Build relaxed GPU lookahead only when the inexpensive full pass exhausts storage.
@@ -448,6 +554,25 @@ class _Batch:
                 variant, hops, self.visit_lower(root, parent, cell, hops), suffix,
                 self.benefits[i], self.problems[i].pi_f, self.negative[i],
             ))
+        self._endpoint_closed = False
+        endpoint = self.endpoints[i]
+        if endpoint is not None:
+            start = int(self.variants[i].start_step[variant])
+            step = start + hops
+            last = min(self.topologies[i].max_step, start + self.topologies[i].air_hop_limit)
+            if step + remaining > last:
+                return -math.inf
+            residual = endpoint.residual(
+                self.paid_mask(root, parent, cell, hops), step, step + remaining, last,
+            )
+            if residual is not None:
+                endpoint_upper = self.bounds[i].endpoint_upper(
+                    variant, hops, remaining, self.positive_lower(root, parent, cell, hops),
+                    residual, self.benefits[i], self.problems[i].pi_f, self.negative[i],
+                )
+                cutoff = self.best[i][0] + _BOUND_CLOSURE_TOL
+                self._endpoint_closed = endpoint_upper <= cutoff < upper
+                upper = min(upper, endpoint_upper)
         return upper
 
     def retain(self, root: int, parent: int, cell: int, hops: int) -> bool:
@@ -459,6 +584,7 @@ class _Batch:
         if upper <= self.best[i][0] + _BOUND_CLOSURE_TOL:
             self.closed_upper[i] = max(self.closed_upper[i], upper)
             self.stats["verified_prunes"] += 1
+            self.stats["endpoint_verified_prunes"] += int(self._endpoint_closed)
             return False
         return True
 
@@ -477,6 +603,9 @@ class _Batch:
             raise _Stopped("label_limit")
         if self.options.cpu_recompute:
             for offset, record in enumerate(records):
+                self.paid_masks[self.used + offset] = self.paid_mask(
+                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
+                )
                 self.prefix_positive[self.used + offset] = self.positive_lower(
                     int(record[1]), int(record[3]), int(record[0]), int(record[2]),
                 )
@@ -518,7 +647,8 @@ class _Batch:
                     continue
             record = np.full(self.stride, -1, np.int32)
             record[:7] = cell, root, 0, -1, -1, -1, 2
-            record[7] = cell
+            record[7:9] = self.root_endpoint[root, :2]
+            record[9] = cell
             records.append(record)
             positive = self.bounds[i].root_positive(variant)
             values.append((v.score[variant], positive))
@@ -717,7 +847,13 @@ class _Batch:
             self.stats["max_frontier"] = max(self.stats["max_frontier"], len(frontier))
             if not len(frontier):
                 continue
+            for i, endpoint in enumerate(self.endpoints):
+                if endpoint is not None:
+                    selected = root_flights[frontier[:, 1]] == i
+                    endpoint.consider(frontier[selected, 7:9].copy().view(np.uint32))
+            self.pack_endpoints()
             visits, blocked = self.visits(step + 1)
+            visit_masks = self.endpoint_visits(step + 1)
             next_records, next_scores = [], []
             next_count = 0
             for start in range(0, len(frontier), self.options.chunk_size):
@@ -744,9 +880,12 @@ class _Batch:
                         self.paid_values,
                         np.empty((count, self.stride), np.int32),
                         np.empty((count, 3), np.float32),
+                        visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
                     ),
                     (10, 11),
-                    static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values"},
+                    static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values",
+                            12: "endpoint_visits", 13: "endpoint_meta", 14: "endpoint_entries",
+                            15: "endpoint_trees"},
                     write_only=(10, 11),
                 )
                 valid = np.flatnonzero(records[:, 6])
@@ -759,6 +898,7 @@ class _Batch:
                     path = None
                     if flags & 4:
                         self.stats["gpu_prune_proposals"] += 1
+                        self.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
                         if not self.retain(root, int(record[3]), int(record[0]), int(record[2])):
                             continue
                     if flags & 1:
@@ -886,7 +1026,9 @@ class _Batch:
                     self.runtime.backend,
                     self.options.cpu_recompute,
                     status,
-                    dict(stats, bound_gap=(max(rc, self.closed_upper[i]) - rc
+                    dict(stats, endpoint=(dict(self.endpoints[i].stats)
+                                          if self.endpoints[i] is not None else {}),
+                         bound_gap=(max(rc, self.closed_upper[i]) - rc
                                           if certified and math.isfinite(rc) else None)),
                 )
             )

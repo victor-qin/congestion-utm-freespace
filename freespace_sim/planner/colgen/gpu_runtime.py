@@ -25,6 +25,10 @@ _ARGUMENTS = (
     "GLOBAL const float* paid_values",
     "GLOBAL int* output",
     "GLOBAL float* scores",
+    "GLOBAL const unsigned int* visit_masks",
+    "GLOBAL const int* endpoint_meta",
+    "GLOBAL const int* endpoint_entries",
+    "GLOBAL const float* endpoint_trees",
 )
 
 
@@ -63,7 +67,8 @@ INLINE int compare_exchange(GLOBAL int* p, int expected, int desired) {
             + f"""
 kernel void expand({expand}, uint tid [[thread_position_in_grid]]) {{
     expand_one(tid, control, labels, values, graph, roots, root_values,
-               visits, blocked, paid_rows, paid_values, output, scores);
+               visits, blocked, paid_rows, paid_values, output, scores,
+               visit_masks, endpoint_meta, endpoint_entries, endpoint_trees);
 }}
 kernel void group_best(device const int* control [[buffer(0)]],
                        device const int* labels [[buffer(1)]],
@@ -75,8 +80,13 @@ kernel void group_best(device const int* control [[buffer(0)]],
 kernel void bound_roots(device const int* control [[buffer(0)]],
                         device const float* roots [[buffer(1)]],
                         device float* bounds [[buffer(2)]],
+                        device const int* root_index [[buffer(3)]],
+                        device const int* root_endpoint [[buffer(4)]],
+                        device const int* meta [[buffer(5)]],
+                        device const int* entries [[buffer(6)]],
+                        device const float* trees [[buffer(7)]],
                         uint tid [[thread_position_in_grid]]) {{
-    root_bound_one(tid, control, roots, bounds);
+    root_bound_one(tid, control, roots, bounds, root_index, root_endpoint, meta, entries, trees);
 }}
 kernel void future_bounds(device const int* control [[buffer(0)]],
                           device const int* graph [[buffer(1)]],
@@ -104,7 +114,8 @@ INLINE int compare_exchange(int* p, int expected, int desired) {
 extern "C" __global__ void expand({", ".join(_ARGUMENTS)}) {{
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     expand_one(tid, control, labels, values, graph, roots, root_values,
-               visits, blocked, paid_rows, paid_values, output, scores);
+               visits, blocked, paid_rows, paid_values, output, scores,
+               visit_masks, endpoint_meta, endpoint_entries, endpoint_trees);
 }}
 extern "C" __global__ void group_best(const int* control, const int* labels,
                                      const float* scores, int* table) {{
@@ -112,9 +123,11 @@ extern "C" __global__ void group_best(const int* control, const int* labels,
     group_one(tid, control, labels, scores, table);
 }}
 extern "C" __global__ void bound_roots(const int* control, const float* roots,
-                                      float* bounds) {{
+                                      float* bounds, const int* root_index,
+                                      const int* root_endpoint, const int* meta,
+                                      const int* entries, const float* trees) {{
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    root_bound_one(tid, control, roots, bounds);
+    root_bound_one(tid, control, roots, bounds, root_index, root_endpoint, meta, entries, trees);
 }}
 extern "C" __global__ void future_bounds(const int* control, const int* graph,
                                         const float* next, const float* visits,
@@ -209,7 +222,7 @@ class ComputeRuntime:
         ------------
         - name (str): compiled kernel name.
         - count (int): number of logical GPU invocations.
-        - arrays (Sequence[np.ndarray]): contiguous int32/float32 buffer arguments.
+        - arrays (Sequence[np.ndarray]): contiguous int32/uint32/float32 buffer arguments.
         - outputs (Sequence[int]): argument indices to read after GPU completion.
         - static (dict[int, str] | None): immutable arguments cached for this batch.
         - write_only (Sequence[int]): nonstatic outputs whose initial content is unused;
@@ -226,8 +239,8 @@ class ComputeRuntime:
         if any(i not in outputs or i in static for i in write_only):
             raise ValueError("Write-only buffers must be nonstatic output arguments")
         for i, array in enumerate(arrays):
-            if array.dtype not in (np.dtype("int32"), np.dtype("float32")):
-                raise TypeError("GPU buffers must use int32 or float32")
+            if array.dtype not in (np.dtype("int32"), np.dtype("uint32"), np.dtype("float32")):
+                raise TypeError("GPU buffers must use int32, uint32 or float32")
             if not array.flags.c_contiguous:
                 raise ValueError("GPU buffers must be contiguous")
             key = static.get(i)

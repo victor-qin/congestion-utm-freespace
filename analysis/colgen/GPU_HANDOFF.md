@@ -24,7 +24,8 @@ run complete GPU search from every legal root
 SEARCH:
     for time in the flight's allowed time horizon:
         CPU: initialize roots starting now
-        CPU: assemble this time's visit prices and blocked-cell flags
+        CPU: assemble visit prices, paid-row masks and blocked-cell flags
+             lazily build budgeted Q/H trees for surviving endpoint masks
 
         for chunk of current labels:
             CPU: copy labels, scores, root values and time-specific inputs
@@ -80,30 +81,28 @@ In the expansion call, `root_values` is uploaded repeatedly even though only its
 cutoff column changes frequently. The same time-layer visit and blocked-cell
 arrays are also uploaded again for every chunk in that layer.
 
-### The stronger future table adds another loop
+### The stronger future table has distinct numerical modes
 
 ```text
 CPU: prepare relaxed graph, positive visit prices and mandatory endpoint costs
 
 for time in reverse:
-    GPU: compute one regular future-cost row from the next row
-    CPU: wait and copy the row back
-    CPU: independently recompute that row in FP64 when verification is enabled
+    if certified:
+        CPU: compute the regular relaxed row directly in FP64
+    else:
+        GPU: compute the regular future-cost row from the next row
+        CPU: wait and copy the FP32 row back
 
     if departures start at this time:
-        GPU: compute first-hop root-role bounds
-        CPU: wait and copy them back
-        CPU: independently recompute those bounds in FP64
+        CPU or GPU: compute first-hop bounds in the same numerical mode
 
-    CPU: pass the returned FP32 row back to the GPU for the next iteration
+    check the shared deadline before publishing further rows
 ```
 
-The FP32 recurrence and the FP64 numerical refinement are independent chains.
-In certified mode, **the FP32 chain is duplicated work whose numerical results
-are not used by the later search**. Every stored regular row and root cost comes
-from the CPU `_relax` call. The returned GPU regular row only feeds the next GPU
-iteration and sanity checks; the GPU root result is only sanity checked. Later
-search inputs read the stored FP64 table. This is the clearest first cleanup.
+Certified mode uses exactly the original FP64 `_relax` dataflow and omits the
+unused FP32 recurrence. Unchecked mode still uses the GPU recurrence and never
+certifies a result. Later constrained searches and root-bound proposals remain
+on the GPU in both modes. No original CPU constrained pricing is invoked.
 
 ## A measured example
 
@@ -124,7 +123,7 @@ No new benchmark was run for this explanation.
 
 ## Reducing exchanges in stages
 
-### 1. Remove the unused GPU future recurrence in certified mode
+### 1. Completed: remove the unused GPU future recurrence in certified mode
 
 When CPU recomputation is enabled, construct the verified relaxed table directly
 with the existing FP64 recurrence and omit its duplicate FP32 GPU calculations.
@@ -138,10 +137,20 @@ unused recurrence would predict 285 total dispatches instead of 2200 if the
 rest of the search work stays unchanged. This is a source-based count estimate,
 not a measured runtime speedup. FP32-only mode still needs its GPU recurrence.
 
-Verify that the stored bound arrays and root costs remain identical in certified
-mode, and preserve deadline checks within the CPU recurrence. Existing tests
-whose deadline or counters depend on a fake GPU call must instead test the
-functional distinction between the two numerical modes.
+Stored arrays and root costs were checked bit-for-bit against the original
+source, including FP32 overflow/underflow inputs. Functional tests require no
+GPU recurrence in certified mode, retained device computation in FP32 mode,
+and deadline propagation from either recurrence.
+
+### Also completed: endpoint paid flags and arrival bounds
+
+Each retained record now has two independent paid-row words before its recent
+cell history. The arrival-only Q/H trees are shared by all roots of a flight
+and built lazily within configurable byte/work budgets. GPU queries produce
+prune proposals; FP64 verification uses original prices and independently
+maintained exact masks. Layer masks are uploaded once and immutable tree buffers
+are replaced only after cache additions. Geometry alone persists across LP
+snapshots. See `GPU_DEVELOPMENT.md` for the accounting proof and API controls.
 
 ### 2. Avoid repeatedly copying unchanged inputs
 

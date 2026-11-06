@@ -34,6 +34,10 @@ _PRICING_DEFAULTS = {
     "pricing_gpu_batch_size": 1,
     "pricing_gpu_max_labels": 250_000,
     "pricing_gpu_chunk_size": 2048,
+    "pricing_gpu_endpoint_bounds": True,
+    "pricing_gpu_endpoint_max_rows": 64,
+    "pricing_gpu_endpoint_cache_bytes": 1_048_576,
+    "pricing_gpu_endpoint_cache_work": 1_000_000,
 }
 
 
@@ -733,6 +737,11 @@ def main() -> int:
         command.add_argument("--pricing-gpu-batch-size", type=int, default=1)
         command.add_argument("--pricing-gpu-max-labels", type=int, default=250_000)
         command.add_argument("--pricing-gpu-chunk-size", type=int, default=2048)
+        command.add_argument("--pricing-gpu-endpoint-bounds", action=argparse.BooleanOptionalAction,
+                             default=True)
+        command.add_argument("--pricing-gpu-endpoint-max-rows", type=int, default=64)
+        command.add_argument("--pricing-gpu-endpoint-cache-bytes", type=int, default=1_048_576)
+        command.add_argument("--pricing-gpu-endpoint-cache-work", type=int, default=1_000_000)
         command.add_argument("--gurobi-threads", type=int, default=4)
         command.add_argument("--lp-gap", type=float, default=0.001)
         command.add_argument("--exact-pricing-interval", type=int, default=5)

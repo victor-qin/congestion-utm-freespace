@@ -174,6 +174,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--cpu-recompute", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-labels", type=int, default=250_000)
     parser.add_argument("--chunk-size", type=int, default=2048)
+    parser.add_argument("--endpoint-bounds", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--endpoint-max-rows", type=int, default=64)
+    parser.add_argument("--endpoint-cache-bytes", type=int, default=1_048_576)
+    parser.add_argument("--endpoint-cache-work", type=int, default=1_000_000)
     parser.add_argument(
         "--budget", type=float, default=60.0, help="Whole replay budget in seconds."
     )
@@ -211,6 +215,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         cpu_recompute=args.cpu_recompute,
         max_labels=args.max_labels,
         chunk_size=args.chunk_size,
+        endpoint_bounds=args.endpoint_bounds,
+        endpoint_max_rows=args.endpoint_max_rows,
+        endpoint_cache_bytes=args.endpoint_cache_bytes,
+        endpoint_cache_work=args.endpoint_cache_work,
     )
     requests = {request.flight_id: request for request in captured["requests"]}
     catalog = StaticTerminalCatalog(captured["static_terminals"], captured["cfg"])

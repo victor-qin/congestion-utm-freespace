@@ -16,7 +16,7 @@ from freespace_sim.planner.colgen.objective import cost_model
 from freespace_sim.planner.colgen.pricing_platform import PricingProblem
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.types import Terminal, vec
-from tests.test_colgen_pricing_platform import _platform
+from tests.test_colgen_pricing_platform import _assert_canonical, _platform
 from tests.test_colgen_solver import _cfg, _params, _request
 
 
@@ -282,6 +282,68 @@ def test_boundary_fold_falls_back_and_origin_prices_include_terminal_rows() -> N
         0.0,
     )
     assert claims.issubset(column_claims(column, graph, cfg))
+
+
+@pytest.mark.parametrize("reachable_destination", [True, False])
+def test_geometry_bound_uses_only_reachable_destination_lanes(
+    monkeypatch: pytest.MonkeyPatch, reachable_destination: bool,
+) -> None:
+    """Disconnected terminal lanes cannot crash pricing or invalidate its cost bound.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): forbids original CPU pricing during the Metal check.
+    - reachable_destination (bool): keeps the reachable lanes or removes every stop
+      from the bound's prepared domain to exercise its conservative fallback.
+
+    Return
+    --------
+    - output (None): verifies a canonical Metal result or a ground-only empty-set bound.
+    """
+    cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=5.0)
+    params = _params(max_air_overrun_hops=0)
+    destination = Terminal("dest", 1, radius=70.0)
+    request = replace(_request(1, (0, 0), (8, 0), cfg), dest_terminal=destination)
+    wall = Terminal("wall", 1, radius=30.0)
+    wall_position = request.dest + vec(120.0 * math.cos(math.pi / 6.0), 60.0, 0.0)
+    graph = build_flight_graph(
+        request, cfg, ((request.dest, destination), (wall_position, wall)), params,
+    )
+    topology, rows = prepared_for(graph, cfg)
+    cells = set(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
+    assert set(pricing._destination_options(graph)) - cells
+    assert topology.dest_mask.any()
+    model = cost_model(cfg, params)
+    seed = pricing._shortest_seed(graph, cfg, model=model)
+    assert seed is not None
+    view = pricing.DualView({}, cfg)
+    variants = prepare_variants(
+        graph, cfg, view, topology, rows, benefit=params.M, pi_f=0.0,
+        model=model, forbidden_rows=frozenset(),
+    )
+    assert variants.n_variants > 0
+    if not reachable_destination:
+        topology = replace(topology, dest_mask=np.zeros_like(topology.dest_mask))
+    problem = PricingProblem(graph, cfg, params, view, 0.0)
+    bounds = CompletionBounds(problem, topology, variants, view)
+    if not reachable_destination:
+        assert bounds.air_per_hop == 0.0
+        assert np.all(np.isneginf(bounds.air_offset))
+        for variant in range(variants.n_variants):
+            assert bounds.cost_lower(variant, topology.air_hop_limit) == 0.0
+        return
+
+    def forbid_cpu(*args: object, **kwargs: object) -> None:
+        """Reject substitution of the original CPU search for GPU pricing."""
+        raise AssertionError("Original CPU pricing is forbidden")
+
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        monkeypatch.setattr(pricing, name, forbid_cpu)
+    (result,) = _platform("metal").price_batch([problem])
+    assert result.certified and result.search_complete
+    assert result.stats["gpu_dispatches"] > 0
+    assert result.upper_bound >= params.M - seed.delay_s
+    _assert_canonical(problem, result)
 
 
 @pytest.mark.parametrize("magnitude", [1.0, 1e8])

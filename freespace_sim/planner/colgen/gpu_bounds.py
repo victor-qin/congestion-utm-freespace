@@ -256,7 +256,6 @@ class CompletionBounds:
             _up(_up(flown_upper + _up(reference)) / cfg.nominal_speed_mps) * self.model.air_weight
         )
         fallback = replace(fallback, air_scale=air_scale)
-        index = {cell: position for position, cell in enumerate(cells)}
 
         def fold_lower(
             point: tuple[float, float], endpoint: tuple[float, float], terminal: object | None
@@ -270,9 +269,10 @@ class CompletionBounds:
                 return None
             return max(0.0, _down(lo - exit_r))
 
+        # Disconnected terminal lanes are absent from the prepared search domain.
         destination_legs = [
-            fold_lower(points[index[cell]], destination, graph.dest_terminal)
-            for cell in pricing._destination_options(graph)
+            fold_lower(points[int(cell)], destination, graph.dest_terminal)
+            for cell in np.flatnonzero(t.dest_mask)
         ]
         if not destination_legs or any(leg is None for leg in destination_legs):
             return fallback

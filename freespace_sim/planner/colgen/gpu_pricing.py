@@ -805,6 +805,74 @@ class _Batch:
         self.stats["grouped_labels"] += len(records) - len(indices)
         return records[indices].copy(), scores[indices].copy()
 
+    def select_beam(
+        self, records: np.ndarray, scores: np.ndarray, step: int, width: int,
+    ) -> np.ndarray:
+        """Rank preliminary routes by unpaid endpoints and reserve root/arrival diversity.
+
+        Parameters
+        ------------
+        - records (np.ndarray): GPU-generated continuing states, before allocation.
+        - scores (np.ndarray): approximate signed prefix scores and pruning proposals.
+        - step (int): absolute time of these states.
+        - width (int): maximum retained states per flight in this heuristic pass.
+
+        Return
+        --------
+        - output (np.ndarray): selected indices; these omissions never enter a certificate.
+        """
+        flights = np.asarray(self.root_flights)[records[:, 1]]
+        remaining = self.graph[records[:, 0], 12]
+        cost = remaining * self.root_values[records[:, 1], 4]
+        selected = []
+        for i in range(len(self.problems)):
+            choices = np.flatnonzero(flights == i)
+            endpoint = self.endpoints[i]
+            if endpoint is not None and not endpoint.rows:
+                endpoint = None
+            if endpoint is None and self.future[i] is None:
+                priority = scores[choices, 0] - cost[choices]
+                order = np.lexsort((choices, remaining[choices], -priority))
+                selected.extend(map(int, choices[order[:width]]))
+                continue
+            if endpoint is not None:
+                endpoint.consider(records[choices, 7:9].copy().view(np.uint32))
+            for index in choices:
+                self.check()
+                record = records[index]
+                root, hops = int(record[1]), int(record[2])
+                if self.future[i] is not None:
+                    cost[index] = max(cost[index], self.future[i].lookup(
+                        int(record[0]) - self.cell_offsets[i], step,
+                    ))
+                if endpoint is not None:
+                    last = min(self.topologies[i].max_step,
+                               step + self.topologies[i].air_hop_limit - hops)
+                    residual = endpoint.residual(
+                        tuple(map(int, record[7:9].view(np.uint32))),
+                        step, step + int(remaining[index]), last,
+                    )
+                    if residual is not None:
+                        cost[index] = max(cost[index], residual[1],
+                                          residual[0] + remaining[index]
+                                          * self.root_values[root, 4])
+            priority = scores[choices, 0] - cost[choices]
+            order = choices[np.lexsort((choices, remaining[choices], -priority))]
+            # A busy departure must not consume every slot before other promising
+            # roots or earliest-arrival regimes can produce a feasible completion.
+            reserved, groups = [], set()
+            for index in order:
+                key = int(records[index, 1]), int(remaining[index])
+                if key not in groups:
+                    reserved.append(int(index))
+                    groups.add(key)
+                    if len(reserved) >= width // 2:
+                        break
+            chosen = set(reserved)
+            reserved.extend(int(index) for index in order if index not in chosen)
+            selected.extend(reserved[:width])
+        return np.asarray(selected, np.intp)
+
     def search(self, beam_width: int | None = None) -> None:
         """Expand immutable time frontiers on the GPU and account for every completion.
 
@@ -919,16 +987,7 @@ class _Batch:
                     heuristic=beam_width is not None,
                 )
                 if beam_width is not None:
-                    selected = []
-                    flights = np.asarray(self.root_flights)[frontier[:, 1]]
-                    remaining = self.graph[frontier[:, 0], 12]
-                    priority = scores[:, 0] - remaining * self.root_values[frontier[:, 1], 4]
-                    if any(future is not None for future in self.future):
-                        priority = scores[:, 0] - visits[frontier[:, 0], 2]
-                    for i in range(len(self.problems)):
-                        choices = np.flatnonzero(flights == i)
-                        order = np.lexsort((choices, remaining[choices], -priority[choices]))
-                        selected.extend(map(int, choices[order[:beam_width]]))
+                    selected = self.select_beam(frontier, scores, step + 1, beam_width)
                     frontier, scores = frontier[selected], scores[selected]
                 frontier = self.allocate(frontier)
                 values = scores[:, :2].copy()

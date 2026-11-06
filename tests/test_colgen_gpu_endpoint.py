@@ -397,3 +397,41 @@ def test_rejected_proposals_and_completions_cannot_certify_unresolved_work(
         assert result.upper_bound >= optimum - 1e-9
         assert result.stats["cpu_recomputations"] > result.stats["verified_prunes"]
         _assert_canonical(problem, result)
+
+
+@pytest.mark.parametrize("cache_bytes", [0, 1_048_576])
+def test_preliminary_selection_prices_paid_endpoint_words_and_preserves_diversity(
+    monkeypatch: pytest.MonkeyPatch, cache_bytes: int,
+) -> None:
+    """The bounded preliminary beam favors paid endpoints without starving alternate roots.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): supplies independent endpoint membership.
+    - cache_bytes (int): exercises available residuals and safe missing-table priority.
+
+    Return
+    --------
+    - output (None): both paid words affect ranking; distinct root/arrival choices survive.
+    """
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    bounds, rows, _ = _endpoint_case(monkeypatch, 100)
+    endpoint = EndpointBounds(bounds, PricingOptions(endpoint_cache_bytes=cache_bytes), lambda: None)
+    records = np.zeros((8, 9), np.int32)
+    records[:, 0] = np.arange(8)
+    records[:, 1] = [0, 0, 0, 0, 0, 0, 1, 0]
+    records[4, 7:9] = np.asarray(endpoint.mask((rows[31], rows[63])), np.uint32).view(np.int32)
+    graph = np.zeros((8, 14), np.int32)
+    graph[:, 12] = [1, 1, 1, 1, 1, 1, 1, 2]
+    scores = np.zeros((8, 3), np.float32)
+    scores[:, 0] = [10, 9, 8, 7, 6, 5, 4, 3]
+    batch = SimpleNamespace(
+        root_flights=[0, 0], graph=graph, root_values=np.zeros((2, 11), np.float32),
+        problems=[bounds.problem], endpoints=[endpoint], future=[None],
+        topologies=[SimpleNamespace(max_step=106, air_hop_limit=6)], check=lambda: None,
+    )
+    selected = _Batch.select_beam(batch, records, scores, 100, 6)
+    assert len(selected) == len(set(selected)) == 6
+    assert selected[0] == (4 if cache_bytes else 0)
+    assert 6 in selected and 7 in selected

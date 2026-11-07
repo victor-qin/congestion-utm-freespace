@@ -143,6 +143,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-labels", type=int, default=250_000)
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--profile", action="store_true", help="Profile only the final restored phase")
+    parser.add_argument("--epsilon", type=float,
+                        help="Experimental absolute GPU pruning allowance; always uncertified")
+    parser.add_argument("--audit-epsilon", action="store_true",
+                        help="Verify every epsilon deletion in FP64, restoring rejected proposals")
+    parser.add_argument("--verify-border", action="store_true",
+                        help="Keep FP64 verification near the cutoff; GPU-only epsilon deletions remain uncertified")
+    parser.add_argument("--warm-repeats", type=int, default=1)
     args = parser.parse_args(argv)
     if len(args.capture) not in (1, 2) or args.batch_size < 1 or args.budget <= 0:
         parser.error("Choose one or two captures and positive batch size/budget")
@@ -172,19 +179,26 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     views = [pricing.DualView(c["duals"], c["cfg"]) for c in captures]
     snapshot_index_s = time.perf_counter() - started
-    platform = PricingPlatform(PricingOptions(device="gpu", gpu_backend="metal",
-                                              max_labels=args.max_labels, chunk_size=args.chunk_size))
+    platform = PricingPlatform(PricingOptions(
+        device="gpu", gpu_backend="metal", max_labels=args.max_labels, chunk_size=args.chunk_size,
+        gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
+        gpu_prune_verify_border=args.verify_border,
+    ))
     started = time.perf_counter()
     platform._runtime = runtime = ComputeRuntime("metal")
     init_s = time.perf_counter() - started
     report = dict(batch_size=args.batch_size, max_labels=args.max_labels, chunk_size=args.chunk_size,
+                  gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
+                  gpu_prune_verify_border=args.verify_border,
                   graph_s=graph_s, snapshot_index_s=snapshot_index_s, init_s=init_s,
                   source=str(Path(pricing.__file__).resolve()),
                   source_sha256={p.name: sha256_bytes(p.read_bytes())
                                  for p in Path(pricing.__file__).parent.iterdir()
                                  if p.suffix in (".py", ".h")},
                   capture_sha256=hashes, cpu_full_pricing_guard=True, runs=[])
-    phases = [("round1_cold", 0), ("round1_warm", 0)]
+    phases = [("round1_cold", 0)] + [
+        (f"round1_warm_{repeat}", 0) for repeat in range(args.warm_repeats)
+    ]
     if len(captures) == 2:
         phases.extend((("round11_changed", 1), ("round11_warm", 1), ("round1_restored", 0)))
     args.out.parent.mkdir(parents=True, exist_ok=True)

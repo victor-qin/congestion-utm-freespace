@@ -150,9 +150,14 @@ INLINE void expand_one(
     float endpoint = endpoint_bound(data, roots + root * 6, step + 1, hops + 1,
                                    remaining, positive, low, high,
                                    endpoint_meta, endpoint_entries, endpoint_trees);
-    if (endpoint <= cutoffs[roots[root * 6]] && upper > cutoffs[roots[root * 6]]) flags |= 8;
+    if (endpoint <= cutoffs[roots[root * 6] * 2] && upper > cutoffs[roots[root * 6] * 2]) flags |= 8;
     upper = fmin(upper, endpoint);
-    if (upper <= cutoffs[roots[root * 6]]) flags |= 4;
+    // Bit 16 is an explicitly uncertified epsilon deletion, never a certificate.
+    int flight = roots[root * 6];
+    if (control[5] && isfinite(upper) && upper <= cutoffs[flight * 2 + 1])
+        flags |= control[5] == 1 ? 16 : (4 | 32);
+    else if ((!control[5] || isfinite(upper)) && upper <= cutoffs[flight * 2])
+        flags |= 4;
     output[b] = target;
     output[b + 1] = root;
     output[b + 2] = hops + 1;

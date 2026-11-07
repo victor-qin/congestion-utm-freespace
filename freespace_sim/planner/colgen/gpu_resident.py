@@ -51,8 +51,9 @@ class ResidentSearch:
         self.event_records = self.empty((self.queue_capacity, self.stride), np.int32)
         self.event_values = self.empty((self.queue_capacity, 2), np.float32)
         self.event_meta = self.empty((self.queue_capacity, 5), np.int32)
-        self.counts = self.empty((6,), np.int32)
-        self.cutoffs = self.empty((len(batch.problems),), np.float32)
+        self.event_upper = self.empty((self.queue_capacity,), np.float32)
+        self.counts = self.empty((7,), np.int32)
+        self.cutoffs = self.empty((len(batch.problems), 2), np.float32)
         self.layer_buffers = [(self.empty((len(batch.cells),), np.float32),
                                self.empty((len(batch.cells),), np.int32)) for _ in range(2)]
         self.known = np.zeros(self.capacity, bool)
@@ -168,9 +169,11 @@ class ResidentSearch:
         - output (None): all decisions resolved; restored records are scheduled before reuse.
         """
         b = self.batch
-        used, _, continuing, events, overflow, candidates = map(int, self.runtime.read(counts))
+        used, _, continuing, events, overflow, candidates, direct = map(int, self.runtime.read(counts))
         b.used = min(used, self.capacity)
         b.stats["candidates"] += candidates
+        b.stats["gpu_direct_prunes"] += direct
+        b.stats["gpu_prune_proposals"] += direct
         b.stats["resident_blocks"] += 1
         b.stats["resident_queue_peak"] = max(b.stats["resident_queue_peak"], events)
         if overflow:
@@ -181,12 +184,17 @@ class ResidentSearch:
             self.free.append(output)
         restored: dict[int, list[int]] = defaultdict(list)
         metadata = self.runtime.read_rows(self.event_meta, 0, events)
+        uppers = (self.runtime.read_rows(self.event_upper, 0, events)
+                  if b.options.gpu_prune_audit else None)
         for index, (cell, root, hops, parent, flags) in enumerate(metadata):
             b.check()
             root, parent, cell, hops, flags = map(int, (root, parent, cell, hops, flags))
             self.ensure_prefix(parent)
             if flags & 4:
                 b.stats["gpu_prune_proposals"] += 1
+                if uppers is not None:
+                    b.audit_upper = float(uppers[index])
+                    b.audit_direct = bool(flags & 32)
                 if not b.retain(root, parent, cell, hops):
                     continue
             record = np.zeros(self.stride, np.int32)
@@ -242,7 +250,8 @@ class ResidentSearch:
                 frontier, counts, self.labels, self.label_values,
             )),
             Dispatch("expand", count * 6, (
-                self.control((count, self.stride, step, *self.batch.offsets)),
+                self.control((count, self.stride, step, *self.batch.offsets,
+                              self.batch.prune_mode)),
                 self.labels, self.label_values, self.graph, self.roots, self.root_values,
                 future, blocked, self.paid_rows, self.paid_values, self.candidates, self.scores,
                 self.price_map, prices.ranges, prices.steps, prices.values, cutoffs,
@@ -250,7 +259,7 @@ class ResidentSearch:
             Dispatch("resident_compact", count * 6, (
                 self.control((count * 6, self.stride, self.capacity, self.queue_capacity)),
                 self.candidates, self.scores, self.arena, self.values, output, counts,
-                self.event_records, self.event_values, self.event_meta,
+                self.event_records, self.event_values, self.event_meta, self.event_upper,
             )),
         ))
 
@@ -312,10 +321,8 @@ class ResidentSearch:
                 calls, self.pending = self.pending, []
                 output, existing = self.frontier(step + 1)
                 counts, cutoffs = self.counts, self.cutoffs
-                self.runtime.write(counts, np.asarray((b.used, count, existing, 0, 0, 0), np.int32))
-                self.runtime.write(cutoffs, np.asarray([
-                    b.proposal_cutoff(i) for i in range(len(b.problems))
-                ], np.float32))
+                self.runtime.write(counts, np.asarray((b.used, count, existing, 0, 0, 0, 0), np.int32))
+                self.runtime.write(cutoffs, b.cutoff_values())
                 budget = self.queue_capacity
                 initial_position = position
                 chunks = 0

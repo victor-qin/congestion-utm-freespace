@@ -20,13 +20,17 @@ INLINE void resident_compact_one(
     unsigned int tid, GLOBAL const int* control, GLOBAL const int* records,
     GLOBAL const float* scores, GLOBAL int* arena, GLOBAL float* arena_values,
     GLOBAL int* next, GLOBAL int* counts, GLOBAL int* event_records,
-    GLOBAL float* event_values, GLOBAL int* event_meta
+    GLOBAL float* event_values, GLOBAL int* event_meta, GLOBAL float* event_upper
 ) {
     int n = control[0], stride = control[1], capacity = control[2], queue_capacity = control[3];
     if (tid >= (unsigned int)n) return;
     int source = (int)tid * stride, flags = records[source + 6];
     if (!flags) return;
     fetch_add(counts + 5, 1);
+    if (flags & 16) {
+        fetch_add(counts + 6, 1);
+        return;
+    }
     // Numerical proposals remain pending; their full state survives until verification.
     if (flags & 5) {
         int event = fetch_add(counts + 3, 1);
@@ -37,6 +41,7 @@ INLINE void resident_compact_one(
         for (int j = 0; j < stride; ++j) event_records[event * stride + j] = records[source + j];
         event_values[event * 2] = scores[tid * 3];
         event_values[event * 2 + 1] = scores[tid * 3 + 1];
+        event_upper[event] = scores[tid * 3 + 2];
         for (int j = 0; j < 4; ++j) event_meta[event * 5 + j] = records[source + j];
         event_meta[event * 5 + 4] = flags;
     }

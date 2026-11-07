@@ -112,10 +112,14 @@ class _Batch:
             deadline,
         )
         self.started = time.monotonic()
+        self.prune_mode = (0 if options.gpu_prune_epsilon is None else
+                           2 if options.gpu_prune_audit else 1)
         self.first_dispatch = runtime.dispatches
         self.first_counters = dict(getattr(runtime, "counters", {}))
         self.best: list[tuple[float, Any]] = [(-math.inf, None) for _ in problems]
         self.closed_upper = [-math.inf for _ in problems]
+        self.audit_upper = math.inf
+        self.audit_direct = False
         normalized: dict[int, pricing.DualView] = {}
         self.views: list[pricing.DualView] = []
         for p in problems:
@@ -153,7 +157,14 @@ class _Batch:
             cpu_recomputations=0,
             verified_prunes=0,
             gpu_prune_proposals=0,
+            gpu_direct_prunes=0,
+            rejected_prunes=0,
+            audited_bound_deficit_max=0.0,
+            rejected_gpu_margin_max=0.0,
+            epsilon_audited=0,
+            epsilon_rejected=0,
             canonical_validations=0,
+            canonical_rejections=0,
             max_frontier=0,
             grouped_labels=0,
             root_prunes=0,
@@ -623,24 +634,55 @@ class _Batch:
 
     def retain(self, root: int, parent: int, cell: int, hops: int) -> bool:
         """Require CPU verification for every proposed numeric deletion in certified mode."""
-        if not self.options.cpu_recompute:
+        if not self.options.verify_prunes:
             return False
         i = self.root_flights[root]
         upper = self.bound(root, parent, cell, hops)
+        if self.options.gpu_prune_audit:
+            self.stats["epsilon_audited"] += int(self.audit_direct)
+            self.stats["audited_bound_deficit_max"] = max(
+                self.stats["audited_bound_deficit_max"], upper - self.audit_upper)
         if upper <= self.best[i][0] + _BOUND_CLOSURE_TOL:
             self.closed_upper[i] = max(self.closed_upper[i], upper)
             self.stats["verified_prunes"] += 1
             self.stats["endpoint_verified_prunes"] += int(self._endpoint_closed)
             return False
+        self.stats["rejected_prunes"] += 1
+        if self.options.gpu_prune_audit:
+            self.stats["epsilon_rejected"] += int(self.audit_direct)
+            self.stats["rejected_gpu_margin_max"] = max(
+                self.stats["rejected_gpu_margin_max"], self.best[i][0] - self.audit_upper)
         return True
 
     def proposal_cutoff(self, flight: int) -> float:
         """Ask FP32 to flag near ties generously; only the FP64 verifier can discard them."""
         best = self.best[flight][0]
+        if self.options.gpu_prune_epsilon is not None and not self.options.gpu_prune_verify_border:
+            return self.epsilon_cutoff(flight)
         if not self.options.cpu_recompute:
             return best
         scale = max(1.0, abs(self.benefits[flight]), abs(self.problems[flight].pi_f), abs(best))
         return best + max(_BOUND_CLOSURE_TOL, 1e-6 * scale) if math.isfinite(best) else best
+
+    def epsilon_cutoff(self, flight: int) -> float:
+        """Subtract the experimental allowance without rounding its cutoff upward."""
+        best = self.best[flight][0]
+        epsilon = self.options.gpu_prune_epsilon
+        if epsilon is not None:
+            # Comparing with a downward-converted cutoff avoids rounding the
+            # chosen absolute margin away during the FP32 threshold upload.
+            cutoff = _down(best - epsilon) if epsilon else best
+            with np.errstate(over="ignore"):
+                rounded = np.float32(cutoff)
+            if float(rounded) > cutoff:
+                rounded = np.nextafter(rounded, np.float32(-math.inf))
+            return float(rounded)
+        return -math.inf
+
+    def cutoff_values(self) -> np.ndarray:
+        """Pack independent CPU-proposal and experimental GPU-deletion cutoffs per flight."""
+        return np.asarray([(self.proposal_cutoff(i), self.epsilon_cutoff(i))
+                           for i in range(len(self.problems))], np.float32)
 
     def allocate(self, records: np.ndarray) -> np.ndarray:
         """Assign predecessor IDs without ever truncating a full frontier on overflow."""
@@ -665,7 +707,7 @@ class _Batch:
         --------
         - output (None): memoized predecessor and FP64 sums; no search decision is made here.
         """
-        if self.options.cpu_recompute:
+        if self.options.verify_prunes:
             args = int(record[1]), int(record[3]), int(record[0]), int(record[2])
             self.prefix_positive[index] = self.positive_lower(*args)
             self.visit_prefix_positive[index] = self.visit_lower(*args)
@@ -694,8 +736,18 @@ class _Batch:
             v = self.variants[i]
             cell = self.cell_offsets[i] + int(v.cell[variant])
             upper = self.root_upper[root]
-            if upper <= np.float32(self.proposal_cutoff(i)):
+            direct = (self.prune_mode and math.isfinite(float(upper)) and
+                      upper <= self.epsilon_cutoff(i))
+            if direct and not self.options.gpu_prune_audit:
                 self.stats["gpu_prune_proposals"] += 1
+                self.stats["gpu_direct_prunes"] += 1
+                self.stats["root_prunes"] += 1
+                continue
+            if ((not self.prune_mode or math.isfinite(float(upper))) and
+                upper <= np.float32(self.proposal_cutoff(i))):
+                self.stats["gpu_prune_proposals"] += 1
+                self.audit_upper = float(upper)
+                self.audit_direct = bool(direct)
                 if not self.retain(root, -1, cell, 0):
                     self.stats["root_prunes"] += 1
                     continue
@@ -869,6 +921,8 @@ class _Batch:
                 p.forbidden_rows,
                 self.models[i],
             )
+            if result is None:
+                self.stats["canonical_rejections"] += 1
             if result is not None and result[0] > self.best[i][0]:
                 self.best[i] = result
 
@@ -1040,15 +1094,14 @@ class _Batch:
             for start in range(0, len(frontier), self.options.chunk_size):
                 self.check()
                 current = frontier[start : start + self.options.chunk_size].copy()
-                cutoffs = np.asarray([
-                    self.proposal_cutoff(i) for i in range(len(self.problems))
-                ], np.float32)
+                cutoffs = self.cutoff_values()
                 count = len(current) * 6
                 records, scores = self.runtime.run(
                     "expand",
                     count,
                     (
-                        np.asarray((len(current), self.stride, step, *self.offsets), np.int32),
+                        np.asarray((len(current), self.stride, step, *self.offsets,
+                                    self.prune_mode), np.int32),
                         current,
                         values[start : start + len(current)].copy(),
                         self.graph,
@@ -1078,10 +1131,16 @@ class _Batch:
                     self.check()
                     record = records[index]
                     root, flags = int(record[1]), int(record[6])
+                    if flags & 16:
+                        self.stats["gpu_direct_prunes"] += 1
+                        self.stats["gpu_prune_proposals"] += 1
+                        continue
                     path = None
                     if flags & 4:
                         self.stats["gpu_prune_proposals"] += 1
                         self.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
+                        self.audit_upper = float(scores[index, 2])
+                        self.audit_direct = bool(flags & 32)
                         if not self.retain(root, int(record[3]), int(record[0]), int(record[2])):
                             continue
                     if flags & 1:
@@ -1147,7 +1206,7 @@ class _Batch:
         --------
         - output (tuple[PricingResult, ...]): ordered incumbents, statuses and batch counters.
         """
-        status = "complete" if self.options.cpu_recompute else "approximate"
+        status = "complete" if self.options.certify_search else "approximate"
         complete = False
         try:
             self.prepare()
@@ -1182,7 +1241,7 @@ class _Batch:
             status = "deadline"
         finally:
             self.runtime.clear_batch()
-        certified = complete and self.options.cpu_recompute
+        certified = complete and self.options.certify_search
         stats = {
             **self.stats,
             **{key: value - self.first_counters[key]
@@ -1197,6 +1256,9 @@ class _Batch:
             "counts_scope": "batch",
             "dominance": "none" if self.options.cpu_recompute else "fp32",
             "bound_closure_tolerance": _BOUND_CLOSURE_TOL,
+            "gpu_prune_epsilon": self.options.gpu_prune_epsilon,
+            "gpu_prune_audit": self.options.gpu_prune_audit,
+            "gpu_prune_verify_border": self.options.gpu_prune_verify_border,
         }
         results = []
         for i, (p, (rc, column)) in enumerate(zip(self.problems, self.best, strict=True)):

@@ -1,6 +1,7 @@
 """Future-cost relaxations preserve exact positive-price lower bounds and deadlines."""
 
 from decimal import Decimal, localcontext
+from dataclasses import replace
 from functools import cache
 from types import SimpleNamespace
 import time
@@ -468,3 +469,139 @@ def test_future_table_empty_roots_and_deadline_are_explicit(
             problem, topology, variants, geometry, view, runtime, deadline,
             cpu_recompute=cpu_recompute,
         )
+
+
+@pytest.mark.parametrize("limit", [3, 4, 11])
+@pytest.mark.parametrize("budget", [0, 1200, 1_000_000])
+@pytest.mark.parametrize("early_prices", [False, True])
+def test_hop_tables_cover_all_rooted_prefixes_and_fall_back_on_missing_bins(
+    monkeypatch: pytest.MonkeyPatch, limit: int, budget: int, early_prices: bool,
+) -> None:
+    """Hop refinement covers original arithmetic, roles, exclusions and incomplete budgets.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): isolates visit and hop costs from endpoint geometry.
+    - limit (int): short, just-feasible and greater-than-six extra allowances.
+    - budget (int): disables tables, stores only some bins or stores the full reachable domain.
+    - early_prices (bool): truncates weighted support before the horizon; later suffixes
+      must inherit the old lower bound instead of being falsely declared unreachable.
+
+    Return
+    --------
+    - output (None): every rooted-prefix cost is covered; missing bins remain weaker bounds.
+    """
+    problem, topology, variants, view = _case()
+    topology = replace(topology, air_hop_limit=limit)
+    if early_prices:
+        view = pricing.DualView({RowKey.cell((1, 0), 0, 11): 19.123456789}, problem.cfg)
+        view._offsets = (-1, 1)
+    monkeypatch.setattr(pricing, "_endpoint_claims", lambda *args, **kwargs: frozenset())
+    for forbidden in (frozenset(), frozenset((RowKey.cell((4, 0), 0, 14),))):
+        current = replace(problem, forbidden_rows=forbidden)
+        table = FutureBounds(
+            current, topology, variants, SimpleNamespace(air_per_hop=0.3), view,
+            _ReferenceRuntime(), None, hop_max_bytes=budget,
+        )
+        old = FutureBounds(
+            current, topology, variants, SimpleNamespace(air_per_hop=0.3), view,
+            _ReferenceRuntime(), None, hop_max_bytes=0,
+        )
+
+        @cache
+        def exact(cell: int, step: int, available: int, first: bool) -> Decimal:
+            """Enumerate the role relaxation with the actual remaining budget in Decimal."""
+            with localcontext() as context:
+                context.prec = 100
+                best = Decimal(0) if topology.dest_mask[cell] else Decimal("Infinity")
+                if not available or step >= topology.max_step:
+                    return best
+                for arc in range(topology.arc_start[cell], topology.arc_start[cell + 1]):
+                    if not topology.arc_roles[arc] & (10 if first else 5):
+                        continue
+                    target = int(topology.arc_target[arc])
+                    claims = pricing._visit_claims((target, 0), 0, step + 1, view.offsets)
+                    if not claims.isdisjoint(forbidden):
+                        continue
+                    cost = sum((Decimal.from_float(max(0., view.row_cost(row))) for row in claims),
+                               Decimal.from_float(0.3))
+                    best = min(best, cost + exact(target, step + 1, available - 1, False))
+                return best
+
+        for cell, start in zip(variants.cell, variants.start_step, strict=True):
+            cell, start = int(cell), int(start)
+            assert Decimal.from_float(table.root_lookup(cell, start)) <= exact(cell, start, limit, True)
+            prefixes = [(cell, start, limit, True)]
+            while prefixes:
+                cell, step, available, first = prefixes.pop()
+                actual = table.root_lookup(cell, step) if first else table.lookup(cell, step, available)
+                assert Decimal.from_float(actual) <= exact(cell, step, available, first)
+                if not first:
+                    assert actual >= old.lookup(cell, step)
+                if available and step < topology.max_step:
+                    for arc in range(topology.arc_start[cell], topology.arc_start[cell + 1]):
+                        if topology.arc_roles[arc] & (10 if first else 5):
+                            prefixes.append((int(topology.arc_target[arc]), step + 1, available - 1, False))
+        if budget == 0:
+            assert table.hops.costs is None
+            assert table.root_lookup(0, 10) == old.root_lookup(0, 10)
+        elif budget == 1_000_000 and limit == 3 and not early_prices:
+            assert table.root_lookup(0, 10) == np.inf
+            if not forbidden:
+                assert old.root_lookup(0, 10) < np.inf
+        assert table.hops.stats['hop_table_bytes'] <= budget
+
+
+def test_hop_snapshots_refresh_prices_roots_and_do_not_publish_interrupted_costs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only unpriced structures survive snapshots; interrupted weighted tables never escape.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): interrupts arithmetic inside the extra recurrence.
+
+    Return
+    --------
+    - output (None): new/sign-changing rows and changed root domains match a fresh build.
+    """
+    from freespace_sim.planner.colgen import gpu_hops
+
+    problem, topology, variants, view = _case()
+    topology = replace(topology, air_hop_limit=4)
+    monkeypatch.setattr(pricing, "_endpoint_claims", lambda *args, **kwargs: frozenset())
+    geometry = SimpleNamespace(air_per_hop=0.3)
+    first = FutureBounds(problem, topology, variants, geometry, view, _ReferenceRuntime(), None)
+    frozen = first.hops.costs.copy()
+    prices = dict(view._duals)
+    prices[RowKey.cell((1, 0), 0, 11)] = -900.0
+    prices[RowKey.cell((4, 0), 0, 13)] = 10.123456789
+    changed = pricing.DualView(prices, problem.cfg)
+    changed._offsets = view.offsets
+    second = FutureBounds(problem, topology, variants, geometry, changed, _ReferenceRuntime(), None)
+    assert first.hops.structure is second.hops.structure
+    np.testing.assert_array_equal(first.hops.costs, frozen)
+    assert not np.array_equal(first.hops.costs, second.hops.costs)
+    fresh_problem, _, _, _ = _case()
+    fresh = FutureBounds(fresh_problem, topology, variants, geometry, changed, _ReferenceRuntime(), None)
+    np.testing.assert_array_equal(second.hops.costs, fresh.hops.costs)
+    reduced = replace(variants, cell=variants.cell[1:], start_step=variants.start_step[1:])
+    moved = FutureBounds(problem, topology, reduced, geometry, changed, _ReferenceRuntime(), None)
+    assert moved.hops.structure is not second.hops.structure
+    original = gpu_hops._add_lower
+    calls = 0
+
+    def expire(*args, **kwargs):
+        """Interrupt after weighted recurrence work has begun, leaving geometry reusable."""
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise pricing.PricingTimeout("interrupted hop table")
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(gpu_hops, "_add_lower", expire)
+        with pytest.raises(pricing.PricingTimeout, match="interrupted hop table"):
+            FutureBounds(problem, topology, variants, geometry, changed, _ReferenceRuntime(), None)
+    retry = FutureBounds(problem, topology, variants, geometry, changed, _ReferenceRuntime(), None)
+    np.testing.assert_array_equal(retry.hops.costs, fresh.hops.costs)

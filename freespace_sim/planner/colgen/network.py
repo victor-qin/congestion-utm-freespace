@@ -854,6 +854,7 @@ class _FlightSearchCache:
         "prepared",
         "gpu_geometry",
         "gpu_endpoints",
+        "gpu_hops",
         "seed_columns",
         "seed_delay_certified",
         "seed_model",
@@ -876,6 +877,7 @@ class _FlightSearchCache:
         # remain call-local. See `gpu_bounds.CompletionBounds._prepare_geometry`.
         self.gpu_geometry: Any | None = None
         self.gpu_endpoints: Any | None = None
+        self.gpu_hops: Any | None = None
         # `(label_capacity, log2cap, candidate_capacity)` the last completed compiled search
         # actually needed.  A density flight can far exceed the 65,536 label default, and
         # re-discovering that by restarting costs ~1.7x on every iteration after the first.

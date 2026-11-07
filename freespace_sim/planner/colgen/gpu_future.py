@@ -45,7 +45,8 @@ class FutureBounds:
     The regular table allows cruise/finish roles, while requested roots use a
     separate first-hop relaxation into the next regular row. Destination stops
     add only mandatory endpoint rows disjoint from all preceding visit windows.
-    The relaxation ignores hop, revisit and forbidden-row constraints. Endpoint
+    A budgeted extra table enforces remaining hops; the old fallback ignores them.
+    Both relaxations ignore revisits but retain visit/mandatory-arrival exclusions. Endpoint
     disjointness uses reachability from every supplied root, so the bounds apply
     to continuations of those roots, not arbitrary unrooted suffixes. Combining
     these costs with canonical geometry and origin claims remains the caller's responsibility.
@@ -63,6 +64,8 @@ class FutureBounds:
         deadline: float | None,
         *,
         cpu_recompute: bool = True,
+        hop_max_bytes: int = 64 * 1024 * 1024,
+        hop_max_work: int = 48_000_000,
     ) -> None:
         """Build the relaxed table in FP64, or on the GPU in unchecked FP32 mode.
 
@@ -77,6 +80,8 @@ class FutureBounds:
         - deadline (float | None): shared monotonic deadline, checked each layer.
         - cpu_recompute (bool): compute relaxed layers directly in binary64;
           this does not invoke the constrained CPU pricing search.
+        - hop_max_bytes (int): extra remaining-hop numeric storage/scratch budget; zero disables.
+        - hop_max_work (int): extra state/arc/time budget; unavailable bins use the old table.
 
         Return
         --------
@@ -182,6 +187,21 @@ class FutureBounds:
             self.stats["future_layers"] += 1
         self._check_deadline()
         self._costs.flags.writeable = False
+        self.hops = None
+        if cpu_recompute and topology.air_hop_limit > 0:
+            from .gpu_hops import HopBounds
+
+            active = np.flatnonzero(np.any(visits > 0.0, axis=1) | (tails > 0.0))
+            end = min(len(visits), int(active[-1]) + 2) if len(active) else 1
+            # Outside weighted support the existing table is a valid continuation
+            # lower bound. Never initialize this truncated boundary as unreachable.
+            boundary = self._costs[end - 1] if end < len(visits) else None
+            self.hops = HopBounds(
+                problem, topology, variants, graph, first_graph, visits[:end], tails[:end],
+                air, self.first_step, self._check_deadline,
+                max_bytes=hop_max_bytes, max_work=hop_max_work, boundary=boundary,
+            )
+            self.stats.update(self.hops.stats)
         self.stats["future_dispatches"] = runtime.dispatches - dispatches
         self.stats["future_table_bytes"] = self._costs.nbytes
         self.stats["future_roots"] = len(self._root_costs)
@@ -251,6 +271,16 @@ class FutureBounds:
             if first <= last:
                 target = visits[first - self.first_step : last - self.first_step + 1, cell]
                 target[:] = _add_lower(target, price)
+        for row in self.problem.forbidden_rows:
+            self._check_deadline()
+            if row.kind != "cell" or row.level != 0:
+                continue
+            cell = index.get(row.cell_coord)
+            if cell is not None:
+                first = max(self.first_step, int(row.step) - hi)
+                last = min(self.last_step, int(row.step) - lo)
+                if first <= last:
+                    visits[first - self.first_step:last - self.first_step + 1, cell] = np.inf
         return visits
 
     def _earliest_visits(self, variants: PreparedVariants) -> np.ndarray:
@@ -316,6 +346,9 @@ class FutureBounds:
             claims = pricing._endpoint_claims(
                 self.problem.graph, self.problem.cfg, origin=False, step=step, timing_steps=0
             )
+            if not claims.isdisjoint(self.problem.forbidden_rows):
+                tails[offset] = np.inf
+                continue
             total = 0.0
             for row in claims:
                 price = view.row_cost(row)
@@ -387,13 +420,14 @@ class FutureBounds:
         result.flags.writeable = False
         return result
 
-    def lookup(self, cell: int, step: int) -> float:
+    def lookup(self, cell: int, step: int, available: int | None = None) -> float:
         """Return a regular-suffix bound after at least one hop has been taken.
 
         Parameters
         ------------
         - cell (int): local topology cell index.
         - step (int): inclusive absolute time in ``[first_step, last_step]``.
+        - available (int | None): remaining moves; None retains the unbounded relaxation.
 
         Return
         --------
@@ -403,7 +437,12 @@ class FutureBounds:
             raise IndexError("future-bound cell is outside the prepared topology")
         if not self.first_step <= step <= self.last_step:
             raise IndexError("future-bound step is outside the prepared time horizon")
-        return float(self._costs[step - self.first_step, cell])
+        lower = float(self._costs[step - self.first_step, cell])
+        if available is not None and self.hops is not None:
+            refined = self.hops.lookup(cell, step, available)
+            if refined is not None:
+                lower = max(lower, refined)
+        return lower
 
     def root_lookup(self, cell: int, step: int) -> float:
         """Return a requested root's first-hop cost followed by a regular suffix.
@@ -418,4 +457,7 @@ class FutureBounds:
         - output (float): first-hop relaxed bound, possibly infinity. Unrequested
           cell/time pairs raise ``KeyError`` instead of using an invalid regular bound.
         """
-        return self._root_costs[cell, step]
+        lower = self._root_costs[cell, step]
+        if self.hops is not None:
+            lower = max(lower, self.hops.roots.get((cell, step), lower))
+        return lower

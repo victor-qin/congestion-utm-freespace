@@ -10,12 +10,13 @@ import pytest
 
 from freespace_sim.planner.colgen import pricing
 from freespace_sim.planner.colgen.gpu_endpoint import EndpointBounds
+from freespace_sim.planner.colgen.gpu_future import FutureBounds
 from freespace_sim.planner.colgen.gpu_runtime import ComputeRuntime
 from freespace_sim.planner.colgen.network import RowKey
 from freespace_sim.planner.colgen.pricing_platform import PricingOptions
 from freespace_sim.planner.colgen.translate import Column
 from tests.test_colgen_gpu_bounds import _bounds
-from tests.test_colgen_gpu_future import _case
+from tests.test_colgen_gpu_future import _ReferenceRuntime, _case
 from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
 
 
@@ -230,8 +231,9 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
     {"endpoint_bounds": False}, {"endpoint_max_rows": 1},
     {"endpoint_cache_bytes": 0}, {"endpoint_cache_work": 0},
 ])
+@pytest.mark.parametrize("hop_budget", [0, 64 * 1024 * 1024])
 def test_endpoint_omission_or_cache_exhaustion_preserves_exhaustive_optimum(
-    monkeypatch: pytest.MonkeyPatch, options: dict,
+    monkeypatch: pytest.MonkeyPatch, options: dict, hop_budget: int,
 ) -> None:
     """Dropping extra-bound information cannot remove routes or invoke CPU full pricing.
 
@@ -239,6 +241,7 @@ def test_endpoint_omission_or_cache_exhaustion_preserves_exhaustive_optimum(
     ------------
     - monkeypatch (pytest.MonkeyPatch): forbids original full-pricing implementations.
     - options (dict): disables the bound, truncates rows, or exhausts one cache budget.
+    - hop_budget (int): disables or enables remaining-hop tables in the GPU search.
 
     Return
     --------
@@ -246,6 +249,21 @@ def test_endpoint_omission_or_cache_exhaustion_preserves_exhaustive_optimum(
     """
     problem = _problem(signed=True)
     optimum = _oracle(problem)
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    prepare, build = _Batch.prepare, FutureBounds.__init__
+
+    def future(instance, *args, **kwargs):
+        """Exercise complete optional tables and missing-table fallback on the same domain."""
+        return build(instance, *args, **kwargs, hop_max_bytes=hop_budget)
+
+    def prepare_future(batch):
+        """Install the normally delayed bound before a small complete GPU enumeration."""
+        prepare(batch)
+        batch.prepare_future()
+
+    monkeypatch.setattr(FutureBounds, "__init__", future)
+    monkeypatch.setattr(_Batch, "prepare", prepare_future)
 
     def forbidden(*args, **kwargs):
         """Prohibit both original constrained CPU pricing implementations."""
@@ -283,6 +301,9 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
     bounds, variants = _bounds(problem)
     endpoint = EndpointBounds(bounds, PricingOptions(endpoint_cache_work=10_000_000), lambda: None)
     graph, cfg, view = problem.graph, problem.cfg, bounds.view
+    future = FutureBounds(
+        problem, bounds.topology, variants, bounds, view, _ReferenceRuntime(), None,
+    )
     negative = 0.0
     for price in view._duals.values():
         if price < 0:
@@ -309,9 +330,11 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
                     dual_cost=view.claim_cost(column.claims), pi_f=problem.pi_f,
                 )
                 union = bounds.origin_claims(variant)
+                visit_union = frozenset()
                 for hop, cell in enumerate(path):
                     step = start + hop
-                    union |= pricing._visit_claims(cell, 0, step, view.offsets)
+                    visit_union |= pricing._visit_claims(cell, 0, step, view.offsets)
+                    union |= visit_union
                     paid = endpoint.mask(union)
                     endpoint.consider(np.array([paid], np.uint32))
                     remaining = int(bounds.topology.rev_remaining[cells[cell]])
@@ -329,6 +352,17 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
                     )
                     assert math.isfinite(upper)
                     assert upper >= actual
+                    visit_lower = 0.0
+                    for row in visit_union:
+                        visit_lower = max(0.0, math.nextafter(
+                            visit_lower + max(0.0, view.row_cost(row)), -math.inf,
+                        ))
+                    suffix = (future.root_lookup(cells[cell], step) if hop == 0 else
+                              future.lookup(cells[cell], step, graph.max_air_hops - hop))
+                    assert bounds.future_upper(
+                        variant, hop, visit_lower, suffix,
+                        problem.params.M, problem.pi_f, negative,
+                    ) >= actual
                     checked += 1
         if hops < graph.max_air_hops:
             depth = view.offsets[1] - view.offsets[0]

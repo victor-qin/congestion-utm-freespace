@@ -499,9 +499,31 @@ def test_gpu_rejects_dual_view_with_mismatched_occupancy_window() -> None:
 
 
 @pytest.mark.parametrize("exclude_arrival", [False, True])
-def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(exclude_arrival: bool) -> None:
-    """Terminal lane geometry, wall roles and arrival exclusions preserve the optimum."""
+def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
+    monkeypatch: pytest.MonkeyPatch, exclude_arrival: bool,
+) -> None:
+    """Terminal lane geometry, wall roles and arrival exclusions preserve the optimum.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): installs future bounds before the small GPU search.
+    - exclude_arrival (bool): forbids the arrival's mandatory terminal resource.
+
+    Return
+    --------
+    - output (None): GPU completion and its upper bound agree with the reference domain.
+    """
     from tests.test_colgen_dp_kernel import _cfg as terminal_cfg, _terminal_graph
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    bootstrap = _Batch.bootstrap
+
+    def with_future(batch: _Batch) -> None:
+        """Exercise hop-aware verification with actual terminal roles and obstacles."""
+        batch.prepare_future()
+        bootstrap(batch)
+
+    monkeypatch.setattr(_Batch, "bootstrap", with_future)
 
     platform = _platform("metal")
     cfg = terminal_cfg(max_ground_delay_s=4.0)
@@ -574,9 +596,29 @@ def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) ->
 
 @pytest.mark.parametrize("improvement", [5e-8, 5e-7])
 def test_near_tie_certificate_covers_improvement_even_when_no_column_is_returned(
-    improvement: float,
+    monkeypatch: pytest.MonkeyPatch, improvement: float,
 ) -> None:
-    """Closing tiny branches reports their upper bound instead of claiming an exact optimum."""
+    """Closing tiny branches reports their upper bound instead of claiming an exact optimum.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): installs remaining-hop bounds before route discovery.
+    - improvement (float): canonical gain deliberately smaller than the closure tolerance.
+
+    Return
+    --------
+    - output (None): the certificate covers the improvement even when no column is returned.
+    """
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    bootstrap = _Batch.bootstrap
+
+    def with_future(batch: _Batch) -> None:
+        """Keep the same near-tie requirement when remaining-hop bounds are installed."""
+        batch.prepare_future()
+        bootstrap(batch)
+
+    monkeypatch.setattr(_Batch, "bootstrap", with_future)
     cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=0.0, time_buffer_s=0.0,
                cost_ground_delay_per_s=1e-12, cost_air_hold_per_s=1e-12,
                cost_air_lateral_per_s=1e-12, max_detour_factor=5.0)

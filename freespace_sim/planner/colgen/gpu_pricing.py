@@ -456,7 +456,8 @@ class _Batch:
             future = self.future[i]
             step = int(self.variants[i].start_step[variant])
             if future.first_step <= step <= future.last_step:
-                self.root_values[root, 10] = future.root_lookup(int(self.variants[i].cell[variant]), step)
+                lower = future.root_lookup(int(self.variants[i].cell[variant]), step)
+                self.root_values[root, 10] = min(lower, float(np.finfo(np.float32).max))
         self.evaluate_roots()
         self.stats["future_s"] = time.monotonic() - started
         self.stats["future_gpu_dispatches"] = self.runtime.dispatches - before
@@ -548,8 +549,9 @@ class _Batch:
         )
         if self.future[i] is not None:
             step = int(self.variants[i].start_step[variant]) + hops
-            lookup = self.future[i].root_lookup if hops == 0 else self.future[i].lookup
-            suffix = lookup(cell - self.cell_offsets[i], step)
+            local = cell - self.cell_offsets[i]
+            suffix = (self.future[i].root_lookup(local, step) if hops == 0 else
+                      self.future[i].lookup(local, step, self.topologies[i].air_hop_limit - hops))
             upper = min(upper, self.bounds[i].future_upper(
                 variant, hops, self.visit_lower(root, parent, cell, hops), suffix,
                 self.benefits[i], self.problems[i].pi_f, self.negative[i],
@@ -736,6 +738,50 @@ class _Batch:
             blocked[forbidden] = 1
         return values, blocked
 
+    def future_proposals(
+        self, records: np.ndarray, visits: np.ndarray, step: int,
+    ) -> np.ndarray:
+        """Gather hop-aware proposals into the existing per-cell GPU visit buffer.
+
+        Parameters
+        ------------
+        - records (np.ndarray): all parents that will read the returned buffer.
+        - visits (np.ndarray): current signed/positive prices and old future proposals.
+        - step (int): absolute time of their children.
+
+        Return
+        --------
+        - output (np.ndarray): same buffer shape; each target uses the largest remaining
+          allowance among all its candidate parents. This relaxes every actual child;
+          FP64 verification still uses that child's exact allowance before deletion.
+        """
+        if not any(f is not None and f.hops is not None and f.hops.costs is not None
+                   for f in self.future):
+            return visits
+        started = time.monotonic()
+        available = np.full(len(self.cells), -1, np.int32)
+        targets = self.graph[records[:, 0], :6].ravel()
+        budgets = np.repeat(self.roots[records[:, 1], 4] - records[:, 2] - 1, 6)
+        valid = targets >= 0
+        np.maximum.at(available, targets[valid], budgets[valid])
+        for i, future in enumerate(self.future):
+            if (future is None or future.hops is None or future.hops.costs is None
+                    or not future.first_step <= step < future.first_step + len(future.hops.costs)):
+                continue
+            hop = future.hops
+            first, count = self.cell_offsets[i], self.topologies[i].n_cells
+            allowance = available[first:first + count]
+            slack = allowance.astype(np.int64) - self.topologies[i].rev_remaining
+            index = hop.structure.offsets[:-1] + slack
+            cells = np.flatnonzero((slack >= 0) & (index < hop.structure.offsets[1:]))
+            values = hop.costs[step - future.first_step, index[cells]]
+            # Infinity in the device ABI also means "unavailable". A finite maximum
+            # asks for verification of a proved empty table state without losing the proposal.
+            lower = np.maximum(visits[first + cells, 2], values)
+            visits[first + cells, 2] = np.minimum(lower, float(np.finfo(np.float32).max))
+        self.stats["hop_gather_s"] = self.stats.get("hop_gather_s", 0.0) + time.monotonic() - started
+        return visits
+
     def complete(self, record: np.ndarray, path: tuple[tuple[int, int], ...]) -> None:
         """Validate every destination lane before any continuation grouping can discard it.
 
@@ -844,6 +890,7 @@ class _Batch:
                 if self.future[i] is not None:
                     cost[index] = max(cost[index], self.future[i].lookup(
                         int(record[0]) - self.cell_offsets[i], step,
+                        self.topologies[i].air_hop_limit - hops,
                     ))
                 if endpoint is not None:
                     last = min(self.topologies[i].max_step,
@@ -921,6 +968,7 @@ class _Batch:
                     endpoint.consider(frontier[selected, 7:9].copy().view(np.uint32))
             self.pack_endpoints()
             visits, blocked = self.visits(step + 1)
+            visits = self.future_proposals(frontier, visits, step + 1)
             visit_masks = self.endpoint_visits(step + 1)
             next_records, next_scores = [], []
             next_count = 0
@@ -1087,6 +1135,7 @@ class _Batch:
                     status,
                     dict(stats, endpoint=(dict(self.endpoints[i].stats)
                                           if self.endpoints[i] is not None else {}),
+                         future=(dict(self.future[i].stats) if self.future[i] is not None else {}),
                          bound_gap=(max(rc, self.closed_upper[i]) - rc
                                           if certified and math.isfinite(rc) else None)),
                 )

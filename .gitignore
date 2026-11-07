@@ -11,6 +11,10 @@ runlogs/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+.context/
+# Local agent state, captures, profiles, and disposable analysis scripts.
+# Reusable diagnostics belong in analysis/; keep local evidence out of commits.
+/.agent/
 .claude/settings.local.json
 .agent/
 

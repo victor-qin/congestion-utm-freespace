@@ -626,7 +626,7 @@ def flight_row(intent: OperationalIntent, cfg: SimConfig,
         # them. Exact for the A* family; continuous planners have lattice_overhead_m == 0, so for
         # them deconfliction_detour_m is simply air_detour_m.
         "lattice_overhead_m": lattice_m,
-        "deconfliction_detour_m": intent.air_detour_m - lattice_m,
+        "deconfliction_detour_m": max(0.0, intent.air_detour_m - lattice_m),
         # detour as lateness-seconds; ground_delay_s + air_hold_s + detour_time_s +
         # altitude_delay_phys_s == total_delay_s (the four time-space levers). Reuse db, lives once.
         "detour_time_s": db["detour_time_s"],

@@ -103,30 +103,35 @@ import uuid
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Mapping
 
 from ...config import SimConfig
 from ...progress import RollingRate
-from ...types import FlightRequest
-from .network import StaticTerminalCatalog, build_flight_graph
+from ...types import FlightRequest, as_terminal
+from .network import FlightGraph, StaticTerminalCatalog, build_flight_graph
 from .params import ColGenParams
+from .objective import cost_model
 from .pricing import (
     DualView,
     PricingTimeout,
     clear_search_record,
     kernel_stats,
     last_search_record,
+    is_certified_column,
     price_flight,
 )
 from .translate import Column
+from .pricing_platform import PricingOptions, PricingPlatform, PricingProblem
 
 log = logging.getLogger(__name__)
+_PRODUCTION_PRICE_FLIGHT = price_flight
 
 
 __all__ = [
     "PricingPool",
     "StalePricingWorker",
     "SweepResult",
+    "make_pricing_platform",
     "price_sweep",
 ]
 
@@ -368,11 +373,15 @@ def _worker_assignment(flight_ids, n_workers: int) -> dict[int, int]:
 
 @dataclass(frozen=True, slots=True)
 class SweepResult:
-    """One sweep's accepted prefix, in ``pricing_order`` index order.
+    """One sweep's returned flight results, in ``pricing_order`` index order.
 
     ``reduced_costs`` and ``columns`` are the same length and cover only the accepted
-    prefix; ``timeout_flight_id`` names the flight that ended it, or is ``None`` when the
-    sweep completed.
+    prefix. GPU batches also retain validated incumbents from an unresolved batch;
+    ``complete`` and ``certified`` must both hold before upper bounds are used.
+    ``upper_bounds`` separates certified GPU bounds from incumbent reduced costs;
+    its default ``None`` uses the exact CPU scores as bounds.
+    ``timeout_flight_id`` identifies an actual deadline expiry; label limits and
+    unsupported GPU domains are reported through ``status`` instead.
     """
 
     flight_ids: tuple[int, ...]
@@ -416,6 +425,16 @@ class SweepResult:
     #: its own field rather than folded into `wall_s` so a run can still SEE that cost after
     #: it stops recurring.
     pool_setup_s: float = 0.0
+    #: Additional valid positive columns from accepted tasks; never additional bound terms.
+    extra_columns: tuple[Column, ...] = ()
+    _certificate: tuple | None = field(default=None, repr=False, compare=False)
+    _certificate_owner: object = field(default_factory=object, init=False, repr=False, compare=False)
+    # Feasible route receipts above and search optimality are separate guarantees.
+    certified: bool = True
+    status: str = "complete"
+    # None preserves the CPU contract: each returned reduced cost is its exact optimum.
+    # GPU bounds may exceed incumbent scores and must never select columns for insertion.
+    upper_bounds: tuple[float, ...] | None = None
 
     @property
     def kernel_priced(self) -> int:
@@ -429,8 +448,8 @@ class SweepResult:
 
     @property
     def complete(self) -> bool:
-        """True when the sweep priced every flight (no timeout ended it)."""
-        return self.timeout_flight_id is None
+        """True when every search finished, including explicitly approximate GPU searches."""
+        return self.timeout_flight_id is None and self.status in {"complete", "approximate"}
 
     def efficiency(self, n_workers: int) -> float:
         """Fraction of the pool's worker-seconds that did real work.
@@ -530,6 +549,7 @@ def _load_sweep_state(
     flight_duals: dict[int, float],
     known_columns: dict[int, Column],
     deadline: float | None,
+    heuristic_only: bool = False,
 ) -> None:
     """Install one sweep's duals in this worker. Runs once per worker per sweep.
 
@@ -582,6 +602,7 @@ def _load_sweep_state(
         # taken in the parent is directly comparable here. It would NOT be across hosts.
         _WORKER["sweep"] = (
             epoch, DualView(duals, _WORKER["cfg"]), flight_duals, known_columns, deadline,
+            heuristic_only,
         )
     except Exception:
         _WORKER["sweep_error"] = traceback.format_exc()
@@ -610,7 +631,8 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
     Messages, FIFO per pipe (the ordering `_load_sweep_state` relies on -- a sweep's duals
     are always drained before the tasks that read them):
 
-      ("sweep", epoch, duals_blob, flight_duals, known_columns, deadline)  -> install duals
+      ("sweep", epoch, duals_blob, flight_duals, known_columns, deadline, heuristic_only)
+                                                        -> install duals and search mode
       ("price", epoch, flight_ids, chunksize)  -> stream ("results", [...]) per chunk
       ("stop",)                                -> exit
 
@@ -656,8 +678,9 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
         if tag == "stop":
             return
         if tag == "sweep":
-            _, epoch, duals_blob, flight_duals, known_columns, deadline = message
-            _load_sweep_state(epoch, duals_blob, flight_duals, known_columns, deadline)
+            _, epoch, duals_blob, flight_duals, known_columns, deadline, heuristic_only = message
+            _load_sweep_state(epoch, duals_blob, flight_duals, known_columns, deadline,
+                              heuristic_only)
             continue
         if tag == "price":
             _, epoch, flight_ids, chunksize = message
@@ -681,9 +704,9 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
 def _price_one(epoch: tuple, flight_id: int):
     """Price one flight in a worker.
 
-    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas, search_record)`` --
-    the shape :func:`_accepted_prefix` reduces, and the reason that function takes a
-    sequence of these rather than a pool.
+    Returns ``(flight_id, priced, rc, column, task_s, counter_deltas, search_record)``.
+    Multi-column pricing appends an eighth field containing certified extra columns;
+    :func:`_accepted_prefix` accepts both shapes and keeps one bound term per flight.
 
     ``epoch`` names the sweep whose duals the caller believes this worker holds, and is
     checked rather than trusted; see :class:`StalePricingWorker` for the failure it is
@@ -743,7 +766,7 @@ def _price_one(epoch: tuple, flight_id: int):
         raise StalePricingWorker(
             f"flight {flight_id} is not in worker {_WORKER.get('worker_index')!r}"
         )
-    _, dual_view, flight_duals, known_columns, deadline = state
+    _, dual_view, flight_duals, known_columns, deadline, heuristic_only = state
     # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
     # so shipping the absolute would double-count on the second task and beyond.
     before = kernel_stats()
@@ -752,6 +775,9 @@ def _price_one(epoch: tuple, flight_id: int):
     # to another is worse than reporting nothing.
     clear_search_record()
     started = time.perf_counter()
+    extras = []
+    extra_kwargs = ({"additional_columns": extras}
+                    if _WORKER["params"].columns_per_flight > 1 else {})
     try:
         reduced_cost, column = price_flight(
             _WORKER["graphs"][flight_id],
@@ -759,6 +785,8 @@ def _price_one(epoch: tuple, flight_id: int):
             flight_duals[flight_id],
             _WORKER["cfg"],
             _WORKER["params"],
+            **extra_kwargs,
+            heuristic_only=heuristic_only,
             known_column=known_columns.get(flight_id),
             deadline=deadline,
         )
@@ -771,6 +799,9 @@ def _price_one(epoch: tuple, flight_id: int):
             last_search_record(),
         )
     after = kernel_stats()
+    search = last_search_record()
+    search["_canonical_pricing_result"] = _certified_result(
+        column, extras, _WORKER["graphs"][flight_id], _WORKER["params"], _WORKER["cfg"])
     # Subtraction over the UNION of keys, not over `before`'s: a `declined_<reason>` key
     # appears the first time that cause fires, so it exists in `after` and not in `before`.
     return (
@@ -780,8 +811,85 @@ def _price_one(epoch: tuple, flight_id: int):
         column,
         time.perf_counter() - started,
         {key: value - before.get(key, 0) for key, value in after.items()},
-        last_search_record(),
-    )
+        search,
+    ) + ((tuple(extras),) if extra_kwargs else ())
+
+
+def _request_definition(request):
+    """Detach caller-owned arrays when identifying a worker's immutable input."""
+    return (request.flight_id, tuple(request.origin), tuple(request.dest), request.t_request,
+            request.t_departure, request.uss_id, as_terminal(request.origin_terminal),
+            as_terminal(request.dest_terminal), request.return_to_origin, request.turnaround_s)
+
+
+def _certified_result(column, extras, graph, params, cfg):
+    """Only graph/objective-certified immutable objects qualify for transport trust."""
+    if price_flight is not _PRODUCTION_PRICE_FLIGHT:
+        return False
+    model = cost_model(cfg, params)
+    return all(is_certified_column(c, graph, model)
+               for c in (column, *extras) if c is not None)
+
+
+def certified_sweep_columns(
+    sweep: SweepResult, graphs: Mapping[int, FlightGraph], cfg: SimConfig,
+    params: ColGenParams, catalog: StaticTerminalCatalog,
+) -> tuple[Column, ...]:
+    """Return exact internal result objects whose graph and solve context still match.
+
+    Parameters
+    ------------
+    - sweep: A production SweepResult; manually constructed results have no receipt.
+    - graphs, cfg, params, catalog: The parent solve context used by price_sweep.
+
+    Return
+    --------
+    - columns: Receipt-backed primary and extra objects, or an empty tuple on mismatch.
+    """
+    receipt = getattr(sweep, '_certificate', None)
+    if receipt is None:
+        return ()
+    owner, primary, extra, context, graph_objects, certified = receipt
+    if owner is not sweep._certificate_owner or primary is not sweep.columns or extra is not sweep.extra_columns:
+        return ()
+    if context != (cfg, params, catalog.entries):
+        return ()
+    if any(graphs.get(fid) is not graph for fid, graph in graph_objects):
+        return ()
+    return certified
+
+
+def _receipt(sweep, requests, graphs, cfg, params, catalog):
+    """Bind worker-validated objects to matching parent graph snapshots once per sweep."""
+    if not isinstance(catalog, StaticTerminalCatalog):
+        return sweep
+    if not (
+        len(sweep.flight_ids) == len(sweep.reduced_costs) == len(sweep.columns)
+        and all(
+            column is None or column.flight_id == flight_id
+            for flight_id, column in zip(sweep.flight_ids, sweep.columns, strict=True)
+        )
+    ):
+        object.__setattr__(sweep, "_certificate", None)
+        return sweep
+    records = {r['flight_id']: r for r in sweep.flight_records if r.get('priced')}
+    request_defs = {r.flight_id: _request_definition(r) for r in requests}
+    context = (cfg, params, catalog.entries)
+    graph_objects = []
+    for fid in sweep.flight_ids:
+        if not records.get(fid, {}).get("_canonical_pricing_result"):
+            continue
+        graph = graphs.get(fid)
+        if (graph is None or graph._search_cache.pricing_context != context
+                or _request_definition(graph.request) != request_defs.get(fid)):
+            continue
+        graph_objects.append((fid, graph))
+    certified_ids = {fid for fid, _graph in graph_objects}
+    certified = tuple(c for c in (*sweep.columns, *sweep.extra_columns)
+                      if c is not None and c.flight_id in certified_ids)
+    object.__setattr__(sweep, '_certificate', (sweep._certificate_owner, sweep.columns, sweep.extra_columns,
+                                             context, tuple(graph_objects), certified))
+    return sweep
 
 
 # --------------------------------------------------------------------------- parent side
@@ -801,12 +909,18 @@ def price_sweep(
     *,
     deadline: float | None = None,
     pool: "PricingPool | None" = None,
+    heuristic_only: bool = False,
+    platform: PricingPlatform | None = None,
 ) -> SweepResult:
-    """Price every flight in ``pricing_order``, sequentially or across processes.
+    """Price ordered flights using the selected CPU workers or a reusable GPU platform.
 
-    Width comes from ``params.n_pricing_workers``; 0 is the sequential loop and is
-    byte-identical to no pool at all.  ``graphs`` is used only by the sequential path;
-    workers build their own from ``requests`` (cheaper than pickling, see the module
+    With ``heuristic_only=True``, returned reduced costs are achievable scores,
+    not certified subproblem optima. ``complete`` only means every task finished;
+    these scores must not be used to tighten a global pricing bound.
+
+    CPU width comes from ``params.n_pricing_workers``; 0 is the sequential loop and is
+    byte-identical to no pool at all. The sequential and GPU paths use ``graphs``;
+    CPU workers build their own from ``requests`` (cheaper than pickling, see the module
     docstring). Passing ``pool`` is what makes each flight's compiled packing survive to the
     next iteration; omitting it builds and tears one down here, so a caller that prices a
     single sweep needs to know nothing about lifetimes.
@@ -816,37 +930,208 @@ def price_sweep(
     - pricing_order (list[int]): flight ids to price; the accepted prefix is defined over
       this order.
     - requests (list[FlightRequest]): flight requests workers rebuild their own graphs from.
-    - graphs (dict): prebuilt flight graphs, read only by the sequential path.
+    - graphs (dict): prebuilt flight graphs for sequential CPU or GPU pricing.
     - cfg (SimConfig): simulation config.
-    - params (ColGenParams): supplies ``n_pricing_workers`` and ``pricing_chunksize``.
+    - params (ColGenParams): selects CPU workers or GPU batching and numerical mode.
     - catalog (StaticTerminalCatalog): the shared wall catalogue every worker graph must see.
     - duals (dict): the iteration's row duals, pickled once and shipped to every worker.
-    - dual_view (DualView): the parent's dual view, read only by the sequential path.
+    - dual_view (DualView): the parent's dual view for sequential CPU or GPU pricing.
     - flight_duals (dict[int, float]): per-flight dual (``pi_f``) by flight id.
     - known_columns (dict[int, Column]): the incumbent column per flight, priced against as a
       cutoff.
     - deadline (float | None): absolute ``time.monotonic`` pricing deadline, or ``None``.
     - pool (PricingPool | None): caller-owned pool that outlives the sweep; ``None`` builds
       and tears one down here.
+    - heuristic_only (bool): request the existing CPU candidate-only search.
+    - platform (PricingPlatform | None): solve-scoped GPU runtime; None creates one here.
 
     Return
     --------
-    - output (SweepResult): the accepted prefix in ``pricing_order`` index order.
+    - output (SweepResult): ordered results with independent completion and proof status.
     """
 
-    if params.n_pricing_workers == 0:
-        return _sweep_sequential(
+    if isinstance(pool, PricingPool) and (
+        pool._cfg != cfg or pool._params != params or pool._catalog != catalog
+        or pool._request_definitions != tuple(_request_definition(r) for r in requests)
+    ):
+        raise ValueError("pricing pool does not match the current request/config/catalog snapshot")
+    if params.pricing_device == "gpu":
+        if pool is not None:
+            raise ValueError("GPU pricing cannot use a CPU pricing pool")
+        if heuristic_only:
+            raise ValueError("GPU pricing does not implement the CPU cheap-pricing stage")
+        result = _sweep_gpu(
             pricing_order, graphs, cfg, params, dual_view, flight_duals,
-            known_columns, deadline,
+            known_columns, deadline, platform,
         )
-    return _sweep_parallel(
-        pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-        known_columns, deadline, pool,
+    elif params.n_pricing_workers == 0:
+        if platform is not None:
+            raise ValueError("A GPU platform cannot be supplied to CPU pricing")
+        result = _sweep_sequential(
+            pricing_order, graphs, cfg, params, dual_view, flight_duals,
+            known_columns, deadline, heuristic_only,
+        )
+    else:
+        if platform is not None:
+            raise ValueError("A GPU platform cannot be supplied to CPU pricing")
+        result = _sweep_parallel(
+            pricing_order, requests, cfg, params, catalog, duals, flight_duals,
+            known_columns, deadline, pool, heuristic_only,
+        )
+    if params.pricing_device == "cpu" and (heuristic_only or not result.complete):
+        result = replace(result, certified=False,
+                         status="deadline" if not result.complete else "approximate")
+    return _receipt(result, requests, graphs, cfg, params, catalog)
+
+
+def _gpu_options(params: ColGenParams) -> PricingOptions:
+    """Resolve the GPU platform options shared by factory creation and reuse validation."""
+    return PricingOptions(
+        device="gpu", gpu_backend=params.pricing_gpu_backend,
+        cpu_recompute=params.pricing_cpu_recompute, max_labels=params.pricing_gpu_max_labels,
+        chunk_size=params.pricing_gpu_chunk_size,
+    )
+
+
+def make_pricing_platform(params: ColGenParams) -> PricingPlatform:
+    """Create a lazy GPU platform using the full solver's backend and resource settings.
+
+    Parameters
+    ------------
+    - params (ColGenParams): solver configuration selecting GPU pricing.
+
+    Return
+    --------
+    - output (PricingPlatform): reusable runtime; physical device creation occurs on first use.
+    """
+    if params.pricing_device != "gpu":
+        raise ValueError("make_pricing_platform requires GPU pricing parameters")
+    return PricingPlatform(_gpu_options(params))
+
+
+def _sweep_gpu(
+    pricing_order: list[int], graphs: Mapping[int, FlightGraph], cfg: SimConfig,
+    params: ColGenParams, dual_view: DualView, flight_duals: Mapping[int, float],
+    known_columns: Mapping[int, Column], deadline: float | None,
+    platform: PricingPlatform | None,
+) -> SweepResult:
+    """Run bounded GPU batches and retain feasible incumbents without inventing a bound.
+
+    Parameters
+    ------------
+    - pricing_order (list[int]): flight IDs in the master's required summation order.
+    - graphs (Mapping[int, FlightGraph]): parent-owned graphs and canonical column registries.
+    - cfg (SimConfig): shared geometry and occupancy-window configuration.
+    - params (ColGenParams): device, precision, batch and label limits.
+    - dual_view (DualView): complete fixed-price snapshot for this sweep.
+    - flight_duals (Mapping[int, float]): assignment prices by flight ID.
+    - known_columns (Mapping[int, Column]): feasible incumbent per flight when available.
+    - deadline (float | None): shared monotonic pricing deadline.
+    - platform (PricingPlatform | None): reusable physical GPU interface, or None.
+
+    Return
+    --------
+    - output (SweepResult): processed results in order, with independent completion and
+      optimality status. Unresolved batches retain valid columns but cannot certify.
+    """
+    if platform is None:
+        platform = make_pricing_platform(params)
+    elif platform.options != _gpu_options(params):
+        raise ValueError("pricing platform options do not match the current solver parameters")
+    model = cost_model(cfg, params)
+    ids: list[int] = []
+    scores: list[float] = []
+    bounds: list[float] = []
+    columns: list[Column | None] = []
+    records: list[dict[str, Any]] = []
+    counters: Counter[str] = Counter()
+    status = "complete" if params.pricing_cpu_recompute else "approximate"
+    certified = params.pricing_cpu_recompute
+    timeout_id = None
+    task_total_s = 0.0
+    started = time.perf_counter()
+    log.info("pricing sweep: %d flights on %s GPU, %s arithmetic",
+             len(pricing_order), params.pricing_gpu_backend,
+             "CPU-verified" if params.pricing_cpu_recompute else "unchecked FP32")
+    for start in range(0, len(pricing_order), params.pricing_gpu_batch_size):
+        if deadline is not None and time.monotonic() >= deadline:
+            status, certified, timeout_id = "deadline", False, pricing_order[start]
+            break
+        batch_ids = pricing_order[start:start + params.pricing_gpu_batch_size]
+        problems = [PricingProblem(graphs[fid], cfg, params, dual_view, flight_duals[fid],
+                                   known_column=known_columns.get(fid)) for fid in batch_ids]
+        batch_started = time.perf_counter()
+        results = platform.price_batch(problems, deadline=deadline)
+        batch_s = time.perf_counter() - batch_started
+        task_total_s += batch_s
+        if len(results) != len(batch_ids):
+            raise ValueError("GPU pricing returned an incomplete result vector")
+        counters["gpu_batches"] += 1
+        # The runtime repeats its shared work counts in each result. Sum each batch once.
+        for key in ("gpu_dispatches", "labels", "candidates", "cpu_recomputations",
+                    "verified_prunes", "gpu_prune_proposals", "canonical_validations",
+                    "grouped_labels"):
+            counter = key if key.startswith("gpu_") else f"gpu_{key}"
+            counters[counter] += int(results[0].stats.get(key, 0))
+        batch_complete = True
+        for position, (fid, result) in enumerate(zip(batch_ids, results, strict=True)):
+            if result.flight_id != fid or (
+                result.column is not None and result.column.flight_id != fid
+            ):
+                raise ValueError("GPU pricing returned a result for the wrong flight")
+            if result.certified and (
+                not result.search_complete or result.upper_bound is None
+                or not result.upper_bound >= result.reduced_cost
+            ):
+                raise ValueError("GPU pricing certificate does not bound its reduced cost")
+            if not result.certified:
+                certified = False
+                if status == "complete":
+                    status = "approximate"
+            if not result.search_complete:
+                if batch_complete:
+                    status = result.status
+                    if status in {"complete", "approximate"}:
+                        status = "incomplete"
+                batch_complete, certified = False, False
+                if result.status == "deadline" and timeout_id is None:
+                    timeout_id = fid
+            ids.append(fid)
+            scores.append(float(result.reduced_cost))
+            bounds.append(float(result.upper_bound) if result.certified else float("inf"))
+            columns.append(result.column)
+            record = _flight_record(fid, batch_s / len(batch_ids), priced=True, search={
+                "pricing_backend": result.backend,
+                "pricing_certified": result.certified,
+                "search_complete": result.search_complete,
+                "pricing_status": result.status,
+                "cpu_recompute": result.cpu_recompute,
+                "upper_bound": result.upper_bound,
+                "device_name": result.stats.get("device_name"),
+                "gpu_batch_index": counters["gpu_batches"] - 1,
+                "gpu_batch_size": len(batch_ids),
+                "timing_scope": "batch_share",
+                "_canonical_pricing_result": (
+                    result.column is None or is_certified_column(result.column, graphs[fid], model)
+                ),
+            })
+            if position == 0:
+                record["gpu_batch_stats"] = dict(result.stats, wall_s=batch_s)
+            records.append(record)
+        log.info("  GPU priced %d/%d flights (%s)", len(ids), len(pricing_order), status)
+        if not batch_complete:
+            break
+    return SweepResult(
+        tuple(ids), tuple(scores), tuple(columns), timeout_id,
+        task_total_s=task_total_s, wall_s=time.perf_counter() - started,
+        kernel_counters=counters, flight_records=tuple(records),
+        certified=certified, status=status, upper_bounds=tuple(bounds),
     )
 
 
 def _sweep_sequential(
-    pricing_order, graphs, cfg, params, dual_view, flight_duals, known_columns, deadline
+    pricing_order, graphs, cfg, params, dual_view, flight_duals, known_columns, deadline,
+    heuristic_only=False,
 ) -> SweepResult:
     """The original in-process loop, kept verbatim as the parity baseline.
 
@@ -870,6 +1155,7 @@ def _sweep_sequential(
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    extra_columns: list[Column] = []
     task_total_s = 0.0
     before = Counter(kernel_stats())
     # Built here too, and not only in the pool: the two arms must report the same SHAPE or
@@ -885,6 +1171,8 @@ def _sweep_sequential(
     for flight_id in pricing_order:
         task_started = time.perf_counter()
         clear_search_record()
+        extras = []
+        extra_kwargs = {"additional_columns": extras} if params.columns_per_flight > 1 else {}
         try:
             reduced_cost, column = price_flight(
                 graphs[flight_id],
@@ -892,6 +1180,8 @@ def _sweep_sequential(
                 flight_duals[flight_id],
                 cfg,
                 params,
+                **extra_kwargs,
+                heuristic_only=heuristic_only,
                 known_column=known_columns.get(flight_id),
                 deadline=deadline,
             )
@@ -904,13 +1194,18 @@ def _sweep_sequential(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, time.perf_counter() - sweep_started,
                 Counter(kernel_stats()) - before, tuple(records),
+                extra_columns=tuple(extra_columns),
             )
         task_s = time.perf_counter() - task_started
-        records.append(_flight_record(flight_id, task_s, priced=True))
+        record = _flight_record(flight_id, task_s, priced=True)
+        record["_canonical_pricing_result"] = _certified_result(
+            column, extras, graphs[flight_id], params, cfg)
+        records.append(record)
         task_total_s += task_s
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        extra_columns.extend(extras)
         progress.advance(len(flight_ids))
     progress.finish(len(flight_ids), complete=True)
     # One worker's worth of work, by definition -- which is what makes it the denominator
@@ -919,6 +1214,7 @@ def _sweep_sequential(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, time.perf_counter() - sweep_started,
         Counter(kernel_stats()) - before, tuple(records),
+        extra_columns=tuple(extra_columns),
     )
 
 
@@ -1009,7 +1305,8 @@ class PricingPool:
         --------
         - output (None): raises ``ValueError`` when ``n_pricing_workers`` is not positive.
         """
-        self._requests = list(requests)
+        self._requests = pickle.loads(pickle.dumps(list(requests), protocol=pickle.HIGHEST_PROTOCOL))
+        self._request_definitions = tuple(_request_definition(r) for r in self._requests)
         self._cfg = cfg
         self._params = params
         self._catalog = catalog
@@ -1124,7 +1421,8 @@ class PricingPool:
         return time.perf_counter() - started
 
     def run_sweep(
-        self, pricing_order, duals, flight_duals, known_columns, deadline
+        self, pricing_order, duals, flight_duals, known_columns, deadline,
+        heuristic_only=False,
     ) -> SweepResult:
         """Price one sweep across the workers, in ``pricing_order`` order.
 
@@ -1190,6 +1488,7 @@ class PricingPool:
                 {f: flight_duals[f] for f in own if f in flight_duals},
                 {f: c for f, c in known_columns.items() if f in own},
                 deadline,
+                heuristic_only,
             ))
             # ONE message carrying every flight this worker owns, rather than one per chunk:
             # it is a list of ints, so it cannot fill the pipe, and the worker streams the
@@ -1310,7 +1609,7 @@ class PricingPool:
 
 def _sweep_parallel(
     pricing_order, requests, cfg, params, catalog, duals, flight_duals,
-    known_columns, deadline, pool: "PricingPool | None" = None,
+    known_columns, deadline, pool: "PricingPool | None" = None, heuristic_only=False,
 ) -> SweepResult:
     """Fan the sweep across the workers, on a caller-owned pool when there is one.
 
@@ -1339,9 +1638,11 @@ def _sweep_parallel(
     """
 
     if pool is not None:
-        return pool.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline)
+        return pool.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline,
+                              heuristic_only)
     with PricingPool(requests, cfg, params, catalog) as own:
-        return own.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline)
+        return own.run_sweep(pricing_order, duals, flight_duals, known_columns, deadline,
+                             heuristic_only)
 
 
 def _price_batch(task):
@@ -1485,12 +1786,15 @@ def _accepted_prefix(results) -> SweepResult:
     flight_ids: list[int] = []
     reduced_costs: list[float] = []
     columns: list[Column | None] = []
+    extra_columns: list[Column] = []
     task_total_s = 0.0
     # `Counter.update` ADDS where `dict.update` would REPLACE, which is the whole reason
     # this is a Counter: a plain dict here would silently report only the last task's tally.
     counters: Counter[str] = Counter()
     records: list[dict[str, Any]] = []
-    for flight_id, priced, reduced_cost, column, task_s, deltas, search in results:
+    for result in results:
+        flight_id, priced, reduced_cost, column, task_s, deltas, search = result[:7]
+        extras = result[7] if len(result) > 7 else ()
         if not priced:
             # Past the first gap nothing is accepted, so returning here stops consuming --
             # which abandons the outstanding tasks, and leaving the caller's `with` block
@@ -1509,6 +1813,7 @@ def _accepted_prefix(results) -> SweepResult:
             return SweepResult(
                 tuple(flight_ids), tuple(reduced_costs), tuple(columns), flight_id,
                 task_total_s, 0.0, counters, tuple(records),
+                extra_columns=tuple(extra_columns),
             )
         records.append(_flight_record(flight_id, task_s, priced=True, search=search))
         task_total_s += task_s
@@ -1516,7 +1821,9 @@ def _accepted_prefix(results) -> SweepResult:
         flight_ids.append(flight_id)
         reduced_costs.append(float(reduced_cost))
         columns.append(column)
+        extra_columns.extend(extras)
     return SweepResult(
         tuple(flight_ids), tuple(reduced_costs), tuple(columns), None,
         task_total_s, 0.0, counters, tuple(records),
+        extra_columns=tuple(extra_columns),
     )

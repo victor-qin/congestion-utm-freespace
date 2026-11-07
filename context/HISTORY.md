@@ -2,6 +2,14 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
+- 2026-11-07T07:20Z [CODE] A clean textual merge does not update hand-copied request schemas.
+  Integrating PR133 with the round-trip model left `paired_outbound_id` in graph snapshots,
+  positional pickle reconstruction and worker identity checks, breaking graph construction and
+  transport. Update all three together when `FlightRequest` changes, and test reconstruction plus
+  rejection of mutated inputs. Files: `freespace_sim/types.py`,
+  `freespace_sim/planner/colgen/{network,pricing_pool}.py`,
+  `tests/test_colgen_{network,pricing_certification}.py`.
+
 - 2026-09-08T20:40Z `[CODE]` `verified` means INTERflight separation only: `find_interflight_conflict`
   replays intents in order and checks each against the flights committed BEFORE it, never against
   itself. A round-trip itinerary files both legs and its pad hold as ONE flight, so anything wrong
@@ -158,3 +166,9 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `plans_terminal_airspace` is now declared only by colgen, so `sim._wall_aware` admits A*-reaching
   chains and colgen and nothing else. Files: `freespace_sim/planner/__init__.py`, `freespace_sim/sim.py`,
   `freespace_sim/metrics.py`.
+
+- 2026-11-06T19:04Z [CODE/TOOL] GPU pricing: an absent/unbuilt bound is not a proved unreachable state. Infinity was initially allowed to propose false deletions when the optional future table was missing; FP64 checking caught this in certified mode but unchecked FP32 needed the same presence guard. Keep explicit availability checks in `freespace_sim/planner/colgen/pricing_gpu.h`, `gpu_pricing.py` and `gpu_future.py`. A cap or incomplete table must return no certificate. Canonical validation of returned routes cannot detect alternatives already discarded incorrectly; cover the upper bound with exhaustive tiny-route tests in `tests/test_colgen_pricing_platform.py` and `test_colgen_gpu_future.py`.
+- 2026-09-11T01:30Z [CODE/TOOL] PR #133: certify shifted-column claims and model cost **before** using their reduced cost as a pruning cutoff. At fractional time steps and large absolute clocks, shifting integer claim timestamps can differ from rebuilding endpoint windows; later parent validation cannot repair search branches already pruned by the wrong cutoff. Keep the exact-shift guard and canonical fallback in `freespace_sim/planner/colgen/network.py` and `pricing.py`; regression in `tests/test_colgen_pricing_certification.py`.
+- 2026-09-11T01:30Z [CODE/TOOL] PR #133: pricing parity includes processing order and incumbent updates, not just transition costs. Epsilon-based dominance is non-transitive, and completion-envelope lengths depend on the incumbent at first use. Reordering, sharing incumbent-dependent envelopes, or delaying sink certification can change retained labels. Preserve these contracts when changing `freespace_sim/planner/colgen/dp_kernel.py`, `dp_prepare.py`, and `pricing.py`; test against the reference as well as independently checking final claims/costs.
+- 2026-09-11T01:30Z [CODE/TOOL] PR #133: a cheaper bootstrap is not necessarily cheaper pricing. The first-goal-only experiment left a weak cutoff and exhausted 67M main-DP labels on flight 1640. Measure bootstrap plus main time and difficult-flight tails before removing restricted refinement in `freespace_sim/planner/colgen/pricing.py`. See `context/colgen.md` and the historical evidence indexed by `analysis/colgen/results.json`.
+- 2026-09-11T03:25Z [CODE/TOOL] PR #133: construct earlier-departure costs from absolute ground delay and preserved air terms, not subtraction from a weighted total. With a 0.7-second step, ground weight 0.3, and seven delayed steps, subtraction gives a negative nominal cost and aborts initialization. The centered-ladder regression in `tests/test_colgen_seed_initialization.py` requires exact canonical cost through the supplied departure; ordinary forward ladders remain unchanged.

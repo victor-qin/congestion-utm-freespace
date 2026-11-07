@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import pickle
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -15,6 +16,7 @@ from freespace_sim.planner.colgen import pricing_pool
 from freespace_sim.planner.colgen.network import StaticTerminalCatalog, build_flight_graph
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView
+from freespace_sim.planner.colgen.pricing_platform import PricingResult
 from freespace_sim.planner.colgen.pricing_pool import (
     PricingPool,
     StalePricingWorker,
@@ -25,6 +27,7 @@ from freespace_sim.planner.colgen.pricing_pool import (
     price_sweep,
 )
 from freespace_sim.planner.colgen.solver import ColGenSolver
+from freespace_sim.planner.colgen.translate import Column
 from freespace_sim.types import FlightRequest, vec
 
 
@@ -52,6 +55,8 @@ def _request(flight_id: int, origin, destination, cfg: SimConfig) -> FlightReque
 def _params(**overrides) -> ColGenParams:
     values = {
         "solver": "highs",
+        "iteration_ip_time_limit_s": 0.0,
+        "lp_gap": 1e-4,
         "max_air_overrun_hops": 0,
         "max_iterations": 3,
         "time_limit_s": 120.0,
@@ -129,6 +134,9 @@ def test_sweep_result_reports_completeness_from_the_timeout_field():
     complete = SweepResult((1, 2), (0.5, 0.25), (None, None), None)
     assert complete.complete
     assert not SweepResult((1,), (0.5,), (None,), 2).complete
+    assert replace(complete, status="approximate", certified=False).complete
+    for status in ("label_limit", "deadline", "unsupported"):
+        assert not replace(complete, status=status, certified=False).complete
 
 
 def test_parallel_sweep_returns_exactly_the_sequential_answer():
@@ -196,7 +204,8 @@ def test_an_expired_deadline_yields_an_empty_prefix_in_both_paths(n_workers):
     assert result.columns == ()
 
 
-def test_a_timeout_discards_later_results_that_completed():
+@pytest.mark.parametrize("multiple", [False, True])
+def test_a_timeout_discards_later_results_that_completed(multiple):
     """The rule the module exists for, on the sequence neither arm above can produce.
 
     The deadline is a wall clock, so `price_sweep` is either past it -- every flight times
@@ -206,11 +215,16 @@ def test_a_timeout_discards_later_results_that_completed():
     admits a column the sequential sweep would have stopped before reaching.
     """
 
-    accepted = _accepted_prefix(iter([
+    extras = [Column(fid, 1, 0, None, None, ((0, 0), (1, 0)), 1.0) for fid in (7, 3, 9)]
+    rows = [
         (7, True, 0.5, None, 1.0, {"priced": 1}, {}),
         (3, False, 0.0, None, 0.25, {}, {}),
         (9, True, 4.0, None, 8.0, {"priced": 1, "fell_back": 1}, {}),
-    ]))
+    ]
+    if multiple:
+        rows = [row + ((extra,),) for row, extra in zip(rows, extras, strict=True)]
+    accepted = _accepted_prefix(iter(rows))
+    assert accepted.extra_columns == ((extras[0],) if multiple else ())
 
     assert accepted.flight_ids == (7,)
     assert accepted.reduced_costs == (0.5,)
@@ -1085,3 +1099,121 @@ def test_results_already_in_the_pipe_survive_an_expired_deadline():
     assert accepted.flight_ids == (10,), "a delivered result was dropped by the deadline"
     assert accepted.timeout_flight_id == 11
     assert not accepted.complete
+
+
+@pytest.mark.parametrize("columns_per_flight", [1, 3])
+@pytest.mark.parametrize("transport", ["sequential", "worker"])
+def test_sweep_transports_extras_without_extra_bound_terms(monkeypatch, columns_per_flight, transport):
+    """Extra routes travel with their flight while the certificate has one term per flight."""
+    extra = Column(7, 1, 0, None, None, ((0, 0), (1, 0)), 1.0)
+
+    def fake_price(*args, **kwargs):
+        if columns_per_flight > 1:
+            kwargs["additional_columns"].append(extra)
+        else:
+            assert "additional_columns" not in kwargs
+        return 2.0, None
+
+    monkeypatch.setattr(pricing_pool, "price_flight", fake_price)
+    params = _params(columns_per_flight=columns_per_flight)
+    if transport == "sequential":
+        result = pricing_pool._sweep_sequential(
+            [7], {7: None}, None, params, None, {7: 0.0}, {}, None,
+        )
+    else:
+        epoch = ("test", 1)
+        monkeypatch.setattr(pricing_pool, "_WORKER", dict(
+            sweep=(epoch, None, {7: 0.0}, {}, None, False), worker_flights={7},
+            graphs={7: None}, cfg=None, params=params,
+        ))
+        # Exercise the serialization boundary as well as prefix acceptance.
+        worker_result = pickle.loads(pickle.dumps(pricing_pool._price_one(epoch, 7)))
+        result = _accepted_prefix([worker_result])
+    assert result.flight_ids == (7,)
+    assert result.reduced_costs == (2.0,)
+    assert result.columns == (None,)
+    assert result.extra_columns == ((extra,) if columns_per_flight > 1 else ())
+
+
+@pytest.mark.parametrize("failure_id", [7, 3])
+@pytest.mark.parametrize("stop", ["complete", "approximate", "label_limit", "deadline", "unsupported"])
+def test_gpu_sweep_preserves_certificates_columns_and_batch_counts(monkeypatch, stop, failure_id):
+    """GPU results keep their proof status and useful incumbents without CPU pricing fallback."""
+    from freespace_sim.planner.colgen.objective import cost_model
+    from freespace_sim.planner.colgen.pricing import seed_column
+
+    cfg = _cfg(max_ground_delay_s=4.0)
+    params = _params(pricing_device="gpu", pricing_gpu_backend="metal",
+                     pricing_cpu_recompute=stop != "approximate", pricing_gpu_batch_size=2)
+    catalog = StaticTerminalCatalog((), cfg)
+    order = [7, 3, 9]
+    requests = [_request(fid, (0, 0), (2, 0), cfg) for fid in order]
+    graphs = {r.flight_id: build_flight_graph(r, cfg, catalog, params) for r in requests}
+    model = cost_model(cfg, params)
+    seeds = {fid: seed_column(graph, cfg, model=model) for fid, graph in graphs.items()}
+    platform = pricing_pool.make_pricing_platform(params)
+    calls = []
+
+    def no_cpu(*args, **kwargs):
+        raise AssertionError("A GPU sweep must not silently rerun CPU pricing")
+
+    def batch(problems, deadline=None):
+        calls.append(tuple(p.graph.request.flight_id for p in problems))
+        results = []
+        for problem in problems:
+            fid = problem.graph.request.flight_id
+            status = stop if (stop == "approximate" or fid == failure_id) else "complete"
+            complete = status in {"complete", "approximate"}
+            certified = status == "complete"
+            column = seeds[fid]
+            rc = params.M - column.delay_s
+            results.append(PricingResult(
+                fid, rc, column, rc + 1e-7 if certified else None, complete, certified,
+                "metal", params.pricing_cpu_recompute, status,
+                {"gpu_dispatches": 6, "labels": 25, "cpu_recomputations": 10},
+            ))
+        return tuple(results)
+
+    monkeypatch.setattr(platform, "price_batch", batch)
+    monkeypatch.setattr(pricing_pool, "price_flight", no_cpu)
+    monkeypatch.setattr(pricing_pool, "_sweep_parallel", no_cpu)
+    monkeypatch.setattr(pricing_pool, "_sweep_sequential", no_cpu)
+    result = price_sweep(order, requests, graphs, cfg, params, catalog, {}, DualView({}, cfg),
+                         dict.fromkeys(order, 0.0), {}, platform=platform)
+    all_complete = stop in {"complete", "approximate"}
+    assert calls == ([(7, 3), (9,)] if all_complete else [(7, 3)])
+    assert result.complete == all_complete
+    assert result.certified == (stop == "complete")
+    assert result.status == stop
+    assert result.timeout_flight_id == (failure_id if stop == "deadline" else None)
+    assert result.flight_ids == tuple(order if all_complete else order[:2])
+    assert result.columns == tuple(seeds[fid] for fid in result.flight_ids)
+    assert result.reduced_costs == tuple(params.M - seeds[fid].delay_s for fid in result.flight_ids)
+    for score, bound, record in zip(
+        result.reduced_costs, result.upper_bounds, result.flight_records, strict=True,
+    ):
+        assert bound == (score + 1e-7 if record["pricing_certified"] else float("inf"))
+    assert pricing_pool.certified_sweep_columns(result, graphs, cfg, params, catalog) == result.columns
+    assert result.kernel_counters["gpu_dispatches"] == 6 * len(calls)
+    assert result.kernel_counters["gpu_labels"] == 25 * len(calls)
+    assert result.kernel_counters["gpu_cpu_recomputations"] == 10 * len(calls)
+    assert result.kernel_counters["gpu_batches"] == len(calls)
+    assert sum("gpu_batch_stats" in record for record in result.flight_records) == len(calls)
+    assert all(record["_canonical_pricing_result"] for record in result.flight_records)
+
+
+@pytest.mark.parametrize("bound", [0.5, float("nan"), None])
+def test_gpu_sweep_rejects_an_invalid_certified_bound(monkeypatch, bound):
+    """A certified upper bound must exist and cover the returned incumbent score."""
+    cfg = _cfg(max_ground_delay_s=4.0)
+    params = _params(pricing_device="gpu", pricing_gpu_backend="metal")
+    request = _request(7, (0, 0), (2, 0), cfg)
+    catalog = StaticTerminalCatalog((), cfg)
+    graph = build_flight_graph(request, cfg, catalog, params)
+    platform = pricing_pool.make_pricing_platform(params)
+    monkeypatch.setattr(platform, "price_batch", lambda *a, **k: (
+        PricingResult(7, 1.0, None, bound, True, True, "metal", True, "complete"),
+    ))
+    with pytest.raises(ValueError, match="certificate"):
+        price_sweep([7], [request], {7: graph}, cfg, params, catalog, {}, DualView({}, cfg),
+                    {7: 0.0}, {}, platform=platform)

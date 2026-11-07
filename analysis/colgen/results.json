@@ -1,0 +1,789 @@
+{
+  "cases": {
+    "baseline_seed0": {
+      "accepted": 1537,
+      "algorithm_params_sha": "2d9787c8bae7c4dbacbf6d720bf65eef016370dc9ac9f1be2c8e855e25d8813d",
+      "columns": 42879,
+      "congestion_cost": 156817.30255254533,
+      "denied": 0,
+      "final_lp_gap_cost": 0.0008520122267288545,
+      "global_cost_gap": 0.011825996423121772,
+      "input_sha": "2f1ebdcf33fe11aa72132c933d128246636e3f371a47c9bd521086e7886481ba",
+      "ip_status": "optimal",
+      "ip_wall_s": 20.85087970783934,
+      "iteration_ip_wall_s": 352.5822890389245,
+      "iterations": 11,
+      "n_requests": 1537,
+      "per_flight_timings": {
+        "bootstrap_goal_s": {
+          "count": 16907,
+          "max_s": 0.38796787499450147,
+          "mean_s": 0.00699909216453428,
+          "median_s": 0.0,
+          "p95_s": 0.033045974886044854,
+          "total_s": 118.33365122578107
+        },
+        "bootstrap_s": {
+          "count": 16907,
+          "max_s": 2.668571542017162,
+          "mean_s": 0.12535120717040157,
+          "median_s": 0.06672420888207853,
+          "p95_s": 0.4407029124442478,
+          "total_s": 2119.3128596299794
+        },
+        "compiled_s": {
+          "count": 16907,
+          "max_s": 4.296218750067055,
+          "mean_s": 0.14545937639890233,
+          "median_s": 0.1364335420075804,
+          "p95_s": 0.26424490897916253,
+          "total_s": 2459.2816767762415
+        },
+        "fallback_s": {
+          "count": 16907,
+          "max_s": 0.0,
+          "mean_s": 0.0,
+          "median_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0.0
+        },
+        "task_s": {
+          "count": 16907,
+          "max_s": 4.504041458945721,
+          "mean_s": 0.2757028645797175,
+          "median_s": 0.22308754082769156,
+          "p95_s": 0.6833891875343389,
+          "total_s": 4661.308331449283
+        }
+      },
+      "pricing_wall_s": 560.8002036251128,
+      "requests_sha": "454a98b0b14c34540a1329531aba6af958890ed86e06d0ce6687e03131720693",
+      "restricted_ip_gap": 1.6628925293811667e-13,
+      "simulation_wall_s": 1198.650061167078,
+      "stage_s": {
+        "add_column": 8.674018759513274,
+        "add_violated_rows": 73.67865012679249,
+        "canonical_heuristic": 3.1140067058149725,
+        "canonical_iteration_ip": 10.894276833161712,
+        "canonical_priced": 91.88610139954835,
+        "iteration_ip": 337.0291621661745,
+        "solve_lp": 87.78245258308016
+      },
+      "trace_hashes": {
+        "column_identities_sha256": "ec549cc1bd23578377e9eb2288d85996faded0ef599a954476b5050265a410dd",
+        "column_numbers_sha256": "bb4834f38ef22e1a5afea296c32e75fda4029a110afe4e681c2d048fce706e11",
+        "paths_jsonl_sha256": "14d021709698f7a92d0d4e2e314be73446e43349744c15b60876c796d32e4786",
+        "semantic_iterations_sha256": "e13d33fb91c84c3de3daff40f67854cf410107e45ee2c3ff5bcc16d79a3bb6aa"
+      },
+      "trajectory_sha": "4a99c3005d15df0fcdcc4d7b6ddd3a296260ecfdbe3ed735e64ee05004d38ce3",
+      "verified": true
+    },
+    "baseline_seed1": {
+      "accepted": 1545,
+      "algorithm_params_sha": "2d9787c8bae7c4dbacbf6d720bf65eef016370dc9ac9f1be2c8e855e25d8813d",
+      "columns": 45568,
+      "congestion_cost": 161135.99633414706,
+      "denied": 0,
+      "final_lp_gap_cost": 0.000717475378373292,
+      "global_cost_gap": 0.008954789047231368,
+      "input_sha": "a0151cd58080414c6f596d52172a098267739e468fb9c685defbc4b3b03adb2a",
+      "ip_status": "optimal",
+      "ip_wall_s": 18.64335204102099,
+      "iteration_ip_wall_s": 408.9569245001767,
+      "iterations": 14,
+      "n_requests": 1545,
+      "per_flight_timings": {
+        "bootstrap_goal_s": {
+          "count": 21630,
+          "max_s": 0.40218483307398856,
+          "mean_s": 0.006980722324282854,
+          "median_s": 0.0,
+          "p95_s": 0.03552099561784416,
+          "total_s": 150.99302387423813
+        },
+        "bootstrap_s": {
+          "count": 21630,
+          "max_s": 2.09357325010933,
+          "mean_s": 0.11407591728403152,
+          "median_s": 0.06412745837587863,
+          "p95_s": 0.37509965635836084,
+          "total_s": 2467.4620908536017
+        },
+        "compiled_s": {
+          "count": 21630,
+          "max_s": 7.654580709058791,
+          "mean_s": 0.1529657195242883,
+          "median_s": 0.1347713335417211,
+          "p95_s": 0.269805452064611,
+          "total_s": 3308.648513310356
+        },
+        "fallback_s": {
+          "count": 21630,
+          "max_s": 0.0,
+          "mean_s": 0.0,
+          "median_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0.0
+        },
+        "task_s": {
+          "count": 21630,
+          "max_s": 9.169680416816846,
+          "mean_s": 0.27179369247902546,
+          "median_s": 0.2177747500827536,
+          "p95_s": 0.644710773252882,
+          "total_s": 5878.897568321321
+        }
+      },
+      "pricing_wall_s": 746.8246072083712,
+      "requests_sha": "1220b09b6ded39759688f7069df8719e11595917da9174ea2c8d11c522792b37",
+      "restricted_ip_gap": 0.0,
+      "simulation_wall_s": 1499.8903689999133,
+      "stage_s": {
+        "add_column": 10.547723178518936,
+        "add_violated_rows": 90.66524908319116,
+        "canonical_heuristic": 3.0431367908604443,
+        "canonical_iteration_ip": 16.487083540065214,
+        "canonical_priced": 106.46521275280975,
+        "iteration_ip": 386.85980116715655,
+        "solve_lp": 123.49430083436891
+      },
+      "trace_hashes": {
+        "column_identities_sha256": "e58b645086a4c14bb9f1b60a6df4f8343331a85a833b0219d6da55bc99993fd9",
+        "column_numbers_sha256": "1194ed57e751de8ae43093e71f2b8a290971fccaf102beb80cffe3213732a309",
+        "paths_jsonl_sha256": "d1b3889707e933e21b5f2d52cfd7d14db1580f8badaa03a32816fd2ca6a70357",
+        "semantic_iterations_sha256": "0b9238f612aadae560bcfd1c74a0c75a553074971bb45b5c7777de65b9a5fd5d"
+      },
+      "trajectory_sha": "18191790074abce9b86d3e88aaf547dfc8cbac3ca677ca9361331ffa3b29de1e",
+      "verified": true
+    },
+    "combined_seed0": {
+      "accepted": 1537,
+      "algorithm_params_sha": "2d9787c8bae7c4dbacbf6d720bf65eef016370dc9ac9f1be2c8e855e25d8813d",
+      "columns": 42879,
+      "congestion_cost": 156817.30255254533,
+      "denied": 0,
+      "final_lp_gap_cost": 0.0008520122267288545,
+      "global_cost_gap": 0.011825996423121772,
+      "input_sha": "2f1ebdcf33fe11aa72132c933d128246636e3f371a47c9bd521086e7886481ba",
+      "ip_status": "optimal",
+      "ip_wall_s": 20.33353558392264,
+      "iteration_ip_wall_s": 374.12152033508755,
+      "iterations": 11,
+      "n_requests": 1537,
+      "per_flight_timings": {
+        "bootstrap_goal_s": {
+          "count": 16907,
+          "max_s": 0.3915378749370575,
+          "mean_s": 0.006938702988690542,
+          "median_s": 0.0,
+          "p95_s": 0.03284104987978935,
+          "total_s": 117.312651429791
+        },
+        "bootstrap_s": {
+          "count": 16907,
+          "max_s": 2.603568624937907,
+          "mean_s": 0.1240718830773338,
+          "median_s": 0.06664645904675126,
+          "p95_s": 0.4376306372927499,
+          "total_s": 2097.6833271884825
+        },
+        "compiled_s": {
+          "count": 16907,
+          "max_s": 4.20920450007543,
+          "mean_s": 0.14498013994127026,
+          "median_s": 0.13531287503428757,
+          "p95_s": 0.26452970004174853,
+          "total_s": 2451.1792259870563
+        },
+        "fallback_s": {
+          "count": 16907,
+          "max_s": 0.0,
+          "mean_s": 0.0,
+          "median_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0.0
+        },
+        "task_s": {
+          "count": 16907,
+          "max_s": 4.4066622499376535,
+          "mean_s": 0.27701036558117614,
+          "median_s": 0.22674287506379187,
+          "p95_s": 0.6800656128209084,
+          "total_s": 4683.4142508809455
+        }
+      },
+      "pricing_wall_s": 472.0306743341498,
+      "requests_sha": "454a98b0b14c34540a1329531aba6af958890ed86e06d0ce6687e03131720693",
+      "restricted_ip_gap": 1.6628925293811667e-13,
+      "simulation_wall_s": 1065.784349041991,
+      "stage_s": {
+        "add_column": 8.902837063418701,
+        "add_violated_rows": 9.73699112678878,
+        "canonical_heuristic": 3.1040582498535514,
+        "canonical_iteration_ip": 32.868572587147355,
+        "iteration_ip": 336.61048587667756,
+        "pricing_certificate_check": 0.0045833352487534285,
+        "solve_lp": 87.47927945945412
+      },
+      "trace_hashes": {
+        "column_identities_sha256": "ec549cc1bd23578377e9eb2288d85996faded0ef599a954476b5050265a410dd",
+        "column_numbers_sha256": "bb4834f38ef22e1a5afea296c32e75fda4029a110afe4e681c2d048fce706e11",
+        "paths_jsonl_sha256": "14d021709698f7a92d0d4e2e314be73446e43349744c15b60876c796d32e4786",
+        "semantic_iterations_sha256": "e13d33fb91c84c3de3daff40f67854cf410107e45ee2c3ff5bcc16d79a3bb6aa"
+      },
+      "trajectory_sha": "4a99c3005d15df0fcdcc4d7b6ddd3a296260ecfdbe3ed735e64ee05004d38ce3",
+      "verified": true
+    },
+    "combined_seed1": {
+      "accepted": 1545,
+      "algorithm_params_sha": "2d9787c8bae7c4dbacbf6d720bf65eef016370dc9ac9f1be2c8e855e25d8813d",
+      "columns": 45568,
+      "congestion_cost": 161135.99633414706,
+      "denied": 0,
+      "final_lp_gap_cost": 0.000717475378373292,
+      "global_cost_gap": 0.008954789047231368,
+      "input_sha": "a0151cd58080414c6f596d52172a098267739e468fb9c685defbc4b3b03adb2a",
+      "ip_status": "optimal",
+      "ip_wall_s": 19.526332583045587,
+      "iteration_ip_wall_s": 446.65887029259466,
+      "iterations": 14,
+      "n_requests": 1545,
+      "per_flight_timings": {
+        "bootstrap_goal_s": {
+          "count": 21630,
+          "max_s": 0.39083841699175537,
+          "mean_s": 0.006985809038336364,
+          "median_s": 0.0,
+          "p95_s": 0.03579974799649788,
+          "total_s": 151.10304949921556
+        },
+        "bootstrap_s": {
+          "count": 21630,
+          "max_s": 2.0648356669116765,
+          "mean_s": 0.11326636452336765,
+          "median_s": 0.06372904148884118,
+          "p95_s": 0.3723841810831799,
+          "total_s": 2449.9514646404423
+        },
+        "compiled_s": {
+          "count": 21630,
+          "max_s": 7.330949499970302,
+          "mean_s": 0.15317267683828512,
+          "median_s": 0.13433081249240786,
+          "p95_s": 0.2739303356735035,
+          "total_s": 3313.125000012107
+        },
+        "fallback_s": {
+          "count": 21630,
+          "max_s": 0.0,
+          "mean_s": 0.0,
+          "median_s": 0.0,
+          "p95_s": 0.0,
+          "total_s": 0.0
+        },
+        "task_s": {
+          "count": 21630,
+          "max_s": 8.962334749987349,
+          "mean_s": 0.27421852073983527,
+          "median_s": 0.22177502105478197,
+          "p95_s": 0.640796693705488,
+          "total_s": 5931.346603602637
+        }
+      },
+      "pricing_wall_s": 644.5771849176381,
+      "requests_sha": "1220b09b6ded39759688f7069df8719e11595917da9174ea2c8d11c522792b37",
+      "restricted_ip_gap": 0.0,
+      "simulation_wall_s": 1345.4894493748434,
+      "stage_s": {
+        "add_column": 10.743037694366649,
+        "add_violated_rows": 3.1466207078192383,
+        "canonical_heuristic": 3.0183228771202266,
+        "canonical_iteration_ip": 45.83592691645026,
+        "iteration_ip": 395.1046136249788,
+        "pricing_certificate_check": 0.005803168285638094,
+        "solve_lp": 122.09426024835557
+      },
+      "trace_hashes": {
+        "column_identities_sha256": "e58b645086a4c14bb9f1b60a6df4f8343331a85a833b0219d6da55bc99993fd9",
+        "column_numbers_sha256": "1194ed57e751de8ae43093e71f2b8a290971fccaf102beb80cffe3213732a309",
+        "paths_jsonl_sha256": "d1b3889707e933e21b5f2d52cfd7d14db1580f8badaa03a32816fd2ca6a70357",
+        "semantic_iterations_sha256": "c778ecb61493e921af9cecc26c0bf1772341b8ec1416938b1d3794b96c8853f4"
+      },
+      "trajectory_sha": "846affc311ba2df9b1983ffee5d9d99b9e8a452c976092f922db2001dde3d0d1",
+      "verified": true
+    }
+  },
+  "configuration": {
+    "bootstrap_method": "astar",
+    "columns_per_flight": 1,
+    "demand_seconds": 1200,
+    "gurobi_threads": 4,
+    "ip_gap": 0,
+    "ip_reserve_s": 660,
+    "ip_time_limit_s": 600,
+    "iteration_ip_time_limit_s": 30,
+    "lp_gap": 0.001,
+    "max_air_overrun_hops": 6,
+    "max_iterations": 30,
+    "outbound_only": true,
+    "pricing_workers": 12,
+    "scenario": "density_faa_wing_zipline",
+    "seed_ladder_steps": 20,
+    "seed_nominal_routes": true,
+    "time_limit_s": 14460
+  },
+  "earlier_experiments": {
+    "path_comparison": {
+      "cost_delta": 0.0,
+      "input_hash_parity": {
+        "config": true,
+        "full_algorithm_params": true,
+        "inputs": true,
+        "requests": true,
+        "static_terminals": true
+      },
+      "limitation": "Column trace omits capacity claims and per-round dual vectors; claims parity is unavailable.",
+      "pricing_wall_s": {
+        "baseline": 730.7034136254806,
+        "candidate": 641.6439908349421
+      },
+      "simulation_wall_s": {
+        "baseline": 1356.3325799170416,
+        "candidate": 1256.2058632920962
+      },
+      "timing_change_percent": {
+        "ip_wall_s": 0.7362595033400865,
+        "iteration_ip_wall_s": -0.8366430633125033,
+        "pricing_wall_s": -12.188176643196247,
+        "simulation_wall_s": -7.38216556230401,
+        "solver_wall_s": -7.400464335614965
+      }
+    },
+    "shared_preparation_and_compiled_goal": {
+      "baseline": {
+        "capture_overhead_s": 4.148601792054251,
+        "peak_process_rss_mib": 9519.625,
+        "pricing_task_total_s": 5965.6366068655625,
+        "pricing_wall_s": 683.7686186644714,
+        "simulation_wall_excluding_capture_s": 1320.35980725009,
+        "simulation_wall_s": 1324.5084090421442,
+        "source": "/private/tmp/colgen-prep-goal-baseline-20260910"
+      },
+      "changes": {
+        "peak_process_rss_mib": 22.375,
+        "peak_process_rss_percent": 0.23504077103877474,
+        "pricing_task_total_percent": -15.041961807663451,
+        "pricing_task_total_s": -897.348779988708,
+        "pricing_wall_percent": -12.878145418739761,
+        "pricing_wall_s": -88.05671703931876,
+        "simulation_wall_excluding_capture_percent": -7.370449529998235,
+        "simulation_wall_excluding_capture_s": -97.31645320774987,
+        "simulation_wall_percent": -7.354385590774948,
+        "simulation_wall_s": -97.409455583198
+      },
+      "combined": {
+        "bootstrap_goal_calls": 6570,
+        "bootstrap_goal_declines": 0,
+        "bootstrap_goal_native": 6570,
+        "capture_overhead_s": 4.055599416606128,
+        "compiled_goal_warmup_s": 0.22132200002670288,
+        "compiled_goal_warmup_signatures": 1,
+        "peak_process_rss_mib": 9542.0,
+        "pricing_task_total_s": 5068.2878268768545,
+        "pricing_wall_s": 595.7119016251527,
+        "simulation_wall_excluding_capture_s": 1223.04335404234,
+        "simulation_wall_s": 1227.0989534589462,
+        "source": "/private/tmp/colgen-prep-goal-combined-20260910"
+      },
+      "correctness": {
+        "accepted_both": 1537,
+        "aggregate_trajectory_metrics_equal": true,
+        "algorithm_params_sha_equal": true,
+        "all_round_lp_pricing_fields_equal": true,
+        "claims_parity_full_run": null,
+        "claims_parity_note": "Full trace omits claims. Matched fresh-process replays prove exact claim hashes for all 1537 flights in rounds 1, 6, and 11.",
+        "column_trace_byte_equal": true,
+        "columns_both": 42879,
+        "congestion_cost_both": 156817.30255254533,
+        "denied_both": 0,
+        "final_ip_status_both": "optimal",
+        "final_selection_changed_flights": 423,
+        "input_sha_equal": true,
+        "kernel_budget_declined_both": 0,
+        "kernel_fell_back_both": 0,
+        "kernel_label_restarts_both": 0,
+        "path_trace_byte_equal": true,
+        "pricing_worker_lost_both": 0,
+        "rounds_both": 11,
+        "termination_both": "lp_gap",
+        "timed_paths_both": 11962,
+        "verified_both": true
+      },
+      "limitations": [
+        "One full run per arm and one demand seed; timing is not a confidence interval.",
+        "Capture serialization and writes advance the solver clock; adjusted wall subtracts their measured duration but cannot undo scheduling effects.",
+        "Time-limited intermediate IP diverged at round 7; later known-column cutoffs and some label counts differ while the byte-identical priced column pool and LP certificate remain unchanged.",
+        "Completed-route screening is outside this frozen candidate and this comparison."
+      ],
+      "scope": "Frozen baseline versus frozen shared-preparation plus compiled-goal candidate; one FAA seed-0 full run per arm",
+      "source_changed_files": [
+        "freespace_sim/planner/colgen/bootstrap_kernel.py",
+        "freespace_sim/planner/colgen/dp_prepare.py",
+        "freespace_sim/planner/colgen/pricing.py"
+      ],
+      "status": "complete"
+    }
+  },
+  "historical_evidence_commit": "1df0c19fe76a7e1946a877ccaf5fbe941ce3ee1a",
+  "historical_files_sha256": {
+    "analysis/colgen_pathcmp_full_1200s_20260910/summary.json": "b57b9169f9c037a4c8a0d8cb6681d4348b7ebe2d1ec7316449bb61a1398621d3",
+    "analysis/colgen_prep_goal_20260910/full_comparison/summary.json": "8b0b06a8207610b47e87ca3806481f51f4b576b332c61af7d83012d04dd4315c",
+    "analysis/colgen_validation_20260910/baseline_source_manifest.json": "079125e6a504d61a3bfc184be45f771385ff8ee8303080a9c1cb7cd15a4514c6",
+    "analysis/colgen_validation_20260910/combined_v2_source_manifest.json": "c78723763bb0a36595c7bf20faac62b4471d840270ae2be28fd6d3d657d6fb57",
+    "analysis/colgen_validation_20260910/full_comparison/seed0_parity.json": "9b317f43b47f4e47563fd829716380ba310bfcda75ccb50386e821c69c25f070",
+    "analysis/colgen_validation_20260910/full_comparison/seed1_parity.json": "a6459e24dbe9846142526975bfc2bd3c8804d1e2b24e458e2f61d1f465d215ae",
+    "analysis/colgen_validation_20260910/full_comparison/summary.json": "6482adfef8c368094f139eee834d38502d2afdf3d5f9577782e4d42e383b499e",
+    "analysis/colgen_validation_20260910/policy25/summary.json": "0da68410b117f25d8a2ad8a767d2435d812481ff23ba999fac9002d3f3cdb95c",
+    "analysis/colgen_validation_20260910/pr_validation.json": "67d672d51c9715f21d9b762da85e066bcdfd60a29581479e6a8d46f21a5cb15d"
+  },
+  "ip_25_second_trial": {
+    "0": {
+      "candidate_safety": {
+        "all_priced_columns_certified": true,
+        "final_lp_gap_reached": true,
+        "no_fallback_restart_workerloss_repair": true,
+        "restricted_ip_optimal": true,
+        "termination_lp_gap": true
+      },
+      "deltas": {
+        "congestion_cost": {
+          "candidate": 156817.30255254533,
+          "control": 156817.30255254533,
+          "delta": 0.0,
+          "percent": 0.0
+        },
+        "ip_wall_s": {
+          "candidate": 18.32308412506245,
+          "control": 20.33353558392264,
+          "delta": -2.0104514588601887,
+          "percent": -9.887367843936678
+        },
+        "iteration_ip_wall_s": {
+          "candidate": 320.9621537923813,
+          "control": 374.12152033508755,
+          "delta": -53.159366542706266,
+          "percent": -14.2091175335472
+        },
+        "simulation_wall_s": {
+          "candidate": 1020.0898483330384,
+          "control": 1065.784349041991,
+          "delta": -45.694500708952546,
+          "percent": -4.287405866864747
+        }
+      },
+      "passed": true,
+      "quality": {
+        "columns": {
+          "candidate": 42879,
+          "control": 42879
+        },
+        "congestion_cost": {
+          "candidate": 156817.30255254533,
+          "control": 156817.30255254533
+        },
+        "global_cost_gap": {
+          "candidate": 0.011825996423121772,
+          "control": 0.011825996423121772
+        },
+        "ip_wall_s": {
+          "candidate": 18.32308412506245,
+          "control": 20.33353558392264
+        },
+        "iteration_ip_wall_s": {
+          "candidate": 320.9621537923813,
+          "control": 374.12152033508755
+        },
+        "iterations": {
+          "candidate": 11,
+          "control": 11
+        },
+        "simulation_wall_s": {
+          "candidate": 1020.0898483330384,
+          "control": 1065.784349041991
+        },
+        "solver_objective": {
+          "candidate": 156817.30255254533,
+          "control": 156817.30255254533
+        }
+      }
+    },
+    "1": {
+      "candidate_safety": {
+        "all_priced_columns_certified": true,
+        "final_lp_gap_reached": true,
+        "no_fallback_restart_workerloss_repair": true,
+        "restricted_ip_optimal": true,
+        "termination_lp_gap": true
+      },
+      "deltas": {
+        "congestion_cost": {
+          "candidate": 161062.13325351613,
+          "control": 161135.99633414706,
+          "delta": -73.86308063092292,
+          "percent": -0.04583896975928203
+        },
+        "ip_wall_s": {
+          "candidate": 16.948639125097543,
+          "control": 19.526332583045587,
+          "delta": -2.577693457948044,
+          "percent": -13.201114172285555
+        },
+        "iteration_ip_wall_s": {
+          "candidate": 412.48842387623154,
+          "control": 446.65887029259466,
+          "delta": -34.17044641636312,
+          "percent": -7.650233475488566
+        },
+        "simulation_wall_s": {
+          "candidate": 1358.2534507079981,
+          "control": 1345.4894493748434,
+          "delta": 12.764001333154738,
+          "percent": 0.9486511647553542
+        }
+      },
+      "passed": true,
+      "quality": {
+        "columns": {
+          "candidate": 46885,
+          "control": 45568
+        },
+        "congestion_cost": {
+          "candidate": 161062.13325351613,
+          "control": 161135.99633414706
+        },
+        "global_cost_gap": {
+          "candidate": 0.008471926483817217,
+          "control": 0.008954789047231368
+        },
+        "ip_wall_s": {
+          "candidate": 16.948639125097543,
+          "control": 19.526332583045587
+        },
+        "iteration_ip_wall_s": {
+          "candidate": 412.48842387623154,
+          "control": 446.65887029259466
+        },
+        "iterations": {
+          "candidate": 15,
+          "control": 14
+        },
+        "simulation_wall_s": {
+          "candidate": 1358.2534507079981,
+          "control": 1345.4894493748434
+        },
+        "solver_objective": {
+          "candidate": 161062.13325351613,
+          "control": 161135.99633414706
+        }
+      }
+    }
+  },
+  "limitations": [
+    "Measurements predate the malformed-sweep guard and centered-departure cost repair; no new full-size benchmark is claimed for those changes.",
+    "Final IP optimality refers to the generated pool, not all possible routes.",
+    "Seed 1 has different finite-time IP trajectory selections at identical aggregate cost.",
+    "Main compiled_s includes preparation/wrapper overhead; it is not pure native DP timing.",
+    "Raw traces, frozen archives and dated drivers remain locally under .context/colgen/analysis; historical committed summaries can be retrieved from historical_evidence_commit."
+  ],
+  "measured_date": "2026-09-10",
+  "merge_cleanup_validation": {
+    "certificate_figures_byte_identical": true,
+    "code_change": "Earlier centered seed departures use absolute ground-delay cost and preserved air terms; default forward-ladder function remains byte-identical to the previously benchmarked branch head.",
+    "command": ".venv/bin/python -m pytest -q -p no:cacheprovider tests/test_colgen*.py tests/test_metrics.py tests/test_cost.py tests/test_experiment_run.py tests/test_sipp*.py -m \"not slow\" -k \"not test_compiled_path_matches_the_reference_across_hop_ceilings and not test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs\"",
+    "date": "2026-09-11",
+    "deselected": 18,
+    "file_sha256": {
+      "analysis/colgen/__init__.py": "d44ec2caec9ff1b14e6228c5e112866546cf34acd6adf4c86d91ea98ec2fd19c",
+      "analysis/colgen/benchmark.py": "824e7fca7b858bab355f139c1e77cfb55afc15601c25db0737555c95b15a51d2",
+      "analysis/colgen/capture.py": "704d0b2577cc40232da7c7f5ec137ed9fd1894f3c78f7c2e83fb2e7b3187e22e",
+      "analysis/colgen/common.py": "623d62dbb4e30ab1b679291f7f24fcf905405d964fcd6b4afbba6cdf2eb7883a",
+      "analysis/colgen/replay.py": "d77f6cb79e7ac3c4a8f5faf976225928b5e432475e410eac0871705f6ff3a631",
+      "analysis/colgen/rows.py": "e2f1c94f3a0d108951c839f1f5b6bdab8cfb8308559a1a236e5fd0922532dcf5",
+      "analysis/colgen/trace.py": "53bd00832bba80dfef3764804ae2ec729e0085c400aaa09b264a4a41d3bd20c4",
+      "context/figures/make_figures.py": "1ddec34fd877e8a9149d4ccaf87802541c14e293f8f1ffe19821ef9cc660ff8e",
+      "freespace_sim/planner/colgen/solver.py": "4f34c326273e75e1d673e88bda9b0d91c857185e47708b2ff8b8c4721eb780dc",
+      "tests/test_colgen_seed_initialization.py": "08c74fa1b2ec9ba6c7039c72cc7efc81c211bca0cbb0ff652f12417fe82c1068"
+    },
+    "full_size_benchmark_rerun": false,
+    "harness_checks": [
+      "Four CLI help paths",
+      "Fresh single-flight module/path captures",
+      "Fresh pricing replay with independent cold claims/cost/reduced-cost verification",
+      "Capacity scan smoke",
+      "Benchmark child from external cwd",
+      "Legacy replay and row fingerprints preserved"
+    ],
+    "passed": 736,
+    "ruff": "Changed source, test, figure generator, and consolidated harness pass",
+    "straight_tests_passed": 4,
+    "wall_s": 280.07,
+    "warnings": "Expected dead-worker lifecycle warning"
+  },
+  "parity": {
+    "0": {
+      "correctness_passed": true,
+      "input_checks": {
+        "algorithm_params_sha": true,
+        "demand_config_sha": true,
+        "generated_requests_sha": true,
+        "input_sha": true,
+        "n_requests": true,
+        "n_static_terminals": true,
+        "requests_sha": true
+      },
+      "safety": {
+        "baseline": {
+          "all_requests_accepted": true,
+          "budget_denied_zero": true,
+          "goal_declines_zero": true,
+          "ip_optimal_true": true,
+          "ip_status_optimal": true,
+          "kernel_fallback_zero": true,
+          "kernel_restart_zero": true,
+          "objective_consistent": true,
+          "repair_added_zero": true,
+          "restricted_ip_gap_finite": true,
+          "search_exhausted_zero": true,
+          "verified": true,
+          "worker_loss_zero": true
+        },
+        "combined": {
+          "all_requests_accepted": true,
+          "budget_denied_zero": true,
+          "goal_declines_zero": true,
+          "ip_optimal_true": true,
+          "ip_status_optimal": true,
+          "kernel_fallback_zero": true,
+          "kernel_restart_zero": true,
+          "objective_consistent": true,
+          "repair_added_zero": true,
+          "restricted_ip_gap_finite": true,
+          "search_exhausted_zero": true,
+          "verified": true,
+          "worker_loss_zero": true
+        }
+      },
+      "trace_note": "Finite 30-second per-round IPs may change incumbents and final trajectories; differences are reported, not silently accepted as exact parity.",
+      "trace_parity": {
+        "column_identities_sha256": true,
+        "column_numbers_sha256": true,
+        "paths_jsonl_sha256": true,
+        "semantic_iterations_sha256": true
+      }
+    },
+    "1": {
+      "correctness_passed": true,
+      "input_checks": {
+        "algorithm_params_sha": true,
+        "demand_config_sha": true,
+        "generated_requests_sha": true,
+        "input_sha": true,
+        "n_requests": true,
+        "n_static_terminals": true,
+        "requests_sha": true
+      },
+      "safety": {
+        "baseline": {
+          "all_requests_accepted": true,
+          "budget_denied_zero": true,
+          "goal_declines_zero": true,
+          "ip_optimal_true": true,
+          "ip_status_optimal": true,
+          "kernel_fallback_zero": true,
+          "kernel_restart_zero": true,
+          "objective_consistent": true,
+          "repair_added_zero": true,
+          "restricted_ip_gap_finite": true,
+          "search_exhausted_zero": true,
+          "verified": true,
+          "worker_loss_zero": true
+        },
+        "combined": {
+          "all_requests_accepted": true,
+          "budget_denied_zero": true,
+          "goal_declines_zero": true,
+          "ip_optimal_true": true,
+          "ip_status_optimal": true,
+          "kernel_fallback_zero": true,
+          "kernel_restart_zero": true,
+          "objective_consistent": true,
+          "repair_added_zero": true,
+          "restricted_ip_gap_finite": true,
+          "search_exhausted_zero": true,
+          "verified": true,
+          "worker_loss_zero": true
+        }
+      },
+      "trace_note": "Finite 30-second per-round IPs may change incumbents and final trajectories; differences are reported, not silently accepted as exact parity.",
+      "trace_parity": {
+        "column_identities_sha256": true,
+        "column_numbers_sha256": true,
+        "paths_jsonl_sha256": true,
+        "semantic_iterations_sha256": false
+      }
+    }
+  },
+  "previous_validation": {
+    "benchmark_scope": "Benchmark V2 predates only the added malformed-sweep receipt guard; all other four latest production deltas match measured snapshot. Full benchmarks not rerun for guard.",
+    "file_sha256": {
+      "freespace_sim/planner/colgen/master.py": "34dc5e0f300385fbf00339cf10219febafba073b0e6812fedb2f9b00a282ac66",
+      "freespace_sim/planner/colgen/network.py": "22e2fdc60608a9b341c9574d0404972af359d0413f67ab2696f00a9acb98ab24",
+      "freespace_sim/planner/colgen/pricing.py": "2ed938d20c05d04804fe2160b9b39517bdce6b7cb98ceaf63136a0c1aba1509b",
+      "freespace_sim/planner/colgen/pricing_pool.py": "ad5df811833bcb48328b789531ccfd487a3adc945cb934241b4efa26254e5d17",
+      "freespace_sim/planner/colgen/solver.py": "8b21cc2e0956832e7f345947f56a8ac79a3e50edbb8a434887ae0ea3d1872607",
+      "tests/test_colgen_pricing_certification.py": "4ec0bc4212aa063d19688186e5e08bef54ba9ab656fe67439594986fe30b2f6b",
+      "tests/test_colgen_solver.py": "a04c2849d63b2ea127f7878717815c2e4eecc092ffeb3303608361efba266365"
+    },
+    "focused_command": ".venv/bin/python -m pytest -q tests/test_colgen*.py tests/test_metrics.py tests/test_cost.py tests/test_experiment_run.py tests/test_sipp*.py -m 'not slow' -k 'not test_compiled_path_matches_the_reference_across_hop_ceilings and not test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs'",
+    "focused_result": {
+      "deselected": 18,
+      "errors": 0,
+      "failures": 0,
+      "passed": 735,
+      "skipped": 0,
+      "wall_s": 277.13,
+      "warnings": 1
+    },
+    "initial_broad_run": {
+      "completed": false,
+      "passed_before_interrupt": 106,
+      "reason": "Manually interrupted during expensive unseeded nine-extra-hop reference case; then narrowed regression scope. No failures before interrupt.",
+      "wall_s": 412.73
+    },
+    "lint": {
+      "archived_harness": "11 files clean",
+      "scoped_production_test_cli": "31 files clean excluding touched SIPP planner",
+      "sipp": "6 findings with identical code/message counts on origin/main; unchanged by branch",
+      "whitespace": "git diff --check passed"
+    },
+    "pytest_junit_sha256": "df05562730a5badd27b3c5e6620796fa9ee5c362f42915c300d725e8450653cc",
+    "pytest_log_sha256": "4ecce2f4841c85532e401c797666197ea61f6a3163dc78a20740488ae211d6ee",
+    "review_guard_checks": {
+      "files": [
+        "tests/test_colgen_pricing_certification.py",
+        "tests/test_colgen_pricing_pool.py"
+      ],
+      "passed": 59,
+      "wall_s": 10.42
+    },
+    "scope": "Column generation, metrics/cost, experiment CLI, SIPP; separate straight planner checks",
+    "straight_planner": {
+      "passed": 4,
+      "wall_s": 0.06
+    },
+    "tested_commit": "8aad3077057af6b827d27d5584230de5f12ad294",
+    "warning": "Expected RuntimeWarning in intentional dead-worker lifecycle test"
+  },
+  "schema_version": 1,
+  "scope": "Capacity separation and worker certification versus branch commit 40c25e9; earlier optimizations are already in the baseline. Single serial trial per arm and seed."
+}

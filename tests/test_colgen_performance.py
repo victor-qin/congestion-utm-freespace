@@ -114,6 +114,7 @@ def test_repeated_pricing_stops_touching_the_arc_oracle_entirely():
 
 
 def test_canonical_claim_cache_is_strictly_bounded():
+    """Time shifts share one certificate; distinct spatial paths still evict at two."""
     cfg = _cfg()
     graph, _params = _graph(cfg, overrun=2)
     seed = seed_column(graph, cfg)
@@ -126,7 +127,16 @@ def test_canonical_claim_cache_is_strictly_bounded():
         )
         column_claims(shifted, graph, cfg)
 
-    assert len(graph._search_cache.certified_claims) == 2
+    cache = graph._search_cache.certified_claims
+    assert len(cache) == 1
+    original_key = next(iter(cache))
+    for path in (
+        ((0, 0), (0, 1), (1, 1), (2, 0)),
+        ((0, 0), (1, -1), (2, -1), (2, 0)),
+    ):
+        column_claims(replace(seed, cell_path=path, claims=frozenset()), graph, cfg)
+        assert len(cache) == 2
+    assert original_key not in cache
 
 
 def _count_exact_pricing(monkeypatch) -> dict[str, int]:
@@ -559,7 +569,9 @@ def _exhaustive_columns(graph, cfg):
     return tuple(columns)
 
 
-def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
+@pytest.mark.parametrize("backend", ["cpu", "metal"])
+@pytest.mark.parametrize("exclude_early", [False, True])
+def test_endpoint_union_bound_matches_exhaustive_pricing_oracle(backend, exclude_early):
     """Positive, negative, and exact-tie endpoint prices preserve the global optimum."""
 
     cfg = replace(_cfg(), max_ground_delay_s=8.0)
@@ -582,6 +594,12 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
     early = RowKey.cell(endpoint_only_cell, 0, 6)
     common = RowKey.cell(endpoint_only_cell, 0, 18)
     late = RowKey.cell(endpoint_only_cell, 0, 20)
+    forbidden = frozenset((early,)) if exclude_early else frozenset()
+    if backend == "metal":
+        from tests.test_colgen_pricing_platform import _platform
+        from freespace_sim.planner.colgen.pricing_platform import PricingProblem
+
+        platform = _platform("metal")
     dual_sweep = (
         {common: 5.0},
         {common: 5.0, late: 20.0},
@@ -610,12 +628,22 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
                     replace(column, delay_s=weighted),
                 )
                 for column in columns
+                if column.claims.isdisjoint(forbidden)
                 for weighted in (_weighted_cost(column, graph, cfg, cost_model(cfg, params)),)
             ),
             key=lambda item: (-item[0], tie_key(item[1])),
         )
         oracle_rc, oracle_column = ranked[0]
-        reduced_cost, column = price_flight(graph, duals, 0.0, cfg, params)
+        if backend == "metal":
+            result, = platform.price_batch([
+                PricingProblem(graph, cfg, params, duals, 0.0, forbidden_rows=forbidden)
+            ])
+            assert result.certified and result.search_complete
+            reduced_cost, column = result.reduced_cost, result.column
+        else:
+            reduced_cost, column = price_flight(
+                graph, duals, 0.0, cfg, params, forbidden_rows=forbidden
+            )
 
         assert reduced_cost == pytest.approx(oracle_rc, abs=1e-8)
         # Identity exactly, magnitude to tolerance.  `_weighted_cost` deliberately reaches
@@ -624,8 +652,10 @@ def test_endpoint_union_bound_matches_exhaustive_pricing_oracle():
         # detour).  Same value, different association, and under a non-unit `w_air` that is
         # a 1-ULP disagreement rather than the exact tie it used to be.  The column IDENTITY
         # is what this oracle is for, so that stays exact.
-        assert replace(column, delay_s=0.0) == replace(oracle_column, delay_s=0.0)
-        assert column.delay_s == pytest.approx(oracle_column.delay_s, rel=1e-12)
+        if backend == "cpu":
+            assert replace(column, delay_s=0.0) == replace(oracle_column, delay_s=0.0)
+            assert column.delay_s == pytest.approx(oracle_column.delay_s, rel=1e-12)
+        assert column.claims.isdisjoint(forbidden)
 
 
 def _weighted_cost(column, graph, cfg, model: CostModel) -> float:

@@ -57,6 +57,15 @@ class CostModel:
             + self.air_weight * air_detour_s
         )
 
+    def intent_cost(self, intent: Any, cfg: Any) -> float:
+        """Price translated trajectory metrics in this solve's objective units."""
+
+        return self.evaluate(
+            ground_s=intent.ground_delay_s,
+            air_hold_s=intent.air_hold_s,
+            air_detour_s=intent.air_detour_m / cfg.nominal_speed_mps,
+        )
+
     def reduced_cost(
         self, *, benefit: float, cost: float, dual_cost: float, pi_f: float
     ) -> float:

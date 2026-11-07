@@ -1,4 +1,7 @@
 // Shared Metal/CUDA body. Address spaces, entry points and atomics are runtime adapters.
+#ifndef PRICING_NUMERIC_WORDS
+#define PRICING_NUMERIC_WORDS 0
+#endif
 // Label fields: cell, root, hops, stable ID/parent ID, first A/B, status, paid low/high, recent cells.
 // Root values: benefit, assignment, ground, negative credit, hop cost, reserved,
 // affine air-cost offset/slope, positive origin price, minimum total hops, future cost.
@@ -176,7 +179,8 @@ INLINE void expand_one(
 
 INLINE bool same_state(GLOBAL const int* labels, int a, int b, int stride) {
     // Root identity refines the production key, keeping different departures/lanes separate.
-    for (int j = 0; j < stride; ++j) {
+    // Derived numeric payload does not change the existing heuristic-only grouping key.
+    for (int j = 0; j < stride - PRICING_NUMERIC_WORDS; ++j) {
         if (j == 3 || j == 6) continue;
         if (labels[a * stride + j] != labels[b * stride + j]) return false;
     }
@@ -189,7 +193,7 @@ INLINE void group_one(unsigned int tid, GLOBAL const int* control,
     int n = control[0], stride = control[1], capacity = control[2];
     if (tid >= (unsigned int)n || !(labels[tid * stride + 6] & 2)) return;
     unsigned int hash = 2166136261u;
-    for (int j = 0; j < stride; ++j) {
+    for (int j = 0; j < stride - PRICING_NUMERIC_WORDS; ++j) {
         if (j == 3 || j == 6) continue;
         hash = (hash ^ (unsigned int)labels[tid * stride + j]) * 16777619u;
     }

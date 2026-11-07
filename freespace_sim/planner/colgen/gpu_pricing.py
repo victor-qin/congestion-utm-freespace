@@ -1139,7 +1139,7 @@ class _Batch:
                     self.check()
                     record = records[index]
                     root, flags = int(record[1]), int(record[6])
-                    if flags & 16:
+                    if flags & (16 | 64):
                         self.stats["gpu_direct_prunes"] += 1
                         self.stats["gpu_prune_proposals"] += 1
                         continue
@@ -1149,6 +1149,8 @@ class _Batch:
                         self.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
                         self.audit_upper = float(scores[index, 2])
                         self.audit_direct = bool(flags & 32)
+                        if flags & 128:
+                            self.audit_integer_record(record)
                         if not self.retain(root, int(record[3]), int(record[0]), int(record[2])):
                             continue
                     if flags & 1:
@@ -1313,6 +1315,8 @@ def price_gpu_batch(
     - output (tuple[PricingResult, ...]): ordered validated incumbents and certificate statuses.
     """
     groups: dict[pricing.DualView, list[int]] = defaultdict(list)
+    if options.gpu_integer_bounds != getattr(runtime, "integer_bounds", False):
+        raise ValueError("Integer pricing options must match the compiled GPU runtime")
     normalized: dict[tuple[int, tuple[int, int]], pricing.DualView] = {}
     current = []
     for index, problem in enumerate(problems):
@@ -1325,8 +1329,13 @@ def price_gpu_batch(
         current.append(replace(problem, duals=view))
         groups[view].append(index)
     results: list[PricingResult | None] = [None] * len(problems)
+    batch_type = _Batch
+    if options.gpu_integer_bounds:
+        from .gpu_integer_search import IntegerBatch
+
+        batch_type = IntegerBatch
     for indices in groups.values():
-        batch = _Batch([current[i] for i in indices], options, runtime, deadline)
+        batch = batch_type([current[i] for i in indices], options, runtime, deadline)
         for index, result in zip(indices, batch.run(), strict=True):
             results[index] = result
     return tuple(results)

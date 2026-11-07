@@ -217,8 +217,9 @@ def test_arrival_union_preserves_destination_choices_and_changed_visit_windows(
 
 @pytest.mark.parametrize("start", [-100, 100, 2**31 - 8])
 @pytest.mark.parametrize("chunk_size", [1, 2])
+@pytest.mark.parametrize("integer_bounds", [False, True])
 def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
-    start: int, chunk_size: int,
+    start: int, chunk_size: int, integer_bounds: bool,
 ) -> None:
     """The device updates high bits/history and proposes deletions unavailable to old bounds.
 
@@ -226,13 +227,16 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
     ------------
     - start (int): absolute clock offset.
     - chunk_size (int): labels per dispatch, including a split between two flights.
+    - integer_bounds (bool): exercise the checked wrapper with exact row membership.
 
     Return
     --------
     - output (None): checks bit 31/63, disjoint price accounting and invalid-cache fallback.
     """
     _platform("metal")
-    runtime = ComputeRuntime("metal")
+    from freespace_sim.planner.colgen.gpu_integer import IntegerInterval, IntegerScale
+
+    runtime = ComputeRuntime("metal", integer_bounds=integer_bounds)
     labels = np.array([[0, i, 0, i, -1, -1, 2, -(2**31), 0, 0, -1] for i in range(2)], np.int32)
     graph = np.full((2, 14), -1, np.int32)
     graph[:, 6:12] = 0
@@ -244,20 +248,35 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
     meta = np.array([[start, start + 3, 4, 0, 1], [start, start + 3, 4, 1, 1]], np.int32)
     entries = np.array([[1 << 31, 1 << 31, 0, 1]], np.uint32).view(np.int32)
     trees = np.full(16, 2, np.float32)
+    extra = ()
+    stride = 11
+    if integer_bounds:
+        scale = IntegerScale(-40)
+        stride += 15
+        prefix = scale.encode_array(np.array([[3., 3., 0.]] * 2)).reshape(2, 15).view(np.int32)
+        labels = np.concatenate((labels, prefix), axis=1)
+        extra = (
+            np.array([[-40, 10, 0, 0]] * 2, np.int32),
+            scale.encode_array(np.array([[10., 0., 0., 0., 0., 3., 3.]] * 2)),
+            scale.encode_array(np.zeros(22)),
+            np.array([2, 0, 0, 0, 2, start, start + 1], np.int32),
+            scale.encode_array(np.array([3., 5.])), scale.encode_array(trees.astype(np.float64)),
+            np.zeros((2, 5), np.uint32), scale.encode_array(np.ones(2)),
+        )
     for valid in (True, False):
         entries[0, 3] = int(valid)
         for first in range(0, 2, chunk_size):
             current = labels[first:first + chunk_size]
             count = len(current) * 6
             records, scores = runtime.run("expand", count, (
-                np.array([len(current), 11, start, 0, 0, 0], np.int32), current,
+                np.array([len(current), stride, start, -1, 0, 0], np.int32), current,
                 np.array([[7, 3]] * len(current), np.float32), graph, roots, data, visits[:, 2].copy(),
-                np.zeros(2, np.int32), np.array([[1, start + 1]], np.int32),
-                np.array([3], np.float32), np.empty((count, 11), np.int32),
+                np.zeros(2, np.int32), np.array([[1, start]], np.int32),
+                np.array([3], np.float32), np.empty((count, stride), np.int32),
                 np.empty((count, 3), np.float32), np.array([0, 1], np.int32),
                 np.array([[0, 0], [0, 1]], np.int32), np.array([start + 1], np.int32),
                 np.array([[8, 8]], np.float32), np.array([[1, -np.inf]] * 2, np.float32),
-                masks, meta, entries, trees,
+                masks, meta, entries, trees, *extra,
             ), (10, 11), write_only=(10, 11))
             for index in range(0, count, 6):
                 record = records[index]
@@ -265,8 +284,11 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
                 np.testing.assert_array_equal(record[9:11], [1, 0])
                 assert scores[index, 1] == 8.0  # Origin/visit overlap costs 3 only once.
                 stronger = valid and int(record[1]) == 0
-                assert bool(record[6] & 4) is stronger
-                assert bool(record[6] & 8) is stronger
+                assert bool(record[6] & (64 if integer_bounds else 4)) is stronger
+                assert bool(record[6] & 8) is (stronger and not integer_bounds)
+                if integer_bounds:
+                    positive = IntegerInterval.unpacked(record[-15:-10].view(np.uint32))
+                    assert positive.valid and positive.lower * scale.quantum <= 8 <= positive.upper * scale.quantum
                 assert scores[index, 2] == (0.0 if stronger else 2.0)
     runtime.clear_cache()
 
@@ -275,6 +297,8 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
     {}, {"gpu_prune_epsilon": 0.001, "gpu_prune_audit": True},
     {"endpoint_bounds": False}, {"endpoint_max_rows": 1},
     {"endpoint_cache_bytes": 0}, {"endpoint_cache_work": 0},
+    {"gpu_integer_bounds": True}, {"gpu_integer_bounds": True, "endpoint_cache_bytes": 0},
+    {"gpu_integer_bounds": True, "gpu_integer_audit": True},
 ])
 @pytest.mark.parametrize("hop_budget", [0, 64 * 1024 * 1024])
 def test_endpoint_omission_or_cache_exhaustion_preserves_exhaustive_optimum(
@@ -344,6 +368,15 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
     prices = {row: price * magnitude + 0.123456789 for row, price in original.duals.items()}
     problem = replace(original, duals=prices, pi_f=10000.0)
     bounds, variants = _bounds(problem)
+    from freespace_sim.planner.colgen.gpu_integer import IntegerScale
+    from freespace_sim.planner.colgen.gpu_integer_bounds import (
+        prepare_reference_operands, reference_upper,
+    )
+
+    integer_scale = IntegerScale.for_values(
+        [problem.params.M, problem.pi_f, *prices.values()],
+        max_terms=len(prices) + bounds.topology.air_hop_limit + 32,
+    )
     endpoint = EndpointBounds(bounds, PricingOptions(endpoint_cache_work=10_000_000), lambda: None)
     graph, cfg, view = problem.graph, problem.cfg, bounds.view
     future = FutureBounds(
@@ -417,6 +450,31 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
                         variant, hop, visit_lower, suffix,
                         problem.params.M, problem.pi_f, negative,
                     ) >= actual
+                    integer_positive = integer_scale.positive_sum(
+                        (max(0.0, view.row_cost(row)) for row in union), extra_rounds=hop,
+                    )
+                    integer_visits = integer_scale.positive_sum(
+                        (max(0.0, view.row_cost(row)) for row in visit_union), extra_rounds=hop,
+                    )
+                    operands = prepare_reference_operands(
+                        integer_scale, bounds, variant, hop, remaining, integer_positive,
+                        integer_visits, suffix, residual, problem.params.M, negative,
+                    )
+                    integer_upper = reference_upper(integer_scale, operands)
+                    # Canonical completion coverage is independent of shader/FP64 parity.
+                    assert integer_upper.valid
+                    assert integer_scale.upper_float(integer_upper) >= actual
+                    from freespace_sim.planner.colgen.gpu_pricing import completion_upper_bound
+
+                    reference = min(
+                        upper,
+                        bounds.future_upper(variant, hop, visit_lower, suffix,
+                                            problem.params.M, problem.pi_f, negative),
+                        completion_upper_bound(problem.params.M, problem.pi_f,
+                                               bounds.cost_lower(variant, hop + remaining),
+                                               (prefix,), negative),
+                    )
+                    assert integer_scale.upper_float(integer_upper) >= reference
                     checked += 1
         if hops < graph.max_air_hops:
             depth = view.offsets[1] - view.offsets[0]

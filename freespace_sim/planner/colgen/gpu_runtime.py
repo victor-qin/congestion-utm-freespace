@@ -185,18 +185,21 @@ extern "C" __global__ void future_bounds(const int* control, const int* graph,
 class ComputeRuntime:
     """Execute shared pricing kernels on an explicitly selected physical GPU."""
 
-    def __init__(self, backend: str) -> None:
+    def __init__(self, backend: str, *, integer_bounds: bool = False) -> None:
         """Compile the kernels; failure never silently selects a CPU device.
 
         Parameters
         ------------
         - backend (str): ``metal`` or ``cuda``.
+        - integer_bounds (bool): compile the optional checked integer pruning interface.
 
         Return
         --------
         - output (None): initializes the selected device and compiled kernels.
         """
         self.backend = backend
+        self.integer_bounds = integer_bounds
+        self.integer_data = None
         self.dispatches = 0
         self._owner = object()
         self.counters = dict(allocations=0, allocated_bytes=0, upload_bytes=0,
@@ -208,6 +211,13 @@ class ComputeRuntime:
         self._static: dict[str, tuple[np.ndarray, object]] = {}
         self._metal_buffers: dict[tuple[str, int], tuple[int, object]] = {}
         try:
+            source = _source(backend)
+            names = ("expand", "group_best", "bound_roots", "future_bounds", *_RESIDENT_ARGUMENTS)
+            if integer_bounds:
+                from .gpu_integer_source import extend_source
+
+                source = extend_source(source, backend, _ARGUMENTS)
+                names += ("integer_roots",)
             if backend == "metal":
                 import Metal
 
@@ -219,13 +229,12 @@ class ComputeRuntime:
                 options = Metal.MTLCompileOptions.alloc().init()
                 options.setFastMathEnabled_(False)
                 library, error = self.device.newLibraryWithSource_options_error_(
-                    _source(backend), options, None
+                    source, options, None
                 )
                 if library is None:
                     raise GPUUnavailable(f"Metal pricing compilation failed: {error}")
                 self.kernels = {}
-                for name in ("expand", "group_best", "bound_roots", "future_bounds",
-                             *_RESIDENT_ARGUMENTS):
+                for name in names:
                     pipeline, error = self.device.newComputePipelineStateWithFunction_error_(
                         library.newFunctionWithName_(name), None
                     )
@@ -241,11 +250,10 @@ class ComputeRuntime:
                 properties = cupy.cuda.runtime.getDeviceProperties(self.device.id)
                 name = properties["name"]
                 self.device_name = name.decode() if isinstance(name, bytes) else str(name)
-                module = cupy.RawModule(code=_source(backend), options=("--fmad=false",))
+                module = cupy.RawModule(code=source, options=("--fmad=false",))
                 self.kernels = {
                     name: module.get_function(name)
-                    for name in ("expand", "group_best", "bound_roots", "future_bounds",
-                                 *_RESIDENT_ARGUMENTS)
+                    for name in names
                 }
             else:
                 raise ValueError("gpu_backend must be 'metal' or 'cuda'")
@@ -263,6 +271,7 @@ class ComputeRuntime:
         """Release flight-specific storage without invalidating shared snapshot prices."""
         self._static.clear()
         self._metal_buffers.clear()
+        self.integer_data = None
 
     def upload(self, array: np.ndarray) -> DeviceBuffer:
         """Copy a typed array into explicitly owned device storage.
@@ -474,6 +483,8 @@ class ComputeRuntime:
         if count == 0:
             return tuple(self.read(arrays[i]) if isinstance(arrays[i], DeviceBuffer)
                          else arrays[i].copy() for i in outputs)
+        if name == "expand" and self.integer_data is not None:
+            arrays = (*arrays, *self.integer_data.arguments(int(arrays[0][2]) + 1))
         buffers = []
         static = static or {}
         if any(i not in outputs or i in static for i in write_only):

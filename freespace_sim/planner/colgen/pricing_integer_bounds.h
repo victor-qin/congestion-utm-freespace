@@ -27,13 +27,11 @@ INLINE IntInterval ib_minimum(IntInterval a, IntInterval b) {
     if (!ii_valid(b)) return a;
     return iw_less(b.upper, a.upper) ? b : a;
 }
-INLINE IntInterval ib_upper(GLOBAL const unsigned int* inputs, int exponent) {
-    IntInterval benefit = ii_load(inputs), assignment = ii_load(inputs + 5);
-    IntInterval negative = ii_load(inputs + 10), allowance = ii_load(inputs + 15);
-    IntInterval cost = ii_load(inputs + 20), affine = ii_load(inputs + 25);
-    IntInterval positive = ii_load(inputs + 30), visits = ii_load(inputs + 35);
-    IntInterval future = ii_load(inputs + 40), arrival = ii_load(inputs + 45);
-    IntInterval arrival_affine = ii_load(inputs + 50);
+INLINE IntInterval ib_evaluate(
+    IntInterval benefit, IntInterval assignment, IntInterval negative, IntInterval allowance,
+    IntInterval cost, IntInterval affine, IntInterval positive, IntInterval visits,
+    IntInterval future, IntInterval arrival, IntInterval arrival_affine, int exponent
+) {
     IntInterval zero = {iw_make(0u, 0u), iw_make(0u, 0u)};
     IntInterval dual = ib_add(ib_add(zero, positive, exponent, -1), negative, exponent, -1);
     IntInterval upper = ib_subtract(benefit, ii_rounded(cost, exponent, -1), exponent, 1);
@@ -47,4 +45,10 @@ INLINE IntInterval ib_upper(GLOBAL const unsigned int* inputs, int exponent) {
     upper = ib_minimum(upper, ib_finish(lower, benefit, assignment, allowance, exponent));
     return ib_minimum(upper, ib_affine(affine, positive, arrival_affine, negative,
                                      benefit, assignment, allowance, exponent));
+}
+INLINE IntInterval ib_upper(GLOBAL const unsigned int* inputs, int exponent) {
+    return ib_evaluate(ii_load(inputs), ii_load(inputs + 5), ii_load(inputs + 10),
+                       ii_load(inputs + 15), ii_load(inputs + 20), ii_load(inputs + 25),
+                       ii_load(inputs + 30), ii_load(inputs + 35), ii_load(inputs + 40),
+                       ii_load(inputs + 45), ii_load(inputs + 50), exponent);
 }

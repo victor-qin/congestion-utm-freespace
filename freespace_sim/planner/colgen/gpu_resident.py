@@ -203,6 +203,8 @@ class ResidentSearch:
                 if uppers is not None:
                     b.audit_upper = float(uppers[index])
                     b.audit_direct = bool(flags & 32)
+                if flags & 128:
+                    b.audit_integer_record(self.runtime.read_rows(self.event_records, index, 1)[0])
                 if not b.retain(root, parent, cell, hops):
                     continue
             record = np.zeros(self.stride, np.int32)
@@ -253,6 +255,8 @@ class ResidentSearch:
         - output (None): adds kernels without a host wait or frontier readback.
         """
         prices = self.batch.device_prices
+        numeric = (self.batch.numeric.arguments(step + 1)
+                   if self.batch.options.gpu_integer_bounds else ())
         calls.extend((
             Dispatch("resident_load", count, (
                 self.control((count, self.stride, start)), self.arena, self.values,
@@ -265,6 +269,7 @@ class ResidentSearch:
                 future, blocked, self.paid_rows, self.paid_values, self.candidates, self.scores,
                 self.price_map, prices.ranges, prices.steps, prices.values, cutoffs,
                 visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
+                *numeric,
             )),
             Dispatch("resident_compact", count * 6, (
                 self.control((count * 6, self.stride, self.capacity, self.queue_capacity)),

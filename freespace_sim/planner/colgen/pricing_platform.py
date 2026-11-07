@@ -28,6 +28,8 @@ class PricingOptions:
     cpu_recompute: bool = True
     max_labels: int = 250_000
     chunk_size: int = 2048
+    gpu_integer_bounds: bool = False
+    gpu_integer_audit: bool = False
     # Experimental absolute RC allowance, not a proved floating-point error bound.
     gpu_prune_epsilon: float | None = None
     gpu_prune_audit: bool = False
@@ -47,6 +49,13 @@ class PricingOptions:
             raise ValueError("Select gpu_backend='metal' or 'cuda' exactly when device='gpu'")
         if not isinstance(self.cpu_recompute, bool):
             raise TypeError("cpu_recompute must be boolean")
+        if not isinstance(self.gpu_integer_bounds, bool) or not isinstance(self.gpu_integer_audit, bool):
+            raise TypeError("integer bound/audit options must be boolean")
+        if self.gpu_integer_bounds:
+            if self.device != "gpu" or not self.cpu_recompute or self.gpu_prune_epsilon is not None:
+                raise ValueError("integer bounds require GPU canonical checks and no epsilon mode")
+        elif self.gpu_integer_audit:
+            raise ValueError("integer audit requires integer bounds")
         if not isinstance(self.gpu_prune_audit, bool):
             raise TypeError("gpu_prune_audit must be boolean")
         if not isinstance(self.gpu_prune_verify_border, bool):
@@ -74,6 +83,8 @@ class PricingOptions:
     @property
     def verify_prunes(self) -> bool:
         """Prepare original-price prefix sums when any proposal can require CPU checking."""
+        if self.gpu_integer_bounds:
+            return self.gpu_integer_audit
         return self.cpu_recompute and (self.gpu_prune_epsilon is None or self.gpu_prune_audit
                                        or self.gpu_prune_verify_border)
 
@@ -156,7 +167,9 @@ class PricingPlatform:
             from .gpu_runtime import ComputeRuntime
 
             if self._runtime is None:
-                self._runtime = ComputeRuntime(self.options.gpu_backend)
+                self._runtime = (ComputeRuntime(self.options.gpu_backend, integer_bounds=True)
+                                 if self.options.gpu_integer_bounds else
+                                 ComputeRuntime(self.options.gpu_backend))
             return price_gpu_batch(problems, self.options, self._runtime, deadline)
         results = []
         for problem in problems:

@@ -1,6 +1,7 @@
 """Exact-oracle containment, failure behavior and actual Metal checks for integer intervals."""
 
 from fractions import Fraction
+from dataclasses import replace
 import itertools
 import math
 from pathlib import Path
@@ -298,7 +299,123 @@ inline int atomicAdd(int* p, int v) { int old=*p; *p+=v; return old; }
 inline int atomicCAS(int* p, int old, int v) { int x=*p; if(x==old)*p=v; return x; }
 """
     path = tmp_path / "integer_cuda.cpp"
-    path.write_text(stub + _bound_probe_source("cuda"))
+    from freespace_sim.planner.colgen.gpu_integer_source import extend_source
+
+    path.write_text(stub + extend_source(_ORIGINAL_SOURCE("cuda"), "cuda", gpu_runtime._ARGUMENTS))
     result = subprocess.run([compiler, "-std=c++17", "-fsyntax-only", str(path)],
                             capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("audit", [False, True])
+def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
+    monkeypatch: pytest.MonkeyPatch, signed: bool, audit: bool,
+) -> None:
+    """Exact signed unions and canonical routes certify while the original pruner is guarded.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): forbids full CPU search and ordinary per-prune verification.
+    - signed (bool): includes all negative credits and origin/visit overlap.
+    - audit (bool): independently compares device deletions with original FP64 bounds.
+
+    Return
+    --------
+    - output (None): actual Metal matches exhaustive canonical completion within certificate tolerance.
+    """
+    from freespace_sim.planner.colgen import pricing
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+    from freespace_sim.planner.colgen.pricing_platform import PricingOptions, PricingPlatform
+    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _problem
+
+    problem = _problem(signed=signed)
+    if signed:
+        # Keep every negative row while allowing enough deletions to exercise the audit.
+        problem = replace(problem, duals={row: price * 0.001 if price < 0 else price
+                                          for row, price in problem.duals.items()})
+    optimum = _oracle(problem)
+
+    def forbidden(*args, **kwargs):
+        """Fail instead of using the original CPU search or per-prune numerical verifier."""
+        pytest.fail("Original CPU pricing/prune verification was called")
+
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        monkeypatch.setattr(pricing, name, forbidden)
+    if not audit:
+        monkeypatch.setattr(_Batch, "bound", forbidden)
+        monkeypatch.setattr(_Batch, "retain", forbidden)
+    platform = PricingPlatform(PricingOptions(device="gpu", gpu_backend="metal",
+                                               gpu_integer_bounds=True, gpu_integer_audit=audit))
+    (result,) = platform.price_batch([problem])
+    assert result.certified and result.search_complete
+    assert result.reduced_cost == pytest.approx(optimum, abs=1e-6)
+    assert result.upper_bound >= optimum - 1e-9
+    assert result.upper_bound - result.reduced_cost <= 1.001e-6
+    assert result.stats["candidates"] > 0
+    if audit:
+        assert result.stats["integer_audited"] > 0
+    else:
+        assert result.stats["cpu_recomputations"] == 0
+    _assert_canonical(problem, result)
+    # A fresh snapshot must observe new support and sign changes in exact membership tables.
+    changed = replace(problem, duals={row: -price + 0.125 for row, price in problem.duals.items()})
+    (again,) = platform.price_batch([changed])
+    assert again.certified
+    _assert_canonical(changed, again)
+
+
+@pytest.mark.parametrize("max_labels", [1, 250_000])
+def test_unrepresentable_operands_retain_alternatives_and_caps_remain_incomplete(
+    monkeypatch: pytest.MonkeyPatch, max_labels: int,
+) -> None:
+    """An unusable grid can disable pruning but cannot erase an unresolved route.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): supplies a deliberately inadequate grid and guards CPU search.
+    - max_labels (int): covers a hard cap and complete enumeration with the same invalid data.
+
+    Return
+    --------
+    - output (None): only the complete domain certifies; no invalid integer authorizes deletion.
+    """
+    from freespace_sim.planner.colgen import pricing
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
+
+    problem = _problem()
+    optimum = _oracle(problem)
+
+    def forbidden(*args, **kwargs):
+        """Refuse CPU fallback even when every integer operand is unavailable."""
+        pytest.fail("Invalid numeric data called CPU search/prune verification")
+
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        monkeypatch.setattr(pricing, name, forbidden)
+    monkeypatch.setattr(_Batch, "bound", forbidden)
+    monkeypatch.setattr(_Batch, "bootstrap", lambda self: None)
+    monkeypatch.setattr(IntegerScale, "for_values", classmethod(lambda cls, values, **kw: cls(-1074)))
+    (result,) = _platform("metal", max_labels=max_labels, integer_bounds=True).price_batch([problem])
+    assert result.stats["gpu_direct_prunes"] == 0
+    assert result.certified == (max_labels > 1)
+    assert result.search_complete == result.certified
+    if result.certified:
+        assert result.reduced_cost == pytest.approx(optimum, abs=1e-6)
+        _assert_canonical(problem, result)
+    else:
+        assert result.status == "label_limit" and result.upper_bound is None
+
+
+@pytest.mark.parametrize("options", [
+    {"gpu_integer_bounds": 1}, {"gpu_integer_audit": 1}, {"gpu_integer_audit": True},
+    {"gpu_integer_bounds": True, "cpu_recompute": False},
+    {"gpu_integer_bounds": True, "gpu_prune_epsilon": 0.},
+    {"gpu_integer_bounds": True, "device": "cpu", "gpu_backend": None},
+])
+def test_invalid_integer_certificate_modes_fail_before_search(options: dict) -> None:
+    """Integer certification cannot inherit unchecked canonical scores or epsilon deletions."""
+    from freespace_sim.planner.colgen.pricing_platform import PricingOptions
+
+    with pytest.raises((TypeError, ValueError)):
+        PricingOptions(**({"device": "gpu", "gpu_backend": "metal"} | options))

@@ -134,4 +134,72 @@ CUDA annotations/intrinsics stubbed; no NVIDIA hardware was used.
 
 These tests validate arithmetic given valid operands. Exact membership transport,
 resident interruption/accounting, the production verifier guard and matched
-performance are separate gates. No production pruning code imports the prototype.
+performance are separate gates. The opt-in integration below is still being validated.
+
+## Opt-in integration contract
+
+`gpu_integer_bounds` selects a separate batch class after ordinary preparation.
+The default path remains unchanged. `gpu_integer_audit` independently reconstructs
+original-price prefixes and checks each proposed device deletion with `_Batch.bound`.
+Without auditing, that verifier is guarded in validation runs and is not a fallback.
+Original canonical completion validation and scoring remain enabled in both modes.
+
+The numeric payload belongs to one invocation, graph domain and immutable price
+view. It is rebuilt for changed prices, clocks, exclusions, objectives and roots;
+there is no persistent weighted numeric cache. It carries exact positive row
+identities and absolute times, original negative credit, original geometry/hop
+cost values and the original canonical arithmetic allowance. Each flight's
+price/objective payload has one explicit scale. Packed intervals use five uint32
+words: low/high lower, low/high upper, then validity. All bounds used by a state
+share its payload's scale; scales are never mixed in arithmetic.
+
+The positive-row lookup includes every currently positive claimable cell row.
+Membership in the original paid-cell table excludes exact origin overlap before
+summation. Origin terminal rows remain in the precomputed root union; visits
+cannot claim terminal rows. Zero/negative rows do not add a positive charge, and
+every negative row remains in the original global credit. New support and sign
+changes rebuild the lookup rather than reusing an earlier positive-only table.
+
+For \(n\) positive row additions, the integer real-sum enclosure receives a
+downward allowance of \(npq\), with \(p\) derived from that sum's upper magnitude
+as in the primitive proof. Every intermediate reference positive sum is between
+zero and the exact total, so this covers every original row iteration order.
+The parent-plus-increment operation receives a separate directed FP64 enclosure.
+The revisit rule makes different visit windows disjoint; exact origin exclusion
+then proves the full union induction. Visit-only prefixes have their own interval.
+
+The resident record appends both prefix intervals and an audit upper (15 words).
+All load/copy/compaction operations preserve the complete stride. The existing
+two endpoint-mask words retain their exact mapping and update rules. Numeric
+words do not change preliminary-search grouping; complete search never groups.
+Each expansion first applies the existing integer structural rules, then erases
+all FP32 numerical flags. Only the new checked comparison can authorize deletion.
+Missing trees, masks, nonfinite operands or failed checked operations weaken the
+bound and retain the state. The optional remaining-hop refinement can be omitted
+by using the existing unrestricted suffix, which is no stronger than the reference.
+
+Every direct deletion satisfies \(U_I(s)\le C_d\) for its dispatch's original
+binary64 cutoff. The host preserves \(\max_d C_d\), a conservative envelope of
+the discarded upper maximum. This avoids FP32 loss and a nonportable 64-bit
+atomic maximum. It can report a slightly looser upper than the previous verifier,
+but it remains at most the final represented incumbent-plus-tolerance cutoff.
+Near ties therefore retain a valid objective gap rather than becoming exact
+optimality claims. Root uppers are read as integer words and converted outward.
+
+Root checks precede lazy continuation-table and resident allocation. Additional
+persistent numeric host/device arrays have a separate 64 MiB budget; the existing
+resident arena has its original 128 MiB budget. These are not total process-memory
+limits. At most two suffix rows are retained across layers. Command blocks own
+their immutable buffers until completion. All caps, deadlines, queue failures
+and unresolved decisions remain incomplete exits. An aborted pass may discard
+its old envelope only because the retry restarts the complete root domain.
+
+The integrated focused gate passed on 2026-11-07: a 50-test arithmetic/search
+smoke and 196 platform/endpoint/runtime checks (these overlap). Coverage includes
+exhaustive signed/overlapping routes and both objectives, forced future retry,
+both mask words at large absolute clocks, missing endpoint caches, changed
+snapshots, near ties, cancellation, invalid integer operands, rejected canonical
+completions, and queue/state/memory/deadline incompletion. The ordinary integer
+path runs with the original numerical verifier and full CPU pricing guarded in
+dedicated tests. Saved-case audits, solver-level validation and performance gates
+remain outstanding; these counts are not a claim that all seven milestones passed.

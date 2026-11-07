@@ -71,6 +71,7 @@ def _platform(
     cpu_recompute: bool = True,
     max_labels: int = 250_000,
     chunk_size: int = 2048,
+    integer_bounds: bool = False,
 ) -> PricingPlatform:
     """
     Select a backend, skipping Metal tests only when its platform or hardware is absent.
@@ -81,6 +82,7 @@ def _platform(
     - cpu_recompute (bool): enable certified numerical recomputation for GPU search.
     - max_labels (int): storage budget used to test incomplete-search handling.
     - chunk_size (int): expansion chunk size used by GPU search.
+    - integer_bounds (bool): use checked GPU intervals instead of CPU per-prune verification.
 
     Return
     --------
@@ -101,6 +103,7 @@ def _platform(
             cpu_recompute=cpu_recompute,
             max_labels=max_labels,
             chunk_size=chunk_size,
+            gpu_integer_bounds=integer_bounds,
         )
     )
 
@@ -170,20 +173,23 @@ def test_cpu_adapter_preserves_existing_pricing_result() -> None:
     _assert_canonical(problem, result)
 
 
-@pytest.mark.parametrize("backend,first_limit", [("cpu", None), ("metal", None), ("metal", 4)])
+@pytest.mark.parametrize("backend,first_limit,integer_bounds", [
+    ("cpu", None, False), ("metal", None, False), ("metal", 4, False),
+    ("metal", None, True), ("metal", 4, True),
+])
 @pytest.mark.parametrize("buffer", [0.0, 4.0])
 @pytest.mark.parametrize("objective", ["total_cost", "total_delay"])
 @pytest.mark.parametrize("signed", [False, True])
 def test_certified_pricing_matches_complete_path_enumeration(
     backend: str, first_limit: int | None, buffer: float, objective: str, signed: bool,
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, integer_bounds: bool,
 ) -> None:
     """Complete pricing, including an early future retry, covers every canonical route."""
     if first_limit is not None:
         from freespace_sim.planner.colgen import gpu_pricing
 
         monkeypatch.setattr(gpu_pricing, "_INITIAL_FULL_LABEL_LIMIT", first_limit)
-    platform = _platform(backend)
+    platform = _platform(backend, integer_bounds=integer_bounds)
     original = _problem(buffer=buffer, objective=objective, signed=signed)
     expected = _oracle(original)
     problem = replace(original, pi_f=expected - 0.125)
@@ -194,7 +200,8 @@ def test_certified_pricing_matches_complete_path_enumeration(
         assert result.stats["gpu_dispatches"] > 0
     assert result.reduced_cost == pytest.approx(0.125, rel=0.0, abs=1e-8)
     assert result.upper_bound is not None
-    assert result.upper_bound == pytest.approx(0.125, rel=0.0, abs=1e-8)
+    assert result.upper_bound >= result.reduced_cost
+    assert result.upper_bound - result.reduced_cost <= (1.001e-6 if integer_bounds else 1e-8)
     _assert_canonical(problem, result)
 
 
@@ -281,6 +288,13 @@ def test_cpu_recomputation_recovers_improvement_hidden_by_fp32(
     assert not fp32.certified and fp32.upper_bound is None
     _assert_canonical(problem, certified)
     _assert_canonical(problem, fp32)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(_Batch, "bound", no_cpu_search)
+        (integer,) = _platform("metal", integer_bounds=True).price_batch([problem])
+    assert integer.certified and integer.stats["cpu_recomputations"] == 0
+    assert integer.reduced_cost == pytest.approx(expected, rel=0, abs=1e-9 * scale)
+    assert integer.upper_bound >= expected
+    _assert_canonical(problem, integer)
     # Isolate the margin from the legacy unchecked mode's approximate grouping.
     for epsilon, audit, border in ((0.0, False, False), (2e-5, False, False),
                                    (0.0, True, False), (2e-5, True, False),
@@ -374,8 +388,10 @@ def test_unchecked_completion_experiment_can_be_audited_after_search(
 @pytest.mark.parametrize("chunk_size", [1, 2048])
 @pytest.mark.parametrize("prepare_future", [False, True])
 @pytest.mark.parametrize("share_prices", [False, True])
+@pytest.mark.parametrize("integer_bounds", [False, True])
 def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
     monkeypatch: pytest.MonkeyPatch, chunk_size: int, prepare_future: bool, share_prices: bool,
+    integer_bounds: bool,
 ) -> None:
     """Flights with different time windows preserve independent optima across batch reuse.
 
@@ -385,6 +401,7 @@ def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
     - chunk_size (int): expansion chunk size, including split single-label layers.
     - prepare_future (bool): exercises stronger bounds even when this small case fits in memory.
     - share_prices (bool): reuse one immutable LP snapshot across flights and separate batches.
+    - integer_bounds (bool): also check fresh integer operands and tables across snapshots.
 
     Return
     --------
@@ -401,7 +418,7 @@ def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
             batch.prepare_future()
 
         monkeypatch.setattr(_Batch, "prepare", prepare_with_future)
-    platform = _platform("metal", chunk_size=chunk_size)
+    platform = _platform("metal", chunk_size=chunk_size, integer_bounds=integer_bounds)
     first = _problem(signed=True)
     second = _problem(signed=False)
     graph = build_flight_graph(
@@ -613,8 +630,9 @@ def test_gpu_rejects_dual_view_with_mismatched_occupancy_window() -> None:
 
 
 @pytest.mark.parametrize("exclude_arrival", [False, True])
+@pytest.mark.parametrize("integer_bounds", [False, True])
 def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
-    monkeypatch: pytest.MonkeyPatch, exclude_arrival: bool,
+    monkeypatch: pytest.MonkeyPatch, exclude_arrival: bool, integer_bounds: bool,
 ) -> None:
     """Terminal lane geometry, wall roles and arrival exclusions preserve the optimum.
 
@@ -622,6 +640,7 @@ def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
     ------------
     - monkeypatch (pytest.MonkeyPatch): installs future bounds before the small GPU search.
     - exclude_arrival (bool): forbids the arrival's mandatory terminal resource.
+    - integer_bounds (bool): compares the CPU verifier and checked device interval paths.
 
     Return
     --------
@@ -639,7 +658,7 @@ def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
 
     monkeypatch.setattr(_Batch, "bootstrap", with_future)
 
-    platform = _platform("metal")
+    platform = _platform("metal", integer_bounds=integer_bounds)
     cfg = terminal_cfg(max_ground_delay_s=4.0)
     graph, params = _terminal_graph(cfg, overrun=0)
     arrival = RowKey.term("kern-B", 15)
@@ -673,15 +692,16 @@ def test_expired_deadline_never_certifies(backend: str) -> None:
 
 
 @pytest.mark.parametrize("max_labels", [1, 1024])
+@pytest.mark.parametrize("integer_bounds", [False, True])
 def test_gpu_label_limit_preserves_incomplete_status(
-    monkeypatch: pytest.MonkeyPatch, max_labels: int,
+    monkeypatch: pytest.MonkeyPatch, max_labels: int, integer_bounds: bool,
 ) -> None:
     """A bounded first pass retries all roots, but exhausting the caller's cap cannot certify."""
     from freespace_sim.planner.colgen import gpu_pricing
 
     monkeypatch.setattr(gpu_pricing, "_INITIAL_FULL_LABEL_LIMIT", 8)
     monkeypatch.setattr(gpu_pricing._Batch, "bootstrap", lambda self: None)
-    platform = _platform("metal", max_labels=max_labels, chunk_size=1)
+    platform = _platform("metal", max_labels=max_labels, chunk_size=1, integer_bounds=integer_bounds)
     problem = _problem(signed=True)
     (result,) = platform.price_batch([problem])
     if max_labels == 1:
@@ -696,10 +716,13 @@ def test_gpu_label_limit_preserves_incomplete_status(
 
 
 @pytest.mark.parametrize("buffer,max_labels", [(4.0, 250_000), (192.0, 250_000), (4.0, 3_000_000)])
-def test_closed_roots_do_not_reserve_a_resident_search_arena(buffer: float, max_labels: int) -> None:
+@pytest.mark.parametrize("integer_bounds", [False, True])
+def test_closed_roots_do_not_reserve_a_resident_search_arena(
+    buffer: float, max_labels: int, integer_bounds: bool,
+) -> None:
     """A zero-label certificate remains available even when unused capacity exceeds GPU memory limits."""
     problem = replace(_problem(buffer=buffer), duals={})
-    result, = _platform("metal", max_labels=max_labels).price_batch([problem])
+    result, = _platform("metal", max_labels=max_labels, integer_bounds=integer_bounds).price_batch([problem])
     assert result.search_complete and result.certified
     assert result.stats["full_search_labels"] == 0 and result.stats["root_prunes"] > 0
     assert result.stats.get("resident_bytes", 0) == 0
@@ -735,8 +758,9 @@ def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) ->
 
 
 @pytest.mark.parametrize("improvement", [5e-8, 5e-7])
+@pytest.mark.parametrize("integer_bounds", [False, True])
 def test_near_tie_certificate_covers_improvement_even_when_no_column_is_returned(
-    monkeypatch: pytest.MonkeyPatch, improvement: float,
+    monkeypatch: pytest.MonkeyPatch, improvement: float, integer_bounds: bool,
 ) -> None:
     """Closing tiny branches reports their upper bound instead of claiming an exact optimum.
 
@@ -744,6 +768,7 @@ def test_near_tie_certificate_covers_improvement_even_when_no_column_is_returned
     ------------
     - monkeypatch (pytest.MonkeyPatch): installs remaining-hop bounds before route discovery.
     - improvement (float): canonical gain deliberately smaller than the closure tolerance.
+    - integer_bounds (bool): retain the device bound or dispatch cutoff envelope.
 
     Return
     --------
@@ -767,11 +792,11 @@ def test_near_tie_certificate_covers_improvement_even_when_no_column_is_returned
     problem = PricingProblem(graph, cfg, params, {RowKey.cell((2, 0), 0, 3): improvement},
                              params.M - improvement)
     expected = _oracle(problem)
-    (result,) = _platform("metal").price_batch([problem])
+    (result,) = _platform("metal", integer_bounds=integer_bounds).price_batch([problem])
     assert result.search_complete and result.certified
     assert result.column is None and result.reduced_cost < expected
     assert result.upper_bound >= expected > pricing._IMPROVING_RC_TOL
-    assert result.upper_bound - result.reduced_cost <= improvement + 1e-8
+    assert result.upper_bound - result.reduced_cost <= (1.001e-6 if integer_bounds else improvement + 1e-8)
 
 
 @pytest.mark.parametrize(
@@ -834,7 +859,8 @@ def test_snapshot_summaries_preserve_rounding_and_interrupted_publication():
 
 
 @pytest.mark.parametrize("layer_block", [1, 2])
-def test_resident_rejected_completion_keeps_its_continuation(monkeypatch, layer_block):
+@pytest.mark.parametrize("integer_bounds", [False, True])
+def test_resident_rejected_completion_keeps_its_continuation(monkeypatch, layer_block, integer_bounds):
     """Rejecting an early destination must retain its later, canonically valid completion."""
     from freespace_sim.planner.colgen import gpu_resident
     from freespace_sim.planner.colgen.gpu_pricing import _Batch
@@ -873,7 +899,7 @@ def test_resident_rejected_completion_keeps_its_continuation(monkeypatch, layer_
     monkeypatch.setattr(pricing, "price_flight", forbid)
     monkeypatch.setattr(pricing, "_best_column", forbid)
     monkeypatch.setattr(pricing, "_best_column_compiled", forbid)
-    (result,) = _platform("metal", max_labels=128).price_batch([problem])
+    (result,) = _platform("metal", max_labels=128, integer_bounds=integer_bounds).price_batch([problem])
     assert rejected and result.certified
     assert result.reduced_cost == pytest.approx(expected, abs=1e-8)
     assert result.column.cell_path == (origin, dest, via, dest)
@@ -883,14 +909,18 @@ def test_resident_rejected_completion_keeps_its_continuation(monkeypatch, layer_
 
 
 @pytest.mark.parametrize("failure", ["buffer_limit", "queue_limit", "deadline"])
-@pytest.mark.parametrize("epsilon", [None, 0.001])
-def test_resident_limits_preserve_incomplete_status_and_allow_runtime_reuse(monkeypatch, failure, epsilon):
+@pytest.mark.parametrize("options", [
+    {}, {"gpu_prune_epsilon": 0.001}, {"gpu_integer_bounds": True},
+    {"gpu_integer_bounds": True, "gpu_integer_audit": True},
+])
+def test_resident_limits_preserve_incomplete_status_and_allow_runtime_reuse(monkeypatch, failure, options):
     """Allocation/queue exhaustion and checkpoint deadlines never close unresolved alternatives."""
     from freespace_sim.planner.colgen import gpu_resident
     from freespace_sim.planner.colgen.gpu_pricing import _Batch
 
     platform = _platform("metal", max_labels=1024)
-    platform.options = replace(platform.options, gpu_prune_epsilon=epsilon)
+    platform.options = replace(platform.options, **options)
+    epsilon = options.get("gpu_prune_epsilon")
     problem = _problem(signed=True)
     with monkeypatch.context() as scoped:
         scoped.setattr(_Batch, "bootstrap", lambda self: None)

@@ -5,6 +5,46 @@ Preliminary search may discard routes, but only canonically validated complete
 routes improve its incumbent. The subsequent certified pass restarts every legal
 root and retains distinct histories. No original CPU pricing search is called.
 
+## Mandatory arrival claim union
+
+The arrival bound now includes the final cell's visit window when every legal
+completion ends at that same cell. This closes a specific gap in the nominal
+endpoint claim set: a final visit can require earlier occupancy rows than the
+nominal endpoint window. For example, flight 480's arrival at step 461 requires
+the final-cell row at step 459, priced at 0.476609739. Its earlier endpoint bound
+omitted that row and stayed above the known route by precisely that amount.
+
+Let \(E(t)\) be the guaranteed nominal destination claims at arrival \(t\),
+\(D\) every distinct destination cell in the prepared topology, and \(V(c,t)\)
+the visit claims for final cell \(c\). The new mandatory set is
+
+\[
+K(t)=E(t)\cup\bigcap_{c\in D}V(c,t).
+\]
+
+Every canonical completion arriving at \(t\) contains \(K(t)\). Distinct cells
+have disjoint visit-row identities, so the intersection adds the final visit
+only when \(D\) has one distinct cell. With multiple cells, the bound retains
+the nominal endpoint claims; it never forces one destination lane. Empty
+destination sets likewise add no visit information, rather than proving
+unreachability through this optional bound.
+
+For already claimed union \(P\), price the selected positive rows in
+\(K(t)\setminus P\), then minimize over the same allowed arrival interval as
+before. The prefix and residual sets are disjoint by construction. The set
+union deduplicates endpoint/final-visit overlap before price accumulation, and
+the existing paid flags remove any origin or earlier-visit overlap. Omitting
+rows through the existing 64-row/cache budgets remains conservative. Negative
+prices retain the existing global credit and original FP64 outward arithmetic.
+This does not add the independent endpoint and future-visit bounds together.
+
+The unpriced membership cache additionally keys the destination-cell set and
+visit-window offsets. Weighted prices and paid-mask trees still refresh per
+snapshot. GPU records, buffers, kernels and arguments are unchanged. Exhaustive
+interval tests now require a final-visit-only row in the high flag word;
+canonical complete-path tests cover every prefix, and the cache tests cover
+alternate destinations, changed windows, repricing and already-paid overlap.
+
 ## Preliminary route discovery
 
 The 64-state-per-flight preliminary beam now accounts for positive endpoint rows
@@ -131,7 +171,7 @@ integration check on ten flights, not a full 1,537-flight run. The pre-existing
 full-suite import failure for `analysis.profile_native_dp` was not part of these
 focused checks. No separate independent review has been performed.
 
-### Original-price replay results
+### Replay before the mandatory final-visit union
 
 [The machine-readable report](endpoint_search_results.json) records capture and
 production-source hashes, per-flight costs/uppers, stage timings, work counts,

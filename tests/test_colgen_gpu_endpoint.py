@@ -37,14 +37,17 @@ def _endpoint_case(monkeypatch: pytest.MonkeyPatch, start: int) -> tuple:
     negative = RowKey.terminal("credit", start)
     prices = {row: 10.0 + (70 - i) * 0.001 for i, row in enumerate(rows)}
     prices[negative] = -100.3
-    arrivals = {
-        start + offset: frozenset((*rows[:70 - offset], negative)) for offset in range(7)
+    nominal = {
+        start + offset: frozenset((*rows[:70 - offset], negative)) - {rows[63]}
+        for offset in range(7)
     }
+    arrivals = {step: claims | {RowKey.cell((63, 0), 0, step + delta) for delta in (-1, 0, 1)}
+                for step, claims in nominal.items()}
 
     def endpoints(graph, cfg, *, origin, step, timing_steps):
-        """Only nominal endpoint claims are valid inputs to the geometric cache."""
+        """Omit a priced final-visit row so only the complete arrival union can include it."""
         assert not origin and timing_steps == 0
-        return arrivals[step]
+        return nominal[step]
 
     monkeypatch.setattr(pricing, "_endpoint_claims", endpoints)
     view = pricing.DualView(prices, problem.cfg)
@@ -53,6 +56,7 @@ def _endpoint_case(monkeypatch: pytest.MonkeyPatch, start: int) -> tuple:
         problem=replace(problem, duals=prices), view=view, air_per_hop=0.3,
         topology=SimpleNamespace(
             max_step=start + 6, cell_q=np.arange(70), cell_r=np.zeros(70),
+            dest_mask=np.arange(70) == 63,
         ),
         variants=SimpleNamespace(n_variants=2, start_step=np.array([start, start + 2])),
         origin_claims=lambda variant: frozenset((rows[31], rows[63])) if variant == 0 else frozenset(),
@@ -149,6 +153,7 @@ def test_endpoint_cache_budgets_refresh_and_interrupted_builds(
     prices[rows[69]] = 123.123456789
     fresh_bounds = SimpleNamespace(**vars(bounds))
     fresh_bounds.view = pricing.DualView(prices, bounds.problem.cfg)
+    fresh_bounds.view._offsets = bounds.view.offsets
     fresh_bounds.problem = replace(bounds.problem, duals=prices)
     refreshed = EndpointBounds(fresh_bounds, PricingOptions(), lambda: None)
     assert refreshed.membership is endpoint.membership
@@ -172,6 +177,42 @@ def test_endpoint_cache_budgets_refresh_and_interrupted_builds(
     with pytest.raises(pricing.PricingTimeout):
         empty.consider(np.array([(123, 456)], np.uint32))
     assert not empty.entries and empty.stats["endpoint_cache_bytes"] == 0
+
+
+def test_arrival_union_preserves_destination_choices_and_changed_visit_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final-visit charge is mandatory only for a shared final cell and current window.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): supplies an endpoint set omitting the priced last visit.
+
+    Return
+    --------
+    - output (None): alternate destinations stay available, caches refresh, and paid rows vanish once.
+    """
+    bounds, rows, _ = _endpoint_case(monkeypatch, 0)
+    previous = None
+    for destinations, offsets, required in (
+        ((63,), (-1, 1), True), ((63, 64), (-1, 1), False),
+        ((63,), (-1, 1), True), ((63,), (0, 0), False),
+        ((), (-1, 1), False),
+    ):
+        bounds.topology.dest_mask = np.isin(np.arange(70), destinations)
+        bounds.view._offsets = offsets
+        endpoint = EndpointBounds(bounds, PricingOptions(), lambda: None)
+        assert endpoint.membership is not previous
+        previous = endpoint.membership
+        paid = endpoint.mask(row for row in rows if row != rows[63])
+        endpoint.consider(np.array([paid], np.uint32))
+        q, _ = endpoint.residual(paid, 0, 2, 2)
+        expected = bounds.view.row_cost(rows[63]) if required else 0.0
+        assert q == pytest.approx(expected, rel=0.0, abs=1e-12)
+        assert q <= expected
+        all_paid = endpoint.mask(rows)
+        endpoint.consider(np.array([all_paid], np.uint32))
+        assert endpoint.residual(all_paid, 0, 2, 2)[0] == 0.0
 
 
 @pytest.mark.parametrize("start", [-100, 100, 2**31 - 8])
@@ -284,7 +325,7 @@ def test_endpoint_omission_or_cache_exhaustion_preserves_exhaustive_optimum(
 def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
     buffer: float, magnitude: float,
 ) -> None:
-    """Arrival-only bounds cover exhaustive completions despite signed-price cancellation.
+    """Mandatory arrival unions cover exhaustive completions despite signed-price cancellation.
 
     Parameters
     ------------

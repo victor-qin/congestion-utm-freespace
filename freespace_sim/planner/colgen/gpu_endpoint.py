@@ -14,19 +14,48 @@ from . import pricing
 from .gpu_bounds import CompletionBounds
 from .gpu_future import _add_lower, _float32_lower
 from .network import RowKey
-from .pricing_platform import PricingOptions
+from .pricing_platform import PricingOptions, PricingProblem
 
 Mask = tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
 class _Membership:
-    """Price-independent nominal endpoint incidence for one configuration/time domain."""
+    """Price-independent mandatory arrival unions for one destination/time domain."""
 
     cfg: object
     first: int
     last: int
+    destinations: tuple[tuple[int, int], ...]
+    visit_offsets: tuple[int, int]
     arrivals: dict[RowKey, np.ndarray]
+
+
+def _arrival_claims(
+    problem: PricingProblem, destinations: tuple[tuple[int, int], ...],
+    step: int, offsets: tuple[int, int],
+) -> frozenset[RowKey]:
+    """Union endpoint claims with final-visit rows required by every destination choice.
+
+    Parameters
+    ------------
+    - problem (PricingProblem): original flight and canonical claim configuration.
+    - destinations (tuple): all distinct final cells in the prepared route domain.
+    - step (int): common absolute arrival time for both claim sets.
+    - offsets (tuple[int, int]): inclusive canonical visit-window offsets.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): mandatory rows, deduplicated before pricing or paid masks.
+    """
+    claims = pricing._endpoint_claims(
+        problem.graph, problem.cfg, origin=False, step=step, timing_steps=0,
+    )
+    # Distinct final cells have disjoint visit-row identities. Their intersection
+    # is empty; never force the search to use a particular destination lane.
+    if len(destinations) == 1:
+        claims |= pricing._visit_claims(destinations[0], 0, step, offsets)
+    return claims
 
 
 def _range_min(tree: np.ndarray, first: int, last: int) -> float:
@@ -47,7 +76,7 @@ def _range_min(tree: np.ndarray, first: int, last: int) -> float:
 
 
 class EndpointBounds:
-    """Track at most 64 positive endpoint rows within one immutable price snapshot.
+    """Track at most 64 positive mandatory arrival rows within one price snapshot.
 
     Only geometric membership persists across snapshots. Each paid mask owns two
     FP64 range-minimum trees, Q and Q plus affine arrival cost; roots share both.
@@ -85,22 +114,25 @@ class EndpointBounds:
             endpoint_max_layer_masks=0,
         )
         self.check()
+        destinations = tuple(sorted({
+            (int(t.cell_q[cell]), int(t.cell_r[cell])) for cell in np.flatnonzero(t.dest_mask)
+        }))
+        visit_offsets = bounds.view.offsets
         cache = p.graph._search_cache
         with cache.lock:
             membership = cache.gpu_endpoints
         if (membership is None or membership.cfg != p.cfg
-                or membership.first != self.first or membership.last != self.last):
+                or membership.first != self.first or membership.last != self.last
+                or membership.destinations != destinations or membership.visit_offsets != visit_offsets):
             arrivals: dict[RowKey, list[int]] = defaultdict(list)
             for offset in range(self.size):
                 self.check()
-                for row in pricing._endpoint_claims(
-                    p.graph, p.cfg, origin=False, step=self.first + offset, timing_steps=0,
-                ):
+                for row in _arrival_claims(p, destinations, self.first + offset, visit_offsets):
                     arrivals[row].append(offset)
             packed = {row: np.asarray(indices, np.intp) for row, indices in arrivals.items()}
             for indices in packed.values():
                 indices.flags.writeable = False
-            membership = _Membership(p.cfg, self.first, self.last, packed)
+            membership = _Membership(p.cfg, self.first, self.last, destinations, visit_offsets, packed)
             self.check()
             with cache.lock:
                 cache.gpu_endpoints = membership

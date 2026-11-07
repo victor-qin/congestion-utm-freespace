@@ -1,5 +1,32 @@
 # Endpoint integration and the 88-flight comparison
 
+The measurements below predate the final PR143 departure-screening and early-retry
+changes. PR144 has since been rebased onto the PR143 merge `0cbd284a`. To compare
+the **current source** using the same 88 requests, run from this checkout:
+
+```sh
+GPU_REF=/Users/victor/Documents/Research/congestion-utm-freespace
+PYTHONPATH="$PWD" "$GPU_REF/.venv/bin/python" -m analysis.colgen.compare_gpu_checks \
+  --capture "$GPU_REF/.agent/runs/colgen-metal-20261105-220722/pricing_captures/round_0001.pkl" \
+  --metal-lock "$GPU_REF/.agent/gpu-followups-20261106/metal-benchmark.lock" \
+  --out ".agent/hard88-checks-$(date +%Y%m%d-%H%M%S)" \
+  --budget 900 --max-labels 250000 --epsilon 0.001 --repeats 1
+```
+
+This runs three fresh LP/IP solves: full checks, epsilon with near-cutoff checks,
+and no per-proposal pruning or completion checks. CPU preparation/screening,
+canonical seeds, route construction/scoring, post-pricing audits and the final
+independent interflight check remain active. The latter two search modes remain
+uncertified. This is a solver comparison, not a fixed-price warm-cache replay.
+
+`comparison.csv` and `comparison.json` report process and solver wall time,
+final total cost, accepted flights, feasibility, completion, certification and
+stopping reason. Per-run logs and detailed manifests/results are retained. Source
+and input hashes must match across modes. Label caps and uncertified results are
+reported without skipping later modes; execution or feasibility failures make the
+comparison command fail. A retained certified bound does not imply the final
+pricing sweep finished. Use `--repeats 3` to rotate the mode order across repeats.
+
 Measured on Apple M1 Ultra, 2026-11-07 UTC. The endpoint algorithms improve the
 final feasible schedule; the execution changes alone do not show a wall-time
 win on this workload. Experimental epsilon pruning with near-cutoff CPU checks

@@ -220,3 +220,89 @@ def test_explicit_selection_rejects_invalid_requests_before_output(
     with pytest.raises(error, match=match):
         gpu_validation.main([mode, "--capture", str(capture), "--out", str(out), *selection])
     assert not out.exists()
+
+
+@pytest.mark.parametrize("problem", [None, "missing_result", "changed_inputs", "infeasible"])
+def test_comparison_preserves_modes_limits_incomplete_results_and_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str | None,
+) -> None:
+    """All modes run with matched limits; missing/invalid output cannot masquerade as a fast solve.
+
+    Parameters
+    ------------
+    - tmp_path (Path): isolated capture, lock and output artifacts.
+    - monkeypatch (pytest.MonkeyPatch): replaces expensive solver subprocesses with recorded outcomes.
+    - problem (str | None): one failed run, or expected incomplete/uncertified pricing only.
+
+    Return
+    --------
+    - output (None): validates mode flags, fresh runs, honest summary and nonzero failure reporting.
+    """
+    from analysis.colgen import compare_gpu_checks
+
+    capture = tmp_path / "capture.pkl"
+    capture.touch()
+    output = tmp_path / "comparison"
+    commands = []
+
+    def simulate(command, *, cwd, env, stdout, stderr, check):
+        """Write one stub solve while checking the user-facing command's exact semantics."""
+        commands.append(command)
+        target = Path(command[command.index("--out") + 1])
+        mode = target.name.split("-", 1)[1]
+        assert command[command.index("--flight-ids") + 1:] == ["3", "2"]
+        assert command[command.index("--budget") + 1] == "120.0"
+        assert command[command.index("--max-labels") + 1] == "12345"
+        assert command[command.index("--batch-size") + 1] == "1"
+        assert env["PYTHONPATH"] == str(cwd)
+        if mode == "full":
+            assert "analysis.colgen.gpu_validation" in command
+            assert "--epsilon" not in command
+        else:
+            assert "analysis.colgen.gpu_epsilon_experiment" in command
+            epsilon = command[command.index("--epsilon") + 1]
+            assert epsilon == ("0.002" if mode == "epsilon_border" else "0")
+            assert ("--verify-border" in command) == (mode == "epsilon_border")
+            assert ("--skip-completion-validation" in command) == (mode == "no_checks")
+        target.mkdir()
+        changed = problem == "changed_inputs" and len(commands) == 2
+        feasible = not (problem == "infeasible" and len(commands) == 2)
+        manifests = dict(
+            capture_sha256="capture", requests_sha256="requests", config_sha256="config",
+            flight_ids=[3, 2], static_terminals_sha256="terminals", run_params={"M": 100},
+            harness_sha256="harness", source_sha256={"a.py": "changed" if changed else "same"},
+        )
+        result = dict(elapsed_s=4.0, accepted=2, verified=feasible, passed=False,
+                      cpu_full_pricing_guard=True, failure_reasons=["label_limit"])
+        stats = dict(objective=10.0 if mode == "full" else 12.0, objective_name="total_cost",
+                     pricing_search_complete=False, pricing_bound_certified=mode == "full",
+                     termination_reason="pricing_label_limit", pricing_failure_status="label_limit")
+        records = [dict(flight_id=3, search_complete=False, certified=False,
+                        stats={"candidates": 10, "cpu_recomputations": 2})]
+        for name, data in (("manifest", manifests), ("result", result), ("planner_stats", stats),
+                           ("pricing", {"results": records})):
+            if name == "result" and problem == "missing_result" and len(commands) == 2:
+                continue
+            (target / f"{name}.json").write_text(json.dumps(data))
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(compare_gpu_checks.subprocess, "run", simulate)
+    status = compare_gpu_checks.main([
+        "--capture", str(capture), "--out", str(output), "--metal-lock", str(tmp_path / "lock"),
+        "--flight-ids", "3", "2", "--budget", "120", "--max-labels", "12345",
+        "--epsilon", "0.002", "--repeats", "2",
+    ])
+    report = json.loads((output / "comparison.json").read_text())
+    rows = report["runs"]
+    assert len(commands) == len(rows) == 6
+    assert [r["mode"] for r in rows] == ["full", "epsilon_border", "no_checks",
+                                         "epsilon_border", "no_checks", "full"]
+    assert status == int(problem is not None)
+    assert rows[0]["pricing_bound_certified"] and not rows[0]["pricing_complete"]
+    assert rows[0]["first_incomplete_flight"] == 3
+    assert rows[0]["cost_minus_full"] == 0.0
+    assert rows[2]["cost_minus_full"] == 2.0 and not rows[2]["pricing_bound_certified"]
+    assert rows[3]["cost_minus_full"] == 2.0
+    assert bool(rows[1].get("error")) == (problem is not None)
+    assert rows[1]["cost_minus_full"] == (2.0 if problem is None else None)
+    assert (output / "comparison.csv").exists()

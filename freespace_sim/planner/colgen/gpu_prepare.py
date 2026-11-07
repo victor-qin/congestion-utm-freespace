@@ -35,8 +35,6 @@ class FlightPacking:
         """
         self.topology, self.cfg = topology, cfg
         self.cells = tuple(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
-        # Coordinate/level tuples are stable physical IDs independent of batch offsets.
-        self.resources = tuple((cell, 0) for cell in self.cells)
         self.origin_data = _prepare_origin_data(graph, cfg, topology)
         self.graph = np.full((topology.n_cells, 14), -1, np.int32)
         self.graph[:, 6:12] = 0

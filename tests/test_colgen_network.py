@@ -60,7 +60,8 @@ from freespace_sim.volumes import (
 )
 
 
-def _cfg(*, time_buffer_s: float = 4.0, planner: str = "colgen") -> SimConfig:
+def _cfg(*, time_buffer_s: float = 4.0, planner: str = "colgen",
+         hover_radius_m: float = 60.0) -> SimConfig:
     """The v1 single-level world, retaining all default ledger geometry."""
 
     return SimConfig(
@@ -70,6 +71,10 @@ def _cfg(*, time_buffer_s: float = 4.0, planner: str = "colgen") -> SimConfig:
         time_buffer_s=time_buffer_s,
         region_size_m=(20_000.0, 20_000.0),
         terminal_airspace_always_active=True,
+        # Pinned, not inherited: these worlds are built from 60 m endpoint discs — the fallback
+        # before a delivery pad got its own default (#134). `test_covering_theorem` re-checks the
+        # theorem at the 10 m default separately, where the disc no longer spans a cell.
+        hover_radius_m=hover_radius_m,
     )
 
 
@@ -482,6 +487,7 @@ def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
         _ground_point(dest_cell, cfg, -5.0, 3.0),
         4.1,
         9.2,
+        turnaround_s=19.75,
     )
     overrun = 4
     fg = build_flight_graph(req, cfg, [], ColGenParams(max_air_overrun_hops=overrun))
@@ -501,6 +507,8 @@ def test_corridor_prune_contains_a_shortest_path_and_obeys_ellipse():
     rebuilt = pickle.loads(pickle.dumps(fg))
     assert rebuilt == fg
     assert rebuilt.corridor_cells == fg.corridor_cells
+    assert rebuilt.request.return_to_origin == fg.request.return_to_origin == req.return_to_origin
+    assert rebuilt.request.turnaround_s == fg.request.turnaround_s == req.turnaround_s
 
     request_origin = fg.request.origin.copy()
     req.origin[0] += 1234.0
@@ -1580,8 +1588,9 @@ def _endpoint_claim_keys(point, volume, cfg: SimConfig) -> frozenset[RowKey]:
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("hover_radius_m", [60.0, 10.0], ids=["60m-pad", "10m-pad"])
 @pytest.mark.parametrize("time_buffer_s", [4.0, 0.0], ids=["default", "zero-buffer"])
-def test_covering_theorem(time_buffer_s):
+def test_covering_theorem(time_buffer_s, hover_radius_m):
     """FCL conflict implies a shared cap-1 row for every v1 geometry pair class.
 
     The hop sweep is exhaustive over all directed edges rooted at one cell, all
@@ -1592,7 +1601,7 @@ def test_covering_theorem(time_buffer_s):
     argument independently of corridor boxes.
     """
 
-    cfg = _cfg(time_buffer_s=time_buffer_s)
+    cfg = _cfg(time_buffer_s=time_buffer_s, hover_radius_m=hover_radius_m)
     dt = cfg.dt_s
 
     # Hop x hop: same direction, crossing, trailing, and head-on/swap instances
@@ -1649,7 +1658,9 @@ def test_covering_theorem(time_buffer_s):
                     assert not endpoint_claims.isdisjoint(
                         _hop_claim_keys(source, direction, shift, cfg)
                     ), (point, source, direction, shift)
-    assert endpoint_conflicts > 40_000
+    # Floors against a vacuous sweep. A 10 m pad disc reaches a third as far as a 60 m one, so it
+    # meets far fewer hops; what must not change is that every conflict it DOES have is covered.
+    assert endpoint_conflicts > (40_000 if hover_radius_m >= 60.0 else 10_000)
 
     # Customer cylinder x cylinder: random position and time offsets exercise
     # the proof's cell(P2) witness without assuming aligned centres or clocks.
@@ -1682,7 +1693,9 @@ def test_covering_theorem(time_buffer_s):
                 second_point,
                 shift,
             )
-    assert cylinder_conflicts > 500
+    # Two 10 m discs sampled within one hex rarely overlap at all (17 pairs here, vs >500 at 60 m),
+    # so this floor only guards against a sweep that finds nothing to check.
+    assert cylinder_conflicts > (500 if hover_radius_m >= 60.0 else 10)
 
 
 @pytest.mark.parametrize("time_buffer_s", [4.0, 0.0], ids=["default", "zero-buffer"])

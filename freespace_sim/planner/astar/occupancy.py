@@ -228,7 +228,7 @@ class HexOccupancyService:
         # Own-column membership is loop-INVARIANT (`own_cols` is fixed for the flight), so resolve it
         # to a hex set once instead of running `hex_center` + a disc test per rasterized cell.
         own_hexes = hg.column_hexes(own_cols, self.R) if own_cols else None
-        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
+        for q, r, L, s_lo, s_hi, in_blk, in_pad in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if floor is not None and s_lo < floor:
@@ -249,9 +249,12 @@ class HexOccupancyService:
                         _rows.append(cid)
                         _rows.append(s_lo)
                         _rows.append(s_hi)
-                        _rows.append(-2 if in_blk else -1)
+                        # Three states, not two: neither footprint contains the other (see
+                        # `hexgrid._sweep_kept`), so a cell can be blocked-only. `on_release` decodes
+                        # this back into which map to decrement — keep the two in lockstep.
+                        _rows.append(-2 if (in_blk and in_pad) else (-3 if in_blk else -1))
                     for s in range(s_lo, s_hi + 1):
-                        if _pad:
+                        if _pad and in_pad:
                             d = pad_b.get(s)
                             if d is None:
                                 d = pad_b[s] = {}
@@ -263,7 +266,7 @@ class HexOccupancyService:
                             d[cell] = d.get(cell, 0) + 1
                 else:
                     for s in range(s_lo, s_hi + 1):
-                        if _pad:
+                        if _pad and in_pad:
                             d = pad_b.get(s)
                             if d is None:
                                 d = pad_b[s] = set()
@@ -376,17 +379,19 @@ class HexOccupancyService:
             if floor is not None and s_lo < floor:
                 s_lo = floor
             cell = cells[rows[i]]
-            if code < 0:                              # corridor: -1 pad-only, -2 pad + blocked
-                in_blk = code == -2
+            if code < 0:               # corridor: -1 pad-only, -2 pad + blocked, -3 blocked-only
+                in_blk = code in (-2, -3)
+                in_pad = code in (-2, -1)
                 for s in range(s_lo, s_hi + 1):       # `_drop` inlined, mirroring `add_volume`
-                    d = pad_b[s]
-                    n = d[cell] - 1
-                    if n:
-                        d[cell] = n
-                    else:
-                        del d[cell]
-                        if not d:
-                            del pad_b[s]
+                    if in_pad:
+                        d = pad_b[s]
+                        n = d[cell] - 1
+                        if n:
+                            d[cell] = n
+                        else:
+                            del d[cell]
+                            if not d:
+                                del pad_b[s]
                     if in_blk and blk_live:
                         d = blk_b[s]
                         n = d[cell] - 1

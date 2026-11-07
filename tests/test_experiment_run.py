@@ -84,7 +84,7 @@ def test_kernel_status_reports_sipp_execution_path():
     assert run_module._kernel_status("straight") == "n/a (planner has no compiled kernel)"
 
 
-@pytest.mark.parametrize("planner_args", [(), ("--planner", "astar"), ("--planner", "milp")])
+@pytest.mark.parametrize("planner_args", [(), ("--planner", "astar"), ("--planner", "straight")])
 def test_execution_mode_defaults_to_sequential_for_every_planner(planner_args):
     assert _args("metro_uniform", *planner_args).mode == "sequential"
 

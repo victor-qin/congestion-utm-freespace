@@ -39,7 +39,6 @@ def main() -> None:
     ap.add_argument("--operators", default="agent,map,random")
     ap.add_argument("--gamma", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=0, help="LNS seed (scenario seed comes from the spec)")
-    ap.add_argument("--return-anchor", default="nominal", choices=["nominal", "realized"])
     ap.add_argument("--time-limit", type=float, default=None)
     ap.add_argument("--verify-every", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=50)
@@ -83,8 +82,7 @@ def main() -> None:
     demand = spec.demand_model()
 
     t0 = time.time()
-    res = sim.run(cfg, demand=demand, planner_name="astar", progress=False,
-                  return_anchor=args.return_anchor)
+    res = sim.run(cfg, demand=demand, planner_name="astar", progress=False)
     baseline_wall = time.time() - t0
     acc = res.accepted
     gd = np.array([i.ground_delay_s for i in acc]) if acc else np.zeros(1)
@@ -121,7 +119,7 @@ def main() -> None:
     )
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="astar compiled kernel FALLBACK")
-        out = run_lns_on_result(res, demand, lns_cfg, return_anchor=args.return_anchor)
+        out = run_lns_on_result(res, demand, lns_cfg)
 
     s = out.summary()
     print(f"lns: cost {s['cost_before']:.0f} -> {s['cost_after']:.0f} "
@@ -172,7 +170,6 @@ def main() -> None:
         payload = {
             "scenario": args.scenario,
             "overrides": overrides,
-            "return_anchor": args.return_anchor,
             "baseline": baseline,
             "lns_config": {k: (sorted(v) if isinstance(v, frozenset) else list(v) if isinstance(v, tuple) else v)
                            for k, v in vars(lns_cfg).items()},

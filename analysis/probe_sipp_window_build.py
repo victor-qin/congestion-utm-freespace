@@ -123,7 +123,7 @@ def main() -> int:
     AP.AStarPlanner._build_window = probe
     t0 = time.monotonic()
     try:
-        sim.run(cfg, demand=demand, planner_name="astar", progress=False, return_anchor="nominal")
+        sim.run(cfg, demand=demand, planner_name="astar", progress=False)
     finally:
         AP.AStarPlanner._build_window = orig      # a raising run must not leave the class patched
     wall = time.monotonic() - t0

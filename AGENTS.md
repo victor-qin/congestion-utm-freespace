@@ -31,6 +31,17 @@ Return
 - output (Type): description
 """
 ```
+- For classes, the docstring should be standardized as:
+```
+"""
+[Description]
+
+Attributes
+------------
+- attribute (Type): description
+
+"""
+```
 - Classes should include a description at the top before parameters are defined.
 - Major functions should annotate every parameter and the return type in the signature
 - Minor functions include at least a sentence long description, depending on how complex the function is.
@@ -41,6 +52,7 @@ Return
 ## Reiviewing Pull Requests
 - Prioritize bugs and flaws that affect the functionality of the changes and surface them to the user. If they arise from a lack of specification about functionality, ask for user feedback.
 - Include in your review any ways to streamline or simplify code, without losing functionality.
+- Whenever fixing code after a review, double-check the issues that were surfaced.
 - Look for sections of code that can be removed.
 
 ## CONTINUITY.md (REQUIRED)

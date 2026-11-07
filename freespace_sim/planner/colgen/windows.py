@@ -21,7 +21,8 @@ from ...config import SimConfig
 from ...conflict import volumes_conflict
 from ...types import Vec
 from ...volumes import Volume4D, corridor_segment_volume
-from ..hexgrid import AXIAL_NEIGHBORS, circumradius, enu_to_axial, hex_center, hex_distance
+from ..hexgrid import (AXIAL_NEIGHBORS, circumradius, enu_to_axial, hex_center,
+                       hex_distance, hop_box_stays_in_its_cells)
 
 AxialCell = tuple[int, int]
 CellWindow = tuple[int, int]
@@ -409,40 +410,6 @@ def derive_cell_window(cfg: SimConfig) -> CellWindow:
     return offsets
 
 
-def hop_box_stays_in_its_cells(cfg: SimConfig) -> bool:
-    """Is a lattice hop's corridor box contained in the union of its two hexes?
-
-    :func:`corridor_segment_volume` builds a hop box that runs between the two cell
-    centres, overhangs each end by ``ext = corridor_width_m / 2`` and is
-    ``corridor_width_m`` wide.  Split it at the midpoint and each half must fit in
-    its own hex:
-
-    * the far corners ``(pitch/2, ±width/2)`` sit on the shared edge, whose half
-      length is the circumradius over two, so ``width <= circumradius``;
-    * the near corners ``(-width/2, ±width/2)`` are inside whenever they are within
-      the inradius ``pitch/2`` of the centre.
-
-    Both hold for the shipped 60 m corridor on a 120 m pitch (60 <= 69.28 and
-    42.43 <= 60), but neither is implied by anything else in the configuration, so
-    :func:`endpoint_claim_cells` asks rather than assumes.
-
-    Parameters
-    ------------
-    - cfg (SimConfig): supplies ``corridor_segment_len_m`` (pitch), ``corridor_width_m``, and
-      the derived circumradius.
-
-    Return
-    --------
-    - output (bool): True if both containment conditions hold (and the geometry is finite and
-      positive), False otherwise.
-    """
-
-    hex_radius = circumradius(cfg)
-    pitch = float(cfg.corridor_segment_len_m)
-    width = float(cfg.corridor_width_m)
-    if not math.isfinite(pitch) or pitch <= 0.0 or not math.isfinite(width) or width < 0.0:
-        return False
-    return width <= hex_radius and math.hypot(width / 2.0, width / 2.0) <= pitch / 2.0
 
 
 def _distance_to_hex(px: float, py: float, cell: AxialCell, hex_radius: float) -> float:

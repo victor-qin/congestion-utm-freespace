@@ -511,7 +511,7 @@ def _shortcut_turn_seeded(corners, had_holds: bool,
 
 
 def _terminal_capacity_for(planner, ledger) -> TerminalCapacity | None:
-    """Find a capacity authority already brought current by the inner A*/MILP plan.
+    """Find a capacity authority already brought current by the inner A* plan.
 
     Reuse avoids a second ledger subscription/index. Asks each planner in the wrapper chain via the
     optional ``capacity_authority(ledger)`` member (see the ``Planner`` Protocol) and takes the first

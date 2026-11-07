@@ -146,11 +146,9 @@ def _density_scenario(
             pads_per_hub=pads_per_hub,
             terminal_radius_m=terminal_radius_m,
             return_flights=True,
-            turnaround_s=0.0,
             lam_per_uss=lam_per_uss,
             departure_offset_s=departure_offset_s,
             timing_mode="departure",
-            paired_return_request=True,
             request_clock_offset_s=request_clock_offset_s,
         ),
     )

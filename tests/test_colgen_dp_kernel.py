@@ -649,22 +649,10 @@ def test_equal_depth_path_comparison_adversarial_ancestry(case):
         check()
 
 
-@pytest.fixture(scope="module")
-def native_profile():
-    """Build the optional analysis twin once for primitive and full-search parity."""
-    from analysis.profile_native_dp import NativeProfile
-    return NativeProfile(dp_kernel)
-
-
-@pytest.mark.parametrize("instrumented", [False, True])
-def test_kernel_prefer_matches_the_reference_dominance_rule(instrumented, native_profile):
+def test_kernel_prefer_matches_the_reference_dominance_rule():
     """`_prefer` agrees with `pricing._prefer` on every pair, ties included."""
 
     prefer = dp_kernel._prefer
-    if instrumented:
-        native_profile.counts.fill(0)
-        def prefer(*args):
-            return native_profile.functions["_prefer"](*args, native_profile.counts)
     rng = random.Random(11)
     pool = _random_pool(rng)
     score, hops, departure, lane, parent, cell = pool.arrays()
@@ -688,12 +676,6 @@ def test_kernel_prefer_matches_the_reference_dominance_rule(instrumented, native
     assert prefer(
         0, -1, score, hops, departure, lane, parent, cell, scratch_a, scratch_b
     )
-
-    if instrumented:
-        counts = native_profile.report()["counters"]
-        assert counts["calls_prefer"] == 4001
-        assert counts["dominance_updates"] + counts["dominance_rejects"] == 4001
-        assert counts["calls_tie_lt"] > 0
 
 
 def test_kernel_prefer_reproduces_the_non_transitive_epsilon_band():
@@ -929,9 +911,8 @@ def _certification_trace(monkeypatch):
     return seen
 
 
-@pytest.mark.parametrize("instrumented", [False, True])
 @pytest.mark.parametrize("shape", sorted(GRAPH_SHAPES))
-def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch, instrumented, native_profile):
+def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch):
     """The kernel's sink set EQUALS the reference's, on both endpoint shapes.
 
     Equality, not inclusion, and the difference is the whole of Phase 2d. Missing a sink
@@ -952,13 +933,7 @@ def test_kernel_proposes_exactly_the_reference_sinks_by_shape(shape, monkeypatch
     model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
-    if instrumented:
-        original = dp_kernel._price_dag
-        with native_profile.installed():
-            result, kernel_side = _kernel_candidates(graph, cfg, view, model)
-        assert dp_kernel._price_dag is original
-    else:
-        result, kernel_side = _kernel_candidates(graph, cfg, view, model)
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model)
     assert result.ok, result.status
     if shape == "terminal":
         topology = dp_prepare.prepare_topology(graph, cfg)

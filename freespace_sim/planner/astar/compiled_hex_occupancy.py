@@ -303,7 +303,7 @@ class CompiledHexOccupancy:
         # Loop-invariant own-column membership, resolved once per flight and shared with the reference
         # service through `column_hexes`' memo (see there).
         own_hexes = hg.column_hexes(own_cols, self.R) if own_cols else None
-        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
+        for q, r, L, s_lo, s_hi, in_blk, _in_pad in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:

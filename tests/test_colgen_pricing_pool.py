@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import pickle
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -15,6 +16,7 @@ from freespace_sim.planner.colgen import pricing_pool
 from freespace_sim.planner.colgen.network import StaticTerminalCatalog, build_flight_graph
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView
+from freespace_sim.planner.colgen.pricing_platform import PricingResult
 from freespace_sim.planner.colgen.pricing_pool import (
     PricingPool,
     StalePricingWorker,
@@ -132,6 +134,9 @@ def test_sweep_result_reports_completeness_from_the_timeout_field():
     complete = SweepResult((1, 2), (0.5, 0.25), (None, None), None)
     assert complete.complete
     assert not SweepResult((1,), (0.5,), (None,), 2).complete
+    assert replace(complete, status="approximate", certified=False).complete
+    for status in ("label_limit", "deadline", "unsupported"):
+        assert not replace(complete, status=status, certified=False).complete
 
 
 def test_parallel_sweep_returns_exactly_the_sequential_answer():
@@ -1128,3 +1133,87 @@ def test_sweep_transports_extras_without_extra_bound_terms(monkeypatch, columns_
     assert result.reduced_costs == (2.0,)
     assert result.columns == (None,)
     assert result.extra_columns == ((extra,) if columns_per_flight > 1 else ())
+
+
+@pytest.mark.parametrize("failure_id", [7, 3])
+@pytest.mark.parametrize("stop", ["complete", "approximate", "label_limit", "deadline", "unsupported"])
+def test_gpu_sweep_preserves_certificates_columns_and_batch_counts(monkeypatch, stop, failure_id):
+    """GPU results keep their proof status and useful incumbents without CPU pricing fallback."""
+    from freespace_sim.planner.colgen.objective import cost_model
+    from freespace_sim.planner.colgen.pricing import seed_column
+
+    cfg = _cfg(max_ground_delay_s=4.0)
+    params = _params(pricing_device="gpu", pricing_gpu_backend="metal",
+                     pricing_cpu_recompute=stop != "approximate", pricing_gpu_batch_size=2)
+    catalog = StaticTerminalCatalog((), cfg)
+    order = [7, 3, 9]
+    requests = [_request(fid, (0, 0), (2, 0), cfg) for fid in order]
+    graphs = {r.flight_id: build_flight_graph(r, cfg, catalog, params) for r in requests}
+    model = cost_model(cfg, params)
+    seeds = {fid: seed_column(graph, cfg, model=model) for fid, graph in graphs.items()}
+    platform = pricing_pool.make_pricing_platform(params)
+    calls = []
+
+    def no_cpu(*args, **kwargs):
+        raise AssertionError("A GPU sweep must not silently rerun CPU pricing")
+
+    def batch(problems, deadline=None):
+        calls.append(tuple(p.graph.request.flight_id for p in problems))
+        results = []
+        for problem in problems:
+            fid = problem.graph.request.flight_id
+            status = stop if (stop == "approximate" or fid == failure_id) else "complete"
+            complete = status in {"complete", "approximate"}
+            certified = status == "complete"
+            column = seeds[fid]
+            rc = params.M - column.delay_s
+            results.append(PricingResult(
+                fid, rc, column, rc + 1e-7 if certified else None, complete, certified,
+                "metal", params.pricing_cpu_recompute, status,
+                {"gpu_dispatches": 6, "labels": 25, "cpu_recomputations": 10},
+            ))
+        return tuple(results)
+
+    monkeypatch.setattr(platform, "price_batch", batch)
+    monkeypatch.setattr(pricing_pool, "price_flight", no_cpu)
+    monkeypatch.setattr(pricing_pool, "_sweep_parallel", no_cpu)
+    monkeypatch.setattr(pricing_pool, "_sweep_sequential", no_cpu)
+    result = price_sweep(order, requests, graphs, cfg, params, catalog, {}, DualView({}, cfg),
+                         dict.fromkeys(order, 0.0), {}, platform=platform)
+    all_complete = stop in {"complete", "approximate"}
+    assert calls == ([(7, 3), (9,)] if all_complete else [(7, 3)])
+    assert result.complete == all_complete
+    assert result.certified == (stop == "complete")
+    assert result.status == stop
+    assert result.timeout_flight_id == (failure_id if stop == "deadline" else None)
+    assert result.flight_ids == tuple(order if all_complete else order[:2])
+    assert result.columns == tuple(seeds[fid] for fid in result.flight_ids)
+    assert result.reduced_costs == tuple(params.M - seeds[fid].delay_s for fid in result.flight_ids)
+    for score, bound, record in zip(
+        result.reduced_costs, result.upper_bounds, result.flight_records, strict=True,
+    ):
+        assert bound == (score + 1e-7 if record["pricing_certified"] else float("inf"))
+    assert pricing_pool.certified_sweep_columns(result, graphs, cfg, params, catalog) == result.columns
+    assert result.kernel_counters["gpu_dispatches"] == 6 * len(calls)
+    assert result.kernel_counters["gpu_labels"] == 25 * len(calls)
+    assert result.kernel_counters["gpu_cpu_recomputations"] == 10 * len(calls)
+    assert result.kernel_counters["gpu_batches"] == len(calls)
+    assert sum("gpu_batch_stats" in record for record in result.flight_records) == len(calls)
+    assert all(record["_canonical_pricing_result"] for record in result.flight_records)
+
+
+@pytest.mark.parametrize("bound", [0.5, float("nan"), None])
+def test_gpu_sweep_rejects_an_invalid_certified_bound(monkeypatch, bound):
+    """A certified upper bound must exist and cover the returned incumbent score."""
+    cfg = _cfg(max_ground_delay_s=4.0)
+    params = _params(pricing_device="gpu", pricing_gpu_backend="metal")
+    request = _request(7, (0, 0), (2, 0), cfg)
+    catalog = StaticTerminalCatalog((), cfg)
+    graph = build_flight_graph(request, cfg, catalog, params)
+    platform = pricing_pool.make_pricing_platform(params)
+    monkeypatch.setattr(platform, "price_batch", lambda *a, **k: (
+        PricingResult(7, 1.0, None, bound, True, True, "metal", True, "complete"),
+    ))
+    with pytest.raises(ValueError, match="certificate"):
+        price_sweep([7], [request], {7: graph}, cfg, params, catalog, {}, DualView({}, cfg),
+                    {7: 0.0}, {}, platform=platform)

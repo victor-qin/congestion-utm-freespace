@@ -12,7 +12,9 @@ runlogs/
 .ruff_cache/
 .DS_Store
 .context/
-.agent/CONTINUITY.md
+# Local agent state, captures, profiles, and disposable analysis scripts.
+# Reusable diagnostics belong in analysis/; keep local evidence out of commits.
+/.agent/
 .claude/settings.local.json
 
 results/supercloud

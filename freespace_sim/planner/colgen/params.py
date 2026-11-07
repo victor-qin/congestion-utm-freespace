@@ -208,6 +208,15 @@ class ColGenParams:
     # Additional certified surviving sinks, not an exhaustive k-best route search.
     columns_per_flight: int = 1
 
+    # Append fields: frozen-slot captures pickle values in field order.
+    # GPU pricing runs in the solver process; worker settings remain CPU-only.
+    pricing_device: str = "cpu"
+    pricing_gpu_backend: str | None = None
+    pricing_cpu_recompute: bool = True
+    pricing_gpu_batch_size: int = 1
+    pricing_gpu_max_labels: int = 250_000
+    pricing_gpu_chunk_size: int = 2048
+
     @property
     def effective_ip_reserve_s(self) -> float:
         return (min(5.0, 0.05 * self.time_limit_s) if self.ip_reserve_s is None
@@ -235,6 +244,35 @@ class ColGenParams:
             if value < 1:
                 raise ValueError(f"{name} must be positive")
             object.__setattr__(self, name, value)
+        if not isinstance(self.pricing_device, str):
+            raise TypeError("pricing_device must be a string")
+        if self.pricing_device not in {"cpu", "gpu"}:
+            raise ValueError("pricing_device must be 'cpu' or 'gpu'")
+        if self.pricing_gpu_backend is not None and not isinstance(self.pricing_gpu_backend, str):
+            raise TypeError("pricing_gpu_backend must be a string or None")
+        if ((self.pricing_device == "cpu" and self.pricing_gpu_backend is not None)
+                or (self.pricing_device == "gpu" and self.pricing_gpu_backend not in {"metal", "cuda"})):
+            raise ValueError("Select pricing_gpu_backend='metal' or 'cuda' exactly for GPU pricing")
+        if not isinstance(self.pricing_cpu_recompute, bool):
+            raise TypeError("pricing_cpu_recompute must be a boolean")
+        for name in ("pricing_gpu_batch_size", "pricing_gpu_max_labels", "pricing_gpu_chunk_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            try:
+                value = operator.index(value)
+            except TypeError as exc:
+                raise TypeError(f"{name} must be an integer") from exc
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            if name != "pricing_gpu_batch_size" and value >= 2**27:
+                raise ValueError(f"{name} must be below 2**27")
+            object.__setattr__(self, name, value)
+        if self.pricing_device == "gpu":
+            if self.columns_per_flight != 1:
+                raise ValueError("GPU pricing currently requires columns_per_flight=1")
+            if self.cheap_pricing:
+                raise ValueError("GPU pricing does not support cheap_pricing")
         if isinstance(self.max_air_overrun_hops, bool):
             raise TypeError("max_air_overrun_hops must be an integer")
         try:

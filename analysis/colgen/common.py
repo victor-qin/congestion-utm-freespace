@@ -41,10 +41,11 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def source_hashes(root: Path) -> dict[str, str]:
-    """Hash every Python file below a selected source tree's package."""
+    """Hash package Python and shared GPU source files for reproducible pricing runs."""
     return {
         str(path.relative_to(root)): sha256_bytes(path.read_bytes())
-        for path in sorted((root / "freespace_sim").rglob("*.py"))
+        for path in sorted((root / "freespace_sim").rglob("*"))
+        if path.is_file() and path.suffix in {".py", ".h"}
     }
 
 

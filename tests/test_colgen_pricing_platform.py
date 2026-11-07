@@ -908,11 +908,11 @@ def test_resident_rejected_completion_keeps_its_continuation(monkeypatch, layer_
     _assert_canonical(problem, result)
 
 
-@pytest.mark.parametrize("failure", ["buffer_limit", "queue_limit", "deadline"])
-@pytest.mark.parametrize("options", [
-    {}, {"gpu_prune_epsilon": 0.001}, {"gpu_integer_bounds": True},
-    {"gpu_integer_bounds": True, "gpu_integer_audit": True},
-])
+@pytest.mark.parametrize("failure,options", [
+    (failure, options) for failure in ("buffer_limit", "queue_limit", "deadline")
+    for options in ({}, {"gpu_prune_epsilon": 0.001}, {"gpu_integer_bounds": True},
+                    {"gpu_integer_bounds": True, "gpu_integer_audit": True})
+] + [("integer_buffer_limit", {"gpu_integer_bounds": True})])
 def test_resident_limits_preserve_incomplete_status_and_allow_runtime_reuse(monkeypatch, failure, options):
     """Allocation/queue exhaustion and checkpoint deadlines never close unresolved alternatives."""
     from freespace_sim.planner.colgen import gpu_resident
@@ -926,6 +926,10 @@ def test_resident_limits_preserve_incomplete_status_and_allow_runtime_reuse(monk
         scoped.setattr(_Batch, "bootstrap", lambda self: None)
         if failure == "buffer_limit":
             scoped.setattr(gpu_resident, "_MAX_BYTES", 1)
+        elif failure == "integer_buffer_limit":
+            from freespace_sim.planner.colgen import gpu_integer_search
+
+            scoped.setattr(gpu_integer_search, "_NUMERIC_BYTES", 1)
         elif failure == "queue_limit":
             original_control = gpu_resident.ResidentSearch.control
 

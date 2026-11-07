@@ -419,3 +419,9 @@ def test_invalid_integer_certificate_modes_fail_before_search(options: dict) -> 
 
     with pytest.raises((TypeError, ValueError)):
         PricingOptions(**({"device": "gpu", "gpu_backend": "metal"} | options))
+    if "gpu_prune_epsilon" not in options:
+        from freespace_sim.planner.colgen.params import ColGenParams
+
+        with pytest.raises((TypeError, ValueError)):
+            ColGenParams(**{"pricing_" + name: value for name, value in
+                            ({"device": "gpu", "gpu_backend": "metal"} | options).items()})

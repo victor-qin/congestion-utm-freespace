@@ -74,12 +74,13 @@ def _timed(method: Callable, name: str, measured: dict[str, float]) -> Callable:
 
 
 @contextmanager
-def _observe(runtime: ComputeRuntime) -> Iterator[dict[str, float]]:
+def _observe(runtime: ComputeRuntime, *, forbid_numeric: bool = False) -> Iterator[dict[str, float]]:
     """Instrument both base and resident implementations with the same observation points.
 
     Parameters
     ------------
     - runtime (ComputeRuntime): actual Metal runtime, initialized before phase timing.
+    - forbid_numeric (bool): require the integer production path to avoid the per-prune verifier.
 
     Return
     --------
@@ -120,6 +121,8 @@ def _observe(runtime: ComputeRuntime) -> Iterator[dict[str, float]]:
                 ResidentSearch.ensure_prefix, "resident_prefix", measured)))
         for name in ("price_flight", "_best_column", "_best_column_compiled"):
             stack.enter_context(patch.object(pricing, name, forbid))
+        if forbid_numeric:
+            stack.enter_context(patch.object(_Batch, "bound", forbid))
         yield measured
 
 
@@ -150,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-border", action="store_true",
                         help="Keep FP64 verification near the cutoff; GPU-only epsilon deletions remain uncertified")
     parser.add_argument("--warm-repeats", type=int, default=1)
+    parser.add_argument("--integer-bounds", action="store_true")
+    parser.add_argument("--audit-integer", action="store_true")
     args = parser.parse_args(argv)
     if len(args.capture) not in (1, 2) or args.batch_size < 1 or args.budget <= 0:
         parser.error("Choose one or two captures and positive batch size/budget")
@@ -183,13 +188,16 @@ def main(argv: list[str] | None = None) -> int:
         device="gpu", gpu_backend="metal", max_labels=args.max_labels, chunk_size=args.chunk_size,
         gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
         gpu_prune_verify_border=args.verify_border,
+        gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
     ))
     started = time.perf_counter()
-    platform._runtime = runtime = ComputeRuntime("metal")
+    platform._runtime = runtime = ComputeRuntime("metal", integer_bounds=args.integer_bounds)
     init_s = time.perf_counter() - started
     report = dict(batch_size=args.batch_size, max_labels=args.max_labels, chunk_size=args.chunk_size,
                   gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
                   gpu_prune_verify_border=args.verify_border,
+                  gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
+                  cpu_numeric_verifier_guard=args.integer_bounds and not args.audit_integer,
                   graph_s=graph_s, snapshot_index_s=snapshot_index_s, init_s=init_s,
                   source=str(Path(pricing.__file__).resolve()),
                   source_sha256={p.name: sha256_bytes(p.read_bytes())
@@ -202,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(captures) == 2:
         phases.extend((("round11_changed", 1), ("round11_warm", 1), ("round1_restored", 0)))
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with _observe(runtime) as measured:
+    with _observe(runtime, forbid_numeric=args.integer_bounds and not args.audit_integer) as measured:
         for label, index in phases:
             measured.clear()
             captured = captures[index]

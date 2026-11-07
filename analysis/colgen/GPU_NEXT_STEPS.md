@@ -116,7 +116,8 @@ to establish that the intended production work is removed. Measure added
 preparation/storage and refinement frequency as well as matched runtime.
 Removing canonical completion validation is a distinct later scope.
 
-Branch2 now has an opt-in checked-integer resident implementation and independent
+[Branch2 draft PR146](https://github.com/victor-qin/congestion-utm-freespace/pull/146)
+now has an opt-in checked-integer resident implementation and independent
 FP64 shadow audits. Ambiguous/overflowed comparisons retain states; original
 canonical scoring stays on the CPU. See [the proof and validation report](GPU_INTEGER_PRUNING.md)
 for the measured retention decision, limitations and reproduction commands.

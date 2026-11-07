@@ -194,6 +194,15 @@ their immutable buffers until completion. All caps, deadlines, queue failures
 and unresolved decisions remain incomplete exits. An aborted pass may discard
 its old envelope only because the retry restarts the complete root domain.
 
+Hop-cost tables are allocated only after a root survives its checked comparison
+and predecessor allocation. Each new generation appends exact root-specific
+operands and keeps existing offsets stable; device buffers remain immutable while
+referenced by a command block. Replacement checks include old/new device buffers
+and retained host rows. A missing offset disables that bound. Future preparation
+restarts the whole domain and releases the old cost generation. Preparing all
+13,515 roots eagerly caused an early numeric-buffer cap on flight1920 in the
+hard88 solver; retaining only needed tables removes that artificial early exit.
+
 The integrated focused gate passed on 2026-11-07: a 50-test arithmetic/search
 smoke and 196 platform/endpoint/runtime checks (these overlap). Coverage includes
 exhaustive signed/overlapping routes and both objectives, forced future retry,

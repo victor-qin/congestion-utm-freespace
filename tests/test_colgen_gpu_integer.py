@@ -180,6 +180,9 @@ def _bound_probe_source(backend: str) -> str:
 
 def test_metal_bound_expressions_enclose_original_fp64_operations(monkeypatch) -> None:
     """Independent original FP64 expressions cover cancellation, missing bounds and overflow."""
+    from tests.test_colgen_pricing_platform import _platform
+
+    _platform("metal")
     def down(value: float) -> float:
         """Apply the reference's original downward binary64 operation."""
         return math.nextafter(value, -math.inf)
@@ -269,6 +272,9 @@ _ORIGINAL_SOURCE = gpu_runtime._source
 
 def test_metal_multiword_primitives_match_checked_exact_integer_model(monkeypatch) -> None:
     """Actual Metal preserves carries, signed comparisons, invalidity and FP64 padding."""
+    from tests.test_colgen_pricing_platform import _platform
+
+    _platform("metal")
     monkeypatch.setattr(gpu_runtime, "_source", _probe_source)
     runtime = gpu_runtime.ComputeRuntime("metal")
     rng = random.Random(123)
@@ -354,8 +360,9 @@ def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
     from freespace_sim.planner.colgen import pricing
     from freespace_sim.planner.colgen.gpu_pricing import _Batch
     from freespace_sim.planner.colgen.pricing_platform import PricingOptions, PricingPlatform
-    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _problem
+    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
 
+    _platform("metal")
     problem = _problem(signed=signed)
     if signed:
         # Keep every negative row while allowing enough deletions to exercise the audit.
@@ -432,6 +439,45 @@ def test_unrepresentable_operands_retain_alternatives_and_caps_remain_incomplete
         _assert_canonical(problem, result)
     else:
         assert result.status == "label_limit" and result.upper_bound is None
+
+
+def test_closed_departures_do_not_reserve_unused_integer_cost_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many legal roots can close under a budget that fits only retained-root cost operands.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): caps numeric storage at 64 KiB and guards CPU verification.
+
+    Return
+    --------
+    - output (None): the full departure domain still certifies its exhaustive canonical optimum.
+    """
+    from freespace_sim.planner.colgen import gpu_integer_search
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+    from freespace_sim.planner.colgen.network import build_flight_graph
+    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
+
+    platform = _platform("metal", integer_bounds=True)
+    platform.options = replace(platform.options, endpoint_bounds=False)
+    problem = _problem()
+    cfg = replace(problem.cfg, max_ground_delay_s=512., cost_ground_delay_per_s=0.01)
+    graph = build_flight_graph(problem.graph.request, cfg, (), problem.params)
+    problem = replace(problem, graph=graph, cfg=cfg)
+    optimum = _oracle(problem)
+    monkeypatch.setattr(gpu_integer_search, "_NUMERIC_BYTES", 64 * 1024)
+
+    def forbidden(*args, **kwargs):
+        """Numerical memory pressure must not activate the original verifier."""
+        pytest.fail("CPU numerical verifier called under small integer budget")
+
+    monkeypatch.setattr(_Batch, "bound", forbidden)
+    (result,) = platform.price_batch([problem])
+    assert result.certified, (result.status, result.stats)
+    assert result.reduced_cost == pytest.approx(optimum, abs=1e-6)
+    assert result.stats["integer_bytes"] <= 64 * 1024
+    _assert_canonical(problem, result)
 
 
 @pytest.mark.parametrize("options", [

@@ -97,7 +97,7 @@ INLINE void integer_expand_one(
     GLOBAL unsigned int* numeric = (GLOBAL unsigned int*)(output + target + numeric_offset);
     ii_store(numeric, positive); ii_store(numeric + 5, visit);
     IntInterval upper = ii_invalid();
-    if (hops + remaining <= limit) {
+    if (cost_offset >= 0 && hops + remaining <= limit) {
         GLOBAL const unsigned int* constants = numeric_roots + root * 35;
         IntInterval benefit = ii_load(constants), assignment = ii_load(constants + 5);
         IntInterval negative = ii_load(constants + 10), allowance = ii_load(constants + 15);

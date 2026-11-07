@@ -61,6 +61,10 @@ class IntegerData:
         self.account()
         self.endpoint_generation = None
         self.cutoff_key = None
+        self.live_roots: set[int] = set()
+        self.cost_roots: set[int] = set()
+        self.cost_arrays: list[np.ndarray] = []
+        self.cost_size = 0
         self.built = False
         self.update_roots()
 
@@ -130,6 +134,17 @@ class IntegerData:
         b = self.batch
         started = time.monotonic()
         self.layers.clear()
+        if self.built:
+            # Future preparation restarts the entire root domain with no commands in flight.
+            self.live_roots.clear()
+            self.cost_roots.clear()
+            self.static_bytes -= sum(array.nbytes for array in self.cost_arrays)
+            self.cost_arrays.clear()
+            self.cost_size = 0
+            self.metadata[:, 2] = -1
+            for name in ("costs", "meta"):
+                self.static_bytes -= self.buffer_sizes.pop(name, 0)
+                self.buffers.pop(name, None)
         inputs = []
         for root in range(len(self.roots)):
             b.check()
@@ -155,23 +170,13 @@ class IntegerData:
         """
         b = self.batch
         started = time.monotonic()
-        metadata, costs = [], []
-        total = sum(2 * (b.topologies[i].air_hop_limit + 1) for i in b.root_flights)
-        self.account(total * 20 + self.roots.nbytes)
-        if total * 5 >= 2**31:
-            raise _Stopped("integer_buffer_limit")
-        offset = 0
-        for root, i in enumerate(b.root_flights):
-            b.check()
-            variant, bounds, scale = b.root_variants[root], b.bounds[i], self.scales[i]
-            limit = b.topologies[i].air_hop_limit
-            values = cost_operands(bounds, variant)
-            costs.append(scale.encode_array(values).reshape(-1, 5))
-            metadata.append((scale.exponent, limit, offset, int(b.options.gpu_integer_audit)))
-            offset += 2 * (limit + 1)
-        self.upload("meta", np.asarray(metadata, np.int32).reshape(-1, 4))
+        self.metadata = np.asarray([
+            (self.scales[i].exponent, b.topologies[i].air_hop_limit, -1, int(b.options.gpu_integer_audit))
+            for i in b.root_flights
+        ], np.int32).reshape(-1, 4)
+        self.account(self.metadata.nbytes)
+        self.static_bytes += self.metadata.nbytes
         self.upload("roots", self.roots)
-        self.upload("costs", np.concatenate(costs) if costs else np.empty((0, 5), np.uint32))
         rows: dict[int, list[tuple[int, float]]] = defaultdict(list)
         for i, view in enumerate(b.views):
             t, v = b.topologies[i], b.variants[i]
@@ -198,6 +203,43 @@ class IntegerData:
         self.upload("prices", np.asarray((len(b.cells), *ranges, *times), np.int32))
         self.upload("price_values", np.concatenate(prices) if prices else np.empty((0, 5), np.uint32))
         self.built = True
+        b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+
+    def prepare_costs(self) -> None:
+        """Append cost operands only for roots that survived the certified root comparison.
+
+        Parameters
+        ------------
+        - self (IntegerData): current invocation and exact retained-root identities.
+
+        Return
+        --------
+        - output (None): publishes immutable cost/offset buffers with stable existing offsets.
+          Missing or interrupted data cannot authorize a deletion.
+        """
+        pending = sorted(self.live_roots - self.cost_roots)
+        if not pending:
+            return
+        b = self.batch
+        started = time.monotonic()
+        extra = sum(2 * (b.topologies[b.root_flights[root]].air_hop_limit + 1) for root in pending)
+        total = self.cost_size + extra
+        if total * 5 >= 2**31:
+            raise _Stopped("integer_buffer_limit")
+        # Include retained host rows and old/new device generations during replacement.
+        self.account((extra + total) * 20 + self.metadata.nbytes)
+        for root in pending:
+            b.check()
+            i, variant = b.root_flights[root], b.root_variants[root]
+            array = self.scales[i].encode_array(cost_operands(b.bounds[i], variant)).reshape(-1, 5)
+            self.metadata[root, 2] = self.cost_size
+            self.cost_size += len(array)
+            self.static_bytes += array.nbytes
+            self.cost_arrays.append(array)
+            self.cost_roots.add(root)
+        self.upload("costs", np.concatenate(self.cost_arrays))
+        self.upload("meta", self.metadata)
+        b.stats["integer_cost_roots"] = len(self.cost_roots)
         b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
 
     def cutoffs(self) -> DeviceBuffer:
@@ -240,6 +282,7 @@ class IntegerData:
         b = self.batch
         if not self.built:
             self.build()
+        self.prepare_costs()
         started = time.monotonic()
         if self.endpoint_generation != b._endpoint_generation:
             arrays = [self.scales[i].encode_array(tree).reshape(-1, 5)
@@ -294,6 +337,7 @@ class IntegerBatch(_Batch):
         self.runtime.integer_data = self.numeric
         self.stats["integer_audited"] = 0
         self.stats["integer_bounds"] = True
+        self.stats["integer_roots"] = len(self.root_flights)
 
     def evaluate_roots(self) -> None:
         """Keep FP32 root ranking separate from refreshed certified integer root bounds."""
@@ -343,7 +387,9 @@ class IntegerBatch(_Batch):
             records.append(record)
             values.append((self.variants[i].score[variant], self.bounds[i].root_positive(variant)))
         packed = np.asarray(records, np.int32).reshape(-1, self.stride)
-        return self.allocate(packed), np.asarray(values, np.float32).reshape(-1, 2)
+        allocated = self.allocate(packed)
+        self.numeric.live_roots.update(map(int, packed[:, 1]))
+        return allocated, np.asarray(values, np.float32).reshape(-1, 2)
 
     def check_upper(self, root: int, parent: int, cell: int, hops: int, upper: IntegerInterval) -> None:
         """Audit a device upper against the original FP64 verifier without trusting device masks.

@@ -64,7 +64,16 @@ def _assert_same_bounds(actual: CompletionBounds, expected: CompletionBounds) ->
     for name in ("air_offset", "_length_offset"):
         assert getattr(actual, name).tobytes() == getattr(expected, name).tobytes()
     p = actual.problem
+    from freespace_sim.planner.colgen.gpu_integer_bounds import cost_operands
+
     for variant in range(actual.variants.n_variants):
+        operands = cost_operands(actual, variant)
+        for hops, (cost, affine) in enumerate(operands):
+            assert cost == actual.cost_lower(variant, hops)
+            first = math.nextafter(float(actual.variants.ground_delay_s[variant])
+                                   + float(actual.air_offset[variant]), -math.inf)
+            assert affine == math.nextafter(first + math.nextafter(hops * actual.air_per_hop, -math.inf),
+                                            -math.inf)
         assert actual.root_positive(variant) == expected.root_positive(variant)
         for hops in (0, actual.topology.shortest_hops, actual.topology.air_hop_limit):
             assert actual.cost_lower(variant, hops) == expected.cost_lower(variant, hops)

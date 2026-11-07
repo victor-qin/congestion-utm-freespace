@@ -28,8 +28,6 @@ class PricingOptions:
     cpu_recompute: bool = True
     max_labels: int = 250_000
     chunk_size: int = 2048
-    gpu_integer_bounds: bool = False
-    gpu_integer_audit: bool = False
     # Experimental absolute RC allowance, not a proved floating-point error bound.
     gpu_prune_epsilon: float | None = None
     gpu_prune_audit: bool = False
@@ -38,6 +36,8 @@ class PricingOptions:
     endpoint_max_rows: int = 64
     endpoint_cache_bytes: int = 1_048_576
     endpoint_cache_work: int = 1_000_000
+    gpu_integer_bounds: bool = False
+    gpu_integer_audit: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous device selection and invalid allocation limits."""

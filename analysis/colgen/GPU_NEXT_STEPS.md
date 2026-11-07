@@ -1,24 +1,24 @@
-# Landing sequence and three follow-up branches
+# Three follow-up branches with PR144 on merge hold
 
 ## Authorization and order
 
-- 2026-11-07 [USER] Review and land PR143 first, then review and land PR144 with
-  the complete PR143 changes integrated. Fix material findings and repeat review
-  as needed. Both PRs must land before launching the three feature conversations.
-- The endpoint conversation coordinates PR143 and the handoff. The GPU execution
-  conversation owns PR144 review, integration and landing. Each edits only its
-  bound checkout. Independent reviews use High effort and identify the exact
-  reviewed commit and base.
+- 2026-11-07 [USER] Supersedes the earlier landing-first order: PR143 is merged
+  at `0cbd284a4d46b42416b5ab1ef09ebf7f903ac13c`; PR144 remains **draft and unmerged**
+  on explicit user merge hold while all three follow-ups proceed. No automatic landing.
+- The common launch base is PR144's pushed `fc30fca4c410602111e724688d3b924c428b6f03`
+  on `codex/gpu-execution-followup`. Branch2 certified numerical pruning and
+  Branch3 synchronous parallel preparation are authorized for implementation at
+  Extra High effort. Branch1 has launched at High for diagnosis only; optimization
+  implementation requires later user approval. CPU/GPU overlap is a future branch.
+- Each conversation edits only its bound checkout. New implementation PRs are
+  drafts against `codex/gpu-execution-followup`; PR144's source branch is untouched.
+  Independent reviews, when requested, use at least High effort and identify the
+  exact reviewed head and base. PR144 still needs a fresh integrated-head review.
 - PR143: <https://github.com/victor-qin/congestion-utm-freespace/pull/143>.
   PR144: <https://github.com/victor-qin/congestion-utm-freespace/pull/144>.
 
-For each landing, resolve review findings, test the final combined source,
-verify that the remote head still matches the reviewed head, and merge only
-after required checks pass. PR144 needs a fresh review after integrating landed
-PR143, even if its earlier review is clean. Record both merge commits and the
-resulting common `main` baseline in the handoff before starting new branches.
-No first-construction, GPU-bound, or preparation-pool implementation is part of
-this landing phase.
+No merges are authorized by this follow-up launch. Draft creation/push must be
+immediately followed by T3 links for the new PR and stack layers 144,143,142,133.
 
 ## Common requirements
 
@@ -29,13 +29,13 @@ overflow and unresolved alternatives must not become successful certificates.
 Unchecked FP32 and unaudited epsilon modes remain explicitly uncertified.
 CUDA source/interface compatibility is required; NVIDIA hardware is untested.
 
-Use independent worktree-bound conversations and PRs from the common landed
+Use independent worktree-bound conversations and PRs from the common pushed
 baseline. Read local `AGENTS.md` and maintain local `.agent/CONTINUITY.md`. Read
 analysis scripts against current production sources before reusing them.
-Serialize sustained Metal workloads and timing comparisons with the shared
+Serialize sustained Metal workloads, CPU-intensive tests and timing comparisons with the shared
 advisory lock at
 `/Users/victor/Documents/Research/congestion-utm-freespace/.agent/gpu-followups-20261106/metal-benchmark.lock`.
-CPU implementation and functional tests may proceed independently.
+Source inspection and editing may proceed independently. Release the lock between jobs.
 
 Benchmark first-use, same-price warm and changed-price calls separately. Compare
 matched certificates and solver completion, not dispatch counts or differently
@@ -46,8 +46,9 @@ wall-time benefit; the previous trials used a 15% retention threshold.
 
 ## Branch A: faster first construction and CPU preparation
 
-Start with a function-level profile of first-use preparation on the combined
-landed implementation. Topology already has a per-graph cache; PR144 additionally
+Return measured function/file/line hotspots, figures, raw data and a ranked plan,
+then wait for user approval before optimization implementation. Profile the common
+pushed base. Topology already has a per-graph cache; PR144 additionally
 caches GPU structures and memberships. Measure construction and invalidation
 costs before proposing more caches.
 
@@ -105,16 +106,16 @@ to establish that the intended production work is removed. Measure added
 preparation/storage and refinement frequency as well as matched runtime.
 Removing canonical completion validation is a distinct later scope.
 
-## Branch C: parallel and overlapped CPU preparation
+## Branch C: synchronous parallel CPU preparation
 
 Prepare independent flights on persistent CPU workers and feed compact prepared
 data to one GPU owner through a bounded ready queue. Keep graph/preparation caches
 alive across rounds; repeatedly transporting whole graphs can lose those caches.
-Reuse the landed preparation contracts and inspect the earlier unmerged pool
+Reuse the current preparation contracts and inspect the earlier unmerged pool
 prototype before reusing any of it. Do not import it without source review.
 
-First establish synchronous parallel preparation with exact result parity. Then
-measure preparing upcoming flights while the GPU handles ready work. Existing
+The first PR is synchronous parallel preparation only. CPU/GPU overlap requires
+a separate future branch. Existing
 full-CPU pricing workers are not a GPU preparation pool. Keep current price
 snapshots immutable and tag prepared work so stale results cannot reach a new
 round. Preserve restrictions, cancellation, deadlines and explicit worker-loss
@@ -124,16 +125,16 @@ and competition with CPU verification before increasing worker counts.
 Test serial/parallel equivalence across signed/new prices and restrictions,
 snapshot changes, cancellation, worker failure and backpressure. Benchmark one
 worker and several worker counts with equal completion requirements, first use
-and changed-price rounds, then compare overlap enabled/disabled. Do not infer
+and changed-price rounds. Do not infer
 linear scaling or a speedup from CPU utilization alone.
 
 ## Handoff and coordination
 
-Only after both PRs land, launch these three conversations with the common base
-SHA, this plan, their scoped ownership, current continuity, source/capture
-fingerprints and verified replay commands. Preserve separate commits and PRs.
+All three conversations are launched from the common pushed base. Preserve their
+scoped ownership, current continuity, source/capture fingerprints and verified replay
+commands in separate commits and PRs; PR144 remains draft and unmerged.
 Branches A and C must coordinate preparation interfaces; branch B should expose
 its numeric preparation data through narrow interfaces that C can transport.
 Freeze those contracts early, then perform a separate combined integration
-check. The existing implementation conversations can settle once their merge
-evidence and handoffs are durable.
+check after the separate branches are ready. Do not infer merge authorization from
+successful individual or combined checks.

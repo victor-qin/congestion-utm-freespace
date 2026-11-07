@@ -14,6 +14,8 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import fields
 import cProfile
 from pathlib import Path
+import resource
+import sys
 import time
 from typing import Any
 from unittest.mock import patch
@@ -238,7 +240,9 @@ def main(argv: list[str] | None = None) -> int:
             counters = {key: value - before[key]
                         for key, value in getattr(runtime, "counters", {}).items()}
             report["runs"].append(dict(label=label, elapsed_s=elapsed, measured=dict(measured),
-                                       counters=counters, results=records))
+                                       counters=counters, results=records,
+                                       process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                                       * (1 if sys.platform == "darwin" else 1024)))
             nonfinite = []
             safe = _json_safe(report, nonfinite)
             safe["nonfinite_fields"] = nonfinite

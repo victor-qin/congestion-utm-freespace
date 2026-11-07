@@ -10,10 +10,9 @@ import weakref
 
 import numpy as np
 
-from .gpu_bounds import _down
 from .gpu_buffers import DeviceBuffer
 from .gpu_integer import IntegerInterval, IntegerScale
-from .gpu_integer_bounds import prepare_reference_operands
+from .gpu_integer_bounds import cost_operands, prepare_reference_operands
 from .gpu_pricing import _Batch, _BOUND_CLOSURE_TOL, _Stopped
 
 _NUMERIC_BYTES = 64 * 1024 * 1024
@@ -166,14 +165,7 @@ class IntegerData:
             b.check()
             variant, bounds, scale = b.root_variants[root], b.bounds[i], self.scales[i]
             limit = b.topologies[i].air_hop_limit
-            values = np.empty((limit + 1, 2), np.float64)
-            ground = float(b.variants[i].ground_delay_s[variant])
-            for hops in range(limit + 1):
-                if hops % 256 == 0:
-                    b.check()
-                values[hops] = (bounds.cost_lower(variant, hops),
-                                _down(_down(ground + float(bounds.air_offset[variant]))
-                                      + _down(hops * bounds.air_per_hop)))
+            values = cost_operands(bounds, variant)
             costs.append(scale.encode_array(values).reshape(-1, 5))
             metadata.append((scale.exponent, limit, offset, int(b.options.gpu_integer_audit)))
             offset += 2 * (limit + 1)

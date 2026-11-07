@@ -121,6 +121,33 @@ def test_snapshot_scale_has_exact_accumulation_headroom_and_checks_bad_estimates
         IntegerScale.for_values([1.0], max_terms=0)
 
 
+@pytest.mark.parametrize("weight", [math.ulp(0.0), 1e-100, 1., 1e100, 1e300])
+def test_prepared_hop_costs_preserve_original_fp64_semantics(weight: float) -> None:
+    """Vector preparation must preserve original geometry allowances at tiny/extreme weights."""
+    from freespace_sim.planner.colgen.gpu_integer_bounds import cost_operands
+    from freespace_sim.planner.colgen.network import build_flight_graph
+    from tests.test_colgen_gpu_bounds import _bounds
+    from tests.test_colgen_pricing_platform import _problem
+
+    problem = _problem()
+    cfg = replace(problem.cfg, cost_ground_delay_per_s=weight,
+                  cost_air_hold_per_s=weight, cost_air_lateral_per_s=weight)
+    graph = build_flight_graph(problem.graph.request, cfg, (), problem.params)
+    bounds, variants = _bounds(replace(problem, graph=graph, cfg=cfg))
+    for missing in (False, True):
+        if missing:
+            bounds._length_offset = np.full(variants.n_variants, -math.inf)
+        for variant in range(variants.n_variants):
+            values = cost_operands(bounds, variant)
+            for hops, (cost, affine) in enumerate(values):
+                assert cost == bounds.cost_lower(variant, hops)
+                first = math.nextafter(float(variants.ground_delay_s[variant])
+                                       + float(bounds.air_offset[variant]), -math.inf)
+                assert affine == math.nextafter(
+                    first + math.nextafter(hops * bounds.air_per_hop, -math.inf), -math.inf,
+                )
+
+
 @pytest.mark.parametrize("magnitude", [math.ulp(0.0), 1e-300, 1.0, 1e8, 1e280])
 def test_positive_sum_covers_all_reference_orders(magnitude: float) -> None:
     """A different exact row iteration order cannot tighten the reference prefix unsafely."""

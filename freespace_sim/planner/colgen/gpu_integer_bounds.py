@@ -55,6 +55,39 @@ class BoundOperands:
         return np.stack([getattr(self, name).packed() for name in self.__dataclass_fields__])
 
 
+def cost_operands(bounds: CompletionBounds, variant: int) -> np.ndarray:
+    """Evaluate original ordered FP64 geometry operands for every remaining-hop count.
+
+    Parameters
+    ------------
+    - bounds (CompletionBounds): original prepared geometry and objective coefficients.
+    - variant (int): exact departure/lane root whose ground and geometry values apply.
+
+    Return
+    --------
+    - output (np.ndarray): clamped and affine columns for hops zero through the legal limit.
+      Each ufunc is a separate binary64 operation; no reassociation or fused arithmetic is used.
+    """
+    hops = np.arange(bounds.topology.air_hop_limit + 1, dtype=np.float64)
+    raw_ground = float(bounds.variants.ground_delay_s[variant])
+    ground = max(0.0, down(raw_ground))
+    offset = float(bounds._length_offset[variant])
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        if math.isfinite(offset):
+            length = np.nextafter(np.nextafter(hops * bounds._edge_min, -np.inf) + offset, -np.inf)
+            detour = np.fmax(0.0, np.nextafter(length - bounds._reference, -np.inf))
+            air = np.fmax(0.0, np.nextafter(
+                np.nextafter(detour / bounds.problem.cfg.nominal_speed_mps, -np.inf)
+                * bounds.model.air_weight, -np.inf,
+            ))
+            cost = np.fmax(0.0, np.nextafter(ground + air, -np.inf))
+        else:
+            cost = np.full(len(hops), ground, np.float64)
+        affine = np.nextafter(down(raw_ground + float(bounds.air_offset[variant]))
+                              + np.nextafter(hops * bounds.air_per_hop, -np.inf), -np.inf)
+    return np.stack((cost, affine), axis=-1)
+
+
 def prepare_reference_operands(
     scale: IntegerScale, bounds: CompletionBounds, variant: int, hops: int, remaining: int,
     positive: IntegerInterval, visits: IntegerInterval, future: float,

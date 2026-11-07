@@ -222,9 +222,10 @@ def test_explicit_selection_rejects_invalid_requests_before_output(
     assert not out.exists()
 
 
+@pytest.mark.parametrize("comparison", ["checks", "preparation"])
 @pytest.mark.parametrize("problem", [None, "missing_result", "changed_inputs", "infeasible"])
 def test_comparison_preserves_modes_limits_incomplete_results_and_failures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str | None, comparison: str,
 ) -> None:
     """All modes run with matched limits; missing/invalid output cannot masquerade as a fast solve.
 
@@ -232,6 +233,7 @@ def test_comparison_preserves_modes_limits_incomplete_results_and_failures(
     ------------
     - tmp_path (Path): isolated capture, lock and output artifacts.
     - monkeypatch (pytest.MonkeyPatch): replaces expensive solver subprocesses with recorded outcomes.
+    - comparison (str): verification controls or fixed preparation reuse.
     - problem (str | None): one failed run, or expected incomplete/uncertified pricing only.
 
     Return
@@ -257,6 +259,9 @@ def test_comparison_preserves_modes_limits_incomplete_results_and_failures(
         assert env["PYTHONPATH"] == str(cwd)
         if mode == "full":
             assert "analysis.colgen.gpu_validation" in command
+            assert "--epsilon" not in command
+        elif mode == "no_preparation_cache":
+            assert "analysis.colgen.gpu_prepare_experiment" in command
             assert "--epsilon" not in command
         else:
             assert "analysis.colgen.gpu_epsilon_experiment" in command
@@ -290,19 +295,46 @@ def test_comparison_preserves_modes_limits_incomplete_results_and_failures(
     status = compare_gpu_checks.main([
         "--capture", str(capture), "--out", str(output), "--metal-lock", str(tmp_path / "lock"),
         "--flight-ids", "3", "2", "--budget", "120", "--max-labels", "12345",
-        "--epsilon", "0.002", "--repeats", "2",
+        "--epsilon", "0.002", "--repeats", "2", "--comparison", comparison,
     ])
     report = json.loads((output / "comparison.json").read_text())
     rows = report["runs"]
-    assert len(commands) == len(rows) == 6
-    assert [r["mode"] for r in rows] == ["full", "epsilon_border", "no_checks",
-                                         "epsilon_border", "no_checks", "full"]
+    assert len(commands) == len(rows) == (6 if comparison == "checks" else 4)
+    expected = (["full", "epsilon_border", "no_checks", "epsilon_border", "no_checks", "full"]
+                if comparison == "checks" else ["full", "no_preparation_cache", "no_preparation_cache", "full"])
+    assert [r["mode"] for r in rows] == expected
     assert status == int(problem is not None)
     assert rows[0]["pricing_bound_certified"] and not rows[0]["pricing_complete"]
     assert rows[0]["first_incomplete_flight"] == 3
     assert rows[0]["cost_minus_full"] == 0.0
     assert rows[2]["cost_minus_full"] == 2.0 and not rows[2]["pricing_bound_certified"]
-    assert rows[3]["cost_minus_full"] == 2.0
+    assert rows[3]["cost_minus_full"] == (2.0 if comparison == "checks" else 0.0)
     assert bool(rows[1].get("error")) == (problem is not None)
     assert rows[1]["cost_minus_full"] == (2.0 if problem is None else None)
     assert (output / "comparison.csv").exists()
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_preparation_ablation_preserves_certified_pricing(signed: bool) -> None:
+    """Disabling fixed reuse keeps exact packing and certified routes through repeated calls."""
+    from analysis.colgen.gpu_prepare_experiment import without_preparation_cache, uncached_packing
+    from freespace_sim.planner.colgen.dp_prepare import prepared_for
+    from freespace_sim.planner.colgen.gpu_prepare import FlightPacking
+    from tests.test_colgen_pricing_platform import _problem, _platform, _assert_canonical
+
+    problem = _problem(signed=signed)
+    topology, _ = prepared_for(problem.graph, problem.cfg)
+    expected = FlightPacking(problem.graph, problem.cfg, topology)
+    packed = uncached_packing(problem.graph, problem.cfg, topology)
+    np.testing.assert_array_equal(packed.graph, expected.graph)
+    assert packed.cells == expected.cells
+    platform = _platform("metal")
+    with without_preparation_cache():
+        uncached = [platform.price_batch([problem])[0] for _ in range(2)]
+        assert problem.graph._search_cache.gpu_packing is None
+    cached = [platform.price_batch([problem])[0] for _ in range(2)]
+    assert problem.graph._search_cache.gpu_packing is not None
+    for result in uncached + cached:
+        assert result.certified and result.search_complete
+        assert result.reduced_cost == pytest.approx(cached[0].reduced_cost, abs=1e-8)
+        _assert_canonical(problem, result)

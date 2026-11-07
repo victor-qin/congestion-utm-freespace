@@ -1,4 +1,4 @@
-"""Compare three GPU verification modes on identical fresh hard-88 LP/IP solves.
+"""Compare GPU verification or fixed preparation reuse on fresh hard-88 LP/IP solves.
 
 Each mode runs in a new process. Shared-lock waiting is excluded from timings.
 The unchecked modes retain CPU preparation/screening, canonical seeds, route construction/scoring,
@@ -88,7 +88,7 @@ def save_summary(output: Path, report: dict[str, Any]) -> None:
                "cost_minus_full", "accepted", "feasible", "pricing_complete",
                "pricing_bound_certified", "cost_lower_bound", "termination", "pricing_failure",
                "first_incomplete_flight", "pricing_results", "complete_results",
-               "certified_results", "candidates", "cpu_recomputations", "canonical_validations",
+               "certified_results", "candidates", "prepare_s", "cpu_recomputations", "canonical_validations",
                "exit_code", "error"]
     with (output / "comparison.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
@@ -108,6 +108,8 @@ def main(argv: list[str] | None = None) -> int:
     - output (int): nonzero for execution, input-matching or feasibility failures, not label caps.
     """
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--comparison", choices=("checks", "preparation"), default="checks",
+                        help="Verification modes, or fixed preparation caches on/off with full checks")
     parser.add_argument("--capture", type=Path, required=True, help="Trusted original early capture")
     parser.add_argument("--out", type=Path, required=True, help="Fresh comparison directory")
     parser.add_argument("--metal-lock", type=Path, required=True, help="Shared advisory lock path")
@@ -117,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repeats", type=int, default=1, help="Rotate mode order across fresh-process repeats")
     parser.add_argument("--flight-ids", type=int, nargs="+", help="Override hard-88 cohort for a smoke test")
     args = parser.parse_args(argv)
+    modes = MODES if args.comparison == "checks" else ("full", "no_preparation_cache")
     if not math.isfinite(args.epsilon) or args.epsilon < 0:
         parser.error("--epsilon must be finite and nonnegative")
     if not math.isfinite(args.budget) or args.budget <= 65:
@@ -137,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, Any] = {
         "flight_ids": ids, "capture": str(capture), "epsilon": args.epsilon,
         "budget_s": args.budget, "max_labels": args.max_labels, "batch_size": 1,
-        "repeats": args.repeats, "runs": [],
+        "repeats": args.repeats, "comparison": args.comparison, "runs": [],
         "notes": [
             "Fresh LP/IP solve per mode; captured duals are not reused.",
             "Process wall includes startup; solver wall includes validation/reporting overhead.",
@@ -145,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
             "Epsilon/border and no-check search are uncertified; final feasibility audits remain.",
             "A retained certified bound does not imply the final pricing sweep completed.",
             "Compare stopping/completion before interpreting runtime differences as speedups.",
+            "Preparation comparison: full=caches on; no_preparation_cache=only fixed reuse off; both fully checked.",
         ],
     }
     reference = None
@@ -153,13 +157,15 @@ def main(argv: list[str] | None = None) -> int:
     with args.metal_lock.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         for repeat in range(args.repeats):
-            offset = repeat % len(MODES)
-            for mode in MODES[offset:] + MODES[:offset]:
+            offset = repeat % len(modes)
+            for mode in modes[offset:] + modes[:offset]:
                 name = f"{repeat + 1:02d}-{mode}"
                 target = output / name
                 command = [sys.executable, "-m"]
                 if mode == "full":
                     command += ["analysis.colgen.gpu_validation", "solve"]
+                elif mode == "no_preparation_cache":
+                    command += ["analysis.colgen.gpu_prepare_experiment", "solve"]
                 else:
                     command += ["analysis.colgen.gpu_epsilon_experiment", "solve", "--epsilon"]
                     command += ([str(args.epsilon), "--verify-border"] if mode == "epsilon_border"

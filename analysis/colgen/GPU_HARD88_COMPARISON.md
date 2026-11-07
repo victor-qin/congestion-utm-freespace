@@ -27,6 +27,16 @@ reported without skipping later modes; execution or feasibility failures make th
 comparison command fail. A retained certified bound does not imply the final
 pricing sweep finished. Use `--repeats 3` to rotate the mode order across repeats.
 
+To isolate fixed graph/start/membership reuse, add `--comparison preparation`
+to the command above and use a fresh output directory. This runs `full` (caches
+on) and `no_preparation_cache` (original call-local preparation and freshly packed
+GPU adjacency), both with full verification. Existing CPU caches, snapshot
+repricing, shared GPU prices, resident execution and PR143 bounds remain enabled.
+The CSV includes `prepare_s` as well as total wall time and quality/stopping
+checks. Use `--repeats 3` for three fresh solves per mode, alternating order. This
+measures the feature within PR144; it is not a whole-branch comparison against
+PR143 alone, nor a fixed-price warm-cache replay.
+
 Measured on Apple M1 Ultra, 2026-11-07 UTC. The endpoint algorithms improve the
 final feasible schedule; the execution changes alone do not show a wall-time
 win on this workload. Experimental epsilon pruning with near-cutoff CPU checks

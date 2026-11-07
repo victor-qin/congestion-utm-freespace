@@ -357,3 +357,132 @@ adding device proposals. Preserve the current valid bounds by taking their
 minimum with any new valid reduced-cost upper. Do not directly add endpoint
 and visit bounds. Certified state merging remains research-only: current
 heuristic keys do not prove complete future equivalence or dominance.
+
+## Departure screening and earlier future retry
+
+Before constructing a departure's endpoint claims, the GPU host can use ground
+cost alone to bound every route starting there. Both multiplications round
+downward; the existing reduced-cost helper rounds upward and includes all
+negative prices. A departure is omitted only when its finite upper is no greater
+than an already canonically validated incumbent. There is no closure tolerance
+in this comparison. Consequently the final incumbent also covers every omitted
+departure, including after a retry clears the separate closed-branch upper.
+Missing witnesses, nonfinite bounds, negative prices, and zero objective weights
+retain the conservative behavior. The callback checks the deadline even for
+screened departures. CPU callers of `prepare_variants` retain their existing gate.
+
+The first complete-domain GPU pass now stops after at most 8,192 allocated
+records, or the caller's smaller cap. Hitting that limit triggers the existing
+future preparation, future-informed preliminary search, and complete-domain
+retry at the original cap. It never closes an unresolved branch. The same
+canonical candidate checks, signed prices, root/hop domains, and deadline remain
+in force. Exhaustion of the final pass still returns an incomplete result.
+This specifically avoids spending most of the cap before discovering the useful
+incumbent in cases such as flight 1638. It changes scheduling, not bound validity.
+
+Neither change modifies the GPU record/buffer layout, kernels, or public pricing
+options. Integration needs the per-batch `search_label_limit` in both allocation
+and pending-layer checks; the allocated arena remains sized to the caller's cap.
+The departure callback is optional and runs before origin-claim construction.
+
+## CPU occupied-slot maintenance
+
+Each of the two native CPU state tables records the slot index on its first
+insertion in a layer. Replacing a dominated label does not append another slot.
+Gathering reads the latest occupant of each recorded slot and retains the
+existing full sort before expansion. Distinct live dominance keys cannot have
+identical full path/departure/lane sort keys, so changing the unsorted gather
+order cannot change the subsequent relaxation order. Every consumed layer clears
+only its recorded slots and resets its count. Both lists and counts survive
+sink, envelope, and output-buffer pauses; retries allocate fresh state.
+
+The internal native call gains two int32 slot arrays of table capacity and a
+two-element int64 count array. Additional storage is \(8C+16\) bytes for capacity
+\(C\); no cross-flight arena or device residency policy is introduced. Public
+pricing interfaces, dominance keys, numerical operations, validation, and search
+work remain unchanged. Functional coverage includes forced table/label growth,
+one-entry output buffers, signed prices, exclusions, and exact reference parity.
+
+## Measured optimization trials (2026-11-07)
+
+The experiment baseline is `e1257b51`, which already includes the mandatory
+arrival union. The retention criterion was a repeatable reduction of at least
+15% in matched-certificate pricing wall time, with no lost certificates. These
+are serialized original-input replays on the M1 Metal device and native CPU
+backend, with unchanged canonical validation. Metal uses cap 250,000, batch 1,
+and chunk 2,048. CPU JIT warmup is separate; graph construction and capture
+loading are outside the measured pricing calls. First use includes cold pricing
+preparation; the warm pass reuses the same process and preparation caches.
+
+| Isolated experiment | First-use hard-88 seconds | Warm hard-88 seconds | Decision |
+| --- | ---: | ---: | --- |
+| CPU baseline | 53.716 | 24.442 | Reference |
+| CPU occupied slots | 49.293 | 20.279 | Keep; repeated warm gain exceeds 18% |
+| CPU obstacle-aware reverse distance | 53.046 | 24.064 | Discard; 1.5% warm gain |
+| CPU bounded buffer reuse | 53.096 | 24.547 | Discard |
+| CPU completion-range minima | 53.570 | 24.564 | Discard |
+| CPU paid-mask bound and range minima | 61.040 | 25.084 | Discard; slower |
+| Metal baseline | 135.943 | 95.883 | Reference |
+| Metal early departure screening | 103.389 | 64.988 | Keep; 32.2% warm gain |
+| Metal earlier future preparation | 110.390 | 70.557 | Keep; 26.4% warm gain |
+| Metal destination-choice unions | 135.313 | 97.177 | Discard; every case has one final cell |
+| Metal combined prototype | 77.640 | 38.657 | Attribution check |
+| Metal final source, with telemetry | 77.162 | 38.808 | 43.2% first / 59.5% warm gain |
+
+Every row represents 88/88 certificates on both passes, with identical best
+reduced costs. CPU occupied-slot warm timings repeat in both orders:
+24.709 to 20.219 seconds, then 24.600 to 20.137 seconds (18.17% and 18.14%).
+Exact routes and all reported search counts are unchanged. Late-price CPU gains
+are smaller, 11.74% and 12.10%. The existing CPU `n_labels` counter is the last
+native search and can retain bootstrap counts when the main search is empty;
+it must not be interpreted as total all-pass allocations.
+
+Final-source Metal checks retain 18/18 late-price certificates in both passes:
+25.329 to 14.993 seconds first use, 13.136 to 3.034 seconds warm. The selected
+17 hard/control flights retain 17/17 in both passes: 50.149 to 17.494 seconds
+first use, 42.713 to 10.084 seconds warm. All returned columns are canonically
+validated and every upper covers the reference witness. No saved route is used
+as an oracle input; original full CPU pricing is blocked throughout Metal runs.
+
+Earlier future preparation reduces all-pass hard-88 allocated route records
+from 1,266,668 to 503,064 and candidates from 5,910,883 to 2,471,158. Screening
+alone leaves those counts unchanged and omits 75,912 departures before claim
+construction. Flight 1638 falls from 208,396 to 13,649 records and from 7.465 to
+1.147 warm seconds. Its optimum and upper remain valid; this fixes the earlier
+cap-timing regression without flight-specific policy.
+
+Final-source hard-88 preparation takes 39.935 seconds first use and 1.625 warm.
+Warm preliminary search takes 33.307 seconds, future preparation 1.417, and
+complete-domain passes 2.417. These stages include numerical verification,
+canonical validation, dispatch, and waits; they do not partition CPU versus GPU
+execution time. In each pass the device telemetry records 13,688 allocations
+(318,980,620 bytes), 1,149,530,432 uploaded bytes, 196,217,072 downloaded bytes,
+and 16,159 waits. Warm allocation/wait/device/runtime times are respectively
+0.196/6.388/0.610/7.705 seconds; these timers overlap. Copy volume is measured,
+not independent transfer time. The final hard-88 baseline has no telemetry;
+the independently measured combined prototype confirms the gain without it.
+Selected-17 and late-18 comparisons have telemetry on both sides.
+
+A final discarded experiment transports complete certificates between saved
+price rounds 6 and 11. It uses the conservative upper
+\(U_{old}+\pi_{old}-\pi_{new}+\sum_r\max(0,p_{old,r}-p_{new,r})\), with
+outward rounding and every potentially claimable row in the prepared spatial
+and padded time domain. Both passes close 0/88 cases. Warm querying costs
+10.736 seconds; first-use domain preparation adds 27.437 seconds. These saved
+rounds are not consecutive. This result does not rule out reuse across smaller
+price changes, but provides no reason to add it to production here.
+
+The retained implementation has 211 unique focused test passes and separate
+10-flight canonical CPU/Gurobi and Metal/Gurobi solver checks. One new test's
+coverage assertion initially failed because its ground weight did not create
+screenable departures; increasing that fixture weight exercises the gate and
+passes. An existing large pure-Python overrun-9 reference comparison was stopped
+after the test run reached 324 seconds and is not counted as a pass. The full
+suite was not run (the base has an unrelated missing `analysis.profile_native_dp`
+fixture). CUDA source/interfaces are preserved, without NVIDIA hardware testing.
+
+`pricing_followup_trials.json` contains aligned per-flight final-source results,
+aggregate isolated trials, CPU startup times, source/capture digests, validation
+evidence and separate preparation/device counters. The CPU optimization is an
+independent commit and does not require the Metal changes. These results do not
+establish a full 1,537-flight solver speedup or that Metal outperforms the CPU.

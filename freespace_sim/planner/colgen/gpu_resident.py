@@ -55,7 +55,8 @@ class ResidentSearch:
         self.counts = self.empty((7,), np.int32)
         self.cutoffs = self.empty((len(batch.problems), 2), np.float32)
         self.layer_buffers = [(self.empty((len(batch.cells),), np.float32),
-                               self.empty((len(batch.cells),), np.int32)) for _ in range(2)]
+                               self.empty((len(batch.cells),), np.int32),
+                               self.empty((len(batch.cells), 2), np.uint32)) for _ in range(2)]
         self.known = np.zeros(self.capacity, bool)
         self.ready: dict[int, tuple[DeviceBuffer, int]] = {}
         self.free: list[DeviceBuffer] = []
@@ -66,6 +67,12 @@ class ResidentSearch:
         self.paid_values = self.runtime.immutable(batch.paid_values, "paid_values")
         self.price_map = self.runtime.immutable(batch.price_map, "price_map")
         self.root_values = self.runtime.upload(batch.root_values)
+        # Reuse masks discovered by roots and the preliminary pass. Missing masks
+        # keep the weaker bound; never read full resident frontiers just to build caches.
+        batch.pack_endpoints()
+        self.endpoint_meta = self.runtime.immutable(batch.endpoint_meta, "endpoint_meta")
+        self.endpoint_entries = self.runtime.immutable(batch.endpoint_entries, "endpoint_entries")
+        self.endpoint_trees = self.runtime.immutable(batch.endpoint_trees, "endpoint_trees")
         self.empty_indices = self.runtime.upload(np.empty(0, np.int32))
         for name in ("resident_blocks", "resident_layers", "resident_multi_layer_blocks",
                      "resident_queue_peak", "resident_prefix_reads", "restored_prunes"):
@@ -192,6 +199,7 @@ class ResidentSearch:
             self.ensure_prefix(parent)
             if flags & 4:
                 b.stats["gpu_prune_proposals"] += 1
+                b.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
                 if uppers is not None:
                     b.audit_upper = float(uppers[index])
                     b.audit_direct = bool(flags & 32)
@@ -222,7 +230,7 @@ class ResidentSearch:
     def expand(
         self, calls: list[Dispatch], step: int, frontier: DeviceBuffer, output: DeviceBuffer,
         counts: DeviceBuffer, start: int, count: int, cutoffs: DeviceBuffer,
-        future: DeviceBuffer, blocked: DeviceBuffer,
+        future: DeviceBuffer, blocked: DeviceBuffer, visit_masks: DeviceBuffer,
     ) -> None:
         """Append dependent load, parallel expansion and device compaction kernels.
 
@@ -238,6 +246,7 @@ class ResidentSearch:
         - cutoffs (DeviceBuffer): only canonically validated per-flight pruning cutoffs.
         - future (DeviceBuffer): flight-specific future bounds at the target time.
         - blocked (DeviceBuffer): current flight-specific forbidden-row flags.
+        - visit_masks (DeviceBuffer): exact paid-arrival bits for the target time.
 
         Return
         --------
@@ -255,6 +264,7 @@ class ResidentSearch:
                 self.labels, self.label_values, self.graph, self.roots, self.root_values,
                 future, blocked, self.paid_rows, self.paid_values, self.candidates, self.scores,
                 self.price_map, prices.ranges, prices.steps, prices.values, cutoffs,
+                visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
             )),
             Dispatch("resident_compact", count * 6, (
                 self.control((count * 6, self.stride, self.capacity, self.queue_capacity)),
@@ -263,13 +273,16 @@ class ResidentSearch:
             )),
         ))
 
-    def layer_inputs(self, step: int, slot: int = 0) -> tuple[DeviceBuffer, DeviceBuffer]:
+    def layer_inputs(self, step: int, slot: int = 0) -> tuple[DeviceBuffer, DeviceBuffer, DeviceBuffer]:
         """Upload only flight-specific bounds/exclusions; prices stay in the shared store."""
         visits, blocked = self.batch.visits(step + 1)
-        future_buffer, blocked_buffer = self.layer_buffers[slot]
+        future_buffer, blocked_buffer, masks_buffer = self.layer_buffers[slot]
+        # The unrestricted future table relaxes every resident parent's hop budget.
+        # Exact remaining-hop lookup remains in FP64 verification and the preliminary pass.
         self.runtime.write(future_buffer, np.ascontiguousarray(visits[:, 2]))
         self.runtime.write(blocked_buffer, blocked)
-        return future_buffer, blocked_buffer
+        self.runtime.write(masks_buffer, self.batch.endpoint_visits(step + 1))
+        return future_buffer, blocked_buffer, masks_buffer
 
     def run(self) -> None:
         """Search all roots and resumable alternatives in bounded ordered layer blocks.
@@ -314,7 +327,7 @@ class ResidentSearch:
                           (not roots or roots[0] > step + 1) and upper_next <= self.chunk and
                           6 * (count + upper_next) <= self.queue_capacity and
                           b.used + 6 * (count + upper_next) <= self.capacity)
-            future, blocked = self.layer_inputs(step)
+            future, blocked, visit_masks = self.layer_inputs(step)
             position = 0
             while position < count:
                 b.check()
@@ -330,7 +343,7 @@ class ResidentSearch:
                        and budget >= 6 * min(self.chunk, count - position)):
                     n = min(self.chunk, count - position)
                     self.expand(calls, step, frontier, output, counts, position, n,
-                                cutoffs, future, blocked)
+                                cutoffs, future, blocked, visit_masks)
                     position += n
                     budget -= 6 * n
                     chunks += 1
@@ -341,9 +354,9 @@ class ResidentSearch:
                 if two_layers:
                     following, existing = self.frontier(step + 2)
                     calls.append(Dispatch("resident_advance", 1, (self.control((existing,)), counts)))
-                    following_future, following_blocked = self.layer_inputs(step + 1, 1)
+                    following_future, following_blocked, following_masks = self.layer_inputs(step + 1, 1)
                     self.expand(calls, step + 1, output, following, counts, 0, upper_next,
-                                cutoffs, following_future, following_blocked)
+                                cutoffs, following_future, following_blocked, following_masks)
                     consumed.append(output)
                     output = following
                     end_step += 1

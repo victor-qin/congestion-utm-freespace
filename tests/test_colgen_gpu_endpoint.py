@@ -250,11 +250,14 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
             current = labels[first:first + chunk_size]
             count = len(current) * 6
             records, scores = runtime.run("expand", count, (
-                np.array([len(current), 11, start, 0, 0], np.int32), current,
-                np.array([[7, 3]] * len(current), np.float32), graph, roots, data, visits,
+                np.array([len(current), 11, start, 0, 0, 0], np.int32), current,
+                np.array([[7, 3]] * len(current), np.float32), graph, roots, data, visits[:, 2].copy(),
                 np.zeros(2, np.int32), np.array([[1, start + 1]], np.int32),
                 np.array([3], np.float32), np.empty((count, 11), np.int32),
-                np.empty((count, 3), np.float32), masks, meta, entries, trees,
+                np.empty((count, 3), np.float32), np.array([0, 1], np.int32),
+                np.array([[0, 0], [0, 1]], np.int32), np.array([start + 1], np.int32),
+                np.array([[8, 8]], np.float32), np.array([[1, -np.inf]] * 2, np.float32),
+                masks, meta, entries, trees,
             ), (10, 11), write_only=(10, 11))
             for index in range(0, count, 6):
                 record = records[index]
@@ -269,6 +272,7 @@ def test_metal_mask_words_history_and_endpoint_only_prune_proposals(
 
 
 @pytest.mark.parametrize("options", [
+    {}, {"gpu_prune_epsilon": 0.001, "gpu_prune_audit": True},
     {"endpoint_bounds": False}, {"endpoint_max_rows": 1},
     {"endpoint_cache_bytes": 0}, {"endpoint_cache_work": 0},
 ])
@@ -423,8 +427,9 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
 
 
 @pytest.mark.parametrize("expire", [False, True])
+@pytest.mark.parametrize("resident", [False, True])
 def test_rejected_proposals_and_completions_cannot_certify_unresolved_work(
-    monkeypatch: pytest.MonkeyPatch, expire: bool,
+    monkeypatch: pytest.MonkeyPatch, expire: bool, resident: bool,
 ) -> None:
     """Untrusted GPU proposals and rejected completions cannot become validated incumbents.
 
@@ -432,6 +437,7 @@ def test_rejected_proposals_and_completions_cannot_certify_unresolved_work(
     ------------
     - monkeypatch (pytest.MonkeyPatch): forces bad proposals and rejects the first completion.
     - expire (bool): interrupts after that rejection instead of allowing a complete retry.
+    - resident (bool): also force proposals and corrupt paid bits inside the resident GPU pass.
 
     Return
     --------
@@ -470,9 +476,24 @@ def test_rejected_proposals_and_completions_cannot_certify_unresolved_work(
     monkeypatch.setattr(pricing, "_shortest_seed", lambda *args, **kwargs: None)
     monkeypatch.setattr(ComputeRuntime, "run", force_proposals)
     monkeypatch.setattr(pricing, "_canonical_candidate", reject_first)
+    if resident:
+        from freespace_sim.planner.colgen import gpu_runtime
+        from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+        source = gpu_runtime._source
+
+        def forced_source(backend: str) -> str:
+            """Corrupt device mask proposals; the verifier must rebuild original paid membership."""
+            return source(backend).replace(
+                "int flags = (finish ? 1 : 0) | (onward ? 2 : 0);",
+                "int flags = (finish ? 1 : 0) | (onward ? 2 : 0) | 4;",
+            ).replace("upper = fmin(upper, endpoint);", "upper = -1e30f; low = high = 0xffffffffu;")
+
+        monkeypatch.setattr(gpu_runtime, "_source", forced_source)
+        monkeypatch.setattr(_Batch, "bootstrap", lambda self: None)
     platform = _platform("metal", chunk_size=1)
     result, = platform.price_batch([problem])
-    assert rejected == 1 and proposed > 0
+    assert rejected == 1 and (proposed > 0 or result.stats["restored_prunes"] > 0)
     if expire:
         assert result.status == "deadline" and not result.certified
         assert result.upper_bound is None

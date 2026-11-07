@@ -709,6 +709,7 @@ class _Batch:
         """
         if self.options.verify_prunes:
             args = int(record[1]), int(record[3]), int(record[0]), int(record[2])
+            self.paid_masks[index] = self.paid_mask(*args)
             self.prefix_positive[index] = self.positive_lower(*args)
             self.visit_prefix_positive[index] = self.visit_lower(*args)
         self.arena[index] = record[[3, 0, 1]]

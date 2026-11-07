@@ -120,13 +120,13 @@ FSUM_MAX_PARTIALS = 64
 # Answer-neutral, because a budget bounds work and never the search: hitting either ceiling
 # returns the same STATUS_LABEL_LIMIT / STATUS_STATE_LIMIT the caller already handles.
 # Sized from measurement rather than a round number.  Labels cost 40 bytes each across the
-# nine parallel arrays (one float64 plus eight int32); a dominance slot costs 32 bytes
-# across the four tables plus the two layer buffers, so `1 << MAX_LOG2CAP` slots is ~2.1 GB.
-# 1<<26 is 67.1M labels at ~2.68 GB, and the arena + state-table pair peaks near 4.83 GB
+# nine parallel arrays (one float64 plus eight int32); a dominance slot costs 40 bytes
+# across the four tables, two layer buffers and two occupied-slot lists (~2.68 GB at 1<<26).
+# 1<<26 is 67.1M labels at ~2.68 GB, and the arena + state-table pair peaks near 5.37 GB
 # per search.
 #
 # THAT IS PER PROCESS, and `pricing_pool` gives every worker its own -- so a 4-worker pool
-# is ~19 GB worst case and this ceiling is the thing that forecloses it on a 4 GB/core node.
+# is ~21.5 GB worst case and this ceiling is the thing that forecloses it on a 4 GB/core node.
 # It is a ceiling, not an allocation: nothing reaches it unless a flight genuinely needs it,
 # and `LABEL_HIGH_WATER_WARN` below exists so you learn which flights are approaching it
 # while they still SUCCEED, rather than from the decline after they stop.
@@ -1354,12 +1354,17 @@ def _register_sinks(
 
 @njit(cache=True, nogil=True)
 def _seed_layer(
-    seed_step, min_step, root_order, root_bucket_start,
-    var_cell, var_score, var_paid_class, var_departure, var_lane,
-    n_labels, label_score, label_cell, label_parent, label_hops, label_variant,
-    label_departure, label_lane, label_first_a, label_first_b,
-    tbl_label, tbl_hash, log2cap, depth, recent_a, probe_recent, scratch_a, scratch_b,
-):
+    seed_step: int, min_step: int, root_order: np.ndarray, root_bucket_start: np.ndarray,
+    var_cell: np.ndarray, var_score: np.ndarray, var_paid_class: np.ndarray,
+    var_departure: np.ndarray, var_lane: np.ndarray,
+    n_labels: int, label_score: np.ndarray, label_cell: np.ndarray, label_parent: np.ndarray,
+    label_hops: np.ndarray, label_variant: np.ndarray,
+    label_departure: np.ndarray, label_lane: np.ndarray, label_first_a: np.ndarray,
+    label_first_b: np.ndarray,
+    tbl_label: np.ndarray, tbl_hash: np.ndarray, log2cap: int, depth: int, recent_a: np.ndarray,
+    probe_recent: np.ndarray, scratch_a: np.ndarray, scratch_b: np.ndarray,
+    touched: np.ndarray, touched_count: np.ndarray, table_id: int,
+) -> int:
     """Insert every root whose start step is ``seed_step``; return the new label count.
 
     Negative returns are failures: ``-1`` label pool full, ``-2`` state table saturated.
@@ -1397,6 +1402,9 @@ def _seed_layer(
     - probe_recent (np.ndarray): scratch buffer for state-table probing.
     - scratch_a (np.ndarray): scratch path buffer for ``_prefer``.
     - scratch_b (np.ndarray): scratch path buffer for ``_prefer``.
+    - touched (np.ndarray): occupied slots for this layer, with no duplicate entries.
+    - touched_count (np.ndarray): occupied counts for the two persistent layer tables.
+    - table_id (int): index of this table in ``touched_count``.
 
     Return
     --------
@@ -1437,6 +1445,8 @@ def _seed_layer(
         if slot < 0:
             return -2
         if not found:
+            touched[touched_count[table_id]] = slot
+            touched_count[table_id] += 1
             tbl_label[slot] = label
             tbl_hash[slot] = key_hash
         elif _prefer(
@@ -1450,37 +1460,46 @@ def _seed_layer(
 @njit(cache=True, nogil=True)
 def _price_dag(
     # --- topology
-    arc_start, arc_target, arc_roles, hex_remaining,
-    dest_mask, dest_lane_start, dest_lane_idx,
-    air_hop_limit, revisit_depth, state_history_depth, track_first_hop,
-    min_step, max_step,
+    arc_start: np.ndarray, arc_target: np.ndarray, arc_roles: np.ndarray, hex_remaining: np.ndarray,
+    dest_mask: np.ndarray, dest_lane_start: np.ndarray, dest_lane_idx: np.ndarray,
+    air_hop_limit: int, revisit_depth: int, state_history_depth: int, track_first_hop: bool,
+    min_step: int, max_step: int,
     # --- roots, pre-bucketed by start step
-    root_order, root_bucket_start,
-    var_cell, var_score, var_paid_class, var_departure, var_lane,
-    var_ground_w, var_origin_leg_w,
-    paid_start, paid_cell, paid_step, paid_value,
+    root_order: np.ndarray, root_bucket_start: np.ndarray,
+    var_cell: np.ndarray, var_score: np.ndarray, var_paid_class: np.ndarray,
+    var_departure: np.ndarray, var_lane: np.ndarray,
+    var_ground_w: np.ndarray, var_origin_leg_w: np.ndarray,
+    paid_start: np.ndarray, paid_cell: np.ndarray, paid_step: np.ndarray, paid_value: np.ndarray,
     # --- duals
-    cell_series, series_first, series_start, series_prefix, offsets_lo, offsets_hi,
+    cell_series: np.ndarray, series_first: np.ndarray, series_start: np.ndarray,
+    series_prefix: np.ndarray, offsets_lo: int, offsets_hi: int,
     # --- rows and exclusions
-    forbidden_bits, rows_n_steps, rows_step0,
+    forbidden_bits: np.ndarray, rows_n_steps: int, rows_step0: int,
     # --- objective
-    air_dt_s, air_weight, dt_s, benefit, pi_f, max_negative_credit,
+    air_dt_s: float, air_weight: float, dt_s: float, benefit: float, pi_f: float,
+    max_negative_credit: float,
     # --- the completion gate
-    env_start, env_len, env_delay, env_dest, destination_lane_tie, cutoff, inc_state,
-    sink_probe,
+    env_start: np.ndarray, env_len: np.ndarray, env_delay: np.ndarray, env_dest: np.ndarray,
+    destination_lane_tie: int, cutoff: np.ndarray, inc_state: np.ndarray,
+    sink_probe: int,
     # --- workspace: label pool
-    label_score, label_cell, label_parent, label_hops, label_variant,
-    label_departure, label_lane, label_first_a, label_first_b,
+    label_score: np.ndarray, label_cell: np.ndarray, label_parent: np.ndarray,
+    label_hops: np.ndarray, label_variant: np.ndarray,
+    label_departure: np.ndarray, label_lane: np.ndarray, label_first_a: np.ndarray,
+    label_first_b: np.ndarray,
     # --- workspace: two layer-local state tables
-    tbl_label_a, tbl_hash_a, tbl_label_b, tbl_hash_b, log2cap,
+    tbl_label_a: np.ndarray, tbl_hash_a: np.ndarray, tbl_label_b: np.ndarray, tbl_hash_b: np.ndarray,
+    log2cap: int,
+    touched_a: np.ndarray, touched_b: np.ndarray, touched_count: np.ndarray,
     # --- workspace: scratch
-    layer_items, layer_buffer, recent_a, recent_b, probe_recent,
-    scratch_a, scratch_b, partials,
+    layer_items: np.ndarray, layer_buffer: np.ndarray, recent_a: np.ndarray, recent_b: np.ndarray,
+    probe_recent: np.ndarray,
+    scratch_a: np.ndarray, scratch_b: np.ndarray, partials: np.ndarray,
     # --- workspace: candidates
-    cand_label, cand_lane, cand_step,
+    cand_label: np.ndarray, cand_lane: np.ndarray, cand_step: np.ndarray,
     # --- control
-    cancel, out_counts, resume, out_sink,
-):
+    cancel: np.ndarray, out_counts: np.ndarray, resume: np.ndarray, out_sink: np.ndarray,
+) -> int:
     """The reference's Tier 1 over flat arrays -- ``pricing._best_column``'s label search.
 
     Returns a status code and writes ``(n_labels, n_candidates)`` into ``out_counts``.  Only
@@ -1609,6 +1628,9 @@ def _price_dag(
     - tbl_label_b (np.ndarray): state-table label ids for the other layer parity.
     - tbl_hash_b (np.ndarray): state-table hashes for the other layer parity.
     - log2cap (int): log2 of each state table's capacity.
+    - touched_a (np.ndarray): occupied slots in table A, each recorded once per layer.
+    - touched_b (np.ndarray): occupied slots in table B, each recorded once per layer.
+    - touched_count (np.ndarray): counts retained across every pause/resume of this search.
 
     Workspace -- scratch:
     - layer_items (np.ndarray): the current layer's gathered label ids.
@@ -1639,7 +1661,6 @@ def _price_dag(
       codes. ``out_counts``, ``resume`` and ``out_sink`` are written in place.
     """
 
-    cap = 1 << log2cap
     pool_cap = label_score.shape[0]
     depth = state_history_depth
 
@@ -1676,7 +1697,7 @@ def _price_dag(
             n_labels, label_score, label_cell, label_parent, label_hops, label_variant,
             label_departure, label_lane, label_first_a, label_first_b,
             tbl_label_a, tbl_hash_a, log2cap, depth, recent_a, probe_recent,
-            scratch_a, scratch_b,
+            scratch_a, scratch_b, touched_a, touched_count, 0,
         )
         if n_labels == -1:
             out_counts[2] = min_step - 1  # no layer was relaxed; the host cannot extrapolate
@@ -1710,10 +1731,16 @@ def _price_dag(
         # previous swap left behind are unreachable: `_state_find` tests `slot_label` before
         # it trusts `slot_hash`, and clearing the labels is what retires the slot.
         if ((step - min_step) & 1) == 0:
+            cur_id = 0
+            cur_touched = touched_a
+            nxt_touched = touched_b
             cur_label = tbl_label_a
             nxt_label = tbl_label_b
             nxt_hash = tbl_hash_b
         else:
+            cur_id = 1
+            cur_touched = touched_b
+            nxt_touched = touched_a
             cur_label = tbl_label_b
             nxt_label = tbl_label_a
             nxt_hash = tbl_hash_a
@@ -1725,7 +1752,7 @@ def _price_dag(
                 n_labels, label_score, label_cell, label_parent, label_hops, label_variant,
                 label_departure, label_lane, label_first_a, label_first_b,
                 nxt_label, nxt_hash, log2cap, depth, recent_a, probe_recent,
-                scratch_a, scratch_b,
+                scratch_a, scratch_b, nxt_touched, touched_count, 1 - cur_id,
             )
             if n_labels == -1:
                 out_counts[1] = n_cand
@@ -1736,11 +1763,11 @@ def _price_dag(
                 return STATUS_STATE_LIMIT
 
             # --- gather and order the current layer -------------------------------------
-            m = 0
-            for slot in range(cap):
-                if cur_label[slot] >= 0:
-                    layer_items[m] = cur_label[slot]
-                    m += 1
+            # Sorting restores the same path order regardless of slot insertion order.
+            # Pauses preserve both occupied lists; only a consumed layer retires its slots.
+            m = touched_count[cur_id]
+            for j in range(m):
+                layer_items[j] = cur_label[cur_touched[j]]
             if m > 1:
                 _sort_layer(
                     layer_items, layer_buffer, m, depth,
@@ -1932,6 +1959,8 @@ def _price_dag(
                         out_counts[1] = n_cand
                         return STATUS_STATE_LIMIT
                     if not found:
+                        nxt_touched[touched_count[1 - cur_id]] = slot
+                        touched_count[1 - cur_id] += 1
                         nxt_label[slot] = nxt
                         nxt_hash[slot] = key_hash
                     elif _prefer(
@@ -1976,8 +2005,9 @@ def _price_dag(
         # The consumed layer becomes the layer AFTER next's write target, so it is cleared
         # here -- which is also what keeps the very first iteration from relaxing into a
         # table it never emptied.
-        for slot in range(cap):
-            cur_label[slot] = -1
+        for j in range(touched_count[cur_id]):
+            cur_label[cur_touched[j]] = -1
+        touched_count[cur_id] = 0
 
     out_counts[0] = n_labels
     out_counts[1] = n_cand
@@ -3054,6 +3084,9 @@ def price_dag(
         cand_label = np.zeros(candidate_capacity, np.int32)
         cand_lane = np.zeros(candidate_capacity, np.int32)
         cand_step = np.zeros(candidate_capacity, np.int32)
+        touched_a = np.empty(cap, np.int32)
+        touched_b = np.empty(cap, np.int32)
+        touched_count = np.zeros(2, np.int64)
         tbl_label_a = np.full(cap, -1, np.int32)
         tbl_hash_a = np.zeros(cap, np.uint64)
         tbl_label_b = np.full(cap, -1, np.int32)
@@ -3126,6 +3159,7 @@ def price_dag(
                 label_score, label_cell, label_parent, label_hops, label_variant,
                 label_departure, label_lane, label_first_a, label_first_b,
                 tbl_label_a, tbl_hash_a, tbl_label_b, tbl_hash_b, log2cap,
+                touched_a, touched_b, touched_count,
                 layer_items, layer_buffer, recent_a, recent_b, probe_recent,
                 scratch_a, scratch_b, partials,
                 cand_label, cand_lane, cand_step,

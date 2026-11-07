@@ -28,6 +28,10 @@ class PricingOptions:
     cpu_recompute: bool = True
     max_labels: int = 250_000
     chunk_size: int = 2048
+    endpoint_bounds: bool = True
+    endpoint_max_rows: int = 64
+    endpoint_cache_bytes: int = 1_048_576
+    endpoint_cache_work: int = 1_000_000
 
     def __post_init__(self) -> None:
         """Reject ambiguous device selection and invalid allocation limits."""
@@ -39,6 +43,14 @@ class PricingOptions:
             raise ValueError("Select gpu_backend='metal' or 'cuda' exactly when device='gpu'")
         if not isinstance(self.cpu_recompute, bool):
             raise TypeError("cpu_recompute must be boolean")
+        if not isinstance(self.endpoint_bounds, bool):
+            raise TypeError("endpoint_bounds must be boolean")
+        for name in ("endpoint_max_rows", "endpoint_cache_bytes", "endpoint_cache_work"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value < 2**31:
+                raise ValueError(f"{name} must be a nonnegative integer below 2**31")
+        if self.endpoint_max_rows > 64:
+            raise ValueError("endpoint_max_rows must be at most 64")
         for name in ("max_labels", "chunk_size"):
             value = getattr(self, name)
             if type(value) is not int or not 0 < value < 2**27:

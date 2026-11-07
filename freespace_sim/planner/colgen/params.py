@@ -216,6 +216,10 @@ class ColGenParams:
     pricing_gpu_batch_size: int = 1
     pricing_gpu_max_labels: int = 250_000
     pricing_gpu_chunk_size: int = 2048
+    pricing_gpu_endpoint_bounds: bool = True
+    pricing_gpu_endpoint_max_rows: int = 64
+    pricing_gpu_endpoint_cache_bytes: int = 1_048_576
+    pricing_gpu_endpoint_cache_work: int = 1_000_000
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -255,6 +259,15 @@ class ColGenParams:
             raise ValueError("Select pricing_gpu_backend='metal' or 'cuda' exactly for GPU pricing")
         if not isinstance(self.pricing_cpu_recompute, bool):
             raise TypeError("pricing_cpu_recompute must be a boolean")
+        if not isinstance(self.pricing_gpu_endpoint_bounds, bool):
+            raise TypeError("pricing_gpu_endpoint_bounds must be a boolean")
+        for name in ("pricing_gpu_endpoint_max_rows", "pricing_gpu_endpoint_cache_bytes",
+                     "pricing_gpu_endpoint_cache_work"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value < 2**31:
+                raise ValueError(f"{name} must be a nonnegative integer below 2**31")
+        if self.pricing_gpu_endpoint_max_rows > 64:
+            raise ValueError("pricing_gpu_endpoint_max_rows must be at most 64")
         for name in ("pricing_gpu_batch_size", "pricing_gpu_max_labels", "pricing_gpu_chunk_size"):
             value = getattr(self, name)
             if isinstance(value, bool):

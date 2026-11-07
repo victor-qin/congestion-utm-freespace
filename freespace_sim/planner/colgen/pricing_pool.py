@@ -990,6 +990,10 @@ def _gpu_options(params: ColGenParams) -> PricingOptions:
         device="gpu", gpu_backend=params.pricing_gpu_backend,
         cpu_recompute=params.pricing_cpu_recompute, max_labels=params.pricing_gpu_max_labels,
         chunk_size=params.pricing_gpu_chunk_size,
+        endpoint_bounds=params.pricing_gpu_endpoint_bounds,
+        endpoint_max_rows=params.pricing_gpu_endpoint_max_rows,
+        endpoint_cache_bytes=params.pricing_gpu_endpoint_cache_bytes,
+        endpoint_cache_work=params.pricing_gpu_endpoint_cache_work,
     )
 
 

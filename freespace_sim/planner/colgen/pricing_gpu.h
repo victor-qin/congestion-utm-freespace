@@ -1,5 +1,5 @@
 // Shared Metal/CUDA body. Address spaces, entry points and atomics are runtime adapters.
-// Label fields: cell, root, hops, stable ID/parent ID, first A/B, flags, recent cells.
+// Label fields: cell, root, hops, stable ID/parent ID, first A/B, status, paid low/high, recent cells.
 // Root values: benefit, assignment, ground, negative credit, hop cost, cutoff,
 // affine air-cost offset/slope, positive origin price, minimum total hops, future cost.
 INLINE float completion_bound(GLOBAL const float* data, float hops, float positive) {
@@ -7,8 +7,52 @@ INLINE float completion_bound(GLOBAL const float* data, float hops, float positi
     return ((data[0] - (data[2] + air)) - (positive - data[3])) - data[1];
 }
 
+INLINE float range_min(GLOBAL const float* tree, int leaves, int first, int last) {
+    first += leaves;
+    last += leaves + 1;
+    float value = INFINITY;
+    while (first < last) {
+        if (first & 1) value = fmin(value, tree[first++]);
+        if (last & 1) value = fmin(value, tree[--last]);
+        first /= 2;
+        last /= 2;
+    }
+    return value;
+}
+
+INLINE float endpoint_bound(
+    GLOBAL const float* data, GLOBAL const int* root, int step, int hops, int remaining,
+    float positive, unsigned int low, unsigned int high, GLOBAL const int* meta,
+    GLOBAL const int* entries, GLOBAL const float* trees
+) {
+    GLOBAL const int* flight = meta + root[0] * 5;
+    int first = step + remaining, last = root[3], available = root[4] - hops;
+    if (available < 0) return -INFINITY;
+    // The hop-limit date can exceed int32 even when the earlier horizon is representable.
+    if (step <= 2147483647 - available) last = min(last, step + available);
+    if (first > last) return -INFINITY;
+    if (step < flight[0] || last > flight[1]) return INFINITY;
+    for (int entry = flight[3]; entry < flight[4]; ++entry) {
+        GLOBAL const int* item = entries + entry * 4;
+        if (!item[3] || (unsigned int)item[0] != low || (unsigned int)item[1] != high) continue;
+        GLOBAL const float* tree = trees + item[2];
+        float q = range_min(tree, flight[2], first - flight[0], last - flight[0]);
+        float h = range_min(tree + 2 * flight[2], flight[2], first - flight[0], last - flight[0]);
+        float d = fmax(0.0f, h - (float)(step - flight[0]) * data[7]);
+        float clamped = completion_bound(data, (float)(hops + remaining), positive + q);
+        float affine = ((data[0] - data[2]) -
+                        (data[6] + (float)hops * data[7] + positive + d - data[3])) - data[1];
+        return fmin(clamped, affine);
+    }
+    // A cache miss is weaker information, never a proof of infeasibility.
+    return INFINITY;
+}
+
 INLINE void root_bound_one(unsigned int tid, GLOBAL const int* control,
-                          GLOBAL const float* roots, GLOBAL float* bounds) {
+                          GLOBAL const float* roots, GLOBAL float* bounds,
+                          GLOBAL const int* root_index, GLOBAL const int* root_endpoint,
+                          GLOBAL const int* meta, GLOBAL const int* entries,
+                          GLOBAL const float* trees) {
     if (tid >= (unsigned int)control[0]) return;
     GLOBAL const float* data = roots + tid * 11;
     float upper = completion_bound(data, data[9], data[8]);
@@ -17,6 +61,10 @@ INLINE void root_bound_one(unsigned int tid, GLOBAL const int* control,
         float future = ((data[0] - data[2]) - (data[6] + data[8] + data[10] - data[3])) - data[1];
         upper = fmin(upper, future);
     }
+    upper = fmin(upper, endpoint_bound(
+        data, root_index + tid * 6, root_endpoint[tid * 3 + 2], 0, (int)data[9], data[8],
+        (unsigned int)root_endpoint[tid * 3], (unsigned int)root_endpoint[tid * 3 + 1],
+        meta, entries, trees));
     bounds[tid] = upper;
 }
 
@@ -44,7 +92,9 @@ INLINE void expand_one(
     GLOBAL const float* values, GLOBAL const int* graph, GLOBAL const int* roots,
     GLOBAL const float* root_values, GLOBAL const float* visits, GLOBAL const int* blocked,
     GLOBAL const int* paid_rows, GLOBAL const float* paid_values,
-    GLOBAL int* output, GLOBAL float* scores
+    GLOBAL int* output, GLOBAL float* scores, GLOBAL const unsigned int* visit_masks,
+    GLOBAL const int* endpoint_meta, GLOBAL const int* endpoint_entries,
+    GLOBAL const float* endpoint_trees
 ) {
     int n = control[0], stride = control[1], step = control[2];
     if (tid >= (unsigned int)(n * 6)) return;
@@ -59,18 +109,22 @@ INLINE void expand_one(
     if (step + 1 + remaining > roots[root * 6 + 3] ||
         hops + 1 + remaining > roots[root * 6 + 4] || blocked[target]) return;
     int depth = roots[root * 6 + 5];
-    for (int j = 0; j < depth; ++j) if (labels[a + 7 + j] == target) return;
+    for (int j = 0; j < depth; ++j) if (labels[a + 9 + j] == target) return;
     bool finish = graph[target * 14 + 13] && (role & (hops == 0 ? 8 : 4));
     bool onward = (role & (hops == 0 ? 2 : 1)) != 0;
     if (!finish && !onward) return;
     float charge = visits[target * 3];
+    float positive_charge = visits[target * 3 + 1];
     for (int j = roots[root * 6 + 1]; j < roots[root * 6 + 2]; ++j) {
         if (paid_rows[j * 2] == target && paid_rows[j * 2 + 1] >= step + 1 + control[3]
-            && paid_rows[j * 2 + 1] <= step + 1 + control[4]) charge -= paid_values[j];
+            && paid_rows[j * 2 + 1] <= step + 1 + control[4]) {
+            charge -= paid_values[j];
+            positive_charge -= fmax(0.0f, paid_values[j]);
+        }
     }
     GLOBAL const float* data = root_values + root * 11;
     float score = (values[src_index * 2] - data[4]) - charge;
-    float positive = values[src_index * 2 + 1] + visits[target * 3 + 1];
+    float positive = values[src_index * 2 + 1] + fmax(0.0f, positive_charge);
     float upper = completion_bound(data,
                                    (float)(hops + 1 + remaining), positive);
     if (isfinite(visits[target * 3 + 2])) {
@@ -79,6 +133,13 @@ INLINE void expand_one(
         upper = fmin(upper, future);
     }
     int flags = (finish ? 1 : 0) | (onward ? 2 : 0);
+    unsigned int low = (unsigned int)labels[a + 7] | visit_masks[target * 2];
+    unsigned int high = (unsigned int)labels[a + 8] | visit_masks[target * 2 + 1];
+    float endpoint = endpoint_bound(data, roots + root * 6, step + 1, hops + 1,
+                                   remaining, positive, low, high,
+                                   endpoint_meta, endpoint_entries, endpoint_trees);
+    if (endpoint <= data[5] && upper > data[5]) flags |= 8;
+    upper = fmin(upper, endpoint);
     if (upper <= data[5]) flags |= 4;
     output[b] = target;
     output[b + 1] = root;
@@ -87,8 +148,10 @@ INLINE void expand_one(
     output[b + 4] = hops == 0 ? cell : labels[a + 4];
     output[b + 5] = hops == 0 ? target : labels[a + 5];
     output[b + 6] = flags;
-    output[b + 7] = target;
-    for (int j = 8; j < stride; ++j) output[b + j] = labels[a + j - 1];
+    output[b + 7] = (int)low;
+    output[b + 8] = (int)high;
+    output[b + 9] = target;
+    for (int j = 10; j < stride; ++j) output[b + j] = labels[a + j - 1];
     scores[tid * 3] = score;
     scores[tid * 3 + 1] = positive;
     scores[tid * 3 + 2] = upper;

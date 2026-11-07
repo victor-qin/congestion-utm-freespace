@@ -1,8 +1,9 @@
 # GPU pricing: implementation boundary and next work
 
-Status: 2026-11-06. The endpoint reachability bound is implemented. Endpoint paid
-flags, certified state merging, and parallel CPU preparation for GPU pricing are
-plans, not implemented features. CUDA has an adapter but has not been tested on
+Status: 2026-11-06. Endpoint reachability and paid endpoint flags are implemented.
+Certified mode builds the relaxed future table directly in FP64, without its
+unused GPU recurrence. Certified state merging and parallel CPU preparation
+remain plans. CUDA shares the kernel implementation but has not been tested on
 an NVIDIA machine. This document separates those plans from the current merge.
 
 ## What the search cap means
@@ -74,7 +75,57 @@ The 109 targeted tests pass; Ruff and diff checks pass. Local evidence is in
 `.agent/gpu-endpoint-bound-20261106/summary.json`. This is not a new full-1537
 replay, full solver run, or timing speedup comparison.
 
-## Proposed: paid flags without another whole-graph DP
+## Implemented: paid flags without another whole-graph DP
+
+`gpu_endpoint.py` implements the two-array design below. `PricingOptions` exposes
+`endpoint_bounds=True`, `endpoint_max_rows=64`, `endpoint_cache_bytes=1048576`,
+and `endpoint_cache_work=1000000`. The solver exposes the same fields with the
+`pricing_gpu_` prefix, appended after previous fields to preserve positional
+capture compatibility. Zero rows or a disabled bound omit this optimization;
+zero cache budgets leave all weighted entries unavailable. Reconstruct older
+captured `ColGenParams` with the current constructor to fill absent defaults,
+as the replay tools already do. Benchmark/replay CLIs expose the same controls.
+
+The normalized `DualView` owns each price snapshot. Every batch creates fresh
+selected rows, masks and weighted trees; only nominal endpoint membership is
+reused from the graph. Preparation is skipped when the existing verified root
+bounds already close every root. Root masks get cache priority; surviving masks
+are considered by frequency at layer boundaries. The default cache uses a byte
+and work budget, not a fixed number of entries. Byte accounting includes FP64
+trees, FP32 upload/device copies and entry metadata; it excludes immutable
+geometric membership and transient packing scratch. Numeric cache storage is
+linear in arrival slots and built masks, with no root dimension. Tree lookup
+is logarithmic in arrival slots; GPU mask lookup scans the bounded entry list.
+
+Original FP64 trees and parent-aligned exact CPU masks verify all numerical
+deletions. GPU proposal trees are rounded down to FP32 and actually queried by
+both root and expansion kernels. Missing/invalid entries select the old bound;
+only a proved empty completion interval can close as infeasible. The existing
+future-table retry remains. No certified history merging is enabled.
+
+Profiling reports per-flight row counts, built entries, resident cache bytes,
+build-work units/time, maximum distinct masks in a layer, and CPU verification
+cache hits/misses/skips. Batch counters report endpoint-only GPU expansion
+proposals and deletions that the endpoint verifier closes beyond older bounds.
+Root endpoint proposals are included in the ordinary root-proposal counter.
+
+Final local follow-up validation (2026-11-06), on top of the disconnected
+destination-lane fix `997dfd11`: 94 endpoint/future/bounds/options tests and 15
+selected platform tests pass, as do Ruff and diff checks. Eight selected actual
+Metal captures reproduce the preserved results and endpoint pruning counts:
+32, 278, 322 and controls 0/34/276/320 certify, with upper bounds covering their
+saved CPU references. Flight 2 remains label-limited (incumbent approximately 6
+versus reference 14), so the eight-case validation does not pass as a whole.
+Full CPU pricing was blocked. Final-source hashes, counts and references are in
+`.agent/endpoint-followup-20261106/summary.json`; the replay manifest matches the
+final production source. No broad suite or full-1537 replay was repeated, and no
+speedup is claimed under shared GPU use. CUDA remains untested on NVIDIA.
+
+The preparation handoff's compatible invariants are retained: membership uses
+complete physical row identities and includes currently unpriced endpoint rows;
+weights and selected bits refresh for each snapshot. Stable global physical-ID
+packing, shared device price tables and device-resident frontiers remain later
+scope, separate from this endpoint patch and the parallel preparation commits.
 
 ### State and price independence
 
@@ -83,7 +134,7 @@ level, not just a hex. The bit means that the origin-and-visit union of this
 partial route already contains that row. It does not mean that the route has
 already paid every future endpoint cost.
 
-Start with two `uint32` words, up to 64 tracked rows per flight and LP snapshot.
+There are two `uint32` words, up to 64 tracked rows per flight and LP snapshot.
 Use unsigned shifts and preserve both words in the shared Metal/CUDA record ABI.
 Keep them separate from the existing finish/continue/prune status flags; update
 the recent-history offsets explicitly rather than extending an implicit copy loop.
@@ -107,7 +158,7 @@ weakens a lower bound safely. All negative prices retain the existing global
 negative-price credit. A later LP may add rows or change signs: refresh the
 selection, weights and snapshot ID, and never reuse old weighted minima.
 
-Initial version: retain bits for the entire search. Do not roll bits forward or
+The implementation retains bits for the entire search. Do not roll bits forward or
 forget old visits. Forgetting needs a proof covering every remaining endpoint
 window as well as visit windows, and is unnecessary for a fixed 64-bit subset.
 
@@ -148,8 +199,8 @@ current future-price bound: their air and price terms overlap.
 
 ### Avoid a root-by-mask-by-arrival table
 
-The exact expression above motivates the bound; its first implementation can
-use two cheaper conservative versions. Let \(a\geq0\) be the existing affine
+The exact expression above motivates the bound; the implementation uses
+two cheaper conservative versions. Let \(a\geq0\) be the existing affine
 air-cost lower coefficient per hop and \(t_{ref}\) the earliest root time.
 For each encountered paid mask, construct two one-dimensional arrays:
 
@@ -272,7 +323,7 @@ recent history and completed-cost dominance still require their own proof.
 
 | Area | Files or changes |
 | --- | --- |
-| New production modules | `gpu_bounds.py`, `gpu_future.py`, `gpu_prices.py`, `gpu_pricing.py`, `gpu_runtime.py`, `pricing_gpu.h`, `pricing_platform.py` under `freespace_sim/planner/colgen/` |
+| New production modules | `gpu_bounds.py`, `gpu_endpoint.py`, `gpu_future.py`, `gpu_prices.py`, `gpu_pricing.py`, `gpu_runtime.py`, `pricing_gpu.h`, `pricing_platform.py` under `freespace_sim/planner/colgen/` |
 | Solver integration | GPU options in `params.py`, cache slots in `network.py`, GPU sweeps in `pricing_pool.py`, bounds/repair/status handling in `solver.py` |
 | Shared preparation hooks | `DualView._gpu_visit_prices` in `pricing.py`; optional retained root unions in `dp_prepare.py` |
 | Installation | Optional macOS Metal dependency in `pyproject.toml` and `uv.lock` |

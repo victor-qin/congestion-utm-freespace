@@ -357,7 +357,7 @@ class CompletionBounds:
             self._claims[variant] = claims
         return claims
 
-    def future_upper(
+    def _affine_upper(
         self,
         variant: int,
         hops: int,
@@ -367,15 +367,14 @@ class CompletionBounds:
         pi: float,
         negative_lower: float,
     ) -> float:
-        """Bound reduced cost using a relaxed suffix's coupled air and visit prices.
+        """Bound reduced cost using affine air cost and disjoint price/air lower terms.
 
         Parameters
         ------------
         - variant (int): departure/lane root index.
         - hops (int): already completed moves, excluding the root visit.
-        - positive_prefix (float): downward sum of positive prefix VISIT prices only.
-        - suffix (float): downward relaxed bound on future ``air_per_hop + visit_positive``
-          and destination charges disjoint from all visits; excludes the current visit.
+        - positive_prefix (float): downward sum of already claimed positive prices.
+        - suffix (float): downward residual air/price bound, with prices disjoint from prefix.
         - benefit (float): original per-flight master benefit.
         - pi (float): original assignment dual.
         - negative_lower (float): downward sum of all negative input row prices.
@@ -383,14 +382,6 @@ class CompletionBounds:
         Return
         --------
         - output (float): certified upper bound, or infinity when the affine bound is unavailable.
-
-        The revisit rule makes all valid visits' row windows disjoint, so prefix
-        and suffix positive prices add without duplicate rows. The suffix may
-        relax revisit, hop and role restrictions: every real suffix remains in
-        that superset with its correctly additive price. Separate endpoint
-        additions are omitted, except for destination rows in the suffix that
-        cannot overlap any visit. Every negative input row
-        is credited once, whether or not the completion claims it.
 
         In real arithmetic, ``ground + b + hops*a + prefix + suffix + negative``
         is a cost-plus-price lower bound. Clamping canonical air detour at zero
@@ -428,6 +419,21 @@ class CompletionBounds:
         lower = _down(lower + positive_prefix)
         lower = _down(lower + suffix)
         lower = _down(lower + negative_lower)
+        return self._roundoff_upper(lower, benefit, pi)
+
+    def _roundoff_upper(self, lower: float, benefit: float, pi: float) -> float:
+        """Retain canonical cost, dual-sum and reduced-cost rounding allowances.
+
+        Parameters
+        ------------
+        - lower (float): outward cost-plus-price lower bound.
+        - benefit (float): original benefit.
+        - pi (float): assignment dual.
+
+        Return
+        --------
+        - output (float): upper bound including the canonical gamma_32 error allowance.
+        """
         scale = _up(_up(abs(benefit) + abs(pi)) + self._cost_scale)
         scale = _up(scale + self._absolute_prices)
         unit = 2.0**-53
@@ -435,6 +441,62 @@ class CompletionBounds:
         allowance = _up(gamma * scale)
         upper = _up(_up(benefit - lower) - pi)
         return _up(upper + allowance)
+
+    def future_upper(
+        self, variant: int, hops: int, positive_prefix: float, suffix: float,
+        benefit: float, pi: float, negative_lower: float,
+    ) -> float:
+        """Bound a relaxed future table using visit-only prefix prices.
+
+        Parameters
+        ------------
+        - variant (int): current root index.
+        - hops (int): completed moves.
+        - positive_prefix (float): downward positive VISIT sum, excluding separate origin rows.
+        - suffix (float): relaxed future air/visit costs and endpoint rows disjoint from visits.
+        - benefit (float): original benefit.
+        - pi (float): assignment dual.
+        - negative_lower (float): global negative-price credit.
+
+        Return
+        --------
+        - output (float): canonical upper bound. Visit windows are disjoint under the revisit
+          rule; origin claims are omitted because the relaxed suffix may overlap them.
+        """
+        return self._affine_upper(
+            variant, hops, positive_prefix, suffix, benefit, pi, negative_lower,
+        )
+
+    def endpoint_upper(
+        self, variant: int, hops: int, remaining: int, positive_union: float,
+        residual: tuple[float, float], benefit: float, pi: float, negative_lower: float,
+    ) -> float:
+        """Combine independent clamped and affine arrival-only bounds without double charging.
+
+        Parameters
+        ------------
+        - variant (int): current root index.
+        - hops (int): completed moves.
+        - remaining (int): relaxed remaining hops.
+        - positive_union (float): verified positive sum of origin UNION all prefix visits.
+        - residual (tuple[float, float]): Q minimum and affine-delay residual for unpaid rows.
+        - benefit (float): original benefit.
+        - pi (float): assignment dual.
+        - negative_lower (float): global credit for every negative price, included once.
+
+        Return
+        --------
+        - output (float): minimum of independent upper bounds, never a sum with future bounds.
+          Future visit charges are omitted; they may pay the reserved endpoint rows later.
+        """
+        q, d = residual
+        lower = _down(self.cost_lower(variant, hops + remaining) + positive_union)
+        lower = _down(_down(lower + q) + negative_lower)
+        clamped = self._roundoff_upper(lower, benefit, pi)
+        affine = self._affine_upper(
+            variant, hops, positive_union, d, benefit, pi, negative_lower,
+        )
+        return min(clamped, affine)
 
     def root_positive(self, variant: int) -> float:
         """Downward-sum only positive prices in the mandatory origin union.

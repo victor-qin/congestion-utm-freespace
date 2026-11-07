@@ -451,6 +451,9 @@ def test_incremental_positive_prices_match_every_generated_prefix_union(
                 seen["overlap"] = True
             claims.update(visit)
         expected = math.fsum(max(0.0, view.row_cost(row)) for row in claims)
+        endpoint = batch.endpoints[i]
+        assert endpoint is not None
+        assert batch.paid_mask(root, parent, cell, hops) == endpoint.mask(claims)
         assert value <= expected
         assert value == pytest.approx(expected, abs=1e-9)
         departures.add(departure)

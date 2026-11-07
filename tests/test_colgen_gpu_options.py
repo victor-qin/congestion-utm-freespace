@@ -41,7 +41,8 @@ def test_benchmark_outbound_selection_preserves_demand(legacy: bool) -> None:
         assert outbound.turnaround_s == 19.0
 
 
-def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults() -> None:
+@pytest.mark.parametrize("before", ["gpu", "endpoint"])
+def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before: str) -> None:
     """Old positional slot states remain readable without shifting existing solver settings."""
     original = ColGenParams(
         n_pricing_workers=2,
@@ -54,7 +55,8 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults() -> No
     legacy_names = [
         field.name
         for field in fields(ColGenParams)
-        if field.name not in benchmark._PRICING_DEFAULTS
+        if (field.name not in benchmark._PRICING_DEFAULTS if before == "gpu"
+            else not field.name.startswith("pricing_gpu_endpoint_"))
     ]
     legacy = object.__new__(ColGenParams)
     legacy.__setstate__([getattr(original, name) for name in legacy_names])
@@ -67,6 +69,7 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults() -> No
     )
     assert all(getattr(restored, name) == getattr(original, name) for name in legacy_names)
     assert restored.pricing_device == "cpu" and restored.pricing_gpu_backend is None
+    assert restored.pricing_gpu_endpoint_bounds and restored.pricing_gpu_endpoint_max_rows == 64
 
 
 def test_cpu_default_and_explicit_gpu_configuration() -> None:
@@ -81,6 +84,10 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
             pricing_gpu_batch_size=3,
             pricing_gpu_max_labels=1000,
             pricing_gpu_chunk_size=128,
+            pricing_gpu_endpoint_bounds=False,
+            pricing_gpu_endpoint_max_rows=32,
+            pricing_gpu_endpoint_cache_bytes=12345,
+            pricing_gpu_endpoint_cache_work=45678,
             n_pricing_workers=2,
         )
         assert selected.pricing_gpu_backend == backend
@@ -88,6 +95,10 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         assert selected.pricing_gpu_batch_size == 3
         assert selected.pricing_gpu_max_labels == 1000
         assert selected.pricing_gpu_chunk_size == 128
+        from freespace_sim.planner.colgen.pricing_pool import _gpu_options
+        options = _gpu_options(selected)
+        assert not options.endpoint_bounds and options.endpoint_max_rows == 32
+        assert options.endpoint_cache_bytes == 12345 and options.endpoint_cache_work == 45678
 
 
 @pytest.mark.parametrize(
@@ -105,6 +116,11 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         {"pricing_gpu_max_labels": 2**27},
         {"pricing_gpu_chunk_size": 2**27},
         {"pricing_gpu_chunk_size": 1.5},
+        {"pricing_gpu_endpoint_bounds": 1},
+        {"pricing_gpu_endpoint_max_rows": 65},
+        {"pricing_gpu_endpoint_max_rows": -1},
+        {"pricing_gpu_endpoint_cache_bytes": True},
+        {"pricing_gpu_endpoint_cache_work": -1},
     ],
 )
 def test_invalid_or_unsupported_pricing_selection_fails(overrides: dict) -> None:
@@ -229,6 +245,10 @@ def test_paired_benchmark_forwards_gpu_controls_and_preserves_kernel_source(
         pricing_gpu_batch_size=3,
         pricing_gpu_max_labels=1000,
         pricing_gpu_chunk_size=128,
+        pricing_gpu_endpoint_bounds=True,
+        pricing_gpu_endpoint_max_rows=64,
+        pricing_gpu_endpoint_cache_bytes=1_048_576,
+        pricing_gpu_endpoint_cache_work=1_000_000,
     )
     manifest = json.loads((output / "manifest.json").read_text())
     assert all(manifest[key] == value for key, value in actual.items())

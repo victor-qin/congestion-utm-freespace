@@ -170,14 +170,19 @@ def test_cpu_adapter_preserves_existing_pricing_result() -> None:
     _assert_canonical(problem, result)
 
 
-@pytest.mark.parametrize("backend", ["cpu", "metal"])
+@pytest.mark.parametrize("backend,first_limit", [("cpu", None), ("metal", None), ("metal", 4)])
 @pytest.mark.parametrize("buffer", [0.0, 4.0])
 @pytest.mark.parametrize("objective", ["total_cost", "total_delay"])
 @pytest.mark.parametrize("signed", [False, True])
 def test_certified_pricing_matches_complete_path_enumeration(
-    backend: str, buffer: float, objective: str, signed: bool
+    backend: str, first_limit: int | None, buffer: float, objective: str, signed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both exact backends agree with all complete routes, allowing different optimal routes."""
+    """Complete pricing, including an early future retry, covers every canonical route."""
+    if first_limit is not None:
+        from freespace_sim.planner.colgen import gpu_pricing
+
+        monkeypatch.setattr(gpu_pricing, "_INITIAL_FULL_LABEL_LIMIT", first_limit)
     platform = _platform(backend)
     original = _problem(buffer=buffer, objective=objective, signed=signed)
     expected = _oracle(original)
@@ -499,9 +504,31 @@ def test_gpu_rejects_dual_view_with_mismatched_occupancy_window() -> None:
 
 
 @pytest.mark.parametrize("exclude_arrival", [False, True])
-def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(exclude_arrival: bool) -> None:
-    """Terminal lane geometry, wall roles and arrival exclusions preserve the optimum."""
+def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
+    monkeypatch: pytest.MonkeyPatch, exclude_arrival: bool,
+) -> None:
+    """Terminal lane geometry, wall roles and arrival exclusions preserve the optimum.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): installs future bounds before the small GPU search.
+    - exclude_arrival (bool): forbids the arrival's mandatory terminal resource.
+
+    Return
+    --------
+    - output (None): GPU completion and its upper bound agree with the reference domain.
+    """
     from tests.test_colgen_dp_kernel import _cfg as terminal_cfg, _terminal_graph
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    bootstrap = _Batch.bootstrap
+
+    def with_future(batch: _Batch) -> None:
+        """Exercise hop-aware verification with actual terminal roles and obstacles."""
+        batch.prepare_future()
+        bootstrap(batch)
+
+    monkeypatch.setattr(_Batch, "bootstrap", with_future)
 
     platform = _platform("metal")
     cfg = terminal_cfg(max_ground_delay_s=4.0)
@@ -550,7 +577,7 @@ def test_gpu_label_limit_preserves_incomplete_status() -> None:
 def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) -> None:
     """A many-path long flight must finish within a small storage budget using safe pruning."""
     cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=120.0,
-               time_buffer_s=4.0, max_detour_factor=5.0)
+               time_buffer_s=4.0, max_detour_factor=5.0, cost_ground_delay_per_s=10.0)
     params = _params(max_air_overrun_hops=6, objective="total_cost")
     graph = build_flight_graph(_request(9, (85, -30), (165, 10), cfg), cfg, (), params)
     problem = PricingProblem(graph, cfg, params, {}, 0.0)
@@ -565,6 +592,7 @@ def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) ->
     (result,) = _platform("metal", max_labels=1000).price_batch([problem])
     assert result.search_complete and result.certified
     assert result.stats["gpu_dispatches"] > 0 and result.stats["root_prunes"] > 0
+    assert result.stats["screened_departures"] > 0
     expected = params.M - seed.delay_s
     assert result.reduced_cost == pytest.approx(expected, rel=0.0, abs=1e-7)
     assert result.upper_bound >= result.reduced_cost
@@ -574,9 +602,29 @@ def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) ->
 
 @pytest.mark.parametrize("improvement", [5e-8, 5e-7])
 def test_near_tie_certificate_covers_improvement_even_when_no_column_is_returned(
-    improvement: float,
+    monkeypatch: pytest.MonkeyPatch, improvement: float,
 ) -> None:
-    """Closing tiny branches reports their upper bound instead of claiming an exact optimum."""
+    """Closing tiny branches reports their upper bound instead of claiming an exact optimum.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): installs remaining-hop bounds before route discovery.
+    - improvement (float): canonical gain deliberately smaller than the closure tolerance.
+
+    Return
+    --------
+    - output (None): the certificate covers the improvement even when no column is returned.
+    """
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    bootstrap = _Batch.bootstrap
+
+    def with_future(batch: _Batch) -> None:
+        """Keep the same near-tie requirement when remaining-hop bounds are installed."""
+        batch.prepare_future()
+        bootstrap(batch)
+
+    monkeypatch.setattr(_Batch, "bootstrap", with_future)
     cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=0.0, time_buffer_s=0.0,
                cost_ground_delay_per_s=1e-12, cost_air_hold_per_s=1e-12,
                cost_air_lateral_per_s=1e-12, max_detour_factor=5.0)

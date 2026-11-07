@@ -18,6 +18,7 @@ import numpy as np
 from . import pricing
 from .dp_prepare import PricingPreparation, prepare_variants, prepared_for
 from .gpu_bounds import CompletionBounds
+from .gpu_endpoint import EndpointBounds, Mask
 from .gpu_future import FutureBounds
 from .gpu_prices import SparseVisitPrices
 from .gpu_runtime import ComputeRuntime
@@ -29,6 +30,7 @@ from .windows import derive_cell_window
 # Near-tie branches retain their proved upper bound in the result certificate.
 # This tolerance never turns a candidate's score into the optimum's exact value.
 _BOUND_CLOSURE_TOL = 1e-6
+_INITIAL_FULL_LABEL_LIMIT = 8192
 
 
 def _down(value: float) -> float:
@@ -138,10 +140,16 @@ class _Batch:
                     value = _down(value + price)
             self.negative.append(value)
         self.arena = np.empty((options.max_labels, 3), np.int32)
+        self.search_label_limit = options.max_labels
         self.prefix_positive = np.empty(options.max_labels, np.float64)
         self.visit_prefix_positive = np.empty(options.max_labels, np.float64)
+        self.paid_masks = np.empty((options.max_labels, 2), np.uint32)
         self._visit_positive: dict[tuple[int, int, int], float] = {}
         self.future: list[FutureBounds | None] = [None for _ in problems]
+        self.endpoints: list[EndpointBounds | None] = [None for _ in problems]
+        self._endpoint_generation: tuple[int, ...] | None = None
+        self._endpoint_visit_step: int | None = None
+        self._endpoint_visits = np.empty((0, 2), np.uint32)
         self.used = 0
         self.stats = dict(
             candidates=0,
@@ -152,6 +160,9 @@ class _Batch:
             max_frontier=0,
             grouped_labels=0,
             root_prunes=0,
+            gpu_endpoint_prune_proposals=0,
+            endpoint_verified_prunes=0,
+            screened_departures=0,
         )
         self.offsets = self.views[0].offsets
         self.destinations = [pricing._destination_options(p.graph) for p in problems]
@@ -163,8 +174,33 @@ class _Batch:
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise _Stopped("deadline")
 
+    def keep_departure(self, flight: int, departure: int) -> bool:
+        """Screen a whole departure using only unavoidable ground cost and a valid witness.
+
+        Parameters
+        ------------
+        - flight (int): index of the flight whose canonical incumbent is available.
+        - departure (int): absolute departure step, at or after the flight's base step.
+
+        Return
+        --------
+        - output (bool): False only when every completion is bounded by the incumbent.
+        """
+        self.check()
+        p = self.problems[flight]
+        ground = max(0.0, _down((departure - p.graph.base_step) * p.cfg.dt_s))
+        cost = max(0.0, _down(ground * self.models[flight].ground_weight))
+        upper = completion_upper_bound(
+            self.benefits[flight], p.pi_f, cost, (), self.negative[flight],
+        )
+        # Use the witness itself, without a closure tolerance: it still covers these
+        # roots after the future retry resets the separately accumulated closed upper.
+        keep = not math.isfinite(upper) or upper > self.best[flight][0]
+        self.stats["screened_departures"] += int(not keep)
+        return keep
+
     def prepare(self) -> None:
-        """Pack topology and all allowed roots without objective-based preparation cuts.
+        """Pack topology and roots that can improve an already validated incumbent.
 
         Parameters
         ------------
@@ -244,6 +280,7 @@ class _Batch:
                 model=model,
                 forbidden_rows=p.forbidden_rows,
                 preparation=preparation,
+                screen_departure=lambda departure: self.keep_departure(i, departure),
             )
             if not v.ok:
                 raise _Stopped("unsupported")
@@ -251,6 +288,15 @@ class _Batch:
             variants.append(v)
             bounds = CompletionBounds(p, topology, v, view, preparation=preparation)
             self.bounds.append(bounds)
+            if (self.options.endpoint_bounds and self.options.endpoint_max_rows and any(
+                completion_upper_bound(
+                    benefit, p.pi_f,
+                    bounds.cost_lower(variant, int(remaining_hops[v.cell[variant]])),
+                    (bounds.root_positive(variant),), self.negative[i],
+                ) > self.best[i][0] + _BOUND_CLOSURE_TOL
+                for variant in range(v.n_variants)
+            )):
+                self.endpoints[i] = EndpointBounds(bounds, self.options, self.check)
             offset = len(self.cells)
             self.cell_offsets.append(offset)
             self.cells.extend(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
@@ -302,7 +348,7 @@ class _Batch:
         if len(self.cells) >= 2**27 or len(roots) >= 2**27 or len(paid_rows) >= 2**27:
             raise _Stopped("label_limit")
         self.topologies, self.variants = topologies, variants
-        self.stride = 7 + max(t.state_history_depth for t in topologies)
+        self.stride = 9 + max(t.state_history_depth for t in topologies)
         if (
             self.options.max_labels * self.stride >= 2**31
             or 6 * min(self.options.chunk_size, self.options.max_labels) * self.stride >= 2**31
@@ -313,6 +359,14 @@ class _Batch:
         self.root_values = np.asarray(root_values, np.float32).reshape(-1, 11)
         self.paid_rows = np.asarray(paid_rows, np.int32).reshape(-1, 2)
         self.paid_values = np.asarray(paid_values, np.float32)
+        self.root_endpoint = np.zeros((len(roots), 3), np.int32)
+        for root, i in enumerate(self.root_flights):
+            variant = self.root_variants[root]
+            endpoint = self.endpoints[i]
+            if endpoint is not None:
+                self.root_endpoint[root, :2] = endpoint.root_masks[variant].view(np.int32)
+            self.root_endpoint[root, 2] = self.variants[i].start_step[variant]
+        self.pack_endpoints()
         self.evaluate_roots()
 
     def evaluate_roots(self) -> None:
@@ -321,9 +375,90 @@ class _Batch:
         (self.root_upper,) = self.runtime.run(
             "bound_roots", count,
             (np.asarray((count,), np.int32), self.root_values,
-             np.empty(count, np.float32)), (2,),
+             np.empty(count, np.float32), self.roots, self.root_endpoint,
+             self.endpoint_meta, self.endpoint_entries, self.endpoint_trees), (2,),
+            static={3: "roots", 4: "root_endpoint", 5: "endpoint_meta",
+                    6: "endpoint_entries", 7: "endpoint_trees"},
             write_only=(2,),
         )
+
+    def pack_endpoints(self) -> None:
+        """Refresh immutable GPU cache buffers only after new mask entries have been built.
+
+        Parameters
+        ------------
+        - self (_Batch): snapshot-local per-flight caches; no weighted data persists across batches.
+
+        Return
+        --------
+        - output (None): prepares shared FP32 proposal trees and explicit entry-validity metadata.
+        """
+        generation = tuple(len(e.entries) if e is not None else 0 for e in self.endpoints)
+        if generation == self._endpoint_generation:
+            return
+        metadata, entries, arrays = [], [], []
+        offset = 0
+        for endpoint in self.endpoints:
+            if endpoint is None:
+                metadata.append((0, 0, 1, 0, 0))
+                continue
+            start = len(entries)
+            for low, high in endpoint.entries:
+                entries.append((low, high, offset, 1))
+                offset += 4 * endpoint.leaves
+            metadata.append((endpoint.first, endpoint.last, endpoint.leaves, start, len(entries)))
+            arrays.append(endpoint.gpu_trees())
+        if offset >= 2**31:
+            raise ValueError("GPU endpoint-tree indexing exceeds int32 range")
+        self.endpoint_meta = np.asarray(metadata, np.int32).reshape(-1, 5)
+        self.endpoint_entries = np.asarray(entries, np.uint32).reshape(-1, 4).view(np.int32)
+        self.endpoint_trees = np.concatenate(arrays) if arrays else np.empty(0, np.float32)
+        self._endpoint_generation = generation
+
+    def endpoint_visits(self, step: int) -> np.ndarray:
+        """Gather exact visit masks once per layer, sharing them across expansion chunks.
+
+        Parameters
+        ------------
+        - step (int): absolute time of the candidate visits.
+
+        Return
+        --------
+        - output (np.ndarray): cell-aligned uint32 pairs, immutable until replaced for a new step.
+        """
+        if step != self._endpoint_visit_step:
+            masks = np.zeros((len(self.cells), 2), np.uint32)
+            for i, endpoint in enumerate(self.endpoints):
+                if endpoint is not None and step in endpoint.visit_masks:
+                    cells, words = endpoint.visit_masks[step]
+                    masks[cells + self.cell_offsets[i]] = words
+            self._endpoint_visits = masks
+            self._endpoint_visit_step = step
+        return self._endpoint_visits
+
+    def paid_mask(self, root: int, parent: int, cell: int, hops: int) -> Mask:
+        """Update parent-aligned exact masks independently of the GPU's proposed bits.
+
+        Parameters
+        ------------
+        - root (int): packed departure/lane root.
+        - parent (int): stable predecessor ID, or -1 for an initial root.
+        - cell (int): packed current cell.
+        - hops (int): completed moves, used to recover the exact absolute visit time.
+
+        Return
+        --------
+        - output (Mask): original origin-and-visit union in the snapshot's fixed row mapping.
+        """
+        i, variant = self.root_flights[root], self.root_variants[root]
+        endpoint = self.endpoints[i]
+        if endpoint is None:
+            return 0, 0
+        if parent < 0:
+            return tuple(map(int, endpoint.root_masks[variant]))
+        step = int(self.variants[i].start_step[variant]) + hops
+        visit = self.endpoint_visits(step)[cell]
+        return tuple(map(int, self.paid_masks[parent] | visit))
 
     def prepare_future(self) -> None:
         """Build relaxed GPU lookahead only when the inexpensive full pass exhausts storage.
@@ -350,7 +485,8 @@ class _Batch:
             future = self.future[i]
             step = int(self.variants[i].start_step[variant])
             if future.first_step <= step <= future.last_step:
-                self.root_values[root, 10] = future.root_lookup(int(self.variants[i].cell[variant]), step)
+                lower = future.root_lookup(int(self.variants[i].cell[variant]), step)
+                self.root_values[root, 10] = min(lower, float(np.finfo(np.float32).max))
         self.evaluate_roots()
         self.stats["future_s"] = time.monotonic() - started
         self.stats["future_gpu_dispatches"] = self.runtime.dispatches - before
@@ -442,12 +578,32 @@ class _Batch:
         )
         if self.future[i] is not None:
             step = int(self.variants[i].start_step[variant]) + hops
-            lookup = self.future[i].root_lookup if hops == 0 else self.future[i].lookup
-            suffix = lookup(cell - self.cell_offsets[i], step)
+            local = cell - self.cell_offsets[i]
+            suffix = (self.future[i].root_lookup(local, step) if hops == 0 else
+                      self.future[i].lookup(local, step, self.topologies[i].air_hop_limit - hops))
             upper = min(upper, self.bounds[i].future_upper(
                 variant, hops, self.visit_lower(root, parent, cell, hops), suffix,
                 self.benefits[i], self.problems[i].pi_f, self.negative[i],
             ))
+        self._endpoint_closed = False
+        endpoint = self.endpoints[i]
+        if endpoint is not None:
+            start = int(self.variants[i].start_step[variant])
+            step = start + hops
+            last = min(self.topologies[i].max_step, start + self.topologies[i].air_hop_limit)
+            if step + remaining > last:
+                return -math.inf
+            residual = endpoint.residual(
+                self.paid_mask(root, parent, cell, hops), step, step + remaining, last,
+            )
+            if residual is not None:
+                endpoint_upper = self.bounds[i].endpoint_upper(
+                    variant, hops, remaining, self.positive_lower(root, parent, cell, hops),
+                    residual, self.benefits[i], self.problems[i].pi_f, self.negative[i],
+                )
+                cutoff = self.best[i][0] + _BOUND_CLOSURE_TOL
+                self._endpoint_closed = endpoint_upper <= cutoff < upper
+                upper = min(upper, endpoint_upper)
         return upper
 
     def retain(self, root: int, parent: int, cell: int, hops: int) -> bool:
@@ -459,6 +615,7 @@ class _Batch:
         if upper <= self.best[i][0] + _BOUND_CLOSURE_TOL:
             self.closed_upper[i] = max(self.closed_upper[i], upper)
             self.stats["verified_prunes"] += 1
+            self.stats["endpoint_verified_prunes"] += int(self._endpoint_closed)
             return False
         return True
 
@@ -473,10 +630,13 @@ class _Batch:
     def allocate(self, records: np.ndarray) -> np.ndarray:
         """Assign predecessor IDs without ever truncating a full frontier on overflow."""
         end = self.used + len(records)
-        if end > self.options.max_labels:
+        if end > self.search_label_limit:
             raise _Stopped("label_limit")
         if self.options.cpu_recompute:
             for offset, record in enumerate(records):
+                self.paid_masks[self.used + offset] = self.paid_mask(
+                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
+                )
                 self.prefix_positive[self.used + offset] = self.positive_lower(
                     int(record[1]), int(record[3]), int(record[0]), int(record[2]),
                 )
@@ -518,7 +678,8 @@ class _Batch:
                     continue
             record = np.full(self.stride, -1, np.int32)
             record[:7] = cell, root, 0, -1, -1, -1, 2
-            record[7] = cell
+            record[7:9] = self.root_endpoint[root, :2]
+            record[9] = cell
             records.append(record)
             positive = self.bounds[i].root_positive(variant)
             values.append((v.score[variant], positive))
@@ -606,6 +767,50 @@ class _Batch:
             blocked[forbidden] = 1
         return values, blocked
 
+    def future_proposals(
+        self, records: np.ndarray, visits: np.ndarray, step: int,
+    ) -> np.ndarray:
+        """Gather hop-aware proposals into the existing per-cell GPU visit buffer.
+
+        Parameters
+        ------------
+        - records (np.ndarray): all parents that will read the returned buffer.
+        - visits (np.ndarray): current signed/positive prices and old future proposals.
+        - step (int): absolute time of their children.
+
+        Return
+        --------
+        - output (np.ndarray): same buffer shape; each target uses the largest remaining
+          allowance among all its candidate parents. This relaxes every actual child;
+          FP64 verification still uses that child's exact allowance before deletion.
+        """
+        if not any(f is not None and f.hops is not None and f.hops.costs is not None
+                   for f in self.future):
+            return visits
+        started = time.monotonic()
+        available = np.full(len(self.cells), -1, np.int32)
+        targets = self.graph[records[:, 0], :6].ravel()
+        budgets = np.repeat(self.roots[records[:, 1], 4] - records[:, 2] - 1, 6)
+        valid = targets >= 0
+        np.maximum.at(available, targets[valid], budgets[valid])
+        for i, future in enumerate(self.future):
+            if (future is None or future.hops is None or future.hops.costs is None
+                    or not future.first_step <= step < future.first_step + len(future.hops.costs)):
+                continue
+            hop = future.hops
+            first, count = self.cell_offsets[i], self.topologies[i].n_cells
+            allowance = available[first:first + count]
+            slack = allowance.astype(np.int64) - self.topologies[i].rev_remaining
+            index = hop.structure.offsets[:-1] + slack
+            cells = np.flatnonzero((slack >= 0) & (index < hop.structure.offsets[1:]))
+            values = hop.costs[step - future.first_step, index[cells]]
+            # Infinity in the device ABI also means "unavailable". A finite maximum
+            # asks for verification of a proved empty table state without losing the proposal.
+            lower = np.maximum(visits[first + cells, 2], values)
+            visits[first + cells, 2] = np.minimum(lower, float(np.finfo(np.float32).max))
+        self.stats["hop_gather_s"] = self.stats.get("hop_gather_s", 0.0) + time.monotonic() - started
+        return visits
+
     def complete(self, record: np.ndarray, path: tuple[tuple[int, int], ...]) -> None:
         """Validate every destination lane before any continuation grouping can discard it.
 
@@ -675,6 +880,75 @@ class _Batch:
         self.stats["grouped_labels"] += len(records) - len(indices)
         return records[indices].copy(), scores[indices].copy()
 
+    def select_beam(
+        self, records: np.ndarray, scores: np.ndarray, step: int, width: int,
+    ) -> np.ndarray:
+        """Rank preliminary routes by unpaid endpoints and reserve root/arrival diversity.
+
+        Parameters
+        ------------
+        - records (np.ndarray): GPU-generated continuing states, before allocation.
+        - scores (np.ndarray): approximate signed prefix scores and pruning proposals.
+        - step (int): absolute time of these states.
+        - width (int): maximum retained states per flight in this heuristic pass.
+
+        Return
+        --------
+        - output (np.ndarray): selected indices; these omissions never enter a certificate.
+        """
+        flights = np.asarray(self.root_flights)[records[:, 1]]
+        remaining = self.graph[records[:, 0], 12]
+        cost = remaining * self.root_values[records[:, 1], 4]
+        selected = []
+        for i in range(len(self.problems)):
+            choices = np.flatnonzero(flights == i)
+            endpoint = self.endpoints[i]
+            if endpoint is not None and not endpoint.rows:
+                endpoint = None
+            if endpoint is None and self.future[i] is None:
+                priority = scores[choices, 0] - cost[choices]
+                order = np.lexsort((choices, remaining[choices], -priority))
+                selected.extend(map(int, choices[order[:width]]))
+                continue
+            if endpoint is not None:
+                endpoint.consider(records[choices, 7:9].copy().view(np.uint32))
+            for index in choices:
+                self.check()
+                record = records[index]
+                root, hops = int(record[1]), int(record[2])
+                if self.future[i] is not None:
+                    cost[index] = max(cost[index], self.future[i].lookup(
+                        int(record[0]) - self.cell_offsets[i], step,
+                        self.topologies[i].air_hop_limit - hops,
+                    ))
+                if endpoint is not None:
+                    last = min(self.topologies[i].max_step,
+                               step + self.topologies[i].air_hop_limit - hops)
+                    residual = endpoint.residual(
+                        tuple(map(int, record[7:9].view(np.uint32))),
+                        step, step + int(remaining[index]), last,
+                    )
+                    if residual is not None:
+                        cost[index] = max(cost[index], residual[1],
+                                          residual[0] + remaining[index]
+                                          * self.root_values[root, 4])
+            priority = scores[choices, 0] - cost[choices]
+            order = choices[np.lexsort((choices, remaining[choices], -priority))]
+            # A busy departure must not consume every slot before other promising
+            # roots or earliest-arrival regimes can produce a feasible completion.
+            reserved, groups = [], set()
+            for index in order:
+                key = int(records[index, 1]), int(remaining[index])
+                if key not in groups:
+                    reserved.append(int(index))
+                    groups.add(key)
+                    if len(reserved) >= width // 2:
+                        break
+            chosen = set(reserved)
+            reserved.extend(int(index) for index in order if index not in chosen)
+            selected.extend(reserved[:width])
+        return np.asarray(selected, np.intp)
+
     def search(self, beam_width: int | None = None) -> None:
         """Expand immutable time frontiers on the GPU and account for every completion.
 
@@ -717,7 +991,14 @@ class _Batch:
             self.stats["max_frontier"] = max(self.stats["max_frontier"], len(frontier))
             if not len(frontier):
                 continue
+            for i, endpoint in enumerate(self.endpoints):
+                if endpoint is not None:
+                    selected = root_flights[frontier[:, 1]] == i
+                    endpoint.consider(frontier[selected, 7:9].copy().view(np.uint32))
+            self.pack_endpoints()
             visits, blocked = self.visits(step + 1)
+            visits = self.future_proposals(frontier, visits, step + 1)
+            visit_masks = self.endpoint_visits(step + 1)
             next_records, next_scores = [], []
             next_count = 0
             for start in range(0, len(frontier), self.options.chunk_size):
@@ -744,9 +1025,12 @@ class _Batch:
                         self.paid_values,
                         np.empty((count, self.stride), np.int32),
                         np.empty((count, 3), np.float32),
+                        visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
                     ),
                     (10, 11),
-                    static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values"},
+                    static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values",
+                            12: "endpoint_visits", 13: "endpoint_meta", 14: "endpoint_entries",
+                            15: "endpoint_trees"},
                     write_only=(10, 11),
                 )
                 valid = np.flatnonzero(records[:, 6])
@@ -759,6 +1043,7 @@ class _Batch:
                     path = None
                     if flags & 4:
                         self.stats["gpu_prune_proposals"] += 1
+                        self.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
                         if not self.retain(root, int(record[3]), int(record[0]), int(record[2])):
                             continue
                     if flags & 1:
@@ -771,7 +1056,7 @@ class _Batch:
                     next_records.append(records[keep])
                     next_scores.append(scores[keep])
                     next_count += len(keep)
-                    if beam_width is None and self.used + next_count > self.options.max_labels:
+                    if beam_width is None and self.used + next_count > self.search_label_limit:
                         raise _Stopped("label_limit")
             if next_records:
                 frontier, scores = self.group(
@@ -779,16 +1064,7 @@ class _Batch:
                     heuristic=beam_width is not None,
                 )
                 if beam_width is not None:
-                    selected = []
-                    flights = np.asarray(self.root_flights)[frontier[:, 1]]
-                    remaining = self.graph[frontier[:, 0], 12]
-                    priority = scores[:, 0] - remaining * self.root_values[frontier[:, 1], 4]
-                    if any(future is not None for future in self.future):
-                        priority = scores[:, 0] - visits[frontier[:, 0], 2]
-                    for i in range(len(self.problems)):
-                        choices = np.flatnonzero(flights == i)
-                        order = np.lexsort((choices, remaining[choices], -priority[choices]))
-                        selected.extend(map(int, choices[order[:beam_width]]))
+                    selected = self.select_beam(frontier, scores, step + 1, beam_width)
                     frontier, scores = frontier[selected], scores[selected]
                 frontier = self.allocate(frontier)
                 values = scores[:, :2].copy()
@@ -839,7 +1115,15 @@ class _Batch:
             self.prepare()
             self.bootstrap()
             try:
-                self.search()
+                # Stop an unproductive first pass early enough to benefit from the
+                # future-informed beam. The retry still searches every root at the
+                # caller's original cap; this limit never authorizes a certificate.
+                self.search_label_limit = min(self.options.max_labels, _INITIAL_FULL_LABEL_LIMIT)
+                self.stats["initial_full_label_limit"] = self.search_label_limit
+                try:
+                    self.search()
+                finally:
+                    self.search_label_limit = self.options.max_labels
             except _Stopped as stop:
                 if str(stop) != "label_limit":
                     raise
@@ -886,7 +1170,10 @@ class _Batch:
                     self.runtime.backend,
                     self.options.cpu_recompute,
                     status,
-                    dict(stats, bound_gap=(max(rc, self.closed_upper[i]) - rc
+                    dict(stats, endpoint=(dict(self.endpoints[i].stats)
+                                          if self.endpoints[i] is not None else {}),
+                         future=(dict(self.future[i].stats) if self.future[i] is not None else {}),
+                         bound_gap=(max(rc, self.closed_upper[i]) - rc
                                           if certified and math.isfinite(rc) else None)),
                 )
             )

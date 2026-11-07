@@ -162,7 +162,7 @@ first-hop roles, exclusions, signed prices, endpoint/origin/visit overlap,
 repricing, changed root sets and interrupted table builds. Existing GPU tests
 cover both flag words, recent revisits, canonical rejection, near ties and limits.
 
-The final focused suite passed **182 tests** in 29.91 seconds. Changed Python
+The final focused suite passed **183 tests** in 29.68 seconds. Changed Python
 files passed Ruff, and `git diff --check` passed. Original full CPU pricing was
 blocked during the actual Metal replays and solver check. The canonical full
 solver, including the licensed Gurobi master, accepted and verified all ten
@@ -170,6 +170,95 @@ flights in the longest-nine-plus-1752 capture subset. This is a full solver
 integration check on ten flights, not a full 1,537-flight run. The pre-existing
 full-suite import failure for `analysis.profile_native_dp` was not part of these
 focused checks. No separate independent review has been performed.
+
+### Replay with the mandatory final-visit union
+
+[The arrival-union report](arrival_union_results.json) compares the unchanged
+`7c23d1e6` implementation with `d6ac84dc`. Capture prices, cap 250,000 per pass,
+batch size one and chunk size 2,048 are unchanged. All measured production-source
+hashes match the corresponding checkout or archived baseline. Full CPU pricing
+is blocked, canonical validation remains enabled, and no saved reference route
+is supplied as an input. Sustained Metal work uses the shared advisory lock.
+
+The union certifies **88/88 early-price hard cases**, up from 84/88, and **18/18
+late-price cases**, up from 16/18. All reduced costs agree within \(10^{-6}\),
+and every new upper covers the corresponding previous feasible witness. Thus
+the four formerly capped early-price incumbents were already optimal within the
+certificate tolerance. Flight 1646 has no improving route.
+
+| Metric, same 84 early-price certified flights | Before union | With union |
+| --- | ---: | ---: |
+| Pricing wall | 202.490 s | 130.566 s |
+| Allocated records, all passes | 3,458,459 | 1,247,920 |
+| Candidate extensions, all passes | 14,738,172 | 5,817,585 |
+| Initial preparation | 56.164 s | 55.823 s |
+| Optional future preparation | 7.606 s | 1.516 s |
+| Preliminary search | 34.735 s | 34.318 s |
+| Certified search passes | 103.786 s | 38.714 s |
+
+Matched-certificate wall is 35.5% lower, records 63.9% lower and candidate
+extensions 60.5% lower. These are single serialized replay aggregates, not a
+statistical speedup estimate. All-88 wall is 135.342 s with the union versus
+257.703 s before, but those totals compare different certificate counts.
+For the same 16 already-certified late-price flights, wall is 23.731 s versus
+41.136 s, with 166,719 versus 678,777 records. All 18 now finish in 25.306 s.
+The remaining-hop code is unchanged; no separate benefit is attributed to it.
+
+A fresh baseline archive replay and a first/repeated union replay confirm the
+four closures and the improvement on flight 278. First use means the first call
+for that graph in the process, with the runtime shared across flights; repeat
+reuses the graph and price view. Capture loading and graph construction are
+outside pricing wall. Each pair below is **first use / repeat**, in seconds.
+
+| Flight | Before wall | Union wall | Before initial prep | Union initial prep | Records before / union |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 480 | 12.637 / 11.848 | 1.813 / 1.112 | 0.840 / 0.193 | 0.842 / 0.320 | 375,223 / 7,937 |
+| 806 | 16.065 / 15.752 | 1.285 / 0.897 | 0.568 / 0.230 | 0.570 / 0.186 | 486,105 / 7,419 |
+| 1646 | 11.817 / 11.543 | 0.679 / 0.385 | 0.613 / 0.345 | 0.544 / 0.248 | 339,030 / 0 |
+| 2526 | 14.822 / 14.574 | 1.094 / 0.737 | 0.518 / 0.187 | 0.590 / 0.226 | 348,973 / 3,392 |
+| 278 | 7.235 / 6.720 | 1.483 / 0.969 | 0.707 / 0.184 | 0.692 / 0.182 | 201,446 / 8,059 |
+
+The first four baseline cases stop at the cap, so their wall reductions are not
+matched-certificate speedups. Every union call certifies; flight 278 certifies
+before and after. Flight 480's union upper is 8.631455483172406 against feasible
+RC 8.631455480197474. Its full pass allocates zero continuation records after
+the preliminary route is found. Flight 1646 closes all roots without allocating
+route records. The other seven selected controls retain their prior work counts.
+
+For repeat flight 480, device allocations fall from 388 to 181, allocated device
+bytes from 17.58 to 7.92 MB, host-to-device copy volume from 306.21 to 96.18 MB,
+and device-to-host copy volume from 97.23 to 3.07 MB. Allocation time is
+7.50 / 2.92 ms, command-wait time 348.86 / 128.97 ms and GPU execution
+26.97 / 10.20 ms, before / after. These timers overlap and must not be added.
+Transfers are copy volumes, not separately timed transfers. Per-flight telemetry,
+preparation and search stages are recorded independently in the report.
+
+#### Flight 1638 regression
+
+Flight 1638 retains the same certified RC 15.42779899989182 and upper
+15.42779901153304, but total records increase from 171,147 to 208,396 and
+candidate extensions from 811,269 to 845,097. Wall is 7.662 / 7.870 s in the
+hard-case replay. Observational before/after Metal traces reproduce those work
+counts without changing search inputs or supplying an incumbent.
+
+The union's frontier is no larger at **every shared time layer** of the initial
+full pass. At step 374 it has 48,183 live states and 125,406 allocated records,
+versus 65,524 live states and 162,036 allocated records before. The old pass
+stops while generating the next layer: 162,036 allocated plus 90,470 pending
+exceeds the 250,000 cap. The new pass fits that complete layer, reaching step
+375 with 73,955 live states and 199,361 allocated records; 51,613 pending records
+then exceed the same cap. Pending records are not counted as allocated because
+the entire next layer must fit. This explains the 21.8% record increase alongside
+the smaller 4.2% increase in candidate extensions.
+
+Both initial preliminary passes find RC approximately 8. Both initial full
+passes leave it unchanged. The retry's future-informed preliminary pass finds
+the same RC 15.427799 optimum, and its final full pass allocates zero records.
+The regression is extra work before that useful retry, rather than a weaker
+incumbent or larger frontier at the same search time. A general policy for
+starting future preparation sooner could address it, but is not changed in this
+bound-only update. Flight 2054 has a separate four-record increase (9,438 to
+9,442); both calls still certify. These regressions remain in the aggregate.
 
 ### Replay before the mandatory final-visit union
 
@@ -202,11 +291,12 @@ neither more roots nor a saved reference route was needed. Widening the beam
 from 64 to 256 increased flight-2 work to 15,106 records and failed to resolve
 480 or 806, so the default remains 64 with 32 selected preliminary roots.
 
-The remaining capped early-price cases are **480, 806, 1646 and 2526**. Their
-incumbents are respectively 8.6314554802, 5.1044821774, approximately zero, and
-7.1785379972. Their upper bounds remain unavailable. On the 18 representative
-late-price cases, both heuristic-only and final versions certify 16; **806 and
-2526** remain capped. No claimed certificate depends on an exact route identity.
+Before the union, capped early-price cases were **480, 806, 1646 and 2526**. Their
+incumbents were respectively 8.6314554802, 5.1044821774, approximately zero, and
+7.1785379972, with no upper certificate. On the 18 representative late-price
+cases, both heuristic-only and pre-union versions certified 16; **806 and
+2526** were capped. The union results above supersede these cap outcomes.
+No claimed certificate depends on an exact route identity.
 
 The hop refinement changed no candidate/record counts or certificate outcomes
 on either the 88 early-price or 18 late-price cases. It added 5.009 seconds of
@@ -254,12 +344,13 @@ flight. The strongest tried a price-only suffix with actual hop allowance,
 reserved every origin/root-visit row against duplicate charging, and combined
 it with the full positive prefix, unpaid endpoint arrival minimum and clamped
 geometry lower bound. Even with a 128 MiB / 150 million-work diagnostic budget,
-it closed **zero of 128 prefixes on each flight**. No production joint bound
-is added on this evidence.
+it closed **zero of 128 prefixes on each flight**. No general production joint
+recurrence is added on this evidence. The simpler mandatory arrival union above
+now closes these four cases without a joint suffix recurrence.
 
-A follow-up would need to couple the arrival time and unpaid mask *inside* the
+A further joint-bound experiment could couple arrival time and unpaid mask *inside* the
 suffix recurrence; independently minimized terms lose that relationship.
-First measure that coupled relaxation on these same surviving prefixes, with
+First identify cases still needing it and measure that coupled relaxation, with
 an explicit disjoint price partition and bounded cache. Then independently
 enumerate tiny canonical completions to verify every prefix upper before
 adding device proposals. Preserve the current valid bounds by taking their

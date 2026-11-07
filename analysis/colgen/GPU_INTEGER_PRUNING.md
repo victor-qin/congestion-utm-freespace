@@ -121,3 +121,17 @@ The parallel-preparation branch owns `prepare_flight` extraction. Numeric data
 will use a separate immutable payload rather than changing that contract before
 the arithmetic and membership gates pass. Production integration and speedup
 are not yet established.
+
+## Prototype validation
+
+The first focused gate passed 20 tests on 2026-11-07 under the shared lock:
+exact-rational conversion/arithmetic oracles, every ordering of small positive
+price sets, cancellation/subnormal/extreme values, checked overflow and ambiguous
+cutoffs. Actual Metal executed 6,000 multiword arithmetic cases and 500 complete
+bound-expression cases. Original binary64 expressions were independently checked
+against the latter uppers. Generated CUDA source passed a C++ syntax check with
+CUDA annotations/intrinsics stubbed; no NVIDIA hardware was used.
+
+These tests validate arithmetic given valid operands. Exact membership transport,
+resident interruption/accounting, the production verifier guard and matched
+performance are separate gates. No production pruning code imports the prototype.

@@ -19,7 +19,7 @@ from .types import FlightRequest, OperationalIntent
 def _warn_if_terminal_dropped(req: FlightRequest, intent: OperationalIntent) -> None:
     """Warn loudly when an accepted plan dropped the terminal tag it asked for.
 
-    A*-based geometry and the terminal-aware MILP family tag a hub flight's terminal column; a
+    A*-based geometry and colgen tag a hub flight's terminal column; a
     planner that rebuilds corridors without threading the terminal (e.g. ``straight``) drops the
     tag, silently disabling the shared-terminal exemption and pad capacity. A visible
     ``RuntimeWarning`` is preferred to a quietly wrong result.

@@ -25,6 +25,10 @@ import sys
 import tarfile
 import time
 import traceback
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from freespace_sim.types import FlightRequest
 
 
 _PRICING_DEFAULTS = {
@@ -65,6 +69,28 @@ def _pricing_argv(args: argparse.Namespace) -> list[str]:
         else:
             result.extend((f"--{flag}", str(value)))
     return result
+
+
+def _outbound_requests(generated: list[FlightRequest]) -> list[FlightRequest]:
+    """Select outbound legs without regenerating demand or changing their IDs and clocks.
+
+    Parameters
+    ------------
+    - generated (list[FlightRequest]): current itineraries or an archived paired-leg stream.
+
+    Return
+    --------
+    - output (list[FlightRequest]): one-way outbound requests, leaving the input unchanged.
+    """
+    if generated and hasattr(generated[0], "return_to_origin"):
+        assert any(r.return_to_origin for r in generated), "Scenario has no round trips"
+        eligible = [dataclasses.replace(r, return_to_origin=False) for r in generated]
+    else:
+        eligible = [r for r in generated if r.paired_outbound_id is None]
+        assert len(eligible) < len(generated), "Scenario has no identified return legs"
+    assert all(r.origin_terminal is not None and r.dest_terminal is None
+               for r in eligible), "Outbound-only benchmark requires hub deliveries"
+    return eligible
 
 
 def jsonable(value):
@@ -233,15 +259,8 @@ def child(args: argparse.Namespace) -> None:
     demand = spec.demand_model()
     generated = sorted(demand.generate(cfg, np.random.default_rng(args.seed)),
                        key=lambda request: request.flight_id)
-    # Generate the original paired stream first so the outbound-only ablation
-    # preserves every outbound ID, coordinate and clock exactly. Turning returns
-    # off in the generator can renumber IDs or change legacy random draws.
-    eligible = ([r for r in generated if r.paired_outbound_id is None]
-                if args.outbound_only else generated)
-    if args.outbound_only:
-        assert len(eligible) < len(generated), "Scenario has no identified return legs"
-        assert all(r.origin_terminal is not None and r.dest_terminal is None
-                   for r in eligible), "Outbound-only benchmark requires hub deliveries"
+    # Select after generation: changing the demand recipe can renumber archived flight IDs.
+    eligible = _outbound_requests(generated) if args.outbound_only else generated
     requests = eligible if args.flights == 0 else eligible[:args.flights]
     static_terms = list(demand.terminals(cfg))
     experimental = {}
@@ -269,10 +288,9 @@ def child(args: argparse.Namespace) -> None:
                             or args.version.startswith("iteration_ip") else args.destroy),
     )
     inputs = {"config": cfg, "params": params, "requests": requests,
-              "static_terminals": static_terms, "return_anchor": "nominal"}
+              "static_terminals": static_terms}
     if args.outbound_only:
-        inputs["return_anchor"] = "not applicable: outbound-only request subset"
-        inputs["demand_selection"] = "paired_outbound_id is None; original IDs and clocks"
+        inputs["demand_selection"] = "Outbound legs only; original IDs and clocks"
     # The two arms differ only in the heuristic mode, excluded from this hash.
     comparable = dict(inputs)
     comparable["params"] = dataclasses.replace(params, lns_destroy_flights=0)
@@ -481,7 +499,9 @@ def child(args: argparse.Namespace) -> None:
         "iteration_ip_wall_s": stats.get("iteration_ip_wall_s", 0),
         "n_generated": len(generated), "n_requests": len(requests),
         "outbound_only": args.outbound_only, "n_eligible": len(eligible),
-        "n_return_requests": sum(r.paired_outbound_id is not None for r in requests),
+        "n_return_requests": sum(getattr(r, "return_to_origin", False)
+                                 or getattr(r, "paired_outbound_id", None) is not None
+                                 for r in requests),
         "requests_sha": digest(requests), "generated_requests_sha": digest(generated),
         "n_static_terminals": len(static_terms), "input_sha": input_sha,
         "demand_config_sha": demand_config_sha, "algorithm_params_sha": algorithm_params_sha,
@@ -560,7 +580,7 @@ def parent(args: argparse.Namespace) -> int:
         "iterations": args.iterations, "solver_time_limit_s": args.budget,
         "demand_duration_override_s": args.demand_seconds,
         "outbound_only": args.outbound_only,
-        "demand_selection": ("Generate original paired demand, then retain outbound requests "
+        "demand_selection": ("Generate original demand, then select outbound legs "
                              "with identical IDs, coordinates and clocks"
                              if args.outbound_only else "All generated requests"),
         "versions": args.versions,
@@ -581,7 +601,7 @@ def parent(args: argparse.Namespace) -> int:
         "solver": "gurobi", "ip_gap": args.gap, "destroy": args.destroy,
         "scope": "Actual sim.run, including batch filing and final conflict verification",
         "timing": "Warmup and demand generation excluded; measured arms never overlap",
-        "return_anchor": "nominal (the existing column-generation support)",
+        "round_trip_support": "Colgen requires one-way requests; use --outbound-only for itineraries",
         "rss": "Peak of the whole fresh process, including warmup; not incremental simulation RSS",
         "first_version": args.first_version,
         "cost": "Congestion cost excludes mandatory climb/descent; filed_cost includes it",
@@ -749,7 +769,7 @@ def main() -> int:
         command.add_argument("--gap", type=float, default=0.001)
         command.add_argument("--demand-seconds", type=float)
         command.add_argument("--outbound-only", action="store_true",
-                             help="Drop paired return legs after generating unchanged demand")
+                             help="Select outbound legs after generating unchanged demand")
     args = parser.parse_args()
     if args.overrun < 0 or args.columns_per_flight < 1:
         parser.error("--overrun must be nonnegative and --columns-per-flight positive")

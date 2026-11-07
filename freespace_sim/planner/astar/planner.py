@@ -49,6 +49,7 @@ from ...volumes import (
     segment_overlaps_column,
     terminal_radius,
 )
+from ..itinerary import reject_itinerary
 from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, aligned_2d
 from . import window as W
@@ -785,6 +786,7 @@ class AStarPlanner:
         - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
           REJECTED intent carrying the :class:`DenialReason`.
         """
+        reject_itinerary(req, "astar")
         self.last_envelope = None            # never leak a previous flight's read set to a consumer
         if not self.compiled:
             return self._plan_reference(req, ledger, cfg)
@@ -1550,7 +1552,7 @@ class AStarPlanner:
             col = hover_reservation(np.asarray(center, float), 0.0, cfg,
                                     terminal_id=term.id, radius=terminal_radius(term, cfg),
                                     climb_time_s=cfg.climb_time_to(z_hi))
-            for q, r, L, _s, in_blk in hg.rasterize_volume_dual(
+            for q, r, L, _s, in_blk, _in_pad in hg.rasterize_volume_dual(
                 col, cfg, cocc.R, cocc.infl_blocked, cocc.infl_pad
             ):
                 if in_blk:

@@ -37,15 +37,14 @@ from freespace_sim import sim                               # noqa: E402
 _LAST_PLANNER: list = []
 
 
-def _fresh_baseline(spec, demand, cfg, return_anchor):
+def _fresh_baseline(spec, demand, cfg):
     """Re-run FCFS so each arm gets its OWN (intents, ledger) pair.
 
     Not an optimisation to skip: `run_lns_on_result` takes the ledger over and mutates it in place,
     so the second arm cannot be handed the first arm's result. Deterministic in `cfg.seed`, so the two
     baselines are identical by construction — asserted below rather than assumed.
     """
-    return sim.run(cfg, demand=demand, planner_name="astar", progress=False,
-                   return_anchor=return_anchor)
+    return sim.run(cfg, demand=demand, planner_name="astar", progress=False)
 
 
 def main() -> int:
@@ -59,12 +58,6 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--time-limit", type=float, default=None)
     ap.add_argument("--verify-every", type=int, default=0)
-    ap.add_argument("--return-anchor", default="nominal", choices=["nominal", "realized"],
-                    help="'realized' re-anchors each round-trip return to its outbound's ACTUAL "
-                         "arrival. Under congestion the nominal anchor schedules a return before "
-                         "its aircraft is back, so a delay measured against it is partly fictional. "
-                         "Both arms share the anchor, and the baseline assert below still pins them "
-                         "to the same starting schedule.")
     ap.add_argument("--arms", default="astar,sipp")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -95,7 +88,7 @@ def main() -> int:
     rows = []
     for arm in (a.strip() for a in args.arms.split(",") if a.strip()):
         t0 = time.monotonic()
-        res = _fresh_baseline(spec, demand, cfg, args.return_anchor)
+        res = _fresh_baseline(spec, demand, cfg)
         base_s = time.monotonic() - t0
         n_legs = sum(1 for it in res.intents if it.accepted)
         base_cost = float(sum(it.cost for it in res.intents if it.accepted))
@@ -113,7 +106,7 @@ def main() -> int:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="astar compiled kernel FALLBACK")
             warnings.filterwarnings("ignore", message="sipp compiled kernel FALLBACK")
-            out = run_lns_on_result(res, demand, lns_cfg, return_anchor=args.return_anchor)
+            out = run_lns_on_result(res, demand, lns_cfg)
         s = out.summary()
         loop_s = max(1e-9, s["wall_s"] - s["init_wall_s"])
         # SIPP kernel fallbacks land in A*'s search, so a high rate would silently erase the
@@ -160,7 +153,7 @@ def main() -> int:
             dict(scenario=args.scenario, iterations=args.iterations,
                  neighborhood=args.neighborhood, seed=args.seed,
                  demand_duration_s=args.demand_duration, horizon_s=args.horizon,
-                 return_anchor=args.return_anchor, arms=rows),
+                 arms=rows),
             indent=2))
         print(f"wrote {args.out}")
     return 0

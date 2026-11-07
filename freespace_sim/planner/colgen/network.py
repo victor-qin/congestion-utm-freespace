@@ -373,7 +373,8 @@ class _ImmutableFlightRequest(FlightRequest):
             self.uss_id,
             self.origin_terminal,
             self.dest_terminal,
-            self.paired_outbound_id,
+            self.return_to_origin,
+            self.turnaround_s,
         )
 
 
@@ -404,7 +405,8 @@ def _snapshot_request(
         uss_id=req.uss_id,
         origin_terminal=origin_terminal,
         dest_terminal=dest_terminal,
-        paired_outbound_id=req.paired_outbound_id,
+        return_to_origin=req.return_to_origin,
+        turnaround_s=req.turnaround_s,
     )
 
 

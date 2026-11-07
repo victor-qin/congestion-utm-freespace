@@ -28,7 +28,7 @@ class Planner(Protocol):
     #       The pad-capacity authority this planner has ALREADY brought current for ``ledger``, or
     #       None if it holds none bound to that ledger. Lets a post-pass reuse the authority the
     #       inner plan just built instead of paying a second ledger subscription + index. A*
-    #       and the MILP implement it; ``shortcut._terminal_capacity_for`` is the consumer.
+    #       implements it; ``shortcut._terminal_capacity_for`` is the consumer.
 
 
 def iter_planner_chain(planner):
@@ -48,8 +48,7 @@ def iter_planner_chain(planner):
     Return
     --------
     - output (Iterator[Planner]): each reachable planner once, deduped by identity, so a diamond
-      (``astar_milp_shortcut`` wraps a MILP warm-started by a *different* ShortcutRefiner) visits
-      each node once.
+      (a wrapper whose ``inner`` and ``warm_planner`` chains meet) visits each node once.
     """
     seen: set[int] = set()
     stack = [planner]
@@ -80,11 +79,17 @@ def uses_hex_lattice(name: str) -> bool:
 
 
 def get_planner(name: str, params=None) -> Planner:
-    """Resolve a planner registry name to a fresh planner instance.
+    """Resolve a planner registry name to a fresh planner instance, wrapped for round trips.
 
     Only ``colgen`` accepts a ``params`` object today, so passing one for any other name raises
     rather than being silently dropped — a dropped solver budget looks like a converged run, not an
     error.
+
+    Every per-flight planner is wrapped in :class:`~.itinerary.ItineraryPlanner`, which composes a
+    ``return_to_origin`` request into one intent covering both legs and the pad between them. The
+    wrapper forwards one-way requests untouched, so this is invisible to every flight that is not a
+    round trip. Whole-schedule planners are NOT wrapped: they receive the schedule, not a request.
+    Reach an inner planner through :func:`iter_planner_chain`, never by assuming a wrapper depth.
 
     Parameters
     ------------
@@ -96,6 +101,15 @@ def get_planner(name: str, params=None) -> Planner:
     - output (Planner): the resolved planner; raises ``ValueError`` on an unknown name or on a
       ``params`` object passed for a non-``colgen`` planner.
     """
+    inner = _get_planner(name, params)
+    if name in WHOLE_SCHEDULE_PLANNERS:
+        return inner
+    from .itinerary import ItineraryPlanner
+
+    return ItineraryPlanner(inner)
+
+
+def _get_planner(name: str, params=None) -> Planner:
     if params is not None and name != "colgen":
         raise ValueError(f"planner {name!r} takes no params object (got {type(params).__name__})")
     if name == "straight":
@@ -106,10 +120,6 @@ def get_planner(name: str, params=None) -> Planner:
         from .decoupled import DecoupledPlanner
 
         return DecoupledPlanner()
-    if name == "milp":
-        from .milp import MILPOptPlanner
-
-        return MILPOptPlanner()
     if name == "astar":
         from .astar import AStarPlanner
 
@@ -120,7 +130,6 @@ def get_planner(name: str, params=None) -> Planner:
         return AStarPlanner(compiled=False)              # pure-Python reference oracle (A/B + fallback)
     if name == "sipp":
         from .sipp import SIPPPlanner
-
         # Cost-aware Safe Interval Path Planning: same cost model, terminal gating and output contract as
         # A*, but the air search collapses the per-step axis into safe intervals (Pareto over
         # (arrival, cost)). Compiled by default, auto-falling back to A* when the kernel bails.
@@ -134,14 +143,12 @@ def get_planner(name: str, params=None) -> Planner:
         from .sipp import SIPPPlanner
 
         return ShortcutRefiner(SIPPPlanner(compiled=True), label="sipp_sc")
-    if name == "astar_milp":
-        return _astar_milp()
     if name == "astar_shortcut":
         from .astar import AStarPlanner
         from .shortcut import ShortcutRefiner
 
-        # A* → greedy shortcut: a solver-free alternative to the MILP refine (tightens the staircase
-        # against the REAL committed obstacles, not A*'s conservative raster).
+        # A* → greedy shortcut: a solver-free geometric refine (tightens the staircase against the
+        # REAL committed obstacles, not A*'s conservative raster).
         return ShortcutRefiner(AStarPlanner(), label="astar_sc")
     if name == "astar_heading_shortcut":
         from .astar import AStarPlanner
@@ -160,18 +167,6 @@ def get_planner(name: str, params=None) -> Planner:
         # runs on either side. The established astar_shortcut remains unchanged for comparison.
         return ShortcutRefiner(
             AStarPlanner(), label="astar_batched_sc", strategy="batched_turns")
-    if name == "astar_milp_shortcut":
-        from .astar import AStarPlanner
-        from .milp import MILPOptPlanner
-        from .shortcut import ShortcutRefiner
-
-        # The full sandwich A* → shortcut → MILP → shortcut: the PRE-shortcut tightens the warm
-        # reference so the MILP locks more binaries and certifies its gap fast (often before the time
-        # cap); the MILP does the optimal continuous refinement within that homotopy; the POST-shortcut
-        # crosses any residual lock slack and strips the resample bloat. Tightest *and* fastest.
-        milp = MILPOptPlanner(
-            warm_planner=ShortcutRefiner(AStarPlanner()), optimize_delay=False, lock_homotopy=True)
-        return ShortcutRefiner(milp, label="astar_milp_sc")
     if name == "colgen":
         from .colgen import ColumnGenerationPlanner
 
@@ -179,12 +174,3 @@ def get_planner(name: str, params=None) -> Planner:
         # routes this planner to `colgen.run_batch` instead. See `plans_whole_schedule`.
         return ColumnGenerationPlanner(params)
     raise ValueError(f"unknown planner: {name!r}")
-
-
-def _astar_milp() -> Planner:
-    """A* picks the homotopy (which side) + the delay; the MILP is LOCKED to that homotopy and
-    tightens the geometry within it (its binaries are pinned → a fast LP, not a fresh search)."""
-    from .astar import AStarPlanner
-    from .milp import MILPOptPlanner
-
-    return MILPOptPlanner(warm_planner=AStarPlanner(), optimize_delay=False, lock_homotopy=True)

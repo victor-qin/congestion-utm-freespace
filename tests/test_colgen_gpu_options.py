@@ -12,6 +12,33 @@ import pytest
 
 from analysis.colgen import benchmark
 from freespace_sim.planner.colgen.params import ColGenParams
+from freespace_sim.types import FlightRequest, Terminal, vec
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_benchmark_outbound_selection_preserves_demand(legacy: bool) -> None:
+    """Current itineraries and archived pairs retain outbound identity without mutating demand."""
+    terminal = Terminal("hub", 2)
+    request = FlightRequest(7, vec(0, 0, 0), vec(1000, 0, 0), 3.0, 9.0,
+                            origin_terminal=terminal, return_to_origin=True, turnaround_s=19.0)
+    if legacy:
+        request = SimpleNamespace(**{
+            name: getattr(request, name) for name in
+            ("flight_id", "origin", "dest", "t_request", "t_departure",
+             "origin_terminal", "dest_terminal")
+        }, paired_outbound_id=None)
+        generated = [request, SimpleNamespace(paired_outbound_id=7)]
+    else:
+        generated = [request]
+    selected = benchmark._outbound_requests(generated)
+    assert len(selected) == 1
+    outbound = selected[0]
+    assert outbound.flight_id == 7 and outbound.t_request == 3.0 and outbound.t_departure == 9.0
+    assert (outbound.origin == request.origin).all() and (outbound.dest == request.dest).all()
+    assert outbound.origin_terminal == terminal and outbound.dest_terminal is None
+    if not legacy:
+        assert request.return_to_origin and not outbound.return_to_origin
+        assert outbound.turnaround_s == 19.0
 
 
 @pytest.mark.parametrize("before", ["gpu", "endpoint"])

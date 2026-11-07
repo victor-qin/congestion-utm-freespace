@@ -16,6 +16,7 @@ runlogs/
 # Reusable diagnostics belong in analysis/; keep local evidence out of commits.
 /.agent/
 .claude/settings.local.json
+.agent/
 
 results/supercloud
 

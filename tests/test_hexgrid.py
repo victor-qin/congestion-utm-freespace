@@ -87,19 +87,59 @@ def test_vectorized_rasterize_matches_scalar_reference(sweep_mode):
         hover_reservation(vec(1500, -700, 0.0), 60.0, CFG),                             # cylinder
     ]
     infl_b = CFG.corridor_width_m / 2.0 + R
-    infl_p = CFG.effective_hover_radius_m + R
-    assert infl_p >= infl_b
-    for v in vols:
-        # single-inflation path == scalar oracle (default corridor inflation)
-        assert set(hg.rasterize_volume(v, CFG, R)) == _scalar_rasterize(v, CFG, R, infl_b)
-        # dual sweep reconstructs BOTH inflation sets exactly
-        blk, pad = set(), set()
-        for q, r, L, s, in_blocked in hg.rasterize_volume_dual(v, CFG, R, infl_b, infl_p):
-            pad.add((q, r, L, s))
-            if in_blocked:
-                blk.add((q, r, L, s))
-        assert blk == _scalar_rasterize(v, CFG, R, infl_b)
-        assert pad == _scalar_rasterize(v, CFG, R, infl_p)
+    # Both orders of the two inflations: a delivery pad narrower than the corridor half-width makes
+    # the PAD footprint the smaller one (#134), and sizing the sweep by it used to drop the outer
+    # ring of the corridor footprint — silently under-blocking every committed corridor.
+    for infl_p in (CFG.effective_hover_radius_m + R, 10.0 + R):
+        for v in vols:
+            # single-inflation path == scalar oracle (default corridor inflation)
+            assert set(hg.rasterize_volume(v, CFG, R)) == _scalar_rasterize(v, CFG, R, infl_b)
+            # dual sweep reconstructs BOTH inflation sets exactly, whichever is wider
+            blk, pad = set(), set()
+            for q, r, L, s, in_blocked, in_pad in hg.rasterize_volume_dual(v, CFG, R, infl_b, infl_p):
+                assert in_blocked or in_pad          # a kept cell lies in at least one footprint
+                if in_pad:
+                    pad.add((q, r, L, s))
+                if in_blocked:
+                    blk.add((q, r, L, s))
+            assert blk == _scalar_rasterize(v, CFG, R, hg.claim_inflation(v, CFG, R, infl_b))
+            assert pad == _scalar_rasterize(v, CFG, R, infl_p)
+
+
+def test_only_a_single_lattice_hop_drops_the_discretization_margin():
+    """#38: the ``+R`` margin exists because the search tests hex CENTRES and only a move's ARRIVAL
+    cell. A corridor that runs one hop centre-to-centre needs neither — the pitch (120 m) exceeds the
+    corridor width (60 m), so distinct cells are separated by construction — and claims just the two
+    cells it flies through. Everything that can pass BETWEEN two centres keeps the margin: a hover
+    disc at an arbitrary pad, an approach leg, a climb box, and a merged multi-hop run."""
+    z = CFG.cruise_level_m
+    infl_b = CFG.corridor_width_m / 2.0 + R
+    c0, c1, c2 = hg.hex_center(10, 3, R), hg.hex_center(11, 3, R), hg.hex_center(12, 3, R)
+    hop = corridor_segment_volume(vec(c0[0], c0[1], z), 0.0, vec(c1[0], c1[1], z), CFG.dt_s, CFG)
+    keeps_margin = {
+        "approach leg": corridor_segment_volume(
+            vec(c0[0] + 37, c0[1] - 12, z), 0.0, vec(c1[0], c1[1], z), CFG.dt_s, CFG),
+        "merged two-hop run": corridor_segment_volume(
+            vec(c0[0], c0[1], z), 0.0, vec(c2[0], c2[1], z), 2 * CFG.dt_s, CFG),
+        "climb box": corridor_segment_volume(
+            vec(c0[0], c0[1], z), 0.0, vec(c1[0], c1[1], z + 15.0), CFG.dt_s, CFG),
+        "hover disc": hover_reservation(vec(1500, -700, 0.0), 60.0, CFG),
+    }
+    assert hg.claim_inflation(hop, CFG, R, infl_b) == CFG.corridor_width_m / 2.0
+    for name, vol in keeps_margin.items():
+        assert hg.claim_inflation(vol, CFG, R, infl_b) == infl_b, name
+
+    def corridor_cells(vol):
+        return {(q, r, L) for q, r, L, _s, blk, _pad
+                in hg.rasterize_volume_dual(vol, CFG, R, infl_b, CFG.effective_hover_radius_m + R)
+                if blk}
+
+    # The hop claims the two cells it flies between — and nothing else.
+    assert {(q, r) for q, r, _L in corridor_cells(hop)} == {(10, 3), (11, 3)}
+    assert len({(q, r) for q, r, _L in corridor_cells(keeps_margin["approach leg"])}) > 2
+    # A pitch below the corridor width would break the argument, so the margin must come back.
+    narrow = replace(CFG, corridor_width_m=hg.SQRT3 * R + 1.0)
+    assert hg.claim_inflation(hop, narrow, R, infl_b) == infl_b
 
 
 def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
@@ -130,7 +170,7 @@ def test_rasterize_ranges_expand_to_dual_and_reuse(monkeypatch):
         again = hg.rasterize_ranges(v, CFG, R, infl_b, infl_p)    # warm: reused, no recompute
         assert again is ranges                                    # the SECOND consumer reuses it
         assert calls["n"] == before + 1                           # exactly one underlying sweep
-        expanded = [(q, r, L, s, b) for q, r, L, s_lo, s_hi, b in ranges
+        expanded = [(q, r, L, s, b, pd) for q, r, L, s_lo, s_hi, b, pd in ranges
                     for s in range(s_lo, s_hi + 1)]
         assert expanded == want                                   # ranges ⇒ dual sweep, byte-for-byte
         assert len(ranges) < len(want)                            # the collapse actually happened
@@ -205,12 +245,12 @@ def test_terminal_column_spans_all_inband_levels():
 
     col = Volume4D(CylinderSpec(0.0, 0.0, 60.0, CFG.ground_level_m, CFG.airspace_ceiling_m), 0.0, 60.0)
     levels = {L for (_, _, L, _) in hg.rasterize_volume(col, CFG, R)}
-    assert levels == {0, 1, 2}
+    assert levels == set(range(CFG.n_levels))
 
 
 def test_single_level_rasterize_tags_zero():
     """With one flight level the (q,r,s) projection matches a single-plane raster, all at L==0."""
-    cfg1 = SimConfig(flight_levels_m=(75.0,))               # one level, ceiling stays 125
+    cfg1 = SimConfig(flight_levels_m=(75.0,))               # one level, ceiling stays at the default
     box = corridor_segment_volume(vec(0, 0, 75.0), 0.0, vec(120, 0, 75.0), cfg1.dt_s, cfg1)
     cells = set(hg.rasterize_volume(box, cfg1, R))
     assert cells
@@ -247,7 +287,8 @@ def test_compiled_box_repairs_a_numpy_threshold_rounding_flip():
         compiled = list(hg.rasterize_volume(vol, CFG, R))
 
     assert compiled == reference
-    assert any((q, r, L) == (4, 3, 1) for q, r, L, _s in compiled)
+    cruise_L = CFG.nearest_level(CFG.cruise_level_m)         # the level the fixture's box flies at
+    assert any((q, r, L) == (4, 3, cruise_L) for q, r, L, _s in compiled)
 
 
 def test_compiled_box_matches_reference_at_random_exact_thresholds():

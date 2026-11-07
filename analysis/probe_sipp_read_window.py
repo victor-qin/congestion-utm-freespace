@@ -50,7 +50,7 @@ def main() -> int:
 
     sipp_mod.SIPPPlanner._splan_compiled = probe
     t0 = time.monotonic()
-    sim.run(cfg, demand=demand, planner_name="sipp", progress=False, return_anchor="nominal")
+    sim.run(cfg, demand=demand, planner_name="sipp", progress=False)
     print(f"sipp run: {len(samples)} compiled plans in {time.monotonic() - t0:.0f}s")
     if not samples:
         print("  no compiled plans — every flight took the reference; nothing to report")

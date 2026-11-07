@@ -45,6 +45,7 @@ from ...volumes import (
     exit_radius,
     terminal_radius,
 )
+from ..itinerary import reject_itinerary
 from .. import hexgrid as hg
 from . import window as SW
 from ..astar import AStarPlanner
@@ -222,7 +223,7 @@ class SafeIntervalIndex:
         # identical `R`/`infl_*`, so all three hit ONE memoized geometry sweep per commit, not 3.
         # This index is step-keyed, so like the hex service it expands the span back out; the saving
         # here is the sweep and the per-row dispatch, not the storage shape.
-        for q, r, L, s_lo, s_hi, in_blk in hg.rasterize_ranges(
+        for q, r, L, s_lo, s_hi, in_blk, _in_pad in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
             if not in_blk:
@@ -719,6 +720,7 @@ class SIPPPlanner(AStarPlanner):
         - output (OperationalIntent): an ACCEPTED intent with volumes/centerline/metrics, or a
           REJECTED intent carrying the :class:`DenialReason`.
         """
+        reject_itinerary(req, "sipp")
         # Per-plan diagnostics must never leak a previous compiled flight through an early host denial,
         # a reference dispatch, or a kernel fallback. Cumulative fallback counters remain cumulative.
         self.last_expansions = 0

@@ -37,6 +37,9 @@ def _cfg() -> SimConfig:
         terminal_airspace_always_active=True,
         max_ground_delay_s=48.0,
         max_detour_factor=10.0,
+        # Pinned, not inherited: this world is built from 60 m endpoint discs — the fallback before
+        # a delivery pad got its own default (#134), and what the oracle below enumerates against.
+        hover_radius_m=60.0,
     )
 
 

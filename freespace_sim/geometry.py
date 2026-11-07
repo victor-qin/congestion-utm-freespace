@@ -124,7 +124,7 @@ class BoxSpec:
         The world half-extent ``|R| @ half`` is computed from the flat ``rot`` tuple with scalars:
         bit-for-bit identical to the numpy matmul (verified) but without rebuilding a 3x3 array or
         paying ufunc dispatch on every call (this runs >1e6 times per refined plan via the ledger
-        broadphase). :meth:`rotation` stays intact for its matrix consumers (hexgrid/opt/milp/viz).
+        broadphase). :meth:`rotation` stays intact for its matrix consumers (hexgrid/viz).
         """
         r = self.rot
         h0, h1, h2 = self.extents[0] / 2.0, self.extents[1] / 2.0, self.extents[2] / 2.0   # == extents / 2

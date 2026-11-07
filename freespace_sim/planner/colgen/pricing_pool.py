@@ -819,7 +819,7 @@ def _request_definition(request):
     """Detach caller-owned arrays when identifying a worker's immutable input."""
     return (request.flight_id, tuple(request.origin), tuple(request.dest), request.t_request,
             request.t_departure, request.uss_id, as_terminal(request.origin_terminal),
-            as_terminal(request.dest_terminal), request.paired_outbound_id)
+            as_terminal(request.dest_terminal), request.return_to_origin, request.turnaround_s)
 
 
 def _certified_result(column, extras, graph, params, cfg):

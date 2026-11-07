@@ -221,14 +221,14 @@ def test_run_batch_rejects_terminal_requests_without_permanent_walls(monkeypatch
 
 
 def test_run_batch_rejects_a_multi_level_run_up_front():
-    """The shipped ladder is three levels, so this is the first wall a new colgen run hits.
+    """The shipped ladder is multi-level, so this is the first wall a new colgen run hits.
 
     ``build_flight_graph`` guards it too, but per flight and four frames down; refusing at the
     entry point is what lets the message name ``flight_levels_m``.
     """
 
-    cfg = SimConfig(planner="colgen")  # default (30, 70, 110) ladder
-    assert cfg.n_levels == 3
+    cfg = SimConfig(planner="colgen")  # the default ladder
+    assert cfg.n_levels > 1
     with pytest.raises(NotImplementedError, match="flight_levels_m"):
         run_batch(
             scenario_from_requests(_requests()), cfg, ReservationLedger(cfg),

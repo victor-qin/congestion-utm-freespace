@@ -110,23 +110,37 @@ def test_mock_pricing_and_foreign_columns_do_not_acquire_internal_provenance(mon
     assert not pricing_pool._certified_result(seed, (), graph, params, cfg)
 
 
-def test_mutable_request_cannot_change_pool_payload_or_acquire_receipt():
+@pytest.mark.parametrize("changed", ["origin", "return_to_origin", "turnaround_s"])
+def test_mutable_request_cannot_change_pool_payload_or_acquire_receipt(changed):
     cfg, params, graph, catalog, seed = _context()
     request = pickle.loads(pickle.dumps(graph.request))
     # Build a mutable public request, preserving the same field values.
     request = FlightRequest(request.flight_id, request.origin.copy(), request.dest.copy(),
-                            request.t_request, request.t_departure, paired_outbound_id=19)
+                            request.t_request, request.t_departure, turnaround_s=19.0)
+    graph = build_flight_graph(request, cfg, catalog, params)
+    seed = pricing.seed_column(graph, cfg, model=cost_model(cfg, params))
     pool = pricing_pool.PricingPool([request], cfg, replace(params, n_pricing_workers=1), catalog)
     original = pool._request_definitions
-    request.origin[0] += 10.
+    before = _sweep([seed])
+    pricing_pool._receipt(before, [request], {seed.flight_id: graph}, cfg, params, catalog)
+    assert pricing_pool.certified_sweep_columns(
+        before, {seed.flight_id: graph}, cfg, params, catalog
+    ) == (seed,)
+    if changed == "origin":
+        request.origin[0] += 10.
+    elif changed == "return_to_origin":
+        request.return_to_origin = True
+    else:
+        request.turnaround_s += 10.
     assert tuple(pricing_pool._request_definition(r) for r in pool._requests) == original
     assert pricing_pool._request_definition(request) != original[0]
     sweep = _sweep([seed])
     pricing_pool._receipt(sweep, [request], {seed.flight_id: graph}, cfg, params, catalog)
     assert pricing_pool.certified_sweep_columns(sweep, {seed.flight_id: graph}, cfg, params, catalog) == ()
-    paired_graph = build_flight_graph(pool._requests[0], cfg, catalog, params)
-    assert paired_graph.request.paired_outbound_id == 19
-    assert pickle.loads(pickle.dumps(paired_graph.request)).paired_outbound_id == 19
+    copied_graph = build_flight_graph(pool._requests[0], cfg, catalog, params)
+    restored = pickle.loads(pickle.dumps(copied_graph.request))
+    assert restored.turnaround_s == copied_graph.request.turnaround_s == 19.0
+    assert restored.return_to_origin is copied_graph.request.return_to_origin is False
 
 
 def test_certification_repairs_claims_and_cost_and_checks_config():

@@ -21,6 +21,7 @@ from freespace_sim.geometry import CylinderSpec, box_from_segment
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.astar import AStarPlanner
+from freespace_sim.planner.itinerary import ItineraryPlanner
 from freespace_sim.planner.astar.compiled_hex_occupancy import CompiledHexOccupancy
 from freespace_sim.planner.astar.occupancy import HexOccupancyService
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
@@ -191,7 +192,11 @@ def test_compiled_mask_widen_re_run_exact():
     version-resets the kernel's hash, so it must run inside the widen loop — hoisting it made the re-run
     reuse the tight pass's closed nodes and return a spurious BUDGET_EXCEEDED while the reference ACCEPTED.
     Assert compiled == reference exactly THROUGH the widen, and that the widen path was actually taken."""
-    wall = Volume4D(box_from_segment(vec(200, -400, 150), vec(200, 400, 150), 200, 400), 0.0, 1000.0)
+    # The wall's near face sits 60 m off the origin pad, INSIDE the pad footprint inflation
+    # (`effective_hover_radius_m + R`, whose R term alone is 69.3 m), so the pad is claimed until the
+    # wall expires at any pad radius — at 100 m it only blocked a 60 m pad and today's 10 m one flew
+    # around, leaving the widen unexercised.
+    wall = Volume4D(box_from_segment(vec(160, -400, 150), vec(160, 400, 150), 200, 400), 0.0, 1000.0)
     req = FlightRequest(1, vec(0, 0, 0), vec(2000, 0, 0), 0.0)
     _, b = _assert_exact(req, [(99, [wall])])          # full exact check incl. last_expansions node-parity
     assert b.accepted
@@ -474,10 +479,13 @@ def test_compiled_replay_exact_dallas_terminal():
     reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    # Planned THROUGH the itinerary wrapper so round trips are covered too; `ref`/`com`
+    # stay the raw planners because the assertions read their per-leg internals.
+    ref_p, com_p = ItineraryPlanner(ref), ItineraryPlanner(com)
     n_term = 0
     for k, rq in enumerate(reqs[:120]):
-        a = ref.plan(rq, led, cfg)
-        b = com.plan(rq, led, cfg)
+        a = ref_p.plan(rq, led, cfg)
+        b = com_p.plan(rq, led, cfg)
         n_term += (rq.origin_terminal is not None or rq.dest_terminal is not None)
         assert a.status is b.status, f"flight {k}: status {a.status} != {b.status}"
         if a.accepted:
@@ -508,12 +516,15 @@ def test_compiled_replay_exact_saturated_terminal():
     reqs = demand.generate(cfg, np.random.default_rng(cfg.seed))
     led = ReservationLedger(cfg)
     ref, com = AStarPlanner(compiled=False), AStarPlanner(compiled=True)
+    # Planned THROUGH the itinerary wrapper so round trips are covered too; `ref`/`com`
+    # stay the raw planners because the assertions read their per-leg internals.
+    ref_p, com_p = ItineraryPlanner(ref), ItineraryPlanner(com)
     n_accepted = 0
     max_gdelay = 0.0
     assert all(r.origin_terminal is not None or r.dest_terminal is not None for r in reqs[:120])  # all terminal
     for k, rq in enumerate(reqs[:120]):
-        a = ref.plan(rq, led, cfg)
-        b = com.plan(rq, led, cfg)
+        a = ref_p.plan(rq, led, cfg)
+        b = com_p.plan(rq, led, cfg)
         assert a.status is b.status, f"flight {k}: status {a.status} != {b.status}"
         if a.accepted:
             n_accepted += 1

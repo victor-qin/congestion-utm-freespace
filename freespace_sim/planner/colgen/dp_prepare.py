@@ -41,7 +41,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, AbstractSet, Any
+from typing import TYPE_CHECKING, AbstractSet, Any, Callable
 
 import numpy as np
 
@@ -1859,18 +1859,19 @@ def _prepare_origin_data(fg, cfg, topology):
 def prepare_variants(
     fg: FlightGraph,
     cfg: SimConfig,
-    view,
+    view: DualView,
     topology: PreparedTopology,
     rows: PreparedRows,
     *,
     benefit: float = 0.0,
     pi_f: float = 0.0,
     cost_cutoff: float | None = None,
-    model=None,
-    forbidden_rows=frozenset(),
+    model: CostModel | None = None,
+    forbidden_rows: AbstractSet[RowKey] = frozenset(),
     envelopes: CompletionEnvelopes | None = None,
     keep_roots: frozenset[tuple[int, int]] | None = None,
     preparation: PricingPreparation | None = None,
+    screen_departure: Callable[[int], bool] | None = None,
 ) -> PreparedVariants:
     """Price every root option once, exactly as ``_best_column``'s initialization does.
 
@@ -1912,10 +1913,13 @@ def prepare_variants(
     - benefit (float): the flight's master benefit ``M`` in the score.
     - pi_f (float): the flight's convexity dual, subtracted from every root's score.
     - cost_cutoff (float | None): ground-delay prefilter threshold, or ``None`` to skip it.
-    - model: the objective's delay model; defaults to ``DELAY_MODEL``.
+    - model (CostModel | None): the objective's delay model; defaults to ``DELAY_MODEL``.
     - forbidden_rows (frozenset): rows a root may not claim; such roots are dropped.
     - envelopes (CompletionEnvelopes | None): the ``can_compete`` root gate, or ``None``.
     - keep_roots (frozenset[tuple[int, int]] | None): allowlist of roots, or ``None`` for all.
+    - preparation (PricingPreparation | None): shared preparation for this fixed problem.
+    - screen_departure (Callable[[int], bool] | None): optional conservative departure
+      gate before claim construction; False must exclude every continuation at that start.
 
     Return
     --------
@@ -1965,6 +1969,9 @@ def prepare_variants(
 
     for departure_step in range(fg.base_step, fg.latest_departure_step + 1):
         considered += 1
+        if screen_departure is not None and not screen_departure(departure_step):
+            prefiltered += 1
+            continue
         ground_delay_s = (departure_step - fg.base_step) * cfg.dt_s
         ground_score = -w_ground * ground_delay_s
         if cost_cutoff is not None:

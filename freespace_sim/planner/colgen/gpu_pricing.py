@@ -160,6 +160,7 @@ class _Batch:
             root_prunes=0,
             gpu_endpoint_prune_proposals=0,
             endpoint_verified_prunes=0,
+            screened_departures=0,
         )
         self.offsets = self.views[0].offsets
         self.destinations = [pricing._destination_options(p.graph) for p in problems]
@@ -171,8 +172,33 @@ class _Batch:
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise _Stopped("deadline")
 
+    def keep_departure(self, flight: int, departure: int) -> bool:
+        """Screen a whole departure using only unavoidable ground cost and a valid witness.
+
+        Parameters
+        ------------
+        - flight (int): index of the flight whose canonical incumbent is available.
+        - departure (int): absolute departure step, at or after the flight's base step.
+
+        Return
+        --------
+        - output (bool): False only when every completion is bounded by the incumbent.
+        """
+        self.check()
+        p = self.problems[flight]
+        ground = max(0.0, _down((departure - p.graph.base_step) * p.cfg.dt_s))
+        cost = max(0.0, _down(ground * self.models[flight].ground_weight))
+        upper = completion_upper_bound(
+            self.benefits[flight], p.pi_f, cost, (), self.negative[flight],
+        )
+        # Use the witness itself, without a closure tolerance: it still covers these
+        # roots after the future retry resets the separately accumulated closed upper.
+        keep = not math.isfinite(upper) or upper > self.best[flight][0]
+        self.stats["screened_departures"] += int(not keep)
+        return keep
+
     def prepare(self) -> None:
-        """Pack topology and all allowed roots without objective-based preparation cuts.
+        """Pack topology and roots that can improve an already validated incumbent.
 
         Parameters
         ------------
@@ -252,6 +278,7 @@ class _Batch:
                 model=model,
                 forbidden_rows=p.forbidden_rows,
                 preparation=preparation,
+                screen_departure=lambda departure: self.keep_departure(i, departure),
             )
             if not v.ok:
                 raise _Stopped("unsupported")

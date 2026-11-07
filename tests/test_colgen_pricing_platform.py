@@ -572,7 +572,7 @@ def test_gpu_label_limit_preserves_incomplete_status() -> None:
 def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) -> None:
     """A many-path long flight must finish within a small storage budget using safe pruning."""
     cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=120.0,
-               time_buffer_s=4.0, max_detour_factor=5.0)
+               time_buffer_s=4.0, max_detour_factor=5.0, cost_ground_delay_per_s=10.0)
     params = _params(max_air_overrun_hops=6, objective="total_cost")
     graph = build_flight_graph(_request(9, (85, -30), (165, 10), cfg), cfg, (), params)
     problem = PricingProblem(graph, cfg, params, {}, 0.0)
@@ -587,6 +587,7 @@ def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) ->
     (result,) = _platform("metal", max_labels=1000).price_batch([problem])
     assert result.search_complete and result.certified
     assert result.stats["gpu_dispatches"] > 0 and result.stats["root_prunes"] > 0
+    assert result.stats["screened_departures"] > 0
     expected = params.M - seed.delay_s
     assert result.reduced_cost == pytest.approx(expected, rel=0.0, abs=1e-7)
     assert result.upper_bound >= result.reduced_cost

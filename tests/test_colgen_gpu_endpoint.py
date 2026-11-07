@@ -321,7 +321,7 @@ def test_endpoint_omission_or_cache_exhaustion_preserves_exhaustive_optimum(
 
 
 @pytest.mark.parametrize("buffer", [0.0, 4.0])
-@pytest.mark.parametrize("magnitude", [1.0, 1e8])
+@pytest.mark.parametrize("magnitude", [0.0, 1.0, 1e8])
 def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
     buffer: float, magnitude: float,
 ) -> None:
@@ -349,6 +349,13 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
     for price in view._duals.values():
         if price < 0:
             negative = math.nextafter(negative + price, -math.inf)
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    screening = SimpleNamespace(
+        problems=[problem], models=[bounds.model], benefits=[problem.params.M],
+        negative=[negative], best=[(-math.inf, None)], stats={"screened_departures": 0},
+        check=lambda: None,
+    )
     cells = {(int(q), int(r)): i for i, (q, r) in enumerate(
         zip(bounds.topology.cell_q, bounds.topology.cell_r, strict=True))}
     paths = [(graph.origin_cell,)]
@@ -370,6 +377,8 @@ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
                     benefit=problem.params.M, cost=column.delay_s,
                     dual_cost=view.claim_cost(column.claims), pi_f=problem.pi_f,
                 )
+                screening.best[0] = math.nextafter(actual, -math.inf), None
+                assert _Batch.keep_departure(screening, 0, column.departure_step)
                 union = bounds.origin_claims(variant)
                 visit_union = frozenset()
                 for hop, cell in enumerate(path):

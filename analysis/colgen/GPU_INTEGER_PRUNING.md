@@ -204,6 +204,96 @@ restarts the whole domain and releases the old cost generation. Preparing all
 13,515 roots eagerly caused an early numeric-buffer cap on flight 1920 in the
 hard88 solver; retaining only needed tables removes that artificial early exit.
 
+## What integer preparation builds, and why it costs time
+
+Integer preparation converts the original prepared problem into the numerical
+inputs the GPU needs to prove a pruning decision. The CPU still prepares the
+graph, legal starts, exact claim sets and original FP64 bounds. `IntegerData`
+then encodes and uploads a separate invocation-owned representation. It does
+not change the objective or convert completed-route scores to integer costs.
+
+First, each flight gets a power-of-two grid spacing \(q=2^e\), selected from
+the magnitude of its original price/objective operands with accumulation
+headroom. A finite represented FP64 value \(x\) becomes integer endpoints
+\[
+L=\lfloor x/q\rfloor,\qquad H=\lceil x/q\rceil,
+\qquad Lq\le x\le Hq.
+\]
+For illustration, with the deliberately coarse grid \(q=1/8\), FP64 `0.3`
+is enclosed by integer endpoints `[2, 3]`, representing `[0.25, 0.375]`.
+The implementation chooses much finer grids when magnitudes permit. Conversion
+encloses the input; subsequent arithmetic also adds the allowances needed to
+enclose the reference's FP64 operations. A scale estimate never replaces runtime
+overflow checks. Nonfinite or unrepresentable operands remain unresolved.
+
+Each interval occupies five 32-bit words: two words for its lower endpoint,
+two for its upper endpoint, and one validity word. This packing lets the Metal
+and CUDA implementations use the same checked word arithmetic. Resource IDs,
+absolute times and paid memberships remain exact integers alongside the numeric
+intervals.
+
+Preparation is staged rather than one eager conversion of every possible table:
+
+| Stage | What is prepared | When it is paid |
+| --- | --- | --- |
+| Root inputs | Benefit, assignment dual, complete negative credit, original rounding allowance, geometry and positive origin/visit sums for legal departure/lane starts | Each invocation; refreshed when future-bound preparation restarts the domain |
+| Root decisions | Packed FP64 operands are uploaded; `integer_roots` computes interval upper bounds on the GPU and returns them for root selection | Before continuation tables are needed |
+| Exact positive-price lookup | Per-cell ranges, sorted absolute row times and outward intervals for currently positive row prices | Lazily when expansion first needs numeric arguments |
+| Hop-cost operands | Original clamped and affine FP64 cost bounds for each legal hop count of a retained root, then outward encoding | Only after that root survives closure and predecessor allocation |
+| Endpoint and future operands | Encoded original endpoint trees and the relevant relaxed future-cost row | Endpoint-generation changes and time layers; at most two future rows retained |
+| Incumbent cutoff | An interval for the represented FP64 best score plus the existing tolerance; pruning compares against its lower endpoint | When a validated incumbent changes |
+
+The hop-cost step uses separate vectorized FP64 operations in the original
+scalar order before encoding. This reduces Python loop overhead while preserving
+the reference operands. When new roots need tables, their rows append with stable
+offsets and replacement buffers are uploaded. Old/new device generations and
+retained host arrays are included in the storage check. These conversions,
+allocations and copies are real additional work.
+
+```text
+after ordinary CPU preparation:
+    choose a checked scale for each flight
+    encode original operands for all legal roots
+    GPU evaluates root upper bounds
+
+before an expansion dispatch:
+    if exact positive-price table is absent:
+        build, encode and upload it
+    for each newly retained root:
+        evaluate original FP64 hop-cost operands
+        encode and append them within the numeric memory budget
+    refresh endpoint operands when their generation changes
+    encode the needed future row if it is not retained
+    refresh the conservative cutoff when the incumbent changes
+    bind the immutable buffers to the GPU dispatch
+
+after the invocation:
+    release its numeric payload
+```
+
+**A warm pricing call does not currently reuse this numeric payload.** Ordinary
+graph/preparation caches can be warm, but a new `IntegerData` is constructed for
+each batch invocation. Root encoding and decisions, and any lazily needed tables,
+are paid again. A future-informed retry can also refresh root inputs within the
+same call. Thus integer preparation does not scale only with expanded labels:
+even a search that closes quickly can have many legal roots to prepare.
+
+Cross-invocation numeric reuse would need to validate every relevant price,
+objective, graph, clock, restriction and membership dependency. New positive
+rows and sign changes can alter table structure as well as values. The current
+implementation rebuilds these data rather than claiming that such a cache is
+already correct. PR145's ordinary prepared-data interface does not yet transport
+or cache this integer payload.
+
+The reported `integer_prepare_s` accumulates root preparation/evaluation,
+positive-table construction and retained-root hop-table preparation. It includes
+associated GPU calls and transfers, so it is not a pure CPU timer.
+`integer_gather_s` separately measures endpoint/future/cutoff argument preparation.
+Both can overlap broader preparation or search timers; they are not additive
+components of the reported wall time. The current measurements do not isolate
+every substage sufficiently to rank a specific conversion or upload as the
+dominant remaining bottleneck.
+
 ## Final functional and containment validation
 
 On 2026-11-07, 378 distinct tests passed across the nine focused files below.

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import pickle
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -85,11 +86,12 @@ def test_prepare_serializes_original_and_legacy_capture_params(
 
 @pytest.mark.parametrize("batch_size", [2, 4])
 @pytest.mark.parametrize("explicit_ids", [None, [10, 3, 6]])
-def test_all_flight_replay_prices_every_request_once_without_solving_master(
+@pytest.mark.parametrize("mode", ["replay", "solve"])
+def test_capture_selection_preserves_order_and_uses_the_requested_price_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch_size: int,
-    explicit_ids: list[int] | None,
+    explicit_ids: list[int] | None, mode: str,
 ) -> None:
-    """Replay includes all captured IDs in order, sharing prices across bounded batches.
+    """Selection reaches either fixed-price replay or a fresh subset simulation unchanged.
 
     Parameters
     ------------
@@ -97,6 +99,7 @@ def test_all_flight_replay_prices_every_request_once_without_solving_master(
     - monkeypatch (pytest.MonkeyPatch): replaces pricing with a deterministic adapter stub.
     - batch_size (int): dispatch group size, including a shorter final group.
     - explicit_ids (list[int] | None): caller-ordered subset, or all captured flights.
+    - mode (str): fixed-price replay or an explicit subset passed to the simulation.
 
     Return
     --------
@@ -105,10 +108,12 @@ def test_all_flight_replay_prices_every_request_once_without_solving_master(
     from analysis.colgen import gpu_validation
     from freespace_sim import sim
     from freespace_sim.planner.colgen import pricing, pricing_platform
-    from freespace_sim.planner.colgen.network import RowKey
+    from freespace_sim.planner.colgen.network import RowKey, StaticTerminalCatalog, build_flight_graph
     from tests.test_colgen_solver import _cfg, _params, _request
 
     cfg = _cfg(flight_levels_m=(30.0,))
+    if mode == "solve" and explicit_ids is None:
+        explicit_ids = [3, 8, 1, 6, 10]
     ids = [3, 8, 1, 6, 10]
     requests = [_request(i, (0, 0), (3, 0), cfg, departure=i * 4.0) for i in ids]
     row = RowKey.cell((1, 0), 0, 4)
@@ -126,8 +131,8 @@ def test_all_flight_replay_prices_every_request_once_without_solving_master(
         for problem in problems:
             views.append(problem.duals)
             assert isinstance(problem.duals, pricing.DualView)
-            assert problem.duals.row_cost(row) == 7.0
-            assert problem.pi_f == float(problem.graph.request.flight_id)
+            assert problem.duals.row_cost(row) == (7.0 if mode == "replay" else 0.0)
+            assert problem.pi_f == (float(problem.graph.request.flight_id) if mode == "replay" else 0.0)
         return tuple(pricing_platform.PricingResult(
             flight_id=p.graph.request.flight_id, reduced_cost=0.0, column=None,
             upper_bound=0.0, search_complete=True, certified=True, backend="metal",
@@ -138,13 +143,45 @@ def test_all_flight_replay_prices_every_request_once_without_solving_master(
         """A fixed-price replay must never start the master/IP simulation."""
         pytest.fail("Replay unexpectedly started the full solver")
 
+    def fresh_solve(
+        config: Any, *, requests: list[Any], planner_params: Any,
+        static_terminals: list[Any], **kwargs: Any,
+    ) -> SimpleNamespace:
+        """Construct fresh subset prices from unchanged selected requests.
+
+        Parameters
+        ------------
+        - config (Any): original simulation configuration.
+        - requests (list[Any]): caller-selected original requests in order.
+        - planner_params (Any): requested GPU resource limits and solver settings.
+        - static_terminals (list[Any]): original catalog used to construct graphs.
+        - kwargs (Any): simulation interface controls outside this selection test.
+
+        Return
+        --------
+        - output (SimpleNamespace): completed stub simulation with separately priced flights.
+        """
+        assert [r.flight_id for r in requests] == explicit_ids
+        assert config == cfg
+        catalog = StaticTerminalCatalog(static_terminals, config)
+        view = pricing.DualView({}, config)
+        problems = [pricing_platform.PricingProblem(
+            build_flight_graph(r, config, catalog, planner_params), config, planner_params, view, 0.0,
+        ) for r in requests]
+        platform = pricing_platform.PricingPlatform()
+        for start in range(0, len(problems), batch_size):
+            platform.price_batch(problems[start:start + batch_size])
+        return SimpleNamespace(verified=True, accepted=requests, denied=[], planner_stats=dict(
+            pricing_search_complete=True, pricing_bound_certified=True, pricing_failure_status=None,
+        ))
+
     monkeypatch.setattr(pricing_platform.PricingPlatform, "price_batch", price_once)
-    monkeypatch.setattr(sim, "run", forbid_solver)
+    monkeypatch.setattr(sim, "run", forbid_solver if mode == "replay" else fresh_solve)
     out = tmp_path / "replay"
     selection = (["--flight-ids", *map(str, explicit_ids)] if explicit_ids is not None
                  else ["--all-flights"])
     assert gpu_validation.main([
-        "replay", "--capture", str(capture), "--out", str(out),
+        mode, "--capture", str(capture), "--out", str(out),
         *selection, "--batch-size", str(batch_size),
     ]) == 0
     ids = explicit_ids if explicit_ids is not None else ids
@@ -166,7 +203,7 @@ def test_all_flight_replay_prices_every_request_once_without_solving_master(
     ("prepare", ["--flight-ids", "3", "3"], ValueError, "distinct flight IDs"),
     ("replay", ["--flight-ids", "99"], ValueError, "absent from capture"),
     ("prepare", ["--all-flights", "--flight-ids", "3"], SystemExit, "2"),
-    ("solve", ["--flight-ids", "3"], SystemExit, "2"),
+    ("solve", ["--flight-ids", "99"], ValueError, "absent from capture"),
 ])
 def test_explicit_selection_rejects_invalid_requests_before_output(
     tmp_path: Path, mode: str, selection: list[str], error: type[Exception], match: str,

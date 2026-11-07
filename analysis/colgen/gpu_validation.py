@@ -95,6 +95,8 @@ def validate_column(problem: Any, result: Any) -> None:
         raise AssertionError("Returned column has the wrong flight ID")
     if column.claims != column_claims(column, problem.graph, problem.cfg):
         raise AssertionError("Returned column claims differ from canonical claims")
+    if column.claims & problem.forbidden_rows:
+        raise AssertionError("Returned column uses a currently forbidden resource row")
     intent = column_to_intent(column, problem.graph.request, problem.cfg)
     if not intent.accepted:
         raise AssertionError("Returned column does not translate to an accepted intent")
@@ -187,12 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     selection.add_argument("--all-flights", action="store_true",
                         help="Include every captured request in prepare/replay mode.")
     selection.add_argument("--flight-ids", type=int, nargs="+",
-                           help="Select captured IDs in the supplied order for prepare/replay.")
+                           help="Select captured IDs in the supplied order, including a fresh subset solve.")
     args = parser.parse_args(argv)
     if args.all_flights and args.mode == "solve":
         parser.error("--all-flights supports prepare/replay only")
-    if args.flight_ids is not None and args.mode == "solve":
-        parser.error("--flight-ids supports prepare/replay only")
     if args.out.exists():
         parser.error("Choose a fresh --out directory")
     if not math.isfinite(args.budget) or args.budget <= 65:
@@ -285,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     with ExitStack() as stack:
         for module in (pricing, pricing_pool, solver):
             stack.enter_context(patch.object(module, "price_flight", forbid_cpu))
+        for name in ("_best_column", "_best_column_compiled"):
+            stack.enter_context(patch.object(pricing, name, forbid_cpu))
         stack.enter_context(patch.object(pricing_platform.PricingPlatform, "price_batch", observe))
         try:
             if args.mode == "solve":

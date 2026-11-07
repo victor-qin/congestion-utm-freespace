@@ -1,5 +1,9 @@
 # GPU pruning allowance experiment
 
+The later endpoint integration and 88-flight replay/fresh-solver comparison are
+recorded in [GPU_HARD88_COMPARISON.md](GPU_HARD88_COMPARISON.md). The original
+measurements below predate that integration.
+
 This follow-up keeps the original certified search as the default. An experimental
 absolute allowance can remove numeric pruning checks from the CPU queue. An
 unaudited allowance **never produces a certificate**, including when a search

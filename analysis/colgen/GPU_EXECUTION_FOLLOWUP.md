@@ -1,5 +1,9 @@
 # GPU execution and data reuse follow-up
 
+Subsequent endpoint integration and the 88-flight comparison are recorded in
+[GPU_HARD88_COMPARISON.md](GPU_HARD88_COMPARISON.md). The measurements below
+remain evidence for the original execution milestone.
+
 Measured 2026-11-07 UTC on Apple M1 Ultra. Base: PR142 at `997dfd11`;
 implementation measured: `863146c7`. This branch targets
 `codex/gpu-pricing-platform`, above PR133. Endpoint-bound/heuristic changes and

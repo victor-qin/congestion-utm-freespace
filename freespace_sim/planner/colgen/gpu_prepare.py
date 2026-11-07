@@ -72,10 +72,9 @@ class FlightPacking:
         value = build()
         self.claim_builds += 1
         size = max(1, len(value))
-        if size <= _MAX_CLAIM_ROWS:
-            while self.claims and self.claim_rows + size > _MAX_CLAIM_ROWS:
-                _, old = self.claims.popitem(last=False)
-                self.claim_rows -= max(1, len(old))
+        # Repeated sweeps visit the same roots in order. LRU eviction would cycle
+        # through an oversized flight with no warm hits; retain bounded admissions.
+        if self.claim_rows + size <= _MAX_CLAIM_ROWS:
             self.claims[key] = value
             self.claim_rows += size
         return value
@@ -109,7 +108,9 @@ class GPUPreparation(PricingPreparation):
     @property
     def packing(self) -> FlightPacking:
         """Resolve packing using the same topology as the shared CPU preparation."""
-        return packing_for(self.fg, self.cfg, self.topology_rows[0])
+        if not hasattr(self, "_packing"):
+            self._packing = packing_for(self.fg, self.cfg, self.topology_rows[0])
+        return self._packing
 
     def origin_data(self, topology: PreparedTopology) -> tuple:
         """Reuse geometry without caching weighted costs or current root filtering."""
@@ -145,9 +146,13 @@ class GPUPreparation(PricingPreparation):
 
     def origin_claims(self, departure: int) -> frozenset[RowKey]:
         """Reuse exact endpoint sets including terminals and zero-priced rows."""
+        if departure in self._origin_claims:
+            return self._origin_claims[departure]
         with self.fg._search_cache.lock:
-            return self.packing.membership((departure,), lambda: super(
+            claims = self.packing.membership((departure,), lambda: super(
                 GPUPreparation, self).origin_claims(departure))
+        self._origin_claims[departure] = claims
+        return claims
 
     def root_claims(
         self, departure: int, lane: int | None, origin_claims: frozenset[RowKey],
@@ -167,7 +172,13 @@ class GPUPreparation(PricingPreparation):
         --------
         - output (frozenset[RowKey]): exact union used for repricing and overlap verification.
         """
+        local_key = departure, lane
+        if self._root_claims is not None and local_key in self._root_claims:
+            return self._root_claims[local_key]
         key = departure, lane, cell, start_step, self.view.offsets
         with self.fg._search_cache.lock:
-            return self.packing.membership(key, lambda: origin_claims | pricing._visit_claims(
+            claims = self.packing.membership(key, lambda: origin_claims | pricing._visit_claims(
                 cell, 0, start_step, self.view.offsets))
+        if self._root_claims is not None:
+            self._root_claims[local_key] = claims
+        return claims

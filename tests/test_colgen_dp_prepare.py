@@ -1084,11 +1084,19 @@ def test_gpu_unpriced_memberships_are_complete_bounded_and_reusable(shape, monke
     changed = pricing.DualView({row: (-1.0 if i % 2 else 3.0)
                                for i, row in enumerate(sorted(all_rows))}, cfg)
     current = GPUPreparation(fg, cfg, changed, benefit=0.0, pi_f=0.0,
-                             model=DELAY_MODEL, forbidden_rows=frozenset())
+                             model=DELAY_MODEL, forbidden_rows=frozenset(), retain_root_claims=True)
     actual = dp_prepare.prepare_variants(fg, cfg, changed, topo, rows, preparation=current)
     reference = dp_prepare.prepare_variants(fg, cfg, changed, topo, rows)
     _assert_prepared_exact(actual, reference)
     assert packing.claim_rows <= 8
+    builds = packing.claim_builds
+    for variant in range(actual.n_variants):
+        departure, lane, cell, step = map(int, (actual.departure_step[variant],
+            actual.lane_idx[variant], actual.cell[variant], actual.start_step[variant]))
+        current.root_claims(departure, None if lane < 0 else lane,
+                            current.origin_claims(departure), packing.cells[cell], step)
+    # A bounded persistent cache must not force this call's verifier to rebuild its own roots.
+    assert packing.claim_builds == builds
     old = dict(packing.claims)
 
     def interrupted():

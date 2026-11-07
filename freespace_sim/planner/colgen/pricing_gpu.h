@@ -92,7 +92,10 @@ INLINE void expand_one(
     GLOBAL const float* values, GLOBAL const int* graph, GLOBAL const int* roots,
     GLOBAL const float* root_values, GLOBAL const float* visits, GLOBAL const int* blocked,
     GLOBAL const int* paid_rows, GLOBAL const float* paid_values,
-    GLOBAL int* output, GLOBAL float* scores, GLOBAL const unsigned int* visit_masks,
+    GLOBAL int* output, GLOBAL float* scores,
+    GLOBAL const int* price_map, GLOBAL const int* price_ranges,
+    GLOBAL const int* price_steps, GLOBAL const float* price_values,
+    GLOBAL const unsigned int* visit_masks,
     GLOBAL const int* endpoint_meta, GLOBAL const int* endpoint_entries,
     GLOBAL const float* endpoint_trees
 ) {
@@ -113,8 +116,16 @@ INLINE void expand_one(
     bool finish = graph[target * 14 + 13] && (role & (hops == 0 ? 8 : 4));
     bool onward = (role & (hops == 0 ? 2 : 1)) != 0;
     if (!finish && !onward) return;
-    float charge = visits[target * 3];
-    float positive_charge = visits[target * 3 + 1];
+    int slot = price_map[target];
+    int lo = price_ranges[slot * 2], stop = price_ranges[slot * 2 + 1], hi = stop;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (price_steps[mid] < step + 1) lo = mid + 1;
+        else hi = mid;
+    }
+    bool priced = lo < stop && price_steps[lo] == step + 1;
+    float charge = priced ? price_values[lo * 2] : 0.0f;
+    float positive_charge = priced ? price_values[lo * 2 + 1] : 0.0f;
     for (int j = roots[root * 6 + 1]; j < roots[root * 6 + 2]; ++j) {
         if (paid_rows[j * 2] == target && paid_rows[j * 2 + 1] >= step + 1 + control[3]
             && paid_rows[j * 2 + 1] <= step + 1 + control[4]) {
@@ -127,9 +138,9 @@ INLINE void expand_one(
     float positive = values[src_index * 2 + 1] + fmax(0.0f, positive_charge);
     float upper = completion_bound(data,
                                    (float)(hops + 1 + remaining), positive);
-    if (isfinite(visits[target * 3 + 2])) {
+    if (isfinite(visits[target])) {
         float future = ((data[0] - data[2]) -
-                        (data[6] + (float)(hops + 1) * data[7] + positive + visits[target * 3 + 2] - data[3])) - data[1];
+                        (data[6] + (float)(hops + 1) * data[7] + positive + visits[target] - data[3])) - data[1];
         upper = fmin(upper, future);
     }
     int flags = (finish ? 1 : 0) | (onward ? 2 : 0);

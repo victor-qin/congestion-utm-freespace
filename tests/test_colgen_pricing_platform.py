@@ -330,6 +330,11 @@ def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
                 assert result.stats["future_gpu_dispatches"] > 0
             _assert_canonical(problem, result)
 
+    if share_prices:
+        # Reordering flights and starting another batch must retain the same device table.
+        assert platform._runtime.counters["price_uploads"] == 1
+        assert platform._runtime.counters["price_cache_hits"] == 3
+
     original_prices = (
         first.duals._duals if isinstance(first.duals, pricing.DualView) else first.duals
     )
@@ -350,6 +355,10 @@ def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
         assert result.reduced_cost == pytest.approx(optimum, abs=1e-8)
         assert result.upper_bound >= optimum - 1e-9
         _assert_canonical(problem, result)
+
+    if share_prices:
+        assert platform._runtime.counters["price_uploads"] == 2
+        assert len(platform._runtime.prices.stores) == 2
 
 
 @pytest.mark.parametrize("buffer", [0.0, 4.0, 12.0])

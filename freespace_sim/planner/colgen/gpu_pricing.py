@@ -11,6 +11,7 @@ import math
 import time
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -112,6 +113,7 @@ class _Batch:
         )
         self.started = time.monotonic()
         self.first_dispatch = runtime.dispatches
+        self.first_counters = dict(getattr(runtime, "counters", {}))
         self.best: list[tuple[float, Any]] = [(-math.inf, None) for _ in problems]
         self.closed_upper = [-math.inf for _ in problems]
         normalized: dict[int, pricing.DualView] = {}
@@ -163,6 +165,7 @@ class _Batch:
         self.destinations = [pricing._destination_options(p.graph) for p in problems]
         self._visit_layers: dict[int, tuple[np.ndarray, np.ndarray]] | None = None
         self._forbidden_layers: dict[int, np.ndarray] = {}
+        self.device_prices = None
 
     def check(self) -> None:
         """Stop cooperatively without converting an interrupted search into a certificate."""
@@ -358,6 +361,28 @@ class _Batch:
             self.root_endpoint[root, 2] = self.variants[i].start_step[variant]
         self.pack_endpoints()
         self.evaluate_roots()
+        self.stats["prepare_s"] = time.monotonic() - self.started
+
+    def prepare_device_prices(self) -> None:
+        """Bind one shared snapshot table and map stable physical IDs to its storage slots.
+
+        Parameters
+        ------------
+        - self (_Batch): flights partitioned by immutable snapshot before execution.
+
+        Return
+        --------
+        - output (None): live shared table and an independent flight-local vertex map.
+        """
+        if any(view is not self.views[0] for view in self.views):
+            raise ValueError("GPU batch must share one immutable price snapshot")
+        started = time.monotonic()
+        self.prepare_visit_prices(gather=False)
+        self.device_prices = self.runtime.prices.get(self.views[0], self.runtime, self.check)
+        self.price_map = np.asarray([
+            self.device_prices.slots.get((cell, 0), 0) for cell in self.cells
+        ], np.int32)
+        self.stats["price_prepare_s"] = time.monotonic() - started
 
     def evaluate_roots(self) -> None:
         """Dispatch all root completion proposals after initial packing or stronger preparation."""
@@ -676,12 +701,13 @@ class _Batch:
         packed = np.asarray(records, np.int32).reshape(-1, self.stride)
         return self.allocate(packed), np.asarray(values, np.float32).reshape(-1, 2)
 
-    def prepare_visit_prices(self) -> None:
+    def prepare_visit_prices(self, *, gather: bool = True) -> None:
         """Gather shared sparse prices and flight-specific exclusions for this batch.
 
         Parameters
         ------------
         - self (_Batch): prepared cell order and fixed price snapshots.
+        - gather (bool): materialize host visit layers only for diagnostic callers.
 
         Return
         --------
@@ -702,12 +728,13 @@ class _Batch:
             offset = self.cell_offsets[i]
             cells = self.cells[offset:offset + topology.n_cells]
             lookup = {coord: offset + local for local, coord in enumerate(cells)}
-            for local, coord in enumerate(cells):
-                if local % 256 == 0:
-                    self.check()
-                for step, value in cache.cells.get((coord, 0), {}).items():
-                    indices[step].append(offset + local)
-                    prices[step].append(value)
+            if gather:
+                for local, coord in enumerate(cells):
+                    if local % 256 == 0:
+                        self.check()
+                    for step, value in cache.cells.get((coord, 0), {}).items():
+                        indices[step].append(offset + local)
+                        prices[step].append(value)
             for raw_row in problem.forbidden_rows:
                 row = raw_row if isinstance(raw_row, RowKey) else RowKey(raw_row)
                 if row.kind != "cell" or row.level != 0:
@@ -989,6 +1016,7 @@ class _Batch:
             visits, blocked = self.visits(step + 1)
             visits = self.future_proposals(frontier, visits, step + 1)
             visit_masks = self.endpoint_visits(step + 1)
+            future_values = np.ascontiguousarray(visits[:, 2])
             next_records, next_scores = [], []
             next_count = 0
             for start in range(0, len(frontier), self.options.chunk_size):
@@ -1009,18 +1037,21 @@ class _Batch:
                         self.graph,
                         self.roots,
                         self.root_values,
-                        visits,
+                        future_values,
                         blocked,
                         self.paid_rows,
                         self.paid_values,
                         np.empty((count, self.stride), np.int32),
                         np.empty((count, 3), np.float32),
+                        self.price_map, self.device_prices.ranges,
+                        self.device_prices.steps, self.device_prices.values,
                         visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
                     ),
                     (10, 11),
-                    static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values",
-                            12: "endpoint_visits", 13: "endpoint_meta", 14: "endpoint_entries",
-                            15: "endpoint_trees"},
+                    static={3: "graph", 4: "roots", 6: "future_values", 7: "blocked",
+                            8: "paid_rows", 9: "paid_values", 12: "price_map",
+                            16: "endpoint_visits", 17: "endpoint_meta", 18: "endpoint_entries",
+                            19: "endpoint_trees"},
                     write_only=(10, 11),
                 )
                 valid = np.flatnonzero(records[:, 6])
@@ -1103,6 +1134,7 @@ class _Batch:
         complete = False
         try:
             self.prepare()
+            self.prepare_device_prices()
             self.bootstrap()
             try:
                 # Stop an unproductive first pass early enough to benefit from the
@@ -1130,10 +1162,12 @@ class _Batch:
         except pricing.PricingTimeout:
             status = "deadline"
         finally:
-            self.runtime.clear_cache()
+            self.runtime.clear_batch()
         certified = complete and self.options.cpu_recompute
         stats = {
             **self.stats,
+            **{key: value - self.first_counters[key]
+               for key, value in self.runtime.counters.items()},
             "labels": (self.used + self.stats.get("bootstrap_labels", 0)
                        + self.stats.get("initial_full_search_labels", 0)),
             "full_search_labels": self.used,
@@ -1189,12 +1223,21 @@ def price_gpu_batch(
     --------
     - output (tuple[PricingResult, ...]): ordered validated incumbents and certificate statuses.
     """
-    groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+    groups: dict[pricing.DualView, list[int]] = defaultdict(list)
+    normalized: dict[tuple[int, tuple[int, int]], pricing.DualView] = {}
+    current = []
     for index, problem in enumerate(problems):
-        groups[derive_cell_window(problem.cfg)].append(index)
+        view = problem.duals
+        if not isinstance(view, pricing.DualView):
+            key = id(view), derive_cell_window(problem.cfg)
+            if key not in normalized:
+                normalized[key] = pricing.DualView(view, problem.cfg)
+            view = normalized[key]
+        current.append(replace(problem, duals=view))
+        groups[view].append(index)
     results: list[PricingResult | None] = [None] * len(problems)
     for indices in groups.values():
-        batch = _Batch([problems[i] for i in indices], options, runtime, deadline)
+        batch = _Batch([current[i] for i in indices], options, runtime, deadline)
         for index, result in zip(indices, batch.run(), strict=True):
             results[index] = result
     return tuple(results)

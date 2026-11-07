@@ -188,3 +188,85 @@ def test_metal_write_only_skips_initial_values_and_zero_count_is_independent(mon
             runtime.run(
                 "bound_roots", 2, (source, output), (1,), static=static, write_only=write_only
             )
+
+
+def test_owned_buffers_survive_batch_cleanup_without_reupload(monkeypatch):
+    """Device data remains live across batches and cannot be bound to another device owner."""
+    def execute(buffers, count):
+        """Use an explicitly owned input and write an explicitly owned output."""
+        source, output = (np.frombuffer(b.data, np.int32, count=count) for b in buffers)
+        output[:] = source + 1
+
+    runtime, allocations = _runtime(monkeypatch, execute)
+    source = np.array([3, 7], np.int32)
+    owned = runtime.upload(source)
+    output = runtime.upload(np.zeros_like(source))
+    source[:] = -1
+    uploaded = runtime.counters["upload_bytes"]
+    for _ in range(2):
+        runtime.clear_batch()
+        (actual,) = runtime.run("bound_roots", 2, (owned, output), (1,))
+        np.testing.assert_array_equal(actual, [4, 8])
+    assert runtime.counters["upload_bytes"] == uploaded
+    assert len(allocations) == 2
+    other, _ = _runtime(monkeypatch, execute)
+    with pytest.raises(ValueError, match="another runtime"):
+        other.run("bound_roots", 2, (owned, output), (1,))
+    runtime.clear_cache()
+    np.testing.assert_array_equal(runtime.read(owned), [3, 7])
+    del owned, output
+    assert all(ref() is None for ref in allocations)
+
+
+def test_price_store_bounds_lifetime_and_preserves_complete_support(monkeypatch):
+    """Complete snapshot tables refresh signs/new rows, survive cleanup, and obey LRU limits."""
+    from freespace_sim.planner.colgen.gpu_prices import DevicePriceCache
+    from freespace_sim.planner.colgen.pricing import DualView
+    from freespace_sim.planner.colgen.network import RowKey
+    from tests.test_colgen_pricing_platform import _cfg
+
+    runtime, _ = _runtime(monkeypatch, lambda buffers, count: None)
+    runtime.prices = DevicePriceCache(max_snapshots=1, max_bytes=1024 * 1024)
+    raw = {RowKey.cell((-999, 99), 0, -4): 7.0,
+           RowKey.cell((-999, 99), 0, -3): -2.0,
+           RowKey.cell((0, 0), 1, 2): 9.0, RowKey.term("A", 3): -6.0}
+    view = DualView(raw, _cfg())
+    first = runtime.prices.get(view, runtime, lambda: None)
+    before = dict(runtime.counters)
+    runtime.clear_batch()
+    assert runtime.prices.get(view, runtime, lambda: None) is first
+    assert runtime.counters["upload_bytes"] == before["upload_bytes"]
+    assert runtime.counters["allocations"] == before["allocations"]
+    ranges, steps, values = map(runtime.read, (first.ranges, first.steps, first.values))
+    for resource, windows in view._gpu_visit_prices.cells.items():
+        start, stop = ranges[first.slots[resource]]
+        assert dict(zip(map(int, steps[start:stop]), map(tuple, values[start:stop]))) == windows
+    assert first.slots.get(((999, -999), 0), 0) == 0
+    assert tuple(ranges[0]) == (0, 0)
+    raw[RowKey.cell((-999, 99), 0, -4)] = -13.0
+    raw[RowKey.cell((999, -999), 0, 777)] = 11.0
+    changed = DualView(raw, _cfg())
+    second = runtime.prices.get(changed, runtime, lambda: None)
+    assert second is not first
+    assert ((999, -999), 0) in second.slots
+    assert list(runtime.prices.stores) == [changed]
+    assert runtime.prices.nbytes == second.nbytes
+    # Eviction releases cache ownership, not a table still used by an active batch.
+    np.testing.assert_array_equal(runtime.read(first.values), values)
+    calls = 0
+
+    def expire():
+        """Interrupt after sparse sums were built but before all device arrays publish."""
+        nonlocal calls
+        calls += 1
+        if calls == len(view._gpu_visit_prices.cells) + 3:
+            raise TimeoutError()
+
+    with pytest.raises(TimeoutError):
+        runtime.prices.get(view, runtime, expire)
+    assert list(runtime.prices.stores) == [changed]
+    runtime.prices.max_bytes = 0
+    runtime.prices.clear()
+    uncached = runtime.prices.get(view, runtime, lambda: None)
+    assert not runtime.prices.stores and runtime.prices.nbytes == 0
+    np.testing.assert_array_equal(runtime.read(uncached.values), values)

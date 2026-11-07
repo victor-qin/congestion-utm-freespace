@@ -30,6 +30,7 @@ from .windows import derive_cell_window
 # Near-tie branches retain their proved upper bound in the result certificate.
 # This tolerance never turns a candidate's score into the optimum's exact value.
 _BOUND_CLOSURE_TOL = 1e-6
+_INITIAL_FULL_LABEL_LIMIT = 8192
 
 
 def _down(value: float) -> float:
@@ -139,6 +140,7 @@ class _Batch:
                     value = _down(value + price)
             self.negative.append(value)
         self.arena = np.empty((options.max_labels, 3), np.int32)
+        self.search_label_limit = options.max_labels
         self.prefix_positive = np.empty(options.max_labels, np.float64)
         self.visit_prefix_positive = np.empty(options.max_labels, np.float64)
         self.paid_masks = np.empty((options.max_labels, 2), np.uint32)
@@ -628,7 +630,7 @@ class _Batch:
     def allocate(self, records: np.ndarray) -> np.ndarray:
         """Assign predecessor IDs without ever truncating a full frontier on overflow."""
         end = self.used + len(records)
-        if end > self.options.max_labels:
+        if end > self.search_label_limit:
             raise _Stopped("label_limit")
         if self.options.cpu_recompute:
             for offset, record in enumerate(records):
@@ -1054,7 +1056,7 @@ class _Batch:
                     next_records.append(records[keep])
                     next_scores.append(scores[keep])
                     next_count += len(keep)
-                    if beam_width is None and self.used + next_count > self.options.max_labels:
+                    if beam_width is None and self.used + next_count > self.search_label_limit:
                         raise _Stopped("label_limit")
             if next_records:
                 frontier, scores = self.group(
@@ -1113,7 +1115,15 @@ class _Batch:
             self.prepare()
             self.bootstrap()
             try:
-                self.search()
+                # Stop an unproductive first pass early enough to benefit from the
+                # future-informed beam. The retry still searches every root at the
+                # caller's original cap; this limit never authorizes a certificate.
+                self.search_label_limit = min(self.options.max_labels, _INITIAL_FULL_LABEL_LIMIT)
+                self.stats["initial_full_label_limit"] = self.search_label_limit
+                try:
+                    self.search()
+                finally:
+                    self.search_label_limit = self.options.max_labels
             except _Stopped as stop:
                 if str(stop) != "label_limit":
                     raise

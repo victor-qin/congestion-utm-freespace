@@ -170,14 +170,19 @@ def test_cpu_adapter_preserves_existing_pricing_result() -> None:
     _assert_canonical(problem, result)
 
 
-@pytest.mark.parametrize("backend", ["cpu", "metal"])
+@pytest.mark.parametrize("backend,first_limit", [("cpu", None), ("metal", None), ("metal", 4)])
 @pytest.mark.parametrize("buffer", [0.0, 4.0])
 @pytest.mark.parametrize("objective", ["total_cost", "total_delay"])
 @pytest.mark.parametrize("signed", [False, True])
 def test_certified_pricing_matches_complete_path_enumeration(
-    backend: str, buffer: float, objective: str, signed: bool
+    backend: str, first_limit: int | None, buffer: float, objective: str, signed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both exact backends agree with all complete routes, allowing different optimal routes."""
+    """Complete pricing, including an early future retry, covers every canonical route."""
+    if first_limit is not None:
+        from freespace_sim.planner.colgen import gpu_pricing
+
+        monkeypatch.setattr(gpu_pricing, "_INITIAL_FULL_LABEL_LIMIT", first_limit)
     platform = _platform(backend)
     original = _problem(buffer=buffer, objective=objective, signed=signed)
     expected = _oracle(original)

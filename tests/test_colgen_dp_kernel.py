@@ -1132,7 +1132,10 @@ def test_kernel_and_reference_restrict_roots_identically(monkeypatch):
     # that the reference would never have generated.
 
 
-def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monkeypatch):
+@pytest.mark.parametrize("candidate_capacity", [1, 1 << 12])
+def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(
+    monkeypatch: pytest.MonkeyPatch, candidate_capacity: int,
+) -> None:
     """The pause protocol reproduces the reference's mid-sweep incumbent, step for step.
 
     This is the direct test of pause-and-resume, and it is sharper than comparing final
@@ -1157,7 +1160,9 @@ def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(monk
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
     kernel_trace = _certification_trace(monkeypatch)
-    result, _ = _kernel_candidates(graph, cfg, view, model, label_capacity=1 << 18)
+    result, _ = _kernel_candidates(
+        graph, cfg, view, model, label_capacity=1 << 18, candidate_capacity=candidate_capacity,
+    )
     assert result.ok, result.status
     assert result.attempts == 1, "the search restarted, so the trace spans two runs"
     kernel_trace = list(kernel_trace)
@@ -1320,7 +1325,10 @@ def test_the_bootstrap_reaches_the_real_search_only_as_an_incumbent(monkeypatch)
     assert ranked_incumbent[0] >= boot[0]
 
 
-def test_kernel_survives_a_budget_restart_with_the_same_answer(monkeypatch):
+@pytest.mark.parametrize("budget", ["labels", "states"])
+def test_kernel_survives_a_budget_restart_with_the_same_answer(
+    monkeypatch: pytest.MonkeyPatch, budget: str,
+) -> None:
     """A pool too small to finish is re-run from scratch, and must re-run identically.
 
     The restart is where the envelope memo can betray parity: envelopes frozen against a
@@ -1337,7 +1345,8 @@ def test_kernel_survives_a_budget_restart_with_the_same_answer(monkeypatch):
     model = cost_model(cfg, params)
     view = DualView(_random_duals(graph, cfg, 606), cfg)
 
-    result, kernel_side = _kernel_candidates(graph, cfg, view, model, label_capacity=1024)
+    options = {"label_capacity": 1024} if budget == "labels" else {"log2cap": 3, "max_attempts": 18}
+    result, kernel_side = _kernel_candidates(graph, cfg, view, model, **options)
     assert result.ok, result.status
     assert result.attempts > 1, "the fixture no longer forces a restart"
 

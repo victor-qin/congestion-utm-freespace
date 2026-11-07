@@ -345,7 +345,7 @@ def test_partial_resident_allocation_releases_storage(monkeypatch, budget):
 
     runtime, references = _runtime(monkeypatch, lambda buffers, count: None)
     batch = SimpleNamespace(runtime=runtime, options=SimpleNamespace(max_labels=8, chunk_size=2),
-                            stride=9, stats={})
+                            search_label_limit=8, stride=9, stats={})
     monkeypatch.setattr(gpu_resident, '_MAX_BYTES', budget)
     with pytest.raises(_Stopped, match='buffer_limit'):
         gpu_resident.ResidentSearch(batch)

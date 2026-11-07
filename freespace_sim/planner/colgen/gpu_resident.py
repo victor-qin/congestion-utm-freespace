@@ -38,7 +38,7 @@ class ResidentSearch:
         - output (None): initialized device state; no root or alternative has been removed.
         """
         self.batch, self.runtime = batch, batch.runtime
-        self.capacity, self.stride = batch.options.max_labels, batch.stride
+        self.capacity, self.stride = batch.search_label_limit, batch.stride
         self.queue_capacity = min(_QUEUE_CAPACITY, max(6, self.capacity))
         self.chunk = min(batch.options.chunk_size, max(1, self.queue_capacity // 6))
         self.bytes = 0
@@ -284,19 +284,21 @@ class ResidentSearch:
         self.runtime.write(masks_buffer, self.batch.endpoint_visits(step + 1))
         return future_buffer, blocked_buffer, masks_buffer
 
-    def run(self) -> None:
+    def run(self, first_step: int, first_records: np.ndarray, first_values: np.ndarray) -> None:
         """Search all roots and resumable alternatives in bounded ordered layer blocks.
 
         Parameters
         ------------
-        - self (ResidentSearch): fixed topology/prices and initially empty resident state.
+        - first_step (int): earliest time with roots surviving FP64 verification.
+        - first_records (np.ndarray): these roots, already allocated in the CPU predecessor mirror.
+        - first_values (np.ndarray): aligned initial FP32 score/positive pairs.
 
         Return
         --------
         - output (None): complete exhaustion; limits or unresolved device failures raise.
         """
         b = self.batch
-        roots = deque(sorted(b.start_buckets))
+        roots = deque(step for step in sorted(b.start_buckets) if step >= first_step)
         last_step = max(t.max_step for t in b.topologies)
         while roots or self.ready:
             b.check()
@@ -307,8 +309,12 @@ class ResidentSearch:
             frontier, count = self.frontier(step)
             if roots and roots[0] == step:
                 roots.popleft()
-                begin = b.used
-                records, values = b.roots_at(step)
+                if step == first_step:
+                    records, values = first_records, first_values
+                    begin = b.used - len(records)
+                else:
+                    begin = b.used
+                    records, values = b.roots_at(step)
                 self.known[begin:b.used] = True
                 if len(records):
                     records[:, 3] = -1

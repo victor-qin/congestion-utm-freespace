@@ -45,7 +45,7 @@ class FlightPacking:
             self.graph[cell, :stop - start] = topology.arc_target[start:stop]
             self.graph[cell, 6:6 + stop - start] = topology.arc_roles[start:stop]
         self.graph.flags.writeable = False
-        self.claims: OrderedDict[tuple, frozenset[RowKey]] = OrderedDict()
+        self.claims: dict[tuple, frozenset[RowKey]] = {}
         self.starts: OrderedDict[int, tuple] = OrderedDict()
         self.claim_rows = 0
         self.start_count = 0
@@ -65,7 +65,6 @@ class FlightPacking:
         """
         if key in self.claims:
             self.claim_hits += 1
-            self.claims.move_to_end(key)
             return self.claims[key]
         value = build()
         self.claim_builds += 1

@@ -672,15 +672,40 @@ def test_expired_deadline_never_certifies(backend: str) -> None:
     assert result.upper_bound is None or result.upper_bound >= _oracle(problem) - 1e-8
 
 
-def test_gpu_label_limit_preserves_incomplete_status() -> None:
-    """Exhausting label storage does not become a no-improvement certificate."""
-    platform = _platform("metal", max_labels=1, chunk_size=1)
+@pytest.mark.parametrize("max_labels", [1, 1024])
+def test_gpu_label_limit_preserves_incomplete_status(
+    monkeypatch: pytest.MonkeyPatch, max_labels: int,
+) -> None:
+    """A bounded first pass retries all roots, but exhausting the caller's cap cannot certify."""
+    from freespace_sim.planner.colgen import gpu_pricing
+
+    monkeypatch.setattr(gpu_pricing, "_INITIAL_FULL_LABEL_LIMIT", 8)
+    monkeypatch.setattr(gpu_pricing._Batch, "bootstrap", lambda self: None)
+    platform = _platform("metal", max_labels=max_labels, chunk_size=1)
     problem = _problem(signed=True)
     (result,) = platform.price_batch([problem])
-    assert not result.search_complete and not result.certified
+    if max_labels == 1:
+        assert not result.search_complete and not result.certified
+    else:
+        assert result.search_complete and result.certified
+        assert 0 < result.stats["initial_full_search_labels"] <= 8
+        assert result.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
     assert result.upper_bound is None or result.upper_bound >= _oracle(problem) - 1e-8
     if result.column is not None:
         _assert_canonical(problem, result)
+
+
+@pytest.mark.parametrize("buffer,max_labels", [(4.0, 250_000), (192.0, 250_000), (4.0, 3_000_000)])
+def test_closed_roots_do_not_reserve_a_resident_search_arena(buffer: float, max_labels: int) -> None:
+    """A zero-label certificate remains available even when unused capacity exceeds GPU memory limits."""
+    problem = replace(_problem(buffer=buffer), duals={})
+    result, = _platform("metal", max_labels=max_labels).price_batch([problem])
+    assert result.search_complete and result.certified
+    assert result.stats["full_search_labels"] == 0 and result.stats["root_prunes"] > 0
+    assert result.stats.get("resident_bytes", 0) == 0
+    assert result.upper_bound >= result.reduced_cost
+    assert result.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
+    _assert_canonical(problem, result)
 
 
 def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) -> None:

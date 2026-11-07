@@ -1046,7 +1046,14 @@ class _Batch:
         if beam_width is None and self.options.cpu_recompute:
             from .gpu_resident import ResidentSearch
 
-            ResidentSearch(self).run()
+            # Close roots with the original verifier before reserving a full device arena.
+            # Keep closed_upper even when no root needs expansion.
+            for step in sorted(self.start_buckets):
+                self._visit_positive.clear()
+                records, values = self.roots_at(step)
+                if len(records):
+                    ResidentSearch(self).run(step, records, values)
+                    break
             return
         allowed_roots = None
         first_step = min(self.start_buckets)

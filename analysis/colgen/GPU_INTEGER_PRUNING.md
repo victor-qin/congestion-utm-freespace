@@ -118,9 +118,10 @@ independently exercise carries, signs, cancellation, subnormals and overflow.
    are compatibility evidence, not NVIDIA execution.
 
 The parallel-preparation branch owns `prepare_flight` extraction. Numeric data
-will use a separate immutable payload rather than changing that contract before
-the arithmetic and membership gates pass. Production integration and speedup
-are not yet established.
+uses a separate invocation-owned payload after ordinary preparation. PR145's
+optional final `prepared` argument can pass through the batch-class selection;
+`IntegerBatch` inherits that constructor. This branch does not merge or validate
+the combined PR145 implementation, add worker numeric payloads, or overlap CPU/GPU work.
 
 ## Prototype validation
 
@@ -134,7 +135,7 @@ CUDA annotations/intrinsics stubbed; no NVIDIA hardware was used.
 
 These tests validate arithmetic given valid operands. Exact membership transport,
 resident interruption/accounting, the production verifier guard and matched
-performance are separate gates. The opt-in integration below is still being validated.
+performance are separate gates, recorded below.
 
 ## Opt-in integration contract
 
@@ -200,15 +201,162 @@ operands and keeps existing offsets stable; device buffers remain immutable whil
 referenced by a command block. Replacement checks include old/new device buffers
 and retained host rows. A missing offset disables that bound. Future preparation
 restarts the whole domain and releases the old cost generation. Preparing all
-13,515 roots eagerly caused an early numeric-buffer cap on flight1920 in the
+13,515 roots eagerly caused an early numeric-buffer cap on flight 1920 in the
 hard88 solver; retaining only needed tables removes that artificial early exit.
 
-The integrated focused gate passed on 2026-11-07: a 50-test arithmetic/search
-smoke and 196 platform/endpoint/runtime checks (these overlap). Coverage includes
-exhaustive signed/overlapping routes and both objectives, forced future retry,
-both mask words at large absolute clocks, missing endpoint caches, changed
-snapshots, near ties, cancellation, invalid integer operands, rejected canonical
-completions, and queue/state/memory/deadline incompletion. The ordinary integer
-path runs with the original numerical verifier and full CPU pricing guarded in
-dedicated tests. Saved-case audits, solver-level validation and performance gates
-remain outstanding; these counts are not a claim that all seven milestones passed.
+## Final functional and containment validation
+
+On 2026-11-07, 378 distinct tests passed across the nine focused files below.
+The first combined run passed 309 tests before two legacy-capture fixture
+failures: filtering out only historical GPU fields accidentally included newly
+appended integer fields. Archived positional states are prefixes. Correcting
+that fixture and adding the pre-integer prefix produced 71 passing option and
+validation tests (two passes overlap the first run); no production slot reorder
+was needed.
+
+| Requirement | Focused coverage |
+| --- | --- |
+| Outward conversion, checked overflow, ordered binary64 operations | `test_colgen_gpu_integer.py`: exact rational oracles, subnormals/extremes/cancellation, actual Metal arithmetic/expression probes, CUDA syntax/interface |
+| Original geometry and canonical completion bounds | `test_colgen_gpu_bounds.py`, `test_colgen_gpu_endpoint.py`: every prefix of exhaustive small canonical completions, cost-vector/scalar parity, signed unions and endpoint choices |
+| Exact membership and legal domain | `test_colgen_pricing_platform.py`, `test_colgen_gpu_endpoint.py`: both words including bits31/63, origin overlap, revisits, roles/hops/obstacles, large/negative clocks, exclusions, ties, both objectives |
+| Ambiguity, changes and interrupted work | Platform/endpoint/future/runtime files: invalid scale retains states, new/sign-changing prices, missing endpoint data, future retry, rejection, cancellation, queue/state/memory/deadline limits |
+| Solver and configuration contracts | `test_colgen_gpu_solver.py`, `test_colgen_gpu_options.py`, `test_colgen_gpu_validation.py`: actual Metal HiGHS/Gurobi paths, guarded CPU entry points, canonical completions, archived prefixes |
+
+The final hard88 audit certified 88/88 and independently checked 1,130,566
+integer deletion proposals against the original FP64 verifier. Late18 certified
+18/18 through cold, same-price warm, changed-price, changed-price warm and restored
+snapshots. The maximum reported gap was \(1.00000000103\times10^{-6}\), the
+represented cutoff tolerance. Non-audit timing and solver runs guard `_Batch.bound`
+and all original full-CPU pricing entry points. Independent canonical validation
+remains enabled. There is no reference-route oracle seed.
+
+The implemented ambiguity policy is retention, as permitted by milestone 5.
+There is no wider-integer/software-binary64 refinement queue or ambiguity-rate
+counter. Overflow can increase work or cause an explicitly incomplete cap; it
+does not force deletion. No certified heuristic merging, removal of CPU canonical
+validation, proof of exact route identity, or NVIDIA execution is claimed.
+
+## Matched performance and retention decision
+
+[Committed measurements](integer_pruning_results.json) record actual Apple M1 Ultra
+Metal runs at numeric source `d8879f8f`. Hard88 and late18 have two fresh-process
+integer repeats and two reference repeats; controls have one pair. The earlier
+reference repeat differs only in the unused integer implementation files. The
+ordinary reference path is unchanged. All compared fixed-price phases complete
+with the same certificates and **exactly equal reduced costs**; no capped phase
+is included in these percentages.
+
+| Cohort / phase | Reference median, s | Integer median, s | Wall-time change |
+| --- | ---: | ---: | ---: |
+| hard88 cold | 78.323 | 65.257 | 16.68% lower |
+| hard88 same-price warm | 38.909 | 25.861 | 33.53% lower |
+| late18 early-price cold | 18.312 | 16.794 | 8.29% lower |
+| late18 early-price warm | 6.161 | 4.675 | 24.11% lower |
+| late18 changed prices | 2.677 | 3.547 | **32.50% higher** |
+| late18 changed-price warm | 1.733 | 2.609 | **50.60% higher** |
+| late18 restored early prices | 6.222 | 4.695 | 24.54% lower |
+| controls4 cold / warm (one pair) | 3.014 / 0.840 | 2.946 / 0.746 | 2.25% / 11.21% lower |
+
+Retain the implementation **opt-in**, with no default change. Hard88 cold and warm
+benefits repeat and exceed the earlier 15% target. The changed late snapshot has
+far fewer CPU checks to remove, so numeric preparation/transport outweighs that
+saving. This is not a uniform acceleration of pricing or complete solver convergence.
+
+The fresh hard88 warm pair illustrates the mechanism and cost (inclusive timers
+overlap; MB below means decimal megabytes):
+
+| Measurement | Reference | Integer |
+| --- | ---: | ---: |
+| Original CPU preparation | 0.798 s | 0.794 s |
+| Added integer preparation / table gathering | 0 / 0 s | 3.420 / 0.418 s |
+| Per-prune CPU verifier / its inclusive time | 1,132,147 / 12.600 s | 0 / 0 s |
+| Canonical validations / completion time | 1,674 / 4.256 s | 1,674 / 4.254 s |
+| Search labels / candidates | 511,170 / 2,467,958 | 511,172 / 2,467,993 |
+| Metal execution / host waiting | 0.641 / 6.540 s | 1.598 / 6.177 s |
+| Allocations / cumulative allocated volume | 14,894 / 340.95 MB | 25,468 / 1,171.27 MB |
+| Upload / download volume | 667.89 / 187.08 MB | 1,559.67 / 352.87 MB |
+| Wait count | 16,083 | 16,176 |
+| Peak resident / numeric persistent storage | 23.18 / 0 MB | 42.97 / 2.25 MB |
+| Process peak RSS after warm phase | 3.23 GB | **5.07 GB** |
+
+Preparation remains on the CPU, and canonical completion validation costs remain.
+The benefit comes from removing repeated numerical verification and prefix work,
+not fewer alternatives, dispatches or transfers. Larger records and extra operand
+buffers increase transfer/allocation volume and observed process RSS. Persistent
+component budgets do not bound total process memory. There is no separate numeric
+refinement queue; ambiguity is retained and its frequency is not instrumented.
+Graph/snapshot/runtime setup for this pair was approximately 0.026/0.029/0.095 s
+in both modes and is excluded from phase wall time. Cold pricing preparation
+itself was 39.94 s integer versus 39.96 s reference, included in the cold totals.
+
+Canonical solver checks used licensed Gurobi with one thread and original captures:
+
+| Subset | Reference | Integer | Completion and quality |
+| --- | ---: | ---: | --- |
+| long10 | 8.474 s | 8.804 s | 10/10 certified; same cost 1895.591897429123; canonical filing validation passes |
+| hard88 | 52.326 s | 46.052 s | Both stop at flight 2224, round 2 `label_limit`; 102/103 pricing results certified; same feasible cost 8716.244488722932 |
+
+The hard88 run remains **incomplete**. Reference lower bound 8604.35016967624
+versus integer8604.350157717476 gives approximately 1.2837% gap in both cases;
+the slight lower-bound difference reflects conservative numerical closure.
+This single matched capped-solve pair is not evidence of complete convergence
+speedup. The long10 pair shows no benefit at this scale.
+
+The evidence also retains the rejected all-root allocation trial: 42.504 s but
+an earlier `integer_buffer_limit` at flight 1920, 91/92 certified and worse
+cost 8720.244488722932. That timing is excluded from performance comparisons.
+The retained-root correction restores the reference stopping point without
+raising the numeric budget. Final-source verification, exhaustive checks and
+matched measurements justify this bounded opt-in implementation; wider GPU
+refinement, lower transport/RSS, PR145 integration and complete hard88 solver
+convergence remain future work.
+
+## Reproduction
+
+Use the shared environment and original captures. The cohort order comes from
+`arrival_union_results.json`, not a newly selected easy subset. A cold phase is
+the first pricing call in a fresh process; graph construction, snapshot indexing
+and backend compilation are separately reported. Every phase includes independent
+canonical validation. Instrumentation is identical between modes. All sustained
+jobs, including tests, use the same advisory lock and release it between jobs.
+
+```sh
+export PYTHONPATH="$PWD"
+/Users/victor/Documents/Research/congestion-utm-freespace/.venv/bin/python - <<'PY'
+import fcntl, json, subprocess, sys
+from pathlib import Path
+root = Path('/Users/victor/Documents/Research/congestion-utm-freespace')
+cohort, mode = 'hard88', 'integer'  # also late18; reference or audit
+saved = json.loads(Path('analysis/colgen/arrival_union_results.json').read_text())
+ids = [row['flight_id'] for row in saved[cohort]['after']['rows']]
+early = root / '.agent/runs/colgen-metal-20261105-220722/pricing_captures/round_0001.pkl'
+late = root / '.agent/runs/colgen-capture-20261105-211249/pricing_captures/round_0011.pkl'
+cmd = [sys.executable, '-m', 'analysis.colgen.execution_replay', '--capture', str(early),
+       '--flight-ids', *map(str, ids), '--batch-size', '1', '--warm-repeats', '1',
+       '--out', f'.agent/replay-{cohort}-{mode}.json']
+if cohort == 'late18':
+    cmd += ['--capture', str(late)]
+if mode != 'reference':
+    cmd += ['--integer-bounds']
+if mode == 'audit':
+    cmd += ['--audit-integer']
+with (root / '.agent/gpu-followups-20261106/metal-benchmark.lock').open('a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    subprocess.run(cmd, check=True)
+PY
+```
+
+For the canonical solver, run `analysis.colgen.gpu_validation solve` under the
+same lock with the early `--capture`, a fresh `--out`, `--budget 300`, and optional
+`--integer-bounds`; set `COLGEN_GUROBI_THREADS=1`. Its default subset is the saved
+long10 selection; supply the exact hard88 IDs above for that solver comparison.
+An incomplete cap intentionally returns a failing validation exit code and must
+be inspected, not relabeled as a completed solve. Controls use IDs 0,34,276,320.
+
+Run the eight `test_colgen_gpu_{integer,bounds,endpoint,future,runtime,solver,options,validation}.py`
+files plus `test_colgen_pricing_platform.py` under the lock for focused coverage.
+The summary command is `python -m analysis.colgen.integer_pruning_report --replays DIR
+--solver SOLVER_DIR --out FILE`; repeat `--solver` for each paired result directory.
+It checks input hashes, cohort order and completed objectives before aggregating
+timings. Raw output hashes, per-phase result hashes and source manifests remain
+in the committed evidence. Timers overlap and are not additive.

@@ -38,6 +38,7 @@ class PricingOptions:
     endpoint_cache_work: int = 1_000_000
     gpu_integer_bounds: bool = False
     gpu_integer_audit: bool = False
+    gpu_approach_bounds: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous device selection and invalid allocation limits."""
@@ -56,6 +57,11 @@ class PricingOptions:
                 raise ValueError("integer bounds require GPU canonical checks and no epsilon mode")
         elif self.gpu_integer_audit:
             raise ValueError("integer audit requires integer bounds")
+        if not isinstance(self.gpu_approach_bounds, bool):
+            raise TypeError("gpu_approach_bounds must be boolean")
+        if self.gpu_approach_bounds and (self.device != "gpu" or not self.cpu_recompute
+                                         or self.gpu_prune_epsilon is not None):
+            raise ValueError("Approach bounds require GPU canonical checks and no epsilon mode")
         if not isinstance(self.gpu_prune_audit, bool):
             raise TypeError("gpu_prune_audit must be boolean")
         if not isinstance(self.gpu_prune_verify_border, bool):

@@ -157,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warm-repeats", type=int, default=1)
     parser.add_argument("--integer-bounds", action="store_true")
     parser.add_argument("--audit-integer", action="store_true")
+    parser.add_argument("--approach-bounds", action="store_true")
     args = parser.parse_args(argv)
     if len(args.capture) not in (1, 2) or args.batch_size < 1 or args.budget <= 0:
         parser.error("Choose one or two captures and positive batch size/budget")
@@ -191,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
         gpu_prune_verify_border=args.verify_border,
         gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
+        gpu_approach_bounds=args.approach_bounds,
     ))
     started = time.perf_counter()
     platform._runtime = runtime = ComputeRuntime("metal", integer_bounds=args.integer_bounds)
@@ -199,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                   gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
                   gpu_prune_verify_border=args.verify_border,
                   gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
+                  gpu_approach_bounds=args.approach_bounds,
                   cpu_numeric_verifier_guard=args.integer_bounds and not args.audit_integer,
                   graph_s=graph_s, snapshot_index_s=snapshot_index_s, init_s=init_s,
                   source=str(Path(pricing.__file__).resolve()),

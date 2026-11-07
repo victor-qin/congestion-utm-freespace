@@ -41,7 +41,7 @@ def test_benchmark_outbound_selection_preserves_demand(legacy: bool) -> None:
         assert outbound.turnaround_s == 19.0
 
 
-@pytest.mark.parametrize("before", ["gpu", "endpoint", "integer"])
+@pytest.mark.parametrize("before", ["gpu", "endpoint", "integer", "approach"])
 def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before: str) -> None:
     """Old positional slot states remain readable without shifting existing solver settings."""
     original = ColGenParams(
@@ -54,7 +54,7 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before:
     )
     names = [field.name for field in fields(ColGenParams)]
     first_new = {"gpu": "pricing_device", "endpoint": "pricing_gpu_endpoint_bounds",
-                 "integer": "pricing_gpu_integer_bounds"}[before]
+                 "integer": "pricing_gpu_integer_bounds", "approach": "pricing_gpu_approach_bounds"}[before]
     # Archived slot states are prefixes; later feature fields did not exist either.
     legacy_names = names[:names.index(first_new)]
     legacy = object.__new__(ColGenParams)
@@ -70,6 +70,7 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before:
     assert restored.pricing_device == "cpu" and restored.pricing_gpu_backend is None
     assert restored.pricing_gpu_endpoint_bounds and restored.pricing_gpu_endpoint_max_rows == 64
     assert not restored.pricing_gpu_integer_bounds and not restored.pricing_gpu_integer_audit
+    assert not restored.pricing_gpu_approach_bounds
 
 
 def test_cpu_default_and_explicit_gpu_configuration() -> None:
@@ -121,6 +122,8 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         {"pricing_gpu_endpoint_max_rows": -1},
         {"pricing_gpu_endpoint_cache_bytes": True},
         {"pricing_gpu_endpoint_cache_work": -1},
+        {"pricing_gpu_approach_bounds": 1},
+        {"pricing_gpu_approach_bounds": True},
     ],
 )
 def test_invalid_or_unsupported_pricing_selection_fails(overrides: dict) -> None:

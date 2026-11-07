@@ -342,8 +342,9 @@ inline int atomicCAS(int* p, int old, int v) { int x=*p; if(x==old)*p=v; return 
 
 @pytest.mark.parametrize("signed", [False, True])
 @pytest.mark.parametrize("audit", [False, True])
+@pytest.mark.parametrize("approach", [False, True])
 def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
-    monkeypatch: pytest.MonkeyPatch, signed: bool, audit: bool,
+    monkeypatch: pytest.MonkeyPatch, signed: bool, audit: bool, approach: bool,
 ) -> None:
     """Exact signed unions and canonical routes certify while the original pruner is guarded.
 
@@ -352,6 +353,7 @@ def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
     - monkeypatch (pytest.MonkeyPatch): forbids full CPU search and ordinary per-prune verification.
     - signed (bool): includes all negative credits and origin/visit overlap.
     - audit (bool): independently compares device deletions with original FP64 bounds.
+    - approach (bool): prepares the optional root union before the small certified pass.
 
     Return
     --------
@@ -380,7 +382,8 @@ def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
         monkeypatch.setattr(_Batch, "bound", forbidden)
         monkeypatch.setattr(_Batch, "retain", forbidden)
     platform = PricingPlatform(PricingOptions(device="gpu", gpu_backend="metal",
-                                               gpu_integer_bounds=True, gpu_integer_audit=audit))
+                                               gpu_integer_bounds=True, gpu_integer_audit=audit,
+                                               gpu_approach_bounds=approach))
     (result,) = platform.price_batch([problem])
     assert result.certified and result.search_complete
     assert result.reduced_cost == pytest.approx(optimum, abs=1e-6)
@@ -400,8 +403,9 @@ def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
 
 
 @pytest.mark.parametrize("max_labels", [1, 250_000])
+@pytest.mark.parametrize("approach", [False, True])
 def test_unrepresentable_operands_retain_alternatives_and_caps_remain_incomplete(
-    monkeypatch: pytest.MonkeyPatch, max_labels: int,
+    monkeypatch: pytest.MonkeyPatch, max_labels: int, approach: bool,
 ) -> None:
     """An unusable grid can disable pruning but cannot erase an unresolved route.
 
@@ -409,6 +413,7 @@ def test_unrepresentable_operands_retain_alternatives_and_caps_remain_incomplete
     ------------
     - monkeypatch (pytest.MonkeyPatch): supplies a deliberately inadequate grid and guards CPU search.
     - max_labels (int): covers a hard cap and complete enumeration with the same invalid data.
+    - approach (bool): a prepared root cap must also fail open on an unusable integer grid.
 
     Return
     --------
@@ -430,8 +435,11 @@ def test_unrepresentable_operands_retain_alternatives_and_caps_remain_incomplete
     monkeypatch.setattr(_Batch, "bound", forbidden)
     monkeypatch.setattr(_Batch, "bootstrap", lambda self: None)
     monkeypatch.setattr(IntegerScale, "for_values", classmethod(lambda cls, values, **kw: cls(-1074)))
-    (result,) = _platform("metal", max_labels=max_labels, integer_bounds=True).price_batch([problem])
+    platform = _platform("metal", max_labels=max_labels, integer_bounds=True)
+    platform.options = replace(platform.options, gpu_approach_bounds=approach)
+    (result,) = platform.price_batch([problem])
     assert result.stats["gpu_direct_prunes"] == 0
+    assert result.stats.get("approach_work", 0) <= 1_000_000
     assert result.certified == (max_labels > 1)
     assert result.search_complete == result.certified
     if result.certified:
@@ -439,6 +447,40 @@ def test_unrepresentable_operands_retain_alternatives_and_caps_remain_incomplete
         _assert_canonical(problem, result)
     else:
         assert result.status == "label_limit" and result.upper_bound is None
+
+
+def test_metal_prepared_root_upper_closes_and_invalid_caps_retain() -> None:
+    """The production root kernel consumes a new upper and ignores unavailable encodings.
+
+    Parameters
+    ------------
+    - none: compares otherwise identical old-open roots with finite/overflowed/missing caps.
+
+    Return
+    --------
+    - output (None): only the complete representable cap authorizes a cutoff comparison.
+    """
+    from tests.test_colgen_pricing_platform import _platform
+    from freespace_sim.planner.colgen.gpu_runtime import ComputeRuntime
+
+    _platform("metal")
+    runtime = ComputeRuntime("metal", integer_bounds=True)
+    scale = IntegerScale(-40)
+    zero, absent = scale.encode(0.0), IntegerInterval()
+    operands = BoundOperands(scale.encode(10.0), zero, zero, zero, zero, zero,
+                             zero, zero, absent, absent, absent).packed()
+    inputs = np.stack([np.concatenate((operands, scale.encode(cap).packed()[None, :]))
+                       for cap in (5.0, math.inf, 1e300)])
+    (result,) = runtime.run("integer_roots", len(inputs), (
+        np.array([len(inputs), *([-40] * len(inputs))], np.int32), inputs,
+        np.empty((len(inputs), 5), np.uint32),
+    ), (2,))
+    uppers = [IntegerInterval.unpacked(row) for row in result]
+    assert [scale.closes(upper, 5.0 + 1e-6) for upper in uppers] == [True, False, False]
+    assert scale.upper_float(uppers[0]) >= 5.0
+    assert scale.upper_float(uppers[1]) >= 10.0
+    assert uppers[1] == uppers[2]
+    runtime.clear_cache()
 
 
 def test_closed_departures_do_not_reserve_unused_integer_cost_tables(
@@ -485,6 +527,8 @@ def test_closed_departures_do_not_reserve_unused_integer_cost_tables(
     {"gpu_integer_bounds": True, "cpu_recompute": False},
     {"gpu_integer_bounds": True, "gpu_prune_epsilon": 0.},
     {"gpu_integer_bounds": True, "device": "cpu", "gpu_backend": None},
+    {"gpu_approach_bounds": 1}, {"gpu_approach_bounds": True, "cpu_recompute": False},
+    {"gpu_approach_bounds": True, "gpu_prune_epsilon": 0.},
 ])
 def test_invalid_integer_certificate_modes_fail_before_search(options: dict) -> None:
     """Integer certification cannot inherit unchecked canonical scores or epsilon deletions."""

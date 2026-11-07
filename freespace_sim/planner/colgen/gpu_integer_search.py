@@ -149,7 +149,10 @@ class IntegerData:
         for root in range(len(self.roots)):
             b.check()
             inputs.append(self.root_operands(root))
-        packed = np.asarray(inputs, np.uint32).reshape(-1, 11, 5)
+        packed = np.zeros((len(inputs), 12, 5), np.uint32)
+        packed[:, :11] = np.asarray(inputs, np.uint32).reshape(-1, 11, 5)
+        for root, upper in b.approach_upper.items():
+            packed[root, 11] = self.scales[b.root_flights[root]].encode(upper).packed()
         exponents = np.asarray([len(inputs), *(self.scales[i].exponent for i in b.root_flights)], np.int32)
         (self.uppers,) = self.runtime.run("integer_roots", len(inputs),
                                         (exponents, packed, np.empty((len(inputs), 5), np.uint32)), (2,))
@@ -375,6 +378,8 @@ class IntegerBatch(_Batch):
                     self.check_upper(root, -1, cell, 0, upper)
                 self.closed_upper[i] = max(self.closed_upper[i], scale.upper_float(upper))
                 self.stats["root_prunes"] += 1
+                if root in self.approach_upper:
+                    self.stats["approach_root_prunes"] = self.stats.get("approach_root_prunes", 0) + 1
                 self.stats["gpu_direct_prunes"] += 1
                 self.stats["gpu_prune_proposals"] += 1
                 continue
@@ -390,6 +395,13 @@ class IntegerBatch(_Batch):
         allocated = self.allocate(packed)
         self.numeric.live_roots.update(map(int, packed[:, 1]))
         return allocated, np.asarray(values, np.float32).reshape(-1, 2)
+
+    def approach_open(self, root: int, cutoff: float) -> bool:
+        """Avoid optional preparation when the original checked device interval already closes."""
+        scale = self.numeric.scales[self.root_flights[root]]
+        return not self.numeric.root_empty[root] and not scale.closes(
+            IntegerInterval.unpacked(self.numeric.uppers[root]), cutoff,
+        )
 
     def check_upper(self, root: int, parent: int, cell: int, hops: int, upper: IntegerInterval) -> None:
         """Audit a device upper against the original FP64 verifier without trusting device masks.

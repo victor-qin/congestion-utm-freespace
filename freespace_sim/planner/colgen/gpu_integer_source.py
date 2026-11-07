@@ -38,7 +38,8 @@ def extend_source(source: str, backend: str, arguments: tuple[str, ...]) -> str:
          f"expand_one(tid, {names}); integer_expand_one(tid, {names}, {extras});"),
         ("integer_roots", root_arguments,
          "if (tid < (unsigned int)exponents[0]) ii_store(output + tid * 5, "
-         "ib_upper(operands + tid * 55, exponents[tid + 1]));"),
+         "ib_minimum(ib_upper(operands + tid * 60, exponents[tid + 1]), "
+         "ii_load(operands + tid * 60 + 55)));"),
     ):
         if backend == "metal":
             formatted = ", ".join(f"{arg} [[buffer({i})]]" for i, arg in enumerate(args))

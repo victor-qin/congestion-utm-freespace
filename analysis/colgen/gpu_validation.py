@@ -187,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--integer-bounds", action="store_true")
     parser.add_argument("--audit-integer", action="store_true")
+    parser.add_argument("--approach-bounds", action="store_true")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--all-flights", action="store_true",
                         help="Include every captured request in prepare/replay mode.")
@@ -233,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                      pricing_cpu_recompute=True, pricing_gpu_max_labels=args.max_labels,
                      pricing_gpu_integer_bounds=args.integer_bounds,
                      pricing_gpu_integer_audit=args.audit_integer,
+                     pricing_gpu_approach_bounds=args.approach_bounds,
                      pricing_gpu_chunk_size=args.chunk_size, pricing_gpu_batch_size=args.batch_size,
                      n_pricing_workers=0, time_limit_s=args.budget, ip_time_limit_s=60.0,
                      ip_reserve_s=65.0)
@@ -318,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
                     device="gpu", gpu_backend="metal", max_labels=args.max_labels,
                     chunk_size=args.chunk_size,
                     gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
+                    gpu_approach_bounds=args.approach_bounds,
                 ))
                 for start in range(0, len(problems), args.batch_size):
                     platform.price_batch(problems[start:start + args.batch_size],

@@ -118,6 +118,8 @@ class _Batch:
         self.first_counters = dict(getattr(runtime, "counters", {}))
         self.best: list[tuple[float, Any]] = [(-math.inf, None) for _ in problems]
         self.closed_upper = [-math.inf for _ in problems]
+        self.approach_upper: dict[int, float] = {}
+        self.approach_work = [0 for _ in problems]
         self.audit_upper = math.inf
         self.audit_direct = False
         normalized: dict[int, pricing.DualView] = {}
@@ -630,7 +632,7 @@ class _Batch:
                 cutoff = self.best[i][0] + _BOUND_CLOSURE_TOL
                 self._endpoint_closed = endpoint_upper <= cutoff < upper
                 upper = min(upper, endpoint_upper)
-        return upper
+        return min(upper, self.approach_upper.get(root, math.inf))
 
     def retain(self, root: int, parent: int, cell: int, hops: int) -> bool:
         """Require CPU verification for every proposed numeric deletion in certified mode."""
@@ -736,6 +738,12 @@ class _Batch:
             i, variant = self.root_flights[root], self.root_variants[root]
             v = self.variants[i]
             cell = self.cell_offsets[i] + int(v.cell[variant])
+            prepared_upper = self.approach_upper.get(root, math.inf)
+            if math.isfinite(prepared_upper) and prepared_upper <= self.best[i][0] + _BOUND_CLOSURE_TOL:
+                self.closed_upper[i] = max(self.closed_upper[i], prepared_upper)
+                self.stats["approach_root_prunes"] = self.stats.get("approach_root_prunes", 0) + 1
+                self.stats["root_prunes"] += 1
+                continue
             upper = self.root_upper[root]
             direct = (self.prune_mode and math.isfinite(float(upper)) and
                       upper <= self.epsilon_cutoff(i))
@@ -1205,6 +1213,46 @@ class _Batch:
             # No predecessor IDs from the heuristic stage enter the certificate pass.
             self.used = 0
 
+    def approach_open(self, root: int, cutoff: float) -> bool:
+        """Use proposals only to schedule optional work; skipping it cannot delete a root."""
+        return float(self.root_upper[root]) > cutoff
+
+    def prepare_approach(self) -> None:
+        """Try bounded whole-root approach unions after a validated incumbent search.
+
+        Parameters
+        ------------
+        - self (_Batch): current snapshot, domain and canonically validated incumbents.
+
+        Return
+        --------
+        - output (None): installs only complete finite root uppers; missing results change nothing.
+        """
+        if not self.options.gpu_approach_bounds:
+            return
+        from .gpu_approach import ApproachBounds, _MAX_WORK
+
+        started = time.monotonic()
+        before = len(self.approach_upper)
+        helpers = {}
+        for root, i in enumerate(self.root_flights):
+            self.check()
+            cutoff = self.best[i][0] + _BOUND_CLOSURE_TOL
+            if root in self.approach_upper or not self.approach_open(root, cutoff):
+                continue
+            if i not in helpers:
+                helpers[i] = ApproachBounds(self.bounds[i], self.check, _MAX_WORK - self.approach_work[i])
+            upper = helpers[i].upper(self.root_variants[root], self.benefits[i], self.negative[i], cutoff)
+            if math.isfinite(upper):
+                self.approach_upper[root] = upper
+        for i, helper in helpers.items():
+            self.approach_work[i] += helper.work
+        self.stats["approach_work"] = sum(self.approach_work)
+        self.stats["approach_roots"] = len(self.approach_upper)
+        if len(self.approach_upper) > before:
+            self.evaluate_roots()
+        self.stats["approach_prepare_s"] = self.stats.get("approach_prepare_s", 0.0) + time.monotonic() - started
+
     def run(self) -> tuple[PricingResult, ...]:
         """Return validated incumbents and certify only complete, CPU-refined searches.
 
@@ -1222,6 +1270,7 @@ class _Batch:
             self.prepare()
             self.prepare_device_prices()
             self.bootstrap()
+            self.prepare_approach()
             try:
                 # Stop an unproductive first pass early enough to benefit from the
                 # future-informed beam. The retry still searches every root at the
@@ -1242,6 +1291,7 @@ class _Batch:
                 self.closed_upper = [-math.inf for _ in self.problems]
                 self.prepare_future()
                 self.bootstrap()
+                self.prepare_approach()
                 self.search()
             self.check()
             complete = True

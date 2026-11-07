@@ -1,6 +1,6 @@
 // Shared Metal/CUDA body. Address spaces, entry points and atomics are runtime adapters.
 // Label fields: cell, root, hops, stable ID/parent ID, first A/B, status, paid low/high, recent cells.
-// Root values: benefit, assignment, ground, negative credit, hop cost, cutoff,
+// Root values: benefit, assignment, ground, negative credit, hop cost, reserved,
 // affine air-cost offset/slope, positive origin price, minimum total hops, future cost.
 INLINE float completion_bound(GLOBAL const float* data, float hops, float positive) {
     float air = fmax(0.0f, data[6] + hops * data[7]);
@@ -94,7 +94,7 @@ INLINE void expand_one(
     GLOBAL const int* paid_rows, GLOBAL const float* paid_values,
     GLOBAL int* output, GLOBAL float* scores,
     GLOBAL const int* price_map, GLOBAL const int* price_ranges,
-    GLOBAL const int* price_steps, GLOBAL const float* price_values,
+    GLOBAL const int* price_steps, GLOBAL const float* price_values, GLOBAL const float* cutoffs,
     GLOBAL const unsigned int* visit_masks,
     GLOBAL const int* endpoint_meta, GLOBAL const int* endpoint_entries,
     GLOBAL const float* endpoint_trees
@@ -104,6 +104,7 @@ INLINE void expand_one(
     int src_index = (int)tid / 6, arc = (int)tid % 6;
     int a = src_index * stride, b = (int)tid * stride;
     output[b + 6] = 0;
+    if (!labels[a + 6]) return;
     int cell = labels[a], root = labels[a + 1], hops = labels[a + 2];
     int target = graph[cell * 14 + arc];
     if (target < 0) return;
@@ -149,9 +150,9 @@ INLINE void expand_one(
     float endpoint = endpoint_bound(data, roots + root * 6, step + 1, hops + 1,
                                    remaining, positive, low, high,
                                    endpoint_meta, endpoint_entries, endpoint_trees);
-    if (endpoint <= data[5] && upper > data[5]) flags |= 8;
+    if (endpoint <= cutoffs[roots[root * 6]] && upper > cutoffs[roots[root * 6]]) flags |= 8;
     upper = fmin(upper, endpoint);
-    if (upper <= data[5]) flags |= 4;
+    if (upper <= cutoffs[roots[root * 6]]) flags |= 4;
     output[b] = target;
     output[b + 1] = root;
     output[b + 2] = hops + 1;

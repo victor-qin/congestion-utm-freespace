@@ -14,3 +14,12 @@ class DeviceBuffer:
     shape: tuple[int, ...]
     dtype: np.dtype
     nbytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Dispatch:
+    """One ordered kernel invocation whose buffer references remain live until completion."""
+
+    name: str
+    count: int
+    buffers: tuple[DeviceBuffer, ...]

@@ -647,21 +647,29 @@ class _Batch:
         end = self.used + len(records)
         if end > self.search_label_limit:
             raise _Stopped("label_limit")
-        if self.options.cpu_recompute:
-            for offset, record in enumerate(records):
-                self.paid_masks[self.used + offset] = self.paid_mask(
-                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
-                )
-                self.prefix_positive[self.used + offset] = self.positive_lower(
-                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
-                )
-                self.visit_prefix_positive[self.used + offset] = self.visit_lower(
-                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
-                )
-        self.arena[self.used : end] = records[:, [3, 0, 1]]
+        for offset, record in enumerate(records):
+            self.store_prefix(self.used + offset, record)
         records[:, 3] = np.arange(self.used, end, dtype=np.int32)
         self.used = end
         return records
+
+    def store_prefix(self, index: int, record: np.ndarray) -> None:
+        """Cache original-price prefix accounting after the predecessor is available.
+
+        Parameters
+        ------------
+        - index (int): stable state ID in the CPU verification mirror.
+        - record (np.ndarray): full record or its cell/root/hops/parent prefix.
+
+        Return
+        --------
+        - output (None): memoized predecessor and FP64 sums; no search decision is made here.
+        """
+        if self.options.cpu_recompute:
+            args = int(record[1]), int(record[3]), int(record[0]), int(record[2])
+            self.prefix_positive[index] = self.positive_lower(*args)
+            self.visit_prefix_positive[index] = self.visit_lower(*args)
+        self.arena[index] = record[[3, 0, 1]]
 
     def roots_at(
         self, step: int, allowed_roots: frozenset[int] | None = None,
@@ -980,6 +988,11 @@ class _Batch:
         """
         if not self.start_buckets:
             return
+        if beam_width is None and self.options.cpu_recompute:
+            from .gpu_resident import ResidentSearch
+
+            ResidentSearch(self).run()
+            return
         allowed_roots = None
         first_step = min(self.start_buckets)
         last_step = max(t.max_step for t in self.topologies)
@@ -999,6 +1012,9 @@ class _Batch:
             last_step = min(last_step, max(steps) + max(t.air_hop_limit for t in self.topologies))
         frontier = np.empty((0, self.stride), np.int32)
         values = np.empty((0, 2), np.float32)
+        future_buffer = self.runtime.empty((len(self.cells),), np.float32)
+        blocked_buffer = self.runtime.empty((len(self.cells),), np.int32)
+        root_values_buffer = self.runtime.upload(self.root_values)
         for step in range(first_step, last_step + 1):
             self.check()
             self._visit_positive.clear()
@@ -1017,6 +1033,8 @@ class _Batch:
             visits = self.future_proposals(frontier, visits, step + 1)
             visit_masks = self.endpoint_visits(step + 1)
             future_values = np.ascontiguousarray(visits[:, 2])
+            self.runtime.write(future_buffer, future_values)
+            self.runtime.write(blocked_buffer, blocked)
             next_records, next_scores = [], []
             next_count = 0
             for start in range(0, len(frontier), self.options.chunk_size):
@@ -1025,7 +1043,6 @@ class _Batch:
                 cutoffs = np.asarray([
                     self.proposal_cutoff(i) for i in range(len(self.problems))
                 ], np.float32)
-                self.root_values[:, 5] = cutoffs[root_flights]
                 count = len(current) * 6
                 records, scores = self.runtime.run(
                     "expand",
@@ -1036,22 +1053,22 @@ class _Batch:
                         values[start : start + len(current)].copy(),
                         self.graph,
                         self.roots,
-                        self.root_values,
-                        future_values,
-                        blocked,
+                        root_values_buffer,
+                        future_buffer,
+                        blocked_buffer,
                         self.paid_rows,
                         self.paid_values,
                         np.empty((count, self.stride), np.int32),
                         np.empty((count, 3), np.float32),
                         self.price_map, self.device_prices.ranges,
                         self.device_prices.steps, self.device_prices.values,
+                        cutoffs,
                         visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
                     ),
                     (10, 11),
-                    static={3: "graph", 4: "roots", 6: "future_values", 7: "blocked",
-                            8: "paid_rows", 9: "paid_values", 12: "price_map",
-                            16: "endpoint_visits", 17: "endpoint_meta", 18: "endpoint_entries",
-                            19: "endpoint_trees"},
+                    static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values",
+                            12: "price_map", 17: "endpoint_visits", 18: "endpoint_meta",
+                            19: "endpoint_entries", 20: "endpoint_trees"},
                     write_only=(10, 11),
                 )
                 valid = np.flatnonzero(records[:, 6])
@@ -1149,6 +1166,8 @@ class _Batch:
             except _Stopped as stop:
                 if str(stop) != "label_limit":
                     raise
+                # Release the stopped resident arenas before allocating a retry's buffers.
+                stop.__traceback__ = None
                 self.stats["initial_full_search_labels"] = self.used
                 self.used = 0
                 self.closed_upper = [-math.inf for _ in self.problems]

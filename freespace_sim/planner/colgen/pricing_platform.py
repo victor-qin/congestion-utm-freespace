@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ...config import SimConfig
@@ -39,6 +39,10 @@ class PricingOptions:
     gpu_integer_bounds: bool = False
     gpu_integer_audit: bool = False
     gpu_approach_bounds: bool = False
+    prepare_workers: int = 0
+    prepare_batch_size: int = 8
+    prepare_max_bytes: int = 128 * 1024 * 1024
+    prepare_cache_bytes: int = 128 * 1024 * 1024
 
     def __post_init__(self) -> None:
         """Reject ambiguous device selection and invalid allocation limits."""
@@ -73,6 +77,15 @@ class PricingOptions:
                 raise ValueError("GPU epsilon needs a finite nonnegative margin and cpu_recompute=True")
         elif self.gpu_prune_audit or self.gpu_prune_verify_border:
             raise ValueError("GPU pruning audit/border verification requires gpu_prune_epsilon")
+        if type(self.prepare_workers) is not int or not 0 <= self.prepare_workers <= 64:
+            raise ValueError("prepare_workers must be an integer between 0 and 64")
+        if self.prepare_workers and self.device != "gpu":
+            raise ValueError("CPU preparation workers require GPU pricing")
+        for name, lower, upper in (("prepare_batch_size", 1, 1024),
+                                   ("prepare_max_bytes", 4096, 2**31 - 1),
+                                   ("prepare_cache_bytes", 0, 2**31 - 1)):
+            if type(getattr(self, name)) is not int or not lower <= getattr(self, name) <= upper:
+                raise ValueError(f"{name} must be an integer between {lower} and {upper}")
         if not isinstance(self.endpoint_bounds, bool):
             raise TypeError("endpoint_bounds must be boolean")
         for name in ("endpoint_max_rows", "endpoint_cache_bytes", "endpoint_cache_work"):
@@ -147,6 +160,112 @@ class PricingPlatform:
         """Store backend options; GPU initialization is deferred until the first batch."""
         self.options = options
         self._runtime = None
+        self._preparation_pool = None
+
+    def close_preparation(self) -> None:
+        """Release CPU workers and caches; a subsequent pricing call may start fresh workers."""
+        if self._preparation_pool is not None:
+            self._preparation_pool.close()
+            self._preparation_pool = None
+
+    def close(self) -> None:
+        """Release preparation workers and all owner-held device caches."""
+        self.close_preparation()
+        if self._runtime is not None:
+            self._runtime.clear_cache()
+            self._runtime = None
+
+    def price_batches(
+        self, problems: Sequence[PricingProblem], batch_size: int,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[PricingResult, ...]]:
+        """Prepare bounded synchronous groups, then submit the original GPU batches in order.
+
+        Parameters
+        ------------
+        - problems (Sequence[PricingProblem]): full ordered sweep; raw prices snapshot when
+          iteration begins and remain fixed across all its groups.
+        - batch_size (int): search batch size, independent of CPU preparation group size.
+        - deadline (float | None): shared deadline, including worker startup and transport.
+
+        Return
+        --------
+        - output (Iterator[tuple[PricingResult, ...]]): unchanged search batches; no worker
+          is preparing while the owner searches. Close the iterator when stopping early.
+        """
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("deadline must be finite")
+        if not self.options.prepare_workers:
+            for start in range(0, len(problems), batch_size):
+                yield self.price_batch(problems[start:start + batch_size], deadline)
+            return
+        from .gpu_prepare_pool import (
+            GPUPreparationLimit, GPUPreparationPool, GPUPreparationWorkerLost,
+        )
+        from .gpu_prepared import PreparedFlight, PreparationStopped
+        from .gpu_pricing import price_gpu_batch
+        from .gpu_runtime import ComputeRuntime
+        from .windows import derive_cell_window
+
+        if batch_size > self.options.prepare_batch_size:
+            raise GPUPreparationLimit("GPU batch exceeds preparation group size")
+        normalized, current = {}, []
+        for p in problems:
+            view = p.duals
+            if not isinstance(view, pricing.DualView):
+                key = id(view), derive_cell_window(p.cfg)
+                if key not in normalized:
+                    normalized[key] = pricing.DualView(view, p.cfg)
+                view = normalized[key]
+            current.append(replace(p, duals=view))
+        width = (self.options.prepare_batch_size // batch_size) * batch_size
+        finished = False
+        try:
+            for start in range(0, len(current), width):
+                group = current[start:start + width]
+                if (self._preparation_pool is not None
+                        and self._preparation_pool.options != self.options):
+                    self.close_preparation()
+                if self._preparation_pool is None or self._preparation_pool.closed:
+                    self._preparation_pool = GPUPreparationPool(self.options)
+                pool = self._preparation_pool
+                before = dict(pool.stats)
+                started = time.monotonic()
+                try:
+                    prepared = pool.prepare(group, deadline)
+                except PreparationStopped:
+                    prepared = tuple(PreparedFlight(status="deadline") for _ in group)
+                except GPUPreparationWorkerLost:
+                    prepared = tuple(PreparedFlight(status="preparation_worker_lost") for _ in group)
+                except GPUPreparationLimit:
+                    prepared = tuple(PreparedFlight(status="preparation_limit") for _ in group)
+                preparation_s = time.monotonic() - started
+                measured = {key: value - before[key] for key, value in pool.stats.items()
+                            if not key.startswith("peak_") and key != "owner_cache_bytes"}
+                measured.update({key: value for key, value in pool.stats.items()
+                                 if key.startswith("peak_") or key == "owner_cache_bytes"})
+                measured.update(wall_s=preparation_s, flights=len(group), overlap=False)
+                # This point is the stage barrier: every job/reply in this group has
+                # completed, or its workers were reaped on timeout. No refill occurs.
+                if self._runtime is None:
+                    self._runtime = (ComputeRuntime(self.options.gpu_backend, integer_bounds=True)
+                                     if self.options.gpu_integer_bounds else
+                                     ComputeRuntime(self.options.gpu_backend))
+                for offset in range(0, len(group), batch_size):
+                    batch = group[offset:offset + batch_size]
+                    values = price_gpu_batch(batch, self.options, self._runtime, deadline,
+                                             prepared[offset:offset + batch_size])
+                    yield tuple(replace(value, stats=dict(value.stats,
+                        preparation_group=measured if offset == 0 else {},
+                        preparation_flight=prepared[offset + i].stats,
+                    )) for i, value in enumerate(values))
+                del prepared
+            finished = True
+        finally:
+            if not finished:
+                self.close_preparation()
 
     def price_batch(
         self, problems: Sequence[PricingProblem], deadline: float | None = None
@@ -168,6 +287,13 @@ class PricingPlatform:
             raise ValueError("deadline must be finite")
         if not problems:
             return ()
+        if self.options.prepare_workers:
+            batches = self.price_batches(problems, len(problems), deadline)
+            try:
+                result, = tuple(batches)
+                return result
+            finally:
+                batches.close()
         if self.options.device == "gpu":
             from .gpu_pricing import price_gpu_batch
             from .gpu_runtime import ComputeRuntime

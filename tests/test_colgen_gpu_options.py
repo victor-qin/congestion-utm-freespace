@@ -41,7 +41,7 @@ def test_benchmark_outbound_selection_preserves_demand(legacy: bool) -> None:
         assert outbound.turnaround_s == 19.0
 
 
-@pytest.mark.parametrize("before", ["gpu", "endpoint", "integer", "approach"])
+@pytest.mark.parametrize("before", ["gpu", "endpoint", "integer", "approach", "preparation"])
 def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before: str) -> None:
     """Old positional slot states remain readable without shifting existing solver settings."""
     original = ColGenParams(
@@ -54,7 +54,8 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before:
     )
     names = [field.name for field in fields(ColGenParams)]
     first_new = {"gpu": "pricing_device", "endpoint": "pricing_gpu_endpoint_bounds",
-                 "integer": "pricing_gpu_integer_bounds", "approach": "pricing_gpu_approach_bounds"}[before]
+                 "preparation": "pricing_gpu_prepare_workers", "integer": "pricing_gpu_integer_bounds",
+                 "approach": "pricing_gpu_approach_bounds"}[before]
     # Archived slot states are prefixes; later feature fields did not exist either.
     legacy_names = names[:names.index(first_new)]
     legacy = object.__new__(ColGenParams)
@@ -100,6 +101,9 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         options = _gpu_options(selected)
         assert not options.endpoint_bounds and options.endpoint_max_rows == 32
         assert options.endpoint_cache_bytes == 12345 and options.endpoint_cache_work == 45678
+        assert _gpu_options(ColGenParams(
+            pricing_device="gpu", pricing_gpu_backend=backend, pricing_gpu_approach_bounds=True,
+        )).gpu_approach_bounds
 
 
 @pytest.mark.parametrize(
@@ -119,11 +123,21 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         {"pricing_gpu_chunk_size": 1.5},
         {"pricing_gpu_endpoint_bounds": 1},
         {"pricing_gpu_endpoint_max_rows": 65},
+        {"pricing_gpu_approach_bounds": 1},
+        {"pricing_gpu_approach_bounds": True},
+        {"pricing_device": "gpu", "pricing_gpu_backend": "metal",
+         "pricing_cpu_recompute": False, "pricing_gpu_approach_bounds": True},
         {"pricing_gpu_endpoint_max_rows": -1},
         {"pricing_gpu_endpoint_cache_bytes": True},
         {"pricing_gpu_endpoint_cache_work": -1},
-        {"pricing_gpu_approach_bounds": 1},
-        {"pricing_gpu_approach_bounds": True},
+        {"pricing_gpu_prepare_workers": True},
+        {"pricing_gpu_prepare_workers": -1},
+        {"pricing_gpu_prepare_workers": 1},
+        {"pricing_gpu_prepare_batch_size": 0},
+        {"pricing_gpu_prepare_max_bytes": 1024},
+        {"pricing_gpu_prepare_cache_bytes": -1},
+        {"pricing_device": "gpu", "pricing_gpu_backend": "metal", "pricing_gpu_prepare_workers": 2,
+         "pricing_gpu_batch_size": 4, "pricing_gpu_prepare_batch_size": 2},
     ],
 )
 def test_invalid_or_unsupported_pricing_selection_fails(overrides: dict) -> None:
@@ -232,6 +246,14 @@ def test_paired_benchmark_forwards_gpu_controls_and_preserves_kernel_source(
             "1000",
             "--pricing-gpu-chunk-size",
             "128",
+            "--pricing-gpu-prepare-workers",
+            "2",
+            "--pricing-gpu-prepare-batch-size",
+            "6",
+            "--pricing-gpu-prepare-max-bytes",
+            "1048576",
+            "--pricing-gpu-prepare-cache-bytes",
+            "2097152",
         ],
     )
     with pytest.raises(CapturedInvocation):
@@ -252,6 +274,10 @@ def test_paired_benchmark_forwards_gpu_controls_and_preserves_kernel_source(
         pricing_gpu_endpoint_max_rows=64,
         pricing_gpu_endpoint_cache_bytes=1_048_576,
         pricing_gpu_endpoint_cache_work=1_000_000,
+        pricing_gpu_prepare_workers=2,
+        pricing_gpu_prepare_batch_size=6,
+        pricing_gpu_prepare_max_bytes=1_048_576,
+        pricing_gpu_prepare_cache_bytes=2_097_152,
     )
     manifest = json.loads((output / "manifest.json").read_text())
     assert all(manifest[key] == value for key, value in actual.items())

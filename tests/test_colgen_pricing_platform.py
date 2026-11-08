@@ -173,6 +173,93 @@ def test_cpu_adapter_preserves_existing_pricing_result() -> None:
     _assert_canonical(problem, result)
 
 
+@pytest.mark.parametrize("integer_bounds", [False, True])
+@pytest.mark.parametrize("workers,approach", [(1, False), (2, False), (4, False), (2, True), (12, True)])
+def test_synchronous_preparation_keeps_certificates_order_and_snapshot_boundaries(monkeypatch, workers, approach, integer_bounds):
+    """Parallel groups retain ordered certified results without preparing during GPU search."""
+    import weakref
+    from freespace_sim.planner.colgen import gpu_pricing
+
+    serial = _platform("metal")
+    parallel = PricingPlatform(replace(serial.options, prepare_workers=workers, prepare_batch_size=3,
+                                       gpu_approach_bounds=approach, gpu_integer_bounds=integer_bounds))
+    originals = [_problem(signed=True), _problem(buffer=0.0), _problem(buffer=12.0)]
+    originals = [replace(p, graph=replace(p.graph, request=replace(p.graph.request, flight_id=i)))
+                 for i, p in enumerate(originals)]
+    dispatch = gpu_pricing.price_gpu_batch
+    run = gpu_pricing._Batch.run
+    completed = []
+    endpoints = []
+
+    def observed_run(batch):
+        """Check that completed GPU batches are released while their prepared group remains."""
+        result = run(batch)
+        if batch.prepared is not None:
+            completed.append(weakref.ref(batch))
+            endpoints.append(any(endpoint is not None for endpoint in batch.endpoints))
+        return result
+
+    def checked_dispatch(*args, **kwargs):
+        """Observe the actual stage boundary without substituting any GPU search work."""
+        pool = parallel._preparation_pool
+        if pool is not None:
+            assert not pool._active
+            assert all(ch.job is None and not ch.outgoing for ch in pool.channels)
+        result = dispatch(*args, **kwargs)
+        assert all(ref() is None for ref in completed)
+        return result
+
+    monkeypatch.setattr(gpu_pricing._Batch, "run", observed_run)
+    monkeypatch.setattr(gpu_pricing, "price_gpu_batch", checked_dispatch)
+    monkeypatch.setattr(pricing, "price_flight", lambda *a, **kw: pytest.fail("Full CPU fallback"))
+    try:
+        for phase in range(3):
+            problems = []
+            for p in originals:
+                if phase == 1:
+                    # Same raw mapping identity, changed support/sign: a fresh snapshot is required.
+                    p.duals.clear()
+                    p.duals.update({RowKey.cell(p.graph.dest_cell, 0, p.graph.max_step): -17.0})
+                problems.append(replace(p, pi_f=float(phase), forbidden_rows=(
+                    frozenset([RowKey.cell(p.graph.origin_cell, 0, p.graph.base_step)])
+                    if phase == 2 else frozenset())))
+            expected = [serial.price_batch([p])[0] for p in problems]
+            batches = parallel.price_batches(problems, 1)
+            actual = [next(batches)[0]]
+            saved = [dict(p.duals) for p in problems]
+            try:
+                for p in problems:
+                    p.duals.clear()
+                actual.extend(batch[0] for batch in batches)
+            finally:
+                for p, prices in zip(problems, saved, strict=True):
+                    p.duals.update(prices)
+            assert [r.flight_id for r in actual] == [0, 1, 2]
+            for p, a, e in zip(problems, actual, expected, strict=True):
+                assert a.search_complete == e.search_complete and a.certified == e.certified
+                assert a.reduced_cost == pytest.approx(e.reduced_cost, abs=1e-8)
+                assert a.upper_bound >= e.reduced_cost - 1e-8
+                assert e.upper_bound >= a.reduced_cost - 1e-8
+                if a.column is not None:
+                    _assert_canonical(p, a)
+                    assert a.column.claims.isdisjoint(p.forbidden_rows)
+            if approach:
+                assert "approach_prepare_s" in actual[0].stats
+            assert actual[0].stats["preparation_group"]["overlap"] is False
+            assert parallel._preparation_pool.stats["peak_jobs"] <= 3
+        assert any(endpoints)
+        # Early consumer cancellation releases processes; the next call starts a fresh pool.
+        batches = parallel.price_batches(problems * 2, 1)
+        next(batches)
+        batches.close()
+        assert parallel._preparation_pool is None
+        result, = parallel.price_batch([problems[0]])
+        assert result.certified
+    finally:
+        parallel.close()
+        serial.close()
+
+
 @pytest.mark.parametrize("backend,first_limit,integer_bounds", [
     ("cpu", None, False), ("metal", None, False), ("metal", 4, False),
     ("metal", None, True), ("metal", 4, True),
@@ -631,8 +718,9 @@ def test_gpu_rejects_dual_view_with_mismatched_occupancy_window() -> None:
 
 @pytest.mark.parametrize("exclude_arrival", [False, True])
 @pytest.mark.parametrize("integer_bounds", [False, True])
+@pytest.mark.parametrize("prepare_workers", [0, 2])
 def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
-    monkeypatch: pytest.MonkeyPatch, exclude_arrival: bool, integer_bounds: bool,
+    monkeypatch: pytest.MonkeyPatch, exclude_arrival: bool, integer_bounds: bool, prepare_workers: int,
 ) -> None:
     """Terminal lane geometry, wall roles and arrival exclusions preserve the optimum.
 
@@ -659,6 +747,7 @@ def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
     monkeypatch.setattr(_Batch, "bootstrap", with_future)
 
     platform = _platform("metal", integer_bounds=integer_bounds)
+    platform.options = replace(platform.options, prepare_workers=prepare_workers)
     cfg = terminal_cfg(max_ground_delay_s=4.0)
     graph, params = _terminal_graph(cfg, overrun=0)
     arrival = RowKey.term("kern-B", 15)
@@ -672,7 +761,10 @@ def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
         forbidden_rows=forbidden,
     )
     (expected,) = _platform("cpu").price_batch([problem])
-    (result,) = platform.price_batch([problem])
+    try:
+        (result,) = platform.price_batch([problem])
+    finally:
+        platform.close()
     assert result.certified and result.stats["gpu_dispatches"] > 0
     assert result.reduced_cost == pytest.approx(expected.reduced_cost, abs=1e-8)
     if exclude_arrival:
@@ -681,12 +773,16 @@ def test_gpu_terminal_lanes_walls_and_forbidden_arrivals(
         _assert_canonical(problem, result)
 
 
-@pytest.mark.parametrize("backend", ["cpu", "metal"])
-def test_expired_deadline_never_certifies(backend: str) -> None:
+@pytest.mark.parametrize("backend,workers", [("cpu", 0), ("metal", 0), ("metal", 2)])
+def test_expired_deadline_never_certifies(backend: str, workers: int) -> None:
     """No backend can report a complete certificate after receiving an expired deadline."""
     platform = _platform(backend)
+    platform.options = replace(platform.options, prepare_workers=workers)
     problem = _problem()
-    (result,) = platform.price_batch([problem], deadline=time.monotonic() - 1.0)
+    try:
+        (result,) = platform.price_batch([problem], deadline=time.monotonic() - 1.0)
+    finally:
+        platform.close()
     assert not result.search_complete and not result.certified
     assert result.upper_bound is None or result.upper_bound >= _oracle(problem) - 1e-8
 

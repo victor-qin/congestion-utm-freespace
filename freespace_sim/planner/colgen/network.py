@@ -770,11 +770,22 @@ class _LazyCorridorCells(AbstractSet[Cell]):
 
     def _within_budget(self, cell: Cell) -> bool:
         """Apply a lower bound on cruise hops through this cell."""
-        return (
-            min(hg.hex_distance(start, cell) for start in self._origin_cells)
-            + min(hg.hex_distance(cell, end) for end in self._dest_cells)
-            <= self._shortest + self._overrun
-        )
+        q, r = cell
+        total = 0
+        for endpoints in (self._origin_cells, self._dest_cells):
+            nearest = None
+            for eq, er in endpoints:
+                dq, dr = eq - q, er - r
+                distance = (abs(dq) + abs(dr) + abs(dq + dr)) // 2
+                if nearest is None or distance < nearest:
+                    nearest = distance
+                    if distance == 0:
+                        break
+            # Keep integer arithmetic unbounded, as in hex_distance.
+            if nearest is None:
+                raise ValueError("min() arg is an empty sequence")
+            total += nearest
+        return total <= self._shortest + self._overrun
 
     def _cells(self) -> frozenset[Cell]:
         """Materialize (once, under lock) the frozenset the lazy membership test implies."""
@@ -1370,13 +1381,12 @@ def _static_hop_allowed_roles(
     length = math.sqrt(dx * dx + dy * dy + dz * dz)
     nsub = max(1, math.ceil(length / cfg.corridor_segment_len_m))
     subvolumes: list[Volume4D] = []
-    base_tags: list[Hashable | None] = []
+    endpoints = []
     for k in range(1, nsub + 1):
         f0, f1 = (k - 1) / nsub, k / nsub
         sa = (p0[0] + f0 * dx, p0[1] + f0 * dy, p0[2] + f0 * dz)
         sb = (p0[0] + f1 * dx, p0[1] + f1 * dy, p0[2] + f1 * dz)
-        tag = _segment_terminal_id(sa, sb, req, origin_terminal, dest_terminal, cfg)
-        base_tags.append(tag)
+        endpoints.append((sa, sb))
         subvolumes.append(
             corridor_segment_volume(
                 sa,
@@ -1384,9 +1394,26 @@ def _static_hop_allowed_roles(
                 sb,
                 k * cfg.dt_s / nsub,
                 cfg,
-                terminal_id=tag,
+                terminal_id=None,
             )
         )
+
+    wall_candidates = tuple(
+        (
+            walls_with_bounds.candidates(base_volume.flat_aabb())
+            if isinstance(walls_with_bounds, _WallSpatialIndex)
+            else all_wall_bounds
+        )
+        for base_volume in subvolumes
+    )
+    # Tags cannot change a volume's AABB. An empty exact broad phase clears
+    # every role without endpoint-tag geometry or tagged-volume allocations.
+    if not any(wall_candidates):
+        return _ALL_ARC_ROLES
+    base_tags = [
+        _segment_terminal_id(sa, sb, req, origin_terminal, dest_terminal, cfg)
+        for sa, sb in endpoints
+    ]
 
     # Builder endpoint overrides are path-position dependent.  Cache all four
     # exact outcomes: the union is useful to discover a possible arc, while
@@ -1415,15 +1442,6 @@ def _static_hop_allowed_roles(
         (_ARC_FIRST, role_tags(first=True, last=False)),
         (_ARC_LAST, role_tags(first=False, last=True)),
         (_ARC_FIRST_LAST, role_tags(first=True, last=True)),
-    )
-
-    wall_candidates = tuple(
-        (
-            walls_with_bounds.candidates(base_volume.flat_aabb())
-            if isinstance(walls_with_bounds, _WallSpatialIndex)
-            else all_wall_bounds
-        )
-        for base_volume in subvolumes
     )
 
     def variant_conflicts(tags: tuple[Hashable | None, ...]) -> bool:

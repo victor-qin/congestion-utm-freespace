@@ -1,0 +1,6 @@
+{
+  "['sysctl', '-n', 'machdep.cpu.brand_string']": "Apple M1 Ultra",
+  "['sw_vers']": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83",
+  "['git', 'rev-parse', 'HEAD']": "b605aba3b5d9a29ad70cfe5b4e6ab6e4ed57182c",
+  "['/Users/victor/Documents/Research/congestion-utm-freespace/.venv/bin/python', '-VV']": "Python 3.14.2 (main, Dec  9 2025, 19:29:30) [Clang 21.1.4 ]"
+}

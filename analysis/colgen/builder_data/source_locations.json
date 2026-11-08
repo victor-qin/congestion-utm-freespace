@@ -1,0 +1,62 @@
+[
+  {
+    "variant": "base",
+    "file": ".agent/builder-base/freespace_sim/planner/colgen/network.py",
+    "function": "_static_hop_allowed_roles",
+    "line": 1322
+  },
+  {
+    "variant": "base",
+    "file": ".agent/builder-base/freespace_sim/planner/colgen/network.py",
+    "function": "_within_budget",
+    "line": 771
+  },
+  {
+    "variant": "base",
+    "file": ".agent/builder-base/freespace_sim/planner/colgen/gpu_bounds.py",
+    "function": "_build_geometry",
+    "line": 276
+  },
+  {
+    "variant": "base",
+    "file": ".agent/builder-base/freespace_sim/planner/colgen/gpu_endpoint.py",
+    "function": "__init__",
+    "line": 87
+  },
+  {
+    "variant": "all",
+    "file": "freespace_sim/planner/colgen/network.py",
+    "function": "_static_hop_allowed_roles",
+    "line": 1333
+  },
+  {
+    "variant": "all",
+    "file": "freespace_sim/planner/colgen/network.py",
+    "function": "_within_budget",
+    "line": 771
+  },
+  {
+    "variant": "all",
+    "file": "freespace_sim/planner/colgen/gpu_bounds.py",
+    "function": "_edge_geometry",
+    "line": 54
+  },
+  {
+    "variant": "all",
+    "file": "freespace_sim/planner/colgen/gpu_bounds.py",
+    "function": "_build_geometry",
+    "line": 321
+  },
+  {
+    "variant": "all",
+    "file": "freespace_sim/planner/colgen/gpu_endpoint.py",
+    "function": "_build_arrivals",
+    "line": 61
+  },
+  {
+    "variant": "all",
+    "file": "freespace_sim/planner/colgen/gpu_endpoint.py",
+    "function": "__init__",
+    "line": 149
+  }
+]

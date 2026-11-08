@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/Users/victor/Documents/Research/congestion-utm-freespace/.venv/bin/python",
+    "analysis/colgen/builder_solve.py",
+    "--direct",
+    "--capture",
+    "/Users/victor/Documents/Research/congestion-utm-freespace/.agent/runs/colgen-metal-20261105-220722/pricing_captures/round_0001.pkl",
+    "--out",
+    "analysis/colgen/builder_data/main-validation",
+    "--prepare-workers",
+    "12"
+  ],
+  "process_wall_s": 33.251650667749345,
+  "exit_code": 0
+}

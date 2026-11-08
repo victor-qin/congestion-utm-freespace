@@ -1478,6 +1478,75 @@ def fig_colgen_certificate_reuse() -> None:
     print("wrote", f"{OUT}/colgen_certificate_temporal.png")
 
 
+def fig_cpu_preparation_builders() -> None:
+    """Plot isolated preparation and matched direct-solver wall times from raw summaries.
+
+    Parameters
+    ------------
+    - None: reads analysis/colgen/builder_data/summary.json.
+
+    Return
+    --------
+    - output (None): writes two standalone scientific PNG figures.
+    """
+    import json
+    from pathlib import Path
+
+    summary = json.loads(Path("analysis/colgen/builder_data/summary.json").read_text())
+    groups = summary["preparation"]
+    variants = ("base", "corridor", "roles", "geometry", "endpoint", "all")
+    labels = ("PR145 base", "Corridor distances", "Lazy role tags", "FP64 geometry arrays",
+              "Endpoint memberships", "All four builders")
+    cold = [next(g for g in groups if g["variant"] == v and g["phase"] == "cold"
+                 and not g["control"]) for v in variants]
+    fig, (ax, warm) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [1.4, 1]},
+                                   constrained_layout=True)
+    values = np.array([g["mean_s"] for g in cold])
+    errors = np.array([[g["mean_s"]-g["min_s"] for g in cold],
+                       [g["max_s"]-g["mean_s"] for g in cold]])
+    bars = ax.barh(labels, values, color=[RAW, BLUE, BLUE, BLUE, BLUE, GREEN], xerr=errors,
+                   capsize=3)
+    ax.bar_label(bars, labels=[f"{x:.2f} s" for x in values], padding=6, fontsize=9)
+    ax.invert_yaxis()
+    ax.set(xlabel="Cold CPU preparation (seconds)", title="Each builder enabled alone",
+           xlim=(0, values.max()*1.19))
+    phases = ("warm", "changed", "changed_warm", "restored")
+    x = np.arange(len(phases))
+    for variant, shift, color in (("base", -.18, RAW), ("all", .18, GREEN)):
+        selected = [next(g for g in groups if g["variant"] == variant and g["phase"] == phase
+                         and not g["control"]) for phase in phases]
+        warm.bar(x+shift, [g["mean_s"] for g in selected], width=.36, color=color,
+                 label="PR145 base" if variant=="base" else "All builders")
+    warm.set(xticks=x, xticklabels=["Same\nprices", "Changed\nprices", "Changed\nwarm", "Restored\nprices"],
+             ylabel="CPU preparation (seconds)", title="Warm and changed-price calls")
+    warm.legend(fontsize=9)
+    fig.suptitle("Hard88 on PR145: exact preparation fingerprints preserved", fontsize=13)
+    fig.text(.05, -.045, "Means and observed ranges; separate cold trials, not additive savings. "
+             "Preparation only: excludes search, runtime, import and evidence hashing.", fontsize=9)
+    _save(fig, "cpu_builder_preparation")
+    if not summary["solves"]:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.8), constrained_layout=True)
+    x = np.arange(2)
+    for variant, shift, color in (("base", -.18, RAW), ("all", .18, GREEN)):
+        measurements = [[r["elapsed_s"] for r in summary["solves"]
+                         if r["name"].startswith(f"{variant}-solve-w{workers}-")]
+                        for workers in (0, 12)]
+        means = np.array([np.mean(v) for v in measurements])
+        errors = np.array([[np.mean(v)-min(v) for v in measurements],
+                           [max(v)-np.mean(v) for v in measurements]])
+        bars = ax.bar(x+shift, means, width=.36, color=color, yerr=errors, capsize=4,
+                      label="PR145 base" if variant=="base" else "All builders")
+        ax.bar_label(bars, fmt="%.2f s", padding=5)
+    ax.set(xticks=x, xticklabels=["Serial CPU preparation", "12 synchronous CPU workers"],
+           ylabel="Production solver wall time (seconds)",
+           title="Hard88: same GPU integer/approach mode, matched completion")
+    ax.legend()
+    fig.text(.07, -.04, "Actual Metal; batch 1; cap 250,000; Gurobi 1 thread. "
+             "Means/ranges, no per-flight audit JSON overhead.", fontsize=9)
+    _save(fig, "cpu_builder_solver")
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,

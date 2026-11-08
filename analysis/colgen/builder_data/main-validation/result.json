@@ -1,0 +1,11 @@
+{
+  "accepted": 88,
+  "cpu_full_pricing_guard": true,
+  "cpu_numeric_verifier_guard": true,
+  "denied": 0,
+  "device": "gpu",
+  "elapsed_s": 31.49439699947834,
+  "passed": true,
+  "timing_scope": "Production run, including iteration callback; no extra batch audits",
+  "verified": true
+}

@@ -50,6 +50,21 @@ def _endpoint_case(monkeypatch: pytest.MonkeyPatch, start: int) -> tuple:
         return nominal[step]
 
     monkeypatch.setattr(pricing, "_endpoint_claims", endpoints)
+    from freespace_sim.planner.colgen import gpu_endpoint
+
+    def membership(problem, destinations, first, last, offsets, check):
+        """Supply synthetic incidence to the weighted-bound tests via the builder boundary."""
+        packed = {}
+        for offset, step in enumerate(range(first, last + 1)):
+            check()
+            for row in gpu_endpoint._arrival_claims(problem, destinations, step, offsets):
+                packed.setdefault(row, []).append(offset)
+        result = {row: np.asarray(indices, np.intp) for row, indices in packed.items()}
+        for indices in result.values():
+            indices.flags.writeable = False
+        return result
+
+    monkeypatch.setattr(gpu_endpoint, "_build_arrivals", membership)
     view = pricing.DualView(prices, problem.cfg)
     view._offsets = (-1, 1)
     bounds = SimpleNamespace(
@@ -724,3 +739,39 @@ def test_preliminary_selection_prices_paid_endpoint_words_and_preserves_diversit
     assert len(selected) == len(set(selected)) == 6
     assert selected[0] == (4 if cache_bytes else 0)
     assert 6 in selected and 7 in selected
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("dt,start", [(2.0, -100), (0.3, 10), (0.3, 2**31 - 20)])
+@pytest.mark.parametrize("destination_count", [0, 1, 2])
+def test_compact_arrivals_equal_canonical_unions(
+    terminal: bool, dt: float, start: int, destination_count: int,
+) -> None:
+    """Compact identities preserve all rows, duplicate unions and absolute clock boundaries."""
+    from freespace_sim.planner.colgen.gpu_endpoint import _arrival_claims, _build_arrivals
+    from freespace_sim.planner.colgen.network import build_flight_graph
+    from freespace_sim.planner.colgen.pricing_platform import PricingProblem
+    from freespace_sim.types import Terminal
+    from tests.test_colgen_solver import _cfg, _params, _request
+
+    cfg = _cfg(dt_s=dt, nominal_speed_mps=120.0 / dt, hover_time_s=0.6, time_buffer_s=0.1)
+    params = _params()
+    request = _request(1, (0, 0), (2, 0), cfg)
+    catalog = ()
+    if terminal:
+        term = Terminal("arrival", 4, radius=120.0)
+        request = replace(request, dest_terminal=term)
+        catalog = ((request.dest, term),)
+    graph = build_flight_graph(request, cfg, catalog, params)
+    problem = PricingProblem(graph, cfg, params, {}, 0.0)
+    destinations = ((2, 0), (3, 0))[:destination_count]
+    for offsets in ((-2, 1), (0, 0), (2, 4)):
+        actual = _build_arrivals(problem, destinations, start, start + 7, offsets, lambda: None)
+        expected = {}
+        for offset in range(8):
+            for row in _arrival_claims(problem, destinations, start + offset, offsets):
+                expected.setdefault(row, []).append(offset)
+        assert actual.keys() == expected.keys()
+        for row, indices in actual.items():
+            assert not indices.flags.writeable
+            np.testing.assert_array_equal(indices, expected[row])

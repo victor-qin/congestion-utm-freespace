@@ -478,3 +478,26 @@ def test_incremental_positive_prices_match_every_generated_prefix_union(
         assert result.stats["bootstrap_gpu_dispatches"] > 0
     assert seen["checks"] > 0 and seen["overlap"] and seen["revisit"]
     assert len(departures) > 1
+
+
+@pytest.mark.parametrize("scale", [1e-100, 1.0, 1e90])
+@pytest.mark.parametrize("count", [0, 17, 65539])
+def test_batched_edge_geometry_matches_scalar_outward_operations(scale: float, count: int) -> None:
+    """Vector blocks retain scalar FP64 bounds and subdivision ceilings, including empty CSR rows."""
+    from freespace_sim.planner.colgen.dp_prepare import PreparedTopology
+    from freespace_sim.planner.colgen.gpu_bounds import _distance_interval, _edge_geometry
+
+    points = [(scale * x, scale * y) for x, y in ((-1.1, 3.4), (7.2, -0.3), (2.4, 0.0))]
+    targets = np.resize(np.array([0, 1], np.int32), count)
+    topology = PreparedTopology(arc_start=np.array([0, 0, 0, count], np.int32), arc_target=targets)
+    segment = scale * 0.3
+    actual = _edge_geometry(points, topology, segment)
+    if count == 0:
+        assert actual == (math.inf, 0.0, 1)
+    else:
+        intervals = [_distance_interval(points[2], points[i]) for i in (0, 1)]
+        subs = [math.ceil(math.sqrt((points[i][0]-points[2][0])**2
+                                   + (points[i][1]-points[2][1])**2) / segment) for i in (0, 1)]
+        assert actual == (min(x[0] for x in intervals), max(x[1] for x in intervals), max(subs))
+    if count:
+        assert _edge_geometry(points, topology, scale * 1e-20) is None

@@ -51,6 +51,51 @@ def _distance_interval(a: tuple[float, float], b: tuple[float, float]) -> tuple[
     return max(0.0, _down(math.sqrt(lower))), _up(math.sqrt(upper))
 
 
+def _edge_geometry(
+    points: list[tuple[float, float]], topology: PreparedTopology, segment_length: float,
+) -> tuple[float, float, int] | None:
+    """Reduce arc geometry in bounded FP64 blocks with the scalar rounding order.
+
+    Parameters
+    ------------
+    - points (list[tuple[float, float]]): unchanged represented hex centers.
+    - topology (PreparedTopology): complete ordered CSR arc domain.
+    - segment_length (float): canonical positive subdivision length.
+
+    Return
+    --------
+    - output (tuple[float, float, int] | None): minimum lower distance, maximum upper
+      distance and subdivision count; None retains the ground-only fallback.
+    """
+    coordinates = np.asarray(points, np.float64).reshape(-1, 2)
+    edge_min, edge_max, max_sub = math.inf, 0.0, 1
+    for start in range(0, len(topology.arc_target), 65536):
+        stop = min(start + 65536, len(topology.arc_target))
+        sources = np.searchsorted(topology.arc_start, np.arange(start, stop), side="right") - 1
+        difference = coordinates[topology.arc_target[start:stop]] - coordinates[sources]
+        lower = np.zeros(stop - start, np.float64)
+        upper = np.zeros(stop - start, np.float64)
+        for axis in range(2):
+            lo = np.nextafter(difference[:, axis], -np.inf)
+            hi = np.nextafter(difference[:, axis], np.inf)
+            magnitude_lo = np.where((lo <= 0.0) & (hi >= 0.0), 0.0,
+                                    np.minimum(np.abs(lo), np.abs(hi)))
+            magnitude_hi = np.maximum(np.abs(lo), np.abs(hi))
+            lower = np.maximum(0.0, np.nextafter(lower + np.maximum(
+                0.0, np.nextafter(magnitude_lo * magnitude_lo, -np.inf)), -np.inf))
+            upper = np.nextafter(upper + np.nextafter(magnitude_hi * magnitude_hi, np.inf), np.inf)
+        lows = np.maximum(0.0, np.nextafter(np.sqrt(lower), -np.inf))
+        highs = np.nextafter(np.sqrt(upper), np.inf)
+        dx, dy = difference[:, 0], difference[:, 1]
+        ratio = np.sqrt(dx * dx + dy * dy) / segment_length
+        if not np.all(np.isfinite(ratio)) or np.any(ratio > 2**30):
+            return None
+        edge_min = min(edge_min, float(lows.min()))
+        edge_max = max(edge_max, float(highs.max()))
+        max_sub = max(max_sub, int(np.ceil(ratio).max()))
+    return edge_min, edge_max, max_sub
+
+
 def completion_upper_bound(
     benefit: float,
     pi_f: float,
@@ -330,18 +375,10 @@ class CompletionBounds:
             or cfg.nominal_speed_mps <= 0
         ):
             return fallback
-        edge_min, edge_max, max_sub = math.inf, 0.0, 1
-        for source, point in enumerate(points):
-            for target in t.arc_target[int(t.arc_start[source]) : int(t.arc_start[source + 1])]:
-                other = points[int(target)]
-                lo, hi = _distance_interval(point, other)
-                edge_min, edge_max = min(edge_min, lo), max(edge_max, hi)
-                dx, dy = other[0] - point[0], other[1] - point[1]
-                length = math.sqrt(dx * dx + dy * dy)
-                subdivision_ratio = length / cfg.corridor_segment_len_m
-                if not math.isfinite(subdivision_ratio) or subdivision_ratio > 2**30:
-                    return fallback
-                max_sub = max(max_sub, math.ceil(subdivision_ratio))
+        edges = _edge_geometry(points, t, cfg.corridor_segment_len_m)
+        if edges is None:
+            return fallback
+        edge_min, edge_max, max_sub = edges
         if not math.isfinite(edge_min) or edge_min <= 0.0:
             return fallback
         n = max(1, int(t.air_hop_limit))

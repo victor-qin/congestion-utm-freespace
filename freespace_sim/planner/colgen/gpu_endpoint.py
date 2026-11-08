@@ -58,6 +58,68 @@ def _arrival_claims(
     return claims
 
 
+def _build_arrivals(
+    problem: PricingProblem, destinations: tuple[tuple[int, int], ...],
+    first: int, last: int, offsets: tuple[int, int], check: Callable[[], None],
+) -> dict[RowKey, np.ndarray]:
+    """Build complete unpriced memberships, sharing identical endpoint time incidence.
+
+    Parameters
+    ------------
+    - problem (PricingProblem): original graph and canonical clock/geometry.
+    - destinations (tuple[tuple[int, int], ...]): all legal final cells.
+    - first, last (int): inclusive absolute arrival domain.
+    - offsets (tuple[int, int]): inclusive canonical final-visit window.
+    - check (Callable[[], None]): interrupt before publishing an incomplete membership.
+
+    Return
+    --------
+    - output (dict[RowKey, np.ndarray]): exact row unions with readonly sorted arrival offsets.
+    """
+    graph, cfg = problem.graph, problem.cfg
+    point, terminal = graph.request.dest, graph.dest_terminal
+    dwell = pricing.column_dwell_s(point, terminal, cfg, graph.levels[0])
+    by_step: dict[int, list[int]] = defaultdict(list)
+    for offset, step in enumerate(range(first, last + 1)):
+        check()
+        t0 = step * cfg.dt_s
+        # Preserve canonical association; pre-adding hover+dwell can cross a clock boundary.
+        t1 = t0 + cfg.hover_time_s + dwell
+        steps = (pricing.terminal_claim_steps(t0, t1, cfg) if terminal is not None else
+                 pricing.endpoint_claim_steps(t0, t1, cfg, timing_steps=0))
+        for row_step in steps:
+            by_step[row_step].append(offset)
+    packed = {step: np.asarray(indices, np.intp) for step, indices in by_step.items()}
+    for indices in packed.values():
+        indices.flags.writeable = False
+    arrivals: dict[RowKey, np.ndarray] = {}
+    if terminal is not None:
+        arrivals = {RowKey.term(terminal.id, step): indices for step, indices in packed.items()}
+    else:
+        cells = pricing.endpoint_claim_cells(point, cfg.effective_hover_radius_m, cfg)
+        for q, r in cells:
+            for level in range(len(graph.levels)):
+                check()
+                arrivals.update((RowKey.cell(q, r, level, step), indices)
+                                for step, indices in packed.items())
+    if len(destinations) == 1:
+        q, r = destinations[0]
+        lo, hi = offsets
+        for step in range(first + lo, last + hi + 1):
+            check()
+            begin, end = max(first, step - hi), min(last, step - lo)
+            if begin > end:
+                continue
+            row = RowKey.cell(q, r, 0, step)
+            indices = np.arange(begin - first, end - first + 1, dtype=np.intp)
+            if row in arrivals:
+                indices = np.union1d(arrivals[row], indices)
+            indices.flags.writeable = False
+            arrivals[row] = indices
+    check()
+    return arrivals
+
+
 def _range_min(tree: np.ndarray, first: int, last: int) -> float:
     """Query an inclusive nonempty leaf interval without allocating an arrival slice."""
     first += len(tree) // 2
@@ -124,14 +186,7 @@ class EndpointBounds:
         if (membership is None or membership.cfg != p.cfg
                 or membership.first != self.first or membership.last != self.last
                 or membership.destinations != destinations or membership.visit_offsets != visit_offsets):
-            arrivals: dict[RowKey, list[int]] = defaultdict(list)
-            for offset in range(self.size):
-                self.check()
-                for row in _arrival_claims(p, destinations, self.first + offset, visit_offsets):
-                    arrivals[row].append(offset)
-            packed = {row: np.asarray(indices, np.intp) for row, indices in arrivals.items()}
-            for indices in packed.values():
-                indices.flags.writeable = False
+            packed = _build_arrivals(p, destinations, self.first, self.last, visit_offsets, self.check)
             membership = _Membership(p.cfg, self.first, self.last, destinations, visit_offsets, packed)
             self.check()
             with cache.lock:

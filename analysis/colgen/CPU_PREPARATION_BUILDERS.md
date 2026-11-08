@@ -2,7 +2,11 @@
 
 Implementation and measurements use PR145 `b605aba3b5d9a29ad70cfe5b4e6ab6e4ed57182c`
 on main `ebc60608`. This supersedes the earlier diagnosis-only approval gate.
-The historical fc30 diagnosis/evidence is preserved unchanged and is not a timing
+The PR is rebased on main `c62e8bbe` after PR145 merged. A fresh main-based validation passes all 264 focused tests and the full Metal
+solve with identical cost, bounds, rounds and dispatches (see `builder_data/main-validation`).
+The only production
+change from the measured b605 base is main's resident-storage cap increase from
+128 to 256 MiB; measured source hashes remain labeled b605. The historical fc30 diagnosis/evidence is preserved unchanged and is not a timing
 baseline for these changes. No integer-cache branch, GPU rewrite or overlap is included.
 
 ## Implemented stages
@@ -54,6 +58,12 @@ iteration telemetry. Per-flight audit JSON rewriting is excluded. Compare base
 and candidate only at identical worker settings and matched completion/results;
 CPU12 results from the handoff are a different algorithmic result and are not
 used as a speedup denominator.
+
+Raw records are bundled in `cpu_builder_evidence.zip`; from the repository root,
+extract them with `unzip analysis/colgen/cpu_builder_evidence.zip 'analysis/colgen/builder_data/*'`.
+The archive preserves the original measured sources/report; current PR notes
+and normalized CSV line endings are maintained separately outside that archive.
+Create `.agent/builder-base` before the source-archive command below.
 
 Every sustained job holds the shared `fcntl.flock`; launchers leave a two-second
 unlocked window between jobs. `builder_locked.py` records exact commands and
@@ -118,6 +128,11 @@ encoding candidate remains material after the cold builders. Raw detail is in
 `summarize_builders.py` and saved in `audit_summary.json`.
 
 ## Retention decision and review order
+
+**All four builders plus PR145 parallel preparation** take 31.346s versus
+59.600s for serial preparation without the builders: **47.4% less total solver
+wall time**. That combined comparison includes PR145's existing parallelization;
+the incremental builder benefit with 12 workers remains 8.7%.
 
 Retain the four small builders together: matched direct solver wall falls
 **21.6% with serial preparation** (59.600 to 46.700s), exceeding the prior 15%

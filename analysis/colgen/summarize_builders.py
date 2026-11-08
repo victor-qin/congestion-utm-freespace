@@ -35,7 +35,7 @@ def main() -> None:
                              phase=phase['label'], prepare_s=phase['prepare_s'],
                              rss_peak_mib=phase['rss_peak_bytes']/2**20))
     with (DATA / 'preparation.csv').open('w') as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     groups = []
@@ -78,7 +78,7 @@ def main() -> None:
                                    completed=run["stats"]["pricing_flights_completed"],
                                    dispatches=run["stats"]["gpu_dispatches"]))
         with (DATA / "solver.csv").open("w") as f:
-            writer = csv.DictWriter(f, fieldnames=list(solve_rows[0]))
+            writer = csv.DictWriter(f, fieldnames=list(solve_rows[0]), lineterminator="\n")
             writer.writeheader()
             writer.writerows(solve_rows)
     summary = dict(base='b605aba3b5d9a29ad70cfe5b4e6ab6e4ed57182c',

@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/Users/victor/Documents/Research/congestion-utm-freespace/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "tests/test_colgen_network.py",
+    "tests/test_colgen_dp_prepare.py",
+    "tests/test_colgen_gpu_bounds.py",
+    "tests/test_colgen_gpu_endpoint.py",
+    "tests/test_colgen_gpu_prepare_pool.py"
+  ],
+  "process_wall_s": 38.370869415812194,
+  "exit_code": 0
+}

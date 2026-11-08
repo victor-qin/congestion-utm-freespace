@@ -5,7 +5,8 @@ This implementation was prepared on PR146 at
 since landed; the cache PR targets main. Measurements use the original stacked
 source rather than the separate main-port experiment. Integer pruning remains
 opt-in. The checked arithmetic, legal search domain, explicit 1e-6 closure rule
-and original canonical completion validation are unchanged.
+and original canonical completion validation remain the default. A separately
+requested diagnostic route-validation switch is described below.
 
 The original measured branch incorporated main at
 `ebc60608e72de1afc5dcbd2e4b82094ab5464210` after all measurements finished.
@@ -24,6 +25,48 @@ combined stack. The root-reordering test now intercepts preparation in
 The rebased integer/runtime/preparation-pool/pricing-platform/GPU-solver suite
 passed **255 tests in 90.41 seconds**, including synchronous worker preparation
 with integer bounds and canonical certificate parity.
+
+## Completed-route validation option
+
+`ColGenParams(pricing_gpu_validate_routes=True)` is the default. GPU pricing
+validates completed routes before using them as incumbents, as before. To run
+an unchecked diagnostic, set `pricing_gpu_validate_routes=False`; the lower-level
+`PricingOptions` name is `validate_routes=False`. The paired benchmark CLI exposes
+`--pricing-gpu-validate-routes` and `--no-pricing-gpu-validate-routes`.
+
+The switch skips route feasibility checks during GPU completion scoring:
+endpoint/path agreement, adjacency, departure/detour budgets, graph membership,
+static-wall geometry and current forbidden rows. Route construction, reservation
+geometry/timing, complete deduplicated claims and original cost/reduced-cost
+arithmetic still run. Required types/indices and supported terminal configuration
+remain construction preconditions. Search constraints and integer bound arithmetic
+are unchanged. This is independent of `pricing_cpu_recompute`, which controls
+numeric pruning mode and must stay enabled for integer bounds.
+
+Unchecked completions do not populate either the certified-claim or certified-column
+cache. Every unchecked pricing result has `certified=False`, `upper_bound=None`
+and `status="approximate"` on exhaustion. Numeric cache keys include the validation
+option. A subsequent checked invocation must validate its own completions. Batch
+telemetry exposes `route_validation`, `canonical_validations`,
+`canonical_validation_skips` and `canonical_rejections`; solver configuration
+telemetry records `pricing_gpu_validate_routes`.
+
+Seed, solver-insertion and final schedule validation remain enabled. The solver
+revalidates unchecked returned routes before insertion and cannot use their pricing
+scores as a certified global bound. Consequently the unchecked full solve may stop
+for approximate stagnation or its iteration/time budget rather than the checked
+LP-gap criterion. Do not compare total solves as matched work without comparing
+iterations, labels and termination. The earlier isolated diagnostic timing below
+is historical evidence, not a measurement of this supported option.
+
+Functional coverage includes real bypasses of exclusion/hop/departure checks,
+exact valid-route cost/claim parity, no certificate-cache pollution, checked reuse
+of an actual Metal runtime, serial/parallel preparation, solver certificate and
+insertion semantics, CLI propagation, and legacy slot-capture field ordering.
+The initial five-file focused run passed 379 tests and exposed four missing
+solver-summary counter assertions; after adding the counters, all 168 affected
+options/solver/network tests passed. Ruff and diff checks passed. A fresh full
+repository suite and independent review are required for this expanded PR.
 
 ## Retained data and exact dependencies
 

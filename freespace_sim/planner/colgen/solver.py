@@ -72,6 +72,7 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
         "pricing_device": params.pricing_device,
         "pricing_gpu_backend": params.pricing_gpu_backend,
         "pricing_cpu_recompute": params.pricing_cpu_recompute,
+        "pricing_gpu_validate_routes": params.pricing_gpu_validate_routes,
         "pricing_gpu_prepare_workers": params.pricing_gpu_prepare_workers,
         "pricing_gpu_prepare_batch_size": params.pricing_gpu_prepare_batch_size,
         "pricing_gpu_prepare_max_bytes": params.pricing_gpu_prepare_max_bytes,
@@ -83,6 +84,9 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
         "gpu_dispatches": 0,
         "gpu_batches": 0,
         "gpu_cpu_recomputations": 0,
+        "gpu_canonical_validations": 0,
+        "gpu_canonical_validation_skips": 0,
+        "gpu_canonical_rejections": 0,
         "gpu_labels": 0,
         "approximate_pricing_sweeps": 0,
         "approximate_pricing_wall_s": 0.0,
@@ -1624,7 +1628,9 @@ class ColGenSolver:
                     attempt_s = time.perf_counter() - sweep_started
                     iteration_sweep_s += attempt_s
                     pricing_wall_s += attempt_s
-                    if params.pricing_device == "gpu" and not params.pricing_cpu_recompute:
+                    if params.pricing_device == "gpu" and (
+                        not params.pricing_cpu_recompute or not params.pricing_gpu_validate_routes
+                    ):
                         approximate_pricing_wall_s += attempt_s
                     elif requested_exact:
                         exact_pricing_wall_s += attempt_s
@@ -1837,6 +1843,7 @@ class ColGenSolver:
                         "pricing_device": params.pricing_device,
                         "pricing_gpu_backend": params.pricing_gpu_backend,
                         "pricing_cpu_recompute": params.pricing_cpu_recompute,
+                        "pricing_gpu_validate_routes": params.pricing_gpu_validate_routes,
                         "pricing_bound_certified": math.isfinite(last_upper_bound),
                         "pricing_search_complete": pricing_complete,
                         "pricing_failure_status": pricing_failure_status,
@@ -2075,6 +2082,9 @@ class ColGenSolver:
                     kernel_counters["gpu_batches"] += 1
                     for counter, key in (("gpu_dispatches", "gpu_dispatches"),
                                          ("gpu_cpu_recomputations", "cpu_recomputations"),
+                                         ("gpu_canonical_validations", "canonical_validations"),
+                                         ("gpu_canonical_validation_skips", "canonical_validation_skips"),
+                                         ("gpu_canonical_rejections", "canonical_rejections"),
                                          ("gpu_labels", "labels")):
                         kernel_counters[counter] += int(outcome.stats.get(key, 0))
                     if not outcome.search_complete:
@@ -2124,7 +2134,8 @@ class ColGenSolver:
             "time_limit", "iteration_limit", "ip_not_proven", "pricing_worker_lost",
             "pricing_bound_gap",
         } or (params.pricing_device == "gpu" and (
-            not params.pricing_cpu_recompute or pricing_failure_status is not None
+            not params.pricing_cpu_recompute or not params.pricing_gpu_validate_routes
+            or pricing_failure_status is not None
         )):
             search_exhausted_flights.update(set(denied) - graph_infeasible)
         search_exhausted = tuple(
@@ -2309,6 +2320,9 @@ class ColGenSolver:
             "gpu_dispatches": kernel_counters.get("gpu_dispatches", 0),
             "gpu_batches": kernel_counters.get("gpu_batches", 0),
             "gpu_cpu_recomputations": kernel_counters.get("gpu_cpu_recomputations", 0),
+            "gpu_canonical_validations": kernel_counters.get("gpu_canonical_validations", 0),
+            "gpu_canonical_validation_skips": kernel_counters.get("gpu_canonical_validation_skips", 0),
+            "gpu_canonical_rejections": kernel_counters.get("gpu_canonical_rejections", 0),
             "gpu_labels": kernel_counters.get("gpu_labels", 0),
             "pricing_timeout_flight_id": pricing_timeout_flight_id,
             # Total pricing wall across every sweep.  Pricing is where a solve spends

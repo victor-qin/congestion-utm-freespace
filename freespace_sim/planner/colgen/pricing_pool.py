@@ -989,6 +989,7 @@ def _gpu_options(params: ColGenParams) -> PricingOptions:
     return PricingOptions(
         device="gpu", gpu_backend=params.pricing_gpu_backend,
         cpu_recompute=params.pricing_cpu_recompute, max_labels=params.pricing_gpu_max_labels,
+        validate_routes=params.pricing_gpu_validate_routes,
         chunk_size=params.pricing_gpu_chunk_size,
         gpu_integer_bounds=params.pricing_gpu_integer_bounds,
         gpu_integer_audit=params.pricing_gpu_integer_audit,
@@ -1057,8 +1058,8 @@ def _sweep_gpu(
     columns: list[Column | None] = []
     records: list[dict[str, Any]] = []
     counters: Counter[str] = Counter()
-    status = "complete" if params.pricing_cpu_recompute else "approximate"
-    certified = params.pricing_cpu_recompute
+    certified = platform.options.certify_search
+    status = "complete" if certified else "approximate"
     timeout_id = None
     task_total_s = 0.0
     started = time.perf_counter()
@@ -1090,6 +1091,7 @@ def _sweep_gpu(
             # The runtime repeats its shared work counts in each result. Sum each batch once.
             for key in ("gpu_dispatches", "labels", "candidates", "cpu_recomputations",
                         "verified_prunes", "gpu_prune_proposals", "canonical_validations",
+                        "canonical_validation_skips", "canonical_rejections",
                         "grouped_labels"):
                 counter = key if key.startswith("gpu_") else f"gpu_{key}"
                 counters[counter] += int(results[0].stats.get(key, 0))
@@ -1126,6 +1128,7 @@ def _sweep_gpu(
                     "search_complete": result.search_complete,
                     "pricing_status": result.status,
                     "cpu_recompute": result.cpu_recompute,
+                    "route_validation": platform.options.validate_routes,
                     "upper_bound": result.upper_bound,
                     "device_name": result.stats.get("device_name"),
                     "gpu_batch_index": counters["gpu_batches"] - 1,

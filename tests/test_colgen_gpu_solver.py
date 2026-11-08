@@ -152,10 +152,13 @@ def test_gpu_residual_bound_is_separate_from_column_score(
 
 
 @pytest.mark.parametrize("backend", ["highs", "gurobi"])
-@pytest.mark.parametrize("cpu_recompute,integer_bounds", [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize("cpu_recompute,integer_bounds,validate_routes", [
+    (True, False, True), (False, False, True), (True, True, True), (True, True, False),
+])
 @pytest.mark.parametrize("prepare_workers", [0, 2])
 def test_full_solver_uses_metal_and_preserves_certificate_meaning(
-    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool, prepare_workers: int,
+    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool,
+    validate_routes: bool, prepare_workers: int,
 ) -> None:
     """Real GPU sweeps feed a feasible master/IP solve without giving FP32 a global proof.
 
@@ -165,6 +168,8 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     - backend (str): LP/IP implementation exercised with actual Metal pricing.
     - cpu_recompute (bool): selects certified or unchecked FP32 GPU search.
     - integer_bounds (bool): use checked GPU deletion bounds with CPU canonical completions.
+    - validate_routes (bool): validate completions during search or defer checks to insertion.
+    - prepare_workers (int): number of CPU preparation workers.
 
     Return
     --------
@@ -192,7 +197,8 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         ip_gap=0.0,
         lp_gap=0.0,
     )
-    expected = ColGenSolver().solve(requests, cfg, (), params) if cpu_recompute else None
+    expected = (ColGenSolver().solve(requests, cfg, (), params)
+                if cpu_recompute and validate_routes else None)
     monkeypatch.setattr(solver, "price_flight", _no_cpu_pricing)
     monkeypatch.setattr(pricing_pool, "price_flight", _no_cpu_pricing)
     observations = []
@@ -201,6 +207,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         pricing_device="gpu",
         pricing_gpu_backend="metal",
         pricing_cpu_recompute=cpu_recompute,
+        pricing_gpu_validate_routes=validate_routes,
         pricing_gpu_integer_bounds=integer_bounds,
         pricing_gpu_batch_size=2,
         pricing_gpu_prepare_workers=prepare_workers,
@@ -215,6 +222,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     assert stats["backend"] == backend
     assert stats["pricing_device"] == "gpu" and stats["pricing_gpu_backend"] == "metal"
     assert stats["pricing_cpu_recompute"] is cpu_recompute
+    assert stats["pricing_gpu_validate_routes"] is validate_routes
     assert stats["gpu_dispatches"] > 0 and stats["gpu_batches"] > 0
     assert stats["pricing_search_complete"]
     assert stats["n_pricing_workers"] == 0
@@ -223,7 +231,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg, gpu_params)
     assert observations
-    if cpu_recompute:
+    if cpu_recompute and validate_routes:
         assert stats["pricing_bound_certified"]
         assert stats["exact_pricing_sweeps"] > 0
         assert stats["objective"] == pytest.approx(expected.stats["objective"], abs=1e-7)
@@ -237,6 +245,10 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         assert not stats["ip_gap_met"]
         assert stats["termination_reason"] in {"approximate_no_new_columns", "iteration_limit"}
         assert all(not p["pricing_exact"] for p in observations)
+    if not validate_routes:
+        assert stats["gpu_canonical_validations"] == 0
+        assert stats["gpu_canonical_validation_skips"] > 0
+        assert stats["pricing_revalidated_columns"] > 0
 
 
 def test_gpu_exhaustion_preserves_earlier_bound_and_valid_columns(

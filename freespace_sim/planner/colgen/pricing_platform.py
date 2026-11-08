@@ -2,7 +2,7 @@
 
 The full solver preserves its CPU worker pool and reuses this platform for GPU
 sweeps and repair. Certificates cover the finite graph, hop and departure domain.
-Disabling CPU recomputation always disables the GPU optimality certificate.
+Disabling CPU recomputation or route validation disables the GPU optimality certificate.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ class PricingOptions:
     prepare_batch_size: int = 8
     prepare_max_bytes: int = 128 * 1024 * 1024
     prepare_cache_bytes: int = 128 * 1024 * 1024
+    validate_routes: bool = True
 
     def __post_init__(self) -> None:
         """Reject ambiguous device selection and invalid allocation limits."""
@@ -54,6 +55,10 @@ class PricingOptions:
             raise ValueError("Select gpu_backend='metal' or 'cuda' exactly when device='gpu'")
         if not isinstance(self.cpu_recompute, bool):
             raise TypeError("cpu_recompute must be boolean")
+        if not isinstance(self.validate_routes, bool):
+            raise TypeError("validate_routes must be boolean")
+        if not self.validate_routes and self.device != "gpu":
+            raise ValueError("Disabling route validation requires GPU pricing")
         if not isinstance(self.gpu_integer_bounds, bool) or not isinstance(self.gpu_integer_audit, bool):
             raise TypeError("integer bound/audit options must be boolean")
         if self.gpu_integer_bounds:
@@ -109,8 +114,9 @@ class PricingOptions:
 
     @property
     def certify_search(self) -> bool:
-        """Only original FP64 checks, including epsilon audits, authorize a certificate."""
-        return self.cpu_recompute and (self.gpu_prune_epsilon is None or self.gpu_prune_audit)
+        """Require route validation plus verified numeric bounds before certifying a search."""
+        return (self.validate_routes and self.cpu_recompute
+                and (self.gpu_prune_epsilon is None or self.gpu_prune_audit))
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,11 +140,12 @@ class PricingProblem:
 
 @dataclass(frozen=True, slots=True)
 class PricingResult:
-    """Validated incumbent, search status and an optional certified upper bound.
+    """Scored incumbent, search status and an optional certified upper bound.
 
     A certified upper bound can exceed the incumbent's reduced cost. It covers
     all omitted alternatives, including near-tie branches closed by the GPU
     search; only the upper bound can prove absence of an improving route.
+    Diagnostic unchecked routes have no certificate and require validation before use.
     """
 
     flight_id: int

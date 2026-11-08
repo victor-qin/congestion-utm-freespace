@@ -1441,6 +1441,12 @@ def test_max_detour_factor_rejects_graph_valid_column():
 
     with pytest.raises(ValueError, match="max_detour_factor"):
         column_claims(raw, fg, cfg)
+    unchecked = column_to_intent(raw, req, cfg, _validate=False)
+    assert unchecked.accepted and unchecked.volumes and unchecked.centerline
+    assert column_claims(raw, fg, cfg, _intent=unchecked, _validate=False)
+    assert not fg._search_cache.certified_claims
+    with pytest.raises(ValueError, match="max_detour_factor"):
+        column_claims(raw, fg, cfg)
     denied = column_to_intent(raw, req, cfg)
     assert not denied.accepted
     assert denied.denial_reason is DenialReason.BUDGET_EXCEEDED
@@ -1976,6 +1982,9 @@ def test_shifted_spatial_certificate_matches_cold_claims(
         column_claims(column, build_flight_graph(req, cfg, terms, params), cfg)
         for column in columns
     ]
+    before = dict(graph._search_cache.certified_claims)
+    assert [column_claims(column, graph, cfg, _validate=False) for column in columns] == expected
+    assert dict(graph._search_cache.certified_claims) == before
     if endpoints == "tt" and clock == 1e12:
         from freespace_sim.planner.colgen.solver import _shift_claims
 

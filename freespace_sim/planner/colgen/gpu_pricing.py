@@ -135,6 +135,7 @@ class _Batch:
             epsilon_audited=0,
             epsilon_rejected=0,
             canonical_validations=0,
+            canonical_validation_skips=0,
             canonical_rejections=0,
             max_frontier=0,
             grouped_labels=0,
@@ -808,7 +809,7 @@ class _Batch:
         return visits
 
     def complete(self, record: np.ndarray, path: tuple[tuple[int, int], ...]) -> None:
-        """Validate every destination lane before any continuation grouping can discard it.
+        """Construct and score every destination lane, with feasibility checks enabled by default.
 
         Parameters
         ------------
@@ -817,7 +818,8 @@ class _Batch:
 
         Return
         --------
-        - output (None): updates the incumbent only with canonical feasible trajectories.
+        - output (None): updates the incumbent with exactly scored trajectories. Diagnostic
+          unchecked completions never register a validated route or authorize a certificate.
         """
         root = int(record[1])
         i, variant = self.root_flights[root], self.root_variants[root]
@@ -828,7 +830,8 @@ class _Batch:
         )
         for dest_lane in self.destinations[i].get(path[-1], ()):
             self.check()
-            self.stats["canonical_validations"] += 1
+            self.stats["canonical_validations" if self.options.validate_routes
+                       else "canonical_validation_skips"] += 1
             candidate = pricing._Candidate(0.0, 0.0, label, dest_lane)
             result = pricing._canonical_candidate(
                 candidate,
@@ -839,6 +842,7 @@ class _Batch:
                 self.benefits[i],
                 p.forbidden_rows,
                 self.models[i],
+                **({} if self.options.validate_routes else {"validate": False}),
             )
             if result is None:
                 self.stats["canonical_rejections"] += 1
@@ -1164,10 +1168,11 @@ class _Batch:
         self.stats["approach_prepare_s"] = self.stats.get("approach_prepare_s", 0.0) + time.monotonic() - started
 
     def run(self) -> tuple[PricingResult, ...]:
-        """Return validated incumbents and certify only complete searches with verified bounds.
+        """Return scored incumbents and certify only validated complete searches with verified bounds.
 
         Numerical pruning uses CPU-verified proposals or checked GPU integer bounds.
         Canonical completion scoring remains CPU-validated in both certified modes.
+        Disabling route validation is diagnostic and always suppresses certification.
 
         Parameters
         ------------
@@ -1236,6 +1241,7 @@ class _Batch:
             "elapsed_s": time.monotonic() - self.started,
             "batch_size": len(self.problems),
             "counts_scope": "batch",
+            "route_validation": self.options.validate_routes,
             "dominance": "none" if self.options.cpu_recompute else "fp32",
             "bound_closure_tolerance": _BOUND_CLOSURE_TOL,
             "gpu_prune_epsilon": self.options.gpu_prune_epsilon,

@@ -119,7 +119,8 @@ class Column:
             raise ValueError("a column path must contain at least two cells")
 
 def _selected_lane(
-    cell: Cell, lane_idx: int | None, lanes: list[hg.Lane], endpoint: str
+    cell: Cell, lane_idx: int | None, lanes: list[hg.Lane], endpoint: str,
+    *, _validate: bool = True,
 ) -> hg.Lane:
     """Validate and return the terminal lane encoded by a column endpoint.
 
@@ -129,6 +130,7 @@ def _selected_lane(
     - lane_idx (int | None): index of the chosen lane; ``None`` is rejected.
     - lanes (list[hg.Lane]): the terminal's exit lanes to index into.
     - endpoint (str): endpoint label ("origin"/"dest") used in error messages.
+    - _validate (bool): check endpoint agreement; indexing remains checked for construction.
 
     Return
     --------
@@ -143,7 +145,7 @@ def _selected_lane(
             f"{endpoint}_lane_idx {lane_idx} is outside the available lane range [0, {len(lanes)})"
         )
     lane = lanes[lane_idx]
-    if cell != lane.cell:
+    if _validate and cell != lane.cell:
         raise ValueError(
             f"column {endpoint} cell {cell} does not match selected terminal lane {lane.cell}"
         )
@@ -154,6 +156,8 @@ def column_to_corners(
     col: Column,
     req: FlightRequest,
     cfg: SimConfig,
+    *,
+    _validate: bool = True,
 ) -> tuple[list[Vec], float, float, float, Terminal | None, Terminal | None]:
     """Convert a discrete column to hex-centre corners and A*-equivalent timing metadata.
 
@@ -167,6 +171,8 @@ def column_to_corners(
     - col (Column): the discrete route to expand; its cells, level, and departure step are read.
     - req (FlightRequest): the flight this column serves, checked to match ``col.flight_id``.
     - cfg (SimConfig): supplies the clock, flight levels, and lattice/terminal geometry.
+    - _validate (bool): enforce route feasibility; False is internal diagnostic construction.
+      Required types, indices and supported terminal configuration are still checked.
 
     Return
     --------
@@ -179,7 +185,7 @@ def column_to_corners(
     flight_id = _index_field(col.flight_id, "flight_id")
     departure_step = _index_field(col.departure_step, "departure_step")
     level = _index_field(col.level, "level")
-    if flight_id != req.flight_id:
+    if _validate and flight_id != req.flight_id:
         raise ValueError(f"column flight_id {col.flight_id} does not match request {req.flight_id}")
     if not 0 <= level < len(cfg.flight_levels_m):
         raise ValueError(
@@ -192,7 +198,7 @@ def column_to_corners(
 
     dt = cfg.dt_s
     base = int(math.ceil(req.t_departure / dt))
-    if departure_step < base:
+    if _validate and departure_step < base:
         raise ValueError(
             f"column departs at step {col.departure_step}, before request base step {base}"
         )
@@ -211,32 +217,32 @@ def column_to_corners(
     if origin_term is not None:
         origin_lanes = hg.terminal_lanes(req.origin, origin_term, cfg)
         lane_steps = _selected_lane(
-            col.cell_path[0], col.origin_lane_idx, origin_lanes, "origin"
+            col.cell_path[0], col.origin_lane_idx, origin_lanes, "origin", _validate=_validate
         ).steps
-    elif col.origin_lane_idx is not None:
+    elif _validate and col.origin_lane_idx is not None:
         raise ValueError("origin_lane_idx must be None for a non-terminal endpoint")
 
-    if dest_term is not None:
+    if _validate and dest_term is not None:
         dest_lanes = hg.terminal_lanes(req.dest, dest_term, cfg)
         _selected_lane(col.cell_path[-1], col.dest_lane_idx, dest_lanes, "dest")
-    elif col.dest_lane_idx is not None:
+    elif _validate and col.dest_lane_idx is not None:
         raise ValueError("dest_lane_idx must be None for a non-terminal endpoint")
 
     z = cfg.flight_levels_m[level]
     radius = hg.circumradius(cfg)
-    if origin_term is None:
+    if _validate and origin_term is None:
         expected = hg.enu_to_axial(float(req.origin[0]), float(req.origin[1]), radius)
         if col.cell_path[0] != expected:
             raise ValueError(
                 f"column origin cell {col.cell_path[0]} does not match customer cell {expected}"
             )
-    if dest_term is None:
+    if _validate and dest_term is None:
         expected = hg.enu_to_axial(float(req.dest[0]), float(req.dest[1]), radius)
         if col.cell_path[-1] != expected:
             raise ValueError(
                 f"column destination cell {col.cell_path[-1]} does not match customer cell {expected}"
             )
-    for first, second in zip(col.cell_path, col.cell_path[1:]):
+    for first, second in (zip(col.cell_path, col.cell_path[1:]) if _validate else ()):
         if hg.hex_distance(first, second) != 1:
             raise ValueError(
                 f"column paths must use adjacent lateral hex hops; found {first} -> {second}"
@@ -367,6 +373,8 @@ def column_to_intent(
     req: FlightRequest,
     cfg: SimConfig,
     solve_share_s: float = 0.0,
+    *,
+    _validate: bool = True,
 ) -> OperationalIntent:
     """Build the exact reservation and reported metrics represented by ``col``.
 
@@ -376,6 +384,8 @@ def column_to_intent(
     - req (FlightRequest): the flight this column serves.
     - cfg (SimConfig): supplies geometry, clock, and cost weights.
     - solve_share_s (float): this column's share of solve wall time, recorded on the intent.
+    - _validate (bool): enforce route and budget checks; False is internal diagnostic
+      construction, with identical geometry, timing and cost calculations.
 
     Return
     --------
@@ -390,14 +400,14 @@ def column_to_intent(
         corridor_t0,
         origin_term,
         dest_term,
-    ) = column_to_corners(col, req, cfg)
+    ) = column_to_corners(col, req, cfg, **({} if _validate else {"_validate": False}))
     level = _index_field(col.level, "level")
     departure_step = _index_field(col.departure_step, "departure_step")
     z = cfg.flight_levels_m[level]
 
     base = int(math.ceil(req.t_departure / cfg.dt_s))
     max_ground_steps = int(math.floor(cfg.max_ground_delay_s / cfg.dt_s + 1e-12))
-    if departure_step > base + max_ground_steps:
+    if _validate and departure_step > base + max_ground_steps:
         return OperationalIntent(
             request=req,
             status=IntentStatus.REJECTED,
@@ -436,7 +446,7 @@ def column_to_intent(
         dest_term,
         cfg,
     )
-    if reference > 1e-9 and flown / reference > cfg.max_detour_factor:
+    if _validate and reference > 1e-9 and flown / reference > cfg.max_detour_factor:
         return OperationalIntent(
             request=req,
             status=IntentStatus.REJECTED,

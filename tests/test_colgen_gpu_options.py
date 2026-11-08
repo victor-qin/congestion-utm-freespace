@@ -41,7 +41,7 @@ def test_benchmark_outbound_selection_preserves_demand(legacy: bool) -> None:
         assert outbound.turnaround_s == 19.0
 
 
-@pytest.mark.parametrize("before", ["gpu", "endpoint", "integer", "approach", "preparation"])
+@pytest.mark.parametrize("before", ["gpu", "endpoint", "integer", "approach", "preparation", "validation"])
 def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before: str) -> None:
     """Old positional slot states remain readable without shifting existing solver settings."""
     original = ColGenParams(
@@ -55,7 +55,8 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before:
     names = [field.name for field in fields(ColGenParams)]
     first_new = {"gpu": "pricing_device", "endpoint": "pricing_gpu_endpoint_bounds",
                  "preparation": "pricing_gpu_prepare_workers", "integer": "pricing_gpu_integer_bounds",
-                 "approach": "pricing_gpu_approach_bounds"}[before]
+                 "approach": "pricing_gpu_approach_bounds",
+                 "validation": "pricing_gpu_validate_routes"}[before]
     # Archived slot states are prefixes; later feature fields did not exist either.
     legacy_names = names[:names.index(first_new)]
     legacy = object.__new__(ColGenParams)
@@ -72,6 +73,7 @@ def test_legacy_capture_parameters_preserve_values_and_fill_gpu_defaults(before:
     assert restored.pricing_gpu_endpoint_bounds and restored.pricing_gpu_endpoint_max_rows == 64
     assert not restored.pricing_gpu_integer_bounds and not restored.pricing_gpu_integer_audit
     assert not restored.pricing_gpu_approach_bounds
+    assert restored.pricing_gpu_validate_routes
 
 
 def test_cpu_default_and_explicit_gpu_configuration() -> None:
@@ -104,6 +106,12 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         assert _gpu_options(ColGenParams(
             pricing_device="gpu", pricing_gpu_backend=backend, pricing_gpu_approach_bounds=True,
         )).gpu_approach_bounds
+        unchecked = _gpu_options(ColGenParams(
+            pricing_device="gpu", pricing_gpu_backend=backend, pricing_gpu_integer_bounds=True,
+            pricing_gpu_validate_routes=False,
+        ))
+        assert not unchecked.validate_routes and not unchecked.certify_search
+        assert unchecked.gpu_integer_bounds and not unchecked.verify_prunes
 
 
 @pytest.mark.parametrize(
@@ -116,6 +124,8 @@ def test_cpu_default_and_explicit_gpu_configuration() -> None:
         {"pricing_device": "gpu", "pricing_gpu_backend": "metal", "columns_per_flight": 2},
         {"pricing_device": "gpu", "pricing_gpu_backend": "metal", "cheap_pricing": True},
         {"pricing_cpu_recompute": 1},
+        {"pricing_gpu_validate_routes": 1},
+        {"pricing_gpu_validate_routes": False},
         {"pricing_gpu_batch_size": 0},
         {"pricing_gpu_batch_size": True},
         {"pricing_gpu_max_labels": 2**27},
@@ -240,6 +250,7 @@ def test_paired_benchmark_forwards_gpu_controls_and_preserves_kernel_source(
             "--pricing-gpu-backend",
             "metal",
             "--no-pricing-cpu-recompute",
+            "--no-pricing-gpu-validate-routes",
             "--pricing-gpu-batch-size",
             "3",
             "--pricing-gpu-max-labels",
@@ -267,6 +278,7 @@ def test_paired_benchmark_forwards_gpu_controls_and_preserves_kernel_source(
         pricing_device="gpu",
         pricing_gpu_backend="metal",
         pricing_cpu_recompute=False,
+        pricing_gpu_validate_routes=False,
         pricing_gpu_batch_size=3,
         pricing_gpu_max_labels=1000,
         pricing_gpu_chunk_size=128,

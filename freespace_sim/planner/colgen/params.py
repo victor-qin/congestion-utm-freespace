@@ -227,6 +227,8 @@ class ColGenParams:
     pricing_gpu_prepare_batch_size: int = 8
     pricing_gpu_prepare_max_bytes: int = 128 * 1024 * 1024
     pricing_gpu_prepare_cache_bytes: int = 128 * 1024 * 1024
+    # Diagnostic GPU mode: retain construction/scoring, but no pricing certificate.
+    pricing_gpu_validate_routes: bool = True
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -278,6 +280,10 @@ class ColGenParams:
             raise ValueError("GPU preparation workers require GPU pricing and a group >= GPU batch")
         if not isinstance(self.pricing_cpu_recompute, bool):
             raise TypeError("pricing_cpu_recompute must be a boolean")
+        if not isinstance(self.pricing_gpu_validate_routes, bool):
+            raise TypeError("pricing_gpu_validate_routes must be a boolean")
+        if not self.pricing_gpu_validate_routes and self.pricing_device != "gpu":
+            raise ValueError("Disabling route validation requires GPU pricing")
         if (not isinstance(self.pricing_gpu_integer_bounds, bool)
                 or not isinstance(self.pricing_gpu_integer_audit, bool)):
             raise TypeError("pricing_gpu_integer_bounds/audit must be boolean")

@@ -13,6 +13,8 @@ import numpy as np
 from .gpu_buffers import DeviceBuffer
 from .gpu_integer import IntegerInterval, IntegerScale
 from .gpu_integer_bounds import cost_operands, prepare_reference_operands
+from .gpu_prepare import packing_for
+from .gpu_prices import summary_for
 from .gpu_pricing import _Batch, _BOUND_CLOSURE_TOL, _Stopped
 
 _NUMERIC_BYTES = 64 * 1024 * 1024
@@ -20,7 +22,7 @@ _STATE_WORDS = 15
 
 
 class IntegerData:
-    """Own immutable numeric operands for exactly one prepared pricing batch.
+    """Borrow immutable operands while owning fresh numeric search state for one batch.
 
     Attributes
     ------------
@@ -51,6 +53,7 @@ class IntegerData:
             self.scales.append(IntegerScale.for_values(
                 (value for value in operands if math.isfinite(value)), max_terms=32,
             ))
+        self.price_key = self.cache_key()
         self.roots = np.zeros((len(batch.root_flights), 7, 5), np.uint32)
         self.root_empty = np.zeros(len(self.roots), bool)
         self.uppers = np.zeros((len(self.roots), 5), np.uint32)
@@ -67,6 +70,46 @@ class IntegerData:
         self.cost_size = 0
         self.built = False
         self.update_roots()
+
+    def cache_key(self) -> tuple:
+        """Describe exact ordered root layouts without retaining an invocation or graph.
+
+        Parameters
+        ------------
+        - self (IntegerData): prepared canonical domain and independently chosen scales.
+
+        Return
+        --------
+        - output (tuple): exact geometry, objective, domain, scale and owned-snapshot key.
+          Packed root IDs alone are insufficient after incumbent filtering or regrouping.
+        """
+        b = self.batch
+        geometry, prices = [], []
+        for i, (p, t, v, bounds, scale) in enumerate(zip(
+            b.problems, b.topologies, b.variants, b.bounds, self.scales, strict=True,
+        )):
+            b.check()
+            token = packing_for(p.graph, p.cfg, t).operand_token
+            roots = tuple(a.tobytes() for a in (
+                v.departure_step, v.lane_idx, v.cell, v.start_step, v.ground_delay_s,
+                bounds._length_offset, bounds.air_offset,
+            ))
+            geometry.append((token, roots, p.forbidden_rows, scale.exponent,
+                             t.min_step, t.max_step, t.air_hop_limit, t.revisit_depth,
+                             b.models[i].ground_weight, b.models[i].air_weight,
+                             getattr(p.params, "objective", None), p.cfg.nominal_speed_mps,
+                             bounds._edge_min, bounds._reference, bounds.air_per_hop))
+            prices.append((summary_for(b.views[i]).operand_token, float(p.pi_f).hex(),
+                           float(b.benefits[i]).hex(), bounds._cost_scale))
+        layout = tuple(zip(b.root_flights, b.root_variants, strict=True))
+        options = tuple(getattr(b.options, name) for name in b.options.__dataclass_fields__)
+        return tuple(geometry), layout, b.offsets, options, tuple(prices)
+
+    def endpoint_key(self) -> tuple:
+        """Keep selected membership and ordered mask entries distinct from future generations."""
+        return tuple(None if e is None else
+                     (e.first, e.last, e.leaves, e.rows, e.root_masks.tobytes(), tuple(e.entries))
+                     for e in self.batch.endpoints)
 
     def account(self, extra: int = 0) -> None:
         """Bound persistent numeric host/device storage separately from resident state arenas."""
@@ -85,6 +128,14 @@ class IntegerData:
         self.buffer_sizes[name] = size
         self.static_bytes += size - old
         return buffer
+
+    def bind(self, name: str, buffer: DeviceBuffer) -> None:
+        """Charge borrowed buffers to the live invocation just like fresh uploads."""
+        old = self.buffer_sizes.get(name, 0)
+        self.account(buffer.nbytes - old)
+        self.buffers[name] = buffer
+        self.buffer_sizes[name] = buffer.nbytes
+        self.static_bytes += buffer.nbytes - old
 
     def root_operands(self, root: int) -> np.ndarray:
         """Encode one root from exact original-price unions, geometry and optional bounds.
@@ -145,6 +196,42 @@ class IntegerData:
             for name in ("costs", "meta"):
                 self.static_bytes -= self.buffer_sizes.pop(name, 0)
                 self.buffers.pop(name, None)
+        # Future tables stay invocation-local. Their absence is an exact generation,
+        # never interchangeable with an unavailable or partially prepared future.
+        key = (("roots", self.price_key, self.endpoint_key(), tuple(b.approach_upper.items()))
+               if all(future is None for future in b.future) else None)
+        block = self.runtime.operands.get(key, self.root_arrays, self.runtime, b.check,
+                                          upload=(2, 3), encoded=(0, 3))
+        self.roots, self.root_empty = block.arrays[:2]
+        exponents, packed = block.buffers
+        (self.uppers,) = self.runtime.run("integer_roots", len(self.roots),
+                                        (exponents, packed, np.empty((len(self.roots), 5), np.uint32)),
+                                        (2,), write_only=(2,))
+        if self.built:
+            self.bind_roots()
+        b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+
+    def bind_roots(self) -> None:
+        """Borrow continuation constants only when a retained root actually needs expansion."""
+        self.account(self.roots.nbytes - self.buffer_sizes.get("roots", 0))
+        block = self.runtime.operands.get(("root_constants", self.price_key), lambda: (self.roots,),
+                                          self.runtime, self.batch.check, upload=(0,))
+        self.bind("roots", block.buffers[0])
+
+    def root_arrays(self) -> tuple[np.ndarray, ...]:
+        """Build a complete root generation before publishing any of its arrays.
+
+        Parameters
+        ------------
+        - self (IntegerData): current roots, endpoint mapping, future tables and approach uppers.
+
+        Return
+        --------
+        - output (tuple[np.ndarray, ...]): root constants, empty-domain flags, scales and inputs.
+        """
+        b = self.batch
+        self.roots = np.zeros((len(b.root_flights), 7, 5), np.uint32)
+        self.root_empty = np.zeros(len(self.roots), bool)
         inputs = []
         for root in range(len(self.roots)):
             b.check()
@@ -154,18 +241,14 @@ class IntegerData:
         for root, upper in b.approach_upper.items():
             packed[root, 11] = self.scales[b.root_flights[root]].encode(upper).packed()
         exponents = np.asarray([len(inputs), *(self.scales[i].exponent for i in b.root_flights)], np.int32)
-        (self.uppers,) = self.runtime.run("integer_roots", len(inputs),
-                                        (exponents, packed, np.empty((len(inputs), 5), np.uint32)), (2,))
-        if self.built:
-            self.upload("roots", self.roots)
-        b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+        return self.roots, self.root_empty, exponents, packed
 
     def build(self) -> None:
         """Pack exact positive row membership and original-FP64 root/hop cost tables lazily.
 
         Parameters
         ------------
-        - self (IntegerData): one immutable invocation; no table is shared across snapshots.
+        - self (IntegerData): fresh invocation borrowing only exact immutable snapshot operands.
 
         Return
         --------
@@ -179,7 +262,26 @@ class IntegerData:
         ], np.int32).reshape(-1, 4)
         self.account(self.metadata.nbytes)
         self.static_bytes += self.metadata.nbytes
-        self.upload("roots", self.roots)
+        self.bind_roots()
+        block = self.runtime.operands.get(("prices", self.price_key), self.price_arrays,
+                                          self.runtime, b.check, upload=(0, 1), encoded=(1,))
+        for name, buffer in zip(("prices", "price_values"), block.buffers, strict=True):
+            self.bind(name, buffer)
+        self.built = True
+        b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+
+    def price_arrays(self) -> tuple[np.ndarray, ...]:
+        """Encode exact positive row support for the current clocks, cells and scales.
+
+        Parameters
+        ------------
+        - self (IntegerData): current owned snapshot and complete local cell layout.
+
+        Return
+        --------
+        - output (tuple[np.ndarray, ...]): sorted exact row indices and original-price intervals.
+        """
+        b = self.batch
         rows: dict[int, list[tuple[int, float]]] = defaultdict(list)
         for i, view in enumerate(b.views):
             t, v = b.topologies[i], b.variants[i]
@@ -203,10 +305,10 @@ class IntegerData:
                 prices.append(self.scales[i].encode_array(np.asarray([price for _, price in values])))
         if len(times) >= 2**27:
             raise _Stopped("integer_buffer_limit")
-        self.upload("prices", np.asarray((len(b.cells), *ranges, *times), np.int32))
-        self.upload("price_values", np.concatenate(prices) if prices else np.empty((0, 5), np.uint32))
-        self.built = True
-        b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+        arrays = (np.asarray((len(b.cells), *ranges, *times), np.int32),
+                  np.concatenate(prices) if prices else np.empty((0, 5), np.uint32))
+        self.account(sum(a.nbytes for a in arrays))
+        return arrays
 
     def prepare_costs(self) -> None:
         """Append cost operands only for roots that survived the certified root comparison.
@@ -231,19 +333,54 @@ class IntegerData:
             raise _Stopped("integer_buffer_limit")
         # Include retained host rows and old/new device generations during replacement.
         self.account((extra + total) * 20 + self.metadata.nbytes)
+        arrays = []
+        metadata = self.metadata.copy()
+        size = self.cost_size
         for root in pending:
             b.check()
-            i, variant = b.root_flights[root], b.root_variants[root]
-            array = self.scales[i].encode_array(cost_operands(b.bounds[i], variant)).reshape(-1, 5)
-            self.metadata[root, 2] = self.cost_size
-            self.cost_size += len(array)
-            self.static_bytes += array.nbytes
-            self.cost_arrays.append(array)
-            self.cost_roots.add(root)
+            array = self.cost_array(root)
+            metadata[root, 2] = size
+            size += len(array)
+            arrays.append(array)
+        # Cache individual retained-root encodings, not every overlapping cumulative
+        # upload. The latter thrashes across a sequential cohort even under a byte cap.
+        self.cost_arrays.extend(arrays)
+        self.static_bytes += sum(array.nbytes for array in arrays)
+        self.metadata, self.cost_size = metadata, total
+        self.cost_roots.update(pending)
         self.upload("costs", np.concatenate(self.cost_arrays))
         self.upload("meta", self.metadata)
         b.stats["integer_cost_roots"] = len(self.cost_roots)
         b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+
+    def cost_array(self, root: int) -> np.ndarray:
+        """Reuse price-independent geometry operands only for an actually retained root.
+
+        Parameters
+        ------------
+        - root (int): current packed root, resolved to its canonical descriptor before lookup.
+
+        Return
+        --------
+        - output (np.ndarray): immutable original-FP64 cost encodings on the matching grid.
+        """
+        b = self.batch
+        i, variant = b.root_flights[root], b.root_variants[root]
+        bounds, scale, v, t = b.bounds[i], self.scales[i], b.variants[i], b.topologies[i]
+        operands = (v.ground_delay_s[variant], bounds._length_offset[variant],
+                    bounds.air_offset[variant], bounds._edge_min, bounds._reference,
+                    bounds.air_per_hop, b.problems[i].cfg.nominal_speed_mps, bounds.model.air_weight)
+        key = ("cost", packing_for(b.problems[i].graph, b.problems[i].cfg, t).operand_token,
+               int(v.departure_step[variant]), int(v.lane_idx[variant]),
+               int(v.cell[variant]), int(v.start_step[variant]), t.air_hop_limit,
+               scale.exponent, tuple(float(x).hex() for x in operands))
+
+        def build() -> tuple[np.ndarray, ...]:
+            """Preserve the original separate FP64 operations before outward encoding."""
+            return (scale.encode_array(cost_operands(bounds, variant)).reshape(-1, 5),)
+
+        return self.runtime.operands.get(key, build, self.runtime, b.check,
+                                         upload=(), encoded=(0,)).arrays[0]
 
     def cutoffs(self) -> DeviceBuffer:
         """Use downward cutoff integers and retain a conservative envelope of discarded maxima.

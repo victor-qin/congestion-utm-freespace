@@ -814,17 +814,33 @@ def test_gpu_label_limit_preserves_incomplete_status(
 @pytest.mark.parametrize("buffer,max_labels", [(4.0, 250_000), (192.0, 250_000), (4.0, 3_000_000)])
 @pytest.mark.parametrize("integer_bounds", [False, True])
 def test_closed_roots_do_not_reserve_a_resident_search_arena(
-    buffer: float, max_labels: int, integer_bounds: bool,
+    monkeypatch: pytest.MonkeyPatch, buffer: float, max_labels: int, integer_bounds: bool,
 ) -> None:
     """A zero-label certificate remains available even when unused capacity exceeds GPU memory limits."""
     problem = replace(_problem(buffer=buffer), duals={})
-    result, = _platform("metal", max_labels=max_labels, integer_bounds=integer_bounds).price_batch([problem])
+    platform = _platform("metal", max_labels=max_labels, integer_bounds=integer_bounds)
+    if integer_bounds:
+        from freespace_sim.planner.colgen.gpu_integer_search import IntegerData
+
+        def forbidden(self):
+            """Closed roots must never allocate unused continuation constants, even on a hit."""
+            pytest.fail("Closed root allocated continuation storage")
+
+        monkeypatch.setattr(IntegerData, "bind_roots", forbidden)
+    owned = replace(problem, duals=pricing.DualView({}, problem.cfg))
+    result, = platform.price_batch([owned])
     assert result.search_complete and result.certified
     assert result.stats["full_search_labels"] == 0 and result.stats["root_prunes"] > 0
     assert result.stats.get("resident_bytes", 0) == 0
     assert result.upper_bound >= result.reduced_cost
     assert result.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
     _assert_canonical(problem, result)
+    if integer_bounds:
+        warm, = platform.price_batch([owned])
+        assert warm.certified and warm.stats["integer_cache_hits"] > 0
+        assert (warm.reduced_cost, warm.upper_bound, warm.column) == (
+            result.reduced_cost, result.upper_bound, result.column,
+        )
 
 
 def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) -> None:
@@ -1116,3 +1132,109 @@ def test_resident_record_copies_preserve_extension_words():
     np.testing.assert_array_equal(runtime.read(counts), [0, 0, 0, 1, 0, 2, 1])
     np.testing.assert_array_equal(runtime.read_rows(event_records, 0, 1), candidates[1:])
     assert runtime.read_rows(event_upper, 0, 1)[0] == 6.0
+
+
+@pytest.mark.parametrize("violation", ["forbidden_row", "graph_hop", "departure_budget"])
+def test_unchecked_route_scoring_preserves_costs_without_publishing_certificates(violation: str) -> None:
+    """Unchecked scoring bypasses real feasibility gates without poisoning later validation.
+
+    Parameters
+    ------------
+    - violation (str): an exclusion, graph hop restriction or departure budget violation.
+
+    Return
+    --------
+    - output (None): checks exact valid scoring, actual bypass and subsequent checked rejection.
+    """
+    problem = _problem(signed=True)
+    graph, cfg = problem.graph, problem.cfg
+    model = cost_model(cfg, problem.params)
+    seed = pricing._shortest_seed(graph, cfg, model=model)
+    candidate = pricing._Candidate(0.0, 0.0, pricing._Label(
+        0.0, seed.departure_step, seed.origin_lane_idx, seed.cell_path, frozenset(),
+    ), seed.dest_lane_idx)
+    view = pricing.DualView(problem.duals, cfg)
+    args = (candidate, graph, view, problem.pi_f, cfg, pricing._benefit(problem.params),
+            frozenset(), model)
+    checked = pricing._canonical_candidate(*args)
+    assert checked is not None
+    original_claims = dict(graph._search_cache.certified_claims)
+    original_columns = dict(graph._search_cache.certified_columns)
+    unchecked = pricing._canonical_candidate(*args, validate=False)
+    assert unchecked == checked
+    assert not pricing.is_certified_column(unchecked[1], graph, model)
+    assert dict(graph._search_cache.certified_claims) == original_claims
+    assert dict(graph._search_cache.certified_columns) == original_columns
+
+    forbidden = frozenset()
+    if violation == "forbidden_row":
+        forbidden = frozenset([next(iter(checked[1].claims))])
+    elif violation == "graph_hop":
+        graph = replace(graph, forbidden_hops=frozenset([tuple(seed.cell_path[:2])]))
+    else:
+        candidate = replace(candidate, label=replace(
+            candidate.label, departure_step=graph.latest_departure_step + 1,
+        ))
+    graph._search_cache.certified_claims.clear()
+    graph._search_cache.certified_columns.clear()
+    args = (candidate, graph, view, problem.pi_f, cfg, pricing._benefit(problem.params),
+            forbidden, model)
+    assert pricing._canonical_candidate(*args) is None
+    graph._search_cache.certified_claims.clear()
+    unchecked = pricing._canonical_candidate(*args, validate=False)
+    assert unchecked is not None
+    assert unchecked[1].claims
+    assert not pricing.is_certified_column(unchecked[1], graph, model)
+    assert not graph._search_cache.certified_claims
+    assert not graph._search_cache.certified_columns
+    assert pricing._canonical_candidate(*args) is None
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_route_validation_toggle_preserves_gpu_scoring_and_checked_reuse(
+    monkeypatch: pytest.MonkeyPatch, workers: int,
+) -> None:
+    """Actual Metal search can skip completion gates but never return an unchecked certificate.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): observes the candidate validation mode.
+    - workers (int): serial or parallel CPU preparation before GPU search.
+
+    Return
+    --------
+    - output (None): exact route/score parity, observable bypass and checked runtime reuse.
+    """
+    platform = _platform("metal", integer_bounds=True)
+    platform.options = replace(platform.options, prepare_workers=workers, validate_routes=False)
+    problem = _problem(signed=True)
+    problem = replace(problem, duals=pricing.DualView(problem.duals, problem.cfg))
+    observed = []
+    canonical = pricing._canonical_candidate
+
+    def record(*args, **kwargs):
+        """Observe the actual feasibility switch without substituting route scoring."""
+        observed.append(kwargs.get("validate", True))
+        return canonical(*args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_canonical_candidate", record)
+    try:
+        unchecked, = platform.price_batch([problem])
+        assert False in observed
+        assert unchecked.search_complete and not unchecked.certified
+        assert unchecked.upper_bound is None and unchecked.status == "approximate"
+        assert not unchecked.stats["route_validation"]
+        assert unchecked.stats["canonical_validations"] == 0
+        assert unchecked.stats["canonical_validation_skips"] == observed.count(False)
+        assert unchecked.stats["cpu_recomputations"] == 0
+        observed.clear()
+        platform.options = replace(platform.options, validate_routes=True)
+        checked, = platform.price_batch([problem])
+        assert observed and all(observed)
+        assert checked.certified and checked.search_complete
+        assert checked.column == unchecked.column and checked.reduced_cost == unchecked.reduced_cost
+        assert checked.stats["canonical_validation_skips"] == 0
+        assert checked.stats["route_validation"]
+        _assert_canonical(problem, checked)
+    finally:
+        platform.close()

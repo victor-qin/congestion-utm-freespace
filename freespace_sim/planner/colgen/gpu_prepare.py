@@ -18,7 +18,17 @@ _MAX_STARTS = 4096
 
 
 class FlightPacking:
-    """One graph's immutable local GPU layout and bounded exact unpriced root data."""
+    """One graph's immutable local GPU layout and bounded exact unpriced root data.
+
+    Attributes
+    ------------
+    - topology (PreparedTopology): immutable graph domain and legal clocks/hops.
+    - cfg (SimConfig): geometry and occupancy configuration owning this packing.
+    - operand_token (object): identity retained without keeping the graph alive.
+    - graph (np.ndarray): immutable local adjacency and structural search fields.
+    - claims (dict): bounded complete unpriced origin/root memberships.
+    - starts (OrderedDict): bounded legal start descriptions, before incumbent filtering.
+    """
 
     def __init__(self, graph: FlightGraph, cfg: SimConfig, topology: PreparedTopology) -> None:
         """Build only fixed geometry; prices, objectives and exclusions remain call-local.
@@ -34,6 +44,9 @@ class FlightPacking:
         - output (None): initializes local adjacency and bounded membership caches.
         """
         self.topology, self.cfg = topology, cfg
+        # A small ownership token lets operand keys outlive this packing without
+        # retaining its graph or risking reuse of a recycled Python object ID.
+        self.operand_token = object()
         self.cells = tuple(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
         self.origin_data = _prepare_origin_data(graph, cfg, topology)
         self.graph = np.full((topology.n_cells, 14), -1, np.int32)

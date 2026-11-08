@@ -1483,6 +1483,8 @@ def _canonical_candidate(
     benefit: float,
     forbidden_rows: AbstractSet[RowKey],
     model: CostModel = DELAY_MODEL,
+    *,
+    validate: bool = True,
 ) -> tuple[float, Column] | None:
     """Certify one search candidate's route and return its exact reduced cost, or ``None``.
 
@@ -1497,6 +1499,8 @@ def _canonical_candidate(
     - benefit (float): the per-flight benefit ``M``.
     - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
     - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
+    - validate (bool): check feasibility and register the result as certified. False is
+      diagnostic scoring only; it never publishes a route or claims certificate.
 
     Return
     --------
@@ -1513,14 +1517,16 @@ def _canonical_candidate(
         cell_path=label.path,
         delay_s=candidate.delay_s,
     )
-    intent = column_to_intent(provisional, fg.request, cfg)
+    intent = column_to_intent(provisional, fg.request, cfg,
+                              **({} if validate else {"_validate": False}))
     if intent.status is not IntentStatus.ACCEPTED:
         return None
     try:
-        claims = column_claims(provisional, fg, cfg, _intent=intent)
+        claims = column_claims(provisional, fg, cfg, _intent=intent,
+                               **({} if validate else {"_validate": False}))
     except (ValueError, NotImplementedError):
         return None
-    if not claims.isdisjoint(forbidden_rows):
+    if validate and not claims.isdisjoint(forbidden_rows):
         return None
 
     exact_delay = model.intent_cost(intent, cfg)
@@ -1537,6 +1543,8 @@ def _canonical_candidate(
     reduced_cost = model.reduced_cost(
         benefit=benefit, cost=exact_delay, dual_cost=duals.claim_cost(claims), pi_f=pi_f
     )
+    if not validate:
+        return reduced_cost, column
     return reduced_cost, _remember_certified_column(
         column, fg, model, intent.air_detour_m / cfg.nominal_speed_mps)
 

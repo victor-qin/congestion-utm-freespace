@@ -158,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--integer-bounds", action="store_true")
     parser.add_argument("--audit-integer", action="store_true")
     parser.add_argument("--approach-bounds", action="store_true")
+    parser.add_argument("--disable-integer-cache", action="store_true",
+                        help="Measure the same numeric code without retaining immutable operands")
     args = parser.parse_args(argv)
     if len(args.capture) not in (1, 2) or args.batch_size < 1 or args.budget <= 0:
         parser.error("Choose one or two captures and positive batch size/budget")
@@ -196,15 +198,23 @@ def main(argv: list[str] | None = None) -> int:
     ))
     started = time.perf_counter()
     platform._runtime = runtime = ComputeRuntime("metal", integer_bounds=args.integer_bounds)
+    if args.disable_integer_cache:
+        runtime.operands.max_entries = 0
     init_s = time.perf_counter() - started
     report = dict(batch_size=args.batch_size, max_labels=args.max_labels, chunk_size=args.chunk_size,
+                  budget_s=args.budget,
                   gpu_prune_epsilon=args.epsilon, gpu_prune_audit=args.audit_epsilon,
                   gpu_prune_verify_border=args.verify_border,
                   gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
                   gpu_approach_bounds=args.approach_bounds,
+                  integer_cache_enabled=not args.disable_integer_cache,
+                  integer_cache_limits=dict(host_bytes=runtime.operands.max_host_bytes,
+                                            device_bytes=runtime.operands.max_device_bytes,
+                                            entries=runtime.operands.max_entries),
                   cpu_numeric_verifier_guard=args.integer_bounds and not args.audit_integer,
                   graph_s=graph_s, snapshot_index_s=snapshot_index_s, init_s=init_s,
                   source=str(Path(pricing.__file__).resolve()),
+                  replay_script_sha256=sha256_bytes(Path(__file__).read_bytes()),
                   source_sha256={p.name: sha256_bytes(p.read_bytes())
                                  for p in Path(pricing.__file__).parent.iterdir()
                                  if p.suffix in (".py", ".h")},
@@ -244,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
                         for key, value in getattr(runtime, "counters", {}).items()}
             report["runs"].append(dict(label=label, elapsed_s=elapsed, measured=dict(measured),
                                        counters=counters, results=records,
+                                       operand_cache={kind: {
+                                           "entries": sum(k[0] == kind for k in runtime.operands.stores),
+                                           "host_bytes": sum(v.host_bytes for k, v in runtime.operands.stores.items()
+                                                             if k[0] == kind),
+                                           "device_bytes": sum(v.device_bytes for k, v in runtime.operands.stores.items()
+                                                               if k[0] == kind),
+                                       } for kind in ("roots", "root_constants", "prices", "cost")},
                                        process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                                        * (1 if sys.platform == "darwin" else 1024)))
             nonfinite = []

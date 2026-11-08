@@ -16,7 +16,14 @@ if TYPE_CHECKING:
 
 
 class PriceSummary:
-    """Original-price validation and outward sums shared by one immutable snapshot."""
+    """Original-price validation and outward sums shared by one immutable snapshot.
+
+    Attributes
+    ------------
+    - negative (float): downward credit including every negative snapshot row.
+    - absolute (float): upward absolute-price sum for canonical arithmetic allowances.
+    - operand_token (object): snapshot ownership without retaining its large price mapping.
+    """
 
     def __init__(self, view: DualView, check: Callable[[], None]) -> None:
         """Retain the exact iteration order and FP64 rounding of the per-flight bounds.
@@ -43,6 +50,7 @@ class PriceSummary:
         check()
 
         self.negative, self.absolute = negative, absolute
+        self.operand_token = object()
 
 
 def summary_for(view: DualView, check: Callable[[], None] = lambda: None) -> PriceSummary:

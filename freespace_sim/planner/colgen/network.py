@@ -1960,6 +1960,61 @@ def shifted_claims_are_exact(column: Column, fg: FlightGraph, cfg: SimConfig, de
         (w.start - column.departure_step, w.stop - column.departure_step) for w in old_windows)
 
 
+def _collect_column_claims(
+    column: Column,
+    fg: FlightGraph,
+    cfg: SimConfig,
+    offsets: tuple[int, int],
+    corridor_start_step: int,
+    windows: tuple[range, ...],
+) -> frozenset[RowKey]:
+    """Construct the complete signed-price-independent claim union without certifying it.
+
+    Parameters
+    ------------
+    - column (Column): route whose cell visits and endpoint dwell rows are collected.
+    - fg (FlightGraph): endpoint geometry and terminals.
+    - cfg (SimConfig): resource windows and flight levels.
+    - offsets (tuple[int, int]): exact derived cell window offsets.
+    - corridor_start_step (int): first enroute visit on the original lattice clock.
+    - windows (tuple[range, ...]): exact origin and destination occupancy windows.
+
+    Return
+    --------
+    - output (frozenset[RowKey]): deduplicated union; no validation cache is read or written.
+    """
+    claims: set[RowKey] = set()
+    for visit_step, (q, r) in enumerate(column.cell_path, start=corridor_start_step):
+        claims.update(
+            RowKey.cell(q, r, column.level, row_step)
+            for row_step in visit_rows(visit_step, offsets)
+        )
+
+    endpoints = (
+        (fg.request.origin, fg.origin_terminal),
+        (fg.request.dest, fg.dest_terminal),
+    )
+    for (point, terminal), endpoint_steps in zip(endpoints, windows, strict=True):
+        if terminal is not None:
+            claims.update(
+                RowKey.term(terminal.id, row_step)
+                for row_step in endpoint_steps
+            )
+            continue
+
+        # Customer cylinders are untagged ledger geometry.  They span the regulated tube, hence
+        # claim every flight level in every nearby cell and time row that could meet a transit.
+        endpoint_cells = endpoint_claim_cells(point, cfg.effective_hover_radius_m, cfg)
+        claims.update(
+            RowKey.cell(q, r, level, row_step)
+            for q, r in endpoint_cells
+            for level in range(len(fg.levels))
+            for row_step in endpoint_steps
+        )
+
+    return frozenset(claims)
+
+
 def column_claims(
     column: Column,
     fg: FlightGraph,
@@ -1967,6 +2022,7 @@ def column_claims(
     W: int | tuple[int, int] | None = None,
     *,
     _intent=None,
+    _validate: bool = True,
 ) -> frozenset[RowKey]:
     """Return the de-duplicated capacity rows claimed by ``column``.
 
@@ -1986,12 +2042,20 @@ def column_claims(
     - W (int | tuple[int, int] | None): optional cell-window width or ``(lo, hi)`` offsets, checked
       against :func:`derive_cell_window`; ``None`` skips the check.
     - _intent: optional pre-built intent to reuse instead of re-translating the column.
+    - _validate (bool): check route feasibility and use certified-claim caching. False
+      constructs diagnostic claims only and neither reads nor writes that cache.
 
     Return
     --------
     - output (frozenset[RowKey]): the capacity rows the column claims; raises ``ValueError`` if the
       column is invalid, out of budget, or overlaps permanent static terminal airspace.
     """
+    if not _validate:
+        lane_steps = (0 if fg.origin_terminal is None else
+                      fg.origin_lanes[column.origin_lane_idx].steps)
+        start = column.departure_step + fg.takeoff_steps[column.level] + lane_steps
+        windows = _column_endpoint_steps(column, fg, cfg, start + len(column.cell_path) - 1)
+        return _collect_column_claims(column, fg, cfg, derive_cell_window(cfg), start, windows)
     if cfg != fg._cfg:
         raise ValueError("column claims require the SimConfig used to build the flight graph")
     if column.flight_id != fg.request.flight_id:
@@ -2135,37 +2199,8 @@ def column_claims(
                         f"terminal {wall.terminal_id!r}"
                     )
 
-    claims: set[RowKey] = set()
-    for visit_step, (q, r) in enumerate(path, start=corridor_start_step):
-        claims.update(
-            RowKey.cell(q, r, column.level, row_step)
-            for row_step in visit_rows(visit_step, offsets)
-        )
-
     windows = _column_endpoint_steps(column, fg, cfg, arrival_step)
-    endpoints = (
-        (fg.request.origin, fg.origin_terminal),
-        (fg.request.dest, fg.dest_terminal),
-    )
-    for (point, terminal), endpoint_steps in zip(endpoints, windows, strict=True):
-        if terminal is not None:
-            claims.update(
-                RowKey.term(terminal.id, row_step)
-                for row_step in endpoint_steps
-            )
-            continue
-
-        # Customer cylinders are untagged ledger geometry.  They span the regulated tube, hence
-        # claim every flight level in every nearby cell and time row that could meet a transit.
-        endpoint_cells = endpoint_claim_cells(point, cfg.effective_hover_radius_m, cfg)
-        claims.update(
-            RowKey.cell(q, r, level, row_step)
-            for q, r in endpoint_cells
-            for level in range(len(fg.levels))
-            for row_step in endpoint_steps
-        )
-
-    result = frozenset(claims)
+    result = _collect_column_claims(column, fg, cfg, offsets, corridor_start_step, windows)
     with fg._search_cache.lock:
         fg._search_cache.certified_claims[certificate_key] = (
             column.departure_step, result,

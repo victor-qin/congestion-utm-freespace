@@ -152,10 +152,13 @@ def test_gpu_residual_bound_is_separate_from_column_score(
 
 
 @pytest.mark.parametrize("backend", ["highs", "gurobi"])
-@pytest.mark.parametrize("cpu_recompute,integer_bounds", [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize("cpu_recompute,integer_bounds,validate_routes", [
+    (True, False, True), (False, False, True), (True, True, True), (True, True, False),
+])
 @pytest.mark.parametrize("prepare_workers", [0, 2])
 def test_full_solver_uses_metal_and_preserves_certificate_meaning(
-    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool, prepare_workers: int,
+    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool,
+    validate_routes: bool, prepare_workers: int,
 ) -> None:
     """Real GPU sweeps feed a feasible master/IP solve without giving FP32 a global proof.
 
@@ -165,6 +168,8 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     - backend (str): LP/IP implementation exercised with actual Metal pricing.
     - cpu_recompute (bool): selects certified or unchecked FP32 GPU search.
     - integer_bounds (bool): use checked GPU deletion bounds with CPU canonical completions.
+    - validate_routes (bool): validate completions during search or defer checks to insertion.
+    - prepare_workers (int): number of CPU preparation workers.
 
     Return
     --------
@@ -192,7 +197,8 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         ip_gap=0.0,
         lp_gap=0.0,
     )
-    expected = ColGenSolver().solve(requests, cfg, (), params) if cpu_recompute else None
+    expected = (ColGenSolver().solve(requests, cfg, (), params)
+                if cpu_recompute and validate_routes else None)
     monkeypatch.setattr(solver, "price_flight", _no_cpu_pricing)
     monkeypatch.setattr(pricing_pool, "price_flight", _no_cpu_pricing)
     observations = []
@@ -201,6 +207,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         pricing_device="gpu",
         pricing_gpu_backend="metal",
         pricing_cpu_recompute=cpu_recompute,
+        pricing_gpu_validate_routes=validate_routes,
         pricing_gpu_integer_bounds=integer_bounds,
         pricing_gpu_batch_size=2,
         pricing_gpu_prepare_workers=prepare_workers,
@@ -215,6 +222,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     assert stats["backend"] == backend
     assert stats["pricing_device"] == "gpu" and stats["pricing_gpu_backend"] == "metal"
     assert stats["pricing_cpu_recompute"] is cpu_recompute
+    assert stats["pricing_gpu_validate_routes"] is validate_routes
     assert stats["gpu_dispatches"] > 0 and stats["gpu_batches"] > 0
     assert stats["pricing_search_complete"]
     assert stats["n_pricing_workers"] == 0
@@ -223,7 +231,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg, gpu_params)
     assert observations
-    if cpu_recompute:
+    if cpu_recompute and validate_routes:
         assert stats["pricing_bound_certified"]
         assert stats["exact_pricing_sweeps"] > 0
         assert stats["objective"] == pytest.approx(expected.stats["objective"], abs=1e-7)
@@ -237,6 +245,10 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         assert not stats["ip_gap_met"]
         assert stats["termination_reason"] in {"approximate_no_new_columns", "iteration_limit"}
         assert all(not p["pricing_exact"] for p in observations)
+    if not validate_routes:
+        assert stats["gpu_canonical_validations"] == 0
+        assert stats["gpu_canonical_validation_skips"] > 0
+        assert stats["pricing_revalidated_columns"] > 0
 
 
 def test_gpu_exhaustion_preserves_earlier_bound_and_valid_columns(
@@ -378,3 +390,95 @@ def test_gpu_repair_can_select_a_feasible_negative_reduced_cost_route(
         assert result.stats["termination_reason"] == "time_limit"
         assert result.stats["pricing_failure_status"] == "deadline"
     _assert_files_cleanly([request], result.columns, cfg, params)
+
+
+@pytest.mark.parametrize("stage", ["insertion", "repair", "capacity", "repair_deadline"])
+@pytest.mark.parametrize("validate_routes", [False, True])
+def test_invalid_unchecked_candidates_preserve_feasible_incumbents(
+    monkeypatch: pytest.MonkeyPatch, stage: str, validate_routes: bool,
+) -> None:
+    """Reject bad unchecked candidates at insertion/repair without losing feasible routes.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): supplies genuinely infeasible scored GPU candidates.
+    - stage (str): main insertion, repair geometry, saturated repair, or repair deadline.
+    - validate_routes (bool): checked mode must still surface a backend contract violation.
+
+    Return
+    --------
+    - output (None): unchecked runs preserve incumbents and conservative bounds/denial status.
+    """
+    from freespace_sim.planner.colgen import pricing
+    from freespace_sim.planner.colgen.objective import cost_model
+
+    cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=1.1)
+    second_y = 0 if stage == "capacity" else 10
+    requests = [_request(1, (0, 0), (3, 0), cfg),
+                _request(2, (0, second_y), (3, second_y), cfg)]
+    params = _params(
+        pricing_device="gpu", pricing_gpu_backend="metal",
+        pricing_gpu_integer_bounds=True, pricing_gpu_validate_routes=validate_routes,
+        pricing_gpu_batch_size=2, max_air_overrun_hops=2, max_iterations=1,
+        seed_nominal_routes=False, seed_ladder_steps=0, ip_gap=0.0, lp_gap=0.0,
+    )
+    seed = seed_column(build_flight_graph(requests[0], cfg, (), params), cfg)
+    emitted = []
+
+    def batch(
+        platform: PricingPlatform, problems: Sequence[PricingProblem],
+        deadline: float | None = None,
+    ) -> tuple[PricingResult, ...]:
+        """Score an over-budget or saturated route using the actual unchecked constructor."""
+        values = []
+        for problem in problems:
+            improving = problem.require_improving
+            produce = problem.graph.request.flight_id == 2 and (
+                improving if stage == "insertion" else not improving
+            )
+            column = None
+            if produce:
+                path = (((0, 0), (1, 0), (2, 0), (3, 0)) if stage == "capacity" else
+                        ((0, second_y), (0, second_y + 1), (1, second_y + 1),
+                         (2, second_y), (3, second_y)))
+                candidate = pricing._Candidate(0.0, 0.0, pricing._Label(
+                    0.0, problem.graph.base_step, None, path, frozenset(),
+                ), None)
+                scored = pricing._canonical_candidate(
+                    candidate, problem.graph, pricing.DualView({}, cfg), 0.0, cfg, params.M,
+                    problem.forbidden_rows, cost_model(cfg, params), validate=False,
+                )
+                assert scored is not None
+                column = scored[1]
+                if stage == "capacity":
+                    assert not column.claims.isdisjoint(problem.forbidden_rows)
+                else:
+                    with pytest.raises(ValueError, match="max_detour_factor"):
+                        solver._canonical_column(column, problem.graph, cfg)
+                emitted.append(column)
+            expired = produce and stage == "repair_deadline"
+            values.append(PricingResult(
+                problem.graph.request.flight_id, params.M if column else 0.0, column,
+                None, not expired, False, "metal", True, "deadline" if expired else "approximate",
+            ))
+        return tuple(values)
+
+    monkeypatch.setattr(PricingPlatform, "price_batch", batch)
+    monkeypatch.setattr(solver, "price_flight", _no_cpu_pricing)
+    monkeypatch.setattr(pricing_pool, "price_flight", _no_cpu_pricing)
+    if validate_routes:
+        with pytest.raises((ValueError, RuntimeError), match="max_detour_factor|infeasible column"):
+            ColGenSolver().solve(requests, cfg, (), params, seed_columns={1: [seed]})
+        return
+    result = ColGenSolver().solve(requests, cfg, (), params, seed_columns={1: [seed]})
+    assert len(emitted) == 1
+    assert set(result.columns) == {1}
+    assert result.stats["gpu_unchecked_rejections"] == 1
+    assert result.stats["repair_added"] == 0
+    assert result.stats["search_exhausted_flight_ids"] == (2,)
+    assert result.stats["budget_denied_flight_ids"] == ()
+    assert not result.stats["pricing_bound_certified"] and math.isinf(result.stats["upper_bound"])
+    if stage == "repair_deadline":
+        assert result.stats["termination_reason"] == "time_limit"
+    _assert_claim_feasible(result.columns)
+    _assert_files_cleanly(requests, result.columns, cfg, params)

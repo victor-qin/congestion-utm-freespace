@@ -35,6 +35,7 @@ _PRICING_DEFAULTS = {
     "pricing_device": "cpu",
     "pricing_gpu_backend": None,
     "pricing_cpu_recompute": True,
+    "pricing_gpu_validate_routes": True,
     "pricing_gpu_batch_size": 1,
     "pricing_gpu_max_labels": 250_000,
     "pricing_gpu_chunk_size": 2048,
@@ -61,7 +62,8 @@ def _pricing_kwargs(args: argparse.Namespace) -> dict[str, object]:
         return {}
     # Default serial preparation also works against archived GPU parameter classes.
     return {name: value for name, value in options.items()
-            if not name.startswith("pricing_gpu_prepare_") or value != _PRICING_DEFAULTS[name]}
+            if (not name.startswith("pricing_gpu_prepare_")
+                and name != "pricing_gpu_validate_routes") or value != _PRICING_DEFAULTS[name]}
 
 
 def _pricing_argv(args: argparse.Namespace) -> list[str]:
@@ -762,6 +764,9 @@ def main() -> int:
         command.add_argument("--pricing-gpu-backend", choices=("metal", "cuda"))
         command.add_argument("--pricing-cpu-recompute", action=argparse.BooleanOptionalAction,
                              default=True)
+        command.add_argument("--pricing-gpu-validate-routes", action=argparse.BooleanOptionalAction,
+                             default=True, help="Check completed GPU routes (default on); disabling "
+                             "keeps construction/scoring but disables pricing certificates")
         command.add_argument("--pricing-gpu-batch-size", type=int, default=1)
         command.add_argument("--pricing-gpu-max-labels", type=int, default=250_000)
         command.add_argument("--pricing-gpu-chunk-size", type=int, default=2048)

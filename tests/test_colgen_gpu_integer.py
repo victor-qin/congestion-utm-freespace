@@ -370,7 +370,11 @@ def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
         # Keep every negative row while allowing enough deletions to exercise the audit.
         problem = replace(problem, duals={row: price * 0.001 if price < 0 else price
                                           for row, price in problem.duals.items()})
+    new_row = next(row for row in problem.duals if row.cell_coord == problem.graph.origin_cell
+                   and row.step == problem.graph.base_step)
+    problem = replace(problem, duals={row: price for row, price in problem.duals.items() if row != new_row})
     optimum = _oracle(problem)
+    problem = replace(problem, duals=pricing.DualView(problem.duals, problem.cfg))
 
     def forbidden(*args, **kwargs):
         """Fail instead of using the original CPU search or per-prune numerical verifier."""
@@ -395,11 +399,221 @@ def test_integer_search_covers_exhaustive_optimum_without_cpu_prune_verifier(
     else:
         assert result.stats["cpu_recomputations"] == 0
     _assert_canonical(problem, result)
+    from freespace_sim.planner.colgen import gpu_integer_search
+
+    cached_arrays = {id(a) for block in platform._runtime.operands.stores.values() for a in block.arrays}
+    upload = platform._runtime.upload
+
+    def guard_upload(array):
+        """Borrow cached uploads while still allowing fresh cutoff and suffix-row storage."""
+        assert id(array) not in cached_arrays, "Immutable operand was uploaded again"
+        return upload(array)
+
+    with monkeypatch.context() as hot:
+        hot.setattr(gpu_integer_search.IntegerData, "root_arrays", forbidden)
+        hot.setattr(gpu_integer_search.IntegerData, "price_arrays", forbidden)
+        hot.setattr(gpu_integer_search, "cost_operands", forbidden)
+        hot.setattr(platform._runtime, "upload", guard_upload)
+        (warm,) = platform.price_batch([problem])
+    assert warm.certified and warm.search_complete
+    assert (warm.reduced_cost, warm.column, warm.upper_bound) == (
+        result.reduced_cost, result.column, result.upper_bound,
+    )
+    assert warm.stats["integer_cache_hits"] > 0
+    assert warm.stats["integer_cache_misses"] == 0
+    assert warm.stats["integer_upload_avoided_bytes"] > 0
+    assert warm.stats["upload_bytes"] < result.stats["upload_bytes"]
+    assert warm.stats["labels"] == result.stats["labels"]
     # A fresh snapshot must observe new support and sign changes in exact membership tables.
-    changed = replace(problem, duals={row: -price + 0.125 for row, price in problem.duals.items()})
+    changed = replace(problem, duals=pricing.DualView(
+        {row: -price + 0.125 for row, price in problem.duals._duals.items()} | {new_row: 0.25},
+        problem.cfg,
+    ))
     (again,) = platform.price_batch([changed])
     assert again.certified
+    assert again.stats["integer_cache_misses"] > 0
+    assert again.reduced_cost == pytest.approx(
+        _oracle(replace(changed, duals=changed.duals._duals)), abs=1e-6,
+    )
     _assert_canonical(changed, again)
+    (restored,) = platform.price_batch([problem])
+    assert restored.certified and restored.stats["integer_cache_misses"] == 0
+    assert (restored.reduced_cost, restored.column, restored.upper_bound) == (
+        result.reduced_cost, result.column, result.upper_bound,
+    )
+
+
+@pytest.mark.parametrize("change", [
+    "assignment", "benefit", "objective", "restriction", "clock", "hops", "exponent",
+    "endpoint", "reorder", "regroup", "filtered",
+])
+def test_integer_cache_invalidates_changed_domain_and_matches_uncached_search(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    """Changed inputs cannot borrow stale operands; the restored domain still hits safely.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): guards CPU fallback and alters root order or grid selection.
+    - change (str): functional input whose stale operands could change the certificate.
+
+    Return
+    --------
+    - output (None): requires matching cached/uncached canonical results and restored warm hits.
+    """
+    from freespace_sim.planner.colgen import gpu_prepared, gpu_pricing, pricing
+    from freespace_sim.planner.colgen.gpu_runtime import ComputeRuntime
+    from freespace_sim.planner.colgen.network import build_flight_graph
+    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
+
+    problem = _problem()
+    if change == "filtered":
+        cfg = replace(problem.cfg, max_ground_delay_s=128., cost_ground_delay_per_s=1.)
+        graph = build_flight_graph(problem.graph.request, cfg, (), problem.params)
+        problem = replace(problem, graph=graph, cfg=cfg)
+    problem = replace(problem, duals=pricing.DualView(problem.duals, problem.cfg))
+    platform = _platform("metal", integer_bounds=True)
+    original, = platform.price_batch([problem])
+    options = platform.options
+    changed = problem
+    if change == "assignment":
+        changed = replace(problem, pi_f=3.25)
+    elif change == "benefit":
+        changed = replace(problem, params=replace(problem.params, M=problem.params.M + 17.))
+    elif change == "objective":
+        changed = replace(problem, params=replace(problem.params, objective="total_delay"))
+    elif change == "restriction":
+        row = next(row for row in original.column.claims if row.kind == "cell"
+                   and row.cell_coord not in (problem.graph.origin_cell, problem.graph.dest_cell))
+        changed = replace(problem, forbidden_rows=frozenset([row]))
+    elif change in ("clock", "hops"):
+        cfg = replace(problem.cfg, dt_s=8.) if change == "clock" else problem.cfg
+        params = (replace(problem.params, max_air_overrun_hops=3)
+                  if change == "hops" else problem.params)
+        graph = build_flight_graph(problem.graph.request, cfg, (), params)
+        changed = replace(problem, graph=graph, cfg=cfg, params=params,
+                          duals=pricing.DualView(problem.duals._duals, cfg))
+    elif change == "endpoint":
+        platform.options = replace(options, endpoint_max_rows=1)
+    elif change == "filtered":
+        changed = replace(problem, known_column=original.column)
+    problems = [changed]
+    if change == "regroup":
+        problems = [replace(changed, pi_f=3.25), changed]
+
+    def forbid(*args, **kwargs):
+        """Compare GPU results without the original CPU pricer or numerical verifier."""
+        pytest.fail("Original CPU search/verifier called")
+
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        monkeypatch.setattr(pricing, name, forbid)
+    monkeypatch.setattr(gpu_pricing._Batch, "bound", forbid)
+    with monkeypatch.context() as altered:
+        if change == "exponent":
+            choose = IntegerScale.for_values
+            altered.setattr(IntegerScale, "for_values", classmethod(
+                lambda cls, values, **kw: cls(choose(values, **kw).exponent + 1),
+            ))
+        elif change == "reorder":
+            prepare = gpu_prepared.prepare_variants
+
+            def reverse(*args, **kwargs):
+                """Reorder complete canonical descriptors while preserving the legal root set."""
+                v = prepare(*args, **kwargs)
+                names = ("departure_step", "lane_idx", "cell", "start_step", "score",
+                         "ground_delay_s", "origin_leg_w_s", "start_dual_cost", "paid_class")
+                return replace(v, **{name: getattr(v, name)[::-1].copy() for name in names})
+
+            altered.setattr(gpu_prepared, "prepare_variants", reverse)
+        actual = platform.price_batch(problems)
+        assert actual[0].stats["integer_cache_misses"] > 0
+        if change == "filtered":
+            assert actual[0].stats["integer_roots"] < original.stats["integer_roots"]
+        uncached = _platform("metal", integer_bounds=True)
+        uncached.options = platform.options
+        uncached._runtime = ComputeRuntime("metal", integer_bounds=True)
+        uncached._runtime.operands.max_entries = 0
+        expected = uncached.price_batch(problems)
+        for p, result, reference in zip(problems, actual, expected, strict=True):
+            assert result.certified and reference.certified
+            assert (result.reduced_cost, result.column, result.upper_bound) == (
+                reference.reduced_cost, reference.column, reference.upper_bound,
+            )
+            if not p.forbidden_rows:
+                assert result.reduced_cost == pytest.approx(
+                    _oracle(replace(p, duals=p.duals._duals)), abs=1e-6,
+                )
+            if result.column is not None:
+                assert result.column.claims.isdisjoint(p.forbidden_rows)
+                _assert_canonical(p, result)
+            else:
+                assert p.known_column is not None or result.reduced_cost == -math.inf
+        uncached._runtime.clear_cache()
+    platform.options = options
+    restored, = platform.price_batch([problem])
+    assert restored.certified and restored.stats["integer_cache_misses"] == 0
+    assert (restored.reduced_cost, restored.column, restored.upper_bound) == (
+        original.reduced_cost, original.column, original.upper_bound,
+    )
+
+
+@pytest.mark.parametrize("stage", ["roots", "root_constants", "prices", "cost"])
+def test_interrupted_operand_build_cannot_publish_or_certify(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    """A deadline after building operands leaves no reusable partial generation or certificate.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): injects a deadline at the build/publication boundary.
+    - stage (str): immutable operand family whose incomplete build must not be reused.
+
+    Return
+    --------
+    - output (None): requires an incomplete exit followed by a canonical certified retry.
+    """
+    from freespace_sim.planner.colgen import pricing
+    from freespace_sim.planner.colgen.gpu_operand_cache import OperandCache
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch, _Stopped
+    from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
+
+    problem = _problem()
+    optimum = _oracle(problem)
+    problem = replace(problem, duals=pricing.DualView(problem.duals, problem.cfg))
+    platform = _platform("metal", integer_bounds=True)
+    get = OperandCache.get
+    interrupted_keys = []
+
+    def interrupt(cache, key, build, runtime, check, *, upload, encoded=()):
+        """Expire after a complete CPU build, before any cache publication."""
+        if key is not None and key[0] == stage:
+            interrupted_keys.append(key)
+
+            def fail():
+                """Discard the completed local arrays when the deadline expires."""
+                build()
+                raise _Stopped("deadline")
+
+            return get(cache, key, fail, runtime, check, upload=upload, encoded=encoded)
+        return get(cache, key, build, runtime, check, upload=upload, encoded=encoded)
+
+    def forbidden(*args, **kwargs):
+        """Deadline recovery must not select the original CPU verifier or pricer."""
+        pytest.fail("CPU search/verifier used after an interrupted numeric build")
+
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        monkeypatch.setattr(pricing, name, forbidden)
+    monkeypatch.setattr(_Batch, "bound", forbidden)
+    with monkeypatch.context() as limited:
+        limited.setattr(OperandCache, "get", interrupt)
+        stopped, = platform.price_batch([problem])
+    assert interrupted_keys
+    assert stopped.status == "deadline" and not stopped.certified and not stopped.search_complete
+    assert stopped.upper_bound is None and platform._runtime.integer_data is None
+    assert all(key not in platform._runtime.operands.stores for key in interrupted_keys)
+    completed, = platform.price_batch([problem])
+    assert completed.certified and completed.reduced_cost == pytest.approx(optimum, abs=1e-6)
+    _assert_canonical(problem, completed)
 
 
 @pytest.mark.parametrize("max_labels", [1, 250_000])

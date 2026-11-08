@@ -351,3 +351,106 @@ def test_partial_resident_allocation_releases_storage(monkeypatch, budget):
         gpu_resident.ResidentSearch(batch)
     gc.collect()
     assert all(ref() is None for ref in references)
+
+
+@pytest.mark.parametrize("backend", ["metal", "cuda"])
+def test_integer_operands_bound_retention_and_keep_evicted_borrowers_alive(
+    monkeypatch: pytest.MonkeyPatch, backend: str,
+) -> None:
+    """Hits skip builds/uploads; eviction, clear and failed builds preserve owner isolation.
+
+    Parameters
+    ------------
+    - monkeypatch (pytest.MonkeyPatch): supplies deterministic CPU-backed adapter storage.
+    - backend (str): Metal or CUDA interface; this test makes no hardware claim.
+
+    Return
+    --------
+    - output (None): requires byte-safe borrowers, no partial publication and complete release.
+    """
+    from freespace_sim.planner.colgen.gpu_operand_cache import OperandCache
+
+    runtime, references = _runtime(monkeypatch, lambda buffers, count: None, backend)
+    runtime.operands = cache = OperandCache(runtime._owner, max_entries=1)
+
+    def build():
+        """Supply a complete immutable generation, without search metadata."""
+        return (np.arange(16, dtype=np.int32),)
+
+    def forbidden():
+        """A hit must not encode or upload the same operands again."""
+        pytest.fail("Cached operand was rebuilt")
+
+    first = cache.get(("first",), build, runtime, lambda: None, upload=(0,))
+    runtime.clear_batch()
+    uploads = runtime.counters["upload_bytes"]
+    assert cache.get(("first",), forbidden, runtime, lambda: None, upload=(0,)) is first
+    assert runtime.counters["upload_bytes"] == uploads
+    assert runtime.counters["integer_upload_avoided_bytes"] == first.buffers[0].nbytes
+    assert not first.arrays[0].flags.writeable
+    second = cache.get(("second",), build, runtime, lambda: None, upload=(0,))
+    assert runtime.counters["integer_cache_evictions"] == 1
+    assert len(cache.stores) == 1
+    np.testing.assert_array_equal(runtime.read(first.buffers[0]), build()[0])
+    foreign, _ = _runtime(monkeypatch, lambda buffers, count: None, backend)
+    with pytest.raises(ValueError, match="another runtime"):
+        cache.get(("second",), forbidden, foreign, lambda: None, upload=(0,))
+    other = foreign.operands.get(("second",), build, foreign, lambda: None, upload=(0,))
+    assert other.buffers[0].owner is not second.buffers[0].owner
+    foreign.clear_cache()
+    del other
+
+    for limit in ("max_host_bytes", "max_device_bytes"):
+        saved = getattr(cache, limit)
+        setattr(cache, limit, 1)
+        skipped = cache.get((limit,), build, runtime, lambda: None, upload=(0,))
+        assert (limit,) not in cache.stores
+        np.testing.assert_array_equal(runtime.read(skipped.buffers[0]), build()[0])
+        setattr(cache, limit, saved)
+    del skipped
+
+    cache.max_entries = 16
+    for limit, size in (("max_host_bytes", first.host_bytes),
+                        ("max_device_bytes", first.device_bytes)):
+        cache.clear()
+        saved = getattr(cache, limit)
+        setattr(cache, limit, size + 16)
+        held = cache.get(("a",), build, runtime, lambda: None, upload=(0,))
+        cache.get(("b",), build, runtime, lambda: None, upload=(0,))
+        assert len(cache.stores) == 1
+        assert cache.host_bytes <= cache.max_host_bytes
+        assert cache.device_bytes <= cache.max_device_bytes
+        np.testing.assert_array_equal(runtime.read(held.buffers[0]), build()[0])
+        setattr(cache, limit, saved)
+    del held
+
+    cache.clear()
+    saved = cache.max_host_bytes
+    cache.max_host_bytes = 2048
+    view = cache.get(("view",), lambda: (np.arange(1024, dtype=np.int32)[:1],),
+                     runtime, lambda: None, upload=(0,))
+    assert not cache.stores and cache.host_bytes == 0
+    assert view.host_bytes >= 4096
+    np.testing.assert_array_equal(runtime.read(view.buffers[0]), [0])
+    del view
+    cache.max_host_bytes = saved
+
+    for failure in (TimeoutError, OverflowError):
+        calls = 0
+
+        def fail_after_upload():
+            """Interrupt after the upload but before a generation could become a hit."""
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise failure()
+
+        with pytest.raises(failure):
+            cache.get((failure.__name__,), build, runtime, fail_after_upload, upload=(0,))
+        assert (failure.__name__,) not in cache.stores
+    runtime.clear_cache()
+    assert cache.host_bytes == cache.device_bytes == 0 and not cache.stores
+    # Cache clearing cannot revoke handles already held by a command or invocation.
+    np.testing.assert_array_equal(runtime.read(first.buffers[0]), build()[0])
+    del first, second
+    assert all(ref() is None for ref in references)

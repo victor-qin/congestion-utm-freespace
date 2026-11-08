@@ -1225,6 +1225,9 @@ class _Batch:
             **self.stats,
             **{key: value - self.first_counters[key]
                for key, value in self.runtime.counters.items()},
+            "integer_cache_host_bytes": self.runtime.operands.host_bytes,
+            "integer_cache_device_bytes": self.runtime.operands.device_bytes,
+            "integer_cache_entries": len(self.runtime.operands.stores),
             "labels": (self.used + self.stats.get("bootstrap_labels", 0)
                        + self.stats.get("initial_full_search_labels", 0)),
             "full_search_labels": self.used,

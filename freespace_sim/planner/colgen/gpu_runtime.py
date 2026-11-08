@@ -183,7 +183,16 @@ extern "C" __global__ void future_bounds(const int* control, const int* graph,
 
 
 class ComputeRuntime:
-    """Execute shared pricing kernels on an explicitly selected physical GPU."""
+    """Execute shared pricing kernels on an explicitly selected physical GPU.
+
+    Attributes
+    ------------
+    - backend (str): explicitly selected Metal or CUDA backend.
+    - prices (DevicePriceCache): bounded shared FP32 snapshot tables.
+    - operands (OperandCache): bounded immutable integer operands owned by this runtime.
+    - integer_data (IntegerData | None): fresh active invocation, cleared after each batch.
+    - counters (dict): cumulative work counters; retained byte gauges belong to the caches.
+    """
 
     def __init__(self, backend: str, *, integer_bounds: bool = False) -> None:
         """Compile the kernels; failure never silently selects a CPU device.
@@ -204,10 +213,16 @@ class ComputeRuntime:
         self._owner = object()
         self.counters = dict(allocations=0, allocated_bytes=0, upload_bytes=0,
                              download_bytes=0, waits=0, wait_s=0.0, gpu_s=0.0,
-                             price_uploads=0, price_upload_bytes=0, price_cache_hits=0)
+                             price_uploads=0, price_upload_bytes=0, price_cache_hits=0,
+                             integer_cache_hits=0, integer_cache_misses=0,
+                             integer_cache_evictions=0, integer_cache_skips=0,
+                             integer_encoding_s=0.0, integer_encoding_avoided_s=0.0,
+                             integer_encoding_avoided_bytes=0, integer_upload_avoided_bytes=0)
         from .gpu_prices import DevicePriceCache
+        from .gpu_operand_cache import OperandCache
 
         self.prices = DevicePriceCache()
+        self.operands = OperandCache(self._owner)
         self._static: dict[str, tuple[np.ndarray, object]] = {}
         self._metal_buffers: dict[tuple[str, int], tuple[int, object]] = {}
         try:
@@ -266,6 +281,7 @@ class ComputeRuntime:
         """Release batch scratch and all retained snapshots when the owner requests it."""
         self.clear_batch()
         self.prices.clear()
+        self.operands.clear()
 
     def clear_batch(self) -> None:
         """Release flight-specific storage without invalidating shared snapshot prices."""

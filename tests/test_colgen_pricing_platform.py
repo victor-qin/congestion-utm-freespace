@@ -814,17 +814,33 @@ def test_gpu_label_limit_preserves_incomplete_status(
 @pytest.mark.parametrize("buffer,max_labels", [(4.0, 250_000), (192.0, 250_000), (4.0, 3_000_000)])
 @pytest.mark.parametrize("integer_bounds", [False, True])
 def test_closed_roots_do_not_reserve_a_resident_search_arena(
-    buffer: float, max_labels: int, integer_bounds: bool,
+    monkeypatch: pytest.MonkeyPatch, buffer: float, max_labels: int, integer_bounds: bool,
 ) -> None:
     """A zero-label certificate remains available even when unused capacity exceeds GPU memory limits."""
     problem = replace(_problem(buffer=buffer), duals={})
-    result, = _platform("metal", max_labels=max_labels, integer_bounds=integer_bounds).price_batch([problem])
+    platform = _platform("metal", max_labels=max_labels, integer_bounds=integer_bounds)
+    if integer_bounds:
+        from freespace_sim.planner.colgen.gpu_integer_search import IntegerData
+
+        def forbidden(self):
+            """Closed roots must never allocate unused continuation constants, even on a hit."""
+            pytest.fail("Closed root allocated continuation storage")
+
+        monkeypatch.setattr(IntegerData, "bind_roots", forbidden)
+    owned = replace(problem, duals=pricing.DualView({}, problem.cfg))
+    result, = platform.price_batch([owned])
     assert result.search_complete and result.certified
     assert result.stats["full_search_labels"] == 0 and result.stats["root_prunes"] > 0
     assert result.stats.get("resident_bytes", 0) == 0
     assert result.upper_bound >= result.reduced_cost
     assert result.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
     _assert_canonical(problem, result)
+    if integer_bounds:
+        warm, = platform.price_batch([owned])
+        assert warm.certified and warm.stats["integer_cache_hits"] > 0
+        assert (warm.reduced_cost, warm.upper_bound, warm.column) == (
+            result.reduced_cost, result.upper_bound, result.column,
+        )
 
 
 def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) -> None:

@@ -9,6 +9,8 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   claiming warm reuse. Files: `freespace_sim/planner/colgen/{gpu_prepare_pool,network}.py`,
   `analysis/colgen/GPU_PARALLEL_PREPARATION.md`.
 
+- 2026-11-08T05:07Z [TOOL] PR #147: bounded LRU storage can still yield zero reuse across a sequential cohort when every overlapping cumulative cost/endpoint generation is retained. The first hard88 cache trial had zero warm hits and 1,081 evictions per pass; retaining individual costs while keeping cumulative endpoints still caused 2,426 evictions. Retain independently reusable operands and keep changing aggregate uploads invocation-local. Size retention from measured concurrent cache bytes and warm hit/eviction counts, never summed per-flight peaks. Files: `freespace_sim/planner/colgen/gpu_operand_cache.py`, `gpu_integer_search.py`, `analysis/colgen/GPU_INTEGER_CACHE.md`, `integer_cache_results.json`.
+
 - 2026-11-07T07:20Z [CODE] A clean textual merge does not update hand-copied request schemas.
   Integrating PR133 with the round-trip model left `paired_outbound_id` in graph snapshots,
   positional pickle reconstruction and worker identity checks, breaking graph construction and

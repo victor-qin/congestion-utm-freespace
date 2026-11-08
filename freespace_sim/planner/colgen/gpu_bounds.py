@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import math
 
@@ -50,6 +51,39 @@ def _distance_interval(a: tuple[float, float], b: tuple[float, float]) -> tuple[
     return max(0.0, _down(math.sqrt(lower))), _up(math.sqrt(upper))
 
 
+def completion_upper_bound(
+    benefit: float,
+    pi_f: float,
+    cost_lower: float,
+    positive_prices: Sequence[float],
+    negative_lower: float,
+) -> float:
+    """Bound canonical completion cost using only irrevocable prefix charges.
+
+    Every canonical route claims its discrete visit rows, including folded
+    corners. Positive prices must be deduplicated by row before this call.
+    Including every negative input dual is conservative for every completion.
+    Outward rounding covers the final FP64 reduced-cost subtraction order.
+
+    Parameters
+    ------------
+    - benefit (float): flight benefit.
+    - pi_f (float): assignment dual.
+    - cost_lower (float): conservative weighted cost of every completion of this prefix.
+    - positive_prices (Sequence[float]): distinct positive prefix row prices.
+    - negative_lower (float): downward-rounded sum of all negative input prices.
+
+    Return
+    --------
+    - output (float): upper bound on every completion's canonical reduced cost.
+    """
+    positive = 0.0
+    for value in positive_prices:
+        positive = _down(positive + value)
+    dual_lower = _down(positive + negative_lower)
+    return _up(_up(_up(benefit - _down(cost_lower)) - dual_lower) - pi_f)
+
+
 @dataclass(frozen=True, slots=True)
 class _GeometryBounds:
     """One graph's immutable geometry bounds, independent of prices and root selection."""
@@ -63,6 +97,30 @@ class _GeometryBounds:
     reference: float = 0.0
     air_per_hop: float = 0.0
     air_scale: float = math.inf
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionBoundData:
+    """Explicit FP64 verification data without a graph or global price mapping.
+
+    Attributes
+    ------------
+    - air_offset, length_offset (np.ndarray): original per-root geometric coefficients.
+    - air_per_hop, edge_min, reference, cost_scale (float): original geometry allowances.
+    - absolute_prices (float): snapshot-wide outward price allowance.
+    - claims (tuple[frozenset[RowKey], ...]): full root unions, including zero-priced rows.
+    - positive (np.ndarray): original per-root positive lower sums in binary64.
+    """
+
+    air_offset: np.ndarray
+    length_offset: np.ndarray
+    air_per_hop: float
+    edge_min: float
+    reference: float
+    cost_scale: float
+    absolute_prices: float
+    claims: tuple[frozenset[RowKey], ...]
+    positive: np.ndarray
 
 
 class CompletionBounds:
@@ -127,6 +185,59 @@ class CompletionBounds:
                 )
         self._positive: dict[int, float] = {}
         self._prepare_geometry()
+
+    def export(self) -> CompletionBoundData:
+        """Freeze exact root unions and FP64 coefficients for a preparation worker reply.
+
+        Parameters
+        ------------
+        - self (CompletionBounds): bounds belonging to one graph, roots and price snapshot.
+
+        Return
+        --------
+        - output (CompletionBoundData): data only, without problem/view/cache ownership.
+        """
+        return CompletionBoundData(
+            self.air_offset, self._length_offset, self.air_per_hop, self._edge_min,
+            self._reference, self._cost_scale, self._absolute_prices,
+            tuple(self.origin_claims(i) for i in range(self.variants.n_variants)),
+            np.asarray([self.root_positive(i) for i in range(self.variants.n_variants)], np.float64),
+        )
+
+    @classmethod
+    def from_data(
+        cls, data: CompletionBoundData, problem: PricingProblem, topology: PreparedTopology,
+        variants: PreparedVariants, view: pricing.DualView,
+    ) -> CompletionBounds:
+        """Bind transferred verification data to the parent's exact problem and snapshot.
+
+        Parameters
+        ------------
+        - data (CompletionBoundData): explicit FP64 coefficients and exact claim membership.
+        - problem (PricingProblem): parent-owned graph, restrictions and configuration.
+        - topology (PreparedTopology): topology for the acknowledged graph version.
+        - variants (PreparedVariants): current root ordering and original FP64 root prices.
+        - view (pricing.DualView): parent's shared snapshot; owns the sparse GPU price cache.
+
+        Return
+        --------
+        - output (CompletionBounds): verification object without repeated geometry preparation.
+        """
+        arrays = (data.air_offset, data.length_offset, data.positive)
+        if len(data.claims) != variants.n_variants or any(
+            a.dtype != np.float64 or a.shape != (variants.n_variants,) for a in arrays
+        ):
+            raise ValueError("Invalid FP64 GPU preparation bounds")
+        result = cls.__new__(cls)
+        result.problem, result.topology, result.variants, result.view = problem, topology, variants, view
+        result.model = cost_model(problem.cfg, problem.params)
+        result.air_offset, result._length_offset = data.air_offset, data.length_offset
+        result.air_per_hop, result._edge_min = data.air_per_hop, data.edge_min
+        result._reference, result._cost_scale = data.reference, data.cost_scale
+        result._absolute_prices = data.absolute_prices
+        result._claims = dict(enumerate(data.claims))
+        result._positive = dict(enumerate(map(float, data.positive)))
+        return result
 
     def _prepare_geometry(self) -> None:
         """Reuse fixed geometry and gather bounds for this call's surviving roots.

@@ -2,6 +2,13 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
+- 2026-11-07T20:40Z [TOOL] Packed arrays underestimate CPU preparation-cache memory. Hard88's
+  retained worker graphs accounted for about 1500 MiB, despite much smaller packed tables;
+  a 128 MiB worker budget rebuilt all 88 graphs on a warm sweep. Count lazy graph, role and claim
+  objects when admitting caches, measure process RSS separately, and inspect evictions before
+  claiming warm reuse. Files: `freespace_sim/planner/colgen/{gpu_prepare_pool,network}.py`,
+  `analysis/colgen/GPU_PARALLEL_PREPARATION.md`.
+
 - 2026-11-07T07:20Z [CODE] A clean textual merge does not update hand-copied request schemas.
   Integrating PR133 with the round-trip model left `paired_outbound_id` in graph snapshots,
   positional pickle reconstruction and worker identity checks, breaking graph construction and

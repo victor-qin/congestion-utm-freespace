@@ -12,7 +12,7 @@ from .gpu_buffers import DeviceBuffer, Dispatch
 if TYPE_CHECKING:
     from .gpu_pricing import _Batch
 
-_MAX_BYTES = 128 * 1024 * 1024
+_MAX_BYTES = 256 * 1024 * 1024
 _QUEUE_CAPACITY = 65_536
 _LAYER_BLOCK = 2
 _CHUNK_BLOCK = 8

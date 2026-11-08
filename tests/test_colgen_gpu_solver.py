@@ -32,7 +32,8 @@ def _no_cpu_pricing(*args: object, **kwargs: object) -> None:
     raise AssertionError("GPU solve must use GPU pricing, including the final repair pass")
 
 
-@pytest.mark.parametrize("status", ["label_limit", "deadline", "unsupported"])
+@pytest.mark.parametrize("status", ["label_limit", "deadline", "unsupported",
+                                    "preparation_worker_lost", "preparation_limit"])
 def test_incomplete_gpu_sweep_emits_diagnostics_before_final_ip(
     monkeypatch: pytest.MonkeyPatch, status: str,
 ) -> None:
@@ -152,8 +153,9 @@ def test_gpu_residual_bound_is_separate_from_column_score(
 
 @pytest.mark.parametrize("backend", ["highs", "gurobi"])
 @pytest.mark.parametrize("cpu_recompute,integer_bounds", [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize("prepare_workers", [0, 2])
 def test_full_solver_uses_metal_and_preserves_certificate_meaning(
-    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool,
+    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool, prepare_workers: int,
 ) -> None:
     """Real GPU sweeps feed a feasible master/IP solve without giving FP32 a global proof.
 
@@ -201,6 +203,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         pricing_cpu_recompute=cpu_recompute,
         pricing_gpu_integer_bounds=integer_bounds,
         pricing_gpu_batch_size=2,
+        pricing_gpu_prepare_workers=prepare_workers,
         n_pricing_workers=2,
     )
     if integer_bounds:

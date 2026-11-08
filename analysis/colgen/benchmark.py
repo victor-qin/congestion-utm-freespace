@@ -42,6 +42,10 @@ _PRICING_DEFAULTS = {
     "pricing_gpu_endpoint_max_rows": 64,
     "pricing_gpu_endpoint_cache_bytes": 1_048_576,
     "pricing_gpu_endpoint_cache_work": 1_000_000,
+    "pricing_gpu_prepare_workers": 0,
+    "pricing_gpu_prepare_batch_size": 8,
+    "pricing_gpu_prepare_max_bytes": 128 * 1024 * 1024,
+    "pricing_gpu_prepare_cache_bytes": 128 * 1024 * 1024,
 }
 
 
@@ -53,7 +57,11 @@ def _pricing_options(args: argparse.Namespace) -> dict[str, object]:
 def _pricing_kwargs(args: argparse.Namespace) -> dict[str, object]:
     """Keep default CPU runs compatible with archived parameter classes lacking GPU fields."""
     options = _pricing_options(args)
-    return {} if options == _PRICING_DEFAULTS else options
+    if options == _PRICING_DEFAULTS:
+        return {}
+    # Default serial preparation also works against archived GPU parameter classes.
+    return {name: value for name, value in options.items()
+            if not name.startswith("pricing_gpu_prepare_") or value != _PRICING_DEFAULTS[name]}
 
 
 def _pricing_argv(args: argparse.Namespace) -> list[str]:
@@ -762,6 +770,10 @@ def main() -> int:
         command.add_argument("--pricing-gpu-endpoint-max-rows", type=int, default=64)
         command.add_argument("--pricing-gpu-endpoint-cache-bytes", type=int, default=1_048_576)
         command.add_argument("--pricing-gpu-endpoint-cache-work", type=int, default=1_000_000)
+        command.add_argument("--pricing-gpu-prepare-workers", type=int, default=0)
+        command.add_argument("--pricing-gpu-prepare-batch-size", type=int, default=8)
+        command.add_argument("--pricing-gpu-prepare-max-bytes", type=int, default=128 * 1024 * 1024)
+        command.add_argument("--pricing-gpu-prepare-cache-bytes", type=int, default=128 * 1024 * 1024)
         command.add_argument("--gurobi-threads", type=int, default=4)
         command.add_argument("--lp-gap", type=float, default=0.001)
         command.add_argument("--exact-pricing-interval", type=int, default=5)
@@ -782,6 +794,15 @@ def main() -> int:
         value = getattr(args, name)
         if value < 1 or (name != "pricing_gpu_batch_size" and value >= 2**27):
             parser.error(f"--{name.replace('_', '-')} must be positive and fit the GPU index limit")
+    for name, lower, upper in (("pricing_gpu_prepare_workers", 0, 64),
+                               ("pricing_gpu_prepare_batch_size", 1, 1024),
+                               ("pricing_gpu_prepare_max_bytes", 4096, 2**31 - 1),
+                               ("pricing_gpu_prepare_cache_bytes", 0, 2**31 - 1)):
+        if not lower <= getattr(args, name) <= upper:
+            parser.error(f"--{name.replace('_', '-')} must be between {lower} and {upper}")
+    if args.pricing_gpu_prepare_workers and (args.pricing_device != "gpu"
+            or args.pricing_gpu_prepare_batch_size < args.pricing_gpu_batch_size):
+        parser.error("Preparation workers need GPU pricing and a group at least as large as its batch")
     if args.pricing_device == "gpu":
         versions = args.versions if args.mode == "run" else (args.version,)
         if args.columns_per_flight != 1 or "iteration_ip_cheap" in versions:

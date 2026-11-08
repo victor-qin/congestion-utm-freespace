@@ -223,6 +223,10 @@ class ColGenParams:
     pricing_gpu_integer_bounds: bool = False
     pricing_gpu_integer_audit: bool = False
     pricing_gpu_approach_bounds: bool = False
+    pricing_gpu_prepare_workers: int = 0
+    pricing_gpu_prepare_batch_size: int = 8
+    pricing_gpu_prepare_max_bytes: int = 128 * 1024 * 1024
+    pricing_gpu_prepare_cache_bytes: int = 128 * 1024 * 1024
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -260,6 +264,18 @@ class ColGenParams:
         if ((self.pricing_device == "cpu" and self.pricing_gpu_backend is not None)
                 or (self.pricing_device == "gpu" and self.pricing_gpu_backend not in {"metal", "cuda"})):
             raise ValueError("Select pricing_gpu_backend='metal' or 'cuda' exactly for GPU pricing")
+        for name, lower, upper in (
+            ("pricing_gpu_prepare_workers", 0, 64), ("pricing_gpu_prepare_batch_size", 1, 1024),
+            ("pricing_gpu_prepare_max_bytes", 4096, 2**31 - 1),
+            ("pricing_gpu_prepare_cache_bytes", 0, 2**31 - 1),
+        ):
+            if type(getattr(self, name)) is not int or not lower <= getattr(self, name) <= upper:
+                raise ValueError(f"{name} must be an integer between {lower} and {upper}")
+        if self.pricing_gpu_prepare_workers and (
+            self.pricing_device != "gpu"
+            or self.pricing_gpu_prepare_batch_size < self.pricing_gpu_batch_size
+        ):
+            raise ValueError("GPU preparation workers require GPU pricing and a group >= GPU batch")
         if not isinstance(self.pricing_cpu_recompute, bool):
             raise TypeError("pricing_cpu_recompute must be a boolean")
         if (not isinstance(self.pricing_gpu_integer_bounds, bool)

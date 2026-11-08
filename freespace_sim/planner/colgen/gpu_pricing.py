@@ -17,12 +17,11 @@ from typing import Any
 import numpy as np
 
 from . import pricing
-from .dp_prepare import prepare_variants, prepared_for
-from .gpu_bounds import CompletionBounds
+from .gpu_bounds import CompletionBounds, completion_upper_bound
 from .gpu_endpoint import EndpointBounds, Mask
 from .gpu_future import FutureBounds
 from .gpu_prices import SparseVisitPrices, summary_for
-from .gpu_prepare import GPUPreparation, packing_for
+from .gpu_prepared import BOUND_CLOSURE_TOL, PreparedFlight, check_deadline, prepare_flight
 from .gpu_runtime import ComputeRuntime
 from .network import RowKey
 from .objective import cost_model
@@ -31,7 +30,7 @@ from .windows import derive_cell_window
 
 # Near-tie branches retain their proved upper bound in the result certificate.
 # This tolerance never turns a candidate's score into the optimum's exact value.
-_BOUND_CLOSURE_TOL = 1e-6
+_BOUND_CLOSURE_TOL = BOUND_CLOSURE_TOL
 _INITIAL_FULL_LABEL_LIMIT = 8192
 
 
@@ -43,39 +42,6 @@ def _down(value: float) -> float:
 def _up(value: float) -> float:
     """Round one finite arithmetic result conservatively toward positive infinity."""
     return math.nextafter(value, math.inf)
-
-
-def completion_upper_bound(
-    benefit: float,
-    pi_f: float,
-    cost_lower: float,
-    positive_prices: Sequence[float],
-    negative_lower: float,
-) -> float:
-    """Bound canonical completion cost using only irrevocable prefix charges.
-
-    Every canonical route claims its discrete visit rows, including folded
-    corners. Positive prices must be deduplicated by row before this call.
-    Including every negative input dual is conservative for every completion.
-    Outward rounding covers the final FP64 reduced-cost subtraction order.
-
-    Parameters
-    ------------
-    - benefit (float): flight benefit.
-    - pi_f (float): assignment dual.
-    - cost_lower (float): conservative weighted cost of every completion of this prefix.
-    - positive_prices (Sequence[float]): distinct positive prefix row prices.
-    - negative_lower (float): downward-rounded sum of all negative input prices.
-
-    Return
-    --------
-    - output (float): upper bound on every completion's canonical reduced cost.
-    """
-    positive = 0.0
-    for value in positive_prices:
-        positive = _down(positive + value)
-    dual_lower = _down(positive + negative_lower)
-    return _up(_up(_up(benefit - _down(cost_lower)) - dual_lower) - pi_f)
 
 
 class _Stopped(Exception):
@@ -91,6 +57,7 @@ class _Batch:
         options: PricingOptions,
         runtime: ComputeRuntime,
         deadline: float | None,
+        prepared: Sequence[PreparedFlight] | None = None,
     ) -> None:
         """Allocate bounded predecessor storage and initialize per-flight incumbents.
 
@@ -100,6 +67,7 @@ class _Batch:
         - options (PricingOptions): precision mode and allocation limits.
         - runtime (ComputeRuntime): selected physical GPU runtime.
         - deadline (float | None): shared monotonic deadline.
+        - prepared (Sequence[PreparedFlight] | None): version-matched CPU results, or serial preparation.
 
         Return
         --------
@@ -111,6 +79,7 @@ class _Batch:
             runtime,
             deadline,
         )
+        self.prepared = prepared
         self.started = time.monotonic()
         self.prune_mode = (0 if options.gpu_prune_epsilon is None else
                            2 if options.gpu_prune_audit else 1)
@@ -234,85 +203,26 @@ class _Batch:
             zip(self.problems, self.views, self.models, self.benefits, strict=True)
         ):
             self.check()
-            if p.cfg != p.graph._cfg or not math.isfinite(p.pi_f):
-                raise ValueError("Pricing needs the graph's configuration and a finite flight dual")
-            if not all(
-                math.isfinite(v) and v >= 0 for v in (model.ground_weight, model.air_weight)
-            ):
-                raise ValueError("Certified bounds require finite nonnegative objective weights")
-            topology, rows = prepared_for(p.graph, p.cfg)
-            if not topology.ok or not rows.ok:
-                raise _Stopped("unsupported")
-            # The reverse graph includes every legal role, so its distances remain
-            # lower bounds while accounting for walls that plain hex distance ignores.
+            item = (prepare_flight(p, view, self.options, self.deadline)
+                    if self.prepared is None else self.prepared[i])
+            self.best[i] = item.best
+            self.stats["screened_departures"] += item.stats.get("screened_departures", 0)
+            if item.status != "complete":
+                raise _Stopped(item.status)
+            item.check(p, view, self.options)
+            topology, v, bounds = item.topology, item.variants, item.bounds
             remaining_hops = np.minimum(topology.rev_remaining, topology.air_hop_limit + 1)
-            remaining = int(remaining_hops.max(initial=0))
-            if (
-                min(topology.min_step, topology.base_step) + min(0, self.offsets[0]) < -(2**31)
-                or max(topology.max_step, topology.air_hop_limit)
-                + remaining
-                + max(1, self.offsets[1])
-                >= 2**31
-            ):
-                raise ValueError("GPU time/hop arithmetic exceeds int32 range")
-            self.check()
-            try:
-                # This seed helper never falls back to a full CPU pricing DP.
-                seed = pricing._shortest_seed(p.graph, p.cfg, deadline=self.deadline, model=model)
-            except ValueError:
-                seed = None
-            for column in (seed, p.known_column):
-                if column is None:
-                    continue
-                column = pricing.certify_column(column, p.graph, p.cfg, model)
-                if column.claims.isdisjoint(p.forbidden_rows):
-                    rc = model.reduced_cost(
-                        benefit=benefit,
-                        cost=column.delay_s,
-                        dual_cost=view.claim_cost(column.claims),
-                        pi_f=p.pi_f,
-                    )
-                    if rc > self.best[i][0]:
-                        self.best[i] = rc, column
-            self.check()
-            preparation = GPUPreparation(
-                p.graph, p.cfg, view, benefit=benefit, pi_f=p.pi_f, model=model,
-                forbidden_rows=p.forbidden_rows, retain_root_claims=True,
-            )
-            v = prepare_variants(
-                p.graph,
-                p.cfg,
-                view,
-                topology,
-                rows,
-                benefit=benefit,
-                pi_f=p.pi_f,
-                model=model,
-                forbidden_rows=p.forbidden_rows,
-                preparation=preparation,
-                screen_departure=lambda departure: self.keep_departure(i, departure),
-            )
-            if not v.ok:
-                raise _Stopped("unsupported")
             topologies.append(topology)
             variants.append(v)
-            bounds = CompletionBounds(p, topology, v, view, preparation=preparation)
             self.bounds.append(bounds)
-            if (self.options.endpoint_bounds and self.options.endpoint_max_rows and any(
-                completion_upper_bound(
-                    benefit, p.pi_f,
-                    bounds.cost_lower(variant, int(remaining_hops[v.cell[variant]])),
-                    (bounds.root_positive(variant),), self.negative[i],
-                ) > self.best[i][0] + _BOUND_CLOSURE_TOL
-                for variant in range(v.n_variants)
-            )):
-                self.endpoints[i] = EndpointBounds(bounds, self.options, self.check)
+            self.endpoints[i] = item.endpoint
+            if item.endpoint is not None:
+                item.endpoint.check = self.check
             offset = len(self.cells)
             self.cell_offsets.append(offset)
-            packing = packing_for(p.graph, p.cfg, topology)
-            self.cells.extend(packing.cells)
+            self.cells.extend(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
             self.cell_flights.extend([i] * topology.n_cells)
-            graph = packing.graph.copy()
+            graph = item.graph.copy()
             neighbors = graph[:, :6]
             neighbors[neighbors >= 0] += offset
             graphs.append(graph)
@@ -1303,6 +1213,12 @@ class _Batch:
         except pricing.PricingTimeout:
             status = "deadline"
         finally:
+            if self.prepared is not None:
+                # Ready groups outlive individual searches. Their endpoints must
+                # not retain completed batches and predecessor/device storage.
+                for endpoint in self.endpoints:
+                    if endpoint is not None:
+                        endpoint.check = lambda deadline=self.deadline: check_deadline(deadline)
             self.runtime.clear_batch()
         certified = complete and self.options.certify_search
         stats = {
@@ -1353,6 +1269,7 @@ def price_gpu_batch(
     options: PricingOptions,
     runtime: ComputeRuntime,
     deadline: float | None,
+    prepared: Sequence[PreparedFlight] | None = None,
 ) -> tuple[PricingResult, ...]:
     """Batch compatible flights and preserve caller order without running CPU pricing.
 
@@ -1362,12 +1279,15 @@ def price_gpu_batch(
     - options (PricingOptions): numeric mode, chunk size and label cap.
     - runtime (ComputeRuntime): reusable physical GPU runtime.
     - deadline (float | None): shared monotonic deadline.
+    - prepared (Sequence[PreparedFlight] | None): ordered completed CPU preparation, if supplied.
 
     Return
     --------
     - output (tuple[PricingResult, ...]): ordered validated incumbents and certificate statuses.
     """
     groups: dict[pricing.DualView, list[int]] = defaultdict(list)
+    if prepared is not None and len(prepared) != len(problems):
+        raise ValueError("Prepared result count does not match the GPU batch")
     if options.gpu_integer_bounds != getattr(runtime, "integer_bounds", False):
         raise ValueError("Integer pricing options must match the compiled GPU runtime")
     normalized: dict[tuple[int, tuple[int, int]], pricing.DualView] = {}
@@ -1385,10 +1305,10 @@ def price_gpu_batch(
     batch_type = _Batch
     if options.gpu_integer_bounds:
         from .gpu_integer_search import IntegerBatch
-
         batch_type = IntegerBatch
     for indices in groups.values():
-        batch = batch_type([current[i] for i in indices], options, runtime, deadline)
+        batch = batch_type([current[i] for i in indices], options, runtime, deadline,
+                       None if prepared is None else [prepared[i] for i in indices])
         for index, result in zip(indices, batch.run(), strict=True):
             results[index] = result
     return tuple(results)

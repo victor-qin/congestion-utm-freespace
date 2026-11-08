@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from heapq import heappop, heappush
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -18,8 +19,10 @@ from .dp_prepare import (
     PreparedVariants,
 )
 from .gpu_bounds import CompletionBounds
-from .gpu_runtime import ComputeRuntime
 from .pricing_platform import PricingProblem
+
+if TYPE_CHECKING:
+    from .gpu_runtime import ComputeRuntime
 
 
 def _float32_lower(values: np.ndarray) -> np.ndarray:

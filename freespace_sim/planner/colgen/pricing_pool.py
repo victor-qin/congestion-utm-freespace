@@ -997,6 +997,10 @@ def _gpu_options(params: ColGenParams) -> PricingOptions:
         endpoint_max_rows=params.pricing_gpu_endpoint_max_rows,
         endpoint_cache_bytes=params.pricing_gpu_endpoint_cache_bytes,
         endpoint_cache_work=params.pricing_gpu_endpoint_cache_work,
+        prepare_workers=params.pricing_gpu_prepare_workers,
+        prepare_batch_size=params.pricing_gpu_prepare_batch_size,
+        prepare_max_bytes=params.pricing_gpu_prepare_max_bytes,
+        prepare_cache_bytes=params.pricing_gpu_prepare_cache_bytes,
     )
 
 
@@ -1041,6 +1045,7 @@ def _sweep_gpu(
     - output (SweepResult): processed results in order, with independent completion and
       optimality status. Unresolved batches retain valid columns but cannot certify.
     """
+    own_platform = platform is None
     if platform is None:
         platform = make_pricing_platform(params)
     elif platform.options != _gpu_options(params):
@@ -1060,74 +1065,89 @@ def _sweep_gpu(
     log.info("pricing sweep: %d flights on %s GPU, %s arithmetic",
              len(pricing_order), params.pricing_gpu_backend,
              "CPU-verified" if params.pricing_cpu_recompute else "unchecked FP32")
-    for start in range(0, len(pricing_order), params.pricing_gpu_batch_size):
-        if deadline is not None and time.monotonic() >= deadline:
-            status, certified, timeout_id = "deadline", False, pricing_order[start]
-            break
-        batch_ids = pricing_order[start:start + params.pricing_gpu_batch_size]
-        problems = [PricingProblem(graphs[fid], cfg, params, dual_view, flight_duals[fid],
-                                   known_column=known_columns.get(fid)) for fid in batch_ids]
-        batch_started = time.perf_counter()
-        results = platform.price_batch(problems, deadline=deadline)
-        batch_s = time.perf_counter() - batch_started
-        task_total_s += batch_s
-        if len(results) != len(batch_ids):
-            raise ValueError("GPU pricing returned an incomplete result vector")
-        counters["gpu_batches"] += 1
-        # The runtime repeats its shared work counts in each result. Sum each batch once.
-        for key in ("gpu_dispatches", "labels", "candidates", "cpu_recomputations",
-                    "verified_prunes", "gpu_prune_proposals", "canonical_validations",
-                    "grouped_labels"):
-            counter = key if key.startswith("gpu_") else f"gpu_{key}"
-            counters[counter] += int(results[0].stats.get(key, 0))
-        batch_complete = True
-        for position, (fid, result) in enumerate(zip(batch_ids, results, strict=True)):
-            if result.flight_id != fid or (
-                result.column is not None and result.column.flight_id != fid
-            ):
-                raise ValueError("GPU pricing returned a result for the wrong flight")
-            if result.certified and (
-                not result.search_complete or result.upper_bound is None
-                or not result.upper_bound >= result.reduced_cost
-            ):
-                raise ValueError("GPU pricing certificate does not bound its reduced cost")
-            if not result.certified:
-                certified = False
-                if status == "complete":
-                    status = "approximate"
-            if not result.search_complete:
-                if batch_complete:
-                    status = result.status
-                    if status in {"complete", "approximate"}:
-                        status = "incomplete"
-                batch_complete, certified = False, False
-                if result.status == "deadline" and timeout_id is None:
-                    timeout_id = fid
-            ids.append(fid)
-            scores.append(float(result.reduced_cost))
-            bounds.append(float(result.upper_bound) if result.certified else float("inf"))
-            columns.append(result.column)
-            record = _flight_record(fid, batch_s / len(batch_ids), priced=True, search={
-                "pricing_backend": result.backend,
-                "pricing_certified": result.certified,
-                "search_complete": result.search_complete,
-                "pricing_status": result.status,
-                "cpu_recompute": result.cpu_recompute,
-                "upper_bound": result.upper_bound,
-                "device_name": result.stats.get("device_name"),
-                "gpu_batch_index": counters["gpu_batches"] - 1,
-                "gpu_batch_size": len(batch_ids),
-                "timing_scope": "batch_share",
-                "_canonical_pricing_result": (
-                    result.column is None or is_certified_column(result.column, graphs[fid], model)
-                ),
-            })
-            if position == 0:
-                record["gpu_batch_stats"] = dict(result.stats, wall_s=batch_s)
-            records.append(record)
-        log.info("  GPU priced %d/%d flights (%s)", len(ids), len(pricing_order), status)
-        if not batch_complete:
-            break
+    prepared_batches = None
+    if params.pricing_gpu_prepare_workers:
+        prepared_batches = platform.price_batches([
+            PricingProblem(graphs[fid], cfg, params, dual_view, flight_duals[fid],
+                           known_column=known_columns.get(fid)) for fid in pricing_order
+        ], params.pricing_gpu_batch_size, deadline)
+    try:
+        for start in range(0, len(pricing_order), params.pricing_gpu_batch_size):
+            if deadline is not None and time.monotonic() >= deadline:
+                status, certified, timeout_id = "deadline", False, pricing_order[start]
+                break
+            batch_ids = pricing_order[start:start + params.pricing_gpu_batch_size]
+            problems = [PricingProblem(graphs[fid], cfg, params, dual_view, flight_duals[fid],
+                                       known_column=known_columns.get(fid)) for fid in batch_ids]
+            batch_started = time.perf_counter()
+            results = (platform.price_batch(problems, deadline=deadline) if prepared_batches is None
+                       else next(prepared_batches))
+            batch_s = time.perf_counter() - batch_started
+            task_total_s += batch_s
+            if len(results) != len(batch_ids):
+                raise ValueError("GPU pricing returned an incomplete result vector")
+            counters["gpu_batches"] += 1
+            # The runtime repeats its shared work counts in each result. Sum each batch once.
+            for key in ("gpu_dispatches", "labels", "candidates", "cpu_recomputations",
+                        "verified_prunes", "gpu_prune_proposals", "canonical_validations",
+                        "grouped_labels"):
+                counter = key if key.startswith("gpu_") else f"gpu_{key}"
+                counters[counter] += int(results[0].stats.get(key, 0))
+            batch_complete = True
+            for position, (fid, result) in enumerate(zip(batch_ids, results, strict=True)):
+                if result.flight_id != fid or (
+                    result.column is not None and result.column.flight_id != fid
+                ):
+                    raise ValueError("GPU pricing returned a result for the wrong flight")
+                if result.certified and (
+                    not result.search_complete or result.upper_bound is None
+                    or not result.upper_bound >= result.reduced_cost
+                ):
+                    raise ValueError("GPU pricing certificate does not bound its reduced cost")
+                if not result.certified:
+                    certified = False
+                    if status == "complete":
+                        status = "approximate"
+                if not result.search_complete:
+                    if batch_complete:
+                        status = result.status
+                        if status in {"complete", "approximate"}:
+                            status = "incomplete"
+                    batch_complete, certified = False, False
+                    if result.status == "deadline" and timeout_id is None:
+                        timeout_id = fid
+                ids.append(fid)
+                scores.append(float(result.reduced_cost))
+                bounds.append(float(result.upper_bound) if result.certified else float("inf"))
+                columns.append(result.column)
+                record = _flight_record(fid, batch_s / len(batch_ids), priced=True, search={
+                    "pricing_backend": result.backend,
+                    "pricing_certified": result.certified,
+                    "search_complete": result.search_complete,
+                    "pricing_status": result.status,
+                    "cpu_recompute": result.cpu_recompute,
+                    "upper_bound": result.upper_bound,
+                    "device_name": result.stats.get("device_name"),
+                    "gpu_batch_index": counters["gpu_batches"] - 1,
+                    "gpu_batch_size": len(batch_ids),
+                    "timing_scope": "batch_share",
+                    "_canonical_pricing_result": (
+                        result.column is None or is_certified_column(result.column, graphs[fid], model)
+                    ),
+                })
+                if position == 0:
+                    record["gpu_batch_stats"] = dict(result.stats, wall_s=batch_s)
+                records.append(record)
+            log.info("  GPU priced %d/%d flights (%s)", len(ids), len(pricing_order), status)
+            if not batch_complete:
+                break
+    finally:
+        if prepared_batches is not None:
+            if len(ids) == len(pricing_order) and status in {"complete", "approximate"}:
+                next(prepared_batches, None)
+            prepared_batches.close()
+        if own_platform:
+            platform.close()
     return SweepResult(
         tuple(ids), tuple(scores), tuple(columns), timeout_id,
         task_total_s=task_total_s, wall_s=time.perf_counter() - started,

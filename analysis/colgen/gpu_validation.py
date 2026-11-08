@@ -165,6 +165,30 @@ def failure_reasons(
     return reasons
 
 
+def cpu_only_preparation_worker(sock: Any, options: Any) -> None:
+    """Guard full CPU pricing and GPU creation in the actual spawned analysis worker.
+
+    Parameters
+    ------------
+    - sock (Any): worker's bounded transport socket.
+    - options (PricingOptions): original preparation limits.
+
+    Return
+    --------
+    - output (None): enters the unchanged CPU worker with ownership guards installed.
+    """
+    from freespace_sim.planner.colgen import gpu_prepare_pool, gpu_runtime, pricing
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        """Reject any original full CPU search or GPU runtime creation in a worker."""
+        raise AssertionError("CPU preparation worker attempted search/device initialization")
+
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        setattr(pricing, name, forbidden)
+    gpu_runtime.ComputeRuntime = forbidden
+    gpu_prepare_pool._worker_main(sock, options)
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Prepare a reproducible selection or run fixed-price/full-solver GPU validation.
@@ -179,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "replay", "solve"))
+    parser.add_argument("--prepare-workers", type=int, default=0)
+    parser.add_argument("--prepare-batch-size", type=int, default=8)
+    parser.add_argument("--prepare-cache-bytes", type=int, default=128 * 1024 * 1024)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True, help="Fresh output directory")
     parser.add_argument("--budget", type=float, default=1800.0)
@@ -236,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
                      pricing_gpu_integer_audit=args.audit_integer,
                      pricing_gpu_approach_bounds=args.approach_bounds,
                      pricing_gpu_chunk_size=args.chunk_size, pricing_gpu_batch_size=args.batch_size,
+                     pricing_gpu_prepare_workers=args.prepare_workers,
+                     pricing_gpu_prepare_batch_size=args.prepare_batch_size,
+                     pricing_gpu_prepare_cache_bytes=args.prepare_cache_bytes,
                      n_pricing_workers=0, time_limit_s=args.budget, ip_time_limit_s=60.0,
                      ip_reserve_s=65.0)
     args.out.mkdir(parents=True)
@@ -269,17 +299,42 @@ def main(argv: list[str] | None = None) -> int:
     records: list[dict[str, Any]] = []
     batch_wall_s: list[float] = []
     original_price_batch = pricing_platform.PricingPlatform.price_batch
+    original_batches = pricing_platform.PricingPlatform.price_batches
+    batch_call_depth = 0
+
+    def record(problems: Any, values: Any, elapsed: float) -> None:
+        """Record and independently audit one ordered search batch exactly once."""
+        batch_wall_s.append(elapsed)
+        records.extend(result_record(value) for value in values)
+        save_report(args.out / "pricing.json", {"results": records})
+        for problem, value in zip(problems, values, strict=True):
+            validate_column(problem, value)
 
     def observe(self: Any, problems: Any, deadline: float | None = None) -> Any:
-        """Persist every completed batch, including incomplete searches and repair calls."""
+        """Observe direct batches, including singleton repair and serial preparation."""
+        nonlocal batch_call_depth
         batch_started = time.perf_counter()
-        results = original_price_batch(self, problems, deadline=deadline)
-        batch_wall_s.append(time.perf_counter() - batch_started)
-        records.extend(result_record(result) for result in results)
-        save_report(args.out / "pricing.json", {"results": records})
-        for problem, result in zip(problems, results, strict=True):
-            validate_column(problem, result)
-        return results
+        batch_call_depth += 1
+        try:
+            values = original_price_batch(self, problems, deadline=deadline)
+        finally:
+            batch_call_depth -= 1
+        record(problems, values, time.perf_counter() - batch_started)
+        return values
+
+    def observe_batches(self: Any, problems: Any, batch_size: int, deadline: float | None = None) -> Any:
+        """Observe synchronous parallel groups without double counting direct price_batch calls."""
+        batches = original_batches(self, problems, batch_size, deadline)
+        batch_started = time.perf_counter()
+        try:
+            for index, values in enumerate(batches):
+                if self.options.prepare_workers and not batch_call_depth:
+                    record(problems[index * batch_size:(index + 1) * batch_size], values,
+                           time.perf_counter() - batch_started)
+                yield values
+                batch_started = time.perf_counter()
+        finally:
+            batches.close()
 
     def forbid_cpu(*positional: Any, **kwargs: Any) -> Any:
         """Reject a CPU full-pricing call rather than accepting silent fallback."""
@@ -289,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
     result = None
     error = None
     with ExitStack() as stack:
+        from freespace_sim.planner.colgen import gpu_prepare_pool
+        stack.enter_context(patch.object(gpu_prepare_pool, "_worker_main", cpu_only_preparation_worker))
         for module in (pricing, pricing_pool, solver):
             stack.enter_context(patch.object(module, "price_flight", forbid_cpu))
         for name in ("_best_column", "_best_column_compiled"):
@@ -298,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
 
             stack.enter_context(patch.object(_Batch, "bound", forbid_cpu))
         stack.enter_context(patch.object(pricing_platform.PricingPlatform, "price_batch", observe))
+        stack.enter_context(patch.object(pricing_platform.PricingPlatform, "price_batches", observe_batches))
         try:
             if args.mode == "solve":
                 result = run(captured["cfg"], requests=requests, planner_name="colgen",
@@ -321,10 +379,14 @@ def main(argv: list[str] | None = None) -> int:
                     chunk_size=args.chunk_size,
                     gpu_integer_bounds=args.integer_bounds, gpu_integer_audit=args.audit_integer,
                     gpu_approach_bounds=args.approach_bounds,
+                    prepare_workers=args.prepare_workers, prepare_batch_size=args.prepare_batch_size,
+                    prepare_cache_bytes=args.prepare_cache_bytes,
                 ))
-                for start in range(0, len(problems), args.batch_size):
-                    platform.price_batch(problems[start:start + args.batch_size],
-                                         deadline=started + args.budget)
+                try:
+                    for _ in platform.price_batches(problems, args.batch_size, started + args.budget):
+                        pass
+                finally:
+                    platform.close()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
     failures = failure_reasons(records, {r.flight_id for r in requests}, result)

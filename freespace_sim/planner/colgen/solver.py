@@ -72,6 +72,10 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
         "pricing_device": params.pricing_device,
         "pricing_gpu_backend": params.pricing_gpu_backend,
         "pricing_cpu_recompute": params.pricing_cpu_recompute,
+        "pricing_gpu_prepare_workers": params.pricing_gpu_prepare_workers,
+        "pricing_gpu_prepare_batch_size": params.pricing_gpu_prepare_batch_size,
+        "pricing_gpu_prepare_max_bytes": params.pricing_gpu_prepare_max_bytes,
+        "pricing_gpu_prepare_cache_bytes": params.pricing_gpu_prepare_cache_bytes,
         "pricing_bound_certified": False,
         "pricing_search_complete": False,
         "last_pricing_status": "not_started",
@@ -1922,6 +1926,8 @@ class ColGenSolver:
             # (including the time limit), and an exception on any of them.
             if sweep_pool is not None:
                 sweep_pool.close()
+            if pricing_platform is not None:
+                pricing_platform.close_preparation()
 
         # The heuristic is a genuine incumbent on both backends and a MIP start
         # on Gurobi.  It may prove the requested IP gap before a final MILP is
@@ -2056,10 +2062,15 @@ class ColGenSolver:
                         deadline=deadline,
                     )
                 else:
-                    outcome, = pricing_platform.price_batch((PricingProblem(
-                        graph, cfg, params, {}, 0.0, forbidden_rows=frozenset(saturated),
-                        require_improving=False,
-                    ),), deadline=deadline)
+                    repair_options = pricing_platform.options
+                    pricing_platform.options = replace(repair_options, prepare_workers=0)
+                    try:
+                        outcome, = pricing_platform.price_batch((PricingProblem(
+                            graph, cfg, params, {}, 0.0, forbidden_rows=frozenset(saturated),
+                            require_improving=False,
+                        ),), deadline=deadline)
+                    finally:
+                        pricing_platform.options = repair_options
                     repaired = outcome.column
                     kernel_counters["gpu_batches"] += 1
                     for counter, key in (("gpu_dispatches", "gpu_dispatches"),

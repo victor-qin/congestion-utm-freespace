@@ -12,6 +12,45 @@ import pytest
 from analysis.colgen.gpu_validation import failure_reasons, select_requests, serializable
 
 
+@pytest.mark.parametrize("changes,comparable", [
+    ({}, True),
+    ({"certified": False, "search_complete": False, "upper_bound": None}, False),
+    ({"reduced_cost": 2.0, "upper_bound": 2.0}, False),
+    ({"upper_bound": 1.01}, False),
+    ({"flight_id": 2224}, False),
+])
+def test_main_port_comparison_requires_matching_complete_certificates(
+    tmp_path: Path, changes: dict, comparable: bool,
+) -> None:
+    """Cold work and capped or mismatched objectives cannot create a warm speedup claim."""
+    from analysis.colgen.main_pruning_experiment import replay_summary
+
+    paths = {}
+    for name, wall, updates in (("main", 4.0, {}), ("port", 2.0, changes)):
+        row = dict(flight_id=940, reduced_cost=1.0, upper_bound=1.0000005,
+                   certified=True, search_complete=True, stats={}) | updates
+        report = dict(capture_sha256=["early", "late"], runs=[
+            dict(label="round1_cold", elapsed_s=100., results=[row]),
+            dict(label="round1_warm_0", elapsed_s=wall, results=[row]),
+            dict(label="round1_warm_1", elapsed_s=wall + 2, results=[row]),
+            dict(label="round11_changed", elapsed_s=wall, results=[row | dict(
+                reduced_cost=10., upper_bound=10.0000005)]),
+        ])
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(report))
+        paths[name] = [path]
+    summary = replay_summary(paths)
+    assert summary["main"]["warm_median_s"] == 5.0
+    assert summary["port"]["warm_median_s"] == 3.0
+    assert summary["port"]["all_complete_matching_objectives"] is comparable
+    reduction = summary["port"]["matched_warm_reduction_percent_vs_first"]
+    assert reduction == (40.0 if comparable else None)
+    report["capture_sha256"] = ["different"]
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="different captured"):
+        replay_summary(paths)
+
+
 def test_selection_preserves_requests_and_required_regression() -> None:
     """Selection retains original coordinates, IDs, and clocks without shortening flights."""
     requests = [SimpleNamespace(flight_id=i, origin=np.zeros(3), dest=np.array([i, 0., 0.]),

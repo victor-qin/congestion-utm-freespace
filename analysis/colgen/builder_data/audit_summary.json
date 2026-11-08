@@ -1,0 +1,16 @@
+{
+  "results": 352,
+  "groups": 32,
+  "elapsed_with_audits_s": 40.57622708380222,
+  "matched_direct_outcome": true,
+  "integer_prepare_s": 8.054411927238107,
+  "group_wall_s": 6.868368045426905,
+  "worker_cpu_prepare_sum_s": 24.990985070355237,
+  "cache_account_sum_s": 9.744387698359787,
+  "canonical_checks": 754,
+  "canonical_rejections": 0,
+  "gpu_s": 0.8979653939604759,
+  "wait_s": 4.116971880197525,
+  "dispatches": 10776,
+  "timing_note": "Nested timers overlap; worker sums are not wall time. Audited elapsed excluded from production comparisons."
+}

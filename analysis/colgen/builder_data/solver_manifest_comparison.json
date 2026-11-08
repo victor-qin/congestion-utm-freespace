@@ -1,0 +1,58 @@
+[
+  {
+    "run": "base-solve-w0-2",
+    "source_changes": [],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "base-solve-w12-2",
+    "source_changes": [],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "all-solve-w12-2",
+    "source_changes": [
+      "freespace_sim/planner/colgen/gpu_bounds.py",
+      "freespace_sim/planner/colgen/gpu_endpoint.py",
+      "freespace_sim/planner/colgen/network.py"
+    ],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "all-solve-w0-1",
+    "source_changes": [
+      "freespace_sim/planner/colgen/gpu_bounds.py",
+      "freespace_sim/planner/colgen/gpu_endpoint.py",
+      "freespace_sim/planner/colgen/network.py"
+    ],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "base-solve-w0-1",
+    "source_changes": [],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "base-solve-w12-1",
+    "source_changes": [],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "all-solve-w12-1",
+    "source_changes": [
+      "freespace_sim/planner/colgen/gpu_bounds.py",
+      "freespace_sim/planner/colgen/gpu_endpoint.py",
+      "freespace_sim/planner/colgen/network.py"
+    ],
+    "inputs_and_limits_match": true
+  },
+  {
+    "run": "all-solve-w0-2",
+    "source_changes": [
+      "freespace_sim/planner/colgen/gpu_bounds.py",
+      "freespace_sim/planner/colgen/gpu_endpoint.py",
+      "freespace_sim/planner/colgen/network.py"
+    ],
+    "inputs_and_limits_match": true
+  }
+]

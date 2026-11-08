@@ -98,8 +98,145 @@ that batch must fit the configured preparation group.
 
 ## Validation and measurements
 
-Rebased validation and fresh hard88 measurements are recorded below. Previous
-measurements on the earlier main revision are superseded.
+Measured on Apple M1 Ultra with licensed Gurobi (one thread), production source
+`82e22724` above main `ebc60608`. All sustained runs held the shared benchmark lock;
+lock waiting is excluded. Input/source hashes, parameters, round timings and
+profile summaries are in [gpu_parallel_rebased_validation.json](gpu_parallel_rebased_validation.json).
+
+### Hard88 production wall time
+
+Two fresh-process runs per backend, original ordered hard88 inputs, fresh subset
+LP prices, the same legal route domain and solver limits. GPU uses twelve
+preparation workers, group twelve, 178956970 accounted cache bytes per worker,
+GPU batch one, cap 250000, chunk 2048, and checked integer plus approach bounds.
+CPU uses twelve native pricing workers. The CPU implementation is current main's
+descendant of PR133, not an exact PR133 checkout. Production canonical validation
+and final independent feasibility checking remain enabled. GPU full-CPU pricing,
+CPU per-prune numeric verification and worker GPU initialization are forbidden by
+runtime guards. No CPU/GPU overlap occurs.
+
+| Measurement | GPU + 12 preparation workers | Native CPU, 12 pricing workers |
+| --- | ---: | ---: |
+| Total wall, repeats (s) | 34.377 / 34.292 | 14.641 / 14.566 |
+| Mean total wall (s) | **34.335** | **14.604** |
+| Mean pricing wall (s) | **30.292** | **9.581** |
+| Pricing rounds | 4 | 6 |
+| Completed/certified flight results | 352/352 | 528/528 |
+| Accepted and independently verified flights | 88 | 88 |
+| Final cost | 8708.244489 | 8716.244489 |
+| Cost lower bound | 8696.551502 | 8700.244489 |
+| Final LP gap | 0.042447% | 0% |
+| Remaining global integer gap | 0.134275% | 0.183565% |
+
+CPU remains faster on this cohort. Both stop at the configured LP-gap criterion,
+with no label cap or incomplete pricing. They generate different columns and
+follow different price trajectories, producing different final integer costs.
+This is a same-input/backend comparison, not an equal-final-result speedup claim;
+neither run proves global integer optimality.
+
+Mean pricing time per round across the two runs:
+
+| Round | GPU (s) | CPU (s) |
+| --- | ---: | ---: |
+| 1 | 10.785 | 3.326 |
+| 2 | 10.763 | 2.297 |
+| 3 | 4.749 | 1.127 |
+| 4 | 3.994 | 0.982 |
+| 5 | stopped | 0.856 |
+| 6 | stopped | 0.994 |
+
+These are full solver sweep timers, including synchronous preparation, transport
+and search. After the initial round, corresponding round numbers do not imply
+identical dual prices or incumbents. Cold work is included in round one; later
+rounds use warm caches with changed prices, not same-price warm replays.
+
+### Preparation benefit and measurement overhead
+
+The separately audited harness, which performs extra per-batch canonical audits
+and rewrites a growing pricing JSON file, measured 67.183 s with serial preparation
+versus 43.120 / 43.340 s with twelve preparation workers: 35.7% less elapsed time
+using the repeated parallel mean against one serial control. All three have the
+same cost, bound, four rounds, 352 certificates, 1,340,700 candidates and 10,776
+dispatches. This supports a benefit from parallel preparation within the GPU path,
+not a speed advantage over native CPU pricing. The serial control was not repeated.
+
+Do not mix those audited timings with production timings. Profiling exposed about
+nine seconds of extra unprofiled harness overhead; it repeatedly serializes all
+accumulated results after every flight. `parallel_profile --direct` avoids that
+extra observation while retaining production checks and fallback guards. Its small
+per-round callback is present in both CPU and GPU runs. The audited and direct GPU
+runs preserve identical final cost/bound, rounds and dispatch counts.
+
+### Profile and remaining CPU work
+
+Owner-only cProfile increases production-path wall from about 34.3 s to 79.059 s
+(81.491 s including outer input/manifest work). These instrumented times identify
+hot functions; they are not normal-runtime measurements. Worker processes are not
+cProfile-instrumented. Selected **nested, nonadditive** cumulative times:
+
+| Owner function | Instrumented cumulative time (s) |
+| --- | ---: |
+| `gpu_integer_search.py:323 IntegerBatch.prepare` | 25.272 |
+| `gpu_integer_search.py:89 root_operands` (inside preparation) | 23.964 |
+| `gpu_integer.py:114 encode` (inside preparation) | 14.004 |
+| `gpu_pricing.py:950 search` | 25.423 |
+| `gpu_pricing.py:810 complete` (inside search) | 10.580 |
+| `gpu_prepare_pool.py:516 prepare` (includes waiting for workers) | 10.801 |
+| `gpu_runtime.py:458 run` | 6.558 |
+
+The unprofiled audited repeat supplies lower-overhead stage telemetry:
+
+- Synchronous preparation groups: 9.139 s wall total; by round
+  5.997 / 1.903 / 0.666 / 0.574 s. Startup 0.752 s, owner serialization 0.138 s,
+  restoration 1.613 s, and price encoding 0.006 s are included/overlapping.
+- Integer-table preparation in the GPU owner: 8.018 s; approach preparation
+  0.811 s; bootstrap search 10.337 s. These overlap other search/runtime timers.
+- Measured GPU execution 0.877 s and owner waits 4.094 s over 10,776 dispatches.
+  GPU time is device-reported command execution, not total search time or a
+  measured utilization percentage; GPU idle time is not directly instrumented.
+- Zero CPU per-prune numeric checks; 754 canonical candidate validations, zero
+  rejections. Canonical checks execute in the owner, not in the preparation pool.
+  There is no queue waiting for a preparation worker to approve GPU deletions.
+- 88 graph registrations across all four rounds, four encoded price snapshots,
+  zero cache evictions; 10.63 MB requests and 79.89 MB replies. Stable assignments
+  and retained caches avoid re-registering flights at each price change.
+- Worker preparation sums to 38.090 CPU-stage seconds and cache accounting to
+  12.048 seconds across workers; these are not wall time. Reported per-worker RSS
+  highwaters range 265–336 MB in this repeat. Their 3.57 GB sum is not a simultaneous
+  memory measurement. The roughly 2 GiB aggregate accounted-cache budget is not an
+  RSS limit. Earlier audited repeat peaked at 248 MB for its largest worker.
+- Device allocation counters: 18,481 allocations / 824.42 MB cumulative allocated;
+  1117.59 MB uploaded and 205.80 MB downloaded. These are traffic/cumulative
+  allocation counts, not peak retained device memory.
+
+Owner integer operand generation/encoding and canonical candidate construction
+remain prominent CPU costs after moving independent flight preparation to workers.
+The profile does not establish that more preparation workers or CPU/GPU overlap
+would remove those costs. Overlap remains a separate follow-up, not this PR.
+
+### Relation to PR133 CPU numbers
+
+The historical optimized results associated with PR133 in
+[results.json](results.json) used **1537 / 1545 flights**, twelve CPU workers and
+four Gurobi threads: 472.031 / 644.577 s pricing over 11 / 14 rounds, or
+**42.912 / 46.041 s per round on average**. Total walls were 1065.784 / 1345.489 s.
+The PR explicitly labels these as measurements before final integration; they
+are not fresh post-merge timings. Comparing their 43–46 s rounds with 88-flight
+GPU rounds would falsely imply a GPU speedup. The fresh 88-flight native CPU
+comparison above is the relevant scale-matched evidence after PR133.
+
+### Functional checks and earlier removal of PR144
+
+379 distinct focused tests pass across preparation pool, pricing platform,
+endpoint, options, validation, solver and integer paths, including actual Metal
+and licensed Gurobi. Two analysis ablation tests initially patched the module
+from before CPU extraction; fixing their target and rechecking resolved both.
+Changed Python passes Ruff; whitespace checks pass. NVIDIA execution is untested.
+
+The earlier port onto main `0cbd284a`, before PR144 landed, preserved the hard88
+cost and all 352 pricing certificates/four rounds. It did not establish equal
+runtime. The current rebase inherits PR144 and PR146 because both are now in main;
+their changes are not part of PR145's diff.
 
 ## Tightened bound and reproduction
 
@@ -115,20 +252,16 @@ cd /Users/victor/.t3/worktrees/congestion-utm-freespace/codex-parallel-cpu-prepa
 export PYTHONPATH="$PWD"
 export COLGEN_GUROBI_THREADS=1
 /Users/victor/Documents/Research/congestion-utm-freespace/.venv/bin/python - <<'PY'
-import fcntl, json, subprocess, sys
+import fcntl, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 
 root = Path('/Users/victor/Documents/Research/congestion-utm-freespace')
-ids = [r['flight_id'] for r in json.loads(Path(
-    'analysis/colgen/arrival_union_results.json').read_text())['hard88']['after']['rows']]
 out = '.agent/runs/parallel-approach-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-cmd = [sys.executable, '-m', 'analysis.colgen.gpu_validation', 'solve',
+cmd = [sys.executable, '-m', 'analysis.colgen.parallel_profile',
        '--capture', str(root / '.agent/runs/colgen-metal-20261105-220722/pricing_captures/round_0001.pkl'),
-       '--flight-ids', *map(str, ids), '--approach-bounds', '--integer-bounds',
-       '--prepare-workers', '12', '--prepare-batch-size', '12',
-       '--prepare-cache-bytes', '178956970', '--batch-size', '1',
-       '--max-labels', '250000', '--chunk-size', '2048', '--budget', '900', '--out', out]
+       '--direct', '--out', out]
+# Add '--profile' for owner cProfile; add '--device', 'cpu' for native CPU comparison.
 with (root / '.agent/gpu-followups-20261106/metal-benchmark.lock').open('a') as lock:
     print('Waiting for benchmark lock; results:', out, flush=True)
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -139,7 +272,10 @@ PY
 This uses new LP prices in a full solver run, original inputs, canonical
 validation and the full CPU-pricer guard. It preserves a 900-second solver
 budget and a 250000-label pricing cap. The output directory contains the source
-and input manifest, pricing records, final schedule and planner statistics.
+and input manifest, per-round times, final verification and planner statistics.
+Omit `--direct` for the extra audited GPU run, which also writes individual pricing
+records and the final schedule; those audited wall times include substantial
+measurement overhead.
 The configured LP-gap stop does not prove exact global integer optimality.
 
 CPU/GPU overlap remains a separate future branch: any future pipeline must keep

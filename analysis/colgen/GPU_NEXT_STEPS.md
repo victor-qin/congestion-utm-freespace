@@ -2,6 +2,12 @@
 
 ## Authorization and order
 
+- 2026-11-08 [USER] Keep PR146 stacked on PR144 and prepare it for merge.
+  Launch integer caching in its own worktree conversation from PR146 at Extra
+  High effort. The main-only experiment remains analysis evidence; do not
+  retarget PR146. Existing draft/no-merge holds remain until explicit landing
+  authorization. The former coordinator is unplugged; report directly to the user.
+
 - 2026-11-07 [USER] Current authorization supersedes the earlier landing-first
   sequence: PR143 has landed; PR144 stays draft and unmerged while all three
   follow-up branches proceed. No automatic merge after their completion.

@@ -117,3 +117,16 @@ comparisons. Local smoke artifacts are `.agent/main-port-smoke`,
 
 Earlier PR146 wall times all included PR144. This experiment provides new
 measurements; it does not retroactively attribute those times to main alone.
+
+## Completed hard88 experiment and decision
+
+The two-process-repeat run completed all 18 phases with 88/88 certificates,
+identical reduced costs and returned columns. Warm medians over four calls were
+39.743073 s for main, 30.355693 s for main plus PR146, and 25.939761 s for the
+PR144+PR146 stack. First-call medians were 78.275586, 68.889249 and 65.109863 s.
+The standalone port saves 23.62% versus main; the stack saves a further 4.415932 s
+(14.55% versus the port). These are fixed-price replay measurements.
+
+The raw bundle is `.agent/main-pr146-hard88-20261107-215305`. On 2026-11-08 the
+user chose to keep PR146 stacked on PR144 and prepare for merge, then launch
+integer caching from PR146. This supersedes the earlier deferred-cache decision.

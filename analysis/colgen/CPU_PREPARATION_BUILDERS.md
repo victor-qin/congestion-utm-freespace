@@ -59,11 +59,16 @@ and candidate only at identical worker settings and matched completion/results;
 CPU12 results from the handoff are a different algorithmic result and are not
 used as a speedup denominator.
 
-Raw records are bundled in `cpu_builder_evidence.zip`; from the repository root,
+To inspect or re-summarize the archived measurements, raw records are bundled
+in `cpu_builder_evidence.zip`; from the repository root,
 extract them with `unzip analysis/colgen/cpu_builder_evidence.zip 'analysis/colgen/builder_data/*'`.
 The archive preserves the original measured sources/report; current PR notes
 and normalized CSV line endings are maintained separately outside that archive.
-Create `.agent/builder-base` before the source-archive command below.
+For fresh measurements, use a fresh checkout without extracting archived raw
+records into `builder_data`; the launcher refuses to overwrite existing outputs.
+It schedules both base/combined preparation repetitions, all isolated trials,
+controls and the direct solver matrix. Create `.agent/builder-base` before the
+source-archive command below.
 
 Every sustained job holds the shared `fcntl.flock`; launchers leave a two-second
 unlocked window between jobs. `builder_locked.py` records exact commands and

@@ -21,7 +21,8 @@ for repeat in (1, 2):
         name = f'{stage}-prep-{repeat}'
         jobs.append((name, [python, benchmark, '--out', str(out / (name+'.json')),
                            '--stages', stage, '--early-only'], here))
-for name, source, controls in [('base-prep-2', base, False), ('all-prep-2', here, False),
+for name, source, controls in [('base-prep-1', base, False), ('all-prep-1', here, False),
+                               ('base-prep-2', base, False), ('all-prep-2', here, False),
                                ('base-controls', base, True), ('all-controls', here, True)]:
     jobs.append((name, [python, benchmark, '--out', str(out / (name+'.json')),
                        '--source', str(source), *(['--controls'] if controls else [])], here))

@@ -53,7 +53,12 @@ telemetry records `pricing_gpu_validate_routes`.
 
 Seed, solver-insertion and final schedule validation remain enabled. The solver
 revalidates unchecked returned routes before insertion and cannot use their pricing
-scores as a certified global bound. Consequently the unchecked full solve may stop
+scores as a certified global bound. Invalid unchecked routes are discarded at
+insertion or repair, including repair routes that touch saturated capacity rows;
+`gpu_unchecked_rejections` counts these downstream rejections separately from
+completion checks. The feasible incumbent is preserved, and rejected repairs remain
+unproven denials. Checked-mode backend contract violations still raise errors.
+Consequently the unchecked full solve may stop
 for approximate stagnation or its iteration/time budget rather than the checked
 LP-gap criterion. Do not compare total solves as matched work without comparing
 iterations, labels and termination. The earlier isolated diagnostic timing below

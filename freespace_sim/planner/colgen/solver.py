@@ -87,6 +87,7 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
         "gpu_canonical_validations": 0,
         "gpu_canonical_validation_skips": 0,
         "gpu_canonical_rejections": 0,
+        "gpu_unchecked_rejections": 0,
         "gpu_labels": 0,
         "approximate_pricing_sweeps": 0,
         "approximate_pricing_wall_s": 0.0,
@@ -1603,10 +1604,17 @@ class ColGenSolver:
                                 priced_columns.append(column)
                             else:
                                 pricing_revalidated_columns += 1
-                                priced_columns.append(_timed(
-                                    "canonical_priced", _canonical_column,
-                                    column, graphs[flight_id], cfg, model=model,
-                                ))
+                                try:
+                                    canonical = _timed(
+                                        "canonical_priced", _canonical_column,
+                                        column, graphs[flight_id], cfg, model=model,
+                                    )
+                                except (ValueError, NotImplementedError):
+                                    if params.pricing_gpu_validate_routes:
+                                        raise
+                                    kernel_counters["gpu_unchecked_rejections"] += 1
+                                    continue
+                                priced_columns.append(canonical)
                     # Extra candidates improve the pool without adding another bound term
                     # for the same flight. Pricing certifies each against the same duals.
                     for column in sweep.extra_columns:
@@ -1850,6 +1858,7 @@ class ColGenSolver:
                         "pricing_timeout_flight_id": pricing_timeout_flight_id,
                         "last_pricing_status": last_pricing_status,
                         "gpu_dispatches": kernel_counters.get("gpu_dispatches", 0),
+                        "gpu_unchecked_rejections": kernel_counters.get("gpu_unchecked_rejections", 0),
                         "cheap_sweep_s": cheap_attempt_s,
                         "cheap_columns_added": cheap_columns_added,
                         # The work the sweep actually did, against the wall above.  With a
@@ -2103,20 +2112,33 @@ class ColGenSolver:
                 break
             if repaired is None:
                 continue
-            repaired = _canonical_column(repaired, graph, cfg)
-            if any(loads[row] + 1 > row_index.cap(row) for row in repaired.claims):
-                raise RuntimeError(
-                    f"repair pricing returned an infeasible column for flight "
-                    f"{graph.request.flight_id}"
-                )
-            incumbent[graph.request.flight_id] = repaired
-            for row in repaired.claims:
-                old_load = loads[row]
-                new_load = old_load + 1
-                loads[row] = new_load
-                if old_load < row_index.cap(row) <= new_load:
-                    saturated.add(row)
-            repair_added += 1
+            try:
+                repaired = _canonical_column(repaired, graph, cfg)
+            except (ValueError, NotImplementedError):
+                if params.pricing_gpu_validate_routes:
+                    raise
+                repaired = None
+            if repaired is not None and any(
+                loads[row] + 1 > row_index.cap(row) for row in repaired.claims
+            ):
+                if params.pricing_gpu_validate_routes:
+                    raise RuntimeError(
+                        f"repair pricing returned an infeasible column for flight "
+                        f"{graph.request.flight_id}"
+                    )
+                repaired = None
+            if repaired is None:
+                kernel_counters["gpu_unchecked_rejections"] += 1
+                search_exhausted_flights.add(graph.request.flight_id)
+            else:
+                incumbent[graph.request.flight_id] = repaired
+                for row in repaired.claims:
+                    old_load = loads[row]
+                    new_load = old_load + 1
+                    loads[row] = new_load
+                    if old_load < row_index.cap(row) <= new_load:
+                        saturated.add(row)
+                repair_added += 1
             if repair_deadline:
                 # An incomplete GPU search can still return a validated incumbent.
                 termination_reason = "time_limit"
@@ -2323,6 +2345,7 @@ class ColGenSolver:
             "gpu_canonical_validations": kernel_counters.get("gpu_canonical_validations", 0),
             "gpu_canonical_validation_skips": kernel_counters.get("gpu_canonical_validation_skips", 0),
             "gpu_canonical_rejections": kernel_counters.get("gpu_canonical_rejections", 0),
+            "gpu_unchecked_rejections": kernel_counters.get("gpu_unchecked_rejections", 0),
             "gpu_labels": kernel_counters.get("gpu_labels", 0),
             "pricing_timeout_flight_id": pricing_timeout_flight_id,
             # Total pricing wall across every sweep.  Pricing is where a solve spends

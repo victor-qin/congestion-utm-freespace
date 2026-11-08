@@ -236,22 +236,33 @@ def test_gpu_fp32_mode_keeps_validation_but_never_certifies() -> None:
     _assert_canonical(problem, result)
 
 
-def test_cpu_recomputation_recovers_improvement_hidden_by_fp32(monkeypatch) -> None:
+@pytest.mark.parametrize("layer_block", [1, 2])
+@pytest.mark.parametrize("benefit", [1e4, 1e8, 1e12])
+def test_cpu_recomputation_recovers_improvement_hidden_by_fp32(
+    monkeypatch: pytest.MonkeyPatch, layer_block: int, benefit: float,
+) -> None:
     """A rounded-away improving route survives refinement without rerunning CPU pricing."""
+    from freespace_sim.planner.colgen import gpu_resident
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    monkeypatch.setattr(gpu_resident, "_LAYER_BLOCK", layer_block)
+    monkeypatch.setattr(_Batch, "bootstrap", lambda self: None)
     exact = _platform("metal")
     approximate = _platform("metal", cpu_recompute=False)
+    scale = benefit / 1e4
     cfg = _cfg(
         flight_levels_m=(30.0,),
         max_ground_delay_s=0.0,
         time_buffer_s=0.0,
-        cost_ground_delay_per_s=1e-10,
-        cost_air_hold_per_s=1e-10,
-        cost_air_lateral_per_s=1e-10,
+        cost_ground_delay_per_s=1e-10 * scale,
+        cost_air_hold_per_s=1e-10 * scale,
+        cost_air_lateral_per_s=1e-10 * scale,
         max_detour_factor=5.0,
     )
-    params = _params(max_air_overrun_hops=2, objective="total_cost")
+    params = _params(max_air_overrun_hops=2, objective="total_cost", M=benefit)
     graph = build_flight_graph(_request(1, (0, 0), (3, 0), cfg), cfg, (), params)
-    problem = PricingProblem(graph, cfg, params, {RowKey.cell((2, 0), 0, 3): 1e-5}, 9999.99998)
+    problem = PricingProblem(graph, cfg, params, {RowKey.cell((2, 0), 0, 3): 1e-5 * scale},
+                             benefit - 2e-5 * scale)
     expected = _oracle(problem)
 
     def no_cpu_search(*args, **kwargs):
@@ -264,11 +275,100 @@ def test_cpu_recomputation_recovers_improvement_hidden_by_fp32(monkeypatch) -> N
     (fp32,) = approximate.price_batch([problem])
     assert certified.certified and certified.stats["cpu_recomputations"] > 0
     assert certified.stats["gpu_dispatches"] > 0
-    assert certified.reduced_cost == pytest.approx(expected, rel=0, abs=1e-9)
-    assert certified.reduced_cost > fp32.reduced_cost + 5e-6
+    assert certified.stats["restored_prunes"] > 0
+    assert certified.reduced_cost == pytest.approx(expected, rel=0, abs=1e-9 * scale)
+    assert certified.reduced_cost > fp32.reduced_cost + 5e-6 * scale
     assert not fp32.certified and fp32.upper_bound is None
     _assert_canonical(problem, certified)
     _assert_canonical(problem, fp32)
+    # Isolate the margin from the legacy unchecked mode's approximate grouping.
+    for epsilon, audit, border in ((0.0, False, False), (2e-5, False, False),
+                                   (0.0, True, False), (2e-5, True, False),
+                                   (0.0, False, True), (2e-5, False, True),
+                                   (2e-5, True, True)):
+        options = replace(exact.options, gpu_prune_epsilon=epsilon * scale, gpu_prune_audit=audit,
+                          gpu_prune_verify_border=border)
+        platform = PricingPlatform(options)
+        platform._runtime = exact._runtime
+        (result,) = platform.price_batch([problem])
+        assert result.search_complete and result.certified == audit
+        assert result.stats["dominance"] == "none"
+        _assert_canonical(problem, result)
+        if audit or epsilon:
+            assert result.reduced_cost == pytest.approx(expected, rel=0, abs=1e-9 * scale)
+        else:
+            assert expected > result.reduced_cost + 5e-6 * scale
+        if audit and epsilon == 0:
+            assert result.stats["rejected_prunes"] > 0
+        if not audit:
+            assert result.upper_bound is None
+            if not border:
+                assert result.stats["cpu_recomputations"] == 0
+
+
+@pytest.mark.parametrize("epsilon", [0.0, 1e-6, 0.01])
+@pytest.mark.parametrize("signed", [False, True])
+def test_epsilon_pruning_preserves_routes_and_never_claims_a_certificate(
+    monkeypatch: pytest.MonkeyPatch, epsilon: float, signed: bool,
+) -> None:
+    """Signed and overlapping claims remain canonical, with no numeric CPU verification."""
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    platform = _platform("metal")
+    platform.options = replace(platform.options, gpu_prune_epsilon=epsilon)
+    problem = _problem(signed=signed)
+    expected = _oracle(problem)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Experimental GPU pruning called an original CPU verifier/pricer")
+
+    monkeypatch.setattr(_Batch, "bound", forbidden)
+    for name in ("price_flight", "_best_column", "_best_column_compiled"):
+        monkeypatch.setattr(pricing, name, forbidden)
+    (result,) = platform.price_batch([problem])
+    assert result.search_complete and not result.certified and result.upper_bound is None
+    assert result.stats["cpu_recomputations"] == 0
+    assert result.stats["candidates"] > 0
+    assert result.reduced_cost == pytest.approx(expected, rel=0, abs=1e-6)
+    _assert_canonical(problem, result)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"gpu_prune_epsilon": -1.0}, {"gpu_prune_epsilon": math.inf},
+    {"gpu_prune_epsilon": math.nan}, {"gpu_prune_epsilon": True},
+    {"gpu_prune_audit": True}, {"gpu_prune_audit": 1},
+    {"gpu_prune_verify_border": True}, {"gpu_prune_verify_border": 1},
+    {"gpu_prune_epsilon": 0.0, "cpu_recompute": False},
+])
+def test_invalid_epsilon_options_fail_before_device_initialization(kwargs: dict) -> None:
+    """Ambiguous numeric modes cannot silently weaken an advertised certificate."""
+    with pytest.raises((TypeError, ValueError)):
+        PricingOptions(device="gpu", gpu_backend="metal", **kwargs)
+
+
+def test_unchecked_completion_experiment_can_be_audited_after_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The diagnostic removes in-search checks while preserving post-search route auditing."""
+    from analysis.colgen.gpu_epsilon_experiment import experiment
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    problem = _problem(signed=True)
+    # The ablation retains normally prepared initial incumbents in every mode.
+    pricing._shortest_seed(problem.graph, problem.cfg, model=cost_model(problem.cfg, problem.params))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unchecked search invoked a verifier or original full CPU pricer")
+
+    with experiment(0.0, True), monkeypatch.context() as scoped:
+        scoped.setattr(_Batch, "bound", forbidden)
+        for name in ("price_flight", "_best_column", "_best_column_compiled", "_canonical_candidate"):
+            scoped.setattr(pricing, name, forbidden)
+        (result,) = _platform("metal").price_batch([problem])
+    assert not result.certified and result.upper_bound is None
+    assert result.stats["cpu_recomputations"] == result.stats["canonical_validations"] == 0
+    assert result.stats["unchecked_completions"] > 0
+    _assert_canonical(problem, result)
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2048])
@@ -330,6 +430,11 @@ def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
                 assert result.stats["future_gpu_dispatches"] > 0
             _assert_canonical(problem, result)
 
+    if share_prices:
+        # Reordering flights and starting another batch must retain the same device table.
+        assert platform._runtime.counters["price_uploads"] == 1
+        assert platform._runtime.counters["price_cache_hits"] == 3
+
     original_prices = (
         first.duals._duals if isinstance(first.duals, pricing.DualView) else first.duals
     )
@@ -350,6 +455,10 @@ def test_gpu_batches_and_reuses_runtime_without_mixing_prices(
         assert result.reduced_cost == pytest.approx(optimum, abs=1e-8)
         assert result.upper_bound >= optimum - 1e-9
         _assert_canonical(problem, result)
+
+    if share_prices:
+        assert platform._runtime.counters["price_uploads"] == 2
+        assert len(platform._runtime.prices.stores) == 2
 
 
 @pytest.mark.parametrize("buffer", [0.0, 4.0, 12.0])
@@ -563,15 +672,40 @@ def test_expired_deadline_never_certifies(backend: str) -> None:
     assert result.upper_bound is None or result.upper_bound >= _oracle(problem) - 1e-8
 
 
-def test_gpu_label_limit_preserves_incomplete_status() -> None:
-    """Exhausting label storage does not become a no-improvement certificate."""
-    platform = _platform("metal", max_labels=1, chunk_size=1)
+@pytest.mark.parametrize("max_labels", [1, 1024])
+def test_gpu_label_limit_preserves_incomplete_status(
+    monkeypatch: pytest.MonkeyPatch, max_labels: int,
+) -> None:
+    """A bounded first pass retries all roots, but exhausting the caller's cap cannot certify."""
+    from freespace_sim.planner.colgen import gpu_pricing
+
+    monkeypatch.setattr(gpu_pricing, "_INITIAL_FULL_LABEL_LIMIT", 8)
+    monkeypatch.setattr(gpu_pricing._Batch, "bootstrap", lambda self: None)
+    platform = _platform("metal", max_labels=max_labels, chunk_size=1)
     problem = _problem(signed=True)
     (result,) = platform.price_batch([problem])
-    assert not result.search_complete and not result.certified
+    if max_labels == 1:
+        assert not result.search_complete and not result.certified
+    else:
+        assert result.search_complete and result.certified
+        assert 0 < result.stats["initial_full_search_labels"] <= 8
+        assert result.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
     assert result.upper_bound is None or result.upper_bound >= _oracle(problem) - 1e-8
     if result.column is not None:
         _assert_canonical(problem, result)
+
+
+@pytest.mark.parametrize("buffer,max_labels", [(4.0, 250_000), (192.0, 250_000), (4.0, 3_000_000)])
+def test_closed_roots_do_not_reserve_a_resident_search_arena(buffer: float, max_labels: int) -> None:
+    """A zero-label certificate remains available even when unused capacity exceeds GPU memory limits."""
+    problem = replace(_problem(buffer=buffer), duals={})
+    result, = _platform("metal", max_labels=max_labels).price_batch([problem])
+    assert result.search_complete and result.certified
+    assert result.stats["full_search_labels"] == 0 and result.stats["root_prunes"] > 0
+    assert result.stats.get("resident_bytes", 0) == 0
+    assert result.upper_bound >= result.reduced_cost
+    assert result.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
+    _assert_canonical(problem, result)
 
 
 def test_long_diagonal_flight_closes_with_a_certified_cost_bound(monkeypatch) -> None:
@@ -662,3 +796,193 @@ def test_unavailable_cuda_fails_explicitly(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(GPUUnavailable, match="[Cc][Uu][Dd][Aa]"):
         platform = PricingPlatform(PricingOptions(device="gpu", gpu_backend="cuda"))
         platform.price_batch([_problem()])
+
+
+def test_snapshot_summaries_preserve_rounding_and_interrupted_publication():
+    """Shared summaries match ordered FP64 bounds, including signed out-of-domain rows."""
+    from freespace_sim.planner.colgen.gpu_prices import summary_for
+
+    cfg = _cfg()
+    raw = {RowKey.cell((-999, 99), 0, 1): -1e20,
+           RowKey.cell((0, 0), 0, 2): -3.25,
+           RowKey.term("terminal", -100): 1e20}
+    view = pricing.DualView(raw, cfg)
+    calls = 0
+
+    def interrupt():
+        """Stop before publication rather than retaining partially accumulated bounds."""
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise pricing.PricingTimeout()
+
+    with pytest.raises(pricing.PricingTimeout):
+        summary_for(view, interrupt)
+    assert view._gpu_summary is None
+    negative = absolute = 0.0
+    for price in raw.values():
+        if price < 0:
+            negative = math.nextafter(negative + price, -math.inf)
+        if price:
+            absolute = math.nextafter(absolute + abs(price), math.inf)
+    result = summary_for(view)
+    assert (result.negative, result.absolute) == (negative, absolute)
+    assert summary_for(view) is result
+    raw[RowKey.term("terminal", -100)] = -7.0
+    assert summary_for(view) is result
+    assert summary_for(pricing.DualView(raw, cfg)).negative < result.negative
+
+
+@pytest.mark.parametrize("layer_block", [1, 2])
+def test_resident_rejected_completion_keeps_its_continuation(monkeypatch, layer_block):
+    """Rejecting an early destination must retain its later, canonically valid completion."""
+    from freespace_sim.planner.colgen import gpu_resident
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    cfg = _cfg(flight_levels_m=(30.0,), max_ground_delay_s=0.0, time_buffer_s=0.0,
+               max_detour_factor=20.0)
+    params = _params(max_air_overrun_hops=2)
+    origin, dest, via = (0, 0), (1, 0), (1, 1)
+    graph = build_flight_graph(_request(1, origin, dest, cfg), cfg, (), params)
+    graph = replace(graph, corridor_cells=frozenset((origin, dest, via)),
+                    forbidden_hops=frozenset(((dest, origin),)))
+    from freespace_sim.planner.colgen.translate import Column
+
+    short = Column(1, graph.base_step, 0, None, None, (origin, dest), 0.0)
+    long = replace(short, cell_path=(origin, dest, via, dest))
+    late = column_claims(long, graph, cfg) - column_claims(short, graph, cfg)
+    priced = next(row for row in sorted(late) if row.kind == "cell" and row.cell_coord == via)
+    problem = PricingProblem(graph, cfg, params, {priced: -1000.0}, 0.0)
+    expected = _oracle(problem)
+    original = pricing._canonical_candidate
+    rejected = []
+
+    def reject_short(candidate, *args, **kwargs):
+        """Model canonical rejection without rejecting that prefix's possible continuations."""
+        if len(candidate.label.path) == 2:
+            rejected.append(candidate)
+            return None
+        return original(candidate, *args, **kwargs)
+
+    def forbid(*args, **kwargs):
+        raise AssertionError("Resident search must not call full CPU pricing")
+
+    monkeypatch.setattr(gpu_resident, "_LAYER_BLOCK", layer_block)
+    monkeypatch.setattr(_Batch, "bootstrap", lambda self: None)
+    monkeypatch.setattr(pricing, "_canonical_candidate", reject_short)
+    monkeypatch.setattr(pricing, "price_flight", forbid)
+    monkeypatch.setattr(pricing, "_best_column", forbid)
+    monkeypatch.setattr(pricing, "_best_column_compiled", forbid)
+    (result,) = _platform("metal", max_labels=128).price_batch([problem])
+    assert rejected and result.certified
+    assert result.reduced_cost == pytest.approx(expected, abs=1e-8)
+    assert result.column.cell_path == (origin, dest, via, dest)
+    if layer_block == 2:
+        assert result.stats["resident_multi_layer_blocks"] > 0
+    _assert_canonical(problem, result)
+
+
+@pytest.mark.parametrize("failure", ["buffer_limit", "queue_limit", "deadline"])
+@pytest.mark.parametrize("epsilon", [None, 0.001])
+def test_resident_limits_preserve_incomplete_status_and_allow_runtime_reuse(monkeypatch, failure, epsilon):
+    """Allocation/queue exhaustion and checkpoint deadlines never close unresolved alternatives."""
+    from freespace_sim.planner.colgen import gpu_resident
+    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+    platform = _platform("metal", max_labels=1024)
+    platform.options = replace(platform.options, gpu_prune_epsilon=epsilon)
+    problem = _problem(signed=True)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(_Batch, "bootstrap", lambda self: None)
+        if failure == "buffer_limit":
+            scoped.setattr(gpu_resident, "_MAX_BYTES", 1)
+        elif failure == "queue_limit":
+            original_control = gpu_resident.ResidentSearch.control
+
+            def undersize_queue(self, values):
+                """Force actual kernel overflow while retaining the normal allocated buffers."""
+                if len(values) == 4:
+                    values = (*values[:3], 0)
+                return original_control(self, values)
+
+            scoped.setattr(gpu_resident.ResidentSearch, "control", undersize_queue)
+            scoped.setattr(_Batch, "proposal_cutoff", lambda self, flight:
+                           math.inf if epsilon is None else -math.inf)
+            original_retain = _Batch.retain
+            scoped.setattr(_Batch, "retain", lambda self, root, parent, cell, hops:
+                           True if hops == 0 else original_retain(self, root, parent, cell, hops))
+        else:
+            original_checkpoint = gpu_resident.ResidentSearch.checkpoint
+
+            def expired(self, *args):
+                """Expire after device work, with any queued choices still unresolved."""
+                self.batch.deadline = 0.0
+                return original_checkpoint(self, *args)
+
+            scoped.setattr(gpu_resident.ResidentSearch, "checkpoint", expired)
+        (result,) = platform.price_batch([problem])
+        assert result.status == failure
+        assert not result.certified and not result.search_complete and result.upper_bound is None
+    (recovered,) = platform.price_batch([problem])
+    assert recovered.certified == (epsilon is None)
+    assert recovered.search_complete
+    assert recovered.reduced_cost == pytest.approx(_oracle(problem), abs=1e-8)
+    _assert_canonical(problem, recovered)
+
+
+def test_resident_record_copies_preserve_extension_words():
+    """Resident buffers preserve opaque mask/bound words beyond the common record prefix."""
+    from freespace_sim.planner.colgen.gpu_buffers import Dispatch
+    from freespace_sim.planner.colgen.gpu_runtime import ComputeRuntime
+
+    _platform('metal')
+    runtime = ComputeRuntime('metal')
+    stride = 12
+    records = np.arange(stride * 2, dtype=np.int32).reshape(2, stride)
+    records[:, 3] = -1
+    records[:, 6] = 2
+    records[:, 7:9] = np.array([[0x80000000, 0xffffffff], [0xffffffff, 0x80000000]],
+                              np.uint32).view(np.int32)
+    source = runtime.upload(records)
+    values = runtime.upload(np.array([[1., 2.], [3., 4.]], np.float32))
+    indices = runtime.upload(np.array([1, 0], np.int32))
+    arena = runtime.empty((4, stride), np.int32)
+    arena_values = runtime.empty((4, 2), np.float32)
+    frontier = runtime.empty((2,), np.int32)
+    labels = runtime.empty((3, stride), np.int32)
+    label_values = runtime.empty((3, 2), np.float32)
+    runtime.run_many((
+        Dispatch('resident_copy', 2, (
+            runtime.upload(np.array([2, stride, 1, 0, 1], np.int32)), source, values, indices,
+            arena, arena_values, frontier,
+        )),
+        Dispatch('resident_load', 3, (
+            runtime.upload(np.array([3, stride, 0], np.int32)), arena, arena_values, frontier,
+            runtime.upload(np.array([3, 2, 0, 0, 0, 0], np.int32)), labels, label_values,
+        )),
+    ))
+    expected = records[[1, 0]].copy()
+    np.testing.assert_array_equal(runtime.read_rows(arena, 1, 2), expected)
+    expected[:, 3] = [1, 2]
+    np.testing.assert_array_equal(runtime.read_rows(labels, 0, 2), expected)
+    assert runtime.read_rows(labels, 2, 1)[0, 6] == 0
+    np.testing.assert_array_equal(runtime.read_rows(label_values, 0, 2), [[3., 4.], [1., 2.]])
+    assert runtime.counters['waits'] == 1
+
+    # Experimental deletions must disappear on-device, without occupying a
+    # verification slot or retaining a completion/continuation as unresolved.
+    candidates = records.copy()
+    candidates[:, 6] = [16 | 1 | 2, 4 | 2]
+    counts = runtime.upload(np.zeros(7, np.int32))
+    event_records = runtime.empty((2, stride), np.int32)
+    event_values = runtime.empty((2, 2), np.float32)
+    event_meta = runtime.empty((2, 5), np.int32)
+    event_upper = runtime.empty((2,), np.float32)
+    runtime.run_many((Dispatch('resident_compact', 2, (
+        runtime.upload(np.array([2, stride, 4, 2], np.int32)), runtime.upload(candidates),
+        runtime.upload(np.array([[1., 2., 3.], [4., 5., 6.]], np.float32)),
+        arena, arena_values, frontier, counts, event_records, event_values, event_meta, event_upper,
+    )),))
+    np.testing.assert_array_equal(runtime.read(counts), [0, 0, 0, 1, 0, 2, 1])
+    np.testing.assert_array_equal(runtime.read_rows(event_records, 0, 1), candidates[1:])
+    assert runtime.read_rows(event_upper, 0, 1)[0] == 6.0

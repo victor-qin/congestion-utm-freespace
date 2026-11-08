@@ -28,6 +28,10 @@ class PricingOptions:
     cpu_recompute: bool = True
     max_labels: int = 250_000
     chunk_size: int = 2048
+    # Experimental absolute RC allowance, not a proved floating-point error bound.
+    gpu_prune_epsilon: float | None = None
+    gpu_prune_audit: bool = False
+    gpu_prune_verify_border: bool = False
     endpoint_bounds: bool = True
     endpoint_max_rows: int = 64
     endpoint_cache_bytes: int = 1_048_576
@@ -43,6 +47,17 @@ class PricingOptions:
             raise ValueError("Select gpu_backend='metal' or 'cuda' exactly when device='gpu'")
         if not isinstance(self.cpu_recompute, bool):
             raise TypeError("cpu_recompute must be boolean")
+        if not isinstance(self.gpu_prune_audit, bool):
+            raise TypeError("gpu_prune_audit must be boolean")
+        if not isinstance(self.gpu_prune_verify_border, bool):
+            raise TypeError("gpu_prune_verify_border must be boolean")
+        if self.gpu_prune_epsilon is not None:
+            if (self.device != "gpu" or not self.cpu_recompute or
+                isinstance(self.gpu_prune_epsilon, bool) or
+                not math.isfinite(self.gpu_prune_epsilon) or self.gpu_prune_epsilon < 0):
+                raise ValueError("GPU epsilon needs a finite nonnegative margin and cpu_recompute=True")
+        elif self.gpu_prune_audit or self.gpu_prune_verify_border:
+            raise ValueError("GPU pruning audit/border verification requires gpu_prune_epsilon")
         if not isinstance(self.endpoint_bounds, bool):
             raise TypeError("endpoint_bounds must be boolean")
         for name in ("endpoint_max_rows", "endpoint_cache_bytes", "endpoint_cache_work"):
@@ -55,6 +70,17 @@ class PricingOptions:
             value = getattr(self, name)
             if type(value) is not int or not 0 < value < 2**27:
                 raise ValueError(f"{name} must be a positive integer below 2**27")
+
+    @property
+    def verify_prunes(self) -> bool:
+        """Prepare original-price prefix sums when any proposal can require CPU checking."""
+        return self.cpu_recompute and (self.gpu_prune_epsilon is None or self.gpu_prune_audit
+                                       or self.gpu_prune_verify_border)
+
+    @property
+    def certify_search(self) -> bool:
+        """Only original FP64 checks, including epsilon audits, authorize a certificate."""
+        return self.cpu_recompute and (self.gpu_prune_epsilon is None or self.gpu_prune_audit)
 
 
 @dataclass(frozen=True, slots=True)

@@ -855,6 +855,7 @@ class _FlightSearchCache:
         "endpoint_claims",
         "prepared",
         "gpu_geometry",
+        "gpu_packing",
         "gpu_endpoints",
         "gpu_hops",
         "seed_columns",
@@ -878,6 +879,7 @@ class _FlightSearchCache:
         # One topology/config/objective-keyed geometry bound; prices and root subsets
         # remain call-local. See `gpu_bounds.CompletionBounds._prepare_geometry`.
         self.gpu_geometry: Any | None = None
+        self.gpu_packing: Any | None = None
         self.gpu_endpoints: Any | None = None
         self.gpu_hops: Any | None = None
         # `(label_capacity, log2cap, candidate_capacity)` the last completed compiled search

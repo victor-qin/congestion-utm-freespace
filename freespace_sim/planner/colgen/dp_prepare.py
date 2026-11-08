@@ -1148,6 +1148,10 @@ class PricingPreparation:
             self._origin_data = _prepare_origin_data(self.fg, self.cfg, topology)
         return self._origin_data
 
+    def legal_starts(self, departure: int, topology: PreparedTopology, build: Any) -> tuple:
+        """Evaluate current unpriced starts; GPU preparation may retain their fixed geometry."""
+        return tuple(build())
+
     def origin_claims(self, departure):
         """Reuse each departure's unchanged endpoint reservation across search stages."""
         if departure not in self._origin_claims:
@@ -1983,21 +1987,25 @@ def prepare_variants(
                          if preparation is None else preparation.origin_claims(departure_step))
         if not origin_claims.isdisjoint(forbidden_rows):
             continue
-        for lane_idx, cell, lane_steps in origin_options:
+        def legal_starts():
+            """Apply only fixed geometry/time guards before any call-specific root filtering."""
+            for lane_idx, cell, lane_steps in origin_options:
+                index = cell_index.get(cell)
+                if index is None:
+                    continue
+                distance_to_go = remaining_distance(cell)
+                start_step = departure_step + fg.takeoff_steps[0] + lane_steps
+                if (start_step >= fg.max_step or start_step + distance_to_go > fg.max_step
+                        or distance_to_go > topology.air_hop_limit):
+                    continue
+                yield lane_idx, cell, index, start_step, distance_to_go
+
+        starts_here = (legal_starts() if preparation is None else
+                       preparation.legal_starts(departure_step, topology, legal_starts))
+        for lane_idx, cell, index, start_step, distance_to_go in starts_here:
             if keep_roots is not None and (
                 departure_step, -1 if lane_idx is None else int(lane_idx)
             ) not in keep_roots:
-                continue
-            index = cell_index.get(cell)
-            if index is None:
-                continue
-            distance_to_go = remaining_distance(cell)
-            start_step = departure_step + fg.takeoff_steps[0] + lane_steps
-            if start_step >= fg.max_step:
-                continue
-            if start_step + distance_to_go > fg.max_step:
-                continue
-            if distance_to_go > topology.air_hop_limit:
                 continue
             if preparation is None:
                 start_claims = origin_claims | _visit_claims(cell, 0, start_step, offsets)

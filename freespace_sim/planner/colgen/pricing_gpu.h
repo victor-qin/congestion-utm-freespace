@@ -1,6 +1,6 @@
 // Shared Metal/CUDA body. Address spaces, entry points and atomics are runtime adapters.
 // Label fields: cell, root, hops, stable ID/parent ID, first A/B, status, paid low/high, recent cells.
-// Root values: benefit, assignment, ground, negative credit, hop cost, cutoff,
+// Root values: benefit, assignment, ground, negative credit, hop cost, reserved,
 // affine air-cost offset/slope, positive origin price, minimum total hops, future cost.
 INLINE float completion_bound(GLOBAL const float* data, float hops, float positive) {
     float air = fmax(0.0f, data[6] + hops * data[7]);
@@ -92,7 +92,10 @@ INLINE void expand_one(
     GLOBAL const float* values, GLOBAL const int* graph, GLOBAL const int* roots,
     GLOBAL const float* root_values, GLOBAL const float* visits, GLOBAL const int* blocked,
     GLOBAL const int* paid_rows, GLOBAL const float* paid_values,
-    GLOBAL int* output, GLOBAL float* scores, GLOBAL const unsigned int* visit_masks,
+    GLOBAL int* output, GLOBAL float* scores,
+    GLOBAL const int* price_map, GLOBAL const int* price_ranges,
+    GLOBAL const int* price_steps, GLOBAL const float* price_values, GLOBAL const float* cutoffs,
+    GLOBAL const unsigned int* visit_masks,
     GLOBAL const int* endpoint_meta, GLOBAL const int* endpoint_entries,
     GLOBAL const float* endpoint_trees
 ) {
@@ -101,6 +104,7 @@ INLINE void expand_one(
     int src_index = (int)tid / 6, arc = (int)tid % 6;
     int a = src_index * stride, b = (int)tid * stride;
     output[b + 6] = 0;
+    if (!labels[a + 6]) return;
     int cell = labels[a], root = labels[a + 1], hops = labels[a + 2];
     int target = graph[cell * 14 + arc];
     if (target < 0) return;
@@ -113,8 +117,16 @@ INLINE void expand_one(
     bool finish = graph[target * 14 + 13] && (role & (hops == 0 ? 8 : 4));
     bool onward = (role & (hops == 0 ? 2 : 1)) != 0;
     if (!finish && !onward) return;
-    float charge = visits[target * 3];
-    float positive_charge = visits[target * 3 + 1];
+    int slot = price_map[target];
+    int lo = price_ranges[slot * 2], stop = price_ranges[slot * 2 + 1], hi = stop;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (price_steps[mid] < step + 1) lo = mid + 1;
+        else hi = mid;
+    }
+    bool priced = lo < stop && price_steps[lo] == step + 1;
+    float charge = priced ? price_values[lo * 2] : 0.0f;
+    float positive_charge = priced ? price_values[lo * 2 + 1] : 0.0f;
     for (int j = roots[root * 6 + 1]; j < roots[root * 6 + 2]; ++j) {
         if (paid_rows[j * 2] == target && paid_rows[j * 2 + 1] >= step + 1 + control[3]
             && paid_rows[j * 2 + 1] <= step + 1 + control[4]) {
@@ -127,9 +139,9 @@ INLINE void expand_one(
     float positive = values[src_index * 2 + 1] + fmax(0.0f, positive_charge);
     float upper = completion_bound(data,
                                    (float)(hops + 1 + remaining), positive);
-    if (isfinite(visits[target * 3 + 2])) {
+    if (isfinite(visits[target])) {
         float future = ((data[0] - data[2]) -
-                        (data[6] + (float)(hops + 1) * data[7] + positive + visits[target * 3 + 2] - data[3])) - data[1];
+                        (data[6] + (float)(hops + 1) * data[7] + positive + visits[target] - data[3])) - data[1];
         upper = fmin(upper, future);
     }
     int flags = (finish ? 1 : 0) | (onward ? 2 : 0);
@@ -138,9 +150,14 @@ INLINE void expand_one(
     float endpoint = endpoint_bound(data, roots + root * 6, step + 1, hops + 1,
                                    remaining, positive, low, high,
                                    endpoint_meta, endpoint_entries, endpoint_trees);
-    if (endpoint <= data[5] && upper > data[5]) flags |= 8;
+    if (endpoint <= cutoffs[roots[root * 6] * 2] && upper > cutoffs[roots[root * 6] * 2]) flags |= 8;
     upper = fmin(upper, endpoint);
-    if (upper <= data[5]) flags |= 4;
+    // Bit 16 is an explicitly uncertified epsilon deletion, never a certificate.
+    int flight = roots[root * 6];
+    if (control[5] && isfinite(upper) && upper <= cutoffs[flight * 2 + 1])
+        flags |= control[5] == 1 ? 16 : (4 | 32);
+    else if ((!control[5] || isfinite(upper)) && upper <= cutoffs[flight * 2])
+        flags |= 4;
     output[b] = target;
     output[b + 1] = root;
     output[b + 2] = hops + 1;

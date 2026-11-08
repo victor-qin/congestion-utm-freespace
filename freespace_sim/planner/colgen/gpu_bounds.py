@@ -11,6 +11,7 @@ from .. import hexgrid as hg
 from ...config import SimConfig
 from ...volumes import enroute_reference_m, exit_radius
 from . import pricing
+from .gpu_prices import summary_for
 from .dp_prepare import PreparedTopology, PreparedVariants, PricingPreparation
 from .network import RowKey
 from .objective import CostModel, cost_model
@@ -106,10 +107,7 @@ class CompletionBounds:
         self._edge_min = 0.0
         self._reference = 0.0
         self._cost_scale = math.inf
-        self._absolute_prices = 0.0
-        for price in view._duals.values():
-            if price != 0.0:
-                self._absolute_prices = _up(self._absolute_prices + abs(price))
+        self._absolute_prices = summary_for(view).absolute
         self._claims: dict[int, frozenset[RowKey]] = {}
         if preparation is not None:
             preparation.check(

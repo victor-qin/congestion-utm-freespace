@@ -30,6 +30,7 @@ class _Buffer:
 def _runtime(
     monkeypatch: pytest.MonkeyPatch,
     execute: Callable[[list[_Buffer], int], None],
+    backend: str = "metal",
 ) -> tuple[ComputeRuntime, list[weakref.ReferenceType[_Buffer]]]:
     """Run the production adapter against synchronous CPU-backed Metal objects.
 
@@ -37,12 +38,42 @@ def _runtime(
     ------------
     - monkeypatch (pytest.MonkeyPatch): installs the fake backend without using a GPU.
     - execute (Callable): simulated kernel receives buffers and the dispatch count.
+    - backend (str): adapter to exercise with CPU-backed allocations.
 
     Return
     --------
     - output (tuple): real runtime and weak references to all allocated buffers.
     """
     allocations = []
+
+    if backend == "cuda":
+        class Array(np.ndarray):
+            """CPU storage exposing the CuPy upload interface without claiming CUDA execution."""
+
+            def set(self, source):
+                """Refresh the explicit allocation without replacing it."""
+                self[:] = source
+
+        def empty(shape, dtype):
+            """Track CUDA-adapter allocations using the same lifetime assertions."""
+            array = np.empty(shape, dtype).view(Array)
+            allocations.append(weakref.ref(array))
+            return array
+
+        api = SimpleNamespace(
+            empty=empty,
+            asarray=lambda source: np.array(source).view(Array),
+            asnumpy=lambda source: np.array(source),
+            cuda=SimpleNamespace(
+                Device=lambda: SimpleNamespace(id=0),
+                runtime=SimpleNamespace(getDeviceProperties=lambda _: {"name": "CPU CUDA double"}),
+                get_current_stream=lambda: SimpleNamespace(synchronize=lambda: None),
+            ),
+            RawModule=lambda **kwargs: SimpleNamespace(get_function=lambda name:
+                lambda grid, block, buffers: execute(buffers, buffers[0].size)),
+        )
+        monkeypatch.setitem(sys.modules, "cupy", api)
+        return ComputeRuntime("cuda"), allocations
 
     def allocate(length: int, options: int) -> _Buffer:
         """Track allocations without retaining buffers after the runtime releases them."""
@@ -53,24 +84,29 @@ def _runtime(
 
     def command_buffer() -> SimpleNamespace:
         """Execute the simulated kernel only when the runtime waits for completion."""
-        buffers = []
-        counts = []
+        commands = []
 
-        def bind(buffer: _Buffer, offset: int, index: int) -> None:
-            """Keep each argument binding in its declared order."""
-            assert offset == 0 and index == len(buffers)
-            buffers.append(buffer)
+        def encoder():
+            """Keep each dependent encoder's bindings until the single block wait."""
+            buffers, counts = [], []
+            commands.append((buffers, counts))
 
-        encoder = SimpleNamespace(
-            setComputePipelineState_=lambda pipeline: None,
-            setBuffer_offset_atIndex_=bind,
-            dispatchThreads_threadsPerThreadgroup_=lambda size, group: counts.append(size[0]),
-            endEncoding=lambda: None,
-        )
+            def bind(buffer: _Buffer, offset: int, index: int) -> None:
+                """Keep each argument binding in its declared order."""
+                assert offset == 0 and index == len(buffers)
+                buffers.append(buffer)
+
+            return SimpleNamespace(
+                setComputePipelineState_=lambda pipeline: None,
+                setBuffer_offset_atIndex_=bind,
+                dispatchThreads_threadsPerThreadgroup_=lambda size, group: counts.append(size[0]),
+                endEncoding=lambda: None,
+            )
+
         return SimpleNamespace(
-            computeCommandEncoder=lambda: encoder,
+            computeCommandEncoder=encoder,
             commit=lambda: None,
-            waitUntilCompleted=lambda: execute(buffers, counts[0]),
+            waitUntilCompleted=lambda: [execute(buffers, counts[0]) for buffers, counts in commands],
             status=lambda: 4,
         )
 
@@ -188,3 +224,130 @@ def test_metal_write_only_skips_initial_values_and_zero_count_is_independent(mon
             runtime.run(
                 "bound_roots", 2, (source, output), (1,), static=static, write_only=write_only
             )
+
+
+@pytest.mark.parametrize("backend", ["metal", "cuda"])
+def test_owned_buffers_survive_batch_cleanup_without_reupload(monkeypatch, backend):
+    """Device data remains live across batches and cannot be bound to another device owner."""
+    def execute(buffers, count):
+        """Use an explicitly owned input and write an explicitly owned output."""
+        source, output = (np.frombuffer(b.data, np.int32, count=count) for b in buffers)
+        output[:] = source + 1
+
+    runtime, allocations = _runtime(monkeypatch, execute, backend)
+    source = np.array([3, 7], np.int32)
+    owned = runtime.upload(source)
+    output = runtime.upload(np.zeros_like(source))
+    source[:] = -1
+    uploaded = runtime.counters["upload_bytes"]
+    for _ in range(2):
+        runtime.clear_batch()
+        (actual,) = runtime.run("bound_roots", 2, (owned, output), (1,))
+        np.testing.assert_array_equal(actual, [4, 8])
+    assert runtime.counters["upload_bytes"] == uploaded
+    assert len(allocations) == 2
+    other, _ = _runtime(monkeypatch, execute, backend)
+    with pytest.raises(ValueError, match="another runtime"):
+        other.run("bound_roots", 2, (owned, output), (1,))
+    runtime.clear_cache()
+    np.testing.assert_array_equal(runtime.read(owned), [3, 7])
+    del owned, output
+    assert all(ref() is None for ref in allocations)
+
+
+def test_price_store_bounds_lifetime_and_preserves_complete_support(monkeypatch):
+    """Complete snapshot tables refresh signs/new rows, survive cleanup, and obey LRU limits."""
+    from freespace_sim.planner.colgen.gpu_prices import DevicePriceCache
+    from freespace_sim.planner.colgen.pricing import DualView
+    from freespace_sim.planner.colgen.network import RowKey
+    from tests.test_colgen_pricing_platform import _cfg
+
+    runtime, _ = _runtime(monkeypatch, lambda buffers, count: None)
+    runtime.prices = DevicePriceCache(max_snapshots=1, max_bytes=1024 * 1024)
+    raw = {RowKey.cell((-999, 99), 0, -4): 7.0,
+           RowKey.cell((-999, 99), 0, -3): -2.0,
+           RowKey.cell((0, 0), 1, 2): 9.0, RowKey.term("A", 3): -6.0}
+    view = DualView(raw, _cfg())
+    first = runtime.prices.get(view, runtime, lambda: None)
+    before = dict(runtime.counters)
+    runtime.clear_batch()
+    assert runtime.prices.get(view, runtime, lambda: None) is first
+    assert runtime.counters["upload_bytes"] == before["upload_bytes"]
+    assert runtime.counters["allocations"] == before["allocations"]
+    ranges, steps, values = map(runtime.read, (first.ranges, first.steps, first.values))
+    for resource, windows in view._gpu_visit_prices.cells.items():
+        start, stop = ranges[first.slots[resource]]
+        assert dict(zip(map(int, steps[start:stop]), map(tuple, values[start:stop]))) == windows
+    assert first.slots.get(((999, -999), 0), 0) == 0
+    assert tuple(ranges[0]) == (0, 0)
+    raw[RowKey.cell((-999, 99), 0, -4)] = -13.0
+    raw[RowKey.cell((999, -999), 0, 777)] = 11.0
+    changed = DualView(raw, _cfg())
+    second = runtime.prices.get(changed, runtime, lambda: None)
+    assert second is not first
+    assert ((999, -999), 0) in second.slots
+    assert list(runtime.prices.stores) == [changed]
+    assert runtime.prices.nbytes == second.nbytes
+    # Eviction releases cache ownership, not a table still used by an active batch.
+    np.testing.assert_array_equal(runtime.read(first.values), values)
+    calls = 0
+
+    def expire():
+        """Interrupt after sparse sums were built but before all device arrays publish."""
+        nonlocal calls
+        calls += 1
+        if calls == len(view._gpu_visit_prices.cells) + 3:
+            raise TimeoutError()
+
+    with pytest.raises(TimeoutError):
+        runtime.prices.get(view, runtime, expire)
+    assert list(runtime.prices.stores) == [changed]
+    runtime.prices.max_bytes = 0
+    runtime.prices.clear()
+    uncached = runtime.prices.get(view, runtime, lambda: None)
+    assert not runtime.prices.stores and runtime.prices.nbytes == 0
+    np.testing.assert_array_equal(runtime.read(uncached.values), values)
+
+
+@pytest.mark.parametrize("backend", ["metal", "cuda"])
+def test_ordered_device_block_waits_once_and_reads_only_selected_rows(monkeypatch, backend):
+    """A later kernel consumes the preceding result without a host copy or intermediate wait."""
+    from freespace_sim.planner.colgen.gpu_buffers import Dispatch
+
+    def execute(buffers, count):
+        """Make the second invocation depend on bytes produced by the first."""
+        source, output = (np.frombuffer(b.data, np.int32, count=count) for b in buffers)
+        output[:] = source + 1
+
+    runtime, _ = _runtime(monkeypatch, execute, backend)
+    source = runtime.upload(np.array([[3, 7], [9, 11]], np.int32))
+    middle = runtime.empty(source.shape, source.dtype)
+    output = runtime.empty(source.shape, source.dtype)
+    runtime.run_many((Dispatch('bound_roots', 4, (source, middle)),
+                      Dispatch('group_best', 4, (middle, output))))
+    assert runtime.dispatches == 2 and runtime.counters['waits'] == 1
+    assert runtime.counters['upload_bytes'] == source.nbytes
+    np.testing.assert_array_equal(runtime.read_rows(output, 1, 1), [[11, 13]])
+    assert runtime.counters['download_bytes'] == 8
+    with pytest.raises(ValueError, match='row range'):
+        runtime.read_rows(output, 1, 2)
+    other, _ = _runtime(monkeypatch, execute, backend)
+    with pytest.raises(ValueError, match='foreign device'):
+        other.run_many((Dispatch('bound_roots', 4, (source, middle)),))
+
+
+@pytest.mark.parametrize('budget', [1, 8 * 9 * 4 + 1])
+def test_partial_resident_allocation_releases_storage(monkeypatch, budget):
+    """A memory limit during construction cannot retain a partially built search arena."""
+    import gc
+    from freespace_sim.planner.colgen import gpu_resident
+    from freespace_sim.planner.colgen.gpu_pricing import _Stopped
+
+    runtime, references = _runtime(monkeypatch, lambda buffers, count: None)
+    batch = SimpleNamespace(runtime=runtime, options=SimpleNamespace(max_labels=8, chunk_size=2),
+                            search_label_limit=8, stride=9, stats={})
+    monkeypatch.setattr(gpu_resident, '_MAX_BYTES', budget)
+    with pytest.raises(_Stopped, match='buffer_limit'):
+        gpu_resident.ResidentSearch(batch)
+    gc.collect()
+    assert all(ref() is None for ref in references)

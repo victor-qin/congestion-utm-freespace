@@ -11,16 +11,18 @@ import math
 import time
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
 
 from . import pricing
-from .dp_prepare import PricingPreparation, prepare_variants, prepared_for
+from .dp_prepare import prepare_variants, prepared_for
 from .gpu_bounds import CompletionBounds
 from .gpu_endpoint import EndpointBounds, Mask
 from .gpu_future import FutureBounds
-from .gpu_prices import SparseVisitPrices
+from .gpu_prices import SparseVisitPrices, summary_for
+from .gpu_prepare import GPUPreparation, packing_for
 from .gpu_runtime import ComputeRuntime
 from .network import RowKey
 from .objective import cost_model
@@ -110,9 +112,14 @@ class _Batch:
             deadline,
         )
         self.started = time.monotonic()
+        self.prune_mode = (0 if options.gpu_prune_epsilon is None else
+                           2 if options.gpu_prune_audit else 1)
         self.first_dispatch = runtime.dispatches
+        self.first_counters = dict(getattr(runtime, "counters", {}))
         self.best: list[tuple[float, Any]] = [(-math.inf, None) for _ in problems]
         self.closed_upper = [-math.inf for _ in problems]
+        self.audit_upper = math.inf
+        self.audit_direct = False
         normalized: dict[int, pricing.DualView] = {}
         self.views: list[pricing.DualView] = []
         for p in problems:
@@ -132,13 +139,7 @@ class _Batch:
             raise ValueError("DualView visit offsets must match the problem configuration")
         self.models = [cost_model(p.cfg, p.params) for p in problems]
         self.benefits = [pricing._benefit(p.params) for p in problems]
-        self.negative = []
-        for view in self.views:
-            value = 0.0
-            for price in view._duals.values():
-                if price < 0:
-                    value = _down(value + price)
-            self.negative.append(value)
+        self.negative: list[float] = []
         self.arena = np.empty((options.max_labels, 3), np.int32)
         self.search_label_limit = options.max_labels
         self.prefix_positive = np.empty(options.max_labels, np.float64)
@@ -156,7 +157,14 @@ class _Batch:
             cpu_recomputations=0,
             verified_prunes=0,
             gpu_prune_proposals=0,
+            gpu_direct_prunes=0,
+            rejected_prunes=0,
+            audited_bound_deficit_max=0.0,
+            rejected_gpu_margin_max=0.0,
+            epsilon_audited=0,
+            epsilon_rejected=0,
             canonical_validations=0,
+            canonical_rejections=0,
             max_frontier=0,
             grouped_labels=0,
             root_prunes=0,
@@ -168,6 +176,7 @@ class _Batch:
         self.destinations = [pricing._destination_options(p.graph) for p in problems]
         self._visit_layers: dict[int, tuple[np.ndarray, np.ndarray]] | None = None
         self._forbidden_layers: dict[int, np.ndarray] = {}
+        self.device_prices = None
 
     def check(self) -> None:
         """Stop cooperatively without converting an interrupted search into a certificate."""
@@ -211,6 +220,7 @@ class _Batch:
         - output (None): initializes shared graph/root arrays and feasible incumbents.
         """
         topologies, variants = [], []
+        self.negative = [summary_for(view, self.check).negative for view in self.views]
         self.bounds: list[CompletionBounds] = []
         self.cells: list[tuple[int, int]] = []
         self.cell_flights: list[int] = []
@@ -228,8 +238,6 @@ class _Batch:
                 math.isfinite(v) and v >= 0 for v in (model.ground_weight, model.air_weight)
             ):
                 raise ValueError("Certified bounds require finite nonnegative objective weights")
-            if not all(math.isfinite(v) for v in view._duals.values()):
-                raise ValueError("Normalized dual prices must be finite")
             topology, rows = prepared_for(p.graph, p.cfg)
             if not topology.ok or not rows.ok:
                 raise _Stopped("unsupported")
@@ -265,7 +273,7 @@ class _Batch:
                     if rc > self.best[i][0]:
                         self.best[i] = rc, column
             self.check()
-            preparation = PricingPreparation(
+            preparation = GPUPreparation(
                 p.graph, p.cfg, view, benefit=benefit, pi_f=p.pi_f, model=model,
                 forbidden_rows=p.forbidden_rows, retain_root_claims=True,
             )
@@ -299,16 +307,12 @@ class _Batch:
                 self.endpoints[i] = EndpointBounds(bounds, self.options, self.check)
             offset = len(self.cells)
             self.cell_offsets.append(offset)
-            self.cells.extend(zip(map(int, topology.cell_q), map(int, topology.cell_r)))
+            packing = packing_for(p.graph, p.cfg, topology)
+            self.cells.extend(packing.cells)
             self.cell_flights.extend([i] * topology.n_cells)
-            graph = np.full((topology.n_cells, 14), -1, np.int32)
-            graph[:, 6:12] = 0
-            graph[:, 12] = remaining_hops
-            graph[:, 13] = topology.dest_mask
-            for cell in range(topology.n_cells):
-                start, stop = map(int, topology.arc_start[cell : cell + 2])
-                graph[cell, : stop - start] = topology.arc_target[start:stop] + offset
-                graph[cell, 6 : 6 + stop - start] = topology.arc_roles[start:stop]
+            graph = packing.graph.copy()
+            neighbors = graph[:, :6]
+            neighbors[neighbors >= 0] += offset
             graphs.append(graph)
             paid_offset = len(paid_values)
             paid_rows.extend(zip(map(int, v.paid_cell + offset), map(int, v.paid_step)))
@@ -368,6 +372,28 @@ class _Batch:
             self.root_endpoint[root, 2] = self.variants[i].start_step[variant]
         self.pack_endpoints()
         self.evaluate_roots()
+        self.stats["prepare_s"] = time.monotonic() - self.started
+
+    def prepare_device_prices(self) -> None:
+        """Bind one shared snapshot table and map stable physical IDs to its storage slots.
+
+        Parameters
+        ------------
+        - self (_Batch): flights partitioned by immutable snapshot before execution.
+
+        Return
+        --------
+        - output (None): live shared table and an independent flight-local vertex map.
+        """
+        if any(view is not self.views[0] for view in self.views):
+            raise ValueError("GPU batch must share one immutable price snapshot")
+        started = time.monotonic()
+        self.prepare_visit_prices(gather=False)
+        self.device_prices = self.runtime.prices.get(self.views[0], self.runtime, self.check)
+        self.price_map = np.asarray([
+            self.device_prices.slots.get((cell, 0), 0) for cell in self.cells
+        ], np.int32)
+        self.stats["price_prepare_s"] = time.monotonic() - started
 
     def evaluate_roots(self) -> None:
         """Dispatch all root completion proposals after initial packing or stronger preparation."""
@@ -608,45 +634,85 @@ class _Batch:
 
     def retain(self, root: int, parent: int, cell: int, hops: int) -> bool:
         """Require CPU verification for every proposed numeric deletion in certified mode."""
-        if not self.options.cpu_recompute:
+        if not self.options.verify_prunes:
             return False
         i = self.root_flights[root]
         upper = self.bound(root, parent, cell, hops)
+        if self.options.gpu_prune_audit:
+            self.stats["epsilon_audited"] += int(self.audit_direct)
+            self.stats["audited_bound_deficit_max"] = max(
+                self.stats["audited_bound_deficit_max"], upper - self.audit_upper)
         if upper <= self.best[i][0] + _BOUND_CLOSURE_TOL:
             self.closed_upper[i] = max(self.closed_upper[i], upper)
             self.stats["verified_prunes"] += 1
             self.stats["endpoint_verified_prunes"] += int(self._endpoint_closed)
             return False
+        self.stats["rejected_prunes"] += 1
+        if self.options.gpu_prune_audit:
+            self.stats["epsilon_rejected"] += int(self.audit_direct)
+            self.stats["rejected_gpu_margin_max"] = max(
+                self.stats["rejected_gpu_margin_max"], self.best[i][0] - self.audit_upper)
         return True
 
     def proposal_cutoff(self, flight: int) -> float:
         """Ask FP32 to flag near ties generously; only the FP64 verifier can discard them."""
         best = self.best[flight][0]
+        if self.options.gpu_prune_epsilon is not None and not self.options.gpu_prune_verify_border:
+            return self.epsilon_cutoff(flight)
         if not self.options.cpu_recompute:
             return best
         scale = max(1.0, abs(self.benefits[flight]), abs(self.problems[flight].pi_f), abs(best))
         return best + max(_BOUND_CLOSURE_TOL, 1e-6 * scale) if math.isfinite(best) else best
+
+    def epsilon_cutoff(self, flight: int) -> float:
+        """Subtract the experimental allowance without rounding its cutoff upward."""
+        best = self.best[flight][0]
+        epsilon = self.options.gpu_prune_epsilon
+        if epsilon is not None:
+            # Comparing with a downward-converted cutoff avoids rounding the
+            # chosen absolute margin away during the FP32 threshold upload.
+            cutoff = _down(best - epsilon) if epsilon else best
+            with np.errstate(over="ignore"):
+                rounded = np.float32(cutoff)
+            if float(rounded) > cutoff:
+                rounded = np.nextafter(rounded, np.float32(-math.inf))
+            return float(rounded)
+        return -math.inf
+
+    def cutoff_values(self) -> np.ndarray:
+        """Pack independent CPU-proposal and experimental GPU-deletion cutoffs per flight."""
+        return np.asarray([(self.proposal_cutoff(i), self.epsilon_cutoff(i))
+                           for i in range(len(self.problems))], np.float32)
 
     def allocate(self, records: np.ndarray) -> np.ndarray:
         """Assign predecessor IDs without ever truncating a full frontier on overflow."""
         end = self.used + len(records)
         if end > self.search_label_limit:
             raise _Stopped("label_limit")
-        if self.options.cpu_recompute:
-            for offset, record in enumerate(records):
-                self.paid_masks[self.used + offset] = self.paid_mask(
-                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
-                )
-                self.prefix_positive[self.used + offset] = self.positive_lower(
-                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
-                )
-                self.visit_prefix_positive[self.used + offset] = self.visit_lower(
-                    int(record[1]), int(record[3]), int(record[0]), int(record[2]),
-                )
-        self.arena[self.used : end] = records[:, [3, 0, 1]]
+        for offset, record in enumerate(records):
+            self.store_prefix(self.used + offset, record)
         records[:, 3] = np.arange(self.used, end, dtype=np.int32)
         self.used = end
         return records
+
+    def store_prefix(self, index: int, record: np.ndarray) -> None:
+        """Cache original-price prefix accounting after the predecessor is available.
+
+        Parameters
+        ------------
+        - index (int): stable state ID in the CPU verification mirror.
+        - record (np.ndarray): full record or its cell/root/hops/parent prefix.
+
+        Return
+        --------
+        - output (None): memoized predecessor and FP64 sums; no search decision is made here.
+        """
+        if self.options.verify_prunes:
+            args = int(record[1]), int(record[3]), int(record[0]), int(record[2])
+            self.paid_masks[index] = self.paid_mask(*args)
+            self.prefix_positive[index] = self.positive_lower(*args)
+            self.visit_prefix_positive[index] = self.visit_lower(*args)
+        self.arena[index] = record[[3, 0, 1]]
 
     def roots_at(
         self, step: int, allowed_roots: frozenset[int] | None = None,
@@ -671,8 +737,18 @@ class _Batch:
             v = self.variants[i]
             cell = self.cell_offsets[i] + int(v.cell[variant])
             upper = self.root_upper[root]
-            if upper <= np.float32(self.proposal_cutoff(i)):
+            direct = (self.prune_mode and math.isfinite(float(upper)) and
+                      upper <= self.epsilon_cutoff(i))
+            if direct and not self.options.gpu_prune_audit:
                 self.stats["gpu_prune_proposals"] += 1
+                self.stats["gpu_direct_prunes"] += 1
+                self.stats["root_prunes"] += 1
+                continue
+            if ((not self.prune_mode or math.isfinite(float(upper))) and
+                upper <= np.float32(self.proposal_cutoff(i))):
+                self.stats["gpu_prune_proposals"] += 1
+                self.audit_upper = float(upper)
+                self.audit_direct = bool(direct)
                 if not self.retain(root, -1, cell, 0):
                     self.stats["root_prunes"] += 1
                     continue
@@ -686,12 +762,13 @@ class _Batch:
         packed = np.asarray(records, np.int32).reshape(-1, self.stride)
         return self.allocate(packed), np.asarray(values, np.float32).reshape(-1, 2)
 
-    def prepare_visit_prices(self) -> None:
+    def prepare_visit_prices(self, *, gather: bool = True) -> None:
         """Gather shared sparse prices and flight-specific exclusions for this batch.
 
         Parameters
         ------------
         - self (_Batch): prepared cell order and fixed price snapshots.
+        - gather (bool): materialize host visit layers only for diagnostic callers.
 
         Return
         --------
@@ -712,12 +789,13 @@ class _Batch:
             offset = self.cell_offsets[i]
             cells = self.cells[offset:offset + topology.n_cells]
             lookup = {coord: offset + local for local, coord in enumerate(cells)}
-            for local, coord in enumerate(cells):
-                if local % 256 == 0:
-                    self.check()
-                for step, value in cache.cells.get((coord, 0), {}).items():
-                    indices[step].append(offset + local)
-                    prices[step].append(value)
+            if gather:
+                for local, coord in enumerate(cells):
+                    if local % 256 == 0:
+                        self.check()
+                    for step, value in cache.cells.get((coord, 0), {}).items():
+                        indices[step].append(offset + local)
+                        prices[step].append(value)
             for raw_row in problem.forbidden_rows:
                 row = raw_row if isinstance(raw_row, RowKey) else RowKey(raw_row)
                 if row.kind != "cell" or row.level != 0:
@@ -844,6 +922,8 @@ class _Batch:
                 p.forbidden_rows,
                 self.models[i],
             )
+            if result is None:
+                self.stats["canonical_rejections"] += 1
             if result is not None and result[0] > self.best[i][0]:
                 self.best[i] = result
 
@@ -963,6 +1043,18 @@ class _Batch:
         """
         if not self.start_buckets:
             return
+        if beam_width is None and self.options.cpu_recompute:
+            from .gpu_resident import ResidentSearch
+
+            # Close roots with the original verifier before reserving a full device arena.
+            # Keep closed_upper even when no root needs expansion.
+            for step in sorted(self.start_buckets):
+                self._visit_positive.clear()
+                records, values = self.roots_at(step)
+                if len(records):
+                    ResidentSearch(self).run(step, records, values)
+                    break
+            return
         allowed_roots = None
         first_step = min(self.start_buckets)
         last_step = max(t.max_step for t in self.topologies)
@@ -982,6 +1074,9 @@ class _Batch:
             last_step = min(last_step, max(steps) + max(t.air_hop_limit for t in self.topologies))
         frontier = np.empty((0, self.stride), np.int32)
         values = np.empty((0, 2), np.float32)
+        future_buffer = self.runtime.empty((len(self.cells),), np.float32)
+        blocked_buffer = self.runtime.empty((len(self.cells),), np.int32)
+        root_values_buffer = self.runtime.upload(self.root_values)
         for step in range(first_step, last_step + 1):
             self.check()
             self._visit_positive.clear()
@@ -999,38 +1094,42 @@ class _Batch:
             visits, blocked = self.visits(step + 1)
             visits = self.future_proposals(frontier, visits, step + 1)
             visit_masks = self.endpoint_visits(step + 1)
+            future_values = np.ascontiguousarray(visits[:, 2])
+            self.runtime.write(future_buffer, future_values)
+            self.runtime.write(blocked_buffer, blocked)
             next_records, next_scores = [], []
             next_count = 0
             for start in range(0, len(frontier), self.options.chunk_size):
                 self.check()
                 current = frontier[start : start + self.options.chunk_size].copy()
-                cutoffs = np.asarray([
-                    self.proposal_cutoff(i) for i in range(len(self.problems))
-                ], np.float32)
-                self.root_values[:, 5] = cutoffs[root_flights]
+                cutoffs = self.cutoff_values()
                 count = len(current) * 6
                 records, scores = self.runtime.run(
                     "expand",
                     count,
                     (
-                        np.asarray((len(current), self.stride, step, *self.offsets), np.int32),
+                        np.asarray((len(current), self.stride, step, *self.offsets,
+                                    self.prune_mode), np.int32),
                         current,
                         values[start : start + len(current)].copy(),
                         self.graph,
                         self.roots,
-                        self.root_values,
-                        visits,
-                        blocked,
+                        root_values_buffer,
+                        future_buffer,
+                        blocked_buffer,
                         self.paid_rows,
                         self.paid_values,
                         np.empty((count, self.stride), np.int32),
                         np.empty((count, 3), np.float32),
+                        self.price_map, self.device_prices.ranges,
+                        self.device_prices.steps, self.device_prices.values,
+                        cutoffs,
                         visit_masks, self.endpoint_meta, self.endpoint_entries, self.endpoint_trees,
                     ),
                     (10, 11),
                     static={3: "graph", 4: "roots", 8: "paid_rows", 9: "paid_values",
-                            12: "endpoint_visits", 13: "endpoint_meta", 14: "endpoint_entries",
-                            15: "endpoint_trees"},
+                            12: "price_map", 17: "endpoint_visits", 18: "endpoint_meta",
+                            19: "endpoint_entries", 20: "endpoint_trees"},
                     write_only=(10, 11),
                 )
                 valid = np.flatnonzero(records[:, 6])
@@ -1040,10 +1139,16 @@ class _Batch:
                     self.check()
                     record = records[index]
                     root, flags = int(record[1]), int(record[6])
+                    if flags & 16:
+                        self.stats["gpu_direct_prunes"] += 1
+                        self.stats["gpu_prune_proposals"] += 1
+                        continue
                     path = None
                     if flags & 4:
                         self.stats["gpu_prune_proposals"] += 1
                         self.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
+                        self.audit_upper = float(scores[index, 2])
+                        self.audit_direct = bool(flags & 32)
                         if not self.retain(root, int(record[3]), int(record[0]), int(record[2])):
                             continue
                     if flags & 1:
@@ -1109,10 +1214,11 @@ class _Batch:
         --------
         - output (tuple[PricingResult, ...]): ordered incumbents, statuses and batch counters.
         """
-        status = "complete" if self.options.cpu_recompute else "approximate"
+        status = "complete" if self.options.certify_search else "approximate"
         complete = False
         try:
             self.prepare()
+            self.prepare_device_prices()
             self.bootstrap()
             try:
                 # Stop an unproductive first pass early enough to benefit from the
@@ -1127,6 +1233,8 @@ class _Batch:
             except _Stopped as stop:
                 if str(stop) != "label_limit":
                     raise
+                # Release the stopped resident arenas before allocating a retry's buffers.
+                stop.__traceback__ = None
                 self.stats["initial_full_search_labels"] = self.used
                 self.used = 0
                 self.closed_upper = [-math.inf for _ in self.problems]
@@ -1140,10 +1248,12 @@ class _Batch:
         except pricing.PricingTimeout:
             status = "deadline"
         finally:
-            self.runtime.clear_cache()
-        certified = complete and self.options.cpu_recompute
+            self.runtime.clear_batch()
+        certified = complete and self.options.certify_search
         stats = {
             **self.stats,
+            **{key: value - self.first_counters[key]
+               for key, value in self.runtime.counters.items()},
             "labels": (self.used + self.stats.get("bootstrap_labels", 0)
                        + self.stats.get("initial_full_search_labels", 0)),
             "full_search_labels": self.used,
@@ -1154,6 +1264,9 @@ class _Batch:
             "counts_scope": "batch",
             "dominance": "none" if self.options.cpu_recompute else "fp32",
             "bound_closure_tolerance": _BOUND_CLOSURE_TOL,
+            "gpu_prune_epsilon": self.options.gpu_prune_epsilon,
+            "gpu_prune_audit": self.options.gpu_prune_audit,
+            "gpu_prune_verify_border": self.options.gpu_prune_verify_border,
         }
         results = []
         for i, (p, (rc, column)) in enumerate(zip(self.problems, self.best, strict=True)):
@@ -1199,12 +1312,21 @@ def price_gpu_batch(
     --------
     - output (tuple[PricingResult, ...]): ordered validated incumbents and certificate statuses.
     """
-    groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+    groups: dict[pricing.DualView, list[int]] = defaultdict(list)
+    normalized: dict[tuple[int, tuple[int, int]], pricing.DualView] = {}
+    current = []
     for index, problem in enumerate(problems):
-        groups[derive_cell_window(problem.cfg)].append(index)
+        view = problem.duals
+        if not isinstance(view, pricing.DualView):
+            key = id(view), derive_cell_window(problem.cfg)
+            if key not in normalized:
+                normalized[key] = pricing.DualView(view, problem.cfg)
+            view = normalized[key]
+        current.append(replace(problem, duals=view))
+        groups[view].append(index)
     results: list[PricingResult | None] = [None] * len(problems)
     for indices in groups.values():
-        batch = _Batch([problems[i] for i in indices], options, runtime, deadline)
+        batch = _Batch([current[i] for i in indices], options, runtime, deadline)
         for index, result in zip(indices, batch.run(), strict=True):
             results[index] = result
     return tuple(results)

@@ -130,6 +130,7 @@ class DualView:
         "_cell_steps",
         "_duals",
         "_gpu_visit_prices",
+        "_gpu_summary",
         "_max_negative_credit",
         "_offsets",
         "_terminal",
@@ -174,6 +175,7 @@ class DualView:
         self._duals = normalized
         # One snapshot owns the lazy GPU cache; replacing LP prices creates a new view.
         self._gpu_visit_prices = None
+        self._gpu_summary = None
         self._max_negative_credit = -math.fsum(min(0.0, value) for value in normalized.values())
         self._offsets = derive_cell_window(cfg)
         self._cell = {resource: _prefix_series(values) for resource, values in cell_values.items()}

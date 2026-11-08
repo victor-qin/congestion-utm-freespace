@@ -201,7 +201,7 @@ class IntegerData:
         key = (("roots", self.price_key, self.endpoint_key(), tuple(b.approach_upper.items()))
                if all(future is None for future in b.future) else None)
         block = self.runtime.operands.get(key, self.root_arrays, self.runtime, b.check,
-                                          upload=(2, 3))
+                                          upload=(2, 3), encoded=(0, 3))
         self.roots, self.root_empty = block.arrays[:2]
         exponents, packed = block.buffers
         (self.uppers,) = self.runtime.run("integer_roots", len(self.roots),
@@ -264,7 +264,7 @@ class IntegerData:
         self.static_bytes += self.metadata.nbytes
         self.bind_roots()
         block = self.runtime.operands.get(("prices", self.price_key), self.price_arrays,
-                                          self.runtime, b.check, upload=(0, 1))
+                                          self.runtime, b.check, upload=(0, 1), encoded=(1,))
         for name, buffer in zip(("prices", "price_values"), block.buffers, strict=True):
             self.bind(name, buffer)
         self.built = True
@@ -379,7 +379,8 @@ class IntegerData:
             """Preserve the original separate FP64 operations before outward encoding."""
             return (scale.encode_array(cost_operands(bounds, variant)).reshape(-1, 5),)
 
-        return self.runtime.operands.get(key, build, self.runtime, b.check, upload=()).arrays[0]
+        return self.runtime.operands.get(key, build, self.runtime, b.check,
+                                         upload=(), encoded=(0,)).arrays[0]
 
     def cutoffs(self) -> DeviceBuffer:
         """Use downward cutoff integers and retain a conservative envelope of discarded maxima.

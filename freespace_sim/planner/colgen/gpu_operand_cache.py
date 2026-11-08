@@ -44,6 +44,7 @@ class OperandBlock:
     - host_bytes (int): retained arrays and conservatively charged key/container storage.
     - device_bytes (int): actual device allocation sizes, including empty-buffer minima.
     - build_s (float): measured host build time avoided on a hit; excludes upload time.
+    - encoded_bytes (int): interval arrays encoded by this build, excluding borrowed inputs.
     """
 
     arrays: tuple[np.ndarray, ...]
@@ -51,6 +52,7 @@ class OperandBlock:
     host_bytes: int
     device_bytes: int
     build_s: float
+    encoded_bytes: int
 
 
 class OperandCache:
@@ -98,6 +100,7 @@ class OperandCache:
     def get(
         self, key: tuple | None, build: Callable[[], tuple[np.ndarray, ...]],
         runtime: ComputeRuntime, check: Callable[[], None], *, upload: tuple[int, ...],
+        encoded: tuple[int, ...] = (),
     ) -> OperandBlock:
         """Borrow exact operands or publish only after the complete build and all uploads.
 
@@ -108,6 +111,7 @@ class OperandCache:
         - runtime (ComputeRuntime): sole device owner of this cache.
         - check (Callable): cooperative deadline check, including before publication and on hits.
         - upload (tuple[int, ...]): array indices to upload in binding order.
+        - encoded (tuple[int, ...]): newly encoded interval arrays, for avoided-work accounting.
 
         Return
         --------
@@ -123,9 +127,7 @@ class OperandCache:
             block = self.stores[key]
             counters["integer_cache_hits"] += 1
             counters["integer_encoding_avoided_s"] += block.build_s
-            counters["integer_encoding_avoided_bytes"] += sum(
-                a.nbytes for a in block.arrays if a.dtype == np.dtype("uint32")
-            )
+            counters["integer_encoding_avoided_bytes"] += block.encoded_bytes
             counters["integer_upload_avoided_bytes"] += sum(b.nbytes for b in block.buffers)
             return block
         counters["integer_cache_misses"] += 1
@@ -144,7 +146,8 @@ class OperandCache:
         host_bytes = (_key_bytes(key) + sys.getsizeof(arrays) + sum(map(_array_bytes, arrays))
                       + 512 + len(buffers) * 128)
         block = OperandBlock(arrays, tuple(buffers), host_bytes,
-                             sum(max(4, b.nbytes) for b in buffers), build_s)
+                             sum(max(4, b.nbytes) for b in buffers), build_s,
+                             sum(arrays[i].nbytes for i in encoded))
         if (key is not None and self.max_entries > 0 and self.max_host_bytes > 0
                 and self.max_device_bytes > 0 and host_bytes <= self.max_host_bytes
                 and block.device_bytes <= self.max_device_bytes):

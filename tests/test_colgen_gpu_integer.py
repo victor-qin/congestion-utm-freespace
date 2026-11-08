@@ -584,7 +584,7 @@ def test_interrupted_operand_build_cannot_publish_or_certify(
     get = OperandCache.get
     interrupted_keys = []
 
-    def interrupt(cache, key, build, runtime, check, *, upload):
+    def interrupt(cache, key, build, runtime, check, *, upload, encoded=()):
         """Expire after a complete CPU build, before any cache publication."""
         if key is not None and key[0] == stage:
             interrupted_keys.append(key)
@@ -594,8 +594,8 @@ def test_interrupted_operand_build_cannot_publish_or_certify(
                 build()
                 raise _Stopped("deadline")
 
-            return get(cache, key, fail, runtime, check, upload=upload)
-        return get(cache, key, build, runtime, check, upload=upload)
+            return get(cache, key, fail, runtime, check, upload=upload, encoded=encoded)
+        return get(cache, key, build, runtime, check, upload=upload, encoded=encoded)
 
     def forbidden(*args, **kwargs):
         """Deadline recovery must not select the original CPU verifier or pricer."""

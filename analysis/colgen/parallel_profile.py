@@ -37,10 +37,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--device', choices=('cpu', 'gpu'), default='gpu')
     parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--batch-size', type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument('--max-labels', type=int, default=250000)
     parser.add_argument('--direct', action='store_true',
                         help='Time the production solver without per-batch validation file writes; '
                              'GPU full-CPU fallback and worker-device guards remain enabled')
     args = parser.parse_args(argv)
+    if args.max_labels <= 0:
+        parser.error('--max-labels must be positive')
     if args.out.exists():
         parser.error('Choose a fresh output directory')
     root = Path(__file__).resolve().parents[2]
@@ -75,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
                     'solve', '--capture', str(args.capture), '--out', str(args.out),
                     '--flight-ids', *map(str, ids), '--integer-bounds', '--approach-bounds',
                     '--prepare-workers', '12', '--prepare-batch-size', '12',
-                    '--prepare-cache-bytes', '178956970', '--batch-size', '1',
-                    '--max-labels', '250000', '--chunk-size', '2048', '--budget', '900',
+                    '--prepare-cache-bytes', '178956970', '--batch-size', str(args.batch_size),
+                    '--max-labels', str(args.max_labels), '--chunk-size', '2048', '--budget', '900',
                 ])
             else:
                 captured, capture_hash = load_capture(args.capture, ids)
@@ -94,7 +98,8 @@ def main(argv: list[str] | None = None) -> int:
                                      pricing_gpu_integer_bounds=True, pricing_gpu_approach_bounds=True,
                                      pricing_gpu_prepare_workers=12, pricing_gpu_prepare_batch_size=12,
                                      pricing_gpu_prepare_cache_bytes=178956970,
-                                     pricing_gpu_batch_size=1, pricing_gpu_max_labels=250000,
+                                     pricing_gpu_batch_size=args.batch_size,
+                                     pricing_gpu_max_labels=args.max_labels,
                                      pricing_gpu_chunk_size=2048)
                 args.out.mkdir(parents=True)
                 write_json(args.out / 'manifest.json', {

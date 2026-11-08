@@ -167,6 +167,22 @@ extra observation while retaining production checks and fallback guards. Its sma
 per-round callback is present in both CPU and GPU runs. The audited and direct GPU
 runs preserve identical final cost/bound, rounds and dispatch counts.
 
+### Million-label batch experiment
+
+The resident search budget is now 256 MiB, allowing the tested integer-mode
+searches with a 1048576-label cap. This budget is separate from worker caches,
+host mirrors and numeric-table limits; it is not a total-process memory limit.
+The label cap remains shared across the GPU batch. The default label cap is unchanged.
+
+User-run, single-trial production hard88 experiments with twelve preparation
+workers measured batch1/2/4 at 34.329 / 34.095 / 34.429 s. All completed four rounds,
+352 certified results and 88 verified flights at cost8708.244489, with no resource
+failure. Dispatches fell10776/9735/8751, but wall time did not materially improve.
+Evidence: [gpu_million_label_batches.json](gpu_million_label_batches.json).
+Use `parallel_profile --direct --batch-size 1 --max-labels 1048576`, replacing
+batch size with2 or4 for the other configurations. The harness preserves the
+same twelve-flight preparation groups and shared-lock wrapper described below.
+
 ### Profile and remaining CPU work
 
 Owner-only cProfile increases production-path wall from about 34.3 s to 79.059 s

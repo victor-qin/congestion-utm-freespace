@@ -461,7 +461,7 @@ def test_integer_cache_invalidates_changed_domain_and_matches_uncached_search(
     --------
     - output (None): requires matching cached/uncached canonical results and restored warm hits.
     """
-    from freespace_sim.planner.colgen import gpu_pricing, pricing
+    from freespace_sim.planner.colgen import gpu_prepared, gpu_pricing, pricing
     from freespace_sim.planner.colgen.gpu_runtime import ComputeRuntime
     from freespace_sim.planner.colgen.network import build_flight_graph
     from tests.test_colgen_pricing_platform import _assert_canonical, _oracle, _platform, _problem
@@ -515,7 +515,7 @@ def test_integer_cache_invalidates_changed_domain_and_matches_uncached_search(
                 lambda cls, values, **kw: cls(choose(values, **kw).exponent + 1),
             ))
         elif change == "reorder":
-            prepare = gpu_pricing.prepare_variants
+            prepare = gpu_prepared.prepare_variants
 
             def reverse(*args, **kwargs):
                 """Reorder complete canonical descriptors while preserving the legal root set."""
@@ -524,7 +524,7 @@ def test_integer_cache_invalidates_changed_domain_and_matches_uncached_search(
                          "ground_delay_s", "origin_leg_w_s", "start_dual_cost", "paid_class")
                 return replace(v, **{name: getattr(v, name)[::-1].copy() for name in names})
 
-            altered.setattr(gpu_pricing, "prepare_variants", reverse)
+            altered.setattr(gpu_prepared, "prepare_variants", reverse)
         actual = platform.price_batch(problems)
         assert actual[0].stats["integer_cache_misses"] > 0
         if change == "filtered":

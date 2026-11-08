@@ -7,13 +7,23 @@ source rather than the separate main-port experiment. Integer pruning remains
 opt-in. The checked arithmetic, legal search domain, explicit 1e-6 closure rule
 and original canonical completion validation are unchanged.
 
-The final branch incorporates main at
+The original measured branch incorporated main at
 `ebc60608e72de1afc5dcbd2e4b82094ab5464210` after all measurements finished.
 Every production source was compared with the recorded measurement manifest;
 the only difference is the parent's `_Batch.run` docstring clarification in
 `gpu_pricing.py`. Python ASTs are identical after removing docstrings. The
 evidence JSON therefore preserves the measured hashes rather than relabeling
 them as the final source hashes.
+
+The cache branch was subsequently rebased onto main at `c62e8bbe`, including
+merged PR145's parallel CPU preparation and larger resident-search budget.
+Those production changes are newer than the saved cache measurements below;
+the original same-price timings must not be treated as measurements of this
+combined stack. The root-reordering test now intercepts preparation in
+`gpu_prepared`, where PR145 moved it.
+The rebased integer/runtime/preparation-pool/pricing-platform/GPU-solver suite
+passed **255 tests in 90.41 seconds**, including synchronous worker preparation
+with integer bounds and canonical certificate parity.
 
 ## Retained data and exact dependencies
 
@@ -59,7 +69,8 @@ buffer requests and 8,192 entries per runtime. Host charging includes numeric
 arrays, keys and container allowances; shared key/array storage is conservatively
 charged again across entries. Empty device allocations count at least four
 bytes. These limits supplement the existing 64 MiB live numeric and 128 MiB
-resident-search budgets. They are not a total process-RSS or backend-allocator
+resident-search budgets in the measured version (the current resident budget
+is 256 MiB following PR145). They are not a total process-RSS or backend-allocator
 memory guarantee, and per-flight peaks must not be summed to size the cache.
 
 A build becomes reusable only after all its arrays and requested uploads finish
@@ -212,6 +223,62 @@ The retained implementation removes those overlapping cumulative generations.
 Only individual retained-root cost encodings persist; aggregate cost/metadata
 uploads and changing endpoint trees retain invocation lifetimes. This preserves
 the byte bounds without enlarging them to hide the observed thrashing.
+
+## Combined parallel-preparation diagnostic after rebase
+
+One locked, lightly instrumented hard88 production solve on main `c62e8bbe`
+plus this cache used 12 preparation workers, preparation groups of 12, GPU batch
+size 1, 250,000 labels, integer and approach bounds, and one Gurobi thread.
+Original capture and cohort selection were unchanged; all CPU canonical checks
+remained enabled. Local artifacts are
+`.agent/runs/rebased-stage-profile-1/{manifest,stages,result,planner_stats,rounds}.json`;
+the wrapper is `.agent/profile_current_stages.py`. Nested owner timers charge
+each interval only to the innermost measured category. This is a diagnostic
+sample, not a repeated speedup experiment.
+
+| Exclusive pricing wall category | Seconds |
+| --- | ---: |
+| Worker preparation barrier, including IPC | 9.306 |
+| Owner integer operands and cutoffs | 8.580 |
+| GPU calls: submission, internal buffer setup and waits | 4.789 |
+| Completed-route construction, validation and scoring | 2.676 |
+| Other owner base/price/approach preparation | 1.387 |
+| Explicit buffer allocation/copy calls | 0.347 |
+| Remaining batch CPU work | 3.942 |
+| Pricing outside measured batch/pool methods | 0.251 |
+| Total pricing wall | 31.280 |
+
+Total solve wall was 35.346 s. All 88 flights were accepted and verified; all
+352 flight-pricing calls completed/certified in four rounds, with cost
+8708.244488722878 and the same 0.1343% global integer gap as earlier full-solver
+runs. There were 754 canonical checks, zero rejections and zero CPU per-prune
+checks. These results do not establish an exact global integer optimum.
+
+The 10,776 GPU dispatches each waited; device execution was 0.872 s and owner
+wait time was 4.066 s. These overlap the GPU-call category and must not be added
+to the table. All 270,641 labels were from the initial beam search for an
+incumbent (`bootstrap_labels`); `full_search_labels` was zero. Thus this run
+never entered the resident full-search expansion loop: integer root bounds
+closed the complete domain after the initial routes were found. The initial
+search still reads expansion records back, processes flags/completions, selects
+the next frontier and submits another GPU call. Removing per-prune CPU
+verification did not eliminate these handoffs.
+
+Cache telemetry recorded 73 hits, 897 misses and zero evictions; it avoided
+324,160 encoding bytes and 546,000 upload bytes. Fresh LP prices/domain changes
+limit reuse here. The two largest preparation categories account for 57% of
+pricing wall; integer operand work remains on the owner after PR145's worker
+barrier. These data support prioritizing owner numeric preparation and the
+initial-search handoffs over removing the remaining route checks.
+
+Earlier uninstrumented, pinned-source paired solves (PR145 `b605aba3` versus
+that version plus cache `e2831fea`) averaged 34.482 versus 35.232 s total and
+30.332 versus 31.168 s pricing: the cache regressed this changed-price workload
+by 2.2% total/2.8% pricing. They are distinct from the same-price replay wins.
+A separate single diagnostic disabling only completed-route feasibility gates,
+while retaining construction/scoring, took 33.381 s total/29.154 s pricing;
+that unchecked run cannot carry a valid pricing certificate. Its observed
+5.3% total/6.5% pricing reduction is not a paired repeated estimate.
 
 ## Reproduction
 

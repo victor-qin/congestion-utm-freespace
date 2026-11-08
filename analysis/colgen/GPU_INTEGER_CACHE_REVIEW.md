@@ -1,5 +1,8 @@
 # Integer payload reuse and remaining host/device work
 
+Implementation follow-up: [bounded operand cache and measured validation](GPU_INTEGER_CACHE.md).
+The audit below records the original pre-cache design and evidence.
+
 2026-11-07. Source and measurements audited at `a794c68e`, before the separate
 approach-and-arrival bound experiment. This is a design/evidence report; no
 production cache or new timing experiment was added. Measurements below are

@@ -220,6 +220,9 @@ class ColGenParams:
     pricing_gpu_endpoint_max_rows: int = 64
     pricing_gpu_endpoint_cache_bytes: int = 1_048_576
     pricing_gpu_endpoint_cache_work: int = 1_000_000
+    pricing_gpu_integer_bounds: bool = False
+    pricing_gpu_integer_audit: bool = False
+    pricing_gpu_approach_bounds: bool = False
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -259,6 +262,17 @@ class ColGenParams:
             raise ValueError("Select pricing_gpu_backend='metal' or 'cuda' exactly for GPU pricing")
         if not isinstance(self.pricing_cpu_recompute, bool):
             raise TypeError("pricing_cpu_recompute must be a boolean")
+        if (not isinstance(self.pricing_gpu_integer_bounds, bool)
+                or not isinstance(self.pricing_gpu_integer_audit, bool)):
+            raise TypeError("pricing_gpu_integer_bounds/audit must be boolean")
+        if self.pricing_gpu_integer_bounds and (self.pricing_device != "gpu" or not self.pricing_cpu_recompute):
+            raise ValueError("Integer bounds require GPU pricing with canonical checks")
+        if self.pricing_gpu_integer_audit and not self.pricing_gpu_integer_bounds:
+            raise ValueError("Integer audit requires integer bounds")
+        if not isinstance(self.pricing_gpu_approach_bounds, bool):
+            raise TypeError("pricing_gpu_approach_bounds must be boolean")
+        if self.pricing_gpu_approach_bounds and (self.pricing_device != "gpu" or not self.pricing_cpu_recompute):
+            raise ValueError("Approach bounds require GPU pricing with canonical checks")
         if not isinstance(self.pricing_gpu_endpoint_bounds, bool):
             raise TypeError("pricing_gpu_endpoint_bounds must be a boolean")
         for name in ("pricing_gpu_endpoint_max_rows", "pricing_gpu_endpoint_cache_bytes",

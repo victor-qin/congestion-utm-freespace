@@ -27,7 +27,7 @@ INLINE void resident_compact_one(
     int source = (int)tid * stride, flags = records[source + 6];
     if (!flags) return;
     fetch_add(counts + 5, 1);
-    if (flags & 16) {
+    if (flags & (16 | 64)) {
         fetch_add(counts + 6, 1);
         return;
     }

@@ -2,6 +2,16 @@
 
 ## Authorization and order
 
+- 2026-11-08 [USER] Fix the remaining documentation suggestion, obtain a fresh
+  independent Extra High review of the PR144/PR146 stack, and merge if no issues
+  remain. This supersedes the earlier draft/no-merge holds for these two PRs.
+  Land PR144 first, then PR146 onto main; preserve other follow-up branches.
+- 2026-11-08 [USER] Keep PR146 stacked on PR144 and prepare it for merge.
+  Launch integer caching in its own worktree conversation from PR146 at Extra
+  High effort. The main-only experiment remains analysis evidence; do not
+  retarget PR146. Existing draft/no-merge holds remain until explicit landing
+  authorization. The former coordinator is unplugged; report directly to the user.
+
 - 2026-11-07 [USER] Current authorization supersedes the earlier landing-first
   sequence: PR143 has landed; PR144 stays draft and unmerged while all three
   follow-up branches proceed. No automatic merge after their completion.
@@ -12,7 +22,7 @@
   parallel CPU preparation only. CPU/GPU overlap belongs on a separate branch/PR.
 - The endpoint conversation coordinates PR143 and the handoff. The GPU execution
   conversation owns PR144 review, integration and landing. Each edits only its
-  bound checkout. Independent reviews use High effort and identify the exact
+  bound checkout. Independent reviews, when requested, use at least High effort and identify the exact
   reviewed commit and base.
 - PR143: <https://github.com/victor-qin/congestion-utm-freespace/pull/143>.
   PR144: <https://github.com/victor-qin/congestion-utm-freespace/pull/144>.
@@ -37,10 +47,10 @@ CUDA source/interface compatibility is required; NVIDIA hardware is untested.
 Use independent worktree-bound conversations and PRs from the common pinned
 baseline. Read local `AGENTS.md` and maintain local `.agent/CONTINUITY.md`. Read
 analysis scripts against current production sources before reusing them.
-Serialize sustained Metal workloads and timing comparisons with the shared
+Serialize sustained Metal workloads, CPU-intensive tests and timing comparisons with the shared
 advisory lock at
 `/Users/victor/Documents/Research/congestion-utm-freespace/.agent/gpu-followups-20261106/metal-benchmark.lock`.
-CPU implementation and functional tests may proceed independently.
+Source inspection and editing may proceed independently. Release the lock between jobs.
 
 Benchmark first-use, same-price warm and changed-price calls separately. Compare
 matched certificates and solver completion, not dispatch counts or differently
@@ -115,6 +125,14 @@ Use CPU shadow audits during development, then guard the per-prune CPU verifier
 to establish that the intended production work is removed. Measure added
 preparation/storage and refinement frequency as well as matched runtime.
 Removing canonical completion validation is a distinct later scope.
+
+[Branch2 draft PR146](https://github.com/victor-qin/congestion-utm-freespace/pull/146)
+now has an opt-in checked-integer resident implementation and independent
+FP64 shadow audits. Ambiguous/overflowed comparisons retain states; original
+canonical scoring stays on the CPU. See [the proof and validation report](GPU_INTEGER_PRUNING.md)
+for the measured retention decision, limitations and reproduction commands.
+PR145 preparation remains a separate integration: forward its optional final
+`prepared` argument through the batch-class selection. No overlap is implemented.
 
 ## Branch C: parallel CPU preparation; overlap in a separate branch
 

@@ -1,0 +1,873 @@
+--- a/freespace_sim/planner/colgen/gpu_integer_search.py
++++ b/freespace_sim/planner/colgen/gpu_integer_search.py
+@@ -10,7 +10,6 @@
+ 
+ import numpy as np
+ 
+-from .gpu_buffers import DeviceBuffer
+ from .gpu_integer import IntegerInterval, IntegerScale
+ from .gpu_integer_bounds import cost_operands, prepare_reference_operands
+ from .gpu_pricing import _Batch, _BOUND_CLOSURE_TOL, _Stopped
+@@ -54,8 +53,8 @@
+         self.roots = np.zeros((len(batch.root_flights), 7, 5), np.uint32)
+         self.root_empty = np.zeros(len(self.roots), bool)
+         self.uppers = np.zeros((len(self.roots), 5), np.uint32)
+-        self.layers: OrderedDict[int, DeviceBuffer] = OrderedDict()
+-        self.buffers: dict[str, DeviceBuffer] = {}
++        self.layers: OrderedDict[int, np.ndarray] = OrderedDict()
++        self.buffers: dict[str, np.ndarray] = {}
+         self.buffer_sizes: dict[str, int] = {}
+         self.static_bytes = self.roots.nbytes + self.uppers.nbytes + self.root_empty.nbytes
+         self.account()
+@@ -75,12 +74,12 @@
+             raise _Stopped("integer_buffer_limit")
+         self.batch.stats["integer_bytes"] = max(size, self.batch.stats.get("integer_bytes", 0))
+ 
+-    def upload(self, name: str, array: np.ndarray) -> DeviceBuffer:
++    def upload(self, name: str, array: np.ndarray) -> np.ndarray:
+         """Replace a numeric generation only after checking its persistent-storage budget."""
+         size = array.nbytes
+         old = self.buffer_sizes.get(name, 0)
+         self.account(size - old)
+-        buffer = self.runtime.upload(array)
++        buffer = np.array(array, copy=True, order="C")
+         self.buffers[name] = buffer
+         self.buffer_sizes[name] = size
+         self.static_bytes += size - old
+@@ -245,7 +244,7 @@
+         b.stats["integer_cost_roots"] = len(self.cost_roots)
+         b.stats["integer_prepare_s"] = b.stats.get("integer_prepare_s", 0.0) + time.monotonic() - started
+ 
+-    def cutoffs(self) -> DeviceBuffer:
++    def cutoffs(self) -> np.ndarray:
+         """Use downward cutoff integers and retain a conservative envelope of discarded maxima.
+ 
+         Parameters
+@@ -254,7 +253,7 @@
+ 
+         Return
+         --------
+-        - output (DeviceBuffer): immutable lower cutoffs; the host retains their original FP64
++        - output (np.ndarray): immutable lower cutoffs; the host retains their original FP64
+           envelope so every discarded integer upper remains covered after interruption/retry.
+         """
+         b = self.batch
+@@ -271,7 +270,7 @@
+                 b.closed_upper[i] = max(b.closed_upper[i], value)
+         return self.buffers["cutoffs"]
+ 
+-    def arguments(self, step: int) -> tuple[DeviceBuffer, ...]:
++    def arguments(self, step: int) -> tuple[np.ndarray, ...]:
+         """Bind one completed numeric generation and exact original-FP64 suffix row.
+ 
+         Parameters
+@@ -280,7 +279,7 @@
+ 
+         Return
+         --------
+-        - output (tuple[DeviceBuffer, ...]): immutable arguments retained through the command block.
++        - output (tuple[np.ndarray, ...]): immutable arguments retained through the command block.
+         """
+         b = self.batch
+         if not self.built:
+@@ -303,7 +302,7 @@
+                     # The unrestricted suffix is weaker than the reference's hop refinement.
+                     packed[first:first + count] = self.scales[i].encode_array(future.row(step))
+             self.account(packed.nbytes)
+-            self.layers[step] = self.runtime.upload(packed)
++            self.layers[step] = packed
+         self.layers.move_to_end(step)
+         cutoff = self.cutoffs()
+         b.stats["integer_gather_s"] = b.stats.get("integer_gather_s", 0.0) + time.monotonic() - started
+--- a/freespace_sim/planner/colgen/gpu_pricing.py
++++ b/freespace_sim/planner/colgen/gpu_pricing.py
+@@ -113,6 +113,8 @@
+         self.first_dispatch = runtime.dispatches
+         self.best: list[tuple[float, Any]] = [(-math.inf, None) for _ in problems]
+         self.closed_upper = [-math.inf for _ in problems]
++        self.approach_upper: dict[int, float] = {}
++        self.approach_work = [0 for _ in problems]
+         normalized: dict[int, pricing.DualView] = {}
+         self.views: list[pricing.DualView] = []
+         for p in problems:
+@@ -152,7 +154,7 @@
+         self._endpoint_visits = np.empty((0, 2), np.uint32)
+         self.used = 0
+         self.stats = dict(
+-            candidates=0,
++            gpu_direct_prunes=0, candidates=0,
+             cpu_recomputations=0,
+             verified_prunes=0,
+             gpu_prune_proposals=0,
+@@ -604,7 +606,7 @@
+                 cutoff = self.best[i][0] + _BOUND_CLOSURE_TOL
+                 self._endpoint_closed = endpoint_upper <= cutoff < upper
+                 upper = min(upper, endpoint_upper)
+-        return upper
++        return min(upper, self.approach_upper.get(root, math.inf))
+ 
+     def retain(self, root: int, parent: int, cell: int, hops: int) -> bool:
+         """Require CPU verification for every proposed numeric deletion in certified mode."""
+@@ -670,6 +672,12 @@
+             i, variant = self.root_flights[root], self.root_variants[root]
+             v = self.variants[i]
+             cell = self.cell_offsets[i] + int(v.cell[variant])
++            prepared_upper = self.approach_upper.get(root, math.inf)
++            if math.isfinite(prepared_upper) and prepared_upper <= self.best[i][0] + _BOUND_CLOSURE_TOL:
++                self.closed_upper[i] = max(self.closed_upper[i], prepared_upper)
++                self.stats["approach_root_prunes"] = self.stats.get("approach_root_prunes", 0) + 1
++                self.stats["root_prunes"] += 1
++                continue
+             upper = self.root_upper[root]
+             if upper <= np.float32(self.proposal_cutoff(i)):
+                 self.stats["gpu_prune_proposals"] += 1
+@@ -1041,7 +1049,13 @@
+                     record = records[index]
+                     root, flags = int(record[1]), int(record[6])
+                     path = None
++                    if flags & 64:
++                        self.stats["gpu_direct_prunes"] += 1
++                        self.stats["gpu_prune_proposals"] += 1
++                        continue
+                     if flags & 4:
++                        if flags & 128:
++                            self.audit_integer_record(record)
+                         self.stats["gpu_prune_proposals"] += 1
+                         self.stats["gpu_endpoint_prune_proposals"] += int(bool(flags & 8))
+                         if not self.retain(root, int(record[3]), int(record[0]), int(record[2])):
+@@ -1098,6 +1112,46 @@
+             # No predecessor IDs from the heuristic stage enter the certificate pass.
+             self.used = 0
+ 
++    def approach_open(self, root: int, cutoff: float) -> bool:
++        """Use proposals only to schedule optional work; skipping it cannot delete a root."""
++        return float(self.root_upper[root]) > cutoff
++
++    def prepare_approach(self) -> None:
++        """Try bounded whole-root approach unions after a validated incumbent search.
++
++        Parameters
++        ------------
++        - self (_Batch): current snapshot, domain and canonically validated incumbents.
++
++        Return
++        --------
++        - output (None): installs only complete finite root uppers; missing results change nothing.
++        """
++        if not self.options.gpu_approach_bounds:
++            return
++        from .gpu_approach import ApproachBounds, _MAX_WORK
++
++        started = time.monotonic()
++        before = len(self.approach_upper)
++        helpers = {}
++        for root, i in enumerate(self.root_flights):
++            self.check()
++            cutoff = self.best[i][0] + _BOUND_CLOSURE_TOL
++            if root in self.approach_upper or not self.approach_open(root, cutoff):
++                continue
++            if i not in helpers:
++                helpers[i] = ApproachBounds(self.bounds[i], self.check, _MAX_WORK - self.approach_work[i])
++            upper = helpers[i].upper(self.root_variants[root], self.benefits[i], self.negative[i], cutoff)
++            if math.isfinite(upper):
++                self.approach_upper[root] = upper
++        for i, helper in helpers.items():
++            self.approach_work[i] += helper.work
++        self.stats["approach_work"] = sum(self.approach_work)
++        self.stats["approach_roots"] = len(self.approach_upper)
++        if len(self.approach_upper) > before:
++            self.evaluate_roots()
++        self.stats["approach_prepare_s"] = self.stats.get("approach_prepare_s", 0.0) + time.monotonic() - started
++
+     def run(self) -> tuple[PricingResult, ...]:
+         """Return validated incumbents and certify only complete, CPU-refined searches.
+ 
+@@ -1114,6 +1168,7 @@
+         try:
+             self.prepare()
+             self.bootstrap()
++            self.prepare_approach()
+             try:
+                 # Stop an unproductive first pass early enough to benefit from the
+                 # future-informed beam. The retry still searches every root at the
+@@ -1132,6 +1187,7 @@
+                 self.closed_upper = [-math.inf for _ in self.problems]
+                 self.prepare_future()
+                 self.bootstrap()
++                self.prepare_approach()
+                 self.search()
+             self.check()
+             complete = True
+@@ -1199,12 +1255,19 @@
+     --------
+     - output (tuple[PricingResult, ...]): ordered validated incumbents and certificate statuses.
+     """
++    if options.gpu_integer_bounds != getattr(runtime, "integer_bounds", False):
++        raise ValueError("Integer pricing options must match the compiled GPU runtime")
++    batch_type = _Batch
++    if options.gpu_integer_bounds:
++        from .gpu_integer_search import IntegerBatch
++
++        batch_type = IntegerBatch
+     groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+     for index, problem in enumerate(problems):
+         groups[derive_cell_window(problem.cfg)].append(index)
+     results: list[PricingResult | None] = [None] * len(problems)
+     for indices in groups.values():
+-        batch = _Batch([problems[i] for i in indices], options, runtime, deadline)
++        batch = batch_type([problems[i] for i in indices], options, runtime, deadline)
+         for index, result in zip(indices, batch.run(), strict=True):
+             results[index] = result
+     return tuple(results)
+--- a/freespace_sim/planner/colgen/gpu_runtime.py
++++ b/freespace_sim/planner/colgen/gpu_runtime.py
+@@ -142,7 +142,7 @@
+ class ComputeRuntime:
+     """Execute shared pricing kernels on an explicitly selected physical GPU."""
+ 
+-    def __init__(self, backend: str) -> None:
++    def __init__(self, backend: str, *, integer_bounds: bool = False) -> None:
+         """Compile the kernels; failure never silently selects a CPU device.
+ 
+         Parameters
+@@ -153,6 +153,15 @@
+         --------
+         - output (None): initializes the selected device and compiled kernels.
+         """
++        self.integer_bounds = integer_bounds
++        self.integer_data = None
++        source = _source(backend)
++        names = ("expand", "group_best", "bound_roots", "future_bounds")
++        if integer_bounds:
++            from .gpu_integer_source import extend_source
++
++            source = extend_source(source, backend, _ARGUMENTS)
++            names += ("integer_roots",)
+         self.backend = backend
+         self.dispatches = 0
+         self._static: dict[str, tuple[np.ndarray, object]] = {}
+@@ -169,12 +178,12 @@
+                 options = Metal.MTLCompileOptions.alloc().init()
+                 options.setFastMathEnabled_(False)
+                 library, error = self.device.newLibraryWithSource_options_error_(
+-                    _source(backend), options, None
++                    source, options, None
+                 )
+                 if library is None:
+                     raise GPUUnavailable(f"Metal pricing compilation failed: {error}")
+                 self.kernels = {}
+-                for name in ("expand", "group_best", "bound_roots", "future_bounds"):
++                for name in names:
+                     pipeline, error = self.device.newComputePipelineStateWithFunction_error_(
+                         library.newFunctionWithName_(name), None
+                     )
+@@ -190,10 +199,10 @@
+                 properties = cupy.cuda.runtime.getDeviceProperties(self.device.id)
+                 name = properties["name"]
+                 self.device_name = name.decode() if isinstance(name, bytes) else str(name)
+-                module = cupy.RawModule(code=_source(backend), options=("--fmad=false",))
++                module = cupy.RawModule(code=source, options=("--fmad=false",))
+                 self.kernels = {
+                     name: module.get_function(name)
+-                    for name in ("expand", "group_best", "bound_roots", "future_bounds")
++                    for name in names
+                 }
+             else:
+                 raise ValueError("gpu_backend must be 'metal' or 'cuda'")
+@@ -204,6 +213,7 @@
+ 
+     def clear_cache(self) -> None:
+         """Release static and reusable Metal buffers at the end of their batch."""
++        self.integer_data = None
+         self._static.clear()
+         self._metal_buffers.clear()
+ 
+@@ -234,8 +244,13 @@
+         """
+         if count == 0:
+             return tuple(arrays[i].copy() for i in outputs)
++        static = dict(static or {})
++        if name == "expand" and self.integer_data is not None:
++            numeric = self.integer_data.arguments(int(arrays[0][2]) + 1)
++            # Main's existing batch-local identity cache accepts immutable arrays.
++            static.update({len(arrays) + i: f"integer_{i}" for i in range(len(numeric))})
++            arrays = (*arrays, *numeric)
+         buffers = []
+-        static = static or {}
+         if any(i not in outputs or i in static for i in write_only):
+             raise ValueError("Write-only buffers must be nonstatic output arguments")
+         for i, array in enumerate(arrays):
+--- a/freespace_sim/planner/colgen/params.py
++++ b/freespace_sim/planner/colgen/params.py
+@@ -220,6 +220,9 @@
+     pricing_gpu_endpoint_max_rows: int = 64
+     pricing_gpu_endpoint_cache_bytes: int = 1_048_576
+     pricing_gpu_endpoint_cache_work: int = 1_000_000
++    pricing_gpu_integer_bounds: bool = False
++    pricing_gpu_integer_audit: bool = False
++    pricing_gpu_approach_bounds: bool = False
+ 
+     @property
+     def effective_ip_reserve_s(self) -> float:
+@@ -259,6 +262,17 @@
+             raise ValueError("Select pricing_gpu_backend='metal' or 'cuda' exactly for GPU pricing")
+         if not isinstance(self.pricing_cpu_recompute, bool):
+             raise TypeError("pricing_cpu_recompute must be a boolean")
++        if (not isinstance(self.pricing_gpu_integer_bounds, bool)
++                or not isinstance(self.pricing_gpu_integer_audit, bool)):
++            raise TypeError("pricing_gpu_integer_bounds/audit must be boolean")
++        if self.pricing_gpu_integer_bounds and (self.pricing_device != "gpu" or not self.pricing_cpu_recompute):
++            raise ValueError("Integer bounds require GPU pricing with canonical checks")
++        if self.pricing_gpu_integer_audit and not self.pricing_gpu_integer_bounds:
++            raise ValueError("Integer audit requires integer bounds")
++        if not isinstance(self.pricing_gpu_approach_bounds, bool):
++            raise TypeError("pricing_gpu_approach_bounds must be boolean")
++        if self.pricing_gpu_approach_bounds and (self.pricing_device != "gpu" or not self.pricing_cpu_recompute):
++            raise ValueError("Approach bounds require GPU pricing with canonical checks")
+         if not isinstance(self.pricing_gpu_endpoint_bounds, bool):
+             raise TypeError("pricing_gpu_endpoint_bounds must be a boolean")
+         for name in ("pricing_gpu_endpoint_max_rows", "pricing_gpu_endpoint_cache_bytes",
+--- a/freespace_sim/planner/colgen/pricing_gpu.h
++++ b/freespace_sim/planner/colgen/pricing_gpu.h
+@@ -2,6 +2,10 @@
+ // Label fields: cell, root, hops, stable ID/parent ID, first A/B, status, paid low/high, recent cells.
+ // Root values: benefit, assignment, ground, negative credit, hop cost, cutoff,
+ // affine air-cost offset/slope, positive origin price, minimum total hops, future cost.
++#ifndef PRICING_NUMERIC_WORDS
++#define PRICING_NUMERIC_WORDS 0
++#endif
++
+ INLINE float completion_bound(GLOBAL const float* data, float hops, float positive) {
+     float air = fmax(0.0f, data[6] + hops * data[7]);
+     return ((data[0] - (data[2] + air)) - (positive - data[3])) - data[1];
+@@ -151,7 +155,7 @@
+     output[b + 7] = (int)low;
+     output[b + 8] = (int)high;
+     output[b + 9] = target;
+-    for (int j = 10; j < stride; ++j) output[b + j] = labels[a + j - 1];
++    for (int j = 10; j < stride - PRICING_NUMERIC_WORDS; ++j) output[b + j] = labels[a + j - 1];
+     scores[tid * 3] = score;
+     scores[tid * 3 + 1] = positive;
+     scores[tid * 3 + 2] = upper;
+@@ -159,7 +163,7 @@
+ 
+ INLINE bool same_state(GLOBAL const int* labels, int a, int b, int stride) {
+     // Root identity refines the production key, keeping different departures/lanes separate.
+-    for (int j = 0; j < stride; ++j) {
++    for (int j = 0; j < stride - PRICING_NUMERIC_WORDS; ++j) {
+         if (j == 3 || j == 6) continue;
+         if (labels[a * stride + j] != labels[b * stride + j]) return false;
+     }
+@@ -172,7 +176,7 @@
+     int n = control[0], stride = control[1], capacity = control[2];
+     if (tid >= (unsigned int)n || !(labels[tid * stride + 6] & 2)) return;
+     unsigned int hash = 2166136261u;
+-    for (int j = 0; j < stride; ++j) {
++    for (int j = 0; j < stride - PRICING_NUMERIC_WORDS; ++j) {
+         if (j == 3 || j == 6) continue;
+         hash = (hash ^ (unsigned int)labels[tid * stride + j]) * 16777619u;
+     }
+--- a/freespace_sim/planner/colgen/pricing_integer_search.h
++++ b/freespace_sim/planner/colgen/pricing_integer_search.h
+@@ -45,8 +45,6 @@
+     GLOBAL const float* root_values, GLOBAL const float* visits, GLOBAL const int* blocked,
+     GLOBAL const int* paid_rows, GLOBAL const float* paid_values,
+     GLOBAL int* output, GLOBAL float* scores,
+-    GLOBAL const int* price_map, GLOBAL const int* price_ranges,
+-    GLOBAL const int* price_steps, GLOBAL const float* price_values, GLOBAL const float* cutoffs,
+     GLOBAL const unsigned int* visit_masks, GLOBAL const int* endpoint_meta,
+     GLOBAL const int* endpoint_entries, GLOBAL const float* endpoint_trees,
+     GLOBAL const int* numeric_meta, GLOBAL const unsigned int* numeric_roots,
+--- a/freespace_sim/planner/colgen/pricing_platform.py
++++ b/freespace_sim/planner/colgen/pricing_platform.py
+@@ -32,6 +32,9 @@
+     endpoint_max_rows: int = 64
+     endpoint_cache_bytes: int = 1_048_576
+     endpoint_cache_work: int = 1_000_000
++    gpu_integer_bounds: bool = False
++    gpu_integer_audit: bool = False
++    gpu_approach_bounds: bool = False
+ 
+     def __post_init__(self) -> None:
+         """Reject ambiguous device selection and invalid allocation limits."""
+@@ -43,6 +46,16 @@
+             raise ValueError("Select gpu_backend='metal' or 'cuda' exactly when device='gpu'")
+         if not isinstance(self.cpu_recompute, bool):
+             raise TypeError("cpu_recompute must be boolean")
++        if not isinstance(self.gpu_integer_bounds, bool) or not isinstance(self.gpu_integer_audit, bool):
++            raise TypeError("integer bound/audit options must be boolean")
++        if self.gpu_integer_bounds and (self.device != "gpu" or not self.cpu_recompute):
++            raise ValueError("integer bounds require GPU canonical checks")
++        if self.gpu_integer_audit and not self.gpu_integer_bounds:
++            raise ValueError("integer audit requires integer bounds")
++        if not isinstance(self.gpu_approach_bounds, bool):
++            raise TypeError("gpu_approach_bounds must be boolean")
++        if self.gpu_approach_bounds and (self.device != "gpu" or not self.cpu_recompute):
++            raise ValueError("Approach bounds require GPU canonical checks")
+         if not isinstance(self.endpoint_bounds, bool):
+             raise TypeError("endpoint_bounds must be boolean")
+         for name in ("endpoint_max_rows", "endpoint_cache_bytes", "endpoint_cache_work"):
+@@ -130,7 +143,9 @@
+             from .gpu_runtime import ComputeRuntime
+ 
+             if self._runtime is None:
+-                self._runtime = ComputeRuntime(self.options.gpu_backend)
++                self._runtime = (ComputeRuntime(self.options.gpu_backend, integer_bounds=True)
++                                 if self.options.gpu_integer_bounds else
++                                 ComputeRuntime(self.options.gpu_backend))
+             return price_gpu_batch(problems, self.options, self._runtime, deadline)
+         results = []
+         for problem in problems:
+--- a/freespace_sim/planner/colgen/pricing_pool.py
++++ b/freespace_sim/planner/colgen/pricing_pool.py
+@@ -990,6 +990,9 @@
+         device="gpu", gpu_backend=params.pricing_gpu_backend,
+         cpu_recompute=params.pricing_cpu_recompute, max_labels=params.pricing_gpu_max_labels,
+         chunk_size=params.pricing_gpu_chunk_size,
++        gpu_integer_bounds=params.pricing_gpu_integer_bounds,
++        gpu_integer_audit=params.pricing_gpu_integer_audit,
++        gpu_approach_bounds=params.pricing_gpu_approach_bounds,
+         endpoint_bounds=params.pricing_gpu_endpoint_bounds,
+         endpoint_max_rows=params.pricing_gpu_endpoint_max_rows,
+         endpoint_cache_bytes=params.pricing_gpu_endpoint_cache_bytes,
+--- a/tests/test_colgen_gpu_endpoint.py
++++ b/tests/test_colgen_gpu_endpoint.py
+@@ -320,6 +320,107 @@
+     _assert_canonical(problem, result)
+ 
+ 
++
++
++@pytest.mark.parametrize("expire", [False, True])
++def test_rejected_proposals_and_completions_cannot_certify_unresolved_work(
++    monkeypatch: pytest.MonkeyPatch, expire: bool,
++) -> None:
++    """Untrusted GPU proposals and rejected completions cannot become validated incumbents.
++
++    Parameters
++    ------------
++    - monkeypatch (pytest.MonkeyPatch): forces bad proposals and rejects the first completion.
++    - expire (bool): interrupts after that rejection instead of allowing a complete retry.
++
++    Return
++    --------
++    - output (None): certified mode recovers the oracle optimum or reports an explicit deadline.
++    """
++    problem = _problem(signed=True)
++    optimum = _oracle(problem)
++    run = ComputeRuntime.run
++    canonical = pricing._canonical_candidate
++    rejected = 0
++    proposed = 0
++
++    def force_proposals(runtime, name, count, arrays, outputs, **kwargs):
++        """Every numeric device claim remains subject to original-price CPU verification."""
++        nonlocal proposed
++        result = run(runtime, name, count, arrays, outputs, **kwargs)
++        if name == "expand":
++            records, scores = result
++            valid = records[:, 6] != 0
++            records[valid, 6] |= 4
++            records[valid, 7:9] = 0
++            scores[valid, 2] = -1e30
++            proposed += int(np.count_nonzero(valid))
++        return result
++
++    def reject_first(*args, **kwargs):
++        """Reject before returning a score, then either retry or terminate cooperatively."""
++        nonlocal rejected
++        if not rejected:
++            rejected += 1
++            return None
++        if expire:
++            raise pricing.PricingTimeout("deadline after rejected completion")
++        return canonical(*args, **kwargs)
++
++    monkeypatch.setattr(pricing, "_shortest_seed", lambda *args, **kwargs: None)
++    monkeypatch.setattr(ComputeRuntime, "run", force_proposals)
++    monkeypatch.setattr(pricing, "_canonical_candidate", reject_first)
++    platform = _platform("metal", chunk_size=1)
++    result, = platform.price_batch([problem])
++    assert rejected == 1 and proposed > 0
++    if expire:
++        assert result.status == "deadline" and not result.certified
++        assert result.upper_bound is None
++    else:
++        assert result.certified and result.reduced_cost == pytest.approx(optimum, abs=1e-8)
++        assert result.upper_bound >= optimum - 1e-9
++        assert result.stats["cpu_recomputations"] > result.stats["verified_prunes"]
++        _assert_canonical(problem, result)
++
++
++@pytest.mark.parametrize("cache_bytes", [0, 1_048_576])
++def test_preliminary_selection_prices_paid_endpoint_words_and_preserves_diversity(
++    monkeypatch: pytest.MonkeyPatch, cache_bytes: int,
++) -> None:
++    """The bounded preliminary beam favors paid endpoints without starving alternate roots.
++
++    Parameters
++    ------------
++    - monkeypatch (pytest.MonkeyPatch): supplies independent endpoint membership.
++    - cache_bytes (int): exercises available residuals and safe missing-table priority.
++
++    Return
++    --------
++    - output (None): both paid words affect ranking; distinct root/arrival choices survive.
++    """
++    from freespace_sim.planner.colgen.gpu_pricing import _Batch
++
++    bounds, rows, _ = _endpoint_case(monkeypatch, 100)
++    endpoint = EndpointBounds(bounds, PricingOptions(endpoint_cache_bytes=cache_bytes), lambda: None)
++    records = np.zeros((8, 9), np.int32)
++    records[:, 0] = np.arange(8)
++    records[:, 1] = [0, 0, 0, 0, 0, 0, 1, 0]
++    records[4, 7:9] = np.asarray(endpoint.mask((rows[31], rows[63])), np.uint32).view(np.int32)
++    graph = np.zeros((8, 14), np.int32)
++    graph[:, 12] = [1, 1, 1, 1, 1, 1, 1, 2]
++    scores = np.zeros((8, 3), np.float32)
++    scores[:, 0] = [10, 9, 8, 7, 6, 5, 4, 3]
++    batch = SimpleNamespace(
++        root_flights=[0, 0], graph=graph, root_values=np.zeros((2, 11), np.float32),
++        problems=[bounds.problem], endpoints=[endpoint], future=[None],
++        topologies=[SimpleNamespace(max_step=106, air_hop_limit=6)], check=lambda: None,
++    )
++    selected = _Batch.select_beam(batch, records, scores, 100, 6)
++    assert len(selected) == len(set(selected)) == 6
++    assert selected[0] == (4 if cache_bytes else 0)
++    assert 6 in selected and 7 in selected
++
++
+ @pytest.mark.parametrize("buffer", [0.0, 4.0])
+ @pytest.mark.parametrize("magnitude", [0.0, 1.0, 1e8])
+ def test_arrival_bounds_cover_every_prefix_of_every_canonical_completion(
+@@ -340,6 +441,15 @@
+     prices = {row: price * magnitude + 0.123456789 for row, price in original.duals.items()}
+     problem = replace(original, duals=prices, pi_f=10000.0)
+     bounds, variants = _bounds(problem)
++    from freespace_sim.planner.colgen.gpu_integer import IntegerScale
++    from freespace_sim.planner.colgen.gpu_integer_bounds import (
++        prepare_reference_operands, reference_upper,
++    )
++
++    integer_scale = IntegerScale.for_values(
++        [problem.params.M, problem.pi_f, *prices.values()],
++        max_terms=len(prices) + bounds.topology.air_hop_limit + 32,
++    )
+     endpoint = EndpointBounds(bounds, PricingOptions(endpoint_cache_work=10_000_000), lambda: None)
+     graph, cfg, view = problem.graph, problem.cfg, bounds.view
+     future = FutureBounds(
+@@ -349,6 +459,12 @@
+     for price in view._duals.values():
+         if price < 0:
+             negative = math.nextafter(negative + price, -math.inf)
++    from freespace_sim.planner.colgen.gpu_approach import ApproachBounds
++
++    approach = ApproachBounds(bounds, lambda: None, max_work=10_000_000)
++    root_uppers = [approach.upper(i, problem.params.M, negative, 1e100)
++                   for i in range(variants.n_variants)]
++    assert all(map(math.isfinite, root_uppers))
+     from freespace_sim.planner.colgen.gpu_pricing import _Batch
+ 
+     screening = SimpleNamespace(
+@@ -377,6 +493,7 @@
+                     benefit=problem.params.M, cost=column.delay_s,
+                     dual_cost=view.claim_cost(column.claims), pi_f=problem.pi_f,
+                 )
++                assert root_uppers[variant] >= actual
+                 screening.best[0] = math.nextafter(actual, -math.inf), None
+                 assert _Batch.keep_departure(screening, 0, column.departure_step)
+                 union = bounds.origin_claims(variant)
+@@ -413,6 +530,31 @@
+                         variant, hop, visit_lower, suffix,
+                         problem.params.M, problem.pi_f, negative,
+                     ) >= actual
++                    integer_positive = integer_scale.positive_sum(
++                        (max(0.0, view.row_cost(row)) for row in union), extra_rounds=hop,
++                    )
++                    integer_visits = integer_scale.positive_sum(
++                        (max(0.0, view.row_cost(row)) for row in visit_union), extra_rounds=hop,
++                    )
++                    operands = prepare_reference_operands(
++                        integer_scale, bounds, variant, hop, remaining, integer_positive,
++                        integer_visits, suffix, residual, problem.params.M, negative,
++                    )
++                    integer_upper = reference_upper(integer_scale, operands)
++                    # Canonical completion coverage is independent of shader/FP64 parity.
++                    assert integer_upper.valid
++                    assert integer_scale.upper_float(integer_upper) >= actual
++                    from freespace_sim.planner.colgen.gpu_pricing import completion_upper_bound
++
++                    reference = min(
++                        upper,
++                        bounds.future_upper(variant, hop, visit_lower, suffix,
++                                            problem.params.M, problem.pi_f, negative),
++                        completion_upper_bound(problem.params.M, problem.pi_f,
++                                               bounds.cost_lower(variant, hop + remaining),
++                                               (prefix,), negative),
++                    )
++                    assert integer_scale.upper_float(integer_upper) >= reference
+                     checked += 1
+         if hops < graph.max_air_hops:
+             depth = view.offsets[1] - view.offsets[0]
+@@ -422,100 +564,127 @@
+     assert checked > 100
+ 
+ 
+-@pytest.mark.parametrize("expire", [False, True])
+-def test_rejected_proposals_and_completions_cannot_certify_unresolved_work(
+-    monkeypatch: pytest.MonkeyPatch, expire: bool,
+-) -> None:
+-    """Untrusted GPU proposals and rejected completions cannot become validated incumbents.
+-
+-    Parameters
+-    ------------
+-    - monkeypatch (pytest.MonkeyPatch): forces bad proposals and rejects the first completion.
+-    - expire (bool): interrupts after that rejection instead of allowing a complete retry.
+-
+-    Return
+-    --------
+-    - output (None): certified mode recovers the oracle optimum or reports an explicit deadline.
+-    """
+-    problem = _problem(signed=True)
+-    optimum = _oracle(problem)
+-    run = ComputeRuntime.run
+-    canonical = pricing._canonical_candidate
+-    rejected = 0
+-    proposed = 0
+-
+-    def force_proposals(runtime, name, count, arrays, outputs, **kwargs):
+-        """Every numeric device claim remains subject to original-price CPU verification."""
+-        nonlocal proposed
+-        result = run(runtime, name, count, arrays, outputs, **kwargs)
+-        if name == "expand":
+-            records, scores = result
+-            valid = records[:, 6] != 0
+-            records[valid, 6] |= 4
+-            records[valid, 7:9] = 0
+-            scores[valid, 2] = -1e30
+-            proposed += int(np.count_nonzero(valid))
+-        return result
+-
+-    def reject_first(*args, **kwargs):
+-        """Reject before returning a score, then either retry or terminate cooperatively."""
+-        nonlocal rejected
+-        if not rejected:
+-            rejected += 1
+-            return None
+-        if expire:
+-            raise pricing.PricingTimeout("deadline after rejected completion")
+-        return canonical(*args, **kwargs)
+-
+-    monkeypatch.setattr(pricing, "_shortest_seed", lambda *args, **kwargs: None)
+-    monkeypatch.setattr(ComputeRuntime, "run", force_proposals)
+-    monkeypatch.setattr(pricing, "_canonical_candidate", reject_first)
+-    platform = _platform("metal", chunk_size=1)
+-    result, = platform.price_batch([problem])
+-    assert rejected == 1 and proposed > 0
+-    if expire:
+-        assert result.status == "deadline" and not result.certified
+-        assert result.upper_bound is None
+-    else:
+-        assert result.certified and result.reduced_cost == pytest.approx(optimum, abs=1e-8)
+-        assert result.upper_bound >= optimum - 1e-9
+-        assert result.stats["cpu_recomputations"] > result.stats["verified_prunes"]
+-        _assert_canonical(problem, result)
+-
+-
+-@pytest.mark.parametrize("cache_bytes", [0, 1_048_576])
+-def test_preliminary_selection_prices_paid_endpoint_words_and_preserves_diversity(
+-    monkeypatch: pytest.MonkeyPatch, cache_bytes: int,
+-) -> None:
+-    """The bounded preliminary beam favors paid endpoints without starving alternate roots.
+-
+-    Parameters
+-    ------------
+-    - monkeypatch (pytest.MonkeyPatch): supplies independent endpoint membership.
+-    - cache_bytes (int): exercises available residuals and safe missing-table priority.
+-
+-    Return
+-    --------
+-    - output (None): both paid words affect ranking; distinct root/arrival choices survive.
+-    """
+-    from freespace_sim.planner.colgen.gpu_pricing import _Batch
+-
+-    bounds, rows, _ = _endpoint_case(monkeypatch, 100)
+-    endpoint = EndpointBounds(bounds, PricingOptions(endpoint_cache_bytes=cache_bytes), lambda: None)
+-    records = np.zeros((8, 9), np.int32)
+-    records[:, 0] = np.arange(8)
+-    records[:, 1] = [0, 0, 0, 0, 0, 0, 1, 0]
+-    records[4, 7:9] = np.asarray(endpoint.mask((rows[31], rows[63])), np.uint32).view(np.int32)
+-    graph = np.zeros((8, 14), np.int32)
+-    graph[:, 12] = [1, 1, 1, 1, 1, 1, 1, 2]
+-    scores = np.zeros((8, 3), np.float32)
+-    scores[:, 0] = [10, 9, 8, 7, 6, 5, 4, 3]
+-    batch = SimpleNamespace(
+-        root_flights=[0, 0], graph=graph, root_values=np.zeros((2, 11), np.float32),
+-        problems=[bounds.problem], endpoints=[endpoint], future=[None],
+-        topologies=[SimpleNamespace(max_step=106, air_hop_limit=6)], check=lambda: None,
+-    )
+-    selected = _Batch.select_beam(batch, records, scores, 100, 6)
+-    assert len(selected) == len(set(selected)) == 6
+-    assert selected[0] == (4 if cache_bytes else 0)
+-    assert 6 in selected and 7 in selected
++def test_approach_budget_cutoff_deadline_and_changed_snapshot_fail_open() -> None:
++    """Incomplete alternative scans never expose an optimistic partial root upper.
++
++    Parameters
++    ------------
++    - none: uses original-price roots and independently changes their prices and restrictions.
++
++    Return
++    --------
++    - output (None): completed uppers enclose enumeration; exhausted/expired scans cannot prune.
++    """
++    from freespace_sim.planner.colgen.gpu_approach import ApproachBounds
++
++    problem = _problem()
++    bounds, _ = _bounds(problem)
++    helper = ApproachBounds(bounds, lambda: None)
++    initial_work = helper.work
++    negative = _negative(bounds.view)
++    upper = helper.upper(0, problem.params.M, negative, 1e100)
++    assert math.isfinite(upper)
++    assert max(helper.upper(i, problem.params.M, negative, 1e100)
++               for i in range(bounds.variants.n_variants)) >= _oracle(problem)
++    assert ApproachBounds(bounds, lambda: None, 0).upper(0, problem.params.M, negative, 1e100) == math.inf
++    limited = ApproachBounds(bounds, lambda: None, initial_work + 2)
++    assert limited.upper(0, problem.params.M, negative, 1e100) == math.inf
++    assert limited.work <= limited.max_work
++    assert ApproachBounds(bounds, lambda: None).upper(
++        0, problem.params.M, negative, math.nextafter(upper, -math.inf),
++    ) == math.inf
++
++    def expire() -> None:
++        """Stop after helper construction so a partial root scan cannot be published."""
++        raise pricing.PricingTimeout("approach deadline")
++
++    helper.check = expire
++    with pytest.raises(pricing.PricingTimeout):
++        helper.upper(0, problem.params.M, negative, 1e100)
++    prices = {row: -value + 0.125 for row, value in problem.duals.items()}
++    prices[RowKey.terminal("unreachable-credit", -7)] = -1e4
++    changed = replace(problem, duals=prices, pi_f=0.5)
++    fresh, variants = _bounds(changed)
++    refreshed = ApproachBounds(fresh, lambda: None)
++    new_negative = _negative(fresh.view)
++    assert max(refreshed.upper(i, changed.params.M, new_negative, 1e100)
++               for i in range(variants.n_variants)) >= _oracle(changed)
++    assert refreshed.upper(0, changed.params.M, -math.inf, 1e100) == math.inf
++
++
++@pytest.mark.parametrize("endpoint_kind", ["one_hop", "origin_terminal", "destination_terminal"])
++@pytest.mark.parametrize("magnitude", [1e-200, 1.0, 1e150])
++def test_approach_unions_cover_short_routes_and_terminal_lane_choices(
++    endpoint_kind: str, magnitude: float,
++) -> None:
++    """Root overlap, alternate terminal lanes and extreme signed prices enclose canonical routes.
++
++    Parameters
++    ------------
++    - endpoint_kind (str): one-hop origin/penultimate overlap or alternate terminal lanes.
++    - magnitude (float): tiny, ordinary and extreme finite original resource prices.
++
++    Return
++    --------
++    - output (None): independently scored canonical routes remain under their own root upper.
++    """
++    from freespace_sim.planner.colgen.gpu_approach import ApproachBounds
++    from freespace_sim.planner.colgen.network import build_flight_graph
++    from freespace_sim.planner.colgen.pricing_platform import PricingProblem
++    from freespace_sim.types import Terminal
++    from tests.test_colgen_solver import _cfg, _params, _request
++
++    cfg = _cfg(max_ground_delay_s=0.0, time_buffer_s=4.0, max_detour_factor=5.0)
++    params = _params(max_air_overrun_hops=0)
++    request = _request(1, (0, 0), (1, 0) if endpoint_kind == "one_hop" else (8, 2), cfg)
++    catalog = ()
++    if endpoint_kind != "one_hop":
++        terminal = Terminal("test-terminal", 4, radius=120.0)
++        origin = endpoint_kind == "origin_terminal"
++        request = replace(request, **{"origin_terminal" if origin else "dest_terminal": terminal})
++        catalog = ((request.origin if origin else request.dest, terminal),)
++    graph = build_flight_graph(request, cfg, catalog, params)
++    problem = PricingProblem(graph, cfg, params, {}, 0.0)
++    unpriced, variants = _bounds(problem)
++    t = unpriced.topology
++    cells = tuple(zip(map(int, t.cell_q), map(int, t.cell_r)))
++    columns = []
++    for variant in range(variants.n_variants):
++        for target in np.flatnonzero(t.dest_mask):
++            path = pricing._shortest_cell_path(graph, cells[int(variants.cell[variant])], cells[int(target)])
++            if path is None or len(path) < 2:
++                continue
++            lane = next((i for i, lane in enumerate(graph.dest_lanes) if lane.cell == path[-1]), None)
++            try:
++                column = pricing.certify_column(Column(
++                    1, int(variants.departure_step[variant]), 0,
++                    None if variants.lane_idx[variant] < 0 else int(variants.lane_idx[variant]),
++                    lane, path, 0.0,
++                ), graph, cfg, unpriced.model)
++            except ValueError:
++                continue
++            columns.append((variant, column))
++    assert columns
++    if endpoint_kind != "one_hop":
++        assert variants.n_variants > 1 or int(t.dest_mask.sum()) > 1
++    all_rows = sorted(frozenset().union(*(column.claims for _, column in columns)))
++    prices = {row: magnitude * (3.25 if i % 4 else -1.125) for i, row in enumerate(all_rows)}
++    problem = replace(problem, duals=prices)
++    bounds, current = _bounds(problem)
++    np.testing.assert_array_equal(current.cell, variants.cell)
++    helper = ApproachBounds(bounds, lambda: None, max_work=10_000_000)
++    negative = _negative(bounds.view)
++    uppers = {i: helper.upper(i, params.M, negative, 1e300) for i, _ in columns}
++    for variant, column in columns:
++        rc = bounds.model.reduced_cost(benefit=params.M, cost=column.delay_s,
++                                       dual_cost=bounds.view.claim_cost(column.claims), pi_f=0.0)
++        assert math.isfinite(uppers[variant]) and uppers[variant] >= rc
++
++
++def _negative(view: pricing.DualView) -> float:
++    """Accumulate complete negative credit in main's original ordered arithmetic."""
++    result = 0.0
++    for price in view._duals.values():
++        if price < 0:
++            result = math.nextafter(result + price, -math.inf)
++    return result
+--- a/tests/test_colgen_gpu_integer.py
++++ b/tests/test_colgen_gpu_integer.py
+@@ -312,7 +312,7 @@
+     )
+     np.testing.assert_array_equal(actual, expected)
+     np.testing.assert_array_equal(actual_closed, closed)
+-    assert runtime.dispatches == 1 and runtime.counters["waits"] == 1
++    assert runtime.dispatches == 1
+ 
+ 
+ def test_cuda_generated_interface_compiles_with_stubbed_intrinsics(tmp_path) -> None:
+--- a/tests/test_colgen_pricing_platform.py
++++ b/tests/test_colgen_pricing_platform.py
+@@ -71,6 +71,7 @@
+     cpu_recompute: bool = True,
+     max_labels: int = 250_000,
+     chunk_size: int = 2048,
++    integer_bounds: bool = False,
+ ) -> PricingPlatform:
+     """
+     Select a backend, skipping Metal tests only when its platform or hardware is absent.
+@@ -81,6 +82,7 @@
+     - cpu_recompute (bool): enable certified numerical recomputation for GPU search.
+     - max_labels (int): storage budget used to test incomplete-search handling.
+     - chunk_size (int): expansion chunk size used by GPU search.
++    - integer_bounds (bool): use checked GPU intervals instead of CPU per-prune verification.
+ 
+     Return
+     --------
+@@ -101,6 +103,7 @@
+             cpu_recompute=cpu_recompute,
+             max_labels=max_labels,
+             chunk_size=chunk_size,
++            gpu_integer_bounds=integer_bounds,
+         )
+     )
+ 

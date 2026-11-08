@@ -151,9 +151,9 @@ def test_gpu_residual_bound_is_separate_from_column_score(
 
 
 @pytest.mark.parametrize("backend", ["highs", "gurobi"])
-@pytest.mark.parametrize("cpu_recompute", [True, False])
+@pytest.mark.parametrize("cpu_recompute,integer_bounds", [(True, False), (False, False), (True, True)])
 def test_full_solver_uses_metal_and_preserves_certificate_meaning(
-    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool
+    monkeypatch: pytest.MonkeyPatch, backend: str, cpu_recompute: bool, integer_bounds: bool,
 ) -> None:
     """Real GPU sweeps feed a feasible master/IP solve without giving FP32 a global proof.
 
@@ -162,6 +162,7 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
     - monkeypatch (pytest.MonkeyPatch): disables full CPU pricing after building the oracle.
     - backend (str): LP/IP implementation exercised with actual Metal pricing.
     - cpu_recompute (bool): selects certified or unchecked FP32 GPU search.
+    - integer_bounds (bool): use checked GPU deletion bounds with CPU canonical completions.
 
     Return
     --------
@@ -198,9 +199,14 @@ def test_full_solver_uses_metal_and_preserves_certificate_meaning(
         pricing_device="gpu",
         pricing_gpu_backend="metal",
         pricing_cpu_recompute=cpu_recompute,
+        pricing_gpu_integer_bounds=integer_bounds,
         pricing_gpu_batch_size=2,
         n_pricing_workers=2,
     )
+    if integer_bounds:
+        from freespace_sim.planner.colgen.gpu_pricing import _Batch
+
+        monkeypatch.setattr(_Batch, "bound", _no_cpu_pricing)
     result = ColGenSolver().solve(requests, cfg, (), gpu_params, on_iteration=observations.append)
     stats = result.stats
     assert stats["backend"] == backend

@@ -1254,7 +1254,10 @@ class _Batch:
         self.stats["approach_prepare_s"] = self.stats.get("approach_prepare_s", 0.0) + time.monotonic() - started
 
     def run(self) -> tuple[PricingResult, ...]:
-        """Return validated incumbents and certify only complete, CPU-refined searches.
+        """Return validated incumbents and certify only complete searches with verified bounds.
+
+        Numerical pruning uses CPU-verified proposals or checked GPU integer bounds.
+        Canonical completion scoring remains CPU-validated in both certified modes.
 
         Parameters
         ------------

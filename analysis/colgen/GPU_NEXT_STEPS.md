@@ -2,6 +2,10 @@
 
 ## Authorization and order
 
+- 2026-11-08 [USER] Fix the remaining documentation suggestion, obtain a fresh
+  independent Extra High review of the PR144/PR146 stack, and merge if no issues
+  remain. This supersedes the earlier draft/no-merge holds for these two PRs.
+  Land PR144 first, then PR146 onto main; preserve other follow-up branches.
 - 2026-11-08 [USER] Keep PR146 stacked on PR144 and prepare it for merge.
   Launch integer caching in its own worktree conversation from PR146 at Extra
   High effort. The main-only experiment remains analysis evidence; do not

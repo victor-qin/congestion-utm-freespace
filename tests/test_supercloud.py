@@ -1,6 +1,13 @@
-"""SuperCloud agent runs without a network: caps, shipped code and the generated job."""
+"""SuperCloud agent runs without a network: caps, shipped code, the generated job and the lock."""
 
+import json
+import math
+import os
+import shlex
+import shutil
 import subprocess
+import sys
+import threading
 from dataclasses import replace
 
 import pytest
@@ -34,17 +41,24 @@ def _req(**changes) -> sc.JobRequest:
     (_req(module="pytest", gpus=1, cores=20), CFG, None),
     (_req(module="os"), CFG, "not allowed"),
     (_req(name="../x"), CFG, "name"),
+    (_req(name="a..b"), CFG, "name"),
+    (_req(name="x.lock"), CFG, "name"),
     (_req(cores=49), CFG, "cores per job"),
     (_req(gpus=3), CFG, "GPUs per job"),
     (_req(hours=48.5), CFG, "hours per job"),
+    (_req(hours=math.nan), CFG, "finite"),
     (_req(gurobi=True), CFG, "Gurobi"),
     (_req(gurobi=True), replace(CFG, allow_gurobi=True), None),
+    (_req(env=(("COLGEN_GUROBI_THREADS", "8"),)), CFG, None),
+    (_req(env=(("lower", "1"),)), CFG, "UPPER_SNAKE_CASE"),
+    (_req(env=(("GRB_LICENSE_FILE", LICENCE),)), CFG, "reserved"),
+    (_req(env=(("PYTHONHOME", "/x"),)), CFG, "reserved"),
     (_req(cores=25), CFG, "total cores"),
     (_req(gpus=2), CFG, "total GPUs"),
     (_req(), replace(CFG, caps=replace(CAPS, max_jobs=2)), "agent jobs already queued"),
-    (_req(env=(("lower", "1"),)), CFG, "UPPER_SNAKE_CASE"),
 ])
 def test_check_request_enforces_caps(req, cfg, refusal):
+    assert sc._parse_command(["--", "python", "-m", "pytest", "-q"]) == ("pytest", ("-q",))
     live = sc.parse_squeue(SQUEUE)
     assert [(j.cores, j.gpus) for j in live] == [(20, 1), (20, 0)]
     problems = sc.check_request(req, cfg, live)
@@ -54,20 +68,49 @@ def test_check_request_enforces_caps(req, cfg, refusal):
         assert any(refusal in p for p in problems), problems
 
 
+@pytest.mark.parametrize("key, value", [
+    ("allow_gurobi", '"false"'),        # a string would read as truthy and enable Gurobi
+    ("max_jobs", "true"),               # bool is an int subclass
+    ("remote_root", '"~/agent-runs"'),  # shell quoting would keep the "~" literal
+    ("max_jobs", ""),                   # TOML syntax error
+])
+def test_load_config_rejects_malformed_settings(tmp_path, key, value):
+    top = {"host": '"supercloud"', "remote_root": '"/home/gridsan/u/agent-runs"',
+           "conda_env": '"congestion-utm"', "allow_gurobi": "false",
+           "gurobi_license_file": f'"{LICENCE}"'}
+    caps = {"max_cores_per_job": "48", "max_gpus_per_job": "2", "max_hours_per_job": "48",
+            "max_jobs": "6", "max_cores_total": "192", "max_gpus_total": "4"}
+    path = tmp_path / "supercloud.toml"
+
+    def write(top: dict, caps: dict) -> None:
+        path.write_text("".join(f"{k} = {v}\n" for k, v in top.items()) + "[caps]\n"
+                        + "".join(f"{k} = {v}\n" for k, v in caps.items()))
+
+    write(top, caps)
+    assert sc.load_config(path).caps.max_jobs == 6
+    write({**top, key: value} if key in top else top, {**caps, key: value} if key in caps else caps)
+    with pytest.raises(sc.SuperCloudError):
+        sc.load_config(path)
+
+
 def _git(repo, *args) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
                           text=True).stdout
 
 
+def _init_repo(path):
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "t")
+    return path
+
+
 def test_snapshot_ships_working_tree_without_touching_it(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
+    repo = _init_repo(tmp_path / "repo")
     (repo / ".gitignore").write_text("ignored.txt\n")
-    (repo / "tracked.py").write_text("v1\n")
-    (repo / "staged.py").write_text("s1\n")
+    for name, text in (("tracked.py", "v1\n"), ("staged.py", "s1\n"), ("gone.py", "g\n")):
+        (repo / name).write_text(text)
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "base")
     (repo / "tracked.py").write_text("v2\n")
@@ -75,6 +118,7 @@ def test_snapshot_ships_working_tree_without_touching_it(tmp_path):
     _git(repo, "add", "staged.py")
     (repo / "new.py").write_text("n\n")
     (repo / "ignored.txt").write_text("x\n")
+    (repo / "gone.py").unlink()
 
     def state():
         return (_git(repo, "rev-parse", "HEAD"), _git(repo, "symbolic-ref", "HEAD"),
@@ -98,23 +142,122 @@ def test_snapshot_ships_working_tree_without_touching_it(tmp_path):
     (repo / "big.bin").write_bytes(b"0" * 2048)
     with pytest.raises(sc.SuperCloudError, match="big.bin"):
         sc.snapshot_commit(repo, "r2", max_file_bytes=1024)
+    (repo / "big.bin").unlink()
+    # A link out of the tree would dangle on the cluster: refused with a message, not a traceback.
+    (repo / "link").symlink_to("/etc/hosts")
+    with pytest.raises(sc.SuperCloudError, match="link"):
+        sc.stage_snapshot(repo, sc.snapshot_commit(repo, "r3"), tmp_path / "stage3")
 
 
 @pytest.mark.parametrize("gurobi, gpus", [(False, 0), (True, 1)])
-def test_job_runs_the_snapshot(gurobi, gpus):
-    req = _req(args=("--scenario", "a b; rm -rf ~"), gurobi=gurobi, gpus=gpus, cores=20,
-               env=(("COLGEN_GUROBI_THREADS", "8"),))
-    script = sc.render_job_script(CFG, req, "r1", RUN_DIR)
-    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+def test_job_runs_the_snapshot(tmp_path, gurobi, gpus):
+    # The decoy package plays the cluster env's editable install of ~/congestion-utm-freespace,
+    # which is on the env python's path behind PYTHONPATH.
+    decoy = tmp_path / "decoy"
+    (decoy / "freespace_sim").mkdir(parents=True)
+    (decoy / "freespace_sim" / "__init__.py").write_text("")
+    home = tmp_path / "home"
+    env_python = home / ".conda" / "envs" / CFG.conda_env / "bin" / "python"
+    env_python.parent.mkdir(parents=True)
+    env_python.write_text("#!/bin/bash\n"
+                          f'export PYTHONPATH="${{PYTHONPATH:+$PYTHONPATH:}}{decoy}"\n'
+                          f'exec {shlex.quote(sys.executable)} "$@"\n')
+    env_python.chmod(0o755)
+    run_dir = tmp_path / "run dir"
+    (run_dir / "freespace_sim").mkdir(parents=True)
+    (run_dir / "freespace_sim" / "__init__.py").write_text("")
+    (run_dir / "probe.py").write_text(
+        "import json, os, sys, freespace_sim\n"
+        "print(json.dumps({'pkg': os.path.realpath(freespace_sim.__file__), 'argv': sys.argv[1:],"
+        " 'threads': os.environ.get('COLGEN_GUROBI_THREADS'),"
+        " 'licence': os.environ.get('GRB_LICENSE_FILE')}))\n")
+    # PY is a legal --env name; it must not be able to replace the job's interpreter.
+    req = _req(module="probe", args=("--scenario", "a b; rm -rf ~"), gurobi=gurobi, gpus=gpus,
+               cores=20, env=(("COLGEN_GUROBI_THREADS", "8"), ("PY", "/bin/false")))
+    script = sc.render_job_script(CFG, req, "r1", str(run_dir))
     assert "#SBATCH" not in script  # LLsub drops command-line options when any is present
-    assert 'export PYTHONPATH="$PWD"' in script and "not this run's snapshot" in script
-    assert (f"export GRB_LICENSE_FILE={LICENCE}" in script) is gurobi
-    # Extra variables come before PYTHONPATH is set, so none can redirect the import.
-    assert script.index("export COLGEN_GUROBI_THREADS=8") < script.index("export PYTHONPATH")
-    assert script.rstrip().endswith(
-        "exec \"$PY\" -m experiments.run --scenario 'a b; rm -rf ~'")
+    env = {"HOME": str(home), "PATH": os.environ["PATH"], "USER": "u"}
+
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env,
+                          timeout=60)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout.strip().splitlines()[-1])
+    assert out == {"pkg": os.path.realpath(run_dir / "freespace_sim" / "__init__.py"),
+                   "argv": ["--scenario", "a b; rm -rf ~"], "threads": "8",
+                   "licence": LICENCE if gurobi else None}
+
+    shutil.rmtree(run_dir / "freespace_sim")  # now only the decoy is importable
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env,
+                          timeout=60)
+    assert done.returncode != 0 and "FATAL" in done.stderr
 
     args = sc.sbatch_args(req, "r1", RUN_DIR)
     assert args[args.index("-p") + 1] == ("xeon-g6-volta" if gpus else "xeon-p8")
     assert ("gpu:volta:1" in args) is bool(gpus)
     assert args[args.index("-t") + 1] == "120"
+
+
+def test_parse_sacct_takes_state_from_the_job_and_memory_from_its_steps():
+    rows = sc.parse_sacct("\n".join([
+        "6219869|COMPLETED|00:01:50|", "6219869.batch|COMPLETED|00:01:50|1.25G",
+        "6219869.extern|COMPLETED|00:01:50|0.01G", "7|PENDING|00:00:00|"]))
+    assert rows == {"6219869": {"state": "COMPLETED", "elapsed": "00:01:50", "max_rss_gb": 1.25},
+                    "7": {"state": "PENDING", "elapsed": "00:00:00", "max_rss_gb": 0.0}}
+
+
+def test_concurrent_submits_from_two_worktrees_cannot_exceed_caps(tmp_path, monkeypatch):
+    main = _init_repo(tmp_path / "main")
+    (main / "a.py").write_text("committed\n")
+    _git(main, "add", ".")
+    _git(main, "commit", "-q", "-m", "base")
+    side = tmp_path / "side"
+    _git(main, "worktree", "add", "-q", str(side), "-b", "side")
+    (side / "a.py").write_text("uncommitted in worktree\n")
+    expected = {"one": "committed\n", "two": "uncommitted in worktree\n"}
+
+    queue = ["101|agent-old|8|N/A|RUNNING"]  # one live agent job; max_jobs=2 leaves one slot
+    guard = threading.Lock()
+    both_uploading = threading.Barrier(2)
+
+    def fake_ssh(cfg, command):
+        words = command.split()
+        with guard:
+            if words[0] == "squeue":
+                return "\n".join(queue)
+            if words[0] == "sbatch":
+                queue.append(f"{200 + len(queue)}|{words[words.index('-J') + 1]}|8|N/A|PENDING")
+                return queue[-1].split("|")[0] + "\n"
+        return ""
+
+    def fake_rsync(src, dest):
+        both_uploading.wait(timeout=30)  # both have passed the pre-check before either locks
+
+    monkeypatch.setattr(sc, "_ssh", fake_ssh)
+    monkeypatch.setattr(sc, "_rsync", fake_rsync)
+    cfg = replace(CFG, caps=replace(CAPS, max_jobs=2))
+    outcomes = {}
+
+    def run(name, tree):
+        try:
+            outcomes[name] = sc.submit(cfg, _req(name=name), tree)
+        except sc.SuperCloudError as exc:
+            outcomes[name] = exc
+
+    threads = [threading.Thread(target=run, args=args) for args in (("one", main), ("two", side))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    accepted = {n: r for n, r in outcomes.items() if isinstance(r, dict)}
+    refused = [r for r in outcomes.values() if isinstance(r, sc.SuperCloudError)]
+    assert len(accepted) == 1 and len(refused) == 1, outcomes
+    assert "agent jobs already queued" in str(refused[0])
+    (name, record), = accepted.items()
+    # One ledger in the MAIN checkout, whichever worktree won.
+    ledger = (main / "results" / "supercloud" / "runs.jsonl").read_text().splitlines()
+    assert [json.loads(line)["run_id"] for line in ledger] == [record["run_id"]]
+    # The refused snapshot's ref is gone; the accepted one holds that worktree's on-disk files.
+    assert _git(main, "for-each-ref", "--format=%(refname)", "refs/supercloud").split() == [
+        f"refs/supercloud/{record['run_id']}"]
+    assert _git(main, "show", f"{record['sha']}:a.py") == expected[name]

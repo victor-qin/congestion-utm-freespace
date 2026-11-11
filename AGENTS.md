@@ -105,4 +105,4 @@ There is an extremely high-bar for transferring things from `.agent/CONTINUITY.m
 - Caps are in `~/.config/congestion-utm/supercloud.toml` and belong to the user. Never edit that file; if a submit is refused, ask the user.
 - `fetch <run_id>` copies results and the Slurm log to the main checkout's `results/supercloud/<run_id>/`. Cite remote results by run id.
 - If a submit fails, run `doctor` (add `--gpu` to test a V100 node) before retrying.
-- Codex agents need network access to `txe1-login.mit.edu` and read access to `~/.ssh`.
+- Codex agents need network access to `txe1-login.mit.edu`, read access to `~/.ssh`, and write access to the main checkout's `.git/` (snapshot refs) and `results/supercloud/` (ledger and lock).

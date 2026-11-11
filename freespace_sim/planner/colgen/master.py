@@ -1748,6 +1748,7 @@ class RestrictedMaster:
         budget_s: float | None = None,
         eager: bool = True,
         max_eager_rows: int | None = None,
+        search: bool = True,
     ) -> dict[int, Column]:
         """Solve the current binary RMP, separating claim rows until it is clean.
 
@@ -1776,11 +1777,13 @@ class RestrictedMaster:
         - eager (bool): materialize all bindable rows up front (default); ``False`` for the
           per-iteration calls inside the column-generation loop.
         - max_eager_rows (int | None): ceiling forwarded to :meth:`materialize_bindable_rows`.
+        - search (bool): run the solver (default). ``False`` stops after the row preparation
+          and returns the recorded incumbent with status ``"rows_only"``.
 
         Return
         --------
         - output (dict[int, Column]): the selected column per flight; the recorded heuristic
-          incumbent when the deadline is hit during separation.
+          incumbent when the deadline is hit during separation or ``search`` is ``False``.
         """
 
         if heuristic is not None:
@@ -1808,6 +1811,16 @@ class RestrictedMaster:
         self.last_ip_status = None
         self.last_ip_optimal = None
         self.last_ip_trajectory = ()
+        if not search:
+            # The rows above are the step's only change to later master LPs: the search adds
+            # no columns and the LP never reads its incumbent. Pricing does read the
+            # incumbent, which here stays as recorded.
+            selection = dict(self._heuristic_selection)
+            self.last_ip_objective = self.objective_of(selection)
+            self.last_ip_bound = math.inf
+            self.last_ip_status = "rows_only"
+            self.last_ip_optimal = False
+            return selection
         original_time_limit_s = self._backend.time_limit_s
         try:
             while True:

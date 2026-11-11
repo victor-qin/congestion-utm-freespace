@@ -96,7 +96,8 @@ There is an extremely high-bar for transferring things from `.agent/CONTINUITY.m
 - If reusing a script from `context/` and `analysis/`, double check for correcteness before using them, especially with files in `freespace_sim/`.
 
 ## SuperCloud (remote runs)
-- Send a run to MIT SuperCloud when it would take more than ~30 min here, needs more memory than this machine, or needs CUDA (V100). Quick checks stay local.
+- Prefer this machine for small runs: tests, debugging, profiling, quick benchmarks, and any single run that finishes in under ~30 min and fits in this machine's memory (128 GB, 20 cores). Local runs start immediately. SuperCloud jobs wait in a queue and recompile numba from scratch, so small runs are slower there.
+- Send big runs to MIT SuperCloud: a run that would take more than ~30 min here, needs more memory than this machine has, or needs CUDA (V100), and batches of independent runs (seeds, sweeps) that would otherwise run one after another here.
 - One tool does it all: `uv run python -m experiments.supercloud {doctor,submit,status,fetch,cancel,list}`. `submit` ships your worktree exactly as it is on disk (uncommitted edits included) and keeps that code as `refs/supercloud/<run_id>`; nothing is committed to your branch.
 - Submit: `uv run python -m experiments.supercloud submit --name <label> --cores N --hours H [--gpus G] [--gurobi] [--env NAME=VALUE] -- experiments.run ... --no-progress`. Only `experiments.run` and `pytest` may run.
 - Cores also buy memory (xeon-p8: 4 GB per core); size runs with the table in `experiments/batch/supercloud_array.sh`. GPU jobs: about 20 cores per GPU.

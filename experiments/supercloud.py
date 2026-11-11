@@ -63,7 +63,7 @@ CONFIG_PATH = Path("~/.config/congestion-utm/supercloud.toml").expanduser()
 # Beside the config rather than in a repo, so agents in different clones also serialize.
 LOCK_PATH = CONFIG_PATH.with_name("supercloud.lock")
 JOB_PREFIX = "agent-"
-# experiments.colgen_four_round (arrives with PR #150) replays a fixed captured cohort for
+# experiments.colgen_four_round replays a fixed captured cohort for
 # per-round colgen timing.
 ALLOWED_MODULES = ("experiments.run", "pytest", "experiments.colgen_four_round")
 # Options that would make an allowed module load code other than the shipped snapshot, after

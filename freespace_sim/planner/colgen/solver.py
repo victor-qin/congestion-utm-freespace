@@ -1716,18 +1716,27 @@ class ColGenSolver:
                         budget_s=params.iteration_ip_time_limit_s,
                         eager=params.iteration_ip_eager,
                         max_eager_rows=params.max_eager_ip_rows,
+                        search=params.iteration_ip_search,
                     )
-                    ip_candidate = _timed(
-                        "canonical_iteration_ip",
-                        lambda: {
-                            fid: _canonical_column(column, graphs[fid], cfg)
-                            for fid, column in ip_candidate.items()
-                        },
-                    )
-                    _assert_claim_feasible(ip_candidate, committed_loads, row_index)
-                    if _better_selection(ip_candidate, best_heuristic, params.M):
-                        best_heuristic = dict(ip_candidate)
-                    master.set_heuristic(best_heuristic)
+                    if params.iteration_ip_search:
+                        ip_candidate = _timed(
+                            "canonical_iteration_ip",
+                            lambda: {
+                                fid: _canonical_column(column, graphs[fid], cfg)
+                                for fid, column in ip_candidate.items()
+                            },
+                        )
+                        _assert_claim_feasible(ip_candidate, committed_loads, row_index)
+                        if _better_selection(ip_candidate, best_heuristic, params.M):
+                            best_heuristic = dict(ip_candidate)
+                        master.set_heuristic(best_heuristic)
+                    # Rows-only returns the incumbent solve_ip just recorded, unchanged, so
+                    # there is nothing to canonicalize, re-check or compare.
+                    elif (params.max_eager_ip_rows is not None and not master.last_ip_eager_rows
+                          and master.bindable_rows - master.materialized_rows):
+                        # materialize_bindable_rows is all-or-nothing under its cap.
+                        log.warning("  rows-only IP step added no rows: pending bindable rows "
+                                    "exceed max_eager_ip_rows=%d", params.max_eager_ip_rows)
                     iteration_ip_info = {
                         "iteration": iterations,
                         "budget_s": params.iteration_ip_time_limit_s,

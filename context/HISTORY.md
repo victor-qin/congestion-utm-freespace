@@ -206,3 +206,22 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `freespace_sim/planner/colgen/params.py`, `experiments/colgen_four_round.py`.
 
 - 2026-11-11T21:21Z [TOOL] PR #149: agent harnesses end a timed-out tool call with SIGTERM. Its default action kills Python without running `except`/`finally` cleanup, so a submit killed mid-upload left a snapshot ref with no job. CLI code that agents run must turn SIGTERM into KeyboardInterrupt in `main`, and hold it (`signal.pthread_sigmask`) across steps that must finish together (sbatch + ledger write). Test it with a real subprocess and `send_signal`. Separately, a race test whose fake I/O returned instantly passed 30/30 with its lock removed; put a delay inside the critical section. Files: `experiments/supercloud.py`, `tests/test_supercloud.py`.
+
+- 2026-11-11T22:40Z [TOOL] PR (follow-up to #150): a pricing pool that feeds workers from the parent
+  idles whenever the parent pauses. With per-flight `time.monotonic` intervals, all 44 workers of a
+  1,537-flight solve stopped together mid-sweep for ~8 s: a generation-2 garbage collection of the
+  parent heap (8.54 s; 19 collections, 27 s over four rounds). The static split hid most of it
+  behind pipe buffers. `run_sweep` now holds the collector off while it dispatches and merges, and
+  each worker's first send is the head of its queue. Before attributing a sweep's wall-minus-work
+  gap, time flights and parent GC (`experiments/colgen_four_round.py --resources` records both).
+  Files: `freespace_sim/planner/colgen/pricing_pool.py`, `experiments/colgen_four_round.py`.
+
+- 2026-11-11T22:40Z [TOOL] Same PR: per-flight pricing time predicts the next round poorly
+  (Pearson 0.47–0.80 on a captured run), so re-planning ownership from measured times gained ≤4%
+  at 44 workers in replay, against ~16% for run-time tail stealing. Steal only the far end of
+  pricing-order queues: longest-first queues collapsed the prefix completed by a mid-sweep
+  deadline to almost nothing. Allocation wins are platform-specific: label `np.empty` cut macOS
+  pricing 15.8% and worker memory 3x but Linux job peak memory not at all (lazy calloc). On Linux each
+  spawned worker reported `ru_maxrss` ~4.7 GB (about the parent's size) while the whole 45-process
+  job peaked at 28 GB, so summed worker peaks are meaningless there; use Slurm MaxRSS. Files:
+  `freespace_sim/planner/colgen/{pricing_pool,dp_kernel}.py`.

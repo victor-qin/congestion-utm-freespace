@@ -1600,6 +1600,8 @@ def _sink_certifier(
       or ``None`` when the sink does not improve on the one passed in.
     """
 
+    visit_cache: dict[tuple[Cell, int], frozenset[RowKey]] = {}
+
     def certify(
         incumbent: tuple[float, Column] | None,
         departure_step: int,
@@ -1615,7 +1617,17 @@ def _sink_certifier(
         )
         if not destination_claims.isdisjoint(forbidden_rows):
             return None
-        claims = _path_claims(fg, cfg, label, dest_lane_idx)
+        # Consecutive sinks share path prefixes, so keep the visit rows of THIS path for the
+        # next one and drop the rest: the memo stays one path long however many sinks a
+        # search certifies. Rows are a pure function of (cell, step); no price or exclusion
+        # verdict is retained.
+        claims = _path_claims(fg, cfg, label, dest_lane_idx, visit_cache=visit_cache)
+        lane_steps = 0 if origin_lane_idx is None else fg.origin_lanes[origin_lane_idx].steps
+        start_step = departure_step + fg.takeoff_steps[0] + lane_steps
+        retained = {(cell, start_step + offset) for offset, cell in enumerate(label.path)}
+        for key in tuple(visit_cache):
+            if key not in retained:
+                del visit_cache[key]
         if not claims.isdisjoint(forbidden_rows):
             return None
         delay_s = _path_delay_s(fg, cfg, label, model)

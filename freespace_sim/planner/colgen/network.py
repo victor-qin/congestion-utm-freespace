@@ -865,6 +865,7 @@ class _FlightSearchCache:
         "dag_budget",
         "endpoint_claims",
         "prepared",
+        "cpu_completion",
         "gpu_geometry",
         "gpu_packing",
         "gpu_endpoints",
@@ -887,6 +888,9 @@ class _FlightSearchCache:
         # priced on EVERY colgen iteration, and rebuilding was measured at up to 80% of the
         # compiled search's own time on a cheap density flight.  See `dp_prepare.prepared_for`.
         self.prepared: Any | None = None
+        # `dp_prepare._FixedCompletion`: price-independent completion-bound geometry and
+        # unweighted air seconds, rebuilt whenever the config or objective differs.
+        self.cpu_completion: Any | None = None
         # One topology/config/objective-keyed geometry bound; prices and root subsets
         # remain call-local. See `gpu_bounds.CompletionBounds._prepare_geometry`.
         self.gpu_geometry: Any | None = None

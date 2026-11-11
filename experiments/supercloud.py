@@ -12,7 +12,8 @@
 a snapshot commit kept locally under ``refs/supercloud/<run_id>``. Nothing is committed to any
 branch. The snapshot is extracted and rsynced to ``<remote_root>/runs/<run_id>``, so the cluster
 needs no git. The runs ledger lives in the MAIN checkout's ``results/supercloud/``, which every
-worktree shares.
+worktree shares; the submit lock lives next to the config, so it covers every clone on the
+machine.
 
 Settings and caps live outside the repo in ``~/.config/congestion-utm/supercloud.toml``, and
 the caps belong to the user. Template:
@@ -43,22 +44,30 @@ import math
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 
 CONFIG_PATH = Path("~/.config/congestion-utm/supercloud.toml").expanduser()
+# Beside the config rather than in a repo, so agents in different clones also serialize.
+LOCK_PATH = CONFIG_PATH.with_name("supercloud.lock")
 JOB_PREFIX = "agent-"
-# experiments.colgen_four_round replays a fixed captured cohort for per-round colgen timing.
+# experiments.colgen_four_round (arrives with PR #150) replays a fixed captured cohort for
+# per-round colgen timing.
 ALLOWED_MODULES = ("experiments.run", "pytest", "experiments.colgen_four_round")
+# Options that would make an allowed module load code other than the shipped snapshot, after
+# the job's import check has already passed.
+FORBIDDEN_OPTIONS = {"experiments.colgen_four_round": ("--source",)}
 CPU_PARTITION = "xeon-p8"
 GPU_PARTITION = "xeon-g6-volta"
 MAX_SNAPSHOT_FILE_BYTES = 20 * 1024 * 1024
@@ -68,17 +77,24 @@ OPTIONAL_IMPORTS = ("gurobipy", "cupy")
 # No dots: every accepted name is then also a valid git ref component (no "..", ".lock", "x.").
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
-# --env may not set what the tool itself sets (GRB_LICENSE_FILE comes only from --gurobi) or
-# anything that changes which interpreter, libraries or code the job runs.
-_RESERVED_ENV_RE = re.compile(r"^(GRB_|PYTHON|LD_|DYLD_)|^(PATH|HOME)$")
+# --env may not set what the tool sets itself (GRB_LICENSE_FILE comes only from --gurobi,
+# PYTHONPATH points at the snapshot) or what redirects which interpreter, packages or shared
+# libraries load. Other PYTHON* variables, e.g. PYTHONHASHSEED, stay allowed.
+_RESERVED_ENV = {"PATH", "HOME", "PYTHONHOME", "PYTHONPATH", "PYTHONSAFEPATH", "PYTHONUSERBASE",
+                 "PYTHONNOUSERSITE", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE", "PYTHONSTARTUP"}
+_RESERVED_ENV_PREFIXES = ("GRB_", "LD_", "DYLD_")
 # Slurm states in which a job still holds or waits for resources; sacct may briefly not know a
 # job it has just accepted, hence "" and UNKNOWN.
 _ACTIVE_STATES = {"", "UNKNOWN", "PENDING", "CONFIGURING", "RUNNING", "COMPLETING",
                   "REQUEUED", "RESIZING", "SUSPENDED"}
+_NO_ROW = {"state": "UNKNOWN", "elapsed": "", "max_rss_gb": 0.0}
 # Matches gpu:volta:2, gres:gpu:volta:2, gres/gpu:volta=2 and gpu:2 across Slurm versions.
 _GPU_RE = re.compile(r"gpu(?::[A-Za-z0-9_-]+)?[:=](\d+)")
 # Login-shell profiles may print to stdout, so remote output is read after this marker only.
 _MARK = "__SUPERCLOUD_OUTPUT__"
+# Module loads can leak these into the env's interpreter (see supercloud_array.sh); doctor
+# clears them exactly as the job script does, so it tests the environment jobs get.
+_CLEAN_PY = "unset PYTHONHOME PYTHONPATH; "
 _REMOTE_TIMEOUT_S = 600
 _LOCK_TIMEOUT_S = 300
 _GPU_PROBE_WAIT_S = 600
@@ -161,7 +177,7 @@ def _check_types(obj: object, path: Path) -> None:
             raise SuperCloudError(f"{path}: {field.name} = {value!r} must be a {field.type}")
 
 
-def load_config(path: Path = CONFIG_PATH) -> SuperCloudConfig:
+def load_config(path: Path) -> SuperCloudConfig:
     """
     Read and validate the user's SuperCloud settings and caps.
 
@@ -197,41 +213,40 @@ def parse_squeue(text: str) -> list[LiveJob]:
 
     Return
     --------
-    - jobs (list[LiveJob]): jobs whose name starts with ``JOB_PREFIX``.
+    - jobs (list[LiveJob]): jobs whose name starts with ``JOB_PREFIX``; an unparseable line
+      raises SuperCloudError rather than being skipped, so caps never undercount.
     """
     jobs = []
     for line in text.splitlines():
         if not line.strip():
             continue
-        # Split from both ends so a '|' inside some other job's name cannot shift the fields.
-        job_id, rest = line.split("|", 1)
-        name, cores, gres, state = rest.rsplit("|", 3)
-        if name.startswith(JOB_PREFIX):
-            gpus = sum(int(n) for n in _GPU_RE.findall(gres))
-            jobs.append(LiveJob(job_id, name, int(cores), gpus, state))
+        try:
+            # Split from both ends so a '|' inside some other job's name cannot shift the fields.
+            job_id, rest = line.split("|", 1)
+            name, cores, gres, state = rest.rsplit("|", 3)
+            if name.startswith(JOB_PREFIX):
+                gpus = sum(int(n) for n in _GPU_RE.findall(gres))
+                jobs.append(LiveJob(job_id, name, int(cores), gpus, state))
+        except ValueError as exc:
+            raise SuperCloudError(f"unexpected squeue line {line!r}") from exc
     return jobs
 
 
-def check_request(req: JobRequest, cfg: SuperCloudConfig, live: list[LiveJob]) -> list[str]:
+def cap_problems(req: JobRequest, caps: Caps, live: list[LiveJob]) -> list[str]:
     """
-    List every rule a job request breaks: allowed commands, per-job caps and agent-wide totals.
+    List the caps a request's resources would break, per job and in total with ``live``.
 
     Parameters
     ------------
-    - req (JobRequest): the job being submitted.
-    - cfg (SuperCloudConfig): settings holding the caps and whether Gurobi jobs are allowed.
+    - req (JobRequest): only ``cores``, ``gpus`` and ``hours`` are read.
+    - caps (Caps): the user's limits.
     - live (list[LiveJob]): agent jobs already running or pending.
 
     Return
     --------
-    - problems (list[str]): one message per broken rule; empty means the job may be submitted.
+    - problems (list[str]): one message per broken cap.
     """
-    caps = cfg.caps
     problems = []
-    if not _NAME_RE.match(req.name):
-        problems.append(f"name {req.name!r} must be 1-41 letters, digits, '_' or '-'")
-    if req.module not in ALLOWED_MODULES:
-        problems.append(f"module {req.module!r} is not allowed; use one of {ALLOWED_MODULES}")
     if req.cores < 1 or req.gpus < 0 or not (math.isfinite(req.hours) and req.hours > 0):
         problems.append("cores must be >= 1, gpus >= 0 and hours a finite number > 0")
     if req.cores > caps.max_cores_per_job:
@@ -240,15 +255,6 @@ def check_request(req: JobRequest, cfg: SuperCloudConfig, live: list[LiveJob]) -
         problems.append(f"{req.gpus} GPUs exceeds {caps.max_gpus_per_job} GPUs per job")
     if req.hours > caps.max_hours_per_job:
         problems.append(f"{req.hours} hours exceeds {caps.max_hours_per_job} hours per job")
-    if req.gurobi and not cfg.allow_gurobi:
-        problems.append("Gurobi jobs are disabled (allow_gurobi = false in the config)")
-    bad_env = [name for name, _ in req.env if not _ENV_NAME_RE.match(name)]
-    if bad_env:
-        problems.append(f"env names {bad_env} must be UPPER_SNAKE_CASE")
-    reserved = [name for name, _ in req.env if _RESERVED_ENV_RE.match(name)]
-    if reserved:
-        problems.append(f"env names {reserved} are reserved: the tool sets them or they change "
-                        "which code runs (use --gurobi for the Gurobi licence)")
     if len(live) + 1 > caps.max_jobs:
         problems.append(f"{len(live)} agent jobs already queued; cap is {caps.max_jobs} in total")
     used_cores = sum(j.cores for j in live)
@@ -260,8 +266,48 @@ def check_request(req: JobRequest, cfg: SuperCloudConfig, live: list[LiveJob]) -
     return problems
 
 
+def check_request(req: JobRequest, cfg: SuperCloudConfig, live: list[LiveJob]) -> list[str]:
+    """
+    List every rule a job request breaks: allowed commands and options, env names, Gurobi, caps.
+
+    Parameters
+    ------------
+    - req (JobRequest): the job being submitted.
+    - cfg (SuperCloudConfig): settings holding the caps and whether Gurobi jobs are allowed.
+    - live (list[LiveJob]): agent jobs already running or pending.
+
+    Return
+    --------
+    - problems (list[str]): one message per broken rule; empty means the job may be submitted.
+    """
+    problems = []
+    if not _NAME_RE.match(req.name):
+        problems.append(f"name {req.name!r} must be 1-41 letters, digits, '_' or '-'")
+    if req.module not in ALLOWED_MODULES:
+        problems.append(f"module {req.module!r} is not allowed; use one of {ALLOWED_MODULES}")
+    for option in FORBIDDEN_OPTIONS.get(req.module, ()):
+        # argparse also accepts unambiguous prefixes (`--sour`) and `--option=value`.
+        used = [a for a in req.args
+                if len(flag := a.split("=", 1)[0]) > 2 and flag.startswith("--")
+                and option.startswith(flag)]
+        if used:
+            problems.append(f"{req.module} may not get {option} ({used}): the job must run the "
+                            "shipped snapshot")
+    if req.gurobi and not cfg.allow_gurobi:
+        problems.append("Gurobi jobs are disabled (allow_gurobi = false in the config)")
+    bad_env = [name for name, _ in req.env if not _ENV_NAME_RE.match(name)]
+    if bad_env:
+        problems.append(f"env names {bad_env} must be UPPER_SNAKE_CASE")
+    reserved = [name for name, _ in req.env
+                if name in _RESERVED_ENV or name.startswith(_RESERVED_ENV_PREFIXES)]
+    if reserved:
+        problems.append(f"env names {reserved} are reserved: the tool sets them or they change "
+                        "which code runs (use --gurobi for the Gurobi licence)")
+    return problems + cap_problems(req, cfg.caps, live)
+
+
 def _refused(problems: list[str]) -> SuperCloudError:
-    """The error raised when ``check_request`` finds problems."""
+    """The error raised when a request breaks rules or caps."""
     return SuperCloudError("submit refused:\n  " + "\n  ".join(problems))
 
 
@@ -343,6 +389,8 @@ def stage_snapshot(worktree: Path, sha: str, dest: Path) -> None:
         # e.g. a symlink to an absolute path: it would dangle on the cluster anyway.
         raise SuperCloudError(f"cannot ship {exc.tarinfo.name!r} ({exc}); "
                               "gitignore or remove it") from exc
+    except tarfile.TarError as exc:
+        raise SuperCloudError(f"cannot extract snapshot {sha}: {exc}") from exc
 
 
 def render_job_script(cfg: SuperCloudConfig, req: JobRequest, run_id: str, run_dir: str) -> str:
@@ -352,10 +400,12 @@ def render_job_script(cfg: SuperCloudConfig, req: JobRequest, run_id: str, run_d
     The script has no directive lines; every Slurm option is passed on the sbatch command line
     (``sbatch_args``). It does not activate conda or load modules: in a batch shell `module` is
     undefined and activation does not reliably fix PATH (see experiments/batch/supercloud_array.sh),
-    so it calls the env's python by absolute path. The interpreter is held in a lowercase
-    variable that ``--env`` (UPPER_SNAKE_CASE only) cannot name, and the tool's import settings
-    come after the ``--env`` exports. PYTHONPATH then outranks the env's editable install of the
-    home checkout, and the import check turns a wrong-copy import into a hard failure.
+    so it calls the env's python by absolute path. sbatch copies the submitting shell's
+    environment into the job, so inherited ``GRB_*`` variables are cleared and the licence is
+    set only for ``--gurobi``. The interpreter is held in a lowercase variable that ``--env``
+    (UPPER_SNAKE_CASE only) cannot name, and the tool's import settings come after the ``--env``
+    exports. PYTHONPATH then outranks the env's editable install of the home checkout, and the
+    import check turns a wrong-copy import into a hard failure.
 
     Parameters
     ------------
@@ -380,6 +430,7 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMBA_NUM_THRE
 # Node-local and outside $TMPDIR, which SuperCloud deletes when the job ends.
 export NUMBA_CACHE_DIR="/state/partition1/user/${{USER:-$(id -un)}}/numba_cache"
 mkdir -p "$NUMBA_CACHE_DIR" 2>/dev/null || unset NUMBA_CACHE_DIR
+for name in $(compgen -v GRB_ || true); do unset "$name"; done
 {extra}unset PYTHONHOME
 py="$HOME/.conda/envs/{cfg.conda_env}/bin/python"
 cd {shlex.quote(run_dir)}
@@ -440,6 +491,8 @@ def _ssh(cfg: SuperCloudConfig, command: str) -> str:
                               capture_output=True, text=True, timeout=_REMOTE_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
         raise SuperCloudError(f"ssh {cfg.host} timed out after {_REMOTE_TIMEOUT_S}s") from exc
+    except OSError as exc:
+        raise SuperCloudError(f"cannot run ssh: {exc}") from exc
     if proc.returncode != 0:
         raise SuperCloudError(f"ssh {cfg.host} exited {proc.returncode} running {command!r}: "
                               f"{proc.stderr.strip()}")
@@ -453,6 +506,8 @@ def _rsync(src: str, dest: str) -> None:
                               capture_output=True, text=True, timeout=_REMOTE_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
         raise SuperCloudError(f"rsync {src} -> {dest} timed out") from exc
+    except OSError as exc:
+        raise SuperCloudError(f"cannot run rsync: {exc}") from exc
     if proc.returncode != 0:
         raise SuperCloudError(f"rsync {src} -> {dest} failed: {proc.stderr.strip()}")
 
@@ -470,7 +525,7 @@ def toplevel(path: Path) -> Path:
 def ledger_dir(worktree: Path) -> Path:
     """
     The main checkout's ``results/supercloud``, created if missing. It is resolved through git's
-    common dir, so every worktree of the repo shares one ledger and one submit lock.
+    common dir, so every worktree of the repo shares one ledger and one fetch destination.
 
     Parameters
     ------------
@@ -487,10 +542,11 @@ def ledger_dir(worktree: Path) -> Path:
 
 
 @contextmanager
-def _locked(path: Path, timeout_s: float = _LOCK_TIMEOUT_S) -> Iterator[None]:
-    """Hold an exclusive lock on ``path`` so submits on this machine serialize; give up after
-    ``timeout_s`` rather than block an agent indefinitely."""
-    with open(path, "w") as fh:
+def _locked(timeout_s: float = _LOCK_TIMEOUT_S) -> Iterator[None]:
+    """Hold the machine-wide submit lock so cap checks and sbatch calls serialize; give up after
+    waiting ``timeout_s`` rather than block an agent indefinitely."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH, "w") as fh:
         deadline = time.monotonic() + timeout_s
         while True:
             try:
@@ -498,10 +554,52 @@ def _locked(path: Path, timeout_s: float = _LOCK_TIMEOUT_S) -> Iterator[None]:
                 break
             except BlockingIOError:
                 if time.monotonic() > deadline:
-                    raise SuperCloudError(f"another submit has held {path} for over "
-                                          f"{timeout_s:.0f}s") from None
+                    raise SuperCloudError(f"waited {timeout_s:.0f}s for another submit to release "
+                                          f"{LOCK_PATH}") from None
                 time.sleep(0.2)
         yield
+
+
+@contextmanager
+def _sigterm_held() -> Iterator[None]:
+    """Hold SIGTERM until the block ends, so the steps inside finish together; a SIGTERM that
+    arrived meanwhile is delivered on exit."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def _locked_sbatch(cfg: SuperCloudConfig, req: JobRequest, run_id: str, run_dir: str,
+                   script: list[str], on_submitted: Callable[[str], None]) -> str:
+    """
+    Re-check the caps against the live queue and submit, under the machine-wide lock.
+
+    Parameters
+    ------------
+    - cfg (SuperCloudConfig): connection settings and caps.
+    - req (JobRequest): resources to check and request.
+    - run_id (str): names the job.
+    - run_dir (str): the job's working and log directory, which must already exist.
+    - script (list[str]): what sbatch runs: a script path, or ``["--wrap", command]``.
+    - on_submitted (Callable[[str], None]): records the job id. It runs with sbatch while
+      SIGTERM is held, so a tool timeout cannot leave a queued job that nothing knows about.
+
+    Return
+    --------
+    - job_id (str): the Slurm job id.
+    """
+    with _locked():
+        problems = cap_problems(req, cfg.caps, live_agent_jobs(cfg))
+        if problems:
+            raise _refused(problems)
+        with _sigterm_held():
+            out = _ssh(cfg, shlex.join(["sbatch", "--parsable",
+                                        *sbatch_args(req, run_id, run_dir), *script]))
+            job_id = out.strip().splitlines()[-1].split(";")[0]
+            on_submitted(job_id)
+    return job_id
 
 
 def read_ledger(worktree: Path) -> list[dict]:
@@ -509,7 +607,14 @@ def read_ledger(worktree: Path) -> list[dict]:
     path = ledger_dir(worktree) / "runs.jsonl"
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    records = []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if line.strip():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise SuperCloudError(f"{path}:{number} is not valid JSON: {exc}") from exc
+    return records
 
 
 def find_run(worktree: Path, run_id: str) -> dict:
@@ -522,13 +627,14 @@ def find_run(worktree: Path, run_id: str) -> dict:
 
 def submit(cfg: SuperCloudConfig, req: JobRequest, worktree: Path) -> dict:
     """
-    Check the caps, ship a snapshot of ``worktree`` to the cluster and submit it to Slurm.
+    Check the rules and caps, ship a snapshot of ``worktree`` to the cluster and submit it.
 
-    The snapshot is taken and uploaded before the lock, so the job runs the files as they were
-    when submit was called and a slow upload never blocks other agents. The lock covers only the
-    final cap check, sbatch and the ledger write, so two agents on this machine cannot both pass
-    the check and then exceed the caps together. Any failure before sbatch accepts the job
-    deletes the snapshot ref, so every ref under ``refs/supercloud/`` is a submitted run.
+    The snapshot is taken right after a cap pre-check and uploaded before the lock, so a slow
+    upload never blocks other agents. The machine-wide lock covers only the binding cap
+    re-check, sbatch and the ledger write, so agents in any clone on this machine cannot both
+    pass the check and then exceed the caps together. Any failure or interruption (including
+    SIGTERM via ``main``) before sbatch accepts the job deletes the snapshot ref and the uploaded
+    run directory; only SIGKILL can leave a ref without a submitted run.
 
     Parameters
     ------------
@@ -548,7 +654,7 @@ def submit(cfg: SuperCloudConfig, req: JobRequest, worktree: Path) -> dict:
     run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{req.name}"
     run_dir = f"{cfg.remote_root}/runs/{run_id}"
     sha = snapshot_commit(worktree, run_id)
-    accepted = False
+    accepted = uploading = False
     try:
         record = {
             "run_id": run_id, "sha": sha, "base_sha": _git(worktree, "rev-parse", f"{sha}^"),
@@ -565,23 +671,27 @@ def submit(cfg: SuperCloudConfig, req: JobRequest, worktree: Path) -> dict:
             meta.mkdir()
             (meta / "job.sh").write_text(render_job_script(cfg, req, run_id, run_dir))
             (meta / "snapshot.json").write_text(json.dumps(record, indent=2) + "\n")
+            uploading = True
             _ssh(cfg, f"mkdir -p {shlex.quote(cfg.remote_root + '/runs')}")
             _rsync(f"{stage}/", f"{cfg.host}:{run_dir}/")
-        with _locked(ledger / ".submit.lock"):
-            problems = check_request(req, cfg, live_agent_jobs(cfg))
-            if problems:
-                raise _refused(problems)
-            out = _ssh(cfg, shlex.join(["sbatch", "--parsable",
-                                        *sbatch_args(req, run_id, run_dir),
-                                        f"{run_dir}/.supercloud/job.sh"]))
-            record["job_id"] = out.strip().splitlines()[-1].split(";")[0]
-            accepted = True
+
+        def record_job(job_id: str) -> None:
+            """Mark the run accepted and append it to the ledger."""
+            nonlocal accepted
+            record["job_id"], accepted = job_id, True
             with open(ledger / "runs.jsonl", "a") as fh:
                 fh.write(json.dumps(record) + "\n")
+
+        _locked_sbatch(cfg, req, run_id, run_dir, [f"{run_dir}/.supercloud/job.sh"], record_job)
     except BaseException:
         if not accepted:
             subprocess.run(["git", "-C", str(worktree), "update-ref", "-d",
                             f"refs/supercloud/{run_id}"], capture_output=True)
+            if uploading:
+                try:
+                    _ssh(cfg, f"rm -rf {shlex.quote(run_dir)}")
+                except SuperCloudError:
+                    pass  # an orphan directory on the cluster is harmless; the error below is not
         raise
     return record
 
@@ -603,8 +713,7 @@ def parse_sacct(text: str) -> dict[str, dict]:
         if line.count("|") != 3:
             continue
         job, state, elapsed, max_rss = line.split("|")
-        row = rows.setdefault(job.split(".")[0],
-                              {"state": "UNKNOWN", "elapsed": "", "max_rss_gb": 0.0})
+        row = rows.setdefault(job.split(".")[0], dict(_NO_ROW))
         if "." not in job:
             row["state"], row["elapsed"] = state, elapsed
         # Peak memory is reported on the job's steps (e.g. 123.batch), not the allocation line.
@@ -633,8 +742,7 @@ def status(cfg: SuperCloudConfig, records: list[dict]) -> list[dict]:
     ids = ",".join(r["job_id"] for r in records)
     found = parse_sacct(_ssh(cfg, f"sacct -n -P --units=G -j {shlex.quote(ids)} "
                                   "-o JobID,State,Elapsed,MaxRSS"))
-    missing = {"state": "UNKNOWN", "elapsed": "", "max_rss_gb": 0.0}
-    return [{"run_id": r["run_id"], "job_id": r["job_id"], **found.get(r["job_id"], missing)}
+    return [{"run_id": r["run_id"], "job_id": r["job_id"], **found.get(r["job_id"], _NO_ROW)}
             for r in records]
 
 
@@ -655,6 +763,8 @@ def fetch(cfg: SuperCloudConfig, record: dict, dest_root: Path) -> Path:
     run_dir = record["run_dir"]
     present = _ssh(cfg, f"cd {shlex.quote(run_dir)} && for d in .supercloud results; "
                         "do if [ -d \"$d\" ]; then echo \"$d\"; fi; done").split()
+    if not present:
+        raise SuperCloudError(f"nothing to fetch in {run_dir}")
     dest = dest_root / record["run_id"]
     for sub in present:
         (dest / sub).mkdir(parents=True, exist_ok=True)
@@ -667,21 +777,20 @@ def cancel(cfg: SuperCloudConfig, record: dict) -> None:
     _ssh(cfg, shlex.join(["scancel", f"--name={JOB_PREFIX}{record['run_id']}", record["job_id"]]))
 
 
-def doctor(cfg: SuperCloudConfig, worktree: Path, gpu: bool = False) -> bool:
+def doctor(cfg: SuperCloudConfig, gpu: bool = False) -> bool:
     """
     Check every piece a submit depends on and print one line per check.
 
     Parameters
     ------------
     - cfg (SuperCloudConfig): connection settings.
-    - worktree (Path): checkout whose shared submit lock the GPU probe takes.
     - gpu (bool): also run a short job on a V100 node, under the caps (waits for the GPU queue).
 
     Return
     --------
     - ok (bool): True when every check passed; the optional imports only inform.
     """
-    py = f'"$HOME/.conda/envs/{cfg.conda_env}/bin/python"'
+    py = f'{_CLEAN_PY}"$HOME/.conda/envs/{cfg.conda_env}/bin/python"'
     probe = ("import importlib, json, sys\n"
              "out = {'python': sys.version.split()[0]}\n"
              f"for m in {REQUIRED_IMPORTS + OPTIONAL_IMPORTS!r}:\n"
@@ -718,7 +827,7 @@ def doctor(cfg: SuperCloudConfig, worktree: Path, gpu: bool = False) -> bool:
             probe_dir = Path(tmp) / "out"
             probe_dir.mkdir()
             (probe_dir / "probe.txt").write_text("supercloud doctor\n")
-            remote = f"{cfg.host}:{cfg.remote_root}/.doctor/"
+            remote = f"{cfg.host}:{cfg.remote_root}/.doctor/rsync/"
             _rsync(f"{probe_dir}/", remote)
             _rsync(remote, f"{Path(tmp) / 'back'}/")
             if (Path(tmp) / "back" / "probe.txt").read_text() != "supercloud doctor\n":
@@ -735,10 +844,12 @@ def doctor(cfg: SuperCloudConfig, worktree: Path, gpu: bool = False) -> bool:
                  "m.setObjective(x.sum(), gp.GRB.MAXIMIZE); m.optimize()\n"
                  "print('solved 3000 vars, status', m.Status, 'gurobipy', gp.gurobi.version())\n")
         lic = shlex.quote(cfg.gurobi_license_file)
-        return _ssh(cfg, f"GRB_LICENSE_FILE={lic} {py} -c {shlex.quote(solve)}").strip().splitlines()[-1]
+        out = _ssh(cfg, f"export GRB_LICENSE_FILE={lic}; {py} -c {shlex.quote(solve)}")
+        return out.strip().splitlines()[-1]
 
     def gpu_check() -> str:
-        """A CUDA kernel compiles and runs on a V100, submitted like any job: capped and locked."""
+        """A CUDA kernel compiles and runs on a V100, submitted like any job: capped and locked.
+        The probe job is cancelled if anything interrupts the wait before it finishes."""
         # Same NVRTC option as the pricing kernels (gpu_runtime.py), compiled for the node's GPU.
         kernel = ("import cupy as cp\n"
                   "k = cp.RawKernel(r'extern \"C\" __global__ void inc(float* x) "
@@ -748,25 +859,25 @@ def doctor(cfg: SuperCloudConfig, worktree: Path, gpu: bool = False) -> bool:
                   "print(props['name'].decode(), 'sm', cp.cuda.Device().compute_capability,\n"
                   "      'cuda', cp.cuda.runtime.runtimeGetVersion(),\n"
                   "      'driver', cp.cuda.runtime.driverGetVersion(), 'sum', float(x.sum()))\n")
-        # Only the resources are checked here; the probe itself runs through --wrap.
-        req = JobRequest("doctor-gpu", ALLOWED_MODULES[0], (), cores=20, gpus=1, hours=0.25)
+        req = JobRequest("doctor-gpu", "", (), cores=20, gpus=1, hours=0.25)
         run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-doctor-gpu"
         run_dir = f"{cfg.remote_root}/.doctor/{run_id}"
         _ssh(cfg, f"mkdir -p {shlex.quote(run_dir + '/.supercloud')}")
-        with _locked(ledger_dir(worktree) / ".submit.lock"):
-            problems = check_request(req, cfg, live_agent_jobs(cfg))
-            if problems:
-                raise _refused(problems)
-            out = _ssh(cfg, shlex.join(["sbatch", "--parsable", *sbatch_args(req, run_id, run_dir),
-                                        "--wrap", f"{py} -c {shlex.quote(kernel)}"]))
-        job = {"run_id": run_id, "job_id": out.strip().splitlines()[-1].split(";")[0]}
-        deadline = time.monotonic() + _GPU_PROBE_WAIT_S
-        while (state := status(cfg, [job])[0]["state"]) in _ACTIVE_STATES:
-            if time.monotonic() > deadline:
+        job = {"run_id": run_id}
+        state = "UNKNOWN"
+        try:
+            _locked_sbatch(cfg, req, run_id, run_dir, ["--wrap", f"{py} -c {shlex.quote(kernel)}"],
+                           lambda job_id: job.update(job_id=job_id))
+            deadline = time.monotonic() + _GPU_PROBE_WAIT_S
+            while (state := status(cfg, [job])[0]["state"]) in _ACTIVE_STATES:
+                if time.monotonic() > deadline:
+                    raise SuperCloudError(f"GPU probe job {job['job_id']} still {state} after "
+                                          f"{_GPU_PROBE_WAIT_S}s; cancelled it")
+                time.sleep(15)
+        except BaseException:
+            if "job_id" in job and state in _ACTIVE_STATES:
                 cancel(cfg, job)
-                raise SuperCloudError(f"GPU probe job {job['job_id']} still {state} after "
-                                      f"{_GPU_PROBE_WAIT_S}s; cancelled it")
-            time.sleep(15)
+            raise
         log = _ssh(cfg, f"cat {shlex.quote(run_dir)}/.supercloud/slurm-{job['job_id']}.log")
         if state != "COMPLETED" or "sum 32.0" not in log:
             raise SuperCloudError(f"job {job['job_id']} {state}: {log.strip()[-500:]}")
@@ -785,9 +896,10 @@ def doctor(cfg: SuperCloudConfig, worktree: Path, gpu: bool = False) -> bool:
     for label, check in checks:
         try:
             print(f"OK    {label}: {str(check()).strip()}")
-        except (SuperCloudError, OSError, ValueError) as exc:
+        except Exception as exc:  # a diagnostic reports any failure; interrupts still propagate
             ok = False
-            print(f"FAIL  {label}: {exc}")
+            detail = str(exc) if isinstance(exc, SuperCloudError) else f"{type(exc).__name__}: {exc}"
+            print(f"FAIL  {label}: {detail}")
     return ok
 
 
@@ -802,6 +914,12 @@ def _parse_command(command: list[str]) -> tuple[str, tuple[str, ...]]:
     return command[0], tuple(command[1:])
 
 
+def _interrupt_on_sigterm(signum: int, frame: object) -> None:
+    """Turn SIGTERM (what agent harnesses send on a tool timeout) into KeyboardInterrupt, so
+    submit's and doctor's cleanup runs instead of the process dying mid-way."""
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Command-line entry point.
@@ -812,7 +930,8 @@ def main(argv: list[str] | None = None) -> int:
 
     Return
     --------
-    - code (int): 0 on success, 1 when a doctor check fails, 2 when a command is refused or fails.
+    - code (int): 0 on success, 1 when a doctor check fails, 2 when a command is refused or
+      fails, 130 when interrupted.
     """
     parser = argparse.ArgumentParser(prog="python -m experiments.supercloud",
                                      description="Submit, track and fetch agent runs on SuperCloud.")
@@ -838,6 +957,8 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_parser(name, help=text).add_argument("run_id")
     sub.add_parser("list", help="every run in the ledger")
     args = parser.parse_args(argv)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
 
     try:
         worktree = toplevel(Path.cwd())
@@ -846,9 +967,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{r['run_id']}  job {r['job_id']}  {r['branch']}  "
                       f"{r['module']} {shlex.join(r['args'])}")
             return 0
-        cfg = load_config()
+        cfg = load_config(CONFIG_PATH)
         if args.cmd == "doctor":
-            return 0 if doctor(cfg, worktree, args.gpu) else 1
+            return 0 if doctor(cfg, args.gpu) else 1
         if args.cmd == "submit":
             module, mod_args = _parse_command(args.command)
             env = tuple(tuple(item.split("=", 1)) for item in args.env)
@@ -874,9 +995,12 @@ def main(argv: list[str] | None = None) -> int:
             cancel(cfg, record)
             print(f"cancelled {record['run_id']} (job {record['job_id']})")
         return 0
-    except SuperCloudError as exc:
+    except (SuperCloudError, OSError) as exc:
         print(f"supercloud: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("supercloud: interrupted; nothing half-submitted was left behind", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

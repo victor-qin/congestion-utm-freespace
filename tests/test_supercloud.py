@@ -5,10 +5,13 @@ import math
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +31,12 @@ SQUEUE = "\n".join([
     "102|agent-20261111T000001Z-b|20|N/A|PENDING",
     "103|my|own|job|48|gpu:volta:2|RUNNING",
 ])
+
+
+@pytest.fixture(autouse=True)
+def _private_lock(tmp_path, monkeypatch):
+    """Keep tests off the real machine-wide submit lock next to the user's config."""
+    monkeypatch.setattr(sc, "LOCK_PATH", tmp_path / "supercloud.lock")
 
 
 def _req(**changes) -> sc.JobRequest:
@@ -50,15 +59,18 @@ def _req(**changes) -> sc.JobRequest:
     (_req(gurobi=True), CFG, "Gurobi"),
     (_req(gurobi=True), replace(CFG, allow_gurobi=True), None),
     (_req(env=(("COLGEN_GUROBI_THREADS", "8"),)), CFG, None),
+    (_req(env=(("PYTHONHASHSEED", "0"),)), CFG, None),  # reproducibility, not a code redirect
     (_req(env=(("lower", "1"),)), CFG, "UPPER_SNAKE_CASE"),
     (_req(env=(("GRB_LICENSE_FILE", LICENCE),)), CFG, "reserved"),
     (_req(env=(("PYTHONHOME", "/x"),)), CFG, "reserved"),
+    (_req(module="experiments.colgen_four_round", args=("--capture", "c.pkl")), CFG, None),
+    (_req(module="experiments.colgen_four_round", args=("--source", "/x")), CFG, "--source"),
+    (_req(module="experiments.colgen_four_round", args=("--sour=/x",)), CFG, "--source"),
     (_req(cores=25), CFG, "total cores"),
     (_req(gpus=2), CFG, "total GPUs"),
     (_req(), replace(CFG, caps=replace(CAPS, max_jobs=2)), "agent jobs already queued"),
 ])
 def test_check_request_enforces_caps(req, cfg, refusal):
-    assert sc._parse_command(["--", "python", "-m", "pytest", "-q"]) == ("pytest", ("-q",))
     live = sc.parse_squeue(SQUEUE)
     assert [(j.cores, j.gpus) for j in live] == [(20, 1), (20, 0)]
     problems = sc.check_request(req, cfg, live)
@@ -93,12 +105,18 @@ def test_load_config_rejects_malformed_settings(tmp_path, key, value):
         sc.load_config(path)
 
 
-def _git(repo, *args) -> str:
+def test_parse_command_accepts_python_dash_m():
+    assert sc._parse_command(["--", "python", "-m", "pytest", "-q"]) == ("pytest", ("-q",))
+    assert sc._parse_command(["experiments.run", "--seed", "1"]) == ("experiments.run",
+                                                                     ("--seed", "1"))
+
+
+def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
                           text=True).stdout
 
 
-def _init_repo(path):
+def _init_repo(path: Path) -> Path:
     path.mkdir()
     _git(path, "init", "-q", "-b", "main")
     _git(path, "config", "user.email", "t@example.com")
@@ -176,7 +194,10 @@ def test_job_runs_the_snapshot(tmp_path, gurobi, gpus):
                cores=20, env=(("COLGEN_GUROBI_THREADS", "8"), ("PY", "/bin/false")))
     script = sc.render_job_script(CFG, req, "r1", str(run_dir))
     assert "#SBATCH" not in script  # LLsub drops command-line options when any is present
-    env = {"HOME": str(home), "PATH": os.environ["PATH"], "USER": "u"}
+    # sbatch copies the login shell's environment into the job; an inherited licence must not
+    # reach a job that did not ask for --gurobi.
+    env = {"HOME": str(home), "PATH": os.environ["PATH"], "USER": "u",
+           "GRB_LICENSE_FILE": "/inherited/gurobi.lic"}
 
     done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env,
                           timeout=60)
@@ -216,14 +237,19 @@ def test_concurrent_submits_from_two_worktrees_cannot_exceed_caps(tmp_path, monk
     expected = {"one": "committed\n", "two": "uncommitted in worktree\n"}
 
     queue = ["101|agent-old|8|N/A|RUNNING"]  # one live agent job; max_jobs=2 leaves one slot
+    removed = []
     guard = threading.Lock()
     both_uploading = threading.Barrier(2)
 
     def fake_ssh(cfg, command):
         words = command.split()
+        if words[0] == "squeue":
+            snapshot = "\n".join(queue)
+            time.sleep(0.2)  # a slow queue query: without the lock both submits read one slot
+            return snapshot
         with guard:
-            if words[0] == "squeue":
-                return "\n".join(queue)
+            if words[:2] == ["rm", "-rf"]:
+                removed.append(shlex.split(command)[2])
             if words[0] == "sbatch":
                 queue.append(f"{200 + len(queue)}|{words[words.index('-J') + 1]}|8|N/A|PENDING")
                 return queue[-1].split("|")[0] + "\n"
@@ -257,7 +283,71 @@ def test_concurrent_submits_from_two_worktrees_cannot_exceed_caps(tmp_path, monk
     # One ledger in the MAIN checkout, whichever worktree won.
     ledger = (main / "results" / "supercloud" / "runs.jsonl").read_text().splitlines()
     assert [json.loads(line)["run_id"] for line in ledger] == [record["run_id"]]
-    # The refused snapshot's ref is gone; the accepted one holds that worktree's on-disk files.
+    # The refused snapshot's ref and upload are gone; the accepted one holds that worktree's
+    # on-disk files.
     assert _git(main, "for-each-ref", "--format=%(refname)", "refs/supercloud").split() == [
         f"refs/supercloud/{record['run_id']}"]
     assert _git(main, "show", f"{record['sha']}:a.py") == expected[name]
+    other = next(n for n in expected if n != name)
+    assert len(removed) == 1 and removed[0].startswith(f"{CFG.remote_root}/runs/")
+    assert removed[0].endswith(f"-{other}")
+
+
+def test_gpu_probe_respects_caps_and_is_cancelled_when_interrupted(monkeypatch, capsys):
+    commands = []
+    queue = "101|agent-a|20|gpu:volta:2|RUNNING"  # every GPU the caps allow is in use
+
+    def fake_ssh(cfg, command):
+        commands.append(command)
+        if command.startswith("squeue"):
+            return queue
+        if command.startswith("sbatch"):
+            return "555\n"
+        if command.startswith("sacct"):
+            raise KeyboardInterrupt  # the agent's tool timed out while doctor waited
+        return ""
+
+    monkeypatch.setattr(sc, "_ssh", fake_ssh)
+    monkeypatch.setattr(sc, "_rsync", lambda src, dest: None)
+    assert sc.doctor(CFG, gpu=True) is False
+    assert "FAIL  gpu kernel: submit refused" in capsys.readouterr().out
+    assert not any(c.startswith("sbatch") for c in commands)
+
+    queue = ""
+    with pytest.raises(KeyboardInterrupt):
+        sc.doctor(CFG, gpu=True)
+    assert any(c.startswith("scancel") and c.endswith(" 555") for c in commands)
+
+
+def test_sigterm_during_submit_leaves_nothing_half_recorded(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("a\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    config = tmp_path / "supercloud.toml"
+    config.write_text('host = "supercloud"\nremote_root = "/r"\nconda_env = "e"\n'
+                      f'allow_gurobi = false\ngurobi_license_file = "{LICENCE}"\n[caps]\n'
+                      "max_cores_per_job = 4\nmax_gpus_per_job = 0\nmax_hours_per_job = 1\n"
+                      "max_jobs = 1\nmax_cores_total = 4\nmax_gpus_total = 0\n")
+    uploading = tmp_path / "uploading"
+    driver = (
+        "import sys, time\nfrom pathlib import Path\nfrom experiments import supercloud as sc\n"
+        f"sc.CONFIG_PATH = Path({str(config)!r})\n"
+        f"sc.LOCK_PATH = Path({str(tmp_path / 'lock')!r})\n"
+        "sc._ssh = lambda cfg, command: ''\n"
+        f"def slow_rsync(src, dest):\n    Path({str(uploading)!r}).touch(); time.sleep(60)\n"
+        "sc._rsync = slow_rsync\n"
+        "sys.exit(sc.main(['submit', '--name', 'x', '--cores', '1', '--hours', '1', '--',"
+        " 'pytest']))\n")
+    root = Path(sc.__file__).resolve().parents[1]
+    proc = subprocess.Popen([sys.executable, "-c", driver], cwd=repo, text=True,
+                            env={**os.environ, "PYTHONPATH": str(root)},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 30
+    while not uploading.exists() and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert uploading.exists(), proc.communicate()
+    proc.send_signal(signal.SIGTERM)  # what an agent harness sends when a tool call times out
+    _, err = proc.communicate(timeout=30)
+    assert proc.returncode == 130, err
+    assert _git(repo, "for-each-ref", "refs/supercloud") == ""

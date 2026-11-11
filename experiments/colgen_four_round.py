@@ -21,6 +21,7 @@ from collections import defaultdict
 from dataclasses import fields, replace
 import fcntl
 import functools
+import gc
 import hashlib
 import inspect
 import json
@@ -103,8 +104,11 @@ def instrument(*, timing: bool = True) -> None:
     def one(*args: Any, **kwargs: Any) -> Any:
         """Attach nonfunctional stage measurements to an existing result record."""
         before = {key: value.copy() for key, value in TIMERS.items()}
+        started = time.monotonic()
         result = original_one(*args, **kwargs)
         record = result[6]
+        # System-wide clock, comparable across workers: idle gaps show dispatch waits.
+        record['experiment_interval'] = (started, time.monotonic())
         record['experiment_profile'] = {
             key: [value[0] - before.get(key, [0, 0])[0],
                   value[1] - before.get(key, [0, 0])[1]]
@@ -126,6 +130,29 @@ def instrument(*, timing: bool = True) -> None:
         return result
 
     pricing_pool._price_one = one
+
+
+def record_gc_pauses(events: list[dict[str, Any]], floor_s: float = 0.05) -> None:
+    """Append every parent garbage collection lasting ``floor_s`` or more to ``events``.
+
+    A worker waiting on the parent for its next flight idles through such a pause, so
+    ``t_end`` (``time.monotonic``, comparable with the workers' flight intervals on one
+    host) locates it against the per-flight timeline.
+    """
+    started: list[float] = []
+
+    def callback(phase: str, info: dict[str, Any]) -> None:
+        """Time one collection from its start to its stop callback."""
+        if phase == 'start':
+            started[:] = [time.monotonic()]
+        elif started:
+            end = time.monotonic()
+            if end - started[0] >= floor_s:
+                events.append(dict(t_end=end, s=end - started[0],
+                                   generation=info['generation'], collected=info['collected']))
+            started.clear()
+
+    gc.callbacks.append(callback)
 
 
 def worker_main(*args: Any, **kwargs: Any) -> None:
@@ -265,6 +292,9 @@ def main() -> None:
         warmup_s = time.perf_counter() - start
         if args.profile:
             instrument()
+        gc_pauses: list[dict[str, Any]] = []
+        if args.profile or args.resources:
+            record_gc_pauses(gc_pauses)
         if args.profile or args.resources:
             pricing_pool._worker_main = worker_main
         solver.price_sweep, solver.ColGenSolver.solve = observe_sweep, observe_solve
@@ -309,7 +339,8 @@ def main() -> None:
                    profile=args.profile, resources=args.resources,
                    mode=args.mode, params=encode(params),
                    requests_sha256=digest(requests), warmup_s=warmup_s, elapsed_s=elapsed,
-                   rounds=rounds, parent_timers=dict(TIMERS), **outcome)
+                   rounds=rounds, parent_timers=dict(TIMERS), parent_gc_pauses=gc_pauses,
+                   **outcome)
     (args.out/'summary.json').write_text(json.dumps(summary, indent=2, default=str)+'\n')
     (args.out/'rounds.pkl').write_bytes(pickle.dumps(dict(requests=requests, cfg=cfg, params=params,
             static_terminals=payload['static_terminals'], initial=initial, snapshots=snapshots),

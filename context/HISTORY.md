@@ -186,3 +186,11 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
 - 2026-11-07T21:19Z [CODE/TOOL] PR #146: allocate continuation-specific numeric tables only after their roots survive certified closure. Eager hop tables for 13,515 roots hit a 64 MiB cap on hard88 solver flight 1920 before useful search, despite few retained roots. Append stable offsets for retained roots, budget old/new buffer generations, and clear them when a retry restarts the complete domain. A cheaper elapsed time from that earlier cap was invalid performance evidence. Files: `freespace_sim/planner/colgen/gpu_integer_search.py`, `pricing_integer_search.h`, `tests/test_colgen_gpu_integer.py`, `analysis/colgen/GPU_INTEGER_PRUNING.md`.
 
 - 2026-11-08T07:27Z [CODE/TOOL] Cold-builder benchmarks: per-flight audit output in `analysis/colgen/gpu_validation.py` rewrites growing pricing JSON and added about nine seconds to the hard88 solve. Use direct production wall for speedup claims and separate audited runs for canonical evidence; compare equal costs, bounds and completion. Reproduction/evidence: `analysis/colgen/CPU_PREPARATION_BUILDERS.md`, `builder_solve.py`.
+
+- 2026-11-11T03:10Z [TOOL] Toggling `iteration_ip_time_limit_s` changes TWO things at once:
+  the per-round eager row materialization and the IP search. Only the rows feed later master
+  LPs; the search adds no columns and the LP never reads its incumbent. A rows-only seed-0 run
+  matched the IP-every-round run's lower bound and rows added for rounds 1–6 exactly, while the
+  run without the step took 18 rounds. Attribute per-round-IP effects with
+  `iteration_ip_search=False`, not by disabling the step. Files:
+  `freespace_sim/planner/colgen/{master,solver,params}.py`, `analysis/colgen/benchmark.py`.

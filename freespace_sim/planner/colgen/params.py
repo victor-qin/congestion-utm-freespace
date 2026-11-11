@@ -229,6 +229,11 @@ class ColGenParams:
     pricing_gpu_prepare_cache_bytes: int = 128 * 1024 * 1024
     # Diagnostic GPU mode: retain construction/scoring, but no pricing certificate.
     pricing_gpu_validate_routes: bool = True
+    # False keeps only the per-round IP step's eager row materialization and skips the
+    # search. Those rows, not the search, are what change later LP duals and hence pricing,
+    # so this trades per-round incumbent improvement (none until the final IP) for the
+    # search time. `iteration_ip_time_limit_s > 0` then only switches the step on.
+    iteration_ip_search: bool = True
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -345,9 +350,15 @@ class ColGenParams:
             )
         object.__setattr__(self, "ip_time_limit_s", ip_limit)
 
-        for name in ("iteration_ip_eager", "cheap_pricing", "seed_nominal_routes"):
+        for name in ("iteration_ip_eager", "iteration_ip_search", "cheap_pricing",
+                     "seed_nominal_routes"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
+        if not self.iteration_ip_search and not self.iteration_ip_eager:
+            raise ValueError(
+                "iteration_ip_search=False requires iteration_ip_eager=True; "
+                "otherwise the per-round step does nothing"
+            )
         if isinstance(self.warm_start_max_shift_steps, bool):
             raise TypeError("warm_start_max_shift_steps must be an integer")
         try:

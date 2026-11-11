@@ -280,6 +280,8 @@ def child(args: argparse.Namespace) -> None:
         experimental["bootstrap_method"] = args.bootstrap_method
     params = ColGenParams(
         max_air_overrun_hops=args.overrun, **experimental, **_pricing_kwargs(args),
+        # Passed only for its arm so older source roots without the field still run.
+        **({"iteration_ip_search": False} if args.version == "iteration_ip_rows_only" else {}),
         solver="gurobi", n_pricing_workers=args.workers, max_iterations=args.iterations,
         time_limit_s=args.budget, ip_time_limit_s=args.ip_budget,
         ip_reserve_s=args.ip_reserve,
@@ -306,6 +308,8 @@ def child(args: argparse.Namespace) -> None:
     comparable["params"] = dataclasses.replace(params, lns_destroy_flights=0)
     if hasattr(params, "iteration_ip_time_limit_s"):
         comparable["params"] = dataclasses.replace(comparable["params"], iteration_ip_time_limit_s=0)
+    if hasattr(params, "iteration_ip_search"):
+        comparable["params"] = dataclasses.replace(comparable["params"], iteration_ip_search=True)
     comparable["params"] = dataclasses.replace(
         comparable["params"], cheap_pricing=False, iteration_ip_eager=True,
         warm_start_planner=None, seed_nominal_routes=True, seed_ladder_steps=20,
@@ -568,7 +572,7 @@ def parent(args: argparse.Namespace) -> int:
         roots["no_ground_bootstrap"] = roots["fixed"]
     if "iteration_ip" in args.versions:
         roots["iteration_ip"] = roots["fixed"]
-    for version in ("iteration_ip_eager", "iteration_ip_cheap", "iteration_ip_astar_seed", "iteration_ip_astar_centered"):
+    for version in ("iteration_ip_eager", "iteration_ip_rows_only", "iteration_ip_cheap", "iteration_ip_astar_seed", "iteration_ip_astar_centered"):
         if version in args.versions:
             roots[version] = roots["fixed"]
     env = dict(os.environ)
@@ -597,7 +601,9 @@ def parent(args: argparse.Namespace) -> int:
         "ablation": "no_ground_bootstrap skips only _initial_feasible_selection; first-LP "
                     "rounding fallback, seed ladder and pricing bootstrap remain enabled. "
                     "iteration_ip_eager forces complete bindable-row materialization before "
-                    "each per-round IP, preserving its separate search budget. iteration_ip_cheap "
+                    "each per-round IP, preserving its separate search budget. "
+                    "iteration_ip_rows_only keeps that per-round materialization but runs no "
+                    "per-round search; the final IP is unchanged. iteration_ip_cheap "
                     "uses restricted root pricing, exact sweeps every configured interval, "
                     "on stagnation, and on the last round; only exact sweeps certify bounds. "
                     "iteration_ip_astar_seed uses only FCFS A* imports with no shift repair, "
@@ -737,12 +743,12 @@ def main() -> int:
     run.add_argument("--first-version", choices=["baseline", "fixed"], default="baseline")
     run.add_argument("--versions", nargs="+", default=["baseline", "fixed"],
                      choices=["baseline", "fixed", "no_ground_bootstrap", "iteration_ip",
-                              "iteration_ip_eager", "iteration_ip_cheap", "iteration_ip_astar_seed", "iteration_ip_astar_centered"])
+                              "iteration_ip_eager", "iteration_ip_rows_only", "iteration_ip_cheap", "iteration_ip_astar_seed", "iteration_ip_astar_centered"])
     child_parser = sub.add_parser("child")
     child_parser.add_argument("--root", required=True)
     child_parser.add_argument("--version", required=True,
                               choices=["baseline", "fixed", "no_ground_bootstrap", "iteration_ip",
-                                       "iteration_ip_eager", "iteration_ip_cheap", "iteration_ip_astar_seed", "iteration_ip_astar_centered"])
+                                       "iteration_ip_eager", "iteration_ip_rows_only", "iteration_ip_cheap", "iteration_ip_astar_seed", "iteration_ip_astar_centered"])
     child_parser.add_argument("--scenario", required=True)
     child_parser.add_argument("--seed", type=int, required=True)
     child_parser.add_argument("--flights", type=int, required=True)

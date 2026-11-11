@@ -1716,6 +1716,7 @@ class ColGenSolver:
                         budget_s=params.iteration_ip_time_limit_s,
                         eager=params.iteration_ip_eager,
                         max_eager_rows=params.max_eager_ip_rows,
+                        search=params.iteration_ip_search,
                     )
                     ip_candidate = _timed(
                         "canonical_iteration_ip",

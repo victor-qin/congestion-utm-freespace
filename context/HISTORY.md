@@ -204,3 +204,5 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   pickles values by position. Append new fields at the end (see the "Append fields" comment) and
   load captures through `hasattr`-filtered construction. Files:
   `freespace_sim/planner/colgen/params.py`, `experiments/colgen_four_round.py`.
+
+- 2026-11-11T21:21Z [TOOL] PR #149: agent harnesses end a timed-out tool call with SIGTERM. Its default action kills Python without running `except`/`finally` cleanup, so a submit killed mid-upload left a snapshot ref with no job. CLI code that agents run must turn SIGTERM into KeyboardInterrupt in `main`, and hold it (`signal.pthread_sigmask`) across steps that must finish together (sbatch + ledger write). Test it with a real subprocess and `send_signal`. Separately, a race test whose fake I/O returned instantly passed 30/30 with its lock removed; put a delay inside the critical section. Files: `experiments/supercloud.py`, `tests/test_supercloud.py`.

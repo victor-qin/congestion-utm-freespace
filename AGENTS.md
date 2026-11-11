@@ -94,3 +94,14 @@ There is an extremely high-bar for transferring things from `.agent/CONTINUITY.m
 ## Repository
 - Files in `context/` and `analysis/` do not need to be maintained.
 - If reusing a script from `context/` and `analysis/`, double check for correcteness before using them, especially with files in `freespace_sim/`.
+
+## SuperCloud (remote runs)
+- Send a run to MIT SuperCloud when it would take more than ~30 min here, needs more memory than this machine, or needs CUDA (V100). Quick checks stay local.
+- One tool does it all: `uv run python -m experiments.supercloud {doctor,submit,status,fetch,cancel,list}`. `submit` ships your worktree exactly as it is on disk (uncommitted edits included) and keeps that code as `refs/supercloud/<run_id>`; nothing is committed to your branch.
+- Submit: `uv run python -m experiments.supercloud submit --name <label> --cores N --hours H [--gpus G] [--gurobi] [--env NAME=VALUE] -- experiments.run ... --no-progress`. Only `experiments.run` and `pytest` may run.
+- Cores also buy memory (xeon-p8: 4 GB per core); size runs with the table in `experiments/batch/supercloud_array.sh`. GPU jobs: about 20 cores per GPU.
+- `--gurobi` uses SuperCloud's full academic licence; pair it with `--colgen-solver gurobi`, and set solver threads with `--env COLGEN_GUROBI_THREADS=N`.
+- Caps are in `~/.config/congestion-utm/supercloud.toml` and belong to the user. Never edit that file; if a submit is refused, ask the user.
+- `fetch <run_id>` copies results and the Slurm log to the main checkout's `results/supercloud/<run_id>/`. Cite remote results by run id.
+- If a submit fails, run `doctor` (add `--gpu` to test a V100 node) before retrying.
+- Codex agents need network access to `txe1-login.mit.edu` and read access to `~/.ssh`.

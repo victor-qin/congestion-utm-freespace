@@ -218,8 +218,10 @@ def child(args: argparse.Namespace) -> None:
     gpu_pricing = pricing_options["pricing_device"] == "gpu"
     if not gpu_pricing:
         dp_kernel.warm_kernel()
+    # 120 s of demand (19 flights), not 4 s: on current main the 4 s warmup is one flight that
+    # pricing settles without entering `_price_dag`, so the warmup assertion below fails.
     warm_spec = with_overrides(get_scenario("colgen_test"), planner="colgen", seed=0,
-                               horizon_s=600.0, demand_duration_s=4.0)
+                               horizon_s=600.0, demand_duration_s=120.0)
     warm_cfg = warm_spec.config()
     warm_demand = warm_spec.demand_model()
     warm_requests = warm_demand.generate(warm_cfg, np.random.default_rng(0))

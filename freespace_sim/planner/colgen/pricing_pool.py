@@ -370,11 +370,18 @@ def _worker_assignment(flight_ids, n_workers: int) -> dict[int, int]:
 class _Dispatch:
     """One sweep's answer to "which flights does this worker get next".
 
-    Every worker's own flights are queued in ``pricing_order`` order and sent in chunks.
-    With ``steal`` on, a worker that has run out -- nothing of its own left and nothing
-    outstanding -- is sent the LAST unsent flight of the worker with the most unsent
-    flights (ties to the lower index), and that flight becomes its own for later sweeps
-    (see context/figures/pricing_pool_tail_stealing.png).
+    Every worker's own flights are queued in ``pricing_order`` order. Its first send carries
+    the head of that queue in one message -- all of it with stealing off, which is the
+    static split exactly, and the first half with it on -- and the rest follows in chunks
+    as results come back. With ``steal`` on, a worker that has run out -- nothing of its
+    own left and nothing outstanding -- is sent the LAST unsent flight of the worker with
+    the most stealable flights (ties to the lower index), and that flight becomes its own
+    for later sweeps (see context/figures/pricing_pool_tail_stealing.png).
+
+    Why a head sent up front: a worker fed one flight at a time idles whenever the parent
+    does. A 7 s parent stall mid-sweep idled all 44 workers at once on a captured run; a
+    worker holding half its queue rides that out. Simulation on the same sweep shows
+    stealing at 12 and 44 workers needs no more than the second half.
 
     Why the tail, and why pricing order rather than longest first: the accepted set is the
     longest completed prefix of ``pricing_order``, so a worker must reach its early flights
@@ -423,6 +430,9 @@ class _Dispatch:
         self.holder: dict[int, int] = {}
         self.moves: list[tuple[int, int, int]] = []
         self.steal = bool(steal)
+        # Flights each worker's first send carries; never stolen, so it can always be sent.
+        self._upfront = [len(queue) - (len(queue) // 2 if self.steal else 0)
+                         for queue in self.queues]
 
     def take(self, worker: int, limit: int, *, idle: bool, dead=frozenset()) -> list[int]:
         """The next flights to send ``worker``: its own, else one stolen, else none.
@@ -430,7 +440,8 @@ class _Dispatch:
         Parameters
         ------------
         - worker (int): the worker asking for more work.
-        - limit (int): most own flights to hand out at once (the chunk size).
+        - limit (int): most own flights to hand out at once after the first send (the
+          chunk size); the first send carries the worker's whole up-front head.
         - idle (bool): whether ``worker`` has nothing outstanding; only then may it steal,
           so a stolen flight is never queued behind other work.
         - dead (Collection[int]): workers known dead; never robbed, their flights are lost.
@@ -441,13 +452,16 @@ class _Dispatch:
         """
 
         own = self.queues[worker]
-        if own:
+        upfront, self._upfront[worker] = self._upfront[worker], 0
+        if upfront:
+            batch = [own.popleft() for _ in range(upfront)]
+        elif own:
             batch = [own.popleft() for _ in range(min(limit, len(own)))]
         elif self.steal and idle:
             victim = max(
-                (other for other, queue in enumerate(self.queues)
-                 if other != worker and other not in dead and queue),
-                key=lambda other: (len(self.queues[other]), -other),
+                (other for other in range(len(self.queues))
+                 if other != worker and other not in dead and self._stealable(other)),
+                key=lambda other: (self._stealable(other), -other),
                 default=None,
             )
             if victim is None:
@@ -460,6 +474,11 @@ class _Dispatch:
         for flight_id in batch:
             self.holder[flight_id] = worker
         return batch
+
+    def _stealable(self, worker: int) -> int:
+        """How many of ``worker``'s unsent flights another worker may take."""
+
+        return len(self.queues[worker]) - self._upfront[worker]
 
     def holder_of(self, flight_id: int) -> int:
         """The worker that has, or will be asked for, ``flight_id``'s result."""
@@ -1879,9 +1898,9 @@ def _sweep_results(
     ``collect(timeout) -> (results_by_worker, died)`` and ``send(worker, flight_ids)`` are
     the only things this needs from the transport, which is what lets it be tested
     without processes at all. ``dispatch`` (:class:`_Dispatch`) decides what each send
-    carries: every worker is kept up to two chunks ahead on its own flights, so it never
-    waits on the parent between flights, and a worker that runs dry asks again only when
-    its last result is in -- which is when it may steal.
+    carries: every worker gets its up-front head, is then kept up to two chunks ahead on
+    its own flights, and a worker that runs dry asks again only when its last result is in
+    -- which is when it may steal.
 
     **Death is an event now, not an inference.** ``collect`` waits on process sentinels
     alongside the pipes, so a worker that dies is reported in ``died`` immediately. The

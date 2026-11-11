@@ -447,8 +447,9 @@ def test_stolen_flights_merge_in_pricing_order_and_respect_the_prefix():
     ))
     assert accepted.flight_ids == (10, 11, 12, 13)
     assert accepted.reduced_costs == (1.0, 2.0, 3.0, 4.0)
-    # Own flights first, two deep; the idle worker takes the tail, one flight at a time.
-    assert sends == [(0, [10]), (0, [11]), (1, [13]), (1, [12])]
+    # The owner's first half up front in one send; the idle worker takes the far end,
+    # one flight at a time.
+    assert sends == [(0, [10, 11]), (1, [13]), (1, [12])]
 
     # Deadline: the stolen 13 completed, but 11 did not, so 13 is discarded with it.
     accepted = _accepted_prefix(_merge(
@@ -512,9 +513,11 @@ def test_dispatch_is_deterministic_and_moves_only_unsent_tails(steal):
     """Which worker prices a flight is decided by one pure rule, and moves stay bounded.
 
     The same sequence of requests always yields the same sends. Every flight is sent
-    exactly once. A worker steals only when it is idle with nothing of its own left, takes
-    only a flight still unsent at the far end of the busiest queue (ties to the lower
-    index), and with stealing off nothing ever moves.
+    exactly once. With stealing off the first send is the whole queue (the static split);
+    with it on, the first half. A worker steals only when it is idle with nothing of its
+    own left, takes only a flight still unsent at the far end of the busiest queue (ties
+    to the lower index), never from a worker's up-front half, and with stealing off
+    nothing ever moves.
     """
 
     order = [5, 1, 4, 2, 6, 3, 7]
@@ -532,20 +535,23 @@ def test_dispatch_is_deterministic_and_moves_only_unsent_tails(steal):
     sends, dispatch = script()
     assert script()[0] == sends
     if steal:
-        assert sends == [[5, 1], [3], [7], [6], [2], [], [4], [], [], []]
-        assert dispatch.moves == [(6, 0, 1), (2, 0, 2), (4, 0, 1)]
-        assert [dispatch.holder_of(f) for f in (5, 6, 2, 4)] == [0, 1, 2, 1]
+        assert sends == [[5, 1, 4], [3], [7], [6], [2], [], [], [], [], []]
+        assert dispatch.moves == [(6, 0, 1), (2, 0, 2)]
+        assert [dispatch.holder_of(f) for f in (5, 6, 2, 4)] == [0, 1, 2, 0]
     else:
-        assert sends == [[5, 1], [3], [7], [], [], [], [], [4, 2], [6], []]
+        assert sends == [[5, 1, 4, 2, 6], [3], [7], [], [], [], [], [], [], []]
         assert dispatch.moves == []
     sent = [f for batch in sends for f in batch]
     assert sorted(sent) == sorted(order), "a flight was lost or sent twice"
 
-    # Equal queues: the lower-indexed worker is robbed, and a dead one never is.
+    # Equal queues: the lower-indexed worker is robbed, a dead one never is, and an
+    # up-front half survives even when its owner has not been served yet.
     dispatch = _Dispatch([1, 2, 3, 4], {1: 0, 2: 0, 3: 1, 4: 1}, 3, steal=True)
     assert dispatch.take(2, 1, idle=True) == [2]
-    assert dispatch.take(2, 1, idle=True, dead={1}) == [1]
     assert dispatch.take(2, 1, idle=True, dead={1}) == []
+    assert dispatch.take(2, 1, idle=True) == [4]
+    assert dispatch.take(0, 1, idle=True) == [1]
+    assert dispatch.take(1, 1, idle=True) == [3]
 
 
 def test_both_arms_report_the_same_per_flight_rows():

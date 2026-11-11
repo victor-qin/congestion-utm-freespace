@@ -197,8 +197,12 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   Files:
   `freespace_sim/planner/colgen/{master,solver,params}.py`, `analysis/colgen/benchmark.py`.
 
+- 2026-11-11T19:40Z [TOOL] SuperCloud Gurobi needs no WLS licence or copied `.lic`: the site token server is `GRB_LICENSE_FILE=/state/partition1/llgrid/pkg/gurobi/gurobi1201/gurobi.lic` (`flexlm.supercloud.mit.edu`). It licensed the env's gurobipy 13.0.2 on compute nodes despite the file's `VERSION=12`/2025 expiry, and WLS would fail there because compute nodes have no internet. Without it, the pip wheel's 2000-variable licence fails only at `optimize()`. `--gurobi` jobs export it. `doctor` checks it on the login node with a 3000-variable solve; compute nodes were verified by colgen job 6219869. Files: `experiments/supercloud.py`; the pattern came from the user's uncommitted cluster-side edit of `experiments/batch/supercloud_runner.sh`, which is not in the repo.
+
 - 2026-11-11T22:00Z [TOOL] PR #150: a new `ColGenParams` field inserted mid-class broke loading an
   archived pricing capture (`bootstrap_method` read back as `20000`): the frozen-slot dataclass
   pickles values by position. Append new fields at the end (see the "Append fields" comment) and
   load captures through `hasattr`-filtered construction. Files:
   `freespace_sim/planner/colgen/params.py`, `experiments/colgen_four_round.py`.
+
+- 2026-11-11T21:21Z [TOOL] PR #149: agent harnesses end a timed-out tool call with SIGTERM. Its default action kills Python without running `except`/`finally` cleanup, so a submit killed mid-upload left a snapshot ref with no job. CLI code that agents run must turn SIGTERM into KeyboardInterrupt in `main`, and hold it (`signal.pthread_sigmask`) across steps that must finish together (sbatch + ledger write). Test it with a real subprocess and `send_signal`. Separately, a race test whose fake I/O returned instantly passed 30/30 with its lock removed; put a delay inside the critical section. Files: `experiments/supercloud.py`, `tests/test_supercloud.py`.

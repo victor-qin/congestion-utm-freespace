@@ -315,8 +315,8 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    # Hashed-key iteration order must match the archived runs. Launchers such as the
-    # SuperCloud runner reserve PYTHON* variables, so pin the seed by re-executing once.
+    # Hashed-key iteration order must match the archived runs. Re-executing once pins the seed
+    # however the module is launched, without relying on the caller to set PYTHONHASHSEED.
     if os.environ.get('PYTHONHASHSEED') != '0':
         # orig_argv keeps the exact invocation (interpreter flags, -m or a file path).
         os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]],

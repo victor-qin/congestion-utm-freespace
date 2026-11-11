@@ -1,6 +1,7 @@
 """The parallel pricing sweep must change work, never answers."""
 from __future__ import annotations
 
+import gc
 import inspect
 import multiprocessing as mp
 import os
@@ -991,6 +992,8 @@ def test_a_pool_that_raised_mid_sweep_refuses_another(monkeypatch):
         )
         with pytest.raises(RuntimeError, match="merge blew up"):
             pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
+        # The sweep holds the parent's garbage collector off; a raise must give it back.
+        assert gc.isenabled()
         monkeypatch.undo()
         with pytest.raises(RuntimeError, match="no longer usable"):
             pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)

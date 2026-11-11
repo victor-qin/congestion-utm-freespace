@@ -93,6 +93,7 @@ cause attached.
 from __future__ import annotations
 
 import collections
+import gc
 import itertools
 import logging
 import multiprocessing as mp
@@ -1734,6 +1735,12 @@ class PricingPool:
                 pass
 
         progress = _SweepProgress(len(pricing_order), self._n_workers)
+        # No cyclic collection while workers depend on this process for their next flight:
+        # a full collection of a 1,537-flight solve's heap took 8.5 s mid-sweep and idled
+        # all 44 workers through it. Results are acyclic, so deferring the collection to
+        # after the merge holds back no memory worth having; the caller's setting returns.
+        collecting = gc.isenabled()
+        gc.disable()
         try:
             accepted = _accepted_prefix(
                 _sweep_results(
@@ -1746,6 +1753,9 @@ class PricingPool:
             # so this pool cannot be trusted for another sweep.
             self._poisoned = f"sweep raised {type(exc).__name__}: {exc}"
             raise
+        finally:
+            if collecting:
+                gc.enable()
         accepted = replace(
             accepted,
             wall_s=time.perf_counter() - sweep_started,

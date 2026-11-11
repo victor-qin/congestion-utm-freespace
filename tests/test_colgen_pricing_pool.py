@@ -21,6 +21,7 @@ from freespace_sim.planner.colgen.pricing_pool import (
     PricingPool,
     StalePricingWorker,
     SweepResult,
+    _Dispatch,
     _accepted_prefix,
     _worker_assignment,
     _sweep_results,
@@ -139,14 +140,22 @@ def test_sweep_result_reports_completeness_from_the_timeout_field():
         assert not replace(complete, status=status, certified=False).complete
 
 
-def test_parallel_sweep_returns_exactly_the_sequential_answer():
+@pytest.mark.parametrize("steal", [False, True])
+def test_parallel_sweep_returns_exactly_the_sequential_answer(monkeypatch, steal):
     """The contract, end to end.
 
     A pool changes only WHEN a subproblem finishes.  Two things would break that and
     neither is visible from a single-arm run: accepting results in completion order feeds
     `master.upper_bound`'s non-associative `sum` a different order, and accepting a flight
     priced after a timeout admits a column the sequential sweep never reached.
+
+    With stealing, every flight starts on worker 0, so worker 1 can only work by taking
+    flights over: results must not depend on which worker -- warm or cold -- priced them.
     """
+
+    if steal:
+        monkeypatch.setattr(pricing_pool, "_worker_assignment",
+                            lambda flight_ids, n_workers: dict.fromkeys(flight_ids, 0))
 
     cfg = _cfg()
     requests = [
@@ -156,7 +165,8 @@ def test_parallel_sweep_returns_exactly_the_sequential_answer():
         _request(4, (4, -4), (-4, 4), cfg),
     ]
     sequential = ColGenSolver().solve(requests, cfg, (), _params())
-    parallel = ColGenSolver().solve(requests, cfg, (), _params(n_pricing_workers=2))
+    parallel = ColGenSolver().solve(
+        requests, cfg, (), _params(n_pricing_workers=2, pricing_work_stealing=steal))
     assert _fingerprint(parallel) == _fingerprint(sequential)
 
 
@@ -315,6 +325,20 @@ class _ScriptedCollector:
         return self._rounds.pop(0)
 
 
+def _merge(collect, n_workers, order, worker_of, deadline, *, steal=False, sends=None):
+    """Drive `_sweep_results` with a real `_Dispatch` and a sender that only records.
+
+    ``sends`` (a list) receives every ``(worker, flight_ids)`` the merge dispatched, which is
+    what the scripted collector's results must be consistent with.
+    """
+
+    sends = [] if sends is None else sends
+    return _sweep_results(
+        collect, n_workers, order, _Dispatch(order, worker_of, n_workers, steal), deadline,
+        send=lambda worker, flight_ids: sends.append((worker, list(flight_ids))),
+    )
+
+
 def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
     """The hang this guards is silent and unbounded, and the wrong fix is worse than it.
 
@@ -330,7 +354,7 @@ def test_a_lost_result_ends_the_sweep_instead_of_blocking_forever():
     ]
     # 7 and 3 arrive; 9 never does, and the clock has already run out.
     accepted = _accepted_prefix(
-        _sweep_results(
+        _merge(
             _ScriptedCollector([({0: priced}, set())]), 1, order,
             {7: 0, 3: 0, 9: 0}, deadline=0.0,
         )
@@ -353,7 +377,7 @@ def test_every_result_arriving_in_time_is_still_a_complete_sweep():
         (3, True, 0.25, None, 0.5, {"priced": 1, "fell_back": 1}, {}),
     ]
     accepted = _accepted_prefix(
-        _sweep_results(
+        _merge(
             _ScriptedCollector([({0: priced}, set())]), 1, order,
             {7: 0, 3: 0}, deadline=None,
         )
@@ -378,7 +402,7 @@ def test_the_worker_merge_yields_pricing_order_when_workers_finish_out_of_order(
     worker_of = {10: 0, 11: 1, 12: 0, 13: 1}
     # Worker 1 is completely finished before worker 0 has produced anything.
     accepted = _accepted_prefix(
-        _sweep_results(
+        _merge(
             _ScriptedCollector([
                 ({1: [(11, True, 2.0, None, 0.1, {}, {}),
                       (13, True, 4.0, None, 0.1, {}, {})]}, set()),
@@ -395,6 +419,59 @@ def test_the_worker_merge_yields_pricing_order_when_workers_finish_out_of_order(
     assert accepted.reduced_costs == (1.0, 2.0, 3.0, 4.0)
 
 
+def _row(flight_id, rc=1.0):
+    """One priced `_price_one` result with a recognisable reduced cost."""
+    return (flight_id, True, rc, None, 0.1, {}, {})
+
+
+def test_stolen_flights_merge_in_pricing_order_and_respect_the_prefix():
+    """Stealing breaks per-worker FIFO, so the merge must reorder by flight id instead.
+
+    Worker 0 owns everything and worker 1 has nothing, so worker 1 steals the LAST unsent
+    flights (13, then 12) and returns them before worker 0 returns its early ones. The
+    merge must still yield pricing order; a deadline must still keep only the completed
+    prefix, discarding a stolen flight that finished; and a thief that dies holding a
+    stolen flight must be worker loss, exactly as for its own flights.
+    """
+
+    order = [10, 11, 12, 13]
+    owner = dict.fromkeys(order, 0)
+    sends = []
+    accepted = _accepted_prefix(_merge(
+        _ScriptedCollector([
+            ({1: [_row(13, 4.0)]}, set()),
+            ({0: [_row(10, 1.0), _row(11, 2.0)]}, set()),
+            ({1: [_row(12, 3.0)]}, set()),
+        ]),
+        2, order, owner, None, steal=True, sends=sends,
+    ))
+    assert accepted.flight_ids == (10, 11, 12, 13)
+    assert accepted.reduced_costs == (1.0, 2.0, 3.0, 4.0)
+    # Own flights first, two deep; the idle worker takes the tail, one flight at a time.
+    assert sends == [(0, [10]), (0, [11]), (1, [13]), (1, [12])]
+
+    # Deadline: the stolen 13 completed, but 11 did not, so 13 is discarded with it.
+    accepted = _accepted_prefix(_merge(
+        _ScriptedCollector([({0: [_row(10)], 1: [_row(13)]}, set())]),
+        2, order, owner, 0.0, steal=True,
+    ))
+    assert accepted.flight_ids == (10,)
+    assert accepted.timeout_flight_id == 11
+
+    # The thief dies holding the stolen 12: worker loss at 12, not a timeout.
+    accepted = _accepted_prefix(_merge(
+        _ScriptedCollector([
+            ({1: [_row(13)]}, set()),
+            ({0: [_row(10), _row(11)]}, set()),
+            ({}, {1}),
+        ]),
+        2, order, owner, None, steal=True,
+    ))
+    assert accepted.flight_ids == (10, 11)
+    assert accepted.timeout_flight_id == 12
+    assert accepted.kernel_counters.get("pool_worker_lost") == 1
+
+
 def test_a_worker_that_returns_the_wrong_flight_is_refused():
     """A merge bug must crash, not transpose two flights' reduced costs.
 
@@ -404,15 +481,15 @@ def test_a_worker_that_returns_the_wrong_flight_is_refused():
 
     order = [10, 11]
     worker_of = {10: 0, 11: 0}
-    wrong = [(11, True, 2.0, None, 0.1, {}, {}), (10, True, 1.0, None, 0.1, {}, {})]
-
-    with pytest.raises(RuntimeError, match="where pricing_order expects"):
-        _accepted_prefix(
-            _sweep_results(
-                _ScriptedCollector([({0: wrong}, set())]), 1, order, worker_of,
-                deadline=None,
+    # A flight the worker was never sent, and one flight answered twice.
+    for wrong in ([_row(12)], [_row(10), _row(10)]):
+        with pytest.raises(RuntimeError, match="which it was not sent"):
+            _accepted_prefix(
+                _merge(
+                    _ScriptedCollector([({0: wrong}, set())]), 1, order, worker_of,
+                    deadline=None,
+                )
             )
-        )
 
 
 def test_worker_assignment_is_stable_and_balanced():
@@ -428,6 +505,47 @@ def test_worker_assignment_is_stable_and_balanced():
     assert _worker_assignment(list(reversed(sparse)), 3) == workers
     # `flight_id % n_workers` would have put 900, 3, 12 and 88 unevenly; sorted-index does not.
     assert _worker_assignment(range(6), 3) == {0: 0, 1: 1, 2: 2, 3: 0, 4: 1, 5: 2}
+
+
+@pytest.mark.parametrize("steal", [False, True])
+def test_dispatch_is_deterministic_and_moves_only_unsent_tails(steal):
+    """Which worker prices a flight is decided by one pure rule, and moves stay bounded.
+
+    The same sequence of requests always yields the same sends. Every flight is sent
+    exactly once. A worker steals only when it is idle with nothing of its own left, takes
+    only a flight still unsent at the far end of the busiest queue (ties to the lower
+    index), and with stealing off nothing ever moves.
+    """
+
+    order = [5, 1, 4, 2, 6, 3, 7]
+    owner = {5: 0, 1: 0, 4: 0, 2: 0, 6: 0, 3: 1, 7: 2}
+
+    def script():
+        dispatch = _Dispatch(order, owner, 3, steal)
+        sends = [dispatch.take(0, 2, idle=True), dispatch.take(1, 2, idle=True),
+                 dispatch.take(2, 2, idle=True), dispatch.take(1, 2, idle=True),
+                 dispatch.take(2, 2, idle=True), dispatch.take(1, 2, idle=False),
+                 dispatch.take(1, 2, idle=True), dispatch.take(0, 2, idle=True),
+                 dispatch.take(0, 2, idle=True), dispatch.take(2, 2, idle=True)]
+        return sends, dispatch
+
+    sends, dispatch = script()
+    assert script()[0] == sends
+    if steal:
+        assert sends == [[5, 1], [3], [7], [6], [2], [], [4], [], [], []]
+        assert dispatch.moves == [(6, 0, 1), (2, 0, 2), (4, 0, 1)]
+        assert [dispatch.holder_of(f) for f in (5, 6, 2, 4)] == [0, 1, 2, 1]
+    else:
+        assert sends == [[5, 1], [3], [7], [], [], [], [], [4, 2], [6], []]
+        assert dispatch.moves == []
+    sent = [f for batch in sends for f in batch]
+    assert sorted(sent) == sorted(order), "a flight was lost or sent twice"
+
+    # Equal queues: the lower-indexed worker is robbed, and a dead one never is.
+    dispatch = _Dispatch([1, 2, 3, 4], {1: 0, 2: 0, 3: 1, 4: 1}, 3, steal=True)
+    assert dispatch.take(2, 1, idle=True) == [2]
+    assert dispatch.take(2, 1, idle=True, dead={1}) == [1]
+    assert dispatch.take(2, 1, idle=True, dead={1}) == []
 
 
 def test_both_arms_report_the_same_per_flight_rows():
@@ -621,6 +739,22 @@ def test_the_packing_is_built_once_across_two_sweeps(monkeypatch):
     graph = pricing_pool._WORKER["graphs"][1]
     assert graph._search_cache.prepared is not None
 
+    # A stolen flight: adopted with its inputs, priced on a graph built here, and later
+    # released by this worker when another takes one of its flights. The worker always
+    # holds exactly the flights it owns.
+    epoch = ("uid", 3)
+    pricing_pool._load_sweep_state(epoch, blob, {1: 0.0}, {}, None)
+    pricing_pool._adopt_flights(epoch, [(_request(2, (0, -4), (0, 4), cfg), 0.0, None)])
+    assert pricing_pool._price_batch((epoch, [2]))[0][1] is True
+    assert set(pricing_pool._WORKER["graphs"]) == {1, 2}
+    pricing_pool._release_flights([1])
+    assert set(pricing_pool._WORKER["graphs"]) == {2}
+    with pytest.raises(StalePricingWorker, match="not in worker"):
+        pricing_pool._price_one(epoch, 1)
+    # Inputs for a sweep this worker does not hold are never installed.
+    pricing_pool._adopt_flights(("uid", 99), [(requests[0], 5.0, None)])
+    assert pricing_pool._WORKER["sweep"][2][1] == 0.0
+
 
 def test_a_worker_refuses_a_task_from_a_sweep_it_does_not_hold(monkeypatch):
     """The stale-dual guard. Without it this is a wrong NUMBER, not an error.
@@ -681,16 +815,36 @@ def test_a_failed_state_load_does_not_leave_the_previous_sweep_readable(monkeypa
         pricing_pool._price_one(("uid", 2), 1)
 
 
-def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight():
-    """The end-to-end shape of the fix: same processes, same flight->worker, every sweep.
+def _sweep_key(sweep):
+    """Everything a sweep returns that the master reads, with floats compared bit for bit."""
+    return (
+        sweep.flight_ids,
+        tuple(rc.hex() for rc in sweep.reduced_costs),
+        tuple(None if c is None else (c, c.delay_s.hex()) for c in sweep.columns),
+        sweep.complete,
+    )
+
+
+@pytest.mark.parametrize("steal", [False, True])
+def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, steal):
+    """The end-to-end shape of the fix: same processes, one owner per flight, every sweep.
 
     Driven through `PricingPool` directly rather than through a solve, because how many
     sweeps a solve runs depends on when column generation converges -- a three-flight
     problem finishes in one iteration, and a one-sweep run cannot show reuse ACROSS sweeps
     no matter what it asserts. Worker identity is also exactly what an in-process test
     cannot see, so this pays for real processes.
+
+    With stealing, all three flights start on worker 0, so worker 1 must take flight 3 (the
+    last in pricing order) in the first sweep and then KEEP it. The duals reach the
+    compiled search, so the thief prices on a cold graph -- no packing, label budget or
+    claim cache -- while the owner is warm, and every sweep must still match the
+    sequential answer bit for bit.
     """
 
+    if steal:
+        monkeypatch.setattr(pricing_pool, "_worker_assignment",
+                            lambda flight_ids, n_workers: dict.fromkeys(flight_ids, 0))
     cfg = _cfg()
     requests = [
         _request(1, (-4, 0), (4, 0), cfg),
@@ -698,12 +852,26 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight():
         _request(3, (-3, 1), (3, -1), cfg),
     ]
     order = [1, 2, 3]
-    flight_duals = dict.fromkeys(order, 0.0)
-    with PricingPool(
-        requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
-    ) as pool:
-        sweeps = [pool.run_sweep(order, {}, flight_duals, {}, None) for _ in range(3)]
+    # Distinct per flight, so a stolen flight priced with another's dual cannot pass.
+    flight_duals = {1: 0.25, 2: 0.5, 3: 0.75}
+    params = _params(n_pricing_workers=2, pricing_work_stealing=steal)
+    catalog = StaticTerminalCatalog((), cfg)
+    duals = {}
+    for request in requests:
+        duals.update(_duals_that_reach_the_compiled_search(request, cfg, params))
+    # Changed, then restored prices: the warm owner and the cold thief must both follow.
+    sweep_duals = [duals, {row: 2.0 * value for row, value in duals.items()}, duals]
+    graphs = {r.flight_id: build_flight_graph(r, cfg, catalog, params) for r in requests}
+    expected = [
+        _sweep_key(price_sweep(order, requests, graphs, cfg, _params(), catalog, d,
+                               DualView(d, cfg), flight_duals, {}, deadline=None))
+        for d in sweep_duals
+    ]
+    with PricingPool(requests, cfg, params, catalog) as pool:
+        sweeps = [pool.run_sweep(order, d, flight_duals, {}, None) for d in sweep_duals]
+        owners = pool.worker_of
 
+    assert [_sweep_key(sweep) for sweep in sweeps] == expected
     seen = [
         {(r["flight_id"], r["worker"], r["pid"]) for r in sweep.flight_records}
         for sweep in sweeps
@@ -711,10 +879,15 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight():
     pids = [{pid for _f, _l, pid in rows} for rows in seen]
     assert all(p == pids[0] for p in pids), f"workers were replaced between sweeps: {pids}"
     assert len(pids[0]) == 2
-    assert all(rows == seen[0] for rows in seen), "a flight moved between workers"
+    assert all(rows == seen[0] for rows in seen), "a flight moved after it had an owner"
     assert os.getpid() not in pids[0], "the pool priced in the parent process"
-    # Two workers over three flights, so the split is 2/1 and neither worker is empty.
-    assert {worker for _f, worker, _p in seen[0]} == {0, 1}
+    workers = {f: worker for f, worker, _p in seen[0]}
+    if steal:
+        assert workers == {1: 0, 2: 0, 3: 1}
+    else:
+        # Two workers over three flights, so the split is 2/1 and neither worker is empty.
+        assert set(workers.values()) == {0, 1}
+    assert owners == workers
 
 
 def test_the_solver_hands_its_sweeps_one_pool():
@@ -893,7 +1066,7 @@ def test_a_dead_worker_is_worker_loss_and_a_slow_one_is_a_timeout():
 
     # Died: reported as worker loss, with the marker the solver reads.
     accepted = _accepted_prefix(
-        _sweep_results(
+        _merge(
             _ScriptedCollector([({0: [first]}, set()), ({}, {0})]), 1, order, worker_of,
             deadline=None,
         )
@@ -904,7 +1077,7 @@ def test_a_dead_worker_is_worker_loss_and_a_slow_one_is_a_timeout():
 
     # Merely slow, with the clock expired: an ordinary timeout, NOT worker loss.
     accepted = _accepted_prefix(
-        _sweep_results(
+        _merge(
             _ScriptedCollector([({0: [first]}, set())]), 1, order, worker_of, deadline=0.0,
         )
     )
@@ -1091,7 +1264,7 @@ def test_results_already_in_the_pipe_survive_an_expired_deadline():
     order = [10, 11]
     delivered = [(10, True, 1.0, None, 0.1, {"priced": 1}, {})]
     accepted = _accepted_prefix(
-        _sweep_results(
+        _merge(
             _ScriptedCollector([({0: delivered}, set())]), 1, order, {10: 0, 11: 0},
             deadline=0.0,
         )

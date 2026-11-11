@@ -1371,6 +1371,63 @@ def _certificate_panel(ax, xy, width, height, title, lines, color) -> None:
             linespacing=1.65, color="#172F43")
 
 
+def _pool_timelines(ax, lanes, deadline, title) -> None:
+    """Draw per-worker flight bars; each bar is ``(start, length, label, colour)``."""
+    ax.set_title(title, fontsize=9.5, color=INK)
+    for w, bars in enumerate(lanes):
+        y = len(lanes) - 1 - w
+        end = 0.0
+        for start, length, label, colour in bars:
+            ax.add_patch(Rectangle((start, y - 0.3), length, 0.6, facecolor=colour, alpha=0.7,
+                                   edgecolor=INK, lw=0.8, zorder=2))
+            ax.text(start + length / 2, y, label, ha="center", va="center", fontsize=7.5,
+                    color="white" if colour != RAW else INK, zorder=3)
+            end = max(end, start + length)
+        ax.text(-0.15, y, f"w{w}", ha="right", va="center", fontsize=8, color=INK)
+        ax.plot([end], [y], "|", color=INK, ms=12, zorder=3)
+    ax.axvline(deadline, color=INK, lw=1.2, ls="--", zorder=1)
+    ax.text(deadline, len(lanes) - 0.35, "deadline", ha="center", va="bottom", fontsize=7.5,
+            color=INK)
+    ax.set_xlim(-0.6, 12.2)
+    ax.set_ylim(-0.9, len(lanes))
+    ax.set_yticks([])
+    ax.set_xlabel("wall clock  →", fontsize=8.5, color=INK)
+
+
+def fig_pricing_pool_tail_stealing() -> None:
+    """colgen pricing_pool `_Dispatch`: pricing-order queues, idle workers steal the busiest tail."""
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.0, 3.6), sharey=True)
+    deadline = 4.6
+    # Labels are pricing_order indices. w0 owns 0,3,6,7,8; w1 owns 1,4; w2 owns 2,5.
+    static = [
+        [(0, 1.5, "0", BLUE), (1.5, 2.0, "3", BLUE), (3.5, 1.0, "6", BLUE),
+         (4.5, 2.5, "7", BLUE), (7.0, 4.0, "8", BLUE)],
+        [(0, 2.0, "1", BLUE), (2.0, 1.5, "4", BLUE)],
+        [(0, 1.0, "2", BLUE), (1.0, 2.0, "5", BLUE)],
+    ]
+    # w2 runs dry first (t=3) and takes the tail, 8; w1 (t=3.5) takes the next tail, 7.
+    # w0 had 6 sent ahead of time, so it keeps it.
+    stolen = [
+        [(0, 1.5, "0", BLUE), (1.5, 2.0, "3", BLUE), (3.5, 1.0, "6", BLUE)],
+        [(0, 2.0, "1", BLUE), (2.0, 1.5, "4", BLUE), (3.5, 0.5, "", RAW),
+         (4.0, 2.5, "7", ORANGE)],
+        [(0, 1.0, "2", BLUE), (1.0, 2.0, "5", BLUE), (3.0, 0.5, "", RAW),
+         (3.5, 4.0, "8", ORANGE)],
+    ]
+    _pool_timelines(axl, static, deadline,
+                    "Fixed owners: w0's queue is the sweep's critical path")
+    _pool_timelines(axr, stolen, deadline,
+                    "Tail stealing: each idle worker takes the busiest queue's LAST unsent flight")
+    fig.text(0.5, -0.06, "Labels are pricing_order positions. Orange = stolen, and owned by the "
+             "thief in later sweeps (the old owner drops its graph); grey = the thief's one cold "
+             "build.\nQueues stay in pricing order and only the far end is stolen, so flights 0–6 "
+             "finish by the deadline either way: the accepted prefix is unchanged.",
+             ha="center", va="top", fontsize=8, color=INK)
+    fig.suptitle("Parallel pricing pool — work stealing balances the slowest worker without "
+                 "moving the accepted prefix", fontsize=11.0, color=INK, y=1.02)
+    _save(fig, "pricing_pool_tail_stealing")
+
+
 def fig_colgen_certificate_reuse() -> None:
     """Render spatial and temporal views of cached column-claim reuse with cold parity checks."""
     cfg, base, intent, terms, data = _certificate_example()
@@ -1556,7 +1613,8 @@ FIGURES = (
     fig_sipp_safe_intervals, fig_itinerary_reservation,
     fig_lns_anytime_loop, fig_lns_destroy_operators, fig_lns_drop_vs_sync,
     fig_od_hop_ellipse, fig_pricing_dag, fig_label_dp_dominance, fig_completion_envelope,
-    fig_cg_loop, fig_pricing_pool_schedule, fig_colgen_certificate_reuse,
+    fig_cg_loop, fig_pricing_pool_schedule, fig_pricing_pool_tail_stealing,
+    fig_colgen_certificate_reuse,
 )
 
 

@@ -10,7 +10,7 @@ so the per-round IP step adds its eager rows without searching. Round sums exclu
 ``--profile`` adds timer wrappers inside the pricing workers.
 
     python -m experiments.colgen_four_round --capture CAPTURE.pkl --out results/four_round/X \
-        --profile [--rows-only] [--workers N] [--gurobi-threads N] [--lock FILE]
+        --profile [--rows-only] [--work-stealing] [--workers N] [--gurobi-threads N] [--lock FILE]
 """
 
 from __future__ import annotations
@@ -164,6 +164,8 @@ def main() -> None:
                         help='Gurobi Threads for the master LP and IPs.')
     parser.add_argument('--rows-only', action='store_true',
                         help='Per-round step adds eager rows only (iteration_ip_search=False).')
+    parser.add_argument('--work-stealing', action='store_true',
+                        help='Idle pricing workers take unsent flights (pricing_work_stealing).')
     args = parser.parse_args()
     args.source = args.source.resolve()
     args.out = args.out.resolve()
@@ -193,7 +195,8 @@ def main() -> None:
                             for f in fields(ColGenParams) if hasattr(payload['params'], f.name)})
     params = replace(params, solver='gurobi', pricing_device='cpu', pricing_gpu_backend=None,
                      n_pricing_workers=args.workers, max_iterations=4,
-                     iteration_ip_search=not args.rows_only)
+                     iteration_ip_search=not args.rows_only,
+                     pricing_work_stealing=args.work_stealing)
     # The per-round step, and so --rows-only, only runs with a positive per-round IP limit.
     assert params.iteration_ip_time_limit_s > 0, params.iteration_ip_time_limit_s
     rounds: list[dict[str, Any]] = []

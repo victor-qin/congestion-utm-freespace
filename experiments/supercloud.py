@@ -55,7 +55,8 @@ from pathlib import Path
 
 CONFIG_PATH = Path("~/.config/congestion-utm/supercloud.toml").expanduser()
 JOB_PREFIX = "agent-"
-ALLOWED_MODULES = ("experiments.run", "pytest")
+# experiments.colgen_four_round replays a fixed captured cohort for per-round colgen timing.
+ALLOWED_MODULES = ("experiments.run", "pytest", "experiments.colgen_four_round")
 CPU_PARTITION = "xeon-p8"
 GPU_PARTITION = "xeon-g6-volta"
 MAX_SNAPSHOT_FILE_BYTES = 20 * 1024 * 1024

@@ -343,4 +343,9 @@ def main() -> None:
 
 
 if __name__ == '__main__':
+    # Hashed-key iteration order must match the archived runs. Launchers such as the
+    # SuperCloud runner reserve PYTHON* variables, so pin the seed by re-executing once.
+    if os.environ.get('PYTHONHASHSEED') != '0':
+        os.execve(sys.executable, [sys.executable, '-m', 'experiments.colgen_four_round',
+                                   *sys.argv[1:]], {**os.environ, 'PYTHONHASHSEED': '0'})
     main()

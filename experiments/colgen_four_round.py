@@ -2,10 +2,10 @@
 
 Replays the archived 1,537-flight density_faa_wing_zipline seed-0 cohort (requests, config,
 params and static terminals from a pricing capture) through the real solver for exactly four
-rounds, with 12 CPU pricing workers and Gurobi, then stops before the final IP. Each round's
-callback record (``iteration_wall_s``, ``stage_s``) and each sweep's outer pricing time are
-saved, which is what the per-round "how much can faster pricing shorten a round" breakdown
-reads. ``--rows-only`` sets ``iteration_ip_search=False`` so the per-round IP step adds its
+rounds (12 CPU pricing workers and 4 Gurobi threads unless overridden), then stops before
+the final IP. Each round's callback record (``iteration_wall_s``, ``stage_s``) and each
+sweep's outer pricing time are saved, which is what the per-round "how much can faster
+pricing shorten a round" breakdown reads. ``--rows-only`` sets ``iteration_ip_search=False`` so the per-round IP step adds its
 eager rows without searching.
 
     python -m experiments.colgen_four_round --capture CAPTURE.pkl --out results/four_round/X \
@@ -164,6 +164,10 @@ def main() -> None:
     parser.add_argument('--deep-profile', action='store_true')
     parser.add_argument('--direct', action='store_true', help='Caller already owns benchmark lock.')
     parser.add_argument('--parallel-seeds', action='store_true')
+    parser.add_argument('--workers', type=int, default=12,
+                        help='Pricing worker processes (n_pricing_workers).')
+    parser.add_argument('--gurobi-threads', type=int, default=4,
+                        help='Gurobi Threads for the master LP and IPs.')
     parser.add_argument('--rows-only', action='store_true',
                         help='Per-round step adds eager rows only (iteration_ip_search=False).')
     args = parser.parse_args()
@@ -181,7 +185,8 @@ def main() -> None:
     os.environ['CPU_EXPERIMENT_DEEP_PROFILE'] = str(int(args.deep_profile))
     os.environ['CPU_EXPERIMENT_PARALLEL_SEEDS'] = str(int(args.parallel_seeds))
     os.environ.update(OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1',
-                      NUMBA_NUM_THREADS='1', COLGEN_GUROBI_THREADS='4')
+                      NUMBA_NUM_THREADS='1',
+                      COLGEN_GUROBI_THREADS=str(args.gurobi_threads))
     from freespace_sim.planner.colgen import solver, dp_kernel, bootstrap_kernel, pricing_pool
     from freespace_sim.planner.colgen.params import ColGenParams
     from freespace_sim.planner.colgen.network import build_flight_graph
@@ -197,7 +202,7 @@ def main() -> None:
     params = ColGenParams(**{f.name: getattr(payload['params'], f.name)
                             for f in fields(ColGenParams) if hasattr(payload['params'], f.name)})
     params = replace(params, solver='gurobi', pricing_device='cpu', pricing_gpu_backend=None,
-                     n_pricing_workers=12, max_iterations=4,
+                     n_pricing_workers=args.workers, max_iterations=4,
                      iteration_ip_search=not args.rows_only)
     rounds: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []

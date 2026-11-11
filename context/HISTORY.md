@@ -188,9 +188,11 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
 - 2026-11-08T07:27Z [CODE/TOOL] Cold-builder benchmarks: per-flight audit output in `analysis/colgen/gpu_validation.py` rewrites growing pricing JSON and added about nine seconds to the hard88 solve. Use direct production wall for speedup claims and separate audited runs for canonical evidence; compare equal costs, bounds and completion. Reproduction/evidence: `analysis/colgen/CPU_PREPARATION_BUILDERS.md`, `builder_solve.py`.
 
 - 2026-11-11T03:10Z [TOOL] Toggling `iteration_ip_time_limit_s` changes TWO things at once:
-  the per-round eager row materialization and the IP search. Only the rows feed later master
-  LPs; the search adds no columns and the LP never reads its incumbent. A rows-only seed-0 run
-  matched the IP-every-round run's lower bound and rows added for rounds 1–6 exactly, while the
-  run without the step took 18 rounds. Attribute per-round-IP effects with
-  `iteration_ip_search=False`, not by disabling the step. Files:
+  the per-round eager row materialization and the IP search. The rows are the step's only
+  change to later master LPs (the search adds no columns), but the search's incumbent still
+  steers pricing (flight order, known-route check). A rows-only seed-0 run matched the
+  IP-every-round run's lower bound and rows added for rounds 1–6 exactly, then diverged
+  (14 vs 11 rounds); the run without the step took 18. Attribute per-round-IP effects with
+  `iteration_ip_search=False`, not by disabling the step, and treat it as its own trajectory.
+  Files:
   `freespace_sim/planner/colgen/{master,solver,params}.py`, `analysis/colgen/benchmark.py`.

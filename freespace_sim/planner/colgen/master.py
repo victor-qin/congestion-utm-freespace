@@ -1812,8 +1812,9 @@ class RestrictedMaster:
         self.last_ip_optimal = None
         self.last_ip_trajectory = ()
         if not search:
-            # The rows above are the only thing a per-round IP feeds back into later LPs:
-            # the search adds no columns and the LP never reads its incumbent.
+            # The rows above are the step's only change to later master LPs: the search adds
+            # no columns and the LP never reads its incumbent. Pricing does read the
+            # incumbent, which here stays as recorded.
             selection = dict(self._heuristic_selection)
             self.last_ip_objective = self.objective_of(selection)
             self.last_ip_bound = math.inf

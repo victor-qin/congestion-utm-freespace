@@ -5,16 +5,18 @@ params and static terminals from a pricing capture) through the real solver for 
 rounds (12 CPU pricing workers and 4 Gurobi threads unless overridden), then stops before
 the final IP. Each round's callback record (``iteration_wall_s``, ``stage_s``) and each
 sweep's outer pricing time are saved, which is what the per-round "how much can faster
-pricing shorten a round" breakdown reads. ``--rows-only`` sets ``iteration_ip_search=False`` so the per-round IP step adds its
-eager rows without searching.
+pricing shorten a round" breakdown reads. ``--rows-only`` sets ``iteration_ip_search=False``
+so the per-round IP step adds its eager rows without searching. Round sums exclude startup;
+``--profile`` adds timer wrappers inside the pricing workers.
 
     python -m experiments.colgen_four_round --capture CAPTURE.pkl --out results/four_round/X \
-        --profile [--rows-only]
+        --profile [--rows-only] [--workers N] [--gurobi-threads N] [--lock FILE]
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 from collections import defaultdict
 from dataclasses import fields, replace
 import fcntl
@@ -26,7 +28,6 @@ import os
 from pathlib import Path
 import pickle
 import resource
-import subprocess
 import sys
 import time
 from typing import Any
@@ -134,12 +135,6 @@ def worker_main(*args: Any, **kwargs: Any) -> None:
     profile = os.environ.get('CPU_EXPERIMENT_PROFILE') == '1'
     if profile or os.environ.get('CPU_EXPERIMENT_RESOURCES') == '1':
         instrument(timing=profile)
-    if os.environ.get('CPU_EXPERIMENT_DEEP_PROFILE') == '1':
-        import deep_profile
-        deep_profile.install()
-    if os.environ.get('CPU_EXPERIMENT_PARALLEL_SEEDS') == '1':
-        import parallel_seed
-        args = (parallel_seed.worker_connection(args[0]), *args[1:])
     pricing_pool._worker_main(*args, **kwargs)
 
 
@@ -161,9 +156,8 @@ def main() -> None:
     parser.add_argument('--mode', choices=('solve', 'replay'), default='solve')
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--resources', action='store_true')
-    parser.add_argument('--deep-profile', action='store_true')
-    parser.add_argument('--direct', action='store_true', help='Caller already owns benchmark lock.')
-    parser.add_argument('--parallel-seeds', action='store_true')
+    parser.add_argument('--lock', type=Path, default=None,
+                        help='File to flock before measuring, e.g. a machine-wide benchmark lock.')
     parser.add_argument('--workers', type=int, default=12,
                         help='Pricing worker processes (n_pricing_workers).')
     parser.add_argument('--gurobi-threads', type=int, default=4,
@@ -171,8 +165,6 @@ def main() -> None:
     parser.add_argument('--rows-only', action='store_true',
                         help='Per-round step adds eager rows only (iteration_ip_search=False).')
     args = parser.parse_args()
-    if args.profile and args.deep_profile:
-        parser.error('Use either inclusive scalar profiling or exclusive stage profiling, not both.')
     args.source = args.source.resolve()
     args.out = args.out.resolve()
     args.out.mkdir(parents=True)
@@ -182,8 +174,6 @@ def main() -> None:
     os.environ['CPU_EXPERIMENT_SOURCE'] = str(args.source)
     os.environ['CPU_EXPERIMENT_PROFILE'] = str(int(args.profile))
     os.environ['CPU_EXPERIMENT_RESOURCES'] = str(int(args.resources))
-    os.environ['CPU_EXPERIMENT_DEEP_PROFILE'] = str(int(args.deep_profile))
-    os.environ['CPU_EXPERIMENT_PARALLEL_SEEDS'] = str(int(args.parallel_seeds))
     os.environ.update(OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1',
                       NUMBA_NUM_THREADS='1',
                       COLGEN_GUROBI_THREADS=str(args.gurobi_threads))
@@ -204,6 +194,8 @@ def main() -> None:
     params = replace(params, solver='gurobi', pricing_device='cpu', pricing_gpu_backend=None,
                      n_pricing_workers=args.workers, max_iterations=4,
                      iteration_ip_search=not args.rows_only)
+    # The per-round step, and so --rows-only, only runs with a positive per-round IP limit.
+    assert params.iteration_ip_time_limit_s > 0, params.iteration_ip_time_limit_s
     rounds: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []
     original_sweep, original_solve = solver.price_sweep, solver.ColGenSolver.solve
@@ -257,13 +249,12 @@ def main() -> None:
         kwargs['on_iteration'] = record
         return original_solve(self, *positional, **kwargs)
 
-    # A cluster job owns its node; the lock only serializes runs sharing one output folder.
-    lock_path = args.out / 'run.lock'
-    with lock_path.open('a') as lock:
-        print('waiting for shared performance lock', flush=True)
-        if args.direct:
-            assert os.environ.get('CPU_EXPERIMENT_LOCKED') == '1'
-        else:
+    # --lock serializes with other benchmarks on a shared machine; a job owning its node
+    # needs none.
+    with contextlib.ExitStack() as stack:
+        if args.lock is not None:
+            lock = stack.enter_context(args.lock.open('a'))
+            print(f'waiting for benchmark lock {args.lock}', flush=True)
             fcntl.flock(lock, fcntl.LOCK_EX)
         start = time.perf_counter()
         dp_kernel.warm_kernel()
@@ -271,7 +262,7 @@ def main() -> None:
         warmup_s = time.perf_counter() - start
         if args.profile:
             instrument()
-        if args.profile or args.resources or args.parallel_seeds or args.deep_profile:
+        if args.profile or args.resources:
             pricing_pool._worker_main = worker_main
         solver.price_sweep, solver.ColGenSolver.solve = observe_sweep, observe_solve
         start = time.perf_counter()
@@ -289,24 +280,17 @@ def main() -> None:
             catalog = payload['initial']['catalog']
             graphs = {r.flight_id: build_flight_graph(r, cfg, catalog, params) for r in requests}
             seed_start = time.perf_counter()
-            seed_info = {}
-            if not args.parallel_seeds:
-                for graph in graphs.values():
-                    try:
-                        seed = seed_column(graph, cfg, model=cost_model(cfg, params))
-                        solver._canonical_column(seed, graph, cfg)
-                    except ValueError:
-                        pass
+            for graph in graphs.values():
+                try:
+                    seed = seed_column(graph, cfg, model=cost_model(cfg, params))
+                    solver._canonical_column(seed, graph, cfg)
+                except ValueError:
+                    pass
             pool_options = ({'seed_graphs': graphs}
                             if 'seed_graphs' in inspect.signature(pricing_pool.PricingPool).parameters
-                            and not args.parallel_seeds else {})
+                            else {})
             pool = pricing_pool.PricingPool(requests, cfg, params, catalog, **pool_options)
             try:
-                if args.parallel_seeds:
-                    import parallel_seed
-                    seed_info = parallel_seed.prepare(pool, graphs, cfg, params,
-                                                      time.monotonic() + 1800)
-                    seed_info.pop('seed_state')
                 seed_s = time.perf_counter() - seed_start
                 for snap in payload['snapshots']:
                     observe_sweep(snap['order'], requests, graphs, cfg, params, catalog,
@@ -314,38 +298,27 @@ def main() -> None:
                                   snap['known'], pool=pool, heuristic_only=snap['heuristic_only'])
             finally:
                 pool.close()
-            outcome = dict(seed_stage_s=seed_s, parallel_seeds=args.parallel_seeds,
-                           seed_info=seed_info, replay=True)
+            outcome = dict(seed_stage_s=seed_s, replay=True)
         elapsed = time.perf_counter() - start
     summary = dict(source=str(args.source), source_sha256=source_hashes(args.source),
                    capture_sha256=hashlib.sha256(args.capture.read_bytes()).hexdigest(),
                    harness_sha256=hashlib.sha256(harness_bytes).hexdigest(),
-                   profile=args.profile, resources=args.resources, deep_profile=args.deep_profile,
+                   profile=args.profile, resources=args.resources,
                    mode=args.mode, params=encode(params),
                    requests_sha256=digest(requests), warmup_s=warmup_s, elapsed_s=elapsed,
                    rounds=rounds, parent_timers=dict(TIMERS), **outcome)
-    summary['auxiliary_sha256'] = {
-        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name, enabled in (('parallel_seed.py', args.parallel_seeds),
-                              ('deep_profile.py', args.deep_profile)) if enabled
-    }
     (args.out/'summary.json').write_text(json.dumps(summary, indent=2, default=str)+'\n')
     (args.out/'rounds.pkl').write_bytes(pickle.dumps(dict(requests=requests, cfg=cfg, params=params,
             static_terminals=payload['static_terminals'], initial=initial, snapshots=snapshots),
             protocol=pickle.HIGHEST_PROTOCOL))
     print(json.dumps(dict(event='complete', elapsed_s=elapsed, rounds=len(snapshots))), flush=True)
-    # The final profiling case can continue the task's batch under its caller's lock.
-    # All measured state and clocks above are finalized before the separate process starts.
-    if args.direct and args.out.name == 'prep-four-round-replay-profile':
-        followup = Path(__file__).with_name('post_profile.py')
-        if followup.exists():
-            subprocess.run([sys.executable, str(followup)], check=True)
 
 
 if __name__ == '__main__':
     # Hashed-key iteration order must match the archived runs. Launchers such as the
     # SuperCloud runner reserve PYTHON* variables, so pin the seed by re-executing once.
     if os.environ.get('PYTHONHASHSEED') != '0':
-        os.execve(sys.executable, [sys.executable, '-m', 'experiments.colgen_four_round',
-                                   *sys.argv[1:]], {**os.environ, 'PYTHONHASHSEED': '0'})
+        # orig_argv keeps the exact invocation (interpreter flags, -m or a file path).
+        os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]],
+                  {**os.environ, 'PYTHONHASHSEED': '0'})
     main()

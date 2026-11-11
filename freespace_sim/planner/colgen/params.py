@@ -230,9 +230,11 @@ class ColGenParams:
     # Diagnostic GPU mode: retain construction/scoring, but no pricing certificate.
     pricing_gpu_validate_routes: bool = True
     # False keeps only the per-round IP step's eager row materialization and skips the
-    # search. Those rows, not the search, are what change later LP duals and hence pricing,
-    # so this trades per-round incumbent improvement (none until the final IP) for the
-    # search time. `iteration_ip_time_limit_s > 0` then only switches the step on.
+    # search. The rows are the step's only change to later master LPs (the search adds no
+    # columns), but the search's better incumbent also steers pricing (flight order and the
+    # known-route check), so the trajectory can differ. Trades per-round incumbent
+    # improvement (none until the final IP) for the search time.
+    # `iteration_ip_time_limit_s > 0` then only switches the step on.
     iteration_ip_search: bool = True
 
     @property

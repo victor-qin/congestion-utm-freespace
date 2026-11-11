@@ -196,3 +196,9 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `iteration_ip_search=False`, not by disabling the step, and treat it as its own trajectory.
   Files:
   `freespace_sim/planner/colgen/{master,solver,params}.py`, `analysis/colgen/benchmark.py`.
+
+- 2026-11-11T22:00Z [TOOL] PR #150: a new `ColGenParams` field inserted mid-class broke loading an
+  archived pricing capture (`bootstrap_method` read back as `20000`): the frozen-slot dataclass
+  pickles values by position. Append new fields at the end (see the "Append fields" comment) and
+  load captures through `hasattr`-filtered construction. Files:
+  `freespace_sim/planner/colgen/params.py`, `experiments/colgen_four_round.py`.

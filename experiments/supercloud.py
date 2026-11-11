@@ -43,6 +43,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -70,16 +71,17 @@ ALLOWED_MODULES = ("experiments.run", "pytest", "experiments.colgen_four_round")
 FORBIDDEN_OPTIONS = {"experiments.colgen_four_round": ("--source",)}
 CPU_PARTITION = "xeon-p8"
 GPU_PARTITION = "xeon-g6-volta"
-MAX_SNAPSHOT_FILE_BYTES = 20 * 1024 * 1024
+MAX_SNAPSHOT_FILE_BYTES = 20_000_000  # "20 MB" in the docs and error messages
 REQUIRED_IMPORTS = ("numpy", "numba", "fcl", "pulp", "scipy", "pandas", "pyarrow", "trimesh")
 OPTIONAL_IMPORTS = ("gurobipy", "cupy")
 
 # No dots: every accepted name is then also a valid git ref component (no "..", ".lock", "x.").
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
-# --env may not set what the tool sets itself (GRB_LICENSE_FILE comes only from --gurobi,
-# PYTHONPATH points at the snapshot) or what redirects which interpreter, packages or shared
-# libraries load. Other PYTHON* variables, e.g. PYTHONHASHSEED, stay allowed.
+# --env may override the job's thread-count and numba-cache defaults, but not the settings the
+# tool relies on for correctness (GRB_LICENSE_FILE comes only from --gurobi, PYTHONPATH points at
+# the snapshot) or what redirects which interpreter, packages or shared libraries load. Other
+# PYTHON* variables, e.g. PYTHONHASHSEED, stay allowed.
 _RESERVED_ENV = {"PATH", "HOME", "PYTHONHOME", "PYTHONPATH", "PYTHONSAFEPATH", "PYTHONUSERBASE",
                  "PYTHONNOUSERSITE", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE", "PYTHONSTARTUP"}
 _RESERVED_ENV_PREFIXES = ("GRB_", "LD_", "DYLD_")
@@ -96,6 +98,8 @@ _MARK = "__SUPERCLOUD_OUTPUT__"
 # clears them exactly as the job script does, so it tests the environment jobs get.
 _CLEAN_PY = "unset PYTHONHOME PYTHONPATH; "
 _REMOTE_TIMEOUT_S = 600
+# sbatch answers in about a second; a short limit keeps the SIGTERM-held window short.
+_SBATCH_TIMEOUT_S = 60
 _LOCK_TIMEOUT_S = 300
 _GPU_PROBE_WAIT_S = 600
 _TOML_TYPES = {"str": (str,), "bool": (bool,), "int": (int,), "float": (int, float)}
@@ -103,6 +107,11 @@ _TOML_TYPES = {"str": (str,), "bool": (bool,), "int": (int,), "float": (int, flo
 
 class SuperCloudError(RuntimeError):
     """A SuperCloud operation was refused or failed; the message says why."""
+
+
+class SubmitStateUnknown(SuperCloudError):
+    """sbatch failed and Slurm could not be asked whether the job was queued anyway, so nothing
+    the submit created is cleaned up."""
 
 
 @dataclass(frozen=True)
@@ -471,7 +480,7 @@ def sbatch_args(req: JobRequest, run_id: str, run_dir: str) -> list[str]:
     return args
 
 
-def _ssh(cfg: SuperCloudConfig, command: str) -> str:
+def _ssh(cfg: SuperCloudConfig, command: str, timeout_s: float = _REMOTE_TIMEOUT_S) -> str:
     """
     Run ``command`` in a login bash on the cluster's login node, never prompting.
 
@@ -479,6 +488,7 @@ def _ssh(cfg: SuperCloudConfig, command: str) -> str:
     ------------
     - cfg (SuperCloudConfig): supplies the ssh host alias.
     - command (str): bash source; callers quote any untrusted parts.
+    - timeout_s (float): give up after this many seconds.
 
     Return
     --------
@@ -488,9 +498,9 @@ def _ssh(cfg: SuperCloudConfig, command: str) -> str:
     try:
         proc = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", cfg.host,
                                "bash -lc " + shlex.quote(remote)],
-                              capture_output=True, text=True, timeout=_REMOTE_TIMEOUT_S)
+                              capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
-        raise SuperCloudError(f"ssh {cfg.host} timed out after {_REMOTE_TIMEOUT_S}s") from exc
+        raise SuperCloudError(f"ssh {cfg.host} timed out after {timeout_s:.0f}s") from exc
     except OSError as exc:
         raise SuperCloudError(f"cannot run ssh: {exc}") from exc
     if proc.returncode != 0:
@@ -595,11 +605,51 @@ def _locked_sbatch(cfg: SuperCloudConfig, req: JobRequest, run_id: str, run_dir:
         if problems:
             raise _refused(problems)
         with _sigterm_held():
-            out = _ssh(cfg, shlex.join(["sbatch", "--parsable",
-                                        *sbatch_args(req, run_id, run_dir), *script]))
-            job_id = out.strip().splitlines()[-1].split(";")[0]
+            try:
+                out = _ssh(cfg, shlex.join(["sbatch", "--parsable",
+                                            *sbatch_args(req, run_id, run_dir), *script]),
+                           timeout_s=_SBATCH_TIMEOUT_S)
+                job_id = out.strip().splitlines()[-1].split(";")[0]
+            except BaseException as exc:
+                # The call can fail after Slurm queued the job (dropped connection, timeout,
+                # Ctrl-C). The job name is unique to this run, so ask Slurm before giving up.
+                job_id = _queued_job_id(cfg, run_id)
+                if job_id is None:
+                    raise
+                if not isinstance(exc, Exception):  # interrupted: record, then honour it
+                    on_submitted(job_id)
+                    raise
             on_submitted(job_id)
     return job_id
+
+
+def _queued_job_id(cfg: SuperCloudConfig, run_id: str) -> str | None:
+    """
+    Find this run's job in Slurm by its name, which is unique to the run.
+
+    Parameters
+    ------------
+    - cfg (SuperCloudConfig): connection settings.
+    - run_id (str): the run whose job is named ``JOB_PREFIX + run_id``.
+
+    Return
+    --------
+    - job_id (str | None): the job's id, or None if Slurm has no such job; raises
+      SubmitStateUnknown if Slurm cannot be asked.
+    """
+    name = shlex.quote(JOB_PREFIX + run_id)
+    try:
+        # squeue sees pending/running jobs at once; sacct also sees one that already ended.
+        out = _ssh(cfg, f"{{ squeue -h -u \"$USER\" --name={name} -o %i; "
+                        f"sacct -n -X -P --name={name} -o JobID; }} | sort -u",
+                   timeout_s=_SBATCH_TIMEOUT_S)
+    except SuperCloudError as exc:
+        raise SubmitStateUnknown(
+            f"sbatch failed and Slurm could not be asked whether {JOB_PREFIX}{run_id} was "
+            f"queued ({exc}). Check `squeue -u $USER --name {JOB_PREFIX}{run_id}` on the "
+            "cluster before resubmitting; the snapshot ref and run directory were kept.") from exc
+    ids = out.split()
+    return ids[-1] if ids else None
 
 
 def read_ledger(worktree: Path) -> list[dict]:
@@ -632,9 +682,12 @@ def submit(cfg: SuperCloudConfig, req: JobRequest, worktree: Path) -> dict:
     The snapshot is taken right after a cap pre-check and uploaded before the lock, so a slow
     upload never blocks other agents. The machine-wide lock covers only the binding cap
     re-check, sbatch and the ledger write, so agents in any clone on this machine cannot both
-    pass the check and then exceed the caps together. Any failure or interruption (including
-    SIGTERM via ``main``) before sbatch accepts the job deletes the snapshot ref and the uploaded
-    run directory; only SIGKILL can leave a ref without a submitted run.
+    pass the check and then exceed the caps together. Once Slurm accepts the job, a
+    ``submitted run ... as job ...`` line is printed and the run is recorded, with SIGTERM held
+    across both. Any failure or interruption (including SIGTERM via ``main``) before that
+    deletes the snapshot ref and the run directory this submit claimed, unless it is unknown
+    whether sbatch queued the job (SubmitStateUnknown), in which case both are kept. Only
+    SIGKILL can leave a ref without a run.
 
     Parameters
     ------------
@@ -651,11 +704,15 @@ def submit(cfg: SuperCloudConfig, req: JobRequest, worktree: Path) -> dict:
     problems = check_request(req, cfg, live_agent_jobs(cfg))
     if problems:
         raise _refused(problems)
-    run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{req.name}"
+    # The random suffix keeps run ids unique across clones submitting the same name at once.
+    run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{req.name}-{secrets.token_hex(3)}"
     run_dir = f"{cfg.remote_root}/runs/{run_id}"
-    sha = snapshot_commit(worktree, run_id)
-    accepted = uploading = False
+    sha = None
+    accepted = claimed = False
     try:
+        # Held so an interruption cannot land between creating the ref and knowing it exists.
+        with _sigterm_held():
+            sha = snapshot_commit(worktree, run_id)
         record = {
             "run_id": run_id, "sha": sha, "base_sha": _git(worktree, "rev-parse", f"{sha}^"),
             "branch": _git(worktree, "rev-parse", "--abbrev-ref", "HEAD"),
@@ -671,23 +728,33 @@ def submit(cfg: SuperCloudConfig, req: JobRequest, worktree: Path) -> dict:
             meta.mkdir()
             (meta / "job.sh").write_text(render_job_script(cfg, req, run_id, run_dir))
             (meta / "snapshot.json").write_text(json.dumps(record, indent=2) + "\n")
-            uploading = True
-            _ssh(cfg, f"mkdir -p {shlex.quote(cfg.remote_root + '/runs')}")
+            # Plain mkdir claims the run directory atomically; cleanup removes only a claimed one.
+            _ssh(cfg, f"mkdir -p {shlex.quote(cfg.remote_root + '/runs')} && "
+                      f"mkdir {shlex.quote(run_dir)}")
+            claimed = True
             _rsync(f"{stage}/", f"{cfg.host}:{run_dir}/")
 
         def record_job(job_id: str) -> None:
-            """Mark the run accepted and append it to the ledger."""
+            """Mark the run accepted, report it, and append it to the ledger."""
             nonlocal accepted
             record["job_id"], accepted = job_id, True
-            with open(ledger / "runs.jsonl", "a") as fh:
-                fh.write(json.dumps(record) + "\n")
+            print(f"submitted run {run_id} as job {job_id} (snapshot {sha[:12]}, "
+                  f"{req.partition})", flush=True)
+            try:
+                with open(ledger / "runs.jsonl", "a") as fh:
+                    fh.write(json.dumps(record) + "\n")
+            except OSError as exc:
+                raise SuperCloudError(
+                    f"job {job_id} (run {run_id}) is queued but writing {ledger / 'runs.jsonl'} "
+                    f"failed ({exc}); record it there by hand or `scancel {job_id}`") from exc
 
         _locked_sbatch(cfg, req, run_id, run_dir, [f"{run_dir}/.supercloud/job.sh"], record_job)
-    except BaseException:
-        if not accepted:
-            subprocess.run(["git", "-C", str(worktree), "update-ref", "-d",
-                            f"refs/supercloud/{run_id}"], capture_output=True)
-            if uploading:
+    except BaseException as exc:
+        if not accepted and not isinstance(exc, SubmitStateUnknown):
+            if sha is not None:
+                subprocess.run(["git", "-C", str(worktree), "update-ref", "-d",
+                                f"refs/supercloud/{run_id}"], capture_output=True)
+            if claimed:
                 try:
                     _ssh(cfg, f"rm -rf {shlex.quote(run_dir)}")
                 except SuperCloudError:
@@ -876,7 +943,11 @@ def doctor(cfg: SuperCloudConfig, gpu: bool = False) -> bool:
                 time.sleep(15)
         except BaseException:
             if "job_id" in job and state in _ACTIVE_STATES:
-                cancel(cfg, job)
+                try:
+                    cancel(cfg, job)
+                except SuperCloudError as exc:
+                    print(f"WARN  GPU probe job {job['job_id']} may still be queued; cancelling it "
+                          f"failed: {exc}", file=sys.stderr)
             raise
         log = _ssh(cfg, f"cat {shlex.quote(run_dir)}/.supercloud/slurm-{job['job_id']}.log")
         if state != "COMPLETED" or "sum 32.0" not in log:
@@ -977,9 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise SuperCloudError(f"--env takes NAME=VALUE, got {args.env}")
             req = JobRequest(args.name, module, mod_args, args.cores, args.gpus, args.hours,
                              args.gurobi, env)
-            record = submit(cfg, req, worktree)
-            print(f"submitted run {record['run_id']} as job {record['job_id']} "
-                  f"(snapshot {record['sha'][:12]}, {record['partition']})")
+            submit(cfg, req, worktree)  # prints the "submitted run ... as job ..." line itself
             return 0
         if args.cmd == "status":
             records = ([find_run(worktree, rid) for rid in args.run_ids] if args.run_ids
@@ -999,7 +1068,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"supercloud: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("supercloud: interrupted; nothing half-submitted was left behind", file=sys.stderr)
+        print("supercloud: interrupted. A job was queued only if a 'submitted run' line was "
+              "printed above; anything else this command started was cleaned up.",
+              file=sys.stderr)
         return 130
 
 

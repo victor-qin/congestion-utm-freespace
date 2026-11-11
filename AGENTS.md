@@ -110,5 +110,5 @@ There is an extremely high-bar for transferring things from `.agent/CONTINUITY.m
 - `--gurobi` uses SuperCloud's full academic licence; pair it with `--colgen-solver gurobi`, and set solver threads with `--env COLGEN_GUROBI_THREADS=N`.
 - Caps are in `~/.config/congestion-utm/supercloud.toml` and belong to the user. Never edit that file; if a submit is refused, ask the user.
 - `fetch <run_id>` copies results and the Slurm log to the main checkout's `results/supercloud/<run_id>/`. Cite remote results by run id.
-- `submit` and `doctor --gpu` can take minutes (lock wait, upload, GPU queue): give them a tool timeout of at least 15 minutes. If interrupted they clean up after themselves. If a submit fails, run `doctor` (add `--gpu` to test a V100 node) before retrying.
+- `submit` and `doctor --gpu` can take minutes (lock wait, upload, GPU queue): give them a tool timeout of at least 15 minutes. A submit queued a job only if it printed `submitted run … as job …`. After an interrupted or failed submit, check `list` and `status` before retrying, and run `doctor` (add `--gpu` to test a V100 node) if the cause is unclear.
 - Codex agents need network access to `txe1-login.mit.edu`, read access to `~/.ssh`, and write access to the main checkout's `.git/` (snapshot refs), its `results/supercloud/` (ledger) and `~/.config/congestion-utm/` (submit lock).

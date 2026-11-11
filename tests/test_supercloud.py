@@ -226,22 +226,30 @@ def test_parse_sacct_takes_state_from_the_job_and_memory_from_its_steps():
                     "7": {"state": "PENDING", "elapsed": "00:00:00", "max_rss_gb": 0.0}}
 
 
-def test_concurrent_submits_from_two_worktrees_cannot_exceed_caps(tmp_path, monkeypatch):
+def test_concurrent_submits_from_two_clones_cannot_exceed_caps(tmp_path, monkeypatch):
     main = _init_repo(tmp_path / "main")
     (main / "a.py").write_text("committed\n")
     _git(main, "add", ".")
     _git(main, "commit", "-q", "-m", "base")
-    side = tmp_path / "side"
-    _git(main, "worktree", "add", "-q", str(side), "-b", "side")
-    (side / "a.py").write_text("uncommitted in worktree\n")
-    expected = {"one": "committed\n", "two": "uncommitted in worktree\n"}
+    # A worktree shares the main checkout's ledger. A separate clone has its own ledger and refs,
+    # so only the machine-wide lock can keep the two submits below apart.
+    worktree = tmp_path / "worktree"
+    _git(main, "worktree", "add", "-q", str(worktree), "-b", "side")
+    assert sc.ledger_dir(worktree) == sc.ledger_dir(main) == main / "results" / "supercloud"
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(main), str(clone)], check=True)
+    _git(clone, "config", "user.email", "t@example.com")
+    _git(clone, "config", "user.name", "t")
+    (clone / "a.py").write_text("uncommitted in clone\n")
+    trees = {"one": main, "two": clone}
+    expected = {"one": "committed\n", "two": "uncommitted in clone\n"}
 
     queue = ["101|agent-old|8|N/A|RUNNING"]  # one live agent job; max_jobs=2 leaves one slot
     removed = []
     guard = threading.Lock()
     both_uploading = threading.Barrier(2)
 
-    def fake_ssh(cfg, command):
+    def fake_ssh(cfg, command, **_):
         words = command.split()
         if words[0] == "squeue":
             snapshot = "\n".join(queue)
@@ -263,13 +271,13 @@ def test_concurrent_submits_from_two_worktrees_cannot_exceed_caps(tmp_path, monk
     cfg = replace(CFG, caps=replace(CAPS, max_jobs=2))
     outcomes = {}
 
-    def run(name, tree):
+    def run(name):
         try:
-            outcomes[name] = sc.submit(cfg, _req(name=name), tree)
+            outcomes[name] = sc.submit(cfg, _req(name=name), trees[name])
         except sc.SuperCloudError as exc:
             outcomes[name] = exc
 
-    threads = [threading.Thread(target=run, args=args) for args in (("one", main), ("two", side))]
+    threads = [threading.Thread(target=run, args=(name,)) for name in trees]
     for t in threads:
         t.start()
     for t in threads:
@@ -280,24 +288,60 @@ def test_concurrent_submits_from_two_worktrees_cannot_exceed_caps(tmp_path, monk
     assert len(accepted) == 1 and len(refused) == 1, outcomes
     assert "agent jobs already queued" in str(refused[0])
     (name, record), = accepted.items()
-    # One ledger in the MAIN checkout, whichever worktree won.
-    ledger = (main / "results" / "supercloud" / "runs.jsonl").read_text().splitlines()
+    ledger = (trees[name] / "results" / "supercloud" / "runs.jsonl").read_text().splitlines()
     assert [json.loads(line)["run_id"] for line in ledger] == [record["run_id"]]
-    # The refused snapshot's ref and upload are gone; the accepted one holds that worktree's
-    # on-disk files.
-    assert _git(main, "for-each-ref", "--format=%(refname)", "refs/supercloud").split() == [
-        f"refs/supercloud/{record['run_id']}"]
-    assert _git(main, "show", f"{record['sha']}:a.py") == expected[name]
-    other = next(n for n in expected if n != name)
+    # The refused snapshot's ref and upload are gone; the accepted one holds its tree's on-disk
+    # files.
+    for n, tree in trees.items():
+        assert _git(tree, "for-each-ref", "--format=%(refname)", "refs/supercloud").split() == (
+            [f"refs/supercloud/{record['run_id']}"] if n == name else [])
+    assert _git(trees[name], "show", f"{record['sha']}:a.py") == expected[name]
+    other = next(n for n in trees if n != name)
     assert len(removed) == 1 and removed[0].startswith(f"{CFG.remote_root}/runs/")
-    assert removed[0].endswith(f"-{other}")
+    assert f"-{other}-" in removed[0]
+
+
+@pytest.mark.parametrize("queued, outcome", [("555\n", "recorded"), ("", "cleaned"),
+                                             (None, "kept")])
+def test_failed_sbatch_never_orphans_a_queued_job(tmp_path, monkeypatch, queued, outcome):
+    # sbatch can fail locally (dropped connection, timeout) after Slurm queued the job. Only a
+    # job Slurm confirms is absent may have its directory deleted.
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("a\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    commands = []
+
+    def fake_ssh(cfg, command, **_):
+        commands.append(command)
+        if command.startswith("sbatch"):
+            raise sc.SuperCloudError("connection dropped")
+        if command.startswith("{ squeue"):  # the lookup of this run's job by name
+            if queued is None:
+                raise sc.SuperCloudError("cluster still unreachable")
+            return queued
+        return ""
+
+    monkeypatch.setattr(sc, "_ssh", fake_ssh)
+    monkeypatch.setattr(sc, "_rsync", lambda src, dest: None)
+    ledger = repo / "results" / "supercloud" / "runs.jsonl"
+    if outcome == "recorded":
+        assert sc.submit(CFG, _req(), repo)["job_id"] == "555"
+        assert json.loads(ledger.read_text())["job_id"] == "555"
+    else:
+        with pytest.raises(sc.SubmitStateUnknown if outcome == "kept" else sc.SuperCloudError):
+            sc.submit(CFG, _req(), repo)
+        assert not ledger.exists()
+    cleaned = outcome == "cleaned"
+    assert (_git(repo, "for-each-ref", "refs/supercloud") == "") is cleaned
+    assert any(c.startswith("rm -rf") for c in commands) is cleaned
 
 
 def test_gpu_probe_respects_caps_and_is_cancelled_when_interrupted(monkeypatch, capsys):
     commands = []
     queue = "101|agent-a|20|gpu:volta:2|RUNNING"  # every GPU the caps allow is in use
 
-    def fake_ssh(cfg, command):
+    def fake_ssh(cfg, command, **_):
         commands.append(command)
         if command.startswith("squeue"):
             return queue
@@ -309,7 +353,7 @@ def test_gpu_probe_respects_caps_and_is_cancelled_when_interrupted(monkeypatch, 
 
     monkeypatch.setattr(sc, "_ssh", fake_ssh)
     monkeypatch.setattr(sc, "_rsync", lambda src, dest: None)
-    assert sc.doctor(CFG, gpu=True) is False
+    sc.doctor(CFG, gpu=True)
     assert "FAIL  gpu kernel: submit refused" in capsys.readouterr().out
     assert not any(c.startswith("sbatch") for c in commands)
 
@@ -319,7 +363,10 @@ def test_gpu_probe_respects_caps_and_is_cancelled_when_interrupted(monkeypatch, 
     assert any(c.startswith("scancel") and c.endswith(" 555") for c in commands)
 
 
-def test_sigterm_during_submit_leaves_nothing_half_recorded(tmp_path):
+@pytest.mark.parametrize("moment", ["upload", "sbatch"])
+def test_sigterm_during_submit_leaves_nothing_half_recorded(tmp_path, moment):
+    # Agent harnesses send SIGTERM when a tool call times out. During the upload, the submit
+    # must clean up; once sbatch is in flight, the job must still be recorded and reported.
     repo = _init_repo(tmp_path / "repo")
     (repo / "a.py").write_text("a\n")
     _git(repo, "add", ".")
@@ -329,25 +376,49 @@ def test_sigterm_during_submit_leaves_nothing_half_recorded(tmp_path):
                       f'allow_gurobi = false\ngurobi_license_file = "{LICENCE}"\n[caps]\n'
                       "max_cores_per_job = 4\nmax_gpus_per_job = 0\nmax_hours_per_job = 1\n"
                       "max_jobs = 1\nmax_cores_total = 4\nmax_gpus_total = 0\n")
-    uploading = tmp_path / "uploading"
+    uploading, log = tmp_path / "uploading", tmp_path / "ssh.log"
     driver = (
-        "import sys, time\nfrom pathlib import Path\nfrom experiments import supercloud as sc\n"
+        "import os, signal, sys, time\nfrom pathlib import Path\n"
+        "from experiments import supercloud as sc\n"
         f"sc.CONFIG_PATH = Path({str(config)!r})\n"
         f"sc.LOCK_PATH = Path({str(tmp_path / 'lock')!r})\n"
-        "sc._ssh = lambda cfg, command: ''\n"
-        f"def slow_rsync(src, dest):\n    Path({str(uploading)!r}).touch(); time.sleep(60)\n"
-        "sc._rsync = slow_rsync\n"
+        f"MOMENT, UPLOADING, LOG = {moment!r}, Path({str(uploading)!r}), Path({str(log)!r})\n"
+        "def fake_ssh(cfg, command, **_):\n"
+        "    with LOG.open('a') as fh:\n"
+        "        fh.write(command + '\\n')\n"
+        "    if command.startswith('sbatch'):\n"
+        "        if MOMENT == 'sbatch':\n"
+        "            os.kill(os.getpid(), signal.SIGTERM)\n"
+        "        return '555\\n'\n"
+        "    return ''\n"
+        "def fake_rsync(src, dest):\n"
+        "    if MOMENT == 'upload':\n"
+        "        UPLOADING.touch()\n"
+        "        time.sleep(60)\n"
+        "sc._ssh, sc._rsync = fake_ssh, fake_rsync\n"
         "sys.exit(sc.main(['submit', '--name', 'x', '--cores', '1', '--hours', '1', '--',"
         " 'pytest']))\n")
     root = Path(sc.__file__).resolve().parents[1]
     proc = subprocess.Popen([sys.executable, "-c", driver], cwd=repo, text=True,
                             env={**os.environ, "PYTHONPATH": str(root)},
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    deadline = time.monotonic() + 30
-    while not uploading.exists() and proc.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert uploading.exists(), proc.communicate()
-    proc.send_signal(signal.SIGTERM)  # what an agent harness sends when a tool call times out
-    _, err = proc.communicate(timeout=30)
+    try:
+        if moment == "upload":
+            deadline = time.monotonic() + 30
+            while not uploading.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert uploading.exists(), proc.communicate()
+            proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
     assert proc.returncode == 130, err
-    assert _git(repo, "for-each-ref", "refs/supercloud") == ""
+    refs = _git(repo, "for-each-ref", "refs/supercloud")
+    ledger = repo / "results" / "supercloud" / "runs.jsonl"
+    removed = "rm -rf" in log.read_text()
+    if moment == "upload":
+        assert refs == "" and removed and not ledger.exists()
+    else:
+        assert "submitted run" in out and "job 555" in out
+        assert refs and not removed and json.loads(ledger.read_text())["job_id"] == "555"

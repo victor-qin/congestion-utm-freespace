@@ -2,6 +2,27 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
+- 2026-11-12T02:10Z [TOOL] `terminal_airspace_always_active` is not only a wall switch: hub placement
+  reject-samples on the wall extent and the demand drops customers inside foreign walls, both keyed on
+  the flag. Flipping it on density_faa moved 119/182 hubs and left 0 of 2,318 requests in common, so an
+  on/off A/B compared two worlds. Pin the layout (`DemandSpec.walled_layout`, density recipes set True)
+  before reading a wall-policy difference. Files: `freespace_sim/demand.py`,
+  `freespace_sim/scenarios/{density,spec}.py`.
+
+- 2026-11-12T02:10Z [TOOL] The A* occupancy raster must never drop a volume the ledger still conflicts,
+  or A* plans through it and the commit denies `conflict_filed`. Two drops did: corridor cells inside the
+  committing flight's own hub column (premise "only raster inflation lies there" fails at 180 m columns,
+  and A* re-enters its own column), and ground-only volumes below every corridor band (an itinerary's
+  parked box). 84/136 future walls-off denials. Any new skip must say what else walls the cells off, and
+  the skip lives in four copies. Files: `freespace_sim/planner/astar/{occupancy,compiled_hex_occupancy}.py`,
+  `freespace_sim/planner/sipp/planner.py`, `freespace_sim/planner/lns/state.py`.
+
+- 2026-11-12T02:10Z [TOOL] A ground hold on a round trip's return keeps the aircraft PARKED, extending a
+  reservation neither leg's search saw; it must be capped where ground traffic first reaches the pad. Do
+  not gate a parked interval with `pad_clear`: it is a full-tube test that counts overflight, which a
+  parked ground box allows (a toy fixture gained a denial and LNS stopped improving). Files:
+  `freespace_sim/planner/{itinerary,pad_hold}.py`.
+
 - 2026-11-07T20:40Z [TOOL] Packed arrays underestimate CPU preparation-cache memory. Hard88's
   retained worker graphs accounted for about 1500 MiB, despite much smaller packed tables;
   a 128 MiB worker budget rebuilt all 88 graphs on a warm sweep. Count lazy graph, role and claim

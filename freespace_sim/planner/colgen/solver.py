@@ -910,6 +910,10 @@ class _ParentHeap:
     survivors rather than every column added since setup. Every exit unfreezes and restores
     the caller's enabled setting.
 
+    Entering collects once first. Otherwise the first ``freeze`` would also pin garbage
+    left by earlier work for this whole solve: back-to-back GPU-priced solves leave
+    reference cycles holding whole flight graphs, and each solve kept every earlier one's.
+
     ``gc.unfreeze`` releases everything frozen, not only what this froze. Do not skip the
     policy when objects are already frozen on entry: CPython 3.12 starts with 375 immortal
     tuples frozen, so such a guard never engages there. Releasing them is harmless.
@@ -920,8 +924,10 @@ class _ParentHeap:
     """
 
     def __enter__(self) -> "_ParentHeap":
+        """Record the caller's setting, stop automatic collection, and clear existing garbage."""
         self.collecting = gc.isenabled()
         gc.disable()
+        gc.collect()
         return self
 
     def freeze(self) -> None:
@@ -931,11 +937,9 @@ class _ParentHeap:
             gc.enable()
 
     def __exit__(self, *exc_info: object) -> None:
+        """Release the frozen heap and restore the caller's setting, on every exit path."""
         gc.unfreeze()
-        if self.collecting:
-            gc.enable()
-        else:
-            gc.disable()
+        (gc.enable if self.collecting else gc.disable)()
 
 
 class ColGenSolver:

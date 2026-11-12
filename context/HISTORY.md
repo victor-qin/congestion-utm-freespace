@@ -245,4 +245,6 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   parent code outside a GC-off window paid 774 collections of ~15 ms (11.9 s vs ~0 unfrozen) until
   #151's review fix moved the per-sweep message build under `gc.disable()`. Measure any parent GC
   change on BOTH interpreters, counting every collection, not just pauses of 50 ms or more.
+  `gc.freeze()` also pins any garbage alive at that moment: GPU pricing's per-solve cycles were
+  carried through every later solve (6→42 flight graphs alive) until `solve` collected first.
   Files: `freespace_sim/planner/colgen/{solver,pricing_pool}.py`, `tests/test_colgen_solver.py`.

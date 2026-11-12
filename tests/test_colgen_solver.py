@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import math
 import time
+import weakref
 from collections import Counter
 from dataclasses import replace
 from typing import Any
@@ -2501,8 +2502,10 @@ def test_solve_freezes_its_heap_for_the_loop_and_restores_gc_on_every_exit(
     """The collector is process state that ``solve`` borrows; one process calls it many times.
 
     Setup (graph building) runs with collection off; inside the loop setup's heap is frozen
-    and collection follows the caller's setting. Every exit -- a return, a raise out of the
-    loop, a pre-master timeout -- leaves nothing frozen and the setting as it was.
+    and collection follows the caller's setting, and garbage from before the solve is not
+    frozen with it (a process that solves repeatedly would otherwise carry every earlier
+    solve's cycles). Every exit -- a return, a raise out of the loop, a pre-master timeout,
+    no requests -- leaves nothing frozen and the setting as it was.
     """
 
     class Stop(Exception):
@@ -2521,26 +2524,40 @@ def test_solve_freezes_its_heap_for_the_loop_and_restores_gc_on_every_exit(
     monkeypatch.setattr(solver_module, "build_flight_graph", spy_build)
     cfg = _cfg(max_ground_delay_s=32.0)
     requests = [_request(1, (-4, 0), (4, 0), cfg)]
-    in_loop: list[tuple[bool, bool]] = []
+    in_loop: list[tuple[bool, bool, bool]] = []
     was_collecting = gc.isenabled()
     (gc.enable if collecting else gc.disable)()
     # Nonzero on CPython 3.12 before anything runs, so "frozen" means "more than this".
     frozen_on_entry = gc.get_freeze_count()
+
+    class Cycle:
+        pass
+
+    garbage = Cycle()
+    garbage.self = garbage
+    garbage_alive = weakref.ref(garbage)
+    del garbage
+
+    def restored() -> bool:
+        return gc.get_freeze_count() <= frozen_on_entry and gc.isenabled() == collecting
+
     try:
         ColGenSolver().solve(
             requests, cfg, (), _params(),
             on_iteration=lambda _s: in_loop.append(
-                (gc.get_freeze_count() > frozen_on_entry, gc.isenabled())
+                (gc.get_freeze_count() > frozen_on_entry, gc.isenabled(), garbage_alive() is None)
             ),
         )
         assert in_setup == [False]
-        assert in_loop and set(in_loop) == {(True, collecting)}
-        assert (gc.get_freeze_count(), gc.isenabled()) == (0, collecting)
+        assert in_loop and set(in_loop) == {(True, collecting, True)}
+        assert restored()
         with pytest.raises(Stop):
             ColGenSolver().solve(requests, cfg, (), _params(), on_iteration=stop)
-        assert (gc.get_freeze_count(), gc.isenabled()) == (0, collecting)
+        assert restored()
         ColGenSolver().solve(requests, cfg, (), _params(time_limit_s=1e-6))
-        assert (gc.get_freeze_count(), gc.isenabled()) == (0, collecting)
+        assert restored()
+        ColGenSolver().solve([], cfg, (), _params())
+        assert restored()
     finally:
         (gc.enable if was_collecting else gc.disable)()
 

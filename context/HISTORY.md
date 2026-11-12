@@ -233,3 +233,18 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   large cohorts with few workers. Send only small, bounded messages to a busy worker (≤2 chunks of
   ids); anything that scales with a sweep goes to idle workers or after the merge. Files:
   `freespace_sim/planner/colgen/pricing_pool.py`, `tests/test_colgen_pricing_pool.py`.
+
+- 2026-11-12T00:30Z [TOOL] Parent GC policy (`gc.freeze`): CPython 3.12 (SuperCloud) starts every
+  interpreter with `gc.get_freeze_count() == 375` (immortal tuples, even under `-I -S`); 3.14 (Mac)
+  starts at 0. A "leave GC alone if anything is already frozen" guard therefore passed every Mac
+  test and silently never engaged on SuperCloud, wasting two A/B runs. Assert "frozen beyond the
+  entry count", run GC tests on 3.12 too, and check `parent_gc_pauses` before trusting an arm.
+  Also: xeon-p8 nodes differ ~20% in single-thread speed (identical setup 116 vs 144 s), so compare
+  A/B arms within a node class (bucket by `solve_lp`) or by GC seconds, never by raw wall sums.
+  CPython 3.14 (incremental collector) reacts differently: with the heap frozen, allocation-heavy
+  parent code outside a GC-off window paid 774 collections of ~15 ms (11.9 s vs ~0 unfrozen) until
+  #151's review fix moved the per-sweep message build under `gc.disable()`. Measure any parent GC
+  change on BOTH interpreters, counting every collection, not just pauses of 50 ms or more.
+  `gc.freeze()` also pins any garbage alive at that moment: GPU pricing's per-solve cycles were
+  carried through every later solve (6→42 flight graphs alive) until `solve` collected first.
+  Files: `freespace_sim/planner/colgen/{solver,pricing_pool}.py`, `tests/test_colgen_solver.py`.

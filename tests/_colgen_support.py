@@ -1,14 +1,30 @@
 """Shared colgen test helpers.
 
-Only one thing lives here, and it is here rather than copied into each colgen test module
-because it encodes a correctness invariant that must not drift between copies.
+What lives here is here rather than copied into each colgen test module because it encodes
+a correctness invariant that must not drift between copies.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
+from freespace_sim.planner.colgen import pricing
 from freespace_sim.planner.colgen.network import FlightGraph, _graph_max_step
+
+
+@pytest.fixture
+def check_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-check every canonicalization shortcut against the untouched reference path.
+
+    Pricing reuses pre-check work when it certifies a route; with this on, each such answer is
+    recomputed the slow way and must match bit for bit (``pricing._CHECK_CANONICAL``).  The
+    environment variable reaches pool workers, which read it at import.  Opt in per module with
+    ``pytestmark = pytest.mark.usefixtures("check_canonical")`` after importing this fixture.
+    """
+    monkeypatch.setattr(pricing, "_CHECK_CANONICAL", True)
+    monkeypatch.setenv("COLGEN_CHECK_CANONICAL", "1")
 
 
 def with_air_hops(fg: FlightGraph, max_air_hops: int) -> FlightGraph:

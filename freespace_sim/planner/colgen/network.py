@@ -2027,6 +2027,7 @@ def column_claims(
     *,
     _intent=None,
     _validate: bool = True,
+    _claims: frozenset[RowKey] | None = None,
 ) -> frozenset[RowKey]:
     """Return the de-duplicated capacity rows claimed by ``column``.
 
@@ -2048,6 +2049,9 @@ def column_claims(
     - _intent: optional pre-built intent to reuse instead of re-translating the column.
     - _validate (bool): check route feasibility and use certified-claim caching. False
       constructs diagnostic claims only and neither reads nor writes that cache.
+    - _claims (frozenset[RowKey] | None): the row union the caller already built for this exact
+      column with the same window helpers (pricing's pre-check); every validation still runs,
+      only the collection is skipped.  ``None`` collects the rows here.
 
     Return
     --------
@@ -2204,7 +2208,10 @@ def column_claims(
                     )
 
     windows = _column_endpoint_steps(column, fg, cfg, arrival_step)
-    result = _collect_column_claims(column, fg, cfg, offsets, corridor_start_step, windows)
+    result = (
+        _collect_column_claims(column, fg, cfg, offsets, corridor_start_step, windows)
+        if _claims is None else _claims
+    )
     with fg._search_cache.lock:
         fg._search_cache.certified_claims[certificate_key] = (
             column.departure_step, result,

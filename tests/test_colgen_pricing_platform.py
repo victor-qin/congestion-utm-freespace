@@ -26,6 +26,9 @@ from freespace_sim.planner.colgen.pricing_platform import (
 from freespace_sim.planner.colgen.translate import column_to_intent
 from tests.test_colgen_review_fixes import _enumerated_best_rc
 from tests.test_colgen_solver import _cfg, _params, _request
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 
 def _problem(

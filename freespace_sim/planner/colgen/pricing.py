@@ -23,15 +23,17 @@ SEARCH for one (see :func:`_bootstrap_incumbent`).
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import math
+import os
 import sys
 import threading
 import time
 import weakref
 import heapq
 import itertools
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass, replace
 from typing import Any, Hashable
@@ -74,6 +76,10 @@ _SCORE_EPS = 1e-12
 _IMPROVING_RC_TOL = 1e-9
 _RECOMPUTE_EPS = 1e-8
 _EMPTY_ROWS: frozenset[RowKey] = frozenset()
+# Debug guard for the canonicalization shortcuts: when set, every canonicalization that
+# reused pre-check work is re-run on the untouched reference path and the two must agree
+# bit for bit.  Read once at import so pool workers inherit it through their environment.
+_CHECK_CANONICAL = os.environ.get("COLGEN_CHECK_CANONICAL") == "1"
 
 class PricingTimeout(TimeoutError):
     """Raised when an exact pricing call reaches its caller-owned deadline."""
@@ -328,12 +334,20 @@ class _Label:
 
 @dataclass(frozen=True, slots=True)
 class _Candidate:
-    """A sink-reaching label ranked by its de-duplicated provisional RC."""
+    """A sink-reaching label ranked by its de-duplicated provisional RC.
+
+    ``claims`` and ``dual_cost`` are the pre-check's row union for exactly this label and its
+    ``fsum`` dual, already gated against the same ``forbidden_rows`` the caller certifies with.
+    They equal what canonicalization would rebuild (same window helpers, level 0, same timing
+    steps), so :func:`_canonical_candidate` reuses them; ``None`` makes it rebuild both.
+    """
 
     reduced_cost: float
     delay_s: float
     label: _Label
     dest_lane_idx: int | None
+    claims: frozenset[RowKey] | None = None
+    dual_cost: float | None = None
 
     @property
     def tie_key(self) -> tuple[Any, ...]:
@@ -1519,10 +1533,15 @@ def _canonical_candidate(
 ) -> tuple[float, Column] | None:
     """Certify one search candidate's route and return its exact reduced cost, or ``None``.
 
+    A candidate carrying its pre-check ``claims`` and ``dual_cost`` reuses them instead of
+    rebuilding the same row union; everything else is the reference certification.  Under
+    ``COLGEN_CHECK_CANONICAL=1`` that answer is compared with the reference run on the bare
+    candidate, so the reuse is checked rather than trusted.
+
     Parameters
     ------------
-    - candidate (_Candidate): the search candidate carrying the label, destination lane, and
-      provisional delay.
+    - candidate (_Candidate): the search candidate carrying the label, destination lane,
+      provisional delay and, optionally, its pre-check claims and dual cost.
     - fg (FlightGraph): the flight graph, supplying the request and geometry.
     - duals (DualView): the dual view scoring the certified claims.
     - pi_f (float): the flight's dual (``pi_f``).
@@ -1532,6 +1551,70 @@ def _canonical_candidate(
     - model (CostModel): cost weights for the delay ruler; defaults to ``DELAY_MODEL``.
     - validate (bool): check feasibility and register the result as certified. False is
       diagnostic scoring only; it never publishes a route or claims certificate.
+
+    Return
+    --------
+    - output (tuple[float, Column] | None): the certified ``(reduced_cost, column)``, or
+      ``None`` when the route is not accepted, has illegal claims, or hits a forbidden row.
+    """
+    reuse = validate and candidate.claims is not None and candidate.dual_cost is not None
+    result = _reference_canonical(candidate, fg, duals, pi_f, cfg, benefit, forbidden_rows,
+                                  model, validate=validate, reuse=reuse)
+    if reuse and _CHECK_CANONICAL:
+        bare = replace(candidate, claims=None, dual_cost=None)
+        with _without_claim_certificates(fg):
+            expected = _reference_canonical(bare, fg, duals, pi_f, cfg, benefit, forbidden_rows,
+                                            model, validate=True, reuse=False)
+        _assert_same_canonical(result, expected, fg)
+    return result
+
+
+@contextlib.contextmanager
+def _without_claim_certificates(fg: FlightGraph):
+    """Hide the graph's claim certificates so a check recomputes rather than reads them.
+
+    ``column_claims`` stores whatever rows it returns, reused ones included; an oracle that
+    read that store back would compare the reused rows with themselves.  The graph's lock is
+    held throughout so no other thread sees the empty store.  Debug-only (check mode).
+    """
+    cache = fg._search_cache
+    with cache.lock:
+        saved, cache.certified_claims = cache.certified_claims, OrderedDict()
+        try:
+            yield
+        finally:
+            cache.certified_claims = saved
+
+
+def _reference_canonical(
+    candidate: _Candidate,
+    fg: FlightGraph,
+    duals: DualView,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel,
+    *,
+    validate: bool,
+    reuse: bool,
+) -> tuple[float, Column] | None:
+    """Certify a candidate through the full intent translation and claim certification.
+
+    Parameters
+    ------------
+    - candidate (_Candidate): the search candidate; with ``reuse`` its ``claims`` and
+      ``dual_cost`` must be set.
+    - fg (FlightGraph): the flight graph, supplying the request and geometry.
+    - duals (DualView): the dual view scoring the certified claims.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): supplies the geometry, clock, and nominal speed.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights for the delay ruler.
+    - validate (bool): check feasibility and register the result as certified.
+    - reuse (bool): hand the pre-check claims to ``column_claims`` (which still validates the
+      route) and reuse the pre-check dual cost, instead of rebuilding both.
 
     Return
     --------
@@ -1554,7 +1637,8 @@ def _canonical_candidate(
         return None
     try:
         claims = column_claims(provisional, fg, cfg, _intent=intent,
-                               **({} if validate else {"_validate": False}))
+                               **({} if validate else {"_validate": False}),
+                               **({"_claims": candidate.claims} if reuse else {}))
     except (ValueError, NotImplementedError):
         return None
     if validate and not claims.isdisjoint(forbidden_rows):
@@ -1571,13 +1655,50 @@ def _canonical_candidate(
         delay_s=exact_delay,
         claims=claims,
     )
+    # `fsum` is exactly rounded, so the pre-check's dual of an equal row set is this one.
+    dual_cost = candidate.dual_cost if reuse else duals.claim_cost(claims)
     reduced_cost = model.reduced_cost(
-        benefit=benefit, cost=exact_delay, dual_cost=duals.claim_cost(claims), pi_f=pi_f
+        benefit=benefit, cost=exact_delay, dual_cost=dual_cost, pi_f=pi_f
     )
     if not validate:
         return reduced_cost, column
     return reduced_cost, _remember_certified_column(
         column, fg, model, intent.air_detour_m / cfg.nominal_speed_mps)
+
+
+def _assert_same_canonical(
+    actual: tuple[float, Column] | None,
+    expected: tuple[float, Column] | None,
+    fg: FlightGraph,
+) -> None:
+    """Raise ``AssertionError`` unless two canonicalizations agree bit for bit.
+
+    Compares the verdict, the reduced cost and delay by float hex, the column (claims as a
+    set) and the air-detour seconds each registered as certified.
+    """
+    if actual is None or expected is None:
+        if actual is not expected:
+            raise AssertionError(f"canonical verdicts differ: {actual!r} vs {expected!r}")
+        return
+    (rc, column), (expected_rc, expected_column) = actual, expected
+    with fg._search_cache.lock:
+        registry = fg._search_cache.certified_columns
+        detour = registry.get(id(column), (None, None, None))[2]
+        expected_detour = registry.get(id(expected_column), (None, None, None))[2]
+    if (
+        rc.hex() != expected_rc.hex()
+        or column != expected_column
+        or column.delay_s.hex() != expected_column.delay_s.hex()
+        or detour is None
+        or expected_detour is None
+        or detour.hex() != expected_detour.hex()
+    ):
+        raise AssertionError(
+            f"canonical results differ for flight {column.flight_id}: "
+            f"rc {rc!r} vs {expected_rc!r}, delay {column.delay_s!r} vs "
+            f"{expected_column.delay_s!r}, detour {detour!r} vs {expected_detour!r}, "
+            f"claims equal {column.claims == expected_column.claims}"
+        )
 
 
 def _sink_certifier(
@@ -1662,16 +1783,17 @@ def _sink_certifier(
         if not claims.isdisjoint(forbidden_rows):
             return None
         delay_s = _path_delay_s(fg, cfg, label, model)
+        dual_cost = dual_view.claim_cost(claims)
         reduced_cost = model.reduced_cost(
             benefit=benefit,
             cost=delay_s,
-            dual_cost=dual_view.claim_cost(claims),
+            dual_cost=dual_cost,
             pi_f=pi_f,
         )
         if incumbent is not None and reduced_cost <= incumbent[0] + _SCORE_EPS:
             return None
         canonical = _canonical_candidate(
-            _Candidate(reduced_cost, delay_s, label, dest_lane_idx),
+            _Candidate(reduced_cost, delay_s, label, dest_lane_idx, claims, dual_cost),
             fg,
             dual_view,
             pi_f,
@@ -2974,7 +3096,7 @@ def _dag_candidates(
     cells = list(zip(topology.cell_q.tolist(), topology.cell_r.tolist()))
     endpoint_cache: dict[tuple[bool, int, int], frozenset[RowKey]] = {}
     visit_cache: dict[tuple[Cell, int], frozenset[RowKey]] = {}
-    priced: dict[int, tuple[frozenset[RowKey], float, float] | None] = {}
+    priced: dict[int, tuple[frozenset[RowKey], float, float, float] | None] = {}
     labels: dict[int, _Label] = {}
     candidates: list[_Candidate] = []
 
@@ -3004,23 +3126,26 @@ def _dag_candidates(
                 entry_priced = None
             else:
                 delay_s = _path_delay_s(fg, cfg, label, model)
+                dual_cost = dual_view.claim_cost(claims)
                 entry_priced = (
                     claims,
                     delay_s,
                     model.reduced_cost(
                         benefit=benefit,
                         cost=delay_s,
-                        dual_cost=dual_view.claim_cost(claims),
+                        dual_cost=dual_cost,
                         pi_f=pi_f,
                     ),
+                    dual_cost,
                 )
             priced[label_index] = entry_priced
         if entry_priced is None:
             continue
-        _claims, delay_s, reduced_cost = entry_priced
+        claims, delay_s, reduced_cost, dual_cost = entry_priced
         candidates.append(
             _Candidate(
-                reduced_cost, delay_s, label, None if dest_lane < 0 else dest_lane
+                reduced_cost, delay_s, label, None if dest_lane < 0 else dest_lane,
+                claims, dual_cost,
             )
         )
     return candidates

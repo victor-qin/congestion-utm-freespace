@@ -17,6 +17,9 @@ from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.translate import Column
 from freespace_sim.volumes import column_dwell_s
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 
 def _cfg(**overrides):
@@ -184,6 +187,21 @@ def test_final_tied_winner_remains_certified_after_more_than_eight_losers():
     assert result is not None
     assert pricing.is_certified_column(result[1], graph, model)
     assert pricing_pool._certified_result(result[1], (), graph, params, cfg)
+
+
+def test_check_mode_rejects_reused_claims_that_differ_from_certification():
+    """The guard compares reused pre-check rows with a fresh certification, not with themselves."""
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    label = pricing._Label(0., seed.departure_step, seed.origin_lane_idx, seed.cell_path, frozenset())
+    wrong = seed.claims - {min(seed.claims, key=repr)}
+    candidate = pricing._Candidate(1000. - seed.delay_s, seed.delay_s, label, seed.dest_lane_idx,
+                                   wrong, 0.)
+    # A cached certificate would hand back the true rows and hide the bad ones.
+    graph._search_cache.certified_claims.clear()
+    with pytest.raises(AssertionError, match='canonical results differ'):
+        pricing._canonical_candidate(candidate, graph, pricing.DualView({}, cfg), 0., cfg, 1000.,
+                                     frozenset(), model)
 
 
 @pytest.mark.parametrize('dt,clock', [(4., 0.), (.1, 0.), (.1, 1_000_000.)])

@@ -393,6 +393,11 @@ class HubRadiusDemand:
     min_od_separation_m: float = 200.0
     hub_seed: int = 0xA17F
     min_hub_gap_m: float = 100.0                     # clearance between terminal-airspace EDGES (no overlap)
+    # Lay the world out for permanent terminal walls — wall-extent hub spacing plus the foreign-wall
+    # customer filter — whatever cfg.terminal_airspace_always_active says. None follows the flag. Pin
+    # True to compare walls on vs off on ONE world: following the flag relocates most hubs and changes
+    # the request set, so the two arms would share no flight.
+    walled_layout: "bool | None" = None
 
     def __post_init__(self):
         """Validate timing/offset knobs and reject USS keys absent from ``n_hubs_per_uss``.
@@ -431,6 +436,21 @@ class HubRadiusDemand:
                     f"{name} references USS(es) {sorted(unknown)} absent from "
                     f"n_hubs_per_uss {sorted(hubs)}")
 
+    def _walled_layout_for(self, cfg: SimConfig) -> bool:
+        """Whether hubs are spaced, and customers filtered, for permanent terminal walls.
+
+        Resolves ``walled_layout`` against ``cfg.terminal_airspace_always_active`` (``None`` follows
+        the flag). Raises ``ValueError`` for walls on with the layout pinned off: bare-column spacing
+        lets one hub's permanent wall engulf a neighbour's approach and keeps customers inside foreign
+        walls, which A* can only deny.
+        """
+        if self.walled_layout is None:
+            return cfg.terminal_airspace_always_active
+        if cfg.terminal_airspace_always_active and not self.walled_layout:
+            raise ValueError("terminal_airspace_always_active needs walled_layout True or None "
+                             "(a bare-column layout puts customers inside foreign walls)")
+        return self.walled_layout
+
     def place_hubs(self, cfg: SimConfig, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Single-point hub centres, reject-sampled so no two hubs' terminal airspaces overlap.
 
@@ -453,8 +473,8 @@ class HubRadiusDemand:
             # just the column — reject-sample on that extent so neighbouring hubs' permanent walls never
             # overlap and foreign-block each other's exit lanes. A boundary-hex centre sits within one hex
             # pitch (SQRT3·circumradius) of the exit_radius edge, so that rigorously upper-bounds the ring
-            # for any gap ≥ 0. Flag off ⇒ the bare column radius (transient dwell walls don't engulf).
-            if cfg.terminal_airspace_always_active:
+            # for any gap ≥ 0. Unwalled layout ⇒ the bare column radius (transient dwell walls don't engulf).
+            if self._walled_layout_for(cfg):
                 term = Terminal(f"{uid}#0", self._pads_for(uid), tr, self.corridor_overlap_m)
                 return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
             return cfg.terminal_radius_m if tr is None else float(tr)
@@ -515,9 +535,9 @@ class HubRadiusDemand:
     def generate(self, cfg: SimConfig, rng: np.random.Generator) -> list[FlightRequest]:
         """Emit deliveries (and optional returns) from each hub to customers in its service disk.
 
-        Honours both timing modes and the per-USS Poisson / share paths; under
-        ``terminal_airspace_always_active`` it drops deliveries whose customer hex falls inside a
-        foreign hub's permanent wall (both legs).
+        Honours both timing modes and the per-USS Poisson / share paths; under a walled layout
+        (``walled_layout``, by default ``terminal_airspace_always_active``) it drops deliveries whose
+        customer hex falls inside a foreign hub's permanent wall (both legs).
 
         Parameters
         ------------
@@ -533,13 +553,13 @@ class HubRadiusDemand:
         demand_duration_s = cfg.effective_demand_duration_s
         hubs = self.place_hubs(cfg, np.random.default_rng(self.hub_seed))
 
-        # foreign-column filter (cfg.terminal_airspace_always_active): a delivery whose customer's hex
+        # foreign-column filter (walled layout, see _walled_layout_for): a delivery whose customer's hex
         # falls inside ANY OTHER hub's permanently-walled terminal cells is unreachable — A* finds the
         # goal hex is_blocked and denies it. Test the EXACT cell set the occupancy walls
         # (hexgrid.terminal_cells, keyed by terminal id just as register_static_terminal builds
         # static_term_cells), so a kept customer's endpoint hex is guaranteed clear for its own flight —
         # no geometric-margin gap. Own hub exempt. terminal_cells resolves radius=None like the wall path.
-        filter_foreign = cfg.terminal_airspace_always_active
+        filter_foreign = self._walled_layout_for(cfg)
         if filter_foreign:
             R = circumradius(cfg)
             foreign_cells: dict[tuple[int, int], set] = {}

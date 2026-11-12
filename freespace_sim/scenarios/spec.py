@@ -53,6 +53,8 @@ class DemandSpec:
     # and differ solely in FCFS filing order. None → the legacy data-dependent shift.
     request_clock_offset_s: "float | None" = None
     min_hub_gap_m: float = 100.0           # hub_radius: clearance between terminal-airspace edges (no overlap)
+    # hub_radius: lay hubs/customers out for permanent walls regardless of the wall flag; None follows it
+    walled_layout: "bool | None" = None
 
     def _hub_labels_counts(self) -> tuple[list[str], list[int]]:
         labels = self.uss or _DEFAULT_HUB_LABELS
@@ -83,6 +85,7 @@ class DemandSpec:
                 timing_mode=self.timing_mode,
                 request_clock_offset_s=self.request_clock_offset_s,
                 min_hub_gap_m=self.min_hub_gap_m,
+                walled_layout=self.walled_layout,
             )
         if self.pattern != "uniform":
             raise ValueError(

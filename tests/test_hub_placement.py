@@ -25,7 +25,7 @@ from freespace_sim.volumes import exit_radius
 
 def _radius_of(dm, uss, cfg):
     tr = dm._terminal_radius_for(uss)          # already collapses a per-USS dict to a scalar (or None)
-    if cfg.terminal_airspace_always_active:    # match place_hubs: taa reject-samples on the WIDER walled
+    if dm._walled_layout_for(cfg):             # match place_hubs: walled layouts reject-sample on the WIDER
         term = Terminal(f"{uss}#0", dm._pads_for(uss), tr, dm.corridor_overlap_m)   # extent (column+ring)
         return exit_radius(term, cfg) + SQRT3 * circumradius(cfg)
     return cfg.terminal_radius_m if tr is None else float(tr)

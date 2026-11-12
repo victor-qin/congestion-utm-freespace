@@ -161,8 +161,8 @@ def _deny(req, reason):
 def _absorb_many(services, ledger):
     """Feed already-committed reservations into EVERY service in ONE pass, grouped BY FLIGHT (volumes
     of one flight are committed contiguously — ``ledger.iter_committed`` guarantees this and points
-    back here), so the per-flight own-column drop in ``on_commit`` applies to pre-existing flights
-    exactly as it does to live commits — not volume-by-volume.
+    back here), so each service sees a pre-existing flight through ``on_commit`` exactly as it sees a
+    live commit — whole, not volume-by-volume.
 
     One pass, not one per service, because ``hexgrid.rasterize_ranges`` memoizes the geometry sweep by
     ``id(vol)`` behind a 1024-entry LRU precisely so a commit's several occupancy consumers share it —

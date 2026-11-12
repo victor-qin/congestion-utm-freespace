@@ -1209,7 +1209,7 @@ def test_unchecked_route_scoring_preserves_costs_without_publishing_certificates
         path, last = seed.cell_path, len(seed.cell_path) - 2
         assert all(graph.hop_allowed_for_role(a, b, first=i == 0, last=i == last)
                    for i, (a, b) in enumerate(zip(path, path[1:])))
-        assert pricing._route_hops_clear(graph, cfg, path)
+        assert pricing._route_hops_clear(graph, path, pricing._route_geometry(graph, cfg))
         candidate = candidate_for(candidate.label)
     graph._search_cache.certified_claims.clear()
     graph._search_cache.certified_columns.clear()

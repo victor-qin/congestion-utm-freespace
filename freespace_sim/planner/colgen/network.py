@@ -1643,8 +1643,8 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         For a caller that only needs a "certainly allowed" answer, such as pricing's
         volume-free certification, which defers every ``False`` to the full check.  A source's
         role entries are written before it is marked expanded, and an unexpanded arc simply
-        has no entry, so this unlocked read never returns ``True`` wrongly.  Keeping the
-        oracle's counters still is what lets a repeated pricing call ask it nothing at all.
+        has no entry, so this unlocked read never returns ``True`` wrongly.  It neither expands
+        nor counts, so pricing can consult it without the oracle's ``arc_cache_stats`` moving.
 
         Parameters
         ------------
@@ -2270,15 +2270,69 @@ def column_claims(
         _collect_column_claims(column, fg, cfg, offsets, corridor_start_step, windows)
         if _claims is None else _claims
     )
-    with fg._search_cache.lock:
-        fg._search_cache.certified_claims[certificate_key] = (
-            column.departure_step, result,
-            tuple((w.start - column.departure_step, w.stop - column.departure_step) for w in windows),
-        )
-        fg._search_cache.certified_claims.move_to_end(certificate_key)
-        while len(fg._search_cache.certified_claims) > _MAX_CERTIFIED_COLUMNS:
-            fg._search_cache.certified_claims.popitem(last=False)
+    _store_claim_certificate(
+        fg, certificate_key, column.departure_step, result,
+        tuple((w.start - column.departure_step, w.stop - column.departure_step) for w in windows),
+    )
     return result
+
+
+def _store_claim_certificate(
+    fg: FlightGraph,
+    key: tuple[Any, ...],
+    departure_step: int,
+    claims: frozenset[RowKey],
+    relative_windows: tuple[tuple[int, int], ...],
+) -> None:
+    """Insert one claim certificate as most recent, evicting beyond ``_MAX_CERTIFIED_COLUMNS``."""
+    cache = fg._search_cache
+    with cache.lock:
+        cache.certified_claims[key] = (departure_step, claims, relative_windows)
+        cache.certified_claims.move_to_end(key)
+        while len(cache.certified_claims) > _MAX_CERTIFIED_COLUMNS:
+            cache.certified_claims.popitem(last=False)
+
+
+def record_claim_certificate(
+    column: Column, fg: FlightGraph, cfg: SimConfig, claims: frozenset[RowKey]
+) -> None:
+    """Leave the claim-certificate cache as ``column_claims`` would after certifying ``column``.
+
+    For a caller that certified ``column`` by other means (pricing's volume-free path).  Later
+    ``column_claims`` calls then find the same certificates, in the same LRU order, as if the
+    route had gone through it: a same-departure or exactly translatable certificate is only
+    refreshed, anything else is replaced.
+
+    Parameters
+    ------------
+    - column (Column): the certified route; it must arrive by ``fg.max_step``.
+    - fg (FlightGraph): the graph whose cache holds the certificates.
+    - cfg (SimConfig): the graph's config, for the endpoint windows.
+    - claims (frozenset[RowKey]): the route's exact claim rows.
+
+    Return
+    --------
+    - output (None): updates ``fg._search_cache.certified_claims``.
+    """
+    path = tuple(tuple(cell) for cell in column.cell_path)
+    key = (column.flight_id, column.level, column.origin_lane_idx, column.dest_lane_idx, path)
+    cache = fg._search_cache
+    with cache.lock:
+        certificate = cache.certified_claims.get(key)
+        if certificate is not None:
+            cache.certified_claims.move_to_end(key)
+    if certificate is not None and certificate[0] == column.departure_step:
+        return
+    lane_steps = (0 if column.origin_lane_idx is None else
+                  fg.origin_lanes[column.origin_lane_idx].steps)
+    arrival = column.departure_step + fg.takeoff_steps[column.level] + lane_steps + len(path) - 1
+    windows = tuple(
+        (w.start - column.departure_step, w.stop - column.departure_step)
+        for w in _column_endpoint_steps(column, fg, cfg, arrival)
+    )
+    if certificate is not None and certificate[2] == windows:
+        return
+    _store_claim_certificate(fg, key, column.departure_step, claims, windows)
 
 
 __all__ = [

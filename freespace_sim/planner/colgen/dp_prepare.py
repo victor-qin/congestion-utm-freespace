@@ -254,7 +254,7 @@ def _role_mask(fg: FlightGraph, source: Cell, target: Cell) -> int:
 
     The lazy oracle already stores exactly this mask, so ask it for the packed value when
     it is present and fall back to four ``hop_allowed_for_role`` calls otherwise --
-    ``forbidden_hops`` is a plain frozenset on a transported graph, where only the public
+    ``forbidden_hops`` is a plain frozenset on a hand-built graph, where only the public
     path works. The two agree by construction: ``_LazyForbiddenHops.allows`` is itself a
     bit test against the same mask, which the parity test asserts arc for arc.
 

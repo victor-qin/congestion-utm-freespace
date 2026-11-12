@@ -436,10 +436,11 @@ def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: 
 
 def lattice_subdivision(p0, p1, segment_len_m: float) -> list[tuple[tuple[float, float, float],
                                                                      tuple[float, float, float]]]:
-    """Split one corner-to-corner edge into the sub-segments :func:`build_reservation_from_corners` boxes.
+    """Split one corner-to-corner edge into the builder's sub-segments.
 
-    The same scalar arithmetic as the builder's loop, so the points are bit-identical to the
-    ones it stamps into its centreline and boxes.  Callers that need the geometry of one lattice
+    The same scalar arithmetic as :func:`build_reservation_from_corners`' loop (which keeps
+    its own inline copy: it is A*'s hot path), so the points are bit-identical to the ones it
+    stamps into its centreline and boxes.  Callers that need the geometry of one lattice
     hop without building a reservation (colgen's per-hop wall verdicts and its canonical
     centreline) use this instead of restating it.  A nominal lattice edge can be a few ulps
     longer than ``segment_len_m`` and so split into two sub-segments.

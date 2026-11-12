@@ -189,11 +189,19 @@ def test_final_tied_winner_remains_certified_after_more_than_eight_losers():
     assert pricing_pool._certified_result(result[1], (), graph, params, cfg)
 
 
-def test_check_mode_rejects_reused_claims_that_differ_from_certification():
-    """The guard compares reused pre-check rows with a fresh certification, not with themselves."""
+@pytest.mark.parametrize("fast", [True, False])
+def test_check_mode_rejects_reused_claims_that_differ_from_certification(monkeypatch, fast):
+    """The guard compares reused pre-check rows with a fresh certification, not with themselves.
+
+    Both the volume-free path and the reference reusing the rows store them as the route's
+    claim certificate; the check must not read that certificate back.
+    """
+    if not fast:
+        monkeypatch.setattr(pricing, "_fast_canonical", lambda *args, **kwargs: pricing._DEFER)
     cfg, params, graph, _catalog, seed = _context()
     model = cost_model(cfg, params)
-    label = pricing._Label(0., seed.departure_step, seed.origin_lane_idx, seed.cell_path, frozenset())
+    label = pricing._Label(0., seed.departure_step, seed.origin_lane_idx, seed.cell_path,
+                           frozenset())
     wrong = seed.claims - {min(seed.claims, key=repr)}
     candidate = pricing._Candidate(1000. - seed.delay_s, seed.delay_s, label, seed.dest_lane_idx,
                                    wrong, 0.)
@@ -201,6 +209,52 @@ def test_check_mode_rejects_reused_claims_that_differ_from_certification():
     graph._search_cache.certified_claims.clear()
     with pytest.raises(AssertionError, match='canonical results differ'):
         pricing._canonical_candidate(candidate, graph, pricing.DualView({}, cfg), 0., cfg, 1000.,
+                                     frozenset(), model)
+
+
+def test_fast_certification_leaves_claim_certificates_as_the_reference_does():
+    """Later reference certifications find the same certificates, in the same LRU order."""
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    view = pricing.DualView({}, cfg)
+    reference = build_flight_graph(graph.request, cfg, (), params)
+    pricing.seed_column(reference, cfg, model=model)
+    other = next(c for c in graph.corridor_cells if hg.hex_distance(c, seed.cell_path[1]) == 1
+                 and c not in seed.cell_path and hg.hex_distance(c, seed.cell_path[2]) == 1)
+    detour = (seed.cell_path[0], seed.cell_path[1], other, *seed.cell_path[2:])
+    for cell in detour:  # expanded, as a pricing search would have
+        graph.outgoing_neighbors(cell)
+    for path, departure in ((seed.cell_path, seed.departure_step),
+                            (seed.cell_path, seed.departure_step + 1),
+                            (detour, seed.departure_step),
+                            (seed.cell_path, seed.departure_step + 2)):
+        label = pricing._Label(0., departure, seed.origin_lane_idx, path, frozenset())
+        claims = pricing._path_claims(graph, cfg, label, seed.dest_lane_idx)
+        reused = pricing._Candidate(0., 0., label, seed.dest_lane_idx, claims, 0.)
+        assert pricing._fast_canonical(reused, graph, 0., cfg, 1000., frozenset(),
+                                       model) is not pricing._DEFER
+        pricing._reference_canonical(pricing._Candidate(0., 0., label, seed.dest_lane_idx),
+                                     reference, view, 0., cfg, 1000., frozenset(), model,
+                                     validate=True, reuse=False)
+        assert list(graph._search_cache.certified_claims.items()) == list(
+            reference._search_cache.certified_claims.items())
+
+
+def test_fast_certification_defers_when_translation_and_graph_disagree():
+    """A hand-built graph whose customer cell is not the request's goes to the reference."""
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    moved = replace(graph, origin_cell=seed.cell_path[1])
+    path = seed.cell_path[1:]
+    label = pricing._Label(0., seed.departure_step, None, path, frozenset())
+    claims = pricing._path_claims(moved, cfg, label, None)
+    candidate = pricing._Candidate(0., 0., label, None, claims, 0.)
+    # The graph's own checks pass; only the translation knows the true customer cell.
+    assert pricing._route_hops_clear(moved, path, pricing._route_geometry(moved, cfg))
+    assert pricing._fast_canonical(candidate, moved, 0., cfg, 1000., frozenset(),
+                                   model) is pricing._DEFER
+    with pytest.raises(ValueError, match="customer cell"):
+        pricing._canonical_candidate(candidate, moved, pricing.DualView({}, cfg), 0., cfg, 1000.,
                                      frozenset(), model)
 
 

@@ -34,7 +34,7 @@ import weakref
 import heapq
 import itertools
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Mapping, Set as AbstractSet
+from collections.abc import Iterable, Iterator, Mapping, Set as AbstractSet
 from dataclasses import dataclass, replace
 from typing import Any, Hashable, NamedTuple
 
@@ -61,6 +61,7 @@ from .network import (
     FlightGraph,
     RowKey,
     column_claims,
+    record_claim_certificate,
     shifted_claims_are_exact,
 )
 from .objective import DELAY_MODEL, CostModel, cost_model
@@ -1581,12 +1582,21 @@ def _canonical_candidate(
 
 
 @contextlib.contextmanager
-def _without_claim_certificates(fg: FlightGraph):
+def _without_claim_certificates(fg: FlightGraph) -> Iterator[None]:
     """Hide the graph's claim certificates so a check recomputes rather than reads them.
 
     ``column_claims`` stores whatever rows it returns, reused ones included; an oracle that
     read that store back would compare the reused rows with themselves.  The graph's lock is
     held throughout so no other thread sees the empty store.  Debug-only (check mode).
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the graph whose certificate cache is set aside.
+
+    Return
+    --------
+    - output (Iterator[None]): a context with an empty certificate cache; the original cache
+      object is restored on exit, whatever the check wrote is discarded.
     """
     cache = fg._search_cache
     with cache.lock:
@@ -1602,14 +1612,35 @@ _DEFER = object()
 
 
 class _RouteMetrics(NamedTuple):
-    """The two trajectory metrics canonical cost reads from an accepted intent."""
+    """The two trajectory metrics canonical cost reads from an accepted intent.
+
+    Attributes
+    ------------
+    - ground_s (float): the intent's reported ground delay, ``(departure - base) * dt``.
+    - detour_m (float): the intent's ``air_detour_m``.
+
+    """
 
     ground_s: float
     detour_m: float
 
 
 class _RouteGeometry(NamedTuple):
-    """Per-graph constants of canonical certification, built once by :func:`_route_geometry`."""
+    """Per-graph constants of canonical certification, built once by :func:`_route_geometry`.
+
+    Attributes
+    ------------
+    - cfg (SimConfig): the config the constants were built with (the memo key).
+    - reference_m (float): the request's ``enroute_reference_m``.
+    - endpoints_clear (bool): both endpoint hover cylinders clear every static wall.  Built at
+      ``t0 = 0``, so it is a spatial verdict only when ``hop_verdicts_exact`` also holds (every
+      wall starts by 0).
+    - hop_verdicts_exact (bool): the lazy per-hop oracle was built for this graph and every
+      wall spans the oracle's relative clock, so its role verdicts are exact spatial verdicts.
+    - endpoints_match_graph (bool): the translation's terminals, lanes and customer cells are
+      the graph's.
+
+    """
 
     cfg: SimConfig
     reference_m: float
@@ -1643,9 +1674,10 @@ def _route_geometry(fg: FlightGraph, cfg: SimConfig) -> _RouteGeometry:
     - output (_RouteGeometry): the memoized per-graph constants.
     """
     cache = fg._search_cache
-    with cache.lock:
-        geometry = cache.route_geometry
-    if geometry is not None and geometry.cfg == cfg:
+    # Unlocked: one attribute read, and a stale or racing value is only rebuilt.  Identity
+    # first because pricing passes the graph's own config and `SimConfig.__eq__` is not cheap.
+    geometry = cache.route_geometry
+    if geometry is not None and (geometry.cfg is cfg or geometry.cfg == cfg):
         return geometry
     request = fg.request
     origin_terminal = as_terminal(request.origin_terminal)
@@ -1696,47 +1728,41 @@ def _route_geometry(fg: FlightGraph, cfg: SimConfig) -> _RouteGeometry:
     return geometry
 
 
-def _route_hops_clear(fg: FlightGraph, cfg: SimConfig, path: tuple[Cell, ...]) -> bool:
+def _route_hops_clear(
+    fg: FlightGraph, path: tuple[Cell, ...], geometry: _RouteGeometry
+) -> bool:
     """Whether every hop is adjacent, inside the corridor and wall-safe for its position.
 
-    With the lazy hop oracle this is one read of its cached role mask per hop: the mask is 0
-    for a non-adjacent, out-of-corridor or not-yet-expanded pair and carries the exact per-role wall verdict
-    (first hop, last hop, both, neither), built on the builder's own sub-boxes and tags.  A
-    route clears the walls iff each hop clears for its role and both endpoint cylinders clear.
-    Without such an oracle built for this graph (an eager ``forbidden_hops`` set only knows
-    the union over roles) a route with walls is never vouched for; without walls the corridor,
-    adjacency and forbidden-hop checks are made directly.
+    One read of the lazy hop oracle's cached role mask per hop: the mask is 0 for a
+    non-adjacent, out-of-corridor or not-yet-expanded pair, and otherwise carries the exact
+    per-role wall verdict (first hop, last hop, both, neither) built on the builder's own
+    sub-boxes and tags.  A route clears the walls iff each hop clears for its role and both
+    endpoint cylinders clear.  Without an oracle built for this graph (an eager
+    ``forbidden_hops`` set only knows the union over roles, and only hand-built graphs carry
+    one) nothing is vouched for.
 
     Parameters
     ------------
     - fg (FlightGraph): the flight graph.
-    - cfg (SimConfig): the graph's config.
     - path (tuple[Cell, ...]): the route's cells, at least two.
+    - geometry (_RouteGeometry): the graph's :func:`_route_geometry`.
 
     Return
     --------
     - output (bool): True only when the reference's corridor, adjacency, forbidden-hop and
       static-wall checks are all certain to pass.
     """
-    last = len(path) - 2
-    geometry = _route_geometry(fg, cfg)
-    if geometry.hop_verdicts_exact:
-        if fg.static_walls and not geometry.endpoints_clear:
-            return False
-        # Already-expanded verdicts only: a DP route's hops were all expanded when its search
-        # was prepared, and an unexpanded one just defers.
-        allows = fg.forbidden_hops.allows_known
-        return all(
-            allows(source, target, first=index == 0, last=index == last)
-            for index, (source, target) in enumerate(zip(path, path[1:]))
-        )
-    if fg.static_walls:
+    if not geometry.hop_verdicts_exact:
         return False
-    corridor = fg.corridor_cells
+    if fg.static_walls and not geometry.endpoints_clear:
+        return False
+    # Already-expanded verdicts only: a DP route's hops were all expanded when its search
+    # was prepared, and an unexpanded one just defers.
+    allows = fg.forbidden_hops.allows_known
+    last = len(path) - 2
     return all(
-        hg.hex_distance(source, target) == 1 and source in corridor and target in corridor
-        and (source, target) not in fg.forbidden_hops
-        for source, target in zip(path, path[1:])
+        allows(source, target, first=index == 0, last=index == last)
+        for index, (source, target) in enumerate(zip(path, path[1:]))
     )
 
 
@@ -1801,7 +1827,7 @@ def _canonical_route_metrics(
         return _DEFER
     if departure > base + int(math.floor(cfg.max_ground_delay_s / dt + 1e-12)):
         return _DEFER
-    if not _route_hops_clear(fg, cfg, path):
+    if not _route_hops_clear(fg, path, geometry):
         return _DEFER
     flown = enroute_flown_m(lattice_centerline(path, cfg.flight_levels_m[0], cfg),
                             request.origin, request.dest, origin_terminal, dest_terminal, cfg)
@@ -1861,6 +1887,9 @@ def _fast_canonical(
         delay_s=cost,
         claims=candidate.claims,
     )
+    # The reference certifies through `column_claims`, which caches a claim certificate;
+    # leave that cache as it would, so later reference certifications run identically.
+    record_claim_certificate(column, fg, cfg, candidate.claims)
     reduced_cost = model.reduced_cost(
         benefit=benefit, cost=cost, dual_cost=candidate.dual_cost, pi_f=pi_f
     )
@@ -1956,6 +1985,16 @@ def _assert_same_canonical(
 
     Compares the verdict, the reduced cost and delay by float hex, the column (claims as a
     set) and the air-detour seconds each registered as certified.
+
+    Parameters
+    ------------
+    - actual (tuple[float, Column] | None): the answer pricing returns.
+    - expected (tuple[float, Column] | None): the reference certification's answer.
+    - fg (FlightGraph): the graph whose certified-column registry both answers are in.
+
+    Return
+    --------
+    - output (None): returns quietly on agreement; raises ``AssertionError`` otherwise.
     """
     if actual is None or expected is None:
         if actual is not expected:

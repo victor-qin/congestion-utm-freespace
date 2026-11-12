@@ -121,6 +121,28 @@ def _lane_index(lanes, cell: tuple[int, int]) -> int:
     return next(index for index, lane in enumerate(lanes) if lane.cell == cell)
 
 
+def _rewalled(fg, cfg: SimConfig, walls):
+    """Return ``fg`` with ``walls`` and a hop oracle built for exactly that graph.
+
+    The graph builder refuses some wall layouts outright, so tests assemble them by hand.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the graph to copy.
+    - cfg (SimConfig): its config.
+    - walls (tuple[Volume4D, ...]): the replacement static walls.
+
+    Return
+    --------
+    - output (FlightGraph): a fresh-cache copy whose wall index and lazy oracle use ``walls``.
+    """
+    index = network_module._WallSpatialIndex(walls, max(256.0, 4.0 * cfg.corridor_width_m))
+    walled = replace(fg, static_walls=walls, _wall_index=index)
+    return replace(walled, forbidden_hops=network_module._LazyForbiddenHops(
+        walled.corridor_cells, walls, walled.request, walled.origin_terminal,
+        walled.dest_terminal, walled.origin_lanes, walled.dest_lanes, cfg, index))
+
+
 def _precheck_canonical(fg, cfg: SimConfig, raw: Column):
     """Canonicalize ``raw`` as pricing does, with its pre-check claims and dual attached.
 
@@ -986,18 +1008,26 @@ def test_resampled_endpoint_hop_with_separate_tags_is_not_falsely_forbidden():
     assert fast is not pricing._DEFER and result is not None
 
     # A foreign wall over the origin pad touches no corridor box, only the origin cylinder:
-    # the per-graph endpoint verdict must catch it.  (The graph builder refuses such a
-    # request outright, so assemble the walled graph and its own hop oracle by hand.)
-    walls = fg.static_walls + (permanent_terminal_reservation(origin, Terminal("C", 1, radius=30.0), cfg),)
-    index = network_module._WallSpatialIndex(walls, max(256.0, 4.0 * cfg.corridor_width_m))
-    walled = replace(fg, static_walls=walls, _wall_index=index)
-    walled = replace(walled, forbidden_hops=network_module._LazyForbiddenHops(
-        walled.corridor_cells, walls, walled.request, walled.origin_terminal,
-        walled.dest_terminal, walled.origin_lanes, walled.dest_lanes, cfg, index))
+    # the per-graph endpoint verdict must catch it.
+    pad_wall = permanent_terminal_reservation(origin, Terminal("C", 1, radius=30.0), cfg)
+    walled = _rewalled(fg, cfg, fg.static_walls + (pad_wall,))
     assert walled.hop_allowed_for_role(*path, first=True, last=True)
     assert not pricing._route_geometry(walled, cfg).endpoints_clear
     fast, result = _precheck_canonical(walled, cfg, raw)
     assert fast is pricing._DEFER and result is None
+
+    # Hop verdicts that cannot vouch for this route make pricing defer; the reference still
+    # accepts it (check mode compares the two).
+    late = _rewalled(fg, cfg, tuple(replace(wall, t_start=1.0) for wall in fg.static_walls))
+    foreign = replace(fg, corridor_cells=frozenset(fg.corridor_cells))  # not the oracle's own
+    excluded = _rewalled(fg, cfg, fg.static_walls)
+    excluded.outgoing_neighbors(path[0])
+    # This one-hop route uses its arc as first AND last; keep every other role allowed.
+    excluded.forbidden_hops._roles[path] = (
+        network_module._ALL_ARC_ROLES & ~network_module._ARC_FIRST_LAST)
+    for graph in (late, foreign, excluded):
+        fast, result = _precheck_canonical(graph, cfg, raw)
+        assert fast is pricing._DEFER and result is not None
 
 
 def test_exact_static_hops_cover_empty_terminal_cell_projection():

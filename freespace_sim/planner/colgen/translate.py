@@ -304,14 +304,9 @@ def _retime_lattice_reservation(
       timed centreline. Raises ``RuntimeError`` when the builder output length does not match
       the column's lattice subdivisions.
     """
-    nsubs: list[int] = []
     segment_len = cfg.corridor_segment_len_m
-    for first, second in zip(corners, corners[1:]):
-        dx = float(second[0]) - float(first[0])
-        dy = float(second[1]) - float(first[1])
-        dz = float(second[2]) - float(first[2])
-        length = math.sqrt(dx * dx + dy * dy + dz * dz)
-        nsubs.append(max(1, math.ceil(length / segment_len)))
+    nsubs = [len(lattice_subdivision(first, second, segment_len))
+             for first, second in zip(corners, corners[1:])]
 
     edge_count = sum(nsubs)
     if len(volumes) != edge_count + 2 or len(centerline) != edge_count + 1:

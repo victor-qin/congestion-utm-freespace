@@ -399,6 +399,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="colgen: with --colgen-workers, an idle pricing worker takes the last "
                         "unsent flight of the busiest worker and keeps it for later sweeps. "
                         "Answer-neutral; balances the slowest worker at high worker counts")
+    p.add_argument("--colgen-min-price-duals", action="store_true", default=None,
+                   help="colgen (Gurobi only): after each master LP, re-solve its dual for the "
+                        "optimal duals with the smallest total capacity price and price against "
+                        "those. Answer-affecting; a round whose re-solve fails keeps the LP's "
+                        "duals and is counted in min_price_dual_fallbacks")
     p.add_argument("--colgen-seed-ladder", type=int, default=None, metavar="STEPS",
                    help="colgen: seed each flight's column with STEPS retimed copies of itself "
                         "before the first LP (default 20; 0 disables). Pure clock translation, so "
@@ -488,6 +493,7 @@ def _colgen_overrides(args) -> dict:
             ("max_air_overrun_hops", args.colgen_max_air_overrun),
             ("n_pricing_workers", args.colgen_workers),
             ("pricing_work_stealing", args.colgen_work_stealing),
+            ("min_price_duals", args.colgen_min_price_duals),
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),

@@ -167,6 +167,7 @@ def test_colgen_flags_reach_the_planner_params():
         "--colgen-max-air-overrun", "3",
         "--colgen-workers", "4",
         "--colgen-work-stealing",
+        "--colgen-min-price-duals",
         "--colgen-seed-ladder", "30",
         "--colgen-greedy-budget-rate", "1.5",
         "--colgen-ip-time-limit", "300",
@@ -188,6 +189,7 @@ def test_colgen_flags_reach_the_planner_params():
     assert params.max_air_overrun_hops == 3
     assert params.n_pricing_workers == 4
     assert params.pricing_work_stealing is True
+    assert params.min_price_duals is True
     assert params.seed_ladder_steps == 30
     assert params.greedy_budget_s_per_flight == 1.5
 
@@ -212,6 +214,7 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     # silently disable the ladder rather than merely resetting a budget.
     assert defaults.n_pricing_workers == 0
     assert defaults.pricing_work_stealing is False
+    assert defaults.min_price_duals is False
     assert defaults.seed_ladder_steps == 20
     assert defaults.greedy_budget_s_per_flight == 0.0
     # Bootstrap is ON at K=1, and the two fields move together: `bootstrap_roots=1` works
@@ -262,6 +265,7 @@ def test_zero_disables_the_ladder_and_the_greedy_rather_than_erroring():
         ("--colgen-max-air-overrun", "3"),
         ("--colgen-workers", "4"),
         ("--colgen-work-stealing",),
+        ("--colgen-min-price-duals",),
         ("--colgen-seed-ladder", "30"),
         ("--colgen-greedy-budget-rate", "1.5"),
         ("--colgen-ip-time-limit", "300"),

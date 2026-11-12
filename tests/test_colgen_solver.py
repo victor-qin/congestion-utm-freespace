@@ -737,6 +737,50 @@ def test_highs_flight_row_owns_its_maximize_dual():
     assert master.flight_duals[9] == pytest.approx(123.0)
 
 
+def test_min_price_duals_move_a_free_row_price_onto_its_flight():
+    """The selected duals are optimal, dual-feasible, and price no row more than they must.
+
+    Row ``s`` is claimed only by flight 1's column, so its flight row and ``s`` bind together
+    and any split of the column's value between ``pi_1`` and ``mu_s`` is optimal. Row ``r`` is
+    contested by flights 2 and 3, whose detours cost 10 s, so ``mu_r = 10`` in every optimal
+    dual. Presolve is off so the master's barrier returns the centre of that set, as it does at
+    scale, instead of a vertex.
+    """
+
+    pytest.importorskip("gurobipy")
+    M = 1000.0
+    s, r = RowKey.cell((5, 0), 0, 1), RowKey.cell((0, 0), 0, 1)
+    master = RestrictedMaster((1, 2, 3), RowIndex(), _params(solver="gurobi", M=M))
+    columns = [_synthetic_column(1, 0.0, frozenset({s}))]
+    for flight_id in (2, 3):
+        columns.append(_synthetic_column(flight_id, 0.0, frozenset({r})))
+        columns.append(_synthetic_column(flight_id, 10.0, frozenset(), departure_step=1))
+    for column in columns:
+        master.add_column(column)
+    master.materialize_rows([s, r])
+    master.backend._model.Params.Presolve = 0
+    z, lp_rows, _ = master.solve_lp()
+    lp_flights = master.flight_duals
+    assert lp_rows[s] > 1.0  # the master really did split the free price
+
+    selection = master.select_min_price_duals()
+
+    assert selection.status == "OPTIMAL"
+    pi, mu = selection.flight_duals, selection.row_duals
+    assert (master.flight_duals, master.last_row_duals) == (pi, mu)
+    for column in columns:
+        claimed = sum(mu.get(row, 0.0) for row in column.claims)
+        assert pi[column.flight_id] + claimed >= M - column.delay_s - 1e-6
+    assert selection.dual_objective == pytest.approx(
+        sum(pi.values()) + sum(mu.values()), abs=1e-9
+    )
+    assert z - 1e-6 <= selection.dual_objective <= z + 1e-9 * max(1.0, abs(z)) + 1e-6
+    assert sum(mu.values()) <= sum(lp_rows.values())
+    assert mu[s] == pytest.approx(0.0, abs=1e-6)
+    assert mu[r] == pytest.approx(10.0, abs=1e-4)
+    assert pi[1] == pytest.approx(lp_flights[1] + lp_rows[s], abs=1e-4) == pytest.approx(M)
+
+
 def test_backend_native_mip_gap_is_scaled_out_of_big_m_revenue():
     params = _params(M=1000.0, ip_gap=0.1)
     backend = create_backend((1, 2), params)
@@ -2158,6 +2202,15 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         assert first.stats[key] == second.stats[key]
 
 
+def test_min_price_duals_refuse_a_highs_master():
+    """The selection re-solves the dual through Gurobi's matrix API; HiGHS has no such step."""
+
+    cfg = _cfg()
+    request = _request(1, (-2, 0), (2, 0), cfg)
+    with pytest.raises(ValueError, match="min_price_duals needs the Gurobi backend"):
+        ColGenSolver().solve([request], cfg, (), _params(min_price_duals=True))
+
+
 def test_single_level_guard():
     cfg = replace(_cfg(), flight_levels_m=(30.0, 70.0, 110.0))
     request = _request(1, (-2, 0), (2, 0), cfg)
@@ -2189,7 +2242,11 @@ def test_backend_parity():
 
 
 def test_backend_parity_when_final_integer_master_runs():
-    """HiGHS and Gurobi return the same answer when the final IP cannot be skipped."""
+    """HiGHS and Gurobi return the same answer when the final IP cannot be skipped.
+
+    So does Gurobi pricing on min-price duals, whose bound must still hold: it adds the
+    reduced costs to ``b^T y`` of the duals it priced against, not to the LP objective.
+    """
 
     pytest.importorskip("gurobipy")
     cfg = _cfg(max_ground_delay_s=48.0)
@@ -2208,10 +2265,22 @@ def test_backend_parity_when_final_integer_master_runs():
     controls = {**controls, "seed_ladder_steps": 0}
     highs = ColGenSolver().solve(requests, cfg, (), _params(solver="highs", **controls))
     gurobi = ColGenSolver().solve(requests, cfg, (), _params(solver="gurobi", **controls))
+    rounds: list[dict] = []
+    min_price = ColGenSolver().solve(
+        requests, cfg, (), _params(solver="gurobi", min_price_duals=True, **controls),
+        on_iteration=rounds.append,
+    )
 
     assert highs.stats["ip_skipped"] is False
     assert gurobi.stats["ip_skipped"] is False
     assert highs.stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
+    assert min_price.stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
+    assert rounds and {r["dual_selection"] for r in rounds} <= {"min_price", "fallback"}
+    assert min_price.stats["min_price_dual_fallbacks"] == sum(
+        r["dual_selection"] == "fallback" for r in rounds
+    )
+    assert gurobi.stats["min_price_dual_fallbacks"] == 0
+    assert max(min_price.stats["cost_lower_bounds"]) <= min_price.stats["objective"] + 1e-6
     assert sorted(column.delay_s for column in highs.columns.values()) == pytest.approx(
         sorted(column.delay_s for column in gurobi.columns.values())
     )

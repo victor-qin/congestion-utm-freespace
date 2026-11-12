@@ -891,6 +891,7 @@ def _pre_master_timeout_result(
             "n_materialized_rows": 0,
             "lazy_rows_added": 0,
             "lazy_row_rounds": 0,
+            "min_price_dual_fallbacks": 0,
             "time_limit_overrun_s": max(0.0, elapsed_s - params.time_limit_s),
             "elapsed_s": elapsed_s,
         },
@@ -1085,6 +1086,7 @@ class ColGenSolver:
                     "n_materialized_rows": 0,
                     "lazy_rows_added": 0,
                     "lazy_row_rounds": 0,
+                    "min_price_dual_fallbacks": 0,
                     "time_limit_overrun_s": 0.0,
                     "elapsed_s": time.monotonic() - started,
                 },
@@ -1161,6 +1163,11 @@ class ColGenSolver:
             seed=cfg.seed,
             fixed_loads=committed_loads,
         )
+        if params.min_price_duals and _backend_name(master) != "gurobi":
+            raise ValueError(
+                "min_price_duals needs the Gurobi backend, but this solve resolved to "
+                f"{_backend_name(master)!r}; set solver='gurobi' or turn min_price_duals off"
+            )
         time_to_master_s = time.monotonic() - started
         seedless_flights: set[int] = set(graph_infeasible)
         seeds: dict[int, Column] = {}
@@ -1350,6 +1357,7 @@ class ColGenSolver:
         heuristic_costs: list[float] = []
         lazy_rows_added = 0
         lazy_row_rounds = 0
+        min_price_dual_fallbacks = 0
         termination_reason = "iteration_limit"
         last_upper_bound = math.inf
         last_lp_objective = -math.inf
@@ -1441,6 +1449,22 @@ class ColGenSolver:
                 last_lp_objective = float(lp_objective)
                 last_x = np.asarray(x, dtype=float)
                 columns_at_lp = len(master.columns)
+                # `dual_objective` is b^T y of the duals pricing uses, which is what the
+                # Lagrangian bound below must add the reduced costs to.
+                dual_selection, dual_objective = "lp", last_lp_objective
+                dual_selection_status = None
+                if params.min_price_duals:
+                    master.backend.time_limit_s = max(1e-6, pricing_deadline - time.monotonic())
+                    selection = _timed("select_duals", master.select_min_price_duals)
+                    dual_selection_status = selection.status
+                    if selection.row_duals is None:
+                        dual_selection = "fallback"
+                        min_price_dual_fallbacks += 1
+                        log.info("  min-price duals: %s, pricing on the LP's duals",
+                                 selection.status)
+                    else:
+                        dual_selection, dual_objective = "min_price", selection.dual_objective
+                        capacity_duals = dict(master.last_row_duals)
 
                 # LNS needs something to start from; `best_heuristic` is the greedy seed on
                 # iteration 1 and a real incumbent after, so it is never empty here -- but
@@ -1758,7 +1782,7 @@ class ColGenSolver:
                 # Only an exact sweep supplies a new valid global bound. Between
                 # exact sweeps retain the previous certificate (infinity initially).
                 raw_upper_bound = (
-                    master.upper_bound(last_lp_objective, pricing_upper_bounds)
+                    master.upper_bound(dual_objective, pricing_upper_bounds)
                     if pricing_complete and pricing_exact else last_upper_bound
                 )
                 # Each iteration's value is a valid global upper bound.  Their
@@ -1909,6 +1933,12 @@ class ColGenSolver:
                         "iteration_ip": dict(iteration_ip_info),
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
+                        # Which duals this round priced against: the LP's own ("lp"), the
+                        # min-price re-selection, or the LP's after a failed one ("fallback",
+                        # with the second solve's Gurobi status).
+                        "dual_selection": dual_selection,
+                        "dual_selection_status": dual_selection_status,
+                        "dual_objective": dual_objective,
                     })
                 # Preserve failed-sweep diagnostics before leaving for final IP, without
                 # treating partial scores as a proof of convergence.
@@ -2402,6 +2432,7 @@ class ColGenSolver:
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,
+            "min_price_dual_fallbacks": min_price_dual_fallbacks,
             "time_limit_overrun_s": max(0.0, elapsed_s - params.time_limit_s),
             "elapsed_s": elapsed_s,
         }

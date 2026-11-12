@@ -241,6 +241,13 @@ class ColGenParams:
     # solve (see `pricing_pool._Dispatch`). Answer-neutral -- results never depend on
     # which worker prices a flight -- but ownership then depends on timing.
     pricing_work_stealing: bool = False
+    # Gurobi only. After each complete master LP, re-solve its dual for the optimal duals
+    # with the smallest total capacity price (flight duals absorb the rest) and price
+    # against those; a round whose re-solve fails keeps the LP's own duals (see
+    # `GurobiBackend.select_min_price_duals`). Answer-affecting: it changes which columns
+    # pricing finds, never the validity of the bound. Off by default: on the 1,537-flight
+    # cohort it cut pricing 33% but its sparser pool's final IP cost 4% more (HISTORY.md).
+    min_price_duals: bool = False
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -358,7 +365,7 @@ class ColGenParams:
         object.__setattr__(self, "ip_time_limit_s", ip_limit)
 
         for name in ("iteration_ip_eager", "iteration_ip_search", "cheap_pricing",
-                     "seed_nominal_routes", "pricing_work_stealing"):
+                     "seed_nominal_routes", "pricing_work_stealing", "min_price_duals"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if not self.iteration_ip_search and not self.iteration_ip_eager:

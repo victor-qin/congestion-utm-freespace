@@ -1948,6 +1948,34 @@ def test_a_malformed_gurobi_env_var_names_itself(monkeypatch):
         master_module.gurobi_lp_method()
 
 
+@pytest.mark.parametrize(
+    ("cpus", "env", "expected"),
+    [
+        (48, None, 12),  # a whole SuperCloud node
+        (12, None, 12),
+        (11, None, 1),  # never 2..11: exactly 2 threads is the pathological IP count
+        (4, "4", 4),  # an explicit count wins in both directions
+        (48, "16", 16),
+        (48, "0", 0),  # Gurobi's own "every core"
+    ],
+)
+def test_gurobi_threads_default_to_twelve_only_where_twelve_cpus_are_available(
+    monkeypatch, cpus, env, expected
+):
+    """The master's Gurobi runs 12 threads when this process may use 12 CPUs, else 1.
+
+    The CPU count is the process's own grant (a Slurm job on a bigger node must not take
+    the threaded default), and ``COLGEN_GUROBI_THREADS`` overrides the default either way.
+    """
+
+    monkeypatch.setattr(master_module, "_available_cpus", lambda: cpus)
+    if env is None:
+        monkeypatch.delenv("COLGEN_GUROBI_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("COLGEN_GUROBI_THREADS", env)
+    assert master_module.gurobi_threads() == expected
+
+
 @pytest.mark.parametrize("columns_per_flight", [1, 3])
 def test_solver_revalidates_replaced_pricing_results(monkeypatch, columns_per_flight):
     """Changed sweep payloads must recover canonical claims and costs before entering the LP."""

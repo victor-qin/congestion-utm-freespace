@@ -286,3 +286,9 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   agrees. An oracle must hide answer-neutral caches that store returned values
   (`pricing._without_claim_certificates`). Files: `freespace_sim/planner/colgen/pricing.py`,
   `freespace_sim/planner/colgen/network.py`.
+
+- 2026-11-12T19:00Z [CODE/TOOL] The master's Gurobi `Threads` default is machine-dependent: 12
+  when the process may use at least 12 CPUs, else 1 (`COLGEN_GUROBI_THREADS` overrides). The
+  count changes the duals and the IP (exactly 2 threads is ~10% worse), so two colgen runs are
+  comparable only at equal `stats["gurobi_threads"]`; with no env var, a machine with fewer than
+  12 CPUs and one with more no longer run the same setting. Files: `freespace_sim/planner/colgen/master.py`.

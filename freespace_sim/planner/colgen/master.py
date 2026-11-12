@@ -113,16 +113,41 @@ def _env_int(name: str, default: int) -> int:
         ) from exc
 
 
-def gurobi_threads() -> int:
-    """``Threads`` for the master's Gurobi model, one by default.
+_DEFAULT_GUROBI_THREADS = 12
 
-    Reported in ``stats`` because it is answer-affecting and lives in an environment variable
-    nothing else writes down, so an archived run that omits it cannot be compared with one
-    that ran at a different count. 4/8/16 threads return an identical objective and 1 is fine,
-    but 2 is reproducibly ~10% worse.
+
+def _available_cpus() -> int:
+    """CPUs this process may run on: its affinity mask (a Slurm job's grant), not the node's.
+
+    ``os.cpu_count()`` counts the whole node, so a 4-core job on a 48-core node would take the
+    threaded default and oversubscribe its own allocation.
     """
 
-    return _env_int("COLGEN_GUROBI_THREADS", 1)
+    process_cpu_count = getattr(os, "process_cpu_count", None)  # Python 3.13+
+    if process_cpu_count is not None:
+        return process_cpu_count() or 1
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS has no affinity API
+        return os.cpu_count() or 1
+
+
+def gurobi_threads() -> int:
+    """``Threads`` for the master's Gurobi model: 12 if this process has 12 CPUs, else 1.
+
+    12 is the master LP's fastest count on the Mac (barrier ~1.4x over 4 threads; 16 and 20
+    are slower than 12). Below 12 CPUs the default stays at ONE rather than "every CPU":
+    exactly 2 threads makes the IP reproducibly ~10% worse, and a default that tracked the
+    core count would make every machine size answer differently. Pricing never runs during
+    a Gurobi solve, so the threads do not compete with the pricing pool.
+
+    Reported in ``stats`` because it is answer-affecting and lives in an environment variable
+    or the machine's CPU count, neither of which a run otherwise writes down, so an archived
+    run that omits it cannot be compared with one that ran at a different count.
+    """
+
+    default = _DEFAULT_GUROBI_THREADS if _available_cpus() >= _DEFAULT_GUROBI_THREADS else 1
+    return _env_int("COLGEN_GUROBI_THREADS", default)
 
 
 def gurobi_lp_method() -> tuple[int, int]:
@@ -486,14 +511,10 @@ class GurobiBackend:
         # (elapsed_s, incumbent, bound) per MIPSOL, filled by `solve_ip`'s callback.
         self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
         model.Params.OutputFlag = 0
-        # ONE thread by default, and it is a determinism choice, not a performance one:
-        # parallel Gurobi breaks ties by whichever worker got there first, so a threaded
-        # solve is not reproducible even at a fixed `Seed`, and this repo pins objectives and
-        # column sets across runs. The cost is real -- at scale the final IP is the binding
-        # stage and burns its budget on one core while the rest sit idle -- so
-        # `COLGEN_GUROBI_THREADS` exists to measure that trade; 0 means every core Gurobi can
-        # see. Reported in `stats` as `gurobi_threads` because it changes the answer (see
-        # `gurobi_threads`).
+        # A run is reproducible at a fixed `Threads` and `Seed`, but the count itself changes
+        # the answer (barrier's interior point and the MIP search both depend on it), so the
+        # default depends on the machine and is reported in `stats` as `gurobi_threads`.
+        # `COLGEN_GUROBI_THREADS` overrides it; 0 means every core Gurobi can see.
         model.Params.Threads = gurobi_threads()
         model.Params.Seed = self.seed
         model.ModelSense = gp.GRB.MAXIMIZE

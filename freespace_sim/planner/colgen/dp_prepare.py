@@ -1580,7 +1580,7 @@ class CompletionEnvelopes:
           the ``corridor_start`` step the bounds are measured from.
         """
 
-        from .pricing import _RECOMPUTE_EPS, _check_deadline
+        from .pricing import _RECOMPUTE_EPS, _air_detour_lb_s, _check_deadline
 
         key = departure_step, lane_idx
         cached = self._delay_envelopes.get(key)
@@ -1617,9 +1617,10 @@ class CompletionEnvelopes:
         for total_hops in range(1, max_total_hops + 1):
             _check_deadline(deadline)
             if total_hops > len(values):
-                # The two cached branches make the same `evaluate` calls, term for term, as
-                # `pricing._arc_delay_lower_bound_s`, so a CostModel subclass that overrides
-                # `evaluate` still gets the uncached oracle's value bit for bit.
+                # The two cached branches make the same `evaluate` calls as
+                # `pricing._arc_delay_lower_bound_s`, and share its air arithmetic, so a
+                # CostModel subclass that overrides `evaluate` still gets the uncached
+                # oracle's value bit for bit.
                 if self._fixed is None:
                     values.append(self.delay_lower_bound(departure_step, lane_idx, total_hops, 0))
                 elif not folding_exact:
@@ -1629,11 +1630,9 @@ class CompletionEnvelopes:
                         if not isinstance(air_values, list):
                             air_values = list(air_values)
                             self._air_values[lane_idx] = air_values
-                        flown_time_lb = (
-                            origin_fold_s + total_hops * self._cfg.dt_s
-                            + self._destination_fold_lb
-                        )
-                        air_values.append(max(0.0, flown_time_lb - self._reference_time_s))
+                        air_values.append(_air_detour_lb_s(
+                            origin_fold_s, total_hops, self._cfg.dt_s,
+                            self._destination_fold_lb, self._reference_time_s))
                     values.append(evaluate(ground_s=ground_s,
                                            air_detour_s=air_values[total_hops - 1]))
             delay_lb = values[total_hops - 1]

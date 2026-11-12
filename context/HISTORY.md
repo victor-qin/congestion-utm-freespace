@@ -225,3 +225,11 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   spawned worker reported `ru_maxrss` ~4.7 GB (about the parent's size) while the whole 45-process
   job peaked at 28 GB, so summed worker peaks are meaningless there; use Slurm MaxRSS. Files:
   `freespace_sim/planner/colgen/{pricing_pool,dp_kernel}.py`.
+
+- 2026-11-12T00:10Z [CODE/TOOL] PR #151 review: a parent send to a BUSY pool worker can block. A
+  worker reads its pipe only between messages, and a macOS socketpair held just 234 small
+  `("release", …)` messages before `send()` blocked; the first stealing version sent one per steal
+  to an owner still inside its up-front batch, which deadlocks the parent against that worker on
+  large cohorts with few workers. Send only small, bounded messages to a busy worker (≤2 chunks of
+  ids); anything that scales with a sweep goes to idle workers or after the merge. Files:
+  `freespace_sim/planner/colgen/pricing_pool.py`, `tests/test_colgen_pricing_pool.py`.

@@ -120,13 +120,10 @@ def instrument(*, timing: bool = True) -> None:
         graph = pricing_pool._WORKER['graphs'][int(args[1])]
         cache = getattr(graph._search_cache, 'cpu_completion', None)
         if cache is not None:
-            values = getattr(cache, 'delay_values', getattr(cache, 'air_values', {}))
-            record['experiment_cache'] = dict(
-                keys=len(values), scalars=sum(map(len, values.values())),
-                hits=getattr(cache, 'hits', None), misses=getattr(cache, 'misses', None),
-                scalar_hits=getattr(cache, 'scalar_hits', None),
-                scalar_misses=getattr(cache, 'scalar_misses', None),
-            )
+            # Size of the retained unweighted air seconds: lanes cached, values held.
+            values = cache.air_values
+            record['experiment_cache'] = dict(keys=len(values),
+                                              scalars=sum(map(len, values.values())))
         return result
 
     pricing_pool._price_one = one

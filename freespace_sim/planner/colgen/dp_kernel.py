@@ -112,7 +112,7 @@ FSUM_MAX_PARTIALS = 64
 
 # Where budget growth STOPS.  `_best_column_compiled` documents "a budget the kernel could
 # not grow into" as a `Declined` case, but without these that case is unreachable: the
-# retry loop grows geometrically and `np.zeros` raises `MemoryError` long before
+# retry loop grows geometrically and allocation raises `MemoryError` long before
 # `max_attempts` runs out, and `MemoryError` is caught nowhere on the path -- so instead of
 # falling back to the reference the solve dies, and under a worker pool an OOM-killed worker
 # hangs the sweep forever (see `pricing_pool`'s module docstring).
@@ -3061,12 +3061,14 @@ def price_dag(
 
     for attempt in range(max_attempts):
         cap = 1 << log2cap
-        # All nine label fields are `np.empty`, and that is only safe while the root
-        # (`_seed_layer`) and child constructors write EVERY field before a label id is
-        # handed out, and every read is indexed by an id already handed out. Zero-filling
-        # was not free: an allocator that recycles a large freed block must write every
-        # page, which on macOS made these six fills most of a warm search's allocation
-        # time and ~3x the workers' resident memory at the 1<<26 ceiling.
+        # All nine label fields are `np.empty`. Untouched pages of a fresh allocation are
+        # mapped lazily, so requesting the 1<<26 ceiling costs only the pages a search
+        # fills. Zero-filling is not free: an allocator that recycles a large freed block
+        # must write every page, which on macOS made these six fills most of a warm
+        # search's allocation time and ~3x the workers' resident memory at the ceiling.
+        # Safe only while the root (`_seed_layer`) and child constructors write EVERY
+        # field before a label id is handed out, and every read is indexed by an id
+        # already handed out.
         label_score = np.empty(label_capacity, np.float64)
         label_cell = np.empty(label_capacity, np.int32)
         label_parent = np.empty(label_capacity, np.int32)

@@ -874,6 +874,16 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, 
                                DualView(d, cfg), flight_duals, {}, deadline=None))
         for d in sweep_duals
     ]
+    messages = []
+    real_send = pricing_pool._WorkerChannel.send
+
+    def record(channel, message):
+        """Log every parent-to-worker message in the order the parent sent it."""
+        messages.append((channel.index, message[0], message[1] if message[0] == "release"
+                         else None))
+        return real_send(channel, message)
+
+    monkeypatch.setattr(pricing_pool._WorkerChannel, "send", record)
     with PricingPool(requests, cfg, params, catalog) as pool:
         sweeps = [pool.run_sweep(order, d, flight_duals, {}, None) for d in sweep_duals]
         owners = pool.worker_of
@@ -891,6 +901,15 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, 
     workers = {f: worker for f, worker, _p in seen[0]}
     if steal:
         assert workers == {1: 0, 2: 0, 3: 1}
+        # A release is sent only once the merge is over -- every worker idle in `recv` --
+        # and as one message per old owner. Sent per steal, mid-sweep, releases queue unread
+        # behind the old owner's batch and can fill its pipe and block the parent.
+        starts = [i for i, m in enumerate(messages) if m[1] == "sweep"][::2]  # 2 workers
+        first = [tag for _w, tag, _f in messages[starts[0]:starts[1]]]
+        assert messages[starts[1] - 1] == (0, "release", (3,))
+        assert first.count("release") == 1
+        assert max(i for i, tag in enumerate(first) if tag == "price") < first.index("release")
+        assert sum(1 for m in messages if m[1] == "release") == 1, "ownership moved again"
     else:
         # Two workers over three flights, so the split is 2/1 and neither worker is empty.
         assert set(workers.values()) == {0, 1}

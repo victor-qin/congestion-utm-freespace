@@ -825,6 +825,36 @@ def _terminal_fold_leg_s(
     return max(0.0, distance - edge_radius) / cfg.nominal_speed_mps, distance >= edge_radius
 
 
+def _air_detour_lb_s(
+    origin_fold_s: float,
+    total_hops: int,
+    dt_s: float,
+    destination_fold_s: float,
+    reference_time_s: float,
+) -> float:
+    """Unweighted air-detour floor for a route of ``total_hops`` arcs with exact folds.
+
+    The one copy of this arithmetic: :func:`_arc_delay_lower_bound_s` and the cached
+    completion bound in ``dp_prepare`` both call it, so the pruning bound cannot drift
+    between them (term order is part of the bit-for-bit parity they rely on).
+
+    Parameters
+    ------------
+    - origin_fold_s (float): the origin fold leg time in seconds.
+    - total_hops (int): arcs flown plus admissible arcs still to fly.
+    - dt_s (float): the clock step in seconds.
+    - destination_fold_s (float): the destination fold leg time in seconds.
+    - reference_time_s (float): the reference (geodesic) flight time in seconds.
+
+    Return
+    --------
+    - output (float): ``max(0, folds + total_hops * dt_s - reference)`` in seconds.
+    """
+
+    flown_time_lb = origin_fold_s + total_hops * dt_s + destination_fold_s
+    return max(0.0, flown_time_lb - reference_time_s)
+
+
 def _arc_delay_lower_bound_s(
     *,
     ground_delay_s: float,
@@ -878,9 +908,10 @@ def _arc_delay_lower_bound_s(
 
     if not folding_exact or reference_time_s <= 0.0:
         return model.evaluate(ground_s=ground_delay_s)
-    flown_time_lb = origin_fold_s + (hops + remaining_hops) * dt_s + destination_fold_s
     return model.evaluate(
-        ground_s=ground_delay_s, air_detour_s=max(0.0, flown_time_lb - reference_time_s)
+        ground_s=ground_delay_s,
+        air_detour_s=_air_detour_lb_s(
+            origin_fold_s, hops + remaining_hops, dt_s, destination_fold_s, reference_time_s),
     )
 
 

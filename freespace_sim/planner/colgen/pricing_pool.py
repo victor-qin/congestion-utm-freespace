@@ -105,6 +105,7 @@ import traceback
 import uuid
 import warnings
 from collections import Counter
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
@@ -409,7 +410,10 @@ class _Dispatch:
     - steal (bool): whether an idle worker may take another worker's unsent flights.
     """
 
-    def __init__(self, pricing_order, worker_of, n_workers: int, steal: bool) -> None:
+    def __init__(
+        self, pricing_order: Sequence[int], worker_of: Mapping[int, int], n_workers: int,
+        steal: bool,
+    ) -> None:
         """Queue every flight under its current owner, in ``pricing_order`` order.
 
         Parameters
@@ -435,7 +439,9 @@ class _Dispatch:
         self._upfront = [len(queue) - (len(queue) // 2 if self.steal else 0)
                          for queue in self.queues]
 
-    def take(self, worker: int, limit: int, *, idle: bool, dead=frozenset()) -> list[int]:
+    def take(
+        self, worker: int, limit: int, *, idle: bool, dead: Collection[int] = frozenset(),
+    ) -> list[int]:
         """The next flights to send ``worker``: its own, else one stolen, else none.
 
         Parameters
@@ -623,9 +629,9 @@ def _init_worker(
 ) -> None:
     """Build this worker's view of ITS OWN flights. Runs once per worker per solve.
 
-    Takes only the worker's requests, not the batch's: under a fixed worker assignment a
-    worker can never be asked for a flight outside its slice, so building the rest would be
-    ~W-fold waste -- that many more graphs than any worker could use, in every worker.
+    Takes only the flights this worker owns, not the batch's: building the rest would be
+    ~W-fold waste -- that many more graphs than any worker could use, in every worker. A
+    flight it takes over later arrives with its request (:func:`_adopt_flights`).
 
     The catalog is shipped rather than rebuilt from raw terminals: every graph in a solve
     must see the identical wall catalogue, and re-deriving it here would be a second source
@@ -735,7 +741,9 @@ def _load_sweep_state(
         _WORKER["sweep_error"] = traceback.format_exc()
 
 
-def _adopt_flights(epoch: tuple, adopted) -> None:
+def _adopt_flights(
+    epoch: tuple, adopted: Iterable[tuple[FlightRequest, float | None, Column | None]],
+) -> None:
     """Take over flights another worker owned, just before pricing them.
 
     A stolen flight arrives with everything its old owner got from the ``"sweep"``
@@ -750,8 +758,9 @@ def _adopt_flights(epoch: tuple, adopted) -> None:
     Parameters
     ------------
     - epoch (tuple): the sweep the flights are being priced for.
-    - adopted (Iterable[tuple[FlightRequest, float, Column | None]]): per stolen flight,
-      its request, flight dual (``pi_f``) and known column.
+    - adopted (Iterable[tuple[FlightRequest, float | None, Column | None]]): per stolen
+      flight, its request, flight dual (``pi_f``, ``None`` if the caller supplied none, which
+      ``_price_one`` then reports) and known column.
 
     Return
     --------
@@ -770,12 +779,13 @@ def _adopt_flights(epoch: tuple, adopted) -> None:
                 request, _WORKER["cfg"], _WORKER["catalog"], _WORKER["params"])
         _WORKER["worker_flights"].add(flight_id)
         if state is not None and state[0] == epoch:
-            state[2][flight_id] = flight_dual
+            if flight_dual is not None:
+                state[2][flight_id] = flight_dual
             if known_column is not None:
                 state[3][flight_id] = known_column
 
 
-def _release_flights(flight_ids) -> None:
+def _release_flights(flight_ids: Iterable[int]) -> None:
     """Drop flights another worker took over, so the pool keeps one graph per flight."""
 
     for flight_id in flight_ids:
@@ -1479,9 +1489,10 @@ class PricingPool:
     construction rather than by a timeout wrapped around something unbounded.
 
     Sending never blocks on a busy peer, which is the hazard ``parallel.py`` had to invent
-    an idle-only outbox flush to avoid. Both parent sends happen at sweep start, when every
-    worker is idle in ``recv``; the only large payload flows the other way, and the parent
-    drains every ready pipe on each wait rather than only the one it needs.
+    an idle-only outbox flush to avoid. The large sends -- duals at sweep start, a stolen
+    flight's inputs, releases after the merge -- go only to a worker idle in ``recv``; a busy
+    worker is sent at most two chunks of flight ids. The only large payload flows the other
+    way, and the parent drains every ready pipe on each wait rather than only the one it needs.
 
     **What this actually buys.** Two things, and the second was the larger one when measured:
 
@@ -1502,10 +1513,10 @@ class PricingPool:
     """
 
     def __init__(self, requests, cfg: SimConfig, params: ColGenParams, catalog) -> None:
-        """Bucket every request to its fixed worker and prepare an unstarted pool.
+        """Assign every request its initial worker and prepare an unstarted pool.
 
-        Builds the flight->worker map (:func:`_worker_assignment`) and groups the requests by
-        worker; the processes themselves are not spawned until :meth:`start`.
+        Builds the flight->worker map (:func:`_worker_assignment`); the processes themselves
+        are not spawned until :meth:`start`.
 
         Parameters
         ------------
@@ -1529,9 +1540,6 @@ class PricingPool:
         self._worker_of = _worker_assignment(
             [request.flight_id for request in self._requests], self._n_workers
         )
-        self._worker_requests: list[list] = [[] for _ in range(self._n_workers)]
-        for request in self._requests:
-            self._worker_requests[self._worker_of[request.flight_id]].append(request)
         # A stolen flight's request travels with it, so its new owner can build the graph.
         self._request_of = {request.flight_id: request for request in self._requests}
         self._steal = bool(params.pricing_work_stealing)
@@ -1578,6 +1586,11 @@ class PricingPool:
         # processes that were created reachable by `close()` rather than orphaned.
         self._channels = []
         try:
+            # From the CURRENT owners, which stealing moves, so a started worker holds
+            # exactly the flights the parent will route to it.
+            worker_requests: list[list[FlightRequest]] = [[] for _ in range(self._n_workers)]
+            for request in self._requests:
+                worker_requests[self._worker_of[request.flight_id]].append(request)
             for worker in range(self._n_workers):
                 # CHECKED BEFORE EACH SPAWN, not only before the readiness wait. Starting a
                 # process is synchronous and `spawn` re-pickles the arguments each time, so
@@ -1592,7 +1605,7 @@ class PricingPool:
                 proc = ctx.Process(
                     target=_worker_main,
                     args=(
-                        child_conn, worker, self._worker_requests[worker], self._cfg,
+                        child_conn, worker, worker_requests[worker], self._cfg,
                         self._params, self._catalog,
                     ),
                     daemon=True,
@@ -1682,77 +1695,82 @@ class PricingPool:
             )
 
         epoch = (self._uid, next(self._counter))
-        # Pickled ONCE for all workers -- see `_load_sweep_state` for why the mapping cannot
-        # be sliced and why one buffer beats W traversals.
-        duals_blob = pickle.dumps(duals, protocol=pickle.HIGHEST_PROTOCOL)
-
-        own_flights: list[list[int]] = [[] for _ in range(self._n_workers)]
-        for flight_id in pricing_order:
-            own_flights[self._worker_of[flight_id]].append(flight_id)
-
-        sweep_started = time.perf_counter()
-        for channel in self._channels:
-            own = set(own_flights[channel.index])
-            # FIFO on this worker's pipe, so the duals are installed before the tasks that
-            # read them. That ordering is the whole delivery mechanism, and it works because
-            # the worker is idle in `recv` at this moment -- so the send cannot block on a
-            # busy peer.
-            channel.send((
-                "sweep",
-                epoch,
-                duals_blob,
-                {f: flight_duals[f] for f in own if f in flight_duals},
-                {f: c for f, c in known_columns.items() if f in own},
-                deadline,
-                heuristic_only,
-            ))
-        dispatch = _Dispatch(pricing_order, self._worker_of, self._n_workers, self._steal)
-        chunksize = max(1, int(self._params.pricing_chunksize))
-
-        def send(worker: int, flight_ids: list[int]) -> None:
-            """Send one batch; a stolen flight carries its inputs and changes owner."""
-            adopted = []
-            for flight_id in flight_ids:
-                previous = self._worker_of[flight_id]
-                if previous == worker:
-                    continue
-                adopted.append((self._request_of[flight_id], flight_duals[flight_id],
-                                known_columns.get(flight_id)))
-                self._worker_of[flight_id] = worker
-                # Never sent this flight this sweep (it was still queued), so dropping its
-                # graph cannot race a task; a dead victim's pipe is simply skipped.
-                try:
-                    self._channels[previous].send(("release", (flight_id,)))
-                except (BrokenPipeError, ConnectionError, OSError):
-                    pass
-            # Small messages to a worker that is busy, or an adopted flight's inputs to one
-            # that is idle in `recv`, so neither can fill the pipe. A failed send means the
-            # worker died; its sentinel reports that as a lost flight.
-            try:
-                self._channels[worker].send(
-                    ("price", epoch, list(flight_ids), chunksize, tuple(adopted)))
-            except (BrokenPipeError, ConnectionError, OSError):
-                pass
-
-        progress = _SweepProgress(len(pricing_order), self._n_workers)
-        # No cyclic collection while workers depend on this process for their next flight:
-        # a full collection of a 1,537-flight solve's heap took 8.5 s mid-sweep and idled
-        # all 44 workers through it. Results are acyclic, so deferring the collection to
-        # after the merge holds back no memory worth having; the caller's setting returns.
+        # No cyclic collection from here until the merge ends, while workers depend on this
+        # process for their duals and their next flight: a full collection of a
+        # 1,537-flight solve's heap took 8.5 s mid-sweep and idled all 44 workers through
+        # it. Results are acyclic, so deferring the collection to after the merge holds back
+        # no memory worth having; the caller's setting returns.
         collecting = gc.isenabled()
         gc.disable()
+        # Old owner -> flights stolen from it. Released only once the merge is over: the old
+        # owner is mid-batch until then, so a release per steal would pile up unread in its
+        # pipe (~234 fit on macOS) and block the parent. Until then the thief's new copy and
+        # the old owner's warm one coexist, one extra graph per steal.
+        released: dict[int, list[int]] = collections.defaultdict(list)
         try:
-            accepted = _accepted_prefix(
-                _sweep_results(
-                    _PipeCollector(self._channels), self._n_workers, pricing_order,
-                    dispatch, deadline, progress, send=send, chunksize=chunksize,
+            # Pickled ONCE for all workers -- see `_load_sweep_state` for why the mapping
+            # cannot be sliced and why one buffer beats W traversals.
+            duals_blob = pickle.dumps(duals, protocol=pickle.HIGHEST_PROTOCOL)
+
+            own_flights: list[list[int]] = [[] for _ in range(self._n_workers)]
+            for flight_id in pricing_order:
+                own_flights[self._worker_of[flight_id]].append(flight_id)
+
+            sweep_started = time.perf_counter()
+            for channel in self._channels:
+                own = set(own_flights[channel.index])
+                # FIFO on this worker's pipe, so the duals are installed before the tasks
+                # that read them. That ordering is the whole delivery mechanism, and it
+                # works because the worker is idle in `recv` at this moment -- so the send
+                # cannot block on a busy peer.
+                channel.send((
+                    "sweep",
+                    epoch,
+                    duals_blob,
+                    {f: flight_duals[f] for f in own if f in flight_duals},
+                    {f: c for f, c in known_columns.items() if f in own},
+                    deadline,
+                    heuristic_only,
+                ))
+            dispatch = _Dispatch(pricing_order, self._worker_of, self._n_workers, self._steal)
+            chunksize = max(1, int(self._params.pricing_chunksize))
+
+            def send(worker: int, flight_ids: list[int]) -> None:
+                """Send one batch; a stolen flight carries its inputs and changes owner."""
+                adopted = []
+                for flight_id in flight_ids:
+                    previous = self._worker_of[flight_id]
+                    if previous == worker:
+                        continue
+                    # `.get`: a missing flight dual then fails in the worker, exactly as it
+                    # does for a flight its owner prices.
+                    adopted.append((self._request_of[flight_id], flight_duals.get(flight_id),
+                                    known_columns.get(flight_id)))
+                    self._worker_of[flight_id] = worker
+                    released[previous].append(flight_id)
+                # Own flights go to a worker at most two chunks ahead, and a stolen flight's
+                # inputs only to a worker with nothing outstanding (idle in `recv`), so this
+                # cannot fill a pipe. A failed send means the worker died; its sentinel
+                # reports that as a lost flight.
+                try:
+                    self._channels[worker].send(
+                        ("price", epoch, list(flight_ids), chunksize, tuple(adopted)))
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
+
+            progress = _SweepProgress(len(pricing_order), self._n_workers)
+            try:
+                accepted = _accepted_prefix(
+                    _sweep_results(
+                        _PipeCollector(self._channels), self._n_workers, pricing_order,
+                        dispatch, deadline, progress, send=send, chunksize=chunksize,
+                    )
                 )
-            )
-        except BaseException as exc:
-            # The workers are mid-assignment and their pipes hold results nobody will read,
-            # so this pool cannot be trusted for another sweep.
-            self._poisoned = f"sweep raised {type(exc).__name__}: {exc}"
-            raise
+            except BaseException as exc:
+                # The workers are mid-assignment and their pipes hold results nobody will
+                # read, so this pool cannot be trusted for another sweep.
+                self._poisoned = f"sweep raised {type(exc).__name__}: {exc}"
+                raise
         finally:
             if collecting:
                 gc.enable()
@@ -1771,6 +1789,13 @@ class PricingPool:
                 f"sweep ended early at flight {accepted.timeout_flight_id}; "
                 f"outstanding work was abandoned"
             )
+            return accepted
+        # Every result is in, so every worker is idle in `recv`: one release each.
+        for previous, flight_ids in released.items():
+            try:
+                self._channels[previous].send(("release", tuple(flight_ids)))
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
         return accepted
 
     def _annotate(self, records, dispatch):
@@ -1901,8 +1926,16 @@ def _price_batch(task):
 
 
 def _sweep_results(
-    collect, n_workers, pricing_order, dispatch, deadline, progress=None, *, send, chunksize=1,
-):
+    collect: Callable[[float | None], tuple[dict[int, list[tuple]], set[int]]],
+    n_workers: int,
+    pricing_order: Sequence[int],
+    dispatch: _Dispatch,
+    deadline: float | None,
+    progress: _SweepProgress | None = None,
+    *,
+    send: Callable[[int, list[int]], None],
+    chunksize: int = 1,
+) -> Iterator[tuple]:
     """Dispatch the sweep and merge the per-worker results into ``pricing_order`` order.
 
     ``collect(timeout) -> (results_by_worker, died)`` and ``send(worker, flight_ids)`` are
@@ -1955,20 +1988,18 @@ def _sweep_results(
 
     chunksize = max(1, int(chunksize))
     depth = 2 * chunksize
-    outstanding = [0] * n_workers
+    # Per worker, the flights sent and not yet answered; its size is the worker's backlog.
     sent: list[set[int]] = [set() for _ in range(n_workers)]
     pending: dict[int, tuple] = {}
     dead: set[int] = set()
 
     def refill(worker: int) -> None:
         """Top ``worker`` up to ``depth`` outstanding flights, if it is alive."""
-        while worker not in dead and outstanding[worker] < depth:
-            batch = dispatch.take(
-                worker, chunksize, idle=outstanding[worker] == 0, dead=dead)
+        while worker not in dead and len(sent[worker]) < depth:
+            batch = dispatch.take(worker, chunksize, idle=not sent[worker], dead=dead)
             if not batch:
                 return
             send(worker, batch)
-            outstanding[worker] += len(batch)
             sent[worker].update(batch)
 
     if progress is None:
@@ -2014,7 +2045,6 @@ def _sweep_results(
                         )
                     sent[worker].remove(result[0])
                     pending[result[0]] = result
-                    outstanding[worker] -= 1
                 refill(worker)
             if flight_id in pending or dispatch.holder_of(flight_id) in dead:
                 continue

@@ -1,6 +1,8 @@
 """Incremental hex-occupancy service: it must stay byte-identical to a from-scratch rasterization
 (the property that lets A* trust the maintained cache instead of rebuilding every plan)."""
 
+import math
+
 import pytest
 
 from freespace_sim.config import SimConfig
@@ -99,6 +101,29 @@ def test_own_hub_column_transparent_foreign_blocks():
     assert svc.is_blocked(q, r, L, s, own={"other"})       # a different hub still sees a wall
 
 
+def test_own_hub_corridor_inside_its_column_blocks_everyone():
+    """A committed hub-tagged corridor box keeps its cells INSIDE its own hub's column: the ledger
+    conflicts it with any other box there — a same-hub sibling's (box↔box) or a foreign cruise box
+    after the column's dwell ends — so A* must see it too. Dropping those cells on commit let both
+    plan through and be denied ``conflict_filed``."""
+    from freespace_sim.types import vec
+
+    svc = HexOccupancyService(CFG)
+    z = CFG.flight_levels_m[0]
+    hub = (1000.0, 1000.0)
+    col = hover_reservation((*hub, 0.0), 0.0, CFG, terminal_id="H", radius=300.0)
+    box = corridor_segment_volume(vec(*hub, z), 200.0, vec(1600, 1000, z), 220.0, CFG, terminal_id="H")
+    assert box.t_start >= col.t_end, "the column must be idle, so nothing else walls the interior"
+    svc.on_commit(1, [col, box])
+    inside = [(q, r, L, s)
+              for q, r, L, lo, hi, in_blk, _ in hg.rasterize_ranges(box, CFG, R, svc.infl_blocked, svc.infl_pad)
+              if in_blk and math.dist(hg.hex_center(q, r, R), hub) <= 300.0 for s in range(lo, hi + 1)]
+    assert inside, "no interior cells: the test would pass vacuously"
+    for q, r, L, s in inside:
+        assert svc.is_blocked(q, r, L, s)                   # foreign cruise
+        assert svc.is_blocked(q, r, L, s, own={"H"})        # same-hub sibling
+
+
 def test_evict_drops_terminal_cells_in_lockstep():
     # the per-cell hub set must be time-evicted like blocked/pad, or stale cells would wrongly mark
     # cruise obstacles (and leak memory) — eviction loops over term_cells too
@@ -169,6 +194,28 @@ def test_pad_clear_blocked_by_corridor_at_any_level():
     assert not svc.pad_clear(q, r, s, 0)                     # but the pad's column spans all levels
 
 
+@pytest.mark.parametrize("track_removal", [False, True])
+def test_parked_aircraft_blocks_nearby_pads_not_cruise(track_removal):
+    """A parked aircraft's ground box sits below every corridor band, yet a landing column at a pad
+    next to it collides in the ledger — so ``pad_clear`` must see it over its stay, while cruise
+    overhead stays free, and releasing it leaves nothing behind."""
+    from freespace_sim.types import vec
+    from freespace_sim.volumes import ground_dwell_reservation
+
+    svc = HexOccupancyService(CFG, track_removal=track_removal)
+    parked = ground_dwell_reservation(vec(1000, 1000, 0), 40.0, 60.0, CFG)
+    svc.on_commit(1, [parked])
+    q, r = hg.enu_to_axial(1015.0, 1000.0, R)                # a pad 15 m away: footprints overlap
+    s_in, s_out = int(70.0 / CFG.dt_s), int(120.0 / CFG.dt_s)
+    assert not svc.pad_clear(q, r, s_in, 0)
+    assert svc.pad_clear(q, r, s_out, 0)                     # the aircraft has left
+    svc.enable_blocked(ReservationLedger(CFG))
+    assert not any(svc.is_blocked(q, r, L, s_in) for L in range(CFG.n_levels))
+    if track_removal:
+        svc.on_release(1, [parked])
+        assert svc.pad_clear(q, r, s_in, 0)
+
+
 # ------------------------------------------------- the `blocked` map's deferred build (area 2)
 
 @pytest.mark.parametrize("track_removal", [False, True])
@@ -176,11 +223,10 @@ def test_enable_blocked_matches_a_map_maintained_all_along(track_removal):
     """A service built with ``maintain_blocked=False`` and armed later must hold EXACTLY the map a
     service that maintained it throughout holds.
 
-    Three things a from-scratch rebuild loop would get wrong, and which routing through
-    ``add_volume`` inherits for free: the committing flight's own-column skip (so its 90 m terminal
-    interior stays passable), the refcount-dict-vs-set branch on ``track_removal`` (a set where
-    ``on_release`` expects counts raises ``TypeError`` on the next destroy), and the
-    ``evicted_before`` clamp. Parameterised over both container shapes for the second of those.
+    Two things a from-scratch rebuild loop would get wrong, and which routing through
+    ``add_volume`` inherits for free: the refcount-dict-vs-set branch on ``track_removal`` (a set
+    where ``on_release`` expects counts raises ``TypeError`` on the next destroy), and the
+    ``evicted_before`` clamp. Parameterised over both container shapes for the first of those.
 
     ``pad`` is asserted too: ``enable_blocked`` passes ``_pad=False``, so a slip there would
     double-count the wider footprint rather than leave it alone."""

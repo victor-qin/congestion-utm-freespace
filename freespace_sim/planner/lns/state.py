@@ -490,10 +490,10 @@ class LNSState:
             self._refresh_contention(cell)
 
     def _index_add(self, fid: int, volumes, refresh: bool = True) -> None:
-        """Index ``fid``'s blocked-cell claims (own-hub column interiors are skipped).
+        """Index ``fid``'s blocked-cell claims, mirroring the occupancy services cell for cell.
 
-        A flight's own terminal-column interior is exempt from deconfliction, so those cells are
-        not indexed (else same-hub flights would look mutually contended at their shared hub).
+        Corridor cells inside the flight's own hub column are indexed too: two same-hub boxes
+        contend in the ledger, so the interior is a real contention site.
 
         Parameters
         ------------
@@ -510,17 +510,6 @@ class LNSState:
         rows = self._cells_of.get(fid)
         if rows is None:
             rows = self._cells_of[fid] = set()
-        # A flight's own terminal-column interior is exempt from deconfliction — the occupancy
-        # services drop those cells (HexOccupancyService.add_volume / CompiledHexOccupancy._add), so
-        # A* never conflicts there (see context/figures/cell_blocking.png). Indexing them anyway
-        # would make same-hub flights look mutually contended at their shared hub, and
-        # the map destroy operator picks cells BY contention, spending neighborhoods on
-        # hub interiors where no conflict can exist.
-        own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
-                         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
-        # Resolved once per flight, and shared with the two occupancy services through the memo in
-        # `hg.column_hexes` — this index is the third consumer of the identical test.
-        own_hexes = hg.column_hexes(own_cols, self._R) if own_cols else None
         for v in volumes:
             if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
                 continue  # capacity-gated own column, not a blocked cell
@@ -528,8 +517,6 @@ class LNSState:
                 v, self.cfg, self._R, self._infl_b, self._infl_p
             ):
                 if not in_blk:
-                    continue
-                if own_hexes is not None and (q, r) in own_hexes:
                     continue
                 cell = (q, r, level)
                 entries = self._claims.get(cell)

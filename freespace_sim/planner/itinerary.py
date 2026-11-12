@@ -4,6 +4,7 @@ See `context/figures/itinerary_reservation.png` for the reservation the composed
 """
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from ..config import SimConfig
@@ -11,6 +12,12 @@ from ..ledger import ReservationLedger
 from ..types import DenialReason, FlightRequest, IntentStatus, OperationalIntent
 from ..volumes import ground_dwell_reservation, terminal_radius
 from . import iter_planner_chain
+from .pad_hold import first_ground_hit_s
+
+
+# Re-timed outbound attempts after a return that could not leave its parked pad in time; each costs
+# three leg plans, and the hold only ever grows, so a small cap bounds the rare worst case.
+_MAX_RETIMES = 3
 
 
 def reject_itinerary(req: FlightRequest, planner: str) -> None:
@@ -96,39 +103,83 @@ class ItineraryPlanner:
         --------
         - intent (OperationalIntent): both legs and the pad between them, or the inner planner's
           result unchanged. Denied whole if either leg is denied — a delivery whose aircraft cannot
-          get home is not a half success.
+          get home is not a half success. A return that cannot leave its parked pad before ground
+          traffic needs it re-times the outbound first, up to `_MAX_RETIMES` times.
         """
         if not req.return_to_origin:
             return self.inner.plan(req, ledger, cfg)
 
-        out = self.inner.plan(self._leg(req, req.origin, req.dest, req.origin_terminal,
-                                        req.dest_terminal, req.t_departure), ledger, cfg)
-        if not out.accepted:
-            return replace(out, request=req)
-
         from ..sim import realized_release_s          # sim imports planners; keep one owner
-        landed = realized_release_s(out)
-        if landed is None:
-            raise ValueError(
-                f"flight {req.flight_id}: the outbound leg was ACCEPTED with no volumes, so there is "
-                "no arrival for the return to depart from. An accepted intent must carry the volumes "
-                "it conflict-checked (see planner.Planner). Returning the outbound alone here would "
-                "be the silent half-trip reject_itinerary exists to prevent.")
-        dwell = cfg.turnaround_s if req.turnaround_s is None else req.turnaround_s
 
-        # Leg 2 is NOT deconflicted against leg 1: both are the same aircraft, and an aircraft does
-        # not conflict with itself.
-        leg1_reads = self._recorded_envelopes()
-        back = self.inner.plan(self._leg(req, req.dest, req.origin, req.dest_terminal,
-                                         req.origin_terminal, float(landed) + dwell),
-                               ledger, cfg)
-        self._absorb_envelopes(leg1_reads, cfg)
-        if not back.accepted:
-            return OperationalIntent(
-                request=req, status=IntentStatus.REJECTED, volumes=[], centerline=[],
-                denial_reason=back.denial_reason, planner=back.planner,
-                solve_time_s=out.solve_time_s + back.solve_time_s)
-        return self._compose(req, out, back, float(landed), cfg, ledger)
+        dwell = cfg.turnaround_s if req.turnaround_s is None else req.turnaround_s
+        slack = cfg.dt_s + cfg.time_buffer_s           # landing-step and departure-ceil rounding
+        # The aircraft stays parked on the dest pad from landing until the return's takeoff column,
+        # an interval no single search sees whole: the outbound may only land where the pad stays
+        # clear of ground traffic for `hold`, and the return may only hold on the ground while it
+        # stays clear (`planner.pad_hold`).
+        hold = dwell + slack
+        reads: list = []
+        solve_s = 0.0
+        for _ in range(_MAX_RETIMES + 1):
+            out = self._plan_leg(self._leg(req, req.origin, req.dest, req.origin_terminal,
+                                           req.dest_terminal, req.t_departure, pad_hold_after_s=hold),
+                                 ledger, cfg, reads)
+            solve_s += out.solve_time_s
+            if not out.accepted:
+                return replace(out, request=req, solve_time_s=solve_s)
+            landed = realized_release_s(out)
+            if landed is None:
+                raise ValueError(
+                    f"flight {req.flight_id}: the outbound leg was ACCEPTED with no volumes, so there is "
+                    "no arrival for the return to depart from. An accepted intent must carry the volumes "
+                    "it conflict-checked (see planner.Planner). Returning the outbound alone here would "
+                    "be the silent half-trip reject_itinerary exists to prevent.")
+            # Leg 2 is NOT deconflicted against leg 1: both are the same aircraft, and an aircraft does
+            # not conflict with itself.
+            back_req = self._leg(req, req.dest, req.origin, req.dest_terminal, req.origin_terminal,
+                                 float(landed) + dwell, parked_since_s=float(landed))
+            back = self._plan_leg(back_req, ledger, cfg, reads)
+            solve_s += back.solve_time_s
+            if back.accepted:
+                return self._compose(req, out, back, float(landed), cfg, ledger)
+            # Parked, the return could not leave before ground traffic reached its pad. Ask how long
+            # it would wait with the pad to itself, and re-time the outbound to keep the pad clear
+            # that long — unless no ground traffic ever reaches the pad (the return failed for
+            # another reason), the return fails regardless, or the hold would not grow.
+            if req.dest_terminal is not None or first_ground_hit_s(
+                    ledger, req.dest, float(landed),
+                    float(landed) + dwell + cfg.max_ground_delay_s + 2 * cfg.dt_s, cfg) == math.inf:
+                break
+            free = self._plan_leg(replace(back_req, parked_since_s=None), ledger, cfg, reads)
+            solve_s += free.solve_time_s
+            if not free.accepted or dwell + free.ground_delay_s + slack <= hold:
+                break
+            hold = dwell + free.ground_delay_s + slack
+        return OperationalIntent(
+            request=req, status=IntentStatus.REJECTED, volumes=[], centerline=[],
+            denial_reason=back.denial_reason, planner=back.planner, solve_time_s=solve_s)
+
+    def _plan_leg(self, leg: FlightRequest, ledger: ReservationLedger, cfg: SimConfig,
+                  reads: list) -> OperationalIntent:
+        """
+        Plan one leg, folding the read sets of every earlier leg of this itinerary into the ones the
+        planners now hold, so the itinerary's envelope covers every plan its answer depended on.
+
+        Parameters
+        ------------
+        - leg (FlightRequest): one leg, as built by `_leg`
+        - ledger (ReservationLedger): committed traffic
+        - cfg (SimConfig): simulation configuration
+        - reads (list): the accumulated `(planner, envelope)` pairs; replaced in place
+
+        Return
+        --------
+        - intent (OperationalIntent): the inner planner's answer for the leg
+        """
+        res = self.inner.plan(leg, ledger, cfg)
+        self._absorb_envelopes(reads, cfg)
+        reads[:] = self._recorded_envelopes()
+        return res
 
     def _recorded_envelopes(self):
         """Every chained planner holding a read envelope right now, paired with what it holds.
@@ -151,8 +202,8 @@ class ItineraryPlanner:
             planner.last_envelope = env if now is None else now.union(env, cfg)
 
     @staticmethod
-    def _leg(req: FlightRequest, origin, dest, o_term, d_term,
-             t_departure: float) -> FlightRequest:
+    def _leg(req: FlightRequest, origin, dest, o_term, d_term, t_departure: float, *,
+             parked_since_s: float | None = None, pad_hold_after_s: float = 0.0) -> FlightRequest:
         """
         One leg as an ordinary one-way request, keeping the itinerary's filing time.
 
@@ -168,13 +219,16 @@ class ItineraryPlanner:
         - o_term (Terminal | None): shared terminal at `origin`, or None
         - d_term (Terminal | None): shared terminal at `dest`, or None
         - t_departure (float): desired departure; for leg 2, the realized arrival plus the dwell
+        - parked_since_s (float | None): leg 2 — when the aircraft landed on the pad it leaves from
+        - pad_hold_after_s (float): leg 1 — how long the aircraft then stays on the pad it lands on
 
         Return
         --------
         - leg (FlightRequest): a one-way request the inner planner can plan unchanged
         """
         return replace(req, origin=origin, dest=dest, origin_terminal=o_term, dest_terminal=d_term,
-                       t_departure=t_departure, return_to_origin=False, turnaround_s=0.0)
+                       t_departure=t_departure, return_to_origin=False, turnaround_s=0.0,
+                       parked_since_s=parked_since_s, pad_hold_after_s=pad_hold_after_s)
 
     @staticmethod
     def _compose(req: FlightRequest, out: OperationalIntent, back: OperationalIntent,

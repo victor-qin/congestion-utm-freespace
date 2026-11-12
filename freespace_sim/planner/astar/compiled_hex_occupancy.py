@@ -237,11 +237,9 @@ class CompiledHexOccupancy:
         """
         hg.prepare_range_cache_for_commit(volumes)   # size the shared raster LRU so every observer
         #                                              of THIS commit reuses one geometry sweep
-        own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
-                         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         rows: list = []
         for v in volumes:
-            self._add(v, own_cols, flight_id, rows)
+            self._add(v, flight_id, rows)
         self.n_added += len(volumes)
         entry = self._rows.get(flight_id)
         if entry is None:
@@ -279,17 +277,15 @@ class CompiledHexOccupancy:
                                np.ascontiguousarray(flat[:, 1]))
         self.n_added -= self._nvol.pop(flight_id)
 
-    def _add(self, vol, own_cols, fid=None, _rows: list | None = None) -> None:
+    def _add(self, vol, fid=None, _rows: list | None = None) -> None:
         """Rasterize one committed volume into claim rows: column cells to the column pool
-        (recording the owner in ``col_owners``), corridor cells to the corridor pool minus the
-        committing flight's own interior; out-of-box corridor cells are skipped (a query falls back
-        via FB_OOB).
+        (recording the owner in ``col_owners``), every corridor cell to the corridor pool (its own
+        hub's interior included, as in ``HexOccupancyService.add_volume``); out-of-box corridor cells
+        are skipped (a query falls back via FB_OOB).
 
         Parameters
         ------------
         - vol (Volume4D): the committed volume to rasterize.
-        - own_cols (tuple): the committing flight's own terminal columns ``(cx, cy, radius)``; a
-          corridor cell inside one is skipped as the vertiport's unreserved interior.
         - fid: the owning flight id, passed through to ``_record`` for each emitted claim.
         - _rows (list | None): list the packed ``(key, claim)`` rows are appended to.
 
@@ -300,9 +296,6 @@ class CompiledHexOccupancy:
         """
         tid = vol.terminal_id
         is_column = tid is not None and isinstance(vol.shape, CylinderSpec)
-        # Loop-invariant own-column membership, resolved once per flight and shared with the reference
-        # service through `column_hexes`' memo (see there).
-        own_hexes = hg.column_hexes(own_cols, self.R) if own_cols else None
         for q, r, L, s_lo, s_hi, in_blk, _in_pad in hg.rasterize_ranges(
             vol, self.cfg, self.R, self.infl_blocked, self.infl_pad
         ):
@@ -317,9 +310,7 @@ class CompiledHexOccupancy:
                 if c >= 0:
                     self.col_owners.setdefault(c, set()).add(tid)
                     self._record(1, c, int(s_lo), int(s_hi), fid, _rows)
-            else:                                       # → corridor pool (minus committing own interior)
-                if own_hexes is not None and (q, r) in own_hexes:
-                    continue
+            else:                                       # → corridor pool
                 if c < 0:                               # outside the box → skip (never crash on commit);
                     if not self._warned_oob:            # a query to this cell gets cell_id<0 → kernel FB_OOB.
                         warnings.warn(                  # warn once/instance (a nonzero count ⇒ margin small)

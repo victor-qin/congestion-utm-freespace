@@ -123,6 +123,8 @@ class FlightRequest:
     - dest_terminal (Terminal | None): Destination vertiport terminal specification if applicable. Defaults to None.
     - return_to_origin (bool): Whether the request includes a return leg. Defaults to False.
     - turnaround_s (float | None): Ground dwell between legs, or None to use the configuration.
+    - parked_since_s (float | None): Leg-only — the aircraft has sat on its origin pad since then.
+    - pad_hold_after_s (float): Leg-only — how long the aircraft stays on its dest pad after landing.
     """
 
     flight_id: int
@@ -145,6 +147,13 @@ class FlightRequest:
     # climb that bracket it (``volumes.column_dwell_s``), so it cannot budget a dwell physics
     # contradicts.
     turnaround_s: "float | None" = None
+    # Leg-only, set by ``ItineraryPlanner`` (see ``planner.pad_hold``): the aircraft has been parked on
+    # its ordinary origin pad since this time, and a ground hold keeps it there, so the hold must end
+    # before ground traffic reaches the pad. None ⇒ nothing parked before takeoff.
+    parked_since_s: "float | None" = None
+    # Leg-only, set by ``ItineraryPlanner``: after landing, the aircraft stays parked on its ordinary
+    # dest pad this long, so the landing must leave the pad clear of ground traffic that long too.
+    pad_hold_after_s: float = 0.0
 
     def __post_init__(self):
         """Default and validate ``t_departure`` after construction.

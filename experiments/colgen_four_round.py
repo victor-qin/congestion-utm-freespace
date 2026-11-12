@@ -7,10 +7,12 @@ the final IP. Each round's callback record (``iteration_wall_s``, ``stage_s``) a
 sweep's outer pricing time are saved, which is what the per-round "how much can faster
 pricing shorten a round" breakdown reads. ``--rows-only`` sets ``iteration_ip_search=False``
 so the per-round IP step adds its eager rows without searching. Round sums exclude startup;
-``--profile`` adds timer wrappers inside the pricing workers.
+``--profile`` adds timer wrappers inside the pricing workers. ``--full`` instead runs the same
+cohort to convergence under the capture's own limits, final IP included.
 
     python -m experiments.colgen_four_round --capture CAPTURE.pkl --out results/four_round/X \
-        --profile [--rows-only] [--work-stealing] [--workers N] [--gurobi-threads N] [--lock FILE]
+        --profile [--rows-only] [--work-stealing] [--full] [--workers N] [--gurobi-threads N]
+        [--lock FILE]
 """
 
 from __future__ import annotations
@@ -190,6 +192,8 @@ def main() -> None:
                         help='Per-round step adds eager rows only (iteration_ip_search=False).')
     parser.add_argument('--work-stealing', action='store_true',
                         help='Idle pricing workers take unsent flights (pricing_work_stealing).')
+    parser.add_argument('--full', action='store_true',
+                        help="Solve to convergence and the final IP under the capture's limits.")
     args = parser.parse_args()
     args.source = args.source.resolve()
     args.out = args.out.resolve()
@@ -218,7 +222,8 @@ def main() -> None:
     params = ColGenParams(**{f.name: getattr(payload['params'], f.name)
                             for f in fields(ColGenParams) if hasattr(payload['params'], f.name)})
     params = replace(params, solver='gurobi', pricing_device='cpu', pricing_gpu_backend=None,
-                     n_pricing_workers=args.workers, max_iterations=4,
+                     n_pricing_workers=args.workers,
+                     max_iterations=params.max_iterations if args.full else 4,
                      iteration_ip_search=not args.rows_only,
                      pricing_work_stealing=args.work_stealing)
     # The per-round step, and so --rows-only, only runs with a positive per-round IP limit.
@@ -270,7 +275,7 @@ def main() -> None:
                                   elapsed_s=value.get('elapsed_s'))), flush=True)
             if callback is not None:
                 callback(value)
-            if args.mode == 'solve' and len(rounds) == 4:
+            if args.mode == 'solve' and not args.full and len(rounds) == 4:
                 raise PricingPrefixComplete
 
         kwargs['on_iteration'] = record

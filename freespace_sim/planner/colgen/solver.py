@@ -10,6 +10,7 @@ semantics as the LP/IP loop.
 
 from __future__ import annotations
 
+import gc
 import logging
 
 import collections
@@ -897,6 +898,46 @@ def _pre_master_timeout_result(
     )
 
 
+class _ParentHeap:
+    """The solver process's cyclic-garbage-collection policy for one ``solve``.
+
+    Setup builds a large, long-lived, acyclic heap (graphs, rows, the master and its
+    columns). On a 1,537-flight solve every parent collection of 50 ms or more reclaimed
+    nothing, yet the full passes over that heap cost ~25 s, most of it while setup was
+    still growing it. So collection is off during setup, and at ``freeze`` everything alive
+    moves to the permanent generation and collection resumes for what the loop allocates.
+    The loop freezes at every iteration, so a full collection scans one iteration's
+    survivors rather than every column added since setup. Every exit unfreezes and restores
+    the caller's enabled setting.
+
+    ``gc.unfreeze`` releases everything frozen, not only what this froze. Do not skip the
+    policy when objects are already frozen on entry: CPython 3.12 starts with 375 immortal
+    tuples frozen, so such a guard never engages there. Releasing them is harmless.
+
+    Attributes
+    ------------
+    - collecting (bool): whether automatic collection was enabled on entry.
+    """
+
+    def __enter__(self) -> "_ParentHeap":
+        self.collecting = gc.isenabled()
+        gc.disable()
+        return self
+
+    def freeze(self) -> None:
+        """Exempt every live object from later collections, then resume the caller's setting."""
+        gc.freeze()
+        if self.collecting:
+            gc.enable()
+
+    def __exit__(self, *exc_info: object) -> None:
+        gc.unfreeze()
+        if self.collecting:
+            gc.enable()
+        else:
+            gc.disable()
+
+
 class ColGenSolver:
     """Whole-schedule column generation solver orchestrating restricted master LP and pricing DAGs."""
 
@@ -957,6 +998,34 @@ class ColGenSolver:
         ``lp_columns`` and read-only ``lp_x`` are aligned snapshots; new columns
         added after that LP have zero values, with ``lp_column_count`` identifying the
         original LP prefix. ``master`` remains live and may grow after the callback.
+        """
+        with _ParentHeap() as heap:
+            return self._solve(
+                requests, cfg, static_terms, params, fixed_claims=fixed_claims,
+                on_iteration=on_iteration, seed_columns=seed_columns, heap=heap,
+            )
+
+    def _solve(
+        self,
+        requests: Sequence[FlightRequest],
+        cfg: SimConfig,
+        static_terms,
+        params: ColGenParams,
+        *,
+        fixed_claims: Sequence[frozenset[RowKey]],
+        on_iteration,
+        seed_columns: Mapping[int, Sequence[Column]] | None,
+        heap: _ParentHeap,
+    ) -> ColGenResult:
+        """Body of :meth:`solve`, which documents every other parameter.
+
+        Parameters
+        ------------
+        - heap (_ParentHeap): the entered GC policy; frozen at the start of every iteration.
+
+        Return
+        --------
+        - output (ColGenResult): as :meth:`solve`.
         """
         started = time.monotonic()
         pricing_wall_s = 0.0
@@ -1381,6 +1450,7 @@ class ColGenSolver:
         pricing_platform = make_pricing_platform(params) if params.pricing_device == "gpu" else None
         try:
             for iteration in range(params.max_iterations):
+                heap.freeze()
                 # One line per iteration BEFORE any of its work, so a run that wedges says
                 # which iteration it wedged in.  The stage lines below say where inside it.
                 log.info(

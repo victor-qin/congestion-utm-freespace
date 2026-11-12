@@ -8,6 +8,7 @@ the independent referee for selected columns.
 
 from __future__ import annotations
 
+import gc
 import math
 import time
 from collections import Counter
@@ -2491,6 +2492,57 @@ def test_every_exit_reports_the_same_stats_keys():
     assert timed_out.stats["termination_reason"] == "time_limit"
     assert set(empty.stats) == set(full.stats)
     assert set(timed_out.stats) == set(full.stats)
+
+
+@pytest.mark.parametrize("collecting", [True, False])
+def test_solve_freezes_its_heap_for_the_loop_and_restores_gc_on_every_exit(
+    collecting, monkeypatch
+):
+    """The collector is process state that ``solve`` borrows; one process calls it many times.
+
+    Setup (graph building) runs with collection off; inside the loop setup's heap is frozen
+    and collection follows the caller's setting. Every exit -- a return, a raise out of the
+    loop, a pre-master timeout -- leaves nothing frozen and the setting as it was.
+    """
+
+    class Stop(Exception):
+        pass
+
+    def stop(_state):
+        raise Stop
+
+    build = solver_module.build_flight_graph
+    in_setup: list[bool] = []
+
+    def spy_build(*args, **kwargs):
+        in_setup.append(gc.isenabled())
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(solver_module, "build_flight_graph", spy_build)
+    cfg = _cfg(max_ground_delay_s=32.0)
+    requests = [_request(1, (-4, 0), (4, 0), cfg)]
+    in_loop: list[tuple[bool, bool]] = []
+    was_collecting = gc.isenabled()
+    (gc.enable if collecting else gc.disable)()
+    # Nonzero on CPython 3.12 before anything runs, so "frozen" means "more than this".
+    frozen_on_entry = gc.get_freeze_count()
+    try:
+        ColGenSolver().solve(
+            requests, cfg, (), _params(),
+            on_iteration=lambda _s: in_loop.append(
+                (gc.get_freeze_count() > frozen_on_entry, gc.isenabled())
+            ),
+        )
+        assert in_setup == [False]
+        assert in_loop and set(in_loop) == {(True, collecting)}
+        assert (gc.get_freeze_count(), gc.isenabled()) == (0, collecting)
+        with pytest.raises(Stop):
+            ColGenSolver().solve(requests, cfg, (), _params(), on_iteration=stop)
+        assert (gc.get_freeze_count(), gc.isenabled()) == (0, collecting)
+        ColGenSolver().solve(requests, cfg, (), _params(time_limit_s=1e-6))
+        assert (gc.get_freeze_count(), gc.isenabled()) == (0, collecting)
+    finally:
+        (gc.enable if was_collecting else gc.disable)()
 
 
 def test_the_objective_stat_says_which_currency_it_is_in():

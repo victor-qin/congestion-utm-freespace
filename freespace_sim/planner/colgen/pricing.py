@@ -1699,8 +1699,8 @@ def _route_geometry(fg: FlightGraph, cfg: SimConfig) -> _RouteGeometry:
 def _route_hops_clear(fg: FlightGraph, cfg: SimConfig, path: tuple[Cell, ...]) -> bool:
     """Whether every hop is adjacent, inside the corridor and wall-safe for its position.
 
-    With the lazy hop oracle this is one cached ``role_mask`` lookup per hop: the mask is 0
-    for a non-adjacent or out-of-corridor pair and carries the exact per-role wall verdict
+    With the lazy hop oracle this is one read of its cached role mask per hop: the mask is 0
+    for a non-adjacent, out-of-corridor or not-yet-expanded pair and carries the exact per-role wall verdict
     (first hop, last hop, both, neither), built on the builder's own sub-boxes and tags.  A
     route clears the walls iff each hop clears for its role and both endpoint cylinders clear.
     Without such an oracle built for this graph (an eager ``forbidden_hops`` set only knows
@@ -1723,8 +1723,11 @@ def _route_hops_clear(fg: FlightGraph, cfg: SimConfig, path: tuple[Cell, ...]) -
     if geometry.hop_verdicts_exact:
         if fg.static_walls and not geometry.endpoints_clear:
             return False
+        # Already-expanded verdicts only: a DP route's hops were all expanded when its search
+        # was prepared, and an unexpanded one just defers.
+        allows = fg.forbidden_hops.allows_known
         return all(
-            fg.hop_allowed_for_role(source, target, first=index == 0, last=index == last)
+            allows(source, target, first=index == 0, last=index == last)
             for index, (source, target) in enumerate(zip(path, path[1:]))
         )
     if fg.static_walls:

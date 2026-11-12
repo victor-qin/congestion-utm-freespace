@@ -1637,6 +1637,37 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         # would rescan a <=6-tuple on each of the two calls the pricing DP makes per arc.
         return bool(self.role_mask(source, target) & role)
 
+    def allows_known(self, source: Cell, target: Cell, *, first: bool, last: bool) -> bool:
+        """``allows`` for an arc already expanded, else ``False``; never expands or counts.
+
+        For a caller that only needs a "certainly allowed" answer, such as pricing's
+        volume-free certification, which defers every ``False`` to the full check.  A source's
+        role entries are written before it is marked expanded, and an unexpanded arc simply
+        has no entry, so this unlocked read never returns ``True`` wrongly.  Keeping the
+        oracle's counters still is what lets a repeated pricing call ask it nothing at all.
+
+        Parameters
+        ------------
+        - source (Cell): the arc's start cell.
+        - target (Cell): the arc's end cell.
+        - first (bool): whether the arc is the path's first hop.
+        - last (bool): whether the arc is the path's last hop.
+
+        Return
+        --------
+        - output (bool): True only if the arc was expanded and is wall-safe in that role.
+        """
+        role = (
+            _ARC_FIRST_LAST
+            if first and last
+            else _ARC_FIRST
+            if first
+            else _ARC_LAST
+            if last
+            else _ARC_INTERNAL
+        )
+        return bool(self._roles.get((source, target), 0) & role)
+
     def __contains__(self, raw_hop: object) -> bool:
         if not isinstance(raw_hop, tuple) or len(raw_hop) != 2:
             return False

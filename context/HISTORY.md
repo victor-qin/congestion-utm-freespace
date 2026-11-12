@@ -233,3 +233,14 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   large cohorts with few workers. Send only small, bounded messages to a busy worker (≤2 chunks of
   ids); anything that scales with a sweep goes to idle workers or after the merge. Files:
   `freespace_sim/planner/colgen/pricing_pool.py`, `tests/test_colgen_pricing_pool.py`.
+
+- 2026-11-12T03:30Z [TOOL] Min-price dual selection (`min_price_duals`): barrier without crossover
+  cannot solve an LP pinned to its own optimum at 1e-9 relative. The feasible slab is thinner than
+  barrier's convergence tolerance, so it returned NUMERIC on 28/28 rounds of two full 1,537-flight
+  solves (homogeneous barrier failed on some rounds too) although the pin was feasible (exact
+  optimum within 5e-7 of the master's barrier z*). Use dual simplex for any second-stage LP pinned
+  to optimality. Separately, faster LP convergence did not mean a better answer: min-price duals
+  cut pricing 33% and lifted the lower bound every round, but the sparser pool's restricted IP was
+  ≥161,934 vs 156,616 (+4.0% final cost, final IP unproven at 600 s). Judge any dual-selection
+  change by the final IP cost, not rounds or bound. Runs 20261112T024339Z-mpd44-spx-on1-dd1941,
+  20261112T024408Z-mpd44-off2-433fee. Files: `freespace_sim/planner/colgen/{master,solver}.py`.

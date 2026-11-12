@@ -41,6 +41,25 @@ class BackendLpResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BackendDualSelection:
+    """Outcome of re-selecting the master's duals for the smallest total capacity price.
+
+    Attributes
+    ------------
+    - status (str): the second solve's Gurobi status name; the duals are set only when it is
+      ``"OPTIMAL"``.
+    - dual_objective (float): ``b^T y`` of the selected duals (``nan`` when not selected).
+    - flight_duals (dict[int, float] | None): selected ``pi_f``, by flight.
+    - row_duals (dict[RowKey, float] | None): selected ``mu_r``, by materialized row.
+    """
+
+    status: str
+    dual_objective: float = math.nan
+    flight_duals: dict[int, float] | None = None
+    row_duals: dict[RowKey, float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class BackendIpResult:
     """One backend-independent integer result, in maximize sense.
 
@@ -634,6 +653,81 @@ class GurobiBackend:
         x = np.asarray([variable.X for variable in self._variables], dtype=float)
         return BackendLpResult(float(self._model.ObjVal), flight_duals, row_duals, x)
 
+    def select_min_price_duals(self, primal_objective: float) -> BackendDualSelection:
+        """Re-select the last LP's duals as the optimal ones with the smallest capacity price.
+
+        Solves ``min sum_r mu_r`` over the master's dual ``{A^T y >= c, y >= 0}``, ``y = (pi,
+        mu)``, pinned to optimality by ``b^T y <= z* + 1e-9 max(1, |z*|)``. Capacity rows
+        priced at zero in every optimal dual stay at zero; the price the LP can spread between
+        a flight row and the rows its columns claim moves onto the flight row. A non-optimal
+        status (e.g. a ``z*`` short of the optimum by more than the pin) means the caller
+        keeps the LP's duals.
+
+        Dual simplex, NOT the master's barrier: the pin leaves a feasible slab ~1e-9 relative
+        thick, below barrier's convergence tolerance, and barrier without crossover returned
+        NUMERIC on every round of a full 1,537-flight solve (homogeneous barrier too, on some
+        rounds). Dual simplex solves the same captured masters exactly in about one master-LP
+        time. It returns a vertex of the minimizers rather than their centre, but the set is
+        small: on the round-7 master the minimum prices 371 rows against the LP's 9,976.
+
+        Parameters
+        ------------
+        - primal_objective (float): ``z*``, the objective of the LP :meth:`solve_lp` just
+          solved on this model (the pool and rows must not have changed since).
+
+        Return
+        --------
+        - output (BackendDualSelection): the selected duals and their ``b^T y``, or only the
+          status when the solve was not optimal.
+        """
+        gp = self._gp
+        model = self._model
+        model.update()
+        constraints = model.getConstrs()
+        # Rows and columns of `getA()` are constraint and variable `.index`, the same order
+        # `getConstrs()` / `getVars()` return.
+        matrix = model.getA()
+        rhs = np.asarray(model.getAttr("RHS", constraints), dtype=float)
+        objective = np.asarray(model.getAttr("Obj", model.getVars()), dtype=float)
+        flight_index = np.array([row.index for row in self._flight_rows.values()], dtype=np.int64)
+        capacity_index = np.array(
+            [row.index for row in self._capacity_rows.values()], dtype=np.int64
+        )
+        weights = np.zeros(len(constraints))
+        weights[capacity_index] = 1.0
+        z = float(primal_objective)
+        pin = z + 1e-9 * max(1.0, abs(z))
+
+        dual = gp.Model("colgen-min-price-duals")
+        try:
+            dual.Params.OutputFlag = 0
+            dual.Params.Threads = gurobi_threads()
+            dual.Params.Seed = self.seed
+            dual.Params.TimeLimit = self.time_limit_s
+            dual.Params.Method = 1
+            y = dual.addMVar(len(constraints), lb=0.0, obj=weights)
+            dual.addMConstr(matrix.T.tocsr(), y, gp.GRB.GREATER_EQUAL, objective)
+            dual.addMConstr(rhs.reshape(1, -1), y, gp.GRB.LESS_EQUAL, np.array([pin]))
+            dual.ModelSense = gp.GRB.MINIMIZE
+            dual.optimize()
+            status = next(
+                (name for name in dir(gp.GRB.Status)
+                 if name.isupper() and getattr(gp.GRB.Status, name) == dual.Status),
+                str(dual.Status),
+            )
+            if dual.Status != gp.GRB.OPTIMAL:
+                return BackendDualSelection(status)
+            # Barrier without crossover can leave components a hair below their bound.
+            values = np.maximum(np.asarray(y.X, dtype=float), 0.0)
+        finally:
+            dual.dispose()
+        return BackendDualSelection(
+            status,
+            float(rhs @ values),
+            dict(zip(self._flight_rows, values[flight_index].tolist())),
+            dict(zip(self._capacity_rows, values[capacity_index].tolist())),
+        )
+
     def solve_ip(self, warm_start: np.ndarray | None = None) -> BackendIpResult:
         """Solve the binary MIP with the recorded warm start and return the incumbent.
 
@@ -1130,6 +1224,31 @@ class RestrictedMaster:
         self.last_lp_objective = float(result.objective)
         self.last_lp_x = np.asarray(result.x, dtype=float)
         return self.last_lp_objective, dict(self.last_row_duals), self.last_lp_x.copy()
+
+    def select_min_price_duals(self) -> BackendDualSelection:
+        """Replace the last LP's duals with optimal ones of smallest total capacity price.
+
+        On success ``last_row_duals`` and ``last_flight_duals`` (so :attr:`flight_duals`) hold
+        the selected duals; otherwise they keep the LP's. Must run before any column or row is
+        added after :meth:`solve_lp`, because the selection re-reads the backend's model.
+
+        Parameters
+        ------------
+        - none: reads ``last_lp_objective`` and the backend's current model.
+
+        Return
+        --------
+        - output (BackendDualSelection): the backend's outcome (see
+          :meth:`GurobiBackend.select_min_price_duals`).
+        """
+        select = getattr(self._backend, "select_min_price_duals", None)
+        if select is None:
+            raise TypeError(f"the {self.backend_name} backend cannot select min-price duals")
+        selection = select(self.last_lp_objective)
+        if selection.row_duals is not None:
+            self.last_flight_duals = dict(selection.flight_duals)
+            self.last_row_duals = dict(selection.row_duals)
+        return selection
 
     def fractional_loads(self, x: Sequence[float]) -> dict[RowKey, float]:
         """Return fixed plus fractional loads over every claim in the support.

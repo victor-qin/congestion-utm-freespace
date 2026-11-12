@@ -23,6 +23,12 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   parked ground box allows (a toy fixture gained a denial and LNS stopped improving). Files:
   `freespace_sim/planner/{itinerary,pad_hold}.py`.
 
+- 2026-11-12T19:30Z [TOOL] Ablating the PR #153 fixes (each switched off on the final code; the
+  interior-fix-only level reproduced its saved runs flight-for-flight): capping a return's ground hold
+  alone denies the same trips, only as `budget_exceeded` instead of `conflict_filed`; re-timing the
+  outbound is what accepts them. Ground holds, not hub spacing, caused 9 of the 10 denials in the
+  unpaired walls-off FAA world. Files: `freespace_sim/planner/{itinerary,pad_hold}.py`.
+
 - 2026-11-07T20:40Z [TOOL] Packed arrays underestimate CPU preparation-cache memory. Hard88's
   retained worker graphs accounted for about 1500 MiB, despite much smaller packed tables;
   a 128 MiB worker budget rebuilt all 88 graphs on a warm sweep. Count lazy graph, role and claim

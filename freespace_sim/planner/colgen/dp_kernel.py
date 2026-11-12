@@ -112,7 +112,7 @@ FSUM_MAX_PARTIALS = 64
 
 # Where budget growth STOPS.  `_best_column_compiled` documents "a budget the kernel could
 # not grow into" as a `Declined` case, but without these that case is unreachable: the
-# retry loop grows geometrically and `np.zeros` raises `MemoryError` long before
+# retry loop grows geometrically and allocation raises `MemoryError` long before
 # `max_attempts` runs out, and `MemoryError` is caught nowhere on the path -- so instead of
 # falling back to the reference the solve dies, and under a worker pool an OOM-killed worker
 # hangs the sweep forever (see `pricing_pool`'s module docstring).
@@ -3061,24 +3061,21 @@ def price_dag(
 
     for attempt in range(max_attempts):
         cap = 1 << log2cap
-        # `np.empty`, not `np.full(-1)`, for the three arrays that carry no sentinel pre-fill.
-        # This is what makes over-allocating the arena FREE: `np.zeros` is calloc and
-        # `np.empty` is malloc, so both hand back lazily-mapped pages that cost no physical
-        # RAM until touched, whereas `np.full(-1)` writes every page up front -- 12 bytes x
-        # capacity, which at the 1<<26 ceiling is 805 MB paid on EVERY search including a
-        # trivial one, and paid again per pricing worker.
-        #
-        # Safe because every allocated slot is fully written before it can be read: root
-        # labels set all three explicitly (the `-1` sentinels below), children set all three
-        # at creation, and every read is indexed by a label id that has already been handed
-        # out.  `np.empty` would be a real hazard if any field were left implicit.
-        label_score = np.zeros(label_capacity, np.float64)
-        label_cell = np.zeros(label_capacity, np.int32)
+        # All nine label fields are `np.empty`. Untouched pages of a fresh allocation are
+        # mapped lazily, so requesting the 1<<26 ceiling costs only the pages a search
+        # fills. Zero-filling is not free: an allocator that recycles a large freed block
+        # must write every page, which on macOS made these six fills most of a warm
+        # search's allocation time and ~3x the workers' resident memory at the ceiling.
+        # Safe only while the root (`_seed_layer`) and child constructors write EVERY
+        # field before a label id is handed out, and every read is indexed by an id
+        # already handed out.
+        label_score = np.empty(label_capacity, np.float64)
+        label_cell = np.empty(label_capacity, np.int32)
         label_parent = np.empty(label_capacity, np.int32)
-        label_hops = np.zeros(label_capacity, np.int32)
-        label_variant = np.zeros(label_capacity, np.int32)
-        label_departure = np.zeros(label_capacity, np.int32)
-        label_lane = np.zeros(label_capacity, np.int32)
+        label_hops = np.empty(label_capacity, np.int32)
+        label_variant = np.empty(label_capacity, np.int32)
+        label_departure = np.empty(label_capacity, np.int32)
+        label_lane = np.empty(label_capacity, np.int32)
         label_first_a = np.empty(label_capacity, np.int32)
         label_first_b = np.empty(label_capacity, np.int32)
         cand_label = np.zeros(candidate_capacity, np.int32)

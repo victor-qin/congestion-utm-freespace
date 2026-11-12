@@ -7,6 +7,8 @@ against a recorded snapshot -- a snapshot would keep passing after the oracle mo
 is the failure mode the whole compiled-pricing effort has to avoid.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 import pytest
 
@@ -929,7 +931,9 @@ def _assert_prepared_exact(actual, expected):
 
 @pytest.mark.parametrize("shape", sorted(GRAPHS))
 @pytest.mark.parametrize("preparer", [dp_prepare.PricingPreparation, GPUPreparation])
-def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape, preparer):
+@pytest.mark.parametrize("fresh_call", [False, True])
+@pytest.mark.parametrize("pi_f", [0.0, 0.137])
+def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape, preparer, fresh_call, pi_f):
     """Changing cutoffs, root restrictions and rewind must not share search-state pruning."""
     from dataclasses import replace
 
@@ -938,11 +942,11 @@ def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape, prepa
     view = pricing.DualView(_duals(fg, cfg, 903), cfg)
     seed = pricing.seed_column(fg, cfg)
     benefit = 1000.0
-    strong = (benefit - seed.delay_s - view.claim_cost(seed.claims), seed)
+    strong = (benefit - seed.delay_s - view.claim_cost(seed.claims) - pi_f, seed)
     weak = (-1000.0, seed)
     tied = (strong[0], replace(seed, departure_step=seed.departure_step + 1))
     context = preparer(
-        fg, cfg, view, benefit=benefit, pi_f=0.0, model=DELAY_MODEL, forbidden_rows=frozenset())
+        fg, cfg, view, benefit=benefit, pi_f=pi_f, model=DELAY_MODEL, forbidden_rows=frozenset())
     topology, rows = context.topology_rows
     _assert_prepared_exact(context.duals, dp_prepare.prepare_duals(view, fg, topology, rows))
     _assert_prepared_exact(context.forbidden, prepare_forbidden(frozenset(), fg, rows, topology))
@@ -954,11 +958,15 @@ def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape, prepa
     stages = [(None, None), (weak, keep), (strong, keep), (strong, None),
               (tied, None), (weak, None), (None, None)]
     for incumbent, restriction in stages:
+        if fresh_call:
+            context = preparer(
+                fg, cfg, view, benefit=benefit, pi_f=pi_f, model=DELAY_MODEL,
+                forbidden_rows=frozenset())
         shared = context.envelopes(incumbent, None)
         fresh = dp_prepare.CompletionEnvelopes(
-            fg, cfg, view, benefit=benefit, pi_f=0.0, model=DELAY_MODEL,
+            fg, cfg, view, benefit=benefit, pi_f=pi_f, model=DELAY_MODEL,
             forbidden_rows=frozenset(), incumbent=incumbent)
-        kwargs = dict(benefit=benefit, pi_f=0.0, model=DELAY_MODEL,
+        kwargs = dict(benefit=benefit, pi_f=pi_f, model=DELAY_MODEL,
                       cost_cutoff=None if incumbent is None else incumbent[0],
                       keep_roots=restriction)
         actual = dp_prepare.prepare_variants(
@@ -991,10 +999,38 @@ def test_pricing_preparation_stages_match_fresh_bounds_and_variants(shape, prepa
         expired.envelope(departure, None if lane < 0 else lane)
 
 
+@dataclass(frozen=True, slots=True)
+class _ExplicitAirModel(CostModel):
+    """An objective whose ``evaluate`` tells an omitted air term from an explicit zero.
+
+    The cached completion bound must make the same ``evaluate`` calls as the oracle
+    ``pricing._arc_delay_lower_bound_s``; with this model any deviation moves the value.
+    """
+
+    def evaluate(self, *, ground_s, air_hold_s=0.0, air_detour_s=None):
+        """Charge an extra 0.5 only when the caller passes ``air_detour_s`` explicitly."""
+        if air_detour_s is None:
+            return CostModel.evaluate(self, ground_s=ground_s, air_hold_s=air_hold_s)
+        return 0.5 + CostModel.evaluate(
+            self, ground_s=ground_s, air_hold_s=air_hold_s, air_detour_s=air_detour_s)
+
+
 @pytest.mark.parametrize("shape", sorted(GRAPHS))
 @pytest.mark.parametrize("preparer", [dp_prepare.PricingPreparation, GPUPreparation])
-def test_pricing_preparation_current_subproblem_scope_and_prices(shape, preparer):
+@pytest.mark.parametrize("force_fold_fallback", [False, True])
+def test_pricing_preparation_current_subproblem_scope_and_prices(
+    shape, preparer, force_fold_fallback, monkeypatch,
+):
     """A new invocation must price current duals, forbidden rows and objective weights."""
+    if force_fold_fallback:
+        original_fold = pricing._terminal_fold_leg_s
+
+        def unretained_fold(*args, **kwargs):
+            """Exercise the ground-only bound when a terminal lane corner is dropped."""
+            leg, _retained = original_fold(*args, **kwargs)
+            return leg, False
+
+        monkeypatch.setattr(pricing, "_terminal_fold_leg_s", unretained_fold)
     cfg = _cfg()
     fg = GRAPHS[shape](cfg)
     seed = pricing.seed_column(fg, cfg)
@@ -1022,8 +1058,15 @@ def test_pricing_preparation_current_subproblem_scope_and_prices(shape, preparer
                                     benefit=1000.0, preparation=context)
     for view, exclusions, objective in (
         (views[0], frozenset(), model),
-        (views[1], frozenset(forbidden), CostModel(ground_weight=7.0, air_weight=1.0)),
+        (views[0], frozenset(), model),
+        (views[1], frozenset(forbidden), model),
+        (views[0], frozenset(), model),
+        (views[1], frozenset(forbidden), CostModel(ground_weight=7.3, air_weight=1.7)),
+        (views[1], frozenset(forbidden), CostModel(ground_weight=7.3, air_weight=1.7)),
         (pricing.DualView({next(iter(seed.claims)): -1e-12}, cfg), frozenset(), model),
+        (views[0], frozenset(), _ExplicitAirModel(ground_weight=7.3, air_weight=1.7)),
+        (views[0], frozenset(), _ExplicitAirModel(ground_weight=7.3, air_weight=1.7)),
+        (views[0], frozenset(), model),
     ):
         current = preparer(
             fg, cfg, view, benefit=1000.0, pi_f=0.0, model=objective, forbidden_rows=exclusions)
@@ -1043,6 +1086,26 @@ def test_pricing_preparation_current_subproblem_scope_and_prices(shape, preparer
                 shared = current.envelopes(None, None)
                 fresh = dp_prepare.CompletionEnvelopes(fg, cfg, view, **kwargs)
                 assert shared.envelope(departure, lane) == _eager_envelope(fresh, departure, lane)
+
+    # Configuration changes and rebuilt domains must not inherit the old scalar ruler.
+    from dataclasses import replace
+
+    for current_cfg, current_fg in (
+        (replace(cfg, nominal_speed_mps=cfg.nominal_speed_mps * 1.25), fg),
+        (cfg, replace(fg, base_step=fg.base_step - 1, max_air_hops=fg.max_air_hops + 2)),
+        (cfg, fg),
+    ):
+        view = pricing.DualView({}, current_cfg)
+        current = preparer(
+            current_fg, current_cfg, view, benefit=1000.0, pi_f=0.0,
+            model=model, forbidden_rows=frozenset())
+        shared = current.envelopes(None, None)
+        fresh = dp_prepare.CompletionEnvelopes(
+            current_fg, current_cfg, view, benefit=1000.0, pi_f=0.0, model=model)
+        for lane in _origin_lanes(current_fg):
+            for departure in range(current_fg.base_step, current_fg.base_step + 3):
+                assert shared._delay_envelope(departure, lane) == fresh._delay_envelope(
+                    departure, lane)
 
 
 @pytest.mark.parametrize("shape", sorted(GRAPHS))

@@ -269,3 +269,37 @@ def test_public_known_column_is_repaired_before_becoming_a_cutoff():
     imported = replace(seed, claims=frozenset(), delay_s=-1_000_000.)
     actual = pricing.price_flight(graph, view, 0., cfg, params, known_column=imported)
     assert actual == expected
+
+
+def test_sink_visit_reuse_preserves_claims_and_refreshes_departures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated callbacks reuse visit memberships without changing canonical answers."""
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    original = pricing._visit_claims
+    calls = []
+
+    def count_visit(*args, **kwargs):
+        """Count visit membership construction beneath sink callbacks."""
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pricing, "_visit_claims", count_visit)
+    view = pricing.DualView({}, cfg)
+    certify = pricing._sink_certifier(graph, view, 0., cfg, 1000., frozenset(), model)
+    lane_steps = 0 if seed.origin_lane_idx is None else graph.origin_lanes[seed.origin_lane_idx].steps
+    arrival = seed.departure_step + graph.takeoff_steps[0] + lane_steps + len(seed.cell_path) - 1
+    first = certify(None, seed.departure_step, seed.origin_lane_idx, seed.dest_lane_idx,
+                    arrival, seed.cell_path)
+    first_count = len(calls)
+    second = certify(None, seed.departure_step, seed.origin_lane_idx, seed.dest_lane_idx,
+                     arrival, seed.cell_path)
+    assert first == second and first is not None
+    assert first_count == len(seed.cell_path) and len(calls) == first_count
+    shifted = certify(None, seed.departure_step + 1, seed.origin_lane_idx, seed.dest_lane_idx,
+                      arrival + 1, seed.cell_path)
+    assert len(calls) > first_count
+    cold = pricing._sink_certifier(graph, view, 0., cfg, 1000., frozenset(), model)
+    assert shifted == cold(None, seed.departure_step + 1, seed.origin_lane_idx,
+                           seed.dest_lane_idx, arrival + 1, seed.cell_path)

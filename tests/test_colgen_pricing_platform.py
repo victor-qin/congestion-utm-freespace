@@ -23,7 +23,8 @@ from freespace_sim.planner.colgen.pricing_platform import (
     PricingProblem,
     PricingResult,
 )
-from freespace_sim.planner.colgen.translate import column_to_intent
+from freespace_sim.planner.colgen.translate import column_to_intent, lattice_centerline
+from freespace_sim.volumes import enroute_flown_m
 from tests.test_colgen_review_fixes import _enumerated_best_rc
 from tests.test_colgen_solver import _cfg, _params, _request
 from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
@@ -1137,13 +1138,19 @@ def test_resident_record_copies_preserve_extension_words():
     assert runtime.read_rows(event_upper, 0, 1)[0] == 6.0
 
 
-@pytest.mark.parametrize("violation", ["forbidden_row", "graph_hop", "departure_budget"])
-def test_unchecked_route_scoring_preserves_costs_without_publishing_certificates(violation: str) -> None:
+@pytest.mark.parametrize("precheck", [False, True])
+@pytest.mark.parametrize(
+    "violation", ["forbidden_row", "graph_hop", "departure_budget", "detour_budget"])
+def test_unchecked_route_scoring_preserves_costs_without_publishing_certificates(
+    violation: str, precheck: bool,
+) -> None:
     """Unchecked scoring bypasses real feasibility gates without poisoning later validation.
 
     Parameters
     ------------
-    - violation (str): an exclusion, graph hop restriction or departure budget violation.
+    - violation (str): an exclusion, graph hop restriction, departure or detour budget violation.
+    - precheck (bool): attach the pre-check's claims and dual, as pricing's own candidates
+      carry them; the volume-free path must then leave every rejection to the reference.
 
     Return
     --------
@@ -1153,10 +1160,19 @@ def test_unchecked_route_scoring_preserves_costs_without_publishing_certificates
     graph, cfg = problem.graph, problem.cfg
     model = cost_model(cfg, problem.params)
     seed = pricing._shortest_seed(graph, cfg, model=model)
-    candidate = pricing._Candidate(0.0, 0.0, pricing._Label(
-        0.0, seed.departure_step, seed.origin_lane_idx, seed.cell_path, frozenset(),
-    ), seed.dest_lane_idx)
     view = pricing.DualView(problem.duals, cfg)
+
+    def candidate_for(label: pricing._Label) -> pricing._Candidate:
+        """Build the search candidate for ``label``, with its pre-check rows if requested."""
+        if not precheck:
+            return pricing._Candidate(0.0, 0.0, label, seed.dest_lane_idx)
+        claims = pricing._path_claims(graph, cfg, label, seed.dest_lane_idx)
+        return pricing._Candidate(0.0, 0.0, label, seed.dest_lane_idx, claims,
+                                  view.claim_cost(claims))
+
+    candidate = candidate_for(pricing._Label(
+        0.0, seed.departure_step, seed.origin_lane_idx, seed.cell_path, frozenset(),
+    ))
     args = (candidate, graph, view, problem.pi_f, cfg, pricing._benefit(problem.params),
             frozenset(), model)
     checked = pricing._canonical_candidate(*args)
@@ -1174,14 +1190,30 @@ def test_unchecked_route_scoring_preserves_costs_without_publishing_certificates
         forbidden = frozenset([next(iter(checked[1].claims))])
     elif violation == "graph_hop":
         graph = replace(graph, forbidden_hops=frozenset([tuple(seed.cell_path[:2])]))
-    else:
-        candidate = replace(candidate, label=replace(
+    elif violation == "departure_budget":
+        candidate = candidate_for(replace(
             candidate.label, departure_step=graph.latest_departure_step + 1,
         ))
+    else:
+        # Tighten the stretch limit to just below this route's own, on an otherwise identical
+        # graph, so the detour budget alone decides.
+        flown = enroute_flown_m(
+            lattice_centerline(seed.cell_path, cfg.flight_levels_m[0], cfg),
+            graph.request.origin, graph.request.dest, graph.request.origin_terminal,
+            graph.request.dest_terminal, cfg)
+        reference = pricing._route_geometry(graph, cfg).reference_m
+        cfg = replace(cfg, max_detour_factor=flown / reference * (1.0 - 1e-9))
+        graph = build_flight_graph(graph.request, cfg, (), problem.params)
+        assert pricing._route_hops_clear(graph, cfg, seed.cell_path)
+        candidate = candidate_for(candidate.label)
     graph._search_cache.certified_claims.clear()
     graph._search_cache.certified_columns.clear()
     args = (candidate, graph, view, problem.pi_f, cfg, pricing._benefit(problem.params),
             forbidden, model)
+    if precheck:
+        assert pricing._fast_canonical(
+            candidate, graph, problem.pi_f, cfg, pricing._benefit(problem.params), forbidden,
+            model) is pricing._DEFER
     assert pricing._canonical_candidate(*args) is None
     graph._search_cache.certified_claims.clear()
     unchecked = pricing._canonical_candidate(*args, validate=False)

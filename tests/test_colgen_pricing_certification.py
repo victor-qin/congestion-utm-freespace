@@ -10,7 +10,7 @@ import pytest
 from freespace_sim.planner.colgen import pricing, pricing_pool
 from freespace_sim.planner.colgen.network import StaticTerminalCatalog, build_flight_graph, column_claims
 from freespace_sim.planner.colgen.objective import cost_model
-from freespace_sim.planner.colgen.translate import column_to_intent
+from freespace_sim.planner.colgen.translate import column_to_intent, lattice_centerline
 from freespace_sim.config import SimConfig
 from freespace_sim.types import FlightRequest, Terminal, vec
 from freespace_sim.planner import hexgrid as hg
@@ -220,6 +220,10 @@ def test_shifted_incumbent_matches_canonical_claims_and_cost(dt, clock):
     assert column.claims == column_claims(column, fresh, cfg, _intent=intent)
     assert column.delay_s.hex() == model.intent_cost(intent, cfg).hex()
     assert rc.hex() == model.reduced_cost(benefit=1000., cost=column.delay_s, dual_cost=0., pi_f=0.).hex()
+    # Fast canonicalization measures the intent's own centreline without building volumes.
+    points = lattice_centerline(column.cell_path, cfg.flight_levels_m[0], cfg)
+    assert [tuple(map(float.hex, point)) for point in points] == [
+        tuple(float(v).hex() for v in point) for point, _t in intent.centerline]
 
 
 def test_shifted_missing_terminal_row_cannot_be_used_as_cutoff():
@@ -304,6 +308,15 @@ def test_sink_visit_reuse_preserves_claims_and_refreshes_departures(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(pricing, "_visit_claims", count_visit)
+    original_fast = pricing._fast_canonical
+    fast = []
+
+    def record_fast(*args, **kwargs):
+        """Record whether canonicalization took the volume-free path."""
+        fast.append(original_fast(*args, **kwargs))
+        return fast[-1]
+
+    monkeypatch.setattr(pricing, "_fast_canonical", record_fast)
     view = pricing.DualView({}, cfg)
     certify = pricing._sink_certifier(graph, view, 0., cfg, 1000., frozenset(), model)
     lane_steps = 0 if seed.origin_lane_idx is None else graph.origin_lanes[seed.origin_lane_idx].steps
@@ -321,3 +334,6 @@ def test_sink_visit_reuse_preserves_claims_and_refreshes_departures(
     cold = pricing._sink_certifier(graph, view, 0., cfg, 1000., frozenset(), model)
     assert shifted == cold(None, seed.departure_step + 1, seed.origin_lane_idx,
                            seed.dest_lane_idx, arrival + 1, seed.cell_path)
+    # Every sink here is a plain accepted route, so none should fall back to volume building
+    # (check mode, on for this module, compares each fast answer with the reference).
+    assert len(fast) == 4 and all(result is not pricing._DEFER for result in fast)

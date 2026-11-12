@@ -36,23 +36,27 @@ import itertools
 from collections import Counter, OrderedDict
 from collections.abc import Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass, replace
-from typing import Any, Hashable
+from typing import Any, Hashable, NamedTuple
 
 import numpy as np
 
 from ...config import SimConfig
-from ...types import IntentStatus, Terminal
+from ...conflict import volumes_conflict
+from ...types import IntentStatus, Terminal, as_terminal
 from ...volumes import (
     column_dwell_s,
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
     exit_radius,
+    hover_reservation,
+    terminal_radius,
 )
 from .. import hexgrid as hg
 from . import dp_prepare
 from .network import (
     _MAX_ENDPOINT_CLAIMS,
+    _LazyForbiddenHops,
     Cell,
     FlightGraph,
     RowKey,
@@ -60,7 +64,7 @@ from .network import (
     shifted_claims_are_exact,
 )
 from .objective import DELAY_MODEL, CostModel, cost_model
-from .translate import Column, column_to_intent
+from .translate import Column, column_to_intent, lattice_centerline
 from .windows import (
     derive_cell_window,
     endpoint_claim_cells,
@@ -1533,10 +1537,12 @@ def _canonical_candidate(
 ) -> tuple[float, Column] | None:
     """Certify one search candidate's route and return its exact reduced cost, or ``None``.
 
-    A candidate carrying its pre-check ``claims`` and ``dual_cost`` reuses them instead of
-    rebuilding the same row union; everything else is the reference certification.  Under
-    ``COLGEN_CHECK_CANONICAL=1`` that answer is compared with the reference run on the bare
-    candidate, so the reuse is checked rather than trusted.
+    A candidate carrying its pre-check ``claims`` and ``dual_cost`` first tries
+    :func:`_fast_canonical`, which accepts a route without building its reservation volumes;
+    anything it cannot vouch for goes to the reference certification, which then reuses the
+    claims and dual cost instead of rebuilding them.  Under ``COLGEN_CHECK_CANONICAL=1`` every
+    such answer is compared with the reference run on the bare candidate, so neither shortcut
+    is trusted unchecked.
 
     Parameters
     ------------
@@ -1558,9 +1564,14 @@ def _canonical_candidate(
       ``None`` when the route is not accepted, has illegal claims, or hits a forbidden row.
     """
     reuse = validate and candidate.claims is not None and candidate.dual_cost is not None
-    result = _reference_canonical(candidate, fg, duals, pi_f, cfg, benefit, forbidden_rows,
-                                  model, validate=validate, reuse=reuse)
-    if reuse and _CHECK_CANONICAL:
+    if not reuse:
+        return _reference_canonical(candidate, fg, duals, pi_f, cfg, benefit, forbidden_rows,
+                                    model, validate=validate, reuse=False)
+    result = _fast_canonical(candidate, fg, pi_f, cfg, benefit, forbidden_rows, model)
+    if result is _DEFER:
+        result = _reference_canonical(candidate, fg, duals, pi_f, cfg, benefit, forbidden_rows,
+                                      model, validate=True, reuse=True)
+    if _CHECK_CANONICAL:
         bare = replace(candidate, claims=None, dual_cost=None)
         with _without_claim_certificates(fg):
             expected = _reference_canonical(bare, fg, duals, pi_f, cfg, benefit, forbidden_rows,
@@ -1584,6 +1595,273 @@ def _without_claim_certificates(fg: FlightGraph):
             yield
         finally:
             cache.certified_claims = saved
+
+
+# `_fast_canonical`'s "cannot vouch for this route": the reference certification decides.
+_DEFER = object()
+
+
+class _RouteMetrics(NamedTuple):
+    """The two trajectory metrics canonical cost reads from an accepted intent."""
+
+    ground_s: float
+    detour_m: float
+
+
+class _RouteGeometry(NamedTuple):
+    """Per-graph constants of canonical certification, built once by :func:`_route_geometry`."""
+
+    cfg: SimConfig
+    reference_m: float
+    endpoints_clear: bool
+    hop_verdicts_exact: bool
+    endpoints_match_graph: bool
+
+
+def _route_geometry(fg: FlightGraph, cfg: SimConfig) -> _RouteGeometry:
+    """Memoize the per-graph inputs of fast canonicalization on the graph's search cache.
+
+    * ``reference_m`` -- :func:`enroute_reference_m`, a function of the request alone.
+    * ``endpoints_clear`` -- whether the two endpoint hover cylinders, built exactly as
+      ``build_reservation_from_corners`` builds them, clear every static wall.  Their shape
+      does not depend on time; they are built at ``t0 = 0`` so a wall starting at 0 overlaps
+      them in time and the verdict is purely spatial, hence valid at every departure.
+    * ``hop_verdicts_exact`` -- the graph's lazy per-hop oracle was built for this graph
+      (``_LazyForbiddenHops.describes``) and every wall overlaps, in time, the relative clock
+      its boxes are built on (``network._static_hop_allowed_roles``), so a hop verdict of
+      "clear" means spatially clear.  Shipped walls span ``[0, 1e12)``.
+    * ``endpoints_match_graph`` -- the request's terminals, lanes and customer cells equal the
+      graph's, so checking a route against the graph is checking it against the translation.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph whose cache holds the memo.
+    - cfg (SimConfig): the config the graph was built with; part of the memo key.
+
+    Return
+    --------
+    - output (_RouteGeometry): the memoized per-graph constants.
+    """
+    cache = fg._search_cache
+    with cache.lock:
+        geometry = cache.route_geometry
+    if geometry is not None and geometry.cfg == cfg:
+        return geometry
+    request = fg.request
+    origin_terminal = as_terminal(request.origin_terminal)
+    dest_terminal = as_terminal(request.dest_terminal)
+    z = cfg.flight_levels_m[0]
+    endpoints_clear = True
+    for point, terminal in ((request.origin, origin_terminal), (request.dest, dest_terminal)):
+        cylinder = hover_reservation(
+            point, 0.0, cfg,
+            terminal_id=terminal.id if terminal is not None else None,
+            radius=terminal_radius(terminal, cfg) if terminal is not None else None,
+            climb_time_s=column_dwell_s(point, terminal, cfg, z),
+        )
+        if cylinder.t_end <= 0.0 or any(
+            volumes_conflict(cylinder, wall)
+            for wall, _bound in fg._wall_index.candidates(cylinder.flat_aabb())
+        ):
+            endpoints_clear = False
+    radius = hg.circumradius(cfg)
+
+    def matches(point, terminal, graph_terminal, graph_lanes, graph_cell) -> bool:
+        """Whether the translation's view of one endpoint is the graph's."""
+        if terminal != graph_terminal:
+            return False
+        if terminal is not None:
+            return tuple(hg.terminal_lanes(point, terminal, cfg)) == tuple(graph_lanes)
+        return hg.enu_to_axial(float(point[0]), float(point[1]), radius) == graph_cell
+
+    geometry = _RouteGeometry(
+        cfg=cfg,
+        reference_m=enroute_reference_m(
+            request.origin, request.dest, origin_terminal, dest_terminal, cfg),
+        endpoints_clear=endpoints_clear,
+        hop_verdicts_exact=(
+            isinstance(fg.forbidden_hops, _LazyForbiddenHops)
+            and fg.forbidden_hops.describes(fg)
+            and all(wall.t_start <= 0.0 and wall.t_end >= cfg.dt_s for wall in fg.static_walls)
+        ),
+        endpoints_match_graph=(
+            matches(request.origin, origin_terminal, fg.origin_terminal, fg.origin_lanes,
+                    fg.origin_cell)
+            and matches(request.dest, dest_terminal, fg.dest_terminal, fg.dest_lanes,
+                        fg.dest_cell)
+        ),
+    )
+    with cache.lock:
+        cache.route_geometry = geometry
+    return geometry
+
+
+def _route_hops_clear(fg: FlightGraph, cfg: SimConfig, path: tuple[Cell, ...]) -> bool:
+    """Whether every hop is adjacent, inside the corridor and wall-safe for its position.
+
+    With the lazy hop oracle this is one cached ``role_mask`` lookup per hop: the mask is 0
+    for a non-adjacent or out-of-corridor pair and carries the exact per-role wall verdict
+    (first hop, last hop, both, neither), built on the builder's own sub-boxes and tags.  A
+    route clears the walls iff each hop clears for its role and both endpoint cylinders clear.
+    Without such an oracle built for this graph (an eager ``forbidden_hops`` set only knows
+    the union over roles) a route with walls is never vouched for; without walls the corridor,
+    adjacency and forbidden-hop checks are made directly.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph.
+    - cfg (SimConfig): the graph's config.
+    - path (tuple[Cell, ...]): the route's cells, at least two.
+
+    Return
+    --------
+    - output (bool): True only when the reference's corridor, adjacency, forbidden-hop and
+      static-wall checks are all certain to pass.
+    """
+    last = len(path) - 2
+    geometry = _route_geometry(fg, cfg)
+    if geometry.hop_verdicts_exact:
+        if fg.static_walls and not geometry.endpoints_clear:
+            return False
+        return all(
+            fg.hop_allowed_for_role(source, target, first=index == 0, last=index == last)
+            for index, (source, target) in enumerate(zip(path, path[1:]))
+        )
+    if fg.static_walls:
+        return False
+    corridor = fg.corridor_cells
+    return all(
+        hg.hex_distance(source, target) == 1 and source in corridor and target in corridor
+        and (source, target) not in fg.forbidden_hops
+        for source, target in zip(path, path[1:])
+    )
+
+
+def _canonical_route_metrics(
+    fg: FlightGraph, cfg: SimConfig, label: _Label, dest_lane_idx: int | None
+) -> _RouteMetrics | object:
+    """Canonical ground delay and detour of an ACCEPTED route, or ``_DEFER``.
+
+    Mirrors every check ``column_to_intent`` and ``column_claims`` make, but answers only
+    "accepted, with these metrics": a budget overrun, a wall, a malformed path or anything
+    unusual returns ``_DEFER`` so the reference rejects (or raises) exactly as before.  The
+    flown distance is measured over :func:`lattice_centerline`, the intent's own points.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the flight graph, supplying the request, lanes and limits.
+    - cfg (SimConfig): must be the graph's config.
+    - label (_Label): the route's departure step, origin lane and cells.
+    - dest_lane_idx (int | None): the selected destination lane.
+
+    Return
+    --------
+    - output (_RouteMetrics | object): ``(ground_s, detour_m)`` bit-identical to the
+      intent's ``ground_delay_s`` and ``air_detour_m``, or ``_DEFER``.
+    """
+    if cfg is not fg._cfg and cfg != fg._cfg:
+        return _DEFER
+    request = fg.request
+    path = label.path
+    if len(path) < 2:
+        return _DEFER
+    origin_terminal = as_terminal(request.origin_terminal)
+    dest_terminal = as_terminal(request.dest_terminal)
+    if (origin_terminal is not None or dest_terminal is not None) and not (
+        cfg.terminal_airspace_always_active and cfg.fixed_exit_lanes
+    ):
+        return _DEFER
+    geometry = _route_geometry(fg, cfg)
+    if not geometry.endpoints_match_graph:
+        return _DEFER
+    dt = cfg.dt_s
+    departure = label.departure_step
+    base = int(math.ceil(request.t_departure / dt))
+    if departure < base or not fg.base_step <= departure <= fg.latest_departure_step:
+        return _DEFER
+    lane_steps = 0
+    origin_lane = label.origin_lane_idx
+    if origin_terminal is not None:
+        if (origin_lane is None or not 0 <= origin_lane < len(fg.origin_lanes)
+                or fg.origin_lanes[origin_lane].cell != path[0]):
+            return _DEFER
+        lane_steps = fg.origin_lanes[origin_lane].steps
+    elif origin_lane is not None or path[0] != fg.origin_cell:
+        return _DEFER
+    if dest_terminal is not None:
+        if (dest_lane_idx is None or not 0 <= dest_lane_idx < len(fg.dest_lanes)
+                or fg.dest_lanes[dest_lane_idx].cell != path[-1]):
+            return _DEFER
+    elif dest_lane_idx is not None or path[-1] != fg.dest_cell:
+        return _DEFER
+    if departure + fg.takeoff_steps[0] + lane_steps + len(path) - 1 > fg.max_step:
+        return _DEFER
+    if departure > base + int(math.floor(cfg.max_ground_delay_s / dt + 1e-12)):
+        return _DEFER
+    if not _route_hops_clear(fg, cfg, path):
+        return _DEFER
+    flown = enroute_flown_m(lattice_centerline(path, cfg.flight_levels_m[0], cfg),
+                            request.origin, request.dest, origin_terminal, dest_terminal, cfg)
+    reference = geometry.reference_m
+    if reference > 1e-9 and flown / reference > cfg.max_detour_factor:
+        return _DEFER
+    return _RouteMetrics((departure - base) * dt, enroute_detour_m(flown, reference))
+
+
+def _fast_canonical(
+    candidate: _Candidate,
+    fg: FlightGraph,
+    pi_f: float,
+    cfg: SimConfig,
+    benefit: float,
+    forbidden_rows: AbstractSet[RowKey],
+    model: CostModel,
+) -> tuple[float, Column] | object:
+    """Certify a claims-carrying candidate without building its reservation, or ``_DEFER``.
+
+    The reference spends nearly all its time building and re-timing reservation volumes, only
+    to read two numbers off them and test them against the static walls.  Here the numbers come
+    from the centreline alone and the walls from the graph's per-hop role verdicts, which test
+    the very same boxes; the claims and their dual are the pre-check's.  Never rejects: every
+    route it cannot accept is the reference's to judge.
+
+    Parameters
+    ------------
+    - candidate (_Candidate): carries the label, destination lane, pre-check claims and dual.
+    - fg (FlightGraph): the flight graph.
+    - pi_f (float): the flight's dual (``pi_f``).
+    - cfg (SimConfig): the graph's config.
+    - benefit (float): the per-flight benefit ``M``.
+    - forbidden_rows (AbstractSet[RowKey]): rows that must stay clear.
+    - model (CostModel): cost weights; ``evaluate`` is called in ``intent_cost``'s term order.
+
+    Return
+    --------
+    - output (tuple[float, Column] | object): the certified ``(reduced_cost, column)``,
+      bit-identical to the reference's, or ``_DEFER``.
+    """
+    if not candidate.claims.isdisjoint(forbidden_rows):
+        return _DEFER
+    label = candidate.label
+    metrics = _canonical_route_metrics(fg, cfg, label, candidate.dest_lane_idx)
+    if metrics is _DEFER:
+        return _DEFER
+    air_detour_s = metrics.detour_m / cfg.nominal_speed_mps
+    cost = model.evaluate(ground_s=metrics.ground_s, air_hold_s=0.0, air_detour_s=air_detour_s)
+    column = Column(
+        flight_id=fg.request.flight_id,
+        departure_step=label.departure_step,
+        level=0,
+        origin_lane_idx=label.origin_lane_idx,
+        dest_lane_idx=candidate.dest_lane_idx,
+        cell_path=label.path,
+        delay_s=cost,
+        claims=candidate.claims,
+    )
+    reduced_cost = model.reduced_cost(
+        benefit=benefit, cost=cost, dual_cost=candidate.dual_cost, pi_f=pi_f
+    )
+    return reduced_cost, _remember_certified_column(column, fg, model, air_detour_s)
 
 
 def _reference_canonical(

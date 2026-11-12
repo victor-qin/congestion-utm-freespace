@@ -34,6 +34,7 @@ from ...volumes import (
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
+    lattice_subdivision,
 )
 from .. import hexgrid as hg
 
@@ -366,6 +367,38 @@ def _retime_lattice_reservation(
     final_point, _old_time = retimed_centerline[-1]
     retimed_centerline[-1] = (final_point, arrival_t)
     return retimed_volumes, retimed_centerline
+
+
+def lattice_centerline(
+    cell_path: tuple[tuple[int, int], ...], z: float, cfg: SimConfig
+) -> list[tuple[float, float, float]]:
+    """The centreline points :func:`column_to_intent` measures, without building any volume.
+
+    ``build_reservation_from_corners`` stamps the first hex-centre corner and then the end of
+    every sub-segment; :func:`_retime_lattice_reservation` changes only their times.  These are
+    the same points, bit for bit (the subdivision is :func:`lattice_subdivision`), so
+    ``enroute_flown_m`` over them reproduces the intent's flown distance exactly.
+
+    Parameters
+    ------------
+    - cell_path (tuple[tuple[int, int], ...]): the column's axial cells, at least two.
+    - z (float): the column's flight-level altitude.
+    - cfg (SimConfig): supplies the lattice radius and segment length.
+
+    Return
+    --------
+    - output (list[tuple[float, float, float]]): the centreline points in flight order.
+    """
+    radius = hg.circumradius(cfg)
+    corners = []
+    for q, r in cell_path:
+        x, y = hg.hex_center(q, r, radius)
+        corners.append((float(x), float(y), float(z)))
+    points = [corners[0]]
+    segment_len = cfg.corridor_segment_len_m
+    for a, b in zip(corners, corners[1:]):
+        points.extend(end for _start, end in lattice_subdivision(a, b, segment_len))
+    return points
 
 
 def column_to_intent(

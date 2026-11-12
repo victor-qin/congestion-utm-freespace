@@ -34,6 +34,7 @@ from freespace_sim.planner.colgen.network import (
     build_flight_graph,
     column_claims,
 )
+from freespace_sim.planner.colgen import pricing
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import seed_column
 from freespace_sim.planner.colgen.translate import (
@@ -57,7 +58,11 @@ from freespace_sim.volumes import (
     enroute_reference_m,
     exit_radius,
     hover_reservation,
+    permanent_terminal_reservation,
 )
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 
 def _cfg(*, time_buffer_s: float = 4.0, planner: str = "colgen",
@@ -114,6 +119,33 @@ def _shortest_path(a: tuple[int, int], b: tuple[int, int]) -> tuple[tuple[int, i
 
 def _lane_index(lanes, cell: tuple[int, int]) -> int:
     return next(index for index, lane in enumerate(lanes) if lane.cell == cell)
+
+
+def _precheck_canonical(fg, cfg: SimConfig, raw: Column):
+    """Canonicalize ``raw`` as pricing does, with its pre-check claims and dual attached.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): the graph to certify on.
+    - cfg (SimConfig): the graph's config.
+    - raw (Column): the route; only its departure, lanes and cells are read.
+
+    Return
+    --------
+    - output (tuple): ``(fast, result)`` -- the volume-free attempt (``pricing._DEFER`` when it
+      cannot vouch for the route) and the full answer, which check mode (on for this module)
+      compares bit for bit with the reference certification.
+    """
+    label = pricing._Label(0.0, raw.departure_step, raw.origin_lane_idx, raw.cell_path,
+                           frozenset())
+    claims = pricing._path_claims(fg, cfg, label, raw.dest_lane_idx)
+    view = pricing.DualView({}, cfg)
+    candidate = pricing._Candidate(0.0, 0.0, label, raw.dest_lane_idx, claims,
+                                   view.claim_cost(claims))
+    model = pricing.DELAY_MODEL
+    fast = pricing._fast_canonical(candidate, fg, 0.0, cfg, 1000.0, frozenset(), model)
+    return fast, pricing._canonical_candidate(candidate, fg, view, 0.0, cfg, 1000.0,
+                                              frozenset(), model)
 
 
 def _priced_delay_s(
@@ -899,6 +931,13 @@ def test_hop_overlapping_both_endpoint_walls_is_rejected():
     with pytest.raises(ValueError, match="overlaps permanent static terminal 'B'"):
         column_claims(raw, exact_only_fg, cfg)
 
+    # Pricing's volume-free certification reads the per-role hop verdict and defers; without
+    # the lazy oracle (union over roles only) it cannot vouch for any walled route.  Either
+    # way the reference rejects.
+    for graph in (fg, exact_only_fg):
+        fast, result = _precheck_canonical(graph, cfg, raw)
+        assert fast is pricing._DEFER and result is None
+
 
 def test_resampled_endpoint_hop_with_separate_tags_is_not_falsely_forbidden():
     """A float-split edge may safely carry A then B instead of one ambiguous tag."""
@@ -941,6 +980,24 @@ def test_resampled_endpoint_hop_with_separate_tags_is_not_falsely_forbidden():
     )
     assert (path[0], path[1]) not in fg.forbidden_hops
     assert column_claims(raw, fg, cfg)
+    # The per-role hop verdict sees the same two differently tagged boxes, so pricing certifies
+    # this route without building its volumes, and identically to the reference.
+    fast, result = _precheck_canonical(fg, cfg, raw)
+    assert fast is not pricing._DEFER and result is not None
+
+    # A foreign wall over the origin pad touches no corridor box, only the origin cylinder:
+    # the per-graph endpoint verdict must catch it.  (The graph builder refuses such a
+    # request outright, so assemble the walled graph and its own hop oracle by hand.)
+    walls = fg.static_walls + (permanent_terminal_reservation(origin, Terminal("C", 1, radius=30.0), cfg),)
+    index = network_module._WallSpatialIndex(walls, max(256.0, 4.0 * cfg.corridor_width_m))
+    walled = replace(fg, static_walls=walls, _wall_index=index)
+    walled = replace(walled, forbidden_hops=network_module._LazyForbiddenHops(
+        walled.corridor_cells, walls, walled.request, walled.origin_terminal,
+        walled.dest_terminal, walled.origin_lanes, walled.dest_lanes, cfg, index))
+    assert walled.hop_allowed_for_role(*path, first=True, last=True)
+    assert not pricing._route_geometry(walled, cfg).endpoints_clear
+    fast, result = _precheck_canonical(walled, cfg, raw)
+    assert fast is pricing._DEFER and result is None
 
 
 def test_exact_static_hops_cover_empty_terminal_cell_projection():

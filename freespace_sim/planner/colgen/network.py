@@ -26,6 +26,7 @@ from ...volumes import (
     Volume4D,
     column_dwell_s,
     corridor_segment_volume,
+    lattice_subdivision,
     permanent_terminal_reservation,
     segment_overlaps_column,
     terminal_radius,
@@ -874,6 +875,7 @@ class _FlightSearchCache:
         "seed_delay_certified",
         "seed_model",
         "seed_search_complete",
+        "route_geometry",
     )
 
     def __init__(self) -> None:
@@ -922,6 +924,9 @@ class _FlightSearchCache:
         # an exception.
         self.seed_model: Any | None = None
         self.seed_search_complete = False
+        # `pricing._RouteGeometry`: per-graph constants of canonical certification (reference
+        # distance, endpoint-cylinder wall verdict), keyed by the config they were built with.
+        self.route_geometry: Any | None = None
 
     def __reduce__(self):
         # A transported graph starts with a cold cache: the lock cannot be pickled and the
@@ -1379,18 +1384,13 @@ def _static_hop_allowed_roles(
     p0 = (float(source_xy[0]), float(source_xy[1]), float(z))
     p1 = (float(target_xy[0]), float(target_xy[1]), float(z))
 
-    # Reproduce ``build_reservation_from_corners`` scalar interpolation.  A
-    # nominal edge can be a few ulps long and split into differently tagged boxes.
-    dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
-    length = math.sqrt(dx * dx + dy * dy + dz * dz)
-    nsub = max(1, math.ceil(length / cfg.corridor_segment_len_m))
+    # The builder's own sub-segments.  A nominal edge can be a few ulps long and split into
+    # differently tagged boxes.  Pricing's canonical shortcut (``pricing._route_hops_clear``)
+    # trusts these verdicts for whole routes, so they must describe the builder's boxes exactly.
+    endpoints = lattice_subdivision(p0, p1, cfg.corridor_segment_len_m)
+    nsub = len(endpoints)
     subvolumes: list[Volume4D] = []
-    endpoints = []
-    for k in range(1, nsub + 1):
-        f0, f1 = (k - 1) / nsub, k / nsub
-        sa = (p0[0] + f0 * dx, p0[1] + f0 * dy, p0[2] + f0 * dz)
-        sb = (p0[0] + f1 * dx, p0[1] + f1 * dy, p0[2] + f1 * dz)
-        endpoints.append((sa, sb))
+    for k, (sa, sb) in enumerate(endpoints, start=1):
         subvolumes.append(
             corridor_segment_volume(
                 sa,
@@ -1588,6 +1588,33 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
 
         self.outgoing(source)
         return self._roles.get((source, target), 0)
+
+    def describes(self, fg: "FlightGraph") -> bool:
+        """Whether these verdicts were built for ``fg``'s own corridor, walls, endpoints and config.
+
+        ``dataclasses.replace`` can pair a graph with another graph's oracle.  A caller that
+        trusts these verdicts in place of the graph's own route checks confirms this first.
+
+        Parameters
+        ------------
+        - fg (FlightGraph): the graph the caller is certifying routes on.
+
+        Return
+        --------
+        - output (bool): True when corridor, walls, wall index and request are the graph's
+          objects and terminals, lanes and config compare equal.
+        """
+        return (
+            self._corridor is fg.corridor_cells
+            and self._walls is fg.static_walls
+            and self._wall_index is fg._wall_index
+            and self._request is fg.request
+            and self._origin_terminal == fg.origin_terminal
+            and self._dest_terminal == fg.dest_terminal
+            and self._origin_lanes == fg.origin_lanes
+            and self._dest_lanes == fg.dest_lanes
+            and self._cfg == fg._cfg
+        )
 
     def allows(
         self,
